@@ -21,6 +21,7 @@ The near-term goal is not full feature completeness. The goal is to build a POC 
 Keep these systems separate:
 
 - `asset layer`: parse VRM/glTF and build engine-native assets
+- `editor / authoring layer`: create optional cloth overlays and save project-local authoring data
 - `avatar layer`: own runtime skeleton, pose, animation, and simulation state
 - `simulation layer`: update spring bones, colliders, and cloth
 - `renderer layer`: own Vulkan resources and shading
@@ -30,6 +31,7 @@ Keep these systems separate:
 The shared contract across those layers is the avatar pose and deformed render state, not Vulkan objects and not physics-engine objects.
 
 Tracking should output a normalized rig-driving signal, not direct renderer commands. Capture/output should consume finished frames, not participate in scene logic.
+Editor tools should author optional overlay assets, not rewrite the imported VRM into a runtime-only format.
 
 ## Recommended Runtime Model
 
@@ -38,6 +40,7 @@ Tracking should output a normalized rig-driving signal, not direct renderer comm
 Responsibilities:
 
 - read `.vrm` files
+- read optional project-local overlay data for authored features such as cloth
 - parse glTF buffers, meshes, skins, nodes, animations, materials
 - parse VRM 1.0 extensions
 - convert source data into engine-native immutable assets
@@ -50,13 +53,36 @@ Outputs:
 - `MaterialAsset`
 - `SpringBoneAsset`
 - `ColliderAsset`
-- `ClothAsset`
+- optional `ClothAsset`
 
 Rules:
 
 - do not leak Vulkan types out of this layer
 - do not leak Rapier types out of this layer
 - absorb VRM-specific schema decisions here
+- absorb project-local overlay schema decisions here
+
+### Editor / Authoring Layer
+
+Responsibilities:
+
+- author optional cloth overlays for imported avatars
+- save or load project-local cloth overlay data
+- stay separate from playback-only runtime code
+
+Outputs:
+
+- optional `ClothAsset`
+- editor metadata needed to re-open authored cloth setups
+
+Rules:
+
+- base VRM data remains generic imported content
+- cloth is an on-demand authored overlay, not a required part of VRM import
+- runtime must function when no cloth overlay exists
+- editor state must not become a required dependency for playback
+
+Detailed GUI flow and authoring interactions live in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
 
 ### Avatar Layer
 
@@ -132,10 +158,11 @@ without caring how simulation produced them.
 
 Responsibilities:
 
-- acquire webcam frames
-- run pose or face or hand estimation
+- acquire webcam frames on a non-render-thread path
+- run pose or face or hand estimation asynchronously
 - retarget estimated landmarks into the avatar rig space
 - smooth, filter, and stabilize tracking output
+- publish the latest completed tracking sample to the main app loop
 
 Outputs:
 
@@ -148,6 +175,8 @@ Rules:
 - webcam and CV code do not become the authoritative skeleton state
 - tracking writes into retargeting inputs, then avatar runtime resolves final pose
 - tracking must tolerate missing landmarks and low-confidence frames
+- the POC should run tracking asynchronously and hand off timestamped results through a narrow mailbox or queue
+- render and simulation must not block on a slow inference step; they should consume the latest valid sample
 
 ### Capture / Output Layer
 
@@ -157,17 +186,24 @@ Responsibilities:
 - provide a route for OBS ingestion
 - optionally expose alpha-capable avatar output
 - manage frame pacing and color format conversion if needed
+- hand off frames to sinks on a non-render-thread path
+- apply explicit backpressure policy when sinks fall behind
+- prefer GPU-resident shared-frame handoff over CPU readback when the target sink supports it
 
 Outputs:
 
 - virtual-camera-compatible video stream
 - optional shared texture or shared-memory transport
 - optional encoded stream for external tools
+- synchronization objects needed to safely consume exported GPU frames
 
 Rules:
 
 - output should consume renderer results through a narrow handoff
 - OBS integration should not force changes into avatar, tracking, or simulation logic
+- the POC should publish frames to output sinks asynchronously
+- output stalls should not block simulation or rendering; dropping or replacing stale frames is preferable to stalling the frame loop
+- the preferred performance path is exportable GPU images plus explicit synchronization, not unconditional CPU copies
 
 ## Physics Strategy
 
@@ -252,25 +288,32 @@ Cloth needs concepts that bone springs do not:
 - optional volume preservation
 - collision proxies against body and environment
 
-### Recommended first cloth target
+### Cloth authoring source
 
-Start with a narrow target:
+Base VRM assets stay generic.
 
-- skirt hem
-- coat flap
-- cape edge
-- ribbon sheet
+Cloth is authored on demand inside this application and stored as project-local overlay data. The runtime then decides whether a given avatar instance attaches that overlay and enables cloth simulation for it.
 
-Avoid full-body garment simulation in the first pass.
+That means:
+
+- VRM import succeeds even when no cloth data exists
+- cloth authoring and cloth playback are separate concerns
+- `ClothAsset` comes from editor-authored overlay data, not from standard VRM 1.0 content
+- the first runtime target should support zero or one optional cloth overlay per avatar instance
+
+The recommended authored representation is not "a few attachment points with local cloth motion". It is a dedicated cloth simulation representation that can drive the rendered garment region. The editor-facing workflow for creating that data is specified separately in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
 
 ### Recommended cloth architecture
 
 Immutable asset side:
 
-- `ClothMeshRegion`
+- `ClothSimulationMesh`
+- `ClothRenderRegionBinding`
+- `ClothMeshMapping`
 - `ClothConstraintSet`
 - `ClothPinSet`
 - `ClothCollisionProxySet`
+- `ClothLodSet`
 
 Runtime side:
 
@@ -283,7 +326,9 @@ Integration options:
 - `skinned source mesh -> cloth sim on selected region -> final deformed render mesh`
 - `bone-driven attachment points -> cloth local simulation -> render buffer update`
 
-For the POC, the second option is safer.
+For this project direction, the first option is the target architecture. A dedicated simulation mesh can be lower resolution than the final render mesh, but the runtime contract should preserve a clear mapping from simulation output to rendered geometry.
+
+For the first implementation pass, simplify by limiting garment scope and collision complexity, not by collapsing the data model into attachment-point cloth.
 
 ## MToon-like Shader Strategy
 
@@ -339,6 +384,20 @@ Decide these early:
 - premultiplied alpha or straight alpha
 - target frame rate
 - sRGB versus linear handoff
+- exported GPU memory handle type and synchronization primitive
+
+### Output handoff model
+
+`handoff` means the ownership and synchronization contract between renderer and output.
+
+For a high-performance path, that contract should be:
+
+- renderer produces an exportable GPU image
+- renderer publishes a frame token that includes the image handle, metadata, and sync object
+- output consumes that token asynchronously and releases it when the sink is done
+- renderer must not recycle the underlying image until the handoff contract says it is safe
+
+The fallback path can still allow CPU readback for debugging or unsupported sinks, but that should not be the architectural center.
 
 If you want compositing in OBS, alpha support becomes an architectural requirement, not a later convenience.
 
@@ -355,7 +414,20 @@ Immutable loaded data:
 - humanoid mapping
 - spring definitions
 - collider definitions
-- cloth region definitions
+
+### `ClothAsset`
+
+Immutable authored overlay data:
+
+- cloth simulation mesh
+- mapping from simulation mesh to rendered garment geometry
+- stable references into the imported avatar mesh and skeleton
+- pin definitions
+- constraint sets
+- collision proxy bindings
+- optional cloth LoD data
+- solver tuning parameters
+- editor-authored metadata needed for reload
 
 ### `AvatarInstance`
 
@@ -366,7 +438,9 @@ Live scene object:
 - current global pose
 - animation runtime state
 - spring runtime state
-- cloth runtime state
+- optional attached `ClothAsset`
+- cloth enabled or disabled runtime state
+- optional cloth runtime state
 
 ### `TrackingRigPose`
 
@@ -377,6 +451,7 @@ Normalized performer input:
 - hand targets
 - facial parameter weights
 - confidence per channel
+- source timestamp
 
 ### `AvatarPose`
 
@@ -403,42 +478,58 @@ Runtime state for cloth:
 - constraint buffers
 - pinned region bindings
 - collision working set
+- activation state for the currently attached cloth overlay
 
 ### `OutputFrame`
 
 Completed render handoff:
 
-- color image handle
+- exportable color image handle
 - optional alpha image handle
 - width and height
 - timestamp
 - color space metadata
+- ownership token for async sink handoff
+- synchronization primitive or fence/semaphore metadata
 
 ## Frame Update Order
 
 Recommended order:
 
 1. input update
-2. webcam tracking acquisition
-3. tracking inference and retargeting
-4. locomotion or gameplay update
-5. animation sampling
-6. base local pose build
-7. merge tracking inputs
-8. spring bone simulation
-9. cloth simulation
-10. recompute final global pose
-11. build skinning matrices
-12. upload pose buffers
-13. upload cloth deformation buffers
-14. render
-15. publish output frame to selected sink
+2. read the latest completed tracking sample from the async tracking worker
+3. locomotion or gameplay update
+4. animation sampling
+5. base local pose build
+6. merge tracking inputs
+7. compute driven global pose for the body before secondary motion
+8. fixed-timestep spring bone simulation against that pose
+9. recompute global pose after spring outputs are applied
+10. fixed-timestep cloth simulation against the resolved body motion for this frame
+11. recompute final global pose
+12. build skinning matrices
+13. upload pose buffers
+14. upload optional cloth deformation buffers
+15. render
+16. publish output frame to the async output sink
 
 Important rule:
 
 Cloth should read the resolved body motion for this frame, not stale matrices from the previous render path.
 
 Tracking should be merged before secondary motion, otherwise spring and cloth will react to stale performer input.
+
+Tracking acquisition and inference still happen, but they happen off the main render loop. The frame loop consumes the latest completed tracking result rather than waiting for a fresh inference every frame.
+
+### Timestep policy
+
+The simulation contract should also state:
+
+- use an accumulator-based fixed timestep for spring and cloth
+- define a maximum substep count per render frame to avoid spiral-of-death behavior
+- define whether render uses latest-sim state directly or interpolates between sim states
+- latch tracking input once per render frame before entering simulation steps
+- if tracking or output falls behind, prefer stale-sample reuse or frame drop over blocking the main loop
 
 ## POC Milestones
 
@@ -480,6 +571,8 @@ Exit criteria:
 - one selected cloth region simulates stably
 - cloth pins to skeleton correctly
 - body collision proxies affect cloth
+- cloth can be enabled or disabled per avatar instance at runtime
+- cloth uses a dedicated simulation representation that drives rendered garment deformation
 
 ### Phase 5: World Physics
 
@@ -495,6 +588,9 @@ Exit criteria:
 - webcam tracking drives head and upper body
 - retargeted motion feeds the avatar runtime cleanly
 - rendered output is routable to OBS through a frame sink
+- tracking runs on an async worker path
+- output sink handoff is async and does not stall rendering
+- preferred OBS path uses GPU-resident shared frame handoff with explicit synchronization
 
 ## Failure Modes To Avoid
 
@@ -503,12 +599,18 @@ Exit criteria:
 - Rapier rigid bodies become the source of truth for avatar bones
 - variable timestep drives spring or cloth solvers
 - cloth is forced into the spring-bone abstraction
+- cloth data model collapses into attachment-point-only simulation and blocks higher-fidelity garments later
 - exact MToon parity becomes the first rendering milestone
+- render or simulation blocks on tracking inference
+- render loop blocks on output sink latency
+- cloth authoring data is mixed into generic imported VRM data without an explicit overlay boundary
+- output handoff falls back to unconditional CPU readback as the primary architecture
 
 ## Repository Mapping
 
 - `src/app/`: orchestration and frame update order
 - `src/asset/`: VRM 1.0 loading and immutable asset conversion
+- `src/editor/`: cloth authoring tools and overlay persistence
 - `src/avatar/`: runtime avatar state and pose ownership
 - `src/simulation/`: spring, cloth, collider, and future world-physics logic
 - `src/renderer/`: Vulkano rendering and material pipelines
@@ -519,6 +621,7 @@ The next likely additions are:
 
 - `src/avatar/animation.rs`
 - `src/avatar/retargeting.rs`
+- `src/editor/cloth_authoring.rs`
 - `src/renderer/material.rs`
 - `src/renderer/mtoon.rs`
 - `src/simulation/spring.rs`
@@ -536,6 +639,8 @@ src/
   asset/
     mod.rs
     vrm.rs
+  editor/
+    mod.rs
   avatar/
     mod.rs
   simulation/
@@ -574,19 +679,23 @@ Those files quickly become dumping grounds and erase the architectural boundarie
 
 Keep dependencies one-way:
 
-- `app -> asset, avatar, simulation, renderer, tracking, output`
-- `avatar -> asset, simulation::cloth, tracking`
+- `app -> asset, editor, avatar, simulation, renderer, tracking, output`
+- `editor -> asset`
+- `avatar -> asset, tracking`
 - `simulation -> avatar, asset`
-- `renderer -> avatar, output`
-- `tracking -> no avatar ownership, outputs rig-driving data only`
+- `renderer -> avatar`
+- `tracking -> no avatar ownership, outputs timestamped rig-driving data only`
 - `output -> no scene ownership, consumes final frames only`
 
 Avoid reverse edges such as:
 
 - `asset -> renderer`
+- `asset -> editor`
 - `simulation -> renderer`
 - `tracking -> renderer`
 - `output -> avatar`
+- `avatar -> simulation`
+- `renderer -> output`
 
 If a feature pressures you into one of those edges, the boundary is probably wrong.
 
@@ -595,12 +704,27 @@ If a feature pressures you into one of those edges, the boundary is probably wro
 The next useful step is not more implementation. It is to pin down concrete Rust structs for:
 
 - `AvatarAsset`
+- `ClothAsset`
 - `AvatarInstance`
 - `AvatarPose`
 - `SpringBoneAsset`
-- `ClothAsset`
 - `ClothState`
 - `TrackingRigPose`
 - `OutputFrame`
+- `SimulationClock`
+- `TrackingMailbox`
+- `FrameSinkQueuePolicy`
+- `GpuFrameToken`
+- `ClothMeshMapping`
 
 That will decide whether the architecture is actually clean enough to implement.
+
+For application-level GUI structure and user workflows, see [application-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/application-design.md).
+
+Detailed contracts for data shapes, persistence, threading, tracking, and output interop live in:
+
+- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
+- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
+- [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md)
+- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
+- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
