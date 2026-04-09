@@ -1,0 +1,14 @@
+/target/
+/Cargo.lock
+
+# Local asset staging
+/assets/
+!/assets/.gitkeep
+
+# Editor and OS noise
+/.vscode/
+/.idea/
+*.swp
+*.tmp
+Thumbs.db
+.DS_Store
