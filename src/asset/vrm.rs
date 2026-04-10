@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::asset::*;
+
+static NEXT_AVATAR_ID: AtomicU64 = AtomicU64::new(1);
 
 mod gltf_ext {
     use serde::Deserialize;
@@ -305,6 +308,7 @@ impl VrmAssetLoader {
         let source_hash = compute_hash(data);
 
         let gltf_doc = gltf::Gltf::from_slice(data)?;
+        let blob = gltf_doc.blob.as_deref();
         let root_ext: Option<gltf_ext::RootExtension> = gltf_doc
             .document
             .extensions()
@@ -318,10 +322,14 @@ impl VrmAssetLoader {
             .map(|ext| Self::build_humanoid_map(ext, &node_name_map))
             .transpose()?;
 
-        let meshes = Self::build_meshes(&gltf_doc.document);
+        let meshes = Self::build_meshes(&gltf_doc.document, blob);
         let materials = Self::build_materials(&gltf_doc.document);
-        let skin_bindings = Self::build_skin_bindings(&gltf_doc.document);
-        let meshes_with_skin = Self::assign_skins_to_meshes(meshes, skin_bindings);
+        let skin_bindings = Self::build_skin_bindings(&gltf_doc.document, blob);
+        let meshes_with_skin = Self::assign_skins_to_meshes(
+            &gltf_doc.document,
+            meshes,
+            &skin_bindings,
+        );
 
         let root_nodes: Vec<NodeId> = gltf_doc
             .document
@@ -330,8 +338,12 @@ impl VrmAssetLoader {
             .map(|scene| scene.nodes().map(|n| NodeId(n.index() as u64)).collect())
             .unwrap_or_default();
 
-        let inv_bind_count = nodes.len();
-        let inverse_bind_matrices = vec![identity_matrix(); inv_bind_count];
+        // Collect inverse bind matrices from all skins
+        let inverse_bind_matrices = if let Some((_, first_skin)) = skin_bindings.first() {
+            first_skin.inverse_bind_matrices.clone()
+        } else {
+            vec![identity_matrix(); nodes.len()]
+        };
 
         let (spring_bones, colliders) = if let Some(spring_ext) = spring_ext {
             Self::build_spring_bones(spring_ext)
@@ -346,7 +358,7 @@ impl VrmAssetLoader {
             });
 
         let asset = AvatarAsset {
-            id: AvatarAssetId(1),
+            id: AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed)),
             source_path,
             source_hash,
             skeleton: SkeletonAsset {
@@ -360,6 +372,7 @@ impl VrmAssetLoader {
             spring_bones,
             colliders,
             default_expressions: expressions,
+            animation_clips: Self::build_animation_clips(&gltf_doc.document, blob),
         };
 
         Ok(Arc::new(asset))
@@ -423,9 +436,27 @@ impl VrmAssetLoader {
         Ok(HumanoidMap { bone_map })
     }
 
-    fn build_meshes(doc: &gltf::Document) -> Vec<MeshAsset> {
+    fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<MeshAsset> {
         let mut next_mesh_id: u64 = 1;
         let mut next_prim_id: u64 = 1;
+
+        let buffers: Vec<gltf::buffer::Data> = doc
+            .buffers()
+            .map(|buf| {
+                let data = match buf.source() {
+                    gltf::buffer::Source::Bin => blob.unwrap_or(&[]).to_vec(),
+                    gltf::buffer::Source::Uri(_uri) => {
+                        eprintln!(
+                            "[vrm] External buffer URIs not supported for mesh loading, \
+                             buffer {} will be empty",
+                            buf.index()
+                        );
+                        vec![]
+                    }
+                };
+                gltf::buffer::Data(data)
+            })
+            .collect();
 
         doc.meshes()
             .map(|gmesh| {
@@ -438,10 +469,39 @@ impl VrmAssetLoader {
                         let prim_id = PrimitiveId(next_prim_id);
                         next_prim_id += 1;
 
-                        let reader = prim.reader(|_| None);
-                        let vertex_count =
-                            reader.read_positions().map(|p| p.count()).unwrap_or(0) as u32;
-                        let index_count = prim.indices().map(|i| i.count()).unwrap_or(0) as u32;
+                        let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+
+                        let positions: Vec<[f32; 3]> = reader
+                            .read_positions()
+                            .map(|iter| iter.collect())
+                            .unwrap_or_default();
+                        let vertex_count = positions.len() as u32;
+
+                        let normals: Vec<[f32; 3]> = reader
+                            .read_normals()
+                            .map(|iter| iter.collect())
+                            .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; vertex_count as usize]);
+
+                        let uvs: Vec<[f32; 2]> = reader
+                            .read_tex_coords(0)
+                            .map(|tc| tc.into_f32().collect())
+                            .unwrap_or_else(|| vec![[0.0, 0.0]; vertex_count as usize]);
+
+                        let joint_indices: Vec<[u16; 4]> = reader
+                            .read_joints(0)
+                            .map(|j| j.into_u16().collect())
+                            .unwrap_or_default();
+
+                        let joint_weights: Vec<[f32; 4]> = reader
+                            .read_weights(0)
+                            .map(|w| w.into_f32().collect())
+                            .unwrap_or_default();
+
+                        let indices: Vec<u32> = reader
+                            .read_indices()
+                            .map(|idx| idx.into_u32().collect())
+                            .unwrap_or_default();
+                        let index_count = indices.len() as u32;
 
                         let material_id = prim
                             .material()
@@ -455,6 +515,24 @@ impl VrmAssetLoader {
                             max: bb.max,
                         };
 
+                        let vertices = if vertex_count > 0 {
+                            Some(VertexData {
+                                positions,
+                                normals,
+                                uvs,
+                                joint_indices,
+                                joint_weights,
+                            })
+                        } else {
+                            None
+                        };
+
+                        let idx_data = if index_count > 0 {
+                            Some(indices)
+                        } else {
+                            None
+                        };
+
                         MeshPrimitiveAsset {
                             id: prim_id,
                             vertex_count,
@@ -462,6 +540,8 @@ impl VrmAssetLoader {
                             material_id,
                             skin: None,
                             bounds,
+                            vertices,
+                            indices: idx_data,
                         }
                     })
                     .collect();
@@ -482,8 +562,23 @@ impl VrmAssetLoader {
                 let pbr = gmat.pbr_metallic_roughness();
                 let base_color = pbr.base_color_factor();
 
-                let alpha_mode = gmat.alpha_mode();
-                let base_mode = if matches!(alpha_mode, gltf::material::AlphaMode::Blend) {
+                let gltf_alpha = gmat.alpha_mode();
+                let alpha_mode = match gltf_alpha {
+                    gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+                    gltf::material::AlphaMode::Mask => {
+                        AlphaMode::Mask(gmat.alpha_cutoff().unwrap_or(0.5))
+                    }
+                    gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+                };
+                let double_sided = gmat.double_sided();
+
+                // Extract MToon extension if present
+                let mtoon_ext = gmat.extensions().and_then(|ext| ext.get("VRMC_materials_mtoon"));
+                let has_mtoon = mtoon_ext.is_some();
+
+                let base_mode = if has_mtoon {
+                    MaterialMode::ToonLike
+                } else if matches!(gltf_alpha, gltf::material::AlphaMode::Blend) {
                     MaterialMode::Unlit
                 } else if pbr.metallic_factor() > 0.0 {
                     MaterialMode::SimpleLit
@@ -492,64 +587,194 @@ impl VrmAssetLoader {
                 };
 
                 let base_color_texture = pbr.base_color_texture().map(|info| {
-                    let uri = info
-                        .texture()
-                        .source()
-                        .name()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    TextureBinding { uri }
+                    Self::texture_binding_from_info(&info.texture())
                 });
 
                 let normal_map_texture = gmat.normal_texture().map(|info| {
-                    let uri = info
-                        .texture()
-                        .source()
-                        .name()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    TextureBinding { uri }
+                    Self::texture_binding_from_info(&info.texture())
                 });
+
+                // Parse MToon parameters
+                let (toon_params, mtoon_params) = if let Some(mtoon) = mtoon_ext {
+                    Self::parse_mtoon_params(mtoon)
+                } else {
+                    (
+                        ToonMaterialParams {
+                            ramp_threshold: 0.5,
+                            shadow_softness: 0.1,
+                            outline_width: 0.01,
+                            outline_color: [0.0, 0.0, 0.0],
+                        },
+                        None,
+                    )
+                };
 
                 MaterialAsset {
                     id: MaterialId(i as u64 + 1),
                     name: gmat.name().unwrap_or("unnamed").to_string(),
                     base_mode,
                     base_color,
+                    alpha_mode,
+                    double_sided,
                     texture_bindings: MaterialTextureSet {
                         base_color_texture,
                         normal_map_texture,
+                        shade_ramp_texture: None,
+                        emissive_texture: None,
                     },
-                    toon_params: ToonMaterialParams {
-                        ramp_threshold: 0.5,
-                        shadow_softness: 0.1,
-                        outline_width: 0.01,
-                        outline_color: [0.0, 0.0, 0.0],
-                    },
+                    toon_params,
+                    mtoon_params,
                 }
             })
             .collect()
     }
 
-    fn build_skin_bindings(doc: &gltf::Document) -> Vec<(usize, SkinBinding)> {
+    fn texture_binding_from_info(texture: &gltf::Texture<'_>) -> TextureBinding {
+        let uri = texture
+            .source()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("texture_{}", texture.index()));
+        TextureBinding { uri }
+    }
+
+    fn parse_mtoon_params(
+        mtoon: &serde_json::Value,
+    ) -> (ToonMaterialParams, Option<MtoonStagedParams>) {
+        use crate::asset::{MtoonOutlineWidthMode, MtoonStagedParams};
+
+        let get_f32 = |key: &str| mtoon.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
+        let get_color3 = |key: &str| -> [f32; 3] {
+            mtoon
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    [
+                        arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    ]
+                })
+                .unwrap_or([0.0; 3])
+        };
+        let get_color4 = |key: &str| -> [f32; 4] {
+            mtoon
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    [
+                        arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                    ]
+                })
+                .unwrap_or([0.0, 0.0, 0.0, 1.0])
+        };
+
+        let shade_color = get_color4("shadeColorFactor");
+        let shade_shift = get_f32("shadingShiftFactor").unwrap_or(0.0);
+        let shade_toony = get_f32("shadingToonyFactor").unwrap_or(0.9);
+        let gi_equalization = get_f32("giEqualizationFactor").unwrap_or(0.9);
+
+        let outline_width_mode_str = mtoon
+            .get("outlineWidthMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        let outline_width_mode = match outline_width_mode_str {
+            "worldCoordinates" => MtoonOutlineWidthMode::WorldCoordinates,
+            "screenCoordinates" => MtoonOutlineWidthMode::ScreenCoordinates,
+            _ => MtoonOutlineWidthMode::None,
+        };
+        let outline_width = get_f32("outlineWidthFactor").unwrap_or(0.0);
+        let outline_color = get_color3("outlineColorFactor");
+
+        let rim_color = get_color4("parametricRimColorFactor");
+        let rim_fresnel_power = get_f32("parametricRimFresnelPowerFactor").unwrap_or(5.0);
+        let rim_lift = get_f32("parametricRimLiftFactor").unwrap_or(0.0);
+        let rim_lighting_mix = get_f32("rimLightingMixFactor").unwrap_or(1.0);
+
+        let emissive_color = get_color4("emissiveFactor");
+
+        let uv_anim_scroll_x = get_f32("uvAnimationScrollXSpeedFactor").unwrap_or(0.0);
+        let uv_anim_scroll_y = get_f32("uvAnimationScrollYSpeedFactor").unwrap_or(0.0);
+        let uv_anim_rotation = get_f32("uvAnimationRotationSpeedFactor").unwrap_or(0.0);
+
+        let toon_params = ToonMaterialParams {
+            ramp_threshold: (1.0 - shade_toony).max(0.01),
+            shadow_softness: (1.0 - shade_toony) * 0.5,
+            outline_width,
+            outline_color,
+        };
+
+        let staged = MtoonStagedParams {
+            shade_color,
+            shade_shift,
+            shade_toony,
+            lit_color: [1.0, 1.0, 1.0, 1.0],
+            gi_equalization,
+            matcap_texture: None,
+            rim_texture: None,
+            rim_color,
+            rim_lighting_mix,
+            rim_fresnel_power,
+            rim_lift,
+            emissive_texture: None,
+            emissive_color,
+            outline_width_mode,
+            outline_color,
+            outline_width,
+            uv_anim_mask_texture: None,
+            uv_anim_scroll_x_speed: uv_anim_scroll_x,
+            uv_anim_scroll_y_speed: uv_anim_scroll_y,
+            uv_anim_rotation_speed: uv_anim_rotation,
+        };
+
+        (toon_params, Some(staged))
+    }
+
+    fn build_skin_bindings(
+        doc: &gltf::Document,
+        blob: Option<&[u8]>,
+    ) -> Vec<(usize, SkinBinding)> {
+        let buffers: Vec<gltf::buffer::Data> = doc
+            .buffers()
+            .map(|buf| {
+                let data = match buf.source() {
+                    gltf::buffer::Source::Bin => blob.unwrap_or(&[]).to_vec(),
+                    gltf::buffer::Source::Uri(_uri) => {
+                        eprintln!(
+                            "[vrm] External buffer URIs not supported for skin loading, \
+                             buffer {} will be empty",
+                            buf.index()
+                        );
+                        vec![]
+                    }
+                };
+                gltf::buffer::Data(data)
+            })
+            .collect();
+
         doc.skins()
-            .map(|skin| {
+            .enumerate()
+            .map(|(skin_index, skin)| {
                 let joint_nodes: Vec<NodeId> =
                     skin.joints().map(|j| NodeId(j.index() as u64)).collect();
 
-                let reader = skin.reader(|_| None);
+                let reader = skin.reader(|buffer| Some(&buffers[buffer.index()]));
                 let inverse_bind_matrices: Vec<Mat4> = reader
                     .read_inverse_bind_matrices()
-                    .map(|iter| iter.map(|m| m).collect())
+                    .map(|iter| iter.collect())
                     .unwrap_or_else(|| {
-                        let node_count = joint_nodes.len();
-                        vec![identity_matrix(); node_count]
+                        eprintln!(
+                            "[vrm] Skin {} has no inverse bind matrices, using identity",
+                            skin_index
+                        );
+                        vec![identity_matrix(); joint_nodes.len()]
                     });
 
-                let skeleton_node_index = skin.skeleton().map(|n| n.index()).unwrap_or(0);
-
                 (
-                    skeleton_node_index,
+                    skin_index,
                     SkinBinding {
                         joint_nodes,
                         inverse_bind_matrices,
@@ -560,20 +785,35 @@ impl VrmAssetLoader {
     }
 
     fn assign_skins_to_meshes(
+        doc: &gltf::Document,
         meshes: Vec<MeshAsset>,
-        skins: Vec<(usize, SkinBinding)>,
+        skins: &[(usize, SkinBinding)],
     ) -> Vec<MeshAsset> {
-        let skin_by_skeleton: HashMap<usize, &SkinBinding> =
-            skins.iter().map(|(idx, binding)| (*idx, binding)).collect();
+        // Build a map from glTF mesh index to skin index by examining nodes.
+        // Each node can reference both a mesh and a skin.
+        let mut mesh_to_skin: HashMap<usize, usize> = HashMap::new();
+        for node in doc.nodes() {
+            if let (Some(mesh), Some(skin)) = (node.mesh(), node.skin()) {
+                mesh_to_skin.insert(mesh.index(), skin.index());
+            }
+        }
 
         meshes
             .into_iter()
-            .map(|mut mesh| {
-                for prim in &mut mesh.primitives {
-                    if let Some(skin) = skin_by_skeleton.get(&0) {
-                        prim.skin = Some((*skin).clone());
-                    } else if let Some((_, skin)) = skins.first() {
+            .enumerate()
+            .map(|(mesh_idx, mut mesh)| {
+                let skin_binding = mesh_to_skin
+                    .get(&mesh_idx)
+                    .and_then(|skin_idx| skins.get(*skin_idx).map(|(_, s)| s));
+
+                if let Some(skin) = skin_binding {
+                    for prim in &mut mesh.primitives {
                         prim.skin = Some(skin.clone());
+                    }
+                } else if let Some((_, fallback_skin)) = skins.first() {
+                    // Fallback: if no explicit mapping, use the first skin (common in VRM)
+                    for prim in &mut mesh.primitives {
+                        prim.skin = Some(fallback_skin.clone());
                     }
                 }
                 mesh
@@ -600,12 +840,24 @@ impl VrmAssetLoader {
                                 sphere.offset.unwrap_or([0.0; 3]),
                             )
                         } else if let Some(ref capsule) = c.shape.capsule {
+                            let offset = capsule.offset.unwrap_or([0.0; 3]);
+                            // Compute capsule height from the distance between
+                            // the offset (head) and the tail position. If tail
+                            // is not specified, fall back to zero height.
+                            let height = if let Some(tail) = capsule.tail {
+                                let dx = tail[0] - offset[0];
+                                let dy = tail[1] - offset[1];
+                                let dz = tail[2] - offset[2];
+                                (dx * dx + dy * dy + dz * dz).sqrt()
+                            } else {
+                                0.0
+                            };
                             (
                                 ColliderShape::Capsule {
                                     radius: capsule.radius,
-                                    height: 0.0,
+                                    height,
                                 },
-                                capsule.offset.unwrap_or([0.0; 3]),
+                                offset,
                             )
                         } else {
                             (ColliderShape::Sphere { radius: 0.0 }, [0.0; 3])
@@ -708,6 +960,24 @@ impl VrmAssetLoader {
                     .and_then(|j| j.hit_radius)
                     .unwrap_or(0.05);
 
+                // Per-joint parameter storage: each joint in the chain can have
+                // its own stiffness, drag and gravity_power values.
+                let joint_stiffness: Vec<f32> = spring
+                    .joints
+                    .iter()
+                    .map(|j| j.stiffness)
+                    .collect();
+                let joint_drag: Vec<f32> = spring
+                    .joints
+                    .iter()
+                    .map(|j| j.drag_force.unwrap_or(drag_force))
+                    .collect();
+                let joint_gravity_power: Vec<f32> = spring
+                    .joints
+                    .iter()
+                    .map(|j| j.gravity_power)
+                    .collect();
+
                 SpringBoneAsset {
                     chain_root,
                     joints,
@@ -717,6 +987,9 @@ impl VrmAssetLoader {
                     gravity_power,
                     radius,
                     collider_refs,
+                    joint_stiffness,
+                    joint_drag,
+                    joint_gravity_power,
                 }
             })
             .collect();
@@ -748,6 +1021,180 @@ impl VrmAssetLoader {
         }
 
         ExpressionAssetSet { expressions }
+    }
+
+    fn build_animation_clips(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<AnimationClip> {
+        let buffers: Vec<gltf::buffer::Data> = doc
+            .buffers()
+            .map(|buf| {
+                let data = match buf.source() {
+                    gltf::buffer::Source::Bin => blob.unwrap_or(&[]).to_vec(),
+                    gltf::buffer::Source::Uri(_) => vec![],
+                };
+                gltf::buffer::Data(data)
+            })
+            .collect();
+
+        let mut clips = Vec::new();
+        for (anim_idx, anim) in doc.animations().enumerate() {
+            let name = anim
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("Animation_{}", anim_idx));
+
+            let mut channels = Vec::new();
+            let mut duration: f32 = 0.0;
+
+            for channel in anim.channels() {
+                let target = channel.target();
+                let target_node = NodeId(target.node().index() as u64);
+
+                let property = match target.property() {
+                    gltf::animation::Property::Translation => AnimationProperty::Translation,
+                    gltf::animation::Property::Rotation => AnimationProperty::Rotation,
+                    gltf::animation::Property::Scale => AnimationProperty::Scale,
+                    gltf::animation::Property::MorphTargetWeights => continue,
+                };
+
+                let reader = channel.reader(|buffer| Some(&buffers[buffer.index()]));
+
+                let timestamps: Vec<f32> = reader
+                    .read_inputs()
+                    .map(|iter| iter.collect())
+                    .unwrap_or_default();
+
+                if let Some(&last_t) = timestamps.last() {
+                    if last_t > duration {
+                        duration = last_t;
+                    }
+                }
+
+                let sampler = channel.sampler();
+                let interp = match sampler.interpolation() {
+                    gltf::animation::Interpolation::Step => InterpolationMode::Step,
+                    gltf::animation::Interpolation::Linear => InterpolationMode::Linear,
+                    gltf::animation::Interpolation::CubicSpline => InterpolationMode::CubicSpline,
+                };
+
+                let outputs = reader.read_outputs();
+                let keyframes: Vec<Keyframe> = match outputs {
+                    Some(gltf::animation::util::ReadOutputs::Translations(iter)) => {
+                        let values: Vec<[f32; 3]> = iter.collect();
+                        Self::build_keyframes_vec3(&timestamps, &values, interp)
+                    }
+                    Some(gltf::animation::util::ReadOutputs::Rotations(rotations)) => {
+                        let values: Vec<[f32; 4]> = rotations.into_f32().collect();
+                        Self::build_keyframes_vec4(&timestamps, &values, interp)
+                    }
+                    Some(gltf::animation::util::ReadOutputs::Scales(iter)) => {
+                        let values: Vec<[f32; 3]> = iter.collect();
+                        Self::build_keyframes_vec3(&timestamps, &values, interp)
+                    }
+                    _ => continue,
+                };
+
+                channels.push(AnimationChannel {
+                    target_node,
+                    property,
+                    keyframes,
+                });
+            }
+
+            if channels.is_empty() {
+                continue;
+            }
+
+            clips.push(AnimationClip {
+                id: AnimationClipId(anim_idx as u64 + 1),
+                name,
+                duration,
+                channels,
+            });
+        }
+
+        clips
+    }
+
+    /// Build keyframes from vec3 outputs (translation/scale).
+    /// For CubicSpline, every 3 consecutive values are [in_tangent, value, out_tangent].
+    fn build_keyframes_vec3(
+        timestamps: &[f32],
+        values: &[[f32; 3]],
+        interp: InterpolationMode,
+    ) -> Vec<Keyframe> {
+        if interp == InterpolationMode::CubicSpline {
+            // CubicSpline: 3 values per keyframe (in_tangent, value, out_tangent)
+            timestamps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &time)| {
+                    let base = i * 3;
+                    if base + 2 >= values.len() {
+                        return None;
+                    }
+                    let in_t = values[base];
+                    let val = values[base + 1];
+                    let out_t = values[base + 2];
+                    Some(Keyframe {
+                        time,
+                        value: [val[0], val[1], val[2], 0.0],
+                        tangents: Some([
+                            [in_t[0], in_t[1], in_t[2], 0.0],
+                            [out_t[0], out_t[1], out_t[2], 0.0],
+                        ]),
+                        interpolation: interp,
+                    })
+                })
+                .collect()
+        } else {
+            timestamps
+                .iter()
+                .zip(values.iter())
+                .map(|(&time, val)| Keyframe {
+                    time,
+                    value: [val[0], val[1], val[2], 0.0],
+                    tangents: None,
+                    interpolation: interp,
+                })
+                .collect()
+        }
+    }
+
+    /// Build keyframes from vec4 outputs (rotation quaternion).
+    fn build_keyframes_vec4(
+        timestamps: &[f32],
+        values: &[[f32; 4]],
+        interp: InterpolationMode,
+    ) -> Vec<Keyframe> {
+        if interp == InterpolationMode::CubicSpline {
+            timestamps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &time)| {
+                    let base = i * 3;
+                    if base + 2 >= values.len() {
+                        return None;
+                    }
+                    Some(Keyframe {
+                        time,
+                        value: values[base + 1],
+                        tangents: Some([values[base], values[base + 2]]),
+                        interpolation: interp,
+                    })
+                })
+                .collect()
+        } else {
+            timestamps
+                .iter()
+                .zip(values.iter())
+                .map(|(&time, &val)| Keyframe {
+                    time,
+                    value: val,
+                    tangents: None,
+                    interpolation: interp,
+                })
+                .collect()
+        }
     }
 }
 

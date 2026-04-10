@@ -60,17 +60,17 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.label("Position");
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_position[0])
+                    egui::DragValue::new(&mut state.transform.position[0])
                         .prefix("X: ")
                         .speed(0.01),
                 );
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_position[1])
+                    egui::DragValue::new(&mut state.transform.position[1])
                         .prefix("Y: ")
                         .speed(0.01),
                 );
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_position[2])
+                    egui::DragValue::new(&mut state.transform.position[2])
                         .prefix("Z: ")
                         .speed(0.01),
                 );
@@ -78,17 +78,17 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.label("Rotation");
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_rotation[0])
+                    egui::DragValue::new(&mut state.transform.rotation[0])
                         .prefix("X: ")
                         .speed(0.1),
                 );
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_rotation[1])
+                    egui::DragValue::new(&mut state.transform.rotation[1])
                         .prefix("Y: ")
                         .speed(0.1),
                 );
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_rotation[2])
+                    egui::DragValue::new(&mut state.transform.rotation[2])
                         .prefix("Z: ")
                         .speed(0.1),
                 );
@@ -96,15 +96,15 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.horizontal(|ui| {
                 ui.label("Scale");
                 ui.add(
-                    egui::DragValue::new(&mut state.transform_scale)
+                    egui::DragValue::new(&mut state.transform.scale)
                         .speed(0.01)
                         .range(0.01..=100.0),
                 );
             });
             if ui.button("Reset Transform").clicked() {
-                state.transform_position = [0.0, 0.0, 0.0];
-                state.transform_rotation = [0.0, 0.0, 0.0];
-                state.transform_scale = 1.0;
+                state.transform.position = [0.0, 0.0, 0.0];
+                state.transform.rotation = [0.0, 0.0, 0.0];
+                state.transform.scale = 1.0;
             }
         });
 
@@ -131,11 +131,14 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Scene Background")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.background_transparent, "Transparent Background");
-            if !state.background_transparent {
+            ui.checkbox(
+                &mut state.rendering.transparent_background,
+                "Transparent Background",
+            );
+            if !state.rendering.transparent_background {
                 ui.horizontal(|ui| {
                     ui.label("Color");
-                    ui.color_edit_button_rgb(&mut state.background_color);
+                    ui.color_edit_button_rgb(&mut state.rendering.background_color);
                 });
             }
         });
@@ -143,11 +146,17 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Runtime Toggles")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.toggle_tracking, "Tracking Enabled");
-            ui.checkbox(&mut state.toggle_spring, "Spring Enabled");
-            ui.checkbox(&mut state.toggle_cloth, "Cloth Enabled");
-            ui.checkbox(&mut state.toggle_collision_debug, "Collision Debug");
-            ui.checkbox(&mut state.toggle_skeleton_debug, "Skeleton Debug");
+            ui.checkbox(&mut state.tracking.toggle_tracking, "Tracking Enabled");
+            ui.checkbox(&mut state.rendering.toggle_spring, "Spring Enabled");
+            ui.checkbox(&mut state.rendering.toggle_cloth, "Cloth Enabled");
+            ui.checkbox(
+                &mut state.rendering.toggle_collision_debug,
+                "Collision Debug",
+            );
+            ui.checkbox(
+                &mut state.rendering.toggle_skeleton_debug,
+                "Skeleton Debug",
+            );
         });
 }
 
@@ -164,80 +173,108 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if state.camera_running {
+                if state.tracking.camera_running {
                     if ui.button("Stop Camera").clicked() {
-                        state.camera_running = false;
+                        state.tracking.camera_running = false;
                     }
                 } else if ui.button("Start Camera").clicked() {
-                    state.camera_running = true;
+                    state.tracking.camera_running = true;
                 }
             });
             egui::ComboBox::from_label("Resolution")
-                .selected_text(["640x480", "1280x720", "1920x1080"][state.camera_resolution_index])
+                .selected_text(
+                    *["640x480", "1280x720", "1920x1080"]
+                        .get(state.tracking.camera_resolution_index)
+                        .unwrap_or(&"Unknown"),
+                )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.camera_resolution_index, 0, "640x480");
-                    ui.selectable_value(&mut state.camera_resolution_index, 1, "1280x720");
-                    ui.selectable_value(&mut state.camera_resolution_index, 2, "1920x1080");
+                    ui.selectable_value(
+                        &mut state.tracking.camera_resolution_index,
+                        0,
+                        "640x480",
+                    );
+                    ui.selectable_value(
+                        &mut state.tracking.camera_resolution_index,
+                        1,
+                        "1280x720",
+                    );
+                    ui.selectable_value(
+                        &mut state.tracking.camera_resolution_index,
+                        2,
+                        "1920x1080",
+                    );
                 });
             egui::ComboBox::from_label("Frame Rate")
-                .selected_text(["30 fps", "60 fps"][state.camera_framerate_index])
+                .selected_text(
+                    *["30 fps", "60 fps"]
+                        .get(state.tracking.camera_framerate_index)
+                        .unwrap_or(&"Unknown"),
+                )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.camera_framerate_index, 0, "30 fps");
-                    ui.selectable_value(&mut state.camera_framerate_index, 1, "60 fps");
+                    ui.selectable_value(
+                        &mut state.tracking.camera_framerate_index,
+                        0,
+                        "30 fps",
+                    );
+                    ui.selectable_value(
+                        &mut state.tracking.camera_framerate_index,
+                        1,
+                        "60 fps",
+                    );
                 });
         });
 
     egui::CollapsingHeader::new("Capture Format")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.tracking_mirror, "Mirror Preview");
+            ui.checkbox(&mut state.tracking.tracking_mirror, "Mirror Preview");
         });
 
     egui::CollapsingHeader::new("Inference Status")
         .default_open(true)
         .show(ui, |ui| {
-            let (status_color, status_text) = if state.camera_running {
+            let (status_color, status_text) = if state.tracking.camera_running {
                 (egui::Color32::GREEN, "Running")
             } else {
                 (egui::Color32::GRAY, "Stopped")
             };
             ui.label(egui::RichText::new(status_text).color(status_color));
 
-            if let Some(avatar) = &state.app.avatar {
-                if let Some(tracking) = &avatar.tracking_input {
-                    ui.label(format!("Timestamp: {}", tracking.source_timestamp));
-                } else {
-                    ui.label("No tracking data");
-                }
+            if let Some(tracking) = &state.app.last_tracking_pose {
+                ui.label(format!("Timestamp: {}", tracking.source_timestamp));
             } else {
-                ui.label("No avatar loaded");
+                ui.label("No tracking data");
             }
         });
 
     egui::CollapsingHeader::new("Retargeting")
         .default_open(true)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.hand_tracking_enabled, "Hand Tracking");
-            ui.checkbox(&mut state.face_tracking_enabled, "Face Tracking");
-            if let Some(avatar) = &state.app.avatar {
-                if let Some(tracking) = &avatar.tracking_input {
-                    ui.separator();
-                    ui.label("Confidence");
-                    let conf = &tracking.confidence;
-                    draw_confidence_bar(ui, "Head", conf.head_confidence);
-                    draw_confidence_bar(ui, "Torso", conf.torso_confidence);
-                    draw_confidence_bar(ui, "Left Arm", conf.left_arm_confidence);
-                    draw_confidence_bar(ui, "Right Arm", conf.right_arm_confidence);
-                    draw_confidence_bar(ui, "Face", conf.face_confidence);
-                }
+            ui.checkbox(&mut state.tracking.hand_tracking_enabled, "Hand Tracking");
+            ui.checkbox(&mut state.tracking.face_tracking_enabled, "Face Tracking");
+            if let Some(tracking) = &state.app.last_tracking_pose {
+                ui.separator();
+                ui.label("Confidence");
+                let conf = &tracking.confidence;
+                draw_confidence_bar(ui, "Head", conf.head_confidence);
+                draw_confidence_bar(ui, "Torso", conf.torso_confidence);
+                draw_confidence_bar(ui, "Left Arm", conf.left_arm_confidence);
+                draw_confidence_bar(ui, "Right Arm", conf.right_arm_confidence);
+                draw_confidence_bar(ui, "Face", conf.face_confidence);
             }
         });
 
     egui::CollapsingHeader::new("Smoothing and Confidence")
         .default_open(false)
         .show(ui, |ui| {
-            ui.add(egui::Slider::new(&mut state.smoothing_strength, 0.0..=1.0).text("Smoothing"));
-            ui.add(egui::Slider::new(&mut state.confidence_threshold, 0.0..=1.0).text("Threshold"));
+            ui.add(
+                egui::Slider::new(&mut state.tracking.smoothing_strength, 0.0..=1.0)
+                    .text("Smoothing"),
+            );
+            ui.add(
+                egui::Slider::new(&mut state.tracking.confidence_threshold, 0.0..=1.0)
+                    .text("Threshold"),
+            );
         });
 }
 
@@ -259,36 +296,38 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Material Mode")
         .default_open(true)
         .show(ui, |ui| {
-            ui.radio_value(&mut state.material_mode_index, 0, "Unlit");
-            ui.radio_value(&mut state.material_mode_index, 1, "Simple Lit");
-            ui.radio_value(&mut state.material_mode_index, 2, "Toon-like");
+            ui.radio_value(&mut state.rendering.material_mode_index, 0, "Unlit");
+            ui.radio_value(&mut state.rendering.material_mode_index, 1, "Simple Lit");
+            ui.radio_value(&mut state.rendering.material_mode_index, 2, "Toon-like");
         });
 
     egui::CollapsingHeader::new("Toon Controls")
         .default_open(true)
         .show(ui, |ui| {
             ui.add_enabled(
-                state.material_mode_index == 2,
-                egui::Slider::new(&mut state.toon_ramp_threshold, 0.0..=1.0).text("Ramp Threshold"),
+                state.rendering.material_mode_index == 2,
+                egui::Slider::new(&mut state.rendering.toon_ramp_threshold, 0.0..=1.0)
+                    .text("Ramp Threshold"),
             );
             ui.add_enabled(
-                state.material_mode_index == 2,
-                egui::Slider::new(&mut state.shadow_softness, 0.0..=1.0).text("Shadow Softness"),
+                state.rendering.material_mode_index == 2,
+                egui::Slider::new(&mut state.rendering.shadow_softness, 0.0..=1.0)
+                    .text("Shadow Softness"),
             );
         });
 
     egui::CollapsingHeader::new("Outline Controls")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.outline_enabled, "Enable Outline");
+            ui.checkbox(&mut state.rendering.outline_enabled, "Enable Outline");
             ui.add_enabled(
-                state.outline_enabled,
-                egui::Slider::new(&mut state.outline_width, 0.0..=0.1).text("Width"),
+                state.rendering.outline_enabled,
+                egui::Slider::new(&mut state.rendering.outline_width, 0.0..=0.1).text("Width"),
             );
-            ui.add_enabled_ui(state.outline_enabled, |ui| {
+            ui.add_enabled_ui(state.rendering.outline_enabled, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Color");
-                    ui.color_edit_button_rgb(&mut state.outline_color);
+                    ui.color_edit_button_rgb(&mut state.rendering.outline_color);
                 });
             });
         });
@@ -299,33 +338,39 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.label("Light Direction");
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::DragValue::new(&mut state.light_direction[0])
+                    egui::DragValue::new(&mut state.rendering.main_light_dir[0])
                         .prefix("X: ")
                         .speed(0.01),
                 );
                 ui.add(
-                    egui::DragValue::new(&mut state.light_direction[1])
+                    egui::DragValue::new(&mut state.rendering.main_light_dir[1])
                         .prefix("Y: ")
                         .speed(0.01),
                 );
                 ui.add(
-                    egui::DragValue::new(&mut state.light_direction[2])
+                    egui::DragValue::new(&mut state.rendering.main_light_dir[2])
                         .prefix("Z: ")
                         .speed(0.01),
                 );
             });
-            ui.add(egui::Slider::new(&mut state.light_intensity, 0.0..=5.0).text("Intensity"));
+            ui.add(
+                egui::Slider::new(&mut state.rendering.main_light_intensity, 0.0..=5.0)
+                    .text("Intensity"),
+            );
             ui.horizontal(|ui| {
                 ui.label("Ambient");
-                ui.color_edit_button_rgb(&mut state.ambient);
+                ui.color_edit_button_rgb(&mut state.rendering.ambient_intensity);
             });
         });
 
     egui::CollapsingHeader::new("Composition")
         .default_open(false)
         .show(ui, |ui| {
-            ui.add(egui::Slider::new(&mut state.camera_fov, 10.0..=120.0).text("Camera FOV"));
-            ui.checkbox(&mut state.alpha_preview, "Alpha Preview");
+            ui.add(
+                egui::Slider::new(&mut state.rendering.camera_fov, 10.0..=120.0)
+                    .text("Camera FOV"),
+            );
+            ui.checkbox(&mut state.rendering.alpha_preview, "Alpha Preview");
         });
 }
 
@@ -341,10 +386,14 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(true)
         .show(ui, |ui| {
             egui::ComboBox::from_label("Output Sink")
-                .selected_text(sink_names[state.output_sink_index])
+                .selected_text(
+                    *sink_names
+                        .get(state.output.output_sink_index)
+                        .unwrap_or(&"Unknown"),
+                )
                 .show_ui(ui, |ui| {
                     for (i, name) in sink_names.iter().enumerate() {
-                        ui.selectable_value(&mut state.output_sink_index, i, *name);
+                        ui.selectable_value(&mut state.output.output_sink_index, i, *name);
                     }
                 });
         });
@@ -353,24 +402,64 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(true)
         .show(ui, |ui| {
             egui::ComboBox::from_label("Resolution")
-                .selected_text(["1920x1080", "1280x720", "640x480"][state.output_resolution_index])
+                .selected_text(
+                    *["1920x1080", "1280x720", "640x480"]
+                        .get(state.output.output_resolution_index)
+                        .unwrap_or(&"Unknown"),
+                )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.output_resolution_index, 0, "1920x1080");
-                    ui.selectable_value(&mut state.output_resolution_index, 1, "1280x720");
-                    ui.selectable_value(&mut state.output_resolution_index, 2, "640x480");
+                    ui.selectable_value(
+                        &mut state.output.output_resolution_index,
+                        0,
+                        "1920x1080",
+                    );
+                    ui.selectable_value(
+                        &mut state.output.output_resolution_index,
+                        1,
+                        "1280x720",
+                    );
+                    ui.selectable_value(
+                        &mut state.output.output_resolution_index,
+                        2,
+                        "640x480",
+                    );
                 });
             egui::ComboBox::from_label("Frame Rate")
-                .selected_text(["60 fps", "30 fps"][state.output_framerate_index])
+                .selected_text(
+                    *["60 fps", "30 fps"]
+                        .get(state.output.output_framerate_index)
+                        .unwrap_or(&"Unknown"),
+                )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.output_framerate_index, 0, "60 fps");
-                    ui.selectable_value(&mut state.output_framerate_index, 1, "30 fps");
+                    ui.selectable_value(
+                        &mut state.output.output_framerate_index,
+                        0,
+                        "60 fps",
+                    );
+                    ui.selectable_value(
+                        &mut state.output.output_framerate_index,
+                        1,
+                        "30 fps",
+                    );
                 });
-            ui.checkbox(&mut state.output_has_alpha, "RGBA (with alpha)");
+            ui.checkbox(&mut state.output.output_has_alpha, "RGBA (with alpha)");
             egui::ComboBox::from_label("Color Space")
-                .selected_text(["sRGB", "Linear sRGB"][state.output_color_space_index])
+                .selected_text(
+                    *["sRGB", "Linear sRGB"]
+                        .get(state.output.output_color_space_index)
+                        .unwrap_or(&"Unknown"),
+                )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.output_color_space_index, 0, "sRGB");
-                    ui.selectable_value(&mut state.output_color_space_index, 1, "Linear sRGB");
+                    ui.selectable_value(
+                        &mut state.output.output_color_space_index,
+                        0,
+                        "sRGB",
+                    );
+                    ui.selectable_value(
+                        &mut state.output.output_color_space_index,
+                        1,
+                        "Linear sRGB",
+                    );
                 });
         });
 
@@ -408,12 +497,14 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 if ui.button("New Overlay").clicked() {
                     let asset = state.app.avatar.as_ref().map(|a| a.asset.clone());
                     if let Some(asset) = asset {
+                        let avatar_id = asset.id;
+                        let avatar_hash = asset.source_hash.clone();
                         state.app.editor.open(asset);
-                        state.app.editor.create_overlay();
+                        state.app.editor.create_overlay(avatar_id, avatar_hash);
                     }
                 }
                 if ui.button("Save Overlay").clicked() {
-                    state.app.editor.save_overlay();
+                    let _ = state.app.editor.save_overlay(None);
                 }
             });
         });

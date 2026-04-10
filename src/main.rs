@@ -1,11 +1,11 @@
-#![allow(dead_code, unused_imports)]
-
 mod app;
 mod asset;
 mod avatar;
 mod editor;
 mod gui;
+mod math_utils;
 mod output;
+mod persistence;
 mod renderer;
 mod simulation;
 mod tracking;

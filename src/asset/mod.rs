@@ -1,5 +1,6 @@
 pub mod vrm;
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub type Vec3 = [f32; 3];
@@ -8,37 +9,90 @@ pub type Quat = [f32; 4];
 pub type Mat4 = [[f32; 4]; 4];
 pub type UVec2 = [u32; 2];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AvatarAssetId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MeshId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrimitiveId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MaterialId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClothOverlayId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColliderId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AnimationClipId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AttachmentClassId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// ---------------------------------------------------------------------------
+// Animation clip types
+// ---------------------------------------------------------------------------
+
+/// Which transform property a channel targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationProperty {
+    Translation,
+    Rotation,
+    Scale,
+}
+
+/// Interpolation mode between keyframes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpolationMode {
+    Step,
+    Linear,
+    CubicSpline,
+}
+
+/// A single keyframe within an animation channel.
+#[derive(Clone, Debug)]
+pub struct Keyframe {
+    /// Time in seconds from the start of the clip.
+    pub time: f32,
+    /// The keyframe value.
+    /// - Translation / Scale: `[x, y, z, 0.0]`
+    /// - Rotation (quaternion): `[x, y, z, w]`
+    pub value: Vec4,
+    /// Tangent data used only for `CubicSpline` interpolation.
+    /// `[in_tangent, out_tangent]` each stored as `Vec4`.
+    pub tangents: Option<[Vec4; 2]>,
+    pub interpolation: InterpolationMode,
+}
+
+/// One channel targets a single property of a single node.
+#[derive(Clone, Debug)]
+pub struct AnimationChannel {
+    pub target_node: NodeId,
+    pub property: AnimationProperty,
+    pub keyframes: Vec<Keyframe>,
+}
+
+/// An animation clip containing one or more channels.
+#[derive(Clone, Debug)]
+pub struct AnimationClip {
+    pub id: AnimationClipId,
+    pub name: String,
+    /// Total duration in seconds (max keyframe time across all channels).
+    pub duration: f32,
+    pub channels: Vec<AnimationChannel>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClothRegionTag(pub u64);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssetSourceHash(pub [u8; 32]);
 
 #[derive(Clone, Debug)]
@@ -55,6 +109,36 @@ impl Default for Transform {
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0, 1.0, 1.0],
         }
+    }
+}
+
+impl Transform {
+    /// Build a 4x4 TRS matrix. Layout: `m[row][col]` with translation in row 3.
+    /// This is the internal convention used throughout the codebase.
+    /// Use `mat4_to_cols()` to convert to column-major for GPU upload.
+    pub fn to_matrix(&self) -> Mat4 {
+        let [x, y, z, w] = self.rotation;
+        let [sx, sy, sz] = self.scale;
+
+        let x2 = x + x;
+        let y2 = y + y;
+        let z2 = z + z;
+        let xx = x * x2;
+        let xy = x * y2;
+        let xz = x * z2;
+        let yy = y * y2;
+        let yz = y * z2;
+        let zz = z * z2;
+        let wx = w * x2;
+        let wy = w * y2;
+        let wz = w * z2;
+
+        [
+            [(1.0 - (yy + zz)) * sx, (xy + wz) * sx,         (xz - wy) * sx,         0.0],
+            [(xy - wz) * sy,         (1.0 - (xx + zz)) * sy,  (yz + wx) * sy,         0.0],
+            [(xz + wy) * sz,         (yz - wx) * sz,          (1.0 - (xx + yy)) * sz, 0.0],
+            [self.translation[0],    self.translation[1],     self.translation[2],     1.0],
+        ]
     }
 }
 
@@ -76,6 +160,7 @@ pub struct AvatarAsset {
     pub spring_bones: Vec<SpringBoneAsset>,
     pub colliders: Vec<ColliderAsset>,
     pub default_expressions: ExpressionAssetSet,
+    pub animation_clips: Vec<AnimationClip>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +188,15 @@ pub struct MeshAsset {
 }
 
 #[derive(Clone, Debug)]
+pub struct VertexData {
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
+    pub uvs: Vec<[f32; 2]>,
+    pub joint_indices: Vec<[u16; 4]>,
+    pub joint_weights: Vec<Vec4>,
+}
+
+#[derive(Clone, Debug)]
 pub struct MeshPrimitiveAsset {
     pub id: PrimitiveId,
     pub vertex_count: u32,
@@ -110,6 +204,8 @@ pub struct MeshPrimitiveAsset {
     pub material_id: MaterialId,
     pub skin: Option<SkinBinding>,
     pub bounds: Aabb,
+    pub vertices: Option<VertexData>,
+    pub indices: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,14 +214,24 @@ pub struct SkinBinding {
     pub inverse_bind_matrices: Vec<Mat4>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlphaMode {
+    Opaque,
+    Mask(f32),
+    Blend,
+}
+
 #[derive(Clone, Debug)]
 pub struct MaterialAsset {
     pub id: MaterialId,
     pub name: String,
     pub base_mode: MaterialMode,
     pub base_color: Vec4,
+    pub alpha_mode: AlphaMode,
+    pub double_sided: bool,
     pub texture_bindings: MaterialTextureSet,
     pub toon_params: ToonMaterialParams,
+    pub mtoon_params: Option<MtoonStagedParams>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +245,8 @@ pub enum MaterialMode {
 pub struct MaterialTextureSet {
     pub base_color_texture: Option<TextureBinding>,
     pub normal_map_texture: Option<TextureBinding>,
+    pub shade_ramp_texture: Option<TextureBinding>,
+    pub emissive_texture: Option<TextureBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +312,12 @@ pub struct SpringBoneAsset {
     pub gravity_power: f32,
     pub radius: f32,
     pub collider_refs: Vec<ColliderRef>,
+    /// Per-joint stiffness overrides. When non-empty, index corresponds to `joints`.
+    pub joint_stiffness: Vec<f32>,
+    /// Per-joint drag overrides. When non-empty, index corresponds to `joints`.
+    pub joint_drag: Vec<f32>,
+    /// Per-joint gravity power overrides. When non-empty, index corresponds to `joints`.
+    pub joint_gravity_power: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,13 +333,13 @@ pub struct ColliderAsset {
     pub offset: Vec3,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColliderShape {
     Sphere { radius: f32 },
     Capsule { radius: f32, height: f32 },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothAsset {
     pub id: ClothOverlayId,
     pub target_avatar: AvatarAssetId,
@@ -242,32 +356,32 @@ pub struct ClothAsset {
     pub metadata: ClothOverlayMetadata,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothStableRefSet {
     pub node_refs: Vec<NodeRef>,
     pub mesh_refs: Vec<MeshRef>,
     pub primitive_refs: Vec<PrimitiveRef>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeRef {
     pub id: NodeId,
     pub name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeshRef {
     pub id: MeshId,
     pub name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrimitiveRef {
     pub id: PrimitiveId,
     pub name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothSimulationMesh {
     pub vertices: Vec<ClothSimVertex>,
     pub indices: Vec<u32>,
@@ -276,7 +390,7 @@ pub struct ClothSimulationMesh {
     pub region_tags: Vec<ClothRegionTag>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothSimVertex {
     pub position: Vec3,
     pub normal: Vec3,
@@ -284,77 +398,77 @@ pub struct ClothSimVertex {
     pub pinned: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothRenderRegionBinding {
     pub primitive: PrimitiveRef,
     pub vertex_subset: VertexSubsetRef,
     pub mapping_region: ClothRegionTag,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VertexSubsetRef {
     pub offset: u32,
     pub count: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothMeshMapping {
     pub mapping_mode: ClothMappingMode,
     pub entries: Vec<ClothMappingEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClothMappingMode {
     Barycentric,
     Nearest,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothMappingEntry {
     pub sim_vertex: u32,
     pub render_vertex: u32,
     pub weight: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothPin {
     pub sim_vertex_indices: Vec<u32>,
     pub binding_node: NodeRef,
     pub offset: Vec3,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothConstraintSet {
     pub distance_constraints: Vec<DistanceConstraint>,
     pub bend_constraints: Vec<BendConstraint>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DistanceConstraint {
     pub indices: [u32; 2],
     pub rest_length: f32,
     pub stiffness: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BendConstraint {
     pub indices: [u32; 3],
     pub stiffness: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothCollisionBinding {
     pub proxy_shape: ColliderShape,
     pub binding_node: NodeRef,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothLod {
     pub distance_threshold: f32,
     pub active_region: ClothRegionTag,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothSolverParams {
     pub substeps: u32,
     pub iterations: u32,
@@ -365,12 +479,112 @@ pub struct ClothSolverParams {
     pub wind_response: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClothOverlayMetadata {
     pub name: String,
     pub format_version: u32,
     pub created_with: String,
     pub last_saved_with: String,
+}
+
+impl ClothAsset {
+    /// Create a minimal valid empty `ClothAsset` targeting the given avatar.
+    pub fn new_empty(
+        id: ClothOverlayId,
+        avatar_id: AvatarAssetId,
+        avatar_hash: AssetSourceHash,
+    ) -> Self {
+        Self {
+            id,
+            target_avatar: avatar_id,
+            target_avatar_hash: avatar_hash,
+            stable_refs: ClothStableRefSet {
+                node_refs: vec![],
+                mesh_refs: vec![],
+                primitive_refs: vec![],
+            },
+            simulation_mesh: ClothSimulationMesh {
+                vertices: vec![],
+                indices: vec![],
+                rest_lengths: vec![],
+                attachment_classes: vec![],
+                region_tags: vec![],
+            },
+            render_bindings: vec![],
+            mesh_mapping: ClothMeshMapping {
+                mapping_mode: ClothMappingMode::Barycentric,
+                entries: vec![],
+            },
+            pins: vec![],
+            constraints: ClothConstraintSet {
+                distance_constraints: vec![],
+                bend_constraints: vec![],
+            },
+            collision_bindings: vec![],
+            lods: vec![],
+            solver_params: ClothSolverParams {
+                substeps: 1,
+                iterations: 4,
+                gravity_scale: 1.0,
+                damping: 0.99,
+                self_collision: false,
+                collision_margin: 0.01,
+                wind_response: 0.5,
+            },
+            metadata: ClothOverlayMetadata {
+                name: "New Overlay".to_string(),
+                format_version: 1,
+                created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+                last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MToon staged parameters (pure data, no GPU types)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+pub struct MtoonStagedParams {
+    pub shade_color: Vec4,
+    pub shade_shift: f32,
+    pub shade_toony: f32,
+    pub lit_color: Vec4,
+    pub gi_equalization: f32,
+    pub matcap_texture: Option<MtoonTextureSlot>,
+    pub rim_texture: Option<MtoonTextureSlot>,
+    pub rim_color: Vec4,
+    pub rim_lighting_mix: f32,
+    pub rim_fresnel_power: f32,
+    pub rim_lift: f32,
+    pub emissive_texture: Option<MtoonTextureSlot>,
+    pub emissive_color: Vec4,
+    pub outline_width_mode: MtoonOutlineWidthMode,
+    pub outline_color: Vec3,
+    pub outline_width: f32,
+    pub uv_anim_mask_texture: Option<MtoonTextureSlot>,
+    pub uv_anim_scroll_x_speed: f32,
+    pub uv_anim_scroll_y_speed: f32,
+    pub uv_anim_rotation_speed: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MtoonTextureSlot {
+    pub uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MtoonOutlineWidthMode {
+    None,
+    WorldCoordinates,
+    ScreenCoordinates,
+}
+
+impl Default for MtoonOutlineWidthMode {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 pub fn identity_matrix() -> Mat4 {

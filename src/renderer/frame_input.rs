@@ -38,6 +38,9 @@ pub struct RenderMeshInstance {
     pub alpha_mode: RenderAlphaMode,
     pub cull_mode: RenderCullMode,
     pub outline: OutlineSnapshot,
+    /// The actual mesh primitive data for GPU upload. When `None`, a placeholder
+    /// triangle is drawn instead.
+    pub primitive_data: Option<std::sync::Arc<crate::asset::MeshPrimitiveAsset>>,
 }
 
 #[derive(Clone, Debug)]

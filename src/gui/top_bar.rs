@@ -1,11 +1,42 @@
+use std::path::Path;
+
 use eframe::egui;
 
 use crate::gui::GuiApp;
+use crate::persistence;
+
+/// Load an avatar from the given file path, attaching it to the application
+/// and updating the recent avatars list.
+fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
+    let loader = crate::asset::vrm::VrmAssetLoader::new();
+    match loader.load(path.to_string_lossy().as_ref()) {
+        Ok(asset) => {
+            let instance_id =
+                crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
+            state.app.next_avatar_instance_id += 1;
+            state.app.physics.attach_avatar(&asset);
+            state.app.avatar =
+                Some(crate::avatar::AvatarInstance::new(instance_id, asset));
+            state.add_recent_avatar(path.to_path_buf());
+            state.push_notification(format!("Loaded avatar: {}", path.display()));
+        }
+        Err(e) => {
+            state.push_notification(format!("Failed to load avatar: {}", e));
+        }
+    }
+}
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
+    // E12: Show dirty indicator in the title heading.
+    let title = if state.project_dirty {
+        "VulVATAR *"
+    } else {
+        "VulVATAR"
+    };
+
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.heading("VulVATAR");
+            ui.heading(title);
             ui.separator();
 
             if ui.button("Open Avatar").clicked() {
@@ -13,37 +44,178 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     .add_filter("VRM 1.0", &["vrm"])
                     .pick_file()
                 {
-                    let loader = crate::asset::vrm::VrmAssetLoader::new();
-                    match loader.load(path.to_string_lossy().as_ref()) {
-                        Ok(asset) => {
-                            let instance_id =
-                                crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
-                            state.app.next_avatar_instance_id += 1;
-                            state.app.physics.attach_avatar(&asset);
-                            state.app.avatar =
-                                Some(crate::avatar::AvatarInstance::new(instance_id, asset));
+                    load_avatar_from_path(state, &path);
+                }
+            }
+
+            // E11: Recent avatars menu.
+            ui.menu_button("Recent", |ui| {
+                if state.recent_avatars.is_empty() {
+                    ui.label("No recent avatars");
+                } else {
+                    let mut load_path: Option<std::path::PathBuf> = None;
+                    for path in &state.recent_avatars {
+                        if ui.button(path.to_string_lossy().as_ref()).clicked() {
+                            load_path = Some(path.clone());
+                            ui.close_menu();
+                        }
+                    }
+                    if let Some(path) = load_path {
+                        load_avatar_from_path(state, &path);
+                    }
+                }
+            });
+
+            ui.separator();
+
+            if ui.button("Open Project").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("VulVATAR Project", &["vvtproj"])
+                    .pick_file()
+                {
+                    match persistence::load_project(&path) {
+                        Ok((project_state, load_warnings)) => {
+                            // Restore avatar if the project references one.
+                            if let Some(ref avatar_path) = project_state.avatar_source_path {
+                                let avatar_file = std::path::Path::new(avatar_path);
+                                if avatar_file.exists() {
+                                    let loader = crate::asset::vrm::VrmAssetLoader::new();
+                                    match loader.load(avatar_path) {
+                                        Ok(asset) => {
+                                            let instance_id =
+                                                crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
+                                            state.app.next_avatar_instance_id += 1;
+                                            state.app.physics.attach_avatar(&asset);
+                                            state.app.avatar =
+                                                Some(crate::avatar::AvatarInstance::new(instance_id, asset));
+                                        }
+                                        Err(e) => {
+                                            state.push_notification(format!("Failed to load avatar '{}': {}", avatar_path, e));
+                                        }
+                                    }
+                                } else {
+                                    state.push_notification(format!("Avatar source file not found: '{}'", avatar_path));
+                                }
+                            }
+
+                            // Restore cloth overlay if the project references one.
+                            if let Some(ref overlay_path_str) = project_state.active_overlay_path {
+                                let overlay_file = std::path::Path::new(overlay_path_str);
+                                if overlay_file.exists() {
+                                    match persistence::load_cloth_overlay(overlay_file) {
+                                        Ok(overlay_file_data) => {
+                                            if let Some(cloth_asset) = overlay_file_data.cloth_asset {
+                                                state.app.editor.overlay_asset = Some(cloth_asset);
+                                                state.app.editor.overlay_path = Some(overlay_file.to_path_buf());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            state.push_notification(format!("Failed to load cloth overlay '{}': {}", overlay_path_str, e));
+                                        }
+                                    }
+                                }
+                            }
+
+                            state.apply_project_state(&project_state);
+                            state.project_path = Some(path.clone());
+                            // E12: Clear dirty on load.
+                            state.project_dirty = false;
+                            for w in &load_warnings.warnings {
+                                state.push_notification(format!("Warning: {}", w));
+                            }
+                            state.push_notification(format!("Opened project: {}", path.display()));
                         }
                         Err(e) => {
-                            eprintln!("failed to load avatar: {}", e);
+                            state.push_notification(format!("Failed to load project: {}", e));
                         }
                     }
                 }
             }
 
-            ui.menu_button("Recent", |ui| {
-                ui.label("No recent avatars");
-            });
+            if ui.button("Save Project").clicked() {
+                let ps = state.to_project_state();
+                if let Some(ref path) = state.project_path.clone() {
+                    // Re-save to the known path.
+                    match persistence::save_project(&ps, path) {
+                        Ok(()) => {
+                            // E12: Clear dirty on save.
+                            state.project_dirty = false;
+                            state.push_notification("Project saved.".to_string());
+                        }
+                        Err(e) => {
+                            state.push_notification(format!("Save project failed: {}", e));
+                        }
+                    }
+                } else {
+                    // No path yet -- behave like Save As.
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("VulVATAR Project", &["vvtproj"])
+                        .set_file_name("project.vvtproj")
+                        .save_file()
+                    {
+                        match persistence::save_project(&ps, &path) {
+                            Ok(()) => {
+                                state.project_path = Some(path);
+                                state.project_dirty = false;
+                                state.push_notification("Project saved.".to_string());
+                            }
+                            Err(e) => {
+                                state.push_notification(format!("Save project failed: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+            if ui.button("Save As").clicked() {
+                let ps = state.to_project_state();
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("VulVATAR Project", &["vvtproj"])
+                    .set_file_name("project.vvtproj")
+                    .save_file()
+                {
+                    match persistence::save_project(&ps, &path) {
+                        Ok(()) => {
+                            state.project_path = Some(path);
+                            state.project_dirty = false;
+                            state.push_notification("Project saved.".to_string());
+                        }
+                        Err(e) => {
+                            state.push_notification(format!("Save as failed: {}", e));
+                        }
+                    }
+                }
+            }
 
             ui.separator();
 
-            if ui.button("Save Project").clicked() {}
-            if ui.button("Save As").clicked() {}
-
-            ui.separator();
-
-            if ui.button("Open Overlay").clicked() {}
+            if ui.button("Open Overlay").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("VulVATAR Cloth Overlay", &["vvtcloth"])
+                    .pick_file()
+                {
+                    match persistence::load_cloth_overlay(&path) {
+                        Ok(overlay) => {
+                            if let Some(cloth_asset) = overlay.cloth_asset {
+                                state.app.editor.overlay_asset = Some(cloth_asset);
+                                state.app.editor.dirty = false;
+                            }
+                            state.app.editor.overlay_path = Some(path.clone());
+                            state.push_notification(format!(
+                                "Opened overlay '{}' (format v{})",
+                                overlay.overlay_name, overlay.format_version
+                            ));
+                        }
+                        Err(e) => {
+                            state.push_notification(format!("Failed to load cloth overlay: {}", e));
+                        }
+                    }
+                }
+            }
             if ui.button("Save Overlay").clicked() {
-                state.app.editor.save_overlay();
+                match state.app.editor.save_overlay(None) {
+                    Ok(()) => state.push_notification("Overlay saved.".to_string()),
+                    Err(e) => state.push_notification(format!("Save overlay failed: {}", e)),
+                }
             }
 
             ui.separator();

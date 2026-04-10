@@ -1,68 +1,445 @@
 use eframe::egui;
 
 use crate::gui::GuiApp;
+use crate::renderer::debug::{self, DebugDrawList};
 
-pub fn draw(ctx: &egui::Context, _state: &mut GuiApp) {
+/// Simple projection helper that maps a 3D world-space point to 2D viewport
+/// coordinates using the current camera state stored in `GuiApp`.
+///
+/// This is a CPU-side fallback for when the Vulkan renderer is not fully
+/// integrated.  It builds a basic perspective projection from the GUI camera
+/// parameters (position, rotation, FOV) and maps the result into the supplied
+/// egui `Rect`.
+fn project_point(
+    point: [f32; 3],
+    cam_pos: [f32; 3],
+    cam_rot: [f32; 3], // euler degrees [pitch, yaw, roll]
+    fov_deg: f32,
+    rect: &egui::Rect,
+) -> Option<egui::Pos2> {
+    // Translate into camera-relative space.
+    let dx = point[0] - cam_pos[0];
+    let dy = point[1] - cam_pos[1];
+    let dz = point[2] - cam_pos[2];
+
+    // Apply inverse camera rotation (yaw then pitch, ignoring roll for
+    // simplicity).
+    let yaw = -cam_rot[1].to_radians();
+    let pitch = -cam_rot[0].to_radians();
+
+    let (sy, cy) = (yaw.sin(), yaw.cos());
+    let x1 = dx * cy - dz * sy;
+    let z1 = dx * sy + dz * cy;
+
+    let (sp, cp) = (pitch.sin(), pitch.cos());
+    let y2 = dy * cp - z1 * sp;
+    let z2 = dy * sp + z1 * cp;
+
+    // z2 is depth into the screen (positive = in front).  A default camera at
+    // z=-5 looks toward +Z, so points near the origin have z2 ~ +5 which is
+    // correct.
+    if z2 < 0.001 {
+        return None; // behind camera
+    }
+
+    let aspect = rect.width() / rect.height().max(1.0);
+    let half_fov_rad = (fov_deg * 0.5).to_radians();
+    let f = 1.0 / half_fov_rad.tan();
+
+    let ndc_x = (f * x1) / (z2 * aspect);
+    let ndc_y = (f * y2) / z2;
+
+    // NDC (-1..1) to viewport pixel coordinates.  Y is flipped (screen Y grows
+    // downward).
+    let px = rect.center().x + ndc_x * rect.width() * 0.5;
+    let py = rect.center().y - ndc_y * rect.height() * 0.5;
+
+    Some(egui::pos2(px, py))
+}
+
+/// Project a world-space radius at a given depth into screen pixels.
+fn project_radius(radius: f32, depth: f32, fov_deg: f32, viewport_height: f32) -> f32 {
+    if depth < 0.001 {
+        return 0.0;
+    }
+    let half_fov_rad = (fov_deg * 0.5).to_radians();
+    let f = 1.0 / half_fov_rad.tan();
+    (f * radius / depth) * viewport_height * 0.5
+}
+
+/// Approximate depth from camera to a point (simplified, uses the same
+/// transform as `project_point`).
+fn point_depth(point: [f32; 3], cam_pos: [f32; 3], cam_rot: [f32; 3]) -> f32 {
+    let dx = point[0] - cam_pos[0];
+    let dy = point[1] - cam_pos[1];
+    let dz = point[2] - cam_pos[2];
+
+    let yaw = -cam_rot[1].to_radians();
+    let pitch = -cam_rot[0].to_radians();
+
+    let (sy, cy) = (yaw.sin(), yaw.cos());
+    let z1 = dx * sy + dz * cy;
+
+    let (sp, cp) = (pitch.sin(), pitch.cos());
+    dy * sp + z1 * cp
+}
+
+/// Draw all debug primitives from a `DebugDrawList` using egui's `Painter`.
+fn draw_debug_list(
+    painter: &egui::Painter,
+    rect: &egui::Rect,
+    list: &DebugDrawList,
+    cam_pos: [f32; 3],
+    cam_rot: [f32; 3],
+    fov_deg: f32,
+) {
+    // Lines.
+    for line in &list.lines {
+        let p0 = project_point(line.start, cam_pos, cam_rot, fov_deg, rect);
+        let p1 = project_point(line.end, cam_pos, cam_rot, fov_deg, rect);
+        if let (Some(a), Some(b)) = (p0, p1) {
+            let color = color_f32_to_egui(&line.color);
+            painter.line_segment([a, b], egui::Stroke::new(1.0, color));
+        }
+    }
+
+    // Spheres (drawn as circles).
+    for sphere in &list.spheres {
+        let center_2d = project_point(sphere.center, cam_pos, cam_rot, fov_deg, rect);
+        if let Some(c) = center_2d {
+            let depth = point_depth(sphere.center, cam_pos, cam_rot);
+            let r = project_radius(sphere.radius, depth, fov_deg, rect.height());
+            let r = r.max(2.0); // minimum visible size
+            let color = color_f32_to_egui(&sphere.color);
+            painter.circle_stroke(c, r, egui::Stroke::new(1.0, color));
+        }
+    }
+}
+
+fn color_f32_to_egui(c: &[f32; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[3].clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
+pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
         .show(ctx, |ui| {
             let desired = ui.available_size();
-            let (rect, _response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
+            let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
 
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
+            // Notify the renderer of the current viewport size so it can
+            // match the offscreen render target resolution.
+            let vp_w = (rect.width() as u32).max(1);
+            let vp_h = (rect.height() as u32).max(1);
+            state.app.set_viewport_size(vp_w, vp_h);
 
-            let grid_color = egui::Color32::from_rgb(45, 45, 55);
-            let spacing = 40.0_f32;
+            // ── Rendered image display ─────────────────────────────────
+            // Check if the Application has produced new rendered pixels
+            // and upload / update the egui texture accordingly.
+            let has_rendered_image = if let Some((pixels, extent)) = state.app.rendered_pixels() {
+                let frame_counter = state.app.rendered_frame_counter();
+                let [w, h] = extent;
+                if w > 0 && h > 0 && pixels.len() == (w as usize) * (h as usize) * 4 {
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pixels);
+                    let options = egui::TextureOptions {
+                        magnification: egui::TextureFilter::Linear,
+                        minification: egui::TextureFilter::Linear,
+                        ..Default::default()
+                    };
 
-            let mut y = rect.top();
-            while y <= rect.bottom() {
+                    if frame_counter != state.viewport_last_frame {
+                        // Update existing texture handle or create a new one.
+                        if let Some(ref mut handle) = state.viewport_texture {
+                            handle.set(color_image, options);
+                        } else {
+                            let handle =
+                                ui.ctx()
+                                    .load_texture("viewport_render", color_image, options);
+                            state.viewport_texture = Some(handle);
+                        }
+                        state.viewport_last_frame = frame_counter;
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if has_rendered_image {
+                if let Some(ref tex) = state.viewport_texture {
+                    // Scale the rendered image to fit the viewport while
+                    // preserving aspect ratio.
+                    let tex_size = tex.size_vec2();
+                    let tex_aspect = tex_size.x / tex_size.y.max(1.0);
+                    let vp_aspect = rect.width() / rect.height().max(1.0);
+
+                    let (draw_w, draw_h) = if tex_aspect > vp_aspect {
+                        // Wider than viewport: fit width.
+                        (rect.width(), rect.width() / tex_aspect)
+                    } else {
+                        // Taller than viewport: fit height.
+                        (rect.height() * tex_aspect, rect.height())
+                    };
+
+                    let draw_rect =
+                        egui::Rect::from_center_size(rect.center(), egui::vec2(draw_w, draw_h));
+
+                    // Fill letterbox/pillarbox area with background.
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
+
+                    // When alpha preview is on, draw a checkerboard behind the
+                    // rendered image so transparent areas are visible.
+                    if state.rendering.alpha_preview {
+                        let check = 16.0_f32;
+                        let c1 = egui::Color32::from_rgb(180, 180, 180);
+                        let c2 = egui::Color32::from_rgb(220, 220, 220);
+                        let cols = ((draw_rect.width() / check).ceil() as usize).min(256);
+                        let rows = ((draw_rect.height() / check).ceil() as usize).min(256);
+                        for row in 0..rows {
+                            for col in 0..cols {
+                                let color = if (row + col) % 2 == 0 { c1 } else { c2 };
+                                let tile = egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        draw_rect.left() + col as f32 * check,
+                                        draw_rect.top() + row as f32 * check,
+                                    ),
+                                    egui::vec2(check, check),
+                                )
+                                .intersect(draw_rect);
+                                if tile.is_positive() {
+                                    painter.rect_filled(tile, 0.0, color);
+                                }
+                            }
+                        }
+                    } else {
+                        // Composite against a solid dark background.
+                        painter.rect_filled(draw_rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
+                    }
+
+                    // Draw the rendered image (flip horizontally when mirror preview is on).
+                    let uv = if state.tracking.tracking_mirror {
+                        egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
+                    } else {
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+                    };
+                    painter.image(
+                        tex.id(),
+                        draw_rect,
+                        uv,
+                        egui::Color32::WHITE,
+                    );
+                }
+            } else {
+                // ── Placeholder (no rendered image yet) ────────────────
+                if state.rendering.transparent_background {
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
+                    let check = 16.0_f32;
+                    let c1 = egui::Color32::from_rgb(30, 30, 35);
+                    let c2 = egui::Color32::from_rgb(40, 40, 45);
+                    let cols = ((rect.width() / check).ceil() as usize).min(256);
+                    let rows = ((rect.height() / check).ceil() as usize).min(256);
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let color = if (row + col) % 2 == 0 { c1 } else { c2 };
+                            let tile = egui::Rect::from_min_size(
+                                egui::pos2(
+                                    rect.left() + col as f32 * check,
+                                    rect.top() + row as f32 * check,
+                                ),
+                                egui::vec2(check, check),
+                            )
+                            .intersect(rect);
+                            if tile.is_positive() {
+                                painter.rect_filled(tile, 0.0, color);
+                            }
+                        }
+                    }
+                } else {
+                    let [r, g, b] = state.rendering.background_color;
+                    painter.rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgb(
+                            (r * 255.0) as u8,
+                            (g * 255.0) as u8,
+                            (b * 255.0) as u8,
+                        ),
+                    );
+                }
+
+                // Grid overlay.
+                let grid_color = egui::Color32::from_rgb(45, 45, 55);
+                let spacing = 40.0_f32;
+
+                let mut y = rect.top();
+                while y <= rect.bottom() {
+                    painter.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        egui::Stroke::new(0.5, grid_color),
+                    );
+                    y += spacing;
+                }
+
+                let mut x = rect.left();
+                while x <= rect.right() {
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(0.5, grid_color),
+                    );
+                    x += spacing;
+                }
+
+                // Center crosshair and labels.
+                let center = rect.center();
+                let cross_color = egui::Color32::from_rgb(70, 70, 85);
                 painter.line_segment(
-                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    egui::Stroke::new(0.5, grid_color),
+                    [
+                        egui::pos2(center.x - 12.0, center.y),
+                        egui::pos2(center.x + 12.0, center.y),
+                    ],
+                    egui::Stroke::new(1.0, cross_color),
                 );
-                y += spacing;
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x, center.y - 12.0),
+                        egui::pos2(center.x, center.y + 12.0),
+                    ],
+                    egui::Stroke::new(1.0, cross_color),
+                );
+
+                painter.text(
+                    egui::pos2(center.x, center.y - 20.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Viewport",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::from_rgb(100, 100, 115),
+                );
+                painter.text(
+                    egui::pos2(center.x, center.y + 20.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Vulkano render target",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(75, 75, 85),
+                );
             }
 
-            let mut x = rect.left();
-            while x <= rect.right() {
-                painter.line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(0.5, grid_color),
-                );
-                x += spacing;
+            // Camera interaction: orbit (left-drag), pan (middle-drag/right-drag), zoom (scroll).
+            if response.dragged_by(egui::PointerButton::Primary) {
+                let delta = response.drag_delta();
+                state.transform.rotation[1] += delta.x * 0.3; // yaw
+                state.transform.rotation[0] += delta.y * 0.3; // pitch
+            }
+            if response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
+            {
+                let delta = response.drag_delta();
+                state.transform.position[0] += delta.x * 0.002;
+                state.transform.position[1] -= delta.y * 0.002;
+            }
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                state.transform.position[2] += scroll * 0.005;
             }
 
-            let center = rect.center();
-            let cross_color = egui::Color32::from_rgb(70, 70, 85);
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - 12.0, center.y),
-                    egui::pos2(center.x + 12.0, center.y),
-                ],
-                egui::Stroke::new(1.0, cross_color),
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x, center.y - 12.0),
-                    egui::pos2(center.x, center.y + 12.0),
-                ],
-                egui::Stroke::new(1.0, cross_color),
-            );
+            // ── Debug drawing (CPU-side fallback) ────────────────────────
+            let cam_pos = state.transform.position;
+            let cam_rot = state.transform.rotation;
+            let fov = state.rendering.camera_fov;
 
-            painter.text(
-                egui::pos2(center.x, center.y - 20.0),
-                egui::Align2::CENTER_CENTER,
-                "Viewport",
-                egui::FontId::proportional(20.0),
-                egui::Color32::from_rgb(100, 100, 115),
+            if let Some(avatar) = &state.app.avatar {
+                // Skeleton debug.
+                if state.rendering.toggle_skeleton_debug {
+                    let skel = &avatar.asset.skeleton;
+                    // Use skinning matrices from pose if available; otherwise
+                    // fall back to identity per node.
+                    let pose_matrices: Vec<crate::asset::Mat4> =
+                        if !avatar.pose.global_transforms.is_empty() {
+                            avatar.pose.global_transforms.clone()
+                        } else {
+                            vec![crate::asset::identity_matrix(); skel.nodes.len()]
+                        };
+                    let skel_list = debug::build_skeleton_debug(skel, &pose_matrices);
+                    draw_debug_list(&painter, &rect, &skel_list, cam_pos, cam_rot, fov);
+                }
+
+                // Collider debug.
+                if state.rendering.toggle_collision_debug {
+                    let skel = &avatar.asset.skeleton;
+                    let pose_matrices: Vec<crate::asset::Mat4> =
+                        if !avatar.pose.global_transforms.is_empty() {
+                            avatar.pose.global_transforms.clone()
+                        } else {
+                            vec![crate::asset::identity_matrix(); skel.nodes.len()]
+                        };
+                    let col_list =
+                        debug::build_collider_debug(&avatar.asset.colliders, skel, &pose_matrices);
+                    draw_debug_list(&painter, &rect, &col_list, cam_pos, cam_rot, fov);
+                }
+
+                // Cloth mesh debug.
+                if state.rendering.toggle_cloth {
+                    if let Some(ref cloth_state) = avatar.cloth_state {
+                        // Try to find the overlay asset from the editor.
+                        if let Some(ref overlay) = state.app.editor.overlay_asset {
+                            let cloth_list = debug::build_cloth_mesh_debug(
+                                &overlay.simulation_mesh,
+                                &cloth_state.sim_positions,
+                            );
+                            draw_debug_list(&painter, &rect, &cloth_list, cam_pos, cam_rot, fov);
+
+                            // Normal debug (when cloth is visible).
+                            if !cloth_state.sim_normals.is_empty() {
+                                let positions = if !cloth_state.sim_positions.is_empty() {
+                                    &cloth_state.sim_positions
+                                } else {
+                                    &vec![]
+                                };
+                                if !positions.is_empty() {
+                                    let normal_list = debug::build_normal_debug(
+                                        positions,
+                                        &cloth_state.sim_normals,
+                                    );
+                                    draw_debug_list(
+                                        &painter,
+                                        &rect,
+                                        &normal_list,
+                                        cam_pos,
+                                        cam_rot,
+                                        fov,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Show camera info overlay.
+            let info = format!(
+                "Pos: [{:.2}, {:.2}, {:.2}]  Rot: [{:.1}, {:.1}, {:.1}]  Scale: {:.2}",
+                state.transform.position[0],
+                state.transform.position[1],
+                state.transform.position[2],
+                state.transform.rotation[0],
+                state.transform.rotation[1],
+                state.transform.rotation[2],
+                state.transform.scale,
             );
             painter.text(
-                egui::pos2(center.x, center.y + 20.0),
-                egui::Align2::CENTER_CENTER,
-                "Vulkano render target placeholder",
-                egui::FontId::proportional(13.0),
-                egui::Color32::from_rgb(75, 75, 85),
+                egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
+                egui::Align2::LEFT_BOTTOM,
+                info,
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgb(90, 90, 100),
             );
         });
 }

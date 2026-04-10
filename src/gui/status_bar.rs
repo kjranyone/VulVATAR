@@ -13,12 +13,12 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             ui.separator();
 
-            let tracking_color = if state.camera_running {
+            let tracking_color = if state.tracking.camera_running {
                 egui::Color32::GREEN
             } else {
                 egui::Color32::GRAY
             };
-            let tracking_text = if state.camera_running {
+            let tracking_text = if state.tracking.camera_running {
                 "Tracking: Active"
             } else {
                 "Tracking: Stopped"
@@ -34,7 +34,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 "Image Sequence",
             ];
             let sink_label = sink_names
-                .get(state.output_sink_index)
+                .get(state.output.output_sink_index)
                 .unwrap_or(&"Unknown");
             ui.label(format!("Output: {}", sink_label));
 
@@ -49,6 +49,19 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             ui.separator();
 
             ui.label(format!("Frame: {}", state.frame_count));
+
+            ui.separator();
+
+            ui.label(format!(
+                "FPS: {:.0}  ({:.1} ms)",
+                state.fps, state.frame_time_ms
+            ));
+
+            // E12: Dirty indicator
+            if state.project_dirty {
+                ui.separator();
+                ui.label(egui::RichText::new("* Modified").color(egui::Color32::YELLOW));
+            }
 
             if state.paused {
                 ui.label(

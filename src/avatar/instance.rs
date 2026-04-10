@@ -1,9 +1,24 @@
 use std::sync::Arc;
 
-use crate::asset::{AvatarAsset, AvatarAssetId, ClothOverlayId, NodeId, Transform, Vec3};
-use crate::avatar::animation::AnimationState;
+use crate::asset::{AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, Mat4, NodeId, Transform, Vec3};
+use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::AvatarPose;
-use crate::tracking::TrackingRigPose;
+use crate::avatar::retargeting::ResolvedExpressionWeight;
+use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
+
+/// Multiply two column-major 4x4 matrices: result = a * b.
+fn mul_mat4(a: &Mat4, b: &Mat4) -> Mat4 {
+    let mut out = [[0.0f32; 4]; 4];
+    for col in 0..4 {
+        for row in 0..4 {
+            out[col][row] = a[0][row] * b[col][0]
+                + a[1][row] * b[col][1]
+                + a[2][row] * b[col][2]
+                + a[3][row] * b[col][3];
+        }
+    }
+    out
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AvatarInstanceId(pub u64);
@@ -17,10 +32,15 @@ pub struct AvatarInstance {
     pub pose: AvatarPose,
     pub animation_state: AnimationState,
     pub secondary_motion: SecondaryMotionState,
-    pub tracking_input: Option<TrackingRigPose>,
     pub attached_cloth: Option<ClothOverlayId>,
     pub cloth_enabled: bool,
     pub cloth_state: Option<ClothState>,
+    pub cloth_sim: Option<ClothSimState>,
+    pub cloth_sim_buffers: Option<ClothSimTempBuffers>,
+    /// Resolved expression weights from the most recent retarget_expressions() call.
+    /// These are tracked in state but do not yet drive morph target deformation
+    /// (morph target application is a future task).
+    pub expression_weights: Vec<ResolvedExpressionWeight>,
 }
 
 #[derive(Clone, Debug)]
@@ -33,8 +53,10 @@ pub struct SecondaryMotionState {
 pub struct SpringChainState {
     pub chain_root: NodeId,
     pub joints: Vec<NodeId>,
-    pub tip_position: Vec3,
-    pub tip_previous_position: Vec3,
+    /// Per-joint positions for Verlet integration (one entry per joint).
+    pub positions: Vec<Vec3>,
+    /// Per-joint previous positions for Verlet integration (one entry per joint).
+    pub previous_positions: Vec<Vec3>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,16 +96,19 @@ pub struct ClothDeformOutput {
 impl AvatarInstance {
     pub fn new(id: AvatarInstanceId, asset: Arc<AvatarAsset>) -> Self {
         let node_count = asset.skeleton.nodes.len();
-        let asset_id = asset.id.clone();
+        let asset_id = asset.id;
 
         let spring_states = asset
             .spring_bones
             .iter()
-            .map(|spring| SpringChainState {
-                chain_root: spring.chain_root.clone(),
-                joints: spring.joints.clone(),
-                tip_position: [0.0, 0.0, 0.0],
-                tip_previous_position: [0.0, 0.0, 0.0],
+            .map(|spring| {
+                let joint_count = spring.joints.len();
+                SpringChainState {
+                    chain_root: spring.chain_root,
+                    joints: spring.joints.clone(),
+                    positions: vec![[0.0, 0.0, 0.0]; joint_count],
+                    previous_positions: vec![[0.0, 0.0, 0.0]; joint_count],
+                }
             })
             .collect();
 
@@ -98,15 +123,17 @@ impl AvatarInstance {
                 spring_states,
                 collision_cache: SecondaryMotionCollisionCache { contact_count: 0 },
             },
-            tracking_input: None,
             attached_cloth: None,
             cloth_enabled: false,
             cloth_state: None,
+            cloth_sim: None,
+            cloth_sim_buffers: None,
+            expression_weights: Vec::new(),
         }
     }
 
     pub fn attach_cloth(&mut self, overlay_id: ClothOverlayId) {
-        self.attached_cloth = Some(overlay_id.clone());
+        self.attached_cloth = Some(overlay_id);
         self.cloth_enabled = true;
         self.cloth_state = Some(ClothState {
             overlay_id,
@@ -128,21 +155,92 @@ impl AvatarInstance {
         });
     }
 
+    /// Initialise the cloth simulation from a `ClothAsset`.
+    /// Call this after `attach_cloth` to populate the PBD solver state.
+    pub fn init_cloth_sim(&mut self, cloth_asset: &ClothAsset) {
+        let sim = ClothSimState::from_asset(cloth_asset);
+        let n = sim.particle_count();
+
+        // Pre-fill ClothState positions from the sim mesh rest pose
+        if let Some(cs) = self.cloth_state.as_mut() {
+            cs.sim_positions = sim.particles.iter().map(|p| p.position).collect();
+            cs.prev_sim_positions = cs.sim_positions.clone();
+            cs.deform_output.deformed_positions = cs.sim_positions.clone();
+        }
+
+        self.cloth_sim_buffers = Some(ClothSimTempBuffers::new(n));
+        self.cloth_sim = Some(sim);
+    }
+
     pub fn detach_cloth(&mut self) {
         self.attached_cloth = None;
         self.cloth_enabled = false;
         self.cloth_state = None;
+        self.cloth_sim = None;
+        self.cloth_sim_buffers = None;
     }
 
-    pub fn apply_tracking(&mut self, tracking: TrackingRigPose) {
-        self.tracking_input = Some(tracking);
+    pub fn build_base_pose(&mut self) {
+        let skeleton = &self.asset.skeleton;
+        for (i, node) in skeleton.nodes.iter().enumerate() {
+            self.pose.local_transforms[i] = node.rest_local.clone();
+        }
+
+        // If an animation clip is active, sample it and overlay onto the rest pose.
+        if let Some(clip_id) = &self.animation_state.active_clip {
+            if let Some(clip) = animation::find_clip(clip_id, &self.asset.animation_clips) {
+                let clip = clip.clone(); // clone to release the borrow on self.asset
+                animation::sample_clip(
+                    &clip,
+                    self.animation_state.playhead_seconds,
+                    &mut self.pose.local_transforms,
+                );
+            }
+        }
     }
 
-    pub fn build_base_pose(&mut self) {}
+    pub fn compute_global_pose(&mut self) {
+        let skeleton = &self.asset.skeleton;
 
-    pub fn compute_global_pose(&mut self) {}
+        // Process root nodes first, then recurse into children.
+        // We use an explicit stack to avoid borrowing issues with recursion.
+        let mut stack: Vec<(usize, Option<usize>)> = Vec::new();
 
-    pub fn build_skinning_matrices(&mut self) {}
+        // Push root nodes (no parent).
+        for root_id in skeleton.root_nodes.iter().rev() {
+            stack.push((root_id.0 as usize, None));
+        }
+
+        while let Some((node_idx, parent_idx)) = stack.pop() {
+            let local_mat = self.pose.local_transforms[node_idx].to_matrix();
+
+            let global_mat = match parent_idx {
+                Some(pi) => mul_mat4(&self.pose.global_transforms[pi], &local_mat),
+                None => local_mat,
+            };
+
+            self.pose.global_transforms[node_idx] = global_mat;
+
+            // Push children in reverse order so they are processed in forward order.
+            for child_id in skeleton.nodes[node_idx].children.iter().rev() {
+                stack.push((child_id.0 as usize, Some(node_idx)));
+            }
+        }
+    }
+
+    pub fn build_skinning_matrices(&mut self) {
+        let skeleton = &self.asset.skeleton;
+        for i in 0..skeleton.nodes.len() {
+            let ibm = if i < skeleton.inverse_bind_matrices.len() {
+                &skeleton.inverse_bind_matrices[i]
+            } else {
+                // Fall back to identity if no IBM for this node.
+                continue;
+            };
+            self.pose.skinning_matrices[i] =
+                mul_mat4(&self.pose.global_transforms[i], ibm);
+        }
+    }
 }
 
 impl Default for SecondaryMotionState {

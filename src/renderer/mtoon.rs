@@ -1,46 +1,8 @@
-use crate::asset::Vec3;
-
-#[derive(Clone, Debug, Default)]
-pub struct MtoonStagedParams {
-    pub shade_color: crate::asset::Vec4,
-    pub shade_shift: f32,
-    pub shade_toony: f32,
-    pub lit_color: crate::asset::Vec4,
-    pub gi_equalization: f32,
-    pub matcap_texture: Option<MtoonTextureSlot>,
-    pub rim_texture: Option<MtoonTextureSlot>,
-    pub rim_color: crate::asset::Vec4,
-    pub rim_lighting_mix: f32,
-    pub rim_fresnel_power: f32,
-    pub rim_lift: f32,
-    pub emissive_texture: Option<MtoonTextureSlot>,
-    pub emissive_color: crate::asset::Vec4,
-    pub outline_width_mode: MtoonOutlineWidthMode,
-    pub outline_color: Vec3,
-    pub outline_width: f32,
-    pub uv_anim_mask_texture: Option<MtoonTextureSlot>,
-    pub uv_anim_scroll_x_speed: f32,
-    pub uv_anim_scroll_y_speed: f32,
-    pub uv_anim_rotation_speed: f32,
-}
-
-#[derive(Clone, Debug)]
-pub struct MtoonTextureSlot {
-    pub uri: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum MtoonOutlineWidthMode {
-    None,
-    WorldCoordinates,
-    ScreenCoordinates,
-}
-
-impl Default for MtoonOutlineWidthMode {
-    fn default() -> Self {
-        Self::None
-    }
-}
+// Re-export MToon staged parameter types from the asset module.
+// These are pure-data types with no GPU dependencies, so they live in `asset`.
+// The re-exports are kept for backward compatibility even if nothing currently uses them.
+#[allow(unused_imports)]
+pub use crate::asset::{MtoonOutlineWidthMode, MtoonStagedParams, MtoonTextureSlot};
 
 #[derive(Clone, Debug, Default)]
 pub struct MtoonCompatibilityStatus {
@@ -58,16 +20,19 @@ pub struct MtoonCompatibilityStatus {
 }
 
 impl MtoonCompatibilityStatus {
-    pub fn initial_stub() -> Self {
+    /// Returns the compatibility status matching the current POC renderer
+    /// capabilities.  Features that the toon-like pipeline and outline pass
+    /// already handle are marked as supported.
+    pub fn initial_poc() -> Self {
         Self {
             base_color_supported: true,
-            texture_sampling_supported: false,
-            alpha_mode_supported: false,
-            culling_mode_supported: false,
-            toon_threshold_supported: false,
-            outline_supported: false,
-            outline_width_supported: false,
-            shade_controls_supported: false,
+            texture_sampling_supported: true,
+            alpha_mode_supported: true,
+            culling_mode_supported: true,
+            toon_threshold_supported: true,
+            outline_supported: true,
+            outline_width_supported: true,
+            shade_controls_supported: true,
             emissive_supported: false,
             rim_supported: false,
             uv_animation_supported: false,
