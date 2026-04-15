@@ -194,10 +194,14 @@ void main() {
         // Unlit: no lighting at all
     } else if (material.shading_mode == 1) {
         // Approximate TinyMToon: mix base/shade color using linearstep over N.L + shift.
+        // Use ambient to raise the floor of the N.L term so shadowed faces
+        // don't go fully dark, then multiply by light color once.
+        float ambient_avg = (camera.ambient_term.x + camera.ambient_term.y + camera.ambient_term.z) / 3.0;
+        float lit = ndotl + material.shade_shift + ambient_avg;
         float shading = linearstep(
             -1.0 + clamp(material.shade_toony, 0.0, 1.0),
             1.0 - clamp(material.shade_toony, 0.0, 1.0),
-            ndotl + material.shade_shift
+            lit
         );
         vec3 shade_col = material.shade_color.rgb * shade_texture_term;
         vec3 toon_col = mix(shade_col, base_color_term, shading);
