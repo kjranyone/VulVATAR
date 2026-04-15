@@ -669,6 +669,19 @@ impl VrmAssetLoader {
                     mtoon_params,
                 }
             })
+            .inspect(|mat| {
+                let tb = &mat.texture_bindings;
+                let base = tb.base_color_texture.as_ref();
+                log::info!(
+                    "[vrm] material #{} '{}' mode={:?} base_tex={} ({}x{})",
+                    mat.id.0,
+                    mat.name,
+                    mat.base_mode,
+                    base.map_or("none", |t| &t.uri),
+                    base.map_or(0, |t| t.dimensions.0),
+                    base.map_or(0, |t| t.dimensions.1),
+                );
+            })
             .collect()
     }
 
@@ -691,19 +704,33 @@ impl VrmAssetLoader {
                     Some(encoded) => match image::load_from_memory(encoded) {
                         Ok(img) => {
                             let (w, h) = img.dimensions();
+                            log::info!(
+                                "[vrm] texture '{}' loaded from buffer: {}x{} ({} bytes)",
+                                uri, w, h, encoded.len()
+                            );
                             (Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
                         }
-                        Err(_) => (None, (0, 0)),
+                        Err(e) => {
+                            log::warn!("[vrm] texture '{}' decode failed: {}", uri, e);
+                            (None, (0, 0))
+                        }
                     },
-                    None => (None, (0, 0)),
+                    None => {
+                        log::warn!("[vrm] texture '{}' buffer range {}..{} out of bounds", uri, start, end);
+                        (None, (0, 0))
+                    }
                 }
             }
             gltf::image::Source::Uri { uri: file_uri, .. } => match image::open(file_uri) {
                 Ok(img) => {
                     let (w, h) = img.dimensions();
+                    log::info!("[vrm] texture '{}' loaded from uri: {}x{}", uri, w, h);
                     (Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
                 }
-                Err(_) => (None, (0, 0)),
+                Err(e) => {
+                    log::warn!("[vrm] texture '{}' file open failed: {}", uri, e);
+                    (None, (0, 0))
+                }
             },
         };
 
