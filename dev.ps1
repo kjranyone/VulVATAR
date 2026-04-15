@@ -32,7 +32,7 @@ $commands = @(
     @{ Label = "setup (download models)"; Cmd = "Install-Models" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
-    @{ Label = "run (debug)";      Cmd = "cargo run" },
+    @{ Label = "run (debug)";      Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run' },
     @{ Label = "run (release)";    Cmd = "cargo run --release" },
     @{ Label = "test";             Cmd = "cargo test" },
     @{ Label = "clippy";           Cmd = "cargo clippy" },

@@ -562,8 +562,10 @@ impl VulkanRenderer {
             _pad0: 0.0,
             light_dir,
             light_intensity: input.lighting.main_light_intensity,
-            ambient_term: input.lighting.ambient_term,
+            light_color: input.lighting.main_light_color,
             _pad1: 0.0,
+            ambient_term: input.lighting.ambient_term,
+            _pad2: 0.0,
         };
         let slot = (self.frame_counter % FRAME_LAG as u64) as usize;
         let (camera_set, outline_camera_set) = {
@@ -674,6 +676,9 @@ impl VulkanRenderer {
                 let texture_view =
                     self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
 
+                let shade_texture_view =
+                    self.resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
+
                 // Resolve matcap texture
                 let matcap_view =
                     self.resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
@@ -686,6 +691,7 @@ impl VulkanRenderer {
                     ds_allocator.clone(),
                     &active_pipeline,
                     texture_view,
+                    shade_texture_view,
                     sampler.clone(),
                     matcap_view,
                 )?;
@@ -908,6 +914,41 @@ impl VulkanRenderer {
         };
         self.texture_cache.insert(uri.clone(), view.clone());
         Some(view)
+    }
+
+    fn resolve_shade_texture(
+        &mut self,
+        slots: &material::MaterialTextureSlots,
+        default_tex: &Arc<ImageView>,
+    ) -> Arc<ImageView> {
+        let binding = match slots.shade_ramp.as_ref() {
+            Some(b) => b,
+            None => return default_tex.clone(),
+        };
+        let uri = &binding.uri;
+        if let Some(cached) = self.texture_cache.get(uri) {
+            return cached.clone();
+        }
+        let view = if binding.pixel_data.is_some() && binding.dimensions.0 > 0 {
+            self.upload_texture_from_binding(binding)
+                .unwrap_or_else(|| {
+                    warn!(
+                        "renderer: failed to upload embedded shade texture '{}', using default white",
+                        uri
+                    );
+                    default_tex.clone()
+                })
+        } else {
+            self.upload_texture(uri).unwrap_or_else(|| {
+                warn!(
+                    "renderer: failed to load shade texture '{}', using default white",
+                    uri
+                );
+                default_tex.clone()
+            })
+        };
+        self.texture_cache.insert(uri.clone(), view.clone());
+        view
     }
 
     fn upload_texture_from_binding(
@@ -1391,8 +1432,10 @@ impl VulkanRenderer {
                 [ld[0] / len, ld[1] / len, ld[2] / len]
             },
             light_intensity: input.lighting.main_light_intensity,
-            ambient_term: input.lighting.ambient_term,
+            light_color: input.lighting.main_light_color,
             _pad1: 0.0,
+            ambient_term: input.lighting.ambient_term,
+            _pad2: 0.0,
         };
 
         let camera_buffer = Buffer::from_data(
@@ -1506,6 +1549,9 @@ impl VulkanRenderer {
                 let texture_view =
                     self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
 
+                let shade_texture_view =
+                    self.resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
+
                 let matcap_view =
                     self.resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
 
@@ -1518,6 +1564,7 @@ impl VulkanRenderer {
                         ds_allocator.clone(),
                         &thumb_pipeline,
                         texture_view,
+                        shade_texture_view,
                         sampler.clone(),
                         matcap_view,
                     )
@@ -1707,8 +1754,10 @@ struct CameraUniform {
     _pad0: f32,
     light_dir: [f32; 3],
     light_intensity: f32,
-    ambient_term: [f32; 3],
+    light_color: [f32; 3],
     _pad1: f32,
+    ambient_term: [f32; 3],
+    _pad2: f32,
 }
 
 /// Convert the project's row-major `Mat4` into column-major for GLSL.
@@ -1756,8 +1805,10 @@ impl CameraRing {
             _pad0: 0.0,
             light_dir: [0.0; 3],
             light_intensity: 0.0,
-            ambient_term: [0.0; 3],
+            light_color: [0.0; 3],
             _pad1: 0.0,
+            ambient_term: [0.0; 3],
+            _pad2: 0.0,
         };
 
         let mut buffers = Vec::with_capacity(FRAME_LAG);

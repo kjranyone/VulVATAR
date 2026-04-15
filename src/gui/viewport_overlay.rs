@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use eframe::egui;
 
 use crate::asset::AvatarAsset;
@@ -26,6 +25,7 @@ impl Default for ViewportOverlayState {
     }
 }
 
+#[allow(dead_code)]
 pub fn draw_selection_overlay(
     ui: &mut egui::Ui,
     selection: Option<&RegionSelection>,

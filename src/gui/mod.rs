@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod hotkey;
 pub mod inspector;
 pub mod mesh_picking;
@@ -23,6 +22,13 @@ pub struct TransformState {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: f32,
+}
+
+pub struct CameraOrbitState {
+    pub yaw_deg: f32,
+    pub pitch_deg: f32,
+    pub pan: [f32; 2],
+    pub distance: f32,
 }
 
 pub struct TrackingGuiState {
@@ -129,6 +135,7 @@ pub struct GuiApp {
     pub notifications: Vec<(String, Instant)>,
 
     pub transform: TransformState,
+    pub camera_orbit: CameraOrbitState,
     pub tracking: TrackingGuiState,
     pub rendering: RenderingGuiState,
     pub output: OutputGuiState,
@@ -214,7 +221,7 @@ impl GuiApp {
             frame_time_ms: 0.0,
             fps: 0.0,
 
-            recent_avatars: Vec::new(),
+            recent_avatars: crate::persistence::load_recent_avatars(),
 
             project_dirty: false,
 
@@ -234,6 +241,12 @@ impl GuiApp {
                 position: [0.0, 0.0, 0.0],
                 rotation: [0.0, 0.0, 0.0],
                 scale: 1.0,
+            },
+            camera_orbit: CameraOrbitState {
+                yaw_deg: 0.0,
+                pitch_deg: 0.0,
+                pan: [0.0, 0.0],
+                distance: 5.0,
             },
             tracking: TrackingGuiState {
                 toggle_tracking: true,
@@ -323,6 +336,7 @@ impl GuiApp {
         self.recent_avatars.retain(|p| p != &path);
         self.recent_avatars.insert(0, path);
         self.recent_avatars.truncate(10);
+        let _ = crate::persistence::save_recent_avatars(&self.recent_avatars);
     }
 
     /// Build a `RuntimeToggles` from the current GUI state.
@@ -330,7 +344,7 @@ impl GuiApp {
         RuntimeToggles {
             tracking_enabled: self.tracking.toggle_tracking,
             spring_enabled: self.rendering.toggle_spring,
-            cloth_enabled: self.rendering.toggle_cloth,
+            cloth_enabled: self.rendering.toggle_cloth && self.cloth_sim_playing,
             collision_debug: self.rendering.toggle_collision_debug,
             skeleton_debug: self.rendering.toggle_skeleton_debug,
         }
@@ -340,14 +354,12 @@ impl GuiApp {
     pub fn to_project_state(&self) -> ProjectState {
         let avatar_source_path = self
             .app
-            .avatar
-            .as_ref()
+            .active_avatar()
             .map(|a| a.asset.source_path.to_string_lossy().into_owned());
 
         let avatar_source_hash = self
             .app
-            .avatar
-            .as_ref()
+            .active_avatar()
             .map(|a| a.asset.source_hash.0.to_vec());
 
         let active_overlay_path = self
@@ -365,6 +377,11 @@ impl GuiApp {
             transform_position: self.transform.position,
             transform_rotation: self.transform.rotation,
             transform_scale: self.transform.scale,
+
+            camera_orbit_yaw: self.camera_orbit.yaw_deg,
+            camera_orbit_pitch: self.camera_orbit.pitch_deg,
+            camera_orbit_pan: self.camera_orbit.pan,
+            camera_orbit_distance: self.camera_orbit.distance,
 
             tracking_mirror: self.tracking.tracking_mirror,
             smoothing_strength: self.tracking.smoothing_strength,
@@ -432,12 +449,16 @@ impl GuiApp {
             self.transform.position = [0.0, 0.0, 0.0];
             self.transform.rotation = [0.0, 0.0, 0.0];
             self.transform.scale = 1.0;
+            self.project_dirty = true;
         }
         if self.hotkeys.check(hotkey::HotkeyAction::ResetCamera, ctx) {
-            self.transform.position = [0.0, 0.0, 0.0];
-            self.transform.rotation = [0.0, 0.0, 0.0];
-            self.app.viewport_camera.distance = 5.0;
-            self.app.viewport_camera.pan = [0.0, 0.0];
+            self.camera_orbit = CameraOrbitState {
+                yaw_deg: 0.0,
+                pitch_deg: 0.0,
+                pan: [0.0, 0.0],
+                distance: 5.0,
+            };
+            self.project_dirty = true;
         }
         if self
             .hotkeys
@@ -484,6 +505,11 @@ impl GuiApp {
         self.transform.rotation = state.transform_rotation;
         self.transform.scale = state.transform_scale;
 
+        self.camera_orbit.yaw_deg = state.camera_orbit_yaw;
+        self.camera_orbit.pitch_deg = state.camera_orbit_pitch;
+        self.camera_orbit.pan = state.camera_orbit_pan;
+        self.camera_orbit.distance = state.camera_orbit_distance;
+
         self.tracking.tracking_mirror = state.tracking_mirror;
         self.tracking.smoothing_strength = state.smoothing_strength;
         self.tracking.confidence_threshold = state.confidence_threshold;
@@ -508,23 +534,8 @@ impl GuiApp {
         self.output.output_color_space_index = state.output_color_space_index;
     }
 
-    fn load_avatar_from_drop(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let loader = crate::asset::vrm::VrmAssetLoader::new();
-        let asset = loader
-            .load(path.to_string_lossy().as_ref())
-            .map_err(|e| format!("{}", e))?;
-        let instance_id = crate::avatar::AvatarInstanceId(self.app.next_avatar_instance_id);
-        self.app.next_avatar_instance_id += 1;
-        self.app.physics.attach_avatar(&asset);
-        let instance = crate::avatar::AvatarInstance::new(instance_id, asset.clone());
-        self.app.add_avatar(instance);
-        let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
-        entry.update_from_asset(&asset);
-        self.app.avatar_library.add(entry);
-        let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
-        self.add_recent_avatar(path.to_path_buf());
-        self.push_notification(format!("Loaded avatar: {}", path.display()));
-        Ok(())
+    fn load_avatar_from_drop(&mut self, path: &std::path::Path) {
+        top_bar::load_avatar_from_path(self, path);
     }
 
     pub fn start_watching_folder(&mut self, path: std::path::PathBuf) -> Result<(), String> {
@@ -599,9 +610,7 @@ impl eframe::App for GuiApp {
                     .to_lowercase();
                 if ext == "vrm" {
                     info!("gui: dropped VRM file: {:?}", path);
-                    if let Err(e) = self.load_avatar_from_drop(&path) {
-                        self.push_notification(format!("Failed to load VRM: {}", e));
-                    }
+                    self.load_avatar_from_drop(&path);
                 }
             }
         }
@@ -622,7 +631,7 @@ impl eframe::App for GuiApp {
         self.poll_folder_watcher();
 
         // Sync GUI-driven state into the application before running the frame.
-        if let Some(avatar) = self.app.avatar.as_mut() {
+        if let Some(avatar) = self.app.active_avatar_mut() {
             avatar.world_transform.translation = self.transform.position;
             // Convert Euler degrees to a quaternion (XYZ order).
             let [rx, ry, rz] = self.transform.rotation;
@@ -645,11 +654,10 @@ impl eframe::App for GuiApp {
         }
 
         // Sync GUI camera controls into the Application's viewport camera.
-        self.app.viewport_camera.yaw_deg = self.transform.rotation[1];
-        self.app.viewport_camera.pitch_deg = self.transform.rotation[0];
-        // Map transform_position[2] as a camera distance offset (closer/further).
-        self.app.viewport_camera.distance = (5.0 - self.transform.position[2] * 10.0).max(0.1);
-        self.app.viewport_camera.pan = [self.transform.position[0], self.transform.position[1]];
+        self.app.viewport_camera.yaw_deg = self.camera_orbit.yaw_deg;
+        self.app.viewport_camera.pitch_deg = self.camera_orbit.pitch_deg;
+        self.app.viewport_camera.distance = self.camera_orbit.distance;
+        self.app.viewport_camera.pan = self.camera_orbit.pan;
         self.app.viewport_camera.fov_deg = self.rendering.camera_fov;
 
         // Sync lighting parameters from GUI inspector.
@@ -730,8 +738,7 @@ impl eframe::App for GuiApp {
                     .unwrap_or_else(|| "Untitled".to_string());
                 let target_avatar_path = self
                     .app
-                    .avatar
-                    .as_ref()
+                    .active_avatar()
                     .map(|a| a.asset.source_path.to_string_lossy().into_owned());
                 Some(crate::persistence::ClothOverlayFile {
                     format_version: 1,

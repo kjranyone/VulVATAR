@@ -129,8 +129,8 @@ pub struct MaterialUniform {
     pub base_color: [f32; 4],
     pub alpha_cutoff: f32,
     pub alpha_mode: i32,
-    pub toon_threshold: f32,
-    pub shadow_softness: f32,
+    pub shade_shift: f32,
+    pub shade_toony: f32,
     pub shading_mode: i32,
     pub shade_color: [f32; 4],
     pub emissive_color: [f32; 4],
@@ -152,6 +152,7 @@ struct MaterialCacheEntry {
     buffer: Subbuffer<MaterialUniform>,
     descriptor_set: Arc<PersistentDescriptorSet>,
     base_color_uri: String,
+    shade_texture_uri: Option<String>,
     matcap_uri: Option<String>,
 }
 
@@ -184,6 +185,7 @@ impl MaterialUploader {
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         pipeline: &Arc<GraphicsPipeline>,
         texture_view: Arc<ImageView>,
+        shade_texture_view: Arc<ImageView>,
         sampler: Arc<Sampler>,
         matcap_texture_view: Option<Arc<ImageView>>,
     ) -> Result<Arc<PersistentDescriptorSet>, String> {
@@ -194,13 +196,17 @@ impl MaterialUploader {
             .map(|b| b.uri.as_str())
             .unwrap_or("")
             .to_string();
+        let shade_texture_uri = request.textures.shade_ramp.as_ref().map(|b| b.uri.clone());
         let matcap_uri = request.textures.matcap.as_ref().map(|b| b.uri.clone());
 
         let uniform_data = Self::compute_uniform(request);
 
         if let Some(key) = cache_key {
             if let Some(entry) = self.cache.get(&key) {
-                if entry.base_color_uri == base_color_uri && entry.matcap_uri == matcap_uri {
+                if entry.base_color_uri == base_color_uri
+                    && entry.shade_texture_uri == shade_texture_uri
+                    && entry.matcap_uri == matcap_uri
+                {
                     {
                         let mut guard = entry
                             .buffer
@@ -243,7 +249,8 @@ impl MaterialUploader {
             [
                 WriteDescriptorSet::buffer(0, uniform_buffer.clone()),
                 WriteDescriptorSet::image_view_sampler(1, texture_view, sampler.clone()),
-                WriteDescriptorSet::image_view_sampler(2, matcap_view, sampler),
+                WriteDescriptorSet::image_view_sampler(2, matcap_view, sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(3, shade_texture_view, sampler),
             ],
             [],
         )
@@ -256,6 +263,7 @@ impl MaterialUploader {
                     buffer: uniform_buffer,
                     descriptor_set: descriptor_set.clone(),
                     base_color_uri,
+                    shade_texture_uri,
                     matcap_uri,
                 },
             );
@@ -275,12 +283,10 @@ impl MaterialUploader {
             _ => 0.5,
         };
 
-        let (toon_threshold, shadow_softness) = if let Some(ref mtoon) = request.mtoon_params {
-            let threshold = (1.0 - mtoon.shade_toony).max(0.01);
-            let softness = (1.0 - mtoon.shade_toony) * 0.5;
-            (threshold, softness)
+        let (shade_shift, shade_toony) = if let Some(ref mtoon) = request.mtoon_params {
+            (mtoon.shade_shift, mtoon.shade_toony)
         } else {
-            (request.toon_ramp_threshold, request.shadow_softness)
+            (0.0, 0.9)
         };
 
         let shading_mode = match request.mode {
@@ -300,11 +306,17 @@ impl MaterialUploader {
             uv_scroll_y,
             uv_rotation,
         ) = if let Some(ref mtoon) = request.mtoon_params {
-            let emissive = if request.textures.emissive.is_some() || request.textures.shade_ramp.is_some() {
-                mtoon.emissive_color
-            } else {
-                [mtoon.emissive_color[0], mtoon.emissive_color[1], mtoon.emissive_color[2], 0.0]
-            };
+            let emissive =
+                if request.textures.emissive.is_some() || request.textures.shade_ramp.is_some() {
+                    mtoon.emissive_color
+                } else {
+                    [
+                        mtoon.emissive_color[0],
+                        mtoon.emissive_color[1],
+                        mtoon.emissive_color[2],
+                        0.0,
+                    ]
+                };
             (
                 mtoon.shade_color,
                 emissive,
@@ -330,26 +342,18 @@ impl MaterialUploader {
             )
         };
 
-        let matcap_blend = if request.textures.matcap.is_some() {
-            if let Some(ref mtoon) = request.mtoon_params {
-                if mtoon.matcap_texture.is_some() {
-                    1.0
-                } else {
-                    0.0
-                }
-            } else {
-                1.0
-            }
-        } else {
-            0.0
-        };
+        // Disable the current matcap path until a proper MToon-compatible
+        // implementation is added. The placeholder VRoid matcap textures
+        // (e.g. `MatcapWarp`) badly over-brighten avatars when treated as a
+        // direct color map.
+        let matcap_blend = 0.0;
 
         MaterialUniform {
             base_color: request.base_color,
             alpha_cutoff,
             alpha_mode: alpha_mode_int,
-            toon_threshold,
-            shadow_softness,
+            shade_shift,
+            shade_toony,
             shading_mode,
             shade_color,
             emissive_color,

@@ -198,6 +198,23 @@ impl PhysicsWorld {
         None
     }
 
+    #[cfg(feature = "rapier")]
+    pub fn remove_character_bodies(&mut self, _path: &str) {
+        if let Some(ref mut rapier) = self.rapier {
+            rapier.remove_character_body();
+        }
+        self.collider_count = 0;
+        self.spring_chain_count = 0;
+        info!("physics: detached avatar");
+    }
+
+    #[cfg(not(feature = "rapier"))]
+    pub fn remove_character_bodies(&mut self, _path: &str) {
+        self.collider_count = 0;
+        self.spring_chain_count = 0;
+        info!("physics: detached avatar");
+    }
+
     /// Add a static sphere collider to the Rapier world (e.g. avatar body part).
     #[cfg(feature = "rapier")]
     pub fn add_static_collider(&mut self, position: [f32; 3], radius: f32) {

@@ -2,6 +2,7 @@
 use image::GenericImageView;
 use log::warn;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -334,7 +335,7 @@ impl VrmAssetLoader {
             .transpose()?;
 
         let meshes = Self::build_meshes(&gltf_doc.document, blob);
-        let materials = Self::build_materials(&gltf_doc.document, blob);
+        let materials = Self::build_materials(&gltf_doc.document, blob, &source_path);
         let skin_bindings = Self::build_skin_bindings(&gltf_doc.document, blob);
         let meshes_with_skin =
             Self::assign_skins_to_meshes(&gltf_doc.document, meshes, &skin_bindings);
@@ -563,13 +564,18 @@ impl VrmAssetLoader {
         doc: &gltf::Document,
         index: usize,
         blob: Option<&[u8]>,
+        source_path: &Path,
     ) -> Option<TextureBinding> {
         doc.textures()
             .nth(index)
-            .map(|tex| Self::texture_binding_from_info(&tex, blob))
+            .map(|tex| Self::texture_binding_from_info(&tex, blob, source_path))
     }
 
-    fn build_materials(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<MaterialAsset> {
+    fn build_materials(
+        doc: &gltf::Document,
+        blob: Option<&[u8]>,
+        source_path: &Path,
+    ) -> Vec<MaterialAsset> {
         doc.materials()
             .enumerate()
             .map(|(i, gmat)| {
@@ -597,27 +603,32 @@ impl VrmAssetLoader {
                     MaterialMode::SimpleLit
                 };
 
-                let base_color_texture = pbr
-                    .base_color_texture()
-                    .map(|info| Self::texture_binding_from_info(&info.texture(), blob));
+                let base_color_texture = pbr.base_color_texture().map(|info| {
+                    Self::texture_binding_from_info(&info.texture(), blob, source_path)
+                });
 
-                let normal_map_texture = gmat
-                    .normal_texture()
-                    .map(|info| Self::texture_binding_from_info(&info.texture(), blob));
+                let normal_map_texture = gmat.normal_texture().map(|info| {
+                    Self::texture_binding_from_info(&info.texture(), blob, source_path)
+                });
 
                 let mut shade_ramp_texture = None;
                 let mut emissive_texture_binding = None;
+                let mut matcap_texture_binding = None;
 
                 let (toon_params, mtoon_params) = if let Some(mtoon) = mtoon_ext {
                     let (toon, mut staged, tex_indices) = Self::parse_mtoon_params(mtoon);
 
                     shade_ramp_texture = tex_indices
                         .shade_color_texture
-                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob));
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob, source_path));
 
                     emissive_texture_binding = tex_indices
                         .emissive_texture
-                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob));
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob, source_path));
+
+                    matcap_texture_binding = tex_indices
+                        .matcap_texture
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob, source_path));
 
                     staged.emissive_texture =
                         emissive_texture_binding
@@ -627,15 +638,15 @@ impl VrmAssetLoader {
                             });
                     staged.rim_texture = tex_indices
                         .rim_texture
-                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob))
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob, source_path))
                         .map(|tb| MtoonTextureSlot { uri: tb.uri });
-                    staged.matcap_texture = tex_indices
-                        .matcap_texture
-                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob))
-                        .map(|tb| MtoonTextureSlot { uri: tb.uri });
+                    staged.matcap_texture =
+                        matcap_texture_binding.as_ref().map(|tb| MtoonTextureSlot {
+                            uri: tb.uri.clone(),
+                        });
                     staged.uv_anim_mask_texture = tex_indices
                         .uv_anim_mask_texture
-                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob))
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob, source_path))
                         .map(|tb| MtoonTextureSlot { uri: tb.uri });
 
                     (toon, Some(staged))
@@ -663,7 +674,7 @@ impl VrmAssetLoader {
                         normal_map_texture,
                         shade_ramp_texture,
                         emissive_texture: emissive_texture_binding,
-                        matcap_texture: None,
+                        matcap_texture: matcap_texture_binding,
                     },
                     toon_params,
                     mtoon_params,
@@ -688,50 +699,75 @@ impl VrmAssetLoader {
     fn texture_binding_from_info(
         texture: &gltf::Texture<'_>,
         blob: Option<&[u8]>,
+        source_path: &Path,
     ) -> TextureBinding {
-        let uri = texture
-            .source()
-            .name()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| format!("texture_{}", texture.index()));
+        let base_dir = source_path.parent();
+        let default_name = format!("texture_{}", texture.index());
+        let texture_name = texture.source().name().unwrap_or(default_name.as_str());
 
         let source = texture.source().source();
-        let (pixel_data, dimensions) = match source {
+        let (uri, pixel_data, dimensions) = match source {
             gltf::image::Source::View { view, .. } => {
                 let start = view.offset();
                 let end = start + view.length();
+                let cache_key = format!("{}#{}", source_path.display(), texture_name);
                 match blob.and_then(|b| b.get(start..end)) {
                     Some(encoded) => match image::load_from_memory(encoded) {
                         Ok(img) => {
                             let (w, h) = img.dimensions();
                             log::info!(
                                 "[vrm] texture '{}' loaded from buffer: {}x{} ({} bytes)",
-                                uri, w, h, encoded.len()
+                                cache_key,
+                                w,
+                                h,
+                                encoded.len()
                             );
-                            (Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
+                            (cache_key, Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
                         }
                         Err(e) => {
-                            log::warn!("[vrm] texture '{}' decode failed: {}", uri, e);
-                            (None, (0, 0))
+                            log::warn!("[vrm] texture '{}' decode failed: {}", cache_key, e);
+                            (cache_key, None, (0, 0))
                         }
                     },
                     None => {
-                        log::warn!("[vrm] texture '{}' buffer range {}..{} out of bounds", uri, start, end);
-                        (None, (0, 0))
+                        log::warn!(
+                            "[vrm] texture '{}' buffer range {}..{} out of bounds",
+                            cache_key,
+                            start,
+                            end
+                        );
+                        (cache_key, None, (0, 0))
                     }
                 }
             }
-            gltf::image::Source::Uri { uri: file_uri, .. } => match image::open(file_uri) {
-                Ok(img) => {
-                    let (w, h) = img.dimensions();
-                    log::info!("[vrm] texture '{}' loaded from uri: {}x{}", uri, w, h);
-                    (Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
+            gltf::image::Source::Uri { uri: file_uri, .. } => {
+                let resolved_path = base_dir
+                    .map(|dir| dir.join(file_uri))
+                    .unwrap_or_else(|| PathBuf::from(file_uri));
+                let cache_key = resolved_path.to_string_lossy().into_owned();
+                match image::open(&resolved_path) {
+                    Ok(img) => {
+                        let (w, h) = img.dimensions();
+                        log::info!(
+                            "[vrm] texture '{}' loaded from uri '{}': {}x{}",
+                            texture_name,
+                            resolved_path.display(),
+                            w,
+                            h
+                        );
+                        (cache_key, Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[vrm] texture '{}' file open failed for '{}': {}",
+                            texture_name,
+                            resolved_path.display(),
+                            e
+                        );
+                        (cache_key, None, (0, 0))
+                    }
                 }
-                Err(e) => {
-                    log::warn!("[vrm] texture '{}' file open failed: {}", uri, e);
-                    (None, (0, 0))
-                }
-            },
+            }
         };
 
         TextureBinding {
@@ -803,7 +839,13 @@ impl VrmAssetLoader {
         let uv_anim_scroll_y = get_f32("uvAnimationScrollYSpeedFactor").unwrap_or(0.0);
         let uv_anim_rotation = get_f32("uvAnimationRotationSpeedFactor").unwrap_or(0.0);
 
-        let get_tex_index = |key: &str| mtoon.get(key).and_then(|v| v.as_u64()).map(|v| v as usize);
+        let get_tex_index = |key: &str| {
+            mtoon.get(key).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.get("index").and_then(|idx| idx.as_u64()))
+                    .map(|v| v as usize)
+            })
+        };
 
         let tex_indices = MtoonTextureIndices {
             shade_color_texture: get_tex_index("shadeColorTexture"),

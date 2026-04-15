@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod avatar_library;
 pub mod bake_cache;
 pub mod folder_watcher;
@@ -101,9 +100,6 @@ pub struct Application {
     pub editor: EditorSession,
     pub avatars: Vec<AvatarInstance>,
     pub active_avatar_index: usize,
-    /// Backward-compatible accessor: same as `self.avatar` was.
-    /// Returns `None` when `avatars` is empty.
-    pub avatar: Option<AvatarInstance>,
     pub next_avatar_instance_id: u64,
     pub running: bool,
     pub avatar_library: avatar_library::AvatarLibrary,
@@ -137,34 +133,36 @@ impl Application {
         self.avatars.get_mut(self.active_avatar_index)
     }
 
-    /// Add an avatar instance to the multi-avatar list and make it active.
-    /// Also updates the backward-compatible `avatar` field.
     pub fn add_avatar(&mut self, instance: AvatarInstance) {
         self.active_avatar_index = self.avatars.len();
-        self.avatar = Some(instance.clone());
         self.avatars.push(instance);
     }
 
-    /// Remove the avatar at the given index. Adjusts `active_avatar_index`
-    /// and the backward-compatible `avatar` field.
     pub fn remove_avatar_at(&mut self, index: usize) {
         if index < self.avatars.len() {
+            self.detach_avatar();
             self.avatars.remove(index);
             if self.avatars.is_empty() {
                 self.active_avatar_index = 0;
-                self.avatar = None;
             } else {
-                if self.active_avatar_index >= self.avatars.len() {
+                if index < self.active_avatar_index {
+                    self.active_avatar_index -= 1;
+                } else if index == self.active_avatar_index
+                    && self.active_avatar_index >= self.avatars.len()
+                {
                     self.active_avatar_index = self.avatars.len() - 1;
                 }
-                self.avatar = Some(self.avatars[self.active_avatar_index].clone());
             }
         }
     }
 
-    /// Sync the backward-compatible `avatar` field from the multi-avatar list.
-    fn sync_avatar_compat(&mut self) {
-        self.avatar = self.avatars.get(self.active_avatar_index).cloned();
+    pub fn detach_avatar(&mut self) {
+        let path = self
+            .active_avatar()
+            .map(|a| a.asset.source_path.to_string_lossy().into_owned());
+        if let Some(p) = path {
+            self.physics.remove_character_bodies(&p);
+        }
     }
 
     pub fn new() -> Self {
@@ -178,7 +176,6 @@ impl Application {
             editor: EditorSession::new(),
             avatars: Vec::new(),
             active_avatar_index: 0,
-            avatar: None,
             next_avatar_instance_id: 1,
             running: false,
             avatar_library: avatar_library::AvatarLibrary::new(),
@@ -293,12 +290,12 @@ impl Application {
         let instance_id = AvatarInstanceId(self.next_avatar_instance_id);
         self.next_avatar_instance_id += 1;
 
+        self.detach_avatar();
         self.physics.attach_avatar(&asset);
         let new_instance = AvatarInstance::new(instance_id, asset);
         if self.active_avatar_index < self.avatars.len() {
-            self.avatars[self.active_avatar_index] = new_instance.clone();
+            self.avatars[self.active_avatar_index] = new_instance;
         }
-        self.avatar = Some(new_instance);
     }
 
     pub fn run_frame(&mut self, config: &FrameConfig) {
@@ -372,7 +369,6 @@ impl Application {
                         .step_springs(self.sim_clock.fixed_dt(), substeps, avatar);
                     avatar.compute_global_pose();
                 }
-
                 if toggles.cloth_enabled && avatar.cloth_enabled {
                     for _ in 0..substeps {
                         self.physics.step_cloth(self.sim_clock.fixed_dt(), avatar);
@@ -383,9 +379,6 @@ impl Application {
 
             avatar.build_skinning_matrices();
         }
-
-        // Sync backward-compat field
-        self.sync_avatar_compat();
 
         if !self.avatars.is_empty() {
             let output_extent = self.output_extent.unwrap_or(self.viewport_extent);
@@ -400,6 +393,8 @@ impl Application {
                 &fi_config,
                 toggles,
                 material_mode_index,
+                self.viewport_background.as_deref(),
+                self.ground_grid_visible,
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -461,11 +456,18 @@ impl Application {
         let (sy, cy) = (yaw.sin(), yaw.cos());
         let (sp, cp) = (pitch.sin(), pitch.cos());
 
-        let eye_x = cam.distance * cp * sy + cam.pan[0];
-        let eye_y = cam.distance * sp + cam.pan[1];
-        let eye_z = cam.distance * cp * cy;
+        let right = [cy, 0.0, -sy];
+        let up = [-sy * sp, cp, -cy * sp];
 
-        let target = [cam.pan[0], cam.pan[1], 0.0f32];
+        let wx = cam.pan[0] * right[0] + cam.pan[1] * up[0];
+        let wy = cam.pan[0] * right[1] + cam.pan[1] * up[1];
+        let wz = cam.pan[0] * right[2] + cam.pan[1] * up[2];
+
+        let eye_x = cam.distance * cp * sy + wx;
+        let eye_y = cam.distance * sp + wy;
+        let eye_z = cam.distance * cp * cy + wz;
+
+        let target = [wx, wy, wz];
 
         let fwd = [target[0] - eye_x, target[1] - eye_y, target[2] - eye_z];
         let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2])
@@ -536,6 +538,8 @@ impl Application {
         fi_config: &FrameInputConfig,
         toggles: &RuntimeToggles,
         material_mode_index: usize,
+        background_image_path: Option<&std::path::Path>,
+        show_ground_grid: bool,
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -657,8 +661,8 @@ impl Application {
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: RenderExportMode::CpuReadback,
             },
-            background_image_path: None,
-            show_ground_grid: false,
+            background_image_path: background_image_path.map(|p| p.to_path_buf()),
+            show_ground_grid,
         }
     }
 
@@ -669,8 +673,7 @@ impl Application {
     fn input_update(&mut self, frame_dt: f32) {
         use crate::avatar::animation;
 
-        if let Some(avatar) = self.avatar.as_mut() {
-            // Advance animation playhead using the real clip duration.
+        for avatar in self.avatars.iter_mut() {
             if let Some(clip_id) = &avatar.animation_state.active_clip {
                 let duration =
                     animation::clip_duration(clip_id, &avatar.asset.animation_clips).unwrap_or(1.0);

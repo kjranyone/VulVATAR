@@ -18,6 +18,11 @@ pub struct ProjectState {
     pub transform_rotation: [f32; 3],
     pub transform_scale: f32,
 
+    pub camera_orbit_yaw: f32,
+    pub camera_orbit_pitch: f32,
+    pub camera_orbit_pan: [f32; 2],
+    pub camera_orbit_distance: f32,
+
     // Tracking config
     pub tracking_mirror: bool,
     pub smoothing_strength: f32,
@@ -56,6 +61,14 @@ pub struct ProjectFile {
     /// SHA-256 hash of the avatar source file at the time the project was saved.
     pub avatar_source_hash: Option<Vec<u8>>,
     pub avatar_transform: TransformState,
+    #[serde(default)]
+    pub camera_orbit_yaw: f32,
+    #[serde(default)]
+    pub camera_orbit_pitch: f32,
+    #[serde(default)]
+    pub camera_orbit_pan: [f32; 2],
+    #[serde(default)]
+    pub camera_orbit_distance: f32,
     pub active_overlay_path: Option<String>,
 
     pub tracking: TrackingConfig,
@@ -69,42 +82,65 @@ pub struct ProjectLoadWarnings {
     pub warnings: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TransformState {
+    #[serde(default)]
     pub position: [f32; 3],
+    #[serde(default)]
     pub rotation: [f32; 3],
+    #[serde(default)]
     pub scale: f32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TrackingConfig {
+    #[serde(default)]
     pub mirror: bool,
+    #[serde(default)]
     pub smoothing_strength: f32,
+    #[serde(default)]
     pub confidence_threshold: f32,
+    #[serde(default)]
     pub hand_tracking_enabled: bool,
+    #[serde(default)]
     pub face_tracking_enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct RenderingConfig {
+    #[serde(default)]
     pub material_mode_index: usize,
+    #[serde(default)]
     pub toon_ramp_threshold: f32,
+    #[serde(default)]
     pub shadow_softness: f32,
+    #[serde(default)]
     pub outline_enabled: bool,
+    #[serde(default)]
     pub outline_width: f32,
+    #[serde(default)]
     pub outline_color: [f32; 3],
+    #[serde(default)]
     pub light_direction: [f32; 3],
+    #[serde(default)]
     pub light_intensity: f32,
+    #[serde(default)]
     pub ambient: [f32; 3],
+    #[serde(default)]
     pub camera_fov: f32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct OutputConfig {
+    #[serde(default)]
     pub sink_index: usize,
+    #[serde(default)]
     pub resolution_index: usize,
+    #[serde(default)]
     pub framerate_index: usize,
+    #[serde(default)]
     pub has_alpha: bool,
+    #[serde(default)]
     pub color_space_index: usize,
 }
 
@@ -141,6 +177,10 @@ impl ProjectFile {
                 rotation: state.transform_rotation,
                 scale: state.transform_scale,
             },
+            camera_orbit_yaw: state.camera_orbit_yaw,
+            camera_orbit_pitch: state.camera_orbit_pitch,
+            camera_orbit_pan: state.camera_orbit_pan,
+            camera_orbit_distance: state.camera_orbit_distance,
             active_overlay_path: state.active_overlay_path.clone(),
 
             tracking: TrackingConfig {
@@ -183,6 +223,11 @@ impl ProjectFile {
             transform_rotation: self.avatar_transform.rotation,
             transform_scale: self.avatar_transform.scale,
 
+            camera_orbit_yaw: self.camera_orbit_yaw,
+            camera_orbit_pitch: self.camera_orbit_pitch,
+            camera_orbit_pan: self.camera_orbit_pan,
+            camera_orbit_distance: self.camera_orbit_distance,
+
             tracking_mirror: self.tracking.mirror,
             smoothing_strength: self.tracking.smoothing_strength,
             confidence_threshold: self.tracking.confidence_threshold,
@@ -212,7 +257,18 @@ impl ProjectFile {
 /// Write a project file to disk as pretty-printed JSON using atomic write
 /// (write to temp file, then rename).
 pub fn save_project(state: &ProjectState, path: &Path) -> Result<(), String> {
-    let project = ProjectFile::from_state(state);
+    let existing_created_with = if path.exists() {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<ProjectFile>(&data).ok())
+            .map(|f| f.created_with)
+    } else {
+        None
+    };
+    let mut project = ProjectFile::from_state(state);
+    if let Some(cw) = existing_created_with {
+        project.created_with = cw;
+    }
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
     atomic_write(path, &json)?;
     info!("persistence: saved project to {}", path.display());
@@ -270,12 +326,19 @@ pub struct AvatarLibraryFile {
     pub format_version: u32,
     pub created_with: String,
     pub last_saved_with: String,
+    #[serde(default)]
     pub library: crate::app::avatar_library::AvatarLibrary,
 }
 
 fn library_path() -> std::path::PathBuf {
     let mut path = app_data_dir();
     path.push("avatar_library.vvtlib");
+    path
+}
+
+fn recent_avatars_path() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("recent_avatars.json");
     path
 }
 
@@ -307,28 +370,28 @@ fn dirs_data_dir() -> std::path::PathBuf {
 pub fn load_avatar_library() -> crate::app::avatar_library::AvatarLibrary {
     let path = library_path();
     if !path.exists() {
-        info!(
-            "persistence: no avatar library at {}, creating empty",
-            path.display()
-        );
-        return crate::app::avatar_library::AvatarLibrary::new();
+        let backup = backup_path_for(&path);
+        if !backup.exists() {
+            info!(
+                "persistence: no avatar library at {}, creating empty",
+                path.display()
+            );
+            return crate::app::avatar_library::AvatarLibrary::new();
+        }
     }
-    match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str::<AvatarLibraryFile>(&data) {
-            Ok(file) => {
-                info!(
-                    "persistence: loaded avatar library with {} entries",
-                    file.library.entries.len()
-                );
-                file.library
-            }
-            Err(e) => {
-                error!("persistence: failed to parse avatar library: {}", e);
-                crate::app::avatar_library::AvatarLibrary::new()
-            }
-        },
+    match load_or_backup::<AvatarLibraryFile>(&path) {
+        Ok(file) => {
+            info!(
+                "persistence: loaded avatar library with {} entries",
+                file.library.entries.len()
+            );
+            file.library
+        }
         Err(e) => {
-            error!("persistence: failed to read avatar library: {}", e);
+            error!(
+                "persistence: failed to load avatar library (primary and backup): {}",
+                e
+            );
             crate::app::avatar_library::AvatarLibrary::new()
         }
     }
@@ -338,12 +401,23 @@ pub fn save_avatar_library(
     library: &crate::app::avatar_library::AvatarLibrary,
 ) -> Result<(), String> {
     let path = library_path();
-    let file = AvatarLibraryFile {
+    let existing_created_with = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<AvatarLibraryFile>(&data).ok())
+            .map(|f| f.created_with)
+    } else {
+        None
+    };
+    let mut file = AvatarLibraryFile {
         format_version: 1,
         created_with: app_tag(),
         last_saved_with: app_tag(),
         library: library.clone(),
     };
+    if let Some(cw) = existing_created_with {
+        file.created_with = cw;
+    }
     let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
     atomic_write(&path, &json)?;
     info!(
@@ -354,21 +428,88 @@ pub fn save_avatar_library(
 }
 
 // ===========================================================================
-// Atomic write helper
+// Recent avatars
 // ===========================================================================
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct RecentAvatarsFile {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+pub fn load_recent_avatars() -> Vec<std::path::PathBuf> {
+    let path = recent_avatars_path();
+    if !path.exists() {
+        let backup = backup_path_for(&path);
+        if !backup.exists() {
+            return Vec::new();
+        }
+    }
+    match load_or_backup::<RecentAvatarsFile>(&path) {
+        Ok(file) => file
+            .paths
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        Err(e) => {
+            error!(
+                "persistence: failed to load recent avatars (primary and backup): {}",
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+pub fn save_recent_avatars(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    let path = recent_avatars_path();
+    let file = RecentAvatarsFile {
+        paths: paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    atomic_write(&path, &json)?;
+    info!("persistence: saved {} recent avatars", paths.len());
+    Ok(())
+}
+
+fn backup_path_for(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension(
+        path.extension()
+            .map(|e| {
+                let mut s = e.to_string_lossy().into_owned();
+                s.push_str(".bak");
+                s
+            })
+            .unwrap_or_else(|| "bak".to_string()),
+    )
+}
+
+fn load_with_fallback<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, String> {
+    let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&data).map_err(|e| e.to_string())
+}
+
+fn load_or_backup<T: serde::de::DeserializeOwned>(primary: &std::path::Path) -> Result<T, String> {
+    let backup = backup_path_for(primary);
+    match load_with_fallback::<T>(primary) {
+        Ok(v) => Ok(v),
+        Err(primary_err) => {
+            warn!(
+                "persistence: primary file failed: {}, trying backup",
+                primary_err
+            );
+            load_with_fallback::<T>(&backup)
+                .map_err(|backup_err| format!("primary: {}; backup: {}", primary_err, backup_err))
+        }
+    }
+}
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     if path.exists() {
-        let backup_path = path.with_extension(
-            path.extension()
-                .map(|e| {
-                    let mut s = e.to_string_lossy().into_owned();
-                    s.push_str(".bak");
-                    s
-                })
-                .unwrap_or_else(|| "bak".to_string()),
-        );
-        let _ = std::fs::copy(path, &backup_path);
+        let _ = std::fs::copy(path, &backup_path_for(path));
     }
 
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -389,16 +530,18 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     })?;
 
     if cfg!(windows) {
-        std::fs::copy(&temp_path, path).map_err(|e| {
+        if std::fs::rename(&temp_path, path).is_err() {
+            std::fs::copy(&temp_path, path).map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                format!(
+                    "atomic_write: failed to copy {} -> {}: {}",
+                    temp_path.display(),
+                    path.display(),
+                    e
+                )
+            })?;
             let _ = std::fs::remove_file(&temp_path);
-            format!(
-                "atomic_write: failed to copy {} -> {}: {}",
-                temp_path.display(),
-                path.display(),
-                e
-            )
-        })?;
-        let _ = std::fs::remove_file(&temp_path);
+        }
     } else {
         std::fs::rename(&temp_path, path).map_err(|e| {
             let _ = std::fs::remove_file(&temp_path);
@@ -423,8 +566,10 @@ pub struct RecoverySnapshot {
     pub format_version: u32,
     pub created_with: String,
     pub timestamp_secs: u64,
+    #[serde(default)]
     pub project: Option<ProjectFile>,
     pub overlay_dirty: bool,
+    #[serde(default)]
     pub overlay: Option<ClothOverlayFile>,
 }
 
@@ -604,6 +749,7 @@ struct ScenePresetFile {
     pub format_version: u32,
     pub created_with: String,
     pub last_saved_with: String,
+    #[serde(default)]
     pub presets: Vec<ScenePreset>,
 }
 
@@ -616,21 +762,21 @@ fn scene_presets_path() -> std::path::PathBuf {
 pub fn load_scene_presets() -> Vec<ScenePreset> {
     let path = scene_presets_path();
     if !path.exists() {
-        return Vec::new();
+        let backup = backup_path_for(&path);
+        if !backup.exists() {
+            return Vec::new();
+        }
     }
-    match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str::<ScenePresetFile>(&data) {
-            Ok(file) => {
-                info!("persistence: loaded {} scene presets", file.presets.len());
-                file.presets
-            }
-            Err(e) => {
-                error!("persistence: failed to parse scene presets: {}", e);
-                Vec::new()
-            }
-        },
+    match load_or_backup::<ScenePresetFile>(&path) {
+        Ok(file) => {
+            info!("persistence: loaded {} scene presets", file.presets.len());
+            file.presets
+        }
         Err(e) => {
-            error!("persistence: failed to read scene presets: {}", e);
+            error!(
+                "persistence: failed to load scene presets (primary and backup): {}",
+                e
+            );
             Vec::new()
         }
     }
@@ -638,12 +784,23 @@ pub fn load_scene_presets() -> Vec<ScenePreset> {
 
 pub fn save_scene_presets(presets: &[ScenePreset]) -> Result<(), String> {
     let path = scene_presets_path();
-    let file = ScenePresetFile {
+    let existing_created_with = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<ScenePresetFile>(&data).ok())
+            .map(|f| f.created_with)
+    } else {
+        None
+    };
+    let mut file = ScenePresetFile {
         format_version: 1,
         created_with: app_tag(),
         last_saved_with: app_tag(),
         presets: presets.to_vec(),
     };
+    if let Some(cw) = existing_created_with {
+        file.created_with = cw;
+    }
     let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
     atomic_write(&path, &json)?;
     info!("persistence: saved {} scene presets", presets.len());

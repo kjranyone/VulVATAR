@@ -24,8 +24,8 @@ fn project_point(
 
     // Apply inverse camera rotation (yaw then pitch, ignoring roll for
     // simplicity).
-    let yaw = -cam_rot[1].to_radians();
-    let pitch = -cam_rot[0].to_radians();
+    let yaw = cam_rot[1].to_radians();
+    let pitch = cam_rot[0].to_radians();
 
     let (sy, cy) = (yaw.sin(), yaw.cos());
     let x1 = dx * cy - dz * sy;
@@ -33,13 +33,10 @@ fn project_point(
 
     let (sp, cp) = (pitch.sin(), pitch.cos());
     let y2 = dy * cp - z1 * sp;
-    let z2 = dy * sp + z1 * cp;
+    let z2 = -(dy * sp + z1 * cp);
 
-    // z2 is depth into the screen (positive = in front).  A default camera at
-    // z=-5 looks toward +Z, so points near the origin have z2 ~ +5 which is
-    // correct.
     if z2 < 0.001 {
-        return None; // behind camera
+        return None;
     }
 
     let aspect = rect.width() / rect.height().max(1.0);
@@ -74,14 +71,14 @@ fn point_depth(point: [f32; 3], cam_pos: [f32; 3], cam_rot: [f32; 3]) -> f32 {
     let dy = point[1] - cam_pos[1];
     let dz = point[2] - cam_pos[2];
 
-    let yaw = -cam_rot[1].to_radians();
-    let pitch = -cam_rot[0].to_radians();
+    let yaw = cam_rot[1].to_radians();
+    let pitch = cam_rot[0].to_radians();
 
     let (sy, cy) = (yaw.sin(), yaw.cos());
     let z1 = dx * sy + dz * cy;
 
     let (sp, cp) = (pitch.sin(), pitch.cos());
-    dy * sp + z1 * cp
+    -(dy * sp + z1 * cp)
 }
 
 /// Draw all debug primitives from a `DebugDrawList` using egui's `Painter`.
@@ -330,27 +327,50 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             // Camera interaction: orbit (left-drag), pan (middle-drag/right-drag), zoom (scroll).
             if response.dragged_by(egui::PointerButton::Primary) {
                 let delta = response.drag_delta();
-                state.transform.rotation[1] += delta.x * 0.3; // yaw
-                state.transform.rotation[0] += delta.y * 0.3; // pitch
+                state.camera_orbit.yaw_deg += delta.x * 0.3;
+                state.camera_orbit.pitch_deg += delta.y * 0.3;
+                state.project_dirty = true;
             }
             if response.dragged_by(egui::PointerButton::Secondary)
                 || response.dragged_by(egui::PointerButton::Middle)
             {
                 let delta = response.drag_delta();
-                state.transform.position[0] += delta.x * 0.002;
-                state.transform.position[1] -= delta.y * 0.002;
+                let scale = 0.002 * state.camera_orbit.distance * 0.2;
+                state.camera_orbit.pan[0] += delta.x * scale;
+                state.camera_orbit.pan[1] -= delta.y * scale;
+                state.project_dirty = true;
             }
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                state.transform.position[2] += scroll * 0.005;
+                state.camera_orbit.distance = (state.camera_orbit.distance - scroll * 0.3).max(0.1);
+                state.project_dirty = true;
             }
 
             // ── Debug drawing (CPU-side fallback) ────────────────────────
-            let cam_pos = state.transform.position;
-            let cam_rot = state.transform.rotation;
+            let yaw = state.camera_orbit.yaw_deg.to_radians();
+            let pitch = state.camera_orbit.pitch_deg.to_radians();
+            let (sy, cy) = (yaw.sin(), yaw.cos());
+            let (sp, cp) = (pitch.sin(), pitch.cos());
+
+            let right = [cy, 0.0, -sy];
+            let up = [-sy * sp, cp, -cy * sp];
+            let wx = state.camera_orbit.pan[0] * right[0] + state.camera_orbit.pan[1] * up[0];
+            let wy = state.camera_orbit.pan[0] * right[1] + state.camera_orbit.pan[1] * up[1];
+            let wz = state.camera_orbit.pan[0] * right[2] + state.camera_orbit.pan[1] * up[2];
+
+            let cam_pos = [
+                state.camera_orbit.distance * cp * sy + wx,
+                state.camera_orbit.distance * sp + wy,
+                state.camera_orbit.distance * cp * cy + wz,
+            ];
+            let cam_rot = [
+                state.camera_orbit.pitch_deg,
+                state.camera_orbit.yaw_deg,
+                0.0,
+            ];
             let fov = state.rendering.camera_fov;
 
-            if let Some(avatar) = &state.app.avatar {
+            if let Some(avatar) = state.app.active_avatar() {
                 // Skeleton debug.
                 if state.rendering.toggle_skeleton_debug {
                     let skel = &avatar.asset.skeleton;
@@ -423,14 +443,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             // Show camera info overlay.
             let info = format!(
-                "Pos: [{:.2}, {:.2}, {:.2}]  Rot: [{:.1}, {:.1}, {:.1}]  Scale: {:.2}",
-                state.transform.position[0],
-                state.transform.position[1],
-                state.transform.position[2],
-                state.transform.rotation[0],
-                state.transform.rotation[1],
-                state.transform.rotation[2],
-                state.transform.scale,
+                "Eye: [{:.2}, {:.2}, {:.2}]  Yaw: {:.1}  Pitch: {:.1}  Dist: {:.2}",
+                cam_pos[0],
+                cam_pos[1],
+                cam_pos[2],
+                state.camera_orbit.yaw_deg,
+                state.camera_orbit.pitch_deg,
+                state.camera_orbit.distance,
             );
             painter.text(
                 egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
@@ -442,7 +461,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             // T04: Draw cloth region selection overlay in ClothAuthoring mode.
             if state.mode == crate::gui::AppMode::ClothAuthoring {
-                if let Some(avatar) = &state.app.avatar {
+                if let Some(avatar) = state.app.active_avatar() {
                     let sel_ref = state.region_selection.as_ref();
                     match sel_ref {
                         Some(sel) => {

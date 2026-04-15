@@ -194,6 +194,7 @@ impl DirectShowFilterRegistrar {
                 return Err(msg);
             }
 
+            // TODO: resolve full DLL path at runtime instead of hardcoding
             let dll_path_w: HSTRING = "vulvatar_dshow_filter.dll".into();
             let dll_pcwstr = PCWSTR(dll_path_w.as_ptr());
             let dll_byte_len = ((dll_path_w.len() + 1) * 2) as u32;

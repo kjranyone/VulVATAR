@@ -5,7 +5,7 @@ use crate::gui::GuiApp;
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            let avatar_label = match &state.app.avatar {
+            let avatar_label = match state.app.active_avatar() {
                 Some(avatar) => avatar.asset.source_path.to_string_lossy().to_string(),
                 None => "No avatar".to_string(),
             };

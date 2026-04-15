@@ -15,3 +15,11 @@ Thumbs.db
 
 # ONNX Models
 models/*.onnx
+
+# Sample data (keep directory)
+/sample_data/*
+!/sample_data/.gitkeep
+
+# Misc
+cigpose_models.zip
+nul

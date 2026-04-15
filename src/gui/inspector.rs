@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use eframe::egui;
 
 use crate::gui::{AppMode, GuiApp};
@@ -14,12 +13,84 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| match state.mode {
-                AppMode::Preview => draw_preview(ui, state),
-                AppMode::TrackingSetup => draw_tracking(ui, state),
-                AppMode::Rendering => draw_rendering(ui, state),
-                AppMode::Output => draw_output(ui, state),
-                AppMode::ClothAuthoring => draw_cloth_authoring(ui, state),
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                match state.mode {
+                    AppMode::Preview => draw_preview(ui, state),
+                    AppMode::TrackingSetup => draw_tracking(ui, state),
+                    AppMode::Rendering => draw_rendering(ui, state),
+                    AppMode::Output => draw_output(ui, state),
+                    AppMode::ClothAuthoring => draw_cloth_authoring(ui, state),
+                }
+
+                ui.separator();
+                egui::CollapsingHeader::new("Camera Transform")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Yaw:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
+                                        .speed(0.5),
+                                )
+                                .changed()
+                            {
+                                state.project_dirty = true;
+                            }
+                            ui.label("Pitch:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
+                                        .speed(0.5),
+                                )
+                                .changed()
+                            {
+                                state.project_dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Distance:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut state.camera_orbit.distance)
+                                        .speed(0.05)
+                                        .range(0.1..=100.0),
+                                )
+                                .changed()
+                            {
+                                state.project_dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Pan X:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut state.camera_orbit.pan[0])
+                                        .speed(0.01),
+                                )
+                                .changed()
+                            {
+                                state.project_dirty = true;
+                            }
+                            ui.label("Y:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut state.camera_orbit.pan[1])
+                                        .speed(0.01),
+                                )
+                                .changed()
+                            {
+                                state.project_dirty = true;
+                            }
+                        });
+                        if ui.button("Reset Camera").clicked() {
+                            state.camera_orbit.yaw_deg = 0.0;
+                            state.camera_orbit.pitch_deg = 0.0;
+                            state.camera_orbit.distance = 5.0;
+                            state.camera_orbit.pan = [0.0, 0.0];
+                            state.project_dirty = true;
+                        }
+                    });
             });
         });
 }
@@ -28,7 +99,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Avatar Asset")
         .default_open(true)
         .show(ui, |ui| {
-            if let Some(avatar) = &state.app.avatar {
+            if let Some(avatar) = state.app.active_avatar() {
                 ui.label(format!("Source: {}", avatar.asset.source_path.display()));
                 ui.label(format!("ID: {}", avatar.asset.id.0));
                 ui.label(format!("Meshes: {}", avatar.asset.meshes.len()));
@@ -58,8 +129,6 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 if ui.button("Detach").clicked() {
                     if !state.app.avatars.is_empty() {
                         state.app.remove_avatar_at(state.app.active_avatar_index);
-                    } else {
-                        state.app.avatar = None;
                     }
                 }
             });
@@ -70,52 +139,88 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
         .show(ui, |ui| {
             ui.label("Position");
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.position[0])
-                        .prefix("X: ")
-                        .speed(0.01),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.position[1])
-                        .prefix("Y: ")
-                        .speed(0.01),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.position[2])
-                        .prefix("Z: ")
-                        .speed(0.01),
-                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.position[0])
+                            .prefix("X: ")
+                            .speed(0.01),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.position[1])
+                            .prefix("Y: ")
+                            .speed(0.01),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.position[2])
+                            .prefix("Z: ")
+                            .speed(0.01),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
             });
             ui.label("Rotation");
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.rotation[0])
-                        .prefix("X: ")
-                        .speed(0.1),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.rotation[1])
-                        .prefix("Y: ")
-                        .speed(0.1),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.rotation[2])
-                        .prefix("Z: ")
-                        .speed(0.1),
-                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.rotation[0])
+                            .prefix("X: ")
+                            .speed(0.1),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.rotation[1])
+                            .prefix("Y: ")
+                            .speed(0.1),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.rotation[2])
+                            .prefix("Z: ")
+                            .speed(0.1),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Scale");
-                ui.add(
-                    egui::DragValue::new(&mut state.transform.scale)
-                        .speed(0.01)
-                        .range(0.01..=100.0),
-                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.transform.scale)
+                            .speed(0.01)
+                            .range(0.01..=100.0),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
             });
             if ui.button("Reset Transform").clicked() {
                 state.transform.position = [0.0, 0.0, 0.0];
                 state.transform.rotation = [0.0, 0.0, 0.0];
                 state.transform.scale = 1.0;
+                state.project_dirty = true;
             }
         });
 
@@ -124,47 +229,46 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Attach Primary").clicked() {
-                    if let Some(avatar) = state.app.avatar.as_mut() {
-                        let overlay_id = state
-                            .app
-                            .editor
-                            .active_overlay()
-                            .unwrap_or(crate::asset::ClothOverlayId(1));
+                    let overlay_id = state
+                        .app
+                        .editor
+                        .active_overlay()
+                        .unwrap_or(crate::asset::ClothOverlayId(1));
+                    if let Some(avatar) = state.app.active_avatar_mut() {
                         avatar.attach_cloth(overlay_id);
                     }
                 }
                 if ui.button("Detach Primary").clicked() {
-                    if let Some(avatar) = state.app.avatar.as_mut() {
+                    if let Some(avatar) = state.app.active_avatar_mut() {
                         avatar.detach_cloth();
                     }
                 }
             });
             ui.horizontal(|ui| {
                 if ui.button("Add Overlay Slot").clicked() {
-                    if let Some(avatar) = state.app.avatar.as_mut() {
-                        let overlay_id = state.app.editor.active_overlay().unwrap_or(
-                            crate::asset::ClothOverlayId((avatar.cloth_overlay_count() as u64) + 2),
-                        );
+                    let sim_mesh = state
+                        .app
+                        .editor
+                        .overlay_asset
+                        .as_ref()
+                        .map(|o| o.simulation_mesh.clone());
+                    if let Some(avatar) = state.app.active_avatar_mut() {
+                        let overlay_id =
+                            crate::asset::ClothOverlayId((avatar.cloth_overlay_count() as u64) + 2);
                         let idx = avatar.attach_cloth_overlay(overlay_id);
-                        if let Some(ref sim_mesh) = state
-                            .app
-                            .editor
-                            .overlay_asset
-                            .as_ref()
-                            .map(|o| &o.simulation_mesh)
-                        {
+                        if let Some(sim_mesh) = sim_mesh {
                             let mut cloth_asset = crate::asset::ClothAsset::new_empty(
                                 crate::asset::ClothOverlayId(0),
                                 avatar.asset.id,
                                 avatar.asset.source_hash.clone(),
                             );
-                            cloth_asset.simulation_mesh = (*sim_mesh).clone();
+                            cloth_asset.simulation_mesh = sim_mesh;
                             avatar.init_cloth_overlay(idx, &cloth_asset);
                         }
                     }
                 }
             });
-            if let Some(avatar) = state.app.avatar.as_mut() {
+            if let Some(avatar) = state.app.active_avatar_mut() {
                 ui.checkbox(&mut avatar.cloth_enabled, "Enable Cloth");
                 for (i, slot) in avatar.cloth_overlays.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
@@ -256,7 +360,12 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Capture Format")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.tracking.tracking_mirror, "Mirror Preview");
+            if ui
+                .checkbox(&mut state.tracking.tracking_mirror, "Mirror Preview")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
         });
 
     egui::CollapsingHeader::new("Inference Status")
@@ -279,8 +388,18 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Retargeting")
         .default_open(true)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.tracking.hand_tracking_enabled, "Hand Tracking");
-            ui.checkbox(&mut state.tracking.face_tracking_enabled, "Face Tracking");
+            if ui
+                .checkbox(&mut state.tracking.hand_tracking_enabled, "Hand Tracking")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .checkbox(&mut state.tracking.face_tracking_enabled, "Face Tracking")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.separator();
                 ui.label("Confidence");
@@ -296,14 +415,24 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Smoothing and Confidence")
         .default_open(false)
         .show(ui, |ui| {
-            ui.add(
-                egui::Slider::new(&mut state.tracking.smoothing_strength, 0.0..=1.0)
-                    .text("Smoothing"),
-            );
-            ui.add(
-                egui::Slider::new(&mut state.tracking.confidence_threshold, 0.0..=1.0)
-                    .text("Threshold"),
-            );
+            if ui
+                .add(
+                    egui::Slider::new(&mut state.tracking.smoothing_strength, 0.0..=1.0)
+                        .text("Smoothing"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .add(
+                    egui::Slider::new(&mut state.tracking.confidence_threshold, 0.0..=1.0)
+                        .text("Threshold"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
         });
 }
 
@@ -325,34 +454,69 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Material Mode")
         .default_open(true)
         .show(ui, |ui| {
-            ui.radio_value(&mut state.rendering.material_mode_index, 0, "Unlit");
-            ui.radio_value(&mut state.rendering.material_mode_index, 1, "Simple Lit");
-            ui.radio_value(&mut state.rendering.material_mode_index, 2, "Toon-like");
+            if ui
+                .radio_value(&mut state.rendering.material_mode_index, 0, "Unlit")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .radio_value(&mut state.rendering.material_mode_index, 1, "Simple Lit")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .radio_value(&mut state.rendering.material_mode_index, 2, "Toon-like")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
         });
 
     egui::CollapsingHeader::new("Toon Controls")
         .default_open(true)
         .show(ui, |ui| {
-            ui.add_enabled(
-                state.rendering.material_mode_index == 2,
-                egui::Slider::new(&mut state.rendering.toon_ramp_threshold, 0.0..=1.0)
-                    .text("Ramp Threshold"),
-            );
-            ui.add_enabled(
-                state.rendering.material_mode_index == 2,
-                egui::Slider::new(&mut state.rendering.shadow_softness, 0.0..=1.0)
-                    .text("Shadow Softness"),
-            );
+            if ui
+                .add_enabled(
+                    state.rendering.material_mode_index == 2,
+                    egui::Slider::new(&mut state.rendering.toon_ramp_threshold, 0.0..=1.0)
+                        .text("Ramp Threshold"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .add_enabled(
+                    state.rendering.material_mode_index == 2,
+                    egui::Slider::new(&mut state.rendering.shadow_softness, 0.0..=1.0)
+                        .text("Shadow Softness"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
         });
 
     egui::CollapsingHeader::new("Outline Controls")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.rendering.outline_enabled, "Enable Outline");
-            ui.add_enabled(
-                state.rendering.outline_enabled,
-                egui::Slider::new(&mut state.rendering.outline_width, 0.0..=0.1).text("Width"),
-            );
+            if ui
+                .checkbox(&mut state.rendering.outline_enabled, "Enable Outline")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .add_enabled(
+                    state.rendering.outline_enabled,
+                    egui::Slider::new(&mut state.rendering.outline_width, 0.0..=0.1).text("Width"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             ui.add_enabled_ui(state.rendering.outline_enabled, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Color");
@@ -366,26 +530,46 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
         .show(ui, |ui| {
             ui.label("Light Direction");
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut state.rendering.main_light_dir[0])
-                        .prefix("X: ")
-                        .speed(0.01),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut state.rendering.main_light_dir[1])
-                        .prefix("Y: ")
-                        .speed(0.01),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut state.rendering.main_light_dir[2])
-                        .prefix("Z: ")
-                        .speed(0.01),
-                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.rendering.main_light_dir[0])
+                            .prefix("X: ")
+                            .speed(0.01),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.rendering.main_light_dir[1])
+                            .prefix("Y: ")
+                            .speed(0.01),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.rendering.main_light_dir[2])
+                            .prefix("Z: ")
+                            .speed(0.01),
+                    )
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
             });
-            ui.add(
-                egui::Slider::new(&mut state.rendering.main_light_intensity, 0.0..=5.0)
-                    .text("Intensity"),
-            );
+            if ui
+                .add(
+                    egui::Slider::new(&mut state.rendering.main_light_intensity, 0.0..=5.0)
+                        .text("Intensity"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             ui.horizontal(|ui| {
                 ui.label("Ambient");
                 ui.color_edit_button_rgb(&mut state.rendering.ambient_intensity);
@@ -395,9 +579,15 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Composition")
         .default_open(false)
         .show(ui, |ui| {
-            ui.add(
-                egui::Slider::new(&mut state.rendering.camera_fov, 10.0..=120.0).text("Camera FOV"),
-            );
+            if ui
+                .add(
+                    egui::Slider::new(&mut state.rendering.camera_fov, 10.0..=120.0)
+                        .text("Camera FOV"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             ui.checkbox(&mut state.rendering.alpha_preview, "Alpha Preview");
         });
 
@@ -463,7 +653,13 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
             "Output sink changed to {}",
             sink_names[state.output.output_sink_index]
         ));
+        state.project_dirty = true;
     }
+
+    let prev_res = state.output.output_resolution_index;
+    let prev_fps = state.output.output_framerate_index;
+    let prev_alpha = state.output.output_has_alpha;
+    let prev_cs = state.output.output_color_space_index;
 
     egui::CollapsingHeader::new("Frame Format")
         .default_open(true)
@@ -506,6 +702,14 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
         });
 
+    if state.output.output_resolution_index != prev_res
+        || state.output.output_framerate_index != prev_fps
+        || state.output.output_has_alpha != prev_alpha
+        || state.output.output_color_space_index != prev_cs
+    {
+        state.project_dirty = true;
+    }
+
     egui::CollapsingHeader::new("Synchronization")
         .default_open(false)
         .show(ui, |ui| {
@@ -538,7 +742,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("New Overlay").clicked() {
-                    let asset = state.app.avatar.as_ref().map(|a| a.asset.clone());
+                    let asset = state.app.active_avatar().map(|a| a.asset.clone());
                     if let Some(asset) = asset {
                         let avatar_id = asset.id;
                         let avatar_hash = asset.source_hash.clone();
@@ -563,7 +767,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Simulation Mesh")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(avatar) = state.app.avatar.as_ref() {
+            if let Some(avatar) = state.app.active_avatar() {
                 ui.label("Select garment region to author");
 
                 ui.horizontal(|ui| {
@@ -656,7 +860,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Pin Binding")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(avatar) = state.app.avatar.as_ref() {
+            if let Some(avatar) = state.app.active_avatar() {
                 let nodes = &avatar.asset.skeleton.nodes;
                 if nodes.is_empty() {
                     ui.label("No skeleton nodes");
@@ -802,7 +1006,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Collision Proxies")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(avatar) = state.app.avatar.as_ref() {
+            if let Some(avatar) = state.app.active_avatar() {
                 let collider_count = avatar.asset.colliders.len();
                 if state.cloth_collider_toggles.len() != collider_count {
                     state.cloth_collider_toggles = vec![true; collider_count];
@@ -847,7 +1051,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Solver Parameters")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(avatar) = state.app.avatar.as_mut() {
+            if let Some(avatar) = state.app.active_avatar_mut() {
                 if let Some(ref mut sim) = avatar.cloth_sim {
                     ui.horizontal(|ui| {
                         ui.label("Iterations:");
@@ -908,7 +1112,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.label("No primary cloth simulation active");
                 }
 
-                if let Some(avatar) = state.app.avatar.as_ref() {
+                if let Some(avatar) = state.app.active_avatar() {
                     if !avatar.cloth_overlays.is_empty() {
                         ui.add_space(4.0);
                         ui.label("Overlay Slots:");
@@ -930,7 +1134,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Preview")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(avatar) = state.app.avatar.as_mut() {
+            if let Some(avatar) = state.app.active_avatar_mut() {
                 ui.checkbox(&mut avatar.cloth_enabled, "Cloth Simulation");
 
                 ui.horizontal(|ui| {
@@ -978,6 +1182,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
 }
 
+#[allow(dead_code)]
 fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Model Library")
         .default_open(true)
@@ -1007,8 +1212,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             let current_avatar_path = state
                 .app
-                .avatar
-                .as_ref()
+                .active_avatar()
                 .map(|a| a.asset.source_path.clone());
 
             let entries: Vec<(
@@ -1360,6 +1564,7 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.rendering.outline_width = preset.rendering.outline_width;
                     state.rendering.outline_color = preset.rendering.outline_color;
                     state.push_notification(format!("Loaded scene preset: {}", preset.name));
+                    state.project_dirty = true;
                 }
             }
 

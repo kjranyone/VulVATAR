@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-use log::info;
+use log::debug;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -79,7 +78,7 @@ impl OutputSinkWriter for ImageSequenceSink {
             )
         })?;
 
-        info!(
+        debug!(
             "ImageSequenceSink: wrote {} ({}x{}, seq={})",
             path.display(),
             width,
@@ -150,7 +149,7 @@ impl OutputSinkWriter for SharedMemorySink {
         fs::copy(&tmp_path, &self.path).map_err(|e| format!("SharedMemorySink: copy: {}", e))?;
         let _ = fs::remove_file(&tmp_path);
 
-        info!(
+        debug!(
             "SharedMemorySink: wrote {} bytes to '{}' (seq={})",
             total_len,
             self.path.display(),
@@ -189,8 +188,9 @@ impl SharedTextureSink {
 impl OutputSinkWriter for SharedTextureSink {
     fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
         let _ = fs::remove_file(&self.ready_path);
+        let seq = self.inner.sequence;
         self.inner.write_frame(frame)?;
-        let seq_bytes = self.inner.sequence.to_le_bytes();
+        let seq_bytes = seq.to_le_bytes();
         fs::write(&self.ready_path, seq_bytes)
             .map_err(|e| format!("SharedTextureSink: failed to write ready signal: {}", e))?;
         Ok(())
@@ -258,7 +258,7 @@ impl OutputSinkWriter for VirtualCameraSink {
             .map_err(|e| format!("VirtualCameraSink: copy: {}", e))?;
         let _ = fs::remove_file(&tmp_path);
 
-        info!(
+        debug!(
             "VirtualCameraSink: wrote {} bytes to '{}' (seq={})",
             total_len,
             self.frame_path.display(),
@@ -386,7 +386,7 @@ impl OutputSinkWriter for RingBufferSharedMemorySink {
             file.flush()
                 .map_err(|e| format!("RingBuffer: flush: {}", e))?;
 
-            file.seek(SeekFrom::Start(24))
+            file.seek(SeekFrom::Start(16))
                 .map_err(|e| format!("RingBuffer: seek header: {}", e))?;
             file.write_all(&self.sequence.to_le_bytes())
                 .map_err(|e| format!("RingBuffer: write seq: {}", e))?;
@@ -398,7 +398,7 @@ impl OutputSinkWriter for RingBufferSharedMemorySink {
 
         let _ = fs::write(&self.ready_path, self.sequence.to_le_bytes());
 
-        info!(
+        debug!(
             "RingBuffer: wrote slot {} (seq={}) to {}",
             slot_index,
             self.sequence,
@@ -581,7 +581,7 @@ impl NullSink {
 
 impl OutputSinkWriter for NullSink {
     fn write_frame(&mut self, _frame: &OutputFrame) -> Result<(), String> {
-        info!("NullSink({}): frame ignored (not implemented)", self.label);
+        debug!("NullSink({}): frame ignored (not implemented)", self.label);
         Ok(())
     }
 
@@ -597,7 +597,7 @@ impl OutputSinkWriter for NullSink {
 #[cfg(target_os = "windows")]
 mod win32_shmem {
     use super::{OutputFrame, OutputSinkWriter};
-    use log::info;
+    use log::debug;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
@@ -744,7 +744,7 @@ mod win32_shmem {
                 );
             }
 
-            info!(
+            debug!(
                 "Win32ShmemSink: wrote {} bytes to '{}' (seq={}, {}x{})",
                 data_len, self.name, self.sequence, width, height,
             );
@@ -775,7 +775,16 @@ use win32_shmem::Win32NamedSharedMemorySink;
 pub fn create_sink_writer(sink: &FrameSink) -> Box<dyn OutputSinkWriter> {
     match sink {
         FrameSink::ImageSequence => Box::new(ImageSequenceSink::new("output_frames")),
-        FrameSink::SharedMemory => Box::new(RingBufferSharedMemorySink::new("VulVATAR_Output", 4)),
+        FrameSink::SharedMemory => {
+            #[cfg(target_os = "windows")]
+            {
+                Box::new(Win32NamedSharedMemorySink::new("VulVATAR_Output"))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Box::new(RingBufferSharedMemorySink::new("VulVATAR_Output", 4))
+            }
+        }
         FrameSink::VirtualCamera => {
             #[cfg(target_os = "windows")]
             {

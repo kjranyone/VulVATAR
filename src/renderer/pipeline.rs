@@ -42,8 +42,8 @@ pub struct GpuVertex {
 
 pub mod vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                            ty: "vertex",
-                                                                                                                                                                                                                            src: r"
+                                                                                                                                                                                                                                                    ty: "vertex",
+                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 layout(location = 0) in vec3 position;
@@ -59,8 +59,10 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad0;
     vec3 light_dir;
     float light_intensity;
-    vec3 ambient_term;
+    vec3 light_color;
     float _pad1;
+    vec3 ambient_term;
+    float _pad2;
 } camera;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
@@ -92,13 +94,13 @@ void main() {
     gl_Position = camera.proj * camera.view * world_pos;
 }
 "
-                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                }
 }
 
 pub mod fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                            ty: "fragment",
-                                                                                                                                                                                                                            src: r"
+                                                                                                                                                                                                                                                    ty: "fragment",
+                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 layout(location = 0) in vec3 frag_normal;
@@ -112,16 +114,18 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad0;
     vec3 light_dir;
     float light_intensity;
-    vec3 ambient_term;
+    vec3 light_color;
     float _pad1;
+    vec3 ambient_term;
+    float _pad2;
 } camera;
 
 layout(set = 2, binding = 0) uniform MaterialData {
     vec4 base_color;
     float alpha_cutoff;
     int alpha_mode;
-    float toon_threshold;
-    float shadow_softness;
+    float shade_shift;
+    float shade_toony;
     int shading_mode;
     vec4 shade_color;
     vec4 emissive_color;
@@ -137,8 +141,17 @@ layout(set = 2, binding = 0) uniform MaterialData {
 
 layout(set = 2, binding = 1) uniform sampler2D base_texture;
 layout(set = 2, binding = 2) uniform sampler2D matcap_texture;
+layout(set = 2, binding = 3) uniform sampler2D shade_texture;
 
 layout(location = 0) out vec4 out_color;
+
+float linearstep(float a, float b, float t) {
+    float denom = b - a;
+    if (abs(denom) < 0.00001) {
+        return t >= b ? 1.0 : 0.0;
+    }
+    return clamp((t - a) / denom, 0.0, 1.0);
+}
 
 void main() {
     vec2 anim_uv = frag_uv;
@@ -153,6 +166,8 @@ void main() {
 
     vec4 tex_color = texture(base_texture, anim_uv);
     vec4 color = material.base_color * tex_color;
+    vec3 base_color_term = color.rgb;
+    vec3 shade_texture_term = texture(shade_texture, anim_uv).rgb;
 
     vec3 n = normalize(frag_normal);
     vec3 l = normalize(camera.light_dir);
@@ -161,22 +176,20 @@ void main() {
     if (material.shading_mode == 0) {
         // Unlit: no lighting at all
     } else if (material.shading_mode == 1) {
-        // MToon: shade/lit color mixing IS the lighting.
-        // Do NOT multiply by additional lighting — the mix factor IS the light.
-        // shade_shift maps to toon_threshold, shade_toony maps to shadow_softness.
-        float shade_grade = clamp(ndotl + (material.toon_threshold - 0.5) * 2.0, 0.0, 1.0);
-        float toony_width = material.shadow_softness;
-        float lit_factor = smoothstep(0.5 - toony_width, 0.5 + toony_width, shade_grade);
-
-        vec3 lit_col = color.rgb;
-        vec3 shade_col = material.shade_color.rgb * tex_color.rgb;
-        color.rgb = mix(shade_col, lit_col, lit_factor);
-        color.rgb += camera.ambient_term;
+        // Approximate TinyMToon: mix base/shade color using linearstep over N.L + shift.
+        float shading = linearstep(
+            -1.0 + clamp(material.shade_toony, 0.0, 1.0),
+            1.0 - clamp(material.shade_toony, 0.0, 1.0),
+            ndotl + material.shade_shift
+        );
+        vec3 shade_col = material.shade_color.rgb * shade_texture_term;
+        vec3 toon_col = mix(shade_col, base_color_term, shading);
+        color.rgb = toon_col * (camera.light_color * max(camera.light_intensity, 0.0));
     } else {
         // SimpleLit: standard diffuse
         float diffuse = max(ndotl, 0.0);
-        vec3 lighting = camera.ambient_term + camera.light_intensity * diffuse;
-        color.rgb *= lighting;
+        vec3 lighting = camera.ambient_term + camera.light_color * (camera.light_intensity * diffuse);
+        color.rgb = base_color_term * lighting;
     }
 
     color.rgb += material.emissive_color.rgb * material.emissive_color.a;
@@ -193,7 +206,7 @@ void main() {
         vec3 view_normal = normalize(mat3(camera.view) * n);
         vec2 matcap_uv = view_normal.xy * 0.5 + 0.5;
         vec4 matcap_sample = texture(matcap_texture, matcap_uv);
-        color.rgb = mix(color.rgb, matcap_sample.rgb, material.matcap_blend);
+        color.rgb = mix(color.rgb, color.rgb * matcap_sample.rgb, material.matcap_blend);
     }
 
     if (material.alpha_mode == 1 && color.a < material.alpha_cutoff) {
@@ -206,7 +219,7 @@ void main() {
     out_color = color;
 }
 "
-                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +228,8 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                            ty: "vertex",
-                                                                                                                                                                                                                            src: r"
+                                                                                                                                                                                                                                                    ty: "vertex",
+                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 layout(location = 0) in vec3 position;
@@ -232,8 +245,10 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad0;
     vec3 light_dir;
     float light_intensity;
-    vec3 ambient_term;
+    vec3 light_color;
     float _pad1;
+    vec3 ambient_term;
+    float _pad2;
 } camera;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
@@ -275,13 +290,13 @@ void main() {
     gl_Position = clip_pos;
 }
 "
-                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                            ty: "fragment",
-                                                                                                                                                                                                                            src: r"
+                                                                                                                                                                                                                                                    ty: "fragment",
+                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -298,13 +313,13 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                }
 }
 
 pub mod depth_only_vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                            ty: "vertex",
-                                                                                                                                                                                                                            src: r"
+                                                                                                                                                                                                                                                    ty: "vertex",
+                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 layout(location = 0) in vec3 position;
@@ -320,8 +335,10 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad0;
     vec3 light_dir;
     float light_intensity;
-    vec3 ambient_term;
+    vec3 light_color;
     float _pad1;
+    vec3 ambient_term;
+    float _pad2;
 } camera;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
@@ -341,19 +358,19 @@ void main() {
     gl_Position = camera.proj * camera.view * world_pos;
 }
 "
-                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                }
 }
 
 pub mod depth_only_fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                            ty: "fragment",
-                                                                                                                                                                                                                            src: r"
+                                                                                                                                                                                                                                                    ty: "fragment",
+                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 void main() {
 }
 "
-                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                }
 }
 
 // ---------------------------------------------------------------------------

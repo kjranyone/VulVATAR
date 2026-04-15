@@ -115,11 +115,10 @@ impl Default for Transform {
 }
 
 impl Transform {
-    /// Build a 4x4 TRS matrix in **row-major** layout (`m[row][col]`).
+    /// Build a 4x4 TRS matrix in **column-major** layout (`m[col][row]`).
     ///
-    /// Translation occupies row 3 (indices `[3][0..3]`). This is the internal
-    /// convention used throughout the codebase. GPU shaders typically expect
-    /// column-major data, so call `mat4_to_cols()` before uploading.
+    /// Translation occupies column 3 (indices `[3][0..3]`). GPU shaders
+    /// expect column-major data, so this can be uploaded directly.
     pub fn to_matrix(&self) -> Mat4 {
         let [x, y, z, w] = self.rotation;
         let [sx, sy, sz] = self.scale;

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod directshow_filter;
 pub mod dshow_source;
 pub mod frame_sink;
@@ -7,7 +6,7 @@ pub mod virtual_camera_native;
 pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter};
 
 use crate::avatar::pose::FrameTimestamp;
-use log::{error, info};
+use log::{debug, error, info};
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -200,7 +199,7 @@ impl OutputRouter {
     /// The frame is queued locally (applying the queue policy) and then
     /// dispatched to the background output worker for actual writing.
     pub fn publish(&mut self, frame: OutputFrame) {
-        info!(
+        debug!(
             "output: publish frame {} {}x{} {:?} alpha={:?} to {:?}",
             frame.frame_id.0,
             frame.extent[0],
