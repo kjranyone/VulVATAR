@@ -1,6 +1,7 @@
+#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 
-use crate::asset::{ClothAsset, ColliderShape, Mat4, Vec3};
+use crate::asset::{ClothAsset, ColliderShape, Mat4, SceneColliderAsset, Vec3};
 
 // ---------------------------------------------------------------------------
 // Spatial hash grid for self-collision broadphase
@@ -79,6 +80,12 @@ impl SpatialHashGrid {
             (position[1] * self.inv_cell_size).floor() as i32,
             (position[2] * self.inv_cell_size).floor() as i32,
         )
+    }
+}
+
+impl Default for SpatialHashGrid {
+    fn default() -> Self {
+        Self::new(0.1)
     }
 }
 
@@ -272,27 +279,26 @@ impl ClothSimState {
                 let p1 = bc.indices[1] as usize;
                 let p2 = bc.indices[2] as usize;
                 // Compute rest angle between edges p0->p1 and p0->p2
-                let rest_angle = if p0 < particles.len()
-                    && p1 < particles.len()
-                    && p2 < particles.len()
-                {
-                    let v0 = particles[p0].position;
-                    let v1 = particles[p1].position;
-                    let v2 = particles[p2].position;
-                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-                    let dot = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
-                    let cross = [
-                        e1[1] * e2[2] - e1[2] * e2[1],
-                        e1[2] * e2[0] - e1[0] * e2[2],
-                        e1[0] * e2[1] - e1[1] * e2[0],
-                    ];
-                    let cross_len =
-                        (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
-                    cross_len.atan2(dot)
-                } else {
-                    std::f32::consts::PI
-                };
+                let rest_angle =
+                    if p0 < particles.len() && p1 < particles.len() && p2 < particles.len() {
+                        let v0 = particles[p0].position;
+                        let v1 = particles[p1].position;
+                        let v2 = particles[p2].position;
+                        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                        let dot = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+                        let cross = [
+                            e1[1] * e2[2] - e1[2] * e2[1],
+                            e1[2] * e2[0] - e1[0] * e2[2],
+                            e1[0] * e2[1] - e1[1] * e2[0],
+                        ];
+                        let cross_len =
+                            (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2])
+                                .sqrt();
+                        cross_len.atan2(dot)
+                    } else {
+                        std::f32::consts::PI
+                    };
                 ClothBendConstraint {
                     p0,
                     p1,
@@ -346,6 +352,38 @@ impl ClothSimState {
     pub fn particle_count(&self) -> usize {
         self.particles.len()
     }
+
+    pub fn apply_lod(&mut self, level: &ClothLoDLevel) {
+        self.solver_iterations = level.solver_iterations();
+        let ratio = level.particle_ratio();
+        if ratio < 1.0 && self.self_collision {
+            self.self_collision = ratio > 0.4;
+        }
+    }
+}
+
+impl Default for ClothSimState {
+    fn default() -> Self {
+        Self {
+            particles: Vec::new(),
+            distance_constraints: Vec::new(),
+            bend_constraints: Vec::new(),
+            pin_targets: Vec::new(),
+            solver_iterations: 8,
+            gravity: [0.0, -9.81, 0.0],
+            damping: 0.98,
+            collision_margin: 0.02,
+            wind_response: 0.0,
+            wind_direction: [1.0, 0.0, 0.0],
+            triangle_indices: Vec::new(),
+            computed_normals: Vec::new(),
+            initialized: false,
+            self_collision: false,
+            self_collision_radius: 0.02,
+            connected_pairs: HashSet::new(),
+            spatial_hash: SpatialHashGrid::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,8 +408,7 @@ impl ClothSimTempBuffers {
 
     pub fn resize(&mut self, particle_count: usize) {
         self.temp_positions.resize(particle_count, [0.0; 3]);
-        self.correction_accumulator
-            .resize(particle_count, [0.0; 3]);
+        self.correction_accumulator.resize(particle_count, [0.0; 3]);
         self.correction_counts.resize(particle_count, 0);
     }
 
@@ -434,4 +471,120 @@ pub fn resolve_colliders(
         }
     }
     out
+}
+
+pub fn resolve_scene_colliders(scene_colliders: &[SceneColliderAsset]) -> Vec<ResolvedCollider> {
+    scene_colliders
+        .iter()
+        .map(|sc| match sc.shape {
+            ColliderShape::Sphere { radius } => ResolvedCollider::Sphere {
+                center: sc.position,
+                radius,
+            },
+            ColliderShape::Capsule { radius, height } => ResolvedCollider::Capsule {
+                center: sc.position,
+                radius,
+                half_height: height * 0.5,
+                axis: [0.0, 1.0, 0.0],
+            },
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ClothLoDLevel {
+    Full,
+    Half,
+    Quarter,
+    Custom { particle_ratio: f32 },
+}
+
+impl ClothLoDLevel {
+    pub fn particle_ratio(&self) -> f32 {
+        match self {
+            ClothLoDLevel::Full => 1.0,
+            ClothLoDLevel::Half => 0.5,
+            ClothLoDLevel::Quarter => 0.25,
+            ClothLoDLevel::Custom { particle_ratio } => particle_ratio.clamp(0.1, 1.0),
+        }
+    }
+
+    pub fn solver_iterations(&self) -> u32 {
+        match self {
+            ClothLoDLevel::Full => 8,
+            ClothLoDLevel::Half => 6,
+            ClothLoDLevel::Quarter => 4,
+            ClothLoDLevel::Custom { .. } => 6,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            ClothLoDLevel::Full => "Full",
+            ClothLoDLevel::Half => "Half",
+            ClothLoDLevel::Quarter => "Quarter",
+            ClothLoDLevel::Custom { .. } => "Custom",
+        }
+    }
+}
+
+impl Default for ClothLoDLevel {
+    fn default() -> Self {
+        ClothLoDLevel::Full
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ClothLoDConfig {
+    pub level: ClothLoDLevel,
+    pub distance_threshold: f32,
+    pub self_collision_enabled: bool,
+}
+
+impl Default for ClothLoDConfig {
+    fn default() -> Self {
+        Self {
+            level: ClothLoDLevel::Full,
+            distance_threshold: 0.0,
+            self_collision_enabled: true,
+        }
+    }
+}
+
+impl ClothLoDConfig {
+    pub fn presets() -> Vec<Self> {
+        vec![
+            Self {
+                level: ClothLoDLevel::Full,
+                distance_threshold: 5.0,
+                self_collision_enabled: true,
+            },
+            Self {
+                level: ClothLoDLevel::Half,
+                distance_threshold: 10.0,
+                self_collision_enabled: true,
+            },
+            Self {
+                level: ClothLoDLevel::Quarter,
+                distance_threshold: 20.0,
+                self_collision_enabled: false,
+            },
+        ]
+    }
+
+    pub fn select_for_distance(presets: &[Self], camera_distance: f32) -> ClothLoDLevel {
+        let mut best: ClothLoDLevel = presets
+            .first()
+            .map(|p| p.level.clone())
+            .unwrap_or(ClothLoDLevel::Full);
+        let mut best_dist = f32::MAX;
+        for preset in presets {
+            if camera_distance >= preset.distance_threshold && preset.distance_threshold < best_dist
+            {
+                best_dist = preset.distance_threshold;
+                best = preset.level.clone();
+            }
+        }
+        best
+    }
 }

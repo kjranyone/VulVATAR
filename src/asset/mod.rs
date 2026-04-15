@@ -1,7 +1,9 @@
+#![allow(dead_code)]
 pub mod vrm;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub type Vec3 = [f32; 3];
 pub type Vec4 = [f32; 4];
@@ -113,9 +115,11 @@ impl Default for Transform {
 }
 
 impl Transform {
-    /// Build a 4x4 TRS matrix. Layout: `m[row][col]` with translation in row 3.
-    /// This is the internal convention used throughout the codebase.
-    /// Use `mat4_to_cols()` to convert to column-major for GPU upload.
+    /// Build a 4x4 TRS matrix in **row-major** layout (`m[row][col]`).
+    ///
+    /// Translation occupies row 3 (indices `[3][0..3]`). This is the internal
+    /// convention used throughout the codebase. GPU shaders typically expect
+    /// column-major data, so call `mat4_to_cols()` before uploading.
     pub fn to_matrix(&self) -> Mat4 {
         let [x, y, z, w] = self.rotation;
         let [sx, sy, sz] = self.scale;
@@ -134,10 +138,15 @@ impl Transform {
         let wz = w * z2;
 
         [
-            [(1.0 - (yy + zz)) * sx, (xy + wz) * sx,         (xz - wy) * sx,         0.0],
-            [(xy - wz) * sy,         (1.0 - (xx + zz)) * sy,  (yz + wx) * sy,         0.0],
-            [(xz + wy) * sz,         (yz - wx) * sz,          (1.0 - (xx + yy)) * sz, 0.0],
-            [self.translation[0],    self.translation[1],     self.translation[2],     1.0],
+            [(1.0 - (yy + zz)) * sx, (xy + wz) * sx, (xz - wy) * sx, 0.0],
+            [(xy - wz) * sy, (1.0 - (xx + zz)) * sy, (yz + wx) * sy, 0.0],
+            [(xz + wy) * sz, (yz - wx) * sz, (1.0 - (xx + yy)) * sz, 0.0],
+            [
+                self.translation[0],
+                self.translation[1],
+                self.translation[2],
+                1.0,
+            ],
         ]
     }
 }
@@ -247,11 +256,14 @@ pub struct MaterialTextureSet {
     pub normal_map_texture: Option<TextureBinding>,
     pub shade_ramp_texture: Option<TextureBinding>,
     pub emissive_texture: Option<TextureBinding>,
+    pub matcap_texture: Option<TextureBinding>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TextureBinding {
     pub uri: String,
+    pub pixel_data: Option<Arc<Vec<u8>>>,
+    pub dimensions: (u32, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +349,16 @@ pub struct ColliderAsset {
 pub enum ColliderShape {
     Sphere { radius: f32 },
     Capsule { radius: f32, height: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SceneColliderId(pub u64);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SceneColliderAsset {
+    pub id: SceneColliderId,
+    pub position: Vec3,
+    pub shape: ColliderShape,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

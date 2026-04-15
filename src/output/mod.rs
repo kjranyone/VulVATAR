@@ -1,10 +1,13 @@
+#![allow(dead_code)]
+pub mod directshow_filter;
+pub mod dshow_source;
 pub mod frame_sink;
+pub mod virtual_camera_native;
 
-pub use frame_sink::{
-    create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter,
-};
+pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter};
 
 use crate::avatar::pose::FrameTimestamp;
+use log::{error, info};
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -66,11 +69,9 @@ pub struct OutputFrame {
     pub color_space: OutputColorSpace,
     pub alpha_mode: AlphaMode,
     pub gpu_token: GpuFrameToken,
-    /// CPU-side RGBA8 pixel data.  `None` when only a GPU token is available.
-    ///
-    /// Wrapped in `Arc` so the buffer can be shared between consumers (viewport
-    /// display + output worker) without duplicating ~8 MB per frame at 1080p.
+    pub handoff_path: HandoffPath,
     pub pixel_data: Option<Arc<Vec<u8>>>,
+    pub gpu_image: Option<Arc<vulkano::image::Image>>,
 }
 
 impl OutputFrame {
@@ -87,13 +88,21 @@ impl OutputFrame {
                 sync: GpuSyncToken::None,
                 lifetime: FrameLifetimeContract::SingleConsumerImmediate,
             },
+            handoff_path: HandoffPath::CpuReadback,
             pixel_data: None,
+            gpu_image: None,
         }
     }
 
-    /// Attach CPU-readback pixel data (RGBA8, row-major, top-to-bottom).
     pub fn with_pixel_data(mut self, data: Arc<Vec<u8>>) -> Self {
         self.pixel_data = Some(data);
+        self
+    }
+
+    pub fn with_gpu_image(mut self, image: Arc<vulkano::image::Image>) -> Self {
+        self.gpu_image = Some(image);
+        self.handoff_path = HandoffPath::GpuSharedFrame;
+        self.gpu_token.handle_type = ExternalHandleType::VkSemaphore;
         self
     }
 }
@@ -154,30 +163,30 @@ impl OutputRouter {
         thread::Builder::new()
             .name("output-worker".into())
             .spawn(move || {
-                println!("output-worker: started (sink={})", writer.name());
+                info!("output-worker: started (sink={})", writer.name());
                 loop {
                     match rx.recv() {
                         Ok(WorkerMessage::Frame(frame)) => {
                             if let Err(e) = writer.write_frame(&frame) {
-                                eprintln!("output-worker: write error: {}", e);
+                                error!("output-worker: write error: {}", e);
                             }
                         }
                         Ok(WorkerMessage::Shutdown) => {
-                            println!("output-worker: shutdown requested, draining queue");
+                            info!("output-worker: shutdown requested, draining queue");
                             // Drain any remaining frames already in the channel.
                             while let Ok(msg) = rx.try_recv() {
                                 if let WorkerMessage::Frame(frame) = msg {
                                     if let Err(e) = writer.write_frame(&frame) {
-                                        eprintln!("output-worker: drain write error: {}", e);
+                                        error!("output-worker: drain write error: {}", e);
                                     }
                                 }
                             }
-                            println!("output-worker: stopped");
+                            info!("output-worker: stopped");
                             break;
                         }
                         Err(_) => {
                             // Sender dropped; treat as implicit shutdown.
-                            println!("output-worker: channel closed, stopping");
+                            info!("output-worker: channel closed, stopping");
                             break;
                         }
                     }
@@ -191,7 +200,7 @@ impl OutputRouter {
     /// The frame is queued locally (applying the queue policy) and then
     /// dispatched to the background output worker for actual writing.
     pub fn publish(&mut self, frame: OutputFrame) {
-        println!(
+        info!(
             "output: publish frame {} {}x{} {:?} alpha={:?} to {:?}",
             frame.frame_id.0,
             frame.extent[0],
@@ -265,7 +274,9 @@ impl OutputRouter {
                 sync: GpuSyncToken::None,
                 lifetime: FrameLifetimeContract::SingleConsumerImmediate,
             },
+            handoff_path: HandoffPath::CpuReadback,
             pixel_data: None,
+            gpu_image: None,
         }
     }
 
@@ -277,7 +288,7 @@ impl OutputRouter {
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
-        println!("OutputRouter: shutdown complete");
+        info!("OutputRouter: shutdown complete");
     }
 
     pub fn dropped_count(&self) -> u64 {
@@ -290,8 +301,10 @@ impl OutputRouter {
 
     pub fn diagnostics(&self) -> OutputDiagnostics {
         let gpu_interop_enabled = matches!(self.sink, FrameSink::SharedTexture);
-        let fallback_active =
-            matches!(self.sink, FrameSink::SharedMemory | FrameSink::ImageSequence);
+        let fallback_active = matches!(
+            self.sink,
+            FrameSink::SharedMemory | FrameSink::ImageSequence
+        );
         OutputDiagnostics {
             active_sink: self.sink.clone(),
             active_handoff_path: if gpu_interop_enabled {
@@ -333,4 +346,3 @@ pub enum HandoffPath {
     CpuReadback,
     SharedMemory,
 }
-

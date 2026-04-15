@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -107,7 +109,7 @@ pub struct OutputConfig {
 }
 
 /// Full cloth overlay file for `.vvtcloth` files, including the complete ClothAsset data.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ClothOverlayFile {
     pub format_version: u32,
     pub created_with: String,
@@ -207,12 +209,13 @@ impl ProjectFile {
     }
 }
 
-/// Write a project file to disk as pretty-printed JSON.
+/// Write a project file to disk as pretty-printed JSON using atomic write
+/// (write to temp file, then rename).
 pub fn save_project(state: &ProjectState, path: &Path) -> Result<(), String> {
     let project = ProjectFile::from_state(state);
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
-    println!("persistence: saved project to {}", path.display());
+    atomic_write(path, &json)?;
+    info!("persistence: saved project to {}", path.display());
     Ok(())
 }
 
@@ -223,12 +226,28 @@ pub fn load_project(path: &Path) -> Result<(ProjectState, ProjectLoadWarnings), 
     let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let project: ProjectFile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
 
-    let warnings = ProjectLoadWarnings::default();
+    let mut warnings = ProjectLoadWarnings::default();
+
+    if project.format_version != 1 {
+        warnings.warnings.push(format!(
+            "unsupported format_version {}, expected 1",
+            project.format_version
+        ));
+    }
+    if let Some(ref p) = project.avatar_source_path {
+        if p.trim().is_empty() {
+            warnings.warnings.push(
+                "avatar_source_path is set but empty; the avatar may not load correctly"
+                    .to_string(),
+            );
+        }
+    }
+
     let state = project.to_state();
 
-    println!("persistence: loaded project from {}", path.display());
+    info!("persistence: loaded project from {}", path.display());
     for w in &warnings.warnings {
-        eprintln!("persistence: WARNING: {}", w);
+        warn!("persistence: WARNING: {}", w);
     }
     Ok((state, warnings))
 }
@@ -237,11 +256,396 @@ pub fn load_project(path: &Path) -> Result<(ProjectState, ProjectLoadWarnings), 
 pub fn load_cloth_overlay(path: &Path) -> Result<ClothOverlayFile, String> {
     let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let overlay: ClothOverlayFile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
-    println!(
+    info!(
         "persistence: loaded cloth overlay '{}' from {} (has cloth_asset: {})",
         overlay.overlay_name,
         path.display(),
         overlay.cloth_asset.is_some(),
     );
     Ok(overlay)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AvatarLibraryFile {
+    pub format_version: u32,
+    pub created_with: String,
+    pub last_saved_with: String,
+    pub library: crate::app::avatar_library::AvatarLibrary,
+}
+
+fn library_path() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("avatar_library.vvtlib");
+    path
+}
+
+fn app_data_dir() -> std::path::PathBuf {
+    let mut path = dirs_data_dir();
+    path.push("VulVATAR");
+    let _ = std::fs::create_dir_all(&path);
+    path
+}
+
+fn dirs_data_dir() -> std::path::PathBuf {
+    if cfg!(target_os = "windows") {
+        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(appdata)
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+    } else {
+        let xdg = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.local/share", home)
+        });
+        std::path::PathBuf::from(xdg)
+    }
+}
+
+pub fn load_avatar_library() -> crate::app::avatar_library::AvatarLibrary {
+    let path = library_path();
+    if !path.exists() {
+        info!(
+            "persistence: no avatar library at {}, creating empty",
+            path.display()
+        );
+        return crate::app::avatar_library::AvatarLibrary::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str::<AvatarLibraryFile>(&data) {
+            Ok(file) => {
+                info!(
+                    "persistence: loaded avatar library with {} entries",
+                    file.library.entries.len()
+                );
+                file.library
+            }
+            Err(e) => {
+                error!("persistence: failed to parse avatar library: {}", e);
+                crate::app::avatar_library::AvatarLibrary::new()
+            }
+        },
+        Err(e) => {
+            error!("persistence: failed to read avatar library: {}", e);
+            crate::app::avatar_library::AvatarLibrary::new()
+        }
+    }
+}
+
+pub fn save_avatar_library(
+    library: &crate::app::avatar_library::AvatarLibrary,
+) -> Result<(), String> {
+    let path = library_path();
+    let file = AvatarLibraryFile {
+        format_version: 1,
+        created_with: app_tag(),
+        last_saved_with: app_tag(),
+        library: library.clone(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    atomic_write(&path, &json)?;
+    info!(
+        "persistence: saved avatar library with {} entries",
+        library.entries.len()
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// Atomic write helper
+// ===========================================================================
+
+pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
+    if path.exists() {
+        let backup_path = path.with_extension(
+            path.extension()
+                .map(|e| {
+                    let mut s = e.to_string_lossy().into_owned();
+                    s.push_str(".bak");
+                    s
+                })
+                .unwrap_or_else(|| "bak".to_string()),
+        );
+        let _ = std::fs::copy(path, &backup_path);
+    }
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let temp_name = format!(
+        ".{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    let temp_path = parent.join(&temp_name);
+
+    std::fs::write(&temp_path, data).map_err(|e| {
+        format!(
+            "atomic_write: failed to write temp file {}: {}",
+            temp_path.display(),
+            e
+        )
+    })?;
+
+    if cfg!(windows) {
+        std::fs::copy(&temp_path, path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!(
+                "atomic_write: failed to copy {} -> {}: {}",
+                temp_path.display(),
+                path.display(),
+                e
+            )
+        })?;
+        let _ = std::fs::remove_file(&temp_path);
+    } else {
+        std::fs::rename(&temp_path, path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!(
+                "atomic_write: failed to rename {} -> {}: {}",
+                temp_path.display(),
+                path.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// Crash recovery
+// ===========================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RecoverySnapshot {
+    pub format_version: u32,
+    pub created_with: String,
+    pub timestamp_secs: u64,
+    pub project: Option<ProjectFile>,
+    pub overlay_dirty: bool,
+    pub overlay: Option<ClothOverlayFile>,
+}
+
+fn recovery_dir() -> std::path::PathBuf {
+    let mut dir = app_data_dir();
+    dir.push("recovery");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn recovery_snapshot_path() -> std::path::PathBuf {
+    recovery_dir().join("recovery.vvtsnap")
+}
+
+pub struct RecoveryManager {
+    interval_secs: u64,
+    last_snapshot_secs: u64,
+    enabled: bool,
+}
+
+impl RecoveryManager {
+    pub fn new(interval_secs: u64) -> Self {
+        Self {
+            interval_secs,
+            last_snapshot_secs: 0,
+            enabled: true,
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn set_interval(&mut self, secs: u64) {
+        self.interval_secs = secs;
+    }
+
+    pub fn should_snapshot(&self, now_secs: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        now_secs >= self.last_snapshot_secs + self.interval_secs
+    }
+
+    pub fn write_snapshot(
+        &mut self,
+        project_state: Option<&ProjectState>,
+        overlay_dirty: bool,
+        overlay: Option<&ClothOverlayFile>,
+    ) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let snapshot = RecoverySnapshot {
+            format_version: 1,
+            created_with: app_tag(),
+            timestamp_secs: now,
+            project: project_state.map(ProjectFile::from_state),
+            overlay_dirty,
+            overlay: overlay.cloned(),
+        };
+
+        let json = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
+        let path = recovery_snapshot_path();
+        atomic_write(&path, &json)?;
+
+        self.last_snapshot_secs = now;
+        Ok(())
+    }
+
+    pub fn detect_recovery() -> Option<RecoverySnapshot> {
+        let path = recovery_snapshot_path();
+        if !path.exists() {
+            return None;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<RecoverySnapshot>(&data) {
+                Ok(snapshot) => {
+                    info!(
+                        "persistence: detected recovery snapshot from {} (has_project={}, has_overlay={})",
+                        snapshot.timestamp_secs,
+                        snapshot.project.is_some(),
+                        snapshot.overlay.is_some(),
+                    );
+                    Some(snapshot)
+                }
+                Err(e) => {
+                    error!("persistence: corrupt recovery snapshot, removing: {}", e);
+                    let _ = std::fs::remove_file(&path);
+                    None
+                }
+            },
+            Err(e) => {
+                error!("persistence: cannot read recovery snapshot: {}", e);
+                None
+            }
+        }
+    }
+
+    pub fn clear_recovery() {
+        let path = recovery_snapshot_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+            info!("persistence: cleared recovery snapshot");
+        }
+    }
+}
+
+pub fn validate_recovery(snapshot: &RecoverySnapshot) -> Result<(), String> {
+    if snapshot.format_version != 1 {
+        return Err(format!(
+            "unsupported recovery format_version {}",
+            snapshot.format_version
+        ));
+    }
+    if let Some(ref project) = snapshot.project {
+        if project.format_version != 1 {
+            return Err(format!(
+                "unsupported project format_version {} in recovery",
+                project.format_version
+            ));
+        }
+    }
+    if let Some(ref overlay) = snapshot.overlay {
+        if overlay.format_version != 1 {
+            return Err(format!(
+                "unsupported overlay format_version {} in recovery",
+                overlay.format_version
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Scene presets
+// ===========================================================================
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ScenePresetLighting {
+    pub main_light_dir: [f32; 3],
+    pub main_light_intensity: f32,
+    pub ambient_intensity: [f32; 3],
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ScenePresetCamera {
+    pub fov: f32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ScenePresetRendering {
+    pub material_mode_index: usize,
+    pub toon_ramp_threshold: f32,
+    pub shadow_softness: f32,
+    pub outline_enabled: bool,
+    pub outline_width: f32,
+    pub outline_color: [f32; 3],
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ScenePreset {
+    pub name: String,
+    pub lighting: ScenePresetLighting,
+    pub camera: ScenePresetCamera,
+    pub rendering: ScenePresetRendering,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ScenePresetFile {
+    pub format_version: u32,
+    pub created_with: String,
+    pub last_saved_with: String,
+    pub presets: Vec<ScenePreset>,
+}
+
+fn scene_presets_path() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("scene_presets.vvtpresets");
+    path
+}
+
+pub fn load_scene_presets() -> Vec<ScenePreset> {
+    let path = scene_presets_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str::<ScenePresetFile>(&data) {
+            Ok(file) => {
+                info!("persistence: loaded {} scene presets", file.presets.len());
+                file.presets
+            }
+            Err(e) => {
+                error!("persistence: failed to parse scene presets: {}", e);
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            error!("persistence: failed to read scene presets: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+pub fn save_scene_presets(presets: &[ScenePreset]) -> Result<(), String> {
+    let path = scene_presets_path();
+    let file = ScenePresetFile {
+        format_version: 1,
+        created_with: app_tag(),
+        last_saved_with: app_tag(),
+        presets: presets.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    atomic_write(&path, &json)?;
+    info!("persistence: saved {} scene presets", presets.len());
+    Ok(())
 }

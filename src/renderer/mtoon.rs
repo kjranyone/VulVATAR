@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Re-export MToon staged parameter types from the asset module.
 // These are pure-data types with no GPU dependencies, so they live in `asset`.
 // The re-exports are kept for backward compatibility even if nothing currently uses them.
@@ -17,6 +18,7 @@ pub struct MtoonCompatibilityStatus {
     pub emissive_supported: bool,
     pub rim_supported: bool,
     pub uv_animation_supported: bool,
+    pub matcap_supported: bool,
 }
 
 impl MtoonCompatibilityStatus {
@@ -33,9 +35,10 @@ impl MtoonCompatibilityStatus {
             outline_supported: true,
             outline_width_supported: true,
             shade_controls_supported: true,
-            emissive_supported: false,
-            rim_supported: false,
-            uv_animation_supported: false,
+            emissive_supported: true,
+            rim_supported: true,
+            uv_animation_supported: true,
+            matcap_supported: true,
         }
     }
 }

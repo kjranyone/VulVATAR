@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+use image::GenericImageView;
+use log::warn;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -290,6 +293,14 @@ impl From<serde_json::Error> for VrmLoadError {
 
 pub struct VrmAssetLoader;
 
+struct MtoonTextureIndices {
+    shade_color_texture: Option<usize>,
+    emissive_texture: Option<usize>,
+    rim_texture: Option<usize>,
+    matcap_texture: Option<usize>,
+    uv_anim_mask_texture: Option<usize>,
+}
+
 impl VrmAssetLoader {
     pub fn new() -> Self {
         Self
@@ -323,13 +334,10 @@ impl VrmAssetLoader {
             .transpose()?;
 
         let meshes = Self::build_meshes(&gltf_doc.document, blob);
-        let materials = Self::build_materials(&gltf_doc.document);
+        let materials = Self::build_materials(&gltf_doc.document, blob);
         let skin_bindings = Self::build_skin_bindings(&gltf_doc.document, blob);
-        let meshes_with_skin = Self::assign_skins_to_meshes(
-            &gltf_doc.document,
-            meshes,
-            &skin_bindings,
-        );
+        let meshes_with_skin =
+            Self::assign_skins_to_meshes(&gltf_doc.document, meshes, &skin_bindings);
 
         let root_nodes: Vec<NodeId> = gltf_doc
             .document
@@ -446,7 +454,7 @@ impl VrmAssetLoader {
                 let data = match buf.source() {
                     gltf::buffer::Source::Bin => blob.unwrap_or(&[]).to_vec(),
                     gltf::buffer::Source::Uri(_uri) => {
-                        eprintln!(
+                        warn!(
                             "[vrm] External buffer URIs not supported for mesh loading, \
                              buffer {} will be empty",
                             buf.index()
@@ -527,11 +535,7 @@ impl VrmAssetLoader {
                             None
                         };
 
-                        let idx_data = if index_count > 0 {
-                            Some(indices)
-                        } else {
-                            None
-                        };
+                        let idx_data = if index_count > 0 { Some(indices) } else { None };
 
                         MeshPrimitiveAsset {
                             id: prim_id,
@@ -555,7 +559,17 @@ impl VrmAssetLoader {
             .collect()
     }
 
-    fn build_materials(doc: &gltf::Document) -> Vec<MaterialAsset> {
+    fn resolve_texture_index(
+        doc: &gltf::Document,
+        index: usize,
+        blob: Option<&[u8]>,
+    ) -> Option<TextureBinding> {
+        doc.textures()
+            .nth(index)
+            .map(|tex| Self::texture_binding_from_info(&tex, blob))
+    }
+
+    fn build_materials(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<MaterialAsset> {
         doc.materials()
             .enumerate()
             .map(|(i, gmat)| {
@@ -572,31 +586,59 @@ impl VrmAssetLoader {
                 };
                 let double_sided = gmat.double_sided();
 
-                // Extract MToon extension if present
-                let mtoon_ext = gmat.extensions().and_then(|ext| ext.get("VRMC_materials_mtoon"));
+                let mtoon_ext = gmat
+                    .extensions()
+                    .and_then(|ext| ext.get("VRMC_materials_mtoon"));
                 let has_mtoon = mtoon_ext.is_some();
 
                 let base_mode = if has_mtoon {
                     MaterialMode::ToonLike
-                } else if matches!(gltf_alpha, gltf::material::AlphaMode::Blend) {
-                    MaterialMode::Unlit
-                } else if pbr.metallic_factor() > 0.0 {
-                    MaterialMode::SimpleLit
                 } else {
-                    MaterialMode::ToonLike
+                    MaterialMode::SimpleLit
                 };
 
-                let base_color_texture = pbr.base_color_texture().map(|info| {
-                    Self::texture_binding_from_info(&info.texture())
-                });
+                let base_color_texture = pbr
+                    .base_color_texture()
+                    .map(|info| Self::texture_binding_from_info(&info.texture(), blob));
 
-                let normal_map_texture = gmat.normal_texture().map(|info| {
-                    Self::texture_binding_from_info(&info.texture())
-                });
+                let normal_map_texture = gmat
+                    .normal_texture()
+                    .map(|info| Self::texture_binding_from_info(&info.texture(), blob));
 
-                // Parse MToon parameters
+                let mut shade_ramp_texture = None;
+                let mut emissive_texture_binding = None;
+
                 let (toon_params, mtoon_params) = if let Some(mtoon) = mtoon_ext {
-                    Self::parse_mtoon_params(mtoon)
+                    let (toon, mut staged, tex_indices) = Self::parse_mtoon_params(mtoon);
+
+                    shade_ramp_texture = tex_indices
+                        .shade_color_texture
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob));
+
+                    emissive_texture_binding = tex_indices
+                        .emissive_texture
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob));
+
+                    staged.emissive_texture =
+                        emissive_texture_binding
+                            .as_ref()
+                            .map(|tb| MtoonTextureSlot {
+                                uri: tb.uri.clone(),
+                            });
+                    staged.rim_texture = tex_indices
+                        .rim_texture
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob))
+                        .map(|tb| MtoonTextureSlot { uri: tb.uri });
+                    staged.matcap_texture = tex_indices
+                        .matcap_texture
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob))
+                        .map(|tb| MtoonTextureSlot { uri: tb.uri });
+                    staged.uv_anim_mask_texture = tex_indices
+                        .uv_anim_mask_texture
+                        .and_then(|idx| Self::resolve_texture_index(doc, idx, blob))
+                        .map(|tb| MtoonTextureSlot { uri: tb.uri });
+
+                    (toon, Some(staged))
                 } else {
                     (
                         ToonMaterialParams {
@@ -619,8 +661,9 @@ impl VrmAssetLoader {
                     texture_bindings: MaterialTextureSet {
                         base_color_texture,
                         normal_map_texture,
-                        shade_ramp_texture: None,
-                        emissive_texture: None,
+                        shade_ramp_texture,
+                        emissive_texture: emissive_texture_binding,
+                        matcap_texture: None,
                     },
                     toon_params,
                     mtoon_params,
@@ -629,18 +672,51 @@ impl VrmAssetLoader {
             .collect()
     }
 
-    fn texture_binding_from_info(texture: &gltf::Texture<'_>) -> TextureBinding {
+    fn texture_binding_from_info(
+        texture: &gltf::Texture<'_>,
+        blob: Option<&[u8]>,
+    ) -> TextureBinding {
         let uri = texture
             .source()
             .name()
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("texture_{}", texture.index()));
-        TextureBinding { uri }
+
+        let source = texture.source().source();
+        let (pixel_data, dimensions) = match source {
+            gltf::image::Source::View { view, .. } => {
+                let start = view.offset();
+                let end = start + view.length();
+                match blob.and_then(|b| b.get(start..end)) {
+                    Some(encoded) => match image::load_from_memory(encoded) {
+                        Ok(img) => {
+                            let (w, h) = img.dimensions();
+                            (Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
+                        }
+                        Err(_) => (None, (0, 0)),
+                    },
+                    None => (None, (0, 0)),
+                }
+            }
+            gltf::image::Source::Uri { uri: file_uri, .. } => match image::open(file_uri) {
+                Ok(img) => {
+                    let (w, h) = img.dimensions();
+                    (Some(Arc::new(img.to_rgba8().into_raw())), (w, h))
+                }
+                Err(_) => (None, (0, 0)),
+            },
+        };
+
+        TextureBinding {
+            uri,
+            pixel_data,
+            dimensions,
+        }
     }
 
     fn parse_mtoon_params(
         mtoon: &serde_json::Value,
-    ) -> (ToonMaterialParams, Option<MtoonStagedParams>) {
+    ) -> (ToonMaterialParams, MtoonStagedParams, MtoonTextureIndices) {
         use crate::asset::{MtoonOutlineWidthMode, MtoonStagedParams};
 
         let get_f32 = |key: &str| mtoon.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -657,7 +733,7 @@ impl VrmAssetLoader {
                 })
                 .unwrap_or([0.0; 3])
         };
-        let get_color4 = |key: &str| -> [f32; 4] {
+        let get_color3_as_4 = |key: &str| -> [f32; 4] {
             mtoon
                 .get(key)
                 .and_then(|v| v.as_array())
@@ -666,13 +742,13 @@ impl VrmAssetLoader {
                         arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                         arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
                         arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                        arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                        1.0f32,
                     ]
                 })
-                .unwrap_or([0.0, 0.0, 0.0, 1.0])
+                .unwrap_or([0.0, 0.0, 0.0, 0.0])
         };
 
-        let shade_color = get_color4("shadeColorFactor");
+        let shade_color = get_color3_as_4("shadeColorFactor");
         let shade_shift = get_f32("shadingShiftFactor").unwrap_or(0.0);
         let shade_toony = get_f32("shadingToonyFactor").unwrap_or(0.9);
         let gi_equalization = get_f32("giEqualizationFactor").unwrap_or(0.9);
@@ -689,16 +765,26 @@ impl VrmAssetLoader {
         let outline_width = get_f32("outlineWidthFactor").unwrap_or(0.0);
         let outline_color = get_color3("outlineColorFactor");
 
-        let rim_color = get_color4("parametricRimColorFactor");
+        let rim_color = get_color3_as_4("parametricRimColorFactor");
         let rim_fresnel_power = get_f32("parametricRimFresnelPowerFactor").unwrap_or(5.0);
         let rim_lift = get_f32("parametricRimLiftFactor").unwrap_or(0.0);
         let rim_lighting_mix = get_f32("rimLightingMixFactor").unwrap_or(1.0);
 
-        let emissive_color = get_color4("emissiveFactor");
+        let emissive_color = get_color3_as_4("emissiveFactor");
 
         let uv_anim_scroll_x = get_f32("uvAnimationScrollXSpeedFactor").unwrap_or(0.0);
         let uv_anim_scroll_y = get_f32("uvAnimationScrollYSpeedFactor").unwrap_or(0.0);
         let uv_anim_rotation = get_f32("uvAnimationRotationSpeedFactor").unwrap_or(0.0);
+
+        let get_tex_index = |key: &str| mtoon.get(key).and_then(|v| v.as_u64()).map(|v| v as usize);
+
+        let tex_indices = MtoonTextureIndices {
+            shade_color_texture: get_tex_index("shadeColorTexture"),
+            emissive_texture: get_tex_index("emissiveTexture"),
+            rim_texture: get_tex_index("rimTexture"),
+            matcap_texture: get_tex_index("matcapTexture"),
+            uv_anim_mask_texture: get_tex_index("uvAnimMaskTexture"),
+        };
 
         let toon_params = ToonMaterialParams {
             ramp_threshold: (1.0 - shade_toony).max(0.01),
@@ -730,20 +816,17 @@ impl VrmAssetLoader {
             uv_anim_rotation_speed: uv_anim_rotation,
         };
 
-        (toon_params, Some(staged))
+        (toon_params, staged, tex_indices)
     }
 
-    fn build_skin_bindings(
-        doc: &gltf::Document,
-        blob: Option<&[u8]>,
-    ) -> Vec<(usize, SkinBinding)> {
+    fn build_skin_bindings(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<(usize, SkinBinding)> {
         let buffers: Vec<gltf::buffer::Data> = doc
             .buffers()
             .map(|buf| {
                 let data = match buf.source() {
                     gltf::buffer::Source::Bin => blob.unwrap_or(&[]).to_vec(),
                     gltf::buffer::Source::Uri(_uri) => {
-                        eprintln!(
+                        warn!(
                             "[vrm] External buffer URIs not supported for skin loading, \
                              buffer {} will be empty",
                             buf.index()
@@ -766,7 +849,7 @@ impl VrmAssetLoader {
                     .read_inverse_bind_matrices()
                     .map(|iter| iter.collect())
                     .unwrap_or_else(|| {
-                        eprintln!(
+                        warn!(
                             "[vrm] Skin {} has no inverse bind matrices, using identity",
                             skin_index
                         );
@@ -962,21 +1045,14 @@ impl VrmAssetLoader {
 
                 // Per-joint parameter storage: each joint in the chain can have
                 // its own stiffness, drag and gravity_power values.
-                let joint_stiffness: Vec<f32> = spring
-                    .joints
-                    .iter()
-                    .map(|j| j.stiffness)
-                    .collect();
+                let joint_stiffness: Vec<f32> = spring.joints.iter().map(|j| j.stiffness).collect();
                 let joint_drag: Vec<f32> = spring
                     .joints
                     .iter()
                     .map(|j| j.drag_force.unwrap_or(drag_force))
                     .collect();
-                let joint_gravity_power: Vec<f32> = spring
-                    .joints
-                    .iter()
-                    .map(|j| j.gravity_power)
-                    .collect();
+                let joint_gravity_power: Vec<f32> =
+                    spring.joints.iter().map(|j| j.gravity_power).collect();
 
                 SpringBoneAsset {
                     chain_root,

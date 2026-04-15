@@ -1,43 +1,31 @@
+#![allow(dead_code)]
+pub mod avatar_library;
+pub mod bake_cache;
+pub mod folder_watcher;
+pub mod render_thread;
+
+use log::{error, info, warn};
 use std::sync::Arc;
 
+use crate::app::render_thread::{RenderCommand, RenderThread};
 use crate::asset::vrm::VrmAssetLoader;
 use crate::avatar::retargeting;
 use crate::avatar::{AvatarInstance, AvatarInstanceId};
 use crate::editor::EditorSession;
 use crate::output::{FrameSink, OutputFrame, OutputRouter};
+use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
     CameraState, ClothDeformSnapshot, LightingState, OutlineSnapshot, OutputTargetRequest,
     RenderAlphaMode, RenderAvatarInstance, RenderCullMode, RenderExportMode, RenderFrameInput,
     RenderMeshInstance, RenderOutputAlpha,
 };
+use crate::renderer::material::MaterialShaderMode;
 use crate::renderer::material::MaterialUploadRequest;
 use crate::renderer::VulkanRenderer;
 use crate::simulation::{PhysicsWorld, SimulationClock};
-use crate::renderer::frame_input::RenderDebugFlags;
-use crate::renderer::material::MaterialShaderMode;
 use crate::tracking::{
     CameraBackend, TrackingCalibration, TrackingSmoothingParams, TrackingSource, TrackingWorker,
 };
-
-// ---------------------------------------------------------------------------
-// Render Command (prepared for future render-thread separation)
-// ---------------------------------------------------------------------------
-
-/// Commands that can be submitted to the render subsystem.
-///
-/// These variants are not yet dispatched at runtime. They exist to define the
-/// interface contract for the planned render-thread separation, where commands
-/// will be sent to a dedicated render thread via a bounded channel. Until that
-/// work lands, the renderer is invoked synchronously inside `run_frame()`.
-#[allow(dead_code)]
-pub enum RenderCommand {
-    /// Render a complete frame from the given snapshot.
-    RenderFrame(RenderFrameInput),
-    /// Resize the swapchain / render targets.
-    Resize(u32, u32),
-    /// Shut down the renderer and release GPU resources.
-    Shutdown,
-}
 
 /// All per-frame parameters passed from the GUI to `run_frame()`.
 #[derive(Clone, Debug)]
@@ -104,58 +92,96 @@ impl Default for ViewportCamera {
 }
 
 pub struct Application {
-    pub renderer: VulkanRenderer,
+    pub render_thread: Option<RenderThread>,
     pub physics: PhysicsWorld,
     pub tracking: TrackingSource,
     pub tracking_calibration: TrackingCalibration,
     pub output: OutputRouter,
     pub sim_clock: SimulationClock,
     pub editor: EditorSession,
+    pub avatars: Vec<AvatarInstance>,
+    pub active_avatar_index: usize,
+    /// Backward-compatible accessor: same as `self.avatar` was.
+    /// Returns `None` when `avatars` is empty.
     pub avatar: Option<AvatarInstance>,
     pub next_avatar_instance_id: u64,
     pub running: bool,
+    pub avatar_library: avatar_library::AvatarLibrary,
 
-    /// The most recent tracking pose received from the tracking worker.
-    /// Stored here for GUI inspector display (timestamp, confidence bars).
     pub last_tracking_pose: Option<crate::tracking::TrackingRigPose>,
 
-    // Viewport integration: rendered pixel readback (Arc-wrapped to share
-    // with the output pipeline without copying ~8 MB per frame at 1080p)
     rendered_pixels: Option<Arc<Vec<u8>>>,
     rendered_extent: [u32; 2],
     rendered_frame_counter: u64,
 
-    // Viewport size requested by the GUI
     viewport_extent: [u32; 2],
 
-    // Camera state driven by GUI viewport controls
     pub viewport_camera: ViewportCamera,
-
-    // Lighting state driven by GUI
     pub viewport_lighting: LightingState,
-
-    // Output resolution preference (may differ from viewport extent)
     pub output_extent: Option<[u32; 2]>,
 
-    // Worker threads
     pub tracking_worker: Option<TrackingWorker>,
-    /// Set to true after `shutdown()` has been called to prevent double-shutdown.
     shutdown_complete: bool,
+    pub viewport_background: Option<std::path::PathBuf>,
+    pub ground_grid_visible: bool,
 }
 
 impl Application {
+    /// Get a reference to the active avatar (the one at `active_avatar_index`).
+    pub fn active_avatar(&self) -> Option<&AvatarInstance> {
+        self.avatars.get(self.active_avatar_index)
+    }
+
+    /// Get a mutable reference to the active avatar.
+    pub fn active_avatar_mut(&mut self) -> Option<&mut AvatarInstance> {
+        self.avatars.get_mut(self.active_avatar_index)
+    }
+
+    /// Add an avatar instance to the multi-avatar list and make it active.
+    /// Also updates the backward-compatible `avatar` field.
+    pub fn add_avatar(&mut self, instance: AvatarInstance) {
+        self.active_avatar_index = self.avatars.len();
+        self.avatar = Some(instance.clone());
+        self.avatars.push(instance);
+    }
+
+    /// Remove the avatar at the given index. Adjusts `active_avatar_index`
+    /// and the backward-compatible `avatar` field.
+    pub fn remove_avatar_at(&mut self, index: usize) {
+        if index < self.avatars.len() {
+            self.avatars.remove(index);
+            if self.avatars.is_empty() {
+                self.active_avatar_index = 0;
+                self.avatar = None;
+            } else {
+                if self.active_avatar_index >= self.avatars.len() {
+                    self.active_avatar_index = self.avatars.len() - 1;
+                }
+                self.avatar = Some(self.avatars[self.active_avatar_index].clone());
+            }
+        }
+    }
+
+    /// Sync the backward-compatible `avatar` field from the multi-avatar list.
+    fn sync_avatar_compat(&mut self) {
+        self.avatar = self.avatars.get(self.active_avatar_index).cloned();
+    }
+
     pub fn new() -> Self {
         Self {
-            renderer: VulkanRenderer::new(),
+            render_thread: None,
             physics: PhysicsWorld::new(),
             tracking: TrackingSource::new(),
             tracking_calibration: TrackingCalibration::default(),
             output: OutputRouter::new(FrameSink::SharedMemory),
             sim_clock: SimulationClock::new(1.0 / 60.0, 8),
             editor: EditorSession::new(),
+            avatars: Vec::new(),
+            active_avatar_index: 0,
             avatar: None,
             next_avatar_instance_id: 1,
             running: false,
+            avatar_library: avatar_library::AvatarLibrary::new(),
             last_tracking_pose: None,
             rendered_pixels: None,
             rendered_extent: [0, 0],
@@ -166,6 +192,8 @@ impl Application {
             output_extent: None,
             tracking_worker: None,
             shutdown_complete: false,
+            viewport_background: None,
+            ground_grid_visible: false,
         }
     }
 
@@ -189,7 +217,10 @@ impl Application {
     }
 
     pub fn bootstrap(&mut self) {
-        self.renderer.initialize();
+        let renderer = VulkanRenderer::new();
+        let rt = RenderThread::new(renderer);
+        self.render_thread = Some(rt);
+        info!("bootstrap: render thread started");
 
         // Try to load a default avatar if present, but continue without one
         // if the file is missing or fails to load.
@@ -201,18 +232,21 @@ impl Application {
                     let instance_id = AvatarInstanceId(self.next_avatar_instance_id);
                     self.next_avatar_instance_id += 1;
                     self.physics.attach_avatar(&asset);
-                    self.avatar = Some(AvatarInstance::new(instance_id, asset));
-                    println!("bootstrap: loaded default avatar from {}", default_path);
+                    self.add_avatar(AvatarInstance::new(instance_id, asset));
+                    info!("bootstrap: loaded default avatar from {}", default_path);
                 }
                 Err(e) => {
-                    eprintln!(
+                    error!(
                         "bootstrap: failed to load default avatar '{}': {} (continuing without avatar)",
                         default_path, e
                     );
                 }
             }
         } else {
-            println!("bootstrap: no default avatar at '{}', starting without avatar", default_path);
+            info!(
+                "bootstrap: no default avatar at '{}', starting without avatar",
+                default_path
+            );
         }
         self.running = true;
 
@@ -223,9 +257,9 @@ impl Application {
         let mut worker = TrackingWorker::new(shared_mailbox);
         worker.start(crate::tracking::CameraBackend::default());
         if worker.is_running() {
-            println!("bootstrap: tracking worker started");
+            info!("bootstrap: tracking worker started");
         } else {
-            eprintln!(
+            warn!(
                 "bootstrap: tracking worker failed to start, falling back to synchronous tracking"
             );
         }
@@ -233,15 +267,15 @@ impl Application {
 
         // The output worker is already running inside OutputRouter (spawned in
         // OutputRouter::new()), so no additional start call is needed here.
-        println!("bootstrap: output worker already running via OutputRouter");
+        info!("bootstrap: output worker already running via OutputRouter");
     }
 
     /// Re-load the currently loaded avatar from its original source path on disk.
     pub fn reload_avatar(&mut self) {
-        let source_path = match self.avatar.as_ref() {
+        let source_path = match self.active_avatar() {
             Some(avatar) => avatar.asset.source_path.clone(),
             None => {
-                eprintln!("reload_avatar: no avatar loaded");
+                warn!("reload_avatar: no avatar loaded");
                 return;
             }
         };
@@ -251,7 +285,7 @@ impl Application {
         let asset = match loader.load(&path_str) {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("reload_avatar: failed to reload '{}': {}", path_str, e);
+                error!("reload_avatar: failed to reload '{}': {}", path_str, e);
                 return;
             }
         };
@@ -260,7 +294,11 @@ impl Application {
         self.next_avatar_instance_id += 1;
 
         self.physics.attach_avatar(&asset);
-        self.avatar = Some(AvatarInstance::new(instance_id, asset));
+        let new_instance = AvatarInstance::new(instance_id, asset);
+        if self.active_avatar_index < self.avatars.len() {
+            self.avatars[self.active_avatar_index] = new_instance.clone();
+        }
+        self.avatar = Some(new_instance);
     }
 
     pub fn run_frame(&mut self, config: &FrameConfig) {
@@ -281,7 +319,7 @@ impl Application {
         // 2. read the latest completed tracking sample from the async tracking worker
         let tracking_sample = if toggles.tracking_enabled {
             if self.tracking.mailbox().is_stale() {
-                eprintln!("tracking: stale sample detected, skipping tracking this frame");
+                warn!("tracking: stale sample detected, skipping tracking this frame");
                 None
             } else {
                 self.step_tracking()
@@ -290,22 +328,20 @@ impl Application {
             None
         };
 
-        if let Some(avatar) = self.avatar.as_mut() {
-            // 3. locomotion or gameplay update
-            // 4. animation sampling
-            // 5. base local pose build
+        // Run simulation on all avatars
+        if let Some(ref tp) = tracking_sample {
+            self.last_tracking_pose = Some(tp.clone());
+        }
+
+        for avatar in self.avatars.iter_mut() {
             avatar.build_base_pose();
 
-            // 6. merge tracking inputs
-            if let Some(mut tracking_pose) = tracking_sample {
-                // Apply calibration before retargeting (M8)
-                self.tracking_calibration
-                    .apply_calibration(&mut tracking_pose);
+            if let Some(ref mut tracking_pose) = tracking_sample.clone() {
+                self.tracking_calibration.apply_calibration(tracking_pose);
 
-                self.last_tracking_pose = Some(tracking_pose.clone());
                 let humanoid = avatar.asset.humanoid.as_ref();
                 retargeting::retarget_tracking_to_pose_filtered(
-                    &tracking_pose,
+                    tracking_pose,
                     &avatar.asset.skeleton,
                     humanoid,
                     &mut avatar.pose.local_transforms,
@@ -314,11 +350,9 @@ impl Application {
                     face_tracking_enabled,
                 );
 
-                // 6b. Retarget expression weights from tracking data.
-                // Only run expression retargeting when face tracking is enabled.
                 if face_tracking_enabled {
                     let new_weights = retargeting::retarget_expressions(
-                        &tracking_pose,
+                        tracking_pose,
                         &avatar.asset.default_expressions,
                         Some(&avatar.expression_weights),
                     );
@@ -326,35 +360,34 @@ impl Application {
                 }
             }
 
-            // 7. compute driven global pose for the body before secondary motion
             avatar.compute_global_pose();
 
-            // 8. fixed-timestep spring bone simulation against that pose
-            // 9. recompute global pose after spring outputs are applied
-            let substeps = self.sim_clock.advance(frame_dt);
-            if toggles.spring_enabled {
-                for _ in 0..substeps {
-                    self.physics.step_springs(self.sim_clock.fixed_dt(), avatar);
-                }
+            if self.physics.rapier_initialized() {
+                self.physics.step_all(frame_dt, avatar);
                 avatar.compute_global_pose();
+            } else {
+                let substeps = self.sim_clock.advance(frame_dt);
+                if toggles.spring_enabled {
+                    self.physics
+                        .step_springs(self.sim_clock.fixed_dt(), substeps, avatar);
+                    avatar.compute_global_pose();
+                }
+
+                if toggles.cloth_enabled && avatar.cloth_enabled {
+                    for _ in 0..substeps {
+                        self.physics.step_cloth(self.sim_clock.fixed_dt(), avatar);
+                    }
+                    avatar.compute_global_pose();
+                }
             }
 
-            // 10. fixed-timestep cloth simulation against the resolved body motion for this frame
-            // 11. recompute final global pose
-            if toggles.cloth_enabled && avatar.cloth_enabled {
-                for _ in 0..substeps {
-                    self.physics.step_cloth(self.sim_clock.fixed_dt(), avatar);
-                }
-                avatar.compute_global_pose();
-            }
-
-            // 12. build skinning matrices
             avatar.build_skinning_matrices();
+        }
 
-            // 13. upload pose buffers
-            // 14. upload optional cloth deformation buffers
+        // Sync backward-compat field
+        self.sync_avatar_compat();
 
-            // 15. build renderer-facing frame snapshot
+        if !self.avatars.is_empty() {
             let output_extent = self.output_extent.unwrap_or(self.viewport_extent);
             let fi_config = FrameInputConfig {
                 camera: self.viewport_camera.clone(),
@@ -362,64 +395,67 @@ impl Application {
                 viewport_extent: self.viewport_extent,
                 output_extent,
             };
-            let frame_input = Self::build_frame_input(
-                avatar,
+            let frame_input = Self::build_frame_input_multi(
+                &self.avatars,
                 &fi_config,
                 toggles,
                 material_mode_index,
             );
 
-            // 16. render
-            let render_result = self.renderer.render(&frame_input);
+            if let Some(ref rt) = self.render_thread {
+                rt.submit(RenderCommand::RenderFrame(frame_input));
+            }
 
-            // 17. Use GPU-rendered pixel data when available; fall back to a
-            //     synthetic placeholder image when the renderer has not yet
-            //     produced real pixels (e.g. during early init or without GPU).
-            let has_gpu_pixels = render_result
-                .exported_frame
-                .as_ref()
-                .map_or(false, |ef| !ef.pixel_data.is_empty());
-
-            if has_gpu_pixels {
-                let exported = render_result.exported_frame.unwrap();
-                // Share the pixel buffer via Arc: one reference for the
-                // viewport display, one for the output pipeline.  This avoids
-                // cloning ~8 MB of RGBA data per frame at 1080p.
-                let pixel_data = exported.pixel_data; // Arc<Vec<u8>>
-                self.rendered_pixels = Some(Arc::clone(&pixel_data));
-                self.rendered_extent = render_result.extent;
-                self.rendered_frame_counter += 1;
-
-                // 18. Construct OutputFrame from raw renderer data (app layer
-                // bridges the renderer and output modules).
-                let mut output_frame = OutputFrame::new(
-                    exported.gpu_token_id,
-                    exported.extent,
-                    exported.timestamp_nanos,
-                );
-                output_frame.pixel_data = Some(pixel_data);
-                self.output.publish(output_frame);
+            let pending_results: Vec<_> = if let Some(ref rt) = self.render_thread {
+                std::iter::from_fn(|| rt.try_recv_result()).collect()
             } else {
-                // No GPU pixels available – clear rendered output so the
-                // viewport shows the placeholder "No GPU output" text instead
-                // of a misleading synthetic gradient.
-                self.rendered_pixels = None;
+                vec![]
+            };
 
-                // 18. Construct and publish output frame without pixel data.
-                if let Some(exported) = render_result.exported_frame {
-                    let output_frame = OutputFrame::new(
-                        exported.gpu_token_id,
-                        exported.extent,
-                        exported.timestamp_nanos,
-                    );
-                    self.output.publish(output_frame);
-                }
+            for result in pending_results {
+                self.process_render_result(result);
             }
         }
     }
 
+    fn process_render_result(&mut self, render_result: crate::renderer::RenderResult) {
+        let Some(exported) = render_result.exported_frame else {
+            self.rendered_pixels = None;
+            return;
+        };
+
+        let mut output_frame = OutputFrame::new(
+            exported.gpu_token_id,
+            exported.extent,
+            exported.timestamp_nanos,
+        );
+
+        output_frame.handoff_path = exported.handoff_path.clone();
+
+        match exported.pixel_data {
+            crate::renderer::output_export::ExportedPixelData::CpuReadback(ref pixel_data)
+                if !pixel_data.is_empty() =>
+            {
+                self.rendered_pixels = Some(Arc::clone(pixel_data));
+                self.rendered_extent = render_result.extent;
+                self.rendered_frame_counter += 1;
+                output_frame.pixel_data = Some(Arc::clone(pixel_data));
+            }
+            crate::renderer::output_export::ExportedPixelData::GpuOwned => {
+                self.rendered_extent = render_result.extent;
+                self.rendered_frame_counter += 1;
+                output_frame.gpu_image = exported.gpu_image.clone();
+            }
+            _ => {
+                self.rendered_pixels = None;
+            }
+        }
+
+        self.output.publish(output_frame);
+    }
+
     /// Build a view matrix from orbital camera parameters (yaw, pitch, distance, pan).
-    fn build_view_matrix(cam: &ViewportCamera) -> crate::asset::Mat4 {
+    fn build_view_matrix(cam: &ViewportCamera) -> (crate::asset::Mat4, [f32; 3]) {
         let yaw = cam.yaw_deg.to_radians();
         let pitch = cam.pitch_deg.to_radians();
         let (sy, cy) = (yaw.sin(), yaw.cos());
@@ -452,17 +488,28 @@ impl Application {
             r[0] * f[1] - r[1] * f[0],
         ];
 
-        [
-            [r[0], u[0], -f[0], 0.0],
-            [r[1], u[1], -f[1], 0.0],
-            [r[2], u[2], -f[2], 0.0],
+        let view_matrix = [
             [
+                r[0],
+                r[1],
+                r[2],
                 -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z),
-                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
-                f[0] * eye_x + f[1] * eye_y + f[2] * eye_z,
-                1.0,
             ],
-        ]
+            [
+                u[0],
+                u[1],
+                u[2],
+                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
+            ],
+            [
+                -f[0],
+                -f[1],
+                -f[2],
+                f[0] * eye_x + f[1] * eye_y + f[2] * eye_z,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        (view_matrix, [eye_x, eye_y, eye_z])
     }
 
     /// Build a perspective projection matrix from FOV (degrees) and aspect ratio.
@@ -474,17 +521,18 @@ impl Application {
     ) -> crate::asset::Mat4 {
         let fov_rad = fov_deg.to_radians();
         let f = 1.0 / (fov_rad * 0.5).tan();
-        let range_inv = 1.0 / (near - far);
+        let a = far / (near - far);
+        let b = far * near / (near - far);
         [
             [f / aspect, 0.0, 0.0, 0.0],
-            [0.0, f, 0.0, 0.0],
-            [0.0, 0.0, (far + near) * range_inv, -1.0],
-            [0.0, 0.0, 2.0 * far * near * range_inv, 0.0],
+            [0.0, -f, 0.0, 0.0],
+            [0.0, 0.0, a, b],
+            [0.0, 0.0, -1.0, 0.0],
         ]
     }
 
-    fn build_frame_input(
-        avatar: &AvatarInstance,
+    fn build_frame_input_multi(
+        avatars: &[AvatarInstance],
         fi_config: &FrameInputConfig,
         toggles: &RuntimeToggles,
         material_mode_index: usize,
@@ -493,99 +541,104 @@ impl Application {
         let lighting = &fi_config.lighting;
         let viewport_extent = fi_config.viewport_extent;
         let output_extent = fi_config.output_extent;
-        let mesh_instances: Vec<RenderMeshInstance> = avatar
-            .asset
-            .meshes
+
+        let instances: Vec<RenderAvatarInstance> = avatars
             .iter()
-            .flat_map(|mesh| {
-                mesh.primitives.iter().map(|prim| {
-                    let material_asset = avatar
-                        .asset
-                        .materials
-                        .iter()
-                        .find(|m| m.id == prim.material_id);
+            .map(|avatar| {
+                let mesh_instances: Vec<RenderMeshInstance> = avatar
+                    .asset
+                    .meshes
+                    .iter()
+                    .flat_map(|mesh| {
+                        mesh.primitives.iter().map(|prim| {
+                            let material_asset = avatar
+                                .asset
+                                .materials
+                                .iter()
+                                .find(|m| m.id == prim.material_id);
 
-                    let material_binding = material_asset
-                        .map(MaterialUploadRequest::from_asset_material)
-                        .unwrap_or_else(|| {
-                            if let Some(m) = avatar.asset.materials.first() {
-                                MaterialUploadRequest::from_asset_material(m)
+                            let material_binding = material_asset
+                                .map(MaterialUploadRequest::from_asset_material)
+                                .unwrap_or_else(|| {
+                                    if let Some(m) = avatar.asset.materials.first() {
+                                        MaterialUploadRequest::from_asset_material(m)
+                                    } else {
+                                        MaterialUploadRequest::default_material()
+                                    }
+                                });
+
+                            let outline = OutlineSnapshot {
+                                enabled: material_binding.outline_width > 0.0,
+                                width: material_binding.outline_width,
+                                color: material_binding.outline_color,
+                            };
+
+                            let alpha_mode = match material_binding.alpha_mode {
+                                crate::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
+                                crate::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
+                                crate::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
+                            };
+
+                            let cull_mode = if material_binding.double_sided {
+                                RenderCullMode::DoubleSided
                             } else {
-                                MaterialUploadRequest::default_material()
+                                RenderCullMode::BackFace
+                            };
+
+                            RenderMeshInstance {
+                                mesh_id: mesh.id,
+                                primitive_id: prim.id,
+                                material_binding,
+                                bounds: prim.bounds.clone(),
+                                alpha_mode,
+                                cull_mode,
+                                outline,
+                                primitive_data: Some(std::sync::Arc::new(prim.clone())),
                             }
-                        });
+                        })
+                    })
+                    .collect();
 
-                    let outline = OutlineSnapshot {
-                        enabled: material_binding.outline_width > 0.0,
-                        width: material_binding.outline_width,
-                        color: material_binding.outline_color,
-                    };
+                let cloth_deform = avatar
+                    .cloth_state
+                    .as_ref()
+                    .or_else(|| {
+                        avatar
+                            .cloth_overlays
+                            .iter()
+                            .find(|s| s.enabled)
+                            .map(|s| &s.state)
+                    })
+                    .map(|cs| ClothDeformSnapshot {
+                        deformed_positions: cs.deform_output.deformed_positions.clone(),
+                        deformed_normals: cs.deform_output.deformed_normals.clone(),
+                        version: cs.deform_output.version,
+                    });
 
-                    let alpha_mode = match material_binding.alpha_mode {
-                        crate::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
-                        crate::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
-                        crate::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
-                    };
-
-                    let cull_mode = if material_binding.double_sided {
-                        RenderCullMode::DoubleSided
-                    } else {
-                        RenderCullMode::BackFace
-                    };
-
-                    RenderMeshInstance {
-                        mesh_id: mesh.id,
-                        primitive_id: prim.id,
-                        material_binding,
-                        bounds: prim.bounds.clone(),
-                        alpha_mode,
-                        cull_mode,
-                        outline,
-                        primitive_data: Some(std::sync::Arc::new(prim.clone())),
-                    }
-                })
+                RenderAvatarInstance {
+                    instance_id: avatar.id,
+                    world_transform: avatar.world_transform.clone(),
+                    mesh_instances,
+                    skinning_matrices: avatar.pose.skinning_matrices.clone(),
+                    cloth_deform,
+                    debug_flags: RenderDebugFlags {
+                        show_skeleton: toggles.skeleton_debug,
+                        show_colliders: toggles.collision_debug,
+                        show_cloth_mesh: toggles.cloth_enabled,
+                        show_normals: false,
+                        material_mode_override: Some(match material_mode_index {
+                            0 => MaterialShaderMode::Unlit,
+                            1 => MaterialShaderMode::SimpleLit,
+                            _ => MaterialShaderMode::ToonLike,
+                        }),
+                    },
+                }
             })
             .collect();
 
-        let cloth_deform = avatar.cloth_state.as_ref().map(|cs| ClothDeformSnapshot {
-            deformed_positions: cs.deform_output.deformed_positions.clone(),
-            deformed_normals: cs.deform_output.deformed_normals.clone(),
-            version: cs.deform_output.version,
-        });
-
-        let render_instance = RenderAvatarInstance {
-            instance_id: avatar.id,
-            world_transform: avatar.world_transform.clone(),
-            mesh_instances,
-            skinning_matrices: avatar.pose.skinning_matrices.clone(),
-            cloth_deform,
-            debug_flags: RenderDebugFlags {
-                show_skeleton: toggles.skeleton_debug,
-                show_colliders: toggles.collision_debug,
-                show_cloth_mesh: toggles.cloth_enabled,
-                show_normals: false,
-                material_mode_override: Some(match material_mode_index {
-                    0 => MaterialShaderMode::Unlit,
-                    1 => MaterialShaderMode::SimpleLit,
-                    _ => MaterialShaderMode::ToonLike,
-                }),
-            },
-        };
-
-        // Build camera matrices from the viewport camera parameters.
-        let aspect = viewport_extent[0] as f32 / viewport_extent[1].max(1) as f32;
-        let view = Self::build_view_matrix(cam);
+        let aspect = output_extent[0] as f32 / output_extent[1].max(1) as f32;
+        let (view, eye_pos) = Self::build_view_matrix(cam);
         let projection = Self::build_projection_matrix(cam.fov_deg, aspect, 0.1, 1000.0);
-
-        let yaw = cam.yaw_deg.to_radians();
-        let pitch = cam.pitch_deg.to_radians();
-        let (sy, cy) = (yaw.sin(), yaw.cos());
-        let (sp, cp) = (pitch.sin(), pitch.cos());
-        let eye_pos = [
-            cam.distance * cp * sy + cam.pan[0],
-            cam.distance * sp + cam.pan[1],
-            cam.distance * cp * cy,
-        ];
 
         RenderFrameInput {
             camera: CameraState {
@@ -595,7 +648,7 @@ impl Application {
                 viewport_extent,
             },
             lighting: lighting.clone(),
-            instances: vec![render_instance],
+            instances,
             output_request: OutputTargetRequest {
                 preview_enabled: true,
                 output_enabled: true,
@@ -604,6 +657,8 @@ impl Application {
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: RenderExportMode::CpuReadback,
             },
+            background_image_path: None,
+            show_ground_grid: false,
         }
     }
 
@@ -639,7 +694,7 @@ impl Application {
         } else {
             // Fallback: synchronous capture on the app thread.
             let frame = self.tracking.sample();
-            println!(
+            info!(
                 "tracking: frame {} body_conf={:.2} face_conf={:.2}",
                 frame.capture_timestamp, frame.body_confidence, frame.face_confidence
             );
@@ -660,7 +715,7 @@ impl Application {
         self.start_tracking_with_params(backend, 640, 480, 30);
     }
 
-    /// Like [`start_tracking`] but allows specifying the webcam resolution and fps.
+    /// Like [`Self::start_tracking`] but allows specifying the webcam resolution and fps.
     pub fn start_tracking_with_params(
         &mut self,
         backend: CameraBackend,
@@ -678,9 +733,9 @@ impl Application {
         let mut worker = TrackingWorker::new(shared_mailbox);
         worker.start_with_params(backend, width, height, fps);
         if worker.is_running() {
-            println!("app: tracking worker started");
+            info!("app: tracking worker started");
         } else {
-            eprintln!("app: tracking worker failed to start");
+            warn!("app: tracking worker failed to start");
         }
         self.tracking_worker = Some(worker);
     }
@@ -689,7 +744,7 @@ impl Application {
     pub fn stop_tracking(&mut self) {
         if let Some(ref mut worker) = self.tracking_worker {
             worker.stop();
-            println!("app: tracking worker stopped");
+            info!("app: tracking worker stopped");
         }
     }
 
@@ -707,13 +762,13 @@ impl Application {
             return;
         }
 
-        println!("app: shutdown starting");
+        info!("app: shutdown starting");
 
         // 1. Stop the tracking worker so no new tracking data arrives.
         if let Some(ref mut worker) = self.tracking_worker {
-            println!("app: stopping tracking worker...");
+            info!("app: stopping tracking worker...");
             worker.stop();
-            println!("app: tracking worker stopped");
+            info!("app: tracking worker stopped");
         }
 
         // 2. Mark application as no longer running (prevents run_frame from
@@ -722,15 +777,36 @@ impl Application {
 
         // 3. Shut down the output router, which drains remaining frames and
         //    joins the output worker thread.
-        println!("app: stopping output worker...");
+        info!("app: stopping output worker...");
         self.output.shutdown();
-        println!("app: output worker stopped");
+        info!("app: output worker stopped");
 
-        // 4. Renderer resources are released when `self.renderer` is dropped
-        //    (Rust's natural drop order handles this after shutdown returns).
+        // 4. Shut down the render thread, which drains pending work and
+        //    releases GPU resources.
+        if let Some(ref mut rt) = self.render_thread {
+            info!("app: stopping render thread...");
+            rt.shutdown();
+            info!("app: render thread stopped");
+        }
 
         self.shutdown_complete = true;
-        println!("app: shutdown complete");
+        info!("app: shutdown complete");
+    }
+
+    pub fn snap_avatar_to_ground(&mut self) {
+        if let Some(avatar) = self.active_avatar_mut() {
+            let current_y = avatar.world_transform.translation[1];
+            avatar.world_transform.translation[1] = 0.0;
+            info!("ground-align: snapped avatar from y={} to y=0.0", current_y);
+        }
+    }
+
+    pub fn set_background_image(&mut self, path: Option<std::path::PathBuf>) {
+        self.viewport_background = path;
+    }
+
+    pub fn set_ground_grid_visible(&mut self, visible: bool) {
+        self.ground_grid_visible = visible;
     }
 }
 
@@ -739,5 +815,454 @@ impl Drop for Application {
         if !self.shutdown_complete {
             self.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mat4_mul_vec4(m: &crate::asset::Mat4, v: [f32; 4]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for row in 0..4 {
+            for col in 0..4 {
+                out[row] += m[row][col] * v[col];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn projection_maps_near_plane_to_zero() {
+        let proj = Application::build_projection_matrix(60.0, 16.0 / 9.0, 0.1, 1000.0);
+        let point = [0.0, 0.0, -0.1, 1.0];
+        let clip = mat4_mul_vec4(&proj, point);
+        assert!(
+            clip[3].abs() > 0.001,
+            "w_clip should be nonzero, got {}",
+            clip[3]
+        );
+        let ndc_z = clip[2] / clip[3];
+        assert!(
+            ndc_z >= -0.01 && ndc_z <= 0.01,
+            "near plane should map to z_ndc=0, got z_ndc={}",
+            ndc_z
+        );
+    }
+
+    #[test]
+    fn projection_maps_far_plane_to_one() {
+        let proj = Application::build_projection_matrix(60.0, 16.0 / 9.0, 0.1, 1000.0);
+        let point = [0.0, 0.0, -1000.0, 1.0];
+        let clip = mat4_mul_vec4(&proj, point);
+        assert!(clip[3].abs() > 0.001, "w_clip should be nonzero");
+        let ndc_z = clip[2] / clip[3];
+        assert!(
+            ndc_z >= 0.99 && ndc_z <= 1.01,
+            "far plane should map to z_ndc=1, got z_ndc={}",
+            ndc_z
+        );
+    }
+
+    #[test]
+    fn projection_avatar_in_front_of_camera_is_visible() {
+        let cam = ViewportCamera::default();
+        let (view, eye) = Application::build_view_matrix(&cam);
+        let proj = Application::build_projection_matrix(cam.fov_deg, 16.0 / 9.0, 0.1, 1000.0);
+
+        let world_point = [0.0, 1.0, 0.0, 1.0];
+        let view_point = mat4_mul_vec4(&view, world_point);
+        let clip = mat4_mul_vec4(&proj, view_point);
+
+        assert!(
+            clip[3] > 0.0,
+            "w_clip must be positive for visible geometry, got w={}",
+            clip[3]
+        );
+        let ndc_z = clip[2] / clip[3];
+        assert!(
+            ndc_z >= 0.0 && ndc_z <= 1.0,
+            "avatar at origin should be in Vulkan clip range [0,1], got z_ndc={} (eye={:?}, view_pt={:?}, clip={:?})",
+            ndc_z, eye, view_point, clip
+        );
+    }
+
+    #[test]
+    fn view_matrix_looks_toward_origin() {
+        let cam = ViewportCamera {
+            yaw_deg: 0.0,
+            pitch_deg: 0.0,
+            distance: 5.0,
+            pan: [0.0, 0.0],
+            fov_deg: 60.0,
+        };
+        let (view, eye) = Application::build_view_matrix(&cam);
+        assert!(
+            eye[2] > 4.0,
+            "camera at yaw=0 should be in +Z, got eye={:?}",
+            eye
+        );
+        let origin_view = mat4_mul_vec4(&view, [0.0, 0.0, 0.0, 1.0]);
+        assert!(
+            origin_view[2] < 0.0,
+            "origin should be at negative z in view space, got z={}",
+            origin_view[2]
+        );
+    }
+
+    fn make_test_avatar() -> AvatarInstance {
+        use crate::asset::*;
+        let skeleton = SkeletonAsset {
+            nodes: vec![SkeletonNode {
+                id: NodeId(0),
+                name: "root".into(),
+                parent: None,
+                children: vec![],
+                rest_local: Transform::default(),
+                humanoid_bone: None,
+            }],
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: vec![identity_matrix()],
+        };
+
+        let verts = VertexData {
+            positions: vec![[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![[0.0, 0.0]; 3],
+            joint_indices: vec![[0, 0, 0, 0]; 3],
+            joint_weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+        };
+
+        let prim = MeshPrimitiveAsset {
+            id: PrimitiveId(0),
+            vertex_count: 3,
+            index_count: 3,
+            material_id: MaterialId(0),
+            skin: Some(SkinBinding {
+                joint_nodes: vec![NodeId(0)],
+                inverse_bind_matrices: vec![identity_matrix()],
+            }),
+            bounds: Aabb {
+                min: [-0.5, 0.0, 0.0],
+                max: [0.5, 1.0, 0.0],
+            },
+            vertices: Some(verts),
+            indices: Some(vec![0, 1, 2]),
+        };
+
+        let mesh = MeshAsset {
+            id: MeshId(0),
+            name: "test_mesh".into(),
+            primitives: vec![prim],
+        };
+
+        let asset = Arc::new(AvatarAsset {
+            id: AvatarAssetId(0),
+            source_path: std::path::PathBuf::from("test.vrm"),
+            source_hash: AssetSourceHash([0u8; 32]),
+            skeleton,
+            meshes: vec![mesh],
+            materials: vec![],
+            humanoid: None,
+            spring_bones: vec![],
+            colliders: vec![],
+            default_expressions: ExpressionAssetSet {
+                expressions: vec![],
+            },
+            animation_clips: vec![],
+        });
+
+        let mut inst = AvatarInstance::new(AvatarInstanceId(1), asset);
+        inst.build_base_pose();
+        inst.compute_global_pose();
+        inst.build_skinning_matrices();
+        inst
+    }
+
+    struct Ray {
+        origin: [f32; 3],
+        dir: [f32; 3],
+    }
+
+    struct RayHit {
+        t: f32,
+        point: [f32; 3],
+        normal: [f32; 3],
+    }
+
+    fn ray_triangle_intersect(ray: &Ray, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> Option<f32> {
+        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+        let h = [
+            ray.dir[1] * e2[2] - ray.dir[2] * e2[1],
+            ray.dir[2] * e2[0] - ray.dir[0] * e2[2],
+            ray.dir[0] * e2[1] - ray.dir[1] * e2[0],
+        ];
+        let a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+        if a.abs() < 1e-8 {
+            return None;
+        }
+        let f = 1.0 / a;
+        let s = [
+            ray.origin[0] - v0[0],
+            ray.origin[1] - v0[1],
+            ray.origin[2] - v0[2],
+        ];
+        let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+        if u < 0.0 || u > 1.0 {
+            return None;
+        }
+        let q = [
+            s[1] * e1[2] - s[2] * e1[1],
+            s[2] * e1[0] - s[0] * e1[2],
+            s[0] * e1[1] - s[1] * e1[0],
+        ];
+        let v = f * (ray.dir[0] * q[0] + ray.dir[1] * q[1] + ray.dir[2] * q[2]);
+        if v < 0.0 || u + v > 1.0 {
+            return None;
+        }
+        let t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]);
+        if t > 1e-6 {
+            Some(t)
+        } else {
+            None
+        }
+    }
+
+    fn ray_cast_avatar(ray: &Ray, avatar: &AvatarInstance) -> Option<RayHit> {
+        let mut best: Option<RayHit> = None;
+        let skin_mats = &avatar.pose.skinning_matrices;
+        for mesh in &avatar.asset.meshes {
+            for prim in &mesh.primitives {
+                if let Some(ref vd) = prim.vertices {
+                    let indices = prim.indices.as_deref().unwrap_or(&[]);
+                    for tri in indices.chunks(3) {
+                        if tri.len() < 3 {
+                            continue;
+                        }
+                        let apply_skin = |idx: usize| -> [f32; 3] {
+                            let p = vd.positions[idx];
+                            let ji = vd.joint_indices[idx];
+                            let jw = vd.joint_weights[idx];
+                            let total = jw[0] + jw[1] + jw[2] + jw[3];
+                            if total < 0.001 {
+                                return p;
+                            }
+                            let mut out = [0.0f32; 3];
+                            for j in 0..4 {
+                                if jw[j] < 0.001 {
+                                    continue;
+                                }
+                                let mat = skin_mats
+                                    .get(ji[j] as usize)
+                                    .copied()
+                                    .unwrap_or_else(|| crate::asset::identity_matrix());
+                                let w = p[0] * mat[0][0]
+                                    + p[1] * mat[1][0]
+                                    + p[2] * mat[2][0]
+                                    + mat[3][0];
+                                let x = p[0] * mat[0][1]
+                                    + p[1] * mat[1][1]
+                                    + p[2] * mat[2][1]
+                                    + mat[3][1];
+                                let y = p[0] * mat[0][2]
+                                    + p[1] * mat[1][2]
+                                    + p[2] * mat[2][2]
+                                    + mat[3][2];
+                                out[0] += jw[j] * w;
+                                out[1] += jw[j] * x;
+                                out[2] += jw[j] * y;
+                            }
+                            out
+                        };
+                        let v0 = apply_skin(tri[0] as usize);
+                        let v1 = apply_skin(tri[1] as usize);
+                        let v2 = apply_skin(tri[2] as usize);
+                        if let Some(t) = ray_triangle_intersect(ray, v0, v1, v2) {
+                            if best.as_ref().map_or(true, |b| t < b.t) {
+                                let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                                let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                                let n = [
+                                    e1[1] * e2[2] - e1[2] * e2[1],
+                                    e1[2] * e2[0] - e1[0] * e2[2],
+                                    e1[0] * e2[1] - e1[1] * e2[0],
+                                ];
+                                let pt = [
+                                    ray.origin[0] + t * ray.dir[0],
+                                    ray.origin[1] + t * ray.dir[1],
+                                    ray.origin[2] + t * ray.dir[2],
+                                ];
+                                best = Some(RayHit {
+                                    t,
+                                    point: pt,
+                                    normal: n,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn ndc_from_world(
+        world: [f32; 3],
+        view: &crate::asset::Mat4,
+        proj: &crate::asset::Mat4,
+    ) -> [f32; 3] {
+        let v = mat4_mul_vec4(view, [world[0], world[1], world[2], 1.0]);
+        let c = mat4_mul_vec4(proj, v);
+        let w = c[3];
+        if w.abs() < 1e-8 {
+            return [f32::NAN; 3];
+        }
+        [c[0] / w, c[1] / w, c[2] / w]
+    }
+
+    #[test]
+    fn ray_cast_center_hits_test_avatar() {
+        let avatar = make_test_avatar();
+        let cam = ViewportCamera::default();
+        let (view, eye) = Application::build_view_matrix(&cam);
+
+        let target = [0.0, 0.5, 0.0];
+        let dx = target[0] - eye[0];
+        let dy = target[1] - eye[1];
+        let dz = target[2] - eye[2];
+        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+        let ray = Ray {
+            origin: eye,
+            dir: [dx / len, dy / len, dz / len],
+        };
+
+        let hit = ray_cast_avatar(&ray, &avatar).expect("center ray should hit the test triangle");
+        assert!(hit.t > 0.0, "hit t should be positive, got {}", hit.t);
+
+        let ndc = ndc_from_world(
+            hit.point,
+            &view,
+            &Application::build_projection_matrix(cam.fov_deg, 16.0 / 9.0, 0.1, 1000.0),
+        );
+        assert!(
+            ndc[0] >= -1.0 && ndc[0] <= 1.0,
+            "hit NDC x out of range: {}",
+            ndc[0]
+        );
+        assert!(
+            ndc[1] >= -1.0 && ndc[1] <= 1.0,
+            "hit NDC y out of range: {}",
+            ndc[1]
+        );
+        assert!(
+            ndc[2] >= 0.0 && ndc[2] <= 1.0,
+            "hit NDC z out of Vulkan range [0,1]: {}",
+            ndc[2]
+        );
+    }
+
+    #[test]
+    fn ray_cast_sweep_viewport_corners() {
+        let avatar = make_test_avatar();
+        let cam = ViewportCamera {
+            distance: 3.0,
+            ..ViewportCamera::default()
+        };
+        let (view, eye) = Application::build_view_matrix(&cam);
+        let proj = Application::build_projection_matrix(cam.fov_deg, 16.0 / 9.0, 0.1, 1000.0);
+
+        let fov_rad = cam.fov_deg.to_radians();
+        let half_fov = fov_rad * 0.5;
+        let aspect = 16.0 / 9.0;
+        let tan_h = half_fov.tan();
+        let tan_w = tan_h * aspect;
+        let fwd = [0.0 - eye[0], 0.0 - eye[1], 0.0 - eye[2]];
+        let flen = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt();
+        let fwd = [fwd[0] / flen, fwd[1] / flen, fwd[2] / flen];
+
+        let right = [fwd[2], 0.0, -fwd[0]];
+        let rlen = (right[0] * right[0] + right[1] * right[1] + right[2] * right[2]).sqrt();
+        let right = [right[0] / rlen, right[1] / rlen, right[2] / rlen];
+        let up = [
+            right[1] * fwd[2] - right[2] * fwd[1],
+            right[2] * fwd[0] - right[0] * fwd[2],
+            right[0] * fwd[1] - right[1] * fwd[0],
+        ];
+
+        let mut hits = 0usize;
+        let mut visible_ndc = 0usize;
+        for &(sx, sy) in &[
+            (0.0f32, 0.0),
+            (0.3, 0.0),
+            (-0.3, 0.0),
+            (0.0, 0.3),
+            (0.0, -0.3),
+        ] {
+            let dx = fwd[0] + sx * tan_w * right[0] + sy * tan_h * up[0];
+            let dy = fwd[1] + sx * tan_w * right[1] + sy * tan_h * up[1];
+            let dz = fwd[2] + sx * tan_w * right[2] + sy * tan_h * up[2];
+            let dl = (dx * dx + dy * dy + dz * dz).sqrt();
+            let ray = Ray {
+                origin: eye,
+                dir: [dx / dl, dy / dl, dz / dl],
+            };
+            if let Some(hit) = ray_cast_avatar(&ray, &avatar) {
+                hits += 1;
+                let ndc = ndc_from_world(hit.point, &view, &proj);
+                if ndc[0] >= -1.0
+                    && ndc[0] <= 1.0
+                    && ndc[1] >= -1.0
+                    && ndc[1] <= 1.0
+                    && ndc[2] >= 0.0
+                    && ndc[2] <= 1.0
+                {
+                    visible_ndc += 1;
+                }
+            }
+        }
+        assert!(hits > 0, "at least one sweep ray should hit the avatar");
+        assert!(
+            visible_ndc > 0,
+            "at least one hit should be in Vulkan NDC range, got {}/{} hits visible",
+            visible_ndc,
+            hits
+        );
+    }
+
+    #[test]
+    fn ray_cast_aabb_frustum_culling() {
+        let _avatar = make_test_avatar();
+        let cam = ViewportCamera::default();
+        let (view, _eye) = Application::build_view_matrix(&cam);
+        let proj = Application::build_projection_matrix(cam.fov_deg, 16.0 / 9.0, 0.1, 1000.0);
+
+        let mut inside_count = 0;
+        let corners = [
+            [-0.5, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [-0.5, 1.0, 0.0],
+            [0.5, 1.0, 0.0],
+            [-0.5, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [-0.5, 1.0, 0.0],
+            [0.5, 1.0, 0.0],
+        ];
+        for &c in &corners {
+            let ndc = ndc_from_world(c, &view, &proj);
+            if ndc[0] >= -1.0
+                && ndc[0] <= 1.0
+                && ndc[1] >= -1.0
+                && ndc[1] <= 1.0
+                && ndc[2] >= 0.0
+                && ndc[2] <= 1.0
+            {
+                inside_count += 1;
+            }
+        }
+        assert!(
+            inside_count >= 4,
+            "AABB corners should be inside frustum: {}/8 corners visible",
+            inside_count
+        );
     }
 }

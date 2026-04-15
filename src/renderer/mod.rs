@@ -1,12 +1,20 @@
+#![allow(dead_code)]
+
 pub mod debug;
 pub mod frame_input;
+pub mod frame_pool;
+pub mod gpu_handle;
 pub mod material;
 pub mod mtoon;
 pub mod output_export;
 pub mod pipeline;
+pub mod targets;
+pub mod thumbnail;
+pub mod upload;
 
 use crate::asset::{MeshId, MeshPrimitiveAsset, PrimitiveId, VertexData};
 use frame_input::{ClothDeformSnapshot, RenderFrameInput};
+use log::{info, warn};
 use output_export::OutputExporter;
 use pipeline::GpuVertex;
 use std::collections::HashMap;
@@ -14,8 +22,8 @@ use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, RenderPassBeginInfo,
-    SubpassBeginInfo, SubpassContents, SubpassEndInfo,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageToBufferInfo,
+    RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
@@ -89,6 +97,16 @@ pub struct VulkanRenderer {
     offscreen_depth_view: Option<Arc<ImageView>>,
     offscreen_framebuffer: Option<Arc<Framebuffer>>,
     current_extent: [u32; 2],
+    camera_ring: Option<CameraRing>,
+    thumb_cache: Option<ThumbnailCache>,
+}
+
+struct ThumbnailCache {
+    extent: [u32; 2],
+    pipeline: Arc<GraphicsPipeline>,
+    framebuffer: Arc<Framebuffer>,
+    color_image: Arc<Image>,
+    readback_buffer: Subbuffer<[u8]>,
 }
 
 impl VulkanRenderer {
@@ -120,6 +138,8 @@ impl VulkanRenderer {
             offscreen_depth_view: None,
             offscreen_framebuffer: None,
             current_extent: [1920, 1080],
+            camera_ring: None,
+            thumb_cache: None,
         }
     }
 
@@ -134,13 +154,14 @@ impl VulkanRenderer {
         )
         .expect("failed to create Vulkan instance");
 
-        let device_extensions = DeviceExtensions {
+        let minimal_extensions = DeviceExtensions {
             ..DeviceExtensions::empty()
         };
+
         let (physical_device, queue_family_index) = instance
             .enumerate_physical_devices()
             .expect("failed to enumerate physical devices")
-            .filter(|p| p.supported_extensions().contains(&device_extensions))
+            .filter(|p| p.supported_extensions().contains(&minimal_extensions))
             .filter_map(|p| {
                 p.queue_family_properties()
                     .iter()
@@ -157,11 +178,34 @@ impl VulkanRenderer {
             })
             .expect("no suitable physical device found");
 
-        println!(
+        info!(
             "renderer: selected device: {} ({:?})",
             physical_device.properties().device_name,
             physical_device.properties().device_type,
         );
+
+        let mut device_extensions = DeviceExtensions {
+            ..DeviceExtensions::empty()
+        };
+
+        let physical_device_exts = physical_device.supported_extensions();
+        if physical_device_exts.khr_external_memory {
+            device_extensions.khr_external_memory = true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if physical_device_exts.khr_external_memory_win32 {
+                device_extensions.khr_external_memory_win32 = true;
+            }
+        }
+
+        if device_extensions.khr_external_memory {
+            info!("renderer: enabled VK_KHR_external_memory");
+        }
+        #[cfg(target_os = "windows")]
+        if device_extensions.khr_external_memory_win32 {
+            info!("renderer: enabled VK_KHR_external_memory_win32");
+        }
 
         let (device, mut queues) = Device::new(
             physical_device,
@@ -224,25 +268,28 @@ impl VulkanRenderer {
             render_pass.clone(),
             viewport.clone(),
             CullMode::Back,
-        );
+        )
+        .expect("failed to create graphics pipeline");
 
         let no_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::None,
-        );
+        )
+        .expect("failed to create no-cull pipeline");
+
         let front_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::Front,
-        );
-        let outline_pipeline = pipeline::create_outline_pipeline(
-            device.clone(),
-            render_pass.clone(),
-            viewport,
-        );
+        )
+        .expect("failed to create front-cull pipeline");
+
+        let outline_pipeline =
+            pipeline::create_outline_pipeline(device.clone(), render_pass.clone(), viewport)
+                .expect("failed to create outline pipeline");
 
         let (color_img, color_view, depth_img, depth_view, framebuffer) =
             Self::create_offscreen_targets(
@@ -272,14 +319,14 @@ impl VulkanRenderer {
 
         self.device = Some(device);
         self.queue = Some(queue);
-        self.memory_allocator = Some(memory_allocator);
+        self.memory_allocator = Some(memory_allocator.clone());
         self.command_buffer_allocator = Some(command_buffer_allocator);
-        self.descriptor_set_allocator = Some(descriptor_set_allocator);
+        self.descriptor_set_allocator = Some(descriptor_set_allocator.clone());
         self.render_pass = Some(render_pass);
         self.graphics_pipeline = Some(gfx_pipeline.clone());
         self.pipeline_no_cull = Some(no_cull_pipeline);
         self.pipeline_front_cull = Some(front_cull_pipeline);
-        self.outline_pipeline = Some(outline_pipeline);
+        self.outline_pipeline = Some(outline_pipeline.clone());
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
         self.offscreen_color = Some(color_img);
@@ -291,27 +338,42 @@ impl VulkanRenderer {
         self.active_pipeline = Some(pipeline::PipelineState {
             active_pipeline: pipeline::RenderPipeline::SkinningUnlit,
             initialized: true,
-            graphics_pipeline: Some(gfx_pipeline),
+            graphics_pipeline: Some(gfx_pipeline.clone()),
         });
 
+        self.camera_ring = Some(CameraRing::new(
+            &memory_allocator,
+            &descriptor_set_allocator,
+            &gfx_pipeline,
+            &outline_pipeline,
+        ));
+
         self.initialized = true;
-        println!("renderer: initialized with Vulkano");
+        info!("renderer: initialized with Vulkano");
     }
 
-    pub fn resize(&mut self, new_extent: [u32; 2]) {
+    pub fn resize(&mut self, new_extent: [u32; 2]) -> Result<(), String> {
         if !self.initialized {
-            return;
+            return Ok(());
         }
         if new_extent == self.current_extent {
-            return;
+            return Ok(());
         }
         if new_extent[0] == 0 || new_extent[1] == 0 {
-            return;
+            return Ok(());
         }
 
-        let device = self.device.as_ref().unwrap().clone();
-        let memory_allocator = self.memory_allocator.as_ref().unwrap().clone();
-        let render_pass = self.render_pass.as_ref().unwrap().clone();
+        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
+        let memory_allocator = self
+            .memory_allocator
+            .as_ref()
+            .ok_or("renderer: no memory allocator")?
+            .clone();
+        let render_pass = self
+            .render_pass
+            .as_ref()
+            .ok_or("renderer: no render pass")?
+            .clone();
 
         let (color_img, color_view, depth_img, depth_view, framebuffer) =
             Self::create_offscreen_targets(
@@ -332,22 +394,27 @@ impl VulkanRenderer {
             render_pass.clone(),
             viewport.clone(),
             CullMode::Back,
-        );
+        )
+        .map_err(|e| format!("resize: failed to create graphics pipeline: {e}"))?;
 
         let no_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::None,
-        );
+        )
+        .map_err(|e| format!("resize: failed to create no-cull pipeline: {e}"))?;
+
         let front_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::Front,
-        );
-        let outline_pipeline =
-            pipeline::create_outline_pipeline(device, render_pass, viewport);
+        )
+        .map_err(|e| format!("resize: failed to create front-cull pipeline: {e}"))?;
+
+        let outline_pipeline = pipeline::create_outline_pipeline(device, render_pass, viewport)
+            .map_err(|e| format!("resize: failed to create outline pipeline: {e}"))?;
 
         self.offscreen_color = Some(color_img);
         self.offscreen_color_view = Some(color_view);
@@ -357,29 +424,37 @@ impl VulkanRenderer {
         self.graphics_pipeline = Some(gfx_pipeline.clone());
         self.pipeline_no_cull = Some(no_cull_pipeline);
         self.pipeline_front_cull = Some(front_cull_pipeline);
-        self.outline_pipeline = Some(outline_pipeline);
+        self.outline_pipeline = Some(outline_pipeline.clone());
         self.current_extent = new_extent;
+
+        if let (Some(ma), Some(dsa)) = (&self.memory_allocator, &self.descriptor_set_allocator) {
+            self.camera_ring = Some(CameraRing::new(ma, dsa, &gfx_pipeline, &outline_pipeline));
+        }
 
         if let Some(ref mut ps) = self.active_pipeline {
             ps.graphics_pipeline = Some(gfx_pipeline);
         }
 
-        println!(
-            "renderer: resized to {}x{}",
-            new_extent[0], new_extent[1]
-        );
+        info!("renderer: resized to {}x{}", new_extent[0], new_extent[1]);
+        Ok(())
     }
 
-    pub fn render(&mut self, input: &RenderFrameInput) -> RenderResult {
+    pub fn clear_caches(&mut self) {
+        self.texture_cache.clear();
+        self.mesh_cache.clear();
+        self.material_uploader.clear_cache();
+    }
+
+    pub fn render(&mut self, input: &RenderFrameInput) -> Result<RenderResult, String> {
         if !self.initialized {
-            eprintln!("renderer: skipped because Vulkan is not initialized");
-            return RenderResult {
+            warn!("renderer: skipped because Vulkan is not initialized");
+            return Ok(RenderResult {
                 extent: [0, 0],
                 timestamp_nanos: 0,
                 has_alpha: false,
                 stats: RenderStats::default(),
                 exported_frame: None,
-            };
+            });
         }
 
         let requested_extent = input.output_request.extent;
@@ -387,20 +462,53 @@ impl VulkanRenderer {
             && requested_extent[0] > 0
             && requested_extent[1] > 0
         {
-            self.resize(requested_extent);
+            self.resize(requested_extent)
+                .map_err(|e| format!("render: resize failed: {e}"))?;
         }
 
-        let device = self.device.as_ref().unwrap().clone();
-        let queue = self.queue.as_ref().unwrap().clone();
-        let memory_allocator = self.memory_allocator.as_ref().unwrap().clone();
-        let cb_allocator = self.command_buffer_allocator.as_ref().unwrap().clone();
-        let ds_allocator = self.descriptor_set_allocator.as_ref().unwrap().clone();
-        let gfx_pipeline = self.graphics_pipeline.as_ref().unwrap().clone();
-        let outline_pipeline = self.outline_pipeline.as_ref().unwrap().clone();
-        let framebuffer = self.offscreen_framebuffer.as_ref().unwrap().clone();
-        let color_image = self.offscreen_color.as_ref().unwrap().clone();
-        let sampler = self.sampler.as_ref().unwrap().clone();
-        let default_tex = self.default_texture_view.as_ref().unwrap().clone();
+        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
+        let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
+        let memory_allocator = self
+            .memory_allocator
+            .as_ref()
+            .ok_or("renderer: no memory allocator")?
+            .clone();
+        let cb_allocator = self
+            .command_buffer_allocator
+            .as_ref()
+            .ok_or("renderer: no command buffer allocator")?
+            .clone();
+        let ds_allocator = self
+            .descriptor_set_allocator
+            .as_ref()
+            .ok_or("renderer: no descriptor set allocator")?
+            .clone();
+        let gfx_pipeline = self
+            .graphics_pipeline
+            .as_ref()
+            .ok_or("renderer: no graphics pipeline")?
+            .clone();
+        let outline_pipeline = self
+            .outline_pipeline
+            .as_ref()
+            .ok_or("renderer: no outline pipeline")?
+            .clone();
+        let framebuffer = self
+            .offscreen_framebuffer
+            .as_ref()
+            .ok_or("renderer: no framebuffer")?
+            .clone();
+        let color_image = self
+            .offscreen_color
+            .as_ref()
+            .ok_or("renderer: no color image")?
+            .clone();
+        let sampler = self.sampler.as_ref().ok_or("renderer: no sampler")?.clone();
+        let default_tex = self
+            .default_texture_view
+            .as_ref()
+            .ok_or("renderer: no default texture")?
+            .clone();
 
         let total_meshes: u32 = input
             .instances
@@ -423,15 +531,12 @@ impl VulkanRenderer {
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-        .expect("failed to create command buffer");
+        .map_err(|e| format!("render: failed to create command buffer: {e}"))?;
 
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![
-                        Some([0.0, 0.0, 0.0, 0.0].into()),
-                        Some(1.0f32.into()),
-                    ],
+                    clear_values: vec![Some([0.0, 0.0, 0.0, 0.0].into()), Some(1.0f32.into())],
                     ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
                 },
                 SubpassBeginInfo {
@@ -439,14 +544,15 @@ impl VulkanRenderer {
                     ..Default::default()
                 },
             )
-            .unwrap()
+            .map_err(|e| format!("render: begin_render_pass failed: {e}"))?
             .bind_pipeline_graphics(gfx_pipeline.clone())
-            .unwrap();
+            .map_err(|e| format!("render: bind_pipeline_graphics failed: {e}"))?;
 
         // Camera uniform (set 0)
         let ld = input.lighting.main_light_dir_ws;
-        let ld_len =
-            (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2]).sqrt().max(1e-6);
+        let ld_len = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2])
+            .sqrt()
+            .max(1e-6);
         let light_dir = [ld[0] / ld_len, ld[1] / ld_len, ld[2] / ld_len];
 
         let camera_data = CameraUniform {
@@ -459,29 +565,20 @@ impl VulkanRenderer {
             ambient_term: input.lighting.ambient_term,
             _pad1: 0.0,
         };
-        let camera_buffer = Buffer::from_data(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::UNIFORM_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            camera_data,
-        )
-        .expect("failed to create camera buffer");
-
-        let camera_set_layout = gfx_pipeline.layout().set_layouts().get(0).unwrap().clone();
-        let camera_set = PersistentDescriptorSet::new(
-            &ds_allocator,
-            camera_set_layout,
-            [WriteDescriptorSet::buffer(0, camera_buffer.clone())],
-            [],
-        )
-        .expect("failed to create camera descriptor set");
+        let slot = (self.frame_counter % FRAME_LAG as u64) as usize;
+        let (camera_set, outline_camera_set) = {
+            let ring = self.camera_ring.as_ref().ok_or("render: no camera ring")?;
+            {
+                let mut guard = ring.buffers[slot]
+                    .write()
+                    .map_err(|e| format!("render: camera buffer write failed: {e}"))?;
+                *guard = camera_data;
+            }
+            (
+                ring.main_sets[slot].clone(),
+                ring.outline_sets[slot].clone(),
+            )
+        };
 
         builder
             .bind_descriptor_sets(
@@ -490,7 +587,7 @@ impl VulkanRenderer {
                 0,
                 camera_set,
             )
-            .unwrap();
+            .map_err(|e| format!("render: bind camera descriptor sets failed: {e}"))?;
 
         // Collect outline draws for second pass
         struct OutlineDrawInfo {
@@ -505,16 +602,15 @@ impl VulkanRenderer {
 
         // Draw each avatar instance
         for instance in &input.instances {
-            let skinning_mats: Vec<[[f32; 4]; 4]> =
-                if instance.skinning_matrices.is_empty() {
-                    vec![crate::asset::identity_matrix()]
-                } else {
-                    instance
-                        .skinning_matrices
-                        .iter()
-                        .map(|m| mat4_to_cols(*m))
-                        .collect()
-                };
+            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
+                vec![crate::asset::identity_matrix()]
+            } else {
+                instance
+                    .skinning_matrices
+                    .iter()
+                    .map(|m| mat4_to_cols(*m))
+                    .collect()
+            };
 
             let skinning_buffer = Buffer::from_iter(
                 memory_allocator.clone(),
@@ -529,17 +625,21 @@ impl VulkanRenderer {
                 },
                 skinning_mats,
             )
-            .expect("failed to create skinning buffer");
+            .map_err(|e| format!("render: failed to create skinning buffer: {e}"))?;
 
-            let skinning_set_layout =
-                gfx_pipeline.layout().set_layouts().get(1).unwrap().clone();
+            let skinning_set_layout = gfx_pipeline
+                .layout()
+                .set_layouts()
+                .get(1)
+                .ok_or("render: no skinning set layout")?
+                .clone();
             let skinning_set = PersistentDescriptorSet::new(
                 &ds_allocator,
                 skinning_set_layout,
                 [WriteDescriptorSet::buffer(0, skinning_buffer)],
                 [],
             )
-            .expect("failed to create skinning descriptor set");
+            .map_err(|e| format!("render: failed to create skinning descriptor set: {e}"))?;
 
             builder
                 .bind_descriptor_sets(
@@ -548,71 +648,90 @@ impl VulkanRenderer {
                     1,
                     skinning_set.clone(),
                 )
-                .unwrap();
+                .map_err(|e| format!("render: bind skinning descriptor sets failed: {e}"))?;
 
             for mesh_inst in &instance.mesh_instances {
+                let active_pipeline = match mesh_inst.cull_mode {
+                    frame_input::RenderCullMode::DoubleSided => self
+                        .pipeline_no_cull
+                        .as_ref()
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    frame_input::RenderCullMode::FrontFace => self
+                        .pipeline_front_cull
+                        .as_ref()
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    frame_input::RenderCullMode::BackFace => gfx_pipeline.clone(),
+                };
+                builder
+                    .bind_pipeline_graphics(active_pipeline.clone())
+                    .map_err(|e| {
+                        format!("render: bind_pipeline_graphics for cull mode failed: {e}")
+                    })?;
+
                 // Resolve texture
                 let texture_view =
                     self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
 
+                // Resolve matcap texture
+                let matcap_view =
+                    self.resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
+
                 // Upload material (set 2) with texture
                 let material_set = self.material_uploader.upload_to_gpu(
+                    Some((mesh_inst.mesh_id, mesh_inst.primitive_id)),
                     &mesh_inst.material_binding,
                     memory_allocator.clone(),
                     ds_allocator.clone(),
-                    &gfx_pipeline,
+                    &active_pipeline,
                     texture_view,
                     sampler.clone(),
-                );
+                    matcap_view,
+                )?;
 
                 builder
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        gfx_pipeline.layout().clone(),
+                        active_pipeline.layout().clone(),
                         2,
                         material_set,
                     )
-                    .unwrap();
+                    .map_err(|e| format!("render: bind material descriptor sets failed: {e}"))?;
 
-                let (vertex_buffer, index_buffer, index_count) =
-                    if let Some(ref prim_asset) = mesh_inst.primitive_data {
-                        if let Some(ref cloth) = instance.cloth_deform {
-                            if let Some(ref vd) = prim_asset.vertices {
-                                let verts = Self::build_cloth_vertices(vd, cloth);
-                                let indices =
-                                    prim_asset.indices.as_deref().unwrap_or(&[]);
-                                let idx_count = indices.len() as u32;
-                                let vb = Self::create_vertex_buffer(
-                                    memory_allocator.clone(),
-                                    &verts,
-                                );
-                                let ib = Self::create_index_buffer(
-                                    memory_allocator.clone(),
-                                    indices,
-                                );
-                                (vb, ib, idx_count)
-                            } else {
-                                Self::create_placeholder_mesh(memory_allocator.clone())
-                            }
+                let (vertex_buffer, index_buffer, index_count) = if let Some(ref prim_asset) =
+                    mesh_inst.primitive_data
+                {
+                    if let Some(ref cloth) = instance.cloth_deform {
+                        if let Some(ref vd) = prim_asset.vertices {
+                            let verts = Self::build_cloth_vertices(vd, cloth);
+                            let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
+                            let idx_count = indices.len() as u32;
+                            let vb = Self::create_vertex_buffer(memory_allocator.clone(), &verts);
+                            let ib = Self::create_index_buffer(memory_allocator.clone(), indices);
+                            (vb, ib, idx_count)
                         } else {
-                            self.upload_mesh(
-                                mesh_inst.mesh_id,
-                                mesh_inst.primitive_id,
-                                prim_asset,
-                                memory_allocator.clone(),
-                            )
+                            Self::create_placeholder_mesh(memory_allocator.clone())
                         }
                     } else {
-                        Self::create_placeholder_mesh(memory_allocator.clone())
-                    };
+                        self.upload_mesh(
+                            mesh_inst.mesh_id,
+                            mesh_inst.primitive_id,
+                            prim_asset,
+                            memory_allocator.clone(),
+                        )
+                    }
+                } else {
+                    Self::create_placeholder_mesh(memory_allocator.clone())
+                };
 
                 builder
                     .bind_vertex_buffers(0, vertex_buffer.clone())
-                    .unwrap()
+                    .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
                     .bind_index_buffer(index_buffer.clone())
-                    .unwrap()
+                    .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?
                     .draw_indexed(index_count, 1, 0, 0, 0)
-                    .unwrap();
+                    .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
 
                 // Collect for outline pass
                 if mesh_inst.outline.enabled && mesh_inst.outline.width > 0.0 {
@@ -632,21 +751,7 @@ impl VulkanRenderer {
         if !outline_draws.is_empty() {
             builder
                 .bind_pipeline_graphics(outline_pipeline.clone())
-                .unwrap();
-
-            let outline_camera_set_layout = outline_pipeline
-                .layout()
-                .set_layouts()
-                .get(0)
-                .unwrap()
-                .clone();
-            let outline_camera_set = PersistentDescriptorSet::new(
-                &ds_allocator,
-                outline_camera_set_layout,
-                [WriteDescriptorSet::buffer(0, camera_buffer)],
-                [],
-            )
-            .expect("failed to create outline camera descriptor set");
+                .map_err(|e| format!("render: bind outline pipeline failed: {e}"))?;
 
             builder
                 .bind_descriptor_sets(
@@ -655,7 +760,7 @@ impl VulkanRenderer {
                     0,
                     outline_camera_set,
                 )
-                .unwrap();
+                .map_err(|e| format!("render: bind outline camera descriptor sets failed: {e}"))?;
 
             for draw in &outline_draws {
                 builder
@@ -665,7 +770,9 @@ impl VulkanRenderer {
                         1,
                         draw.skinning_set.clone(),
                     )
-                    .unwrap();
+                    .map_err(|e| {
+                        format!("render: bind outline skinning descriptor sets failed: {e}")
+                    })?;
 
                 let push = OutlinePushConstants {
                     outline_width: draw.outline_width,
@@ -676,33 +783,35 @@ impl VulkanRenderer {
                 };
                 builder
                     .push_constants(outline_pipeline.layout().clone(), 0, push)
-                    .unwrap();
+                    .map_err(|e| format!("render: push_constants failed: {e}"))?;
 
                 builder
                     .bind_vertex_buffers(0, draw.vertex_buffer.clone())
-                    .unwrap()
+                    .map_err(|e| format!("render: outline bind_vertex_buffers failed: {e}"))?
                     .bind_index_buffer(draw.index_buffer.clone())
-                    .unwrap()
+                    .map_err(|e| format!("render: outline bind_index_buffer failed: {e}"))?
                     .draw_indexed(draw.index_count, 1, 0, 0, 0)
-                    .unwrap();
+                    .map_err(|e| format!("render: outline draw_indexed failed: {e}"))?;
             }
         }
 
         builder
             .end_render_pass(SubpassEndInfo::default())
-            .unwrap();
+            .map_err(|e| format!("render: end_render_pass failed: {e}"))?;
 
-        let command_buffer = builder.build().unwrap();
+        let command_buffer = builder
+            .build()
+            .map_err(|e| format!("render: failed to build command buffer: {e}"))?;
 
         let future = vulkano::sync::now(device.clone())
             .then_execute(queue.clone(), command_buffer)
-            .unwrap();
+            .map_err(|e| format!("render: then_execute failed: {e}"))?;
 
         self.frame_counter += 1;
         let timestamp_nanos = self.frame_counter * 16_666_667u64;
         let extent = self.current_extent;
 
-        let export_result = self.output_exporter.export_readback(
+        let export_result = self.output_exporter.export(
             &output_export::ExportRequest {
                 output_request: input.output_request.clone(),
                 color_image_id: 0,
@@ -716,7 +825,7 @@ impl VulkanRenderer {
             timestamp_nanos,
         );
 
-        RenderResult {
+        Ok(RenderResult {
             extent,
             timestamp_nanos,
             has_alpha: true,
@@ -727,7 +836,7 @@ impl VulkanRenderer {
                 cloth_instances,
             },
             exported_frame: export_result.exported_frame,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -747,15 +856,75 @@ impl VulkanRenderer {
         if let Some(cached) = self.texture_cache.get(uri) {
             return cached.clone();
         }
-        let view = self.upload_texture(uri).unwrap_or_else(|| {
-            eprintln!(
-                "renderer: failed to load texture '{}', using default white",
-                uri
-            );
-            default_tex.clone()
-        });
+        let view = if binding.pixel_data.is_some() && binding.dimensions.0 > 0 {
+            self.upload_texture_from_binding(binding)
+                .unwrap_or_else(|| {
+                    warn!(
+                        "renderer: failed to upload embedded texture '{}', using default white",
+                        uri
+                    );
+                    default_tex.clone()
+                })
+        } else {
+            self.upload_texture(uri).unwrap_or_else(|| {
+                warn!(
+                    "renderer: failed to load texture '{}', using default white",
+                    uri
+                );
+                default_tex.clone()
+            })
+        };
         self.texture_cache.insert(uri.clone(), view.clone());
         view
+    }
+
+    fn resolve_matcap_texture(
+        &mut self,
+        slots: &material::MaterialTextureSlots,
+        default_tex: &Arc<ImageView>,
+    ) -> Option<Arc<ImageView>> {
+        let binding = slots.matcap.as_ref()?;
+        let uri = &binding.uri;
+        if let Some(cached) = self.texture_cache.get(uri) {
+            return Some(cached.clone());
+        }
+        let view = if binding.pixel_data.is_some() && binding.dimensions.0 > 0 {
+            self.upload_texture_from_binding(binding)
+                .unwrap_or_else(|| {
+                    warn!(
+                        "renderer: failed to upload embedded matcap '{}', skipping",
+                        uri
+                    );
+                    default_tex.clone()
+                })
+        } else {
+            self.upload_texture(uri).unwrap_or_else(|| {
+                warn!(
+                    "renderer: failed to load matcap texture '{}', skipping",
+                    uri
+                );
+                default_tex.clone()
+            })
+        };
+        self.texture_cache.insert(uri.clone(), view.clone());
+        Some(view)
+    }
+
+    fn upload_texture_from_binding(
+        &self,
+        binding: &crate::renderer::material::MaterialTextureBinding,
+    ) -> Option<Arc<ImageView>> {
+        let pixels = binding.pixel_data.as_ref()?;
+        let (width, height) = binding.dimensions;
+        Self::upload_rgba_texture(
+            self.device.as_ref()?.clone(),
+            self.memory_allocator.as_ref()?.clone(),
+            self.command_buffer_allocator.as_ref()?.clone(),
+            self.queue.as_ref()?.clone(),
+            width,
+            height,
+            pixels,
+        )
     }
 
     fn upload_texture(&self, uri: &str) -> Option<Arc<ImageView>> {
@@ -845,16 +1014,8 @@ impl VulkanRenderer {
         queue: Arc<Queue>,
     ) -> Arc<ImageView> {
         let pixels: [u8; 4] = [255, 255, 255, 255];
-        Self::upload_rgba_texture(
-            device,
-            memory_allocator,
-            cb_allocator,
-            queue,
-            1,
-            1,
-            &pixels,
-        )
-        .expect("failed to create default white texture")
+        Self::upload_rgba_texture(device, memory_allocator, cb_allocator, queue, 1, 1, &pixels)
+            .expect("failed to create default white texture")
     }
 
     // -----------------------------------------------------------------------
@@ -934,10 +1095,7 @@ impl VulkanRenderer {
         result
     }
 
-    fn build_cloth_vertices(
-        vd: &VertexData,
-        cloth: &ClothDeformSnapshot,
-    ) -> Vec<GpuVertex> {
+    fn build_cloth_vertices(vd: &VertexData, cloth: &ClothDeformSnapshot) -> Vec<GpuVertex> {
         let count = vd.positions.len();
         (0..count)
             .map(|i| {
@@ -1027,7 +1185,7 @@ impl VulkanRenderer {
     }
 
     fn create_offscreen_targets(
-        _device: Arc<Device>,
+        device: Arc<Device>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         render_pass: Arc<RenderPass>,
         extent: [u32; 2],
@@ -1038,17 +1196,45 @@ impl VulkanRenderer {
         Arc<ImageView>,
         Arc<Framebuffer>,
     ) {
-        let color_image = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
+        let mut color_create_info = ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R8G8B8A8_SRGB,
+            extent: [extent[0], extent[1], 1],
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
+            ..Default::default()
+        };
+
+        let enabled_exts = device.enabled_extensions();
+        if enabled_exts.khr_external_memory {
+            use vulkano::image::ImageFormatInfo;
+            use vulkano::memory::{ExternalMemoryHandleType, ExternalMemoryHandleTypes};
+            let fmt_info = ImageFormatInfo {
                 format: Format::R8G8B8A8_SRGB,
-                extent: [extent[0], extent[1], 1],
+                image_type: ImageType::Dim2d,
                 usage: ImageUsage::COLOR_ATTACHMENT
                     | ImageUsage::TRANSFER_SRC
                     | ImageUsage::SAMPLED,
+                external_memory_handle_type: Some(ExternalMemoryHandleType::OpaqueWin32Kmt),
                 ..Default::default()
-            },
+            };
+            let external_ok = device
+                .physical_device()
+                .image_format_properties(fmt_info)
+                .ok()
+                .flatten()
+                .is_some();
+            if external_ok {
+                color_create_info.external_memory_handle_types =
+                    ExternalMemoryHandleTypes::OPAQUE_WIN32_KMT;
+                info!("renderer: exportable color image with OPAQUE_WIN32_KMT");
+            } else {
+                warn!("renderer: external memory unsupported for color target, skipping");
+            }
+        }
+
+        let color_image = Image::new(
+            memory_allocator.clone(),
+            color_create_info,
             AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
@@ -1084,7 +1270,366 @@ impl VulkanRenderer {
         )
         .expect("failed to create offscreen framebuffer");
 
-        (color_image, color_view, depth_image, depth_view, framebuffer)
+        (
+            color_image,
+            color_view,
+            depth_image,
+            depth_view,
+            framebuffer,
+        )
+    }
+
+    pub fn render_to_thumbnail(
+        &mut self,
+        input: &RenderFrameInput,
+        thumb_width: u32,
+        thumb_height: u32,
+    ) -> Result<Vec<u8>, String> {
+        if !self.initialized {
+            return Err("renderer: not initialized".to_string());
+        }
+
+        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
+        let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
+        let memory_allocator = self
+            .memory_allocator
+            .as_ref()
+            .ok_or("renderer: no memory allocator")?
+            .clone();
+        let cb_allocator = self
+            .command_buffer_allocator
+            .as_ref()
+            .ok_or("renderer: no cb allocator")?
+            .clone();
+        let ds_allocator = self
+            .descriptor_set_allocator
+            .as_ref()
+            .ok_or("renderer: no ds allocator")?
+            .clone();
+        let render_pass = self
+            .render_pass
+            .as_ref()
+            .ok_or("renderer: no render pass")?
+            .clone();
+        let sampler = self.sampler.as_ref().ok_or("renderer: no sampler")?.clone();
+        let default_tex = self
+            .default_texture_view
+            .as_ref()
+            .ok_or("renderer: no default texture")?
+            .clone();
+
+        let extent = [thumb_width.max(1), thumb_height.max(1)];
+
+        if self
+            .thumb_cache
+            .as_ref()
+            .map_or(true, |c| c.extent != extent)
+        {
+            let viewport = Viewport {
+                offset: [0.0, 0.0],
+                extent: [extent[0] as f32, extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            };
+
+            let thumb_pipeline = pipeline::create_graphics_pipeline(
+                device.clone(),
+                render_pass.clone(),
+                viewport,
+                vulkano::pipeline::graphics::rasterization::CullMode::Back,
+            )
+            .map_err(|e| format!("thumbnail: pipeline creation failed: {e}"))?;
+
+            let (color_img, _color_view, _depth_img, _depth_view, framebuffer) =
+                Self::create_offscreen_targets(
+                    device.clone(),
+                    memory_allocator.clone(),
+                    render_pass,
+                    extent,
+                );
+
+            let byte_count = (extent[0] * extent[1] * 4) as u64;
+            let readback_buffer: Subbuffer<[u8]> = Buffer::new_slice::<u8>(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                    ..Default::default()
+                },
+                byte_count,
+            )
+            .map_err(|e| format!("thumbnail: readback buffer failed: {e}"))?;
+
+            self.thumb_cache = Some(ThumbnailCache {
+                extent,
+                pipeline: thumb_pipeline,
+                framebuffer,
+                color_image: color_img,
+                readback_buffer,
+            });
+        }
+
+        let tc = self.thumb_cache.as_ref().unwrap();
+        let thumb_pipeline = tc.pipeline.clone();
+        let framebuffer = tc.framebuffer.clone();
+        let color_img = tc.color_image.clone();
+        let readback_buffer = tc.readback_buffer.clone();
+
+        let camera_data = CameraUniform {
+            view: mat4_to_cols(input.camera.view),
+            proj: mat4_to_cols(input.camera.projection),
+            camera_pos: input.camera.position_ws,
+            _pad0: 0.0,
+            light_dir: {
+                let ld = input.lighting.main_light_dir_ws;
+                let len = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2])
+                    .sqrt()
+                    .max(1e-6);
+                [ld[0] / len, ld[1] / len, ld[2] / len]
+            },
+            light_intensity: input.lighting.main_light_intensity,
+            ambient_term: input.lighting.ambient_term,
+            _pad1: 0.0,
+        };
+
+        let camera_buffer = Buffer::from_data(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            camera_data,
+        )
+        .map_err(|e| format!("thumbnail: camera buffer failed: {e}"))?;
+
+        let camera_set_layout = thumb_pipeline
+            .layout()
+            .set_layouts()
+            .get(0)
+            .ok_or("thumbnail: no set 0")?
+            .clone();
+        let camera_set = PersistentDescriptorSet::new(
+            &ds_allocator,
+            camera_set_layout,
+            [WriteDescriptorSet::buffer(0, camera_buffer)],
+            [],
+        )
+        .map_err(|e| format!("thumbnail: camera desc set failed: {e}"))?;
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &cb_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .map_err(|e| format!("thumbnail: cmd buffer failed: {e}"))?;
+
+        builder
+            .begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![Some([0.2, 0.2, 0.2, 1.0].into()), Some(1.0f32.into())],
+                    ..RenderPassBeginInfo::framebuffer(framebuffer)
+                },
+                SubpassBeginInfo {
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("thumbnail: begin_render_pass failed: {e}"))?
+            .bind_pipeline_graphics(thumb_pipeline.clone())
+            .map_err(|e| format!("thumbnail: bind pipeline failed: {e}"))?
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                thumb_pipeline.layout().clone(),
+                0,
+                camera_set,
+            )
+            .map_err(|e| format!("thumbnail: bind camera set failed: {e}"))?;
+
+        for instance in &input.instances {
+            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
+                vec![crate::asset::identity_matrix()]
+            } else {
+                instance
+                    .skinning_matrices
+                    .iter()
+                    .map(|m| mat4_to_cols(*m))
+                    .collect()
+            };
+
+            let skinning_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                skinning_mats,
+            )
+            .map_err(|e| format!("thumbnail: skinning buffer failed: {e}"))?;
+
+            let skinning_set_layout = thumb_pipeline
+                .layout()
+                .set_layouts()
+                .get(1)
+                .ok_or("thumbnail: no set 1")?
+                .clone();
+            let skinning_set = PersistentDescriptorSet::new(
+                &ds_allocator,
+                skinning_set_layout,
+                [WriteDescriptorSet::buffer(0, skinning_buffer)],
+                [],
+            )
+            .map_err(|e| format!("thumbnail: skinning desc set failed: {e}"))?;
+
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    thumb_pipeline.layout().clone(),
+                    1,
+                    skinning_set,
+                )
+                .map_err(|e| format!("thumbnail: bind skinning set failed: {e}"))?;
+
+            for mesh_inst in &instance.mesh_instances {
+                let texture_view =
+                    self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
+
+                let matcap_view =
+                    self.resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
+
+                let material_set = self
+                    .material_uploader
+                    .upload_to_gpu(
+                        None,
+                        &mesh_inst.material_binding,
+                        memory_allocator.clone(),
+                        ds_allocator.clone(),
+                        &thumb_pipeline,
+                        texture_view,
+                        sampler.clone(),
+                        matcap_view,
+                    )
+                    .map_err(|e| format!("thumbnail: material upload failed: {e}"))?;
+
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        thumb_pipeline.layout().clone(),
+                        2,
+                        material_set,
+                    )
+                    .map_err(|e| format!("thumbnail: bind material set failed: {e}"))?;
+
+                let prim_asset = match mesh_inst.primitive_data.as_ref() {
+                    Some(p) => p.as_ref(),
+                    None => {
+                        let (vb, ib, idx_count) =
+                            Self::create_placeholder_mesh(memory_allocator.clone());
+                        builder
+                            .bind_vertex_buffers(0, vb)
+                            .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
+                            .bind_index_buffer(ib)
+                            .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?
+                            .draw_indexed(idx_count, 1, 0, 0, 0)
+                            .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+                        continue;
+                    }
+                };
+
+                let (vb, ib, idx_count) = if let Some(ref cloth_snap) = instance.cloth_deform {
+                    if let Some(ref vd) = prim_asset.vertices {
+                        let cloth_verts = Self::build_cloth_vertices(vd, cloth_snap);
+                        let cloth_vb = Buffer::from_iter(
+                            memory_allocator.clone(),
+                            BufferCreateInfo {
+                                usage: BufferUsage::VERTEX_BUFFER,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo {
+                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                ..Default::default()
+                            },
+                            cloth_verts,
+                        )
+                        .map_err(|e| format!("thumbnail: cloth vb failed: {e}"))?;
+                        let (_, cached_ib, cached_idx) = self.upload_mesh(
+                            mesh_inst.mesh_id,
+                            mesh_inst.primitive_id,
+                            prim_asset,
+                            memory_allocator.clone(),
+                        );
+                        (cloth_vb, cached_ib, cached_idx)
+                    } else {
+                        self.upload_mesh(
+                            mesh_inst.mesh_id,
+                            mesh_inst.primitive_id,
+                            prim_asset,
+                            memory_allocator.clone(),
+                        )
+                    }
+                } else {
+                    self.upload_mesh(
+                        mesh_inst.mesh_id,
+                        mesh_inst.primitive_id,
+                        prim_asset,
+                        memory_allocator.clone(),
+                    )
+                };
+
+                builder
+                    .bind_vertex_buffers(0, vb)
+                    .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
+                    .bind_index_buffer(ib)
+                    .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?
+                    .draw_indexed(idx_count, 1, 0, 0, 0)
+                    .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+            }
+        }
+
+        builder
+            .end_render_pass(SubpassEndInfo::default())
+            .map_err(|e| format!("thumbnail: end_render_pass failed: {e}"))?;
+
+        builder
+            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                color_img,
+                readback_buffer.clone(),
+            ))
+            .map_err(|e| format!("thumbnail: copy_image_to_buffer failed: {e}"))?;
+
+        let command_buffer = builder
+            .build()
+            .map_err(|e| format!("thumbnail: build cmd buffer failed: {e}"))?;
+
+        let future = vulkano::sync::now(device.clone())
+            .then_execute(queue.clone(), command_buffer)
+            .map_err(|e| format!("thumbnail: execute failed: {e}"))?
+            .then_signal_fence_and_flush()
+            .map_err(|e| format!("thumbnail: fence failed: {e}"))?;
+
+        future
+            .wait(None)
+            .map_err(|e| format!("thumbnail: wait failed: {e}"))?;
+
+        let buffer_guard = readback_buffer
+            .read()
+            .map_err(|e| format!("thumbnail: read buffer failed: {e}"))?;
+        let pixels: Vec<u8> = buffer_guard.to_vec();
+
+        Ok(pixels)
     }
 
     fn create_placeholder_mesh(
@@ -1174,4 +1719,92 @@ fn mat4_to_cols(m: crate::asset::Mat4) -> [[f32; 4]; 4] {
         [m[0][2], m[1][2], m[2][2], m[3][2]],
         [m[0][3], m[1][3], m[2][3], m[3][3]],
     ]
+}
+
+const FRAME_LAG: usize = 3;
+
+struct CameraRing {
+    buffers: Vec<Subbuffer<CameraUniform>>,
+    main_sets: Vec<Arc<PersistentDescriptorSet>>,
+    outline_sets: Vec<Arc<PersistentDescriptorSet>>,
+}
+
+impl CameraRing {
+    fn new(
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+        main_pipeline: &Arc<GraphicsPipeline>,
+        outline_pipeline: &Arc<GraphicsPipeline>,
+    ) -> Self {
+        let main_layout = main_pipeline
+            .layout()
+            .set_layouts()
+            .get(0)
+            .expect("main pipeline has no set 0")
+            .clone();
+        let outline_layout = outline_pipeline
+            .layout()
+            .set_layouts()
+            .get(0)
+            .expect("outline pipeline has no set 0")
+            .clone();
+
+        let initial = CameraUniform {
+            view: [[0.0; 4]; 4],
+            proj: [[0.0; 4]; 4],
+            camera_pos: [0.0; 3],
+            _pad0: 0.0,
+            light_dir: [0.0; 3],
+            light_intensity: 0.0,
+            ambient_term: [0.0; 3],
+            _pad1: 0.0,
+        };
+
+        let mut buffers = Vec::with_capacity(FRAME_LAG);
+        let mut main_sets = Vec::with_capacity(FRAME_LAG);
+        let mut outline_sets = Vec::with_capacity(FRAME_LAG);
+
+        for _ in 0..FRAME_LAG {
+            let buffer = Buffer::from_data(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::UNIFORM_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                initial,
+            )
+            .expect("camera ring buffer alloc failed");
+
+            let main_set = PersistentDescriptorSet::new(
+                ds_allocator,
+                main_layout.clone(),
+                [WriteDescriptorSet::buffer(0, buffer.clone())],
+                [],
+            )
+            .expect("camera main desc set alloc failed");
+
+            let outline_set = PersistentDescriptorSet::new(
+                ds_allocator,
+                outline_layout.clone(),
+                [WriteDescriptorSet::buffer(0, buffer.clone())],
+                [],
+            )
+            .expect("camera outline desc set alloc failed");
+
+            buffers.push(buffer);
+            main_sets.push(main_set);
+            outline_sets.push(outline_set);
+        }
+
+        CameraRing {
+            buffers,
+            main_sets,
+            outline_sets,
+        }
+    }
 }

@@ -1,9 +1,13 @@
+#![allow(dead_code)]
 pub mod cloth;
 pub mod cloth_solver;
 pub mod spring;
 
+use log::info;
+
 use crate::asset::AvatarAsset;
 use crate::avatar::AvatarInstance;
+use crate::simulation::cloth::ClothLoDConfig;
 
 pub struct SimulationClock {
     accumulator: f32,
@@ -23,7 +27,9 @@ impl SimulationClock {
     pub fn advance(&mut self, frame_dt: f32) -> u32 {
         self.accumulator += frame_dt;
         // Clamp accumulator before the loop to prevent spiral of death.
-        self.accumulator = self.accumulator.min(self.fixed_dt * self.max_substeps as f32);
+        self.accumulator = self
+            .accumulator
+            .min(self.fixed_dt * self.max_substeps as f32);
         let mut substeps = 0u32;
         while self.accumulator >= self.fixed_dt && substeps < self.max_substeps {
             self.accumulator -= self.fixed_dt;
@@ -44,6 +50,9 @@ impl SimulationClock {
 pub struct PhysicsWorld {
     collider_count: usize,
     spring_chain_count: usize,
+    sim_clock: SimulationClock,
+    scene_colliders: Vec<crate::asset::SceneColliderAsset>,
+    cloth_lod_presets: Vec<ClothLoDConfig>,
     #[cfg(feature = "rapier")]
     rapier: Option<RapierWorld>,
 }
@@ -53,6 +62,9 @@ impl PhysicsWorld {
         Self {
             collider_count: 0,
             spring_chain_count: 0,
+            sim_clock: SimulationClock::new(1.0 / 120.0, 8),
+            scene_colliders: Vec::new(),
+            cloth_lod_presets: ClothLoDConfig::presets(),
             #[cfg(feature = "rapier")]
             rapier: None,
         }
@@ -61,31 +73,129 @@ impl PhysicsWorld {
     pub fn attach_avatar(&mut self, asset: &AvatarAsset) {
         self.collider_count = asset.colliders.len();
         self.spring_chain_count = asset.spring_bones.len();
-        println!(
+        info!(
             "physics: attached avatar with {} collider(s) and {} spring chain(s)",
             self.collider_count, self.spring_chain_count
         );
+
+        #[cfg(feature = "rapier")]
+        {
+            if self.rapier.is_none() {
+                self.init_rapier();
+            }
+            if let Some(ref mut rapier) = self.rapier {
+                rapier.add_character_body([0.0, 0.0, 0.0], 0.3, 0.5);
+            }
+        }
     }
 
-    pub fn step_springs(&mut self, dt: f32, avatar: &mut AvatarInstance) {
-        spring::step_spring_bones(dt, avatar);
+    pub fn step_springs(&mut self, fixed_dt: f32, substeps: u32, avatar: &mut AvatarInstance) {
+        let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        for _ in 0..substeps {
+            spring::step_spring_bones(fixed_dt, avatar, &world_colliders);
+        }
     }
 
     pub fn step_cloth(&mut self, dt: f32, avatar: &mut AvatarInstance) {
-        cloth_solver::step_cloth(dt, avatar);
+        let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        cloth_solver::step_cloth(dt, avatar, &world_colliders);
+    }
+
+    pub fn step_cloth_with_camera_distance(
+        &mut self,
+        dt: f32,
+        avatar: &mut AvatarInstance,
+        camera_distance: f32,
+    ) {
+        let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        if let Some(ref mut sim) = avatar.cloth_sim {
+            let lod = ClothLoDConfig::select_for_distance(&self.cloth_lod_presets, camera_distance);
+            sim.apply_lod(&lod);
+        }
+        for slot in &mut avatar.cloth_overlays {
+            let lod = ClothLoDConfig::select_for_distance(&self.cloth_lod_presets, camera_distance);
+            slot.sim.apply_lod(&lod);
+        }
+        cloth_solver::step_cloth(dt, avatar, &world_colliders);
+    }
+
+    pub fn step_all(&mut self, dt: f32, avatar: &mut AvatarInstance) {
+        let substeps = self.sim_clock.advance(dt);
+        let fixed_dt = self.sim_clock.fixed_dt();
+        let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        for _ in 0..substeps {
+            spring::step_spring_bones(fixed_dt, avatar, &world_colliders);
+            cloth_solver::step_cloth(fixed_dt, avatar, &world_colliders);
+            #[cfg(feature = "rapier")]
+            if let Some(ref mut rapier) = self.rapier {
+                rapier.step(fixed_dt);
+            }
+        }
+        self.sim_clock.reset();
+    }
+
+    pub fn simulation_clock(&self) -> &SimulationClock {
+        &self.sim_clock
+    }
+
+    pub fn add_scene_collider(&mut self, collider: crate::asset::SceneColliderAsset) {
+        #[cfg(feature = "rapier")]
+        if let Some(ref mut rapier) = self.rapier {
+            match collider.shape {
+                crate::asset::ColliderShape::Sphere { radius } => {
+                    rapier.add_static_sphere(collider.position, radius);
+                }
+                crate::asset::ColliderShape::Capsule { radius, height } => {
+                    rapier.add_static_capsule(collider.position, radius, height * 0.5);
+                }
+            }
+        }
+        info!(
+            "physics: added scene collider {:?} at {:?}",
+            collider.id, collider.position
+        );
+        self.scene_colliders.push(collider);
+    }
+
+    pub fn scene_collider_count(&self) -> usize {
+        self.scene_colliders.len()
+    }
+
+    pub fn clear_scene_colliders(&mut self) {
+        self.scene_colliders.clear();
     }
 
     /// Initialise Rapier world (requires the `rapier` feature).
     #[cfg(feature = "rapier")]
     pub fn init_rapier(&mut self) {
         self.rapier = Some(RapierWorld::new());
-        println!("physics: rapier world initialised");
+        info!("physics: rapier world initialised");
     }
 
     /// No-op when the rapier feature is not enabled.
     #[cfg(not(feature = "rapier"))]
     pub fn init_rapier(&mut self) {
         // Rapier feature not compiled in; nothing to do.
+    }
+
+    #[cfg(feature = "rapier")]
+    pub fn rapier_initialized(&self) -> bool {
+        self.rapier.is_some()
+    }
+
+    #[cfg(not(feature = "rapier"))]
+    pub fn rapier_initialized(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "rapier")]
+    pub fn character_position(&self) -> Option<[f32; 3]> {
+        self.rapier.as_ref().and_then(|r| r.character_position())
+    }
+
+    #[cfg(not(feature = "rapier"))]
+    pub fn character_position(&self) -> Option<[f32; 3]> {
+        None
     }
 
     /// Add a static sphere collider to the Rapier world (e.g. avatar body part).
@@ -149,6 +259,7 @@ pub struct RapierWorld {
     multibody_joint_set: MultibodyJointSet,
     ccd_solver: CCDSolver,
     query_pipeline: QueryPipeline,
+    character_body: Option<RigidBodyHandle>,
 }
 
 #[cfg(feature = "rapier")]
@@ -166,6 +277,7 @@ impl RapierWorld {
             multibody_joint_set: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             query_pipeline: QueryPipeline::new(),
+            character_body: None,
         }
     }
 
@@ -177,6 +289,18 @@ impl RapierWorld {
         let rb_handle = self.rigid_body_set.insert(rb);
 
         let collider = ColliderBuilder::ball(radius).build();
+        self.collider_set
+            .insert_with_parent(collider, rb_handle, &mut self.rigid_body_set);
+    }
+
+    /// Add a fixed (static) capsule collider at the given world position.
+    pub fn add_static_capsule(&mut self, position: [f32; 3], radius: f32, half_height: f32) {
+        let rb = RigidBodyBuilder::fixed()
+            .translation(vector![position[0], position[1], position[2]])
+            .build();
+        let rb_handle = self.rigid_body_set.insert(rb);
+
+        let collider = ColliderBuilder::capsule_y(half_height, radius).build();
         self.collider_set
             .insert_with_parent(collider, rb_handle, &mut self.rigid_body_set);
     }
@@ -200,8 +324,7 @@ impl RapierWorld {
             &(),
             &(),
         );
-        self.query_pipeline
-            .update(&self.collider_set);
+        self.query_pipeline.update(&self.collider_set);
     }
 
     /// Query contacts: find colliders intersecting a sphere at `position`
@@ -241,5 +364,72 @@ impl RapierWorld {
             },
         );
         results
+    }
+
+    pub fn add_character_body(&mut self, position: [f32; 3], radius: f32, half_height: f32) {
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(vector![position[0], position[1], position[2]])
+            .lock_rotations()
+            .build();
+        let rb_handle = self.rigid_body_set.insert(rb);
+
+        let capsule = ColliderBuilder::capsule_y(half_height, radius)
+            .restitution(0.0)
+            .friction(0.7)
+            .build();
+        self.collider_set
+            .insert_with_parent(capsule, rb_handle, &mut self.rigid_body_set);
+
+        self.character_body = Some(rb_handle);
+        info!(
+            "physics: added character body at {:?} (radius={}, half_height={})",
+            position, radius, half_height
+        );
+    }
+
+    pub fn move_character(&mut self, velocity: [f32; 3]) {
+        if let Some(handle) = self.character_body {
+            if let Some(body) = self.rigid_body_set.get_mut(handle) {
+                body.set_linvel(vector![velocity[0], velocity[1], velocity[2]], true);
+            }
+        }
+    }
+
+    pub fn character_position(&self) -> Option<[f32; 3]> {
+        self.character_body.and_then(|handle| {
+            self.rigid_body_set.get(handle).map(|body| {
+                let t = body.translation();
+                [t.x, t.y, t.z]
+            })
+        })
+    }
+
+    pub fn query_sphere_cast(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+        radius: f32,
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let shape = rapier3d::geometry::Ball::new(radius);
+        let origin_iso = Isometry::translation(origin[0], origin[1], origin[2]);
+        let dir = vector![direction[0], direction[1], direction[2]];
+        let toi = self.query_pipeline.cast_shape(
+            &self.rigid_body_set,
+            &self.collider_set,
+            &origin_iso,
+            &dir,
+            &shape,
+            max_distance,
+            true,
+            QueryFilter::default(),
+        )?;
+        let hit_point = [
+            origin[0] + direction[0] * toi,
+            origin[1] + direction[1] * toi,
+            origin[2] + direction[2] * toi,
+        ];
+        let normal = [-direction[0], -direction[1], -direction[2]];
+        Some((hit_point, normal))
     }
 }

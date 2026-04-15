@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::asset::Mat4;
 use crate::avatar::AvatarInstanceId;
 use crate::renderer::material::MaterialUploadRequest;
@@ -8,6 +9,8 @@ pub struct RenderFrameInput {
     pub lighting: LightingState,
     pub instances: Vec<RenderAvatarInstance>,
     pub output_request: OutputTargetRequest,
+    pub background_image_path: Option<std::path::PathBuf>,
+    pub show_ground_grid: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -4,6 +4,7 @@ use crate::math_utils::{
     closest_point_on_segment, quat_mul, quat_normalize, vec3_add, vec3_cross, vec3_dot,
     vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
 };
+use crate::simulation::cloth::ResolvedCollider;
 
 /// Verlet integration-based spring bone solver.
 ///
@@ -30,13 +31,9 @@ fn verlet_integrate_joint(
     dt: f32,
     dt2: f32,
 ) -> Vec3 {
-    let velocity = vec3_scale(
-        &vec3_sub(current, previous),
-        (1.0 - drag).max(0.0),
-    );
+    let velocity = vec3_scale(&vec3_sub(current, previous), (1.0 - drag).max(0.0));
     let gravity = vec3_scale(gravity_dir, gravity_power * dt2);
-    let stiffness_force =
-        vec3_scale(&vec3_sub(rest_world_target, current), stiffness * dt);
+    let stiffness_force = vec3_scale(&vec3_sub(rest_world_target, current), stiffness * dt);
     vec3_add(
         &vec3_add(&vec3_add(current, &velocity), &stiffness_force),
         &gravity,
@@ -137,7 +134,11 @@ fn compute_rotation_writeback(
     true
 }
 
-pub fn step_spring_bones(dt: f32, avatar: &mut AvatarInstance) {
+pub fn step_spring_bones(
+    dt: f32,
+    avatar: &mut AvatarInstance,
+    world_colliders: &[ResolvedCollider],
+) {
     let chain_count = avatar.secondary_motion.spring_states.len();
     if chain_count == 0 || dt <= 0.0 {
         return;
@@ -146,7 +147,9 @@ pub fn step_spring_bones(dt: f32, avatar: &mut AvatarInstance) {
     let dt2 = dt * dt;
 
     for chain_idx in 0..chain_count {
-        if chain_idx >= avatar.asset.spring_bones.len() { continue; }
+        if chain_idx >= avatar.asset.spring_bones.len() {
+            continue;
+        }
         let spring_asset = &avatar.asset.spring_bones[chain_idx];
         let chain_stiffness = spring_asset.stiffness;
         let chain_drag = spring_asset.drag_force;
@@ -168,17 +171,35 @@ pub fn step_spring_bones(dt: f32, avatar: &mut AvatarInstance) {
         }
 
         for j in 1..joints.len() {
-            let stiffness = spring_asset.joint_stiffness.get(j).copied().unwrap_or(chain_stiffness);
-            let drag = spring_asset.joint_drag.get(j).copied().unwrap_or(chain_drag);
-            let gravity_power = spring_asset.joint_gravity_power.get(j).copied().unwrap_or(chain_gravity_power);
+            let stiffness = spring_asset
+                .joint_stiffness
+                .get(j)
+                .copied()
+                .unwrap_or(chain_stiffness);
+            let drag = spring_asset
+                .joint_drag
+                .get(j)
+                .copied()
+                .unwrap_or(chain_drag);
+            let gravity_power = spring_asset
+                .joint_gravity_power
+                .get(j)
+                .copied()
+                .unwrap_or(chain_gravity_power);
             let node_idx = joints[j].0 as usize;
             let parent_idx = joints[j - 1].0 as usize;
 
             // Retrieve current / previous positions from per-joint state.
             let current = avatar.secondary_motion.spring_states[chain_idx]
-                .positions.get(j).copied().unwrap_or([0.0, 0.0, 0.0]);
+                .positions
+                .get(j)
+                .copied()
+                .unwrap_or([0.0, 0.0, 0.0]);
             let previous = avatar.secondary_motion.spring_states[chain_idx]
-                .previous_positions.get(j).copied().unwrap_or(current);
+                .previous_positions
+                .get(j)
+                .copied()
+                .unwrap_or(current);
 
             // Handle uninitialized positions.
             let current = if vec3_length_sq(&current) < 1e-12 {
@@ -192,8 +213,7 @@ pub fn step_spring_bones(dt: f32, avatar: &mut AvatarInstance) {
                 previous
             };
 
-            let parent_world_pos =
-                mat4_translation(&avatar.pose.global_transforms[parent_idx]);
+            let parent_world_pos = mat4_translation(&avatar.pose.global_transforms[parent_idx]);
             let rest_local_translation =
                 avatar.asset.skeleton.nodes[node_idx].rest_local.translation;
             let bone_length = vec3_length(&rest_local_translation).max(0.001);
@@ -229,7 +249,10 @@ pub fn step_spring_bones(dt: f32, avatar: &mut AvatarInstance) {
                 let collider_node = collider.node.0 as usize;
                 let collider_world_pos =
                     mat4_translation(&avatar.pose.global_transforms[collider_node]);
-                let rotated_offset = mat4_transform_direction(&avatar.pose.global_transforms[collider_node], &collider.offset);
+                let rotated_offset = mat4_transform_direction(
+                    &avatar.pose.global_transforms[collider_node],
+                    &collider.offset,
+                );
                 let collider_center = vec3_add(&collider_world_pos, &rotated_offset);
 
                 match collider.shape {
@@ -268,11 +291,50 @@ pub fn step_spring_bones(dt: f32, avatar: &mut AvatarInstance) {
                 }
             }
 
+            // 3b. World collider resolution (scene-level colliders from Rapier/PhysicsWorld)
+            for wc in world_colliders {
+                match wc {
+                    ResolvedCollider::Sphere { center, radius } => {
+                        next = resolve_sphere_collision(
+                            &next,
+                            center,
+                            *radius,
+                            bone_radius,
+                            &parent_world_pos,
+                            bone_length,
+                        );
+                    }
+                    ResolvedCollider::Capsule {
+                        center,
+                        radius,
+                        half_height,
+                        axis,
+                    } => {
+                        next = resolve_capsule_collision(
+                            &next,
+                            center,
+                            axis,
+                            *half_height,
+                            *radius,
+                            bone_radius,
+                            &parent_world_pos,
+                            bone_length,
+                        );
+                    }
+                }
+            }
+
             // 4. Update per-joint state
-            if let Some(pos) = avatar.secondary_motion.spring_states[chain_idx].positions.get_mut(j) {
+            if let Some(pos) = avatar.secondary_motion.spring_states[chain_idx]
+                .positions
+                .get_mut(j)
+            {
                 *pos = next;
             }
-            if let Some(prev) = avatar.secondary_motion.spring_states[chain_idx].previous_positions.get_mut(j) {
+            if let Some(prev) = avatar.secondary_motion.spring_states[chain_idx]
+                .previous_positions
+                .get_mut(j)
+            {
                 *prev = current;
             }
 

@@ -5,6 +5,7 @@
 //! frames suitable for the pose estimation pipeline.
 
 use super::CameraInfo;
+use log::{error, info};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
 use nokhwa::Camera;
@@ -40,7 +41,7 @@ impl WebcamCapture {
         let actual_width = resolution.width();
         let actual_height = resolution.height();
 
-        println!(
+        info!(
             "webcam: opened camera {} at {}x{} (requested {}x{} @ {} fps)",
             index, actual_width, actual_height, width, height, fps,
         );
@@ -100,7 +101,7 @@ pub fn list_cameras_impl() -> Vec<CameraInfo> {
             })
             .collect(),
         Err(e) => {
-            eprintln!("webcam: failed to enumerate cameras: {}", e);
+            error!("webcam: failed to enumerate cameras: {}", e);
             Vec::new()
         }
     }

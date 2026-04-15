@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#[cfg(feature = "webcam")]
+use log::warn;
+use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -8,8 +12,10 @@ mod webcam;
 
 mod pose_estimation;
 
-type Vec3 = [f32; 3];
-type Quat = [f32; 4];
+pub mod inference;
+
+use crate::asset::Quat;
+use crate::math_utils::Vec3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TrackingSourceId(pub u64);
@@ -49,6 +55,9 @@ pub struct TrackingRigPose {
     pub shoulders: RigShoulderTargets,
     pub arms: RigArmTargets,
     pub hands: Option<RigHandTargets>,
+    pub legs: Option<RigLegTargets>,
+    pub feet: Option<RigFeetTargets>,
+    pub fingers: Option<RigFingerTargets>,
     pub expressions: ExpressionWeightSet,
     pub confidence: TrackingConfidenceMap,
 }
@@ -81,6 +90,34 @@ pub struct RigHandTargets {
 }
 
 #[derive(Clone, Debug)]
+pub struct RigLegTargets {
+    pub left_upper: Option<RigTarget>,
+    pub left_lower: Option<RigTarget>,
+    pub right_upper: Option<RigTarget>,
+    pub right_lower: Option<RigTarget>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RigFeetTargets {
+    pub left: Option<RigTarget>,
+    pub right: Option<RigTarget>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RigFingerTargets {
+    pub left_thumb: Option<RigTarget>,
+    pub left_index: Option<RigTarget>,
+    pub left_middle: Option<RigTarget>,
+    pub left_ring: Option<RigTarget>,
+    pub left_pinky: Option<RigTarget>,
+    pub right_thumb: Option<RigTarget>,
+    pub right_index: Option<RigTarget>,
+    pub right_middle: Option<RigTarget>,
+    pub right_ring: Option<RigTarget>,
+    pub right_pinky: Option<RigTarget>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ExpressionWeightSet {
     pub weights: Vec<ExpressionWeight>,
 }
@@ -98,6 +135,26 @@ pub struct TrackingConfidenceMap {
     pub left_arm_confidence: f32,
     pub right_arm_confidence: f32,
     pub face_confidence: f32,
+    pub left_leg_confidence: f32,
+    pub right_leg_confidence: f32,
+    pub left_hand_confidence: f32,
+    pub right_hand_confidence: f32,
+}
+
+impl Default for TrackingConfidenceMap {
+    fn default() -> Self {
+        Self {
+            head_confidence: 0.0,
+            torso_confidence: 0.0,
+            left_arm_confidence: 0.0,
+            right_arm_confidence: 0.0,
+            face_confidence: 0.0,
+            left_leg_confidence: 0.0,
+            right_leg_confidence: 0.0,
+            left_hand_confidence: 0.0,
+            right_hand_confidence: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +272,57 @@ impl TrackingCalibration {
             vec3_scale(&mut t.position, s);
         }
 
+        if let Some(ref mut hands) = pose.hands {
+            if let Some(ref mut t) = hands.left {
+                vec3_scale(&mut t.position, s);
+            }
+            if let Some(ref mut t) = hands.right {
+                vec3_scale(&mut t.position, s);
+            }
+        }
+
+        if let Some(ref mut legs) = pose.legs {
+            if let Some(ref mut t) = legs.left_upper {
+                vec3_scale(&mut t.position, s);
+            }
+            if let Some(ref mut t) = legs.left_lower {
+                vec3_scale(&mut t.position, s);
+            }
+            if let Some(ref mut t) = legs.right_upper {
+                vec3_scale(&mut t.position, s);
+            }
+            if let Some(ref mut t) = legs.right_lower {
+                vec3_scale(&mut t.position, s);
+            }
+        }
+
+        if let Some(ref mut feet) = pose.feet {
+            if let Some(ref mut t) = feet.left {
+                vec3_scale(&mut t.position, s);
+            }
+            if let Some(ref mut t) = feet.right {
+                vec3_scale(&mut t.position, s);
+            }
+        }
+
+        if let Some(ref mut fingers) = pose.fingers {
+            let scale_finger = |t: &mut Option<RigTarget>| {
+                if let Some(ref mut t) = t {
+                    vec3_scale(&mut t.position, s);
+                }
+            };
+            scale_finger(&mut fingers.left_thumb);
+            scale_finger(&mut fingers.left_index);
+            scale_finger(&mut fingers.left_middle);
+            scale_finger(&mut fingers.left_ring);
+            scale_finger(&mut fingers.left_pinky);
+            scale_finger(&mut fingers.right_thumb);
+            scale_finger(&mut fingers.right_index);
+            scale_finger(&mut fingers.right_middle);
+            scale_finger(&mut fingers.right_ring);
+            scale_finger(&mut fingers.right_pinky);
+        }
+
         // Adjust shoulder width if override is set
         if let Some(desired_width) = self.shoulder_width_override {
             let half_width = desired_width / 2.0;
@@ -246,14 +354,11 @@ impl Default for TrackingRigPose {
                 right_lower: None,
             },
             hands: None,
+            legs: None,
+            feet: None,
+            fingers: None,
             expressions: ExpressionWeightSet { weights: vec![] },
-            confidence: TrackingConfidenceMap {
-                head_confidence: 0.0,
-                torso_confidence: 0.0,
-                left_arm_confidence: 0.0,
-                right_arm_confidence: 0.0,
-                face_confidence: 0.0,
-            },
+            confidence: TrackingConfidenceMap::default(),
         }
     }
 }
@@ -529,14 +634,8 @@ impl TrackingWorker {
         self.start_with_params(backend, 640, 480, 30);
     }
 
-    /// Like [`start`] but allows specifying the webcam resolution and fps.
-    pub fn start_with_params(
-        &mut self,
-        backend: CameraBackend,
-        width: u32,
-        height: u32,
-        fps: u32,
-    ) {
+    /// Like [`Self::start`] but allows specifying the webcam resolution and fps.
+    pub fn start_with_params(&mut self, backend: CameraBackend, width: u32, height: u32, fps: u32) {
         if self.handle.is_some() {
             return;
         }
@@ -551,7 +650,15 @@ impl TrackingWorker {
         let handle = thread::Builder::new()
             .name("tracking-worker".into())
             .spawn(move || {
-                Self::worker_loop(backend, mailbox, running, frame_interval, width, height, fps);
+                Self::worker_loop(
+                    backend,
+                    mailbox,
+                    running,
+                    frame_interval,
+                    width,
+                    height,
+                    fps,
+                );
             })
             .expect("failed to spawn tracking-worker thread");
 
@@ -565,7 +672,7 @@ impl TrackingWorker {
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             if let Err(e) = handle.join() {
-                eprintln!("tracking-worker: thread panicked: {:?}", e);
+                error!("tracking-worker: thread panicked: {:?}", e);
             }
         }
     }
@@ -588,14 +695,22 @@ impl TrackingWorker {
             }
             #[cfg(feature = "webcam")]
             CameraBackend::Webcam { camera_index } => {
-                Self::run_webcam(camera_index, &mailbox, &running, frame_interval, width, height, fps);
+                Self::run_webcam(
+                    camera_index,
+                    &mailbox,
+                    &running,
+                    frame_interval,
+                    width,
+                    height,
+                    fps,
+                );
             }
         }
     }
 
     /// Generate synthetic tracking data in a loop.
     fn run_synthetic(mailbox: &TrackingMailbox, running: &AtomicBool, interval: Duration) {
-        println!("tracking-worker: started (synthetic, ~30 fps)");
+        info!("tracking-worker: started (synthetic, ~30 fps)");
         let mut frame_index: u64 = 0;
 
         while running.load(Ordering::SeqCst) {
@@ -612,7 +727,7 @@ impl TrackingWorker {
             }
         }
 
-        println!("tracking-worker: stopped");
+        info!("tracking-worker: stopped");
     }
 
     /// Capture from a real webcam and run simplified pose estimation.
@@ -626,22 +741,32 @@ impl TrackingWorker {
         height: u32,
         fps: u32,
     ) {
-        println!("tracking-worker: opening webcam {} ({}x{} @ {} fps)", camera_index, width, height, fps);
+        info!(
+            "tracking-worker: opening webcam {} ({}x{} @ {} fps)",
+            camera_index, width, height, fps
+        );
 
         let mut capture = match webcam::WebcamCapture::open(camera_index, width, height, fps) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
+                error!(
                     "tracking-worker: failed to open camera {}: {}",
                     camera_index, e
                 );
-                eprintln!("tracking-worker: falling back to synthetic backend");
+                warn!("tracking-worker: falling back to synthetic backend");
                 Self::run_synthetic(mailbox, running, interval);
                 return;
             }
         };
 
-        println!("tracking-worker: webcam opened successfully");
+        // Initialize inference engine (use default wholebody model)
+        #[cfg(feature = "inference")]
+        let pose_estimator =
+            inference::CigPoseInference::new("models/cigpose-m_coco-wholebody_256x192.onnx").ok();
+        #[cfg(not(feature = "inference"))]
+        let pose_estimator: Option<inference::CigPoseInference> = None;
+
+        info!("tracking-worker: webcam opened successfully");
         let mut frame_index: u64 = 0;
 
         while running.load(Ordering::SeqCst) {
@@ -651,12 +776,17 @@ impl TrackingWorker {
                 Ok(rgb_data) => {
                     let width = capture.width();
                     let height = capture.height();
-                    let pose =
-                        pose_estimation::estimate_pose(&rgb_data, width, height, frame_index);
+
+                    let pose = if let Some(ref mut estimator) = pose_estimator {
+                        estimator.estimate_pose(&rgb_data, width, height, frame_index)
+                    } else {
+                        pose_estimation::estimate_pose(&rgb_data, width, height, frame_index)
+                    };
+
                     mailbox.publish(pose);
                 }
                 Err(e) => {
-                    eprintln!("tracking-worker: frame grab error: {}", e);
+                    error!("tracking-worker: frame grab error: {}", e);
                 }
             }
 
@@ -668,7 +798,7 @@ impl TrackingWorker {
             }
         }
 
-        println!("tracking-worker: stopped");
+        info!("tracking-worker: stopped");
     }
 }
 
@@ -732,6 +862,9 @@ fn synthetic_pose(frame_index: u64, t: f32) -> TrackingRigPose {
             right_lower: None,
         },
         hands: None,
+        legs: None,
+        feet: None,
+        fingers: None,
         expressions: ExpressionWeightSet {
             weights: vec![ExpressionWeight {
                 name: "blink".to_string(),
@@ -744,6 +877,10 @@ fn synthetic_pose(frame_index: u64, t: f32) -> TrackingRigPose {
             left_arm_confidence: 0.8,
             right_arm_confidence: 0.8,
             face_confidence: 0.75,
+            left_leg_confidence: 0.0,
+            right_leg_confidence: 0.0,
+            left_hand_confidence: 0.0,
+            right_hand_confidence: 0.0,
         },
     }
 }

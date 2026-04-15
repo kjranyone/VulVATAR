@@ -231,12 +231,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     } else {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
                     };
-                    painter.image(
-                        tex.id(),
-                        draw_rect,
-                        uv,
-                        egui::Color32::WHITE,
-                    );
+                    painter.image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
                 }
             } else {
                 // ── Placeholder (no rendered image yet) ────────────────
@@ -387,8 +382,12 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
                 // Cloth mesh debug.
                 if state.rendering.toggle_cloth {
-                    if let Some(ref cloth_state) = avatar.cloth_state {
-                        // Try to find the overlay asset from the editor.
+                    let cloth_states: Vec<_> = avatar
+                        .cloth_state
+                        .iter()
+                        .chain(avatar.cloth_overlays.iter().map(|s| &s.state))
+                        .collect();
+                    for cloth_state in cloth_states {
                         if let Some(ref overlay) = state.app.editor.overlay_asset {
                             let cloth_list = debug::build_cloth_mesh_debug(
                                 &overlay.simulation_mesh,
@@ -396,7 +395,6 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                             );
                             draw_debug_list(&painter, &rect, &cloth_list, cam_pos, cam_rot, fov);
 
-                            // Normal debug (when cloth is visible).
                             if !cloth_state.sim_normals.is_empty() {
                                 let positions = if !cloth_state.sim_positions.is_empty() {
                                     &cloth_state.sim_positions
@@ -441,5 +439,55 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 egui::FontId::monospace(11.0),
                 egui::Color32::from_rgb(90, 90, 100),
             );
+
+            // T04: Draw cloth region selection overlay in ClothAuthoring mode.
+            if state.mode == crate::gui::AppMode::ClothAuthoring {
+                if let Some(avatar) = &state.app.avatar {
+                    let sel_ref = state.region_selection.as_ref();
+                    match sel_ref {
+                        Some(sel) => {
+                            let prim_label = avatar
+                                .asset
+                                .meshes
+                                .iter()
+                                .flat_map(|m| m.primitives.iter())
+                                .find(|p| p.id == sel.target_primitive)
+                                .map(|p| format!("Primitive {}", p.id.0))
+                                .unwrap_or_else(|| format!("Primitive {}", sel.target_primitive.0));
+
+                            let vert_count = sel.selected_vertices.len();
+                            let lines = [
+                                format!("Selected: {} vertices", vert_count),
+                                format!("Target: {}", prim_label),
+                                format!(
+                                    "Range: {}..{}",
+                                    sel.selected_vertex_range.0, sel.selected_vertex_range.1
+                                ),
+                            ];
+
+                            let mut y = rect.top() + 6.0;
+                            for line in &lines {
+                                painter.text(
+                                    egui::pos2(rect.left() + 8.0, y),
+                                    egui::Align2::LEFT_TOP,
+                                    line,
+                                    egui::FontId::monospace(12.0),
+                                    egui::Color32::from_rgba_unmultiplied(255, 220, 80, 220),
+                                );
+                                y += 16.0;
+                            }
+                        }
+                        None => {
+                            painter.text(
+                                egui::pos2(rect.left() + 8.0, rect.top() + 6.0),
+                                egui::Align2::LEFT_TOP,
+                                "No region selected",
+                                egui::FontId::monospace(12.0),
+                                egui::Color32::from_rgba_unmultiplied(180, 180, 180, 160),
+                            );
+                        }
+                    }
+                }
+            }
         });
 }

@@ -7,16 +7,21 @@ use crate::persistence;
 
 /// Load an avatar from the given file path, attaching it to the application
 /// and updating the recent avatars list.
-fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
+pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
     let loader = crate::asset::vrm::VrmAssetLoader::new();
     match loader.load(path.to_string_lossy().as_ref()) {
         Ok(asset) => {
-            let instance_id =
-                crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
+            let instance_id = crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
             state.app.next_avatar_instance_id += 1;
             state.app.physics.attach_avatar(&asset);
-            state.app.avatar =
-                Some(crate::avatar::AvatarInstance::new(instance_id, asset));
+
+            let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
+            entry.update_from_asset(&asset);
+            state.app.avatar_library.add(entry);
+            let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+
+            let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
+            state.app.add_avatar(instance);
             state.add_recent_avatar(path.to_path_buf());
             state.push_notification(format!("Loaded avatar: {}", path.display()));
         }
@@ -82,19 +87,29 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     let loader = crate::asset::vrm::VrmAssetLoader::new();
                                     match loader.load(avatar_path) {
                                         Ok(asset) => {
-                                            let instance_id =
-                                                crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
+                                            let instance_id = crate::avatar::AvatarInstanceId(
+                                                state.app.next_avatar_instance_id,
+                                            );
                                             state.app.next_avatar_instance_id += 1;
                                             state.app.physics.attach_avatar(&asset);
-                                            state.app.avatar =
-                                                Some(crate::avatar::AvatarInstance::new(instance_id, asset));
+                                            let instance = crate::avatar::AvatarInstance::new(
+                                                instance_id,
+                                                asset,
+                                            );
+                                            state.app.add_avatar(instance);
                                         }
                                         Err(e) => {
-                                            state.push_notification(format!("Failed to load avatar '{}': {}", avatar_path, e));
+                                            state.push_notification(format!(
+                                                "Failed to load avatar '{}': {}",
+                                                avatar_path, e
+                                            ));
                                         }
                                     }
                                 } else {
-                                    state.push_notification(format!("Avatar source file not found: '{}'", avatar_path));
+                                    state.push_notification(format!(
+                                        "Avatar source file not found: '{}'",
+                                        avatar_path
+                                    ));
                                 }
                             }
 
@@ -104,13 +119,18 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 if overlay_file.exists() {
                                     match persistence::load_cloth_overlay(overlay_file) {
                                         Ok(overlay_file_data) => {
-                                            if let Some(cloth_asset) = overlay_file_data.cloth_asset {
+                                            if let Some(cloth_asset) = overlay_file_data.cloth_asset
+                                            {
                                                 state.app.editor.overlay_asset = Some(cloth_asset);
-                                                state.app.editor.overlay_path = Some(overlay_file.to_path_buf());
+                                                state.app.editor.overlay_path =
+                                                    Some(overlay_file.to_path_buf());
                                             }
                                         }
                                         Err(e) => {
-                                            state.push_notification(format!("Failed to load cloth overlay '{}': {}", overlay_path_str, e));
+                                            state.push_notification(format!(
+                                                "Failed to load cloth overlay '{}': {}",
+                                                overlay_path_str, e
+                                            ));
                                         }
                                     }
                                 }
@@ -227,6 +247,42 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             } else {
                 if ui.button("Pause").clicked() {
                     state.paused = true;
+                }
+            }
+
+            ui.separator();
+
+            ui.label("Profile:");
+            let active_idx = state.profiles.active_index.unwrap_or(0);
+            let profile_names: Vec<String> = state
+                .profiles
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            let selected_name = profile_names
+                .get(active_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("None");
+            let mut clicked_index: Option<usize> = None;
+            egui::ComboBox::from_id_salt("profile_selector")
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    for (i, name) in profile_names.iter().enumerate() {
+                        if ui
+                            .selectable_label(i == active_idx, name.as_str())
+                            .clicked()
+                        {
+                            clicked_index = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = clicked_index {
+                if let Some(profile) = state.profiles.profiles.get(i).cloned() {
+                    let name = profile.name.clone();
+                    state.profiles.set_active(i);
+                    state.apply_profile(&profile);
+                    state.push_notification(format!("Switched to profile: {}", name));
                 }
             }
         });

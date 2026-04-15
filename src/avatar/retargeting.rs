@@ -1,4 +1,7 @@
-use crate::asset::{ExpressionAssetSet, HumanoidBone, HumanoidMap, Quat, SkeletonAsset, Transform, Vec3};
+#![allow(dead_code)]
+use crate::asset::{
+    ExpressionAssetSet, HumanoidBone, HumanoidMap, Quat, SkeletonAsset, Transform, Vec3,
+};
 use crate::math_utils::quat_normalize;
 use crate::tracking::{RigTarget, TrackingRigPose, TrackingSmoothingParams};
 
@@ -270,9 +273,9 @@ pub fn retarget_expressions(
 
             // Apply smoothing against previous value if available.
             let final_weight = if smoothing > 0.0 {
-                if let Some(prev) = previous_weights.and_then(|pw| {
-                    pw.iter().find(|p| p.name == expr_def.name)
-                }) {
+                if let Some(prev) =
+                    previous_weights.and_then(|pw| pw.iter().find(|p| p.name == expr_def.name))
+                {
                     let t = 1.0 - smoothing;
                     prev.weight + t * (raw_weight - prev.weight)
                 } else {
@@ -485,6 +488,7 @@ mod tests {
                 left_arm_confidence: 0.9,
                 right_arm_confidence: 0.9,
                 face_confidence: 0.9,
+                ..TrackingConfidenceMap::default()
             },
             ..TrackingRigPose::default()
         };
@@ -525,6 +529,7 @@ mod tests {
                 left_arm_confidence: 0.9,
                 right_arm_confidence: 0.9,
                 face_confidence: 0.1, // low
+                ..TrackingConfidenceMap::default()
             },
             ..TrackingRigPose::default()
         };

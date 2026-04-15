@@ -1,6 +1,9 @@
+#![allow(dead_code)]
 use std::sync::Arc;
 
-use crate::asset::{AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, Mat4, NodeId, Transform, Vec3};
+use crate::asset::{
+    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, Mat4, NodeId, Transform, Vec3,
+};
 use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::AvatarPose;
 use crate::avatar::retargeting::ResolvedExpressionWeight;
@@ -37,10 +40,17 @@ pub struct AvatarInstance {
     pub cloth_state: Option<ClothState>,
     pub cloth_sim: Option<ClothSimState>,
     pub cloth_sim_buffers: Option<ClothSimTempBuffers>,
-    /// Resolved expression weights from the most recent retarget_expressions() call.
-    /// These are tracked in state but do not yet drive morph target deformation
-    /// (morph target application is a future task).
+    pub cloth_overlays: Vec<ClothOverlaySlot>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClothOverlaySlot {
+    pub overlay_id: ClothOverlayId,
+    pub enabled: bool,
+    pub state: ClothState,
+    pub sim: ClothSimState,
+    pub buffers: ClothSimTempBuffers,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +138,7 @@ impl AvatarInstance {
             cloth_state: None,
             cloth_sim: None,
             cloth_sim_buffers: None,
+            cloth_overlays: Vec::new(),
             expression_weights: Vec::new(),
         }
     }
@@ -180,6 +191,77 @@ impl AvatarInstance {
         self.cloth_sim_buffers = None;
     }
 
+    pub fn attach_cloth_overlay(&mut self, overlay_id: ClothOverlayId) -> usize {
+        let slot_index = self.cloth_overlays.len();
+        let state = ClothState {
+            overlay_id,
+            enabled: true,
+            sim_positions: vec![],
+            prev_sim_positions: vec![],
+            sim_normals: vec![],
+            constraint_cache: ClothConstraintRuntimeCache {
+                active_constraint_count: 0,
+            },
+            collision_cache: ClothCollisionRuntimeCache {
+                active_collision_count: 0,
+            },
+            deform_output: ClothDeformOutput {
+                deformed_positions: vec![],
+                deformed_normals: None,
+                version: 0,
+            },
+        };
+        let sim = ClothSimState::default();
+        let n = sim.particle_count();
+        let buffers = ClothSimTempBuffers::new(n);
+
+        self.cloth_overlays.push(ClothOverlaySlot {
+            overlay_id,
+            enabled: true,
+            state,
+            sim,
+            buffers,
+        });
+        self.cloth_enabled = true;
+        if self.attached_cloth.is_none() {
+            self.attached_cloth = Some(overlay_id);
+        }
+        slot_index
+    }
+
+    pub fn init_cloth_overlay(&mut self, slot_index: usize, cloth_asset: &ClothAsset) {
+        if let Some(slot) = self.cloth_overlays.get_mut(slot_index) {
+            slot.sim = ClothSimState::from_asset(cloth_asset);
+            let n = slot.sim.particle_count();
+            slot.state.sim_positions = slot.sim.particles.iter().map(|p| p.position).collect();
+            slot.state.prev_sim_positions = slot.state.sim_positions.clone();
+            slot.state.deform_output.deformed_positions = slot.state.sim_positions.clone();
+            slot.buffers = ClothSimTempBuffers::new(n);
+        }
+    }
+
+    pub fn remove_cloth_overlay(&mut self, slot_index: usize) {
+        if slot_index < self.cloth_overlays.len() {
+            let removed = self.cloth_overlays.remove(slot_index);
+            if self.attached_cloth == Some(removed.overlay_id) {
+                self.attached_cloth = self.cloth_overlays.first().map(|s| s.overlay_id);
+            }
+            self.cloth_enabled = self.cloth_state.is_some() || !self.cloth_overlays.is_empty();
+        }
+    }
+
+    pub fn cloth_overlay_count(&self) -> usize {
+        self.cloth_overlays.len()
+    }
+
+    pub fn get_cloth_overlay(&self, index: usize) -> Option<&ClothOverlaySlot> {
+        self.cloth_overlays.get(index)
+    }
+
+    pub fn get_cloth_overlay_mut(&mut self, index: usize) -> Option<&mut ClothOverlaySlot> {
+        self.cloth_overlays.get_mut(index)
+    }
+
     pub fn build_base_pose(&mut self) {
         let skeleton = &self.asset.skeleton;
         for (i, node) in skeleton.nodes.iter().enumerate() {
@@ -230,15 +312,51 @@ impl AvatarInstance {
 
     pub fn build_skinning_matrices(&mut self) {
         let skeleton = &self.asset.skeleton;
-        for i in 0..skeleton.nodes.len() {
-            let ibm = if i < skeleton.inverse_bind_matrices.len() {
-                &skeleton.inverse_bind_matrices[i]
-            } else {
-                // Fall back to identity if no IBM for this node.
-                continue;
-            };
-            self.pose.skinning_matrices[i] =
-                mul_mat4(&self.pose.global_transforms[i], ibm);
+
+        let first_skin = self
+            .asset
+            .meshes
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .filter_map(|p| p.skin.as_ref())
+            .next();
+
+        if let Some(skin) = first_skin {
+            let node_count = skeleton.nodes.len();
+            let mut node_to_global = vec![0usize; node_count];
+            for (i, &NodeId(nid)) in skin.joint_nodes.iter().enumerate() {
+                let idx = nid as usize;
+                if idx < node_count {
+                    node_to_global[idx] = i;
+                }
+            }
+
+            let needed = skin.joint_nodes.len().max(skin.inverse_bind_matrices.len());
+            self.pose.skinning_matrices = vec![crate::asset::identity_matrix(); needed];
+
+            for (joint_idx, &NodeId(node_id)) in skin.joint_nodes.iter().enumerate() {
+                let node_idx = node_id as usize;
+                let ibm = if joint_idx < skin.inverse_bind_matrices.len() {
+                    &skin.inverse_bind_matrices[joint_idx]
+                } else {
+                    continue;
+                };
+                let global = if node_idx < self.pose.global_transforms.len() {
+                    &self.pose.global_transforms[node_idx]
+                } else {
+                    continue;
+                };
+                self.pose.skinning_matrices[joint_idx] = mul_mat4(global, ibm);
+            }
+        } else {
+            for i in 0..skeleton.nodes.len() {
+                let ibm = if i < skeleton.inverse_bind_matrices.len() {
+                    &skeleton.inverse_bind_matrices[i]
+                } else {
+                    continue;
+                };
+                self.pose.skinning_matrices[i] = mul_mat4(&self.pose.global_transforms[i], ibm);
+            }
         }
     }
 }

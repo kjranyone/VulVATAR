@@ -1,9 +1,15 @@
+#![allow(dead_code)]
+pub mod hotkey;
 pub mod inspector;
+pub mod mesh_picking;
 pub mod mode_nav;
+pub mod profile;
 pub mod status_bar;
 pub mod top_bar;
 pub mod viewport;
+pub mod viewport_overlay;
 
+use log::{info, warn};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -90,7 +96,7 @@ impl AppMode {
 
 pub struct GuiApp {
     pub mode: AppMode,
-    pub app: Application,
+    pub app: Box<Application>,
     pub paused: bool,
     pub frame_count: u64,
     pub project_path: Option<PathBuf>,
@@ -107,10 +113,17 @@ pub struct GuiApp {
     pub project_dirty: bool,
 
     // E14: Autosave
-    /// If `Some`, autosave will trigger after this interval when the project is dirty.
     pub autosave_interval: Option<Duration>,
-    /// Tracks the last time an autosave (or manual save) occurred.
     pub last_autosave: Instant,
+
+    // Crash recovery
+    pub recovery_manager: crate::persistence::RecoveryManager,
+    pub overlay_dirty: bool,
+
+    // Hotkeys & profiles
+    pub hotkeys: hotkey::HotkeyMap,
+    pub profiles: profile::ProfileLibrary,
+    pub wind_presets: profile::WindPresetLibrary,
 
     // M10: Notification/toast system
     pub notifications: Vec<(String, Instant)>,
@@ -130,15 +143,65 @@ pub struct GuiApp {
     pub cloth_rename_buf: String,
     pub cloth_save_status: Option<String>,
 
+    // T04: Region selection and viewport overlay state
+    pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
+    pub viewport_overlay: viewport_overlay::ViewportOverlayState,
+    pub cloth_material_pick_index: usize,
+    pub cloth_distance_stiffness: f32,
+    pub cloth_bend_enabled: bool,
+    pub cloth_bend_stiffness: f32,
+    pub cloth_collider_toggles: Vec<bool>,
+    pub cloth_pin_node_index: usize,
+    pub cloth_autosave_consent: Option<bool>,
+
+    pub expression_weights: Vec<f32>,
+
+    // Scene presets
+    pub scene_presets: Vec<crate::persistence::ScenePreset>,
+    pub scene_preset_index: Option<usize>,
+    pub scene_preset_name: String,
+
     // Viewport texture integration
     pub viewport_texture: Option<egui::TextureHandle>,
     pub viewport_last_frame: u64,
+
+    // Avatar library GUI state
+    pub library_search_query: String,
+    pub library_selected_index: Option<usize>,
+    pub library_rename_buf: String,
+    pub library_tag_buf: String,
+    pub library_show_missing: bool,
+
+    pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
+    pub watched_avatar_dirs: Vec<std::path::PathBuf>,
+    pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
 }
 
 impl GuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let mut app = Application::new();
+        let mut app = Box::new(Application::new());
         app.bootstrap();
+        app.avatar_library = crate::persistence::load_avatar_library();
+
+        if let Some(snapshot) = crate::persistence::RecoveryManager::detect_recovery() {
+            match crate::persistence::validate_recovery(&snapshot) {
+                Ok(()) => {
+                    warn!(
+                        "persistence: recovery snapshot found (age={}s). \
+                         It will be offered for restore in the GUI.",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            .saturating_sub(snapshot.timestamp_secs)
+                    );
+                }
+                Err(e) => {
+                    warn!("persistence: invalid recovery snapshot: {}", e);
+                    crate::persistence::RecoveryManager::clear_recovery();
+                }
+            }
+        }
 
         Self {
             mode: AppMode::Preview,
@@ -157,6 +220,13 @@ impl GuiApp {
 
             autosave_interval: Some(Duration::from_secs(300)), // 5 minutes
             last_autosave: Instant::now(),
+
+            recovery_manager: crate::persistence::RecoveryManager::new(120),
+            overlay_dirty: false,
+
+            hotkeys: hotkey::HotkeyMap::new(),
+            profiles: profile::ProfileLibrary::new(),
+            wind_presets: profile::WindPresetLibrary::new(),
 
             notifications: Vec::new(),
 
@@ -211,8 +281,33 @@ impl GuiApp {
             cloth_rename_buf: String::new(),
             cloth_save_status: None,
 
+            region_selection: None,
+            viewport_overlay: viewport_overlay::ViewportOverlayState::default(),
+            cloth_material_pick_index: 0,
+            cloth_distance_stiffness: 1.0,
+            cloth_bend_enabled: true,
+            cloth_bend_stiffness: 0.5,
+            cloth_collider_toggles: Vec::new(),
+            cloth_pin_node_index: 0,
+            cloth_autosave_consent: None,
+            expression_weights: Vec::new(),
+
+            scene_presets: crate::persistence::load_scene_presets(),
+            scene_preset_index: None,
+            scene_preset_name: String::new(),
+
             viewport_texture: None,
             viewport_last_frame: 0,
+
+            library_search_query: String::new(),
+            library_selected_index: None,
+            library_rename_buf: String::new(),
+            library_tag_buf: String::new(),
+            library_show_missing: false,
+
+            folder_watcher: None,
+            watched_avatar_dirs: Vec::new(),
+            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::default(),
         }
     }
 }
@@ -296,6 +391,92 @@ impl GuiApp {
         }
     }
 
+    pub fn apply_profile(&mut self, profile: &profile::StreamProfile) {
+        self.tracking.tracking_mirror = profile.tracking_mirror;
+        self.tracking.smoothing_strength = profile.smoothing_strength;
+        self.tracking.confidence_threshold = profile.confidence_threshold;
+        self.rendering.main_light_dir = profile.light_direction;
+        self.rendering.main_light_intensity = profile.light_intensity;
+        self.rendering.ambient_intensity = profile.ambient;
+        self.rendering.camera_fov = profile.camera_fov;
+        self.rendering.outline_enabled = profile.outline_enabled;
+        self.rendering.outline_width = profile.outline_width;
+        self.rendering.outline_color = profile.outline_color;
+        self.output.output_sink_index = profile.output_sink_index;
+        self.output.output_resolution_index = profile.output_resolution_index;
+        self.output.output_framerate_index = profile.output_framerate_index;
+        self.project_dirty = true;
+    }
+
+    fn process_hotkeys(&mut self, ctx: &egui::Context) {
+        if self.hotkeys.check(hotkey::HotkeyAction::TogglePause, ctx) {
+            self.paused = !self.paused;
+            self.push_notification(if self.paused {
+                "Paused".to_string()
+            } else {
+                "Resumed".to_string()
+            });
+        }
+        if self
+            .hotkeys
+            .check(hotkey::HotkeyAction::ToggleTracking, ctx)
+        {
+            self.tracking.toggle_tracking = !self.tracking.toggle_tracking;
+            self.project_dirty = true;
+        }
+        if self.hotkeys.check(hotkey::HotkeyAction::ToggleCloth, ctx) {
+            self.rendering.toggle_cloth = !self.rendering.toggle_cloth;
+            self.project_dirty = true;
+        }
+        if self.hotkeys.check(hotkey::HotkeyAction::ResetPose, ctx) {
+            self.transform.position = [0.0, 0.0, 0.0];
+            self.transform.rotation = [0.0, 0.0, 0.0];
+            self.transform.scale = 1.0;
+        }
+        if self.hotkeys.check(hotkey::HotkeyAction::ResetCamera, ctx) {
+            self.transform.position = [0.0, 0.0, 0.0];
+            self.transform.rotation = [0.0, 0.0, 0.0];
+            self.app.viewport_camera.distance = 5.0;
+            self.app.viewport_camera.pan = [0.0, 0.0];
+        }
+        if self
+            .hotkeys
+            .check(hotkey::HotkeyAction::SwitchModePreview, ctx)
+        {
+            self.mode = AppMode::Preview;
+        }
+        if self
+            .hotkeys
+            .check(hotkey::HotkeyAction::SwitchModeAuthoring, ctx)
+        {
+            self.mode = AppMode::ClothAuthoring;
+        }
+        if self.hotkeys.check(hotkey::HotkeyAction::SaveProject, ctx) {
+            let ps = self.to_project_state();
+            if let Some(ref path) = self.project_path.clone() {
+                match crate::persistence::save_project(&ps, path) {
+                    Ok(()) => {
+                        self.project_dirty = false;
+                        self.push_notification("Project saved.".to_string());
+                    }
+                    Err(e) => {
+                        self.push_notification(format!("Save failed: {}", e));
+                    }
+                }
+            } else {
+                self.push_notification("No project path set. Use Save As.".to_string());
+            }
+        }
+        if self.hotkeys.check(hotkey::HotkeyAction::LoadAvatar, ctx) {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("VRM 1.0", &["vrm"])
+                .pick_file()
+            {
+                top_bar::load_avatar_from_path(self, &path);
+            }
+        }
+    }
+
     /// Apply a loaded `ProjectState` to the GUI fields.
     /// Avatar and overlay loading is handled separately by the caller.
     pub fn apply_project_state(&mut self, state: &ProjectState) {
@@ -326,10 +507,105 @@ impl GuiApp {
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
     }
+
+    fn load_avatar_from_drop(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let loader = crate::asset::vrm::VrmAssetLoader::new();
+        let asset = loader
+            .load(path.to_string_lossy().as_ref())
+            .map_err(|e| format!("{}", e))?;
+        let instance_id = crate::avatar::AvatarInstanceId(self.app.next_avatar_instance_id);
+        self.app.next_avatar_instance_id += 1;
+        self.app.physics.attach_avatar(&asset);
+        let instance = crate::avatar::AvatarInstance::new(instance_id, asset.clone());
+        self.app.add_avatar(instance);
+        let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
+        entry.update_from_asset(&asset);
+        self.app.avatar_library.add(entry);
+        let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+        self.add_recent_avatar(path.to_path_buf());
+        self.push_notification(format!("Loaded avatar: {}", path.display()));
+        Ok(())
+    }
+
+    pub fn start_watching_folder(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        if self.folder_watcher.is_none() {
+            self.folder_watcher = Some(crate::app::folder_watcher::FolderWatcher::new());
+        }
+
+        if let Some(ref mut fw) = self.folder_watcher {
+            fw.watch(&path, true)?;
+            self.watched_avatar_dirs.push(path.clone());
+            self.push_notification(format!("Watching folder: {}", path.display()));
+        }
+        Ok(())
+    }
+
+    pub fn stop_watching_folder(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(ref mut fw) = self.folder_watcher {
+            fw.unwatch(path)?;
+            self.watched_avatar_dirs.retain(|p| p != path);
+            self.push_notification(format!("Stopped watching: {}", path.display()));
+            if self.watched_avatar_dirs.is_empty() {
+                self.folder_watcher = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_folder_watcher(&mut self) {
+        if let Some(ref mut fw) = self.folder_watcher {
+            let events = fw.poll().to_vec();
+            let vrm_events = crate::app::folder_watcher::FolderWatcher::filter_vrm(&events);
+            for event in vrm_events {
+                if event.kind == crate::app::folder_watcher::FolderWatchEventKind::Created {
+                    for vrm_path in &event.paths {
+                        if !self.app.avatar_library.find_by_path(vrm_path).is_some() {
+                            let mut entry =
+                                crate::app::avatar_library::AvatarLibraryEntry::from_path(vrm_path);
+                            if let Ok(loader) =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::asset::vrm::VrmAssetLoader::new()
+                                }))
+                            {
+                                let loader = loader;
+                                if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {
+                                    entry.update_from_asset(&asset);
+                                }
+                            }
+                            self.app.avatar_library.add(entry);
+                            self.push_notification(format!(
+                                "New VRM detected: {}",
+                                vrm_path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle drag-and-drop VRM files
+        let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            if let Some(path) = file.path {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ext == "vrm" {
+                    info!("gui: dropped VRM file: {:?}", path);
+                    if let Err(e) = self.load_avatar_from_drop(&path) {
+                        self.push_notification(format!("Failed to load VRM: {}", e));
+                    }
+                }
+            }
+        }
+
         // E10: Measure frame timing.
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame_instant);
@@ -340,6 +616,10 @@ impl eframe::App for GuiApp {
         if dt_secs > 0.0 {
             self.fps = self.fps * 0.9 + (1.0 / dt_secs) * 0.1;
         }
+
+        self.process_hotkeys(ctx);
+
+        self.poll_folder_watcher();
 
         // Sync GUI-driven state into the application before running the frame.
         if let Some(avatar) = self.app.avatar.as_mut() {
@@ -368,7 +648,7 @@ impl eframe::App for GuiApp {
         self.app.viewport_camera.yaw_deg = self.transform.rotation[1];
         self.app.viewport_camera.pitch_deg = self.transform.rotation[0];
         // Map transform_position[2] as a camera distance offset (closer/further).
-        self.app.viewport_camera.distance = 5.0 - self.transform.position[2] * 10.0;
+        self.app.viewport_camera.distance = (5.0 - self.transform.position[2] * 10.0).max(0.1);
         self.app.viewport_camera.pan = [self.transform.position[0], self.transform.position[1]];
         self.app.viewport_camera.fov_deg = self.rendering.camera_fov;
 
@@ -427,6 +707,73 @@ impl eframe::App for GuiApp {
             }
         }
 
+        // Recovery snapshot on timer (separate from project autosave)
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if self.recovery_manager.should_snapshot(now_secs) {
+            let project_state = if self.project_dirty {
+                Some(self.to_project_state())
+            } else {
+                None
+            };
+
+            let has_overlay = self.app.editor.overlay_asset.is_some();
+            let overlay_for_snapshot = if has_overlay && self.cloth_autosave_consent == Some(true) {
+                let overlay_name = self
+                    .app
+                    .editor
+                    .overlay_asset
+                    .as_ref()
+                    .map(|a| a.metadata.name.clone())
+                    .unwrap_or_else(|| "Untitled".to_string());
+                let target_avatar_path = self
+                    .app
+                    .avatar
+                    .as_ref()
+                    .map(|a| a.asset.source_path.to_string_lossy().into_owned());
+                Some(crate::persistence::ClothOverlayFile {
+                    format_version: 1,
+                    created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+                    last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+                    overlay_name,
+                    target_avatar_path,
+                    cloth_asset: self.app.editor.overlay_asset.clone(),
+                })
+            } else {
+                None
+            };
+
+            let _ = self.recovery_manager.write_snapshot(
+                project_state.as_ref(),
+                self.overlay_dirty,
+                overlay_for_snapshot.as_ref(),
+            );
+        }
+
+        // Cloth overlay autosave consent dialog
+        if self.app.editor.overlay_asset.is_some() && self.cloth_autosave_consent.is_none() {
+            egui::Window::new("Cloth Autosave Consent")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        "A cloth overlay is active. Allow it to be included in recovery snapshots?",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            self.cloth_autosave_consent = Some(true);
+                        }
+                        if ui.button("No").clicked() {
+                            self.cloth_autosave_consent = Some(false);
+                        }
+                    });
+                });
+        }
+
         top_bar::draw(ctx, self);
         mode_nav::draw(ctx, self);
         status_bar::draw(ctx, self);
@@ -463,8 +810,9 @@ impl eframe::App for GuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Perform ordered shutdown of worker threads when the window closes.
-        println!("gui: window closing, initiating application shutdown");
+        let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+        crate::persistence::RecoveryManager::clear_recovery();
+        info!("gui: window closing, initiating application shutdown");
         self.app.shutdown();
     }
 }

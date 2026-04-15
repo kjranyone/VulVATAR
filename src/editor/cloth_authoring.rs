@@ -1,8 +1,8 @@
+#![allow(dead_code)]
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::asset::{
-    AvatarAsset, ClothSimVertex, ClothSimulationMesh,
-    DistanceConstraint, MaterialId, PrimitiveId,
+    AvatarAsset, ClothSimVertex, ClothSimulationMesh, DistanceConstraint, MaterialId, PrimitiveId,
 };
 
 #[derive(Clone, Debug)]
@@ -102,7 +102,11 @@ pub fn generate_sim_mesh(
 
             // Record edges (canonical order: smaller index first).
             for (a, b) in [(n0, n1), (n1, n2), (n2, n0)] {
-                let edge = if a < b { (a as u32, b as u32) } else { (b as u32, a as u32) };
+                let edge = if a < b {
+                    (a as u32, b as u32)
+                } else {
+                    (b as u32, a as u32)
+                };
                 edge_set.insert(edge);
             }
         }
@@ -169,7 +173,10 @@ pub fn generate_sim_mesh(
 
 impl RegionSelection {
     /// Select all vertices of primitives that use the given material.
-    pub fn select_by_material(avatar: &AvatarAsset, material_id: MaterialId) -> Option<RegionSelection> {
+    pub fn select_by_material(
+        avatar: &AvatarAsset,
+        material_id: MaterialId,
+    ) -> Option<RegionSelection> {
         // Find the first primitive using this material and select all its
         // vertices.  In a multi-primitive scenario the caller could iterate,
         // but for the POC we target one primitive at a time.
@@ -281,7 +288,9 @@ impl RegionSelection {
                 indices[t * 3 + 2] as usize,
             ];
             let any_in = tri_verts.iter().any(|v| self.selected_vertices.contains(v));
-            let any_out = tri_verts.iter().any(|v| !self.selected_vertices.contains(v));
+            let any_out = tri_verts
+                .iter()
+                .any(|v| !self.selected_vertices.contains(v));
             if any_in && any_out {
                 for v in &tri_verts {
                     if self.selected_vertices.contains(v) {

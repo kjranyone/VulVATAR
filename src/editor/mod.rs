@@ -1,9 +1,14 @@
+#![allow(dead_code)]
 pub mod cloth_authoring;
 
+use log::info;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::asset::{AssetSourceHash, AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, MeshId, NodeId, PrimitiveId};
+use crate::asset::{
+    AssetSourceHash, AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, MeshId, NodeId,
+    PrimitiveId,
+};
 use crate::persistence::ClothOverlayFile;
 
 pub struct EditorSession {
@@ -38,7 +43,11 @@ impl EditorSession {
         self.dirty = false;
     }
 
-    pub fn create_overlay(&mut self, avatar_id: AvatarAssetId, avatar_hash: AssetSourceHash) -> ClothOverlayId {
+    pub fn create_overlay(
+        &mut self,
+        avatar_id: AvatarAssetId,
+        avatar_hash: AssetSourceHash,
+    ) -> ClothOverlayId {
         let id = ClothOverlayId(self.next_overlay_id);
         self.next_overlay_id += 1;
         self.active_overlay = Some(id);
@@ -77,11 +86,11 @@ impl EditorSession {
         };
 
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-        std::fs::write(&save_path, json).map_err(|e| e.to_string())?;
+        crate::persistence::atomic_write(&save_path, &json)?;
 
         self.overlay_path = Some(save_path.clone());
         self.dirty = false;
-        println!("editor: saved cloth overlay to {}", save_path.display());
+        info!("editor: saved cloth overlay to {}", save_path.display());
         Ok(())
     }
 
@@ -151,19 +160,12 @@ impl EditorSession {
         }
 
         // Collect the set of valid node IDs from the avatar skeleton.
-        let valid_nodes: std::collections::HashSet<NodeId> = avatar
-            .skeleton
-            .nodes
-            .iter()
-            .map(|n| n.id)
-            .collect();
+        let valid_nodes: std::collections::HashSet<NodeId> =
+            avatar.skeleton.nodes.iter().map(|n| n.id).collect();
 
         // Collect the set of valid mesh IDs from the avatar meshes.
-        let valid_meshes: std::collections::HashSet<MeshId> = avatar
-            .meshes
-            .iter()
-            .map(|m| m.id)
-            .collect();
+        let valid_meshes: std::collections::HashSet<MeshId> =
+            avatar.meshes.iter().map(|m| m.id).collect();
 
         // 3. All stable node refs must resolve to an existing skeleton node.
         for node_ref in &overlay.stable_refs.node_refs {

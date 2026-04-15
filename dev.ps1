@@ -1,6 +1,35 @@
 $ErrorActionPreference = "Stop"
 
+function Install-Models {
+    Write-Host "Setting up ONNX models..." -ForegroundColor Cyan
+    $modelName = "cigpose-m_coco-wholebody_256x192.onnx"
+    $modelPath = "models\$modelName"
+    
+    if (!(Test-Path "models")) {
+        New-Item -ItemType Directory -Force -Path "models" | Out-Null
+    }
+
+    if (Test-Path $modelPath) {
+        Write-Host "Model $modelName already exists. Skipping download." -ForegroundColor Green
+        return
+    }
+
+    $zipPath = "cigpose_models.zip"
+    Write-Host "Downloading cigpose_models.zip (this may take a while as it is >1GB)..."
+    Invoke-WebRequest -Uri "https://github.com/namas191297/cigpose-onnx/releases/latest/download/cigpose_models.zip" -OutFile $zipPath
+
+    Write-Host "Extracting..."
+    # Warning: The zip contains many models. Expand-Archive might take time.
+    Expand-Archive -Path $zipPath -DestinationPath "models" -Force
+
+    Write-Host "Cleaning up zip archive..."
+    Remove-Item $zipPath -Force
+
+    Write-Host "ONNX Models installed successfully." -ForegroundColor Green
+}
+
 $commands = @(
+    @{ Label = "setup (download models)"; Cmd = "Install-Models" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
     @{ Label = "run (debug)";      Cmd = "cargo run" },

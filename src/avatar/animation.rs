@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::asset::{
     AnimationChannel, AnimationClip, AnimationClipId, AnimationProperty, InterpolationMode,
     Keyframe, Transform, Vec4,
@@ -123,16 +124,9 @@ fn cubic_hermite_vec4(p0: &Vec4, m0: &Vec4, p1: &Vec4, m1: &Vec4, t: f32) -> Vec
 /// Find the index of the last keyframe whose time is <= `time`.
 /// Returns `None` if all keyframes are after `time`.
 fn find_lower_keyframe(keyframes: &[Keyframe], time: f32) -> Option<usize> {
-    // Keyframes are assumed sorted by time.
-    let mut result: Option<usize> = None;
-    for (i, kf) in keyframes.iter().enumerate() {
-        if kf.time <= time {
-            result = Some(i);
-        } else {
-            break;
-        }
-    }
-    result
+    keyframes
+        .partition_point(|kf| kf.time <= time)
+        .checked_sub(1)
 }
 
 /// Interpolate a single channel at the given `time` and return the resulting `Vec4`.

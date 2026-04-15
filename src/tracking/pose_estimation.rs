@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Simplified pose estimation from webcam frames.
 //!
 //! This module provides a placeholder face/pose detector based on skin-color
@@ -102,6 +103,10 @@ pub fn estimate_pose(
                 left_arm_confidence: 0.0,
                 right_arm_confidence: 0.0,
                 face_confidence: 0.0,
+                left_leg_confidence: 0.0,
+                right_leg_confidence: 0.0,
+                left_hand_confidence: 0.0,
+                right_hand_confidence: 0.0,
             },
             ..Default::default()
         };
@@ -192,6 +197,9 @@ pub fn estimate_pose(
             right_lower: None,
         },
         hands: None,
+        legs: None,
+        feet: None,
+        fingers: None,
         expressions: ExpressionWeightSet {
             weights: vec![ExpressionWeight {
                 name: "blink".to_string(),
@@ -204,6 +212,10 @@ pub fn estimate_pose(
             left_arm_confidence: 0.0,
             right_arm_confidence: 0.0,
             face_confidence: confidence * 0.7,
+            left_leg_confidence: 0.0,
+            right_leg_confidence: 0.0,
+            left_hand_confidence: 0.0,
+            right_hand_confidence: 0.0,
         },
     }
 }

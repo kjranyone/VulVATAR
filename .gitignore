@@ -12,3 +12,6 @@
 *.tmp
 Thumbs.db
 .DS_Store
+
+# ONNX Models
+models/*.onnx
