@@ -244,6 +244,22 @@ This is not the final formula, but it captures the responsibility split.
 
 The outline path should not depend on the main fragment lighting model.
 
+### Outline Stencil Masking (Implemented)
+
+The outline pass **must** use stencil-buffer masking to prevent overwriting main geometry.
+
+Without stencil masking, screen-space XY offset outlines will overdraw the model interior because back faces share the same depth as front faces (only XY is modified, not Z). This causes the entire body to render as dark maroon/black, especially visible on body/clothing meshes. Depth bias workarounds are insufficient because thin geometry (neck, fingers) has back faces closer than adjacent front faces at any camera distance.
+
+Current implementation:
+
+- Depth format: `D32_SFLOAT_S8_UINT` (includes stencil bits)
+- Main pass: `stencil compare_op=Always, pass_op=Replace, reference=1` (writes stencil=1 on all drawn fragments)
+- Outline pass: `stencil compare_op=NotEqual, reference=1, write_mask=0` (draws only where stencil != 1, i.e. silhouette edges)
+- Outline pass: `depth compare_op=LessOrEqual, write_enable=false`
+- Outline vertex shader: front-face culling, screen-space normal expansion
+
+This guarantees the outline never overwrites interior pixels regardless of camera distance or mesh topology.
+
 ## Normal Handling
 
 Normal quality strongly affects toon visuals.
@@ -268,6 +284,28 @@ Useful material-debug shader modes:
 - outline mask visualization
 
 These should be easy to enable without rewriting shader logic.
+
+### Implemented Debug Views
+
+The fragment shader supports `material.debug_view`:
+
+- `0`: normal rendering
+- `1`: UV visualization (`fract(frag_uv)` as RG)
+- `2`: base texture only (`tex_color.rgb` without base_color multiplication or lighting)
+
+These are controlled via `MaterialDebugView` enum and `MaterialUniform.debug_view`.
+
+### diagnose_vrm Binary
+
+`src/bin/diagnose_vrm.rs` renders a VRM to a PNG for offline inspection.
+
+```
+diagnose_vrm <input.vrm> [output.png] [mode] [yaw_deg] [material_filter] [noskin]
+```
+
+Modes: `toon`, `simple`, `unlit`, `uv`, `tex`, `atlas`
+
+This tool is essential for diagnosing rendering issues without the GUI loop. It also prints per-primitive UV stats with CPU-side texture sampling averages, useful for verifying UV correctness independently of the GPU pipeline.
 
 ## Failure Modes To Avoid
 

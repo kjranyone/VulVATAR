@@ -173,6 +173,29 @@ The early renderer succeeds if:
 
 The renderer does not need full parity to be useful.
 
+## Implementation Status and Known Issues
+
+### Implemented MToon Features
+
+- base color factor and texture (`pbrMetallicRoughness.baseColorFactor/Texture`)
+- shade color factor and texture (`shadeColorFactor`, `shadeMultiplyTexture`)
+- shade shift / shade toony parameters
+- emissive color and texture
+- rim color, fresnel power, lift, lighting mix
+- alpha modes (opaque, mask, blend)
+- double-sided rendering
+- outline width and color (stencil-masked)
+
+### Disabled Features
+
+- **Matcap**: forced to blend=0.0. VRoid placeholder `MatcapWarp` textures (8x8 pixels) cause severe over-brightening. Requires proper MToon matcap sampling implementation.
+- **UV animation**: scroll/rotation speeds are uploaded as raw values without time multiplication. Currently static only.
+
+### Known Visual Issues
+
+- **Toon shading lacks ambient term**: the ToonLike path multiplies by `light_color * light_intensity` without adding `ambient_term`. When normals face away from light, fragments go fully to `shade_color` with no ambient floor. This makes untextured or light-colored meshes appear dark/brown from certain angles. The `SimpleLit` path correctly includes ambient. The fix is to add an ambient floor to the toon path as described in shader-implementation-notes.md.
+- **VRoid shade_color values**: VRoid Studio exports shade_color as warm/brown tones for skin materials. This is intentional MToon behavior, but combined with the missing ambient term it can look overly dark.
+
 ## Failure Modes To Avoid
 
 - calling the renderer "MToon compatible" too early

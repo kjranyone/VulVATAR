@@ -363,6 +363,37 @@ The renderer should leave room for:
 
 These should be optional overlays, not special cases embedded into production material logic.
 
+## Implementation Lessons
+
+### Depth+Stencil Format
+
+The render pass uses `D32_SFLOAT_S8_UINT` (not plain `D32_SFLOAT`). The stencil bits are required for outline masking. All depth image creation, clear values, and framebuffer attachments must match this format.
+
+Clear values for depth+stencil attachments use `ClearValue::DepthStencil((1.0, 0))`, not `1.0f32.into()`.
+
+### Blend Pipeline Variants
+
+Each cull mode (Back, Front, None) needs separate Opaque and Blend pipeline variants. Blend pipelines differ in:
+
+- `depth_write_enable: false` (prevents blend ordering artifacts)
+- `blend: Some(AttachmentBlend::alpha())`
+
+The render loop iterates `blend_pass in [false, true]` and skips non-matching meshes.
+
+### Front Face Winding
+
+VRM/glTF uses clockwise front face winding (`FrontFace::Clockwise`). This was originally set to `CounterClockwise` which caused incorrect culling behavior. All pipelines (main, outline, depth-only) must use the same winding convention.
+
+### Skinning Matrix Convention
+
+Skinning matrices from the avatar/pose system are stored **column-major** (matching GLSL `mat4`). The camera view/projection matrices are stored **row-major** and require `mat4_to_cols()` transposition before upload.
+
+Do not apply `mat4_to_cols()` to skinning matrices — it double-transposes them.
+
+### Matcap Disabled
+
+The matcap path (`matcap_blend`) is forced to 0.0 because VRoid placeholder matcap textures (`MatcapWarp`, 8x8) over-brighten avatars when treated as direct color maps. Re-enable once a proper MToon-compatible matcap implementation is added.
+
 ## Failure Modes To Avoid
 
 - renderer decodes VRM schema directly during draw submission
