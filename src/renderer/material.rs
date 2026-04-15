@@ -16,10 +16,18 @@ pub enum MaterialShaderMode {
     ToonLike,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MaterialDebugView {
+    None,
+    Uv,
+    BaseTexture,
+}
+
 #[derive(Clone, Debug)]
 pub struct MaterialUploadRequest {
     pub base_color: Vec4,
     pub mode: MaterialShaderMode,
+    pub debug_view: MaterialDebugView,
     pub alpha_mode: AlphaMode,
     pub double_sided: bool,
     pub toon_ramp_threshold: f32,
@@ -52,6 +60,7 @@ impl MaterialUploadRequest {
         Self {
             base_color: [1.0, 1.0, 1.0, 1.0],
             mode: MaterialShaderMode::Unlit,
+            debug_view: MaterialDebugView::None,
             alpha_mode: AlphaMode::Opaque,
             double_sided: false,
             toon_ramp_threshold: 0.5,
@@ -71,6 +80,7 @@ impl MaterialUploadRequest {
                 MaterialMode::SimpleLit => MaterialShaderMode::SimpleLit,
                 MaterialMode::ToonLike => MaterialShaderMode::ToonLike,
             },
+            debug_view: MaterialDebugView::None,
             alpha_mode: asset.alpha_mode,
             double_sided: asset.double_sided,
             toon_ramp_threshold: asset.toon_params.ramp_threshold,
@@ -132,6 +142,8 @@ pub struct MaterialUniform {
     pub shade_shift: f32,
     pub shade_toony: f32,
     pub shading_mode: i32,
+    pub debug_view: i32,
+    pub _pad_debug0: [i32; 2],
     pub shade_color: [f32; 4],
     pub emissive_color: [f32; 4],
     pub rim_color: [f32; 4],
@@ -294,6 +306,11 @@ impl MaterialUploader {
             MaterialShaderMode::SimpleLit => 2i32,
             MaterialShaderMode::ToonLike => 1i32,
         };
+        let debug_view = match request.debug_view {
+            MaterialDebugView::None => 0i32,
+            MaterialDebugView::Uv => 1i32,
+            MaterialDebugView::BaseTexture => 2i32,
+        };
 
         let (
             shade_color,
@@ -355,6 +372,8 @@ impl MaterialUploader {
             shade_shift,
             shade_toony,
             shading_mode,
+            debug_view,
+            _pad_debug0: [0, 0],
             shade_color,
             emissive_color,
             rim_color,

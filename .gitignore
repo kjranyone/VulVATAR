@@ -20,6 +20,9 @@ models/*.onnx
 /sample_data/*
 !/sample_data/.gitkeep
 
+# Diagnostic output
+/diagnostics/
+
 # Misc
 cigpose_models.zip
 nul

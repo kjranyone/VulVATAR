@@ -561,7 +561,7 @@ impl Application {
                                 .iter()
                                 .find(|m| m.id == prim.material_id);
 
-                            let material_binding = material_asset
+                            let mut material_binding = material_asset
                                 .map(MaterialUploadRequest::from_asset_material)
                                 .unwrap_or_else(|| {
                                     if let Some(m) = avatar.asset.materials.first() {
@@ -570,6 +570,12 @@ impl Application {
                                         MaterialUploadRequest::default_material()
                                     }
                                 });
+
+                            material_binding.mode = match material_mode_index {
+                                0 => MaterialShaderMode::Unlit,
+                                1 => MaterialShaderMode::SimpleLit,
+                                _ => MaterialShaderMode::ToonLike,
+                            };
 
                             let outline = OutlineSnapshot {
                                 enabled: material_binding.outline_width > 0.0,

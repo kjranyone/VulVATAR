@@ -29,6 +29,7 @@ pub struct CameraOrbitState {
     pub pitch_deg: f32,
     pub pan: [f32; 2],
     pub distance: f32,
+    pub target_distance: f32,
 }
 
 pub struct TrackingGuiState {
@@ -247,6 +248,7 @@ impl GuiApp {
                 pitch_deg: 0.0,
                 pan: [0.0, 0.0],
                 distance: 5.0,
+                target_distance: 5.0,
             },
             tracking: TrackingGuiState {
                 toggle_tracking: true,
@@ -457,6 +459,7 @@ impl GuiApp {
                 pitch_deg: 0.0,
                 pan: [0.0, 0.0],
                 distance: 5.0,
+                target_distance: 5.0,
             };
             self.project_dirty = true;
         }
@@ -652,6 +655,11 @@ impl eframe::App for GuiApp {
             let s = self.transform.scale;
             avatar.world_transform.scale = [s, s, s];
         }
+
+        // Smooth zoom: lerp distance toward target_distance each frame.
+        let t = (1.0 - (-5.0 * self.frame_time_ms / 1000.0).exp()) as f32;
+        self.camera_orbit.distance +=
+            (self.camera_orbit.target_distance - self.camera_orbit.distance) * t;
 
         // Sync GUI camera controls into the Application's viewport camera.
         self.app.viewport_camera.yaw_deg = self.camera_orbit.yaw_deg;

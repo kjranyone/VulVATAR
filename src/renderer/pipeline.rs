@@ -6,7 +6,9 @@ use vulkano::device::Device;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
 };
-use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::depth_stencil::{
+    CompareOp, DepthState, DepthStencilState, StencilOp, StencilOpState, StencilState,
+};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
@@ -42,8 +44,8 @@ pub struct GpuVertex {
 
 pub mod vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                    ty: "vertex",
-                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                        ty: "vertex",
+                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 layout(location = 0) in vec3 position;
@@ -94,13 +96,13 @@ void main() {
     gl_Position = camera.proj * camera.view * world_pos;
 }
 "
-                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                    }
 }
 
 pub mod fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                    ty: "fragment",
-                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                        ty: "fragment",
+                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 layout(location = 0) in vec3 frag_normal;
@@ -127,6 +129,8 @@ layout(set = 2, binding = 0) uniform MaterialData {
     float shade_shift;
     float shade_toony;
     int shading_mode;
+    int debug_view;
+    ivec2 _pad_debug0;
     vec4 shade_color;
     vec4 emissive_color;
     vec4 rim_color;
@@ -169,6 +173,19 @@ void main() {
     vec3 base_color_term = color.rgb;
     vec3 shade_texture_term = texture(shade_texture, anim_uv).rgb;
 
+    if (material.alpha_mode == 1 && color.a < material.alpha_cutoff) {
+        discard;
+    }
+
+    if (material.debug_view == 1) {
+        out_color = vec4(fract(frag_uv), 0.0, 1.0);
+        return;
+    }
+    if (material.debug_view == 2) {
+        out_color = vec4(tex_color.rgb, 1.0);
+        return;
+    }
+
     vec3 n = normalize(frag_normal);
     vec3 l = normalize(camera.light_dir);
     float ndotl = dot(n, l);
@@ -209,9 +226,6 @@ void main() {
         color.rgb = mix(color.rgb, color.rgb * matcap_sample.rgb, material.matcap_blend);
     }
 
-    if (material.alpha_mode == 1 && color.a < material.alpha_cutoff) {
-        discard;
-    }
     if (material.alpha_mode == 0) {
         color.a = 1.0;
     }
@@ -219,7 +233,7 @@ void main() {
     out_color = color;
 }
 "
-                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,8 +242,8 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                    ty: "vertex",
-                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                        ty: "vertex",
+                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 layout(location = 0) in vec3 position;
@@ -290,13 +304,13 @@ void main() {
     gl_Position = clip_pos;
 }
 "
-                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                    }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                    ty: "fragment",
-                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                        ty: "fragment",
+                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -313,13 +327,13 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                    }
 }
 
 pub mod depth_only_vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                    ty: "vertex",
-                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                        ty: "vertex",
+                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 layout(location = 0) in vec3 position;
@@ -358,19 +372,19 @@ void main() {
     gl_Position = camera.proj * camera.view * world_pos;
 }
 "
-                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                    }
 }
 
 pub mod depth_only_fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                    ty: "fragment",
-                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                        ty: "fragment",
+                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 void main() {
 }
 "
-                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +479,7 @@ pub fn create_graphics_pipeline(
     render_pass: Arc<RenderPass>,
     viewport: Viewport,
     cull_mode: CullMode,
+    alpha_mode: RenderAlphaMode,
 ) -> Result<Arc<GraphicsPipeline>, String> {
     let vs_module = vs::load(device.clone())
         .map_err(|e| format!("failed to load vertex shader module: {e}"))?;
@@ -498,6 +513,11 @@ pub fn create_graphics_pipeline(
     let subpass = Subpass::from(render_pass.clone(), 0)
         .ok_or_else(|| "failed to get subpass from render pass".to_string())?;
 
+    let (depth_write_enable, blend_state) = match alpha_mode {
+        RenderAlphaMode::Blend => (false, Some(AttachmentBlend::alpha())),
+        RenderAlphaMode::Opaque | RenderAlphaMode::Cutout => (true, None),
+    };
+
     GraphicsPipeline::new(
         device.clone(),
         None,
@@ -511,20 +531,44 @@ pub fn create_graphics_pipeline(
             }),
             rasterization_state: Some(RasterizationState {
                 cull_mode,
-                front_face: FrontFace::CounterClockwise,
+                front_face: FrontFace::Clockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
             depth_stencil_state: Some(DepthStencilState {
                 depth: Some(DepthState {
-                    write_enable: true,
+                    write_enable: depth_write_enable,
                     compare_op: CompareOp::LessOrEqual,
+                }),
+                stencil: Some(StencilState {
+                    front: StencilOpState {
+                        ops: vulkano::pipeline::graphics::depth_stencil::StencilOps {
+                            pass_op: StencilOp::Replace,
+                            fail_op: StencilOp::Keep,
+                            depth_fail_op: StencilOp::Keep,
+                            compare_op: CompareOp::Always,
+                        },
+                        compare_mask: 0xFF,
+                        write_mask: 0xFF,
+                        reference: 1,
+                    },
+                    back: StencilOpState {
+                        ops: vulkano::pipeline::graphics::depth_stencil::StencilOps {
+                            pass_op: StencilOp::Replace,
+                            fail_op: StencilOp::Keep,
+                            depth_fail_op: StencilOp::Keep,
+                            compare_op: CompareOp::Always,
+                        },
+                        compare_mask: 0xFF,
+                        write_mask: 0xFF,
+                        reference: 1,
+                    },
                 }),
                 ..Default::default()
             }),
             color_blend_state: Some(ColorBlendState {
                 attachments: vec![ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend::alpha()),
+                    blend: blend_state,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -587,7 +631,7 @@ pub fn create_outline_pipeline(
             }),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Front,
-                front_face: FrontFace::CounterClockwise,
+                front_face: FrontFace::Clockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -595,6 +639,30 @@ pub fn create_outline_pipeline(
                 depth: Some(DepthState {
                     write_enable: false,
                     compare_op: CompareOp::LessOrEqual,
+                }),
+                stencil: Some(StencilState {
+                    front: StencilOpState {
+                        ops: vulkano::pipeline::graphics::depth_stencil::StencilOps {
+                            pass_op: StencilOp::Keep,
+                            fail_op: StencilOp::Keep,
+                            depth_fail_op: StencilOp::Keep,
+                            compare_op: CompareOp::NotEqual,
+                        },
+                        compare_mask: 0xFF,
+                        write_mask: 0x00,
+                        reference: 1,
+                    },
+                    back: StencilOpState {
+                        ops: vulkano::pipeline::graphics::depth_stencil::StencilOps {
+                            pass_op: StencilOp::Keep,
+                            fail_op: StencilOp::Keep,
+                            depth_fail_op: StencilOp::Keep,
+                            compare_op: CompareOp::NotEqual,
+                        },
+                        compare_mask: 0xFF,
+                        write_mask: 0x00,
+                        reference: 1,
+                    },
                 }),
                 ..Default::default()
             }),
@@ -663,7 +731,7 @@ pub fn create_depth_only_pipeline(
             }),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
-                front_face: FrontFace::CounterClockwise,
+                front_face: FrontFace::Clockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),

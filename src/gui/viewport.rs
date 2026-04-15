@@ -342,7 +342,9 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             }
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                state.camera_orbit.distance = (state.camera_orbit.distance - scroll * 0.3).max(0.1);
+                state.camera_orbit.target_distance = (state.camera_orbit.target_distance
+                    - scroll * state.camera_orbit.target_distance * 0.03)
+                    .max(0.1);
                 state.project_dirty = true;
             }
 

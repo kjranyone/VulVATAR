@@ -86,8 +86,11 @@ pub struct VulkanRenderer {
     descriptor_set_allocator: Option<Arc<StandardDescriptorSetAllocator>>,
     render_pass: Option<Arc<RenderPass>>,
     graphics_pipeline: Option<Arc<GraphicsPipeline>>,
+    graphics_pipeline_blend: Option<Arc<GraphicsPipeline>>,
     pipeline_no_cull: Option<Arc<GraphicsPipeline>>,
+    pipeline_no_cull_blend: Option<Arc<GraphicsPipeline>>,
     pipeline_front_cull: Option<Arc<GraphicsPipeline>>,
+    pipeline_front_cull_blend: Option<Arc<GraphicsPipeline>>,
     outline_pipeline: Option<Arc<GraphicsPipeline>>,
     sampler: Option<Arc<Sampler>>,
     default_texture_view: Option<Arc<ImageView>>,
@@ -127,8 +130,11 @@ impl VulkanRenderer {
             descriptor_set_allocator: None,
             render_pass: None,
             graphics_pipeline: None,
+            graphics_pipeline_blend: None,
             pipeline_no_cull: None,
+            pipeline_no_cull_blend: None,
             pipeline_front_cull: None,
+            pipeline_front_cull_blend: None,
             outline_pipeline: None,
             sampler: None,
             default_texture_view: None,
@@ -242,7 +248,7 @@ impl VulkanRenderer {
                     store_op: Store,
                 },
                 depth_stencil: {
-                    format: Format::D32_SFLOAT,
+                    format: Format::D32_SFLOAT_S8_UINT,
                     samples: 1,
                     load_op: Clear,
                     store_op: DontCare,
@@ -268,24 +274,54 @@ impl VulkanRenderer {
             render_pass.clone(),
             viewport.clone(),
             CullMode::Back,
+            frame_input::RenderAlphaMode::Opaque,
         )
         .expect("failed to create graphics pipeline");
+
+        let gfx_pipeline_blend = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Back,
+            frame_input::RenderAlphaMode::Blend,
+        )
+        .expect("failed to create blend graphics pipeline");
 
         let no_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::None,
+            frame_input::RenderAlphaMode::Opaque,
         )
         .expect("failed to create no-cull pipeline");
+
+        let no_cull_pipeline_blend = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::None,
+            frame_input::RenderAlphaMode::Blend,
+        )
+        .expect("failed to create blend no-cull pipeline");
 
         let front_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::Front,
+            frame_input::RenderAlphaMode::Opaque,
         )
         .expect("failed to create front-cull pipeline");
+
+        let front_cull_pipeline_blend = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Front,
+            frame_input::RenderAlphaMode::Blend,
+        )
+        .expect("failed to create blend front-cull pipeline");
 
         let outline_pipeline =
             pipeline::create_outline_pipeline(device.clone(), render_pass.clone(), viewport)
@@ -324,8 +360,11 @@ impl VulkanRenderer {
         self.descriptor_set_allocator = Some(descriptor_set_allocator.clone());
         self.render_pass = Some(render_pass);
         self.graphics_pipeline = Some(gfx_pipeline.clone());
+        self.graphics_pipeline_blend = Some(gfx_pipeline_blend);
         self.pipeline_no_cull = Some(no_cull_pipeline);
+        self.pipeline_no_cull_blend = Some(no_cull_pipeline_blend);
         self.pipeline_front_cull = Some(front_cull_pipeline);
+        self.pipeline_front_cull_blend = Some(front_cull_pipeline_blend);
         self.outline_pipeline = Some(outline_pipeline.clone());
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
@@ -394,24 +433,54 @@ impl VulkanRenderer {
             render_pass.clone(),
             viewport.clone(),
             CullMode::Back,
+            frame_input::RenderAlphaMode::Opaque,
         )
         .map_err(|e| format!("resize: failed to create graphics pipeline: {e}"))?;
+
+        let gfx_pipeline_blend = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Back,
+            frame_input::RenderAlphaMode::Blend,
+        )
+        .map_err(|e| format!("resize: failed to create blend graphics pipeline: {e}"))?;
 
         let no_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::None,
+            frame_input::RenderAlphaMode::Opaque,
         )
         .map_err(|e| format!("resize: failed to create no-cull pipeline: {e}"))?;
+
+        let no_cull_pipeline_blend = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::None,
+            frame_input::RenderAlphaMode::Blend,
+        )
+        .map_err(|e| format!("resize: failed to create blend no-cull pipeline: {e}"))?;
 
         let front_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
             render_pass.clone(),
             viewport.clone(),
             CullMode::Front,
+            frame_input::RenderAlphaMode::Opaque,
         )
         .map_err(|e| format!("resize: failed to create front-cull pipeline: {e}"))?;
+
+        let front_cull_pipeline_blend = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Front,
+            frame_input::RenderAlphaMode::Blend,
+        )
+        .map_err(|e| format!("resize: failed to create blend front-cull pipeline: {e}"))?;
 
         let outline_pipeline = pipeline::create_outline_pipeline(device, render_pass, viewport)
             .map_err(|e| format!("resize: failed to create outline pipeline: {e}"))?;
@@ -422,8 +491,11 @@ impl VulkanRenderer {
         self.offscreen_depth_view = Some(depth_view);
         self.offscreen_framebuffer = Some(framebuffer);
         self.graphics_pipeline = Some(gfx_pipeline.clone());
+        self.graphics_pipeline_blend = Some(gfx_pipeline_blend);
         self.pipeline_no_cull = Some(no_cull_pipeline);
+        self.pipeline_no_cull_blend = Some(no_cull_pipeline_blend);
         self.pipeline_front_cull = Some(front_cull_pipeline);
+        self.pipeline_front_cull_blend = Some(front_cull_pipeline_blend);
         self.outline_pipeline = Some(outline_pipeline.clone());
         self.current_extent = new_extent;
 
@@ -536,7 +608,10 @@ impl VulkanRenderer {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![Some([0.0, 0.0, 0.0, 0.0].into()), Some(1.0f32.into())],
+                    clear_values: vec![
+                        Some([0.0, 0.0, 0.0, 0.0].into()),
+                        Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
+                    ],
                     ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
                 },
                 SubpassBeginInfo {
@@ -605,12 +680,12 @@ impl VulkanRenderer {
         // Draw each avatar instance
         for instance in &input.instances {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
-                vec![crate::asset::identity_matrix()]
+                vec![mat4_cols_identity()]
             } else {
                 instance
                     .skinning_matrices
                     .iter()
-                    .map(|m| mat4_to_cols(*m))
+                    .copied()
                     .collect()
             };
 
@@ -652,103 +727,128 @@ impl VulkanRenderer {
                 )
                 .map_err(|e| format!("render: bind skinning descriptor sets failed: {e}"))?;
 
-            for mesh_inst in &instance.mesh_instances {
-                let active_pipeline = match mesh_inst.cull_mode {
-                    frame_input::RenderCullMode::DoubleSided => self
-                        .pipeline_no_cull
-                        .as_ref()
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    frame_input::RenderCullMode::FrontFace => self
-                        .pipeline_front_cull
-                        .as_ref()
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    frame_input::RenderCullMode::BackFace => gfx_pipeline.clone(),
-                };
-                builder
-                    .bind_pipeline_graphics(active_pipeline.clone())
-                    .map_err(|e| {
-                        format!("render: bind_pipeline_graphics for cull mode failed: {e}")
-                    })?;
+            for blend_pass in [false, true] {
+                for mesh_inst in &instance.mesh_instances {
+                    let is_blend =
+                        matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
+                    if is_blend != blend_pass {
+                        continue;
+                    }
 
-                // Resolve texture
-                let texture_view =
-                    self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
+                    let active_pipeline = match (mesh_inst.cull_mode.clone(), is_blend) {
+                        (frame_input::RenderCullMode::DoubleSided, true) => self
+                            .pipeline_no_cull_blend
+                            .as_ref()
+                            .or(self.pipeline_no_cull.as_ref())
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::FrontFace, true) => self
+                            .pipeline_front_cull_blend
+                            .as_ref()
+                            .or(self.pipeline_front_cull.as_ref())
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::BackFace, true) => self
+                            .graphics_pipeline_blend
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::DoubleSided, false) => self
+                            .pipeline_no_cull
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::FrontFace, false) => self
+                            .pipeline_front_cull
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::BackFace, false) => gfx_pipeline.clone(),
+                    };
+                    builder
+                        .bind_pipeline_graphics(active_pipeline.clone())
+                        .map_err(|e| {
+                            format!(
+                                "render: bind_pipeline_graphics for cull/alpha mode failed: {e}"
+                            )
+                        })?;
 
-                let shade_texture_view =
-                    self.resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
+                    let texture_view =
+                        self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
+                    let shade_texture_view = self
+                        .resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
+                    let matcap_view = self
+                        .resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
 
-                // Resolve matcap texture
-                let matcap_view =
-                    self.resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
+                    let material_set = self.material_uploader.upload_to_gpu(
+                        Some((mesh_inst.mesh_id, mesh_inst.primitive_id)),
+                        &mesh_inst.material_binding,
+                        memory_allocator.clone(),
+                        ds_allocator.clone(),
+                        &active_pipeline,
+                        texture_view,
+                        shade_texture_view,
+                        sampler.clone(),
+                        matcap_view,
+                    )?;
 
-                // Upload material (set 2) with texture
-                let material_set = self.material_uploader.upload_to_gpu(
-                    Some((mesh_inst.mesh_id, mesh_inst.primitive_id)),
-                    &mesh_inst.material_binding,
-                    memory_allocator.clone(),
-                    ds_allocator.clone(),
-                    &active_pipeline,
-                    texture_view,
-                    shade_texture_view,
-                    sampler.clone(),
-                    matcap_view,
-                )?;
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            active_pipeline.layout().clone(),
+                            2,
+                            material_set,
+                        )
+                        .map_err(|e| {
+                            format!("render: bind material descriptor sets failed: {e}")
+                        })?;
 
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        active_pipeline.layout().clone(),
-                        2,
-                        material_set,
-                    )
-                    .map_err(|e| format!("render: bind material descriptor sets failed: {e}"))?;
-
-                let (vertex_buffer, index_buffer, index_count) = if let Some(ref prim_asset) =
-                    mesh_inst.primitive_data
-                {
-                    if let Some(ref cloth) = instance.cloth_deform {
-                        if let Some(ref vd) = prim_asset.vertices {
-                            let verts = Self::build_cloth_vertices(vd, cloth);
-                            let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
-                            let idx_count = indices.len() as u32;
-                            let vb = Self::create_vertex_buffer(memory_allocator.clone(), &verts);
-                            let ib = Self::create_index_buffer(memory_allocator.clone(), indices);
-                            (vb, ib, idx_count)
+                    let (vertex_buffer, index_buffer, index_count) = if let Some(ref prim_asset) =
+                        mesh_inst.primitive_data
+                    {
+                        if let Some(ref cloth) = instance.cloth_deform {
+                            if let Some(ref vd) = prim_asset.vertices {
+                                let verts = Self::build_cloth_vertices(vd, cloth);
+                                let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
+                                let idx_count = indices.len() as u32;
+                                let vb =
+                                    Self::create_vertex_buffer(memory_allocator.clone(), &verts);
+                                let ib =
+                                    Self::create_index_buffer(memory_allocator.clone(), indices);
+                                (vb, ib, idx_count)
+                            } else {
+                                Self::create_placeholder_mesh(memory_allocator.clone())
+                            }
                         } else {
-                            Self::create_placeholder_mesh(memory_allocator.clone())
+                            self.upload_mesh(
+                                mesh_inst.mesh_id,
+                                mesh_inst.primitive_id,
+                                prim_asset,
+                                memory_allocator.clone(),
+                            )
                         }
                     } else {
-                        self.upload_mesh(
-                            mesh_inst.mesh_id,
-                            mesh_inst.primitive_id,
-                            prim_asset,
-                            memory_allocator.clone(),
-                        )
+                        Self::create_placeholder_mesh(memory_allocator.clone())
+                    };
+
+                    builder
+                        .bind_vertex_buffers(0, vertex_buffer.clone())
+                        .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
+                        .bind_index_buffer(index_buffer.clone())
+                        .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?
+                        .draw_indexed(index_count, 1, 0, 0, 0)
+                        .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
+
+                    if !is_blend && mesh_inst.outline.enabled && mesh_inst.outline.width > 0.0 {
+                        outline_draws.push(OutlineDrawInfo {
+                            vertex_buffer,
+                            index_buffer,
+                            index_count,
+                            skinning_set: skinning_set.clone(),
+                            outline_width: mesh_inst.outline.width,
+                            outline_color: mesh_inst.outline.color,
+                        });
                     }
-                } else {
-                    Self::create_placeholder_mesh(memory_allocator.clone())
-                };
-
-                builder
-                    .bind_vertex_buffers(0, vertex_buffer.clone())
-                    .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
-                    .bind_index_buffer(index_buffer.clone())
-                    .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?
-                    .draw_indexed(index_count, 1, 0, 0, 0)
-                    .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
-
-                // Collect for outline pass
-                if mesh_inst.outline.enabled && mesh_inst.outline.width > 0.0 {
-                    outline_draws.push(OutlineDrawInfo {
-                        vertex_buffer,
-                        index_buffer,
-                        index_count,
-                        skinning_set: skinning_set.clone(),
-                        outline_width: mesh_inst.outline.width,
-                        outline_color: mesh_inst.outline.color,
-                    });
                 }
             }
         }
@@ -1287,7 +1387,7 @@ impl VulkanRenderer {
             memory_allocator,
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
-                format: Format::D32_SFLOAT,
+                format: Format::D32_SFLOAT_S8_UINT,
                 extent: [extent[0], extent[1], 1],
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
                 ..Default::default()
@@ -1377,6 +1477,7 @@ impl VulkanRenderer {
                 render_pass.clone(),
                 viewport,
                 vulkano::pipeline::graphics::rasterization::CullMode::Back,
+                frame_input::RenderAlphaMode::Opaque,
             )
             .map_err(|e| format!("thumbnail: pipeline creation failed: {e}"))?;
 
@@ -1477,7 +1578,10 @@ impl VulkanRenderer {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![Some([0.2, 0.2, 0.2, 1.0].into()), Some(1.0f32.into())],
+                    clear_values: vec![
+                        Some([0.2, 0.2, 0.2, 1.0].into()),
+                        Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
+                    ],
                     ..RenderPassBeginInfo::framebuffer(framebuffer)
                 },
                 SubpassBeginInfo {
@@ -1498,12 +1602,12 @@ impl VulkanRenderer {
 
         for instance in &input.instances {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
-                vec![crate::asset::identity_matrix()]
+                vec![mat4_cols_identity()]
             } else {
                 instance
                     .skinning_matrices
                     .iter()
-                    .map(|m| mat4_to_cols(*m))
+                    .copied()
                     .collect()
             };
 
@@ -1760,7 +1864,7 @@ struct CameraUniform {
     _pad2: f32,
 }
 
-/// Convert the project's row-major `Mat4` into column-major for GLSL.
+/// Convert row-major camera matrices into column-major for GLSL.
 fn mat4_to_cols(m: crate::asset::Mat4) -> [[f32; 4]; 4] {
     [
         [m[0][0], m[1][0], m[2][0], m[3][0]],
@@ -1768,6 +1872,11 @@ fn mat4_to_cols(m: crate::asset::Mat4) -> [[f32; 4]; 4] {
         [m[0][2], m[1][2], m[2][2], m[3][2]],
         [m[0][3], m[1][3], m[2][3], m[3][3]],
     ]
+}
+
+/// Skinning and TRS matrices are already stored column-major in the asset/avatar path.
+fn mat4_cols_identity() -> [[f32; 4]; 4] {
+    crate::asset::identity_matrix()
 }
 
 const FRAME_LAG: usize = 3;
