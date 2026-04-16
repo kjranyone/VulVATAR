@@ -187,6 +187,7 @@ void main() {
     }
 
     vec3 n = normalize(frag_normal);
+    if (!gl_FrontFacing) n = -n;
     vec3 l = normalize(camera.light_dir);
     float ndotl = dot(n, l);
 
