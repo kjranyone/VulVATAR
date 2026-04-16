@@ -13,12 +13,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             ui.separator();
 
-            let tracking_color = if state.tracking.camera_running {
+            let tracking_active = state.is_tracking_active();
+            let tracking_color = if tracking_active {
                 egui::Color32::GREEN
             } else {
                 egui::Color32::GRAY
             };
-            let tracking_text = if state.tracking.camera_running {
+            let tracking_text = if tracking_active {
                 "Tracking: Active"
             } else {
                 "Tracking: Stopped"

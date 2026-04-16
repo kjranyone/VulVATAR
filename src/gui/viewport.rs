@@ -443,6 +443,132 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 }
             }
 
+            // ── Camera PIP wipe ───────────────────────────────────────
+            if state.show_camera_wipe {
+                let snap = state.app.tracking.mailbox().snapshot();
+                if let Some(ref frame) = snap.frame {
+                    if snap.sequence != state.camera_wipe_seq {
+                        let w = frame.width as usize;
+                        let h = frame.height as usize;
+                        if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
+                            let needed = w * h * 4;
+                            if state.camera_wipe_rgba_buf.len() != needed {
+                                state.camera_wipe_rgba_buf.resize(needed, 255);
+                            }
+                            let rgba = &mut state.camera_wipe_rgba_buf;
+                            for i in 0..w * h {
+                                rgba[i * 4] = frame.rgb_data[i * 3];
+                                rgba[i * 4 + 1] = frame.rgb_data[i * 3 + 1];
+                                rgba[i * 4 + 2] = frame.rgb_data[i * 3 + 2];
+                                rgba[i * 4 + 3] = 255;
+                            }
+                            let color_image =
+                                egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+                            let options = egui::TextureOptions {
+                                magnification: egui::TextureFilter::Linear,
+                                minification: egui::TextureFilter::Linear,
+                                ..Default::default()
+                            };
+                            if let Some(ref mut handle) = state.camera_wipe_texture {
+                                handle.set(color_image, options);
+                            } else {
+                                let handle =
+                                    ui.ctx().load_texture("camera_wipe", color_image, options);
+                                state.camera_wipe_texture = Some(handle);
+                            }
+                        }
+                        state.camera_wipe_seq = snap.sequence;
+                    }
+
+                    if let Some(ref tex) = state.camera_wipe_texture {
+                        let pip_max_w = 240.0;
+                        let tex_size = tex.size_vec2();
+                        let scale = pip_max_w / tex_size.x.max(1.0);
+                        let pip_w = tex_size.x * scale;
+                        let pip_h = tex_size.y * scale;
+                        let pip_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - pip_w - 12.0, rect.bottom() - pip_h - 12.0),
+                            egui::vec2(pip_w, pip_h),
+                        );
+                        painter.rect_filled(pip_rect, 4.0, egui::Color32::from_rgb(18, 18, 22));
+                        painter.rect_stroke(
+                            pip_rect,
+                            4.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 130, 200)),
+                        );
+
+                        let uv = if state.tracking.tracking_mirror {
+                            egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
+                        } else {
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+                        };
+                        painter.image(tex.id(), pip_rect, uv, egui::Color32::WHITE);
+
+                        // ── Detection annotations ──────────────────────
+                        if state.show_detection_annotations {
+                            if let Some(ref ann) = snap.annotation {
+                                let kpt_color =
+                                    egui::Color32::from_rgba_unmultiplied(0, 255, 128, 220);
+                                let line_color =
+                                    egui::Color32::from_rgba_unmultiplied(0, 200, 255, 180);
+                                let bb_color =
+                                    egui::Color32::from_rgba_unmultiplied(255, 220, 80, 200);
+
+                                let mirror = state.tracking.tracking_mirror;
+                                let map_x = |nx: f32| {
+                                    let x = if mirror { 1.0 - nx } else { nx };
+                                    pip_rect.left() + x * pip_rect.width()
+                                };
+                                let map_y = |ny: f32| pip_rect.top() + ny * pip_rect.height();
+
+                                for &(kx, ky, conf) in &ann.keypoints {
+                                    if conf < 0.1 {
+                                        continue;
+                                    }
+                                    painter.circle_filled(
+                                        egui::pos2(map_x(kx), map_y(ky)),
+                                        3.0,
+                                        kpt_color,
+                                    );
+                                }
+
+                                for &(a, b) in &ann.skeleton {
+                                    let ka = ann.keypoints.get(a);
+                                    let kb = ann.keypoints.get(b);
+                                    if let (Some(&(ax, ay, ac)), Some(&(bx, by, bc))) = (ka, kb) {
+                                        if ac >= 0.1 && bc >= 0.1 {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(map_x(ax), map_y(ay)),
+                                                    egui::pos2(map_x(bx), map_y(by)),
+                                                ],
+                                                egui::Stroke::new(1.5, line_color),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if let Some((bx1, by1, bx2, by2)) = ann.bounding_box {
+                                    let px1 = map_x(bx1);
+                                    let py1 = map_y(by1);
+                                    let px2 = map_x(bx2);
+                                    let py2 = map_y(by2);
+                                    let bb_rect = egui::Rect::from_min_max(
+                                        egui::pos2(px1.min(px2), py1.min(py2)),
+                                        egui::pos2(px1.max(px2), py2.max(py2)),
+                                    );
+                                    painter.rect_stroke(
+                                        bb_rect,
+                                        0.0,
+                                        egui::Stroke::new(1.5, bb_color),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Show camera info overlay.
             let info = format!(
                 "Eye: [{:.2}, {:.2}, {:.2}]  Yaw: {:.1}  Pitch: {:.1}  Dist: {:.2}",

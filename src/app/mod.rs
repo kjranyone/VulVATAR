@@ -749,14 +749,6 @@ impl Application {
         }
     }
 
-    pub fn webcam_frame(&self) -> Option<crate::tracking::WebcamFrame> {
-        self.tracking.mailbox().latest_frame()
-    }
-
-    pub fn webcam_annotation(&self) -> Option<crate::tracking::DetectionAnnotation> {
-        self.tracking.mailbox().latest_annotation()
-    }
-
     /// Replace the active output sink, shutting down the old OutputRouter and
     /// creating a new one with the selected sink.
     pub fn set_output_sink(&mut self, sink: FrameSink) {

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-use super::TrackingRigPose;
+use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{
-    pose_estimation::euler_to_quat, ExpressionWeightSet, RigShoulderTargets, RigTarget,
-    TrackingConfidenceMap,
+    pose_estimation::euler_to_quat, DetectionAnnotation, ExpressionWeightSet, RigShoulderTargets,
+    RigTarget, TrackingConfidenceMap, TrackingRigPose,
 };
 #[cfg(feature = "inference")]
 use log::{error, info};
@@ -53,7 +53,7 @@ impl CigPoseInference {
         width: u32,
         height: u32,
         frame_index: u64,
-    ) -> TrackingRigPose {
+    ) -> PoseEstimate {
         #[cfg(feature = "inference")]
         return self.estimate_pose_internal(rgb_data, width, height, frame_index);
 
@@ -70,7 +70,7 @@ impl CigPoseInference {
         width: u32,
         height: u32,
         frame_index: u64,
-    ) -> TrackingRigPose {
+    ) -> PoseEstimate {
         let (tensor, aspect) =
             preprocess_frame(rgb_data, width, height, self.input_w, self.input_h);
 
@@ -78,9 +78,12 @@ impl CigPoseInference {
             Ok(v) => v,
             Err(e) => {
                 error!("TensorRef creation failed: {}", e);
-                return TrackingRigPose {
-                    source_timestamp: frame_index,
-                    ..Default::default()
+                return PoseEstimate {
+                    rig_pose: TrackingRigPose {
+                        source_timestamp: frame_index,
+                        ..Default::default()
+                    },
+                    annotation: DetectionAnnotation::default(),
                 };
             }
         };
@@ -89,9 +92,12 @@ impl CigPoseInference {
             Ok(out) => out,
             Err(e) => {
                 error!("ONNX inference failed: {}", e);
-                return TrackingRigPose {
-                    source_timestamp: frame_index,
-                    ..Default::default()
+                return PoseEstimate {
+                    rig_pose: TrackingRigPose {
+                        source_timestamp: frame_index,
+                        ..Default::default()
+                    },
+                    annotation: DetectionAnnotation::default(),
                 };
             }
         };
@@ -102,7 +108,20 @@ impl CigPoseInference {
         let split_ratio = 2.0;
         let kpts = decode_simcc_from_slice(data_x, data_y, shape_x, split_ratio);
 
-        map_to_rig_pose(kpts, self.input_w, self.input_h, aspect, frame_index)
+        let rig_pose = map_to_rig_pose(
+            kpts.clone(),
+            self.input_w,
+            self.input_h,
+            aspect,
+            frame_index,
+        );
+
+        let annotation = build_annotation(kpts, self.input_w, self.input_h, width, height);
+
+        PoseEstimate {
+            rig_pose,
+            annotation,
+        }
     }
 }
 
@@ -199,6 +218,49 @@ fn decode_simcc_from_slice(
         kpts.push((x, y, conf));
     }
     kpts
+}
+
+/// COCO-wholebody skeleton connections (body part only).
+const SKELETON_CONNECTIONS: [(usize, usize); 16] = [
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (5, 6),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
+];
+
+#[cfg(feature = "inference")]
+fn build_annotation(
+    kpts: Vec<(f32, f32, f32)>,
+    model_w: u32,
+    model_h: u32,
+    orig_w: u32,
+    orig_h: u32,
+) -> DetectionAnnotation {
+    let mw = model_w as f32;
+    let mh = model_h as f32;
+    let ow = orig_w as f32;
+    let oh = orig_h as f32;
+    let norm_kpts: Vec<(f32, f32, f32)> = kpts
+        .into_iter()
+        .map(|(x, y, c)| (x / mw, y / mh, c))
+        .collect();
+    DetectionAnnotation {
+        keypoints: norm_kpts,
+        skeleton: SKELETON_CONNECTIONS.to_vec(),
+        bounding_box: None,
+    }
 }
 
 #[cfg(feature = "inference")]

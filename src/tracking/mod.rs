@@ -1,7 +1,5 @@
 #![allow(dead_code)]
-#[cfg(feature = "webcam")]
-use log::warn;
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -375,6 +373,8 @@ pub struct TrackingMailbox {
 
 struct TrackingMailboxInner {
     latest_pose: Option<TrackingRigPose>,
+    latest_frame: Option<WebcamFrame>,
+    latest_annotation: Option<DetectionAnnotation>,
     sequence: u64,
     last_update_nanos: u64,
 }
@@ -386,11 +386,22 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+/// Atomically captured snapshot of the tracking mailbox state.
+#[derive(Clone, Debug, Default)]
+pub struct MailboxSnapshot {
+    pub pose: Option<TrackingRigPose>,
+    pub frame: Option<WebcamFrame>,
+    pub annotation: Option<DetectionAnnotation>,
+    pub sequence: u64,
+}
+
 impl TrackingMailbox {
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Mutex::new(TrackingMailboxInner {
                 latest_pose: None,
+                latest_frame: None,
+                latest_annotation: None,
                 sequence: 0,
                 last_update_nanos: 0,
             })),
@@ -411,6 +422,27 @@ impl TrackingMailbox {
         self.publish(pose);
     }
 
+    /// Publish a full estimation result including frame and annotations.
+    pub fn publish_estimate(&self, estimate: PoseEstimate, frame: Option<WebcamFrame>) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.latest_pose = Some(estimate.rig_pose);
+        inner.latest_annotation = Some(estimate.annotation);
+        inner.latest_frame = frame;
+        inner.sequence += 1;
+        inner.last_update_nanos = now_nanos();
+    }
+
+    /// Atomically snapshot the entire mailbox state under a single lock.
+    pub fn snapshot(&self) -> MailboxSnapshot {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        MailboxSnapshot {
+            pose: inner.latest_pose.clone(),
+            frame: inner.latest_frame.clone(),
+            annotation: inner.latest_annotation.clone(),
+            sequence: inner.sequence,
+        }
+    }
+
     /// Thread-safe read: takes &self, locks the mutex, clones the pose.
     pub fn latest_pose(&self) -> Option<TrackingRigPose> {
         let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -422,9 +454,18 @@ impl TrackingMailbox {
         self.latest_pose()
     }
 
+    /// Read the latest webcam frame (downscaled for GUI display).
+    pub fn latest_frame(&self) -> Option<WebcamFrame> {
+        self.snapshot().frame
+    }
+
+    /// Read the latest 2D detection annotation.
+    pub fn latest_annotation(&self) -> Option<DetectionAnnotation> {
+        self.snapshot().annotation
+    }
+
     pub fn sequence(&self) -> u64 {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.sequence
+        self.snapshot().sequence
     }
 
     /// Returns true if the latest sample is older than `stale_timeout_nanos`,
@@ -437,6 +478,35 @@ impl TrackingMailbox {
         let elapsed = now_nanos().saturating_sub(inner.last_update_nanos);
         elapsed > self.stale_timeout_nanos
     }
+}
+
+// ---------------------------------------------------------------------------
+// Webcam frame & detection annotation (for GUI PIP wipe display)
+// ---------------------------------------------------------------------------
+
+/// A downscaled webcam frame for the GUI camera-preview overlay.
+#[derive(Clone, Debug)]
+pub struct WebcamFrame {
+    pub rgb_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 2D detection annotation overlaid on the camera preview.
+#[derive(Clone, Debug, Default)]
+pub struct DetectionAnnotation {
+    /// Keypoints as (x, y, confidence) in normalised [0, 1] image coords.
+    pub keypoints: Vec<(f32, f32, f32)>,
+    /// Skeleton line connections as pairs of keypoint indices.
+    pub skeleton: Vec<(usize, usize)>,
+    /// Bounding box (min_x, min_y, max_x, max_y) in normalised coords.
+    pub bounding_box: Option<(f32, f32, f32, f32)>,
+}
+
+/// Combined output of a pose estimation pass: rig pose + 2D annotation.
+pub struct PoseEstimate {
+    pub rig_pose: TrackingRigPose,
+    pub annotation: DetectionAnnotation,
 }
 
 // ---------------------------------------------------------------------------
@@ -667,12 +737,27 @@ impl TrackingWorker {
 
     /// Signal the worker to stop and join the thread.
     ///
-    /// Blocks until the worker thread exits. Safe to call multiple times.
+    /// Waits up to 3 seconds for the worker thread to exit. If it hasn't
+    /// exited by then (e.g. `grab_frame()` is blocking indefinitely), the
+    /// thread is detached so the caller is not blocked. Safe to call
+    /// multiple times.
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            if let Err(e) = handle.join() {
-                error!("tracking-worker: thread panicked: {:?}", e);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if handle.is_finished() {
+                    if let Err(e) = handle.join() {
+                        error!("tracking-worker: thread panicked: {:?}", e);
+                    }
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn!("tracking-worker: thread did not exit within timeout, detaching");
+                    std::mem::drop(handle);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -777,13 +862,14 @@ impl TrackingWorker {
                     let width = capture.width();
                     let height = capture.height();
 
-                    let pose = if let Some(ref mut estimator) = pose_estimator {
+                    let estimate = if let Some(ref mut estimator) = pose_estimator {
                         estimator.estimate_pose(&rgb_data, width, height, frame_index)
                     } else {
                         pose_estimation::estimate_pose(&rgb_data, width, height, frame_index)
                     };
 
-                    mailbox.publish(pose);
+                    let frame = Some(downscale_for_gui(&rgb_data, width, height, 320));
+                    mailbox.publish_estimate(estimate, frame);
                 }
                 Err(e) => {
                     error!("tracking-worker: frame grab error: {}", e);
@@ -882,5 +968,36 @@ fn synthetic_pose(frame_index: u64, t: f32) -> TrackingRigPose {
             left_hand_confidence: 0.0,
             right_hand_confidence: 0.0,
         },
+    }
+}
+
+/// Downscale an RGB frame to a maximum width, preserving aspect ratio.
+fn downscale_for_gui(rgb_data: &[u8], src_w: u32, src_h: u32, max_w: u32) -> WebcamFrame {
+    if src_w <= max_w {
+        return WebcamFrame {
+            rgb_data: rgb_data.to_vec(),
+            width: src_w,
+            height: src_h,
+        };
+    }
+    let scale = max_w as f32 / src_w as f32;
+    let dst_w = max_w;
+    let dst_h = ((src_h as f32 * scale).round() as u32).max(1);
+    let mut out = vec![0u8; (dst_w * dst_h * 3) as usize];
+    for y in 0..dst_h {
+        let sy = ((y as f32 / scale) as u32).min(src_h - 1);
+        for x in 0..dst_w {
+            let sx = ((x as f32 / scale) as u32).min(src_w - 1);
+            let si = ((sy * src_w + sx) * 3) as usize;
+            let di = ((y * dst_w + x) * 3) as usize;
+            out[di] = rgb_data[si];
+            out[di + 1] = rgb_data[si + 1];
+            out[di + 2] = rgb_data[si + 2];
+        }
+    }
+    WebcamFrame {
+        rgb_data: out,
+        width: dst_w,
+        height: dst_h,
     }
 }

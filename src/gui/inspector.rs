@@ -530,9 +530,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     {
         // Start/stop processor when toggle changes.
         if state.lipsync.enabled && !was_enabled {
-            match crate::lipsync::LipSyncProcessor::start(Some(
-                state.lipsync.mic_device_index,
-            )) {
+            match crate::lipsync::LipSyncProcessor::start(Some(state.lipsync.mic_device_index)) {
                 Ok(proc) => {
                     state.lipsync_processor = Some(proc);
                     state.push_notification("Lip sync started.".to_string());
@@ -553,19 +551,28 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         // Run inference each frame and update volume meter.
         if let Some(ref mut proc) = state.lipsync_processor {
             state.lipsync.current_volume = proc.rms_volume();
-            let viseme = proc.process_frame(state.lipsync.smoothing);
+            let dt = state.frame_time_ms as f32 / 1000.0;
+            let viseme = proc.process_frame(state.lipsync.smoothing, dt.max(0.001));
 
             // Feed viseme weights into the avatar's expression weights.
             if let Some(avatar) = state.app.active_avatar_mut() {
                 for (name, weight) in viseme.as_expression_pairs() {
                     if weight < state.lipsync.volume_threshold && name == "aa" {
                         // Below threshold: close mouth.
-                        if let Some(ew) = avatar.expression_weights.iter_mut().find(|w| w.name == name) {
+                        if let Some(ew) = avatar
+                            .expression_weights
+                            .iter_mut()
+                            .find(|w| w.name == name)
+                        {
                             ew.weight = 0.0;
                         }
                         continue;
                     }
-                    if let Some(ew) = avatar.expression_weights.iter_mut().find(|w| w.name == name) {
+                    if let Some(ew) = avatar
+                        .expression_weights
+                        .iter_mut()
+                        .find(|w| w.name == name)
+                    {
                         ew.weight = weight;
                     }
                 }
@@ -1813,6 +1820,16 @@ fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                             },
                         )
                         .collect();
+                }
+            }
+
+            if !changed {
+                if let Some(avatar) = state.app.active_avatar() {
+                    let avatar_weights: Vec<f32> =
+                        avatar.expression_weights.iter().map(|w| w.weight).collect();
+                    if avatar_weights.len() == state.expression_weights.len() {
+                        state.expression_weights = avatar_weights;
+                    }
                 }
             }
 

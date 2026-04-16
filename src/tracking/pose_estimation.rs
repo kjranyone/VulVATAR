@@ -16,25 +16,22 @@
 //! 7. Derive a rough confidence from the proportion of skin pixels.
 
 use super::{
-    ExpressionWeight, ExpressionWeightSet, RigArmTargets, RigShoulderTargets, RigTarget,
-    TrackingConfidenceMap, TrackingRigPose,
+    DetectionAnnotation, ExpressionWeight, ExpressionWeightSet, PoseEstimate, RigArmTargets,
+    RigShoulderTargets, RigTarget, TrackingConfidenceMap, TrackingRigPose,
 };
 
-/// Produce a `TrackingRigPose` from a raw RGB frame.
+/// Produce a `PoseEstimate` from a raw RGB frame.
 ///
 /// `rgb_data` must contain `width * height * 3` bytes in row-major RGB order.
-pub fn estimate_pose(
-    rgb_data: &[u8],
-    width: u32,
-    height: u32,
-    frame_index: u64,
-) -> TrackingRigPose {
+pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64) -> PoseEstimate {
     let expected_len = (width * height * 3) as usize;
     if rgb_data.len() < expected_len {
-        // Malformed frame -- return a default (no-detection) pose.
-        return TrackingRigPose {
-            source_timestamp: frame_index,
-            ..Default::default()
+        return PoseEstimate {
+            rig_pose: TrackingRigPose {
+                source_timestamp: frame_index,
+                ..Default::default()
+            },
+            annotation: DetectionAnnotation::default(),
         };
     }
 
@@ -95,20 +92,23 @@ pub fn estimate_pose(
     // We expect roughly 5-30% of the frame to be skin if a face/upper-body
     // is visible.  Below 2% we treat as "no detection".
     if skin_ratio < 0.02 || skin_pixel_count == 0 {
-        return TrackingRigPose {
-            source_timestamp: frame_index,
-            confidence: TrackingConfidenceMap {
-                head_confidence: 0.0,
-                torso_confidence: 0.0,
-                left_arm_confidence: 0.0,
-                right_arm_confidence: 0.0,
-                face_confidence: 0.0,
-                left_leg_confidence: 0.0,
-                right_leg_confidence: 0.0,
-                left_hand_confidence: 0.0,
-                right_hand_confidence: 0.0,
+        return PoseEstimate {
+            rig_pose: TrackingRigPose {
+                source_timestamp: frame_index,
+                confidence: TrackingConfidenceMap {
+                    head_confidence: 0.0,
+                    torso_confidence: 0.0,
+                    left_arm_confidence: 0.0,
+                    right_arm_confidence: 0.0,
+                    face_confidence: 0.0,
+                    left_leg_confidence: 0.0,
+                    right_leg_confidence: 0.0,
+                    left_hand_confidence: 0.0,
+                    right_hand_confidence: 0.0,
+                },
+                ..Default::default()
             },
-            ..Default::default()
+            annotation: DetectionAnnotation::default(),
         };
     }
 
@@ -161,62 +161,78 @@ pub fn estimate_pose(
     // 6. Build the pose
     // -----------------------------------------------------------------------
 
-    TrackingRigPose {
-        source_timestamp: frame_index,
-        head: Some(RigTarget {
-            position: [head_x, head_y, head_z],
-            orientation: head_orientation,
-            confidence,
-        }),
-        neck: Some(RigTarget {
-            position: [head_x * 0.5, head_y - 0.1, 0.0],
-            orientation: [0.0, 0.0, 0.0, 1.0],
-            confidence: confidence * 0.8,
-        }),
-        spine: Some(RigTarget {
-            position: [0.0, 1.0, 0.0],
-            orientation: [0.0, 0.0, 0.0, 1.0],
-            confidence: confidence * 0.5,
-        }),
-        shoulders: RigShoulderTargets {
-            left: Some(RigTarget {
-                position: [-0.15, head_y - 0.2, 0.0],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-                confidence: confidence * 0.4,
+    let w = width as f32;
+    let h = height as f32;
+    let annotation = DetectionAnnotation {
+        keypoints: vec![(centroid_x / w, centroid_y / h, confidence)],
+        skeleton: vec![],
+        bounding_box: Some((
+            skin_min_x as f32 / w,
+            skin_min_y as f32 / h,
+            skin_max_x as f32 / w,
+            skin_max_y as f32 / h,
+        )),
+    };
+
+    PoseEstimate {
+        rig_pose: TrackingRigPose {
+            source_timestamp: frame_index,
+            head: Some(RigTarget {
+                position: [head_x, head_y, head_z],
+                orientation: head_orientation,
+                confidence,
             }),
-            right: Some(RigTarget {
-                position: [0.15, head_y - 0.2, 0.0],
+            neck: Some(RigTarget {
+                position: [head_x * 0.5, head_y - 0.1, 0.0],
                 orientation: [0.0, 0.0, 0.0, 1.0],
-                confidence: confidence * 0.4,
+                confidence: confidence * 0.8,
             }),
+            spine: Some(RigTarget {
+                position: [0.0, 1.0, 0.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                confidence: confidence * 0.5,
+            }),
+            shoulders: RigShoulderTargets {
+                left: Some(RigTarget {
+                    position: [-0.15, head_y - 0.2, 0.0],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                    confidence: confidence * 0.4,
+                }),
+                right: Some(RigTarget {
+                    position: [0.15, head_y - 0.2, 0.0],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                    confidence: confidence * 0.4,
+                }),
+            },
+            arms: RigArmTargets {
+                left_upper: None,
+                left_lower: None,
+                right_upper: None,
+                right_lower: None,
+            },
+            hands: None,
+            legs: None,
+            feet: None,
+            fingers: None,
+            expressions: ExpressionWeightSet {
+                weights: vec![ExpressionWeight {
+                    name: "blink".to_string(),
+                    weight: 0.0,
+                }],
+            },
+            confidence: TrackingConfidenceMap {
+                head_confidence: confidence,
+                torso_confidence: confidence * 0.5,
+                left_arm_confidence: 0.0,
+                right_arm_confidence: 0.0,
+                face_confidence: confidence * 0.7,
+                left_leg_confidence: 0.0,
+                right_leg_confidence: 0.0,
+                left_hand_confidence: 0.0,
+                right_hand_confidence: 0.0,
+            },
         },
-        arms: RigArmTargets {
-            left_upper: None,
-            left_lower: None,
-            right_upper: None,
-            right_lower: None,
-        },
-        hands: None,
-        legs: None,
-        feet: None,
-        fingers: None,
-        expressions: ExpressionWeightSet {
-            weights: vec![ExpressionWeight {
-                name: "blink".to_string(),
-                weight: 0.0, // cannot detect blinks with color thresholding
-            }],
-        },
-        confidence: TrackingConfidenceMap {
-            head_confidence: confidence,
-            torso_confidence: confidence * 0.5,
-            left_arm_confidence: 0.0,
-            right_arm_confidence: 0.0,
-            face_confidence: confidence * 0.7,
-            left_leg_confidence: 0.0,
-            right_leg_confidence: 0.0,
-            left_hand_confidence: 0.0,
-            right_hand_confidence: 0.0,
-        },
+        annotation,
     }
 }
 
@@ -288,13 +304,12 @@ mod tests {
 
     #[test]
     fn estimate_pose_empty_frame_returns_default() {
-        let pose = estimate_pose(&[], 640, 480, 0);
-        assert!(pose.head.is_none());
+        let result = estimate_pose(&[], 640, 480, 0);
+        assert!(result.rig_pose.head.is_none());
     }
 
     #[test]
     fn estimate_pose_uniform_skin_color() {
-        // Fill a small frame with a skin-like color (R=200, G=150, B=120).
         let w: u32 = 32;
         let h: u32 = 32;
         let mut data = vec![0u8; (w * h * 3) as usize];
@@ -303,10 +318,11 @@ mod tests {
             data[i * 3 + 1] = 150;
             data[i * 3 + 2] = 120;
         }
-        let pose = estimate_pose(&data, w, h, 42);
-        assert!(pose.head.is_some());
-        assert!(pose.confidence.head_confidence > 0.0);
-        assert_eq!(pose.source_timestamp, 42);
+        let result = estimate_pose(&data, w, h, 42);
+        assert!(result.rig_pose.head.is_some());
+        assert!(result.rig_pose.confidence.head_confidence > 0.0);
+        assert_eq!(result.rig_pose.source_timestamp, 42);
+        assert!(result.annotation.bounding_box.is_some());
     }
 
     #[test]
