@@ -382,7 +382,11 @@ The render loop iterates `blend_pass in [false, true]` and skips non-matching me
 
 ### Front Face Winding
 
-VRM/glTF uses clockwise front face winding (`FrontFace::Clockwise`). This was originally set to `CounterClockwise` which caused incorrect culling behavior. All pipelines (main, outline, depth-only) must use the same winding convention.
+glTF/VRM uses counter-clockwise front face winding (`FrontFace::CounterClockwise`). This is Vulkan's default. Do NOT change to `Clockwise` — doing so causes back-face textures to render on the front of the body (reversed legs, neck, etc.). All pipelines (main, outline, depth-only) must use the same `CounterClockwise` convention.
+
+### Outline and Alpha-Masked Materials
+
+The outline shader does not perform alpha testing. For alpha-masked (Cutout) materials, the outline pass would draw in regions that the main pass discarded via alpha cutoff, creating dark jagged artifacts that extend beyond the visible mesh boundary. Therefore, outline collection must be skipped for `RenderAlphaMode::Cutout` materials.
 
 ### Skinning Matrix Convention
 
