@@ -261,8 +261,18 @@ fn build_frame_input(
         })
         .collect();
 
+    let cam_distance: f32 = std::env::var("CAM_DIST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5.0);
+    let cam_pan_y: f32 = std::env::var("CAM_PAN_Y")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let camera = ViewportCamera {
         yaw_deg,
+        distance: cam_distance,
+        pan: [0.0, cam_pan_y],
         ..ViewportCamera::default()
     };
     let (view, eye_pos) = build_view_matrix(&camera);

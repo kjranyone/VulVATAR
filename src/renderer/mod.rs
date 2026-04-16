@@ -839,7 +839,11 @@ impl VulkanRenderer {
                         .draw_indexed(index_count, 1, 0, 0, 0)
                         .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
 
-                    if !is_blend && mesh_inst.outline.enabled && mesh_inst.outline.width > 0.0 {
+                    // Skip outlines for alpha-masked (Cutout) materials: the outline
+                    // shader cannot do alpha testing, so it would draw in regions
+                    // that the main pass discarded, creating dark jagged artifacts.
+                    let is_cutout = matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
+                    if !is_blend && !is_cutout && mesh_inst.outline.enabled && mesh_inst.outline.width > 0.0 {
                         outline_draws.push(OutlineDrawInfo {
                             vertex_buffer,
                             index_buffer,

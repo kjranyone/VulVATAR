@@ -536,7 +536,7 @@ pub fn create_graphics_pipeline(
             }),
             rasterization_state: Some(RasterizationState {
                 cull_mode,
-                front_face: FrontFace::Clockwise,
+                front_face: FrontFace::CounterClockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -636,7 +636,7 @@ pub fn create_outline_pipeline(
             }),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Front,
-                front_face: FrontFace::Clockwise,
+                front_face: FrontFace::CounterClockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -736,7 +736,7 @@ pub fn create_depth_only_pipeline(
             }),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
-                front_face: FrontFace::Clockwise,
+                front_face: FrontFace::CounterClockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
