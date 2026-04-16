@@ -233,92 +233,15 @@ impl TrackingCalibration {
             head.orientation = quat_mul(&inv_offset, &head.orientation);
         }
 
-        // Scale all positions by scale_factor
+        // Scale all target positions by scale_factor
         let s = self.scale_factor;
-        if let Some(ref mut t) = pose.head {
-            vec3_scale(&mut t.position, s);
-        }
+        pose.for_each_target_mut(|t| vec3_scale(&mut t.position, s));
 
         // Apply head_position_offset AFTER scaling
         if let Some(ref mut head) = pose.head {
             head.position[0] += self.head_position_offset[0];
             head.position[1] += self.head_position_offset[1];
             head.position[2] += self.head_position_offset[2];
-        }
-        if let Some(ref mut t) = pose.neck {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.spine {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.shoulders.left {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.shoulders.right {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.arms.left_upper {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.arms.left_lower {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.arms.right_upper {
-            vec3_scale(&mut t.position, s);
-        }
-        if let Some(ref mut t) = pose.arms.right_lower {
-            vec3_scale(&mut t.position, s);
-        }
-
-        if let Some(ref mut hands) = pose.hands {
-            if let Some(ref mut t) = hands.left {
-                vec3_scale(&mut t.position, s);
-            }
-            if let Some(ref mut t) = hands.right {
-                vec3_scale(&mut t.position, s);
-            }
-        }
-
-        if let Some(ref mut legs) = pose.legs {
-            if let Some(ref mut t) = legs.left_upper {
-                vec3_scale(&mut t.position, s);
-            }
-            if let Some(ref mut t) = legs.left_lower {
-                vec3_scale(&mut t.position, s);
-            }
-            if let Some(ref mut t) = legs.right_upper {
-                vec3_scale(&mut t.position, s);
-            }
-            if let Some(ref mut t) = legs.right_lower {
-                vec3_scale(&mut t.position, s);
-            }
-        }
-
-        if let Some(ref mut feet) = pose.feet {
-            if let Some(ref mut t) = feet.left {
-                vec3_scale(&mut t.position, s);
-            }
-            if let Some(ref mut t) = feet.right {
-                vec3_scale(&mut t.position, s);
-            }
-        }
-
-        if let Some(ref mut fingers) = pose.fingers {
-            let scale_finger = |t: &mut Option<RigTarget>| {
-                if let Some(ref mut t) = t {
-                    vec3_scale(&mut t.position, s);
-                }
-            };
-            scale_finger(&mut fingers.left_thumb);
-            scale_finger(&mut fingers.left_index);
-            scale_finger(&mut fingers.left_middle);
-            scale_finger(&mut fingers.left_ring);
-            scale_finger(&mut fingers.left_pinky);
-            scale_finger(&mut fingers.right_thumb);
-            scale_finger(&mut fingers.right_index);
-            scale_finger(&mut fingers.right_middle);
-            scale_finger(&mut fingers.right_ring);
-            scale_finger(&mut fingers.right_pinky);
         }
 
         // Adjust shoulder width if override is set
@@ -329,6 +252,88 @@ impl TrackingCalibration {
             }
             if let Some(ref mut right) = pose.shoulders.right {
                 right.position[0] = half_width;
+            }
+        }
+    }
+}
+
+impl TrackingRigPose {
+    /// Iterate over every `RigTarget` in the pose, calling `f` on each one.
+    /// Covers head, neck, spine, shoulders, arms, hands, legs, feet, fingers.
+    pub fn for_each_target_mut(&mut self, mut f: impl FnMut(&mut RigTarget)) {
+        if let Some(ref mut t) = self.head {
+            f(t);
+        }
+        if let Some(ref mut t) = self.neck {
+            f(t);
+        }
+        if let Some(ref mut t) = self.spine {
+            f(t);
+        }
+        if let Some(ref mut t) = self.shoulders.left {
+            f(t);
+        }
+        if let Some(ref mut t) = self.shoulders.right {
+            f(t);
+        }
+        if let Some(ref mut t) = self.arms.left_upper {
+            f(t);
+        }
+        if let Some(ref mut t) = self.arms.left_lower {
+            f(t);
+        }
+        if let Some(ref mut t) = self.arms.right_upper {
+            f(t);
+        }
+        if let Some(ref mut t) = self.arms.right_lower {
+            f(t);
+        }
+        if let Some(ref mut hands) = self.hands {
+            if let Some(ref mut t) = hands.left {
+                f(t);
+            }
+            if let Some(ref mut t) = hands.right {
+                f(t);
+            }
+        }
+        if let Some(ref mut legs) = self.legs {
+            if let Some(ref mut t) = legs.left_upper {
+                f(t);
+            }
+            if let Some(ref mut t) = legs.left_lower {
+                f(t);
+            }
+            if let Some(ref mut t) = legs.right_upper {
+                f(t);
+            }
+            if let Some(ref mut t) = legs.right_lower {
+                f(t);
+            }
+        }
+        if let Some(ref mut feet) = self.feet {
+            if let Some(ref mut t) = feet.left {
+                f(t);
+            }
+            if let Some(ref mut t) = feet.right {
+                f(t);
+            }
+        }
+        if let Some(ref mut fingers) = self.fingers {
+            for t in [
+                &mut fingers.left_thumb,
+                &mut fingers.left_index,
+                &mut fingers.left_middle,
+                &mut fingers.left_ring,
+                &mut fingers.left_pinky,
+                &mut fingers.right_thumb,
+                &mut fingers.right_index,
+                &mut fingers.right_middle,
+                &mut fingers.right_ring,
+                &mut fingers.right_pinky,
+            ] {
+                if let Some(ref mut t) = t {
+                    f(t);
+                }
             }
         }
     }
@@ -377,6 +382,7 @@ struct TrackingMailboxInner {
     latest_annotation: Option<DetectionAnnotation>,
     sequence: u64,
     last_update_nanos: u64,
+    pending_error: Option<String>,
 }
 
 fn now_nanos() -> u64 {
@@ -404,6 +410,7 @@ impl TrackingMailbox {
                 latest_annotation: None,
                 sequence: 0,
                 last_update_nanos: 0,
+                pending_error: None,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -443,6 +450,18 @@ impl TrackingMailbox {
         }
     }
 
+    /// Report a non-fatal error from the worker thread (shown as GUI toast).
+    pub fn report_error(&self, msg: String) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.pending_error = Some(msg);
+    }
+
+    /// Drain the latest pending error (returns it only once).
+    pub fn drain_error(&self) -> Option<String> {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.pending_error.take()
+    }
+
     /// Thread-safe read: takes &self, locks the mutex, clones the pose.
     pub fn latest_pose(&self) -> Option<TrackingRigPose> {
         let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -456,16 +475,19 @@ impl TrackingMailbox {
 
     /// Read the latest webcam frame (downscaled for GUI display).
     pub fn latest_frame(&self) -> Option<WebcamFrame> {
-        self.snapshot().frame
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.latest_frame.clone()
     }
 
     /// Read the latest 2D detection annotation.
     pub fn latest_annotation(&self) -> Option<DetectionAnnotation> {
-        self.snapshot().annotation
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.latest_annotation.clone()
     }
 
     pub fn sequence(&self) -> u64 {
-        self.snapshot().sequence
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.sequence
     }
 
     /// Returns true if the latest sample is older than `stale_timeout_nanos`,
@@ -608,55 +630,6 @@ impl TrackingSource {
         self.set_backend(CameraBackend::Webcam {
             camera_index: index,
         });
-    }
-
-    /// Synchronous sample -- produces a `TrackingFrame` and publishes a
-    /// `TrackingRigPose` to the internal mailbox.
-    ///
-    /// For the `Synthetic` backend this generates a synthetic pose inline.
-    /// For the `Webcam` backend the actual capture runs on the worker thread;
-    /// this method returns the latest data the worker has published.
-    pub fn sample(&mut self) -> TrackingFrame {
-        match &self.backend {
-            CameraBackend::Synthetic => {
-                let t = self.frame_index as f32 * 0.05;
-                let pose = synthetic_pose(self.frame_index, t);
-                self.mailbox.publish(pose);
-
-                let frame = TrackingFrame {
-                    source_id: self.source_id.clone(),
-                    capture_timestamp: self.frame_index,
-                    frame_size: [640, 480],
-                    image_format: TrackingImageFormat::default(),
-                    body_confidence: 0.9,
-                    face_confidence: 0.8,
-                };
-                self.frame_index += 1;
-                frame
-            }
-            #[cfg(feature = "webcam")]
-            CameraBackend::Webcam { .. } => {
-                // The worker thread does the real capture; here we just report
-                // whatever the mailbox currently holds.
-                let (body_conf, face_conf) = self
-                    .mailbox
-                    .latest_pose()
-                    .as_ref()
-                    .map(|p| (p.confidence.torso_confidence, p.confidence.face_confidence))
-                    .unwrap_or((0.0, 0.0));
-
-                let frame = TrackingFrame {
-                    source_id: self.source_id.clone(),
-                    capture_timestamp: self.frame_index,
-                    frame_size: [640, 480],
-                    image_format: TrackingImageFormat::Rgb8,
-                    body_confidence: body_conf,
-                    face_confidence: face_conf,
-                };
-                self.frame_index += 1;
-                frame
-            }
-        }
     }
 
     pub fn mailbox(&self) -> &TrackingMailbox {
@@ -856,6 +829,10 @@ impl TrackingWorker {
                     "tracking-worker: failed to open camera {}: {}",
                     camera_index, e
                 );
+                mailbox.report_error(format!(
+                    "Camera {} open failed: {}. Check if another app is using the camera.",
+                    camera_index, e
+                ));
                 warn!("tracking-worker: falling back to synthetic backend");
                 Self::run_synthetic(mailbox, running, interval);
                 return;
@@ -871,12 +848,15 @@ impl TrackingWorker {
 
         info!("tracking-worker: webcam opened successfully");
         let mut frame_index: u64 = 0;
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
         while running.load(Ordering::SeqCst) {
             let loop_start = std::time::Instant::now();
 
             match capture.grab_frame() {
                 Ok(rgb_data) => {
+                    consecutive_errors = 0;
                     let width = capture.width();
                     let height = capture.height();
 
@@ -890,7 +870,22 @@ impl TrackingWorker {
                     mailbox.publish_estimate(estimate, frame);
                 }
                 Err(e) => {
-                    error!("tracking-worker: frame grab error: {}", e);
+                    consecutive_errors += 1;
+                    if consecutive_errors == 1 {
+                        error!("tracking-worker: frame grab error: {}", e);
+                    }
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!(
+                            "tracking-worker: {} consecutive grab failures, stopping worker",
+                            consecutive_errors
+                        );
+                        mailbox.report_error(format!(
+                            "Camera stopped after {} consecutive read errors. \
+                             Another app may be using the camera, or the device was disconnected.",
+                            consecutive_errors
+                        ));
+                        return;
+                    }
                 }
             }
 
