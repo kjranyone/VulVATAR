@@ -44,6 +44,9 @@ pub struct RenderMeshInstance {
     /// The actual mesh primitive data for GPU upload. When `None`, a placeholder
     /// triangle is drawn instead.
     pub primitive_data: Option<std::sync::Arc<crate::asset::MeshPrimitiveAsset>>,
+    /// Per-morph-target weights for this primitive. Indices correspond to
+    /// `MeshPrimitiveAsset::morph_targets`. Empty when no morph targets are active.
+    pub morph_weights: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]

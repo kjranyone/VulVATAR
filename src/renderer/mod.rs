@@ -964,12 +964,32 @@ impl VulkanRenderer {
                             format!("render: bind material descriptor sets failed: {e}")
                         })?;
 
+                    let has_morph = !mesh_inst.morph_weights.is_empty()
+                        && mesh_inst.morph_weights.iter().any(|w| w.abs() > 1e-6);
+
                     let (vertex_buffer, index_buffer, index_count) = if let Some(ref prim_asset) =
                         mesh_inst.primitive_data
                     {
                         if let Some(ref cloth) = instance.cloth_deform {
                             if let Some(ref vd) = prim_asset.vertices {
                                 let verts = Self::build_cloth_vertices(vd, cloth);
+                                let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
+                                let idx_count = indices.len() as u32;
+                                let vb =
+                                    Self::create_vertex_buffer(memory_allocator.clone(), &verts);
+                                let ib =
+                                    Self::create_index_buffer(memory_allocator.clone(), indices);
+                                (vb, ib, idx_count)
+                            } else {
+                                Self::create_placeholder_mesh(memory_allocator.clone())
+                            }
+                        } else if has_morph {
+                            if let Some(ref vd) = prim_asset.vertices {
+                                let verts = Self::build_morphed_vertices(
+                                    vd,
+                                    &prim_asset.morph_targets,
+                                    &mesh_inst.morph_weights,
+                                );
                                 let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
                                 let idx_count = indices.len() as u32;
                                 let vb =
@@ -1527,6 +1547,55 @@ impl VulkanRenderer {
         let result = (vb, ib, index_count);
         self.mesh_cache.insert(key, result.clone());
         result
+    }
+
+    /// Apply morph target (blend shape) deltas to base vertex data on the CPU.
+    fn build_morphed_vertices(
+        vd: &VertexData,
+        morph_targets: &[crate::asset::MorphTargetDelta],
+        morph_weights: &[f32],
+    ) -> Vec<GpuVertex> {
+        let count = vd.positions.len();
+        (0..count)
+            .map(|i| {
+                let mut pos = vd.positions[i];
+                let mut norm = vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
+
+                for (ti, target) in morph_targets.iter().enumerate() {
+                    let w = morph_weights.get(ti).copied().unwrap_or(0.0);
+                    if w.abs() < 1e-6 {
+                        continue;
+                    }
+                    if let Some(d) = target.position_deltas.get(i) {
+                        pos[0] += w * d[0];
+                        pos[1] += w * d[1];
+                        pos[2] += w * d[2];
+                    }
+                    if let Some(d) = target.normal_deltas.get(i) {
+                        norm[0] += w * d[0];
+                        norm[1] += w * d[1];
+                        norm[2] += w * d[2];
+                    }
+                }
+
+                let uv = vd.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                let ji = if i < vd.joint_indices.len() {
+                    let j = vd.joint_indices[i];
+                    [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                let jw = vd.joint_weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+
+                GpuVertex {
+                    position: pos,
+                    normal: norm,
+                    uv,
+                    joint_indices: ji,
+                    joint_weights: jw,
+                }
+            })
+            .collect()
     }
 
     fn build_cloth_vertices(vd: &VertexData, cloth: &ClothDeformSnapshot) -> Vec<GpuVertex> {

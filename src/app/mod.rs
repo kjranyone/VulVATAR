@@ -596,6 +596,42 @@ impl Application {
                                 RenderCullMode::BackFace
                             };
 
+                            // Resolve expression weights → per-primitive morph weights.
+                            let morph_weights = if prim.morph_targets.is_empty() {
+                                Vec::new()
+                            } else {
+                                let mut weights = vec![0.0f32; prim.morph_targets.len()];
+                                for ew in &avatar.expression_weights {
+                                    if let Some(expr_def) = avatar
+                                        .asset
+                                        .default_expressions
+                                        .expressions
+                                        .iter()
+                                        .find(|e| e.name == ew.name)
+                                    {
+                                        for bind in &expr_def.morph_binds {
+                                            // Resolve node → mesh index.
+                                            if let Some(&mi) =
+                                                avatar.asset.node_to_mesh.get(&bind.node_index)
+                                            {
+                                                if let Some(m) = avatar.asset.meshes.get(mi) {
+                                                    if m.primitives.iter().any(|p| p.id == prim.id)
+                                                        && bind.morph_target_index < weights.len()
+                                                    {
+                                                        weights[bind.morph_target_index] +=
+                                                            ew.weight * bind.weight;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for w in &mut weights {
+                                    *w = w.clamp(0.0, 1.0);
+                                }
+                                weights
+                            };
+
                             RenderMeshInstance {
                                 mesh_id: mesh.id,
                                 primitive_id: prim.id,
@@ -605,6 +641,7 @@ impl Application {
                                 cull_mode,
                                 outline,
                                 primitive_data: Some(std::sync::Arc::new(prim.clone())),
+                                morph_weights,
                             }
                         })
                     })
@@ -712,6 +749,14 @@ impl Application {
         }
     }
 
+    pub fn webcam_frame(&self) -> Option<crate::tracking::WebcamFrame> {
+        self.tracking.mailbox().latest_frame()
+    }
+
+    pub fn webcam_annotation(&self) -> Option<crate::tracking::DetectionAnnotation> {
+        self.tracking.mailbox().latest_annotation()
+    }
+
     /// Replace the active output sink, shutting down the old OutputRouter and
     /// creating a new one with the selected sink.
     pub fn set_output_sink(&mut self, sink: FrameSink) {
@@ -726,6 +771,9 @@ impl Application {
     }
 
     /// Like [`Self::start_tracking`] but allows specifying the webcam resolution and fps.
+    ///
+    /// If a worker is already running it is stopped and replaced with the new
+    /// backend / parameters so the caller can switch backends at any time.
     pub fn start_tracking_with_params(
         &mut self,
         backend: CameraBackend,
@@ -733,10 +781,10 @@ impl Application {
         height: u32,
         fps: u32,
     ) {
-        // If there is an existing worker that is already running, do nothing.
-        if let Some(ref worker) = self.tracking_worker {
+        if let Some(ref mut worker) = self.tracking_worker {
             if worker.is_running() {
-                return;
+                worker.stop();
+                info!("app: stopped previous tracking worker for backend switch");
             }
         }
         let shared_mailbox = self.tracking.shared_mailbox();

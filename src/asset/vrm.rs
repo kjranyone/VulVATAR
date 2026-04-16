@@ -39,6 +39,8 @@ mod gltf_ext {
         pub override_mouth: Option<String>,
         #[serde(default)]
         pub binds: Option<Vec<ExpressionBind>>,
+        #[serde(default, rename = "morphTargetBinds")]
+        pub morph_target_binds: Option<Vec<MorphTargetBind>>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +48,14 @@ mod gltf_ext {
         pub node: u32,
         pub property: String,
         pub value: f32,
+    }
+
+    /// VRM 1.0 morph target bind (inside `morphTargetBinds`).
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct MorphTargetBind {
+        pub node: u32,
+        pub index: u32,
+        pub weight: f32,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -366,6 +376,15 @@ impl VrmAssetLoader {
                 expressions: vec![],
             });
 
+        // Build node → mesh index mapping for morph target expression binding.
+        let node_to_mesh: std::collections::HashMap<usize, usize> = gltf_doc
+            .document
+            .nodes()
+            .filter_map(|node| {
+                node.mesh().map(|m| (node.index(), m.index()))
+            })
+            .collect();
+
         let asset = AvatarAsset {
             id: AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed)),
             source_path,
@@ -382,6 +401,7 @@ impl VrmAssetLoader {
             colliders,
             default_expressions: expressions,
             animation_clips: Self::build_animation_clips(&gltf_doc.document, blob),
+            node_to_mesh,
         };
 
         Ok(Arc::new(asset))
@@ -538,6 +558,71 @@ impl VrmAssetLoader {
 
                         let idx_data = if index_count > 0 { Some(indices) } else { None };
 
+                        // Parse morph targets (blend shapes).
+                        let target_names: Vec<String> = gmesh
+                            .extras()
+                            .as_ref()
+                            .and_then(|raw| {
+                                let v: serde_json::Value =
+                                    serde_json::from_str(raw.get()).ok()?;
+                                let arr = v.get("targetNames")?.as_array()?;
+                                Some(
+                                    arr.iter()
+                                        .filter_map(|s| s.as_str().map(String::from))
+                                        .collect(),
+                                )
+                            })
+                            .unwrap_or_default();
+
+                        let get_buf_data = |buffer: gltf::Buffer<'_>| -> Option<&[u8]> {
+                            buffers.get(buffer.index()).map(|d| d.0.as_slice())
+                        };
+
+                        let morph_targets: Vec<MorphTargetDelta> = prim
+                            .morph_targets()
+                            .enumerate()
+                            .map(|(ti, mt)| {
+                                let pos_d: Vec<[f32; 3]> = mt
+                                    .positions()
+                                    .and_then(|acc| {
+                                        let iter = gltf::accessor::Iter::<[f32; 3]>::new(
+                                            acc,
+                                            get_buf_data.clone(),
+                                        )?;
+                                        Some(iter.collect())
+                                    })
+                                    .unwrap_or_default();
+                                let norm_d: Vec<[f32; 3]> = mt
+                                    .normals()
+                                    .and_then(|acc| {
+                                        let iter = gltf::accessor::Iter::<[f32; 3]>::new(
+                                            acc,
+                                            get_buf_data.clone(),
+                                        )?;
+                                        Some(iter.collect())
+                                    })
+                                    .unwrap_or_default();
+                                let name = target_names
+                                    .get(ti)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("target_{}", ti));
+                                MorphTargetDelta {
+                                    name,
+                                    position_deltas: pos_d,
+                                    normal_deltas: norm_d,
+                                }
+                            })
+                            .collect();
+
+                        if !morph_targets.is_empty() {
+                            log::info!(
+                                "[vrm] mesh '{}' prim {} has {} morph targets",
+                                gmesh.name().unwrap_or("unnamed"),
+                                prim_id.0,
+                                morph_targets.len(),
+                            );
+                        }
+
                         MeshPrimitiveAsset {
                             id: prim_id,
                             vertex_count,
@@ -547,6 +632,7 @@ impl VrmAssetLoader {
                             bounds,
                             vertices,
                             indices: idx_data,
+                            morph_targets,
                         }
                     })
                     .collect();
@@ -1142,25 +1228,39 @@ impl VrmAssetLoader {
         (spring_bones, colliders)
     }
 
+    fn build_expression_def(expr: &gltf_ext::Expression) -> ExpressionDef {
+        let morph_binds = expr
+            .morph_target_binds
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|b| ExpressionMorphBind {
+                node_index: b.node as usize,
+                morph_target_index: b.index as usize,
+                weight: b.weight,
+            })
+            .collect();
+
+        ExpressionDef {
+            name: expr.name.clone(),
+            weight: 0.0,
+            morph_binds,
+        }
+    }
+
     fn build_expressions(ext: &gltf_ext::VrmExtension) -> ExpressionAssetSet {
         let mut expressions = Vec::new();
 
         if let Some(ref expr_section) = ext.expressions {
             if let Some(ref preset) = expr_section.preset {
                 for expr in preset.all_expressions() {
-                    expressions.push(ExpressionDef {
-                        name: expr.name.clone(),
-                        weight: 0.0,
-                    });
+                    expressions.push(Self::build_expression_def(expr));
                 }
             }
 
             if let Some(ref custom) = expr_section.custom {
                 for expr in custom {
-                    expressions.push(ExpressionDef {
-                        name: expr.name.clone(),
-                        weight: 0.0,
-                    });
+                    expressions.push(Self::build_expression_def(expr));
                 }
             }
         }

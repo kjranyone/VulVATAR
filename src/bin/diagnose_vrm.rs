@@ -256,6 +256,7 @@ fn build_frame_input(
                     cull_mode,
                     outline,
                     primitive_data: Some(Arc::new(prim.clone())),
+                    morph_weights: Vec::new(),
                 })
             })
         })

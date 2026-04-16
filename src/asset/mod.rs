@@ -169,6 +169,8 @@ pub struct AvatarAsset {
     pub colliders: Vec<ColliderAsset>,
     pub default_expressions: ExpressionAssetSet,
     pub animation_clips: Vec<AnimationClip>,
+    /// Maps glTF node index → meshes index (for morph target expression binding).
+    pub node_to_mesh: std::collections::HashMap<usize, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +206,14 @@ pub struct VertexData {
     pub joint_weights: Vec<Vec4>,
 }
 
+/// Per-vertex deltas for a single morph target (blend shape).
+#[derive(Clone, Debug)]
+pub struct MorphTargetDelta {
+    pub name: String,
+    pub position_deltas: Vec<Vec3>,
+    pub normal_deltas: Vec<Vec3>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MeshPrimitiveAsset {
     pub id: PrimitiveId,
@@ -214,6 +224,9 @@ pub struct MeshPrimitiveAsset {
     pub bounds: Aabb,
     pub vertices: Option<VertexData>,
     pub indices: Option<Vec<u32>>,
+    /// Morph targets parsed from glTF. Index corresponds to the glTF
+    /// morph target index within this primitive.
+    pub morph_targets: Vec<MorphTargetDelta>,
 }
 
 #[derive(Clone, Debug)]
@@ -307,10 +320,23 @@ pub struct ExpressionAssetSet {
     pub expressions: Vec<ExpressionDef>,
 }
 
+/// Links a VRM expression to one or more morph targets on specific meshes.
+#[derive(Clone, Debug)]
+pub struct ExpressionMorphBind {
+    /// glTF node index that owns the target mesh.
+    pub node_index: usize,
+    /// Morph target index within that mesh's primitive.
+    pub morph_target_index: usize,
+    /// Weight to apply when the expression is fully active (1.0).
+    pub weight: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExpressionDef {
     pub name: String,
     pub weight: f32,
+    /// Morph target bindings from the VRM extension.
+    pub morph_binds: Vec<ExpressionMorphBind>,
 }
 
 #[derive(Clone, Debug)]
