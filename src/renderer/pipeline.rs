@@ -204,7 +204,10 @@ void main() {
             1.0 - clamp(material.shade_toony, 0.0, 1.0),
             lit
         );
-        vec3 shade_col = material.shade_color.rgb * shade_texture_term;
+        // MToon shade: shade_color modulates the base texture, not replaces it.
+        // When no dedicated shade texture exists, shade_texture_term is white,
+        // so shade_col = shade_color * base_texture_color.
+        vec3 shade_col = material.shade_color.rgb * shade_texture_term * tex_color.rgb;
         vec3 toon_col = mix(shade_col, base_color_term, shading);
         color.rgb = toon_col * (camera.light_color * max(camera.light_intensity, 0.0));
     } else {
