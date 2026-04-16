@@ -102,8 +102,32 @@ impl CigPoseInference {
             }
         };
 
-        let (shape_x, data_x) = outputs["simcc_x"].try_extract_tensor::<f32>().unwrap();
-        let (_shape_y, data_y) = outputs["simcc_y"].try_extract_tensor::<f32>().unwrap();
+        let (shape_x, data_x) = match outputs["simcc_x"].try_extract_tensor::<f32>() {
+            Ok(v) => v,
+            Err(e) => {
+                error!("ONNX simcc_x extraction failed: {}", e);
+                return PoseEstimate {
+                    rig_pose: TrackingRigPose {
+                        source_timestamp: frame_index,
+                        ..Default::default()
+                    },
+                    annotation: DetectionAnnotation::default(),
+                };
+            }
+        };
+        let (_shape_y, data_y) = match outputs["simcc_y"].try_extract_tensor::<f32>() {
+            Ok(v) => v,
+            Err(e) => {
+                error!("ONNX simcc_y extraction failed: {}", e);
+                return PoseEstimate {
+                    rig_pose: TrackingRigPose {
+                        source_timestamp: frame_index,
+                        ..Default::default()
+                    },
+                    annotation: DetectionAnnotation::default(),
+                };
+            }
+        };
 
         let split_ratio = 2.0;
         let kpts = decode_simcc_from_slice(data_x, data_y, shape_x, split_ratio);

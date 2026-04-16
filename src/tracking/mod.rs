@@ -524,6 +524,17 @@ pub enum CameraBackend {
     Webcam { camera_index: usize },
 }
 
+impl CameraBackend {
+    /// Short label for display in the GUI status bar.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Synthetic => "Synthetic",
+            #[cfg(feature = "webcam")]
+            Self::Webcam { .. } => "Webcam",
+        }
+    }
+}
+
 impl Default for CameraBackend {
     fn default() -> Self {
         Self::Synthetic
@@ -670,6 +681,7 @@ pub struct TrackingWorker {
     handle: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
     mailbox: TrackingMailbox,
+    backend: CameraBackend,
 }
 
 impl TrackingWorker {
@@ -681,6 +693,7 @@ impl TrackingWorker {
             handle: None,
             running: Arc::new(AtomicBool::new(false)),
             mailbox,
+            backend: CameraBackend::default(),
         }
     }
 
@@ -692,6 +705,11 @@ impl TrackingWorker {
     /// Returns `true` if the worker thread is currently running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// Returns the backend this worker was started with.
+    pub fn active_backend(&self) -> &CameraBackend {
+        &self.backend
     }
 
     /// Spawn the tracking worker thread with the given backend.
@@ -710,12 +728,12 @@ impl TrackingWorker {
             return;
         }
 
+        self.backend = backend.clone();
+        self.running = Arc::new(AtomicBool::new(true));
         let running = Arc::clone(&self.running);
         let mailbox = self.mailbox.clone();
         let target_fps: u64 = fps.max(1) as u64;
         let frame_interval = Duration::from_micros(1_000_000 / target_fps);
-
-        running.store(true, Ordering::SeqCst);
 
         let handle = thread::Builder::new()
             .name("tracking-worker".into())

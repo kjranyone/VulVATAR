@@ -555,7 +555,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     let py2 = map_y(by2);
                                     let bb_rect = egui::Rect::from_min_max(
                                         egui::pos2(px1.min(px2), py1.min(py2)),
-                                        egui::pos2(px1.max(px2), py2.max(py2)),
+                                        egui::pos2(px1.max(px2), py1.max(py2)),
                                     );
                                     painter.rect_stroke(
                                         bb_rect,

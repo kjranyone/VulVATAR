@@ -281,14 +281,24 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Scene Background")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(
-                &mut state.rendering.transparent_background,
-                "Transparent Background",
-            );
+            if ui
+                .checkbox(
+                    &mut state.rendering.transparent_background,
+                    "Transparent Background",
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             if !state.rendering.transparent_background {
                 ui.horizontal(|ui| {
                     ui.label("Color");
-                    ui.color_edit_button_rgb(&mut state.rendering.background_color);
+                    if ui
+                        .color_edit_button_rgb(&mut state.rendering.background_color)
+                        .changed()
+                    {
+                        state.project_dirty = true;
+                    }
                 });
             }
         });
@@ -296,9 +306,18 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Runtime Toggles")
         .default_open(false)
         .show(ui, |ui| {
-            ui.checkbox(&mut state.tracking.toggle_tracking, "Tracking Enabled");
-            ui.checkbox(&mut state.rendering.toggle_spring, "Spring Enabled");
-            ui.checkbox(&mut state.rendering.toggle_cloth, "Cloth Enabled");
+            if ui
+                .checkbox(&mut state.rendering.toggle_spring, "Spring Enabled")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .checkbox(&mut state.rendering.toggle_cloth, "Cloth Enabled")
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             ui.checkbox(
                 &mut state.rendering.toggle_collision_debug,
                 "Collision Debug",
@@ -310,10 +329,19 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
+    if ui
+        .checkbox(&mut state.tracking.toggle_tracking, "Tracking Enabled")
+        .changed()
+    {
+        state.project_dirty = true;
+    }
+    ui.add_space(4.0);
+
     egui::CollapsingHeader::new("Input Device")
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                let prev_camera = state.camera_index;
                 let selected_text = state
                     .available_cameras
                     .iter()
@@ -334,6 +362,9 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                             }
                         }
                     });
+                if state.camera_index != prev_camera {
+                    state.project_dirty = true;
+                }
                 if ui.button("🔄").clicked() {
                     state.available_cameras = crate::tracking::list_cameras();
                     if !state
@@ -375,10 +406,21 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.app.start_tracking_with_params(backend, w, h, fps);
                 }
             });
-            ui.checkbox(&mut state.show_camera_wipe, "Camera Wipe (PIP)");
-            if state.show_camera_wipe {
-                ui.checkbox(&mut state.show_detection_annotations, "Show Annotations");
+            if ui
+                .checkbox(&mut state.show_camera_wipe, "Camera Wipe (PIP)")
+                .changed()
+            {
+                state.project_dirty = true;
             }
+            if state.show_camera_wipe {
+                if ui
+                    .checkbox(&mut state.show_detection_annotations, "Show Annotations")
+                    .changed()
+                {
+                    state.project_dirty = true;
+                }
+            }
+            let prev_res = state.tracking.camera_resolution_index;
             egui::ComboBox::from_label("Resolution")
                 .selected_text(
                     *["640x480", "1280x720", "1920x1080"]
@@ -394,6 +436,10 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                         "1920x1080",
                     );
                 });
+            if state.tracking.camera_resolution_index != prev_res {
+                state.project_dirty = true;
+            }
+            let prev_fps = state.tracking.camera_framerate_index;
             egui::ComboBox::from_label("Frame Rate")
                 .selected_text(
                     *["30 fps", "60 fps"]
@@ -404,6 +450,9 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.selectable_value(&mut state.tracking.camera_framerate_index, 0, "30 fps");
                     ui.selectable_value(&mut state.tracking.camera_framerate_index, 1, "60 fps");
                 });
+            if state.tracking.camera_framerate_index != prev_fps {
+                state.project_dirty = true;
+            }
         });
 
     egui::CollapsingHeader::new("Capture Format")
@@ -420,12 +469,25 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Inference Status")
         .default_open(true)
         .show(ui, |ui| {
-            let (status_color, status_text) = if state.is_tracking_active() {
+            let camera_running = state.is_tracking_active();
+            let tracking_on = state.tracking.toggle_tracking;
+            let (status_color, status_text) = if camera_running && tracking_on {
                 (egui::Color32::GREEN, "Running")
+            } else if camera_running {
+                (egui::Color32::YELLOW, "Camera active (tracking paused)")
             } else {
                 (egui::Color32::GRAY, "Stopped")
             };
             ui.label(egui::RichText::new(status_text).color(status_color));
+            if camera_running {
+                let backend_label = state
+                    .app
+                    .tracking_worker
+                    .as_ref()
+                    .map(|w| w.active_backend().label())
+                    .unwrap_or("Unknown");
+                ui.label(format!("Backend: {}", backend_label));
+            }
 
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.label(format!("Timestamp: {}", tracking.source_timestamp));

@@ -248,20 +248,9 @@ impl Application {
         }
         self.running = true;
 
-        // Start the tracking worker thread.
-        // The worker publishes poses to the same mailbox that the app thread
-        // reads from via `self.tracking.mailbox()`.
-        let shared_mailbox = self.tracking.shared_mailbox();
-        let mut worker = TrackingWorker::new(shared_mailbox);
-        worker.start(crate::tracking::CameraBackend::default());
-        if worker.is_running() {
-            info!("bootstrap: tracking worker started");
-        } else {
-            warn!(
-                "bootstrap: tracking worker failed to start, falling back to synchronous tracking"
-            );
-        }
-        self.tracking_worker = Some(worker);
+        // Tracking worker is NOT started at bootstrap.
+        // The user must explicitly start it from the Tracking Setup panel.
+        info!("bootstrap: tracking worker idle (start from Tracking Setup)");
 
         // The output worker is already running inside OutputRouter (spawned in
         // OutputRouter::new()), so no additional start call is needed here.
@@ -739,13 +728,10 @@ impl Application {
             // Non-blocking read from the shared mailbox populated by the worker.
             self.tracking.mailbox().read()
         } else {
-            // Fallback: synchronous capture on the app thread.
-            let frame = self.tracking.sample();
-            info!(
-                "tracking: frame {} body_conf={:.2} face_conf={:.2}",
-                frame.capture_timestamp, frame.body_confidence, frame.face_confidence
-            );
-            self.tracking.mailbox().read()
+            // No worker running — return None so tracking is skipped.
+            // (The old synchronous fallback generated synthetic data on every
+            // frame and spammed info logs at 60 fps.)
+            None
         }
     }
 

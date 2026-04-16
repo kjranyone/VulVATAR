@@ -14,15 +14,27 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             ui.separator();
 
             let tracking_active = state.is_tracking_active();
-            let tracking_color = if tracking_active {
-                egui::Color32::GREEN
+            let tracking_enabled = state.tracking.toggle_tracking;
+            let (tracking_color, tracking_text) = if tracking_active {
+                let backend_label = state
+                    .app
+                    .tracking_worker
+                    .as_ref()
+                    .map(|w| w.active_backend().label())
+                    .unwrap_or("Unknown");
+                if tracking_enabled {
+                    (
+                        egui::Color32::GREEN,
+                        format!("Tracking: Active ({})", backend_label),
+                    )
+                } else {
+                    (
+                        egui::Color32::YELLOW,
+                        format!("Tracking: Paused ({})", backend_label),
+                    )
+                }
             } else {
-                egui::Color32::GRAY
-            };
-            let tracking_text = if tracking_active {
-                "Tracking: Active"
-            } else {
-                "Tracking: Stopped"
+                (egui::Color32::GRAY, "Tracking: Stopped".to_string())
             };
             ui.label(egui::RichText::new(tracking_text).color(tracking_color));
 

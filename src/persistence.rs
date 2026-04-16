@@ -24,11 +24,17 @@ pub struct ProjectState {
     pub camera_orbit_distance: f32,
 
     // Tracking config
+    pub tracking_enabled: bool,
     pub tracking_mirror: bool,
+    pub camera_resolution_index: usize,
+    pub camera_framerate_index: usize,
     pub smoothing_strength: f32,
     pub confidence_threshold: f32,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
+    pub camera_index: usize,
+    pub show_camera_wipe: bool,
+    pub show_detection_annotations: bool,
 
     // Rendering config
     pub material_mode_index: usize,
@@ -41,6 +47,10 @@ pub struct ProjectState {
     pub light_intensity: f32,
     pub ambient: [f32; 3],
     pub camera_fov: f32,
+    pub background_color: [f32; 3],
+    pub transparent_background: bool,
+    pub toggle_spring: bool,
+    pub toggle_cloth: bool,
 
     // Output config
     pub output_sink_index: usize,
@@ -82,6 +92,10 @@ pub struct ProjectLoadWarnings {
     pub warnings: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TransformState {
     #[serde(default)]
@@ -94,8 +108,14 @@ pub struct TransformState {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TrackingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub mirror: bool,
+    #[serde(default)]
+    pub camera_resolution_index: usize,
+    #[serde(default)]
+    pub camera_framerate_index: usize,
     #[serde(default)]
     pub smoothing_strength: f32,
     #[serde(default)]
@@ -104,6 +124,12 @@ pub struct TrackingConfig {
     pub hand_tracking_enabled: bool,
     #[serde(default)]
     pub face_tracking_enabled: bool,
+    #[serde(default)]
+    pub camera_index: usize,
+    #[serde(default)]
+    pub show_camera_wipe: bool,
+    #[serde(default)]
+    pub show_detection_annotations: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -128,6 +154,14 @@ pub struct RenderingConfig {
     pub ambient: [f32; 3],
     #[serde(default)]
     pub camera_fov: f32,
+    #[serde(default)]
+    pub background_color: [f32; 3],
+    #[serde(default)]
+    pub transparent_background: bool,
+    #[serde(default = "default_true")]
+    pub toggle_spring: bool,
+    #[serde(default)]
+    pub toggle_cloth: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -184,11 +218,17 @@ impl ProjectFile {
             active_overlay_path: state.active_overlay_path.clone(),
 
             tracking: TrackingConfig {
+                enabled: state.tracking_enabled,
                 mirror: state.tracking_mirror,
+                camera_resolution_index: state.camera_resolution_index,
+                camera_framerate_index: state.camera_framerate_index,
                 smoothing_strength: state.smoothing_strength,
                 confidence_threshold: state.confidence_threshold,
                 hand_tracking_enabled: state.hand_tracking_enabled,
                 face_tracking_enabled: state.face_tracking_enabled,
+                camera_index: state.camera_index,
+                show_camera_wipe: state.show_camera_wipe,
+                show_detection_annotations: state.show_detection_annotations,
             },
             rendering: RenderingConfig {
                 material_mode_index: state.material_mode_index,
@@ -201,6 +241,10 @@ impl ProjectFile {
                 light_intensity: state.light_intensity,
                 ambient: state.ambient,
                 camera_fov: state.camera_fov,
+                background_color: state.background_color,
+                transparent_background: state.transparent_background,
+                toggle_spring: state.toggle_spring,
+                toggle_cloth: state.toggle_cloth,
             },
             output: OutputConfig {
                 sink_index: state.output_sink_index,
@@ -228,11 +272,17 @@ impl ProjectFile {
             camera_orbit_pan: self.camera_orbit_pan,
             camera_orbit_distance: self.camera_orbit_distance,
 
+            tracking_enabled: self.tracking.enabled,
             tracking_mirror: self.tracking.mirror,
+            camera_resolution_index: self.tracking.camera_resolution_index,
+            camera_framerate_index: self.tracking.camera_framerate_index,
             smoothing_strength: self.tracking.smoothing_strength,
             confidence_threshold: self.tracking.confidence_threshold,
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
+            camera_index: self.tracking.camera_index,
+            show_camera_wipe: self.tracking.show_camera_wipe,
+            show_detection_annotations: self.tracking.show_detection_annotations,
 
             material_mode_index: self.rendering.material_mode_index,
             toon_ramp_threshold: self.rendering.toon_ramp_threshold,
@@ -244,6 +294,10 @@ impl ProjectFile {
             light_intensity: self.rendering.light_intensity,
             ambient: self.rendering.ambient,
             camera_fov: self.rendering.camera_fov,
+            background_color: self.rendering.background_color,
+            transparent_background: self.rendering.transparent_background,
+            toggle_spring: self.rendering.toggle_spring,
+            toggle_cloth: self.rendering.toggle_cloth,
 
             output_sink_index: self.output.sink_index,
             output_resolution_index: self.output.resolution_index,

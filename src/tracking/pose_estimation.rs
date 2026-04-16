@@ -47,8 +47,9 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
     let mut skin_sum_x: u64 = 0;
     let mut skin_sum_y: u64 = 0;
 
-    for y in 0..height {
-        for x in 0..width {
+    let stride: u32 = 2;
+    for y in (0..height).step_by(stride as usize) {
+        for x in (0..width).step_by(stride as usize) {
             let base = ((y * width + x) * 3) as usize;
             let r = rgb_data[base] as f32 / 255.0;
             let g = rgb_data[base + 1] as f32 / 255.0;
@@ -60,7 +61,8 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
             // Hue: roughly 0-50 degrees (reds/oranges/yellows)
             // Saturation: 0.15 - 0.75
             // Value: 0.2 - 0.95
-            let is_skin = (h <= 50.0 || h >= 340.0) && s >= 0.15 && s <= 0.75 && v >= 0.2;
+            let is_skin =
+                (h <= 50.0 || h >= 340.0) && s >= 0.15 && s <= 0.75 && v >= 0.2 && v <= 0.95;
 
             if is_skin {
                 skin_pixel_count += 1;
@@ -86,8 +88,8 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
     // 2. Detection quality / confidence
     // -----------------------------------------------------------------------
 
-    let total_pixels = width * height;
-    let skin_ratio = skin_pixel_count as f32 / total_pixels as f32;
+    let sampled_pixels = (width / stride) * (height / stride);
+    let skin_ratio = skin_pixel_count as f32 / sampled_pixels as f32;
 
     // We expect roughly 5-30% of the frame to be skin if a face/upper-body
     // is visible.  Below 2% we treat as "no detection".

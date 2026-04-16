@@ -430,11 +430,17 @@ impl GuiApp {
             camera_orbit_pan: self.camera_orbit.pan,
             camera_orbit_distance: self.camera_orbit.distance,
 
+            tracking_enabled: self.tracking.toggle_tracking,
             tracking_mirror: self.tracking.tracking_mirror,
+            camera_resolution_index: self.tracking.camera_resolution_index,
+            camera_framerate_index: self.tracking.camera_framerate_index,
             smoothing_strength: self.tracking.smoothing_strength,
             confidence_threshold: self.tracking.confidence_threshold,
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
+            camera_index: self.camera_index,
+            show_camera_wipe: self.show_camera_wipe,
+            show_detection_annotations: self.show_detection_annotations,
 
             material_mode_index: self.rendering.material_mode_index,
             toon_ramp_threshold: self.rendering.toon_ramp_threshold,
@@ -446,6 +452,10 @@ impl GuiApp {
             light_intensity: self.rendering.main_light_intensity,
             ambient: self.rendering.ambient_intensity,
             camera_fov: self.rendering.camera_fov,
+            background_color: self.rendering.background_color,
+            transparent_background: self.rendering.transparent_background,
+            toggle_spring: self.rendering.toggle_spring,
+            toggle_cloth: self.rendering.toggle_cloth,
 
             output_sink_index: self.output.output_sink_index,
             output_resolution_index: self.output.output_resolution_index,
@@ -557,12 +567,19 @@ impl GuiApp {
         self.camera_orbit.pitch_deg = state.camera_orbit_pitch;
         self.camera_orbit.pan = state.camera_orbit_pan;
         self.camera_orbit.distance = state.camera_orbit_distance;
+        self.camera_orbit.target_distance = state.camera_orbit_distance;
 
+        self.tracking.toggle_tracking = state.tracking_enabled;
         self.tracking.tracking_mirror = state.tracking_mirror;
+        self.tracking.camera_resolution_index = state.camera_resolution_index;
+        self.tracking.camera_framerate_index = state.camera_framerate_index;
         self.tracking.smoothing_strength = state.smoothing_strength;
         self.tracking.confidence_threshold = state.confidence_threshold;
         self.tracking.hand_tracking_enabled = state.hand_tracking_enabled;
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
+        self.camera_index = state.camera_index;
+        self.show_camera_wipe = state.show_camera_wipe;
+        self.show_detection_annotations = state.show_detection_annotations;
 
         self.rendering.material_mode_index = state.material_mode_index;
         self.rendering.toon_ramp_threshold = state.toon_ramp_threshold;
@@ -574,6 +591,10 @@ impl GuiApp {
         self.rendering.main_light_intensity = state.light_intensity;
         self.rendering.ambient_intensity = state.ambient;
         self.rendering.camera_fov = state.camera_fov;
+        self.rendering.background_color = state.background_color;
+        self.rendering.transparent_background = state.transparent_background;
+        self.rendering.toggle_spring = state.toggle_spring;
+        self.rendering.toggle_cloth = state.toggle_cloth;
 
         self.output.output_sink_index = state.output_sink_index;
         self.output.output_resolution_index = state.output_resolution_index;
