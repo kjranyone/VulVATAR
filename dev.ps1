@@ -28,11 +28,42 @@ function Install-Models {
     Write-Host "ONNX Models installed successfully." -ForegroundColor Green
 }
 
+function Install-VisemeModel {
+    Write-Host "Training viseme lip-sync model..." -ForegroundColor Cyan
+    $modelPath = "models\viseme_nn.onnx"
+
+    if (Test-Path $modelPath) {
+        Write-Host "Viseme model already exists at $modelPath." -ForegroundColor Green
+        $ans = Read-Host "Retrain? (y/N)"
+        if ($ans -ne "y") { return }
+    }
+
+    # Check Python + torch availability.
+    try {
+        python -c "import torch; import numpy" 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "missing" }
+    } catch {
+        Write-Host "Error: Python with torch and numpy is required." -ForegroundColor Red
+        Write-Host "  pip install torch numpy" -ForegroundColor Yellow
+        return
+    }
+
+    $env:PYTHONIOENCODING = "utf-8"
+    python scripts/train_viseme_model.py --output $modelPath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Viseme model ready at $modelPath." -ForegroundColor Green
+    } else {
+        Write-Host "Training failed." -ForegroundColor Red
+    }
+}
+
 $commands = @(
-    @{ Label = "setup (download models)"; Cmd = "Install-Models" },
+    @{ Label = "setup (download pose models)"; Cmd = "Install-Models" },
+    @{ Label = "setup (train viseme model)";   Cmd = "Install-VisemeModel" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
     @{ Label = "run (debug)";      Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run' },
+    @{ Label = "run (debug+lipsync)"; Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
     @{ Label = "run (release)";    Cmd = "cargo run --release" },
     @{ Label = "test";             Cmd = "cargo test" },
     @{ Label = "clippy";           Cmd = "cargo clippy" },
