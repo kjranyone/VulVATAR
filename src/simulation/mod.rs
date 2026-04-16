@@ -404,6 +404,19 @@ impl RapierWorld {
         );
     }
 
+    pub fn remove_character_body(&mut self) {
+        if let Some(handle) = self.character_body.take() {
+            self.rigid_body_set.remove(
+                handle,
+                &mut self.island_manager,
+                &mut self.collider_set,
+                &mut self.impulse_joint_set,
+                &mut self.multibody_joint_set,
+                true,
+            );
+        }
+    }
+
     pub fn move_character(&mut self, velocity: [f32; 3]) {
         if let Some(handle) = self.character_body {
             if let Some(body) = self.rigid_body_set.get_mut(handle) {
@@ -431,16 +444,21 @@ impl RapierWorld {
         let shape = rapier3d::geometry::Ball::new(radius);
         let origin_iso = Isometry::translation(origin[0], origin[1], origin[2]);
         let dir = vector![direction[0], direction[1], direction[2]];
-        let toi = self.query_pipeline.cast_shape(
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: max_distance,
+            stop_at_penetration: true,
+            ..Default::default()
+        };
+        let (_handle, hit) = self.query_pipeline.cast_shape(
             &self.rigid_body_set,
             &self.collider_set,
             &origin_iso,
             &dir,
             &shape,
-            max_distance,
-            true,
+            options,
             QueryFilter::default(),
         )?;
+        let toi = hit.time_of_impact;
         let hit_point = [
             origin[0] + direction[0] * toi,
             origin[1] + direction[1] * toi,

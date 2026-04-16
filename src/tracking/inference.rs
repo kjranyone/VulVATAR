@@ -274,8 +274,8 @@ fn build_annotation(
 ) -> DetectionAnnotation {
     let mw = model_w as f32;
     let mh = model_h as f32;
-    let ow = orig_w as f32;
-    let oh = orig_h as f32;
+    let _ow = orig_w as f32;
+    let _oh = orig_h as f32;
     let norm_kpts: Vec<(f32, f32, f32)> = kpts
         .into_iter()
         .map(|(x, y, c)| (x / mw, y / mh, c))

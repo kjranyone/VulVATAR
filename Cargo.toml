@@ -9,7 +9,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["webcam", "lipsync"]
+default = ["webcam", "lipsync", "rapier", "inference", "virtual-camera"]
 webcam = ["nokhwa"]
 rapier = ["rapier3d"]
 inference = ["ort", "ndarray"]
