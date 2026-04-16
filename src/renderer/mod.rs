@@ -70,6 +70,19 @@ struct OutlinePushConstants {
     a: f32,
 }
 
+/// State for an in-flight readback whose GPU fence has not yet been waited on.
+/// The `wait_fn` closure captures the `FenceSignalFuture` by move so that we
+/// can wait on it later without naming the complex concrete future type.
+struct PendingReadbackState {
+    wait_fn: Box<dyn FnOnce() -> Result<(), String> + Send>,
+    readback_buffer: Subbuffer<[u8]>,
+    extent: [u32; 2],
+    timestamp_nanos: u64,
+    stats: RenderStats,
+}
+
+const READBACK_RING_SIZE: usize = 2;
+
 pub struct VulkanRenderer {
     initialized: bool,
     output_exporter: OutputExporter,
@@ -102,6 +115,21 @@ pub struct VulkanRenderer {
     current_extent: [u32; 2],
     camera_ring: Option<CameraRing>,
     thumb_cache: Option<ThumbnailCache>,
+
+    // Async readback ring: two-stage (staging + readback) buffers and pending fence.
+    staging_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
+    readback_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
+    readback_slot: usize,
+    pending_readback: Option<PendingReadbackState>,
+    // Cached skinning buffer + descriptor set per avatar instance slot.
+    skinning_cache: Vec<SkinningCacheEntry>,
+}
+
+/// Reusable skinning buffer and its matching descriptor set.
+struct SkinningCacheEntry {
+    buffer: Subbuffer<[[[f32; 4]; 4]]>,
+    descriptor_set: Arc<PersistentDescriptorSet>,
+    capacity: usize,
 }
 
 struct ThumbnailCache {
@@ -146,6 +174,148 @@ impl VulkanRenderer {
             current_extent: [1920, 1080],
             camera_ring: None,
             thumb_cache: None,
+
+            staging_buffers: [None, None],
+            readback_buffers: [None, None],
+            readback_slot: 0,
+            pending_readback: None,
+            skinning_cache: Vec::new(),
+        }
+    }
+
+    /// Wait on any pending readback and return its data as a `RenderResult`.
+    fn harvest_pending_readback(&mut self) -> Result<Option<RenderResult>, String> {
+        let pending = match self.pending_readback.take() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        (pending.wait_fn)()?;
+
+        let pixel_data = pending
+            .readback_buffer
+            .read()
+            .map_err(|e| format!("render: readback buffer read failed: {e}"))?
+            .to_vec();
+
+        let exported_frame = output_export::ExportedFrame {
+            pixel_data: output_export::ExportedPixelData::CpuReadback(Arc::new(pixel_data)),
+            gpu_image: None,
+            extent: pending.extent,
+            timestamp_nanos: pending.timestamp_nanos,
+            gpu_token_id: self.frame_counter.saturating_sub(1),
+            export_metadata: output_export::ExportMetadata {
+                width: pending.extent[0],
+                height: pending.extent[1],
+                has_alpha: true,
+                color_space: "srgb".to_string(),
+                timestamp_nanos: pending.timestamp_nanos,
+            },
+            handoff_path: crate::output::HandoffPath::CpuReadback,
+        };
+
+        Ok(Some(RenderResult {
+            extent: pending.extent,
+            timestamp_nanos: pending.timestamp_nanos,
+            has_alpha: true,
+            stats: pending.stats,
+            exported_frame: Some(exported_frame),
+        }))
+    }
+
+    /// Ensure pre-allocated readback buffers exist for the given extent.
+    ///
+    /// Returns `(staging, readback)` where:
+    /// - `staging` is a device-local + host-visible (BAR) buffer used as the
+    ///   target for `copy_image_to_buffer` (fast GPU copy).
+    /// - `readback` is a host-cached buffer for fast CPU reads; the render
+    ///   command buffer also contains a `copy_buffer` from staging→readback
+    ///   so that the CPU never reads uncached VRAM.
+    fn ensure_readback_buffers(
+        &mut self,
+        extent: [u32; 2],
+    ) -> Result<(Subbuffer<[u8]>, Subbuffer<[u8]>), String> {
+        let slot = self.readback_slot;
+        let pixel_count = (extent[0] as u64) * (extent[1] as u64);
+        let needed = pixel_count * 4;
+
+        let needs_recreate = match &self.readback_buffers[slot] {
+            Some(buf) => buf.len() != needed,
+            None => true,
+        };
+
+        if needs_recreate {
+            let ma = self
+                .memory_allocator
+                .as_ref()
+                .ok_or("renderer: no memory allocator")?
+                .clone();
+
+            // Staging: device-local + host-visible (resizable BAR).
+            // Falls back to plain host-visible if BAR unavailable.
+            let staging = Buffer::new_slice::<u8>(
+                ma.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                needed,
+            )
+            .or_else(|_| {
+                Buffer::new_slice::<u8>(
+                    ma.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                            | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                        ..Default::default()
+                    },
+                    needed,
+                )
+            })
+            .map_err(|e| format!("render: staging buffer alloc failed: {e}"))?;
+
+            // Readback: host-cached for fast CPU reads.
+            let readback = Buffer::new_slice::<u8>(
+                ma,
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                    ..Default::default()
+                },
+                needed,
+            )
+            .map_err(|e| format!("render: readback buffer alloc failed: {e}"))?;
+
+            self.staging_buffers[slot] = Some(staging);
+            self.readback_buffers[slot] = Some(readback);
+        }
+
+        // Advance slot for next frame.
+        self.readback_slot = (slot + 1) % READBACK_RING_SIZE;
+
+        Ok((
+            self.staging_buffers[slot].as_ref().unwrap().clone(),
+            self.readback_buffers[slot].as_ref().unwrap().clone(),
+        ))
+    }
+
+    /// Flush any in-flight readback (used during shutdown).
+    pub fn flush_pending(&mut self) {
+        if let Some(pending) = self.pending_readback.take() {
+            let _ = (pending.wait_fn)();
         }
     }
 
@@ -507,6 +677,10 @@ impl VulkanRenderer {
             ps.graphics_pipeline = Some(gfx_pipeline);
         }
 
+        // Invalidate pre-allocated readback buffers (extent changed).
+        self.staging_buffers = [None, None];
+        self.readback_buffers = [None, None];
+
         info!("renderer: resized to {}x{}", new_extent[0], new_extent[1]);
         Ok(())
     }
@@ -515,6 +689,7 @@ impl VulkanRenderer {
         self.texture_cache.clear();
         self.mesh_cache.clear();
         self.material_uploader.clear_cache();
+        self.skinning_cache.clear();
     }
 
     pub fn render(&mut self, input: &RenderFrameInput) -> Result<RenderResult, String> {
@@ -537,6 +712,11 @@ impl VulkanRenderer {
             self.resize(requested_extent)
                 .map_err(|e| format!("render: resize failed: {e}"))?;
         }
+
+        // ── Phase 1: Harvest the previous frame's readback ──────────────
+        let harvested = self.harvest_pending_readback()?;
+
+        // ── Phase 2: Build and submit the current frame ─────────────────
 
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
         let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
@@ -678,7 +858,7 @@ impl VulkanRenderer {
         let mut outline_draws: Vec<OutlineDrawInfo> = Vec::new();
 
         // Draw each avatar instance
-        for instance in &input.instances {
+        for (inst_idx, instance) in input.instances.iter().enumerate() {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
                 vec![mat4_cols_identity()]
             } else {
@@ -689,34 +869,15 @@ impl VulkanRenderer {
                     .collect()
             };
 
-            let skinning_buffer = Buffer::from_iter(
+            let mat_count = skinning_mats.len();
+            let skinning_set = self.get_or_update_skinning(
+                inst_idx,
+                &skinning_mats,
+                mat_count,
                 memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                skinning_mats,
-            )
-            .map_err(|e| format!("render: failed to create skinning buffer: {e}"))?;
-
-            let skinning_set_layout = gfx_pipeline
-                .layout()
-                .set_layouts()
-                .get(1)
-                .ok_or("render: no skinning set layout")?
-                .clone();
-            let skinning_set = PersistentDescriptorSet::new(
-                &ds_allocator,
-                skinning_set_layout,
-                [WriteDescriptorSet::buffer(0, skinning_buffer)],
-                [],
-            )
-            .map_err(|e| format!("render: failed to create skinning descriptor set: {e}"))?;
+                ds_allocator.clone(),
+                &gfx_pipeline,
+            )?;
 
             builder
                 .bind_descriptor_sets(
@@ -909,44 +1070,172 @@ impl VulkanRenderer {
             .end_render_pass(SubpassEndInfo::default())
             .map_err(|e| format!("render: end_render_pass failed: {e}"))?;
 
+        // ── Readback: two-stage copy to avoid slow Intel DMA path ────
+        // Stage 1 (GPU): image → device-local staging buffer (fast on-chip copy)
+        // Stage 2 (GPU): staging → host-cached readback buffer (GPU memcpy)
+        // The CPU then reads from the host-cached buffer without penalty.
+        let (staging_buffer, readback_buffer) =
+            self.ensure_readback_buffers(self.current_extent)?;
+
+        builder
+            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                color_image,
+                staging_buffer.clone(),
+            ))
+            .map_err(|e| format!("render: copy_image_to_buffer failed: {e}"))?;
+
+        builder
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                staging_buffer,
+                readback_buffer.clone(),
+            ))
+            .map_err(|e| format!("render: copy_buffer staging→readback failed: {e}"))?;
+
         let command_buffer = builder
             .build()
             .map_err(|e| format!("render: failed to build command buffer: {e}"))?;
 
-        let future = vulkano::sync::now(device.clone())
+        // ── Submit without waiting ──────────────────────────────────────
+        let fence_future = vulkano::sync::now(device.clone())
             .then_execute(queue.clone(), command_buffer)
-            .map_err(|e| format!("render: then_execute failed: {e}"))?;
+            .map_err(|e| format!("render: then_execute failed: {e}"))?
+            .then_signal_fence_and_flush()
+            .map_err(|e| format!("render: fence signal failed: {e}"))?;
 
         self.frame_counter += 1;
         let timestamp_nanos = self.frame_counter * 16_666_667u64;
         let extent = self.current_extent;
 
-        let export_result = self.output_exporter.export(
-            &output_export::ExportRequest {
-                output_request: input.output_request.clone(),
-                color_image_id: 0,
-                alpha_image_id: None,
-            },
-            color_image,
-            memory_allocator,
-            cb_allocator,
-            queue,
-            future.boxed(),
-            timestamp_nanos,
-        );
+        let stats = RenderStats {
+            instance_count: input.instances.len() as u32,
+            mesh_count: total_meshes,
+            material_count: total_materials,
+            cloth_instances,
+        };
 
-        Ok(RenderResult {
+        // Store the fence and readback buffer for harvest on the next frame.
+        self.pending_readback = Some(PendingReadbackState {
+            wait_fn: Box::new(move || {
+                fence_future
+                    .wait(None)
+                    .map_err(|e| format!("render: fence wait failed: {e}"))
+            }),
+            readback_buffer,
             extent,
             timestamp_nanos,
+            stats: stats.clone(),
+        });
+
+        // ── Return the *previous* frame's result ────────────────────────
+        Ok(harvested.unwrap_or(RenderResult {
+            extent,
+            timestamp_nanos: 0,
             has_alpha: true,
-            stats: RenderStats {
-                instance_count: input.instances.len() as u32,
-                mesh_count: total_meshes,
-                material_count: total_materials,
-                cloth_instances,
-            },
-            exported_frame: export_result.exported_frame,
-        })
+            stats,
+            exported_frame: None,
+        }))
+    }
+
+    /// Get or create a reusable skinning buffer + descriptor set for the given
+    /// avatar instance slot, writing the current frame's matrices into it.
+    fn get_or_update_skinning(
+        &mut self,
+        inst_idx: usize,
+        skinning_mats: &[[[f32; 4]; 4]],
+        mat_count: usize,
+        memory_allocator: Arc<StandardMemoryAllocator>,
+        ds_allocator: Arc<StandardDescriptorSetAllocator>,
+        gfx_pipeline: &Arc<GraphicsPipeline>,
+    ) -> Result<Arc<PersistentDescriptorSet>, String> {
+        // Grow the cache vector if needed.
+        while self.skinning_cache.len() <= inst_idx {
+            // Placeholder; will be (re)created below.
+            let buf = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                vec![mat4_cols_identity()],
+            )
+            .map_err(|e| format!("render: skinning buffer init failed: {e}"))?;
+
+            let layout = gfx_pipeline
+                .layout()
+                .set_layouts()
+                .get(1)
+                .ok_or("render: no skinning set layout")?
+                .clone();
+            let ds = PersistentDescriptorSet::new(
+                &ds_allocator,
+                layout,
+                [WriteDescriptorSet::buffer(0, buf.clone())],
+                [],
+            )
+            .map_err(|e| format!("render: skinning desc set init failed: {e}"))?;
+
+            self.skinning_cache.push(SkinningCacheEntry {
+                buffer: buf,
+                descriptor_set: ds,
+                capacity: 1,
+            });
+        }
+
+        let entry = &mut self.skinning_cache[inst_idx];
+
+        // If the buffer is too small, reallocate.
+        if mat_count > entry.capacity {
+            let buf = Buffer::from_iter(
+                memory_allocator,
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                skinning_mats.iter().copied(),
+            )
+            .map_err(|e| format!("render: skinning buffer realloc failed: {e}"))?;
+
+            let layout = gfx_pipeline
+                .layout()
+                .set_layouts()
+                .get(1)
+                .ok_or("render: no skinning set layout")?
+                .clone();
+            let ds = PersistentDescriptorSet::new(
+                &ds_allocator,
+                layout,
+                [WriteDescriptorSet::buffer(0, buf.clone())],
+                [],
+            )
+            .map_err(|e| format!("render: skinning desc set realloc failed: {e}"))?;
+
+            entry.buffer = buf;
+            entry.descriptor_set = ds;
+            entry.capacity = mat_count;
+
+            return Ok(entry.descriptor_set.clone());
+        }
+
+        // Buffer is large enough — write in-place.
+        {
+            let mut guard = entry
+                .buffer
+                .write()
+                .map_err(|e| format!("render: skinning buffer write failed: {e}"))?;
+            guard[..mat_count].copy_from_slice(skinning_mats);
+        }
+
+        Ok(entry.descriptor_set.clone())
     }
 
     // -----------------------------------------------------------------------

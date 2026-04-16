@@ -23,6 +23,9 @@ models/*.onnx
 # Diagnostic output
 /diagnostics/
 
+# Profiling logs (see docs/profiling.md)
+/profile/
+
 # Misc
 cigpose_models.zip
 nul

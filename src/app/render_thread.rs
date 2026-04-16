@@ -121,6 +121,7 @@ impl RenderThreadInner {
                 }
                 RenderCommand::Shutdown => {
                     info!("render_thread: shutdown received");
+                    self.renderer.flush_pending();
                     return;
                 }
             }

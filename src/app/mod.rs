@@ -183,6 +183,7 @@ impl Application {
             rendered_pixels: None,
             rendered_extent: [0, 0],
             rendered_frame_counter: 0,
+
             viewport_extent: [1920, 1080],
             viewport_camera: ViewportCamera::default(),
             viewport_lighting: LightingState::default(),

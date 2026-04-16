@@ -46,3 +46,25 @@ windows = { version = "0.58", features = [
 notify = "7"
 ort = { version = "2.0.0-rc.12", optional = true }
 ndarray = { version = "0.17.2", optional = true }
+
+# Dev builds: optimise crates that handle bulk pixel data so that
+# 8 MB copies/uploads are not 40x slower than release.
+# Only the crates that touch the hot path are listed here;
+# shaderc-sys and other native-build crates stay at opt-level 0
+# to reuse the existing build cache.
+[profile.dev.package.vulvatar]
+opt-level = 2
+[profile.dev.package.egui]
+opt-level = 2
+[profile.dev.package.epaint]
+opt-level = 2
+[profile.dev.package.eframe]
+opt-level = 2
+[profile.dev.package.emath]
+opt-level = 2
+[profile.dev.package.egui-winit]
+opt-level = 2
+[profile.dev.package.egui_glow]
+opt-level = 2
+[profile.dev.package.glow]
+opt-level = 2

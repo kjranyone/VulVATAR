@@ -142,6 +142,7 @@ pub struct GuiApp {
     pub output: OutputGuiState,
 
     pub camera_index: usize,
+    pub available_cameras: Vec<crate::tracking::CameraInfo>,
 
     // Animation inspector state
     pub animation_playing: bool,
@@ -289,6 +290,7 @@ impl GuiApp {
             },
 
             camera_index: 0,
+            available_cameras: crate::tracking::list_cameras(),
 
             animation_playing: false,
 

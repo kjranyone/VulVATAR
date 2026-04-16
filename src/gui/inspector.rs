@@ -313,13 +313,42 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Input Device")
         .default_open(true)
         .show(ui, |ui| {
-            egui::ComboBox::from_label("Camera")
-                .selected_text(format!("Camera {}", state.camera_index))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.camera_index, 0, "Camera 0");
-                    ui.selectable_value(&mut state.camera_index, 1, "Camera 1");
-                    ui.selectable_value(&mut state.camera_index, 2, "Camera 2");
-                });
+            ui.horizontal(|ui| {
+                let selected_text = state
+                    .available_cameras
+                    .iter()
+                    .find(|c| c.index == state.camera_index)
+                    .map(|c| format!("{}: {}", c.index, c.name))
+                    .unwrap_or_else(|| format!("Camera {}", state.camera_index));
+                egui::ComboBox::from_label("Camera")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        if state.available_cameras.is_empty() {
+                            ui.selectable_value(&mut state.camera_index, 0, "Camera 0");
+                            ui.selectable_value(&mut state.camera_index, 1, "Camera 1");
+                            ui.selectable_value(&mut state.camera_index, 2, "Camera 2");
+                        } else {
+                            for cam in &state.available_cameras {
+                                let label = format!("{}: {}", cam.index, cam.name);
+                                ui.selectable_value(&mut state.camera_index, cam.index, label);
+                            }
+                        }
+                    });
+                if ui.button("🔄").clicked() {
+                    state.available_cameras = crate::tracking::list_cameras();
+                    if !state
+                        .available_cameras
+                        .iter()
+                        .any(|c| c.index == state.camera_index)
+                    {
+                        state.camera_index = state
+                            .available_cameras
+                            .first()
+                            .map(|c| c.index)
+                            .unwrap_or(0);
+                    }
+                }
+            });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if state.tracking.camera_running {
