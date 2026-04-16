@@ -301,6 +301,33 @@ fn map_to_rig_pose(
     let to_norm_y = |y: f32| 1.0 - (y / input_h as f32) * 2.0;
 
     let kpt = |i: usize| -> (f32, f32, f32) { kpts.get(i).copied().unwrap_or((0.0, 0.0, 0.0)) };
+
+    let min_conf = 0.1f32;
+
+    // Compute a bone orientation from the 2D vector (parent → child).
+    // The angle of the vector in the image plane is mapped to a Z-axis
+    // rotation (roll) so that the avatar's limbs visually follow the
+    // performer's limb direction.  For upper arms the rest pose points
+    // roughly downward, so we subtract π/2 (left) or add π/2 (right)
+    // as the rest-pose offset.
+    let orientation_from_limb =
+        |parent: (f32, f32, f32), child: (f32, f32, f32), rest_angle: f32| -> [f32; 4] {
+            let dx = child.0 - parent.0;
+            let dy = child.1 - parent.1;
+            let angle = dy.atan2(dx); // image-space angle (right=0, down=π/2)
+            let roll = angle - rest_angle;
+            euler_to_quat(0.0, 0.0, roll)
+        };
+
+    let make_target_with_orient =
+        |k: (f32, f32, f32), orient: [f32; 4]| -> RigTarget {
+            RigTarget {
+                position: [to_norm_x(k.0) * aspect, to_norm_y(k.1) + 1.6, 0.0],
+                orientation: orient,
+                confidence: k.2,
+            }
+        };
+
     let make_target = |k: (f32, f32, f32)| -> RigTarget {
         RigTarget {
             position: [to_norm_x(k.0) * aspect, to_norm_y(k.1) + 1.6, 0.0],
@@ -309,7 +336,6 @@ fn map_to_rig_pose(
         }
     };
 
-    let min_conf = 0.1f32;
     let maybe_target = |k: (f32, f32, f32)| -> Option<RigTarget> {
         if k.2 < min_conf {
             None
@@ -332,14 +358,79 @@ fn map_to_rig_pose(
     let left_ankle = kpt(15);
     let right_ankle = kpt(16);
 
+    // --- Head: yaw from nose horizontal position, pitch from vertical ---
     let head_yaw = to_norm_x(nose.0) * -0.5;
-    let head_orientation = euler_to_quat(0.0, head_yaw, 0.0);
+    let head_pitch = to_norm_y(nose.1) * -0.15;
+    let head_orientation = euler_to_quat(head_pitch, head_yaw, 0.0);
+
+    // --- Spine: torso lean from shoulder midpoint ---
+    let spine_orientation = if left_shoulder.2 >= min_conf && right_shoulder.2 >= min_conf {
+        let mid_x = (left_shoulder.0 + right_shoulder.0) * 0.5;
+        let mid_y = (left_shoulder.1 + right_shoulder.1) * 0.5;
+        let hip_mid_x = (left_hip.0 + right_hip.0) * 0.5;
+        let hip_mid_y = (left_hip.1 + right_hip.1) * 0.5;
+        let dx = mid_x - hip_mid_x;
+        let dy = mid_y - hip_mid_y;
+        // Shoulder roll from shoulder-line angle
+        let shoulder_dx = right_shoulder.0 - left_shoulder.0;
+        let shoulder_dy = right_shoulder.1 - left_shoulder.1;
+        let roll = shoulder_dy.atan2(shoulder_dx) * 0.5;
+        // Forward lean from torso vertical deviation
+        let lean = dx.atan2(dy.abs().max(1.0)) * 0.3;
+        euler_to_quat(lean, 0.0, roll)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+
+    // --- Arms: compute orientations from limb direction vectors ---
+    // Rest pose: upper arms point downward in image space.
+    // Image atan2 convention: right=0, down=+π/2
+    // Left upper arm rest angle ≈ π/2 (pointing down)
+    // Right upper arm rest angle ≈ π/2 (pointing down)
+    use std::f32::consts::FRAC_PI_2;
+
+    let left_upper_orient = if left_shoulder.2 >= min_conf && left_elbow.2 >= min_conf {
+        orientation_from_limb(left_shoulder, left_elbow, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let left_lower_orient = if left_elbow.2 >= min_conf && left_wrist.2 >= min_conf {
+        orientation_from_limb(left_elbow, left_wrist, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let right_upper_orient = if right_shoulder.2 >= min_conf && right_elbow.2 >= min_conf {
+        orientation_from_limb(right_shoulder, right_elbow, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let right_lower_orient = if right_elbow.2 >= min_conf && right_wrist.2 >= min_conf {
+        orientation_from_limb(right_elbow, right_wrist, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
 
     let arms = RigArmTargets {
-        left_upper: maybe_target(left_shoulder),
-        left_lower: maybe_target(left_elbow),
-        right_upper: maybe_target(right_shoulder),
-        right_lower: maybe_target(right_elbow),
+        left_upper: if left_shoulder.2 >= min_conf {
+            Some(make_target_with_orient(left_shoulder, left_upper_orient))
+        } else {
+            None
+        },
+        left_lower: if left_elbow.2 >= min_conf {
+            Some(make_target_with_orient(left_elbow, left_lower_orient))
+        } else {
+            None
+        },
+        right_upper: if right_shoulder.2 >= min_conf {
+            Some(make_target_with_orient(right_shoulder, right_upper_orient))
+        } else {
+            None
+        },
+        right_lower: if right_elbow.2 >= min_conf {
+            Some(make_target_with_orient(right_elbow, right_lower_orient))
+        } else {
+            None
+        },
     };
 
     let hands = if left_wrist.2 >= min_conf || right_wrist.2 >= min_conf {
@@ -351,12 +442,50 @@ fn map_to_rig_pose(
         None
     };
 
+    // --- Legs: compute orientations from limb direction vectors ---
+    let left_upper_leg_orient = if left_hip.2 >= min_conf && left_knee.2 >= min_conf {
+        orientation_from_limb(left_hip, left_knee, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let left_lower_leg_orient = if left_knee.2 >= min_conf && left_ankle.2 >= min_conf {
+        orientation_from_limb(left_knee, left_ankle, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let right_upper_leg_orient = if right_hip.2 >= min_conf && right_knee.2 >= min_conf {
+        orientation_from_limb(right_hip, right_knee, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let right_lower_leg_orient = if right_knee.2 >= min_conf && right_ankle.2 >= min_conf {
+        orientation_from_limb(right_knee, right_ankle, FRAC_PI_2)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+
     let legs = if left_hip.2 >= min_conf || right_hip.2 >= min_conf {
         Some(RigLegTargets {
-            left_upper: maybe_target(left_hip),
-            left_lower: maybe_target(left_knee),
-            right_upper: maybe_target(right_hip),
-            right_lower: maybe_target(right_knee),
+            left_upper: if left_hip.2 >= min_conf {
+                Some(make_target_with_orient(left_hip, left_upper_leg_orient))
+            } else {
+                None
+            },
+            left_lower: if left_knee.2 >= min_conf {
+                Some(make_target_with_orient(left_knee, left_lower_leg_orient))
+            } else {
+                None
+            },
+            right_upper: if right_hip.2 >= min_conf {
+                Some(make_target_with_orient(right_hip, right_upper_leg_orient))
+            } else {
+                None
+            },
+            right_lower: if right_knee.2 >= min_conf {
+                Some(make_target_with_orient(right_knee, right_lower_leg_orient))
+            } else {
+                None
+            },
         })
     } else {
         None
@@ -409,6 +538,12 @@ fn map_to_rig_pose(
         None
     };
 
+    let spine_conf = if left_shoulder.2 >= min_conf && right_shoulder.2 >= min_conf {
+        (left_shoulder.2 + right_shoulder.2) * 0.5
+    } else {
+        0.0
+    };
+
     TrackingRigPose {
         source_timestamp: frame_index,
         head: Some(RigTarget {
@@ -417,7 +552,15 @@ fn map_to_rig_pose(
             confidence: nose.2,
         }),
         neck: maybe_target(kpt(1)),
-        spine: None,
+        spine: if spine_conf >= min_conf {
+            Some(RigTarget {
+                position: [0.0, 1.0, 0.0],
+                orientation: spine_orientation,
+                confidence: spine_conf,
+            })
+        } else {
+            None
+        },
         shoulders: RigShoulderTargets {
             left: maybe_target(left_shoulder),
             right: maybe_target(right_shoulder),

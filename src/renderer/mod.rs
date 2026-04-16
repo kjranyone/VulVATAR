@@ -26,7 +26,7 @@ use vulkano::command_buffer::{
     RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::PhysicalDeviceType;
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
@@ -128,7 +128,7 @@ pub struct VulkanRenderer {
 /// Reusable skinning buffer and its matching descriptor set.
 struct SkinningCacheEntry {
     buffer: Subbuffer<[[[f32; 4]; 4]]>,
-    descriptor_set: Arc<PersistentDescriptorSet>,
+    descriptor_set: Arc<DescriptorSet>,
     capacity: usize,
 }
 
@@ -779,7 +779,7 @@ impl VulkanRenderer {
             .count() as u32;
 
         let mut builder = AutoCommandBufferBuilder::primary(
-            &cb_allocator,
+            cb_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
@@ -851,7 +851,7 @@ impl VulkanRenderer {
             vertex_buffer: Subbuffer<[GpuVertex]>,
             index_buffer: Subbuffer<[u32]>,
             index_count: u32,
-            skinning_set: Arc<PersistentDescriptorSet>,
+            skinning_set: Arc<DescriptorSet>,
             outline_width: f32,
             outline_color: [f32; 3],
         }
@@ -1016,9 +1016,12 @@ impl VulkanRenderer {
                         .bind_vertex_buffers(0, vertex_buffer.clone())
                         .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
                         .bind_index_buffer(index_buffer.clone())
-                        .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?
-                        .draw_indexed(index_count, 1, 0, 0, 0)
-                        .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
+                        .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?;
+                    unsafe {
+                        builder
+                            .draw_indexed(index_count, 1, 0, 0, 0)
+                            .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
+                    }
 
                     // Skip outlines for alpha-masked (Cutout) materials: the outline
                     // shader cannot do alpha testing, so it would draw in regions
@@ -1080,9 +1083,12 @@ impl VulkanRenderer {
                     .bind_vertex_buffers(0, draw.vertex_buffer.clone())
                     .map_err(|e| format!("render: outline bind_vertex_buffers failed: {e}"))?
                     .bind_index_buffer(draw.index_buffer.clone())
-                    .map_err(|e| format!("render: outline bind_index_buffer failed: {e}"))?
-                    .draw_indexed(draw.index_count, 1, 0, 0, 0)
-                    .map_err(|e| format!("render: outline draw_indexed failed: {e}"))?;
+                    .map_err(|e| format!("render: outline bind_index_buffer failed: {e}"))?;
+                unsafe {
+                    builder
+                        .draw_indexed(draw.index_count, 1, 0, 0, 0)
+                        .map_err(|e| format!("render: outline draw_indexed failed: {e}"))?;
+                }
             }
         }
 
@@ -1166,7 +1172,7 @@ impl VulkanRenderer {
         memory_allocator: Arc<StandardMemoryAllocator>,
         ds_allocator: Arc<StandardDescriptorSetAllocator>,
         gfx_pipeline: &Arc<GraphicsPipeline>,
-    ) -> Result<Arc<PersistentDescriptorSet>, String> {
+    ) -> Result<Arc<DescriptorSet>, String> {
         // Grow the cache vector if needed.
         while self.skinning_cache.len() <= inst_idx {
             // Placeholder; will be (re)created below.
@@ -1191,8 +1197,8 @@ impl VulkanRenderer {
                 .get(1)
                 .ok_or("render: no skinning set layout")?
                 .clone();
-            let ds = PersistentDescriptorSet::new(
-                &ds_allocator,
+            let ds = DescriptorSet::new(
+                ds_allocator.clone(),
                 layout,
                 [WriteDescriptorSet::buffer(0, buf.clone())],
                 [],
@@ -1231,8 +1237,8 @@ impl VulkanRenderer {
                 .get(1)
                 .ok_or("render: no skinning set layout")?
                 .clone();
-            let ds = PersistentDescriptorSet::new(
-                &ds_allocator,
+            let ds = DescriptorSet::new(
+                ds_allocator.clone(),
                 layout,
                 [WriteDescriptorSet::buffer(0, buf.clone())],
                 [],
@@ -1438,7 +1444,7 @@ impl VulkanRenderer {
         .ok()?;
 
         let mut cmd = AutoCommandBufferBuilder::primary(
-            &cb_allocator,
+            cb_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
@@ -1922,8 +1928,8 @@ impl VulkanRenderer {
             .get(0)
             .ok_or("thumbnail: no set 0")?
             .clone();
-        let camera_set = PersistentDescriptorSet::new(
-            &ds_allocator,
+        let camera_set = DescriptorSet::new(
+            ds_allocator.clone(),
             camera_set_layout,
             [WriteDescriptorSet::buffer(0, camera_buffer)],
             [],
@@ -1931,7 +1937,7 @@ impl VulkanRenderer {
         .map_err(|e| format!("thumbnail: camera desc set failed: {e}"))?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
-            &cb_allocator,
+            cb_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
@@ -1994,8 +2000,8 @@ impl VulkanRenderer {
                 .get(1)
                 .ok_or("thumbnail: no set 1")?
                 .clone();
-            let skinning_set = PersistentDescriptorSet::new(
-                &ds_allocator,
+            let skinning_set = DescriptorSet::new(
+                ds_allocator.clone(),
                 skinning_set_layout,
                 [WriteDescriptorSet::buffer(0, skinning_buffer)],
                 [],
@@ -2054,9 +2060,12 @@ impl VulkanRenderer {
                             .bind_vertex_buffers(0, vb)
                             .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
                             .bind_index_buffer(ib)
-                            .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?
-                            .draw_indexed(idx_count, 1, 0, 0, 0)
-                            .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+                            .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?;
+                        unsafe {
+                            builder
+                                .draw_indexed(idx_count, 1, 0, 0, 0)
+                                .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+                        }
                         continue;
                     }
                 };
@@ -2106,9 +2115,12 @@ impl VulkanRenderer {
                     .bind_vertex_buffers(0, vb)
                     .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
                     .bind_index_buffer(ib)
-                    .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?
-                    .draw_indexed(idx_count, 1, 0, 0, 0)
-                    .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+                    .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?;
+                unsafe {
+                    builder
+                        .draw_indexed(idx_count, 1, 0, 0, 0)
+                        .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+                }
             }
         }
 
@@ -2245,8 +2257,8 @@ const FRAME_LAG: usize = 3;
 
 struct CameraRing {
     buffers: Vec<Subbuffer<CameraUniform>>,
-    main_sets: Vec<Arc<PersistentDescriptorSet>>,
-    outline_sets: Vec<Arc<PersistentDescriptorSet>>,
+    main_sets: Vec<Arc<DescriptorSet>>,
+    outline_sets: Vec<Arc<DescriptorSet>>,
 }
 
 impl CameraRing {
@@ -2302,16 +2314,16 @@ impl CameraRing {
             )
             .expect("camera ring buffer alloc failed");
 
-            let main_set = PersistentDescriptorSet::new(
-                ds_allocator,
+            let main_set = DescriptorSet::new(
+                ds_allocator.clone(),
                 main_layout.clone(),
                 [WriteDescriptorSet::buffer(0, buffer.clone())],
                 [],
             )
             .expect("camera main desc set alloc failed");
 
-            let outline_set = PersistentDescriptorSet::new(
-                ds_allocator,
+            let outline_set = DescriptorSet::new(
+                ds_allocator.clone(),
                 outline_layout.clone(),
                 [WriteDescriptorSet::buffer(0, buffer.clone())],
                 [],

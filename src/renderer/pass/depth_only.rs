@@ -1,18 +1,14 @@
 use std::sync::Arc;
 use vulkano::buffer::Subbuffer;
-use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint};
 
 use super::forward::ForwardPassDraw;
 
 pub fn record_depth_prepass(
-    builder: &mut AutoCommandBufferBuilder<
-        PrimaryAutoCommandBuffer<Arc<StandardCommandBufferAllocator>>,
-        Arc<StandardCommandBufferAllocator>,
-    >,
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
     depth_pipeline: &Arc<GraphicsPipeline>,
     camera_buffer: Subbuffer<crate::renderer::CameraUniform>,
     ds_allocator: &Arc<StandardDescriptorSetAllocator>,
@@ -32,8 +28,8 @@ pub fn record_depth_prepass(
         .get(0)
         .ok_or("depth prepass: no camera set layout")?
         .clone();
-    let camera_set = PersistentDescriptorSet::new(
-        ds_allocator,
+    let camera_set = DescriptorSet::new(
+        ds_allocator.clone(),
         camera_set_layout,
         [WriteDescriptorSet::buffer(0, camera_buffer)],
         [],
@@ -63,9 +59,12 @@ pub fn record_depth_prepass(
             .bind_vertex_buffers(0, draw.vertex_buffer.clone())
             .map_err(|e| format!("depth prepass: bind vertex buffer: {e}"))?
             .bind_index_buffer(draw.index_buffer.clone())
-            .map_err(|e| format!("depth prepass: bind index buffer: {e}"))?
-            .draw_indexed(draw.index_count, 1, 0, 0, 0)
-            .map_err(|e| format!("depth prepass: draw indexed: {e}"))?;
+            .map_err(|e| format!("depth prepass: bind index buffer: {e}"))?;
+        unsafe {
+            builder
+                .draw_indexed(draw.index_count, 1, 0, 0, 0)
+                .map_err(|e| format!("depth prepass: draw indexed: {e}"))?;
+        }
     }
 
     Ok(())

@@ -707,6 +707,10 @@ impl eframe::App for GuiApp {
 
         self.process_hotkeys(ctx);
 
+        if let Some(err) = self.app.tracking.mailbox().drain_error() {
+            self.push_notification(err);
+        }
+
         self.poll_folder_watcher();
 
         // Sync GUI-driven state into the application before running the frame.

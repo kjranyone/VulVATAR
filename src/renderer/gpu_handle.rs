@@ -161,19 +161,18 @@ impl GpuHandleExporter {
             );
         }
 
-        let raw_device = device.handle();
         let raw_memory = device_memory.handle();
 
-        let mut info = vk::MemoryGetWin32HandleInfoKHR::default();
-        info.memory = raw_memory;
-        info.handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT;
+        let info = vk::MemoryGetWin32HandleInfoKHR::default()
+            .memory(raw_memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT);
 
         let fns = device.fns();
-        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut handle: vk::HANDLE = 0;
 
         let result = unsafe {
             (fns.khr_external_memory_win32.get_memory_win32_handle_khr)(
-                raw_device,
+                device.handle(),
                 &info,
                 &mut handle,
             )

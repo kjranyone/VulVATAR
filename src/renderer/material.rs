@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::Sampler;
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
@@ -162,7 +162,7 @@ pub struct MaterialUniform {
 
 struct MaterialCacheEntry {
     buffer: Subbuffer<MaterialUniform>,
-    descriptor_set: Arc<PersistentDescriptorSet>,
+    descriptor_set: Arc<DescriptorSet>,
     base_color_uri: String,
     shade_texture_uri: Option<String>,
     matcap_uri: Option<String>,
@@ -200,7 +200,7 @@ impl MaterialUploader {
         shade_texture_view: Arc<ImageView>,
         sampler: Arc<Sampler>,
         matcap_texture_view: Option<Arc<ImageView>>,
-    ) -> Result<Arc<PersistentDescriptorSet>, String> {
+    ) -> Result<Arc<DescriptorSet>, String> {
         let base_color_uri = request
             .textures
             .base_color
@@ -255,8 +255,8 @@ impl MaterialUploader {
             })?
             .clone();
         let matcap_view = matcap_texture_view.unwrap_or_else(|| texture_view.clone());
-        let descriptor_set = PersistentDescriptorSet::new(
-            &descriptor_set_allocator,
+        let descriptor_set = DescriptorSet::new(
+            descriptor_set_allocator,
             layout,
             [
                 WriteDescriptorSet::buffer(0, uniform_buffer.clone()),

@@ -120,6 +120,7 @@ pub struct Application {
     shutdown_complete: bool,
     pub viewport_background: Option<std::path::PathBuf>,
     pub ground_grid_visible: bool,
+    stale_warn_cooldown: std::time::Instant,
 }
 
 impl Application {
@@ -190,6 +191,7 @@ impl Application {
             output_extent: None,
             tracking_worker: None,
             shutdown_complete: false,
+            stale_warn_cooldown: std::time::Instant::now(),
             viewport_background: None,
             ground_grid_visible: false,
         }
@@ -306,7 +308,10 @@ impl Application {
         // 2. read the latest completed tracking sample from the async tracking worker
         let tracking_sample = if toggles.tracking_enabled {
             if self.tracking.mailbox().is_stale() {
-                warn!("tracking: stale sample detected, skipping tracking this frame");
+                if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
+                    warn!("tracking: stale sample detected, skipping tracking this frame");
+                    self.stale_warn_cooldown = std::time::Instant::now();
+                }
                 None
             } else {
                 self.step_tracking()

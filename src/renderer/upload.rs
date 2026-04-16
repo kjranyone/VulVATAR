@@ -56,7 +56,7 @@ pub fn upload_rgba_texture(
     .ok()?;
 
     let mut cmd = AutoCommandBufferBuilder::primary(
-        &cb_allocator,
+        cb_allocator.clone(),
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     )

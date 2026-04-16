@@ -502,7 +502,7 @@ pub fn create_graphics_pipeline(
         .ok_or_else(|| "fragment shader entry point 'main' not found".to_string())?;
 
     let vertex_input_state = GpuVertex::per_vertex()
-        .definition(&vs_entry.info().input_interface)
+        .definition(&vs_entry)
         .map_err(|e| format!("failed to get vertex input state: {e}"))?;
 
     let stages = [
@@ -607,7 +607,7 @@ pub fn create_outline_pipeline(
         .ok_or_else(|| "outline fragment shader entry point 'main' not found".to_string())?;
 
     let vertex_input_state = GpuVertex::per_vertex()
-        .definition(&vs_entry.info().input_interface)
+        .definition(&vs_entry)
         .map_err(|e| format!("failed to get outline vertex input state: {e}"))?;
 
     let stages = [
@@ -706,7 +706,7 @@ pub fn create_depth_only_pipeline(
         .ok_or_else(|| "depth-only fragment shader entry point 'main' not found".to_string())?;
 
     let vertex_input_state = GpuVertex::per_vertex()
-        .definition(&vs_entry.info().input_interface)
+        .definition(&vs_entry)
         .map_err(|e| format!("failed to get depth-only vertex input state: {e}"))?;
 
     let stages = [

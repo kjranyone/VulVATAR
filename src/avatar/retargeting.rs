@@ -160,69 +160,85 @@ pub fn retarget_tracking_to_pose_filtered(
 
     let threshold = params.confidence_threshold;
     let orientation_smooth = params.orientation_smoothing;
-    let position_smooth = params.position_smoothing;
 
-    // Helper closure: apply both rotation and position for a target/bone pair.
-    let mut apply_target = |target: &RigTarget, bone: HumanoidBone| {
+    // Helper closure: apply rotation only for a target/bone pair.
+    // Position from 2D pose estimation is in image-normalised space and must NOT
+    // be written into skeleton local transforms (it would destroy the bind pose).
+    let mut apply_rotation = |target: &RigTarget, bone: HumanoidBone| {
         if let Some(idx) = bone_index(bone_map, bone) {
             apply_target_rotation(target, idx, threshold, orientation_smooth, local_transforms);
-            apply_target_position(target, idx, threshold, position_smooth, local_transforms);
         }
     };
 
     // --- Head ---
     if let Some(ref target) = tracking.head {
-        apply_target(target, HumanoidBone::Head);
+        apply_rotation(target, HumanoidBone::Head);
     }
 
     // --- Neck ---
     if let Some(ref target) = tracking.neck {
-        apply_target(target, HumanoidBone::Neck);
+        apply_rotation(target, HumanoidBone::Neck);
     }
 
     // --- Spine ---
     if let Some(ref target) = tracking.spine {
-        apply_target(target, HumanoidBone::Spine);
+        apply_rotation(target, HumanoidBone::Spine);
     }
 
     // --- Left Shoulder ---
     if let Some(ref target) = tracking.shoulders.left {
-        apply_target(target, HumanoidBone::LeftShoulder);
+        apply_rotation(target, HumanoidBone::LeftShoulder);
     }
 
     // --- Right Shoulder ---
     if let Some(ref target) = tracking.shoulders.right {
-        apply_target(target, HumanoidBone::RightShoulder);
+        apply_rotation(target, HumanoidBone::RightShoulder);
     }
 
     // --- Left Upper Arm ---
     if let Some(ref target) = tracking.arms.left_upper {
-        apply_target(target, HumanoidBone::LeftUpperArm);
+        apply_rotation(target, HumanoidBone::LeftUpperArm);
     }
 
     // --- Left Lower Arm ---
     if let Some(ref target) = tracking.arms.left_lower {
-        apply_target(target, HumanoidBone::LeftLowerArm);
+        apply_rotation(target, HumanoidBone::LeftLowerArm);
     }
 
     // --- Right Upper Arm ---
     if let Some(ref target) = tracking.arms.right_upper {
-        apply_target(target, HumanoidBone::RightUpperArm);
+        apply_rotation(target, HumanoidBone::RightUpperArm);
     }
 
     // --- Right Lower Arm ---
     if let Some(ref target) = tracking.arms.right_lower {
-        apply_target(target, HumanoidBone::RightLowerArm);
+        apply_rotation(target, HumanoidBone::RightLowerArm);
+    }
+
+    // --- Legs ---
+    if let Some(ref legs) = tracking.legs {
+        if let Some(ref target) = legs.left_upper {
+            apply_rotation(target, HumanoidBone::LeftUpperLeg);
+        }
+        if let Some(ref target) = legs.left_lower {
+            apply_rotation(target, HumanoidBone::LeftLowerLeg);
+        }
+        if let Some(ref target) = legs.right_upper {
+            apply_rotation(target, HumanoidBone::RightUpperLeg);
+        }
+        if let Some(ref target) = legs.right_lower {
+            apply_rotation(target, HumanoidBone::RightLowerLeg);
+        }
     }
 
     // --- Hands (only if hand tracking is enabled) ---
     if hand_tracking_enabled {
         if let Some(ref hands) = tracking.hands {
             if let Some(ref target) = hands.left {
-                apply_target(target, HumanoidBone::LeftHand);
+                apply_rotation(target, HumanoidBone::LeftHand);
             }
             if let Some(ref target) = hands.right {
-                apply_target(target, HumanoidBone::RightHand);
+                apply_rotation(target, HumanoidBone::RightHand);
             }
         }
     }

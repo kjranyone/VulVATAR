@@ -298,7 +298,7 @@ impl OutputExporter {
         };
 
         let mut builder = match AutoCommandBufferBuilder::primary(
-            &command_buffer_allocator,
+            command_buffer_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         ) {
@@ -407,7 +407,7 @@ impl OutputExporter {
         };
 
         let mut builder = match AutoCommandBufferBuilder::primary(
-            &command_buffer_allocator,
+            command_buffer_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         ) {
