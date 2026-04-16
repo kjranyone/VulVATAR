@@ -34,7 +34,6 @@ pub struct CameraOrbitState {
 
 pub struct TrackingGuiState {
     pub toggle_tracking: bool,
-    pub camera_running: bool,
     pub camera_resolution_index: usize,
     pub camera_framerate_index: usize,
     pub tracking_mirror: bool,
@@ -42,6 +41,16 @@ pub struct TrackingGuiState {
     pub face_tracking_enabled: bool,
     pub smoothing_strength: f32,
     pub confidence_threshold: f32,
+}
+
+pub struct LipSyncGuiState {
+    pub enabled: bool,
+    pub mic_device_index: usize,
+    pub available_mics: Vec<crate::lipsync::AudioDeviceInfo>,
+    pub volume_threshold: f32,
+    pub smoothing: f32,
+    /// Current RMS volume (for the live meter in the UI).
+    pub current_volume: f32,
 }
 
 pub struct RenderingGuiState {
@@ -143,6 +152,16 @@ pub struct GuiApp {
 
     pub camera_index: usize,
     pub available_cameras: Vec<crate::tracking::CameraInfo>,
+    pub show_camera_wipe: bool,
+    pub show_detection_annotations: bool,
+    pub camera_wipe_texture: Option<egui::TextureHandle>,
+    pub camera_wipe_seq: u64,
+    pub camera_wipe_rgba_buf: Vec<u8>,
+
+    // Lip sync
+    pub lipsync: LipSyncGuiState,
+    #[cfg(feature = "lipsync")]
+    pub lipsync_processor: Option<crate::lipsync::LipSyncProcessor>,
 
     // Animation inspector state
     pub animation_playing: bool,
@@ -253,7 +272,6 @@ impl GuiApp {
             },
             tracking: TrackingGuiState {
                 toggle_tracking: true,
-                camera_running: false,
                 camera_resolution_index: 0,
                 camera_framerate_index: 0,
                 tracking_mirror: true,
@@ -291,6 +309,22 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
+            show_camera_wipe: false,
+            show_detection_annotations: true,
+            camera_wipe_texture: None,
+            camera_wipe_seq: 0,
+            camera_wipe_rgba_buf: Vec::new(),
+
+            lipsync: LipSyncGuiState {
+                enabled: false,
+                mic_device_index: 0,
+                available_mics: crate::lipsync::audio_capture::list_audio_devices(),
+                volume_threshold: 0.01,
+                smoothing: 0.5,
+                current_volume: 0.0,
+            },
+            #[cfg(feature = "lipsync")]
+            lipsync_processor: None,
 
             animation_playing: false,
 
@@ -330,6 +364,15 @@ impl GuiApp {
 }
 
 impl GuiApp {
+    /// Whether the tracking worker is actually running, derived from the
+    /// real worker state instead of the GUI toggle flag.
+    pub fn is_tracking_active(&self) -> bool {
+        self.app
+            .tracking_worker
+            .as_ref()
+            .map_or(false, |w| w.is_running())
+    }
+
     /// Push a notification message that will auto-dismiss after 5 seconds.
     pub fn push_notification(&mut self, msg: String) {
         self.notifications.push((msg, Instant::now()));

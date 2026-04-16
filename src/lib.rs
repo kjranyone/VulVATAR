@@ -4,6 +4,7 @@ pub mod avatar;
 pub mod dshow_dll;
 pub mod editor;
 pub mod gui;
+pub mod lipsync;
 pub mod math_utils;
 pub mod output;
 pub mod persistence;

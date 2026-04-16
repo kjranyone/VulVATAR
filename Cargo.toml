@@ -14,6 +14,7 @@ webcam = ["nokhwa"]
 rapier = ["rapier3d"]
 inference = ["ort", "ndarray"]
 virtual-camera = ["windows"]
+lipsync = ["cpal", "rustfft"]
 
 [dependencies]
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }
@@ -46,6 +47,8 @@ windows = { version = "0.58", features = [
 notify = "7"
 ort = { version = "2.0.0-rc.12", optional = true }
 ndarray = { version = "0.17.2", optional = true }
+cpal = { version = "0.17", optional = true }
+rustfft = { version = "6.4", optional = true }
 
 # Dev builds: optimise crates that handle bulk pixel data so that
 # 8 MB copies/uploads are not 40x slower than release.

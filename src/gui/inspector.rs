@@ -351,14 +351,34 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if state.tracking.camera_running {
+                if state.is_tracking_active() {
                     if ui.button("Stop Camera").clicked() {
-                        state.tracking.camera_running = false;
+                        state.app.stop_tracking();
                     }
                 } else if ui.button("Start Camera").clicked() {
-                    state.tracking.camera_running = true;
+                    let (w, h) = match state.tracking.camera_resolution_index {
+                        1 => (1280, 720),
+                        2 => (1920, 1080),
+                        _ => (640, 480),
+                    };
+                    let fps: u32 = if state.tracking.camera_framerate_index == 1 {
+                        60
+                    } else {
+                        30
+                    };
+                    #[cfg(feature = "webcam")]
+                    let backend = crate::tracking::CameraBackend::Webcam {
+                        camera_index: state.camera_index,
+                    };
+                    #[cfg(not(feature = "webcam"))]
+                    let backend = crate::tracking::CameraBackend::Synthetic;
+                    state.app.start_tracking_with_params(backend, w, h, fps);
                 }
             });
+            ui.checkbox(&mut state.show_camera_wipe, "Camera Wipe (PIP)");
+            if state.show_camera_wipe {
+                ui.checkbox(&mut state.show_detection_annotations, "Show Annotations");
+            }
             egui::ComboBox::from_label("Resolution")
                 .selected_text(
                     *["640x480", "1280x720", "1920x1080"]
@@ -400,7 +420,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Inference Status")
         .default_open(true)
         .show(ui, |ui| {
-            let (status_color, status_text) = if state.tracking.camera_running {
+            let (status_color, status_text) = if state.is_tracking_active() {
                 (egui::Color32::GREEN, "Running")
             } else {
                 (egui::Color32::GRAY, "Stopped")
@@ -463,6 +483,135 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.project_dirty = true;
             }
         });
+
+    egui::CollapsingHeader::new("Lip Sync")
+        .default_open(false)
+        .show(ui, |ui| {
+            draw_lipsync(ui, state);
+        });
+}
+
+fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
+    ui.horizontal(|ui| {
+        let selected_mic = state
+            .lipsync
+            .available_mics
+            .iter()
+            .find(|m| m.index == state.lipsync.mic_device_index)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("Device {}", state.lipsync.mic_device_index));
+        egui::ComboBox::from_label("Microphone")
+            .selected_text(selected_mic)
+            .show_ui(ui, |ui| {
+                if state.lipsync.available_mics.is_empty() {
+                    ui.label("No devices found");
+                } else {
+                    for mic in &state.lipsync.available_mics {
+                        ui.selectable_value(
+                            &mut state.lipsync.mic_device_index,
+                            mic.index,
+                            &mic.name,
+                        );
+                    }
+                }
+            });
+        if ui.button("Refresh").clicked() {
+            state.lipsync.available_mics = crate::lipsync::audio_capture::list_audio_devices();
+        }
+    });
+
+    ui.add_space(4.0);
+
+    #[allow(unused_variables)]
+    let was_enabled = state.lipsync.enabled;
+    ui.checkbox(&mut state.lipsync.enabled, "Enable Lip Sync");
+
+    #[cfg(feature = "lipsync")]
+    {
+        // Start/stop processor when toggle changes.
+        if state.lipsync.enabled && !was_enabled {
+            match crate::lipsync::LipSyncProcessor::start(Some(
+                state.lipsync.mic_device_index,
+            )) {
+                Ok(proc) => {
+                    state.lipsync_processor = Some(proc);
+                    state.push_notification("Lip sync started.".to_string());
+                }
+                Err(e) => {
+                    state.lipsync.enabled = false;
+                    state.push_notification(format!("Lip sync failed: {}", e));
+                }
+            }
+        } else if !state.lipsync.enabled && was_enabled {
+            if let Some(ref mut proc) = state.lipsync_processor {
+                proc.stop();
+            }
+            state.lipsync_processor = None;
+            state.push_notification("Lip sync stopped.".to_string());
+        }
+
+        // Run inference each frame and update volume meter.
+        if let Some(ref mut proc) = state.lipsync_processor {
+            state.lipsync.current_volume = proc.rms_volume();
+            let viseme = proc.process_frame(state.lipsync.smoothing);
+
+            // Feed viseme weights into the avatar's expression weights.
+            if let Some(avatar) = state.app.active_avatar_mut() {
+                for (name, weight) in viseme.as_expression_pairs() {
+                    if weight < state.lipsync.volume_threshold && name == "aa" {
+                        // Below threshold: close mouth.
+                        if let Some(ew) = avatar.expression_weights.iter_mut().find(|w| w.name == name) {
+                            ew.weight = 0.0;
+                        }
+                        continue;
+                    }
+                    if let Some(ew) = avatar.expression_weights.iter_mut().find(|w| w.name == name) {
+                        ew.weight = weight;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "lipsync"))]
+    {
+        if state.lipsync.enabled {
+            state.lipsync.enabled = false;
+            state.push_notification(
+                "Lip sync unavailable: build with --features lipsync".to_string(),
+            );
+        }
+    }
+
+    // Volume meter.
+    let vol = state.lipsync.current_volume;
+    let meter_rect = ui.available_rect_before_wrap();
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(meter_rect.width().min(200.0), 14.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(30, 30, 35));
+    let fill_w = (vol * 10.0).clamp(0.0, 1.0) * rect.width();
+    let fill_color = if vol > state.lipsync.volume_threshold {
+        egui::Color32::from_rgb(80, 200, 80)
+    } else {
+        egui::Color32::from_rgb(60, 60, 70)
+    };
+    painter.rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height())),
+        2.0,
+        fill_color,
+    );
+    ui.label(format!("Volume: {:.3}", vol));
+
+    ui.add_space(4.0);
+    ui.add(
+        egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
+            .text("Threshold")
+            .logarithmic(true),
+    );
+    ui.add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text("Smoothing"));
 }
 
 fn draw_confidence_bar(ui: &mut egui::Ui, label: &str, value: f32) {
