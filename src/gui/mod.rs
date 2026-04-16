@@ -457,6 +457,11 @@ impl GuiApp {
             toggle_spring: self.rendering.toggle_spring,
             toggle_cloth: self.rendering.toggle_cloth,
 
+            lipsync_enabled: self.lipsync.enabled,
+            lipsync_mic_device_index: self.lipsync.mic_device_index,
+            lipsync_volume_threshold: self.lipsync.volume_threshold,
+            lipsync_smoothing: self.lipsync.smoothing,
+
             output_sink_index: self.output.output_sink_index,
             output_resolution_index: self.output.output_resolution_index,
             output_framerate_index: self.output.output_framerate_index,
@@ -595,6 +600,11 @@ impl GuiApp {
         self.rendering.transparent_background = state.transparent_background;
         self.rendering.toggle_spring = state.toggle_spring;
         self.rendering.toggle_cloth = state.toggle_cloth;
+
+        self.lipsync.enabled = state.lipsync_enabled;
+        self.lipsync.mic_device_index = state.lipsync_mic_device_index;
+        self.lipsync.volume_threshold = state.lipsync_volume_threshold;
+        self.lipsync.smoothing = state.lipsync_smoothing;
 
         self.output.output_sink_index = state.output_sink_index;
         self.output.output_resolution_index = state.output_resolution_index;

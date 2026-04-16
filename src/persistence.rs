@@ -52,6 +52,12 @@ pub struct ProjectState {
     pub toggle_spring: bool,
     pub toggle_cloth: bool,
 
+    // Lip sync config
+    pub lipsync_enabled: bool,
+    pub lipsync_mic_device_index: usize,
+    pub lipsync_volume_threshold: f32,
+    pub lipsync_smoothing: f32,
+
     // Output config
     pub output_sink_index: usize,
     pub output_resolution_index: usize,
@@ -83,6 +89,8 @@ pub struct ProjectFile {
 
     pub tracking: TrackingConfig,
     pub rendering: RenderingConfig,
+    #[serde(default)]
+    pub lipsync: LipSyncConfig,
     pub output: OutputConfig,
 }
 
@@ -162,6 +170,26 @@ pub struct RenderingConfig {
     pub toggle_spring: bool,
     #[serde(default)]
     pub toggle_cloth: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct LipSyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mic_device_index: usize,
+    #[serde(default = "default_volume_threshold")]
+    pub volume_threshold: f32,
+    #[serde(default = "default_lipsync_smoothing")]
+    pub smoothing: f32,
+}
+
+fn default_volume_threshold() -> f32 {
+    0.01
+}
+
+fn default_lipsync_smoothing() -> f32 {
+    0.5
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -246,6 +274,12 @@ impl ProjectFile {
                 toggle_spring: state.toggle_spring,
                 toggle_cloth: state.toggle_cloth,
             },
+            lipsync: LipSyncConfig {
+                enabled: state.lipsync_enabled,
+                mic_device_index: state.lipsync_mic_device_index,
+                volume_threshold: state.lipsync_volume_threshold,
+                smoothing: state.lipsync_smoothing,
+            },
             output: OutputConfig {
                 sink_index: state.output_sink_index,
                 resolution_index: state.output_resolution_index,
@@ -298,6 +332,11 @@ impl ProjectFile {
             transparent_background: self.rendering.transparent_background,
             toggle_spring: self.rendering.toggle_spring,
             toggle_cloth: self.rendering.toggle_cloth,
+
+            lipsync_enabled: self.lipsync.enabled,
+            lipsync_mic_device_index: self.lipsync.mic_device_index,
+            lipsync_volume_threshold: self.lipsync.volume_threshold,
+            lipsync_smoothing: self.lipsync.smoothing,
 
             output_sink_index: self.output.sink_index,
             output_resolution_index: self.output.resolution_index,

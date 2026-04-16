@@ -352,9 +352,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
                         if state.available_cameras.is_empty() {
-                            ui.selectable_value(&mut state.camera_index, 0, "Camera 0");
-                            ui.selectable_value(&mut state.camera_index, 1, "Camera 1");
-                            ui.selectable_value(&mut state.camera_index, 2, "Camera 2");
+                            ui.label("No cameras detected. Click 🔄 to scan.");
                         } else {
                             for cam in &state.available_cameras {
                                 let label = format!("{}: {}", cam.index, cam.name);
@@ -555,6 +553,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
 
 fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.horizontal(|ui| {
+        let prev_mic = state.lipsync.mic_device_index;
         let selected_mic = state
             .lipsync
             .available_mics
@@ -566,7 +565,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
             .selected_text(selected_mic)
             .show_ui(ui, |ui| {
                 if state.lipsync.available_mics.is_empty() {
-                    ui.label("No devices found");
+                    ui.label("No devices found. Click Refresh to scan.");
                 } else {
                     for mic in &state.lipsync.available_mics {
                         ui.selectable_value(
@@ -577,6 +576,9 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             });
+        if state.lipsync.mic_device_index != prev_mic {
+            state.project_dirty = true;
+        }
         if ui.button("Refresh").clicked() {
             state.lipsync.available_mics = crate::lipsync::audio_capture::list_audio_devices();
         }
@@ -586,7 +588,12 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     #[allow(unused_variables)]
     let was_enabled = state.lipsync.enabled;
-    ui.checkbox(&mut state.lipsync.enabled, "Enable Lip Sync");
+    if ui
+        .checkbox(&mut state.lipsync.enabled, "Enable Lip Sync")
+        .changed()
+    {
+        state.project_dirty = true;
+    }
 
     #[cfg(feature = "lipsync")]
     {
@@ -675,12 +682,22 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.label(format!("Volume: {:.3}", vol));
 
     ui.add_space(4.0);
-    ui.add(
-        egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
-            .text("Threshold")
-            .logarithmic(true),
-    );
-    ui.add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text("Smoothing"));
+    if ui
+        .add(
+            egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
+                .text("Threshold")
+                .logarithmic(true),
+        )
+        .changed()
+    {
+        state.project_dirty = true;
+    }
+    if ui
+        .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text("Smoothing"))
+        .changed()
+    {
+        state.project_dirty = true;
+    }
 }
 
 fn draw_confidence_bar(ui: &mut egui::Ui, label: &str, value: f32) {

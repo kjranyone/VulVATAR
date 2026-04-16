@@ -864,10 +864,10 @@ impl TrackingWorker {
 
         // Initialize inference engine (use default wholebody model)
         #[cfg(feature = "inference")]
-        let pose_estimator =
+        let mut pose_estimator =
             inference::CigPoseInference::new("models/cigpose-m_coco-wholebody_256x192.onnx").ok();
         #[cfg(not(feature = "inference"))]
-        let pose_estimator: Option<inference::CigPoseInference> = None;
+        let mut pose_estimator: Option<inference::CigPoseInference> = None;
 
         info!("tracking-worker: webcam opened successfully");
         let mut frame_index: u64 = 0;
