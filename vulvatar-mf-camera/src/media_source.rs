@@ -11,7 +11,8 @@
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
-use windows::Win32::Foundation::E_INVALIDARG;
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
+use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER};
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent, IMFMediaEventGenerator_Impl,
     IMFMediaEventQueue, IMFMediaSource, IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl,
@@ -40,7 +41,7 @@ enum SourceState {
     Shutdown,
 }
 
-#[implement(IMFMediaSourceEx, IMFMediaSource)]
+#[implement(IMFMediaSourceEx, IMFMediaSource, IKsControl)]
 pub struct VulvatarMediaSource {
     inner: OnceLock<Inner>,
     mutable: Mutex<MutableState>,
@@ -304,6 +305,47 @@ impl IMFMediaSourceEx_Impl for VulvatarMediaSource_Impl {
         // Returning S_OK lets MF continue; MF_E_UNSUPPORTED would also be
         // legal but some clients treat it as fatal.
         Ok(())
+    }
+}
+
+/// MFCreateVirtualCamera / Frame Server QI the source for `IKsControl`
+/// at Start time, following the DirectShow-era property-set plumbing that
+/// every camera pipeline eventually falls back on. We don't expose any
+/// kernel-streaming properties, methods or events (nothing to configure
+/// for a software virtual camera), but the interface has to be present
+/// or Start returns `E_NOINTERFACE`.
+impl IKsControl_Impl for VulvatarMediaSource_Impl {
+    fn KsProperty(
+        &self,
+        _property: *const KSIDENTIFIER,
+        _property_length: u32,
+        _property_data: *mut core::ffi::c_void,
+        _data_length: u32,
+        _bytes_returned: *mut u32,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn KsMethod(
+        &self,
+        _method: *const KSIDENTIFIER,
+        _method_length: u32,
+        _method_data: *mut core::ffi::c_void,
+        _data_length: u32,
+        _bytes_returned: *mut u32,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn KsEvent(
+        &self,
+        _event: *const KSIDENTIFIER,
+        _event_length: u32,
+        _event_data: *mut core::ffi::c_void,
+        _data_length: u32,
+        _bytes_returned: *mut u32,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
     }
 }
 
