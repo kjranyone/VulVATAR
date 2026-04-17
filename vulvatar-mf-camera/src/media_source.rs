@@ -17,13 +17,14 @@ use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService, IMFGetService_Impl,
     IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource,
     IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl, IMFMediaStream, IMFMediaType,
-    IMFPresentationDescriptor, IMFStreamDescriptor, MFCreateAttributes, MFCreateEventQueue,
-    MFCreateMediaType, MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFMediaType_Video,
-    MFVideoFormat_RGB32, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted,
-    MESourceStopped, MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS,
-    MFMEDIASOURCE_IS_LIVE, MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MFVideoInterlace_Progressive,
+    IMFPresentationDescriptor, IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl,
+    IMFStreamDescriptor, MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType,
+    MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFMediaType_Video,
+    MFSampleAllocatorUsage, MFVideoFormat_RGB32, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+    MENewStream, MESourceStarted, MESourceStopped, MEStreamStarted, MEStreamStopped,
+    MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE, MF_E_SHUTDOWN, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MFVideoInterlace_Progressive,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -42,7 +43,13 @@ enum SourceState {
     Shutdown,
 }
 
-#[implement(IMFMediaSourceEx, IMFMediaSource, IKsControl, IMFGetService)]
+#[implement(
+    IMFMediaSourceEx,
+    IMFMediaSource,
+    IKsControl,
+    IMFGetService,
+    IMFSampleAllocatorControl
+)]
 pub struct VulvatarMediaSource {
     inner: OnceLock<Inner>,
     mutable: Mutex<MutableState>,
@@ -370,6 +377,39 @@ impl IMFGetService_Impl for VulvatarMediaSource_Impl {
             *ppv_object = core::ptr::null_mut();
         }
         Err(E_NOINTERFACE.into())
+    }
+}
+
+/// Also on the "Frame Server QI probe" list — mirrored from the MS
+/// SimpleMediaSource sample. Neither the default allocator nor the usage
+/// query needs bespoke behaviour for a CPU-only software source; letting
+/// MF plug its own allocator and reporting "uses default" covers it.
+impl IMFSampleAllocatorControl_Impl for VulvatarMediaSource_Impl {
+    fn SetDefaultAllocator(
+        &self,
+        _output_stream_id: u32,
+        _allocator: Option<&IUnknown>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn GetAllocatorUsage(
+        &self,
+        _output_stream_id: u32,
+        input_stream_id: *mut u32,
+        usage: *mut MFSampleAllocatorUsage,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            if !input_stream_id.is_null() {
+                *input_stream_id = 0;
+            }
+            if !usage.is_null() {
+                // MFSampleAllocatorUsage_UsesProvidedAllocator = 0 → let MF
+                // manage buffers for us.
+                *usage = MFSampleAllocatorUsage(0);
+            }
+        }
+        Ok(())
     }
 }
 
