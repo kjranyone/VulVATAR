@@ -12,6 +12,12 @@ This repository is intentionally design-first. The current code is only a scaffo
 
 See [architecture.md](/C:/lib/github/kjranyone/VulVATAR/docs/architecture.md) for the current system design.
 
+## Prerequisites
+
+- **Vulkan SDK**: [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home) をインストールしてください。shaderc ライブラリが同梱されており、ビルドに必要です。
+  - インストール後、環境変数 `VULKAN_SDK` が設定されていることを確認してください（インストーラが自動設定します）。
+  - 新しいターミナルを開いてから `cargo build` を実行してください。
+
 ## Current Direction
 
 - target `VRM 1.0 only`

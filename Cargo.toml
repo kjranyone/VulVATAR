@@ -5,6 +5,7 @@ edition = "2021"
 default-run = "vulvatar"
 
 [lib]
+name = "vulvatar_lib"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 

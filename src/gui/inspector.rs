@@ -15,6 +15,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 match state.mode {
+                    AppMode::Avatar => draw_avatar(ui, state),
                     AppMode::Preview => draw_preview(ui, state),
                     AppMode::TrackingSetup => draw_tracking(ui, state),
                     AppMode::Rendering => draw_rendering(ui, state),
@@ -93,6 +94,146 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     });
             });
         });
+}
+
+fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
+    egui::CollapsingHeader::new("Current Avatar")
+        .default_open(true)
+        .show(ui, |ui| {
+            if let Some(avatar) = state.app.active_avatar() {
+                let asset = &avatar.asset;
+                let meta = &asset.vrm_meta;
+
+                let version_color = match meta.spec_version {
+                    crate::asset::VrmSpecVersion::V1 => egui::Color32::from_rgb(120, 200, 140),
+                    crate::asset::VrmSpecVersion::V0 => egui::Color32::from_rgb(220, 180, 100),
+                    crate::asset::VrmSpecVersion::Unknown => egui::Color32::from_rgb(200, 100, 100),
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Spec:");
+                    ui.label(
+                        egui::RichText::new(meta.spec_version.label())
+                            .strong()
+                            .color(version_color),
+                    );
+                    if let Some(raw) = &meta.spec_version_raw {
+                        ui.label(
+                            egui::RichText::new(format!("({})", raw))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                });
+
+                if meta.spec_version == crate::asset::VrmSpecVersion::V0 {
+                    ui.label(
+                        egui::RichText::new(
+                            "Note: VRM 0.x — humanoid/expressions/springs not loaded by this build.",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(220, 180, 100)),
+                    );
+                }
+
+                let title = meta.title.as_deref().unwrap_or("—");
+                ui.horizontal(|ui| {
+                    ui.label("Title:");
+                    ui.label(title);
+                });
+                let authors = if meta.authors.is_empty() {
+                    "—".to_string()
+                } else {
+                    meta.authors.join(", ")
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Authors:");
+                    ui.label(authors);
+                });
+                if let Some(v) = &meta.model_version {
+                    ui.horizontal(|ui| {
+                        ui.label("Model version:");
+                        ui.label(v);
+                    });
+                }
+                if let Some(c) = &meta.contact_information {
+                    ui.horizontal(|ui| {
+                        ui.label("Contact:");
+                        ui.label(c);
+                    });
+                }
+                if let Some(l) = &meta.license {
+                    ui.horizontal(|ui| {
+                        ui.label("License:");
+                        ui.label(l);
+                    });
+                }
+                if let Some(cr) = &meta.copyright_information {
+                    ui.horizontal(|ui| {
+                        ui.label("Copyright:");
+                        ui.label(cr);
+                    });
+                }
+                if !meta.references.is_empty() {
+                    ui.collapsing("References", |ui| {
+                        for r in &meta.references {
+                            ui.label(
+                                egui::RichText::new(r).small().color(egui::Color32::GRAY),
+                            );
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("Source: {}", asset.source_path.display()))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(format!("Meshes: {}", asset.meshes.len()));
+                    ui.label(format!("Materials: {}", asset.materials.len()));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(format!("Spring chains: {}", asset.spring_bones.len()));
+                    ui.label(format!("Colliders: {}", asset.colliders.len()));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Humanoid: {}",
+                        if asset.humanoid.is_some() { "yes" } else { "no" }
+                    ));
+                    ui.label(format!(
+                        "Expressions: {}",
+                        asset.default_expressions.expressions.len()
+                    ));
+                    ui.label(format!(
+                        "Animations: {}",
+                        asset.animation_clips.len()
+                    ));
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reload").clicked() {
+                        state.app.reload_avatar();
+                    }
+                    if ui.button("Detach").clicked() {
+                        if !state.app.avatars.is_empty() {
+                            state.app.remove_avatar_at(state.app.active_avatar_index);
+                        }
+                    }
+                });
+            } else {
+                ui.label("No avatar loaded");
+                ui.label(
+                    egui::RichText::new("Use the library below or the top bar to load one.")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+        });
+
+    draw_model_library(ui, state);
 }
 
 fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
@@ -1446,7 +1587,6 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
 }
 
-#[allow(dead_code)]
 fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Model Library")
         .default_open(true)

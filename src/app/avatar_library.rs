@@ -67,6 +67,15 @@ impl AvatarLibraryEntry {
         self.collider_count = Some(asset.colliders.len());
         self.has_humanoid = Some(asset.humanoid.is_some());
         self.last_loaded = Some(chrono_free_timestamp());
+
+        let meta = &asset.vrm_meta;
+        self.vrm_title = meta.title.clone();
+        self.vrm_author = if meta.authors.is_empty() {
+            None
+        } else {
+            Some(meta.authors.join(", "))
+        };
+        self.vrm_version = Some(meta.spec_version.label().to_string());
     }
 }
 

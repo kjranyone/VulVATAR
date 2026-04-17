@@ -7,7 +7,9 @@
 use super::CameraInfo;
 use log::{error, info};
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
+use nokhwa::utils::{
+    CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+};
 use nokhwa::Camera;
 
 /// Wraps a nokhwa `Camera` handle and provides a simple frame-grab interface.
@@ -25,8 +27,12 @@ impl WebcamCapture {
     pub fn open(index: usize, width: u32, height: u32, fps: u32) -> Result<Self, String> {
         let camera_index = CameraIndex::Index(index as u32);
 
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::HighestResolution(
-            Resolution::new(width, height),
+        // Pin the source pixel format to NV12. NV12 is spec-mandated top-down,
+        // so the decoded RGB buffer comes out right-side-up with no flip.
+        // Without this, MediaFoundation often picks RAWBGR (DIB-order, bottom-up)
+        // at very low frame rates.
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+            CameraFormat::new(Resolution::new(width, height), FrameFormat::NV12, fps),
         ));
 
         let mut camera = Camera::new(camera_index, requested)

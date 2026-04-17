@@ -1,34 +1,53 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use eframe::egui;
 
+use crate::asset::AvatarAsset;
+use crate::gui::avatar_load::{AfterLoad, AvatarLoadJob};
 use crate::gui::GuiApp;
 use crate::persistence;
 
-/// Load an avatar from the given file path, attaching it to the application
-/// and updating the recent avatars list.
+/// Kick off a background avatar load. The heavy CPU work (file I/O,
+/// glTF parse, texture decode) runs on a worker thread; finalisation
+/// happens on the UI thread once the asset arrives via
+/// [`finalize_avatar_load`].
 pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
-    let loader = crate::asset::vrm::VrmAssetLoader::new();
-    match loader.load(path.to_string_lossy().as_ref()) {
-        Ok(asset) => {
-            let instance_id = crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
-            state.app.next_avatar_instance_id += 1;
-            state.app.physics.attach_avatar(&asset);
-
-            let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
-            entry.update_from_asset(&asset);
-            state.app.avatar_library.add(entry);
-            let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
-
-            let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
-            state.app.add_avatar(instance);
-            state.add_recent_avatar(path.to_path_buf());
-            state.push_notification(format!("Loaded avatar: {}", path.display()));
-        }
-        Err(e) => {
-            state.push_notification(format!("Failed to load avatar: {}", e));
-        }
+    if state.avatar_load_job.is_some() {
+        state.push_notification("Avatar load already in progress.".to_string());
+        return;
     }
+    state.push_notification(format!("Loading avatar: {}", path.display()));
+    state.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
+}
+
+/// UI-thread post-load work: build an `AvatarInstance`, attach it to physics,
+/// register it in the library, and update recent-avatar history.
+pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAsset>) {
+    let instance_id = crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
+    state.app.next_avatar_instance_id += 1;
+    state.app.physics.attach_avatar(&asset);
+
+    let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
+    entry.update_from_asset(&asset);
+    state.app.avatar_library.add(entry);
+    let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+
+    let (pan_y, distance) = crate::gui::autoframe_aabb(
+        &asset.root_aabb,
+        state.rendering.camera_fov,
+        1.0,
+    );
+    state.camera_orbit.pan = [0.0, pan_y];
+    state.camera_orbit.distance = distance;
+    state.camera_orbit.target_distance = distance;
+    state.camera_orbit.yaw_deg = 0.0;
+    state.camera_orbit.pitch_deg = 0.0;
+
+    let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
+    state.app.add_avatar(instance);
+    state.add_recent_avatar(path.to_path_buf());
+    state.push_notification(format!("Loaded avatar: {}", path.display()));
 }
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
@@ -80,40 +99,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 {
                     match persistence::load_project(&path) {
                         Ok((project_state, load_warnings)) => {
-                            // Restore avatar if the project references one.
-                            if let Some(ref avatar_path) = project_state.avatar_source_path {
-                                let avatar_file = std::path::Path::new(avatar_path);
-                                if avatar_file.exists() {
-                                    let loader = crate::asset::vrm::VrmAssetLoader::new();
-                                    match loader.load(avatar_path) {
-                                        Ok(asset) => {
-                                            let instance_id = crate::avatar::AvatarInstanceId(
-                                                state.app.next_avatar_instance_id,
-                                            );
-                                            state.app.next_avatar_instance_id += 1;
-                                            state.app.physics.attach_avatar(&asset);
-                                            let instance = crate::avatar::AvatarInstance::new(
-                                                instance_id,
-                                                asset,
-                                            );
-                                            state.app.add_avatar(instance);
-                                        }
-                                        Err(e) => {
-                                            state.push_notification(format!(
-                                                "Failed to load avatar '{}': {}",
-                                                avatar_path, e
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    state.push_notification(format!(
-                                        "Avatar source file not found: '{}'",
-                                        avatar_path
-                                    ));
-                                }
-                            }
-
-                            // Restore cloth overlay if the project references one.
+                            // Cloth overlay: small JSON, load synchronously.
                             if let Some(ref overlay_path_str) = project_state.active_overlay_path {
                                 let overlay_file = std::path::Path::new(overlay_path_str);
                                 if overlay_file.exists() {
@@ -136,14 +122,56 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 }
                             }
 
-                            state.apply_project_state(&project_state);
-                            state.project_path = Some(path.clone());
-                            // E12: Clear dirty on load.
-                            state.project_dirty = false;
-                            for w in &load_warnings.warnings {
-                                state.push_notification(format!("Warning: {}", w));
+                            // Avatar: heavy. Either spawn a job that applies the
+                            // project state once it finishes, or apply immediately
+                            // if no avatar is referenced.
+                            let avatar_to_load = project_state
+                                .avatar_source_path
+                                .as_ref()
+                                .map(std::path::PathBuf::from)
+                                .filter(|p| p.exists());
+                            if let Some(missing) = project_state
+                                .avatar_source_path
+                                .as_ref()
+                                .filter(|p| !std::path::Path::new(p).exists())
+                            {
+                                state.push_notification(format!(
+                                    "Avatar source file not found: '{}'",
+                                    missing
+                                ));
                             }
-                            state.push_notification(format!("Opened project: {}", path.display()));
+
+                            if let Some(avatar_path) = avatar_to_load {
+                                if state.avatar_load_job.is_some() {
+                                    state.push_notification(
+                                        "Avatar load already in progress.".to_string(),
+                                    );
+                                } else {
+                                    state.push_notification(format!(
+                                        "Loading project '{}'…",
+                                        path.display()
+                                    ));
+                                    state.avatar_load_job = Some(AvatarLoadJob::spawn(
+                                        avatar_path,
+                                        AfterLoad::ApplyProject {
+                                            project_state: Box::new(project_state),
+                                            project_path: path.clone(),
+                                            warnings: load_warnings,
+                                        },
+                                    ));
+                                }
+                            } else {
+                                state.apply_project_state(&project_state);
+                                state.project_path = Some(path.clone());
+                                state.project_dirty = false;
+                                for w in &load_warnings.warnings {
+                                    state.push_notification(format!("Warning: {}", w));
+                                }
+                                state.push_notification(format!(
+                                    "Opened project: {}",
+                                    path.display()
+                                ));
+                            }
                         }
                         Err(e) => {
                             state.push_notification(format!("Failed to load project: {}", e));

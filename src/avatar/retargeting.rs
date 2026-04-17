@@ -477,10 +477,12 @@ mod tests {
                 ExpressionDef {
                     name: "blink".to_string(),
                     weight: 0.0,
+                    morph_binds: Vec::new(),
                 },
                 ExpressionDef {
                     name: "smile".to_string(),
                     weight: 0.0,
+                    morph_binds: Vec::new(),
                 },
             ],
         };
@@ -524,6 +526,7 @@ mod tests {
             expressions: vec![ExpressionDef {
                 name: "blink".to_string(),
                 weight: 0.0,
+                morph_binds: Vec::new(),
             }],
         };
 

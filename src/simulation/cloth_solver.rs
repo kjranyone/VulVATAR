@@ -1253,6 +1253,9 @@ mod tests {
                 expressions: Vec::new(),
             },
             animation_clips: Vec::new(),
+            node_to_mesh: Default::default(),
+            vrm_meta: Default::default(),
+            root_aabb: crate::asset::Aabb::empty(),
         })
     }
 

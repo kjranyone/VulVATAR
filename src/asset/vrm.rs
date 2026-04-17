@@ -11,6 +11,36 @@ use crate::asset::*;
 
 static NEXT_AVATAR_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Coarse-grained progress reported by [`VrmAssetLoader::load_with_progress`].
+#[derive(Clone, Debug)]
+pub enum LoadStage {
+    Reading,
+    Parsing,
+    Skeleton,
+    Meshes,
+    /// Per-material progress. `current` reaches `total` when done.
+    Materials { current: usize, total: usize },
+    SpringBones,
+    Finalizing,
+}
+
+impl LoadStage {
+    /// Human-readable label for display in the loading UI.
+    pub fn label(&self) -> String {
+        match self {
+            LoadStage::Reading => "Reading file…".into(),
+            LoadStage::Parsing => "Parsing glTF…".into(),
+            LoadStage::Skeleton => "Building skeleton…".into(),
+            LoadStage::Meshes => "Decoding meshes…".into(),
+            LoadStage::Materials { current, total } => {
+                format!("Decoding materials ({}/{})", current, total)
+            }
+            LoadStage::SpringBones => "Building spring bones…".into(),
+            LoadStage::Finalizing => "Finalizing…".into(),
+        }
+    }
+}
+
 mod gltf_ext {
     use serde::Deserialize;
 
@@ -172,6 +202,63 @@ mod gltf_ext {
         pub humanoid: Humanoid,
         #[serde(default)]
         pub expressions: Option<Expressions>,
+        #[serde(default, rename = "specVersion")]
+        pub spec_version: Option<String>,
+        #[serde(default)]
+        pub meta: Option<Meta>,
+    }
+
+    /// VRM 1.x `VRMC_vrm.meta`.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct Meta {
+        #[serde(default)]
+        pub name: Option<String>,
+        #[serde(default)]
+        pub version: Option<String>,
+        #[serde(default)]
+        pub authors: Option<Vec<String>>,
+        #[serde(default, rename = "copyrightInformation")]
+        pub copyright_information: Option<String>,
+        #[serde(default, rename = "contactInformation")]
+        pub contact_information: Option<String>,
+        #[serde(default)]
+        pub references: Option<Vec<String>>,
+        #[serde(default, rename = "licenseUrl")]
+        pub license_url: Option<String>,
+        #[serde(default, rename = "thirdPartyLicenses")]
+        pub third_party_licenses: Option<String>,
+    }
+
+    /// VRM 0.x `VRM.meta`. Field names differ from 1.x.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct LegacyMeta {
+        #[serde(default)]
+        pub title: Option<String>,
+        #[serde(default)]
+        pub version: Option<String>,
+        #[serde(default)]
+        pub author: Option<String>,
+        #[serde(default, rename = "contactInformation")]
+        pub contact_information: Option<String>,
+        #[serde(default)]
+        pub reference: Option<String>,
+        #[serde(default, rename = "licenseName")]
+        pub license_name: Option<String>,
+        #[serde(default, rename = "otherLicenseUrl")]
+        pub other_license_url: Option<String>,
+    }
+
+    /// VRM 0.x root `VRM` extension. We only parse the metadata here — the
+    /// rest (humanoid, blendshapes, secondaryAnimation) is unsupported by
+    /// this loader.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct LegacyVrmExtension {
+        #[serde(default, rename = "exporterVersion")]
+        pub exporter_version: Option<String>,
+        #[serde(default, rename = "specVersion")]
+        pub spec_version: Option<String>,
+        #[serde(default)]
+        pub meta: Option<LegacyMeta>,
     }
 
     #[derive(Debug, Clone, Default, Deserialize)]
@@ -258,6 +345,9 @@ mod gltf_ext {
         pub vrmc_vrm: Option<VrmExtension>,
         #[serde(rename = "VRMC_springBone")]
         pub vrmc_spring_bone: Option<SpringBoneExtension>,
+        /// Legacy VRM 0.x root extension (metadata only).
+        #[serde(rename = "VRM")]
+        pub legacy_vrm: Option<LegacyVrmExtension>,
     }
 }
 
@@ -318,8 +408,20 @@ impl VrmAssetLoader {
     }
 
     pub fn load(&self, path: &str) -> Result<Arc<AvatarAsset>, VrmLoadError> {
+        self.load_with_progress(path, |_| {})
+    }
+
+    /// Like [`load`], but invokes `on_progress` at each major stage so the
+    /// caller can update a loading UI. The callback runs on the same thread
+    /// as the caller — typically a worker thread spawned by the GUI.
+    pub fn load_with_progress(
+        &self,
+        path: &str,
+        on_progress: impl Fn(LoadStage),
+    ) -> Result<Arc<AvatarAsset>, VrmLoadError> {
+        on_progress(LoadStage::Reading);
         let file_data = std::fs::read(path)?;
-        self.load_from_bytes(&file_data, PathBuf::from(path))
+        self.load_from_bytes_with_progress(&file_data, PathBuf::from(path), on_progress)
     }
 
     pub fn load_from_bytes(
@@ -327,8 +429,18 @@ impl VrmAssetLoader {
         data: &[u8],
         source_path: PathBuf,
     ) -> Result<Arc<AvatarAsset>, VrmLoadError> {
+        self.load_from_bytes_with_progress(data, source_path, |_| {})
+    }
+
+    pub fn load_from_bytes_with_progress(
+        &self,
+        data: &[u8],
+        source_path: PathBuf,
+        on_progress: impl Fn(LoadStage),
+    ) -> Result<Arc<AvatarAsset>, VrmLoadError> {
         let source_hash = compute_hash(data);
 
+        on_progress(LoadStage::Parsing);
         let gltf_doc = gltf::Gltf::from_slice(data)?;
         let blob = gltf_doc.blob.as_deref();
         let root_ext: Option<gltf_ext::RootExtension> = gltf_doc
@@ -338,14 +450,19 @@ impl VrmAssetLoader {
 
         let vrm_ext = root_ext.as_ref().and_then(|r| r.vrmc_vrm.as_ref());
         let spring_ext = root_ext.as_ref().and_then(|r| r.vrmc_spring_bone.as_ref());
+        let legacy_ext = root_ext.as_ref().and_then(|r| r.legacy_vrm.as_ref());
+        let vrm_meta = Self::build_vrm_meta(vrm_ext, legacy_ext);
 
-        let (nodes, node_name_map) = Self::build_skeleton_nodes(&gltf_doc.document);
+        on_progress(LoadStage::Skeleton);
+        let (mut nodes, node_name_map) = Self::build_skeleton_nodes(&gltf_doc.document);
         let humanoid = vrm_ext
             .map(|ext| Self::build_humanoid_map(ext, &node_name_map))
             .transpose()?;
 
+        on_progress(LoadStage::Meshes);
         let meshes = Self::build_meshes(&gltf_doc.document, blob);
-        let materials = Self::build_materials(&gltf_doc.document, blob, &source_path);
+        let materials =
+            Self::build_materials(&gltf_doc.document, blob, &source_path, &on_progress);
         let skin_bindings = Self::build_skin_bindings(&gltf_doc.document, blob);
         let meshes_with_skin =
             Self::assign_skins_to_meshes(&gltf_doc.document, meshes, &skin_bindings);
@@ -357,6 +474,14 @@ impl VrmAssetLoader {
             .map(|scene| scene.nodes().map(|n| NodeId(n.index() as u64)).collect())
             .unwrap_or_default();
 
+        // VRM 0.x stores the model facing -Z; VRM 1.x (and the rest of this
+        // engine) expects +Z. Bake a 180° Y rotation into each root node so
+        // the skeleton, spring bones and retargeting all see the 1.x
+        // orientation without touching the mesh vertex data.
+        if vrm_meta.spec_version == VrmSpecVersion::V0 {
+            Self::bake_y_flip_on_roots(&mut nodes, &root_nodes);
+        }
+
         // Collect inverse bind matrices from all skins
         let inverse_bind_matrices = if let Some((_, first_skin)) = skin_bindings.first() {
             first_skin.inverse_bind_matrices.clone()
@@ -364,11 +489,14 @@ impl VrmAssetLoader {
             vec![identity_matrix(); nodes.len()]
         };
 
+        on_progress(LoadStage::SpringBones);
         let (spring_bones, colliders) = if let Some(spring_ext) = spring_ext {
             Self::build_spring_bones(spring_ext)
         } else {
             (vec![], vec![])
         };
+
+        on_progress(LoadStage::Finalizing);
 
         let expressions = vrm_ext
             .map(|ext| Self::build_expressions(ext))
@@ -384,6 +512,13 @@ impl VrmAssetLoader {
                 node.mesh().map(|m| (node.index(), m.index()))
             })
             .collect();
+
+        let mut root_aabb = Aabb::empty();
+        for mesh in &meshes_with_skin {
+            for prim in &mesh.primitives {
+                root_aabb.expand(&prim.bounds);
+            }
+        }
 
         let asset = AvatarAsset {
             id: AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed)),
@@ -402,9 +537,83 @@ impl VrmAssetLoader {
             default_expressions: expressions,
             animation_clips: Self::build_animation_clips(&gltf_doc.document, blob),
             node_to_mesh,
+            vrm_meta,
+            root_aabb,
         };
 
         Ok(Arc::new(asset))
+    }
+
+    /// Pre-multiply each root node's rest_local by a 180° Y rotation, so the
+    /// whole skeleton subtree appears rotated 180° around Y in world space.
+    /// Equivalent to `three-vrm`'s `VRMUtils.rotateVRM0()`.
+    fn bake_y_flip_on_roots(nodes: &mut [SkeletonNode], root_nodes: &[NodeId]) {
+        // Y-axis 180° quaternion in xyzw layout: (0, 1, 0, 0).
+        let y_flip: [f32; 4] = [0.0, 1.0, 0.0, 0.0];
+        for root_id in root_nodes {
+            let idx = root_id.0 as usize;
+            if idx >= nodes.len() {
+                continue;
+            }
+            let node = &mut nodes[idx];
+            // new_rot = Y180 * old_rot
+            node.rest_local.rotation =
+                crate::math_utils::quat_mul(&y_flip, &node.rest_local.rotation);
+            // new_t = Y180 * old_t  →  flip X and Z, keep Y.
+            node.rest_local.translation = [
+                -node.rest_local.translation[0],
+                node.rest_local.translation[1],
+                -node.rest_local.translation[2],
+            ];
+        }
+    }
+
+    fn build_vrm_meta(
+        vrm_ext: Option<&gltf_ext::VrmExtension>,
+        legacy_ext: Option<&gltf_ext::LegacyVrmExtension>,
+    ) -> VrmMeta {
+        if let Some(ext) = vrm_ext {
+            let meta = ext.meta.clone().unwrap_or_default();
+            return VrmMeta {
+                spec_version: VrmSpecVersion::V1,
+                spec_version_raw: ext.spec_version.clone(),
+                title: meta.name,
+                authors: meta.authors.unwrap_or_default(),
+                model_version: meta.version,
+                contact_information: meta.contact_information,
+                references: meta.references.unwrap_or_default(),
+                license: meta.license_url,
+                copyright_information: meta.copyright_information,
+            };
+        }
+        if let Some(ext) = legacy_ext {
+            let meta = ext.meta.clone().unwrap_or_default();
+            // VRM 0.x `author` is a single string; convention is
+            // comma-separated for multiple authors. Split so Inspector and
+            // library entries treat each as its own name.
+            let authors: Vec<String> = meta
+                .author
+                .map(|s| {
+                    s.split(',')
+                        .map(|a| a.trim().to_string())
+                        .filter(|a| !a.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let references = meta.reference.into_iter().collect();
+            return VrmMeta {
+                spec_version: VrmSpecVersion::V0,
+                spec_version_raw: ext.spec_version.clone(),
+                title: meta.title,
+                authors,
+                model_version: meta.version,
+                contact_information: meta.contact_information,
+                references,
+                license: meta.license_name.or(meta.other_license_url),
+                copyright_information: None,
+            };
+        }
+        VrmMeta::default()
     }
 
     fn build_skeleton_nodes(doc: &gltf::Document) -> (Vec<SkeletonNode>, HashMap<u32, String>) {
@@ -661,7 +870,10 @@ impl VrmAssetLoader {
         doc: &gltf::Document,
         blob: Option<&[u8]>,
         source_path: &Path,
+        on_progress: &dyn Fn(LoadStage),
     ) -> Vec<MaterialAsset> {
+        let total = doc.materials().count();
+        on_progress(LoadStage::Materials { current: 0, total });
         doc.materials()
             .enumerate()
             .map(|(i, gmat)| {
@@ -748,7 +960,7 @@ impl VrmAssetLoader {
                     )
                 };
 
-                MaterialAsset {
+                let asset = MaterialAsset {
                     id: MaterialId(i as u64 + 1),
                     name: gmat.name().unwrap_or("unnamed").to_string(),
                     base_mode,
@@ -764,7 +976,12 @@ impl VrmAssetLoader {
                     },
                     toon_params,
                     mtoon_params,
-                }
+                };
+                on_progress(LoadStage::Materials {
+                    current: i + 1,
+                    total,
+                });
+                asset
             })
             .inspect(|mat| {
                 let tb = &mat.texture_bindings;

@@ -150,10 +150,95 @@ impl Transform {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Aabb {
     pub min: Vec3,
     pub max: Vec3,
+}
+
+impl Aabb {
+    /// An Aabb that consumes no points — useful as the seed for `union`.
+    pub fn empty() -> Self {
+        Self {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.min[0] > self.max[0] || self.min[1] > self.max[1] || self.min[2] > self.max[2]
+    }
+
+    pub fn expand(&mut self, other: &Aabb) {
+        if other.is_empty() {
+            return;
+        }
+        for i in 0..3 {
+            if other.min[i] < self.min[i] {
+                self.min[i] = other.min[i];
+            }
+            if other.max[i] > self.max[i] {
+                self.max[i] = other.max[i];
+            }
+        }
+    }
+
+    pub fn center(&self) -> Vec3 {
+        [
+            0.5 * (self.min[0] + self.max[0]),
+            0.5 * (self.min[1] + self.max[1]),
+            0.5 * (self.min[2] + self.max[2]),
+        ]
+    }
+
+    pub fn size(&self) -> Vec3 {
+        [
+            self.max[0] - self.min[0],
+            self.max[1] - self.min[1],
+            self.max[2] - self.min[2],
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VrmSpecVersion {
+    /// VRM 0.x (legacy `VRM` extension).
+    V0,
+    /// VRM 1.x (`VRMC_vrm` extension).
+    V1,
+    /// No recognizable VRM extension found.
+    #[default]
+    Unknown,
+}
+
+impl VrmSpecVersion {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::V0 => "VRM 0.x",
+            Self::V1 => "VRM 1.x",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// Metadata extracted from the VRM file's meta block. Fields from VRM 0.x
+/// and 1.x are unified here; empty when the field is absent in the source.
+#[derive(Clone, Debug, Default)]
+pub struct VrmMeta {
+    pub spec_version: VrmSpecVersion,
+    /// Optional explicit spec version string from the file (e.g. "1.0").
+    pub spec_version_raw: Option<String>,
+    pub title: Option<String>,
+    pub authors: Vec<String>,
+    pub model_version: Option<String>,
+    pub contact_information: Option<String>,
+    pub references: Vec<String>,
+    /// VRM 1.x: `licenseUrl`. VRM 0.x: `licenseName` (a well-known identifier
+    /// like `"CC_BY"`), falling back to `otherLicenseUrl`. The two conventions
+    /// are merged here for display; callers that need to distinguish URL from
+    /// identifier should inspect `spec_version`.
+    pub license: Option<String>,
+    pub copyright_information: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +256,10 @@ pub struct AvatarAsset {
     pub animation_clips: Vec<AnimationClip>,
     /// Maps glTF node index → meshes index (for morph target expression binding).
     pub node_to_mesh: std::collections::HashMap<usize, usize>,
+    pub vrm_meta: VrmMeta,
+    /// Union of all primitive AABBs in model/rest-pose space. Used for camera
+    /// framing and debug visualisation.
+    pub root_aabb: Aabb,
 }
 
 #[derive(Clone, Debug)]

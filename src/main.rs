@@ -11,6 +11,6 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "VulVATAR",
         options,
-        Box::new(|cc| Ok(Box::new(vulvatar::gui::GuiApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(vulvatar_lib::gui::GuiApp::new(cc)))),
     )
 }

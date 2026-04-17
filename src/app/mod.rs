@@ -989,6 +989,7 @@ mod tests {
             },
             vertices: Some(verts),
             indices: Some(vec![0, 1, 2]),
+            morph_targets: Vec::new(),
         };
 
         let mesh = MeshAsset {
@@ -1011,6 +1012,9 @@ mod tests {
                 expressions: vec![],
             },
             animation_clips: vec![],
+            node_to_mesh: Default::default(),
+            vrm_meta: Default::default(),
+            root_aabb: crate::asset::Aabb::empty(),
         });
 
         let mut inst = AvatarInstance::new(AvatarInstanceId(1), asset);
@@ -1028,7 +1032,6 @@ mod tests {
     struct RayHit {
         t: f32,
         point: [f32; 3],
-        normal: [f32; 3],
     }
 
     fn ray_triangle_intersect(ray: &Ray, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> Option<f32> {
@@ -1121,23 +1124,12 @@ mod tests {
                         let v2 = apply_skin(tri[2] as usize);
                         if let Some(t) = ray_triangle_intersect(ray, v0, v1, v2) {
                             if best.as_ref().map_or(true, |b| t < b.t) {
-                                let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
-                                let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
-                                let n = [
-                                    e1[1] * e2[2] - e1[2] * e2[1],
-                                    e1[2] * e2[0] - e1[0] * e2[2],
-                                    e1[0] * e2[1] - e1[1] * e2[0],
-                                ];
                                 let pt = [
                                     ray.origin[0] + t * ray.dir[0],
                                     ray.origin[1] + t * ray.dir[1],
                                     ray.origin[2] + t * ray.dir[2],
                                 ];
-                                best = Some(RayHit {
-                                    t,
-                                    point: pt,
-                                    normal: n,
-                                });
+                                best = Some(RayHit { t, point: pt });
                             }
                         }
                     }

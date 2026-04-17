@@ -1,3 +1,4 @@
+pub mod avatar_load;
 pub mod hotkey;
 pub mod inspector;
 pub mod mesh_picking;
@@ -30,6 +31,44 @@ pub struct CameraOrbitState {
     pub pan: [f32; 2],
     pub distance: f32,
     pub target_distance: f32,
+}
+
+/// Compute camera orbit settings that frame the given AABB with the avatar's
+/// head/face near the centre of the viewport.
+///
+/// Returns `(pan_y, distance)`. The caller is expected to write these into
+/// the camera orbit state alongside yaw=0, pitch=0 to get a conventional
+/// front-facing view. Yaw/pitch are left untouched so the user's preferred
+/// viewing angle (if any) is preserved when only the model changes.
+///
+/// `fov_deg` is the vertical FOV. `aspect` is the expected viewport aspect
+/// — pass `1.0` to be conservative (guarantees the model fits even in a
+/// square viewport).
+pub fn autoframe_aabb(
+    aabb: &crate::asset::Aabb,
+    fov_deg: f32,
+    aspect: f32,
+) -> (f32, f32) {
+    if aabb.is_empty() {
+        return (0.0, 5.0);
+    }
+    let center = aabb.center();
+    let size = aabb.size();
+
+    let tan_v = (fov_deg.to_radians() * 0.5).tan().max(1e-4);
+    let tan_h = tan_v * aspect.max(1e-4);
+
+    let half_w = size[0].max(size[2]) * 0.5;
+    let half_h = size[1] * 0.5;
+    let half_d = size[2] * 0.5;
+
+    let dist_v = half_h / tan_v;
+    let dist_h = half_w / tan_h;
+    // +half_d so the front of the bbox doesn't land on the near plane.
+    // 1.15 is a visual margin so the avatar doesn't touch the viewport edges.
+    let distance = (dist_v.max(dist_h) + half_d) * 1.15;
+
+    (center[1], distance.max(0.5))
 }
 
 pub struct TrackingGuiState {
@@ -83,6 +122,7 @@ pub struct OutputGuiState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMode {
+    Avatar,
     Preview,
     TrackingSetup,
     Rendering,
@@ -91,7 +131,8 @@ pub enum AppMode {
 }
 
 impl AppMode {
-    pub const ALL: [AppMode; 5] = [
+    pub const ALL: [AppMode; 6] = [
+        AppMode::Avatar,
         AppMode::Preview,
         AppMode::TrackingSetup,
         AppMode::Rendering,
@@ -101,6 +142,7 @@ impl AppMode {
 
     pub fn label(&self) -> &str {
         match self {
+            AppMode::Avatar => "Avatar",
             AppMode::Preview => "Preview",
             AppMode::TrackingSetup => "Tracking Setup",
             AppMode::Rendering => "Rendering",
@@ -203,6 +245,10 @@ pub struct GuiApp {
     pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
     pub watched_avatar_dirs: Vec<std::path::PathBuf>,
     pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
+
+    /// Background avatar load in progress, if any. Set by `top_bar::load_*`
+    /// helpers, polled and cleared by `update`.
+    pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
 }
 
 impl GuiApp {
@@ -359,6 +405,8 @@ impl GuiApp {
             folder_watcher: None,
             watched_avatar_dirs: Vec::new(),
             thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::default(),
+
+            avatar_load_job: None,
         }
     }
 }
@@ -642,6 +690,50 @@ impl GuiApp {
         Ok(())
     }
 
+    fn poll_avatar_load_job(&mut self) {
+        // Drain progress messages; bail if no terminal outcome arrived yet.
+        let outcome = match self.avatar_load_job.as_mut().and_then(|j| j.poll()) {
+            Some(o) => o,
+            None => return,
+        };
+
+        // Worker finished — take ownership so we can mutate other GuiApp fields.
+        let job = self.avatar_load_job.take().expect("job still present");
+        if let Some(handle) = job.worker {
+            let _ = handle.join();
+        }
+
+        match outcome {
+            avatar_load::LoadOutcome::Done(asset) => {
+                top_bar::finalize_avatar_load(self, &job.path, asset);
+                if let avatar_load::AfterLoad::ApplyProject {
+                    project_state,
+                    project_path,
+                    warnings,
+                } = job.after_load
+                {
+                    self.apply_project_state(&project_state);
+                    self.project_path = Some(project_path.clone());
+                    self.project_dirty = false;
+                    for w in &warnings.warnings {
+                        self.push_notification(format!("Warning: {}", w));
+                    }
+                    self.push_notification(format!(
+                        "Opened project: {}",
+                        project_path.display()
+                    ));
+                }
+            }
+            avatar_load::LoadOutcome::Error(e) => {
+                self.push_notification(format!(
+                    "Failed to load avatar '{}': {}",
+                    job.path.display(),
+                    e
+                ));
+            }
+        }
+    }
+
     fn poll_folder_watcher(&mut self) {
         if let Some(ref mut fw) = self.folder_watcher {
             let events = fw.poll().to_vec();
@@ -712,6 +804,7 @@ impl eframe::App for GuiApp {
         }
 
         self.poll_folder_watcher();
+        self.poll_avatar_load_job();
 
         // Sync GUI-driven state into the application before running the frame.
         if let Some(avatar) = self.app.active_avatar_mut() {
@@ -874,6 +967,29 @@ impl eframe::App for GuiApp {
         status_bar::draw(ctx, self);
         inspector::draw(ctx, self);
         viewport::draw(ctx, self);
+
+        // Loading-spinner overlay while a background avatar load is in flight.
+        if let Some(job) = self.avatar_load_job.as_ref() {
+            let stage_label = job.current_stage.label();
+            let file_label = job
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| job.path.display().to_string());
+            egui::Window::new("Loading avatar")
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.vertical(|ui| {
+                            ui.label(file_label);
+                            ui.label(stage_label);
+                        });
+                    });
+                });
+        }
 
         // M10: Draw notification toasts and expire old ones.
         self.notifications

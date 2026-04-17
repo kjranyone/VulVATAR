@@ -3,18 +3,18 @@ use std::sync::Arc;
 use std::collections::HashSet;
 
 use image::ImageBuffer;
-use vulvatar::app::ViewportCamera;
-use vulvatar::asset::vrm::VrmAssetLoader;
-use vulvatar::avatar::{AvatarInstance, AvatarInstanceId};
-use vulvatar::renderer::pipeline::GpuVertex;
-use vulvatar::renderer::frame_input::{
+use vulvatar_lib::app::ViewportCamera;
+use vulvatar_lib::asset::vrm::VrmAssetLoader;
+use vulvatar_lib::avatar::{AvatarInstance, AvatarInstanceId};
+use vulvatar_lib::renderer::pipeline::GpuVertex;
+use vulvatar_lib::renderer::frame_input::{
     CameraState, LightingState, OutputTargetRequest, RenderAlphaMode, RenderAvatarInstance,
     RenderCullMode, RenderDebugFlags, RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
 };
-use vulvatar::renderer::material::{
+use vulvatar_lib::renderer::material::{
     MaterialDebugView, MaterialShaderMode, MaterialUploadRequest,
 };
-use vulvatar::renderer::VulkanRenderer;
+use vulvatar_lib::renderer::VulkanRenderer;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 
 fn main() -> Result<(), String> {
@@ -149,7 +149,7 @@ fn default_output_path(
 }
 
 fn dump_first_matching_texture(
-    asset: &vulvatar::asset::AvatarAsset,
+    asset: &vulvatar_lib::asset::AvatarAsset,
     output_path: &Path,
     material_filter: Option<&str>,
 ) -> Result<(), String> {
@@ -229,16 +229,16 @@ fn build_frame_input(
                 material_binding.mode = material_mode.clone();
                 material_binding.debug_view = debug_view.clone();
 
-                let outline = vulvatar::renderer::frame_input::OutlineSnapshot {
+                let outline = vulvatar_lib::renderer::frame_input::OutlineSnapshot {
                     enabled: material_binding.outline_width > 0.0,
                     width: material_binding.outline_width,
                     color: material_binding.outline_color,
                 };
 
                 let alpha_mode = match material_binding.alpha_mode {
-                    vulvatar::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
-                    vulvatar::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
-                    vulvatar::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
+                    vulvatar_lib::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
+                    vulvatar_lib::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
+                    vulvatar_lib::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
                 };
 
                 let cull_mode = if material_binding.double_sided {
@@ -297,7 +297,7 @@ fn build_frame_input(
             world_transform: avatar.world_transform.clone(),
             mesh_instances,
             skinning_matrices: if disable_skinning {
-                vec![vulvatar::asset::identity_matrix(); avatar.pose.skinning_matrices.len().max(1)]
+                vec![vulvatar_lib::asset::identity_matrix(); avatar.pose.skinning_matrices.len().max(1)]
             } else {
                 avatar.pose.skinning_matrices.clone()
             },
@@ -311,16 +311,16 @@ fn build_frame_input(
             preview_enabled: true,
             output_enabled: true,
             extent,
-            color_space: vulvatar::renderer::frame_input::RenderColorSpace::Srgb,
+            color_space: vulvatar_lib::renderer::frame_input::RenderColorSpace::Srgb,
             alpha_mode: RenderOutputAlpha::Premultiplied,
-            export_mode: vulvatar::renderer::frame_input::RenderExportMode::CpuReadback,
+            export_mode: vulvatar_lib::renderer::frame_input::RenderExportMode::CpuReadback,
         },
         background_image_path: None,
         show_ground_grid: false,
     }
 }
 
-fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar::asset::Mat4, [f32; 3]) {
+fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 3]) {
     let yaw = cam.yaw_deg.to_radians();
     let pitch = cam.pitch_deg.to_radians();
     let (sy, cy) = (yaw.sin(), yaw.cos());
@@ -391,7 +391,7 @@ fn build_projection_matrix(
     aspect: f32,
     near: f32,
     far: f32,
-) -> vulvatar::asset::Mat4 {
+) -> vulvatar_lib::asset::Mat4 {
     let fov_rad = fov_deg.to_radians();
     let f = 1.0 / (fov_rad * 0.5).tan();
     let a = far / (near - far);
@@ -434,7 +434,7 @@ fn compute_stats(pixels: &[u8]) -> ImageStats {
     ImageStats { avg, stddev }
 }
 
-fn print_uv_stats(asset: &vulvatar::asset::AvatarAsset, material_filter: Option<&str>) {
+fn print_uv_stats(asset: &vulvatar_lib::asset::AvatarAsset, material_filter: Option<&str>) {
     let filter = material_filter.map(|s| s.to_ascii_lowercase());
     for mesh in &asset.meshes {
         for prim in &mesh.primitives {
@@ -499,7 +499,7 @@ fn print_uv_stats(asset: &vulvatar::asset::AvatarAsset, material_filter: Option<
 }
 
 fn sample_average_rgb(
-    material: &vulvatar::asset::MaterialAsset,
+    material: &vulvatar_lib::asset::MaterialAsset,
     uvs: &[[f32; 2]],
     used_indices: &[usize],
 ) -> Option<[u8; 3]> {
