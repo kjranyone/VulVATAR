@@ -15,12 +15,16 @@
 
 use core::ffi::c_void;
 
-use windows::core::{implement, IUnknown, Interface, GUID, PROPVARIANT, PWSTR};
+use windows::core::{implement, IUnknown, Interface as _, GUID, PROPVARIANT, PWSTR};
 use windows::Win32::Foundation::{BOOL, E_POINTER};
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFActivate_Impl, IMFAttributes, IMFAttributes_Impl, MFCreateAttributes,
     MF_ATTRIBUTES_MATCH_TYPE, MF_ATTRIBUTE_TYPE,
 };
+
+use std::sync::Mutex;
+
+use windows::Win32::Media::MediaFoundation::IMFMediaSource;
 
 use crate::media_source::VulvatarMediaSource;
 use crate::{dll_add_ref, dll_release};
@@ -28,6 +32,11 @@ use crate::{dll_add_ref, dll_release};
 #[implement(IMFActivate, IMFAttributes)]
 pub struct VulvatarActivate {
     attributes: IMFAttributes,
+    /// Cached media source. MS's VirtualCameraMediaSourceActivate keeps a
+    /// strong reference so repeated `ActivateObject` calls and later QI's
+    /// (e.g. for IMFGetService) observe the same instance. Creating a new
+    /// source on every call is enough to confuse the Frame Server.
+    cached_source: Mutex<Option<IMFMediaSource>>,
 }
 
 impl VulvatarActivate {
@@ -37,6 +46,7 @@ impl VulvatarActivate {
         unsafe { MFCreateAttributes(&mut attrs, 1)? };
         Ok(Self {
             attributes: attrs.expect("MFCreateAttributes returned no interface"),
+            cached_source: Mutex::new(None),
         })
     }
 }
@@ -62,8 +72,21 @@ impl IMFActivate_Impl for VulvatarActivate_Impl {
                 return Err(E_POINTER.into());
             }
             *ppv = core::ptr::null_mut();
-            let source: IUnknown = VulvatarMediaSource::new().into();
-            let hr = source.query(riid, ppv);
+
+            let mut cache = self.cached_source.lock().unwrap();
+            let source: IMFMediaSource = if let Some(ref s) = *cache {
+                crate::t!("Activate::ActivateObject: returning cached source");
+                s.clone()
+            } else {
+                crate::t!("Activate::ActivateObject: constructing new source");
+                let s: IMFMediaSource = VulvatarMediaSource::new().into();
+                *cache = Some(s.clone());
+                s
+            };
+            drop(cache);
+
+            let unk: IUnknown = source.cast()?;
+            let hr = unk.query(riid, ppv);
             crate::t!("Activate::ActivateObject: source.query -> {:?}", hr);
             if hr.is_err() {
                 return Err(hr.into());
@@ -74,11 +97,22 @@ impl IMFActivate_Impl for VulvatarActivate_Impl {
 
     fn ShutdownObject(&self) -> windows::core::Result<()> {
         crate::t!("Activate::ShutdownObject");
+        // Forward to the cached source so its event queue / streams wind
+        // down cleanly. The cache stays populated — DetachObject is the
+        // hook that drops it.
+        let cache = self.cached_source.lock().unwrap();
+        if let Some(ref s) = *cache {
+            unsafe {
+                let _ = s.Shutdown();
+            }
+        }
         Ok(())
     }
 
     fn DetachObject(&self) -> windows::core::Result<()> {
         crate::t!("Activate::DetachObject");
+        let mut cache = self.cached_source.lock().unwrap();
+        *cache = None;
         Ok(())
     }
 }

@@ -36,6 +36,7 @@ pub fn trace(msg: &str) {
     let line = format!("{ts} pid={pid} tid={tid} {msg}\n");
     if let Ok(mut f) = OpenOptions::new().append(true).create(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
     }
 }
 

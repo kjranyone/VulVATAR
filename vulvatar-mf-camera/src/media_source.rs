@@ -11,7 +11,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER};
+use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{
     IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
 };
