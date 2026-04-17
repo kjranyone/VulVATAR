@@ -41,62 +41,248 @@ impl LoadStage {
     }
 }
 
-mod gltf_ext {
+// ---------------------------------------------------------------------------
+// Version-specific schema modules
+// ---------------------------------------------------------------------------
+//
+// VRM 0.x and 1.x have incompatible JSON layouts and live under different
+// root extensions, so each version gets its own serde schema here. The
+// loader picks the right one based on which extension is present in the
+// glTF root `extensions` map.
+//
+// VRM 0.x (root extension: `VRM`)
+//   - humanoid.humanBones: array of `{bone, node, ...}`
+//   - blendShapeMaster.blendShapeGroups: array; binds reference mesh index
+//     with weight in 0..=100
+//   - secondaryAnimation.boneGroups: per-root spring chains sharing
+//     parameters; field is spelled `stiffiness` (sic) in the on-disk spec
+//   - secondaryAnimation.colliderGroups: spheres only
+//
+// VRM 1.x (root extensions: `VRMC_vrm` + `VRMC_springBone`)
+//   - VRMC_vrm.humanoid.humanBones: map `{boneName: {node}}`
+//   - VRMC_vrm.expressions.preset: map with fixed camelCase keys; the
+//     map key IS the expression name (no `name` field on the value)
+//   - VRMC_vrm.expressions.custom: map {name: Expression}
+//   - VRMC_springBone.springs[].joints[]: per-joint stiffness/drag/gravity
+//     with field names in camelCase
+//   - VRMC_springBone.colliders: sphere or capsule
+
+mod v0 {
     use serde::Deserialize;
 
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct HumanoidBone {
-        pub node: u32,
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct VrmRoot {
+        #[serde(default, rename = "exporterVersion")]
+        pub exporter_version: Option<String>,
+        #[serde(default, rename = "specVersion")]
+        pub spec_version: Option<String>,
         #[serde(default)]
-        pub use_default_value: Option<bool>,
+        pub meta: Option<Meta>,
+        #[serde(default)]
+        pub humanoid: Option<Humanoid>,
+        #[serde(default, rename = "blendShapeMaster")]
+        pub blend_shape_master: Option<BlendShapeMaster>,
+        #[serde(default, rename = "secondaryAnimation")]
+        pub secondary_animation: Option<SecondaryAnimation>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct Meta {
+        #[serde(default)]
+        pub title: Option<String>,
+        #[serde(default)]
+        pub version: Option<String>,
+        /// VRM 0.x uses a single `author` string; multi-author files put
+        /// names as a comma-separated list. The loader splits on commas.
+        #[serde(default)]
+        pub author: Option<String>,
+        #[serde(default, rename = "contactInformation")]
+        pub contact_information: Option<String>,
+        #[serde(default)]
+        pub reference: Option<String>,
+        #[serde(default, rename = "licenseName")]
+        pub license_name: Option<String>,
+        #[serde(default, rename = "otherLicenseUrl")]
+        pub other_license_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct Humanoid {
+        #[serde(default, rename = "humanBones")]
+        pub human_bones: Vec<HumanBone>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct HumanBone {
+        #[serde(default)]
+        pub bone: String,
+        /// Nullable in practice: some exporters emit `-1` for unmapped bones.
+        #[serde(default)]
+        pub node: i32,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct BlendShapeMaster {
+        #[serde(default, rename = "blendShapeGroups")]
+        pub blend_shape_groups: Vec<BlendShapeGroup>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct BlendShapeGroup {
+        #[serde(default)]
+        pub name: String,
+        #[serde(default, rename = "presetName")]
+        pub preset_name: Option<String>,
+        #[serde(default)]
+        pub binds: Vec<BlendShapeBind>,
+        #[serde(default, rename = "isBinary")]
+        pub is_binary: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct BlendShapeBind {
+        #[serde(default)]
+        pub mesh: i32,
+        #[serde(default)]
+        pub index: i32,
+        /// VRM 0.x spec defines the weight range as 0..=100
+        /// (SkinnedMeshRenderer.SetBlendShapeWeight). The loader rescales
+        /// to 0..=1 when building `ExpressionMorphBind`.
+        #[serde(default)]
+        pub weight: f32,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct SecondaryAnimation {
+        #[serde(default, rename = "boneGroups")]
+        pub bone_groups: Vec<BoneGroup>,
+        #[serde(default, rename = "colliderGroups")]
+        pub collider_groups: Vec<ColliderGroup>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct BoneGroup {
+        #[serde(default)]
+        pub comment: Option<String>,
+        /// Field is spelled `stiffiness` (double-i) in the VRM 0.x spec.
+        /// Preserved verbatim so files written by Unity-era exporters
+        /// continue to parse.
+        #[serde(default, rename = "stiffiness")]
+        pub stiffiness: f32,
+        #[serde(default, rename = "gravityPower")]
+        pub gravity_power: f32,
+        #[serde(default, rename = "gravityDir")]
+        pub gravity_dir: Option<XyzVec>,
+        #[serde(default, rename = "dragForce")]
+        pub drag_force: f32,
+        #[serde(default)]
+        pub center: Option<i32>,
+        #[serde(default, rename = "hitRadius")]
+        pub hit_radius: f32,
+        /// Each entry is a chain-root node index; children form the chain.
+        #[serde(default)]
+        pub bones: Vec<i32>,
+        /// Indices into the sibling `colliderGroups` array.
+        #[serde(default, rename = "colliderGroups")]
+        pub collider_groups: Vec<u32>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct XyzVec {
+        #[serde(default)]
+        pub x: f32,
+        #[serde(default)]
+        pub y: f32,
+        #[serde(default)]
+        pub z: f32,
+    }
+
+    impl XyzVec {
+        pub fn to_array(&self) -> [f32; 3] {
+            [self.x, self.y, self.z]
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct ColliderGroup {
+        #[serde(default)]
+        pub node: i32,
+        #[serde(default)]
+        pub colliders: Vec<Collider>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct Collider {
+        #[serde(default)]
+        pub offset: Option<XyzVec>,
+        #[serde(default)]
+        pub radius: f32,
+    }
+}
+
+mod v1 {
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct VrmExtension {
+        pub humanoid: Humanoid,
+        #[serde(default)]
+        pub expressions: Option<Expressions>,
+        #[serde(default, rename = "specVersion")]
+        pub spec_version: Option<String>,
+        #[serde(default)]
+        pub meta: Option<Meta>,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct Meta {
+        #[serde(default)]
+        pub name: Option<String>,
+        #[serde(default)]
+        pub version: Option<String>,
+        #[serde(default)]
+        pub authors: Option<Vec<String>>,
+        #[serde(default, rename = "copyrightInformation")]
+        pub copyright_information: Option<String>,
+        #[serde(default, rename = "contactInformation")]
+        pub contact_information: Option<String>,
+        #[serde(default)]
+        pub references: Option<Vec<String>>,
+        #[serde(default, rename = "licenseUrl")]
+        pub license_url: Option<String>,
+        #[serde(default, rename = "thirdPartyLicenses")]
+        pub third_party_licenses: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     pub struct Humanoid {
-        pub human_bones: std::collections::HashMap<String, HumanoidBone>,
+        #[serde(rename = "humanBones")]
+        pub human_bones: HashMap<String, HumanBone>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
-    pub struct Expression {
-        pub name: String,
-        #[serde(default)]
-        pub is_binary: Option<bool>,
-        #[serde(default)]
-        pub override_blink: Option<String>,
-        #[serde(default)]
-        pub override_look_at: Option<String>,
-        #[serde(default)]
-        pub override_mouth: Option<String>,
-        #[serde(default)]
-        pub binds: Option<Vec<ExpressionBind>>,
-        #[serde(default, rename = "morphTargetBinds")]
-        pub morph_target_binds: Option<Vec<MorphTargetBind>>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct ExpressionBind {
+    pub struct HumanBone {
         pub node: u32,
-        pub property: String,
-        pub value: f32,
-    }
-
-    /// VRM 1.0 morph target bind (inside `morphTargetBinds`).
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct MorphTargetBind {
-        pub node: u32,
-        pub index: u32,
-        pub weight: f32,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     pub struct Expressions {
         #[serde(default)]
         pub preset: Option<Preset>,
+        /// VRM 1.0: `custom` is a map {name: Expression}. The map key is the
+        /// expression name; the `Expression` value has no `name` field.
         #[serde(default)]
-        pub custom: Option<Vec<Expression>>,
+        pub custom: Option<HashMap<String, Expression>>,
     }
 
-    #[derive(Debug, Clone, Deserialize)]
+    /// VRM 1.0 `preset` expression map. JSON keys are camelCase
+    /// (`blinkLeft`, `lookUp`, ...), so we keep snake_case Rust fields and
+    /// rely on `rename_all` to bridge the two. Each value is an expression
+    /// object; the *map key* is the name, so `Expression` has no `name`
+    /// field.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct Preset {
         #[serde(default)]
         pub happy: Option<Expression>,
@@ -137,161 +323,79 @@ mod gltf_ext {
     }
 
     impl Preset {
-        pub fn all_expressions(&self) -> Vec<&Expression> {
-            let mut result = Vec::new();
-            if let Some(ref e) = self.blink {
-                result.push(e);
+        /// Return `(canonical_name, expression)` pairs for every populated
+        /// preset slot. The canonical name is the VRM 1.0 camelCase key
+        /// (e.g. `"blinkLeft"`) and matches the identifiers produced by the
+        /// tracking layer.
+        pub fn iter_named(&self) -> Vec<(&'static str, &Expression)> {
+            let mut out = Vec::new();
+            macro_rules! push_if {
+                ($field:ident, $name:literal) => {
+                    if let Some(ref e) = self.$field {
+                        out.push(($name, e));
+                    }
+                };
             }
-            if let Some(ref e) = self.blink_left {
-                result.push(e);
-            }
-            if let Some(ref e) = self.blink_right {
-                result.push(e);
-            }
-            if let Some(ref e) = self.look_up {
-                result.push(e);
-            }
-            if let Some(ref e) = self.look_down {
-                result.push(e);
-            }
-            if let Some(ref e) = self.look_left {
-                result.push(e);
-            }
-            if let Some(ref e) = self.look_right {
-                result.push(e);
-            }
-            if let Some(ref e) = self.happy {
-                result.push(e);
-            }
-            if let Some(ref e) = self.angry {
-                result.push(e);
-            }
-            if let Some(ref e) = self.sad {
-                result.push(e);
-            }
-            if let Some(ref e) = self.relaxed {
-                result.push(e);
-            }
-            if let Some(ref e) = self.surprised {
-                result.push(e);
-            }
-            if let Some(ref e) = self.aa {
-                result.push(e);
-            }
-            if let Some(ref e) = self.ih {
-                result.push(e);
-            }
-            if let Some(ref e) = self.ou {
-                result.push(e);
-            }
-            if let Some(ref e) = self.ee {
-                result.push(e);
-            }
-            if let Some(ref e) = self.oh {
-                result.push(e);
-            }
-            if let Some(ref e) = self.neutral {
-                result.push(e);
-            }
-            result
+            push_if!(happy, "happy");
+            push_if!(angry, "angry");
+            push_if!(sad, "sad");
+            push_if!(relaxed, "relaxed");
+            push_if!(surprised, "surprised");
+            push_if!(aa, "aa");
+            push_if!(ih, "ih");
+            push_if!(ou, "ou");
+            push_if!(ee, "ee");
+            push_if!(oh, "oh");
+            push_if!(blink, "blink");
+            push_if!(blink_left, "blinkLeft");
+            push_if!(blink_right, "blinkRight");
+            push_if!(look_up, "lookUp");
+            push_if!(look_down, "lookDown");
+            push_if!(look_left, "lookLeft");
+            push_if!(look_right, "lookRight");
+            push_if!(neutral, "neutral");
+            out
         }
     }
 
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct VrmExtension {
-        pub humanoid: Humanoid,
-        #[serde(default)]
-        pub expressions: Option<Expressions>,
-        #[serde(default, rename = "specVersion")]
-        pub spec_version: Option<String>,
-        #[serde(default)]
-        pub meta: Option<Meta>,
-    }
-
-    /// VRM 1.x `VRMC_vrm.meta`.
     #[derive(Debug, Clone, Default, Deserialize)]
-    pub struct Meta {
-        #[serde(default)]
-        pub name: Option<String>,
-        #[serde(default)]
-        pub version: Option<String>,
-        #[serde(default)]
-        pub authors: Option<Vec<String>>,
-        #[serde(default, rename = "copyrightInformation")]
-        pub copyright_information: Option<String>,
-        #[serde(default, rename = "contactInformation")]
-        pub contact_information: Option<String>,
-        #[serde(default)]
-        pub references: Option<Vec<String>>,
-        #[serde(default, rename = "licenseUrl")]
-        pub license_url: Option<String>,
-        #[serde(default, rename = "thirdPartyLicenses")]
-        pub third_party_licenses: Option<String>,
-    }
-
-    /// VRM 0.x `VRM.meta`. Field names differ from 1.x.
-    #[derive(Debug, Clone, Default, Deserialize)]
-    pub struct LegacyMeta {
-        #[serde(default)]
-        pub title: Option<String>,
-        #[serde(default)]
-        pub version: Option<String>,
-        #[serde(default)]
-        pub author: Option<String>,
-        #[serde(default, rename = "contactInformation")]
-        pub contact_information: Option<String>,
-        #[serde(default)]
-        pub reference: Option<String>,
-        #[serde(default, rename = "licenseName")]
-        pub license_name: Option<String>,
-        #[serde(default, rename = "otherLicenseUrl")]
-        pub other_license_url: Option<String>,
-    }
-
-    /// VRM 0.x root `VRM` extension. We only parse the metadata here — the
-    /// rest (humanoid, blendshapes, secondaryAnimation) is unsupported by
-    /// this loader.
-    #[derive(Debug, Clone, Default, Deserialize)]
-    pub struct LegacyVrmExtension {
-        #[serde(default, rename = "exporterVersion")]
-        pub exporter_version: Option<String>,
-        #[serde(default, rename = "specVersion")]
-        pub spec_version: Option<String>,
-        #[serde(default)]
-        pub meta: Option<LegacyMeta>,
-    }
-
-    #[derive(Debug, Clone, Default, Deserialize)]
-    pub struct ColliderShapeDef {
-        #[serde(default)]
-        pub sphere: Option<SphereShapeDef>,
-        #[serde(default)]
-        pub capsule: Option<CapsuleShapeDef>,
+    pub struct Expression {
+        #[serde(default, rename = "morphTargetBinds")]
+        pub morph_target_binds: Vec<MorphTargetBind>,
+        #[serde(default, rename = "isBinary")]
+        pub is_binary: Option<bool>,
+        #[serde(default, rename = "overrideBlink")]
+        pub override_blink: Option<String>,
+        #[serde(default, rename = "overrideLookAt")]
+        pub override_look_at: Option<String>,
+        #[serde(default, rename = "overrideMouth")]
+        pub override_mouth: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
-    pub struct SpringBoneCollider {
+    pub struct MorphTargetBind {
         pub node: u32,
+        pub index: u32,
+        pub weight: f32,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct SpringBoneExtension {
         #[serde(default)]
-        pub shape: ColliderShapeDef,
+        pub springs: Vec<Spring>,
+        #[serde(default, rename = "colliderGroups")]
+        pub collider_groups: Option<Vec<ColliderGroup>>,
+        #[serde(default)]
+        pub colliders: Option<Vec<Collider>>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
-    pub struct SphereShapeDef {
+    pub struct Spring {
         #[serde(default)]
-        pub radius: f32,
-        #[serde(default)]
-        pub offset: Option<[f32; 3]>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct CapsuleShapeDef {
-        #[serde(default)]
-        pub radius: f32,
-        #[serde(default)]
-        pub offset: Option<[f32; 3]>,
-        #[serde(default)]
-        pub tail: Option<[f32; 3]>,
+        pub name: String,
+        pub joints: Vec<Joint>,
+        #[serde(default, rename = "colliderGroups")]
+        pub collider_groups: Option<Vec<u32>>,
     }
 
     fn default_stiffness() -> f32 {
@@ -302,52 +406,56 @@ mod gltf_ext {
     }
 
     #[derive(Debug, Clone, Deserialize)]
-    pub struct SpringBoneJoint {
+    pub struct Joint {
         pub node: u32,
-        #[serde(default)]
+        #[serde(default, rename = "hitRadius")]
         pub hit_radius: Option<f32>,
         #[serde(default = "default_stiffness")]
         pub stiffness: f32,
-        #[serde(default = "default_gravity_power")]
+        #[serde(default = "default_gravity_power", rename = "gravityPower")]
         pub gravity_power: f32,
-        #[serde(default)]
+        #[serde(default, rename = "gravityDir")]
         pub gravity_dir: Option<[f32; 3]>,
-        #[serde(default)]
+        #[serde(default, rename = "dragForce")]
         pub drag_force: Option<f32>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
-    pub struct SpringBoneColliderGroup {
+    pub struct Collider {
+        pub node: u32,
+        #[serde(default)]
+        pub shape: ColliderShape,
+    }
+
+    #[derive(Debug, Clone, Default, Deserialize)]
+    pub struct ColliderShape {
+        #[serde(default)]
+        pub sphere: Option<SphereShape>,
+        #[serde(default)]
+        pub capsule: Option<CapsuleShape>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct SphereShape {
+        #[serde(default)]
+        pub radius: f32,
+        #[serde(default)]
+        pub offset: Option<[f32; 3]>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct CapsuleShape {
+        #[serde(default)]
+        pub radius: f32,
+        #[serde(default)]
+        pub offset: Option<[f32; 3]>,
+        #[serde(default)]
+        pub tail: Option<[f32; 3]>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct ColliderGroup {
         pub colliders: Vec<u32>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct SpringBoneSpring {
-        pub name: String,
-        pub joints: Vec<SpringBoneJoint>,
-        #[serde(default)]
-        pub collider_groups: Option<Vec<u32>>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct SpringBoneExtension {
-        #[serde(default)]
-        pub springs: Vec<SpringBoneSpring>,
-        #[serde(default)]
-        pub collider_groups: Option<Vec<SpringBoneColliderGroup>>,
-        #[serde(default)]
-        pub colliders: Option<Vec<SpringBoneCollider>>,
-    }
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct RootExtension {
-        #[serde(rename = "VRMC_vrm")]
-        pub vrmc_vrm: Option<VrmExtension>,
-        #[serde(rename = "VRMC_springBone")]
-        pub vrmc_spring_bone: Option<SpringBoneExtension>,
-        /// Legacy VRM 0.x root extension (metadata only).
-        #[serde(rename = "VRM")]
-        pub legacy_vrm: Option<LegacyVrmExtension>,
     }
 }
 
@@ -443,21 +551,19 @@ impl VrmAssetLoader {
         on_progress(LoadStage::Parsing);
         let gltf_doc = gltf::Gltf::from_slice(data)?;
         let blob = gltf_doc.blob.as_deref();
-        let root_ext: Option<gltf_ext::RootExtension> = gltf_doc
+
+        // Snapshot root-level glTF extensions as raw JSON values, keyed by
+        // extension name, so each version-specific parser can pull only the
+        // sub-tree it cares about without being held hostage by sibling
+        // extensions that fail to deserialise.
+        let ext_map: HashMap<String, serde_json::Value> = gltf_doc
             .document
             .extensions()
-            .and_then(|ext| serde_json::from_value(serde_json::Value::Object(ext.clone())).ok());
-
-        let vrm_ext = root_ext.as_ref().and_then(|r| r.vrmc_vrm.as_ref());
-        let spring_ext = root_ext.as_ref().and_then(|r| r.vrmc_spring_bone.as_ref());
-        let legacy_ext = root_ext.as_ref().and_then(|r| r.legacy_vrm.as_ref());
-        let vrm_meta = Self::build_vrm_meta(vrm_ext, legacy_ext);
+            .map(|ext| ext.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
 
         on_progress(LoadStage::Skeleton);
-        let (mut nodes, node_name_map) = Self::build_skeleton_nodes(&gltf_doc.document);
-        let humanoid = vrm_ext
-            .map(|ext| Self::build_humanoid_map(ext, &node_name_map))
-            .transpose()?;
+        let (mut nodes, _node_name_map) = Self::build_skeleton_nodes(&gltf_doc.document);
 
         on_progress(LoadStage::Meshes);
         let meshes = Self::build_meshes(&gltf_doc.document, blob);
@@ -474,44 +580,52 @@ impl VrmAssetLoader {
             .map(|scene| scene.nodes().map(|n| NodeId(n.index() as u64)).collect())
             .unwrap_or_default();
 
+        // glTF node index → mesh index. VRM 1.x morph target binds reference
+        // nodes directly; VRM 0.x references meshes and needs the inverse
+        // lookup, built below.
+        let node_to_mesh: HashMap<usize, usize> = gltf_doc
+            .document
+            .nodes()
+            .filter_map(|node| node.mesh().map(|m| (node.index(), m.index())))
+            .collect();
+        let mut mesh_to_node: HashMap<usize, usize> = HashMap::new();
+        for (&n, &m) in &node_to_mesh {
+            mesh_to_node.entry(m).or_insert(n);
+        }
+
+        on_progress(LoadStage::SpringBones);
+        let parsed = parse_vrm_extensions(&ext_map, &nodes, &mesh_to_node)?;
+
         // VRM 0.x stores the model facing -Z; VRM 1.x (and the rest of this
         // engine) expects +Z. Bake a 180° Y rotation into each root node so
         // the skeleton, spring bones and retargeting all see the 1.x
         // orientation without touching the mesh vertex data.
-        if vrm_meta.spec_version == VrmSpecVersion::V0 {
+        if parsed.meta.spec_version == VrmSpecVersion::V0 {
             Self::bake_y_flip_on_roots(&mut nodes, &root_nodes);
         }
 
-        // Collect inverse bind matrices from all skins
-        let inverse_bind_matrices = if let Some((_, first_skin)) = skin_bindings.first() {
-            first_skin.inverse_bind_matrices.clone()
-        } else {
-            vec![identity_matrix(); nodes.len()]
-        };
-
-        on_progress(LoadStage::SpringBones);
-        let (spring_bones, colliders) = if let Some(spring_ext) = spring_ext {
-            Self::build_spring_bones(spring_ext)
-        } else {
-            (vec![], vec![])
-        };
+        // Build per-node inverse bind matrices. For each glTF node, if any
+        // skin lists it as a joint, use that skin's IBM for this node. VRM
+        // files typically carry consistent bind poses across skins, so the
+        // "first skin wins" fallback is safe for multi-skin avatars (face
+        // + body + accessories). Nodes that never appear in any skin get
+        // identity — they will not be skinned anyway.
+        let mut inverse_bind_matrices = vec![identity_matrix(); nodes.len()];
+        let mut ibm_set = vec![false; nodes.len()];
+        for (_skin_index, skin) in &skin_bindings {
+            for (joint_pos, NodeId(node_id)) in skin.joint_nodes.iter().enumerate() {
+                let node_idx = *node_id as usize;
+                if node_idx >= inverse_bind_matrices.len() || ibm_set[node_idx] {
+                    continue;
+                }
+                if let Some(ibm) = skin.inverse_bind_matrices.get(joint_pos) {
+                    inverse_bind_matrices[node_idx] = *ibm;
+                    ibm_set[node_idx] = true;
+                }
+            }
+        }
 
         on_progress(LoadStage::Finalizing);
-
-        let expressions = vrm_ext
-            .map(|ext| Self::build_expressions(ext))
-            .unwrap_or_else(|| ExpressionAssetSet {
-                expressions: vec![],
-            });
-
-        // Build node → mesh index mapping for morph target expression binding.
-        let node_to_mesh: std::collections::HashMap<usize, usize> = gltf_doc
-            .document
-            .nodes()
-            .filter_map(|node| {
-                node.mesh().map(|m| (node.index(), m.index()))
-            })
-            .collect();
 
         let mut root_aabb = Aabb::empty();
         for mesh in &meshes_with_skin {
@@ -531,13 +645,13 @@ impl VrmAssetLoader {
             },
             meshes: meshes_with_skin,
             materials,
-            humanoid,
-            spring_bones,
-            colliders,
-            default_expressions: expressions,
+            humanoid: parsed.humanoid,
+            spring_bones: parsed.springs,
+            colliders: parsed.colliders,
+            default_expressions: parsed.expressions,
             animation_clips: Self::build_animation_clips(&gltf_doc.document, blob),
             node_to_mesh,
-            vrm_meta,
+            vrm_meta: parsed.meta,
             root_aabb,
         };
 
@@ -566,54 +680,6 @@ impl VrmAssetLoader {
                 -node.rest_local.translation[2],
             ];
         }
-    }
-
-    fn build_vrm_meta(
-        vrm_ext: Option<&gltf_ext::VrmExtension>,
-        legacy_ext: Option<&gltf_ext::LegacyVrmExtension>,
-    ) -> VrmMeta {
-        if let Some(ext) = vrm_ext {
-            let meta = ext.meta.clone().unwrap_or_default();
-            return VrmMeta {
-                spec_version: VrmSpecVersion::V1,
-                spec_version_raw: ext.spec_version.clone(),
-                title: meta.name,
-                authors: meta.authors.unwrap_or_default(),
-                model_version: meta.version,
-                contact_information: meta.contact_information,
-                references: meta.references.unwrap_or_default(),
-                license: meta.license_url,
-                copyright_information: meta.copyright_information,
-            };
-        }
-        if let Some(ext) = legacy_ext {
-            let meta = ext.meta.clone().unwrap_or_default();
-            // VRM 0.x `author` is a single string; convention is
-            // comma-separated for multiple authors. Split so Inspector and
-            // library entries treat each as its own name.
-            let authors: Vec<String> = meta
-                .author
-                .map(|s| {
-                    s.split(',')
-                        .map(|a| a.trim().to_string())
-                        .filter(|a| !a.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let references = meta.reference.into_iter().collect();
-            return VrmMeta {
-                spec_version: VrmSpecVersion::V0,
-                spec_version_raw: ext.spec_version.clone(),
-                title: meta.title,
-                authors,
-                model_version: meta.version,
-                contact_information: meta.contact_information,
-                references,
-                license: meta.license_name.or(meta.other_license_url),
-                copyright_information: None,
-            };
-        }
-        VrmMeta::default()
     }
 
     fn build_skeleton_nodes(doc: &gltf::Document) -> (Vec<SkeletonNode>, HashMap<u32, String>) {
@@ -659,19 +725,6 @@ impl VrmAssetLoader {
             }
         }
         None
-    }
-
-    fn build_humanoid_map(
-        ext: &gltf_ext::VrmExtension,
-        _node_name_map: &HashMap<u32, String>,
-    ) -> Result<HumanoidMap, VrmLoadError> {
-        let mut bone_map = HashMap::new();
-        for (bone_name, bone_def) in &ext.humanoid.human_bones {
-            let humanoid_bone = parse_humanoid_bone(bone_name)
-                .ok_or_else(|| VrmLoadError::InvalidHumanoidBone(bone_name.to_string()))?;
-            bone_map.insert(humanoid_bone, NodeId(bone_def.node as u64));
-        }
-        Ok(HumanoidMap { bone_map })
     }
 
     fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<MeshAsset> {
@@ -1261,228 +1314,34 @@ impl VrmAssetLoader {
                     .get(&mesh_idx)
                     .and_then(|skin_idx| skins.get(*skin_idx).map(|(_, s)| s));
 
-                if let Some(skin) = skin_binding {
+                let effective_skin = skin_binding.or_else(|| skins.first().map(|(_, s)| s));
+
+                if let Some(skin) = effective_skin {
                     for prim in &mut mesh.primitives {
+                        // Remap vertex joint indices from "skin-relative"
+                        // (index into this skin's joint_nodes list) to
+                        // "node-relative" (glTF node index). This lets the
+                        // renderer use a single skinning matrix array shared
+                        // across all skins in the avatar — critical for VRM
+                        // models that ship separate skins for face/body/etc.
+                        if let Some(ref mut vd) = prim.vertices {
+                            for ji in vd.joint_indices.iter_mut() {
+                                for slot in ji.iter_mut() {
+                                    let joint_idx = *slot as usize;
+                                    if let Some(NodeId(node_id)) =
+                                        skin.joint_nodes.get(joint_idx)
+                                    {
+                                        *slot = *node_id as u16;
+                                    }
+                                }
+                            }
+                        }
                         prim.skin = Some(skin.clone());
-                    }
-                } else if let Some((_, fallback_skin)) = skins.first() {
-                    // Fallback: if no explicit mapping, use the first skin (common in VRM)
-                    for prim in &mut mesh.primitives {
-                        prim.skin = Some(fallback_skin.clone());
                     }
                 }
                 mesh
             })
             .collect()
-    }
-
-    fn build_spring_bones(
-        ext: &gltf_ext::SpringBoneExtension,
-    ) -> (Vec<SpringBoneAsset>, Vec<ColliderAsset>) {
-        let mut collider_id: u64 = 1;
-        let colliders: Vec<ColliderAsset> = ext
-            .colliders
-            .as_ref()
-            .map(|collider_defs| {
-                collider_defs
-                    .iter()
-                    .map(|c| {
-                        let (shape, offset) = if let Some(ref sphere) = c.shape.sphere {
-                            (
-                                ColliderShape::Sphere {
-                                    radius: sphere.radius,
-                                },
-                                sphere.offset.unwrap_or([0.0; 3]),
-                            )
-                        } else if let Some(ref capsule) = c.shape.capsule {
-                            let offset = capsule.offset.unwrap_or([0.0; 3]);
-                            // Compute capsule height from the distance between
-                            // the offset (head) and the tail position. If tail
-                            // is not specified, fall back to zero height.
-                            let height = if let Some(tail) = capsule.tail {
-                                let dx = tail[0] - offset[0];
-                                let dy = tail[1] - offset[1];
-                                let dz = tail[2] - offset[2];
-                                (dx * dx + dy * dy + dz * dz).sqrt()
-                            } else {
-                                0.0
-                            };
-                            (
-                                ColliderShape::Capsule {
-                                    radius: capsule.radius,
-                                    height,
-                                },
-                                offset,
-                            )
-                        } else {
-                            (ColliderShape::Sphere { radius: 0.0 }, [0.0; 3])
-                        };
-
-                        let id = ColliderId(collider_id);
-                        collider_id += 1;
-                        ColliderAsset {
-                            id,
-                            node: NodeId(c.node as u64),
-                            shape,
-                            offset,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let collider_id_map: HashMap<u32, ColliderId> = ext
-            .colliders
-            .as_ref()
-            .map(|defs| {
-                defs.iter()
-                    .enumerate()
-                    .map(|(i, _)| (i as u32, ColliderId(i as u64 + 1)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let collider_group_map: HashMap<u32, Vec<ColliderId>> = ext
-            .collider_groups
-            .as_ref()
-            .map(|groups| {
-                groups
-                    .iter()
-                    .enumerate()
-                    .map(|(gi, group)| {
-                        let ids: Vec<ColliderId> = group
-                            .colliders
-                            .iter()
-                            .filter_map(|ci| collider_id_map.get(ci).copied())
-                            .collect();
-                        (gi as u32, ids)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let spring_bones: Vec<SpringBoneAsset> = ext
-            .springs
-            .iter()
-            .map(|spring| {
-                let chain_root = spring
-                    .joints
-                    .first()
-                    .map(|j| NodeId(j.node as u64))
-                    .unwrap_or(NodeId(0));
-
-                let joints: Vec<NodeId> = spring
-                    .joints
-                    .iter()
-                    .map(|j| NodeId(j.node as u64))
-                    .collect();
-
-                let collider_refs: Vec<ColliderRef> = spring
-                    .collider_groups
-                    .as_ref()
-                    .map(|groups| {
-                        groups
-                            .iter()
-                            .filter_map(|gi| {
-                                collider_group_map
-                                    .get(gi)
-                                    .map(|ids| ids.iter().map(|&id| ColliderRef { id }))
-                            })
-                            .flatten()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let stiffness = spring.joints.first().map(|j| j.stiffness).unwrap_or(1.0);
-                let drag_force = spring
-                    .joints
-                    .first()
-                    .and_then(|j| j.drag_force)
-                    .unwrap_or(0.5);
-                let gravity_dir = spring
-                    .joints
-                    .first()
-                    .and_then(|j| j.gravity_dir)
-                    .unwrap_or([0.0, -1.0, 0.0]);
-                let gravity_power = spring
-                    .joints
-                    .first()
-                    .map(|j| j.gravity_power)
-                    .unwrap_or(0.0);
-                let radius = spring
-                    .joints
-                    .first()
-                    .and_then(|j| j.hit_radius)
-                    .unwrap_or(0.05);
-
-                // Per-joint parameter storage: each joint in the chain can have
-                // its own stiffness, drag and gravity_power values.
-                let joint_stiffness: Vec<f32> = spring.joints.iter().map(|j| j.stiffness).collect();
-                let joint_drag: Vec<f32> = spring
-                    .joints
-                    .iter()
-                    .map(|j| j.drag_force.unwrap_or(drag_force))
-                    .collect();
-                let joint_gravity_power: Vec<f32> =
-                    spring.joints.iter().map(|j| j.gravity_power).collect();
-
-                SpringBoneAsset {
-                    chain_root,
-                    joints,
-                    stiffness,
-                    drag_force,
-                    gravity_dir,
-                    gravity_power,
-                    radius,
-                    collider_refs,
-                    joint_stiffness,
-                    joint_drag,
-                    joint_gravity_power,
-                }
-            })
-            .collect();
-
-        (spring_bones, colliders)
-    }
-
-    fn build_expression_def(expr: &gltf_ext::Expression) -> ExpressionDef {
-        let morph_binds = expr
-            .morph_target_binds
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|b| ExpressionMorphBind {
-                node_index: b.node as usize,
-                morph_target_index: b.index as usize,
-                weight: b.weight,
-            })
-            .collect();
-
-        ExpressionDef {
-            name: expr.name.clone(),
-            weight: 0.0,
-            morph_binds,
-        }
-    }
-
-    fn build_expressions(ext: &gltf_ext::VrmExtension) -> ExpressionAssetSet {
-        let mut expressions = Vec::new();
-
-        if let Some(ref expr_section) = ext.expressions {
-            if let Some(ref preset) = expr_section.preset {
-                for expr in preset.all_expressions() {
-                    expressions.push(Self::build_expression_def(expr));
-                }
-            }
-
-            if let Some(ref custom) = expr_section.custom {
-                for expr in custom {
-                    expressions.push(Self::build_expression_def(expr));
-                }
-            }
-        }
-
-        ExpressionAssetSet { expressions }
     }
 
     fn build_animation_clips(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<AnimationClip> {
@@ -1660,6 +1519,579 @@ impl VrmAssetLoader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VRM extension dispatch — picks the right per-version parser.
+// ---------------------------------------------------------------------------
+
+struct ParsedVrm {
+    meta: VrmMeta,
+    humanoid: Option<HumanoidMap>,
+    expressions: ExpressionAssetSet,
+    springs: Vec<SpringBoneAsset>,
+    colliders: Vec<ColliderAsset>,
+}
+
+impl ParsedVrm {
+    fn empty() -> Self {
+        Self {
+            meta: VrmMeta::default(),
+            humanoid: None,
+            expressions: ExpressionAssetSet {
+                expressions: vec![],
+            },
+            springs: vec![],
+            colliders: vec![],
+        }
+    }
+}
+
+fn parse_vrm_extensions(
+    ext_map: &HashMap<String, serde_json::Value>,
+    nodes: &[SkeletonNode],
+    mesh_to_node: &HashMap<usize, usize>,
+) -> Result<ParsedVrm, VrmLoadError> {
+    // When both VRMC_vrm and VRM are present (some exporters bundle legacy
+    // data for backwards compatibility), VRM 1.x is authoritative. Fall back
+    // to the other path only if parsing the primary one fails outright.
+    if let Some(raw) = ext_map.get("VRMC_vrm") {
+        match parse_v1_extensions(raw, ext_map.get("VRMC_springBone")) {
+            Ok(parsed) => return Ok(parsed),
+            Err(e) => {
+                warn!(
+                    "VRM 1.x extension parse failed ({e}); falling back to VRM 0.x if available"
+                );
+            }
+        }
+    }
+    if let Some(raw) = ext_map.get("VRM") {
+        return parse_v0_extensions(raw, nodes, mesh_to_node);
+    }
+    // No recognised VRM extension: return glTF-as-avatar with no retargeting.
+    warn!("no VRM extension found in glTF root; loading as glTF-only avatar");
+    Ok(ParsedVrm::empty())
+}
+
+// ---------------------------------------------------------------------------
+// VRM 1.x parser
+// ---------------------------------------------------------------------------
+
+fn parse_v1_extensions(
+    vrmc_vrm_raw: &serde_json::Value,
+    vrmc_spring_bone_raw: Option<&serde_json::Value>,
+) -> Result<ParsedVrm, VrmLoadError> {
+    let vrmc_vrm: v1::VrmExtension = serde_json::from_value(vrmc_vrm_raw.clone())
+        .map_err(|e| {
+            warn!("VRMC_vrm deserialisation failed: {e}");
+            VrmLoadError::JsonParse(e)
+        })?;
+
+    let meta = build_v1_meta(&vrmc_vrm);
+    let humanoid = Some(build_v1_humanoid(&vrmc_vrm.humanoid)?);
+    let expressions = vrmc_vrm
+        .expressions
+        .as_ref()
+        .map(build_v1_expressions)
+        .unwrap_or_else(|| ExpressionAssetSet {
+            expressions: vec![],
+        });
+
+    let (springs, colliders) = match vrmc_spring_bone_raw {
+        Some(raw) => match serde_json::from_value::<v1::SpringBoneExtension>(raw.clone()) {
+            Ok(sb) => build_v1_springs(&sb),
+            Err(e) => {
+                warn!("VRMC_springBone parse failed: {e}");
+                (vec![], vec![])
+            }
+        },
+        None => (vec![], vec![]),
+    };
+
+    Ok(ParsedVrm {
+        meta,
+        humanoid,
+        expressions,
+        springs,
+        colliders,
+    })
+}
+
+fn build_v1_meta(ext: &v1::VrmExtension) -> VrmMeta {
+    let meta = ext.meta.clone().unwrap_or_default();
+    VrmMeta {
+        spec_version: VrmSpecVersion::V1,
+        spec_version_raw: ext.spec_version.clone(),
+        title: meta.name,
+        authors: meta.authors.unwrap_or_default(),
+        model_version: meta.version,
+        contact_information: meta.contact_information,
+        references: meta.references.unwrap_or_default(),
+        license: meta.license_url,
+        copyright_information: meta.copyright_information,
+    }
+}
+
+fn build_v1_humanoid(humanoid: &v1::Humanoid) -> Result<HumanoidMap, VrmLoadError> {
+    let mut bone_map = HashMap::new();
+    for (bone_name, bone_def) in &humanoid.human_bones {
+        // Unknown bones (fingers, toes, jaw, eyes, ...) are accepted by the
+        // VRM 1.0 spec but ignored by this retargeting pipeline. Skipping them
+        // is friendlier than hard-erroring the entire load.
+        if let Some(humanoid_bone) = parse_humanoid_bone(bone_name) {
+            bone_map.insert(humanoid_bone, NodeId(bone_def.node as u64));
+        }
+    }
+    Ok(HumanoidMap { bone_map })
+}
+
+fn build_v1_expressions(section: &v1::Expressions) -> ExpressionAssetSet {
+    let mut expressions = Vec::new();
+
+    if let Some(ref preset) = section.preset {
+        for (name, expr) in preset.iter_named() {
+            expressions.push(v1_expression_to_def(name, expr));
+        }
+    }
+    if let Some(ref custom) = section.custom {
+        for (name, expr) in custom {
+            expressions.push(v1_expression_to_def(name, expr));
+        }
+    }
+
+    ExpressionAssetSet { expressions }
+}
+
+fn v1_expression_to_def(name: &str, expr: &v1::Expression) -> ExpressionDef {
+    let morph_binds = expr
+        .morph_target_binds
+        .iter()
+        .map(|b| ExpressionMorphBind {
+            node_index: b.node as usize,
+            morph_target_index: b.index as usize,
+            weight: b.weight,
+        })
+        .collect();
+
+    ExpressionDef {
+        name: name.to_string(),
+        weight: 0.0,
+        morph_binds,
+    }
+}
+
+fn build_v1_springs(ext: &v1::SpringBoneExtension) -> (Vec<SpringBoneAsset>, Vec<ColliderAsset>) {
+    // Colliders are numbered sequentially starting at 1 so that references from
+    // spring collider_groups can resolve back via the index map below.
+    let mut next_collider_id: u64 = 1;
+    let colliders: Vec<ColliderAsset> = ext
+        .colliders
+        .as_ref()
+        .map(|defs| {
+            defs.iter()
+                .map(|c| {
+                    let (shape, offset) = if let Some(ref sphere) = c.shape.sphere {
+                        (
+                            ColliderShape::Sphere {
+                                radius: sphere.radius,
+                            },
+                            sphere.offset.unwrap_or([0.0; 3]),
+                        )
+                    } else if let Some(ref capsule) = c.shape.capsule {
+                        let offset = capsule.offset.unwrap_or([0.0; 3]);
+                        let height = if let Some(tail) = capsule.tail {
+                            let dx = tail[0] - offset[0];
+                            let dy = tail[1] - offset[1];
+                            let dz = tail[2] - offset[2];
+                            (dx * dx + dy * dy + dz * dz).sqrt()
+                        } else {
+                            0.0
+                        };
+                        (
+                            ColliderShape::Capsule {
+                                radius: capsule.radius,
+                                height,
+                            },
+                            offset,
+                        )
+                    } else {
+                        (ColliderShape::Sphere { radius: 0.0 }, [0.0; 3])
+                    };
+                    let id = ColliderId(next_collider_id);
+                    next_collider_id += 1;
+                    ColliderAsset {
+                        id,
+                        node: NodeId(c.node as u64),
+                        shape,
+                        offset,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let collider_id_map: HashMap<u32, ColliderId> = ext
+        .colliders
+        .as_ref()
+        .map(|defs| {
+            defs.iter()
+                .enumerate()
+                .map(|(i, _)| (i as u32, ColliderId(i as u64 + 1)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let collider_group_map: HashMap<u32, Vec<ColliderId>> = ext
+        .collider_groups
+        .as_ref()
+        .map(|groups| {
+            groups
+                .iter()
+                .enumerate()
+                .map(|(gi, group)| {
+                    let ids: Vec<ColliderId> = group
+                        .colliders
+                        .iter()
+                        .filter_map(|ci| collider_id_map.get(ci).copied())
+                        .collect();
+                    (gi as u32, ids)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let springs: Vec<SpringBoneAsset> = ext
+        .springs
+        .iter()
+        .map(|spring| {
+            let chain_root = spring
+                .joints
+                .first()
+                .map(|j| NodeId(j.node as u64))
+                .unwrap_or(NodeId(0));
+            let joints: Vec<NodeId> = spring
+                .joints
+                .iter()
+                .map(|j| NodeId(j.node as u64))
+                .collect();
+            let collider_refs: Vec<ColliderRef> = spring
+                .collider_groups
+                .as_ref()
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(|gi| {
+                            collider_group_map
+                                .get(gi)
+                                .map(|ids| ids.iter().map(|&id| ColliderRef { id }))
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let first = spring.joints.first();
+            let stiffness = first.map(|j| j.stiffness).unwrap_or(1.0);
+            let drag_force = first.and_then(|j| j.drag_force).unwrap_or(0.5);
+            let gravity_dir = first.and_then(|j| j.gravity_dir).unwrap_or([0.0, -1.0, 0.0]);
+            let gravity_power = first.map(|j| j.gravity_power).unwrap_or(0.0);
+            let radius = first.and_then(|j| j.hit_radius).unwrap_or(0.05);
+
+            let joint_stiffness: Vec<f32> = spring.joints.iter().map(|j| j.stiffness).collect();
+            let joint_drag: Vec<f32> = spring
+                .joints
+                .iter()
+                .map(|j| j.drag_force.unwrap_or(drag_force))
+                .collect();
+            let joint_gravity_power: Vec<f32> =
+                spring.joints.iter().map(|j| j.gravity_power).collect();
+
+            SpringBoneAsset {
+                chain_root,
+                joints,
+                stiffness,
+                drag_force,
+                gravity_dir,
+                gravity_power,
+                radius,
+                collider_refs,
+                joint_stiffness,
+                joint_drag,
+                joint_gravity_power,
+            }
+        })
+        .collect();
+
+    (springs, colliders)
+}
+
+// ---------------------------------------------------------------------------
+// VRM 0.x parser
+// ---------------------------------------------------------------------------
+
+fn parse_v0_extensions(
+    vrm_raw: &serde_json::Value,
+    nodes: &[SkeletonNode],
+    mesh_to_node: &HashMap<usize, usize>,
+) -> Result<ParsedVrm, VrmLoadError> {
+    let root: v0::VrmRoot = serde_json::from_value(vrm_raw.clone()).map_err(|e| {
+        warn!("VRM 0.x root extension parse failed: {e}");
+        VrmLoadError::JsonParse(e)
+    })?;
+
+    let meta = build_v0_meta(&root);
+    let humanoid = root.humanoid.as_ref().map(build_v0_humanoid);
+    let expressions = root
+        .blend_shape_master
+        .as_ref()
+        .map(|bsm| build_v0_expressions(bsm, mesh_to_node))
+        .unwrap_or_else(|| ExpressionAssetSet {
+            expressions: vec![],
+        });
+    let (springs, colliders) = root
+        .secondary_animation
+        .as_ref()
+        .map(|sa| build_v0_springs(sa, nodes))
+        .unwrap_or_else(|| (vec![], vec![]));
+
+    Ok(ParsedVrm {
+        meta,
+        humanoid,
+        expressions,
+        springs,
+        colliders,
+    })
+}
+
+fn build_v0_meta(root: &v0::VrmRoot) -> VrmMeta {
+    let meta = root.meta.clone().unwrap_or_default();
+    // VRM 0.x `author` is a single string; multi-author files put names as a
+    // comma-separated list. Split so Inspector and library entries treat each
+    // as its own name.
+    let authors: Vec<String> = meta
+        .author
+        .map(|s| {
+            s.split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let references = meta.reference.into_iter().collect();
+    VrmMeta {
+        spec_version: VrmSpecVersion::V0,
+        spec_version_raw: root.spec_version.clone(),
+        title: meta.title,
+        authors,
+        model_version: meta.version,
+        contact_information: meta.contact_information,
+        references,
+        license: meta.license_name.or(meta.other_license_url),
+        copyright_information: None,
+    }
+}
+
+fn build_v0_humanoid(humanoid: &v0::Humanoid) -> HumanoidMap {
+    let mut bone_map = HashMap::new();
+    for entry in &humanoid.human_bones {
+        if entry.node < 0 {
+            continue;
+        }
+        if let Some(bone) = parse_humanoid_bone(&entry.bone) {
+            bone_map.insert(bone, NodeId(entry.node as u64));
+        }
+    }
+    HumanoidMap { bone_map }
+}
+
+fn build_v0_expressions(
+    master: &v0::BlendShapeMaster,
+    mesh_to_node: &HashMap<usize, usize>,
+) -> ExpressionAssetSet {
+    let mut expressions = Vec::with_capacity(master.blend_shape_groups.len());
+
+    for group in &master.blend_shape_groups {
+        // Prefer the preset name (mapped to the VRM 1.0 canonical key) so the
+        // tracking layer finds the right slot. Fall back to the group name for
+        // unknown/custom blendshapes.
+        let name = group
+            .preset_name
+            .as_deref()
+            .and_then(v0_preset_name_to_v1)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| group.name.clone());
+
+        if name.is_empty() {
+            continue;
+        }
+
+        let morph_binds: Vec<ExpressionMorphBind> = group
+            .binds
+            .iter()
+            .filter_map(|bind| {
+                if bind.mesh < 0 || bind.index < 0 {
+                    return None;
+                }
+                let node_index = mesh_to_node.get(&(bind.mesh as usize))?;
+                Some(ExpressionMorphBind {
+                    node_index: *node_index,
+                    morph_target_index: bind.index as usize,
+                    // VRM 0.x weights are 0..=100; rescale to 0..=1.
+                    weight: bind.weight / 100.0,
+                })
+            })
+            .collect();
+
+        expressions.push(ExpressionDef {
+            name,
+            weight: 0.0,
+            morph_binds,
+        });
+    }
+
+    ExpressionAssetSet { expressions }
+}
+
+/// Translate a VRM 0.x `presetName` value to the VRM 1.0 canonical expression
+/// identifier used throughout the tracking/retargeting pipeline. Returns
+/// `None` for unknown presets and for `"unknown"` (so callers fall back to
+/// the group's `name`).
+fn v0_preset_name_to_v1(preset: &str) -> Option<&'static str> {
+    match preset {
+        "neutral" => Some("neutral"),
+        // Mouth / vowels
+        "a" => Some("aa"),
+        "i" => Some("ih"),
+        "u" => Some("ou"),
+        "e" => Some("ee"),
+        "o" => Some("oh"),
+        // Eye blinks
+        "blink" => Some("blink"),
+        "blink_l" => Some("blinkLeft"),
+        "blink_r" => Some("blinkRight"),
+        // Emotions
+        "joy" => Some("happy"),
+        "angry" => Some("angry"),
+        "sorrow" => Some("sad"),
+        "fun" => Some("relaxed"),
+        // Gaze
+        "lookup" => Some("lookUp"),
+        "lookdown" => Some("lookDown"),
+        "lookleft" => Some("lookLeft"),
+        "lookright" => Some("lookRight"),
+        _ => None,
+    }
+}
+
+fn build_v0_springs(
+    sa: &v0::SecondaryAnimation,
+    nodes: &[SkeletonNode],
+) -> (Vec<SpringBoneAsset>, Vec<ColliderAsset>) {
+    // Flatten 0.x colliderGroups (which bundle spheres under a single node)
+    // into per-group ColliderAsset lists that can be referenced by index.
+    let mut next_collider_id: u64 = 1;
+    let mut all_colliders: Vec<ColliderAsset> = Vec::new();
+    let mut group_to_ids: Vec<Vec<ColliderId>> = Vec::with_capacity(sa.collider_groups.len());
+
+    for group in &sa.collider_groups {
+        if group.node < 0 {
+            group_to_ids.push(vec![]);
+            continue;
+        }
+        let node = NodeId(group.node as u64);
+        let mut ids = Vec::with_capacity(group.colliders.len());
+        for c in &group.colliders {
+            let offset = c.offset.as_ref().map(|v| v.to_array()).unwrap_or([0.0; 3]);
+            let id = ColliderId(next_collider_id);
+            next_collider_id += 1;
+            all_colliders.push(ColliderAsset {
+                id,
+                node,
+                shape: ColliderShape::Sphere { radius: c.radius },
+                offset,
+            });
+            ids.push(id);
+        }
+        group_to_ids.push(ids);
+    }
+
+    let mut springs: Vec<SpringBoneAsset> = Vec::new();
+    for group in &sa.bone_groups {
+        let collider_refs: Vec<ColliderRef> = group
+            .collider_groups
+            .iter()
+            .filter_map(|gi| group_to_ids.get(*gi as usize))
+            .flat_map(|ids| ids.iter().map(|&id| ColliderRef { id }))
+            .collect();
+
+        let gravity_dir = group
+            .gravity_dir
+            .as_ref()
+            .map(|v| v.to_array())
+            .unwrap_or([0.0, -1.0, 0.0]);
+        let radius = if group.hit_radius > 0.0 {
+            group.hit_radius
+        } else {
+            0.02
+        };
+
+        for &root_idx in &group.bones {
+            if root_idx < 0 {
+                continue;
+            }
+            let chain = walk_v0_chain(nodes, root_idx as usize);
+            if chain.is_empty() {
+                continue;
+            }
+            let chain_root = chain[0];
+            let joint_count = chain.len();
+            springs.push(SpringBoneAsset {
+                chain_root,
+                joints: chain,
+                stiffness: group.stiffiness,
+                drag_force: group.drag_force,
+                gravity_dir,
+                gravity_power: group.gravity_power,
+                radius,
+                collider_refs: collider_refs.clone(),
+                // 0.x shares parameters across the whole chain, so broadcast
+                // the group values into per-joint slots.
+                joint_stiffness: vec![group.stiffiness; joint_count],
+                joint_drag: vec![group.drag_force; joint_count],
+                joint_gravity_power: vec![group.gravity_power; joint_count],
+            });
+        }
+    }
+
+    (springs, all_colliders)
+}
+
+/// Walk a VRM 0.x spring chain starting at `root_idx`, following the first
+/// child at each step. Stops when a node has no children. Branching chains
+/// are flattened to the primary strand — the common case (hair, skirt
+/// strands) has a single child per node.
+fn walk_v0_chain(nodes: &[SkeletonNode], root_idx: usize) -> Vec<NodeId> {
+    let mut chain = Vec::new();
+    let mut cursor = root_idx;
+    loop {
+        if cursor >= nodes.len() {
+            break;
+        }
+        chain.push(NodeId(cursor as u64));
+        let next = nodes[cursor].children.first().copied();
+        match next {
+            Some(NodeId(n)) => {
+                let n = n as usize;
+                // Guard against accidental cycles (malformed input).
+                if n == cursor || chain.iter().any(|NodeId(c)| *c as usize == n) {
+                    break;
+                }
+                cursor = n;
+            }
+            None => break,
+        }
+    }
+    chain
+}
+
 fn compute_hash(data: &[u8]) -> AssetSourceHash {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1692,6 +2124,717 @@ fn parse_humanoid_bone(name: &str) -> Option<HumanoidBone> {
         "rightUpperLeg" => Some(HumanoidBone::RightUpperLeg),
         "rightLowerLeg" => Some(HumanoidBone::RightLowerLeg),
         "rightFoot" => Some(HumanoidBone::RightFoot),
+
+        // ----- Fingers -----
+        "leftThumbProximal" => Some(HumanoidBone::LeftThumbProximal),
+        "leftThumbIntermediate" | "leftThumbMetacarpal" => {
+            Some(HumanoidBone::LeftThumbIntermediate)
+        }
+        "leftThumbDistal" => Some(HumanoidBone::LeftThumbDistal),
+        "leftIndexProximal" => Some(HumanoidBone::LeftIndexProximal),
+        "leftIndexIntermediate" => Some(HumanoidBone::LeftIndexIntermediate),
+        "leftIndexDistal" => Some(HumanoidBone::LeftIndexDistal),
+        "leftMiddleProximal" => Some(HumanoidBone::LeftMiddleProximal),
+        "leftMiddleIntermediate" => Some(HumanoidBone::LeftMiddleIntermediate),
+        "leftMiddleDistal" => Some(HumanoidBone::LeftMiddleDistal),
+        "leftRingProximal" => Some(HumanoidBone::LeftRingProximal),
+        "leftRingIntermediate" => Some(HumanoidBone::LeftRingIntermediate),
+        "leftRingDistal" => Some(HumanoidBone::LeftRingDistal),
+        "leftLittleProximal" => Some(HumanoidBone::LeftLittleProximal),
+        "leftLittleIntermediate" => Some(HumanoidBone::LeftLittleIntermediate),
+        "leftLittleDistal" => Some(HumanoidBone::LeftLittleDistal),
+
+        "rightThumbProximal" => Some(HumanoidBone::RightThumbProximal),
+        "rightThumbIntermediate" | "rightThumbMetacarpal" => {
+            Some(HumanoidBone::RightThumbIntermediate)
+        }
+        "rightThumbDistal" => Some(HumanoidBone::RightThumbDistal),
+        "rightIndexProximal" => Some(HumanoidBone::RightIndexProximal),
+        "rightIndexIntermediate" => Some(HumanoidBone::RightIndexIntermediate),
+        "rightIndexDistal" => Some(HumanoidBone::RightIndexDistal),
+        "rightMiddleProximal" => Some(HumanoidBone::RightMiddleProximal),
+        "rightMiddleIntermediate" => Some(HumanoidBone::RightMiddleIntermediate),
+        "rightMiddleDistal" => Some(HumanoidBone::RightMiddleDistal),
+        "rightRingProximal" => Some(HumanoidBone::RightRingProximal),
+        "rightRingIntermediate" => Some(HumanoidBone::RightRingIntermediate),
+        "rightRingDistal" => Some(HumanoidBone::RightRingDistal),
+        "rightLittleProximal" => Some(HumanoidBone::RightLittleProximal),
+        "rightLittleIntermediate" => Some(HumanoidBone::RightLittleIntermediate),
+        "rightLittleDistal" => Some(HumanoidBone::RightLittleDistal),
+
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    const SAMPLE_VRM: &str = "sample_data/AvatarSample_A.vrm";
+    const SAMPLE_VRM0: &str = "sample_data/vrm0x.vrm";
+
+    /// Confirms the VRM 1.x sample parses end-to-end: spec version is
+    /// detected, all tracked humanoid bones are present, preset expressions
+    /// survive the dispatch, and at least one spring bone was produced.
+    #[test]
+    fn sample_vrm_loads_fully() {
+        let loader = VrmAssetLoader::new();
+        let asset = loader
+            .load(SAMPLE_VRM)
+            .expect("sample VRM must load via VrmAssetLoader");
+
+        assert_eq!(
+            asset.vrm_meta.spec_version,
+            VrmSpecVersion::V1,
+            "sample_data/AvatarSample_A.vrm is VRM 1.x"
+        );
+        assert!(
+            asset.vrm_meta.title.is_some(),
+            "VRMC_vrm.meta.name must be populated for a well-formed sample"
+        );
+
+        let humanoid = asset
+            .humanoid
+            .as_ref()
+            .expect("humanoid map must be populated for retargeting to work");
+        assert!(
+            humanoid.bone_map.contains_key(&HumanoidBone::Hips),
+            "Hips bone must be mapped"
+        );
+        assert!(
+            humanoid.bone_map.contains_key(&HumanoidBone::Head),
+            "Head bone must be mapped"
+        );
+        assert!(
+            humanoid.bone_map.len() >= 15,
+            "expected at least the 15 core humanoid bones, got {}",
+            humanoid.bone_map.len()
+        );
+
+        assert!(
+            !asset.default_expressions.expressions.is_empty(),
+            "preset expressions must survive VRMC_vrm parsing"
+        );
+        let names: std::collections::HashSet<&str> = asset
+            .default_expressions
+            .expressions
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        for expected in ["blink", "aa"] {
+            assert!(
+                names.contains(expected),
+                "expected canonical preset '{expected}' in {:?}",
+                names
+            );
+        }
+
+        assert!(
+            !asset.spring_bones.is_empty(),
+            "VRMC_springBone must produce at least one spring chain for the sample"
+        );
+    }
+
+    /// Load the real VRM 0.x sample end-to-end and assert that every piece
+    /// of the avatar pipeline (metadata, humanoid, expressions, spring
+    /// bones) makes it through the 0.x → 1.x canonicalisation.
+    #[test]
+    fn sample_vrm0_loads_fully() {
+        let loader = VrmAssetLoader::new();
+        let asset = loader
+            .load(SAMPLE_VRM0)
+            .expect("sample VRM 0.x must load via VrmAssetLoader");
+
+        assert_eq!(
+            asset.vrm_meta.spec_version,
+            VrmSpecVersion::V0,
+            "sample_data/vrm0x.vrm must parse as VRM 0.x"
+        );
+
+        let humanoid = asset
+            .humanoid
+            .as_ref()
+            .expect("humanoid map must be populated for 0.x retargeting");
+        assert!(
+            humanoid.bone_map.contains_key(&HumanoidBone::Hips),
+            "VRM 0.x Hips bone must be mapped"
+        );
+        assert!(
+            humanoid.bone_map.contains_key(&HumanoidBone::Head),
+            "VRM 0.x Head bone must be mapped"
+        );
+        assert!(
+            humanoid.bone_map.len() >= 15,
+            "expected at least the 15 core humanoid bones in 0.x sample, got {}",
+            humanoid.bone_map.len()
+        );
+
+        // Most 0.x models ship at least `a`/`blink` presets; verify the
+        // canonicalisation landed them under the VRM 1.0 identifiers the
+        // tracking layer expects.
+        if !asset.default_expressions.expressions.is_empty() {
+            let names: std::collections::HashSet<&str> = asset
+                .default_expressions
+                .expressions
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect();
+            eprintln!("0.x canonicalised expression names: {:?}", names);
+            // Weight rescaling: no bind should exceed 1.0 after the
+            // 0..=100 → 0..=1 conversion.
+            for expr in &asset.default_expressions.expressions {
+                for bind in &expr.morph_binds {
+                    assert!(
+                        bind.weight <= 1.0 + 1e-4,
+                        "expression '{}' bind weight {} exceeds 1.0 — 0.x 100-scale not rescaled?",
+                        expr.name,
+                        bind.weight
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "VRM 0.x sample: title={:?} authors={:?} humanoid_bones={} expressions={} springs={} colliders={}",
+            asset.vrm_meta.title,
+            asset.vrm_meta.authors,
+            humanoid.bone_map.len(),
+            asset.default_expressions.expressions.len(),
+            asset.spring_bones.len(),
+            asset.colliders.len(),
+        );
+    }
+
+    /// End-to-end sanity for VRM 0.x tracking → GPU skinning matrix.
+    ///
+    /// Loads the real VRM 0.x sample (which ships *two* distinct skins — a
+    /// tiny 1-joint skin and the main 172-joint body skin), feeds it a
+    /// synthetic `SourceSkeleton` with a raised left arm and a turned head,
+    /// runs the solver + skinning pipeline, and asserts:
+    ///
+    ///   1. `pose_solver::solve_avatar_pose` writes the Head bone's local
+    ///      rotation away from rest when a non-zero face pose is supplied.
+    ///   2. The LeftUpperArm bone's local rotation is modified when the
+    ///      solver has both a shoulder and an elbow source joint to work
+    ///      with — the direction-match path (not just the face-pose path)
+    ///      reaches the skeleton.
+    ///   3. After `compute_global_pose` + `build_skinning_matrices`, the
+    ///      Head bone's skinning matrix (as the shader sees it, indexed by
+    ///      glTF node id) reflects the rotation — i.e. multi-skin models
+    ///      still feed the right joint.
+    #[test]
+    fn sample_vrm0_solver_drives_head_and_arm() {
+        use crate::avatar::pose_solver::{solve_avatar_pose, SolverParams};
+        use crate::avatar::{AvatarInstance, AvatarInstanceId};
+        use crate::tracking::source_skeleton::{FacePose, SourceJoint, SourceSkeleton};
+
+        let loader = VrmAssetLoader::new();
+        let asset = loader.load(SAMPLE_VRM0).expect("load VRM 0.x sample");
+
+        let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset.clone());
+        avatar.build_base_pose();
+
+        let head_idx = asset
+            .humanoid
+            .as_ref()
+            .unwrap()
+            .bone_map
+            .get(&HumanoidBone::Head)
+            .expect("Head mapped")
+            .0 as usize;
+        let left_upper_arm_idx = asset
+            .humanoid
+            .as_ref()
+            .unwrap()
+            .bone_map
+            .get(&HumanoidBone::LeftUpperArm)
+            .expect("LeftUpperArm mapped")
+            .0 as usize;
+
+        let head_rest = avatar.pose.local_transforms[head_idx].rotation;
+        let upper_arm_rest = avatar.pose.local_transforms[left_upper_arm_idx].rotation;
+
+        // Build a synthetic source skeleton:
+        //   * Left shoulder at x = -0.2, elbow up + out (x = -0.4, y = +0.3)
+        //     so the LeftUpperArm direction tilts away from the body.
+        //   * Head face pose yaw = 45°, all other zero.
+        let mut source = SourceSkeleton::empty(0);
+        source.joints.insert(
+            HumanoidBone::LeftShoulder,
+            SourceJoint {
+                position: [-0.2, 1.4],
+                confidence: 1.0,
+            },
+        );
+        source.joints.insert(
+            HumanoidBone::LeftUpperArm,
+            SourceJoint {
+                position: [-0.2, 1.4],
+                confidence: 1.0,
+            },
+        );
+        source.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [-0.4, 1.7],
+                confidence: 1.0,
+            },
+        );
+        source.joints.insert(
+            HumanoidBone::RightShoulder,
+            SourceJoint {
+                position: [0.2, 1.4],
+                confidence: 1.0,
+            },
+        );
+        source.face = Some(FacePose {
+            yaw: std::f32::consts::FRAC_PI_4,
+            pitch: 0.0,
+            roll: 0.0,
+            confidence: 1.0,
+        });
+        source.overall_confidence = 1.0;
+
+        let params = SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.1,
+            face_confidence_threshold: 0.1,
+        };
+        solve_avatar_pose(
+            &source,
+            &avatar.asset.skeleton,
+            avatar.asset.humanoid.as_ref(),
+            &mut avatar.pose.local_transforms,
+            &params,
+        );
+
+        let head_after = avatar.pose.local_transforms[head_idx].rotation;
+        let arm_after = avatar.pose.local_transforms[left_upper_arm_idx].rotation;
+        eprintln!("head rest  : {:?}", head_rest);
+        eprintln!("head after : {:?}", head_after);
+        eprintln!("arm rest   : {:?}", upper_arm_rest);
+        eprintln!("arm after  : {:?}", arm_after);
+
+        let head_diff: f32 = head_rest
+            .iter()
+            .zip(head_after.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            head_diff > 1e-4,
+            "Head bone local rotation did not change in response to face pose ({head_diff})"
+        );
+
+        let arm_diff: f32 = upper_arm_rest
+            .iter()
+            .zip(arm_after.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            arm_diff > 1e-4,
+            "LeftUpperArm local rotation did not change when elbow moved in source ({arm_diff})"
+        );
+
+        // Confirm the Head's skinning matrix actually changes.
+        avatar.compute_global_pose();
+        avatar.build_skinning_matrices();
+        let skin_with_tracking = avatar.pose.skinning_matrices[head_idx];
+
+        avatar.build_base_pose();
+        avatar.compute_global_pose();
+        avatar.build_skinning_matrices();
+        let skin_rest = avatar.pose.skinning_matrices[head_idx];
+
+        let max_diff: f32 = skin_rest
+            .iter()
+            .zip(skin_with_tracking.iter())
+            .flat_map(|(a, b)| a.iter().zip(b.iter()))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "Head skinning matrix unchanged after solver — multi-skin indexing regressed ({max_diff})"
+        );
+    }
+
+    /// Synthesise a bent index finger on one hand and assert the solver
+    /// drives the avatar's corresponding finger bones. This is the
+    /// regression test for "making a fist / peace sign / open hand doesn't
+    /// register" — the solver has to walk the finger chain (Proximal →
+    /// Intermediate → Distal) and turn each bone toward the next joint's
+    /// image-space position.
+    #[test]
+    fn sample_vrm0_solver_bends_fingers() {
+        use crate::avatar::pose_solver::{solve_avatar_pose, SolverParams};
+        use crate::avatar::{AvatarInstance, AvatarInstanceId};
+        use crate::tracking::source_skeleton::{SourceJoint, SourceSkeleton};
+
+        let loader = VrmAssetLoader::new();
+        let asset = loader.load(SAMPLE_VRM0).expect("load VRM 0.x sample");
+
+        let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset.clone());
+        avatar.build_base_pose();
+
+        // Pick the LEFT index chain — the 0.x sample maps these to
+        // separate skin nodes (see `sample_vrm0_humanoid_mapping_looks_sane`).
+        // COCO keypoints on the user's anatomical LEFT hand drive the
+        // avatar's RIGHT chain (mirror), but for the solver we can plug
+        // values directly into the source skeleton under either side.
+        let humanoid = asset.humanoid.as_ref().unwrap();
+        let prox = humanoid
+            .bone_map
+            .get(&HumanoidBone::RightIndexProximal)
+            .copied()
+            .unwrap()
+            .0 as usize;
+        let inter = humanoid
+            .bone_map
+            .get(&HumanoidBone::RightIndexIntermediate)
+            .copied()
+            .unwrap()
+            .0 as usize;
+        let distal = humanoid
+            .bone_map
+            .get(&HumanoidBone::RightIndexDistal)
+            .copied()
+            .unwrap()
+            .0 as usize;
+
+        let rest_prox = avatar.pose.local_transforms[prox].rotation;
+        let rest_inter = avatar.pose.local_transforms[inter].rotation;
+        let rest_distal = avatar.pose.local_transforms[distal].rotation;
+
+        // Plant a curled index finger on the right side of the source
+        // skeleton. MCP sits near the palm; PIP/DIP/TIP progressively curl
+        // downward (smaller y). Confidence maxed so the solver does not
+        // threshold us out.
+        let mut source = SourceSkeleton::empty(0);
+        let mut put = |bone, x, y| {
+            source.joints.insert(
+                bone,
+                SourceJoint {
+                    position: [x, y],
+                    confidence: 1.0,
+                },
+            );
+        };
+        // Wrist / anchor so the arm chain upstream does not move wildly.
+        put(HumanoidBone::RightHand, -0.4, 0.2);
+        put(HumanoidBone::RightIndexProximal, -0.42, 0.15);
+        put(HumanoidBone::RightIndexIntermediate, -0.44, 0.05);
+        put(HumanoidBone::RightIndexDistal, -0.45, -0.05);
+        source.fingertips.insert(
+            HumanoidBone::RightIndexDistal,
+            SourceJoint {
+                position: [-0.44, -0.12],
+                confidence: 1.0,
+            },
+        );
+        source.overall_confidence = 1.0;
+
+        let params = SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.1,
+            face_confidence_threshold: 0.1,
+        };
+        solve_avatar_pose(
+            &source,
+            &avatar.asset.skeleton,
+            avatar.asset.humanoid.as_ref(),
+            &mut avatar.pose.local_transforms,
+            &params,
+        );
+
+        let new_prox = avatar.pose.local_transforms[prox].rotation;
+        let new_inter = avatar.pose.local_transforms[inter].rotation;
+        let new_distal = avatar.pose.local_transforms[distal].rotation;
+
+        for (label, rest, new) in [
+            ("Proximal", rest_prox, new_prox),
+            ("Intermediate", rest_inter, new_inter),
+            ("Distal", rest_distal, new_distal),
+        ] {
+            let diff: f32 = rest
+                .iter()
+                .zip(new.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(
+                diff > 1e-4,
+                "Right Index {label} local rotation did not react to bent-finger source ({diff})"
+            );
+        }
+    }
+
+    /// Dump the VRM 0.x sample's humanoid mapping alongside the skeleton
+    /// node names so we can visually confirm each HumanoidBone points at a
+    /// sensibly-named node (e.g. `Head` bone → `J_Bip_C_Head`).
+    #[test]
+    fn sample_vrm0_humanoid_mapping_looks_sane() {
+        let loader = VrmAssetLoader::new();
+        let asset = loader.load(SAMPLE_VRM0).expect("load VRM 0.x sample");
+        let humanoid = asset.humanoid.as_ref().expect("humanoid populated");
+
+        let mut pairs: Vec<_> = humanoid.bone_map.iter().collect();
+        pairs.sort_by_key(|(bone, _)| format!("{:?}", bone));
+        eprintln!("-- VRM 0.x humanoid map --");
+        for (bone, NodeId(node_idx)) in pairs {
+            let name = asset
+                .skeleton
+                .nodes
+                .get(*node_idx as usize)
+                .map(|n| n.name.as_str())
+                .unwrap_or("<out-of-range>");
+            eprintln!("  {:?} -> node[{}] = {:?}", bone, node_idx, name);
+        }
+
+        // Sanity: expected bones present.
+        for bone in [
+            HumanoidBone::Hips,
+            HumanoidBone::Spine,
+            HumanoidBone::Head,
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::LeftUpperLeg,
+            HumanoidBone::RightUpperLeg,
+        ] {
+            assert!(
+                humanoid.bone_map.contains_key(&bone),
+                "expected HumanoidBone::{:?} in 0.x humanoid map",
+                bone
+            );
+        }
+    }
+
+    /// Synthesise a minimal VRM 0.x root extension JSON and exercise the
+    /// per-version parser directly — we have no real 0.x sample file in-tree,
+    /// so the schema coverage is validated at the unit level.
+    #[test]
+    fn v0_synthetic_extension_parses_humanoid_and_blendshapes() {
+        let raw = serde_json::json!({
+            "exporterVersion": "VRMUnityExporter-0.62",
+            "specVersion": "0.0",
+            "meta": {
+                "title": "Synthetic 0.x Model",
+                "author": "Author A, Author B",
+                "contactInformation": "test@example.com",
+                "licenseName": "CC_BY"
+            },
+            "humanoid": {
+                "humanBones": [
+                    { "bone": "hips", "node": 0 },
+                    { "bone": "spine", "node": 1 },
+                    { "bone": "head", "node": 2 },
+                    { "bone": "leftHand", "node": 3 },
+                    // Unknown bone (jaw) must not error out the whole parse.
+                    { "bone": "jaw", "node": 99 },
+                    // Negative node is a common sentinel for "unmapped".
+                    { "bone": "rightEye", "node": -1 }
+                ]
+            },
+            "blendShapeMaster": {
+                "blendShapeGroups": [
+                    {
+                        "name": "A",
+                        "presetName": "a",
+                        "binds": [ { "mesh": 0, "index": 5, "weight": 100.0 } ]
+                    },
+                    {
+                        "name": "Blink",
+                        "presetName": "blink",
+                        "binds": [ { "mesh": 0, "index": 6, "weight": 100.0 } ]
+                    },
+                    {
+                        "name": "Joy",
+                        "presetName": "joy",
+                        "binds": [ { "mesh": 0, "index": 7, "weight": 100.0 } ]
+                    },
+                    {
+                        "name": "CustomGroup",
+                        "presetName": "unknown",
+                        "binds": [ { "mesh": 0, "index": 8, "weight": 50.0 } ]
+                    }
+                ]
+            },
+            "secondaryAnimation": {
+                "boneGroups": [
+                    {
+                        "comment": "hair",
+                        "stiffiness": 1.5,
+                        "gravityPower": 0.2,
+                        "gravityDir": { "x": 0.0, "y": -1.0, "z": 0.0 },
+                        "dragForce": 0.4,
+                        "center": -1,
+                        "hitRadius": 0.03,
+                        "bones": [4],
+                        "colliderGroups": [0]
+                    }
+                ],
+                "colliderGroups": [
+                    {
+                        "node": 10,
+                        "colliders": [
+                            { "offset": { "x": 0.0, "y": 0.1, "z": 0.0 }, "radius": 0.1 }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        // Synthesise a minimal skeleton: a single chain 4 → 5 → 6 → (leaf).
+        let mut nodes = vec![
+            SkeletonNode {
+                id: NodeId(0),
+                name: "root".into(),
+                parent: None,
+                children: vec![],
+                rest_local: Transform::default(),
+                humanoid_bone: None,
+            };
+            11
+        ];
+        nodes[4].children = vec![NodeId(5)];
+        nodes[5].children = vec![NodeId(6)];
+
+        let mesh_to_node: HashMap<usize, usize> =
+            [(0usize, 2usize)].into_iter().collect();
+
+        let parsed =
+            super::parse_v0_extensions(&raw, &nodes, &mesh_to_node).expect("v0 parse");
+
+        assert_eq!(parsed.meta.spec_version, VrmSpecVersion::V0);
+        assert_eq!(parsed.meta.title.as_deref(), Some("Synthetic 0.x Model"));
+        assert_eq!(
+            parsed.meta.authors,
+            vec!["Author A".to_string(), "Author B".to_string()],
+            "VRM 0.x comma-separated authors split into separate entries"
+        );
+
+        let humanoid = parsed.humanoid.expect("humanoid built");
+        assert_eq!(humanoid.bone_map.get(&HumanoidBone::Hips), Some(&NodeId(0)));
+        assert_eq!(humanoid.bone_map.get(&HumanoidBone::Head), Some(&NodeId(2)));
+        assert!(
+            !humanoid.bone_map.contains_key(&HumanoidBone::LeftFoot),
+            "unmapped bones absent"
+        );
+
+        let by_name: std::collections::HashMap<&str, &ExpressionDef> = parsed
+            .expressions
+            .expressions
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
+        assert!(by_name.contains_key("aa"), "a → aa");
+        assert!(by_name.contains_key("blink"));
+        assert!(by_name.contains_key("happy"), "joy → happy");
+        assert!(
+            by_name.contains_key("CustomGroup"),
+            "unknown preset falls back to the group name"
+        );
+        let aa = by_name["aa"];
+        assert_eq!(aa.morph_binds.len(), 1);
+        // mesh 0 → node 2 via mesh_to_node map
+        assert_eq!(aa.morph_binds[0].node_index, 2);
+        assert_eq!(aa.morph_binds[0].morph_target_index, 5);
+        assert!(
+            (aa.morph_binds[0].weight - 1.0).abs() < 1e-6,
+            "0.x weight 100 rescales to 1.0"
+        );
+
+        assert_eq!(parsed.colliders.len(), 1);
+        assert_eq!(parsed.colliders[0].node, NodeId(10));
+        assert!(matches!(
+            parsed.colliders[0].shape,
+            ColliderShape::Sphere { .. }
+        ));
+        assert_eq!(parsed.springs.len(), 1);
+        let spring = &parsed.springs[0];
+        assert_eq!(spring.chain_root, NodeId(4));
+        assert_eq!(
+            spring.joints,
+            vec![NodeId(4), NodeId(5), NodeId(6)],
+            "walk_v0_chain follows first child until a leaf"
+        );
+        assert!((spring.stiffness - 1.5).abs() < 1e-6);
+        assert!(!spring.collider_refs.is_empty());
+    }
+
+    /// Synthesise a minimal VRM 1.x VRMC_vrm + VRMC_springBone pair and check
+    /// the shared output. This catches regressions in the preset expression
+    /// naming (which broke silently before the v0/v1 split).
+    #[test]
+    fn v1_synthetic_extension_parses_preset_expressions() {
+        let vrmc_vrm = serde_json::json!({
+            "specVersion": "1.0",
+            "meta": {
+                "name": "Synthetic 1.x",
+                "authors": ["Alice"],
+                "licenseUrl": "https://example.com/license"
+            },
+            "humanoid": {
+                "humanBones": {
+                    "hips":  { "node": 0 },
+                    "spine": { "node": 1 },
+                    "head":  { "node": 2 }
+                }
+            },
+            "expressions": {
+                "preset": {
+                    "aa": {
+                        "morphTargetBinds": [ { "node": 2, "index": 5, "weight": 1.0 } ]
+                    },
+                    "blinkLeft": {
+                        "morphTargetBinds": [ { "node": 2, "index": 6, "weight": 1.0 } ]
+                    }
+                },
+                "custom": {
+                    "MyCustom": {
+                        "morphTargetBinds": [ { "node": 2, "index": 7, "weight": 0.5 } ]
+                    }
+                }
+            }
+        });
+        let vrmc_spring = serde_json::json!({
+            "springs": [
+                {
+                    "name": "hair",
+                    "joints": [
+                        { "node": 10, "hitRadius": 0.02, "stiffness": 1.0, "gravityPower": 0.0, "dragForce": 0.5 },
+                        { "node": 11, "hitRadius": 0.02, "stiffness": 1.0, "gravityPower": 0.0, "dragForce": 0.5 }
+                    ],
+                    "colliderGroups": [0]
+                }
+            ],
+            "colliders": [
+                { "node": 1, "shape": { "sphere": { "offset": [0.0, 0.0, 0.0], "radius": 0.05 } } }
+            ],
+            "colliderGroups": [
+                { "colliders": [0] }
+            ]
+        });
+
+        let parsed =
+            super::parse_v1_extensions(&vrmc_vrm, Some(&vrmc_spring)).expect("v1 parse");
+
+        assert_eq!(parsed.meta.spec_version, VrmSpecVersion::V1);
+        assert_eq!(parsed.meta.title.as_deref(), Some("Synthetic 1.x"));
+        assert_eq!(parsed.meta.authors, vec!["Alice".to_string()]);
+
+        let humanoid = parsed.humanoid.expect("humanoid built");
+        assert_eq!(humanoid.bone_map.len(), 3);
+
+        let names: std::collections::HashSet<&str> = parsed
+            .expressions
+            .expressions
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(names.contains("aa"));
+        assert!(names.contains("blinkLeft"), "blinkLeft preset key preserved");
+        assert!(names.contains("MyCustom"), "custom expression keyed by map key");
+
+        assert_eq!(parsed.springs.len(), 1);
+        assert_eq!(parsed.springs[0].joints.len(), 2);
+        assert_eq!(parsed.colliders.len(), 1);
     }
 }

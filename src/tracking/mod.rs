@@ -11,9 +11,9 @@ mod webcam;
 mod pose_estimation;
 
 pub mod inference;
+pub mod source_skeleton;
 
-use crate::asset::Quat;
-use crate::math_utils::Vec3;
+pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TrackingSourceId(pub u64);
@@ -44,324 +44,53 @@ pub struct TrackingFrame {
     pub face_confidence: f32,
 }
 
-#[derive(Clone, Debug)]
-pub struct TrackingRigPose {
-    pub source_timestamp: u64,
-    pub head: Option<RigTarget>,
-    pub neck: Option<RigTarget>,
-    pub spine: Option<RigTarget>,
-    pub shoulders: RigShoulderTargets,
-    pub arms: RigArmTargets,
-    pub hands: Option<RigHandTargets>,
-    pub legs: Option<RigLegTargets>,
-    pub feet: Option<RigFeetTargets>,
-    pub fingers: Option<RigFingerTargets>,
-    pub expressions: ExpressionWeightSet,
-    pub confidence: TrackingConfidenceMap,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigTarget {
-    pub position: Vec3,
-    pub orientation: Quat,
-    pub confidence: f32,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigShoulderTargets {
-    pub left: Option<RigTarget>,
-    pub right: Option<RigTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigArmTargets {
-    pub left_upper: Option<RigTarget>,
-    pub left_lower: Option<RigTarget>,
-    pub right_upper: Option<RigTarget>,
-    pub right_lower: Option<RigTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigHandTargets {
-    pub left: Option<RigTarget>,
-    pub right: Option<RigTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigLegTargets {
-    pub left_upper: Option<RigTarget>,
-    pub left_lower: Option<RigTarget>,
-    pub right_upper: Option<RigTarget>,
-    pub right_lower: Option<RigTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigFeetTargets {
-    pub left: Option<RigTarget>,
-    pub right: Option<RigTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RigFingerTargets {
-    pub left_thumb: Option<RigTarget>,
-    pub left_index: Option<RigTarget>,
-    pub left_middle: Option<RigTarget>,
-    pub left_ring: Option<RigTarget>,
-    pub left_pinky: Option<RigTarget>,
-    pub right_thumb: Option<RigTarget>,
-    pub right_index: Option<RigTarget>,
-    pub right_middle: Option<RigTarget>,
-    pub right_ring: Option<RigTarget>,
-    pub right_pinky: Option<RigTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ExpressionWeightSet {
-    pub weights: Vec<ExpressionWeight>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ExpressionWeight {
-    pub name: String,
-    pub weight: f32,
-}
-
-#[derive(Clone, Debug)]
-pub struct TrackingConfidenceMap {
-    pub head_confidence: f32,
-    pub torso_confidence: f32,
-    pub left_arm_confidence: f32,
-    pub right_arm_confidence: f32,
-    pub face_confidence: f32,
-    pub left_leg_confidence: f32,
-    pub right_leg_confidence: f32,
-    pub left_hand_confidence: f32,
-    pub right_hand_confidence: f32,
-}
-
-impl Default for TrackingConfidenceMap {
-    fn default() -> Self {
-        Self {
-            head_confidence: 0.0,
-            torso_confidence: 0.0,
-            left_arm_confidence: 0.0,
-            right_arm_confidence: 0.0,
-            face_confidence: 0.0,
-            left_leg_confidence: 0.0,
-            right_leg_confidence: 0.0,
-            left_hand_confidence: 0.0,
-            right_hand_confidence: 0.0,
-        }
-    }
-}
-
+/// Smoothing/threshold params that the GUI exposes as sliders. Consumed by
+/// [`crate::avatar::pose_solver::solve_avatar_pose`] via
+/// [`SolverParams`](crate::avatar::pose_solver::SolverParams).
 #[derive(Clone, Debug)]
 pub struct TrackingSmoothingParams {
-    pub position_smoothing: f32,
-    pub orientation_smoothing: f32,
-    pub expression_smoothing: f32,
-    pub confidence_threshold: f32,
+    /// Per-frame blend factor toward the new rotation. Maps directly to
+    /// `SolverParams::rotation_blend`.
+    pub rotation_blend: f32,
+    /// Per-frame blend factor toward new expression weights.
+    pub expression_blend: f32,
+    /// Minimum keypoint confidence for a joint to drive a bone.
+    pub joint_confidence_threshold: f32,
+    /// Minimum face-pose confidence for the head to react.
+    pub face_confidence_threshold: f32,
     pub stale_timeout_nanos: u64,
 }
 
 impl Default for TrackingSmoothingParams {
     fn default() -> Self {
         Self {
-            position_smoothing: 0.3,
-            orientation_smoothing: 0.3,
-            expression_smoothing: 0.2,
-            confidence_threshold: 0.5,
+            rotation_blend: 0.7,
+            expression_blend: 0.8,
+            joint_confidence_threshold: 0.3,
+            face_confidence_threshold: 0.3,
             stale_timeout_nanos: 200_000_000,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+/// Per-session calibration. The only field that survives the SourceSkeleton
+/// rewrite is `neutral_face_pose`: operators calibrate by facing the camera
+/// squarely for a moment, and every subsequent face pose gets this reading
+/// subtracted so that "neutral" really is `yaw = pitch = roll = 0`.
+#[derive(Clone, Debug, Default)]
 pub struct TrackingCalibration {
-    pub neutral_head_offset: Quat,
-    pub scale_factor: f32,
-    pub shoulder_width_override: Option<f32>,
-    pub head_position_offset: Vec3,
-}
-
-impl Default for TrackingCalibration {
-    fn default() -> Self {
-        Self {
-            neutral_head_offset: [0.0, 0.0, 0.0, 1.0],
-            scale_factor: 1.0,
-            shoulder_width_override: None,
-            head_position_offset: [0.0, 0.0, 0.0],
-        }
-    }
+    pub neutral_face_pose: FacePose,
 }
 
 impl TrackingCalibration {
-    /// Apply calibration adjustments to a raw tracking pose in-place.
-    ///
-    /// - Subtracts `neutral_head_offset` from head orientation (inverse multiply).
-    /// - Scales all target positions by `scale_factor`.
-    /// - Adds `head_position_offset` to the head target position.
-    /// - If `shoulder_width_override` is set, adjusts shoulder target X positions
-    ///   to match the desired width.
-    pub fn apply_calibration(&self, pose: &mut TrackingRigPose) {
-        // Helper: multiply quaternion a * b
-        fn quat_mul(a: &Quat, b: &Quat) -> Quat {
-            [
-                a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-                a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-                a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-                a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-            ]
-        }
-
-        // Helper: conjugate (inverse for unit quaternion)
-        fn quat_conjugate(q: &Quat) -> Quat {
-            [-q[0], -q[1], -q[2], q[3]]
-        }
-
-        // Helper: scale a Vec3
-        fn vec3_scale(v: &mut Vec3, s: f32) {
-            v[0] *= s;
-            v[1] *= s;
-            v[2] *= s;
-        }
-
-        // Subtract neutral_head_offset from head orientation:
-        // corrected = inverse(offset) * raw
-        if let Some(ref mut head) = pose.head {
-            let inv_offset = quat_conjugate(&self.neutral_head_offset);
-            head.orientation = quat_mul(&inv_offset, &head.orientation);
-        }
-
-        // Scale all target positions by scale_factor
-        let s = self.scale_factor;
-        pose.for_each_target_mut(|t| vec3_scale(&mut t.position, s));
-
-        // Apply head_position_offset AFTER scaling
-        if let Some(ref mut head) = pose.head {
-            head.position[0] += self.head_position_offset[0];
-            head.position[1] += self.head_position_offset[1];
-            head.position[2] += self.head_position_offset[2];
-        }
-
-        // Adjust shoulder width if override is set
-        if let Some(desired_width) = self.shoulder_width_override {
-            let half_width = desired_width / 2.0;
-            if let Some(ref mut left) = pose.shoulders.left {
-                left.position[0] = -half_width;
-            }
-            if let Some(ref mut right) = pose.shoulders.right {
-                right.position[0] = half_width;
-            }
-        }
-    }
-}
-
-impl TrackingRigPose {
-    /// Iterate over every `RigTarget` in the pose, calling `f` on each one.
-    /// Covers head, neck, spine, shoulders, arms, hands, legs, feet, fingers.
-    pub fn for_each_target_mut(&mut self, mut f: impl FnMut(&mut RigTarget)) {
-        if let Some(ref mut t) = self.head {
-            f(t);
-        }
-        if let Some(ref mut t) = self.neck {
-            f(t);
-        }
-        if let Some(ref mut t) = self.spine {
-            f(t);
-        }
-        if let Some(ref mut t) = self.shoulders.left {
-            f(t);
-        }
-        if let Some(ref mut t) = self.shoulders.right {
-            f(t);
-        }
-        if let Some(ref mut t) = self.arms.left_upper {
-            f(t);
-        }
-        if let Some(ref mut t) = self.arms.left_lower {
-            f(t);
-        }
-        if let Some(ref mut t) = self.arms.right_upper {
-            f(t);
-        }
-        if let Some(ref mut t) = self.arms.right_lower {
-            f(t);
-        }
-        if let Some(ref mut hands) = self.hands {
-            if let Some(ref mut t) = hands.left {
-                f(t);
-            }
-            if let Some(ref mut t) = hands.right {
-                f(t);
-            }
-        }
-        if let Some(ref mut legs) = self.legs {
-            if let Some(ref mut t) = legs.left_upper {
-                f(t);
-            }
-            if let Some(ref mut t) = legs.left_lower {
-                f(t);
-            }
-            if let Some(ref mut t) = legs.right_upper {
-                f(t);
-            }
-            if let Some(ref mut t) = legs.right_lower {
-                f(t);
-            }
-        }
-        if let Some(ref mut feet) = self.feet {
-            if let Some(ref mut t) = feet.left {
-                f(t);
-            }
-            if let Some(ref mut t) = feet.right {
-                f(t);
-            }
-        }
-        if let Some(ref mut fingers) = self.fingers {
-            for t in [
-                &mut fingers.left_thumb,
-                &mut fingers.left_index,
-                &mut fingers.left_middle,
-                &mut fingers.left_ring,
-                &mut fingers.left_pinky,
-                &mut fingers.right_thumb,
-                &mut fingers.right_index,
-                &mut fingers.right_middle,
-                &mut fingers.right_ring,
-                &mut fingers.right_pinky,
-            ] {
-                if let Some(ref mut t) = t {
-                    f(t);
-                }
-            }
-        }
-    }
-}
-
-impl Default for TrackingRigPose {
-    fn default() -> Self {
-        Self {
-            source_timestamp: 0,
-            head: None,
-            neck: None,
-            spine: None,
-            shoulders: RigShoulderTargets {
-                left: None,
-                right: None,
-            },
-            arms: RigArmTargets {
-                left_upper: None,
-                left_lower: None,
-                right_upper: None,
-                right_lower: None,
-            },
-            hands: None,
-            legs: None,
-            feet: None,
-            fingers: None,
-            expressions: ExpressionWeightSet { weights: vec![] },
-            confidence: TrackingConfidenceMap::default(),
+    /// Subtract the stored neutral face pose from the live sample so the
+    /// solver receives deltas relative to calibration, not absolute camera
+    /// angles.
+    pub fn apply_calibration(&self, sample: &mut SourceSkeleton) {
+        if let Some(ref mut face) = sample.face {
+            face.yaw -= self.neutral_face_pose.yaw;
+            face.pitch -= self.neutral_face_pose.pitch;
+            face.roll -= self.neutral_face_pose.roll;
         }
     }
 }
@@ -377,7 +106,7 @@ pub struct TrackingMailbox {
 }
 
 struct TrackingMailboxInner {
-    latest_pose: Option<TrackingRigPose>,
+    latest_pose: Option<SourceSkeleton>,
     latest_frame: Option<WebcamFrame>,
     latest_annotation: Option<DetectionAnnotation>,
     sequence: u64,
@@ -395,7 +124,7 @@ fn now_nanos() -> u64 {
 /// Atomically captured snapshot of the tracking mailbox state.
 #[derive(Clone, Debug, Default)]
 pub struct MailboxSnapshot {
-    pub pose: Option<TrackingRigPose>,
+    pub pose: Option<SourceSkeleton>,
     pub frame: Option<WebcamFrame>,
     pub annotation: Option<DetectionAnnotation>,
     pub sequence: u64,
@@ -417,22 +146,17 @@ impl TrackingMailbox {
     }
 
     /// Thread-safe publish: takes &self, locks the mutex internally.
-    pub fn publish(&self, pose: TrackingRigPose) {
+    pub fn publish(&self, pose: SourceSkeleton) {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         inner.latest_pose = Some(pose);
         inner.sequence += 1;
         inner.last_update_nanos = now_nanos();
     }
 
-    /// Alias for `publish` to match the update_pose naming convention.
-    pub fn update_pose(&self, pose: TrackingRigPose) {
-        self.publish(pose);
-    }
-
     /// Publish a full estimation result including frame and annotations.
     pub fn publish_estimate(&self, estimate: PoseEstimate, frame: Option<WebcamFrame>) {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.latest_pose = Some(estimate.rig_pose);
+        inner.latest_pose = Some(estimate.skeleton);
         inner.latest_annotation = Some(estimate.annotation);
         inner.latest_frame = frame;
         inner.sequence += 1;
@@ -463,14 +187,9 @@ impl TrackingMailbox {
     }
 
     /// Thread-safe read: takes &self, locks the mutex, clones the pose.
-    pub fn latest_pose(&self) -> Option<TrackingRigPose> {
+    pub fn latest_pose(&self) -> Option<SourceSkeleton> {
         let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         inner.latest_pose.clone()
-    }
-
-    /// Legacy read alias.
-    pub fn read(&self) -> Option<TrackingRigPose> {
-        self.latest_pose()
     }
 
     /// Read the latest webcam frame (downscaled for GUI display).
@@ -525,9 +244,9 @@ pub struct DetectionAnnotation {
     pub bounding_box: Option<(f32, f32, f32, f32)>,
 }
 
-/// Combined output of a pose estimation pass: rig pose + 2D annotation.
+/// Combined output of a pose estimation pass: source skeleton + 2D annotation.
 pub struct PoseEstimate {
-    pub rig_pose: TrackingRigPose,
+    pub skeleton: SourceSkeleton,
     pub annotation: DetectionAnnotation,
 }
 
@@ -647,7 +366,7 @@ impl TrackingSource {
 // ---------------------------------------------------------------------------
 
 /// Background worker that continuously captures tracking frames and publishes
-/// the latest `TrackingRigPose` to a shared `TrackingMailbox`.
+/// the latest `SourceSkeleton` to a shared `TrackingMailbox`.
 ///
 /// The app thread reads from the same mailbox using latest-sample semantics.
 pub struct TrackingWorker {
@@ -930,77 +649,42 @@ impl Drop for TrackingWorker {
 // Synthetic pose generation
 // ---------------------------------------------------------------------------
 
-/// Build a synthetic tracking pose with gentle animation driven by `t`.
-fn synthetic_pose(frame_index: u64, t: f32) -> TrackingRigPose {
-    let head_yaw = t.sin() * 0.1;
-    let head_pitch = (t * 0.7).cos() * 0.05;
-    let head_orientation: Quat = pose_estimation::euler_to_quat(head_pitch, head_yaw, 0.0);
+/// Build a synthetic tracking sample with gentle animation driven by `t`.
+/// Used by `CameraBackend::Synthetic` when no webcam is available.
+fn synthetic_pose(frame_index: u64, t: f32) -> SourceSkeleton {
+    use crate::asset::HumanoidBone;
+    let mut sk = SourceSkeleton::empty(frame_index);
 
-    TrackingRigPose {
-        source_timestamp: frame_index,
-        head: Some(RigTarget {
-            position: [0.0, 1.6, 0.0],
-            orientation: head_orientation,
-            confidence: 0.95,
-        }),
-        neck: Some(RigTarget {
-            position: [0.0, 1.5, 0.0],
-            orientation: [0.0, 0.0, 0.0, 1.0],
-            confidence: 0.9,
-        }),
-        spine: Some(RigTarget {
-            position: [0.0, 1.0, 0.0],
-            orientation: [0.0, 0.0, 0.0, 1.0],
-            confidence: 0.85,
-        }),
-        shoulders: RigShoulderTargets {
-            left: Some(RigTarget {
-                position: [-0.15, 1.4, 0.0],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-                confidence: 0.88,
-            }),
-            right: Some(RigTarget {
-                position: [0.15, 1.4, 0.0],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-                confidence: 0.88,
-            }),
+    // Shoulders bob a few cm laterally so the pose solver produces a
+    // visible spine lean on synthetic input.
+    let sx = t.cos() * 0.01;
+    sk.joints.insert(
+        HumanoidBone::LeftShoulder,
+        SourceJoint {
+            position: [-0.15 + sx, 1.4],
+            confidence: 0.88,
         },
-        arms: RigArmTargets {
-            left_upper: Some(RigTarget {
-                position: [-0.2, 1.2, 0.0],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-                confidence: 0.8,
-            }),
-            left_lower: None,
-            right_upper: Some(RigTarget {
-                position: [0.2, 1.2, 0.0],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-                confidence: 0.8,
-            }),
-            right_lower: None,
+    );
+    sk.joints.insert(
+        HumanoidBone::RightShoulder,
+        SourceJoint {
+            position: [0.15 + sx, 1.4],
+            confidence: 0.88,
         },
-        hands: None,
-        legs: None,
-        feet: None,
-        fingers: None,
-        expressions: ExpressionWeightSet {
-            weights: vec![ExpressionWeight {
-                name: "blink".to_string(),
-                weight: 0.1,
-            }],
-        },
-        confidence: TrackingConfidenceMap {
-            head_confidence: 0.95,
-            torso_confidence: 0.85,
-            left_arm_confidence: 0.8,
-            right_arm_confidence: 0.8,
-            face_confidence: 0.75,
-            left_leg_confidence: 0.0,
-            right_leg_confidence: 0.0,
-            left_hand_confidence: 0.0,
-            right_hand_confidence: 0.0,
-        },
-    }
+    );
+
+    sk.face = Some(FacePose {
+        yaw: t.sin() * 0.1,
+        pitch: (t * 0.7).cos() * 0.05,
+        roll: 0.0,
+        confidence: 0.95,
+    });
+    sk.expressions = vec![SourceExpression {
+        name: "blink".to_string(),
+        weight: 0.1,
+    }];
+    sk.overall_confidence = 0.9;
+    sk
 }
 
 /// Downscale an RGB frame to a maximum width, preserving aspect ratio.

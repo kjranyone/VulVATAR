@@ -661,12 +661,26 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.separator();
                 ui.label("Confidence");
-                let conf = &tracking.confidence;
-                draw_confidence_bar(ui, "Head", conf.head_confidence);
-                draw_confidence_bar(ui, "Torso", conf.torso_confidence);
-                draw_confidence_bar(ui, "Left Arm", conf.left_arm_confidence);
-                draw_confidence_bar(ui, "Right Arm", conf.right_arm_confidence);
-                draw_confidence_bar(ui, "Face", conf.face_confidence);
+                draw_confidence_bar(ui, "Overall", tracking.overall_confidence);
+                if let Some(face) = tracking.face {
+                    draw_confidence_bar(ui, "Face", face.confidence);
+                }
+                use crate::asset::HumanoidBone;
+                let joint_conf = |b: HumanoidBone| -> f32 {
+                    tracking.joints.get(&b).map(|j| j.confidence).unwrap_or(0.0)
+                };
+                draw_confidence_bar(
+                    ui,
+                    "Left Shoulder",
+                    joint_conf(HumanoidBone::LeftShoulder),
+                );
+                draw_confidence_bar(
+                    ui,
+                    "Right Shoulder",
+                    joint_conf(HumanoidBone::RightShoulder),
+                );
+                draw_confidence_bar(ui, "Left Hand", joint_conf(HumanoidBone::LeftHand));
+                draw_confidence_bar(ui, "Right Hand", joint_conf(HumanoidBone::RightHand));
             }
         });
 
@@ -2041,7 +2055,7 @@ fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .iter()
                         .zip(state.expression_weights.iter())
                         .map(
-                            |(expr, &w)| crate::avatar::retargeting::ResolvedExpressionWeight {
+                            |(expr, &w)| crate::avatar::pose_solver::ResolvedExpressionWeight {
                                 name: expr.name.clone(),
                                 weight: w,
                             },

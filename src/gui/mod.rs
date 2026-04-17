@@ -876,10 +876,13 @@ impl eframe::App for GuiApp {
             let frame_config = crate::app::FrameConfig {
                 toggles: self.runtime_toggles(),
                 smoothing: TrackingSmoothingParams {
-                    position_smoothing: self.tracking.smoothing_strength,
-                    orientation_smoothing: self.tracking.smoothing_strength,
-                    expression_smoothing: self.tracking.smoothing_strength * 0.6,
-                    confidence_threshold: self.tracking.confidence_threshold,
+                    // "Smoothing strength" in the GUI is the inverse of the
+                    // solver's blend toward the new value: 0 = instant snap,
+                    // 1 = never move.
+                    rotation_blend: (1.0 - self.tracking.smoothing_strength).clamp(0.05, 1.0),
+                    expression_blend: (1.0 - self.tracking.smoothing_strength * 0.6).clamp(0.05, 1.0),
+                    joint_confidence_threshold: self.tracking.confidence_threshold,
+                    face_confidence_threshold: self.tracking.confidence_threshold,
                     ..TrackingSmoothingParams::default()
                 },
                 material_mode_index: self.rendering.material_mode_index,

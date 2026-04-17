@@ -380,7 +380,7 @@ pub struct HumanoidMap {
     pub bone_map: std::collections::HashMap<HumanoidBone, NodeId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HumanoidBone {
     Hips,
     Spine,
@@ -402,6 +402,37 @@ pub enum HumanoidBone {
     RightUpperLeg,
     RightLowerLeg,
     RightFoot,
+    // ----- Fingers (VRM humanoid finger bones) -----
+    LeftThumbProximal,
+    LeftThumbIntermediate,
+    LeftThumbDistal,
+    LeftIndexProximal,
+    LeftIndexIntermediate,
+    LeftIndexDistal,
+    LeftMiddleProximal,
+    LeftMiddleIntermediate,
+    LeftMiddleDistal,
+    LeftRingProximal,
+    LeftRingIntermediate,
+    LeftRingDistal,
+    LeftLittleProximal,
+    LeftLittleIntermediate,
+    LeftLittleDistal,
+    RightThumbProximal,
+    RightThumbIntermediate,
+    RightThumbDistal,
+    RightIndexProximal,
+    RightIndexIntermediate,
+    RightIndexDistal,
+    RightMiddleProximal,
+    RightMiddleIntermediate,
+    RightMiddleDistal,
+    RightRingProximal,
+    RightRingIntermediate,
+    RightRingDistal,
+    RightLittleProximal,
+    RightLittleIntermediate,
+    RightLittleDistal,
 }
 
 #[derive(Clone, Debug)]

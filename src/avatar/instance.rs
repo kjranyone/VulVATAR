@@ -6,7 +6,7 @@ use crate::asset::{
 };
 use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::AvatarPose;
-use crate::avatar::retargeting::ResolvedExpressionWeight;
+use crate::avatar::pose_solver::ResolvedExpressionWeight;
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 
 /// Multiply two column-major 4x4 matrices: result = a * b.
@@ -312,51 +312,29 @@ impl AvatarInstance {
 
     pub fn build_skinning_matrices(&mut self) {
         let skeleton = &self.asset.skeleton;
+        let node_count = skeleton.nodes.len();
 
-        let first_skin = self
-            .asset
-            .meshes
-            .iter()
-            .flat_map(|m| m.primitives.iter())
-            .filter_map(|p| p.skin.as_ref())
-            .next();
+        // Vertex joint indices are rewritten to be glTF node indices at load
+        // time (see VrmAssetLoader::assign_skins_to_meshes). A single node-
+        // indexed skinning array then serves every skin in the avatar,
+        // regardless of whether the model ships one unified skin or separate
+        // face/body/accessory skins.
+        if self.pose.skinning_matrices.len() != node_count {
+            self.pose.skinning_matrices = vec![crate::asset::identity_matrix(); node_count];
+        }
 
-        if let Some(skin) = first_skin {
-            let node_count = skeleton.nodes.len();
-            let mut node_to_global = vec![0usize; node_count];
-            for (i, &NodeId(nid)) in skin.joint_nodes.iter().enumerate() {
-                let idx = nid as usize;
-                if idx < node_count {
-                    node_to_global[idx] = i;
-                }
-            }
-
-            let needed = skin.joint_nodes.len().max(skin.inverse_bind_matrices.len());
-            self.pose.skinning_matrices = vec![crate::asset::identity_matrix(); needed];
-
-            for (joint_idx, &NodeId(node_id)) in skin.joint_nodes.iter().enumerate() {
-                let node_idx = node_id as usize;
-                let ibm = if joint_idx < skin.inverse_bind_matrices.len() {
-                    &skin.inverse_bind_matrices[joint_idx]
-                } else {
-                    continue;
-                };
-                let global = if node_idx < self.pose.global_transforms.len() {
-                    &self.pose.global_transforms[node_idx]
-                } else {
-                    continue;
-                };
-                self.pose.skinning_matrices[joint_idx] = mul_mat4(global, ibm);
-            }
-        } else {
-            for i in 0..skeleton.nodes.len() {
-                let ibm = if i < skeleton.inverse_bind_matrices.len() {
-                    &skeleton.inverse_bind_matrices[i]
-                } else {
-                    continue;
-                };
-                self.pose.skinning_matrices[i] = mul_mat4(&self.pose.global_transforms[i], ibm);
-            }
+        for i in 0..node_count {
+            let ibm = if i < skeleton.inverse_bind_matrices.len() {
+                &skeleton.inverse_bind_matrices[i]
+            } else {
+                continue;
+            };
+            let global = if i < self.pose.global_transforms.len() {
+                &self.pose.global_transforms[i]
+            } else {
+                continue;
+            };
+            self.pose.skinning_matrices[i] = mul_mat4(global, ibm);
         }
     }
 }

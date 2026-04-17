@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::app::render_thread::{RenderCommand, RenderThread};
 use crate::asset::vrm::VrmAssetLoader;
-use crate::avatar::retargeting;
+use crate::avatar::pose_solver::{self, SolverParams};
 use crate::avatar::{AvatarInstance, AvatarInstanceId};
 use crate::editor::EditorSession;
 use crate::output::{FrameSink, OutputFrame, OutputRouter};
@@ -104,7 +104,7 @@ pub struct Application {
     pub running: bool,
     pub avatar_library: avatar_library::AvatarLibrary,
 
-    pub last_tracking_pose: Option<crate::tracking::TrackingRigPose>,
+    pub last_tracking_pose: Option<crate::tracking::SourceSkeleton>,
 
     rendered_pixels: Option<Arc<Vec<u8>>>,
     rendered_extent: [u32; 2],
@@ -297,7 +297,7 @@ impl Application {
 
         let toggles = &config.toggles;
         let smoothing_params = &config.smoothing;
-        let hand_tracking_enabled = config.hand_tracking_enabled;
+        let _hand_tracking_enabled = config.hand_tracking_enabled;
         let face_tracking_enabled = config.face_tracking_enabled;
         let frame_dt = config.frame_dt;
         let material_mode_index = config.material_mode_index;
@@ -325,28 +325,33 @@ impl Application {
             self.last_tracking_pose = Some(tp.clone());
         }
 
+        let solver_params = SolverParams {
+            rotation_blend: smoothing_params.rotation_blend,
+            joint_confidence_threshold: smoothing_params.joint_confidence_threshold,
+            face_confidence_threshold: smoothing_params.face_confidence_threshold,
+        };
+
         for avatar in self.avatars.iter_mut() {
             avatar.build_base_pose();
 
-            if let Some(ref mut tracking_pose) = tracking_sample.clone() {
-                self.tracking_calibration.apply_calibration(tracking_pose);
+            if let Some(ref mut source) = tracking_sample.clone() {
+                self.tracking_calibration.apply_calibration(source);
 
                 let humanoid = avatar.asset.humanoid.as_ref();
-                retargeting::retarget_tracking_to_pose_filtered(
-                    tracking_pose,
+                pose_solver::solve_avatar_pose(
+                    source,
                     &avatar.asset.skeleton,
                     humanoid,
                     &mut avatar.pose.local_transforms,
-                    smoothing_params,
-                    hand_tracking_enabled,
-                    face_tracking_enabled,
+                    &solver_params,
                 );
 
                 if face_tracking_enabled {
-                    let new_weights = retargeting::retarget_expressions(
-                        tracking_pose,
+                    let new_weights = pose_solver::solve_expressions(
+                        source,
                         &avatar.asset.default_expressions,
                         Some(&avatar.expression_weights),
+                        smoothing_params.expression_blend,
                     );
                     avatar.expression_weights = new_weights;
                 }
@@ -720,7 +725,7 @@ impl Application {
         }
     }
 
-    fn step_tracking(&mut self) -> Option<crate::tracking::TrackingRigPose> {
+    fn step_tracking(&mut self) -> Option<crate::tracking::SourceSkeleton> {
         // When the tracking worker is running, read the latest pose from the
         // shared mailbox (non-blocking). The worker thread is producing poses
         // independently, so we just grab whatever is newest.
@@ -731,7 +736,7 @@ impl Application {
 
         if worker_running {
             // Non-blocking read from the shared mailbox populated by the worker.
-            self.tracking.mailbox().read()
+            self.tracking.mailbox().latest_pose()
         } else {
             // No worker running — return None so tracking is skipped.
             // (The old synchronous fallback generated synthetic data on every
