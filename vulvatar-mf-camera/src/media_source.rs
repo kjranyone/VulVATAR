@@ -11,18 +11,19 @@
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER};
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent, IMFMediaEventGenerator_Impl,
-    IMFMediaEventQueue, IMFMediaSource, IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl,
-    IMFMediaStream, IMFMediaType, IMFPresentationDescriptor, IMFStreamDescriptor,
-    MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType, MFCreatePresentationDescriptor,
-    MFCreateStreamDescriptor, MFMediaType_Video, MFVideoFormat_RGB32,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted, MESourceStopped,
-    MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE,
-    MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFVideoInterlace_Progressive,
+    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService, IMFGetService_Impl,
+    IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource,
+    IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl, IMFMediaStream, IMFMediaType,
+    IMFPresentationDescriptor, IMFStreamDescriptor, MFCreateAttributes, MFCreateEventQueue,
+    MFCreateMediaType, MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFMediaType_Video,
+    MFVideoFormat_RGB32, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted,
+    MESourceStopped, MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS,
+    MFMEDIASOURCE_IS_LIVE, MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MFVideoInterlace_Progressive,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -41,7 +42,7 @@ enum SourceState {
     Shutdown,
 }
 
-#[implement(IMFMediaSourceEx, IMFMediaSource, IKsControl)]
+#[implement(IMFMediaSourceEx, IMFMediaSource, IKsControl, IMFGetService)]
 pub struct VulvatarMediaSource {
     inner: OnceLock<Inner>,
     mutable: Mutex<MutableState>,
@@ -346,6 +347,29 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
         Err(E_NOTIMPL.into())
+    }
+}
+
+/// MF's Frame Server pipes several interop facilities (clock, rate control,
+/// quality advise, DXGI device manager, …) through `IMFGetService`. A
+/// software virtual camera provides none of them, but the interface itself
+/// has to respond — clients query it before deciding whether to use a
+/// service and cope fine with `E_NOINTERFACE`, whereas a missing
+/// `IMFGetService` vtable kills `IMFVirtualCamera::Start`.
+impl IMFGetService_Impl for VulvatarMediaSource_Impl {
+    fn GetService(
+        &self,
+        _guid_service: *const GUID,
+        _riid: *const GUID,
+        ppv_object: *mut *mut core::ffi::c_void,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            if ppv_object.is_null() {
+                return Err(E_POINTER.into());
+            }
+            *ppv_object = core::ptr::null_mut();
+        }
+        Err(E_NOINTERFACE.into())
     }
 }
 
