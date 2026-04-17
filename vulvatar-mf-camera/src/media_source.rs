@@ -41,6 +41,13 @@ pub const DEFAULT_HEIGHT: u32 = 1080;
 pub const DEFAULT_FPS: u32 = 30;
 pub const DEFAULT_STREAM_ID: u32 = 0;
 
+/// `HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND)` = 0x80070492. The value MS
+/// SimpleMediaSource returns from unknown KS property / method / event
+/// probes — MF distinguishes "this property set is not implemented" from
+/// "this interface is unusable", and mapping to `E_NOTIMPL` causes the
+/// latter at the IMFVirtualCamera::Start boundary.
+const KS_PROPERTY_NOT_FOUND: HRESULT = HRESULT(0x80070492u32 as i32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceState {
     Stopped,
@@ -344,7 +351,11 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
         crate::t!("Source::KsProperty");
-        Err(E_NOTIMPL.into())
+        // MS SimpleMediaSource pattern: unknown KS property/method/event
+        // sets are reported as ERROR_SET_NOT_FOUND, not E_NOTIMPL. Frame
+        // Server maps E_NOTIMPL from the KS probe back to E_NOINTERFACE
+        // at the MFCreateVirtualCamera boundary.
+        Err(KS_PROPERTY_NOT_FOUND.into())
     }
 
     fn KsMethod(
@@ -356,7 +367,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
         crate::t!("Source::KsMethod");
-        Err(E_NOTIMPL.into())
+        Err(KS_PROPERTY_NOT_FOUND.into())
     }
 
     fn KsEvent(
@@ -368,7 +379,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
         crate::t!("Source::KsEvent");
-        Err(E_NOTIMPL.into())
+        Err(KS_PROPERTY_NOT_FOUND.into())
     }
 }
 
