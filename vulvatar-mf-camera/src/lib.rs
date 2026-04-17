@@ -60,7 +60,7 @@ pub(crate) fn dll_release() {
 /// Build-time identifier baked into the DLL. If the FrameServer reuses an
 /// older scratch copy, the trace at the top of each run will show the
 /// stale marker and we know not to trust subsequent diagnostics.
-const BUILD_MARKER: &str = concat!("privacy-v2 ", file!(), ":", line!());
+const BUILD_MARKER: &str = concat!("privacy-extendedprop ", file!(), ":", line!());
 
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(

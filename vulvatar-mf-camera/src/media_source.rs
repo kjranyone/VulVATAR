@@ -385,14 +385,12 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
                 const KSPROPERTY_TYPE_SET: u32 = 0x2;
                 if flags & KSPROPERTY_TYPE_GET != 0 {
                     unsafe {
-                        if !property_data.is_null() && data_length >= 4 {
-                            core::ptr::write_bytes(property_data as *mut u8, 0, 4);
-                        }
+                        write_extended_prop_privacy_off(property_data, data_length);
                         if !bytes_returned.is_null() {
-                            *bytes_returned = 4;
+                            *bytes_returned = data_length.min(EXTENDED_PROP_SIZE);
                         }
                     }
-                    crate::t!("Source::KsProperty PRIVACY GET -> S_OK value=0");
+                    crate::t!("Source::KsProperty PRIVACY GET -> S_OK (EXTENDEDPROP)");
                     return Ok(());
                 }
                 if flags & KSPROPERTY_TYPE_SET != 0 {
@@ -435,6 +433,63 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
 /// a strong enum type; the trace receives and compares raw u32 values,
 /// so keep the numeric form handy.
 const KSPROPERTY_CAMERACONTROL_PRIVACY_ID: u32 = 8;
+
+/// `sizeof(KSCAMERA_EXTENDEDPROP_HEADER)` (32) + `sizeof(ULONGLONG)` (8).
+/// Windows 11 Frame Server probes privacy with this buffer size; writing
+/// a legacy `KSPROPERTY_CAMERACONTROL_S` payload (12 bytes) leaves Frame
+/// Server with garbage-looking data and Start fails.
+const EXTENDED_PROP_SIZE: u32 = 40;
+
+/// Fill the `data_length`-byte buffer at `data` with a
+/// KSCAMERA_EXTENDEDPROP_HEADER + Value that reports "privacy feature
+/// permanently off".
+///
+/// Layout (all little-endian):
+///   offset 0  u32  Version    = 1
+///   offset 4  u32  PinId      = 0xFFFFFFFF (KSCAMERA_EXTENDEDPROP_FILTERSCOPE)
+///   offset 8  u32  Size       = 40
+///   offset 12 u32  Result     = 0 (S_OK)
+///   offset 16 u64  Flags      = KSCAMERA_EXTENDEDPROP_PRIVACY_OFF (= 2)
+///   offset 24 u64  Capability = KSCAMERA_EXTENDEDPROP_PRIVACY_OFF (= 2)
+///   offset 32 u64  Value      = 0
+unsafe fn write_extended_prop_privacy_off(data: *mut core::ffi::c_void, data_length: u32) {
+    if data.is_null() {
+        return;
+    }
+    let dst = data as *mut u8;
+    // Zero everything first so trailing bytes are clean.
+    let n = data_length.min(EXTENDED_PROP_SIZE) as usize;
+    core::ptr::write_bytes(dst, 0, n);
+
+    let write_u32 = |offset: usize, value: u32| {
+        if offset + 4 <= n {
+            let bytes = value.to_le_bytes();
+            for i in 0..4 {
+                *dst.add(offset + i) = bytes[i];
+            }
+        }
+    };
+    let write_u64 = |offset: usize, value: u64| {
+        if offset + 8 <= n {
+            let bytes = value.to_le_bytes();
+            for i in 0..8 {
+                *dst.add(offset + i) = bytes[i];
+            }
+        }
+    };
+
+    write_u32(0, 1); // Version
+    write_u32(4, 0xFFFF_FFFF); // PinId = FILTERSCOPE
+    write_u32(8, EXTENDED_PROP_SIZE); // Size
+    write_u32(12, 0); // Result = S_OK
+
+    // KSCAMERA_EXTENDEDPROP_PRIVACY_OFF = 2 in the public KS headers.
+    // Report both current flag value and capability mask as "off".
+    const PRIVACY_OFF: u64 = 2;
+    write_u64(16, PRIVACY_OFF); // Flags (current)
+    write_u64(24, PRIVACY_OFF); // Capability (mask)
+    write_u64(32, 0); // Value (no per-feature payload)
+}
 
 /// Decompose a raw `KSIDENTIFIER` pointer into `(Set, Id, Flags)`. The
 /// windows-rs definition uses a nameless union for the body; we treat
