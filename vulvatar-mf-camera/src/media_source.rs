@@ -375,13 +375,16 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
             if set == PROPSETID_VIDCAP_CAMERACONTROL
                 && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID
             {
+                crate::t!(
+                    "Source::KsProperty handling PRIVACY flags={:#x} data_ptr={:?} data_len={}",
+                    flags,
+                    property_data,
+                    data_length,
+                );
                 const KSPROPERTY_TYPE_GET: u32 = 0x1;
                 const KSPROPERTY_TYPE_SET: u32 = 0x2;
                 if flags & KSPROPERTY_TYPE_GET != 0 {
                     unsafe {
-                        // Frame Server passes a 4-byte buffer for the BOOL
-                        // privacy state. Zero it (off) and report 4 bytes
-                        // returned.
                         if !property_data.is_null() && data_length >= 4 {
                             core::ptr::write_bytes(property_data as *mut u8, 0, 4);
                         }
@@ -389,10 +392,11 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
                             *bytes_returned = 4;
                         }
                     }
+                    crate::t!("Source::KsProperty PRIVACY GET -> S_OK value=0");
                     return Ok(());
                 }
                 if flags & KSPROPERTY_TYPE_SET != 0 {
-                    // SET on privacy is a no-op for a software source.
+                    crate::t!("Source::KsProperty PRIVACY SET -> S_OK (no-op)");
                     return Ok(());
                 }
             }

@@ -57,13 +57,18 @@ pub(crate) fn dll_release() {
 
 /// `DllGetClassObject` — COM entry point. Returns an `IClassFactory` for
 /// our single media source class.
+/// Build-time identifier baked into the DLL. If the FrameServer reuses an
+/// older scratch copy, the trace at the top of each run will show the
+/// stale marker and we know not to trust subsequent diagnostics.
+const BUILD_MARKER: &str = concat!("privacy-v2 ", file!(), ":", line!());
+
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    t!("DllGetClassObject enter");
+    t!("DllGetClassObject enter marker={}", BUILD_MARKER);
     if rclsid.is_null() || riid.is_null() || ppv.is_null() {
         t!("DllGetClassObject: null pointer");
         return E_POINTER;
