@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{
-    IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
+    IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE, PROPSETID_VIDCAP_CAMERACONTROL,
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService, IMFGetService_Impl,
@@ -357,11 +357,47 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         &self,
         property: *const KSIDENTIFIER,
         property_length: u32,
-        _property_data: *mut core::ffi::c_void,
-        _data_length: u32,
-        _bytes_returned: *mut u32,
+        property_data: *mut core::ffi::c_void,
+        data_length: u32,
+        bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
         log_ksid("KsProperty", property, property_length);
+
+        if let Some((set, id, flags)) = parse_ksid(property, property_length) {
+            // Windows 11's Frame Server makes registering a virtual camera
+            // conditional on a successful GET of the privacy-shutter state
+            // (PROPSETID_VIDCAP_CAMERACONTROL / KSPROPERTY_CAMERACONTROL_
+            // PRIVACY). Older versions tolerated ERROR_SET_NOT_FOUND here,
+            // newer Frame Server versions treat the refusal as
+            // E_NOINTERFACE out of IMFVirtualCamera::Start. Respond as
+            // "privacy shutter permanently off" so the registration path
+            // succeeds; a software source has no physical shutter anyway.
+            if set == PROPSETID_VIDCAP_CAMERACONTROL
+                && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID
+            {
+                const KSPROPERTY_TYPE_GET: u32 = 0x1;
+                const KSPROPERTY_TYPE_SET: u32 = 0x2;
+                if flags & KSPROPERTY_TYPE_GET != 0 {
+                    unsafe {
+                        // Frame Server passes a 4-byte buffer for the BOOL
+                        // privacy state. Zero it (off) and report 4 bytes
+                        // returned.
+                        if !property_data.is_null() && data_length >= 4 {
+                            core::ptr::write_bytes(property_data as *mut u8, 0, 4);
+                        }
+                        if !bytes_returned.is_null() {
+                            *bytes_returned = 4;
+                        }
+                    }
+                    return Ok(());
+                }
+                if flags & KSPROPERTY_TYPE_SET != 0 {
+                    // SET on privacy is a no-op for a software source.
+                    return Ok(());
+                }
+            }
+        }
+
         Err(KS_PROPERTY_NOT_FOUND.into())
     }
 
@@ -387,6 +423,37 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
     ) -> windows::core::Result<()> {
         log_ksid("KsEvent", event, event_length);
         Err(KS_PROPERTY_NOT_FOUND.into())
+    }
+}
+
+/// ID of `KSPROPERTY_CAMERACONTROL_PRIVACY` within
+/// `PROPSETID_VIDCAP_CAMERACONTROL`. windows-rs exposes the constant as
+/// a strong enum type; the trace receives and compares raw u32 values,
+/// so keep the numeric form handy.
+const KSPROPERTY_CAMERACONTROL_PRIVACY_ID: u32 = 8;
+
+/// Decompose a raw `KSIDENTIFIER` pointer into `(Set, Id, Flags)`. The
+/// windows-rs definition uses a nameless union for the body; we treat
+/// the first 24 bytes as the fixed `{ GUID, u32, u32 }` layout KS always
+/// uses. Returns `None` for a null/short buffer.
+fn parse_ksid(id: *const KSIDENTIFIER, len: u32) -> Option<(GUID, u32, u32)> {
+    unsafe {
+        if id.is_null() || len < 24 {
+            return None;
+        }
+        let bytes = core::slice::from_raw_parts(id as *const u8, 24);
+        let set = GUID::from_values(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            [
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ],
+        );
+        let prop_id = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        Some((set, prop_id, flags))
     }
 }
 
