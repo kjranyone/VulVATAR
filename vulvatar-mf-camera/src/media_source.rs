@@ -29,7 +29,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID, MF_E_SHUTDOWN,
     MF_E_UNSUPPORTED_SERVICE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MFVideoInterlace_Progressive,
+    MF_VIRTUALCAMERA_CONFIGURATION_APP_PACKAGE_FAMILY_NAME, MFVideoInterlace_Progressive,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -129,8 +129,19 @@ impl VulvatarMediaSource {
 
         let source_attributes = unsafe {
             let mut a: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut a, 1)?;
-            a.unwrap()
+            MFCreateAttributes(&mut a, 4)?;
+            let attrs = a.unwrap();
+            // Signal "this is a Windows 11 Frame Server virtual camera" at
+            // the source level. Mirrors MS SimpleMediaSource's
+            // _CreateSourceAttributes() output. App package name is left
+            // as an empty string to mean "no per-package gating"; Frame
+            // Server still accepts that as long as the attribute exists.
+            attrs.SetString(
+                &MF_VIRTUALCAMERA_CONFIGURATION_APP_PACKAGE_FAMILY_NAME,
+                windows::core::w!(""),
+            )?;
+            attrs.SetUINT32(&MF_DEVICESTREAM_FRAMESERVER_SHARED, 1)?;
+            attrs
         };
         let stream_attributes = unsafe {
             let mut a: Option<IMFAttributes> = None;
@@ -344,42 +355,72 @@ impl IMFMediaSourceEx_Impl for VulvatarMediaSource_Impl {
 impl IKsControl_Impl for VulvatarMediaSource_Impl {
     fn KsProperty(
         &self,
-        _property: *const KSIDENTIFIER,
-        _property_length: u32,
+        property: *const KSIDENTIFIER,
+        property_length: u32,
         _property_data: *mut core::ffi::c_void,
         _data_length: u32,
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
-        crate::t!("Source::KsProperty");
-        // MS SimpleMediaSource pattern: unknown KS property/method/event
-        // sets are reported as ERROR_SET_NOT_FOUND, not E_NOTIMPL. Frame
-        // Server maps E_NOTIMPL from the KS probe back to E_NOINTERFACE
-        // at the MFCreateVirtualCamera boundary.
+        log_ksid("KsProperty", property, property_length);
         Err(KS_PROPERTY_NOT_FOUND.into())
     }
 
     fn KsMethod(
         &self,
-        _method: *const KSIDENTIFIER,
-        _method_length: u32,
+        method: *const KSIDENTIFIER,
+        method_length: u32,
         _method_data: *mut core::ffi::c_void,
         _data_length: u32,
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
-        crate::t!("Source::KsMethod");
+        log_ksid("KsMethod", method, method_length);
         Err(KS_PROPERTY_NOT_FOUND.into())
     }
 
     fn KsEvent(
         &self,
-        _event: *const KSIDENTIFIER,
-        _event_length: u32,
+        event: *const KSIDENTIFIER,
+        event_length: u32,
         _event_data: *mut core::ffi::c_void,
         _data_length: u32,
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
-        crate::t!("Source::KsEvent");
+        log_ksid("KsEvent", event, event_length);
         Err(KS_PROPERTY_NOT_FOUND.into())
+    }
+}
+
+fn log_ksid(label: &str, id: *const KSIDENTIFIER, len: u32) {
+    unsafe {
+        if id.is_null() || len < std::mem::size_of::<KSIDENTIFIER>() as u32 {
+            crate::t!("Source::{label} (null or short id, len={len})");
+            return;
+        }
+        let ksid = &*id;
+        // KSIDENTIFIER overlays: Set (GUID) / Id (u32) / Flags (u32). The
+        // windows-rs definition uses a union; pull the fields out by
+        // treating the struct as a fixed-layout { GUID, u32, u32 }.
+        let bytes = core::slice::from_raw_parts(id as *const u8, 24);
+        let mut set_bytes = [0u8; 16];
+        set_bytes.copy_from_slice(&bytes[..16]);
+        let set_guid = GUID::from_values(
+            u32::from_le_bytes([set_bytes[0], set_bytes[1], set_bytes[2], set_bytes[3]]),
+            u16::from_le_bytes([set_bytes[4], set_bytes[5]]),
+            u16::from_le_bytes([set_bytes[6], set_bytes[7]]),
+            [
+                set_bytes[8], set_bytes[9], set_bytes[10], set_bytes[11], set_bytes[12],
+                set_bytes[13], set_bytes[14], set_bytes[15],
+            ],
+        );
+        let prop_id = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let flags = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let _ = ksid;
+        crate::t!(
+            "Source::{label} set={:?} id={} flags={:#x}",
+            set_guid,
+            prop_id,
+            flags
+        );
     }
 }
 
