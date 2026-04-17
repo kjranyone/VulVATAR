@@ -419,11 +419,51 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         &self,
         event: *const KSIDENTIFIER,
         event_length: u32,
-        _event_data: *mut core::ffi::c_void,
-        _data_length: u32,
-        _bytes_returned: *mut u32,
+        event_data: *mut core::ffi::c_void,
+        data_length: u32,
+        bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
         log_ksid("KsEvent", event, event_length);
+        crate::t!(
+            "Source::KsEvent data_ptr={:?} data_len={}",
+            event_data,
+            data_length
+        );
+
+        if let Some((set, id, flags)) = parse_ksid(event, event_length) {
+            if set == PROPSETID_VIDCAP_CAMERACONTROL
+                && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID
+            {
+                const KSEVENT_TYPE_ENABLE: u32 = 0x1;
+                const KSEVENT_TYPE_BASICSUPPORT: u32 = 0x200;
+                if flags & KSEVENT_TYPE_BASICSUPPORT != 0 {
+                    // Advertise the privacy-change event as supported.
+                    // We never actually fire it (privacy is always off for
+                    // a software source), but Windows 11 Frame Server
+                    // treats absent support as "camera can't report
+                    // privacy state" and refuses to register the device.
+                    unsafe {
+                        if !event_data.is_null() && data_length > 0 {
+                            core::ptr::write_bytes(
+                                event_data as *mut u8,
+                                0,
+                                data_length as usize,
+                            );
+                        }
+                        if !bytes_returned.is_null() {
+                            *bytes_returned = data_length;
+                        }
+                    }
+                    crate::t!("Source::KsEvent PRIVACY BASICSUPPORT -> S_OK");
+                    return Ok(());
+                }
+                if flags & KSEVENT_TYPE_ENABLE != 0 {
+                    crate::t!("Source::KsEvent PRIVACY ENABLE -> S_OK (never fires)");
+                    return Ok(());
+                }
+            }
+        }
+
         Err(KS_PROPERTY_NOT_FOUND.into())
     }
 }
