@@ -11,20 +11,25 @@
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER};
-use windows::Win32::Media::KernelStreaming::{IKsControl, IKsControl_Impl, KSIDENTIFIER};
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER};
+use windows::Win32::Media::KernelStreaming::{
+    IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
+};
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService, IMFGetService_Impl,
     IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource,
     IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl, IMFMediaStream, IMFMediaType,
     IMFPresentationDescriptor, IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl,
     IMFStreamDescriptor, MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType,
-    MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFMediaType_Video,
-    MFSampleAllocatorUsage, MFVideoFormat_RGB32, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-    MENewStream, MESourceStarted, MESourceStopped, MEStreamStarted, MEStreamStopped,
-    MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE, MF_E_SHUTDOWN, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MFVideoInterlace_Progressive,
+    MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFFrameSourceTypes_Color,
+    MFMediaType_Video, MFSampleAllocatorUsage, MFVideoFormat_RGB32,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted, MESourceStopped,
+    MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE,
+    MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MF_DEVICESTREAM_FRAMESERVER_SHARED,
+    MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID, MF_E_SHUTDOWN,
+    MF_E_UNSUPPORTED_SERVICE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MFVideoInterlace_Progressive,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -34,6 +39,7 @@ use crate::{dll_add_ref, dll_release};
 pub const DEFAULT_WIDTH: u32 = 1920;
 pub const DEFAULT_HEIGHT: u32 = 1080;
 pub const DEFAULT_FPS: u32 = 30;
+pub const DEFAULT_STREAM_ID: u32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceState {
@@ -92,9 +98,18 @@ impl VulvatarMediaSource {
 
         let media_type = build_default_media_type()?;
         let stream_descriptor =
-            unsafe { MFCreateStreamDescriptor(0, &[Some(media_type.clone())])? };
+            unsafe { MFCreateStreamDescriptor(DEFAULT_STREAM_ID, &[Some(media_type.clone())])? };
         let handler = unsafe { stream_descriptor.GetMediaTypeHandler()? };
         unsafe { handler.SetCurrentMediaType(&media_type)? };
+
+        // Frame Server inspects these attributes to decide whether a
+        // source is a Frame-Server-shareable camera. Omitting them (in
+        // particular MF_DEVICESTREAM_FRAMESERVER_SHARED) causes
+        // IMFVirtualCamera::Start to refuse with E_NOINTERFACE — not
+        // because any interface is missing, but because Frame Server
+        // won't dispatch the stream to the virtual-camera surface.
+        let sd_attrs: IMFAttributes = stream_descriptor.cast()?;
+        apply_stream_attributes(&sd_attrs)?;
 
         let presentation_descriptor = unsafe {
             MFCreatePresentationDescriptor(Some(&[Some(stream_descriptor.clone())]))?
@@ -105,11 +120,6 @@ impl VulvatarMediaSource {
 
         let event_queue = unsafe { MFCreateEventQueue()? };
 
-        // MF Frame Server fetches the source's IMFAttributes during
-        // MFCreateVirtualCamera / Start. An empty container is enough to
-        // pass the "is this actually a Frame Server source" check; extra
-        // attributes (MF_VIRTUALCAMERA_*, MF_DEVICESTREAM_* …) can be
-        // added later if specific clients require them.
         let source_attributes = unsafe {
             let mut a: Option<IMFAttributes> = None;
             MFCreateAttributes(&mut a, 1)?;
@@ -117,8 +127,10 @@ impl VulvatarMediaSource {
         };
         let stream_attributes = unsafe {
             let mut a: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut a, 1)?;
-            a.unwrap()
+            MFCreateAttributes(&mut a, 4)?;
+            let attrs = a.unwrap();
+            apply_stream_attributes(&attrs)?;
+            attrs
         };
 
         let _ = self.inner.set(Inner {
@@ -376,7 +388,12 @@ impl IMFGetService_Impl for VulvatarMediaSource_Impl {
             }
             *ppv_object = core::ptr::null_mut();
         }
-        Err(E_NOINTERFACE.into())
+        // Match MS SimpleMediaSource: callers that probe a service we
+        // don't offer expect MF_E_UNSUPPORTED_SERVICE, not E_NOINTERFACE.
+        // E_NOINTERFACE would suggest IMFGetService itself is missing,
+        // which would be a QI-level failure rather than a per-service
+        // rejection — some Frame Server code paths treat it as fatal.
+        Err(MF_E_UNSUPPORTED_SERVICE.into())
     }
 }
 
@@ -423,10 +440,11 @@ fn build_default_media_type() -> windows::core::Result<IMFMediaType> {
         let mt = MFCreateMediaType()?;
         mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+        mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        mt.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
         mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(DEFAULT_WIDTH, DEFAULT_HEIGHT))?;
         mt.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(DEFAULT_FPS, 1))?;
         mt.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1))?;
-        mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         Ok(mt)
     }
 }
@@ -434,6 +452,22 @@ fn build_default_media_type() -> windows::core::Result<IMFMediaType> {
 #[inline]
 fn pack_2x32(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
+}
+
+/// Apply the four stream-scoped attributes the Frame Server inspects to
+/// decide whether a stream is a colour-video Frame Server camera. Mirrors
+/// MS's SimpleMediaStream::_SetStreamDescriptorAttributes.
+fn apply_stream_attributes(attrs: &IMFAttributes) -> windows::core::Result<()> {
+    unsafe {
+        attrs.SetGUID(&MF_DEVICESTREAM_STREAM_CATEGORY, &PINNAME_VIDEO_CAPTURE)?;
+        attrs.SetUINT32(&MF_DEVICESTREAM_STREAM_ID, DEFAULT_STREAM_ID)?;
+        attrs.SetUINT32(&MF_DEVICESTREAM_FRAMESERVER_SHARED, 1)?;
+        attrs.SetUINT32(
+            &MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES,
+            MFFrameSourceTypes_Color.0 as u32,
+        )?;
+    }
+    Ok(())
 }
 
 // Compile-time guard: keep MFMEDIASOURCE_CHARACTERISTICS imported even when
