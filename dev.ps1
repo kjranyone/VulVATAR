@@ -28,6 +28,21 @@ function Install-Models {
     Write-Host "ONNX Models installed successfully." -ForegroundColor Green
 }
 
+function Uninstall-MfCamera {
+    Write-Host "Removing HKCU registration for VulVATAR virtual camera..." -ForegroundColor Cyan
+    $clsid = "{B5F1C320-2B8F-4A9C-9BDC-43B0E8E6B2E1}"
+    $key = "HKCU:\Software\Classes\CLSID\$clsid"
+    if (Test-Path $key) {
+        Remove-Item $key -Recurse -Force
+        Write-Host "Removed $key" -ForegroundColor Green
+    } else {
+        Write-Host "No registration found at $key (nothing to do)" -ForegroundColor DarkGray
+    }
+    # The registration the main app owns is MFVirtualCameraLifetime_Session,
+    # so any IMFVirtualCamera disappears with its process — nothing else to
+    # clean up.
+}
+
 $commands = @(
     @{ Label = "setup (download pose models)"; Cmd = "Install-Models" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
@@ -35,6 +50,7 @@ $commands = @(
     @{ Label = "run (debug)";      Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run' },
     @{ Label = "run (debug+lipsync)"; Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
     @{ Label = "run (release)";    Cmd = "cargo run --release" },
+    @{ Label = "uninstall mf virtual camera (HKCU)"; Cmd = "Uninstall-MfCamera" },
     @{ Label = "test";             Cmd = "cargo test" },
     @{ Label = "clippy";           Cmd = "cargo clippy" },
     @{ Label = "fmt";              Cmd = "cargo fmt" },

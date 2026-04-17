@@ -20,6 +20,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFVirtualCameraLifetime_Session, MFVirtualCameraType_SoftwareCameraSource, MFSTARTUP_FULL,
     MF_VERSION,
 };
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
+};
 
 /// Same CLSID as `vulvatar_mf_camera::CLSID_VULVATAR_MEDIA_SOURCE`. The
 /// constant is duplicated here rather than imported because the DLL is a
@@ -63,6 +67,17 @@ impl MfVirtualCamera {
     pub fn start(&mut self) -> Result<(), String> {
         if self.is_started() {
             return Ok(());
+        }
+
+        // Dev-friendly self-registration: point HKCU at our sibling DLL
+        // every run so debug/release toggling and rebuilds to fresh output
+        // paths "just work" without manual `regsvr32`. See
+        // [`ensure_dll_registered`].
+        if let Err(e) = ensure_dll_registered() {
+            warn!(
+                "output: could not auto-register vulvatar_mf_camera.dll ({e}); \
+                 falling back to whatever regsvr32 has written previously"
+            );
         }
 
         unsafe {
@@ -124,4 +139,97 @@ impl Drop for MfVirtualCamera {
             self.mf_started = false;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Self-registration: keep HKCU's inproc-server entry pointing at the DLL
+// that sits next to the currently-running exe.
+// ---------------------------------------------------------------------------
+
+/// Write the per-user COM class registration so `MFCreateVirtualCamera`
+/// (which ultimately calls `CoCreateInstance(CLSID_VULVATAR_MEDIA_SOURCE)`)
+/// can find our DLL, and so the registered path always matches the DLL
+/// produced by the current build. `cargo run` between debug/release or
+/// from different output directories stays functional without a manual
+/// `regsvr32`.
+///
+/// Writes three values under HKCU:
+/// ```text
+/// Software\Classes\CLSID\{CLSID}               = VulVATAR Virtual Camera
+/// Software\Classes\CLSID\{CLSID}\InprocServer32 = <sibling dll path>
+/// Software\Classes\CLSID\{CLSID}\InprocServer32\ThreadingModel = Both
+/// ```
+fn ensure_dll_registered() -> Result<(), String> {
+    let dll_path = sibling_dll_path()?;
+    let clsid_key = format!("Software\\Classes\\CLSID\\{}", CLSID_VULVATAR_MEDIA_SOURCE);
+    let inproc_key = format!("{clsid_key}\\InprocServer32");
+
+    write_reg_string(&clsid_key, None, VULVATAR_CAMERA_FRIENDLY_NAME)?;
+    write_reg_string(&inproc_key, None, &dll_path)?;
+    write_reg_string(&inproc_key, Some("ThreadingModel"), "Both")?;
+    info!(
+        "output: HKCU COM class {} → {}",
+        CLSID_VULVATAR_MEDIA_SOURCE, dll_path
+    );
+    Ok(())
+}
+
+/// Full path to `vulvatar_mf_camera.dll` that sits alongside the running
+/// executable. Rust's `cargo build` drops both artefacts into the same
+/// `target/<profile>/` directory, so a straight sibling lookup is correct
+/// for dev builds. Installers place the DLL next to the installed exe, so
+/// the same lookup works for shipped builds too.
+fn sibling_dll_path() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "exe has no parent directory".to_string())?;
+    let dll = dir.join("vulvatar_mf_camera.dll");
+    if !dll.exists() {
+        return Err(format!(
+            "{} not found — run `cargo build -p vulvatar-mf-camera`",
+            dll.display()
+        ));
+    }
+    dll.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "dll path contains non-UTF8 characters".to_string())
+}
+
+fn write_reg_string(subkey: &str, value_name: Option<&str>, value: &str) -> Result<(), String> {
+    let subkey_w: HSTRING = subkey.into();
+    let mut key = HKEY::default();
+    let res = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey_w.as_ptr()),
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if res.is_err() {
+        return Err(format!("RegCreateKeyExW({subkey}): {res:?}"));
+    }
+
+    let value_w: HSTRING = value.into();
+    let value_name_w: Option<HSTRING> = value_name.map(|n| n.into());
+    let value_bytes = unsafe {
+        core::slice::from_raw_parts(value_w.as_ptr() as *const u8, (value_w.len() + 1) * 2)
+    };
+    let name_pcwstr = value_name_w
+        .as_ref()
+        .map(|s| PCWSTR(s.as_ptr()))
+        .unwrap_or(PCWSTR::null());
+    let res = unsafe { RegSetValueExW(key, name_pcwstr, 0, REG_SZ, Some(value_bytes)) };
+    let _ = unsafe { RegCloseKey(key) };
+    if res.is_err() {
+        return Err(format!("RegSetValueExW({subkey}): {res:?}"));
+    }
+    Ok(())
 }
