@@ -325,16 +325,51 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             }
 
             // Camera interaction: orbit (left-drag), pan (middle-drag/right-drag), zoom (scroll).
-            if response.dragged_by(egui::PointerButton::Primary) {
-                let delta = response.drag_delta();
+            //
+            // While any viewport drag is active the cursor is locked and hidden
+            // so the user gets Blender-style infinite movement.  Raw mouse
+            // deltas come from `pointer.motion()` (DeviceEvent::MouseMotion)
+            // which is independent of cursor position.
+            let drag_orbit = response.dragged_by(egui::PointerButton::Primary);
+            let drag_pan = response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle);
+            let any_drag = drag_orbit || drag_pan;
+
+            if any_drag && !state.viewport_cursor_grabbed {
+                // First frame of a drag — lock the cursor.
+                state.viewport_drag_origin = ctx.input(|i| i.pointer.interact_pos());
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                    egui::viewport::CursorGrab::Locked,
+                ));
+                state.viewport_cursor_grabbed = true;
+            } else if !any_drag && state.viewport_cursor_grabbed {
+                // Drag ended — unlock the cursor and warp back to the origin.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                    egui::viewport::CursorGrab::None,
+                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                if let Some(origin) = state.viewport_drag_origin.take() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(origin));
+                }
+                state.viewport_cursor_grabbed = false;
+            }
+
+            // Use raw device motion when the cursor is locked; fall back to
+            // the normal drag delta otherwise (first frame of drag, or if the
+            // platform doesn't support CursorGrab::Locked).
+            let delta = if state.viewport_cursor_grabbed {
+                ctx.input(|i| i.pointer.motion()).unwrap_or_else(|| response.drag_delta())
+            } else {
+                response.drag_delta()
+            };
+
+            if drag_orbit {
                 state.camera_orbit.yaw_deg += delta.x * 0.3;
                 state.camera_orbit.pitch_deg += delta.y * 0.3;
                 state.project_dirty = true;
             }
-            if response.dragged_by(egui::PointerButton::Secondary)
-                || response.dragged_by(egui::PointerButton::Middle)
-            {
-                let delta = response.drag_delta();
+            if drag_pan {
                 let scale = 0.002 * state.camera_orbit.distance * 0.2;
                 state.camera_orbit.pan[0] += delta.x * scale;
                 state.camera_orbit.pan[1] -= delta.y * scale;

@@ -235,6 +235,10 @@ pub struct GuiApp {
     pub viewport_texture: Option<egui::TextureHandle>,
     pub viewport_last_frame: u64,
 
+    // Infinite-drag state (Blender-style cursor grab during orbit/pan)
+    pub viewport_cursor_grabbed: bool,
+    pub viewport_drag_origin: Option<egui::Pos2>,
+
     // Avatar library GUI state
     pub library_search_query: String,
     pub library_selected_index: Option<usize>,
@@ -395,6 +399,8 @@ impl GuiApp {
 
             viewport_texture: None,
             viewport_last_frame: 0,
+            viewport_cursor_grabbed: false,
+            viewport_drag_origin: None,
 
             library_search_query: String::new(),
             library_selected_index: None,
@@ -419,6 +425,15 @@ impl GuiApp {
             .tracking_worker
             .as_ref()
             .map_or(false, |w| w.is_running())
+    }
+
+    /// Whether the tracking worker has finished initialisation and is
+    /// actively producing frames.
+    pub fn is_tracking_ready(&self) -> bool {
+        self.app
+            .tracking_worker
+            .as_ref()
+            .map_or(false, |w| w.is_ready())
     }
 
     /// Push a notification message that will auto-dismiss after 5 seconds.

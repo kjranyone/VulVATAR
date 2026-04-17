@@ -521,10 +521,15 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if state.is_tracking_active() {
+                let active = state.is_tracking_active();
+                let ready = state.is_tracking_ready();
+                if active && ready {
                     if ui.button("Stop Camera").clicked() {
                         state.app.stop_tracking();
                     }
+                } else if active {
+                    // Camera is initialising — show a disabled placeholder.
+                    ui.add_enabled(false, egui::Button::new("Preparing..."));
                 } else if ui.button("Start Camera").clicked() {
                     let (w, h) = match state.tracking.camera_resolution_index {
                         1 => (1280, 720),
@@ -609,8 +614,11 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(true)
         .show(ui, |ui| {
             let camera_running = state.is_tracking_active();
+            let camera_ready = state.is_tracking_ready();
             let tracking_on = state.tracking.toggle_tracking;
-            let (status_color, status_text) = if camera_running && tracking_on {
+            let (status_color, status_text) = if camera_running && !camera_ready {
+                (egui::Color32::YELLOW, "Preparing camera...")
+            } else if camera_running && tracking_on {
                 (egui::Color32::GREEN, "Running")
             } else if camera_running {
                 (egui::Color32::YELLOW, "Camera active (tracking paused)")

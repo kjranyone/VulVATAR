@@ -653,6 +653,7 @@ impl TrackingSource {
 pub struct TrackingWorker {
     handle: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
     mailbox: TrackingMailbox,
     backend: CameraBackend,
 }
@@ -665,6 +666,7 @@ impl TrackingWorker {
         Self {
             handle: None,
             running: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(AtomicBool::new(false)),
             mailbox,
             backend: CameraBackend::default(),
         }
@@ -678,6 +680,12 @@ impl TrackingWorker {
     /// Returns `true` if the worker thread is currently running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// Returns `true` once the worker has finished initialisation (camera
+    /// opened or fallback engaged) and is actively producing frames.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
 
     /// Returns the backend this worker was started with.
@@ -703,7 +711,9 @@ impl TrackingWorker {
 
         self.backend = backend.clone();
         self.running = Arc::new(AtomicBool::new(true));
+        self.ready = Arc::new(AtomicBool::new(false));
         let running = Arc::clone(&self.running);
+        let ready = Arc::clone(&self.ready);
         let mailbox = self.mailbox.clone();
         let target_fps: u64 = fps.max(1) as u64;
         let frame_interval = Duration::from_micros(1_000_000 / target_fps);
@@ -715,6 +725,7 @@ impl TrackingWorker {
                     backend,
                     mailbox,
                     running,
+                    ready,
                     frame_interval,
                     width,
                     height,
@@ -759,6 +770,7 @@ impl TrackingWorker {
         backend: CameraBackend,
         mailbox: TrackingMailbox,
         running: Arc<AtomicBool>,
+        ready: Arc<AtomicBool>,
         frame_interval: Duration,
         width: u32,
         height: u32,
@@ -767,6 +779,7 @@ impl TrackingWorker {
         match backend {
             CameraBackend::Synthetic => {
                 let _ = (width, height, fps);
+                ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(&mailbox, &running, frame_interval);
             }
             #[cfg(feature = "webcam")]
@@ -775,6 +788,7 @@ impl TrackingWorker {
                     camera_index,
                     &mailbox,
                     &running,
+                    &ready,
                     frame_interval,
                     width,
                     height,
@@ -782,6 +796,8 @@ impl TrackingWorker {
                 );
             }
         }
+        // Ensure running is cleared when the thread exits for any reason.
+        running.store(false, Ordering::SeqCst);
     }
 
     /// Generate synthetic tracking data in a loop.
@@ -812,6 +828,7 @@ impl TrackingWorker {
         camera_index: usize,
         mailbox: &TrackingMailbox,
         running: &AtomicBool,
+        ready: &AtomicBool,
         interval: Duration,
         width: u32,
         height: u32,
@@ -834,6 +851,7 @@ impl TrackingWorker {
                     camera_index, e
                 ));
                 warn!("tracking-worker: falling back to synthetic backend");
+                ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(mailbox, running, interval);
                 return;
             }
@@ -847,6 +865,7 @@ impl TrackingWorker {
         let mut pose_estimator: Option<inference::CigPoseInference> = None;
 
         info!("tracking-worker: webcam opened successfully");
+        ready.store(true, Ordering::SeqCst);
         let mut frame_index: u64 = 0;
         let mut consecutive_errors: u32 = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 30;
