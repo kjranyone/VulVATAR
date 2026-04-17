@@ -1,0 +1,33 @@
+[package]
+name = "vulvatar-mf-camera"
+version = "0.1.0"
+edition = "2021"
+description = "MediaFoundation software media source DLL for the VulVATAR virtual camera"
+
+[lib]
+# cdylib so we produce a COM inproc server DLL loadable by regsvr32 and by
+# MFCreateVirtualCamera. `vulvatar_mf_camera.dll` is the output name; the
+# main app and installation scripts reference it under that name.
+name = "vulvatar_mf_camera"
+crate-type = ["cdylib"]
+
+[dependencies]
+log = "0.4"
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Variant",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
