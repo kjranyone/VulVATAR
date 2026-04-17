@@ -1,6 +1,8 @@
 pub mod directshow_filter;
 pub mod dshow_source;
 pub mod frame_sink;
+#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
+pub mod mf_virtual_camera;
 pub mod virtual_camera_native;
 
 pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter};

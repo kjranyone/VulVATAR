@@ -21,6 +21,7 @@
 
 mod class_factory;
 mod media_source;
+mod media_stream;
 mod registry;
 
 use core::ffi::c_void;

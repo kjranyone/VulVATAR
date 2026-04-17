@@ -117,6 +117,11 @@ pub struct Application {
     pub output_extent: Option<[u32; 2]>,
 
     pub tracking_worker: Option<TrackingWorker>,
+    /// Lifetime owner for the MediaFoundation virtual-camera registration.
+    /// `None` until the user enables the VirtualCamera output sink; held
+    /// for the rest of the process so the camera stays visible to clients.
+    #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
+    pub mf_virtual_camera: Option<crate::output::mf_virtual_camera::MfVirtualCamera>,
     shutdown_complete: bool,
     pub viewport_background: Option<std::path::PathBuf>,
     pub ground_grid_visible: bool,
@@ -190,6 +195,8 @@ impl Application {
             viewport_lighting: LightingState::default(),
             output_extent: None,
             tracking_worker: None,
+            #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
+            mf_virtual_camera: None,
             shutdown_complete: false,
             stale_warn_cooldown: std::time::Instant::now(),
             viewport_background: None,
@@ -749,7 +756,43 @@ impl Application {
     /// creating a new one with the selected sink.
     pub fn set_output_sink(&mut self, sink: FrameSink) {
         self.output.shutdown();
-        self.output = OutputRouter::new(sink);
+        self.output = OutputRouter::new(sink.clone());
+
+        #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
+        {
+            // Register the MediaFoundation virtual camera the first time
+            // the user picks the VirtualCamera sink, and tear it back down
+            // when they switch away. The shared-memory-frame plumbing is
+            // independent (frames flow even if the camera is unregistered),
+            // but client apps only see "VulVATAR Virtual Camera" in their
+            // device picker while the IMFVirtualCamera is alive.
+            use crate::output::mf_virtual_camera::MfVirtualCamera;
+            match sink {
+                FrameSink::VirtualCamera => {
+                    if self.mf_virtual_camera.is_none() {
+                        let mut cam = MfVirtualCamera::new();
+                        match cam.start() {
+                            Ok(()) => {
+                                info!("output: MediaFoundation virtual camera registered");
+                                self.mf_virtual_camera = Some(cam);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "output: MFCreateVirtualCamera failed ({e}); is \
+                                     vulvatar_mf_camera.dll registered? Run \
+                                     `regsvr32 /n /i:user vulvatar_mf_camera.dll` once."
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if self.mf_virtual_camera.take().is_some() {
+                        info!("output: MediaFoundation virtual camera unregistered");
+                    }
+                }
+            }
+        }
     }
 
     /// Start the tracking worker thread with default resolution/fps. No-op if already running.
