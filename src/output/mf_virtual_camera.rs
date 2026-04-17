@@ -146,21 +146,25 @@ impl Drop for MfVirtualCamera {
 // that sits next to the currently-running exe.
 // ---------------------------------------------------------------------------
 
-/// Write the per-user COM class registration so `MFCreateVirtualCamera`
-/// (which ultimately calls `CoCreateInstance(CLSID_VULVATAR_MEDIA_SOURCE)`)
-/// can find our DLL, and so the registered path always matches the DLL
-/// produced by the current build. `cargo run` between debug/release or
-/// from different output directories stays functional without a manual
-/// `regsvr32`.
+/// Ensure HKCU points at a fresh, unlocked copy of the DLL, then return.
+///
+/// **Why the copy?** Windows' Frame Server loads whatever path is in
+/// `InprocServer32` and keeps it `LoadLibrary`-held long after our
+/// process exits. If we registered `target/debug/vulvatar_mf_camera.dll`
+/// directly, the next `cargo build` would hit "access denied" when
+/// linking a rebuilt DLL. By copying the canonical build output to a
+/// per-run scratch file and registering *that* path, the canonical build
+/// output is never loaded by any client — `cargo build` is always free
+/// to overwrite it.
 ///
 /// Writes three values under HKCU:
 /// ```text
 /// Software\Classes\CLSID\{CLSID}               = VulVATAR Virtual Camera
-/// Software\Classes\CLSID\{CLSID}\InprocServer32 = <sibling dll path>
+/// Software\Classes\CLSID\{CLSID}\InprocServer32 = <scratch dll path>
 /// Software\Classes\CLSID\{CLSID}\InprocServer32\ThreadingModel = Both
 /// ```
 fn ensure_dll_registered() -> Result<(), String> {
-    let dll_path = sibling_dll_path()?;
+    let dll_path = prepare_scratch_dll()?;
     let clsid_key = format!("Software\\Classes\\CLSID\\{}", CLSID_VULVATAR_MEDIA_SOURCE);
     let inproc_key = format!("{clsid_key}\\InprocServer32");
 
@@ -174,27 +178,52 @@ fn ensure_dll_registered() -> Result<(), String> {
     Ok(())
 }
 
-/// Full path to `vulvatar_mf_camera.dll` that sits alongside the running
-/// executable. Rust's `cargo build` drops both artefacts into the same
-/// `target/<profile>/` directory, so a straight sibling lookup is correct
-/// for dev builds. Installers place the DLL next to the installed exe, so
-/// the same lookup works for shipped builds too.
-fn sibling_dll_path() -> Result<String, String> {
+/// Copy the canonical `vulvatar_mf_camera.dll` (produced by cargo next
+/// to the running exe) into a timestamped scratch file inside
+/// `<exe_dir>/mf-camera-runtime/`. Old scratch files left over from
+/// previous runs are deleted best-effort; any that remain locked by a
+/// still-loaded Frame Server stay on disk and are ignored.
+fn prepare_scratch_dll() -> Result<String, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("current_exe: {e}"))?;
-    let dir = exe
+    let exe_dir = exe
         .parent()
         .ok_or_else(|| "exe has no parent directory".to_string())?;
-    let dll = dir.join("vulvatar_mf_camera.dll");
-    if !dll.exists() {
+
+    let source = exe_dir.join("vulvatar_mf_camera.dll");
+    if !source.exists() {
         return Err(format!(
-            "{} not found — run `cargo build -p vulvatar-mf-camera`",
-            dll.display()
+            "{} not found — `cargo build` should produce it alongside the exe",
+            source.display()
         ));
     }
-    dll.to_str()
+
+    let scratch_dir = exe_dir.join("mf-camera-runtime");
+    std::fs::create_dir_all(&scratch_dir)
+        .map_err(|e| format!("create {}: {e}", scratch_dir.display()))?;
+
+    // Best-effort cleanup of earlier scratch copies. Anything still held
+    // open by Frame Server will fail to delete — harmless, they just sit
+    // there until the next successful sweep. Cargo clean wipes the
+    // parent target directory when the developer really wants a reset.
+    if let Ok(rd) = std::fs::read_dir(&scratch_dir) {
+        for entry in rd.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let target = scratch_dir.join(format!("vulvatar_mf_camera_{ts}.dll"));
+    std::fs::copy(&source, &target)
+        .map_err(|e| format!("copy DLL to scratch {}: {e}", target.display()))?;
+
+    target
+        .to_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| "dll path contains non-UTF8 characters".to_string())
+        .ok_or_else(|| "scratch path contains non-UTF8 characters".to_string())
 }
 
 fn write_reg_string(subkey: &str, value_name: Option<&str>, value: &str) -> Result<(), String> {

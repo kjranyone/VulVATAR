@@ -777,11 +777,7 @@ impl Application {
                                 self.mf_virtual_camera = Some(cam);
                             }
                             Err(e) => {
-                                warn!(
-                                    "output: MFCreateVirtualCamera failed ({e}); is \
-                                     vulvatar_mf_camera.dll registered? Run \
-                                     `regsvr32 /n /i:user vulvatar_mf_camera.dll` once."
-                                );
+                                warn!("output: MFCreateVirtualCamera failed ({e})");
                             }
                         }
                     }

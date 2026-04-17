@@ -13,15 +13,15 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
 use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncResult, IMFMediaEvent, IMFMediaEventGenerator_Impl,
-    IMFMediaEventQueue, IMFMediaSource, IMFMediaSource_Impl, IMFMediaStream, IMFMediaType,
-    IMFPresentationDescriptor, IMFStreamDescriptor, MFCreateEventQueue, MFCreateMediaType,
-    MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFMediaType_Video,
-    MFVideoFormat_RGB32, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted,
-    MESourceStopped, MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS,
-    MFMEDIASOURCE_IS_LIVE, MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MFVideoInterlace_Progressive,
+    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent, IMFMediaEventGenerator_Impl,
+    IMFMediaEventQueue, IMFMediaSource, IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl,
+    IMFMediaStream, IMFMediaType, IMFPresentationDescriptor, IMFStreamDescriptor,
+    MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType, MFCreatePresentationDescriptor,
+    MFCreateStreamDescriptor, MFMediaType_Video, MFVideoFormat_RGB32,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted, MESourceStopped,
+    MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE,
+    MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFVideoInterlace_Progressive,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -40,7 +40,7 @@ enum SourceState {
     Shutdown,
 }
 
-#[implement(IMFMediaSource)]
+#[implement(IMFMediaSourceEx, IMFMediaSource)]
 pub struct VulvatarMediaSource {
     inner: OnceLock<Inner>,
     mutable: Mutex<MutableState>,
@@ -50,6 +50,8 @@ struct Inner {
     event_queue: IMFMediaEventQueue,
     presentation_descriptor: IMFPresentationDescriptor,
     stream_descriptor: IMFStreamDescriptor,
+    source_attributes: IMFAttributes,
+    stream_attributes: IMFAttributes,
 }
 
 struct MutableState {
@@ -94,10 +96,28 @@ impl VulvatarMediaSource {
 
         let event_queue = unsafe { MFCreateEventQueue()? };
 
+        // MF Frame Server fetches the source's IMFAttributes during
+        // MFCreateVirtualCamera / Start. An empty container is enough to
+        // pass the "is this actually a Frame Server source" check; extra
+        // attributes (MF_VIRTUALCAMERA_*, MF_DEVICESTREAM_* …) can be
+        // added later if specific clients require them.
+        let source_attributes = unsafe {
+            let mut a: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut a, 1)?;
+            a.unwrap()
+        };
+        let stream_attributes = unsafe {
+            let mut a: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut a, 1)?;
+            a.unwrap()
+        };
+
         let _ = self.inner.set(Inner {
             event_queue,
             presentation_descriptor,
             stream_descriptor,
+            source_attributes,
+            stream_attributes,
         });
         Ok(self.inner.get().unwrap())
     }
@@ -259,6 +279,30 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
         }
         self.mutable.lock().unwrap().state = SourceState::Shutdown;
         self.mutable.lock().unwrap().stream = None;
+        Ok(())
+    }
+}
+
+impl IMFMediaSourceEx_Impl for VulvatarMediaSource_Impl {
+    fn GetSourceAttributes(&self) -> windows::core::Result<IMFAttributes> {
+        let inner = self.initialised()?;
+        Ok(inner.source_attributes.clone())
+    }
+
+    fn GetStreamAttributes(
+        &self,
+        _stream_id: u32,
+    ) -> windows::core::Result<IMFAttributes> {
+        // Only one stream (id 0). Return the same container regardless so
+        // clients can set per-stream state there too.
+        let inner = self.initialised()?;
+        Ok(inner.stream_attributes.clone())
+    }
+
+    fn SetD3DManager(&self, _manager: Option<&IUnknown>) -> windows::core::Result<()> {
+        // Software source: we do not participate in the DX manager hand-off.
+        // Returning S_OK lets MF continue; MF_E_UNSUPPORTED would also be
+        // legal but some clients treat it as fatal.
         Ok(())
     }
 }
