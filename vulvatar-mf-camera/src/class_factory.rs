@@ -10,7 +10,7 @@ use windows::core::{implement, IUnknown, Interface, GUID};
 use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 
-use crate::{dll_add_ref, dll_release, media_source::VulvatarMediaSource};
+use crate::{activate::VulvatarActivate, dll_add_ref, dll_release};
 
 #[implement(IClassFactory)]
 pub struct VulvatarClassFactory;
@@ -36,16 +36,25 @@ impl IClassFactory_Impl for VulvatarClassFactory_Impl {
         ppv: *mut *mut c_void,
     ) -> windows::core::Result<()> {
         unsafe {
+            crate::t!("ClassFactory::CreateInstance iid={:?}", *iid);
             if ppv.is_null() {
+                crate::t!("ClassFactory::CreateInstance: null ppv");
                 return Err(E_POINTER.into());
             }
             *ppv = core::ptr::null_mut();
             if outer.is_some() {
+                crate::t!("ClassFactory::CreateInstance: aggregation");
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
 
-            let source: IUnknown = VulvatarMediaSource::new().into();
-            let hr = source.query(iid, ppv);
+            // `CoCreateInstance(CLSID, IID_IMFActivate)` is how Frame
+            // Server probes software camera CLSIDs. We therefore return
+            // an IMFActivate wrapper; the real media source is lazily
+            // constructed inside `VulvatarActivate::ActivateObject`.
+            let activate_unk: IUnknown =
+                VulvatarActivate::new().map_err(|e| windows::core::Error::from(e))?.into();
+            let hr = activate_unk.query(iid, ppv);
+            crate::t!("ClassFactory::CreateInstance: activate.query -> {:?}", hr);
             if hr.is_err() {
                 return Err(hr.into());
             }

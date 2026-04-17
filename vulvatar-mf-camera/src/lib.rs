@@ -19,10 +19,13 @@
 #![cfg(target_os = "windows")]
 #![allow(non_snake_case)]
 
+mod activate;
 mod class_factory;
 mod media_source;
 mod media_stream;
 mod registry;
+#[macro_use]
+pub mod trace;
 
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,18 +63,23 @@ pub unsafe extern "system" fn DllGetClassObject(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    t!("DllGetClassObject enter");
     if rclsid.is_null() || riid.is_null() || ppv.is_null() {
+        t!("DllGetClassObject: null pointer");
         return E_POINTER;
     }
     *ppv = core::ptr::null_mut();
 
     if *rclsid != CLSID_VULVATAR_MEDIA_SOURCE {
+        t!("DllGetClassObject: CLSID mismatch");
         return CLASS_E_CLASSNOTAVAILABLE;
     }
 
     let factory: IClassFactory = class_factory::VulvatarClassFactory::new().into();
     let unk: IUnknown = factory.cast().unwrap_or_else(|_| factory.clone().into());
-    unk.query(riid, ppv)
+    let hr = unk.query(riid, ppv);
+    t!("DllGetClassObject: query riid={:?} -> {:?}", *riid, hr);
+    hr
 }
 
 /// `DllCanUnloadNow` — COM hook letting the loader release this DLL.

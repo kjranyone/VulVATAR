@@ -155,6 +155,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
         &self,
         flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
     ) -> windows::core::Result<IMFMediaEvent> {
+        crate::t!("Source::GetEvent flags={:#x}", flags.0);
         let inner = self.initialised()?;
         unsafe { inner.event_queue.GetEvent(flags.0 as u32) }
     }
@@ -164,6 +165,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
         callback: Option<&IMFAsyncCallback>,
         state: Option<&IUnknown>,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::BeginGetEvent");
         let inner = self.initialised()?;
         unsafe { inner.event_queue.BeginGetEvent(callback, state) }
     }
@@ -172,6 +174,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
         &self,
         result: Option<&IMFAsyncResult>,
     ) -> windows::core::Result<IMFMediaEvent> {
+        crate::t!("Source::EndGetEvent");
         let inner = self.initialised()?;
         unsafe { inner.event_queue.EndGetEvent(result) }
     }
@@ -183,6 +186,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
         hr_status: HRESULT,
         value: *const PROPVARIANT,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::QueueEvent met={}", met);
         let inner = self.initialised()?;
         unsafe { inner.event_queue.QueueEventParamVar(met, guid_extended_type, hr_status, value) }
     }
@@ -190,6 +194,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
 
 impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
     fn GetCharacteristics(&self) -> windows::core::Result<u32> {
+        crate::t!("Source::GetCharacteristics");
         // Live software source, no seeking, no rate control.
         Ok(MFMEDIASOURCE_IS_LIVE.0 as u32)
     }
@@ -197,9 +202,8 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
     fn CreatePresentationDescriptor(
         &self,
     ) -> windows::core::Result<IMFPresentationDescriptor> {
+        crate::t!("Source::CreatePresentationDescriptor");
         let inner = self.initialised()?;
-        // MF requires a fresh clone per call so callers can mutate
-        // selection independently.
         unsafe { inner.presentation_descriptor.Clone() }
     }
 
@@ -209,6 +213,7 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
         _time_format: *const GUID,
         _start_position: *const PROPVARIANT,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::Start pd={}", pd.is_some());
         let inner = self.initialised()?;
         let pd = pd.ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
 
@@ -306,24 +311,19 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
 
 impl IMFMediaSourceEx_Impl for VulvatarMediaSource_Impl {
     fn GetSourceAttributes(&self) -> windows::core::Result<IMFAttributes> {
+        crate::t!("SourceEx::GetSourceAttributes");
         let inner = self.initialised()?;
         Ok(inner.source_attributes.clone())
     }
 
-    fn GetStreamAttributes(
-        &self,
-        _stream_id: u32,
-    ) -> windows::core::Result<IMFAttributes> {
-        // Only one stream (id 0). Return the same container regardless so
-        // clients can set per-stream state there too.
+    fn GetStreamAttributes(&self, stream_id: u32) -> windows::core::Result<IMFAttributes> {
+        crate::t!("SourceEx::GetStreamAttributes id={}", stream_id);
         let inner = self.initialised()?;
         Ok(inner.stream_attributes.clone())
     }
 
     fn SetD3DManager(&self, _manager: Option<&IUnknown>) -> windows::core::Result<()> {
-        // Software source: we do not participate in the DX manager hand-off.
-        // Returning S_OK lets MF continue; MF_E_UNSUPPORTED would also be
-        // legal but some clients treat it as fatal.
+        crate::t!("SourceEx::SetD3DManager");
         Ok(())
     }
 }
@@ -343,6 +343,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _data_length: u32,
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::KsProperty");
         Err(E_NOTIMPL.into())
     }
 
@@ -354,6 +355,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _data_length: u32,
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::KsMethod");
         Err(E_NOTIMPL.into())
     }
 
@@ -365,6 +367,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         _data_length: u32,
         _bytes_returned: *mut u32,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::KsEvent");
         Err(E_NOTIMPL.into())
     }
 }
@@ -378,11 +381,16 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
 impl IMFGetService_Impl for VulvatarMediaSource_Impl {
     fn GetService(
         &self,
-        _guid_service: *const GUID,
-        _riid: *const GUID,
+        guid_service: *const GUID,
+        riid: *const GUID,
         ppv_object: *mut *mut core::ffi::c_void,
     ) -> windows::core::Result<()> {
         unsafe {
+            crate::t!(
+                "Source::GetService guid={:?} riid={:?}",
+                if guid_service.is_null() { GUID::zeroed() } else { *guid_service },
+                if riid.is_null() { GUID::zeroed() } else { *riid },
+            );
             if ppv_object.is_null() {
                 return Err(E_POINTER.into());
             }
@@ -407,6 +415,7 @@ impl IMFSampleAllocatorControl_Impl for VulvatarMediaSource_Impl {
         _output_stream_id: u32,
         _allocator: Option<&IUnknown>,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::SetDefaultAllocator");
         Ok(())
     }
 
@@ -416,6 +425,7 @@ impl IMFSampleAllocatorControl_Impl for VulvatarMediaSource_Impl {
         input_stream_id: *mut u32,
         usage: *mut MFSampleAllocatorUsage,
     ) -> windows::core::Result<()> {
+        crate::t!("Source::GetAllocatorUsage");
         unsafe {
             if !input_stream_id.is_null() {
                 *input_stream_id = 0;

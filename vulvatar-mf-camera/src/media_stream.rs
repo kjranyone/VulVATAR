@@ -102,17 +102,17 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaStream_Impl {
 
 impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
     fn GetMediaSource(&self) -> windows::core::Result<IMFMediaSource> {
+        crate::t!("Stream::GetMediaSource");
         Ok(self.inner.lock().unwrap().parent_source.clone())
     }
 
     fn GetStreamDescriptor(&self) -> windows::core::Result<IMFStreamDescriptor> {
+        crate::t!("Stream::GetStreamDescriptor");
         Ok(self.inner.lock().unwrap().descriptor.clone())
     }
 
     fn RequestSample(&self, _token: Option<&IUnknown>) -> windows::core::Result<()> {
-        // No frames yet — the device will appear in the camera picker but
-        // produce no video until the shared-memory pipe is wired (task
-        // #10). Returning E_NOTIMPL signals "no sample available".
+        crate::t!("Stream::RequestSample");
         Err(E_NOTIMPL.into())
     }
 }
