@@ -104,8 +104,8 @@ pub struct TrackingGuiState {
 }
 
 pub struct LipSyncGuiState {
-    pub enabled: bool,
-    pub mic_device_index: usize,
+    /// List of mics enumerated for the dropdown. Pure UI artifact —
+    /// runtime state (selected mic + enabled flag) lives on Application.
     pub available_mics: Vec<crate::lipsync::AudioDeviceInfo>,
     pub volume_threshold: f32,
     pub smoothing: f32,
@@ -133,8 +133,15 @@ pub struct RenderingGuiState {
     pub toggle_skeleton_debug: bool,
 }
 
+/// Output settings the inspector binds to. The pipeline-bound fields
+/// (sink) live exclusively on `Application` after Phase C — the inspector
+/// reads them via getters (`app.output.active_sink()`) and writes via
+/// mutators (`app.ensure_output_sink_runtime()`).
+///
+/// The other fields below are not yet wired to any pipeline consumer
+/// (Phase B). They remain GUI-only state for now and are persisted via
+/// `to_project_state` so the user's selection survives across sessions.
 pub struct OutputGuiState {
-    pub output_sink_index: usize,
     pub output_resolution_index: usize,
     pub output_framerate_index: usize,
     pub output_has_alpha: bool,
@@ -369,7 +376,6 @@ impl GuiApp {
                 toggle_skeleton_debug: false,
             },
             output: OutputGuiState {
-                output_sink_index: 2,
                 output_resolution_index: 0,
                 output_framerate_index: 0,
                 output_has_alpha: true,
@@ -385,8 +391,6 @@ impl GuiApp {
             camera_wipe_rgba_buf: Vec::new(),
 
             lipsync: LipSyncGuiState {
-                enabled: false,
-                mic_device_index: 0,
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
                 volume_threshold: 0.01,
                 smoothing: 0.5,
@@ -537,12 +541,12 @@ impl GuiApp {
             toggle_spring: self.rendering.toggle_spring,
             toggle_cloth: self.rendering.toggle_cloth,
 
-            lipsync_enabled: self.lipsync.enabled,
-            lipsync_mic_device_index: self.lipsync.mic_device_index,
+            lipsync_enabled: self.app.is_lipsync_enabled(),
+            lipsync_mic_device_index: self.app.lipsync_mic_device_index(),
             lipsync_volume_threshold: self.lipsync.volume_threshold,
             lipsync_smoothing: self.lipsync.smoothing,
 
-            output_sink_index: self.output.output_sink_index,
+            output_sink_index: self.app.output.active_sink().to_gui_index(),
             output_resolution_index: self.output.output_resolution_index,
             output_framerate_index: self.output.output_framerate_index,
             output_has_alpha: self.output.output_has_alpha,
@@ -550,58 +554,24 @@ impl GuiApp {
         }
     }
 
-    /// Bring `Application` runtime state in line with the current `GuiState`
-    /// values. Idempotent — comparing requested vs active state means
-    /// repeated calls are no-ops.
-    ///
-    /// Pipeline-bound GuiState fields live in two places: a shadow value on
-    /// the GUI side (so combo boxes can bind to it) and the runtime state
-    /// on the [`Application`] side (OutputRouter, lipsync_processor,
-    /// mf_virtual_camera). Anything that mutates the GUI shadow value —
-    /// combo box `onchange`, project load, profile apply — should call
-    /// this after the mutation so the App side catches up. Skipping it is
-    /// the bug class T11 was created to fix.
-    ///
-    /// Tracking deliberately is **not** reconciled here: `tracking.toggle_tracking`
-    /// is the inference gate (read each frame to decide whether to apply
-    /// pose), not the camera-worker lifecycle. Webcam start/stop is owned
-    /// by the Inspector's Start/Stop Camera buttons. Auto-starting on load
-    /// would surprise the user by opening the webcam every time a project
-    /// is opened.
-    pub fn reconcile_app_with_gui(&mut self) {
-        self.reconcile_output_runtime();
-        self.reconcile_lipsync_runtime();
-    }
-
-    fn reconcile_output_runtime(&mut self) {
+    /// Apply the pipeline-bound parts of a saved snapshot directly to
+    /// `Application` mutators. After Phase C the GUI no longer holds shadow
+    /// values for these settings — `Application` is the single source of
+    /// truth. Failures surface as user-visible notifications; the App stays
+    /// at its previous state, which the GUI will display on the next frame.
+    fn apply_pipeline_bound_settings(
+        &mut self,
+        sink_index: usize,
+        lipsync_enabled: bool,
+        lipsync_mic: usize,
+    ) {
         use crate::output::FrameSink;
-
-        let want_sink = FrameSink::from_gui_index(self.output.output_sink_index);
+        let want_sink = FrameSink::from_gui_index(sink_index);
         if let Err(e) = self.app.ensure_output_sink_runtime(want_sink) {
-            // VirtualCamera 起動失敗 (典型的には MFCreateVirtualCamera::Start)。
-            // GUI shadow を SharedMemory に戻し、router もそちらへ確定させる。
-            // ユーザが再度 VirtualCamera を選び直せば retry がかかる。
-            //
-            // Note: project_dirty が立っている状態でこれが走ると、autosave
-            // で SharedMemory がプロジェクトに永続化される。ユーザの選択を
-            // 失わせないためには session_active_sink と saved_sink を分離
-            // する必要があるが T11 scope 外。
             self.push_notification(format!("Virtual Camera unavailable: {e}"));
-            let fallback = FrameSink::SharedMemory;
-            self.output.output_sink_index = fallback.to_gui_index();
-            if let Err(e2) = self.app.ensure_output_sink_runtime(fallback) {
-                warn!("reconcile: fallback to SharedMemory also failed: {e2}");
-            }
         }
-    }
-
-    fn reconcile_lipsync_runtime(&mut self) {
-        if let Err(e) = self
-            .app
-            .set_lipsync_enabled(self.lipsync.enabled, self.lipsync.mic_device_index)
-        {
-            warn!("reconcile: lipsync apply failed: {e}");
-            self.lipsync.enabled = false;
+        if let Err(e) = self.app.set_lipsync_enabled(lipsync_enabled, lipsync_mic) {
+            warn!("lipsync apply failed: {e}");
             self.push_notification(format!("Lip sync failed: {e}"));
         }
     }
@@ -617,11 +587,16 @@ impl GuiApp {
         self.rendering.outline_enabled = profile.outline_enabled;
         self.rendering.outline_width = profile.outline_width;
         self.rendering.outline_color = profile.outline_color;
-        self.output.output_sink_index = profile.output_sink_index;
         self.output.output_resolution_index = profile.output_resolution_index;
         self.output.output_framerate_index = profile.output_framerate_index;
         self.project_dirty = true;
-        self.reconcile_app_with_gui();
+        // Profiles don't carry lipsync settings; pass current App values to
+        // keep them unchanged.
+        self.apply_pipeline_bound_settings(
+            profile.output_sink_index,
+            self.app.is_lipsync_enabled(),
+            self.app.lipsync_mic_device_index(),
+        );
     }
 
     fn process_hotkeys(&mut self, ctx: &egui::Context) {
@@ -738,18 +713,19 @@ impl GuiApp {
         self.rendering.toggle_spring = state.toggle_spring;
         self.rendering.toggle_cloth = state.toggle_cloth;
 
-        self.lipsync.enabled = state.lipsync_enabled;
-        self.lipsync.mic_device_index = state.lipsync_mic_device_index;
         self.lipsync.volume_threshold = state.lipsync_volume_threshold;
         self.lipsync.smoothing = state.lipsync_smoothing;
 
-        self.output.output_sink_index = state.output_sink_index;
         self.output.output_resolution_index = state.output_resolution_index;
         self.output.output_framerate_index = state.output_framerate_index;
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
 
-        self.reconcile_app_with_gui();
+        self.apply_pipeline_bound_settings(
+            state.output_sink_index,
+            state.lipsync_enabled,
+            state.lipsync_mic_device_index,
+        );
     }
 
     fn load_avatar_from_drop(&mut self, path: &std::path::Path) {

@@ -47,7 +47,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 "Image Sequence",
             ];
             let sink_label = sink_names
-                .get(state.output.output_sink_index)
+                .get(state.app.output.active_sink().to_gui_index())
                 .unwrap_or(&"Unknown");
             ui.label(format!("Output: {}", sink_label));
 

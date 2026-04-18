@@ -134,11 +134,18 @@ pub struct Application {
     /// eliminate.
     #[cfg(feature = "lipsync")]
     lipsync_processor: Option<crate::lipsync::LipSyncProcessor>,
-    /// Mic device index the running [`Self::lipsync_processor`] was started
-    /// with. Lets [`Self::set_lipsync_enabled`] notice mic changes and
-    /// restart the processor without an extra dedicated mutator.
+    /// User's selected mic device. Doubles as:
+    /// - The mic the running [`Self::lipsync_processor`] was started with
+    ///   (so [`Self::set_lipsync_enabled`] can detect mic changes and
+    ///   restart in place)
+    /// - The mic to use the next time lipsync is enabled (so the user's
+    ///   selection survives a disable / re-enable cycle without a
+    ///   separate "preferred mic" field)
+    ///
+    /// Always updated by [`Self::set_lipsync_enabled`], including the
+    /// `enabled=false` path.
     #[cfg(feature = "lipsync")]
-    lipsync_active_mic: usize,
+    lipsync_mic_device_index: usize,
     shutdown_complete: bool,
     pub viewport_background: Option<std::path::PathBuf>,
     pub ground_grid_visible: bool,
@@ -217,7 +224,7 @@ impl Application {
             #[cfg(feature = "lipsync")]
             lipsync_processor: None,
             #[cfg(feature = "lipsync")]
-            lipsync_active_mic: 0,
+            lipsync_mic_device_index: 0,
             shutdown_complete: false,
             stale_warn_cooldown: std::time::Instant::now(),
             viewport_background: None,
@@ -871,15 +878,19 @@ impl Application {
         }
     }
 
-    /// Bring the lipsync processor in line with the requested state. Idempotent.
+    /// Bring the lipsync processor in line with the requested state. Idempotent
+    /// over `(enabled, mic_device_index)`. The mic preference is always
+    /// stored, even when `enabled=false`, so the user's selection survives
+    /// a disable / re-enable cycle.
     ///
-    /// - `enabled=true` and not running: start with `mic_device_index`
-    /// - `enabled=true` and running with a different mic: restart with new mic
-    /// - `enabled=false` and running: stop
-    /// - everything else: no-op
+    /// - `enabled=true`, not running: start with `mic_device_index`
+    /// - `enabled=true`, running, mic changed: restart with new mic
+    /// - `enabled=true`, running, mic unchanged: no-op
+    /// - `enabled=false`, running: stop, remember mic for next enable
+    /// - `enabled=false`, not running: just remember mic
     ///
     /// Errors propagate from the underlying audio capture init; callers
-    /// should surface them to the user (push notification, etc.).
+    /// should surface them to the user (push notification).
     #[cfg(feature = "lipsync")]
     pub fn set_lipsync_enabled(
         &mut self,
@@ -887,36 +898,40 @@ impl Application {
         mic_device_index: usize,
     ) -> Result<(), String> {
         let active = self.lipsync_processor.is_some();
-        let mic_changed = active && self.lipsync_active_mic != mic_device_index;
+        let mic_changed = self.lipsync_mic_device_index != mic_device_index;
+        // Remember the mic preference up-front so the disable path also
+        // updates it (used as the start mic for the next enable).
+        self.lipsync_mic_device_index = mic_device_index;
 
-        if !enabled && active {
-            if let Some(ref mut proc) = self.lipsync_processor {
-                proc.stop();
+        if !enabled {
+            if active {
+                if let Some(ref mut proc) = self.lipsync_processor {
+                    proc.stop();
+                }
+                self.lipsync_processor = None;
+                info!("app: lipsync stopped");
             }
-            self.lipsync_processor = None;
-            info!("app: lipsync stopped");
             return Ok(());
         }
 
-        if enabled && (!active || mic_changed) {
+        if !active || mic_changed {
             if let Some(ref mut proc) = self.lipsync_processor {
                 proc.stop();
                 self.lipsync_processor = None;
             }
             let proc = crate::lipsync::LipSyncProcessor::start(Some(mic_device_index))?;
             self.lipsync_processor = Some(proc);
-            self.lipsync_active_mic = mic_device_index;
             info!(
                 "app: lipsync {} (mic={})",
-                if mic_changed { "restarted" } else { "started" },
+                if mic_changed && active { "restarted" } else { "started" },
                 mic_device_index
             );
         }
         Ok(())
     }
 
-    /// No-op stub when the `lipsync` feature is disabled — keeps the GUI
-    /// reconciliation path identical regardless of build features.
+    /// No-op stub when the `lipsync` feature is disabled — keeps GUI call
+    /// sites identical regardless of build features.
     #[cfg(not(feature = "lipsync"))]
     pub fn set_lipsync_enabled(
         &mut self,
@@ -924,6 +939,26 @@ impl Application {
         _mic_device_index: usize,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    /// True if the lipsync processor is currently running. Reflects runtime
+    /// state, not user intent — e.g. if the user requested `enabled=true`
+    /// but the audio device couldn't open, this stays `false`. Source of
+    /// truth for the GUI's lipsync checkbox after Phase C.
+    pub fn is_lipsync_enabled(&self) -> bool {
+        #[cfg(feature = "lipsync")]
+        return self.lipsync_processor.is_some();
+        #[cfg(not(feature = "lipsync"))]
+        return false;
+    }
+
+    /// The mic device index the running processor uses, or the preferred
+    /// mic for the next enable. Always defined (defaults to 0).
+    pub fn lipsync_mic_device_index(&self) -> usize {
+        #[cfg(feature = "lipsync")]
+        return self.lipsync_mic_device_index;
+        #[cfg(not(feature = "lipsync"))]
+        return 0;
     }
 
     /// Run lipsync inference for one frame and apply viseme weights to the

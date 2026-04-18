@@ -4,9 +4,10 @@
 
 ## Status
 
-**Phase A: COMPLETED (2026-04-19)** — drift bug class structurally eliminated. See "Implementation summary" below.
-
-Phase B / C / D は未着手。既知の限界 (rollback の project 永続化、pause 中の lipsync 停止挙動、dead control の未配線) は当該 Phase で扱う。
+- **Phase A: COMPLETED (2026-04-19)** — reconcile pattern + App-side mutators で drift bug class を構造的に消去。詳細は "Implementation summary (Phase A)"
+- **Phase C: COMPLETED (2026-04-19)** — pipeline-bound shadow フィールド (output_sink_index / lipsync.enabled / lipsync.mic_device_index) を `OutputGuiState` / `LipSyncGuiState` から削除し、Application を単一 source of truth に。reconcile_app_with_gui 自体を廃止 (shadow が無いので reconcile すべき差分が無い)。詳細は "Implementation summary (Phase C)"
+- **Phase B: 未着手** — dead control (output resolution/fps/alpha/color_space + tracking camera resolution restart) を実際に pipeline へ配線する作業
+- **Phase D: 未着手** — saved-intent と session-active state の分離 (rollback / 失敗時 fallback の autosave 永続化問題)
 
 ## Source
 
@@ -255,6 +256,42 @@ impl GuiApp {
 | Rollback の project 永続化 | `reconcile_output_runtime` が VirtualCamera 失敗時に GUI shadow を SharedMemory に書き換える。autosave / 手動 save 時にユーザの真の選択 (VirtualCamera) が失われる |
 | Pause 中の lipsync 停止 | `step_lipsync` が `if !self.paused` ブロック内なので pause で audio capture も止まる。旧コード (`draw_lipsync` 内実行) は panel 表示中のみだが pause 影響なし |
 | dead control 4 個未配線 | output resolution/fps/alpha/color_space は GUI で選べるが pipeline で消費されない (Phase B 対象) |
+
+---
+
+## Implementation summary (Phase C)
+
+### 変更ファイル
+
+- `src/app/mod.rs` — `lipsync_active_mic` を `lipsync_mic_device_index` に rename し、`set_lipsync_enabled` が常に mic を保存するよう変更 (disable 時も次回 enable 用に preserve)。`is_lipsync_enabled() -> bool` と `lipsync_mic_device_index() -> usize` getter を追加 (両者 feature 無効時にも利用可能な stub 付き)
+- `src/gui/mod.rs` — `OutputGuiState.output_sink_index` 削除、`LipSyncGuiState.enabled` / `mic_device_index` 削除。`reconcile_app_with_gui` / `reconcile_output_runtime` / `reconcile_lipsync_runtime` を全削除し、`apply_pipeline_bound_settings(sink, lipsync_enabled, mic)` ヘルパに集約。`apply_project_state` / `apply_profile` / `to_project_state` を Application getter / mutator 経由に書換
+- `src/gui/inspector.rs` — sink combo / lipsync mic combo / lipsync enable checkbox を Application 由来 local 変数 (`active_idx = state.app.output.active_sink().to_gui_index()` 等) に bind し、変更検出で App mutator 呼出。失敗は push_notification のみ (rollback 不要 — 次フレームで App state を再 read するので combo は実態を表示)
+- `src/gui/status_bar.rs` — sink label を `state.app.output.active_sink().to_gui_index()` から取得
+
+### Phase C 完了条件達成
+
+| Criterion | 状況 |
+|---|---|
+| `OutputGuiState.output_sink_index` 削除 | ✅ |
+| `LipSyncGuiState.enabled` / `mic_device_index` 削除 | ✅ |
+| 全 GUI 表示が App getter から派生 | ✅ (sink label, mic dropdown, enabled checkbox) |
+| `reconcile_*` 関数廃止 | ✅ (Phase A の reconcile は shadow 同期のために存在していたので不要に) |
+| Phase A の acceptance criteria 維持 | ✅ (project load → MF camera 自動 register、MF 失敗時 notify、tracking 自動起動なし、lipsync inference per-frame) |
+| cargo check warning 0 / error 0 | ✅ (3 feature combo 全部) |
+
+### Phase C による副次的改善
+
+- 「load 経路で reconcile を呼び忘れる」事故が**構造的に発生不可能**に。shadow が無いので新規 GUI フィールド追加時にも load path で代入し忘れることが無い (代入できる shadow が無い)
+- Phase A の reconcile の MF rollback ロジックが消えた → コードシンプル化。rollback の project 永続化問題 (Phase D 対象) は残存するが、影響範囲が単純化
+- 失敗時 GUI 表示の整合: 例えば VirtualCamera 選択中に MF 起動失敗 → App は前 sink のまま → 次フレームで combo が前 sink を表示。ユーザは「失敗した」ことを通知 + 視覚で同時に認識できる
+
+### Phase C で削除した API
+
+- `GuiApp::reconcile_app_with_gui()` → 廃止
+- `GuiApp::reconcile_output_runtime()` → 廃止
+- `GuiApp::reconcile_lipsync_runtime()` → 廃止
+
+→ 後方互換が必要な場合は復活させるが、現状内部 API なので問題なし
 
 ---
 

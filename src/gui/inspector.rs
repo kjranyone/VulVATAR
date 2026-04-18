@@ -708,15 +708,22 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
+    // Read App-derived state once for this frame. The combo / checkbox bind
+    // to local copies; on change we route through Application mutators.
+    let active_mic = state.app.lipsync_mic_device_index();
+    let active_enabled = state.app.is_lipsync_enabled();
+
+    let mut new_mic = active_mic;
+    let mut refresh_clicked = false;
+
     ui.horizontal(|ui| {
-        let prev_mic = state.lipsync.mic_device_index;
         let selected_mic = state
             .lipsync
             .available_mics
             .iter()
-            .find(|m| m.index == state.lipsync.mic_device_index)
+            .find(|m| m.index == active_mic)
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("Device {}", state.lipsync.mic_device_index));
+            .unwrap_or_else(|| format!("Device {}", active_mic));
         egui::ComboBox::from_label("Microphone")
             .selected_text(selected_mic)
             .show_ui(ui, |ui| {
@@ -724,41 +731,47 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.label("No devices found. Click Refresh to scan.");
                 } else {
                     for mic in &state.lipsync.available_mics {
-                        ui.selectable_value(
-                            &mut state.lipsync.mic_device_index,
-                            mic.index,
-                            &mic.name,
-                        );
+                        ui.selectable_value(&mut new_mic, mic.index, &mic.name);
                     }
                 }
             });
-        let mic_changed = state.lipsync.mic_device_index != prev_mic;
-        if mic_changed {
-            state.project_dirty = true;
-        }
         if ui.button("Refresh").clicked() {
-            state.lipsync.available_mics = crate::lipsync::audio_capture::list_audio_devices();
-        }
-        if mic_changed {
-            // reconcile picks up the new mic and restarts the processor
-            // in-place if lipsync is currently enabled.
-            state.reconcile_app_with_gui();
+            refresh_clicked = true;
         }
     });
 
+    if refresh_clicked {
+        state.lipsync.available_mics = crate::lipsync::audio_capture::list_audio_devices();
+    }
+
+    if new_mic != active_mic {
+        // Always store the mic preference; restart only if currently enabled.
+        if let Err(e) = state.app.set_lipsync_enabled(active_enabled, new_mic) {
+            state.push_notification(format!("Lip sync mic switch failed: {e}"));
+        }
+        state.project_dirty = true;
+    }
+
     ui.add_space(4.0);
 
-    let prev_enabled = state.lipsync.enabled;
+    let mut new_enabled = active_enabled;
     if ui
-        .checkbox(&mut state.lipsync.enabled, "Enable Lip Sync")
+        .checkbox(&mut new_enabled, "Enable Lip Sync")
         .changed()
     {
-        state.project_dirty = true;
-        state.reconcile_app_with_gui();
-        if state.lipsync.enabled && !prev_enabled {
-            state.push_notification("Lip sync started.".to_string());
-        } else if !state.lipsync.enabled && prev_enabled {
-            state.push_notification("Lip sync stopped.".to_string());
+        match state.app.set_lipsync_enabled(new_enabled, active_mic) {
+            Ok(()) => {
+                state.project_dirty = true;
+                if new_enabled {
+                    state.push_notification("Lip sync started.".to_string());
+                } else {
+                    state.push_notification("Lip sync stopped.".to_string());
+                }
+            }
+            Err(e) => {
+                state.push_notification(format!("Lip sync failed: {e}"));
+                // App stays disabled; checkbox will reflect that next frame.
+            }
         }
     }
 
@@ -769,8 +782,10 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     #[cfg(not(feature = "lipsync"))]
     {
-        if state.lipsync.enabled {
-            state.lipsync.enabled = false;
+        if active_enabled {
+            // Without the feature, set_lipsync_enabled is a no-op stub that
+            // returns Ok, so just call it to reset App state.
+            let _ = state.app.set_lipsync_enabled(false, active_mic);
             state.push_notification(
                 "Lip sync unavailable: build with --features lipsync".to_string(),
             );
@@ -1003,31 +1018,38 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         "Image Sequence",
     ];
 
-    let prev_sink_index = state.output.output_sink_index;
+    // After Phase C the active sink lives on Application. Bind the combo
+    // to a local copy of the App-derived index, then on change push the
+    // new selection through the mutator. No GuiState shadow.
+    use crate::output::FrameSink;
+    let active_idx = state.app.output.active_sink().to_gui_index();
+    let mut new_idx = active_idx;
 
     egui::CollapsingHeader::new("Sink Selection")
         .default_open(true)
         .show(ui, |ui| {
             egui::ComboBox::from_label("Output Sink")
-                .selected_text(
-                    *sink_names
-                        .get(state.output.output_sink_index)
-                        .unwrap_or(&"Unknown"),
-                )
+                .selected_text(*sink_names.get(active_idx).unwrap_or(&"Unknown"))
                 .show_ui(ui, |ui| {
                     for (i, name) in sink_names.iter().enumerate() {
-                        ui.selectable_value(&mut state.output.output_sink_index, i, *name);
+                        ui.selectable_value(&mut new_idx, i, *name);
                     }
                 });
         });
 
-    if state.output.output_sink_index != prev_sink_index {
-        state.reconcile_app_with_gui();
-        state.push_notification(format!(
-            "Output sink changed to {}",
-            sink_names[state.output.output_sink_index]
-        ));
-        state.project_dirty = true;
+    if new_idx != active_idx {
+        let want_sink = FrameSink::from_gui_index(new_idx);
+        match state.app.ensure_output_sink_runtime(want_sink) {
+            Ok(()) => {
+                state.push_notification(format!("Output sink changed to {}", sink_names[new_idx]));
+                state.project_dirty = true;
+            }
+            Err(e) => {
+                state.push_notification(format!("Output sink change failed: {e}"));
+                // App stayed at the previous sink; the combo will display
+                // that on the next frame because it reads from App.
+            }
+        }
     }
 
     let prev_res = state.output.output_resolution_index;
