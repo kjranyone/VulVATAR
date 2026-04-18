@@ -22,7 +22,7 @@ use windows::Win32::Media::MediaFoundation::{
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::media_source::DEFAULT_FPS;
-use crate::shared_memory::SharedMemoryReader;
+use crate::shared_memory::{SharedMemoryReader, FRAME_FLAG_PRESERVE_ALPHA};
 use crate::{dll_add_ref, dll_release};
 
 /// Resolution + framerate the client has currently negotiated. If we can't
@@ -162,6 +162,7 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
 
         let sample = match self.shared_memory.read_latest() {
             Some(view) => {
+                let preserve_alpha = view.flags & FRAME_FLAG_PRESERVE_ALPHA != 0;
                 let resampled;
                 let (rgba, w, h) = if view.width == format.width && view.height == format.height {
                     (view.pixels.as_slice(), view.width, view.height)
@@ -183,17 +184,18 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
                     (resampled.as_slice(), format.width, format.height)
                 };
                 crate::t!(
-                    "Stream::RequestSample frame seq={} client_size={}x{}@{} subtype={}",
+                    "Stream::RequestSample frame seq={} client_size={}x{}@{} subtype={} alpha={}",
                     view.sequence,
                     format.width,
                     format.height,
                     format.fps,
                     if is_nv12 { "NV12" } else { "RGB32" },
+                    preserve_alpha,
                 );
                 if is_nv12 {
                     build_sample_nv12_from_rgba(rgba, w, h, time, dur)?
                 } else {
-                    build_sample_rgb32_from_rgba(rgba, w, h, time, dur)?
+                    build_sample_rgb32_from_rgba(rgba, w, h, preserve_alpha, time, dur)?
                 }
             }
             None => {
@@ -206,6 +208,8 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
                 if is_nv12 {
                     build_black_sample_nv12(format.width, format.height, time, dur)?
                 } else {
+                    // Black with alpha is just black; no need for the
+                    // preserve-alpha branch on the no-producer path.
                     build_black_sample_rgb32(format.width, format.height, time, dur)?
                 }
             }
@@ -269,13 +273,16 @@ impl VulvatarMediaStream {
 }
 
 /// Convert RGBA bytes (R first, length = w * h * 4) into an `IMFSample`
-/// containing RGB32 (BGRX, B first; alpha-as-padding) pixel data. The
-/// negotiated client size is used; caller is responsible for resampling
+/// containing RGB32 (BGRA layout, B first) pixel data. When `preserve_alpha`
+/// is true the source alpha byte is copied to the output's 4th byte;
+/// otherwise it's forced to 0xFF (opaque, treating the format as BGRX).
+/// The negotiated client size is used; caller is responsible for resampling
 /// the renderer's source frame to that size before calling.
 fn build_sample_rgb32_from_rgba(
     rgba: &[u8],
     width: u32,
     height: u32,
+    preserve_alpha: bool,
     time_hns: u64,
     duration_hns: u64,
 ) -> windows::core::Result<IMFSample> {
@@ -298,7 +305,7 @@ fn build_sample_rgb32_from_rgba(
             *d = *s.add(2); // B ← R
             *d.add(1) = *s.add(1); // G
             *d.add(2) = *s; // R ← B
-            *d.add(3) = 0xFF; // X (padding) — opaque
+            *d.add(3) = if preserve_alpha { *s.add(3) } else { 0xFF };
         }
         buffer.SetCurrentLength(buffer_size as u32)?;
         buffer.Unlock()?;

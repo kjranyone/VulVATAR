@@ -92,6 +92,27 @@ pub fn camera_fps_for_index(index: usize) -> u32 {
     }
 }
 
+/// Map an `output.output_resolution_index` (Output inspector combo position)
+/// to the actual width/height the renderer should render at. Note the
+/// inspector orders descending: 0 = 1920×1080, 1 = 1280×720, 2 = 640×480.
+pub fn output_resolution_for_index(index: usize) -> [u32; 2] {
+    match index {
+        1 => [1280, 720],
+        2 => [640, 480],
+        _ => [1920, 1080],
+    }
+}
+
+/// Map an `output.output_framerate_index` to the actual fps. Inspector
+/// order: 0 = 60, 1 = 30.
+pub fn output_fps_for_index(index: usize) -> u32 {
+    if index == 1 {
+        30
+    } else {
+        60
+    }
+}
+
 pub struct TrackingGuiState {
     pub toggle_tracking: bool,
     pub camera_resolution_index: usize,
@@ -541,12 +562,16 @@ impl GuiApp {
             toggle_spring: self.rendering.toggle_spring,
             toggle_cloth: self.rendering.toggle_cloth,
 
-            lipsync_enabled: self.app.is_lipsync_enabled(),
+            // Save user **intent** (Phase D), not the currently-running
+            // state. If MF init failed this session, runtime is on a
+            // SharedMemory fallback but we don't want to overwrite the
+            // user's saved VirtualCamera choice.
+            lipsync_enabled: self.app.requested_lipsync_enabled(),
             lipsync_mic_device_index: self.app.lipsync_mic_device_index(),
             lipsync_volume_threshold: self.lipsync.volume_threshold,
             lipsync_smoothing: self.lipsync.smoothing,
 
-            output_sink_index: self.app.output.active_sink().to_gui_index(),
+            output_sink_index: self.app.requested_sink().to_gui_index(),
             output_resolution_index: self.output.output_resolution_index,
             output_framerate_index: self.output.output_framerate_index,
             output_has_alpha: self.output.output_has_alpha,
@@ -555,10 +580,12 @@ impl GuiApp {
     }
 
     /// Apply the pipeline-bound parts of a saved snapshot directly to
-    /// `Application` mutators. After Phase C the GUI no longer holds shadow
-    /// values for these settings — `Application` is the single source of
-    /// truth. Failures surface as user-visible notifications; the App stays
-    /// at its previous state, which the GUI will display on the next frame.
+    /// `Application` mutators (the Phase D `set_requested_*` variants so
+    /// runtime failures don't overwrite the user's saved intent). After
+    /// Phase C the GUI no longer holds shadow values for these settings;
+    /// `Application` is the single source of truth. Failures surface as
+    /// user-visible notifications; the runtime stays at its fallback state
+    /// while the requested state remembers the user's pick.
     fn apply_pipeline_bound_settings(
         &mut self,
         sink_index: usize,
@@ -567,10 +594,10 @@ impl GuiApp {
     ) {
         use crate::output::FrameSink;
         let want_sink = FrameSink::from_gui_index(sink_index);
-        if let Err(e) = self.app.ensure_output_sink_runtime(want_sink) {
+        if let Err(e) = self.app.set_requested_sink(want_sink) {
             self.push_notification(format!("Virtual Camera unavailable: {e}"));
         }
-        if let Err(e) = self.app.set_lipsync_enabled(lipsync_enabled, lipsync_mic) {
+        if let Err(e) = self.app.set_requested_lipsync(lipsync_enabled, lipsync_mic) {
             warn!("lipsync apply failed: {e}");
             self.push_notification(format!("Lip sync failed: {e}"));
         }
@@ -590,11 +617,11 @@ impl GuiApp {
         self.output.output_resolution_index = profile.output_resolution_index;
         self.output.output_framerate_index = profile.output_framerate_index;
         self.project_dirty = true;
-        // Profiles don't carry lipsync settings; pass current App values to
-        // keep them unchanged.
+        // Profiles don't carry lipsync settings; pass current App requested
+        // state to keep them unchanged.
         self.apply_pipeline_bound_settings(
             profile.output_sink_index,
-            self.app.is_lipsync_enabled(),
+            self.app.requested_lipsync_enabled(),
             self.app.lipsync_mic_device_index(),
         );
     }
@@ -913,13 +940,21 @@ impl eframe::App for GuiApp {
         self.app.viewport_lighting.main_light_intensity = self.rendering.main_light_intensity;
         self.app.viewport_lighting.ambient_term = self.rendering.ambient_intensity;
 
-        // Sync output resolution preference from GUI inspector.
-        let output_res = match self.output.output_resolution_index {
-            0 => [1920u32, 1080u32],
-            1 => [1280, 720],
-            _ => [640, 480],
-        };
-        self.app.output_extent = Some(output_res);
+        // Sync output resolution preference from GUI inspector. The renderer
+        // reads this through OutputTargetRequest.extent, so changing the
+        // combo immediately resizes the next render's output target.
+        self.app.output_extent =
+            Some(output_resolution_for_index(self.output.output_resolution_index));
+
+        // Phase B-3: throttle the output cadence to the user's selection.
+        // Idempotent (just sets a Duration), so no need for change-detect.
+        self.app
+            .output
+            .set_target_fps(output_fps_for_index(self.output.output_framerate_index));
+
+        // Phase B-4: forward the alpha preference. Read each frame in
+        // process_render_result to tag OutputFrame.alpha_mode.
+        self.app.output_preserve_alpha = self.output.output_has_alpha;
 
         if !self.paused {
             let real_dt = (self.frame_time_ms / 1000.0) as f32;

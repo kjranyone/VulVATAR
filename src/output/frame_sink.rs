@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use super::OutputFrame;
+use super::{AlphaMode, OutputFrame};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameSink {
@@ -621,7 +621,7 @@ impl OutputSinkWriter for NullSink {
 
 #[cfg(target_os = "windows")]
 mod win32_shmem {
-    use super::{OutputFrame, OutputSinkWriter};
+    use super::{AlphaMode, OutputFrame, OutputSinkWriter};
     use log::debug;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -731,6 +731,11 @@ mod win32_shmem {
         }
     }
 
+    /// Phase B-4: bit 0 in the shared-memory header `flags` u32 (offset 28)
+    /// asks the consumer to preserve the source RGBA alpha channel rather
+    /// than forcing the output to opaque. NV12 paths ignore the flag.
+    const SHMEM_FLAG_PRESERVE_ALPHA: u32 = 1 << 0;
+
     impl OutputSinkWriter for Win32NamedSharedMemorySink {
         fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
             let pixel_data = match &frame.pixel_data {
@@ -743,6 +748,14 @@ mod win32_shmem {
             let data_len = pixel_data.len();
 
             self.ensure_mapping(data_len)?;
+
+            // Pack alpha intent into the header `flags` field at offset 28.
+            // OutputFrame.alpha_mode is set by the host (App::process_render_result)
+            // from the GUI's "RGBA (with alpha)" toggle.
+            let mut flags: u32 = 0;
+            if !matches!(frame.alpha_mode, AlphaMode::Opaque) {
+                flags |= SHMEM_FLAG_PRESERVE_ALPHA;
+            }
 
             unsafe {
                 let base = self.view;
@@ -761,6 +774,9 @@ mod win32_shmem {
 
                 let ts_bytes = frame.timestamp.to_le_bytes();
                 ptr::copy_nonoverlapping(ts_bytes.as_ptr(), base.add(20) as *mut u8, 8);
+
+                let flag_bytes = flags.to_le_bytes();
+                ptr::copy_nonoverlapping(flag_bytes.as_ptr(), base.add(28) as *mut u8, 4);
 
                 ptr::copy_nonoverlapping(
                     pixel_data.as_ptr(),

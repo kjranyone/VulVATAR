@@ -5,9 +5,14 @@
 ## Status
 
 - **Phase A: COMPLETED (2026-04-19)** — reconcile pattern + App-side mutators で drift bug class を構造的に消去。詳細は "Implementation summary (Phase A)"
-- **Phase C: COMPLETED (2026-04-19)** — pipeline-bound shadow フィールド (output_sink_index / lipsync.enabled / lipsync.mic_device_index) を `OutputGuiState` / `LipSyncGuiState` から削除し、Application を単一 source of truth に。reconcile_app_with_gui 自体を廃止 (shadow が無いので reconcile すべき差分が無い)。詳細は "Implementation summary (Phase C)"
-- **Phase B: 未着手** — dead control (output resolution/fps/alpha/color_space + tracking camera resolution restart) を実際に pipeline へ配線する作業
-- **Phase D: 未着手** — saved-intent と session-active state の分離 (rollback / 失敗時 fallback の autosave 永続化問題)
+- **Phase C: COMPLETED (2026-04-19)** — pipeline-bound shadow フィールド (output_sink_index / lipsync.enabled / lipsync.mic_device_index) を `OutputGuiState` / `LipSyncGuiState` から削除し、Application を単一 source of truth に。reconcile_app_with_gui 自体を廃止
+- **Phase D: COMPLETED (2026-04-19)** — `Application::requested_sink` / `requested_lipsync_enabled` フィールド追加。setter は requested を更新してから active の試行 (失敗しても requested 保持)。`to_project_state` は requested を保存するため MF 起動失敗で fallback しても autosave で saved 値が上書きされない。combo は requested 表示 + 不一致時の警告ラベル
+- **Phase B: 部分完了 (2026-04-19)**
+  - B-1: COMPLETED — tracking camera resolution / framerate combo 変更で webcam worker が in-place restart
+  - B-2: COMPLETED — `output_resolution_index` → renderer output target は元から wired。helper `output_resolution_for_index` に集約
+  - B-3: COMPLETED — `output_framerate_index` → `OutputRouter::set_target_fps` で publish 側 throttle (旧 frame は drop)
+  - B-4: COMPLETED — `output_has_alpha` → 共有メモリ header offset 28 の `flags` u32 (bit 0 = `FRAME_FLAG_PRESERVE_ALPHA`) 経由で DLL に伝達。RGB32 path はソース alpha 保持/破棄を切替
+  - **B-5: DEFERRED** — `output_color_space_index` (sRGB / Linear sRGB)。GUI → app への配線は trivial だが下流の renderer が `output_export.rs` で `color_space: "srgb"` をハードコードしており、render target format selection / MTOON shader 出力 gamma 分岐 / MF sample の `MF_MT_VIDEO_PRIMARIES` `MF_MT_TRANSFER_FUNCTION` attribute まで含めた renderer color management 改修が必要。T11 scope (drift fix) を超えるため別タスク化
 
 ## Source
 
@@ -295,28 +300,50 @@ impl GuiApp {
 
 ---
 
-## Phase B: Wire dead controls to pipeline
+## Implementation summary (Phase B + D)
 
-### 目的
+### Phase B 変更ファイル
 
-現状 GUI で選べるが pipeline へ流れていない設定 4 件を実装する。
+- `src/gui/mod.rs` — helper 関数 `output_resolution_for_index` / `output_fps_for_index` 追加 (camera 系と同じ pattern)。GuiApp::update で `app.output_extent` / `app.output.set_target_fps` / `app.output_preserve_alpha` を per-frame sync
+- `src/gui/inspector.rs` — tracking resolution/framerate combo 変更時に `app.is_tracking_running()` ならば `app.start_tracking_with_params` で in-place restart (B-1)
+- `src/output/mod.rs` — `OutputRouter` に `forward_min_interval: Duration` / `last_forward_at: Option<Instant>` 追加。`set_target_fps(fps)` で interval 更新。`publish` 内で前フレームから interval 未満なら drop (B-3)
+- `src/output/frame_sink.rs` — `Win32NamedSharedMemorySink::write_frame` が `OutputFrame.alpha_mode` を見て shared memory header offset 28 の `flags` u32 に `SHMEM_FLAG_PRESERVE_ALPHA` (bit 0) を書く (B-4)
+- `src/app/mod.rs` — `output_preserve_alpha: bool` フィールド追加。`process_render_result` で `OutputFrame.alpha_mode` を `Premultiplied` / `Opaque` に設定 (B-4)。`is_tracking_running()` getter を再追加 (B-1)
+- `vulvatar-mf-camera/src/shared_memory.rs` — `FRAME_FLAG_PRESERVE_ALPHA` 公開定数。`Header.flags: u32` 追加、`FrameView.flags` 公開 (B-4)
+- `vulvatar-mf-camera/src/media_stream.rs` — `build_sample_rgb32_from_rgba` に `preserve_alpha: bool` 引数。true ならソース alpha バイトを保持、false なら従来通り 0xFF 強制 (B-4)
 
-### 対象
+### Phase D 変更ファイル
 
-| 設定 | 現状 | 実装内容 |
-|---|---|---|
-| `output.output_resolution_index` | `GuiApp::update` で `app.output_extent = Some([w,h])` に書いているが renderer 側で消費されていない疑い | renderer の output target 解像度に反映 + DLL 側 SUPPORTED_FORMATS との整合 |
-| `output.output_framerate_index` | 全く消費されない | sample timestamp cadence + frame skipping (output worker 側) |
-| `output.output_has_alpha` | 全く消費されない | RGBA / RGB の切替。DLL 側で `MFVideoFormat_ARGB32` 追加または既存 RGB32 と切替 |
-| `output.output_color_space_index` | 全く消費されない | render target の sRGB / Linear 切替。MTOON shader の output gamma 対応 |
-| `tracking.camera_resolution_index` | 「Start Camera」押下時のみ消費 | combo onchange で `app.start_tracking_with_params` を再呼出 (camera 起動中のみ) |
-| `tracking.camera_framerate_index` | 同上 | 同上 |
+- `src/app/mod.rs` — `requested_sink: FrameSink` / `requested_lipsync_enabled: bool` フィールド追加。`requested_sink()` / `requested_lipsync_enabled()` getter、`set_requested_sink()` / `set_requested_lipsync()` setter (まず requested 更新 → active 試行、失敗しても requested 保持)
+- `src/gui/mod.rs` — `to_project_state` が `requested_*` getter 経由で読むよう変更 (active ではない)。`apply_pipeline_bound_settings` も `set_requested_*` 経由に
+- `src/gui/inspector.rs` — sink combo / lipsync enable+mic combo は `requested_*` を表示し `set_requested_*` で書込。requested ≠ active のときは黄色で「(running on X — requested Y unavailable)」を表示
 
-### 設計方針
+### Phase B + D 完了条件達成
 
-各設定について App 側に対応する `set_*` mutator を追加し、reconcile_app_with_gui() に対応する reconcile_* 関数を追加。Phase A で確立したパターンをそのまま適用。
+| Criterion | 状況 |
+|---|---|
+| Tracking resolution/framerate 変更が webcam 起動中に即時反映 | ✅ (B-1) |
+| Output resolution が renderer 出力サイズに反映 | ✅ (B-2 — 元から wired を確認) |
+| Output framerate combo で publish が throttle される | ✅ (B-3) |
+| `output_has_alpha` 切替で RGB32 出力の alpha チャンネル保持/破棄が切り替わる | ✅ (B-4 — flag 経由) |
+| MF init 失敗時 autosave で saved 値が上書きされない | ✅ (D — to_project_state が requested を保存) |
+| requested ≠ active の状態が GUI で見えて分かる | ✅ (D — 黄色警告ラベル) |
+| cargo check warning 0 / error 0 | ✅ (3 feature combo 全部) |
 
-注意: `output_color_space_index` の Linear sRGB 化は MTOON shader 出力との整合確認が必要。
+---
+
+## Phase B-5 (deferred to separate task)
+
+### なぜ deferred か
+
+GUI → App への色空間プリファレンス引き渡し自体は数行で済むが、**意味のある実装にするには renderer 全体の color management 改修が必要**:
+
+1. `src/renderer/output_export.rs` 行 211, 240, 259, 499 で `color_space: "srgb".to_string()` をハードコード — output frame に常に "srgb" を貼る
+2. Render target の format が固定 (B8G8R8A8 系)。Linear sRGB を真に出力するには render target の gamma 変換セマンティクスを変える必要
+3. MTOON shader が sRGB-encoded output を前提。Linear 出力モードを足すには shader 側に gamma 分岐
+4. DLL 側 MF sample の `MF_MT_VIDEO_PRIMARIES` / `MF_MT_TRANSFER_FUNCTION` attribute 設定が現状無い (clients が解釈するかは別問題)
+
+これらは render pipeline / shader 側の実装で、GUI ↔ pipeline drift 修正の T11 scope 外。別 task (T12 想定: "renderer color management") として切り出すのが妥当。
 
 ---
 
@@ -343,32 +370,21 @@ T11 Phase A で「reconcile pattern」が確立しユーザに動作確認され
 
 ---
 
-## Phase D: Session-active vs saved-state separation
+## Phase D: Session-active vs requested separation (Implemented)
 
-### 目的
+実装としては「saved/session 分離」ではなく **"requested vs active" 分離** に落ち着いた:
 
-Phase A の rollback (VirtualCamera 失敗時の SharedMemory フォールバック) が autosave で project に永続化される問題を解決する。
+- `Application::requested_sink: FrameSink` — ユーザが望んだ sink (project に save される)
+- `Application::output.active_sink()` — 現セッションで実際に running
+- 両者は失敗時に乖離。`requested_sink` は失敗しても保持される
 
-### 設計方針案
+`to_project_state` が `requested_sink()` を呼ぶことで「runtime の実態」ではなく「ユーザの意図」を save する。MF 起動失敗で active が SharedMemory にフォールバックしても、project ファイルには VirtualCamera が残る。
 
-`OutputGuiState.output_sink_index` を 2 系統に分割:
+同じパターンを lipsync.enabled に適用 (`requested_lipsync_enabled`)。mic は `set_lipsync_enabled` が常に保存するため別フィールド不要。
 
-- `saved_sink_index: usize` — project にシリアライズされる、ユーザの意図
-- `active_sink_index: usize` — 現セッションでの実態 (rollback で書換可)
+GUI 上は **requested を表示**。requested ≠ active のときは Inspector に黄色の警告ラベル (`(running on X — requested Y unavailable)` / `(requested, but audio device couldn't open)`) を出すことで「希望は通ってないが意図は記憶されている」ことをユーザに伝える。
 
-`to_project_state` は `saved_sink_index` を使用、reconcile は `active_sink_index` を更新。combo onchange は両方を更新 (ユーザ意図の更新 + 反映)。`apply_project_state` は両方を `saved_sink_index` から初期化 → reconcile で active 側のみ rollback され saved 側は維持。
-
-### 適用範囲
-
-同様の rollback がある全ての shadow value:
-- `output_sink_index` (Phase A で対象)
-- `lipsync.enabled` (Phase A の reconcile_lipsync_runtime も failed 時 false に書き換え)
-- 将来 Phase B で増える可能性のある settings
-
-### リスク
-
-- Project state schema 変更 (saved_* 追加)。既存 project ファイルとの互換性管理
-- combo box の displayed value がどちらかを混乱なく扱う UI 設計が必要
+互換性: project ファイル schema 変更なし (output_sink_index フィールドは同じ意味、ただし保存される値が現セッション active から requested に変わっただけ)。
 
 ---
 

@@ -573,7 +573,8 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                         "1920x1080",
                     );
                 });
-            if state.tracking.camera_resolution_index != prev_res {
+            let res_changed = state.tracking.camera_resolution_index != prev_res;
+            if res_changed {
                 state.project_dirty = true;
             }
             let prev_fps = state.tracking.camera_framerate_index;
@@ -587,8 +588,30 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.selectable_value(&mut state.tracking.camera_framerate_index, 0, "30 fps");
                     ui.selectable_value(&mut state.tracking.camera_framerate_index, 1, "60 fps");
                 });
-            if state.tracking.camera_framerate_index != prev_fps {
+            let fps_changed = state.tracking.camera_framerate_index != prev_fps;
+            if fps_changed {
                 state.project_dirty = true;
+            }
+            // Phase B-1: if the webcam is currently running, restart it with
+            // the new params so the change takes effect immediately rather
+            // than only at the next Stop / Start Camera cycle.
+            if (res_changed || fps_changed) && state.app.is_tracking_running() {
+                let (w, h) = crate::gui::camera_resolution_for_index(
+                    state.tracking.camera_resolution_index,
+                );
+                let fps =
+                    crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+                #[cfg(feature = "webcam")]
+                let backend = crate::tracking::CameraBackend::Webcam {
+                    camera_index: state.camera_index,
+                };
+                #[cfg(not(feature = "webcam"))]
+                let backend = crate::tracking::CameraBackend::Synthetic;
+                state.app.start_tracking_with_params(backend, w, h, fps);
+                state.push_notification(format!(
+                    "Camera restarted: {}x{} @ {} fps",
+                    w, h, fps
+                ));
             }
         });
 
@@ -708,10 +731,12 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
-    // Read App-derived state once for this frame. The combo / checkbox bind
-    // to local copies; on change we route through Application mutators.
+    // Phase D: bind UI to user-requested state, not runtime state. If the
+    // audio device fails to open the runtime stays disabled, but the
+    // checkbox keeps the user's intent so a mic refresh can retry.
     let active_mic = state.app.lipsync_mic_device_index();
-    let active_enabled = state.app.is_lipsync_enabled();
+    let requested_enabled = state.app.requested_lipsync_enabled();
+    let runtime_enabled = state.app.is_lipsync_enabled();
 
     let mut new_mic = active_mic;
     let mut refresh_clicked = false;
@@ -745,8 +770,12 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 
     if new_mic != active_mic {
-        // Always store the mic preference; restart only if currently enabled.
-        if let Err(e) = state.app.set_lipsync_enabled(active_enabled, new_mic) {
+        // Goes through requested setter so a failed mic switch still
+        // updates the user's preference (next attempt won't revert).
+        if let Err(e) = state
+            .app
+            .set_requested_lipsync(requested_enabled, new_mic)
+        {
             state.push_notification(format!("Lip sync mic switch failed: {e}"));
         }
         state.project_dirty = true;
@@ -754,12 +783,12 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     ui.add_space(4.0);
 
-    let mut new_enabled = active_enabled;
+    let mut new_enabled = requested_enabled;
     if ui
         .checkbox(&mut new_enabled, "Enable Lip Sync")
         .changed()
     {
-        match state.app.set_lipsync_enabled(new_enabled, active_mic) {
+        match state.app.set_requested_lipsync(new_enabled, active_mic) {
             Ok(()) => {
                 state.project_dirty = true;
                 if new_enabled {
@@ -769,10 +798,18 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             }
             Err(e) => {
+                // requested stays at new_enabled; runtime didn't make it.
                 state.push_notification(format!("Lip sync failed: {e}"));
-                // App stays disabled; checkbox will reflect that next frame.
+                state.project_dirty = true;
             }
         }
+    }
+
+    if requested_enabled && !runtime_enabled {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 80),
+            "(requested, but audio device couldn't open)",
+        );
     }
 
     // Per-frame lipsync inference is owned by `Application::step_lipsync`
@@ -782,10 +819,10 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     #[cfg(not(feature = "lipsync"))]
     {
-        if active_enabled {
-            // Without the feature, set_lipsync_enabled is a no-op stub that
-            // returns Ok, so just call it to reset App state.
-            let _ = state.app.set_lipsync_enabled(false, active_mic);
+        if requested_enabled {
+            // Without the feature, set_requested_lipsync is a no-op stub
+            // that returns Ok, so just call it to reset App state.
+            let _ = state.app.set_requested_lipsync(false, active_mic);
             state.push_notification(
                 "Lip sync unavailable: build with --features lipsync".to_string(),
             );
@@ -1018,36 +1055,51 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         "Image Sequence",
     ];
 
-    // After Phase C the active sink lives on Application. Bind the combo
-    // to a local copy of the App-derived index, then on change push the
-    // new selection through the mutator. No GuiState shadow.
+    // Combo binds to the user's REQUESTED sink (Phase D). If the runtime
+    // can't honor it (MF init failed), the request still persists so
+    // autosave doesn't overwrite the user's choice with a fallback.
     use crate::output::FrameSink;
+    let requested_idx = state.app.requested_sink().to_gui_index();
     let active_idx = state.app.output.active_sink().to_gui_index();
-    let mut new_idx = active_idx;
+    let mut new_idx = requested_idx;
 
     egui::CollapsingHeader::new("Sink Selection")
         .default_open(true)
         .show(ui, |ui| {
             egui::ComboBox::from_label("Output Sink")
-                .selected_text(*sink_names.get(active_idx).unwrap_or(&"Unknown"))
+                .selected_text(*sink_names.get(requested_idx).unwrap_or(&"Unknown"))
                 .show_ui(ui, |ui| {
                     for (i, name) in sink_names.iter().enumerate() {
                         ui.selectable_value(&mut new_idx, i, *name);
                     }
                 });
+            // Surface the runtime / requested mismatch so the user knows
+            // their selection isn't actually live (e.g. MF init failed).
+            if active_idx != requested_idx {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 80),
+                    format!(
+                        "(running on {} — requested {} unavailable)",
+                        sink_names.get(active_idx).unwrap_or(&"?"),
+                        sink_names.get(requested_idx).unwrap_or(&"?"),
+                    ),
+                );
+            }
         });
 
-    if new_idx != active_idx {
+    if new_idx != requested_idx {
         let want_sink = FrameSink::from_gui_index(new_idx);
-        match state.app.ensure_output_sink_runtime(want_sink) {
+        match state.app.set_requested_sink(want_sink) {
             Ok(()) => {
                 state.push_notification(format!("Output sink changed to {}", sink_names[new_idx]));
                 state.project_dirty = true;
             }
             Err(e) => {
+                // requested_sink was still updated; runtime stays on
+                // whatever fallback was previously active. Notify the user
+                // and mark dirty so the requested choice is persisted.
                 state.push_notification(format!("Output sink change failed: {e}"));
-                // App stayed at the previous sink; the combo will display
-                // that on the next frame because it reads from App.
+                state.project_dirty = true;
             }
         }
     }

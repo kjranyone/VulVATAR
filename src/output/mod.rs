@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Unique identifier for a GPU-exported resource (shared texture handle, etc.).
 pub type ExportedResourceId = u64;
@@ -130,6 +131,13 @@ pub struct OutputRouter {
     dropped_count: u64,
     last_publish_timestamp: FrameTimestamp,
 
+    /// Phase B-3: minimum interval between forwarded frames. The renderer
+    /// usually produces at the display rate (e.g. 60 Hz), but the user can
+    /// pick a slower output cadence in the inspector. `Duration::ZERO`
+    /// means "no throttling, forward every frame".
+    forward_min_interval: Duration,
+    last_forward_at: Option<Instant>,
+
     /// Channel sender to the background output worker.
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
     /// Join handle for the background worker thread.
@@ -150,9 +158,23 @@ impl OutputRouter {
             next_frame_id: 0,
             dropped_count: 0,
             last_publish_timestamp: 0,
+            forward_min_interval: Duration::ZERO,
+            last_forward_at: None,
             worker_tx: Some(tx),
             worker_handle: Some(handle),
         }
+    }
+
+    /// Set the minimum interval between forwarded frames. Called every
+    /// frame from `GuiApp::update` based on the user's framerate combo
+    /// selection — idempotent, so it's cheap to call from the hot path.
+    /// `fps == 0` disables throttling.
+    pub fn set_target_fps(&mut self, fps: u32) {
+        self.forward_min_interval = if fps == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(1_000_000 / fps.max(1) as u64)
+        };
     }
 
     /// Spawn a dedicated output worker thread that receives frames over a
@@ -201,6 +223,21 @@ impl OutputRouter {
     /// The frame is queued locally (applying the queue policy) and then
     /// dispatched to the background output worker for actual writing.
     pub fn publish(&mut self, frame: OutputFrame) {
+        // Phase B-3: framerate throttling. Skip the entire publish path
+        // (including the local queue) if we're publishing faster than the
+        // configured cadence — that way the latest frame at the next
+        // tick is the freshest one rather than a stale queued one.
+        if !self.forward_min_interval.is_zero() {
+            let now = Instant::now();
+            if let Some(last) = self.last_forward_at {
+                if now.duration_since(last) < self.forward_min_interval {
+                    self.dropped_count += 1;
+                    return;
+                }
+            }
+            self.last_forward_at = Some(now);
+        }
+
         debug!(
             "output: publish frame {} {}x{} {:?} alpha={:?} to {:?}",
             frame.frame_id.0,

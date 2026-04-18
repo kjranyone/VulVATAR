@@ -30,6 +30,11 @@ const SHMEM_NAME: &str = "Local\\VulVATAR_VirtualCamera";
 const SHMEM_HEADER_SIZE: usize = 32;
 const SHMEM_MAGIC: u32 = 0x5643_4D46;
 
+/// Bit 0 of the producer-written `flags` u32 at header offset 28. When
+/// set, the RGB32 conversion path keeps the source RGBA's alpha byte
+/// instead of forcing 0xFF; NV12 paths ignore this (no alpha channel).
+pub const FRAME_FLAG_PRESERVE_ALPHA: u32 = 1 << 0;
+
 /// One frame view returned from the shared memory.
 pub struct FrameView {
     pub width: u32,
@@ -41,6 +46,8 @@ pub struct FrameView {
     /// matches the producer one-to-one.
     #[allow(dead_code)]
     pub timestamp_ns: u64,
+    /// Producer-supplied flags (see `FRAME_FLAG_*` constants).
+    pub flags: u32,
     /// RGBA pixels. `len() == width * height * 4`.
     pub pixels: Vec<u8>,
 }
@@ -115,6 +122,7 @@ impl SharedMemoryReader {
             height: header.height,
             sequence: header.sequence,
             timestamp_ns: header.timestamp,
+            flags: header.flags,
             pixels,
         })
     }
@@ -135,6 +143,7 @@ struct Header {
     height: u32,
     sequence: u64,
     timestamp: u64,
+    flags: u32,
 }
 
 unsafe fn read_header(ptr: *const u8) -> Option<Header> {
@@ -154,6 +163,7 @@ unsafe fn read_header(ptr: *const u8) -> Option<Header> {
         height: read_u32(8),
         sequence: read_u64(12),
         timestamp: read_u64(20),
+        flags: read_u32(28),
     })
 }
 

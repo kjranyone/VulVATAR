@@ -115,6 +115,10 @@ pub struct Application {
     pub viewport_camera: ViewportCamera,
     pub viewport_lighting: LightingState,
     pub output_extent: Option<[u32; 2]>,
+    /// Phase B-4: whether the output sink should preserve the renderer's
+    /// alpha channel (true) or force opaque (false). Synced from the GUI
+    /// `output.output_has_alpha` toggle every frame.
+    pub output_preserve_alpha: bool,
 
     pub tracking_worker: Option<TrackingWorker>,
     /// Lifetime owner for the MediaFoundation virtual-camera registration.
@@ -146,6 +150,19 @@ pub struct Application {
     /// `enabled=false` path.
     #[cfg(feature = "lipsync")]
     lipsync_mic_device_index: usize,
+    /// Phase D: user's requested sink, kept separate from the actually-running
+    /// `output.active_sink()`. If the runtime fails to switch (typical case:
+    /// MFCreateVirtualCamera::Start fails), `requested_sink` keeps the user's
+    /// intent so it survives autosave and a future retry. Persisted by
+    /// `to_project_state`. Combo box display reads this, not active.
+    requested_sink: FrameSink,
+    /// Phase D companion to [`Self::lipsync_processor`]: the user's intent.
+    /// `lipsync_processor.is_some()` reflects runtime success;
+    /// `requested_lipsync_enabled` survives a failed start so the next
+    /// mic refresh / app restart can retry, and `to_project_state` saves
+    /// what the user picked rather than what currently happens to work.
+    #[cfg(feature = "lipsync")]
+    requested_lipsync_enabled: bool,
     shutdown_complete: bool,
     pub viewport_background: Option<std::path::PathBuf>,
     pub ground_grid_visible: bool,
@@ -218,6 +235,7 @@ impl Application {
             viewport_camera: ViewportCamera::default(),
             viewport_lighting: LightingState::default(),
             output_extent: None,
+            output_preserve_alpha: false,
             tracking_worker: None,
             #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
             mf_virtual_camera: None,
@@ -225,6 +243,9 @@ impl Application {
             lipsync_processor: None,
             #[cfg(feature = "lipsync")]
             lipsync_mic_device_index: 0,
+            requested_sink: FrameSink::SharedMemory,
+            #[cfg(feature = "lipsync")]
+            requested_lipsync_enabled: false,
             shutdown_complete: false,
             stale_warn_cooldown: std::time::Instant::now(),
             viewport_background: None,
@@ -461,6 +482,14 @@ impl Application {
         );
 
         output_frame.handoff_path = exported.handoff_path.clone();
+        // Phase B-4: tag the frame with the user's alpha preference so the
+        // downstream sink (Win32NamedSharedMemorySink → DLL) knows whether
+        // to preserve or clobber the alpha channel.
+        output_frame.alpha_mode = if self.output_preserve_alpha {
+            crate::output::AlphaMode::Premultiplied
+        } else {
+            crate::output::AlphaMode::Opaque
+        };
 
         match exported.pixel_data {
             crate::renderer::output_export::ExportedPixelData::CpuReadback(ref pixel_data)
@@ -878,6 +907,15 @@ impl Application {
         }
     }
 
+    /// True if the webcam tracking worker is currently running. Used by
+    /// the inspector to decide whether a resolution / framerate combo
+    /// change should restart the worker in place.
+    pub fn is_tracking_running(&self) -> bool {
+        self.tracking_worker
+            .as_ref()
+            .is_some_and(|w| w.is_running())
+    }
+
     /// Bring the lipsync processor in line with the requested state. Idempotent
     /// over `(enabled, mic_device_index)`. The mic preference is always
     /// stored, even when `enabled=false`, so the user's selection survives
@@ -941,10 +979,11 @@ impl Application {
         Ok(())
     }
 
-    /// True if the lipsync processor is currently running. Reflects runtime
-    /// state, not user intent — e.g. if the user requested `enabled=true`
-    /// but the audio device couldn't open, this stays `false`. Source of
-    /// truth for the GUI's lipsync checkbox after Phase C.
+    /// True if the lipsync processor is currently running. Reflects **runtime
+    /// reality**, not user intent — e.g. if the user requested `enabled=true`
+    /// but the audio device couldn't open, this stays `false`. Use
+    /// [`Self::requested_lipsync_enabled`] for user intent (project save,
+    /// combo display).
     pub fn is_lipsync_enabled(&self) -> bool {
         #[cfg(feature = "lipsync")]
         return self.lipsync_processor.is_some();
@@ -959,6 +998,60 @@ impl Application {
         return self.lipsync_mic_device_index;
         #[cfg(not(feature = "lipsync"))]
         return 0;
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase D: requested vs active separation
+    //
+    // The `requested_*` fields track user intent (what the user picked in
+    // the GUI / what the project file says). The `active_*` getters / fields
+    // track runtime reality (what's currently running). They diverge when a
+    // runtime change fails (e.g. MFCreateVirtualCamera::Start returns Err).
+    // GUI display + project save read `requested_*` so the user's choice
+    // survives transient failures and isn't silently overwritten by autosave
+    // when a fallback kicks in.
+    // ---------------------------------------------------------------------
+
+    /// User's requested sink (the choice they made / the project file holds).
+    /// May differ from `output.active_sink()` if the runtime failed to switch.
+    pub fn requested_sink(&self) -> &FrameSink {
+        &self.requested_sink
+    }
+
+    /// Update the requested sink and try to make the runtime match. The
+    /// requested value is updated unconditionally, even if the runtime
+    /// transition fails — the user's intent persists for next time
+    /// (autosave, restart, retry).
+    pub fn set_requested_sink(&mut self, sink: FrameSink) -> Result<(), String> {
+        self.requested_sink = sink.clone();
+        self.ensure_output_sink_runtime(sink)
+    }
+
+    /// User's requested lipsync enabled state. May differ from
+    /// [`Self::is_lipsync_enabled`] if the audio device couldn't open.
+    pub fn requested_lipsync_enabled(&self) -> bool {
+        #[cfg(feature = "lipsync")]
+        return self.requested_lipsync_enabled;
+        #[cfg(not(feature = "lipsync"))]
+        return false;
+    }
+
+    /// Update the requested lipsync state and try to make the runtime match.
+    /// As with [`Self::set_requested_sink`], the requested value is updated
+    /// regardless of runtime success.
+    pub fn set_requested_lipsync(
+        &mut self,
+        enabled: bool,
+        mic_device_index: usize,
+    ) -> Result<(), String> {
+        #[cfg(feature = "lipsync")]
+        {
+            self.requested_lipsync_enabled = enabled;
+        }
+        // mic_device_index is always remembered by set_lipsync_enabled
+        // (including the disable path) so we don't need a separate
+        // requested_mic field.
+        self.set_lipsync_enabled(enabled, mic_device_index)
     }
 
     /// Run lipsync inference for one frame and apply viseme weights to the
