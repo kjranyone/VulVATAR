@@ -24,6 +24,7 @@ mod class_factory;
 mod media_source;
 mod media_stream;
 mod registry;
+mod shared_memory;
 #[macro_use]
 pub mod trace;
 
@@ -60,7 +61,7 @@ pub(crate) fn dll_release() {
 /// Build-time identifier baked into the DLL. If the FrameServer reuses an
 /// older scratch copy, the trace at the top of each run will show the
 /// stale marker and we know not to trust subsequent diagnostics.
-const BUILD_MARKER: &str = concat!("privacy-event-header ", file!(), ":", line!());
+const BUILD_MARKER: &str = concat!("frames-from-shared-memory ", file!(), ":", line!());
 
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(
