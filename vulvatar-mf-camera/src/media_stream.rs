@@ -16,14 +16,40 @@ use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncResult, IMFMediaEvent, IMFMediaEventGenerator_Impl,
     IMFMediaEventQueue, IMFMediaSource, IMFMediaStream, IMFMediaStream2, IMFMediaStream2_Impl,
     IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor, MFCreateMemoryBuffer, MFCreateSample,
-    MFVideoFormat_NV12, MFVideoFormat_RGB32, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEMediaSample,
-    MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
+    MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEMediaSample,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
 };
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
-use crate::media_source::{DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_WIDTH};
-use crate::shared_memory::{FrameView, SharedMemoryReader};
+use crate::media_source::DEFAULT_FPS;
+use crate::shared_memory::SharedMemoryReader;
 use crate::{dll_add_ref, dll_release};
+
+/// Resolution + framerate the client has currently negotiated. If we can't
+/// read it from the media-type handler (race during init etc.), fall back
+/// to 1920×1080@30 NV12 so something sensible always ships.
+#[derive(Clone, Copy, Debug)]
+struct CurrentFormat {
+    subtype: GUID,
+    width: u32,
+    height: u32,
+    fps: u32,
+}
+
+impl CurrentFormat {
+    fn fallback() -> Self {
+        Self {
+            subtype: MFVideoFormat_NV12,
+            width: 1920,
+            height: 1080,
+            fps: DEFAULT_FPS,
+        }
+    }
+
+    fn frame_duration_hns(&self) -> u64 {
+        10_000_000u64 / self.fps.max(1) as u64
+    }
+}
 
 #[implement(IMFMediaStream2, IMFMediaStream)]
 pub struct VulvatarMediaStream {
@@ -67,11 +93,6 @@ impl VulvatarMediaStream {
         }
     }
 
-    /// Frame interval in 100-nanosecond units. Used for both sample
-    /// timestamps and durations.
-    fn frame_duration_hns() -> u64 {
-        10_000_000u64 / DEFAULT_FPS as u64
-    }
 }
 
 impl Drop for VulvatarMediaStream {
@@ -132,47 +153,60 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
     fn RequestSample(&self, token: Option<&IUnknown>) -> windows::core::Result<()> {
         crate::t!("Stream::RequestSample");
 
-        // Look up the currently-negotiated subtype (NV12 or RGB32) so the
-        // builder can match what the client actually expects. Browsers /
-        // WebRTC pin NV12; Windows Camera and OBS happily take either.
-        let subtype = self
-            .current_subtype()
-            .unwrap_or_else(|| MFVideoFormat_NV12);
-        let is_nv12 = subtype == MFVideoFormat_NV12;
-        let time = self.next_timestamp();
-        let dur = VulvatarMediaStream::frame_duration_hns();
+        let format = self.current_format();
+        let is_nv12 = format.subtype == MFVideoFormat_NV12;
+        let time = self
+            .sample_time_hns
+            .fetch_add(format.frame_duration_hns(), Ordering::Relaxed);
+        let dur = format.frame_duration_hns();
 
         let sample = match self.shared_memory.read_latest() {
-            Some(view) if view.width == DEFAULT_WIDTH && view.height == DEFAULT_HEIGHT => {
+            Some(view) => {
+                let resampled;
+                let (rgba, w, h) = if view.width == format.width && view.height == format.height {
+                    (view.pixels.as_slice(), view.width, view.height)
+                } else {
+                    crate::t!(
+                        "Stream::RequestSample resample {}x{} → {}x{}",
+                        view.width,
+                        view.height,
+                        format.width,
+                        format.height,
+                    );
+                    resampled = resample_rgba_nearest(
+                        &view.pixels,
+                        view.width as usize,
+                        view.height as usize,
+                        format.width as usize,
+                        format.height as usize,
+                    );
+                    (resampled.as_slice(), format.width, format.height)
+                };
                 crate::t!(
-                    "Stream::RequestSample frame seq={} {}x{} subtype={}",
+                    "Stream::RequestSample frame seq={} client_size={}x{}@{} subtype={}",
                     view.sequence,
-                    view.width,
-                    view.height,
+                    format.width,
+                    format.height,
+                    format.fps,
                     if is_nv12 { "NV12" } else { "RGB32" },
                 );
                 if is_nv12 {
-                    build_sample_nv12(&view, time, dur)?
+                    build_sample_nv12_from_rgba(rgba, w, h, time, dur)?
                 } else {
-                    build_sample_from_rgba(&view, time, dur)?
+                    build_sample_rgb32_from_rgba(rgba, w, h, time, dur)?
                 }
             }
-            other => {
-                if let Some(view) = other.as_ref() {
-                    crate::t!(
-                        "Stream::RequestSample size mismatch (sm={}x{}, declared={}x{}); sending black",
-                        view.width,
-                        view.height,
-                        DEFAULT_WIDTH,
-                        DEFAULT_HEIGHT,
-                    );
-                } else {
-                    crate::t!("Stream::RequestSample no producer yet, sending black ({})", if is_nv12 { "NV12" } else { "RGB32" });
-                }
+            None => {
+                crate::t!(
+                    "Stream::RequestSample no producer yet, sending black ({}x{} {})",
+                    format.width,
+                    format.height,
+                    if is_nv12 { "NV12" } else { "RGB32" },
+                );
                 if is_nv12 {
-                    build_black_sample_nv12(time, dur)?
+                    build_black_sample_nv12(format.width, format.height, time, dur)?
                 } else {
-                    build_black_sample(time, dur)?
+                    build_black_sample_rgb32(format.width, format.height, time, dur)?
                 }
             }
         };
@@ -197,32 +231,55 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
 }
 
 impl VulvatarMediaStream {
-    fn next_timestamp(&self) -> u64 {
-        self.sample_time_hns
-            .fetch_add(VulvatarMediaStream::frame_duration_hns(), Ordering::Relaxed)
-    }
-
-    /// Read the currently-selected media subtype from the stream
-    /// descriptor's media-type handler. Returns `None` if the lookup fails
-    /// (the caller falls back to NV12, our declared primary).
-    fn current_subtype(&self) -> Option<GUID> {
-        let descriptor = self.inner.lock().ok()?.descriptor.clone();
-        let handler = unsafe { descriptor.GetMediaTypeHandler().ok()? };
-        let mt = unsafe { handler.GetCurrentMediaType().ok()? };
-        unsafe { mt.GetGUID(&MF_MT_SUBTYPE).ok() }
+    /// Read the currently-negotiated subtype + frame size + frame rate
+    /// off the stream descriptor's media-type handler. Falls back to
+    /// NV12 1920×1080@30 if any lookup fails.
+    fn current_format(&self) -> CurrentFormat {
+        let descriptor = match self.inner.lock() {
+            Ok(g) => g.descriptor.clone(),
+            Err(_) => return CurrentFormat::fallback(),
+        };
+        unsafe {
+            let Ok(handler) = descriptor.GetMediaTypeHandler() else {
+                return CurrentFormat::fallback();
+            };
+            let Ok(mt) = handler.GetCurrentMediaType() else {
+                return CurrentFormat::fallback();
+            };
+            let subtype = mt.GetGUID(&MF_MT_SUBTYPE).unwrap_or(MFVideoFormat_NV12);
+            let size = mt.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+            let rate = mt.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
+            let width = (size >> 32) as u32;
+            let height = (size & 0xFFFF_FFFF) as u32;
+            // Frame rate is packed (numerator, denominator). For
+            // integer framerates the denominator is 1; we ignore the
+            // ratio and use the numerator directly.
+            let fps = (rate >> 32) as u32;
+            if width == 0 || height == 0 || fps == 0 {
+                return CurrentFormat::fallback();
+            }
+            CurrentFormat {
+                subtype,
+                width,
+                height,
+                fps,
+            }
+        }
     }
 }
 
-/// Convert the renderer's RGBA output (one byte per channel, R first) into
-/// an RGB32 (BGRX, B first, alpha-as-padding) `IMFSample`. Most MF clients
-/// — including OBS, Teams and Windows Camera — consume RGB32 directly.
-fn build_sample_from_rgba(
-    view: &FrameView,
+/// Convert RGBA bytes (R first, length = w * h * 4) into an `IMFSample`
+/// containing RGB32 (BGRX, B first; alpha-as-padding) pixel data. The
+/// negotiated client size is used; caller is responsible for resampling
+/// the renderer's source frame to that size before calling.
+fn build_sample_rgb32_from_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
     time_hns: u64,
     duration_hns: u64,
 ) -> windows::core::Result<IMFSample> {
-    let pixel_count = view.pixels.len() / 4;
-    let buffer_size = pixel_count * 4;
+    let buffer_size = (width as usize) * (height as usize) * 4;
     let buffer = unsafe { MFCreateMemoryBuffer(buffer_size as u32)? };
     unsafe {
         let mut dst_ptr: *mut u8 = core::ptr::null_mut();
@@ -234,10 +291,8 @@ fn build_sample_from_rgba(
             return Err(E_FAIL.into());
         }
 
-        // RGBA → BGRX byte-swap. RGB32 stores pixels as B G R X (little-
-        // endian D3DFMT_X8R8G8B8); the renderer writes R G B A.
-        let src = view.pixels.as_ptr();
-        for i in 0..pixel_count {
+        let src = rgba.as_ptr();
+        for i in 0..(buffer_size / 4) {
             let s = src.add(i * 4);
             let d = dst_ptr.add(i * 4);
             *d = *s.add(2); // B ← R
@@ -258,13 +313,14 @@ fn build_sample_from_rgba(
     Ok(sample)
 }
 
-/// Build a fully-opaque black frame of `DEFAULT_WIDTH × DEFAULT_HEIGHT`.
-/// Used until the renderer has written its first frame.
-fn build_black_sample(
+/// Build a fully-opaque black RGB32 sample of `width × height`.
+fn build_black_sample_rgb32(
+    width: u32,
+    height: u32,
     time_hns: u64,
     duration_hns: u64,
 ) -> windows::core::Result<IMFSample> {
-    let buffer_size = DEFAULT_WIDTH as usize * DEFAULT_HEIGHT as usize * 4;
+    let buffer_size = (width as usize) * (height as usize) * 4;
     let buffer = unsafe { MFCreateMemoryBuffer(buffer_size as u32)? };
     unsafe {
         let mut dst_ptr: *mut u8 = core::ptr::null_mut();
@@ -272,7 +328,6 @@ fn build_black_sample(
         let mut current_len: u32 = 0;
         buffer.Lock(&mut dst_ptr, Some(&mut max_len), Some(&mut current_len))?;
         if !dst_ptr.is_null() && (max_len as usize) >= buffer_size {
-            // Black opaque: B=0, G=0, R=0, X=0xFF.
             for i in 0..(buffer_size / 4) {
                 let d = dst_ptr.add(i * 4);
                 *d = 0;
@@ -291,6 +346,34 @@ fn build_black_sample(
         sample.SetSampleDuration(duration_hns as i64)?;
     }
     Ok(sample)
+}
+
+/// Nearest-neighbour RGBA resampler. Cheap, GPU-free, fine for a virtual
+/// camera path where the renderer is the upstream of truth and clients
+/// only need plausible sub-frames.
+fn resample_rgba_nearest(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    if src_w == dst_w && src_h == dst_h {
+        return src.to_vec();
+    }
+    let mut out = vec![0u8; dst_w * dst_h * 4];
+    let src_stride = src_w * 4;
+    let dst_stride = dst_w * 4;
+    for y in 0..dst_h {
+        let sy = y * src_h / dst_h;
+        for x in 0..dst_w {
+            let sx = x * src_w / dst_w;
+            let s_off = sy * src_stride + sx * 4;
+            let d_off = y * dst_stride + x * 4;
+            out[d_off..d_off + 4].copy_from_slice(&src[s_off..s_off + 4]);
+        }
+    }
+    out
 }
 
 /// `MFSampleExtension_Token` (well-known constant) — when MF clients call
@@ -321,14 +404,16 @@ const fn nv12_size(w: u32, h: u32) -> usize {
     (w as usize) * (h as usize) * 3 / 2
 }
 
-fn build_sample_nv12(
-    view: &FrameView,
+fn build_sample_nv12_from_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
     time_hns: u64,
     duration_hns: u64,
 ) -> windows::core::Result<IMFSample> {
-    let w = view.width as usize;
-    let h = view.height as usize;
-    let buffer_size = nv12_size(view.width, view.height);
+    let w = width as usize;
+    let h = height as usize;
+    let buffer_size = nv12_size(width, height);
 
     let buffer = unsafe { MFCreateMemoryBuffer(buffer_size as u32)? };
     unsafe {
@@ -340,7 +425,7 @@ fn build_sample_nv12(
             buffer.Unlock()?;
             return Err(E_FAIL.into());
         }
-        rgba_to_nv12(&view.pixels, w, h, dst_ptr);
+        rgba_to_nv12(rgba, w, h, dst_ptr);
         buffer.SetCurrentLength(buffer_size as u32)?;
         buffer.Unlock()?;
     }
@@ -355,12 +440,14 @@ fn build_sample_nv12(
 }
 
 fn build_black_sample_nv12(
+    width: u32,
+    height: u32,
     time_hns: u64,
     duration_hns: u64,
 ) -> windows::core::Result<IMFSample> {
-    let w = DEFAULT_WIDTH as usize;
-    let h = DEFAULT_HEIGHT as usize;
-    let buffer_size = nv12_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let w = width as usize;
+    let h = height as usize;
+    let buffer_size = nv12_size(width, height);
 
     let buffer = unsafe { MFCreateMemoryBuffer(buffer_size as u32)? };
     unsafe {
@@ -393,7 +480,7 @@ unsafe fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: *mut u8) {
     let stride = w * 4;
 
     // Walk in 2×2 blocks: every block contributes 4 Y samples and 1 UV pair.
-    let mut y_idx = |x: usize, y: usize| y * w + x;
+    let y_idx = |x: usize, y: usize| y * w + x;
 
     let mut row = 0;
     while row < h {

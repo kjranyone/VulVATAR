@@ -35,6 +35,11 @@ pub struct FrameView {
     pub width: u32,
     pub height: u32,
     pub sequence: u64,
+    /// Frame timestamp the producer wrote. Currently unused on the
+    /// consumer side — MF samples carry their own timestamp derived from
+    /// the negotiated framerate — but kept around so the wire format
+    /// matches the producer one-to-one.
+    #[allow(dead_code)]
     pub timestamp_ns: u64,
     /// RGBA pixels. `len() == width * height * 4`.
     pub pixels: Vec<u8>,

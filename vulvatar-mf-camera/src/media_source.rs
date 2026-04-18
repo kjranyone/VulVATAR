@@ -42,9 +42,10 @@ use windows::Win32::Media::MediaFoundation::{
 use crate::media_stream::VulvatarMediaStream;
 use crate::{dll_add_ref, dll_release};
 
-/// Default video output format. Matches the renderer's CPU readback.
-pub const DEFAULT_WIDTH: u32 = 1920;
-pub const DEFAULT_HEIGHT: u32 = 1080;
+/// Fallback framerate used when the negotiated media type can't be read
+/// (e.g. during a transient race in `current_format`). The full set of
+/// (subtype, width, height, fps) combinations the camera advertises lives
+/// in [`SUPPORTED_FORMATS`].
 pub const DEFAULT_FPS: u32 = 30;
 pub const DEFAULT_STREAM_ID: u32 = 0;
 
@@ -111,19 +112,23 @@ impl VulvatarMediaSource {
             return Ok(inner);
         }
 
-        // Offer NV12 first (the format WebRTC / Chrome / Meet pipelines
-        // prefer — RGB32-only sources are silently rejected by browsers)
-        // and RGB32 as a fallback for clients that ask for it explicitly.
-        let nv12 = build_media_type(&MFVideoFormat_NV12)?;
-        let rgb32 = build_media_type(&MFVideoFormat_RGB32)?;
+        // Offer the full SUPPORTED_FORMATS list so clients can pick
+        // whichever resolution / framerate / pixel layout suits them.
+        // RequestSample resamples the renderer's native frame into the
+        // selected size on demand.
+        let media_types: Vec<IMFMediaType> = SUPPORTED_FORMATS
+            .iter()
+            .map(|(subtype, w, h, fps)| build_media_type(subtype, *w, *h, *fps))
+            .collect::<windows::core::Result<_>>()?;
+        let descriptor_input: Vec<Option<IMFMediaType>> =
+            media_types.iter().cloned().map(Some).collect();
         let stream_descriptor = unsafe {
-            MFCreateStreamDescriptor(
-                DEFAULT_STREAM_ID,
-                &[Some(nv12.clone()), Some(rgb32.clone())],
-            )?
+            MFCreateStreamDescriptor(DEFAULT_STREAM_ID, &descriptor_input)?
         };
         let handler = unsafe { stream_descriptor.GetMediaTypeHandler()? };
-        unsafe { handler.SetCurrentMediaType(&nv12)? };
+        // Default to the first entry (1920×1080@30 NV12) so clients that
+        // never call SetCurrentMediaType still get a sensible format.
+        unsafe { handler.SetCurrentMediaType(&media_types[0])? };
 
         // Frame Server inspects these attributes to decide whether a
         // source is a Frame-Server-shareable camera. Omitting them (in
@@ -894,24 +899,48 @@ impl IMFSampleAllocatorControl_Impl for VulvatarMediaSource_Impl {
     }
 }
 
-/// Build a 1920x1080 @ 30fps media type for the given subtype GUID.
+/// Build a `width × height @ fps` media type for the given subtype GUID.
 ///
 /// `MFSetAttributeSize` / `MFSetAttributeRatio` are inline helpers in the
 /// SDK header and are not exposed by `windows-rs`; we pack the two `u32`
 /// halves into a `u64` ourselves (high → numerator, low → denominator).
-fn build_media_type(subtype: &GUID) -> windows::core::Result<IMFMediaType> {
+fn build_media_type(
+    subtype: &GUID,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> windows::core::Result<IMFMediaType> {
     unsafe {
         let mt = MFCreateMediaType()?;
         mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         mt.SetGUID(&MF_MT_SUBTYPE, subtype)?;
         mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         mt.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-        mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(DEFAULT_WIDTH, DEFAULT_HEIGHT))?;
-        mt.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(DEFAULT_FPS, 1))?;
+        mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(width, height))?;
+        mt.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(fps, 1))?;
         mt.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1))?;
         Ok(mt)
     }
 }
+
+/// Resolutions × framerates × pixel formats this source advertises.
+///
+/// Order matters: clients that just take "the first type" land on
+/// `1920×1080@30 NV12` (the renderer's native output, no resampling on the
+/// hot path). NV12 entries are listed before RGB32 because Chrome / WebRTC
+/// reject the source when only RGB32 is offered.
+pub const SUPPORTED_FORMATS: &[(GUID, u32, u32, u32)] = &[
+    (MFVideoFormat_NV12, 1920, 1080, 30),
+    (MFVideoFormat_NV12, 1920, 1080, 60),
+    (MFVideoFormat_NV12, 1280, 720, 60),
+    (MFVideoFormat_NV12, 1280, 720, 30),
+    (MFVideoFormat_NV12, 960, 540, 30),
+    (MFVideoFormat_NV12, 640, 480, 30),
+    (MFVideoFormat_NV12, 320, 240, 30),
+    (MFVideoFormat_RGB32, 1920, 1080, 30),
+    (MFVideoFormat_RGB32, 1280, 720, 30),
+    (MFVideoFormat_RGB32, 640, 480, 30),
+];
 
 #[inline]
 fn pack_2x32(hi: u32, lo: u32) -> u64 {
