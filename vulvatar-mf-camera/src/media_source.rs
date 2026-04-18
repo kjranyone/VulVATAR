@@ -8,28 +8,35 @@
 
 #![allow(unused_variables)]
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
 
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
 use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{
-    IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE, PROPSETID_VIDCAP_CAMERACONTROL,
+    IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
+    PROPSETID_VIDCAP_CAMERACONTROL,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFGetService, IMFGetService_Impl,
-    IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource,
-    IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl, IMFMediaStream, IMFMediaType,
-    IMFPresentationDescriptor, IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl,
-    IMFStreamDescriptor, MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType,
-    MFCreatePresentationDescriptor, MFCreateStreamDescriptor, MFFrameSourceTypes_Color,
-    MFMediaType_Video, MFSampleAllocatorUsage, MFVideoFormat_RGB32,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MENewStream, MESourceStarted, MESourceStopped,
-    MEStreamStarted, MEStreamStopped, MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE,
+    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFExtendedCameraControl,
+    IMFExtendedCameraControl_Impl, IMFExtendedCameraController, IMFExtendedCameraController_Impl,
+    IMFGetService, IMFGetService_Impl, IMFMediaEvent, IMFMediaEventGenerator_Impl,
+    IMFMediaEventQueue, IMFMediaSource, IMFMediaSourceEx, IMFMediaSourceEx_Impl,
+    IMFMediaSource_Impl, IMFMediaStream, IMFMediaType, IMFPresentationDescriptor,
+    IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl, IMFStreamDescriptor, MENewStream,
+    MESourceStarted, MESourceStopped, MEStreamStarted, MEStreamStopped, MFCreateAttributes,
+    MFCreateEventQueue, MFCreateMediaType, MFCreatePresentationDescriptor,
+    MFCreateStreamDescriptor, MFFrameSourceTypes_Color, MFMediaType_Video, MFSampleAllocatorUsage,
+    MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoInterlace_Progressive,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+    MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE, MF_CAPTURE_ENGINE_MEDIASOURCE,
     MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MF_DEVICESTREAM_FRAMESERVER_SHARED,
-    MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID, MF_E_SHUTDOWN,
-    MF_E_UNSUPPORTED_SERVICE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_VIRTUALCAMERA_CONFIGURATION_APP_PACKAGE_FAMILY_NAME, MFVideoInterlace_Progressive,
+    MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID, MF_E_INVALIDSTREAMNUMBER,
+    MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_VIRTUALCAMERA_CONFIGURATION_APP_PACKAGE_FAMILY_NAME,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -61,7 +68,8 @@ enum SourceState {
     IMFMediaSource,
     IKsControl,
     IMFGetService,
-    IMFSampleAllocatorControl
+    IMFSampleAllocatorControl,
+    IMFExtendedCameraController
 )]
 pub struct VulvatarMediaSource {
     inner: OnceLock<Inner>,
@@ -103,11 +111,19 @@ impl VulvatarMediaSource {
             return Ok(inner);
         }
 
-        let media_type = build_default_media_type()?;
-        let stream_descriptor =
-            unsafe { MFCreateStreamDescriptor(DEFAULT_STREAM_ID, &[Some(media_type.clone())])? };
+        // Offer NV12 first (the format WebRTC / Chrome / Meet pipelines
+        // prefer — RGB32-only sources are silently rejected by browsers)
+        // and RGB32 as a fallback for clients that ask for it explicitly.
+        let nv12 = build_media_type(&MFVideoFormat_NV12)?;
+        let rgb32 = build_media_type(&MFVideoFormat_RGB32)?;
+        let stream_descriptor = unsafe {
+            MFCreateStreamDescriptor(
+                DEFAULT_STREAM_ID,
+                &[Some(nv12.clone()), Some(rgb32.clone())],
+            )?
+        };
         let handler = unsafe { stream_descriptor.GetMediaTypeHandler()? };
-        unsafe { handler.SetCurrentMediaType(&media_type)? };
+        unsafe { handler.SetCurrentMediaType(&nv12)? };
 
         // Frame Server inspects these attributes to decide whether a
         // source is a Frame-Server-shareable camera. Omitting them (in
@@ -118,9 +134,8 @@ impl VulvatarMediaSource {
         let sd_attrs: IMFAttributes = stream_descriptor.cast()?;
         apply_stream_attributes(&sd_attrs)?;
 
-        let presentation_descriptor = unsafe {
-            MFCreatePresentationDescriptor(Some(&[Some(stream_descriptor.clone())]))?
-        };
+        let presentation_descriptor =
+            unsafe { MFCreatePresentationDescriptor(Some(&[Some(stream_descriptor.clone())]))? };
         // Mark our single stream as selected by default so the Frame Server
         // does not need to call SelectStream itself.
         unsafe { presentation_descriptor.SelectStream(0)? };
@@ -188,10 +203,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
         unsafe { inner.event_queue.BeginGetEvent(callback, state) }
     }
 
-    fn EndGetEvent(
-        &self,
-        result: Option<&IMFAsyncResult>,
-    ) -> windows::core::Result<IMFMediaEvent> {
+    fn EndGetEvent(&self, result: Option<&IMFAsyncResult>) -> windows::core::Result<IMFMediaEvent> {
         crate::t!("Source::EndGetEvent");
         let inner = self.initialised()?;
         unsafe { inner.event_queue.EndGetEvent(result) }
@@ -206,7 +218,11 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
     ) -> windows::core::Result<()> {
         crate::t!("Source::QueueEvent met={}", met);
         let inner = self.initialised()?;
-        unsafe { inner.event_queue.QueueEventParamVar(met, guid_extended_type, hr_status, value) }
+        unsafe {
+            inner
+                .event_queue
+                .QueueEventParamVar(met, guid_extended_type, hr_status, value)
+        }
     }
 }
 
@@ -217,9 +233,7 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
         Ok(MFMEDIASOURCE_IS_LIVE.0 as u32)
     }
 
-    fn CreatePresentationDescriptor(
-        &self,
-    ) -> windows::core::Result<IMFPresentationDescriptor> {
+    fn CreatePresentationDescriptor(&self) -> windows::core::Result<IMFPresentationDescriptor> {
         crate::t!("Source::CreatePresentationDescriptor");
         let inner = self.initialised()?;
         unsafe { inner.presentation_descriptor.Clone() }
@@ -372,9 +386,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
             // E_NOINTERFACE out of IMFVirtualCamera::Start. Respond as
             // "privacy shutter permanently off" so the registration path
             // succeeds; a software source has no physical shutter anyway.
-            if set == PROPSETID_VIDCAP_CAMERACONTROL
-                && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID
-            {
+            if set == PROPSETID_VIDCAP_CAMERACONTROL && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID {
                 crate::t!(
                     "Source::KsProperty handling PRIVACY flags={:#x} data_ptr={:?} data_len={}",
                     flags,
@@ -431,9 +443,7 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
         );
 
         if let Some((set, id, flags)) = parse_ksid(event, event_length) {
-            if set == PROPSETID_VIDCAP_CAMERACONTROL
-                && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID
-            {
+            if set == PROPSETID_VIDCAP_CAMERACONTROL && id == KSPROPERTY_CAMERACONTROL_PRIVACY_ID {
                 const KSEVENT_TYPE_ENABLE: u32 = 0x1;
                 const KSEVENT_TYPE_BASICSUPPORT: u32 = 0x200;
                 if flags & KSEVENT_TYPE_BASICSUPPORT != 0 {
@@ -470,6 +480,12 @@ impl IKsControl_Impl for VulvatarMediaSource_Impl {
 /// a strong enum type; the trace receives and compares raw u32 values,
 /// so keep the numeric form handy.
 const KSPROPERTY_CAMERACONTROL_PRIVACY_ID: u32 = 8;
+
+/// `KSPROPERTY_CAMERACONTROL_EXTENDED_ROI_CONFIGCAPS` in ksmedia.h.
+const KSPROPERTY_CAMERACONTROL_EXTENDED_ROI_CONFIGCAPS_ID: u32 = 21;
+
+/// `KSPROPERTY_CAMERACONTROL_EXTENDED_ROI_ISPCONTROL` in ksmedia.h.
+const KSPROPERTY_CAMERACONTROL_EXTENDED_ROI_ISPCONTROL_ID: u32 = 22;
 
 /// `sizeof(KSCAMERA_EXTENDEDPROP_HEADER)` = 32. Just the header; used by
 /// event BASICSUPPORT probes and some SET paths that carry no payload.
@@ -600,8 +616,14 @@ fn log_ksid(label: &str, id: *const KSIDENTIFIER, len: u32) {
             u16::from_le_bytes([set_bytes[4], set_bytes[5]]),
             u16::from_le_bytes([set_bytes[6], set_bytes[7]]),
             [
-                set_bytes[8], set_bytes[9], set_bytes[10], set_bytes[11], set_bytes[12],
-                set_bytes[13], set_bytes[14], set_bytes[15],
+                set_bytes[8],
+                set_bytes[9],
+                set_bytes[10],
+                set_bytes[11],
+                set_bytes[12],
+                set_bytes[13],
+                set_bytes[14],
+                set_bytes[15],
             ],
         );
         let prop_id = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
@@ -632,13 +654,32 @@ impl IMFGetService_Impl for VulvatarMediaSource_Impl {
         unsafe {
             crate::t!(
                 "Source::GetService guid={:?} riid={:?}",
-                if guid_service.is_null() { GUID::zeroed() } else { *guid_service },
-                if riid.is_null() { GUID::zeroed() } else { *riid },
+                if guid_service.is_null() {
+                    GUID::zeroed()
+                } else {
+                    *guid_service
+                },
+                if riid.is_null() {
+                    GUID::zeroed()
+                } else {
+                    *riid
+                },
             );
             if ppv_object.is_null() {
                 return Err(E_POINTER.into());
             }
             *ppv_object = core::ptr::null_mut();
+
+            if !riid.is_null() && *riid == IMFExtendedCameraController::IID {
+                let controller: IMFExtendedCameraController = self.cast()?;
+                let unk: IUnknown = controller.cast()?;
+                let hr = unk.query(riid, ppv_object);
+                crate::t!("Source::GetService IMFExtendedCameraController -> {:?}", hr);
+                if hr.is_err() {
+                    return Err(hr.into());
+                }
+                return Ok(());
+            }
         }
         // Match MS SimpleMediaSource: callers that probe a service we
         // don't offer expect MF_E_UNSUPPORTED_SERVICE, not E_NOINTERFACE.
@@ -647,6 +688,175 @@ impl IMFGetService_Impl for VulvatarMediaSource_Impl {
         // rejection — some Frame Server code paths treat it as fatal.
         Err(MF_E_UNSUPPORTED_SERVICE.into())
     }
+}
+
+/// Windows 11 Frame Server probes modern camera controls through
+/// `IMFExtendedCameraController` before falling back to KS properties.
+/// A software source has no hardware controls, but surfacing a valid
+/// controller keeps this probe from looking like a missing COM interface.
+impl IMFExtendedCameraController_Impl for VulvatarMediaSource_Impl {
+    fn GetExtendedCameraControl(
+        &self,
+        stream_index: u32,
+        property_id: u32,
+    ) -> windows::core::Result<IMFExtendedCameraControl> {
+        crate::t!(
+            "Source::GetExtendedCameraControl stream={} property={}",
+            stream_index,
+            property_id
+        );
+
+        if stream_index != DEFAULT_STREAM_ID && stream_index != MF_CAPTURE_ENGINE_MEDIASOURCE.0 {
+            return Err(MF_E_INVALIDSTREAMNUMBER.into());
+        }
+
+        let control: IMFExtendedCameraControl =
+            VulvatarExtendedCameraControl::new(property_id).into();
+        Ok(control)
+    }
+}
+
+#[implement(IMFExtendedCameraControl)]
+struct VulvatarExtendedCameraControl {
+    property_id: u32,
+    capabilities: u64,
+    flags: AtomicU64,
+    payload: Vec<u8>,
+}
+
+impl VulvatarExtendedCameraControl {
+    fn new(property_id: u32) -> Self {
+        dll_add_ref();
+
+        // Frame Server already asks the legacy KS privacy-control path for
+        // property id 8. If it asks the modern controller for the same id,
+        // answer consistently: a virtual camera has no physical privacy
+        // shutter and is currently unblocked.
+        let (capabilities, flags, payload) = match property_id {
+            KSPROPERTY_CAMERACONTROL_PRIVACY_ID => (
+                PRIVACY_OFF_FLAG,
+                PRIVACY_OFF_FLAG,
+                0u64.to_le_bytes().to_vec(),
+            ),
+            KSPROPERTY_CAMERACONTROL_EXTENDED_ROI_CONFIGCAPS_ID => {
+                (0, 0, build_roi_configcaps_payload())
+            }
+            KSPROPERTY_CAMERACONTROL_EXTENDED_ROI_ISPCONTROL_ID => {
+                (0, 0, build_roi_ispcontrol_payload())
+            }
+            _ => (0, 0, Vec::new()),
+        };
+
+        Self {
+            property_id,
+            capabilities,
+            flags: AtomicU64::new(flags),
+            payload,
+        }
+    }
+}
+
+impl Drop for VulvatarExtendedCameraControl {
+    fn drop(&mut self) {
+        dll_release();
+    }
+}
+
+impl IMFExtendedCameraControl_Impl for VulvatarExtendedCameraControl_Impl {
+    fn GetCapabilities(&self) -> u64 {
+        crate::t!(
+            "ExtendedControl::GetCapabilities property={} -> {:#x}",
+            self.property_id,
+            self.capabilities
+        );
+        self.capabilities
+    }
+
+    fn SetFlags(&self, flags: u64) -> windows::core::Result<()> {
+        crate::t!(
+            "ExtendedControl::SetFlags property={} flags={:#x}",
+            self.property_id,
+            flags
+        );
+        if self.capabilities == 0 {
+            self.flags.store(0, Ordering::SeqCst);
+        } else {
+            self.flags
+                .store(flags & self.capabilities, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn GetFlags(&self) -> u64 {
+        let flags = self.flags.load(Ordering::SeqCst);
+        crate::t!(
+            "ExtendedControl::GetFlags property={} -> {:#x}",
+            self.property_id,
+            flags
+        );
+        flags
+    }
+
+    fn LockPayload(
+        &self,
+        payload: *mut *mut u8,
+        payload_len: *mut u32,
+    ) -> windows::core::Result<()> {
+        crate::t!(
+            "ExtendedControl::LockPayload property={} len={}",
+            self.property_id,
+            self.payload.len()
+        );
+        unsafe {
+            if payload.is_null() || payload_len.is_null() {
+                return Err(E_POINTER.into());
+            }
+            *payload = if self.payload.is_empty() {
+                core::ptr::null_mut()
+            } else {
+                self.payload.as_ptr() as *mut u8
+            };
+            *payload_len = self.payload.len() as u32;
+        }
+        Ok(())
+    }
+
+    fn UnlockPayload(&self) -> windows::core::Result<()> {
+        crate::t!(
+            "ExtendedControl::UnlockPayload property={}",
+            self.property_id
+        );
+        Ok(())
+    }
+
+    fn CommitSettings(&self) -> windows::core::Result<()> {
+        crate::t!(
+            "ExtendedControl::CommitSettings property={}",
+            self.property_id
+        );
+        Ok(())
+    }
+}
+
+fn build_roi_configcaps_payload() -> Vec<u8> {
+    // KSCAMERA_EXTENDEDPROP_ROI_CONFIGCAPSHEADER with ConfigCapCount = 0.
+    // This advertises that the software source supports no ISP ROI controls
+    // while still returning the well-formed header Frame Server expects.
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes
+}
+
+fn build_roi_ispcontrol_payload() -> Vec<u8> {
+    // KSCAMERA_EXTENDEDPROP_ROI_ISPCONTROLHEADER with ControlCount = 0.
+    // A zero count means there are no ROIs configured.
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes
 }
 
 /// Also on the "Frame Server QI probe" list — mirrored from the MS
@@ -684,16 +894,16 @@ impl IMFSampleAllocatorControl_Impl for VulvatarMediaSource_Impl {
     }
 }
 
-/// Build the default RGB32 1920x1080 @ 30fps media type.
+/// Build a 1920x1080 @ 30fps media type for the given subtype GUID.
 ///
 /// `MFSetAttributeSize` / `MFSetAttributeRatio` are inline helpers in the
 /// SDK header and are not exposed by `windows-rs`; we pack the two `u32`
 /// halves into a `u64` ourselves (high → numerator, low → denominator).
-fn build_default_media_type() -> windows::core::Result<IMFMediaType> {
+fn build_media_type(subtype: &GUID) -> windows::core::Result<IMFMediaType> {
     unsafe {
         let mt = MFCreateMediaType()?;
         mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+        mt.SetGUID(&MF_MT_SUBTYPE, subtype)?;
         mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         mt.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
         mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(DEFAULT_WIDTH, DEFAULT_HEIGHT))?;
