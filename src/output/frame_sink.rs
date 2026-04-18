@@ -5,12 +5,37 @@ use std::path::PathBuf;
 
 use super::OutputFrame;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameSink {
     VirtualCamera,
     SharedTexture,
     SharedMemory,
     ImageSequence,
+}
+
+impl FrameSink {
+    /// Map a sink to the GUI inspector's combo box position. Kept on the
+    /// type itself so the GUI and reconcile path agree without any party
+    /// hard-coding integers.
+    pub fn to_gui_index(&self) -> usize {
+        match self {
+            FrameSink::VirtualCamera => 0,
+            FrameSink::SharedTexture => 1,
+            FrameSink::SharedMemory => 2,
+            FrameSink::ImageSequence => 3,
+        }
+    }
+
+    /// Inverse of [`Self::to_gui_index`]. Out-of-range indices fall back to
+    /// `ImageSequence` (matches the inspector's `_ =>` arm).
+    pub fn from_gui_index(index: usize) -> Self {
+        match index {
+            0 => FrameSink::VirtualCamera,
+            1 => FrameSink::SharedTexture,
+            2 => FrameSink::SharedMemory,
+            _ => FrameSink::ImageSequence,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

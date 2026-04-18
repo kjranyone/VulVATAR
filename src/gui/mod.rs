@@ -71,6 +71,27 @@ pub fn autoframe_aabb(
     (center[1], distance.max(0.5))
 }
 
+/// Map a `tracking.camera_resolution_index` (combo box position) to actual
+/// width/height. Kept as a free function so both the inspector (combo
+/// onchange and Start Camera button) and the GUI reconciliation path resolve
+/// indices identically.
+pub fn camera_resolution_for_index(index: usize) -> (u32, u32) {
+    match index {
+        1 => (1280, 720),
+        2 => (1920, 1080),
+        _ => (640, 480),
+    }
+}
+
+/// Map a `tracking.camera_framerate_index` to the actual fps value.
+pub fn camera_fps_for_index(index: usize) -> u32 {
+    if index == 1 {
+        60
+    } else {
+        30
+    }
+}
+
 pub struct TrackingGuiState {
     pub toggle_tracking: bool,
     pub camera_resolution_index: usize,
@@ -202,8 +223,6 @@ pub struct GuiApp {
 
     // Lip sync
     pub lipsync: LipSyncGuiState,
-    #[cfg(feature = "lipsync")]
-    pub lipsync_processor: Option<crate::lipsync::LipSyncProcessor>,
 
     // Animation inspector state
     pub animation_playing: bool,
@@ -373,8 +392,6 @@ impl GuiApp {
                 smoothing: 0.5,
                 current_volume: 0.0,
             },
-            #[cfg(feature = "lipsync")]
-            lipsync_processor: None,
 
             animation_playing: false,
 
@@ -533,6 +550,62 @@ impl GuiApp {
         }
     }
 
+    /// Bring `Application` runtime state in line with the current `GuiState`
+    /// values. Idempotent — comparing requested vs active state means
+    /// repeated calls are no-ops.
+    ///
+    /// Pipeline-bound GuiState fields live in two places: a shadow value on
+    /// the GUI side (so combo boxes can bind to it) and the runtime state
+    /// on the [`Application`] side (OutputRouter, lipsync_processor,
+    /// mf_virtual_camera). Anything that mutates the GUI shadow value —
+    /// combo box `onchange`, project load, profile apply — should call
+    /// this after the mutation so the App side catches up. Skipping it is
+    /// the bug class T11 was created to fix.
+    ///
+    /// Tracking deliberately is **not** reconciled here: `tracking.toggle_tracking`
+    /// is the inference gate (read each frame to decide whether to apply
+    /// pose), not the camera-worker lifecycle. Webcam start/stop is owned
+    /// by the Inspector's Start/Stop Camera buttons. Auto-starting on load
+    /// would surprise the user by opening the webcam every time a project
+    /// is opened.
+    pub fn reconcile_app_with_gui(&mut self) {
+        self.reconcile_output_runtime();
+        self.reconcile_lipsync_runtime();
+    }
+
+    fn reconcile_output_runtime(&mut self) {
+        use crate::output::FrameSink;
+
+        let want_sink = FrameSink::from_gui_index(self.output.output_sink_index);
+        if let Err(e) = self.app.ensure_output_sink_runtime(want_sink) {
+            // VirtualCamera 起動失敗 (典型的には MFCreateVirtualCamera::Start)。
+            // GUI shadow を SharedMemory に戻し、router もそちらへ確定させる。
+            // ユーザが再度 VirtualCamera を選び直せば retry がかかる。
+            //
+            // Note: project_dirty が立っている状態でこれが走ると、autosave
+            // で SharedMemory がプロジェクトに永続化される。ユーザの選択を
+            // 失わせないためには session_active_sink と saved_sink を分離
+            // する必要があるが T11 scope 外。
+            self.push_notification(format!("Virtual Camera unavailable: {e}"));
+            let fallback = FrameSink::SharedMemory;
+            self.output.output_sink_index = fallback.to_gui_index();
+            if let Err(e2) = self.app.ensure_output_sink_runtime(fallback) {
+                warn!("reconcile: fallback to SharedMemory also failed: {e2}");
+            }
+        }
+    }
+
+    fn reconcile_lipsync_runtime(&mut self) {
+        if let Err(e) = self
+            .app
+            .set_lipsync_enabled(self.lipsync.enabled, self.lipsync.mic_device_index)
+        {
+            warn!("reconcile: lipsync apply failed: {e}");
+            self.lipsync.enabled = false;
+            self.push_notification(format!("Lip sync failed: {e}"));
+        }
+    }
+
     pub fn apply_profile(&mut self, profile: &profile::StreamProfile) {
         self.tracking.tracking_mirror = profile.tracking_mirror;
         self.tracking.smoothing_strength = profile.smoothing_strength;
@@ -548,6 +621,7 @@ impl GuiApp {
         self.output.output_resolution_index = profile.output_resolution_index;
         self.output.output_framerate_index = profile.output_framerate_index;
         self.project_dirty = true;
+        self.reconcile_app_with_gui();
     }
 
     fn process_hotkeys(&mut self, ctx: &egui::Context) {
@@ -674,6 +748,8 @@ impl GuiApp {
         self.output.output_framerate_index = state.output_framerate_index;
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
+
+        self.reconcile_app_with_gui();
     }
 
     fn load_avatar_from_drop(&mut self, path: &std::path::Path) {
@@ -873,6 +949,17 @@ impl eframe::App for GuiApp {
             let real_dt = (self.frame_time_ms / 1000.0) as f32;
             // Clamp dt to avoid huge steps on first frame or after pauses.
             let frame_dt = real_dt.clamp(0.001, 0.1);
+
+            // Lipsync inference is per-frame (not per-panel-render) so the
+            // viseme keeps moving even when the inspector lipsync section
+            // is collapsed. `step_lipsync` returns None when not active.
+            if let Some(rms) =
+                self.app
+                    .step_lipsync(self.lipsync.smoothing, self.lipsync.volume_threshold, frame_dt)
+            {
+                self.lipsync.current_volume = rms;
+            }
+
             let frame_config = crate::app::FrameConfig {
                 toggles: self.runtime_toggles(),
                 smoothing: TrackingSmoothingParams {

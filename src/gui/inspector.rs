@@ -531,16 +531,9 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     // Camera is initialising — show a disabled placeholder.
                     ui.add_enabled(false, egui::Button::new("Preparing..."));
                 } else if ui.button("Start Camera").clicked() {
-                    let (w, h) = match state.tracking.camera_resolution_index {
-                        1 => (1280, 720),
-                        2 => (1920, 1080),
-                        _ => (640, 480),
-                    };
-                    let fps: u32 = if state.tracking.camera_framerate_index == 1 {
-                        60
-                    } else {
-                        30
-                    };
+                    let (w, h) =
+                        crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
+                    let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
                     #[cfg(feature = "webcam")]
                     let backend = crate::tracking::CameraBackend::Webcam {
                         camera_index: state.camera_index,
@@ -739,78 +732,40 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             });
-        if state.lipsync.mic_device_index != prev_mic {
+        let mic_changed = state.lipsync.mic_device_index != prev_mic;
+        if mic_changed {
             state.project_dirty = true;
         }
         if ui.button("Refresh").clicked() {
             state.lipsync.available_mics = crate::lipsync::audio_capture::list_audio_devices();
         }
+        if mic_changed {
+            // reconcile picks up the new mic and restarts the processor
+            // in-place if lipsync is currently enabled.
+            state.reconcile_app_with_gui();
+        }
     });
 
     ui.add_space(4.0);
 
-    #[allow(unused_variables)]
-    let was_enabled = state.lipsync.enabled;
+    let prev_enabled = state.lipsync.enabled;
     if ui
         .checkbox(&mut state.lipsync.enabled, "Enable Lip Sync")
         .changed()
     {
         state.project_dirty = true;
-    }
-
-    #[cfg(feature = "lipsync")]
-    {
-        // Start/stop processor when toggle changes.
-        if state.lipsync.enabled && !was_enabled {
-            match crate::lipsync::LipSyncProcessor::start(Some(state.lipsync.mic_device_index)) {
-                Ok(proc) => {
-                    state.lipsync_processor = Some(proc);
-                    state.push_notification("Lip sync started.".to_string());
-                }
-                Err(e) => {
-                    state.lipsync.enabled = false;
-                    state.push_notification(format!("Lip sync failed: {}", e));
-                }
-            }
-        } else if !state.lipsync.enabled && was_enabled {
-            if let Some(ref mut proc) = state.lipsync_processor {
-                proc.stop();
-            }
-            state.lipsync_processor = None;
+        state.reconcile_app_with_gui();
+        if state.lipsync.enabled && !prev_enabled {
+            state.push_notification("Lip sync started.".to_string());
+        } else if !state.lipsync.enabled && prev_enabled {
             state.push_notification("Lip sync stopped.".to_string());
         }
-
-        // Run inference each frame and update volume meter.
-        if let Some(ref mut proc) = state.lipsync_processor {
-            state.lipsync.current_volume = proc.rms_volume();
-            let dt = state.frame_time_ms as f32 / 1000.0;
-            let viseme = proc.process_frame(state.lipsync.smoothing, dt.max(0.001));
-
-            // Feed viseme weights into the avatar's expression weights.
-            if let Some(avatar) = state.app.active_avatar_mut() {
-                for (name, weight) in viseme.as_expression_pairs() {
-                    if weight < state.lipsync.volume_threshold && name == "aa" {
-                        // Below threshold: close mouth.
-                        if let Some(ew) = avatar
-                            .expression_weights
-                            .iter_mut()
-                            .find(|w| w.name == name)
-                        {
-                            ew.weight = 0.0;
-                        }
-                        continue;
-                    }
-                    if let Some(ew) = avatar
-                        .expression_weights
-                        .iter_mut()
-                        .find(|w| w.name == name)
-                    {
-                        ew.weight = weight;
-                    }
-                }
-            }
-        }
     }
+
+    // Per-frame lipsync inference is owned by `Application::step_lipsync`
+    // and called from `GuiApp::update` so it keeps running even when this
+    // panel is collapsed. The volume meter value (`state.lipsync.current_volume`)
+    // is also written by `GuiApp::update` from `step_lipsync`'s return value.
 
     #[cfg(not(feature = "lipsync"))]
     {
@@ -1041,8 +996,6 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
-    use crate::output::FrameSink;
-
     let sink_names = [
         "Virtual Camera",
         "Shared Texture",
@@ -1069,13 +1022,7 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
 
     if state.output.output_sink_index != prev_sink_index {
-        let sink = match state.output.output_sink_index {
-            0 => FrameSink::VirtualCamera,
-            1 => FrameSink::SharedTexture,
-            2 => FrameSink::SharedMemory,
-            _ => FrameSink::ImageSequence,
-        };
-        state.app.set_output_sink(sink);
+        state.reconcile_app_with_gui();
         state.push_notification(format!(
             "Output sink changed to {}",
             sink_names[state.output.output_sink_index]

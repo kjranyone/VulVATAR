@@ -122,6 +122,23 @@ pub struct Application {
     /// for the rest of the process so the camera stays visible to clients.
     #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
     pub mf_virtual_camera: Option<crate::output::mf_virtual_camera::MfVirtualCamera>,
+    /// Lifetime owner for the lipsync audio capture + inference worker. Used
+    /// to be tracked by the GUI; moved here so [`Self::set_lipsync_enabled`]
+    /// can manage it from any caller (project load reconciliation, GUI
+    /// toggle, etc.) without GUI-specific plumbing.
+    ///
+    /// Deliberately **not `pub`** — the only allowed touch points are
+    /// [`Self::set_lipsync_enabled`] (lifecycle) and [`Self::step_lipsync`]
+    /// (per-frame inference). Direct access from the GUI would re-enable
+    /// the kind of inline side-effect code that T11 was designed to
+    /// eliminate.
+    #[cfg(feature = "lipsync")]
+    lipsync_processor: Option<crate::lipsync::LipSyncProcessor>,
+    /// Mic device index the running [`Self::lipsync_processor`] was started
+    /// with. Lets [`Self::set_lipsync_enabled`] notice mic changes and
+    /// restart the processor without an extra dedicated mutator.
+    #[cfg(feature = "lipsync")]
+    lipsync_active_mic: usize,
     shutdown_complete: bool,
     pub viewport_background: Option<std::path::PathBuf>,
     pub ground_grid_visible: bool,
@@ -197,6 +214,10 @@ impl Application {
             tracking_worker: None,
             #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
             mf_virtual_camera: None,
+            #[cfg(feature = "lipsync")]
+            lipsync_processor: None,
+            #[cfg(feature = "lipsync")]
+            lipsync_active_mic: 0,
             shutdown_complete: false,
             stale_warn_cooldown: std::time::Instant::now(),
             viewport_background: None,
@@ -752,43 +773,60 @@ impl Application {
         }
     }
 
-    /// Replace the active output sink, shutting down the old OutputRouter and
-    /// creating a new one with the selected sink.
-    pub fn set_output_sink(&mut self, sink: FrameSink) {
-        self.output.shutdown();
-        self.output = OutputRouter::new(sink.clone());
+    /// Bring the OutputRouter and (on Windows) the MF virtual camera in line
+    /// with the requested sink. Idempotent.
+    ///
+    /// Critically, the OutputRouter swap and the MF camera lifetime are
+    /// managed as **independent steps**. If a previous call swapped the
+    /// router to `VirtualCamera` but `MfVirtualCamera::start` failed, a
+    /// subsequent call still retries the MF start (the router swap is
+    /// no-op the second time). Without this, a transient MF failure left
+    /// the system in a permanently-broken `output.sink == VirtualCamera &&
+    /// mf_virtual_camera == None` state.
+    ///
+    /// Returns `Err` only when the requested sink is `VirtualCamera` and
+    /// MF camera registration fails. Callers should propagate to the user
+    /// (notification) and roll their requested-sink shadow back to a
+    /// known-good fallback like `SharedMemory`.
+    pub fn ensure_output_sink_runtime(&mut self, sink: FrameSink) -> Result<(), String> {
+        if self.output.active_sink() != &sink {
+            info!(
+                "output: swapping sink {:?} -> {:?}",
+                self.output.active_sink(),
+                sink
+            );
+            self.output.shutdown();
+            self.output = OutputRouter::new(sink.clone());
+        }
 
         #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
         {
-            // Register the MediaFoundation virtual camera the first time
-            // the user picks the VirtualCamera sink, and tear it back down
-            // when they switch away. The shared-memory-frame plumbing is
-            // independent (frames flow even if the camera is unregistered),
-            // but client apps only see "VulVATAR Virtual Camera" in their
-            // device picker while the IMFVirtualCamera is alive.
             use crate::output::mf_virtual_camera::MfVirtualCamera;
             match sink {
                 FrameSink::VirtualCamera => {
                     if self.mf_virtual_camera.is_none() {
                         let mut cam = MfVirtualCamera::new();
-                        match cam.start() {
-                            Ok(()) => {
-                                info!("output: MediaFoundation virtual camera registered");
-                                self.mf_virtual_camera = Some(cam);
-                            }
-                            Err(e) => {
-                                warn!("output: MFCreateVirtualCamera failed ({e})");
-                            }
-                        }
+                        cam.start().map_err(|e| {
+                            warn!("output: MFCreateVirtualCamera failed ({e})");
+                            e
+                        })?;
+                        info!("output: MediaFoundation virtual camera registered");
+                        self.mf_virtual_camera = Some(cam);
                     }
                 }
-                _ => {
+                // Enumerate non-VC variants explicitly so adding a future
+                // FrameSink variant trips a compile error here, forcing the
+                // author to decide whether the new sink needs MF teardown.
+                FrameSink::SharedTexture
+                | FrameSink::SharedMemory
+                | FrameSink::ImageSequence => {
                     if self.mf_virtual_camera.take().is_some() {
                         info!("output: MediaFoundation virtual camera unregistered");
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Start the tracking worker thread with default resolution/fps. No-op if already running.
@@ -831,6 +869,112 @@ impl Application {
             worker.stop();
             info!("app: tracking worker stopped");
         }
+    }
+
+    /// Bring the lipsync processor in line with the requested state. Idempotent.
+    ///
+    /// - `enabled=true` and not running: start with `mic_device_index`
+    /// - `enabled=true` and running with a different mic: restart with new mic
+    /// - `enabled=false` and running: stop
+    /// - everything else: no-op
+    ///
+    /// Errors propagate from the underlying audio capture init; callers
+    /// should surface them to the user (push notification, etc.).
+    #[cfg(feature = "lipsync")]
+    pub fn set_lipsync_enabled(
+        &mut self,
+        enabled: bool,
+        mic_device_index: usize,
+    ) -> Result<(), String> {
+        let active = self.lipsync_processor.is_some();
+        let mic_changed = active && self.lipsync_active_mic != mic_device_index;
+
+        if !enabled && active {
+            if let Some(ref mut proc) = self.lipsync_processor {
+                proc.stop();
+            }
+            self.lipsync_processor = None;
+            info!("app: lipsync stopped");
+            return Ok(());
+        }
+
+        if enabled && (!active || mic_changed) {
+            if let Some(ref mut proc) = self.lipsync_processor {
+                proc.stop();
+                self.lipsync_processor = None;
+            }
+            let proc = crate::lipsync::LipSyncProcessor::start(Some(mic_device_index))?;
+            self.lipsync_processor = Some(proc);
+            self.lipsync_active_mic = mic_device_index;
+            info!(
+                "app: lipsync {} (mic={})",
+                if mic_changed { "restarted" } else { "started" },
+                mic_device_index
+            );
+        }
+        Ok(())
+    }
+
+    /// No-op stub when the `lipsync` feature is disabled — keeps the GUI
+    /// reconciliation path identical regardless of build features.
+    #[cfg(not(feature = "lipsync"))]
+    pub fn set_lipsync_enabled(
+        &mut self,
+        _enabled: bool,
+        _mic_device_index: usize,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Run lipsync inference for one frame and apply viseme weights to the
+    /// active avatar's expression weights. Returns the current rms volume
+    /// for the GUI's volume meter, or `None` when lipsync is not active.
+    ///
+    /// Called every frame from `GuiApp::update` so lipsync output continues
+    /// even when the lip sync inspector panel is collapsed (the previous
+    /// design ran inference inside `draw_lipsync` and froze when the panel
+    /// was hidden).
+    #[cfg(feature = "lipsync")]
+    pub fn step_lipsync(
+        &mut self,
+        smoothing: f32,
+        volume_threshold: f32,
+        dt: f32,
+    ) -> Option<f32> {
+        let viseme = self
+            .lipsync_processor
+            .as_mut()?
+            .process_frame(smoothing, dt.max(0.001));
+        let rms = self.lipsync_processor.as_ref()?.rms_volume();
+
+        if let Some(avatar) = self.active_avatar_mut() {
+            for (name, weight) in viseme.as_expression_pairs() {
+                let effective = if weight < volume_threshold && name == "aa" {
+                    // Below threshold: close mouth.
+                    0.0
+                } else {
+                    weight
+                };
+                if let Some(ew) = avatar
+                    .expression_weights
+                    .iter_mut()
+                    .find(|w| w.name == name)
+                {
+                    ew.weight = effective;
+                }
+            }
+        }
+        Some(rms)
+    }
+
+    #[cfg(not(feature = "lipsync"))]
+    pub fn step_lipsync(
+        &mut self,
+        _smoothing: f32,
+        _volume_threshold: f32,
+        _dt: f32,
+    ) -> Option<f32> {
+        None
     }
 
     /// Perform an ordered shutdown of all worker threads and subsystems.

@@ -300,6 +300,13 @@ impl OutputRouter {
         self.queue.len()
     }
 
+    /// Currently configured sink. Used by [`crate::app::Application`] callers
+    /// (e.g. the GUI reconciliation path) to skip a no-op sink swap when the
+    /// requested variant matches what is already running.
+    pub fn active_sink(&self) -> &FrameSink {
+        &self.sink
+    }
+
     pub fn diagnostics(&self) -> OutputDiagnostics {
         let gpu_interop_enabled = matches!(self.sink, FrameSink::SharedTexture);
         let fallback_active = matches!(
