@@ -3,9 +3,8 @@
 //! Replaces the legacy DirectShow-only registrar (`directshow_filter`)
 //! with the modern MediaFoundation virtual camera path. The companion DLL
 //! `vulvatar_mf_camera.dll` (sub-crate `vulvatar-mf-camera`) hosts the
-//! `IMFMediaSource` referenced by the CLSID below; it must be installed
-//! once via `regsvr32 /n /i:user vulvatar_mf_camera.dll` before
-//! [`MfVirtualCamera::start`] can succeed.
+//! `IMFMediaSource` referenced by the CLSID below. Windows' Frame Server
+//! loads that COM server out of HKLM registration.
 //!
 //! The virtual camera is created with `MFVirtualCameraLifetime_Session`
 //! so it disappears the moment the main process exits — no cleanup needed
@@ -21,8 +20,9 @@ use windows::Win32::Media::MediaFoundation::{
     MF_VERSION,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
-    REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE,
+    REG_SZ, REG_VALUE_TYPE,
 };
 
 /// Same CLSID as `vulvatar_mf_camera::CLSID_VULVATAR_MEDIA_SOURCE`. The
@@ -69,16 +69,7 @@ impl MfVirtualCamera {
             return Ok(());
         }
 
-        // Dev-friendly self-registration: point HKCU at our sibling DLL
-        // every run so debug/release toggling and rebuilds to fresh output
-        // paths "just work" without manual `regsvr32`. See
-        // [`ensure_dll_registered`].
-        if let Err(e) = ensure_dll_registered() {
-            warn!(
-                "output: could not auto-register vulvatar_mf_camera.dll ({e}); \
-                 falling back to whatever regsvr32 has written previously"
-            );
-        }
+        ensure_dll_registered()?;
 
         unsafe {
             if !self.mf_started {
@@ -142,50 +133,104 @@ impl Drop for MfVirtualCamera {
 }
 
 // ---------------------------------------------------------------------------
-// Self-registration: keep HKCU's inproc-server entry pointing at the DLL
-// that sits next to the currently-running exe.
+// Self-registration: keep HKLM's inproc-server entry pointing at a system
+// install copy of the DLL.
 // ---------------------------------------------------------------------------
 
-/// Ensure HKCU points at a fresh, unlocked copy of the DLL, then return.
+/// Ensure HKLM has a usable registration for the media-source DLL.
 ///
 /// **Why the copy?** Windows' Frame Server loads whatever path is in
 /// `InprocServer32` and keeps it `LoadLibrary`-held long after our
 /// process exits. If we registered `target/debug/vulvatar_mf_camera.dll`
 /// directly, the next `cargo build` would hit "access denied" when
-/// linking a rebuilt DLL. By copying the canonical build output to a
-/// per-run scratch file and registering *that* path, the canonical build
-/// output is never loaded by any client — `cargo build` is always free
-/// to overwrite it.
+/// linking a rebuilt DLL. By copying the canonical build output to
+/// `Program Files\VulVATAR\VirtualCamera\` under a timestamped filename,
+/// the canonical build output is never loaded by any client and Frame
+/// Server does not need to load code from the developer tree.
 ///
-/// Writes three values under HKCU:
+/// Writes three values under HKLM:
 /// ```text
 /// Software\Classes\CLSID\{CLSID}               = VulVATAR Virtual Camera
 /// Software\Classes\CLSID\{CLSID}\InprocServer32 = <scratch dll path>
 /// Software\Classes\CLSID\{CLSID}\InprocServer32\ThreadingModel = Both
 /// ```
+///
+/// HKCU registration is not enough here: `MFCreateVirtualCamera` loads the
+/// media source in FrameServerMonitor / FrameServer services. HKCU can pass
+/// local probes and still fail later with HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND).
+/// It is also actively harmful once HKLM is installed because HKCR resolves
+/// HKCU before HKLM for the current user.
 fn ensure_dll_registered() -> Result<(), String> {
-    let dll_path = prepare_scratch_dll()?;
     let clsid_key = format!("Software\\Classes\\CLSID\\{}", CLSID_VULVATAR_MEDIA_SOURCE);
     let inproc_key = format!("{clsid_key}\\InprocServer32");
 
-    write_reg_string(&clsid_key, None, VULVATAR_CAMERA_FRIENDLY_NAME)?;
-    write_reg_string(&inproc_key, None, &dll_path)?;
-    write_reg_string(&inproc_key, Some("ThreadingModel"), "Both")?;
+    remove_legacy_hkcu_registration(&clsid_key);
+
+    if let Some(path) = read_registered_dll_path(&inproc_key).ok().flatten() {
+        if std::path::Path::new(&path).exists() && is_system_install_path(&path) {
+            info!("output: using existing HKLM COM class {}", path);
+            return Ok(());
+        }
+        warn!("output: ignoring non-system HKLM COM class {}", path);
+    }
+
+    let dll_path = prepare_scratch_dll().map_err(|e| {
+        format!(
+            "{e}; run VulVATAR elevated once or use dev.ps1 -> install mf virtual camera (HKLM)"
+        )
+    })?;
+    write_hklm_registration(&clsid_key, &inproc_key, &dll_path).map_err(|e| {
+        format!(
+            "{e}; run VulVATAR elevated once or use dev.ps1 -> install mf virtual camera (HKLM)"
+        )
+    })?;
+
     info!(
-        "output: HKCU COM class {} → {}",
+        "output: HKLM COM class {} -> {}",
         CLSID_VULVATAR_MEDIA_SOURCE, dll_path
     );
     Ok(())
 }
 
+fn remove_legacy_hkcu_registration(clsid_key: &str) {
+    let subkey_w: HSTRING = clsid_key.into();
+    let res = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey_w.as_ptr())) };
+    if res.is_ok() {
+        info!(
+            "output: removed legacy HKCU COM class {}",
+            CLSID_VULVATAR_MEDIA_SOURCE
+        );
+    }
+}
+
+fn write_hklm_registration(
+    clsid_key: &str,
+    inproc_key: &str,
+    dll_path: &str,
+) -> Result<(), String> {
+    write_reg_string(
+        HKEY_LOCAL_MACHINE,
+        clsid_key,
+        None,
+        VULVATAR_CAMERA_FRIENDLY_NAME,
+    )?;
+    write_reg_string(HKEY_LOCAL_MACHINE, inproc_key, None, dll_path)?;
+    write_reg_string(
+        HKEY_LOCAL_MACHINE,
+        inproc_key,
+        Some("ThreadingModel"),
+        "Both",
+    )?;
+    Ok(())
+}
+
 /// Copy the canonical `vulvatar_mf_camera.dll` (produced by cargo next
-/// to the running exe) into a timestamped scratch file inside
-/// `<exe_dir>/mf-camera-runtime/`. Old scratch files left over from
-/// previous runs are deleted best-effort; any that remain locked by a
+/// to the running exe) into a timestamped install file inside
+/// `%ProgramFiles%\VulVATAR\VirtualCamera\`. Old install files left over
+/// from previous runs are deleted best-effort; any that remain locked by a
 /// still-loaded Frame Server stay on disk and are ignored.
 fn prepare_scratch_dll() -> Result<String, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let exe_dir = exe
         .parent()
         .ok_or_else(|| "exe has no parent directory".to_string())?;
@@ -198,7 +243,7 @@ fn prepare_scratch_dll() -> Result<String, String> {
         ));
     }
 
-    let scratch_dir = exe_dir.join("mf-camera-runtime");
+    let scratch_dir = program_files_dir()?.join("VulVATAR").join("VirtualCamera");
     std::fs::create_dir_all(&scratch_dir)
         .map_err(|e| format!("create {}: {e}", scratch_dir.display()))?;
 
@@ -208,7 +253,16 @@ fn prepare_scratch_dll() -> Result<String, String> {
     // parent target directory when the developer really wants a reset.
     if let Ok(rd) = std::fs::read_dir(&scratch_dir) {
         for entry in rd.flatten() {
-            let _ = std::fs::remove_file(entry.path());
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("vulvatar_mf_camera_") && name.ends_with(".dll")
+                })
+            {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
@@ -226,12 +280,36 @@ fn prepare_scratch_dll() -> Result<String, String> {
         .ok_or_else(|| "scratch path contains non-UTF8 characters".to_string())
 }
 
-fn write_reg_string(subkey: &str, value_name: Option<&str>, value: &str) -> Result<(), String> {
+fn program_files_dir() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("ProgramFiles")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "%ProgramFiles% is not set".to_string())
+}
+
+fn is_system_install_path(path: &str) -> bool {
+    let Ok(program_files) = program_files_dir() else {
+        return false;
+    };
+    let Ok(path) = std::path::Path::new(path).canonicalize() else {
+        return false;
+    };
+    let Ok(program_files) = program_files.canonicalize() else {
+        return false;
+    };
+    path.starts_with(program_files)
+}
+
+fn write_reg_string(
+    root: HKEY,
+    subkey: &str,
+    value_name: Option<&str>,
+    value: &str,
+) -> Result<(), String> {
     let subkey_w: HSTRING = subkey.into();
     let mut key = HKEY::default();
     let res = unsafe {
         RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            root,
             PCWSTR(subkey_w.as_ptr()),
             0,
             None,
@@ -261,4 +339,63 @@ fn write_reg_string(subkey: &str, value_name: Option<&str>, value: &str) -> Resu
         return Err(format!("RegSetValueExW({subkey}): {res:?}"));
     }
     Ok(())
+}
+
+fn read_registered_dll_path(subkey: &str) -> Result<Option<String>, String> {
+    let subkey_w: HSTRING = subkey.into();
+    let mut key = HKEY::default();
+    let res = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+    };
+    if res.is_err() {
+        return Ok(None);
+    }
+
+    let mut value_type = REG_VALUE_TYPE(0);
+    let mut byte_len = 0u32;
+    let res = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR::null(),
+            None,
+            Some(&mut value_type),
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if res.is_err() || value_type != REG_SZ || byte_len < 2 {
+        let _ = unsafe { RegCloseKey(key) };
+        return Ok(None);
+    }
+
+    let mut bytes = vec![0u8; byte_len as usize];
+    let res = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR::null(),
+            None,
+            Some(&mut value_type),
+            Some(bytes.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    let _ = unsafe { RegCloseKey(key) };
+    if res.is_err() || value_type != REG_SZ {
+        return Ok(None);
+    }
+
+    let words: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .take_while(|ch| *ch != 0)
+        .collect();
+    String::from_utf16(&words)
+        .map(Some)
+        .map_err(|e| format!("decode registered DLL path: {e}"))
 }

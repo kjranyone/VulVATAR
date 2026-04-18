@@ -28,15 +28,80 @@ function Install-Models {
     Write-Host "ONNX Models installed successfully." -ForegroundColor Green
 }
 
-function Uninstall-MfCamera {
-    Write-Host "Removing HKCU registration for VulVATAR virtual camera..." -ForegroundColor Cyan
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Install-MfCameraSystem {
+    if (!(Test-Admin)) {
+        throw "HKLM virtual camera registration requires an elevated PowerShell. Run this menu as Administrator, then select this command once."
+    }
+
+    Write-Host "Building MediaFoundation virtual camera DLL..." -ForegroundColor Cyan
+    $oldRustFlags = $env:RUSTFLAGS
+    try {
+        if ([string]::IsNullOrWhiteSpace($oldRustFlags)) {
+            $env:RUSTFLAGS = "-C target-feature=+crt-static"
+        } elseif ($oldRustFlags -notmatch "crt-static") {
+            $env:RUSTFLAGS = "$oldRustFlags -C target-feature=+crt-static"
+        }
+        cargo build -p vulvatar-mf-camera
+    } finally {
+        if ($null -eq $oldRustFlags) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $oldRustFlags
+        }
+    }
+
     $clsid = "{B5F1C320-2B8F-4A9C-9BDC-43B0E8E6B2E1}"
-    $key = "HKCU:\Software\Classes\CLSID\$clsid"
-    if (Test-Path $key) {
-        Remove-Item $key -Recurse -Force
-        Write-Host "Removed $key" -ForegroundColor Green
+    $friendly = "VulVATAR Virtual Camera"
+    $source = Resolve-Path "target\debug\vulvatar_mf_camera.dll"
+    $runtime = Join-Path $env:ProgramFiles "VulVATAR\VirtualCamera"
+    New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+
+    $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $targetDir = Resolve-Path $runtime
+    $target = Join-Path $targetDir "vulvatar_mf_camera_system_$timestamp.dll"
+    Copy-Item $source $target -Force
+
+    $key = "HKLM:\Software\Classes\CLSID\$clsid"
+    $inproc = Join-Path $key "InprocServer32"
+    $legacyUserKey = "HKCU:\Software\Classes\CLSID\$clsid"
+    if (Test-Path $legacyUserKey) {
+        Remove-Item $legacyUserKey -Recurse -Force
+        Write-Host "Removed legacy per-user COM registration at $legacyUserKey" -ForegroundColor DarkGray
+    }
+    New-Item -Force -Path $key | Out-Null
+    New-Item -Force -Path $inproc | Out-Null
+    Set-Item -Path $key -Value $friendly
+    Set-Item -Path $inproc -Value $target
+    New-ItemProperty -Path $inproc -Name ThreadingModel -Value Both -PropertyType String -Force | Out-Null
+
+    Write-Host "Registered $friendly in HKLM:" -ForegroundColor Green
+    Write-Host "  $target"
+    Write-Host "You can now run VulVATAR without elevation until you rebuild/reinstall this DLL." -ForegroundColor DarkGray
+}
+
+function Uninstall-MfCamera {
+    Write-Host "Removing VulVATAR virtual camera COM registration..." -ForegroundColor Cyan
+    $clsid = "{B5F1C320-2B8F-4A9C-9BDC-43B0E8E6B2E1}"
+    $keys = @("HKCU:\Software\Classes\CLSID\$clsid")
+    if (Test-Admin) {
+        $keys += "HKLM:\Software\Classes\CLSID\$clsid"
     } else {
-        Write-Host "No registration found at $key (nothing to do)" -ForegroundColor DarkGray
+        Write-Host "Not elevated; HKLM removal will be skipped." -ForegroundColor Yellow
+    }
+
+    foreach ($key in $keys) {
+        if (Test-Path $key) {
+            Remove-Item $key -Recurse -Force
+            Write-Host "Removed $key" -ForegroundColor Green
+        } else {
+            Write-Host "No registration found at $key (nothing to do)" -ForegroundColor DarkGray
+        }
     }
     # The registration the main app owns is MFVirtualCameraLifetime_Session,
     # so any IMFVirtualCamera disappears with its process — nothing else to
@@ -50,7 +115,8 @@ $commands = @(
     @{ Label = "run (debug)";      Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run' },
     @{ Label = "run (debug+lipsync)"; Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
     @{ Label = "run (release)";    Cmd = "cargo run --release" },
-    @{ Label = "uninstall mf virtual camera (HKCU)"; Cmd = "Uninstall-MfCamera" },
+    @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
+    @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
     @{ Label = "test";             Cmd = "cargo test" },
     @{ Label = "clippy";           Cmd = "cargo clippy" },
     @{ Label = "fmt";              Cmd = "cargo fmt" },
