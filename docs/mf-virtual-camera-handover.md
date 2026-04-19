@@ -1,5 +1,14 @@
 # MF Virtual Camera — handover for MF virtual-camera registration
 
+> **Superseded.** The virtual camera is shipped and working end-to-end
+> as of 2026-04-20. For the authoritative contract, interfaces,
+> attributes, install workflow and diagnostics, see
+> [**mf-virtual-camera.md**](./mf-virtual-camera.md).
+>
+> This document is kept as a historical log of the debugging timeline:
+> which probe / interface / attribute was added when, and why. Read it
+> top-to-bottom if you want the story behind the current implementation.
+
 Status: updated 2026-04-17. The `E_NOINTERFACE` block was traced to missing
 modern camera-control service support and has been addressed in code by
 implementing `IMFExtendedCameraController` / `IMFExtendedCameraControl` plus
