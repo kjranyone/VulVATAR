@@ -3,8 +3,10 @@
 //! up in the DLL (it runs inside the Frame Server process, which does not
 //! configure `env_logger`), so we append lines directly to a known path.
 //!
-//! Log location: `%TEMP%\vulvatar_mf_camera.log`. Each line is prefixed
-//! with an epoch-millisecond timestamp and the thread id.
+//! Log location: `C:\Users\Public\vulvatar_mf_camera.log`. Public is chosen
+//! because both the user running the main app AND the `LocalService` svchost
+//! that loads us inside Frame Server have write access there — the
+//! per-user `%TEMP%` would only capture the user-side half.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -19,7 +21,10 @@ fn log_path() -> PathBuf {
     if let Some(p) = guard.as_ref() {
         return p.clone();
     }
-    let mut p = std::env::temp_dir();
+    let public = std::env::var_os("PUBLIC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public"));
+    let mut p = public;
     p.push("vulvatar_mf_camera.log");
     *guard = Some(p.clone());
     p

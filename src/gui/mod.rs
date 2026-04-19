@@ -44,11 +44,7 @@ pub struct CameraOrbitState {
 /// `fov_deg` is the vertical FOV. `aspect` is the expected viewport aspect
 /// — pass `1.0` to be conservative (guarantees the model fits even in a
 /// square viewport).
-pub fn autoframe_aabb(
-    aabb: &crate::asset::Aabb,
-    fov_deg: f32,
-    aspect: f32,
-) -> (f32, f32) {
+pub fn autoframe_aabb(aabb: &crate::asset::Aabb, fov_deg: f32, aspect: f32) -> (f32, f32) {
     if aabb.is_empty() {
         return (0.0, 5.0);
     }
@@ -271,6 +267,8 @@ pub struct GuiApp {
     pub cloth_pin_node_index: usize,
     pub cloth_autosave_consent: Option<bool>,
 
+    pub inspector_open: bool,
+
     pub expression_weights: Vec<f32>,
 
     // Scene presets
@@ -433,6 +431,7 @@ impl GuiApp {
             cloth_collider_toggles: Vec::new(),
             cloth_pin_node_index: 0,
             cloth_autosave_consent: None,
+            inspector_open: true,
             expression_weights: Vec::new(),
 
             scene_presets: crate::persistence::load_scene_presets(),
@@ -812,10 +811,7 @@ impl GuiApp {
                     for w in &warnings.warnings {
                         self.push_notification(format!("Warning: {}", w));
                     }
-                    self.push_notification(format!(
-                        "Opened project: {}",
-                        project_path.display()
-                    ));
+                    self.push_notification(format!("Opened project: {}", project_path.display()));
                 }
             }
             avatar_load::LoadOutcome::Error(e) => {
@@ -951,8 +947,9 @@ impl eframe::App for GuiApp {
         // Sync output resolution preference from GUI inspector. The renderer
         // reads this through OutputTargetRequest.extent, so changing the
         // combo immediately resizes the next render's output target.
-        self.app.output_extent =
-            Some(output_resolution_for_index(self.output.output_resolution_index));
+        self.app.output_extent = Some(output_resolution_for_index(
+            self.output.output_resolution_index,
+        ));
 
         // Phase B-3: throttle the output cadence to the user's selection.
         // Idempotent (just sets a Duration), so no need for change-detect.
@@ -972,10 +969,11 @@ impl eframe::App for GuiApp {
             // Lipsync inference is per-frame (not per-panel-render) so the
             // viseme keeps moving even when the inspector lipsync section
             // is collapsed. `step_lipsync` returns None when not active.
-            if let Some(rms) =
-                self.app
-                    .step_lipsync(self.lipsync.smoothing, self.lipsync.volume_threshold, frame_dt)
-            {
+            if let Some(rms) = self.app.step_lipsync(
+                self.lipsync.smoothing,
+                self.lipsync.volume_threshold,
+                frame_dt,
+            ) {
                 self.lipsync.current_volume = rms;
             }
 
@@ -986,7 +984,8 @@ impl eframe::App for GuiApp {
                     // solver's blend toward the new value: 0 = instant snap,
                     // 1 = never move.
                     rotation_blend: (1.0 - self.tracking.smoothing_strength).clamp(0.05, 1.0),
-                    expression_blend: (1.0 - self.tracking.smoothing_strength * 0.6).clamp(0.05, 1.0),
+                    expression_blend: (1.0 - self.tracking.smoothing_strength * 0.6)
+                        .clamp(0.05, 1.0),
                     joint_confidence_threshold: self.tracking.confidence_threshold,
                     face_confidence_threshold: self.tracking.confidence_threshold,
                     ..TrackingSmoothingParams::default()

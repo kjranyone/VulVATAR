@@ -99,10 +99,7 @@ fn write_string_value(
     // Include the trailing NUL in the byte length — Windows expects REG_SZ
     // strings to be null-terminated on disk.
     let value_bytes = unsafe {
-        core::slice::from_raw_parts(
-            value_w.as_ptr() as *const u8,
-            (value_w.len() + 1) * 2,
-        )
+        core::slice::from_raw_parts(value_w.as_ptr() as *const u8, (value_w.len() + 1) * 2)
     };
     let name_pcwstr = value_name_w
         .as_ref()
@@ -132,8 +129,7 @@ fn current_module_path() -> Result<String, HRESULT> {
         let mut hmod = windows::Win32::Foundation::HMODULE(core::ptr::null_mut());
         let addr = current_module_path as *const () as *const u16;
         let got = GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             PCWSTR(addr),
             &mut hmod,
         );

@@ -1,8 +1,8 @@
 //! `IClassFactory` implementation for our single media-source COM class.
 //!
-//! `DllGetClassObject` hands out one of these; `MFCreateVirtualCamera`
-//! ultimately calls `CreateInstance(IID_IMFMediaSource)` through it to get
-//! a fresh media source for the new virtual camera.
+//! `DllGetClassObject` hands out one of these; Frame Server asks it for
+//! `IMFActivate`, and the returned media source object implements that
+//! interface directly.
 
 use core::ffi::c_void;
 
@@ -10,7 +10,7 @@ use windows::core::{implement, IUnknown, Interface, GUID};
 use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_POINTER};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 
-use crate::{activate::VulvatarActivate, dll_add_ref, dll_release};
+use crate::{dll_add_ref, dll_release, media_source::VulvatarMediaSource};
 
 #[implement(IClassFactory)]
 pub struct VulvatarClassFactory;
@@ -47,14 +47,15 @@ impl IClassFactory_Impl for VulvatarClassFactory_Impl {
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
 
-            // `CoCreateInstance(CLSID, IID_IMFActivate)` is how Frame
-            // Server probes software camera CLSIDs. We therefore return
-            // an IMFActivate wrapper; the real media source is lazily
-            // constructed inside `VulvatarActivate::ActivateObject`.
-            let activate_unk: IUnknown =
-                VulvatarActivate::new().map_err(|e| windows::core::Error::from(e))?.into();
-            let hr = activate_unk.query(iid, ppv);
-            crate::t!("ClassFactory::CreateInstance: activate.query -> {:?}", hr);
+            // Keep IMFActivate, IMFMediaSourceEx, and IMFAttributes on one
+            // COM identity. Frame Server writes attributes through the
+            // activate view before calling ActivateObject, then reads them
+            // through the source view during FsProxy setup.
+            let source_unk: IUnknown = VulvatarMediaSource::new()
+                .map_err(windows::core::Error::from)?
+                .into();
+            let hr = source_unk.query(iid, ppv);
+            crate::t!("ClassFactory::CreateInstance: source.query -> {:?}", hr);
             if hr.is_err() {
                 return Err(hr.into());
             }

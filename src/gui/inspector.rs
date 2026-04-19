@@ -3,94 +3,109 @@ use eframe::egui;
 use crate::gui::{AppMode, GuiApp};
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
-    egui::SidePanel::right("inspector")
+    if !state.inspector_open {
+        return;
+    }
+
+    let mode_label = state.mode.label().to_owned();
+
+    egui::Window::new(&mode_label)
+        .id(egui::Id::new("inspector_window"))
+        .default_rect(egui::Rect::from_min_size(
+            egui::pos2(150.0, 40.0),
+            egui::vec2(300.0, 600.0),
+        ))
         .resizable(true)
-        .default_width(300.0)
-        .min_width(250.0)
+        .collapsible(true)
+        .scroll([false, true])
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading(state.mode.label());
+                ui.heading(&mode_label);
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                match state.mode {
-                    AppMode::Avatar => draw_avatar(ui, state),
-                    AppMode::Preview => draw_preview(ui, state),
-                    AppMode::TrackingSetup => draw_tracking(ui, state),
-                    AppMode::Rendering => draw_rendering(ui, state),
-                    AppMode::Output => draw_output(ui, state),
-                    AppMode::ClothAuthoring => draw_cloth_authoring(ui, state),
-                }
-
-                ui.separator();
-                egui::CollapsingHeader::new("Camera Transform")
-                    .default_open(true)
+            ui.push_id("inspector_scroll", |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(f32::INFINITY)
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Yaw:");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
-                                        .speed(0.5),
-                                )
-                                .changed()
-                            {
-                                state.project_dirty = true;
-                            }
-                            ui.label("Pitch:");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
-                                        .speed(0.5),
-                                )
-                                .changed()
-                            {
-                                state.project_dirty = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Distance:");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut state.camera_orbit.distance)
-                                        .speed(0.05)
-                                        .range(0.1..=100.0),
-                                )
-                                .changed()
-                            {
-                                state.project_dirty = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Pan X:");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut state.camera_orbit.pan[0])
-                                        .speed(0.01),
-                                )
-                                .changed()
-                            {
-                                state.project_dirty = true;
-                            }
-                            ui.label("Y:");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut state.camera_orbit.pan[1])
-                                        .speed(0.01),
-                                )
-                                .changed()
-                            {
-                                state.project_dirty = true;
-                            }
-                        });
-                        if ui.button("Reset Camera").clicked() {
-                            state.camera_orbit.yaw_deg = 0.0;
-                            state.camera_orbit.pitch_deg = 0.0;
-                            state.camera_orbit.distance = 5.0;
-                            state.camera_orbit.pan = [0.0, 0.0];
-                            state.project_dirty = true;
+                        match state.mode {
+                            AppMode::Avatar => draw_avatar(ui, state),
+                            AppMode::Preview => draw_preview(ui, state),
+                            AppMode::TrackingSetup => draw_tracking(ui, state),
+                            AppMode::Rendering => draw_rendering(ui, state),
+                            AppMode::Output => draw_output(ui, state),
+                            AppMode::ClothAuthoring => draw_cloth_authoring(ui, state),
                         }
+
+                        ui.separator();
+                        egui::CollapsingHeader::new("Camera Transform")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Yaw:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
+                                                .speed(0.5),
+                                        )
+                                        .changed()
+                                    {
+                                        state.project_dirty = true;
+                                    }
+                                    ui.label("Pitch:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
+                                                .speed(0.5),
+                                        )
+                                        .changed()
+                                    {
+                                        state.project_dirty = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Distance:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut state.camera_orbit.distance)
+                                                .speed(0.05)
+                                                .range(0.1..=100.0),
+                                        )
+                                        .changed()
+                                    {
+                                        state.project_dirty = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Pan X:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut state.camera_orbit.pan[0])
+                                                .speed(0.01),
+                                        )
+                                        .changed()
+                                    {
+                                        state.project_dirty = true;
+                                    }
+                                    ui.label("Y:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut state.camera_orbit.pan[1])
+                                                .speed(0.01),
+                                        )
+                                        .changed()
+                                    {
+                                        state.project_dirty = true;
+                                    }
+                                });
+                                if ui.button("Reset Camera").clicked() {
+                                    state.camera_orbit.yaw_deg = 0.0;
+                                    state.camera_orbit.pitch_deg = 0.0;
+                                    state.camera_orbit.distance = 5.0;
+                                    state.camera_orbit.pan = [0.0, 0.0];
+                                    state.project_dirty = true;
+                                }
+                            });
                     });
             });
         });
@@ -531,9 +546,11 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     // Camera is initialising — show a disabled placeholder.
                     ui.add_enabled(false, egui::Button::new("Preparing..."));
                 } else if ui.button("Start Camera").clicked() {
-                    let (w, h) =
-                        crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
-                    let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+                    let (w, h) = crate::gui::camera_resolution_for_index(
+                        state.tracking.camera_resolution_index,
+                    );
+                    let fps =
+                        crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
                     #[cfg(feature = "webcam")]
                     let backend = crate::tracking::CameraBackend::Webcam {
                         camera_index: state.camera_index,
@@ -596,11 +613,9 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             // the new params so the change takes effect immediately rather
             // than only at the next Stop / Start Camera cycle.
             if (res_changed || fps_changed) && state.app.is_tracking_running() {
-                let (w, h) = crate::gui::camera_resolution_for_index(
-                    state.tracking.camera_resolution_index,
-                );
-                let fps =
-                    crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+                let (w, h) =
+                    crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
+                let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
                 #[cfg(feature = "webcam")]
                 let backend = crate::tracking::CameraBackend::Webcam {
                     camera_index: state.camera_index,
@@ -608,10 +623,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 #[cfg(not(feature = "webcam"))]
                 let backend = crate::tracking::CameraBackend::Synthetic;
                 state.app.start_tracking_with_params(backend, w, h, fps);
-                state.push_notification(format!(
-                    "Camera restarted: {}x{} @ {} fps",
-                    w, h, fps
-                ));
+                state.push_notification(format!("Camera restarted: {}x{} @ {} fps", w, h, fps));
             }
         });
 
@@ -685,11 +697,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let joint_conf = |b: HumanoidBone| -> f32 {
                     tracking.joints.get(&b).map(|j| j.confidence).unwrap_or(0.0)
                 };
-                draw_confidence_bar(
-                    ui,
-                    "Left Shoulder",
-                    joint_conf(HumanoidBone::LeftShoulder),
-                );
+                draw_confidence_bar(ui, "Left Shoulder", joint_conf(HumanoidBone::LeftShoulder));
                 draw_confidence_bar(
                     ui,
                     "Right Shoulder",
@@ -772,10 +780,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     if new_mic != active_mic {
         // Goes through requested setter so a failed mic switch still
         // updates the user's preference (next attempt won't revert).
-        if let Err(e) = state
-            .app
-            .set_requested_lipsync(requested_enabled, new_mic)
-        {
+        if let Err(e) = state.app.set_requested_lipsync(requested_enabled, new_mic) {
             state.push_notification(format!("Lip sync mic switch failed: {e}"));
         }
         state.project_dirty = true;
@@ -784,10 +789,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.add_space(4.0);
 
     let mut new_enabled = requested_enabled;
-    if ui
-        .checkbox(&mut new_enabled, "Enable Lip Sync")
-        .changed()
-    {
+    if ui.checkbox(&mut new_enabled, "Enable Lip Sync").changed() {
         match state.app.set_requested_lipsync(new_enabled, active_mic) {
             Ok(()) => {
                 state.project_dirty = true;

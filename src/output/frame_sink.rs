@@ -758,29 +758,38 @@ mod win32_shmem {
             }
 
             unsafe {
-                let base = self.view;
+                // Cast through `*mut u8` BEFORE doing pointer arithmetic.
+                // `self.view: *mut ()` is a ZST pointer and `*mut T::add(n)`
+                // advances by `n * size_of::<T>()` bytes — which is `0` for
+                // `()`, so every `base.add(N)` returned the same address as
+                // `base`. The result was that magic, width, height, …,
+                // flags and the pixel data were all written on top of each
+                // other at offset 0, leaving the on-wire header entirely
+                // garbled (magic ≠ SHMEM_MAGIC) so the DLL discarded every
+                // frame and Frame Server's watchdog tore the camera down.
+                let base = self.view as *mut u8;
 
                 let magic = SHMEM_MAGIC.to_le_bytes();
-                ptr::copy_nonoverlapping(magic.as_ptr(), base as *mut u8, 4);
+                ptr::copy_nonoverlapping(magic.as_ptr(), base, 4);
 
                 let w_bytes = width.to_le_bytes();
-                ptr::copy_nonoverlapping(w_bytes.as_ptr(), base.add(4) as *mut u8, 4);
+                ptr::copy_nonoverlapping(w_bytes.as_ptr(), base.add(4), 4);
 
                 let h_bytes = height.to_le_bytes();
-                ptr::copy_nonoverlapping(h_bytes.as_ptr(), base.add(8) as *mut u8, 4);
+                ptr::copy_nonoverlapping(h_bytes.as_ptr(), base.add(8), 4);
 
                 let seq_bytes = self.sequence.to_le_bytes();
-                ptr::copy_nonoverlapping(seq_bytes.as_ptr(), base.add(12) as *mut u8, 8);
+                ptr::copy_nonoverlapping(seq_bytes.as_ptr(), base.add(12), 8);
 
                 let ts_bytes = frame.timestamp.to_le_bytes();
-                ptr::copy_nonoverlapping(ts_bytes.as_ptr(), base.add(20) as *mut u8, 8);
+                ptr::copy_nonoverlapping(ts_bytes.as_ptr(), base.add(20), 8);
 
                 let flag_bytes = flags.to_le_bytes();
-                ptr::copy_nonoverlapping(flag_bytes.as_ptr(), base.add(28) as *mut u8, 4);
+                ptr::copy_nonoverlapping(flag_bytes.as_ptr(), base.add(28), 4);
 
                 ptr::copy_nonoverlapping(
                     pixel_data.as_ptr(),
-                    base.add(SHMEM_HEADER_SIZE) as *mut u8,
+                    base.add(SHMEM_HEADER_SIZE),
                     data_len,
                 );
             }

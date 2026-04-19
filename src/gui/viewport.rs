@@ -359,7 +359,8 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             // the normal drag delta otherwise (first frame of drag, or if the
             // platform doesn't support CursorGrab::Locked).
             let delta = if state.viewport_cursor_grabbed {
-                ctx.input(|i| i.pointer.motion()).unwrap_or_else(|| response.drag_delta())
+                ctx.input(|i| i.pointer.motion())
+                    .unwrap_or_else(|| response.drag_delta())
             } else {
                 response.drag_delta()
             };
@@ -375,12 +376,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 state.camera_orbit.pan[1] -= delta.y * scale;
                 state.project_dirty = true;
             }
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll.abs() > 0.0 {
-                state.camera_orbit.target_distance = (state.camera_orbit.target_distance
-                    - scroll * state.camera_orbit.target_distance * 0.03)
-                    .max(0.1);
-                state.project_dirty = true;
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll.abs() > 0.0 {
+                    state.camera_orbit.target_distance = (state.camera_orbit.target_distance
+                        - scroll * state.camera_orbit.target_distance * 0.1)
+                        .max(0.1);
+                    state.project_dirty = true;
+                }
             }
 
             // ── Debug drawing (CPU-side fallback) ────────────────────────

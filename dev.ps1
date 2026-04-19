@@ -67,6 +67,30 @@ function Install-MfCameraSystem {
     $target = Join-Path $targetDir "vulvatar_mf_camera_system_$timestamp.dll"
     Copy-Item $source $target -Force
 
+    # Frame Server runs the camera-source proxy under NT AUTHORITY\LocalService.
+    # Default Program Files ACL only grants BUILTIN\Users (which does NOT
+    # include LocalService) read+execute on inherited files, so without an
+    # explicit grant Frame Server's svchost cannot LoadLibrary the DLL
+    # and clients see ReadSample return MF_SOURCE_READERF_ENDOFSTREAM
+    # immediately. Grant LocalService RX on every install — the alternative
+    # is installing outside Program Files which loses the system-managed
+    # uninstall semantics.
+    Write-Host "Granting NT AUTHORITY\LocalService:(RX) on installed DLL..." -ForegroundColor Cyan
+    Write-Host "  target: $target" -ForegroundColor DarkGray
+    $aclOutput = icacls.exe $target /grant 'NT AUTHORITY\LocalService:(RX)' 2>&1 | Out-String
+    Write-Host $aclOutput.TrimEnd() -ForegroundColor DarkGray
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls grant LocalService failed (exit $LASTEXITCODE). Frame Server will not be able to load the DLL."
+    }
+    # Verify the explicit grant landed. icacls input syntax accepts
+    # `LocalService` (no space) but Windows displays the resolved name as
+    # `LOCAL SERVICE` (with space, S-1-5-19). Match either form.
+    $verify = (icacls.exe $target | Out-String)
+    if ($verify -notmatch 'LOCAL\s*SERVICE') {
+        throw "icacls reported success but the LOCAL SERVICE grant is not visible on $target.`nicacls output:`n$verify"
+    }
+    Write-Host "LOCAL SERVICE grant confirmed." -ForegroundColor Green
+
     $key = "HKLM:\Software\Classes\CLSID\$clsid"
     $inproc = Join-Path $key "InprocServer32"
     $legacyUserKey = "HKCU:\Software\Classes\CLSID\$clsid"

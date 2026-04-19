@@ -637,8 +637,9 @@ impl Application {
                     .asset
                     .meshes
                     .iter()
-                    .flat_map(|mesh| {
-                        mesh.primitives.iter().map(|prim| {
+                    .enumerate()
+                    .flat_map(|(mi, mesh)| {
+                        mesh.primitives.iter().enumerate().map(move |(pi, prim)| {
                             let material_asset = avatar
                                 .asset
                                 .materials
@@ -679,7 +680,6 @@ impl Application {
                                 RenderCullMode::BackFace
                             };
 
-                            // Resolve expression weights → per-primitive morph weights.
                             let morph_weights = if prim.morph_targets.is_empty() {
                                 Vec::new()
                             } else {
@@ -693,11 +693,10 @@ impl Application {
                                         .find(|e| e.name == ew.name)
                                     {
                                         for bind in &expr_def.morph_binds {
-                                            // Resolve node → mesh index.
-                                            if let Some(&mi) =
+                                            if let Some(&mesh_idx) =
                                                 avatar.asset.node_to_mesh.get(&bind.node_index)
                                             {
-                                                if let Some(m) = avatar.asset.meshes.get(mi) {
+                                                if let Some(m) = avatar.asset.meshes.get(mesh_idx) {
                                                     if m.primitives.iter().any(|p| p.id == prim.id)
                                                         && bind.morph_target_index < weights.len()
                                                     {
@@ -715,15 +714,22 @@ impl Application {
                                 weights
                             };
 
+                            let prim_arc = avatar
+                                .primitive_arcs
+                                .get(mi)
+                                .and_then(|v| v.get(pi))
+                                .cloned()
+                                .unwrap_or_else(|| std::sync::Arc::new(prim.clone()));
+
                             RenderMeshInstance {
                                 mesh_id: mesh.id,
                                 primitive_id: prim.id,
                                 material_binding,
-                                bounds: prim.bounds.clone(),
+                                bounds: prim.bounds,
                                 alpha_mode,
                                 cull_mode,
                                 outline,
-                                primitive_data: Some(std::sync::Arc::new(prim.clone())),
+                                primitive_data: Some(prim_arc),
                                 morph_weights,
                             }
                         })
@@ -875,9 +881,7 @@ impl Application {
                 // Enumerate non-VC variants explicitly so adding a future
                 // FrameSink variant trips a compile error here, forcing the
                 // author to decide whether the new sink needs MF teardown.
-                FrameSink::SharedTexture
-                | FrameSink::SharedMemory
-                | FrameSink::ImageSequence => {
+                FrameSink::SharedTexture | FrameSink::SharedMemory | FrameSink::ImageSequence => {
                     if self.mf_virtual_camera.take().is_some() {
                         info!("output: MediaFoundation virtual camera unregistered");
                     }
@@ -983,7 +987,11 @@ impl Application {
             self.lipsync_processor = Some(proc);
             info!(
                 "app: lipsync {} (mic={})",
-                if mic_changed && active { "restarted" } else { "started" },
+                if mic_changed && active {
+                    "restarted"
+                } else {
+                    "started"
+                },
                 mic_device_index
             );
         }
@@ -1085,12 +1093,7 @@ impl Application {
     /// design ran inference inside `draw_lipsync` and froze when the panel
     /// was hidden).
     #[cfg(feature = "lipsync")]
-    pub fn step_lipsync(
-        &mut self,
-        smoothing: f32,
-        volume_threshold: f32,
-        dt: f32,
-    ) -> Option<f32> {
+    pub fn step_lipsync(&mut self, smoothing: f32, volume_threshold: f32, dt: f32) -> Option<f32> {
         let viseme = self
             .lipsync_processor
             .as_mut()?

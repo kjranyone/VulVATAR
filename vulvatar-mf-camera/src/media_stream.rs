@@ -8,22 +8,26 @@
 
 #![allow(unused_variables)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
-use windows::Win32::Foundation::E_FAIL;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT, PWSTR};
+use windows::Win32::Foundation::{BOOL, E_FAIL};
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncResult, IMFMediaEvent, IMFMediaEventGenerator_Impl,
-    IMFMediaEventQueue, IMFMediaSource, IMFMediaStream, IMFMediaStream2, IMFMediaStream2_Impl,
-    IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor, MFCreateMemoryBuffer, MFCreateSample,
-    MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MEMediaSample,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
+    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFAttributes_Impl, IMFMediaEvent,
+    IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2,
+    IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor,
+    IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample,
+    MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_ATTRIBUTES_MATCH_TYPE,
+    MF_ATTRIBUTE_TYPE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE,
+    MF_STREAM_STATE_RUNNING,
 };
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::media_source::DEFAULT_FPS;
 use crate::shared_memory::{SharedMemoryReader, FRAME_FLAG_PRESERVE_ALPHA};
 use crate::{dll_add_ref, dll_release};
+
+const GUID_NULL_VALUE: GUID = GUID::from_u128(0);
 
 /// Resolution + framerate the client has currently negotiated. If we can't
 /// read it from the media-type handler (race during init etc.), fall back
@@ -51,9 +55,12 @@ impl CurrentFormat {
     }
 }
 
-#[implement(IMFMediaStream2, IMFMediaStream)]
+#[implement(IMFMediaStream2, IMFAttributes)]
 pub struct VulvatarMediaStream {
     inner: Mutex<StreamInner>,
+    /// Stream-scoped attribute identity. `IMFMediaSourceEx::GetStreamAttributes`
+    /// returns this same object through the stream's `IMFAttributes` view.
+    attributes: IMFAttributes,
     /// Current MF_STREAM_STATE value. Stored as the discriminant so
     /// `IMFMediaStream2::Get/SetStreamState` can answer without holding
     /// the mutex. Initialised to MF_STREAM_STATE_RUNNING (the stream
@@ -66,6 +73,15 @@ pub struct VulvatarMediaStream {
     /// units, MF's standard time base). Increments by `frame_duration_hns`
     /// per published sample.
     sample_time_hns: AtomicU64,
+    /// Frame Server-provided sample allocator. Shared with the source so
+    /// a stream created during `GetStreamAttributes` still sees a later
+    /// `SetDefaultAllocator` call before `Start`.
+    allocator: Arc<Mutex<Option<IMFVideoSampleAllocatorEx>>>,
+    /// Whether `IMFVideoSampleAllocatorEx::InitializeSampleAllocator` has
+    /// been called for the currently-negotiated media type. The pool only
+    /// needs to be initialised once unless the format changes mid-stream,
+    /// which our SUPPORTED_FORMATS list doesn't currently allow.
+    allocator_initialized: AtomicBool,
 }
 
 struct StreamInner {
@@ -79,20 +95,24 @@ impl VulvatarMediaStream {
         parent_source: IMFMediaSource,
         descriptor: IMFStreamDescriptor,
         event_queue: IMFMediaEventQueue,
-    ) -> Self {
+        allocator: Arc<Mutex<Option<IMFVideoSampleAllocatorEx>>>,
+    ) -> windows::core::Result<Self> {
         dll_add_ref();
-        Self {
+        let attributes: IMFAttributes = descriptor.cast()?;
+        Ok(Self {
             inner: Mutex::new(StreamInner {
                 parent_source,
                 descriptor,
                 event_queue,
             }),
+            attributes,
             stream_state: AtomicI32::new(MF_STREAM_STATE_RUNNING.0),
             shared_memory: SharedMemoryReader::new(),
             sample_time_hns: AtomicU64::new(0),
-        }
+            allocator,
+            allocator_initialized: AtomicBool::new(false),
+        })
     }
-
 }
 
 impl Drop for VulvatarMediaStream {
@@ -119,10 +139,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaStream_Impl {
         unsafe { queue.BeginGetEvent(callback, state) }
     }
 
-    fn EndGetEvent(
-        &self,
-        result: Option<&IMFAsyncResult>,
-    ) -> windows::core::Result<IMFMediaEvent> {
+    fn EndGetEvent(&self, result: Option<&IMFAsyncResult>) -> windows::core::Result<IMFMediaEvent> {
         let queue = self.inner.lock().unwrap().event_queue.clone();
         unsafe { queue.EndGetEvent(result) }
     }
@@ -135,7 +152,14 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaStream_Impl {
         value: *const PROPVARIANT,
     ) -> windows::core::Result<()> {
         let queue = self.inner.lock().unwrap().event_queue.clone();
-        unsafe { queue.QueueEventParamVar(met, guid_extended_type, hr_status, value) }
+        let extended_type = unsafe {
+            if guid_extended_type.is_null() {
+                &GUID_NULL_VALUE
+            } else {
+                &*guid_extended_type
+            }
+        };
+        unsafe { queue.QueueEventParamVar(met, extended_type, hr_status, value) }
     }
 }
 
@@ -160,57 +184,87 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
             .fetch_add(format.frame_duration_hns(), Ordering::Relaxed);
         let dur = format.frame_duration_hns();
 
-        let sample = match self.shared_memory.read_latest() {
-            Some(view) => {
-                let preserve_alpha = view.flags & FRAME_FLAG_PRESERVE_ALPHA != 0;
-                let resampled;
-                let (rgba, w, h) = if view.width == format.width && view.height == format.height {
-                    (view.pixels.as_slice(), view.width, view.height)
-                } else {
+        // Two paths:
+        //   - allocator path (Frame Server-mediated client): snapshot the
+        //     IMFVideoSampleAllocatorEx Frame Server gave us via
+        //     SetDefaultAllocator, lazy-initialise the pool with the
+        //     current media type, then `AllocateSample()` and fill its
+        //     buffer in place. Frame Server requires this for cross-process
+        //     sample marshaling; CPU MFCreateMemoryBuffer-backed samples
+        //     can't reach the FrameServerPool and ReadSample returns
+        //     MF_SOURCE_READERF_ENDOFSTREAM otherwise.
+        //   - direct CoCreateInstance path (no allocator was set): build
+        //     the sample with MFCreateMemoryBuffer + MFCreateSample.
+        let allocator_opt = self.allocator.lock().unwrap().clone();
+
+        let sample: IMFSample = if let Some(allocator) = allocator_opt {
+            if !self.allocator_initialized.load(Ordering::Acquire) {
+                let descriptor = self.inner.lock().unwrap().descriptor.clone();
+                let mt = unsafe { descriptor.GetMediaTypeHandler()?.GetCurrentMediaType()? };
+                crate::t!("Stream::RequestSample InitializeSampleAllocator(10, current_type)");
+                unsafe { allocator.InitializeSampleAllocator(10, &mt)? };
+                self.allocator_initialized.store(true, Ordering::Release);
+            }
+            let s = unsafe { allocator.AllocateSample()? };
+            self.fill_allocated_sample(&s, format, is_nv12)?;
+            unsafe {
+                s.SetSampleTime(time as i64)?;
+                s.SetSampleDuration(dur as i64)?;
+            }
+            s
+        } else {
+            // Direct path — keep the existing MFCreateMemoryBuffer flow.
+            match self.shared_memory.read_latest() {
+                Some(view) => {
+                    let preserve_alpha = view.flags & FRAME_FLAG_PRESERVE_ALPHA != 0;
+                    let resampled;
+                    let (rgba, w, h) = if view.width == format.width && view.height == format.height
+                    {
+                        (view.pixels.as_slice(), view.width, view.height)
+                    } else {
+                        crate::t!(
+                            "Stream::RequestSample resample {}x{} → {}x{}",
+                            view.width,
+                            view.height,
+                            format.width,
+                            format.height,
+                        );
+                        resampled = resample_rgba_nearest(
+                            &view.pixels,
+                            view.width as usize,
+                            view.height as usize,
+                            format.width as usize,
+                            format.height as usize,
+                        );
+                        (resampled.as_slice(), format.width, format.height)
+                    };
                     crate::t!(
-                        "Stream::RequestSample resample {}x{} → {}x{}",
-                        view.width,
-                        view.height,
+                        "Stream::RequestSample direct frame seq={} {}x{}@{} subtype={} alpha={}",
+                        view.sequence,
                         format.width,
                         format.height,
+                        format.fps,
+                        if is_nv12 { "NV12" } else { "RGB32" },
+                        preserve_alpha,
                     );
-                    resampled = resample_rgba_nearest(
-                        &view.pixels,
-                        view.width as usize,
-                        view.height as usize,
-                        format.width as usize,
-                        format.height as usize,
-                    );
-                    (resampled.as_slice(), format.width, format.height)
-                };
-                crate::t!(
-                    "Stream::RequestSample frame seq={} client_size={}x{}@{} subtype={} alpha={}",
-                    view.sequence,
-                    format.width,
-                    format.height,
-                    format.fps,
-                    if is_nv12 { "NV12" } else { "RGB32" },
-                    preserve_alpha,
-                );
-                if is_nv12 {
-                    build_sample_nv12_from_rgba(rgba, w, h, time, dur)?
-                } else {
-                    build_sample_rgb32_from_rgba(rgba, w, h, preserve_alpha, time, dur)?
+                    if is_nv12 {
+                        build_sample_nv12_from_rgba(rgba, w, h, time, dur)?
+                    } else {
+                        build_sample_rgb32_from_rgba(rgba, w, h, preserve_alpha, time, dur)?
+                    }
                 }
-            }
-            None => {
-                crate::t!(
-                    "Stream::RequestSample no producer yet, sending black ({}x{} {})",
-                    format.width,
-                    format.height,
-                    if is_nv12 { "NV12" } else { "RGB32" },
-                );
-                if is_nv12 {
-                    build_black_sample_nv12(format.width, format.height, time, dur)?
-                } else {
-                    // Black with alpha is just black; no need for the
-                    // preserve-alpha branch on the no-producer path.
-                    build_black_sample_rgb32(format.width, format.height, time, dur)?
+                None => {
+                    crate::t!(
+                        "Stream::RequestSample direct no producer ({}x{} {})",
+                        format.width,
+                        format.height,
+                        if is_nv12 { "NV12" } else { "RGB32" },
+                    );
+                    if is_nv12 {
+                        build_black_sample_nv12(format.width, format.height, time, dur)?
+                    } else {
+                        build_black_sample_rgb32(format.width, format.height, time, dur)?
+                    }
                 }
             }
         };
@@ -221,14 +275,132 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
 
         let queue = self.inner.lock().unwrap().event_queue.clone();
         let sample_unk: IUnknown = sample.cast()?;
-        let value = PROPVARIANT::from(sample_unk);
         unsafe {
-            queue.QueueEventParamVar(
+            queue.QueueEventParamUnk(
                 MEMediaSample.0 as u32,
-                core::ptr::null(),
+                &GUID_NULL_VALUE,
                 windows::core::HRESULT(0),
-                &value,
+                &sample_unk,
             )?;
+        }
+        Ok(())
+    }
+}
+
+impl VulvatarMediaStream {
+    /// Fill an already-allocated `IMFSample` (from
+    /// `IMFVideoSampleAllocatorEx::AllocateSample`) with the latest pixel
+    /// data from shared memory. Keeps the allocator's pre-allocated
+    /// `IMFMediaBuffer` rather than swapping in a fresh `MFCreateMemoryBuffer`,
+    /// which is what Frame Server's marshaller requires.
+    fn fill_allocated_sample(
+        &self,
+        sample: &IMFSample,
+        format: CurrentFormat,
+        is_nv12: bool,
+    ) -> windows::core::Result<()> {
+        let buffer = unsafe { sample.GetBufferByIndex(0)? };
+        let view = self.shared_memory.read_latest();
+        let preserve_alpha = view
+            .as_ref()
+            .map(|v| v.flags & FRAME_FLAG_PRESERVE_ALPHA != 0)
+            .unwrap_or(false);
+
+        unsafe {
+            let mut dst_ptr: *mut u8 = core::ptr::null_mut();
+            let mut max_len: u32 = 0;
+            let mut current_len: u32 = 0;
+            buffer.Lock(&mut dst_ptr, Some(&mut max_len), Some(&mut current_len))?;
+            if dst_ptr.is_null() {
+                buffer.Unlock()?;
+                return Err(E_FAIL.into());
+            }
+
+            let written = match view {
+                Some(view) => {
+                    let resampled;
+                    let (rgba, w, h) = if view.width == format.width && view.height == format.height
+                    {
+                        (view.pixels.as_slice(), view.width, view.height)
+                    } else {
+                        resampled = resample_rgba_nearest(
+                            &view.pixels,
+                            view.width as usize,
+                            view.height as usize,
+                            format.width as usize,
+                            format.height as usize,
+                        );
+                        (resampled.as_slice(), format.width, format.height)
+                    };
+                    crate::t!(
+                        "Stream::RequestSample alloc frame seq={} {}x{}@{} subtype={} alpha={}",
+                        view.sequence,
+                        format.width,
+                        format.height,
+                        format.fps,
+                        if is_nv12 { "NV12" } else { "RGB32" },
+                        preserve_alpha,
+                    );
+                    if is_nv12 {
+                        let need = nv12_size(w, h) as u32;
+                        if max_len < need {
+                            buffer.Unlock()?;
+                            return Err(E_FAIL.into());
+                        }
+                        rgba_to_nv12(rgba, w as usize, h as usize, dst_ptr);
+                        need
+                    } else {
+                        let need = (w as u32) * (h as u32) * 4;
+                        if max_len < need {
+                            buffer.Unlock()?;
+                            return Err(E_FAIL.into());
+                        }
+                        let src = rgba.as_ptr();
+                        for i in 0..(need as usize / 4) {
+                            let s = src.add(i * 4);
+                            let d = dst_ptr.add(i * 4);
+                            *d = *s.add(2);
+                            *d.add(1) = *s.add(1);
+                            *d.add(2) = *s;
+                            *d.add(3) = if preserve_alpha { *s.add(3) } else { 0xFF };
+                        }
+                        need
+                    }
+                }
+                None => {
+                    crate::t!(
+                        "Stream::RequestSample alloc no producer ({}x{} {})",
+                        format.width,
+                        format.height,
+                        if is_nv12 { "NV12" } else { "RGB32" },
+                    );
+                    if is_nv12 {
+                        let need = nv12_size(format.width, format.height) as u32;
+                        if max_len >= need {
+                            // Limited-range black: Y=16, UV=128
+                            let y_len = (format.width * format.height) as usize;
+                            core::ptr::write_bytes(dst_ptr, 16, y_len);
+                            core::ptr::write_bytes(dst_ptr.add(y_len), 128, y_len / 2);
+                        }
+                        need
+                    } else {
+                        let need = (format.width as u32) * (format.height as u32) * 4;
+                        if max_len >= need {
+                            for i in 0..(need as usize / 4) {
+                                let d = dst_ptr.add(i * 4);
+                                *d = 0;
+                                *d.add(1) = 0;
+                                *d.add(2) = 0;
+                                *d.add(3) = 0xFF;
+                            }
+                        }
+                        need
+                    }
+                }
+            };
+
+            buffer.SetCurrentLength(written)?;
+            buffer.Unlock()?;
         }
         Ok(())
     }
@@ -269,6 +441,206 @@ impl VulvatarMediaStream {
                 fps,
             }
         }
+    }
+}
+
+impl IMFAttributes_Impl for VulvatarMediaStream_Impl {
+    fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> windows::core::Result<()> {
+        unsafe { self.attributes.GetItem(guidkey, Some(pvalue)) }
+    }
+
+    fn GetItemType(&self, guidkey: *const GUID) -> windows::core::Result<MF_ATTRIBUTE_TYPE> {
+        unsafe { self.attributes.GetItemType(guidkey) }
+    }
+
+    fn CompareItem(
+        &self,
+        guidkey: *const GUID,
+        value: *const PROPVARIANT,
+    ) -> windows::core::Result<BOOL> {
+        unsafe { self.attributes.CompareItem(guidkey, value) }
+    }
+
+    fn Compare(
+        &self,
+        ptheirs: Option<&IMFAttributes>,
+        matchtype: MF_ATTRIBUTES_MATCH_TYPE,
+    ) -> windows::core::Result<BOOL> {
+        unsafe {
+            self.attributes
+                .Compare(ptheirs.unwrap_or(&self.attributes), matchtype)
+        }
+    }
+
+    fn GetUINT32(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
+        unsafe { self.attributes.GetUINT32(guidkey) }
+    }
+
+    fn GetUINT64(&self, guidkey: *const GUID) -> windows::core::Result<u64> {
+        unsafe { self.attributes.GetUINT64(guidkey) }
+    }
+
+    fn GetDouble(&self, guidkey: *const GUID) -> windows::core::Result<f64> {
+        unsafe { self.attributes.GetDouble(guidkey) }
+    }
+
+    fn GetGUID(&self, guidkey: *const GUID) -> windows::core::Result<GUID> {
+        unsafe { self.attributes.GetGUID(guidkey) }
+    }
+
+    fn GetStringLength(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
+        unsafe { self.attributes.GetStringLength(guidkey) }
+    }
+
+    fn GetString(
+        &self,
+        guidkey: *const GUID,
+        pwszvalue: PWSTR,
+        cchbufsize: u32,
+        pcchlength: *mut u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let slice = core::slice::from_raw_parts_mut(pwszvalue.0, cchbufsize as usize);
+            self.attributes.GetString(guidkey, slice, Some(pcchlength))
+        }
+    }
+
+    fn GetAllocatedString(
+        &self,
+        guidkey: *const GUID,
+        ppwszvalue: *mut PWSTR,
+        pcchlength: *mut u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            self.attributes
+                .GetAllocatedString(guidkey, ppwszvalue, pcchlength)
+        }
+    }
+
+    fn GetBlobSize(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
+        unsafe { self.attributes.GetBlobSize(guidkey) }
+    }
+
+    fn GetBlob(
+        &self,
+        guidkey: *const GUID,
+        pbuf: *mut u8,
+        cbbufsize: u32,
+        pcbblobsize: *mut u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let slice = core::slice::from_raw_parts_mut(pbuf, cbbufsize as usize);
+            self.attributes.GetBlob(guidkey, slice, Some(pcbblobsize))
+        }
+    }
+
+    fn GetAllocatedBlob(
+        &self,
+        guidkey: *const GUID,
+        ppbuf: *mut *mut u8,
+        pcbsize: *mut u32,
+    ) -> windows::core::Result<()> {
+        unsafe { self.attributes.GetAllocatedBlob(guidkey, ppbuf, pcbsize) }
+    }
+
+    fn GetUnknown(
+        &self,
+        guidkey: *const GUID,
+        riid: *const GUID,
+        ppv: *mut *mut core::ffi::c_void,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let vt = IMFAttributes::vtable(&self.attributes);
+            (vt.GetUnknown)(IMFAttributes::as_raw(&self.attributes), guidkey, riid, ppv).ok()
+        }
+    }
+
+    fn SetItem(
+        &self,
+        guidkey: *const GUID,
+        value: *const PROPVARIANT,
+    ) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetItem(guidkey, value) }
+    }
+
+    fn DeleteItem(&self, guidkey: *const GUID) -> windows::core::Result<()> {
+        unsafe { self.attributes.DeleteItem(guidkey) }
+    }
+
+    fn DeleteAllItems(&self) -> windows::core::Result<()> {
+        unsafe { self.attributes.DeleteAllItems() }
+    }
+
+    fn SetUINT32(&self, guidkey: *const GUID, unvalue: u32) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetUINT32(guidkey, unvalue) }
+    }
+
+    fn SetUINT64(&self, guidkey: *const GUID, unvalue: u64) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetUINT64(guidkey, unvalue) }
+    }
+
+    fn SetDouble(&self, guidkey: *const GUID, fvalue: f64) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetDouble(guidkey, fvalue) }
+    }
+
+    fn SetGUID(&self, guidkey: *const GUID, guidvalue: *const GUID) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetGUID(guidkey, guidvalue) }
+    }
+
+    fn SetString(
+        &self,
+        guidkey: *const GUID,
+        wszvalue: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetString(guidkey, *wszvalue) }
+    }
+
+    fn SetBlob(
+        &self,
+        guidkey: *const GUID,
+        pbuf: *const u8,
+        cbbufsize: u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let slice = core::slice::from_raw_parts(pbuf, cbbufsize as usize);
+            self.attributes.SetBlob(guidkey, slice)
+        }
+    }
+
+    fn SetUnknown(
+        &self,
+        guidkey: *const GUID,
+        punknown: Option<&IUnknown>,
+    ) -> windows::core::Result<()> {
+        unsafe { self.attributes.SetUnknown(guidkey, punknown) }
+    }
+
+    fn LockStore(&self) -> windows::core::Result<()> {
+        unsafe { self.attributes.LockStore() }
+    }
+
+    fn UnlockStore(&self) -> windows::core::Result<()> {
+        unsafe { self.attributes.UnlockStore() }
+    }
+
+    fn GetCount(&self) -> windows::core::Result<u32> {
+        unsafe { self.attributes.GetCount() }
+    }
+
+    fn GetItemByIndex(
+        &self,
+        unindex: u32,
+        pguidkey: *mut GUID,
+        pvalue: *mut PROPVARIANT,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            self.attributes
+                .GetItemByIndex(unindex, pguidkey, Some(pvalue))
+        }
+    }
+
+    fn CopyAllItems(&self, pdest: Option<&IMFAttributes>) -> windows::core::Result<()> {
+        unsafe { self.attributes.CopyAllItems(pdest) }
     }
 }
 
@@ -387,8 +759,7 @@ fn resample_rgba_nearest(
 /// `RequestSample` with a token, they expect to find that same `IUnknown`
 /// stashed on the returned sample under this attribute key.
 #[allow(non_upper_case_globals)]
-const MFSampleExtension_Token: GUID =
-    GUID::from_u128(0x8294da66_f328_4805_b551_00deb4c57a61);
+const MFSampleExtension_Token: GUID = GUID::from_u128(0x8294da66_f328_4805_b551_00deb4c57a61);
 
 // ---------------------------------------------------------------------------
 // NV12 path
@@ -505,12 +876,7 @@ unsafe fn rgba_to_nv12(rgba: &[u8], w: usize, h: usize, dst: *mut u8) {
             let p01 = take(0, 1);
             let p11 = take(1, 1);
 
-            for (dx, dy, p) in [
-                (0, 0, p00),
-                (1, 0, p10),
-                (0, 1, p01),
-                (1, 1, p11),
-            ] {
+            for (dx, dy, p) in [(0, 0, p00), (1, 0, p10), (0, 1, p01), (1, 1, p11)] {
                 let xx = col + dx;
                 let yy = row + dy;
                 if xx < w && yy < h {

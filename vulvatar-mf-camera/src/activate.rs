@@ -19,15 +19,16 @@ use windows::core::{implement, IUnknown, Interface as _, GUID, PROPVARIANT, PWST
 use windows::Win32::Foundation::{BOOL, E_POINTER};
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFActivate_Impl, IMFAttributes, IMFAttributes_Impl, MFCreateAttributes,
-    MF_ATTRIBUTES_MATCH_TYPE, MF_ATTRIBUTE_TYPE,
+    MFT_TRANSFORM_CLSID_Attribute, MF_ATTRIBUTES_MATCH_TYPE, MF_ATTRIBUTE_TYPE,
+    MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES,
 };
 
 use std::sync::Mutex;
 
-use windows::Win32::Media::MediaFoundation::IMFMediaSource;
+use windows::Win32::Media::MediaFoundation::{IMFMediaSource, IMFMediaSourceEx};
 
 use crate::media_source::VulvatarMediaSource;
-use crate::{dll_add_ref, dll_release};
+use crate::{dll_add_ref, dll_release, CLSID_VULVATAR_MEDIA_SOURCE};
 
 #[implement(IMFActivate, IMFAttributes)]
 pub struct VulvatarActivate {
@@ -44,8 +45,23 @@ impl VulvatarActivate {
         dll_add_ref();
         let mut attrs: Option<IMFAttributes> = None;
         unsafe { MFCreateAttributes(&mut attrs, 1)? };
+        let attributes = attrs.expect("MFCreateAttributes returned no interface");
+        unsafe {
+            // Mirrors Microsoft's VirtualCameraMediaSourceActivate sample.
+            // Frame Server uses this activate-level hint while constructing
+            // the software camera source graph.
+            attributes.SetUINT32(&MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, 1)?;
+            // Tell Frame Server *which* CLSID this activate object backs.
+            // smourier/VCamSample sets this; without it Frame Server's
+            // FsProxy can't resolve the source CLSID for the marshaled
+            // path and short-circuits the stream with end-of-stream
+            // (observed: ReadSample returns flags=0x100 immediately and
+            // the DLL is never loaded into the Frame Server svchost,
+            // even though direct CoCreateInstance + ActivateObject works).
+            attributes.SetGUID(&MFT_TRANSFORM_CLSID_Attribute, &CLSID_VULVATAR_MEDIA_SOURCE)?;
+        }
         Ok(Self {
-            attributes: attrs.expect("MFCreateAttributes returned no interface"),
+            attributes,
             cached_source: Mutex::new(None),
         })
     }
@@ -79,7 +95,31 @@ impl IMFActivate_Impl for VulvatarActivate_Impl {
                 s.clone()
             } else {
                 crate::t!("Activate::ActivateObject: constructing new source");
-                let s: IMFMediaSource = VulvatarMediaSource::new().into();
+                let source_ex: IMFMediaSourceEx = VulvatarMediaSource::new()?.into();
+
+                // smourier/VCamSample's MediaSource::Initialize calls
+                // `attributes->CopyAllItems(this)` on the activator's
+                // attribute store. Frame Server stamps additional attributes
+                // onto the activator BEFORE calling ActivateObject (the
+                // device interface symbolic link, MF_FRAMESERVER_CLIENTCONTEXT
+                // _CLIENTPID etc.); without copying them onto the source's
+                // attribute store the source can't be matched against the
+                // device interface that enumerated it, and FsProxy discards
+                // it in microseconds — exactly the symptom we observe.
+                if let Ok(source_attrs) = source_ex.GetSourceAttributes() {
+                    if let Err(e) = self.attributes.CopyAllItems(&source_attrs) {
+                        crate::t!(
+                            "Activate::ActivateObject: CopyAllItems activator->source failed: {:?}",
+                            e
+                        );
+                    } else {
+                        crate::t!(
+                            "Activate::ActivateObject: copied activator attrs into source"
+                        );
+                    }
+                }
+
+                let s: IMFMediaSource = source_ex.cast()?;
                 *cache = Some(s.clone());
                 s
             };

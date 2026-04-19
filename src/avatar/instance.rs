@@ -2,7 +2,8 @@
 use std::sync::Arc;
 
 use crate::asset::{
-    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, Mat4, NodeId, Transform, Vec3,
+    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, Mat4, MeshPrimitiveAsset, NodeId,
+    Transform, Vec3,
 };
 use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::AvatarPose;
@@ -42,6 +43,9 @@ pub struct AvatarInstance {
     pub cloth_sim_buffers: Option<ClothSimTempBuffers>,
     pub cloth_overlays: Vec<ClothOverlaySlot>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
+    /// Pre-built `Arc<MeshPrimitiveAsset>` per (mesh, primitive) to avoid
+    /// cloning vertex data every frame. Built once in `AvatarInstance::new`.
+    pub primitive_arcs: Vec<Vec<Arc<MeshPrimitiveAsset>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +126,17 @@ impl AvatarInstance {
             })
             .collect();
 
+        let primitive_arcs = asset
+            .meshes
+            .iter()
+            .map(|mesh| {
+                mesh.primitives
+                    .iter()
+                    .map(|prim| Arc::new(prim.clone()))
+                    .collect()
+            })
+            .collect();
+
         Self {
             id,
             asset_id,
@@ -140,6 +155,7 @@ impl AvatarInstance {
             cloth_sim_buffers: None,
             cloth_overlays: Vec::new(),
             expression_weights: Vec::new(),
+            primitive_arcs,
         }
     }
 

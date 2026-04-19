@@ -185,7 +185,13 @@ fn ensure_mapping(state: &mut Inner) -> bool {
         .chain(std::iter::once(0))
         .collect();
 
-    let handle = unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, windows::core::PCWSTR(wide_name.as_ptr())) };
+    let handle = unsafe {
+        OpenFileMappingW(
+            FILE_MAP_READ.0,
+            false,
+            windows::core::PCWSTR(wide_name.as_ptr()),
+        )
+    };
     let handle = match handle {
         Ok(h) => h,
         Err(_) => return false,

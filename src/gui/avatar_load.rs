@@ -96,9 +96,7 @@ impl AvatarLoadJob {
                 Err(mpsc::TryRecvError::Empty) => return None,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // Worker died without sending a terminal message.
-                    return Some(LoadOutcome::Error(
-                        "loader worker disconnected".to_string(),
-                    ));
+                    return Some(LoadOutcome::Error("loader worker disconnected".to_string()));
                 }
             }
         }

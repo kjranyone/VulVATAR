@@ -33,11 +33,8 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     state.app.avatar_library.add(entry);
     let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
 
-    let (pan_y, distance) = crate::gui::autoframe_aabb(
-        &asset.root_aabb,
-        state.rendering.camera_fov,
-        1.0,
-    );
+    let (pan_y, distance) =
+        crate::gui::autoframe_aabb(&asset.root_aabb, state.rendering.camera_fov, 1.0);
     state.camera_orbit.pan = [0.0, pan_y];
     state.camera_orbit.distance = distance;
     state.camera_orbit.target_distance = distance;
