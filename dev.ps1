@@ -1,3 +1,7 @@
+param(
+    [int]$Select = 0
+)
+
 $ErrorActionPreference = "Stop"
 
 function Install-Models {
@@ -162,6 +166,24 @@ function Show-Menu {
     Write-Host ""
 }
 
+function Invoke-DevCommand {
+    param([int]$Index)
+
+    if ($Index -lt 1 -or $Index -gt $commands.Count) {
+        throw "Invalid selection: $Index"
+    }
+
+    $cmd = $commands[$Index - 1].Cmd
+    Write-Host "> $cmd" -ForegroundColor Yellow
+    Write-Host ""
+    Invoke-Expression $cmd
+}
+
+if ($Select -ne 0) {
+    Invoke-DevCommand -Index $Select
+    return
+}
+
 while ($true) {
     Show-Menu
     $input = Read-Host "Select"
@@ -172,10 +194,7 @@ while ($true) {
 
     $idx = 0
     if ([int]::TryParse($input, [ref]$idx) -and $idx -ge 1 -and $idx -le $commands.Count) {
-        $cmd = $commands[$idx - 1].Cmd
-        Write-Host "> $cmd" -ForegroundColor Yellow
-        Write-Host ""
-        Invoke-Expression $cmd
+        Invoke-DevCommand -Index $idx
         Write-Host ""
         Write-Host "Done. Press any key to continue..." -ForegroundColor DarkGray
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use eframe::egui;
+use log::info;
 
 use crate::asset::AvatarAsset;
 use crate::gui::avatar_load::{AfterLoad, AvatarLoadJob};
@@ -44,6 +45,7 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
     state.app.add_avatar(instance);
     state.add_recent_avatar(path.to_path_buf());
+    info!("avatar loaded: {}", path.display());
     state.push_notification(format!("Loaded avatar: {}", path.display()));
 }
 

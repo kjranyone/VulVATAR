@@ -13,35 +13,34 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 
-use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT, PWSTR};
-use windows::Win32::Foundation::{BOOL, E_INVALIDARG, E_POINTER};
+use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
+use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER};
 use windows::Win32::Media::KernelStreaming::{
     IKsControl, IKsControl_Impl, KSCAMERAPROFILE_Legacy, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
     PROPSETID_VIDCAP_CAMERACONTROL,
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFActivate_Impl, IMFAsyncCallback, IMFAsyncResult, IMFAttributes,
-    IMFAttributes_Impl, IMFExtendedCameraControl, IMFExtendedCameraControl_Impl,
-    IMFExtendedCameraController, IMFExtendedCameraController_Impl, IMFGetService,
-    IMFGetService_Impl, IMFMediaEvent, IMFMediaEventGenerator_Impl, IMFMediaEventQueue,
-    IMFMediaSource, IMFMediaSourceEx, IMFMediaSourceEx_Impl, IMFMediaSource_Impl, IMFMediaStream,
-    IMFMediaStream2, IMFMediaType, IMFPresentationDescriptor, IMFRealTimeClient,
-    IMFRealTimeClientEx, IMFRealTimeClientEx_Impl, IMFRealTimeClient_Impl,
-    IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl, IMFStreamDescriptor,
-    IMFVideoSampleAllocatorEx, MENewStream, MESourceStarted, MESourceStopped, MEStreamStarted,
-    MEStreamStopped, MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType,
+    IMFExtendedCameraControl, IMFExtendedCameraControl_Impl, IMFExtendedCameraController,
+    IMFExtendedCameraController_Impl, IMFGetService, IMFGetService_Impl, IMFMediaEvent,
+    IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaSourceEx,
+    IMFMediaSourceEx_Impl, IMFMediaSource_Impl, IMFMediaStream, IMFMediaStream2, IMFMediaType,
+    IMFPresentationDescriptor, IMFRealTimeClient, IMFRealTimeClientEx, IMFRealTimeClientEx_Impl,
+    IMFRealTimeClient_Impl, IMFSampleAllocatorControl, IMFSampleAllocatorControl_Impl,
+    IMFStreamDescriptor, IMFVideoSampleAllocatorEx, MENewStream, MESourceStarted, MESourceStopped,
+    MEStreamStarted, MEStreamStopped, MFCreateAttributes, MFCreateEventQueue, MFCreateMediaType,
     MFCreatePresentationDescriptor, MFCreateSensorProfile, MFCreateSensorProfileCollection,
     MFCreateStreamDescriptor, MFFrameSourceTypes_Color, MFMediaType_Video, MFSampleAllocatorUsage,
     MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_NV12, MFVideoFormat_RGB32,
     MFVideoInterlace_Progressive, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-    MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE, MF_ATTRIBUTES_MATCH_TYPE,
-    MF_ATTRIBUTE_TYPE, MF_CAPTURE_ENGINE_MEDIASOURCE, MF_DEVICEMFT_SENSORPROFILE_COLLECTION,
-    MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MF_DEVICESTREAM_FRAMESERVER_SHARED,
-    MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID, MF_E_INVALIDSTREAMNUMBER,
-    MF_E_INVALID_STATE_TRANSITION, MF_E_SHUTDOWN, MF_E_UNSUPPORTED_SERVICE,
-    MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES,
+    MFMEDIASOURCE_CHARACTERISTICS, MFMEDIASOURCE_IS_LIVE, MF_CAPTURE_ENGINE_MEDIASOURCE,
+    MF_DEVICEMFT_SENSORPROFILE_COLLECTION, MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES,
+    MF_DEVICESTREAM_FRAMESERVER_SHARED, MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID,
+    MF_E_INVALIDSTREAMNUMBER, MF_E_INVALID_STATE_TRANSITION, MF_E_SHUTDOWN,
+    MF_E_UNSUPPORTED_SERVICE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
+    MF_MT_SUBTYPE,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -124,9 +123,7 @@ impl VulvatarMediaSource {
         unsafe { MFCreateAttributes(&mut a, 6)? };
         let attributes = a.expect("MFCreateAttributes returned no interface");
         unsafe {
-            attributes.SetUINT32(&MF_DEVICESTREAM_FRAMESERVER_SHARED, 1)?;
             attributes.SetGUID(&MFT_TRANSFORM_CLSID_Attribute, &CLSID_VULVATAR_MEDIA_SOURCE)?;
-            attributes.SetUINT32(&MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, 1)?;
         }
         Ok(Self {
             attributes,
@@ -384,8 +381,20 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
     }
 
     fn Stop(&self) -> windows::core::Result<()> {
-        let inner = self.initialised()?;
-        let stream = self.mutable.lock().unwrap().stream.clone();
+        crate::t!("Source::Stop");
+        // Don't trigger lazy `initialised()` from Stop — if Start was never
+        // called there is no event queue to drain, and constructing one
+        // here just to immediately tear it down is wasteful.
+        let Some(inner) = self.inner.get() else {
+            self.mutable.lock().unwrap().state = SourceState::Stopped;
+            return Ok(());
+        };
+        // Take the stream out of mutable state so the next Start builds
+        // a fresh stream object — fresh format cache, fresh allocator-
+        // initialised flag, fresh event queue. MF's source contract says
+        // every Start sends `MENewStream`, so a new stream identity is
+        // both legal and what clients expect after Stop.
+        let stream = self.mutable.lock().unwrap().stream.take();
         unsafe {
             if let Some(stream) = stream {
                 stream.QueueEvent(
@@ -417,13 +426,18 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
     }
 
     fn Shutdown(&self) -> windows::core::Result<()> {
+        crate::t!("Source::Shutdown");
         if let Some(inner) = self.inner.get() {
             unsafe {
                 let _ = inner.event_queue.Shutdown();
             }
         }
-        self.mutable.lock().unwrap().state = SourceState::Shutdown;
-        self.mutable.lock().unwrap().stream = None;
+        // Single critical section: setting Shutdown state and dropping the
+        // stream reference must be atomic, otherwise another thread can
+        // observe Shutdown with a still-live stream and act on it.
+        let mut state = self.mutable.lock().unwrap();
+        state.state = SourceState::Shutdown;
+        state.stream = None;
         Ok(())
     }
 }
@@ -450,7 +464,12 @@ impl IMFMediaSourceEx_Impl for VulvatarMediaSource_Impl {
     }
 
     fn SetD3DManager(&self, _manager: Option<&IUnknown>) -> windows::core::Result<()> {
-        crate::t!("SourceEx::SetD3DManager");
+        // Software-only source: every sample is built from a CPU buffer
+        // (either MFCreateMemoryBuffer in the direct path or the
+        // FrameServer-provided allocator), so a DXGI device manager has
+        // nowhere to plug in. We accept the call and discard the manager —
+        // returning E_NOTIMPL here makes some clients abandon the source.
+        crate::t!("SourceEx::SetD3DManager (ignored, software-only)");
         Ok(())
     }
 }
@@ -1094,9 +1113,27 @@ fn build_media_type(
         mt.SetGUID(&MF_MT_SUBTYPE, subtype)?;
         mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         mt.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        mt.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
         mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(width, height))?;
         mt.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(fps, 1))?;
         mt.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1))?;
+        if *subtype == MFVideoFormat_NV12 {
+            let sample_size = width.saturating_mul(height).saturating_mul(3) / 2;
+            mt.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
+            mt.SetUINT32(&MF_MT_SAMPLE_SIZE, sample_size)?;
+            mt.SetUINT32(
+                &MF_MT_AVG_BITRATE,
+                sample_size.saturating_mul(8).saturating_mul(fps),
+            )?;
+        } else {
+            let sample_size = width.saturating_mul(height).saturating_mul(4);
+            mt.SetUINT32(&MF_MT_DEFAULT_STRIDE, width.saturating_mul(4))?;
+            mt.SetUINT32(&MF_MT_SAMPLE_SIZE, sample_size)?;
+            mt.SetUINT32(
+                &MF_MT_AVG_BITRATE,
+                sample_size.saturating_mul(8).saturating_mul(fps),
+            )?;
+        }
         Ok(mt)
     }
 }
@@ -1176,206 +1213,8 @@ const _CHARACTERISTICS_TYPE: MFMEDIASOURCE_CHARACTERISTICS = MFMEDIASOURCE_IS_LI
 // multiple-inheritance in C++). Frame Server's FsProxy does
 // `QueryInterface<IMFAttributes>(source)` during catalog bridge setup;
 // without this impl it gets E_NOINTERFACE and abandons the bridge
-// synchronously. Matches the same boilerplate as `activate.rs`'s activator
-// forwarders — all calls go through the single store `self.attributes`
-// which `IMFMediaSourceEx::GetSourceAttributes` also returns.
+// synchronously. The same forwarder shape is needed in `media_stream.rs`,
+// so the boilerplate lives in `attributes.rs` as a `forward_imfattributes!`
+// macro that targets a `self.attributes: IMFAttributes` field.
 
-impl IMFAttributes_Impl for VulvatarMediaSource_Impl {
-    fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> windows::core::Result<()> {
-        unsafe { self.attributes.GetItem(guidkey, Some(pvalue)) }
-    }
-
-    fn GetItemType(&self, guidkey: *const GUID) -> windows::core::Result<MF_ATTRIBUTE_TYPE> {
-        unsafe { self.attributes.GetItemType(guidkey) }
-    }
-
-    fn CompareItem(
-        &self,
-        guidkey: *const GUID,
-        value: *const PROPVARIANT,
-    ) -> windows::core::Result<BOOL> {
-        unsafe { self.attributes.CompareItem(guidkey, value) }
-    }
-
-    fn Compare(
-        &self,
-        ptheirs: Option<&IMFAttributes>,
-        matchtype: MF_ATTRIBUTES_MATCH_TYPE,
-    ) -> windows::core::Result<BOOL> {
-        unsafe {
-            self.attributes
-                .Compare(ptheirs.unwrap_or(&self.attributes), matchtype)
-        }
-    }
-
-    fn GetUINT32(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetUINT32(guidkey) }
-    }
-
-    fn GetUINT64(&self, guidkey: *const GUID) -> windows::core::Result<u64> {
-        unsafe { self.attributes.GetUINT64(guidkey) }
-    }
-
-    fn GetDouble(&self, guidkey: *const GUID) -> windows::core::Result<f64> {
-        unsafe { self.attributes.GetDouble(guidkey) }
-    }
-
-    fn GetGUID(&self, guidkey: *const GUID) -> windows::core::Result<GUID> {
-        unsafe { self.attributes.GetGUID(guidkey) }
-    }
-
-    fn GetStringLength(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetStringLength(guidkey) }
-    }
-
-    fn GetString(
-        &self,
-        guidkey: *const GUID,
-        pwszvalue: PWSTR,
-        cchbufsize: u32,
-        pcchlength: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let slice = core::slice::from_raw_parts_mut(pwszvalue.0, cchbufsize as usize);
-            self.attributes.GetString(guidkey, slice, Some(pcchlength))
-        }
-    }
-
-    fn GetAllocatedString(
-        &self,
-        guidkey: *const GUID,
-        ppwszvalue: *mut PWSTR,
-        pcchlength: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            self.attributes
-                .GetAllocatedString(guidkey, ppwszvalue, pcchlength)
-        }
-    }
-
-    fn GetBlobSize(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetBlobSize(guidkey) }
-    }
-
-    fn GetBlob(
-        &self,
-        guidkey: *const GUID,
-        pbuf: *mut u8,
-        cbbufsize: u32,
-        pcbblobsize: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let slice = core::slice::from_raw_parts_mut(pbuf, cbbufsize as usize);
-            self.attributes.GetBlob(guidkey, slice, Some(pcbblobsize))
-        }
-    }
-
-    fn GetAllocatedBlob(
-        &self,
-        guidkey: *const GUID,
-        ppbuf: *mut *mut u8,
-        pcbsize: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.GetAllocatedBlob(guidkey, ppbuf, pcbsize) }
-    }
-
-    fn GetUnknown(
-        &self,
-        guidkey: *const GUID,
-        riid: *const GUID,
-        ppv: *mut *mut core::ffi::c_void,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let vt = IMFAttributes::vtable(&self.attributes);
-            (vt.GetUnknown)(IMFAttributes::as_raw(&self.attributes), guidkey, riid, ppv).ok()
-        }
-    }
-
-    fn SetItem(
-        &self,
-        guidkey: *const GUID,
-        value: *const PROPVARIANT,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetItem(guidkey, value) }
-    }
-
-    fn DeleteItem(&self, guidkey: *const GUID) -> windows::core::Result<()> {
-        unsafe { self.attributes.DeleteItem(guidkey) }
-    }
-
-    fn DeleteAllItems(&self) -> windows::core::Result<()> {
-        unsafe { self.attributes.DeleteAllItems() }
-    }
-
-    fn SetUINT32(&self, guidkey: *const GUID, unvalue: u32) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetUINT32(guidkey, unvalue) }
-    }
-
-    fn SetUINT64(&self, guidkey: *const GUID, unvalue: u64) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetUINT64(guidkey, unvalue) }
-    }
-
-    fn SetDouble(&self, guidkey: *const GUID, fvalue: f64) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetDouble(guidkey, fvalue) }
-    }
-
-    fn SetGUID(&self, guidkey: *const GUID, guidvalue: *const GUID) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetGUID(guidkey, guidvalue) }
-    }
-
-    fn SetString(
-        &self,
-        guidkey: *const GUID,
-        wszvalue: &windows::core::PCWSTR,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetString(guidkey, *wszvalue) }
-    }
-
-    fn SetBlob(
-        &self,
-        guidkey: *const GUID,
-        pbuf: *const u8,
-        cbbufsize: u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let slice = core::slice::from_raw_parts(pbuf, cbbufsize as usize);
-            self.attributes.SetBlob(guidkey, slice)
-        }
-    }
-
-    fn SetUnknown(
-        &self,
-        guidkey: *const GUID,
-        punknown: Option<&IUnknown>,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetUnknown(guidkey, punknown) }
-    }
-
-    fn LockStore(&self) -> windows::core::Result<()> {
-        unsafe { self.attributes.LockStore() }
-    }
-
-    fn UnlockStore(&self) -> windows::core::Result<()> {
-        unsafe { self.attributes.UnlockStore() }
-    }
-
-    fn GetCount(&self) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetCount() }
-    }
-
-    fn GetItemByIndex(
-        &self,
-        unindex: u32,
-        pguidkey: *mut GUID,
-        pvalue: *mut PROPVARIANT,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            self.attributes
-                .GetItemByIndex(unindex, pguidkey, Some(pvalue))
-        }
-    }
-
-    fn CopyAllItems(&self, pdest: Option<&IMFAttributes>) -> windows::core::Result<()> {
-        unsafe { self.attributes.CopyAllItems(pdest) }
-    }
-}
+crate::forward_imfattributes!(VulvatarMediaSource_Impl);

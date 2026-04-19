@@ -10,17 +10,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT, PWSTR};
-use windows::Win32::Foundation::{BOOL, E_FAIL};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
+use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFAttributes_Impl, IMFMediaEvent,
-    IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2,
-    IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor,
-    IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample,
-    MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_ATTRIBUTES_MATCH_TYPE,
-    MF_ATTRIBUTE_TYPE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE,
-    MF_STREAM_STATE_RUNNING,
+    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent, IMFMediaEventGenerator_Impl,
+    IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2, IMFMediaStream2_Impl, IMFMediaStream_Impl,
+    IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer,
+    MFCreateSample, MFGetSystemTime, MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
 };
 
 use crate::media_source::DEFAULT_FPS;
@@ -69,10 +67,14 @@ pub struct VulvatarMediaStream {
     /// Reader for the named shared-memory frame buffer the host process
     /// fills via `vulvatar::output::frame_sink::Win32NamedSharedMemorySink`.
     shared_memory: SharedMemoryReader,
-    /// Monotonic frame counter used for sample timestamps (in 100-ns
-    /// units, MF's standard time base). Increments by `frame_duration_hns`
-    /// per published sample.
-    sample_time_hns: AtomicU64,
+    /// Cached negotiated format. Resolved from the stream descriptor's
+    /// media-type handler the first time `RequestSample` runs and reused
+    /// thereafter — the handler call costs a COM clone + PROPVARIANT
+    /// reads which would otherwise hit the hot path 30–60× per second.
+    /// The cache lives for the stream's lifetime; the source drops the
+    /// stream on Stop/Shutdown so a renegotiated format on the next Start
+    /// gets a fresh stream with a fresh cache.
+    cached_format: Mutex<Option<CurrentFormat>>,
     /// Frame Server-provided sample allocator. Shared with the source so
     /// a stream created during `GetStreamAttributes` still sees a later
     /// `SetDefaultAllocator` call before `Start`.
@@ -108,7 +110,7 @@ impl VulvatarMediaStream {
             attributes,
             stream_state: AtomicI32::new(MF_STREAM_STATE_RUNNING.0),
             shared_memory: SharedMemoryReader::new(),
-            sample_time_hns: AtomicU64::new(0),
+            cached_format: Mutex::new(None),
             allocator,
             allocator_initialized: AtomicBool::new(false),
         })
@@ -179,10 +181,13 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
 
         let format = self.current_format();
         let is_nv12 = format.subtype == MFVideoFormat_NV12;
-        let time = self
-            .sample_time_hns
-            .fetch_add(format.frame_duration_hns(), Ordering::Relaxed);
-        let dur = format.frame_duration_hns();
+        // Live source: sample timestamps follow MF's system clock (the
+        // same clock SourceReader / capture engine uses to schedule
+        // downstream consumers). Negative values aren't possible in
+        // practice but `MFGetSystemTime` returns LONGLONG, so guard
+        // before passing to `SetSampleTime`.
+        let time: i64 = unsafe { MFGetSystemTime() }.max(0);
+        let dur: i64 = format.frame_duration_hns() as i64;
 
         // Two paths:
         //   - allocator path (Frame Server-mediated client): snapshot the
@@ -208,8 +213,8 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
             let s = unsafe { allocator.AllocateSample()? };
             self.fill_allocated_sample(&s, format, is_nv12)?;
             unsafe {
-                s.SetSampleTime(time as i64)?;
-                s.SetSampleDuration(dur as i64)?;
+                s.SetSampleTime(time)?;
+                s.SetSampleDuration(dur)?;
             }
             s
         } else {
@@ -407,10 +412,22 @@ impl VulvatarMediaStream {
 }
 
 impl VulvatarMediaStream {
-    /// Read the currently-negotiated subtype + frame size + frame rate
-    /// off the stream descriptor's media-type handler. Falls back to
-    /// NV12 1920×1080@30 if any lookup fails.
+    /// Resolve the negotiated subtype + frame size + frame rate. Cached
+    /// after the first call so the hot path avoids the descriptor lock,
+    /// `GetMediaTypeHandler` COM clone and three `GetUINT*` reads per
+    /// frame. The cache is dropped from `clear_format_cache` whenever
+    /// the source transitions through Stop/Shutdown — a renegotiated
+    /// type is then picked up on the next Start.
     fn current_format(&self) -> CurrentFormat {
+        if let Some(f) = *self.cached_format.lock().unwrap() {
+            return f;
+        }
+        let format = self.read_format_from_descriptor();
+        *self.cached_format.lock().unwrap() = Some(format);
+        format
+    }
+
+    fn read_format_from_descriptor(&self) -> CurrentFormat {
         let descriptor = match self.inner.lock() {
             Ok(g) => g.descriptor.clone(),
             Err(_) => return CurrentFormat::fallback(),
@@ -444,205 +461,9 @@ impl VulvatarMediaStream {
     }
 }
 
-impl IMFAttributes_Impl for VulvatarMediaStream_Impl {
-    fn GetItem(&self, guidkey: *const GUID, pvalue: *mut PROPVARIANT) -> windows::core::Result<()> {
-        unsafe { self.attributes.GetItem(guidkey, Some(pvalue)) }
-    }
-
-    fn GetItemType(&self, guidkey: *const GUID) -> windows::core::Result<MF_ATTRIBUTE_TYPE> {
-        unsafe { self.attributes.GetItemType(guidkey) }
-    }
-
-    fn CompareItem(
-        &self,
-        guidkey: *const GUID,
-        value: *const PROPVARIANT,
-    ) -> windows::core::Result<BOOL> {
-        unsafe { self.attributes.CompareItem(guidkey, value) }
-    }
-
-    fn Compare(
-        &self,
-        ptheirs: Option<&IMFAttributes>,
-        matchtype: MF_ATTRIBUTES_MATCH_TYPE,
-    ) -> windows::core::Result<BOOL> {
-        unsafe {
-            self.attributes
-                .Compare(ptheirs.unwrap_or(&self.attributes), matchtype)
-        }
-    }
-
-    fn GetUINT32(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetUINT32(guidkey) }
-    }
-
-    fn GetUINT64(&self, guidkey: *const GUID) -> windows::core::Result<u64> {
-        unsafe { self.attributes.GetUINT64(guidkey) }
-    }
-
-    fn GetDouble(&self, guidkey: *const GUID) -> windows::core::Result<f64> {
-        unsafe { self.attributes.GetDouble(guidkey) }
-    }
-
-    fn GetGUID(&self, guidkey: *const GUID) -> windows::core::Result<GUID> {
-        unsafe { self.attributes.GetGUID(guidkey) }
-    }
-
-    fn GetStringLength(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetStringLength(guidkey) }
-    }
-
-    fn GetString(
-        &self,
-        guidkey: *const GUID,
-        pwszvalue: PWSTR,
-        cchbufsize: u32,
-        pcchlength: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let slice = core::slice::from_raw_parts_mut(pwszvalue.0, cchbufsize as usize);
-            self.attributes.GetString(guidkey, slice, Some(pcchlength))
-        }
-    }
-
-    fn GetAllocatedString(
-        &self,
-        guidkey: *const GUID,
-        ppwszvalue: *mut PWSTR,
-        pcchlength: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            self.attributes
-                .GetAllocatedString(guidkey, ppwszvalue, pcchlength)
-        }
-    }
-
-    fn GetBlobSize(&self, guidkey: *const GUID) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetBlobSize(guidkey) }
-    }
-
-    fn GetBlob(
-        &self,
-        guidkey: *const GUID,
-        pbuf: *mut u8,
-        cbbufsize: u32,
-        pcbblobsize: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let slice = core::slice::from_raw_parts_mut(pbuf, cbbufsize as usize);
-            self.attributes.GetBlob(guidkey, slice, Some(pcbblobsize))
-        }
-    }
-
-    fn GetAllocatedBlob(
-        &self,
-        guidkey: *const GUID,
-        ppbuf: *mut *mut u8,
-        pcbsize: *mut u32,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.GetAllocatedBlob(guidkey, ppbuf, pcbsize) }
-    }
-
-    fn GetUnknown(
-        &self,
-        guidkey: *const GUID,
-        riid: *const GUID,
-        ppv: *mut *mut core::ffi::c_void,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let vt = IMFAttributes::vtable(&self.attributes);
-            (vt.GetUnknown)(IMFAttributes::as_raw(&self.attributes), guidkey, riid, ppv).ok()
-        }
-    }
-
-    fn SetItem(
-        &self,
-        guidkey: *const GUID,
-        value: *const PROPVARIANT,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetItem(guidkey, value) }
-    }
-
-    fn DeleteItem(&self, guidkey: *const GUID) -> windows::core::Result<()> {
-        unsafe { self.attributes.DeleteItem(guidkey) }
-    }
-
-    fn DeleteAllItems(&self) -> windows::core::Result<()> {
-        unsafe { self.attributes.DeleteAllItems() }
-    }
-
-    fn SetUINT32(&self, guidkey: *const GUID, unvalue: u32) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetUINT32(guidkey, unvalue) }
-    }
-
-    fn SetUINT64(&self, guidkey: *const GUID, unvalue: u64) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetUINT64(guidkey, unvalue) }
-    }
-
-    fn SetDouble(&self, guidkey: *const GUID, fvalue: f64) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetDouble(guidkey, fvalue) }
-    }
-
-    fn SetGUID(&self, guidkey: *const GUID, guidvalue: *const GUID) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetGUID(guidkey, guidvalue) }
-    }
-
-    fn SetString(
-        &self,
-        guidkey: *const GUID,
-        wszvalue: &windows::core::PCWSTR,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetString(guidkey, *wszvalue) }
-    }
-
-    fn SetBlob(
-        &self,
-        guidkey: *const GUID,
-        pbuf: *const u8,
-        cbbufsize: u32,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            let slice = core::slice::from_raw_parts(pbuf, cbbufsize as usize);
-            self.attributes.SetBlob(guidkey, slice)
-        }
-    }
-
-    fn SetUnknown(
-        &self,
-        guidkey: *const GUID,
-        punknown: Option<&IUnknown>,
-    ) -> windows::core::Result<()> {
-        unsafe { self.attributes.SetUnknown(guidkey, punknown) }
-    }
-
-    fn LockStore(&self) -> windows::core::Result<()> {
-        unsafe { self.attributes.LockStore() }
-    }
-
-    fn UnlockStore(&self) -> windows::core::Result<()> {
-        unsafe { self.attributes.UnlockStore() }
-    }
-
-    fn GetCount(&self) -> windows::core::Result<u32> {
-        unsafe { self.attributes.GetCount() }
-    }
-
-    fn GetItemByIndex(
-        &self,
-        unindex: u32,
-        pguidkey: *mut GUID,
-        pvalue: *mut PROPVARIANT,
-    ) -> windows::core::Result<()> {
-        unsafe {
-            self.attributes
-                .GetItemByIndex(unindex, pguidkey, Some(pvalue))
-        }
-    }
-
-    fn CopyAllItems(&self, pdest: Option<&IMFAttributes>) -> windows::core::Result<()> {
-        unsafe { self.attributes.CopyAllItems(pdest) }
-    }
-}
+// IMFAttributes forwarder — see `attributes.rs` for the macro definition
+// and `media_source.rs` for the matching impl on the source side.
+crate::forward_imfattributes!(VulvatarMediaStream_Impl);
 
 /// Convert RGBA bytes (R first, length = w * h * 4) into an `IMFSample`
 /// containing RGB32 (BGRA layout, B first) pixel data. When `preserve_alpha`
@@ -655,8 +476,8 @@ fn build_sample_rgb32_from_rgba(
     width: u32,
     height: u32,
     preserve_alpha: bool,
-    time_hns: u64,
-    duration_hns: u64,
+    time_hns: i64,
+    duration_hns: i64,
 ) -> windows::core::Result<IMFSample> {
     let buffer_size = (width as usize) * (height as usize) * 4;
     let buffer = unsafe { MFCreateMemoryBuffer(buffer_size as u32)? };
@@ -686,8 +507,8 @@ fn build_sample_rgb32_from_rgba(
     let sample = unsafe { MFCreateSample()? };
     unsafe {
         sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(time_hns as i64)?;
-        sample.SetSampleDuration(duration_hns as i64)?;
+        sample.SetSampleTime(time_hns)?;
+        sample.SetSampleDuration(duration_hns)?;
     }
     Ok(sample)
 }
@@ -696,8 +517,8 @@ fn build_sample_rgb32_from_rgba(
 fn build_black_sample_rgb32(
     width: u32,
     height: u32,
-    time_hns: u64,
-    duration_hns: u64,
+    time_hns: i64,
+    duration_hns: i64,
 ) -> windows::core::Result<IMFSample> {
     let buffer_size = (width as usize) * (height as usize) * 4;
     let buffer = unsafe { MFCreateMemoryBuffer(buffer_size as u32)? };
@@ -721,8 +542,8 @@ fn build_black_sample_rgb32(
     let sample = unsafe { MFCreateSample()? };
     unsafe {
         sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(time_hns as i64)?;
-        sample.SetSampleDuration(duration_hns as i64)?;
+        sample.SetSampleTime(time_hns)?;
+        sample.SetSampleDuration(duration_hns)?;
     }
     Ok(sample)
 }
@@ -786,8 +607,8 @@ fn build_sample_nv12_from_rgba(
     rgba: &[u8],
     width: u32,
     height: u32,
-    time_hns: u64,
-    duration_hns: u64,
+    time_hns: i64,
+    duration_hns: i64,
 ) -> windows::core::Result<IMFSample> {
     let w = width as usize;
     let h = height as usize;
@@ -811,8 +632,8 @@ fn build_sample_nv12_from_rgba(
     let sample = unsafe { MFCreateSample()? };
     unsafe {
         sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(time_hns as i64)?;
-        sample.SetSampleDuration(duration_hns as i64)?;
+        sample.SetSampleTime(time_hns)?;
+        sample.SetSampleDuration(duration_hns)?;
     }
     Ok(sample)
 }
@@ -820,8 +641,8 @@ fn build_sample_nv12_from_rgba(
 fn build_black_sample_nv12(
     width: u32,
     height: u32,
-    time_hns: u64,
-    duration_hns: u64,
+    time_hns: i64,
+    duration_hns: i64,
 ) -> windows::core::Result<IMFSample> {
     let w = width as usize;
     let h = height as usize;
@@ -844,8 +665,8 @@ fn build_black_sample_nv12(
     let sample = unsafe { MFCreateSample()? };
     unsafe {
         sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(time_hns as i64)?;
-        sample.SetSampleDuration(duration_hns as i64)?;
+        sample.SetSampleTime(time_hns)?;
+        sample.SetSampleDuration(duration_hns)?;
     }
     Ok(sample)
 }

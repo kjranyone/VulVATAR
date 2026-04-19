@@ -305,6 +305,13 @@ impl GuiApp {
         let mut app = Box::new(Application::new());
         app.bootstrap();
         app.avatar_library = crate::persistence::load_avatar_library();
+        if std::env::var_os("VULVATAR_AUTOSTART_VIRTUAL_CAMERA").is_some() {
+            if let Err(e) = app.set_requested_sink(crate::output::FrameSink::VirtualCamera) {
+                warn!("virtual-camera autostart failed: {e}");
+            } else {
+                info!("virtual-camera autostart enabled");
+            }
+        }
 
         if let Some(snapshot) = crate::persistence::RecoveryManager::detect_recovery() {
             match crate::persistence::validate_recovery(&snapshot) {
@@ -326,7 +333,7 @@ impl GuiApp {
             }
         }
 
-        Self {
+        let mut state = Self {
             mode: AppMode::Preview,
             app,
             paused: false,
@@ -454,7 +461,19 @@ impl GuiApp {
             thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::default(),
 
             avatar_load_job: None,
+        };
+
+        if let Some(path) = std::env::var_os("VULVATAR_AUTOSTART_AVATAR") {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                info!("avatar autostart loading {}", path.display());
+                top_bar::load_avatar_from_path(&mut state, &path);
+            } else {
+                warn!("avatar autostart path does not exist: {}", path.display());
+            }
         }
+
+        state
     }
 }
 

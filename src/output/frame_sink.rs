@@ -622,18 +622,24 @@ impl OutputSinkWriter for NullSink {
 #[cfg(target_os = "windows")]
 mod win32_shmem {
     use super::{AlphaMode, OutputFrame, OutputSinkWriter};
-    use log::debug;
-    use std::ffi::OsStr;
+    use log::{debug, info};
+    use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
     const PAGE_READWRITE: u32 = 0x04;
     const FILE_MAP_ALL_ACCESS: u32 = 0xF001F;
+    const SDDL_REVISION_1: u32 = 1;
+
+    // Win32 GetLastError codes used to diagnose CreateFileMappingW failures.
+    // Documented under WinError.h.
+    const ERROR_PRIVILEGE_NOT_HELD: u32 = 0x522; // 1314
+    const ERROR_ACCESS_DENIED: u32 = 0x5; // 5
 
     extern "system" {
         fn CreateFileMappingW(
             hFile: isize,
-            lpFileMappingAttributes: *mut (),
+            lpFileMappingAttributes: *mut SecurityAttributes,
             flProtect: u32,
             dwMaximumSizeHigh: u32,
             dwMaximumSizeLow: u32,
@@ -646,11 +652,29 @@ mod win32_shmem {
             dwFileOffsetHigh: u32,
             dwFileOffsetLow: u32,
             dwNumberOfBytesToMap: usize,
-        ) -> *mut ();
+        ) -> *mut c_void;
 
-        fn UnmapViewOfFile(lpBaseAddress: *const ()) -> i32;
+        fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> i32;
 
         fn CloseHandle(hObject: isize) -> i32;
+
+        fn GetLastError() -> u32;
+
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        security_descriptor: *mut c_void,
+        inherit_handle: i32,
     }
 
     const SHMEM_HEADER_SIZE: usize = 32;
@@ -658,10 +682,11 @@ mod win32_shmem {
 
     pub struct Win32NamedSharedMemorySink {
         handle: isize,
-        view: *mut (),
+        view: *mut c_void,
         name: String,
         mapped_size: usize,
         sequence: u64,
+        logged_first_write: bool,
     }
 
     unsafe impl Send for Win32NamedSharedMemorySink {}
@@ -671,9 +696,10 @@ mod win32_shmem {
             Self {
                 handle: 0,
                 view: ptr::null_mut(),
-                name: format!("Local\\{}", name),
+                name: format!("Global\\{}", name),
                 mapped_size: 0,
                 sequence: 0,
+                logged_first_write: false,
             }
         }
 
@@ -690,10 +716,11 @@ mod win32_shmem {
                 .chain(std::iter::once(0))
                 .collect();
 
+            let mut security = MappingSecurity::new()?;
             let handle = unsafe {
                 CreateFileMappingW(
                     -1isize,
-                    ptr::null_mut(),
+                    security.as_mut_ptr(),
                     PAGE_READWRITE,
                     (total >> 32) as u32,
                     total as u32,
@@ -702,14 +729,27 @@ mod win32_shmem {
             };
 
             if handle == 0 {
-                return Err(format!("CreateFileMappingW failed for '{}'", self.name));
+                let err = unsafe { GetLastError() };
+                let hint = match err {
+                    ERROR_PRIVILEGE_NOT_HELD => " (SeCreateGlobalPrivilege missing — run as a normal interactive user, not from a non-Session-0 service or a stripped token)",
+                    ERROR_ACCESS_DENIED => " (an existing object with the same name has a stricter DACL — check whether another process already opened it)",
+                    _ => "",
+                };
+                return Err(format!(
+                    "CreateFileMappingW failed for '{}' (GetLastError={}){}",
+                    self.name, err, hint,
+                ));
             }
 
             let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total) };
 
             if view.is_null() {
+                let err = unsafe { GetLastError() };
                 unsafe { CloseHandle(handle) };
-                return Err(format!("MapViewOfFile failed for '{}'", self.name));
+                return Err(format!(
+                    "MapViewOfFile failed for '{}' (GetLastError={})",
+                    self.name, err
+                ));
             }
 
             self.handle = handle;
@@ -720,7 +760,7 @@ mod win32_shmem {
 
         unsafe fn unmap(&mut self) {
             if !self.view.is_null() {
-                unsafe { UnmapViewOfFile(self.view as *const ()) };
+                unsafe { UnmapViewOfFile(self.view as *const c_void) };
                 self.view = ptr::null_mut();
             }
             if self.handle != 0 {
@@ -728,6 +768,57 @@ mod win32_shmem {
                 self.handle = 0;
             }
             self.mapped_size = 0;
+        }
+    }
+
+    struct MappingSecurity {
+        descriptor: *mut c_void,
+        attributes: SecurityAttributes,
+    }
+
+    impl MappingSecurity {
+        fn new() -> Result<Self, String> {
+            // Interactive users write the frames; FrameServer runs as
+            // LocalService and only needs read access to consume them.
+            let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GR;;;LS)";
+            let wide: Vec<u16> = OsStr::new(sddl)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut descriptor: *mut c_void = ptr::null_mut();
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 || descriptor.is_null() {
+                return Err("ConvertStringSecurityDescriptorToSecurityDescriptorW failed".into());
+            }
+            Ok(Self {
+                descriptor,
+                attributes: SecurityAttributes {
+                    n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+                    security_descriptor: descriptor,
+                    inherit_handle: 0,
+                },
+            })
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut SecurityAttributes {
+            &mut self.attributes
+        }
+    }
+
+    impl Drop for MappingSecurity {
+        fn drop(&mut self) {
+            if !self.descriptor.is_null() {
+                unsafe {
+                    let _ = LocalFree(self.descriptor);
+                }
+            }
         }
     }
 
@@ -758,15 +849,15 @@ mod win32_shmem {
             }
 
             unsafe {
-                // Cast through `*mut u8` BEFORE doing pointer arithmetic.
-                // `self.view: *mut ()` is a ZST pointer and `*mut T::add(n)`
-                // advances by `n * size_of::<T>()` bytes — which is `0` for
-                // `()`, so every `base.add(N)` returned the same address as
-                // `base`. The result was that magic, width, height, …,
-                // flags and the pixel data were all written on top of each
-                // other at offset 0, leaving the on-wire header entirely
-                // garbled (magic ≠ SHMEM_MAGIC) so the DLL discarded every
-                // frame and Frame Server's watchdog tore the camera down.
+                // Cast to `*mut u8` so byte-offset arithmetic is well-defined.
+                // (Historical note: this used to be `*mut ()` which made
+                // `base.add(N)` a no-op since `size_of::<()>() == 0` —
+                // every header field overwrote offset 0, the on-wire magic
+                // was garbled, the DLL discarded every frame, and Frame
+                // Server tore the camera down. The struct now stores
+                // `*mut c_void` so the type system can't recreate that
+                // bug, but the explicit `*mut u8` cast keeps the intent
+                // visible.)
                 let base = self.view as *mut u8;
 
                 let magic = SHMEM_MAGIC.to_le_bytes();
@@ -798,6 +889,13 @@ mod win32_shmem {
                 "Win32ShmemSink: wrote {} bytes to '{}' (seq={}, {}x{})",
                 data_len, self.name, self.sequence, width, height,
             );
+            if !self.logged_first_write {
+                info!(
+                    "Win32ShmemSink: first write {} bytes to '{}' (seq={}, {}x{})",
+                    data_len, self.name, self.sequence, width, height,
+                );
+                self.logged_first_write = true;
+            }
 
             self.sequence += 1;
             Ok(())

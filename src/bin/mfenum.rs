@@ -80,37 +80,64 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             };
-            println!("Source reader created, requesting 1 sample (timeout ~5s)...");
+            // ~3 second budget — Frame-Server-mediated path can take
+            // 100–300ms before the first allocator-backed sample arrives,
+            // and we want a clean "no producer" diagnosis rather than
+            // tripping out on an unrelated transient.
+            const READ_ATTEMPTS: u32 = 30;
+            const READ_INTERVAL_MS: u64 = 100;
+            const FLAG_ENDOFSTREAM: u32 = 0x100;
+            println!(
+                "Source reader created, requesting up to {} samples (timeout ~{}s)...",
+                READ_ATTEMPTS,
+                (READ_ATTEMPTS as u64) * READ_INTERVAL_MS / 1000,
+            );
 
             let stream_index = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-            let mut actual_stream: u32 = 0;
-            let mut flags: u32 = 0;
-            let mut timestamp: i64 = 0;
-            let mut sample: Option<IMFSample> = None;
-            let read_ret = reader.ReadSample(
-                stream_index,
-                0,
-                Some(&mut actual_stream),
-                Some(&mut flags),
-                Some(&mut timestamp),
-                Some(&mut sample),
-            );
-            match read_ret {
-                Ok(_) => {
-                    println!(
-                        "ReadSample returned: actual_stream={} flags=0x{:X} ts={} sample={}",
-                        actual_stream,
-                        flags,
-                        timestamp,
-                        sample.is_some()
-                    );
-                    if let Some(s) = sample {
-                        let buf_count = s.GetBufferCount().unwrap_or(0);
-                        let total_len = s.GetTotalLength().unwrap_or(0);
-                        println!("  sample buffers={} total_bytes={}", buf_count, total_len);
+            for i in 0..READ_ATTEMPTS {
+                let mut actual_stream: u32 = 0;
+                let mut flags: u32 = 0;
+                let mut timestamp: i64 = 0;
+                let mut sample: Option<IMFSample> = None;
+                let read_ret = reader.ReadSample(
+                    stream_index,
+                    0,
+                    Some(&mut actual_stream),
+                    Some(&mut flags),
+                    Some(&mut timestamp),
+                    Some(&mut sample),
+                );
+                match read_ret {
+                    Ok(_) => {
+                        println!(
+                            "ReadSample[{}] returned: actual_stream={} flags=0x{:X} ts={} sample={}",
+                            i,
+                            actual_stream,
+                            flags,
+                            timestamp,
+                            sample.is_some()
+                        );
+                        if let Some(s) = sample {
+                            let buf_count = s.GetBufferCount().unwrap_or(0);
+                            let total_len = s.GetTotalLength().unwrap_or(0);
+                            println!("  sample buffers={} total_bytes={}", buf_count, total_len);
+                            break;
+                        }
+                        if flags & FLAG_ENDOFSTREAM != 0 {
+                            // Frame Server / source signalled end of
+                            // stream; further reads will keep returning
+                            // the same flag with no sample. Bail so the
+                            // failure surfaces fast.
+                            println!("ENDOFSTREAM signalled — stopping retry loop");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        println!("ReadSample[{}] failed: {:?}", i, e);
+                        break;
                     }
                 }
-                Err(e) => println!("ReadSample failed: {:?}", e),
+                std::thread::sleep(std::time::Duration::from_millis(READ_INTERVAL_MS));
             }
 
             let _ = source.Shutdown();

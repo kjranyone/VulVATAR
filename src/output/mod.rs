@@ -142,6 +142,7 @@ pub struct OutputRouter {
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
     /// Join handle for the background worker thread.
     worker_handle: Option<thread::JoinHandle<()>>,
+    logged_first_publish: bool,
 }
 
 impl OutputRouter {
@@ -162,6 +163,7 @@ impl OutputRouter {
             last_forward_at: None,
             worker_tx: Some(tx),
             worker_handle: Some(handle),
+            logged_first_publish: false,
         }
     }
 
@@ -247,6 +249,19 @@ impl OutputRouter {
             frame.alpha_mode,
             self.sink,
         );
+        if !self.logged_first_publish {
+            info!(
+                "output: first publish frame {} {}x{} {:?} alpha={:?} to {:?} pixel_data={}",
+                frame.frame_id.0,
+                frame.extent[0],
+                frame.extent[1],
+                frame.color_space,
+                frame.alpha_mode,
+                self.sink,
+                frame.pixel_data.as_ref().map_or(0, |p| p.len()),
+            );
+            self.logged_first_publish = true;
+        }
 
         self.last_publish_timestamp = frame.timestamp;
 

@@ -183,6 +183,7 @@ pub struct Application {
     pub viewport_background: Option<std::path::PathBuf>,
     pub ground_grid_visible: bool,
     stale_warn_cooldown: std::time::Instant,
+    logged_first_render_result: bool,
 }
 
 impl Application {
@@ -268,6 +269,7 @@ impl Application {
             stale_warn_cooldown: std::time::Instant::now(),
             viewport_background: None,
             ground_grid_visible: false,
+            logged_first_render_result: false,
         }
     }
 
@@ -515,12 +517,28 @@ impl Application {
             crate::renderer::output_export::ExportedPixelData::CpuReadback(ref pixel_data)
                 if !pixel_data.is_empty() =>
             {
+                if !self.logged_first_render_result {
+                    info!(
+                        "render: first CPU readback result {}x{} bytes={}",
+                        exported.extent[0],
+                        exported.extent[1],
+                        pixel_data.len(),
+                    );
+                    self.logged_first_render_result = true;
+                }
                 self.rendered_pixels = Some(Arc::clone(pixel_data));
                 self.rendered_extent = render_result.extent;
                 self.rendered_frame_counter += 1;
                 output_frame.pixel_data = Some(Arc::clone(pixel_data));
             }
             crate::renderer::output_export::ExportedPixelData::GpuOwned => {
+                if !self.logged_first_render_result {
+                    info!(
+                        "render: first result is GPU-owned {}x{}",
+                        exported.extent[0], exported.extent[1],
+                    );
+                    self.logged_first_render_result = true;
+                }
                 self.rendered_extent = render_result.extent;
                 self.rendered_frame_counter += 1;
                 output_frame.gpu_image = exported.gpu_image.clone();

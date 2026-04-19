@@ -12,9 +12,8 @@
 //! offset 32  ...  width * height * 4 RGBA bytes
 //! ```
 //!
-//! Per the MS Frame Server docs the named object lives in the global
-//! `Local\` namespace so a SYSTEM-hosted Frame Server process can see what
-//! a normal user-mode `vulvatar.exe` writes.
+//! The named object lives in the `Global\` namespace so the FrameServer
+//! service process can see what the interactive `vulvatar.exe` writes.
 
 use core::sync::atomic::{AtomicI64, Ordering};
 use std::ffi::OsStr;
@@ -26,7 +25,7 @@ use windows::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
 };
 
-const SHMEM_NAME: &str = "Local\\VulVATAR_VirtualCamera";
+const SHMEM_NAME: &str = "Global\\VulVATAR_VirtualCamera";
 const SHMEM_HEADER_SIZE: usize = 32;
 const SHMEM_MAGIC: u32 = 0x5643_4D46;
 

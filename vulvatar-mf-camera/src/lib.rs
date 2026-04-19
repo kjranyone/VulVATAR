@@ -19,6 +19,8 @@
 #![cfg(target_os = "windows")]
 #![allow(non_snake_case)]
 
+#[macro_use]
+mod attributes;
 mod class_factory;
 mod media_source;
 mod media_stream;
@@ -61,7 +63,7 @@ pub(crate) fn dll_release() {
 /// older scratch copy, the trace at the top of each run will show the
 /// stale marker and we know not to trust subsequent diagnostics.
 const BUILD_MARKER: &str = concat!(
-    "source-is-activate-rtclient-streamdescattrs ",
+    "source-is-activate-streamattrs-no-associated ",
     file!(),
     ":",
     line!()
