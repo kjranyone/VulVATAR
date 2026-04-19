@@ -785,11 +785,23 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("render: failed to create command buffer: {e}"))?;
 
+        // Use the user's Scene Background settings: transparent_background
+        // clears to (0,0,0,0) so OBS chroma keys / RGBA-aware consumers can
+        // composite the avatar over their own background. When false the
+        // pass clears to the user's solid colour with full alpha so MF
+        // virtual camera consumers (Meet, Zoom, NV12 conversion) get a
+        // visible background instead of all-black.
+        let bg_clear = if input.transparent_background {
+            [0.0_f32, 0.0, 0.0, 0.0]
+        } else {
+            let [r, g, b] = input.background_color;
+            [r, g, b, 1.0]
+        };
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
                     clear_values: vec![
-                        Some([0.0, 0.0, 0.0, 0.0].into()),
+                        Some(bg_clear.into()),
                         Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
                     ],
                     ..RenderPassBeginInfo::framebuffer(framebuffer.clone())

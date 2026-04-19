@@ -317,6 +317,8 @@ fn build_frame_input(
         },
         background_image_path: None,
         show_ground_grid: false,
+        background_color: [0.1, 0.1, 0.1],
+        transparent_background: true,
     }
 }
 

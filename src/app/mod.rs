@@ -44,6 +44,13 @@ pub struct FrameInputConfig {
     pub lighting: LightingState,
     pub viewport_extent: [u32; 2],
     pub output_extent: [u32; 2],
+    /// RGB clear color for the render pass when `transparent_background` is
+    /// false. Synced from the GUI inspector. Ignored if transparent.
+    pub background_color: [f32; 3],
+    /// When true, the render target is cleared to `(0,0,0,0)` and only the
+    /// avatar pixels are non-zero. When false, the render target is cleared
+    /// to `(background_color, 1)` so the output is opaque.
+    pub transparent_background: bool,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -119,6 +126,15 @@ pub struct Application {
     /// alpha channel (true) or force opaque (false). Synced from the GUI
     /// `output.output_has_alpha` toggle every frame.
     pub output_preserve_alpha: bool,
+    /// Solid background colour the Vulkan renderer clears to when
+    /// `transparent_background` is false. Synced from the Inspector's
+    /// "Scene Background" panel each frame.
+    pub background_color: [f32; 3],
+    /// When true the renderer clears to `(0,0,0,0)` so only avatar pixels
+    /// are non-transparent — useful for OBS chroma keys but produces a
+    /// black NV12 output for clients (Meet / Zoom) that don't honour
+    /// alpha. Synced from the same inspector panel.
+    pub transparent_background: bool,
 
     pub tracking_worker: Option<TrackingWorker>,
     /// Lifetime owner for the MediaFoundation virtual-camera registration.
@@ -236,6 +252,8 @@ impl Application {
             viewport_lighting: LightingState::default(),
             output_extent: None,
             output_preserve_alpha: false,
+            background_color: [0.1, 0.1, 0.1],
+            transparent_background: true,
             tracking_worker: None,
             #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
             mf_virtual_camera: None,
@@ -443,6 +461,8 @@ impl Application {
                 lighting: self.viewport_lighting.clone(),
                 viewport_extent: self.viewport_extent,
                 output_extent,
+                background_color: self.background_color,
+                transparent_background: self.transparent_background,
             };
             let frame_input = Self::build_frame_input_multi(
                 &self.avatars,
@@ -770,6 +790,8 @@ impl Application {
             },
             background_image_path: background_image_path.map(|p| p.to_path_buf()),
             show_ground_grid,
+            background_color: fi_config.background_color,
+            transparent_background: fi_config.transparent_background,
         }
     }
 

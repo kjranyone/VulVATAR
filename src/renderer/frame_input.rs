@@ -11,6 +11,12 @@ pub struct RenderFrameInput {
     pub output_request: OutputTargetRequest,
     pub background_image_path: Option<std::path::PathBuf>,
     pub show_ground_grid: bool,
+    /// Solid clear color for the main render pass when not transparent.
+    /// `(r, g, b, 1.0)` is written into the colour attachment's clear value.
+    /// Ignored when [`Self::transparent_background`] is true (the render
+    /// target is cleared to `(0,0,0,0)` instead).
+    pub background_color: [f32; 3],
+    pub transparent_background: bool,
 }
 
 #[derive(Clone, Debug)]

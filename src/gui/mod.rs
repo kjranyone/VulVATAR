@@ -940,6 +940,14 @@ impl eframe::App for GuiApp {
         self.app.viewport_lighting.main_light_intensity = self.rendering.main_light_intensity;
         self.app.viewport_lighting.ambient_term = self.rendering.ambient_intensity;
 
+        // Sync Scene Background to the Vulkan renderer's clear color. Until
+        // T11 found this gap the inspector toggle was a pure egui-side hint
+        // and the renderer always cleared to (0,0,0,0), which made the MF
+        // virtual camera output appear all-black to clients that don't
+        // honour the alpha channel (Meet / Zoom).
+        self.app.background_color = self.rendering.background_color;
+        self.app.transparent_background = self.rendering.transparent_background;
+
         // Sync output resolution preference from GUI inspector. The renderer
         // reads this through OutputTargetRequest.extent, so changing the
         // combo immediately resizes the next render's output target.
