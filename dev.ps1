@@ -110,6 +110,29 @@ function Install-MfCameraSystem {
 
     Write-Host "Registered $friendly in HKLM:" -ForegroundColor Green
     Write-Host "  $target"
+
+    # Restart FrameServer so it drops any cached IClassFactory pointing
+    # at the previously-installed DLL. Without this step, svchost keeps
+    # the old DLL `LoadLibrary`-held and serves it to new clients even
+    # though HKLM now points at the fresh timestamped copy — clients
+    # like Google Meet would keep seeing the old behaviour (e.g. the
+    # missing-IMF2DBuffer all-green NV12 bug) until the next reboot.
+    # Stopping the service kicks out any active camera consumer, so
+    # close Meet/Chrome/Camera app first if you want a graceful test.
+    Write-Host "Restarting Windows Camera Frame Server (FrameServer)..." -ForegroundColor Cyan
+    try {
+        $svc = Get-Service -Name 'FrameServer' -ErrorAction Stop
+        if ($svc.Status -eq 'Running') {
+            Stop-Service -Name 'FrameServer' -Force -ErrorAction Stop
+            Write-Host "  stopped" -ForegroundColor DarkGray
+        }
+        Start-Service -Name 'FrameServer' -ErrorAction Stop
+        Write-Host "  started — svchost will load the new DLL on the next ActivateObject." -ForegroundColor Green
+    } catch {
+        Write-Host ("  WARNING: could not restart FrameServer: " + $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host "  Reboot or run 'sc stop FrameServer; sc start FrameServer' as admin to pick up the new DLL." -ForegroundColor Yellow
+    }
+
     Write-Host "You can now run VulVATAR without elevation until you rebuild/reinstall this DLL." -ForegroundColor DarkGray
 }
 

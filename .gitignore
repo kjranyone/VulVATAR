@@ -26,6 +26,10 @@ models/*.onnx
 # Profiling logs (see docs/profiling.md)
 /profile/
 
+# Runtime logs captured when launching the app from a script / CI
+*.stdout.log
+*.stderr.log
+
 # Misc
 cigpose_models.zip
 nul

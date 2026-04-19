@@ -14,11 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use windows::core::{implement, IUnknown, Interface, GUID, HRESULT, PROPVARIANT};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::MediaFoundation::{
-    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent, IMFMediaEventGenerator_Impl,
-    IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2, IMFMediaStream2_Impl, IMFMediaStream_Impl,
-    IMFSample, IMFStreamDescriptor, IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer,
-    MFCreateSample, MFGetSystemTime, MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
+    IMF2DBuffer, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer, IMFMediaEvent,
+    IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2,
+    IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor,
+    IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample, MFGetSystemTime,
+    MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
 };
 
 use crate::media_source::DEFAULT_FPS;
@@ -298,6 +299,16 @@ impl VulvatarMediaStream {
     /// data from shared memory. Keeps the allocator's pre-allocated
     /// `IMFMediaBuffer` rather than swapping in a fresh `MFCreateMemoryBuffer`,
     /// which is what Frame Server's marshaller requires.
+    ///
+    /// Frame Server's allocator-backed buffers commonly come with
+    /// row-stride padding (e.g. width=1920 but pitch=2048) for hardware
+    /// alignment. We always try `IMF2DBuffer::Lock2D` first to get the
+    /// real `pitch` and write each row at `scanline + row * pitch` —
+    /// otherwise NV12's UV plane lands in the Y plane's padding region
+    /// and the consumer reads `U=V=0` for every chroma sample, which
+    /// renders as a uniform green frame (Y' is fine, but the missing
+    /// chroma forces the YCbCr→RGB conversion into the all-green
+    /// quadrant of the colour space).
     fn fill_allocated_sample(
         &self,
         sample: &IMFSample,
@@ -311,105 +322,263 @@ impl VulvatarMediaStream {
             .map(|v| v.flags & FRAME_FLAG_PRESERVE_ALPHA != 0)
             .unwrap_or(false);
 
-        unsafe {
-            let mut dst_ptr: *mut u8 = core::ptr::null_mut();
-            let mut max_len: u32 = 0;
-            let mut current_len: u32 = 0;
-            buffer.Lock(&mut dst_ptr, Some(&mut max_len), Some(&mut current_len))?;
-            if dst_ptr.is_null() {
-                buffer.Unlock()?;
-                return Err(E_FAIL.into());
-            }
-
-            let written = match view {
-                Some(view) => {
-                    let resampled;
-                    let (rgba, w, h) = if view.width == format.width && view.height == format.height
-                    {
-                        (view.pixels.as_slice(), view.width, view.height)
-                    } else {
-                        resampled = resample_rgba_nearest(
-                            &view.pixels,
-                            view.width as usize,
-                            view.height as usize,
-                            format.width as usize,
-                            format.height as usize,
-                        );
-                        (resampled.as_slice(), format.width, format.height)
-                    };
-                    crate::t!(
-                        "Stream::RequestSample alloc frame seq={} {}x{}@{} subtype={} alpha={}",
-                        view.sequence,
-                        format.width,
-                        format.height,
-                        format.fps,
-                        if is_nv12 { "NV12" } else { "RGB32" },
-                        preserve_alpha,
-                    );
-                    if is_nv12 {
-                        let need = nv12_size(w, h) as u32;
-                        if max_len < need {
-                            buffer.Unlock()?;
-                            return Err(E_FAIL.into());
-                        }
-                        rgba_to_nv12(rgba, w as usize, h as usize, dst_ptr);
-                        need
-                    } else {
-                        let need = (w as u32) * (h as u32) * 4;
-                        if max_len < need {
-                            buffer.Unlock()?;
-                            return Err(E_FAIL.into());
-                        }
-                        let src = rgba.as_ptr();
-                        for i in 0..(need as usize / 4) {
-                            let s = src.add(i * 4);
-                            let d = dst_ptr.add(i * 4);
-                            *d = *s.add(2);
-                            *d.add(1) = *s.add(1);
-                            *d.add(2) = *s;
-                            *d.add(3) = if preserve_alpha { *s.add(3) } else { 0xFF };
-                        }
-                        need
-                    }
-                }
-                None => {
-                    crate::t!(
-                        "Stream::RequestSample alloc no producer ({}x{} {})",
-                        format.width,
-                        format.height,
-                        if is_nv12 { "NV12" } else { "RGB32" },
-                    );
-                    if is_nv12 {
-                        let need = nv12_size(format.width, format.height) as u32;
-                        if max_len >= need {
-                            // Limited-range black: Y=16, UV=128
-                            let y_len = (format.width * format.height) as usize;
-                            core::ptr::write_bytes(dst_ptr, 16, y_len);
-                            core::ptr::write_bytes(dst_ptr.add(y_len), 128, y_len / 2);
-                        }
-                        need
-                    } else {
-                        let need = (format.width as u32) * (format.height as u32) * 4;
-                        if max_len >= need {
-                            for i in 0..(need as usize / 4) {
-                                let d = dst_ptr.add(i * 4);
-                                *d = 0;
-                                *d.add(1) = 0;
-                                *d.add(2) = 0;
-                                *d.add(3) = 0xFF;
-                            }
-                        }
-                        need
-                    }
-                }
-            };
-
-            buffer.SetCurrentLength(written)?;
-            buffer.Unlock()?;
+        if let Some(ref v) = view {
+            crate::t!(
+                "Stream::RequestSample alloc frame seq={} {}x{}@{} subtype={} alpha={}",
+                v.sequence,
+                format.width,
+                format.height,
+                format.fps,
+                if is_nv12 { "NV12" } else { "RGB32" },
+                preserve_alpha,
+            );
+        } else {
+            crate::t!(
+                "Stream::RequestSample alloc no producer ({}x{} {})",
+                format.width,
+                format.height,
+                if is_nv12 { "NV12" } else { "RGB32" },
+            );
         }
+
+        // Pick the source RGBA slice + (width, height), resampling if the
+        // producer hasn't caught up to the negotiated format yet.
+        let (rgba_owned_resample, rgba_slice, src_w, src_h) = match view {
+            Some(view) => {
+                if view.width == format.width && view.height == format.height {
+                    (None, Some(view.pixels), view.width, view.height)
+                } else {
+                    let resampled = resample_rgba_nearest(
+                        &view.pixels,
+                        view.width as usize,
+                        view.height as usize,
+                        format.width as usize,
+                        format.height as usize,
+                    );
+                    (Some(resampled), None, format.width, format.height)
+                }
+            }
+            None => (None, None, format.width, format.height),
+        };
+        let rgba_ref: Option<&[u8]> = rgba_slice
+            .as_ref()
+            .map(|v| v.as_slice())
+            .or_else(|| rgba_owned_resample.as_deref());
+
+        let pixel_writer = PixelWriter {
+            rgba: rgba_ref,
+            width: src_w,
+            height: src_h,
+            preserve_alpha,
+        };
+
+        // Try the 2D path. If the buffer doesn't expose IMF2DBuffer (rare
+        // for FrameServer allocator pools but possible for the direct
+        // CoCreateInstance path's MFCreateMemoryBuffer fallback), drop
+        // back to a contiguous write.
+        let written = if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+            write_with_2d_buffer(&buffer_2d, &pixel_writer, is_nv12)?
+        } else {
+            write_with_1d_buffer(&buffer, &pixel_writer, is_nv12)?
+        };
+
+        unsafe { buffer.SetCurrentLength(written)? };
         Ok(())
     }
 }
+
+/// Pixel source + format metadata passed to the per-buffer writers so
+/// they can stamp Y/UV (or BGRA) into the destination at the correct
+/// stride. `rgba == None` ⇒ producer has not delivered a frame yet, in
+/// which case the writer fills the buffer with limited-range black so
+/// downstream consumers see a valid (if blank) sample.
+struct PixelWriter<'a> {
+    rgba: Option<&'a [u8]>,
+    width: u32,
+    height: u32,
+    preserve_alpha: bool,
+}
+
+/// Write through `IMF2DBuffer::Lock2D`, which exposes the real row pitch
+/// (≥ width-bytes; possibly more for alignment). For NV12 the UV plane
+/// starts at `scanline + height * pitch`; for RGB32 there's a single
+/// plane and we just stride one row at a time.
+fn write_with_2d_buffer(
+    buffer: &IMF2DBuffer,
+    writer: &PixelWriter,
+    is_nv12: bool,
+) -> windows::core::Result<u32> {
+    let mut scanline: *mut u8 = core::ptr::null_mut();
+    let mut pitch: i32 = 0;
+    unsafe { buffer.Lock2D(&mut scanline, &mut pitch)? };
+    if scanline.is_null() || pitch <= 0 {
+        // Refuse negative-pitch (bottom-up) layouts — neither MF NV12
+        // nor RGB32 negotiation produces them in practice and our
+        // writers assume top-down. Releasing immediately keeps the
+        // buffer consistent for the next attempt.
+        let _ = unsafe { buffer.Unlock2D() };
+        return Err(E_FAIL.into());
+    }
+    let pitch = pitch as usize;
+    let result = unsafe {
+        if is_nv12 {
+            write_nv12_strided(scanline, pitch, writer);
+            nv12_size(writer.width, writer.height) as u32
+        } else {
+            write_rgb32_strided(scanline, pitch, writer);
+            (writer.width * writer.height * 4) as u32
+        }
+    };
+    unsafe { buffer.Unlock2D()? };
+    Ok(result)
+}
+
+/// Fallback for buffers that don't expose IMF2DBuffer (assumes
+/// contiguous storage with row stride == width). Used for
+/// `MFCreateMemoryBuffer`-backed direct-path samples; FrameServer
+/// allocator buffers always implement IMF2DBuffer so this path is
+/// hit only for the developer-tools probe.
+fn write_with_1d_buffer(
+    buffer: &IMFMediaBuffer,
+    writer: &PixelWriter,
+    is_nv12: bool,
+) -> windows::core::Result<u32> {
+    unsafe {
+        let mut dst_ptr: *mut u8 = core::ptr::null_mut();
+        let mut max_len: u32 = 0;
+        let mut current_len: u32 = 0;
+        buffer.Lock(&mut dst_ptr, Some(&mut max_len), Some(&mut current_len))?;
+        if dst_ptr.is_null() {
+            buffer.Unlock()?;
+            return Err(E_FAIL.into());
+        }
+        let result = if is_nv12 {
+            let need = nv12_size(writer.width, writer.height) as u32;
+            if max_len < need {
+                buffer.Unlock()?;
+                return Err(E_FAIL.into());
+            }
+            // pitch == width for the contiguous case.
+            write_nv12_strided(dst_ptr, writer.width as usize, writer);
+            need
+        } else {
+            let need = writer.width * writer.height * 4;
+            if max_len < need {
+                buffer.Unlock()?;
+                return Err(E_FAIL.into());
+            }
+            write_rgb32_strided(dst_ptr, (writer.width * 4) as usize, writer);
+            need
+        };
+        buffer.Unlock()?;
+        Ok(result)
+    }
+}
+
+/// Write NV12 (Y then interleaved CbCr) into `scanline` honouring the
+/// destination row pitch. UV plane starts at `scanline + height * pitch`.
+unsafe fn write_nv12_strided(scanline: *mut u8, pitch: usize, writer: &PixelWriter) {
+    let w = writer.width as usize;
+    let h = writer.height as usize;
+    let uv_base = scanline.add(h * pitch);
+
+    let Some(rgba) = writer.rgba else {
+        // No producer: limited-range black (Y=16, UV=128 for grey
+        // chroma) — write each Y row at `pitch`, each UV row at
+        // `pitch`. Padding bytes between width and pitch are left
+        // alone; they're outside the consumer's MF_MT_DEFAULT_STRIDE
+        // window so their value doesn't matter.
+        for row in 0..h {
+            core::ptr::write_bytes(scanline.add(row * pitch), 16, w);
+        }
+        for chroma_row in 0..(h / 2) {
+            core::ptr::write_bytes(uv_base.add(chroma_row * pitch), 128, w);
+        }
+        return;
+    };
+
+    let src_stride = w * 4;
+
+    // Y plane: one byte per source pixel.
+    for row in 0..h {
+        let dst_row = scanline.add(row * pitch);
+        for col in 0..w {
+            let src_off = row * src_stride + col * 4;
+            let r = rgba[src_off];
+            let g = rgba[src_off + 1];
+            let b = rgba[src_off + 2];
+            *dst_row.add(col) = bt601_y(r, g, b);
+        }
+    }
+
+    // UV plane: one CbCr pair per 2×2 source block. Each chroma row
+    // contains `width` bytes (= `width/2` interleaved CbCr pairs)
+    // followed by stride padding.
+    let mut row = 0;
+    while row + 1 < h {
+        let dst_row = uv_base.add((row / 2) * pitch);
+        let mut col = 0;
+        while col + 1 < w {
+            let p = |dx: usize, dy: usize| -> (u32, u32, u32) {
+                let off = (row + dy) * src_stride + (col + dx) * 4;
+                (
+                    rgba[off] as u32,
+                    rgba[off + 1] as u32,
+                    rgba[off + 2] as u32,
+                )
+            };
+            let (r0, g0, b0) = p(0, 0);
+            let (r1, g1, b1) = p(1, 0);
+            let (r2, g2, b2) = p(0, 1);
+            let (r3, g3, b3) = p(1, 1);
+            let r = ((r0 + r1 + r2 + r3) / 4) as u8;
+            let g = ((g0 + g1 + g2 + g3) / 4) as u8;
+            let b = ((b0 + b1 + b2 + b3) / 4) as u8;
+            let (cb, cr) = bt601_uv(r, g, b);
+            *dst_row.add(col) = cb;
+            *dst_row.add(col + 1) = cr;
+            col += 2;
+        }
+        row += 2;
+    }
+}
+
+/// Write RGB32 (BGRA byte order — Windows DIB convention) into
+/// `scanline` honouring the destination row pitch. Pitch is in bytes
+/// and is at least `width * 4`.
+unsafe fn write_rgb32_strided(scanline: *mut u8, pitch: usize, writer: &PixelWriter) {
+    let w = writer.width as usize;
+    let h = writer.height as usize;
+    let row_bytes = w * 4;
+
+    let Some(rgba) = writer.rgba else {
+        for row in 0..h {
+            let dst_row = scanline.add(row * pitch);
+            for col in 0..w {
+                let d = dst_row.add(col * 4);
+                *d = 0; // B
+                *d.add(1) = 0; // G
+                *d.add(2) = 0; // R
+                *d.add(3) = 0xFF;
+            }
+        }
+        return;
+    };
+
+    for row in 0..h {
+        let src_row = rgba.as_ptr().add(row * row_bytes);
+        let dst_row = scanline.add(row * pitch);
+        for col in 0..w {
+            let s = src_row.add(col * 4);
+            let d = dst_row.add(col * 4);
+            *d = *s.add(2); // B (BGRA's first byte ← RGBA's third byte)
+            *d.add(1) = *s.add(1); // G
+            *d.add(2) = *s; // R
+            *d.add(3) = if writer.preserve_alpha { *s.add(3) } else { 0xFF };
+        }
+    }
+}
+
 
 impl VulvatarMediaStream {
     /// Resolve the negotiated subtype + frame size + frame rate. Cached
