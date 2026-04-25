@@ -55,6 +55,11 @@ pub struct ClothOverlaySlot {
     pub state: ClothState,
     pub sim: ClothSimState,
     pub buffers: ClothSimTempBuffers,
+    /// Filesystem path the overlay was loaded from (if any). Saved with
+    /// the project so load-time can re-attach the same overlays via
+    /// `persistence::load_cloth_overlay`. `None` for slots created
+    /// procedurally via "Add Overlay Slot" — those have no file backing.
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +242,7 @@ impl AvatarInstance {
             state,
             sim,
             buffers,
+            source_path: None,
         });
         self.cloth_enabled = true;
         if self.attached_cloth.is_none() {

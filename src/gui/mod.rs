@@ -592,10 +592,26 @@ impl GuiApp {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
 
+        // File-backed cloth overlays attached to the active avatar via
+        // "Load Overlay File...". Procedurally-added slots have None
+        // here and intentionally don't round-trip through projects.
+        let cloth_overlay_paths: Vec<String> = self
+            .app
+            .active_avatar()
+            .map(|a| {
+                a.cloth_overlays
+                    .iter()
+                    .filter_map(|s| s.source_path.as_ref())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         ProjectState {
             avatar_source_path,
             avatar_source_hash,
             active_overlay_path,
+            cloth_overlay_paths,
 
             transform_position: self.transform.position,
             transform_rotation: self.transform.rotation,
@@ -824,6 +840,73 @@ impl GuiApp {
             state.lipsync_enabled,
             state.lipsync_mic_device_index,
         );
+
+        self.restore_cloth_overlay_paths(&state.cloth_overlay_paths);
+    }
+
+    /// Re-attach each cloth overlay listed in the project file to the
+    /// active avatar. Each path is loaded via
+    /// [`crate::persistence::load_cloth_overlay`] (which handles version
+    /// migration) and then attached + initialised on a fresh slot,
+    /// preserving its source path so a subsequent save round-trips.
+    /// Failures are surfaced as notifications and skip that single
+    /// overlay rather than aborting the whole apply.
+    fn restore_cloth_overlay_paths(&mut self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        // Resolve the assets first so the avatar borrow doesn't overlap
+        // with notification pushes.
+        let resolved: Vec<(std::path::PathBuf, crate::asset::ClothAsset)> = paths
+            .iter()
+            .filter_map(|p| {
+                let path = std::path::PathBuf::from(p);
+                if !path.exists() {
+                    self.push_notification(format!(
+                        "Cloth overlay '{}' not found, skipping",
+                        path.display()
+                    ));
+                    return None;
+                }
+                match crate::persistence::load_cloth_overlay(&path) {
+                    Ok(file) => match file.cloth_asset {
+                        Some(asset) => Some((path, asset)),
+                        None => {
+                            self.push_notification(format!(
+                                "Cloth overlay '{}' has no payload, skipping",
+                                path.display()
+                            ));
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        self.push_notification(format!(
+                            "Failed to load cloth overlay '{}': {}",
+                            path.display(),
+                            e
+                        ));
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        if resolved.is_empty() {
+            return;
+        }
+
+        if let Some(avatar) = self.app.active_avatar_mut() {
+            for (path, cloth_asset) in resolved {
+                let overlay_id = crate::asset::ClothOverlayId(
+                    (avatar.cloth_overlay_count() as u64) + 2,
+                );
+                let idx = avatar.attach_cloth_overlay(overlay_id);
+                avatar.init_cloth_overlay(idx, &cloth_asset);
+                if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
+                    slot.source_path = Some(path);
+                }
+            }
+        }
     }
 
     fn load_avatar_from_drop(&mut self, path: &std::path::Path) {

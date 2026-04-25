@@ -448,6 +448,9 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 );
                                 let idx = avatar.attach_cloth_overlay(overlay_id);
                                 avatar.init_cloth_overlay(idx, &cloth_asset);
+                                if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
+                                    slot.source_path = Some(path.clone());
+                                }
                                 state.push_notification(format!(
                                     "Attached overlay from '{}' as slot #{}",
                                     path.display(),

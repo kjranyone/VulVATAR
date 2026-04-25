@@ -12,6 +12,13 @@ pub struct ProjectState {
     pub avatar_source_path: Option<String>,
     pub avatar_source_hash: Option<Vec<u8>>,
     pub active_overlay_path: Option<String>,
+    /// Filesystem paths of every cloth overlay attached to the active
+    /// avatar via "Load Overlay File..." (i.e. each `ClothOverlaySlot`
+    /// whose `source_path` is `Some`). On load the project re-attaches
+    /// each one through `persistence::load_cloth_overlay`. Slots
+    /// created procedurally (no file backing) are intentionally
+    /// dropped — they have no canonical re-creation source.
+    pub cloth_overlay_paths: Vec<String>,
 
     // Transform
     pub transform_position: [f32; 3],
@@ -86,6 +93,10 @@ pub struct ProjectFile {
     #[serde(default)]
     pub camera_orbit_distance: f32,
     pub active_overlay_path: Option<String>,
+    /// See [`ProjectState::cloth_overlay_paths`]. `#[serde(default)]`
+    /// keeps older projects (which lacked this field) loadable.
+    #[serde(default)]
+    pub cloth_overlay_paths: Vec<String>,
 
     pub tracking: TrackingConfig,
     pub rendering: RenderingConfig,
@@ -323,6 +334,7 @@ impl ProjectFile {
             camera_orbit_pan: state.camera_orbit_pan,
             camera_orbit_distance: state.camera_orbit_distance,
             active_overlay_path: state.active_overlay_path.clone(),
+            cloth_overlay_paths: state.cloth_overlay_paths.clone(),
 
             tracking: TrackingConfig {
                 enabled: state.tracking_enabled,
@@ -375,6 +387,7 @@ impl ProjectFile {
             avatar_source_path: self.avatar_source_path.clone(),
             avatar_source_hash: self.avatar_source_hash.clone(),
             active_overlay_path: self.active_overlay_path.clone(),
+            cloth_overlay_paths: self.cloth_overlay_paths.clone(),
 
             transform_position: self.avatar_transform.position,
             transform_rotation: self.avatar_transform.rotation,
