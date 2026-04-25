@@ -426,10 +426,27 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             });
             if let Some(avatar) = state.app.active_avatar_mut() {
                 ui.checkbox(&mut avatar.cloth_enabled, "Enable Cloth");
+                // Defer removal until after the iter_mut borrow ends —
+                // can't mutate the Vec we're iterating.
+                let mut remove_slot: Option<usize> = None;
                 for (i, slot) in avatar.cloth_overlays.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut slot.enabled, format!("Overlay #{}", i));
+                        ui.checkbox(
+                            &mut slot.enabled,
+                            format!(
+                                "#{} (id={}, {} particles)",
+                                i,
+                                slot.overlay_id.0,
+                                slot.sim.particle_count()
+                            ),
+                        );
+                        if ui.button("Remove").clicked() {
+                            remove_slot = Some(i);
+                        }
                     });
+                }
+                if let Some(idx) = remove_slot {
+                    avatar.remove_cloth_overlay(idx);
                 }
             }
         });
