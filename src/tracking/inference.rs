@@ -49,12 +49,7 @@ impl CigPoseInference {
     ) -> std::result::Result<Self, String> {
         info!("Loading CIGPose model from {}", model_path);
 
-        let session = Session::builder()
-            .map_err(|e| format!("ORT build error: {}", e))?
-            .with_intra_threads(4)
-            .map_err(|e| format!("ORT threads error: {}", e))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("ORT load error: {}", e))?;
+        let session = build_session(model_path, 4, "CIGPose")?;
 
         let input_name = session
             .inputs()
@@ -249,6 +244,66 @@ struct PoseModelConfig {
     input_w: u32,
     input_h: u32,
     split_ratio: f32,
+}
+
+/// Build an ORT [`Session`] with a small thread pool, optionally
+/// routing through the DirectML execution provider when the
+/// `inference-gpu` cargo feature is enabled. ORT walks the EP list in
+/// order at registration time, so DirectML attempts to claim the
+/// graph first and CPU is the implicit fallback. If DirectML
+/// registration fails (no DX12 hardware, missing DLL, driver issue),
+/// we emit a warning and retry on a CPU-only builder so a broken GPU
+/// path doesn't kill tracking.
+#[cfg(feature = "inference")]
+fn build_session(model_path: &str, intra_threads: usize, label: &str) -> Result<Session, String> {
+    #[cfg(feature = "inference-gpu")]
+    {
+        match try_build_directml_session(model_path, intra_threads) {
+            Ok(session) => {
+                info!(
+                    "{} session created via DirectML execution provider ({})",
+                    label, model_path
+                );
+                return Ok(session);
+            }
+            Err(e) => {
+                warn!(
+                    "{} DirectML EP registration failed for '{}': {}. \
+                     Falling back to CPU.",
+                    label, model_path, e
+                );
+            }
+        }
+    }
+
+    let session = Session::builder()
+        .map_err(|e| format!("ORT build error ({}): {}", label, e))?
+        .with_intra_threads(intra_threads)
+        .map_err(|e| format!("ORT threads error ({}): {}", label, e))?
+        .commit_from_file(model_path)
+        .map_err(|e| format!("ORT load error ({}): {}", label, e))?;
+    info!("{} session created on CPU EP ({})", label, model_path);
+    Ok(session)
+}
+
+/// Attempt the DirectML EP path. Kept separate so the error-type
+/// shuffling between `with_execution_providers` (BuilderResult) and
+/// `commit_from_file` (ort::Result) doesn't leak into the caller.
+#[cfg(feature = "inference-gpu")]
+fn try_build_directml_session(
+    model_path: &str,
+    intra_threads: usize,
+) -> std::result::Result<Session, String> {
+    let builder = Session::builder().map_err(|e| format!("builder: {}", e))?;
+    let builder = builder
+        .with_execution_providers([ort::ep::DirectML::default().build()])
+        .map_err(|e| format!("with_execution_providers: {}", e))?;
+    let mut builder = builder
+        .with_intra_threads(intra_threads)
+        .map_err(|e| format!("with_intra_threads: {}", e))?;
+    builder
+        .commit_from_file(model_path)
+        .map_err(|e| format!("commit_from_file: {}", e))
 }
 
 #[cfg(feature = "inference")]
@@ -528,12 +583,7 @@ struct YoloxDetector {
 #[cfg(feature = "inference")]
 impl YoloxDetector {
     fn new(model_path: &str) -> std::result::Result<Self, String> {
-        let session = Session::builder()
-            .map_err(|e| format!("ORT detector build error: {}", e))?
-            .with_intra_threads(2)
-            .map_err(|e| format!("ORT detector threads error: {}", e))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("ORT detector load error: {}", e))?;
+        let session = build_session(model_path, 2, "YOLOX")?;
         let input_name = session
             .inputs()
             .first()

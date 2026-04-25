@@ -17,6 +17,11 @@ default = ["webcam", "lipsync", "rapier", "inference", "virtual-camera"]
 webcam = ["nokhwa"]
 rapier = ["rapier3d"]
 inference = ["ort", "ndarray"]
+# Routes ORT through the DirectML execution provider when running on
+# DirectX 12-capable Windows hardware, falling back to CPU on EP
+# registration failure. Pulls in a DirectML-enabled ONNX Runtime
+# binary, so it's Windows-only and not in the default feature set.
+inference-gpu = ["inference", "ort/directml"]
 virtual-camera = ["windows"]
 lipsync = ["cpal", "rustfft"]
 
