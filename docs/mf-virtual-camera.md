@@ -29,13 +29,13 @@ Two processes, one OS service in the middle.
 │                              │       │  runs as NT AUTHORITY\LocalService)│
 │  renderer → OutputRouter     │       │                                  │
 │     ↓                        │       │  loads vulvatar_mf_camera.dll    │
-│  Win32NamedSharedMemorySink  │       │  via HKLM InprocServer32         │
-│     writes Global\VulVATAR_  │       │     ↓                            │
-│     VirtualCamera            │──────►│  IMFMediaSource → IMFMediaStream │
-│                              │  shm  │     ↑                            │
-│  MFCreateVirtualCamera       │       │  reads Global\VulVATAR_          │
-│  registers source CLSID and  │       │  VirtualCamera on each           │
-│  starts the virtual camera   │       │  RequestSample                   │
+│  Win32FileBackedSharedMemory │       │  via HKLM InprocServer32         │
+│     writes header + pixels   │       │     ↓                            │
+│     to camera_frame_buffer   │──────►│  IMFMediaSource → IMFMediaStream │
+│     .bin                     │  file │     ↑                            │
+│  MFCreateVirtualCamera       │       │  reads camera_frame_buffer.bin   │
+│  registers source CLSID and  │       │  through file-backed mapping     │
+│  starts the virtual camera   │       │  on each RequestSample           │
 └──────────────────────────────┘       └──────────────────────────────────┘
                                                       ↑
                                                   FsProxy
@@ -43,9 +43,11 @@ Two processes, one OS service in the middle.
                                           Google Meet / Chrome / Teams
 ```
 
-- Renderer produces RGBA frames; `Win32NamedSharedMemorySink` writes a
-  32-byte header + pixel data into a `Global\VulVATAR_VirtualCamera`
-  file mapping (SDDL grants `LocalService` read).
+- Renderer produces RGBA frames; `Win32FileBackedSharedMemorySink`
+  writes a 32-byte header + pixel data into
+  `%ProgramData%\VulVATAR\camera_frame_buffer.bin` and creates an
+  unnamed file-backed `CreateFileMappingW` over the file. Inherited
+  ACL grants `LocalService:(RX)` so svchost can map and read it.
 - `MFCreateVirtualCamera` tells Windows to register our CLSID as a
   camera under `SWD\VCAMDEVAPI\{hash}`.
 - When a client enumerates cameras and calls `ActivateObject`, Frame
@@ -319,7 +321,9 @@ resolves it via HKLM when a client activates the device.
    - Copy the new DLL to `Program Files` under a fresh timestamp
    - `icacls` grant `LocalService:(RX)` + verify the grant landed
    - Create `%ProgramData%\VulVATAR\` and grant inherited
-     `LocalService:(OI)(CI)(RX)` for the frame-buffer discovery file
+     `LocalService:(OI)(CI)(RX)` so the frame-buffer file
+     (`camera_frame_buffer.bin`) the producer creates inside
+     automatically gets read access for FrameServer's svchost
    - Remove any legacy HKCU registration
    - Write HKLM `CLSID` + `InprocServer32` + `ThreadingModel=Both`
    - **Stop and restart the `FrameServer` service** — svchost pins a
@@ -472,7 +476,7 @@ For headless repro or quick install-and-test cycles:
 | `vulvatar-mf-camera/src/shared_memory.rs` | Shared-memory reader (DLL side). |
 | `vulvatar-mf-camera/src/registry.rs` | `DllRegisterServer` per-user path (unused in the shipped Program-Files install). |
 | `vulvatar-mf-camera/src/trace.rs` | File-based tracing to `C:\Users\Public\`. |
-| `src/output/frame_sink.rs` | `Win32NamedSharedMemorySink` (host writer side). |
+| `src/output/frame_sink.rs` | `Win32FileBackedSharedMemorySink` (host writer side, file-backed mapping for VirtualCamera). |
 | `src/output/mf_virtual_camera.rs` | `MFCreateVirtualCamera` wrapper, HKLM self-registration. |
 | `src/bin/mfenum.rs` | Diagnostic tool (enumerate + direct probe + FS-mediated ReadSample). |
 | `dev.ps1` | `Install-MfCameraSystem` — build, copy, ACL, HKLM, FrameServer restart. |
