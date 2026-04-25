@@ -9,17 +9,14 @@
 
 ## Status
 
-**IMPLEMENTED**
+This is the project's standing backlog of "nice to have" extensions.
+Most application-level and library items have landed; remaining work
+clusters around webcam tracking, renderer color management, and a few
+cloth-authoring polish items that each need their own design pass
+before implementation. Mark items completed as they ship, with a
+short note pointing at the relevant code.
 
-Hotkey system (`src/gui/hotkey.rs`) wired into the update loop with 9 default bindings:
-TogglePause (Space), ToggleTracking (Ctrl+T), ToggleCloth (Ctrl+C), ResetPose (Ctrl+Shift+R),
-ResetCamera (Home), SwitchModePreview (F5), SwitchModeAuthoring (F6), SaveProject (Ctrl+S),
-LoadAvatar (Ctrl+O).
-
-Profile system (`src/gui/profile.rs`) with 3 presets (Streaming, Recording, Performance)
-and a profile selector dropdown in the top bar that live-applies tracking/rendering/output
-settings to the GUI state.
-Remaining items below are still deferred.
+Legend: `[x]` done, `[~]` partial, `[ ]` not started.
 
 ## Items
 
@@ -55,9 +52,9 @@ Remaining items below are still deferred.
 
 ### Webcam Tracking
 
-- [ ] **Hand tracking** — finger-level tracking from webcam
-- [ ] **Lower-body tracking** — legs and feet from webcam (if supported by CV stack)
-- [ ] **GPU inference backend** — run inference on GPU instead of CPU
+- [~] **Hand tracking** — inference plumbing landed: `CigPoseInference::from_models_dir` auto-picks the best CIGPose ONNX in `models/`, an optional YOLOX person crop (`YoloxDetector`) bounds the inference region, and the `cigpose-x_coco-ubody_384x288` model exposes hand keypoints. **Still TODO**: map decoded hand keypoints to humanoid finger bones in the retargeting layer so the avatar's fingers actually move.
+- [ ] **Lower-body tracking** — `cigpose-x_coco-ubody_*` is upper-body-only by construction, so this requires either a different CIGPose variant (e.g. `*_coco-wholebody`) or a separate lower-body model. Defer until hand tracking retargeting lands and we know which model we want long-term.
+- [ ] **GPU inference backend** — `ort` builds against CPU EP today. Switching to DirectML / CUDA needs an `ExecutionProvider` choice in `Session::builder()`, a runtime fallback when the GPU EP fails to create, and a build flag to gate the backend so headless CI keeps passing without GPU drivers.
 
 ### Model Library
 
@@ -70,5 +67,9 @@ Remaining items below are still deferred.
 
 ## Notes
 
-These items should each get their own TODO file when promoted to active work.
-Priority and phase should be re-evaluated at that time.
+This file is the project's only active backlog (older T01–T11 plans
+were retired once their work shipped — see git history for that
+context). Promote an item to its own dedicated plan file only when
+the work needs cross-session design discussion (e.g. partial
+rebinding, offline bake), or when the implementation is large enough
+that a single git commit message wouldn't capture the design.
