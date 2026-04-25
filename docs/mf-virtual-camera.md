@@ -16,8 +16,6 @@ Related documents:
 - [architecture.md](./architecture.md) — process-level overview
 - [output-interop.md](./output-interop.md) — sink abstraction
 - [threading-model.md](./threading-model.md) — GUI / render / worker threads
-- [mf-virtual-camera-handover.md](./mf-virtual-camera-handover.md) —
-  historical debugging log (superseded by this document)
 
 ## Architecture
 
