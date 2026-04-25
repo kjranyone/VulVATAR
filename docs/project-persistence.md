@@ -147,6 +147,36 @@ Every persisted file type should include:
 
 Do not rely on implicit schema compatibility.
 
+### Current schema versions
+
+| File              | Constant in `src/persistence.rs` | Current value |
+|-------------------|----------------------------------|---------------|
+| `.vvtproj`        | `PROJECT_FORMAT_VERSION`         | 1             |
+| `.vvtcloth`       | `OVERLAY_FORMAT_VERSION`         | 1             |
+| `.vvtlib`         | `LIBRARY_FORMAT_VERSION`         | 1             |
+| recovery snapshot | `RECOVERY_FORMAT_VERSION`        | 1             |
+
+Bumping any of these requires registering a migrator in the matching
+`step_*` function so old saves load cleanly.
+
+### Load-side migration framework
+
+`load_project` and `load_cloth_overlay` both:
+
+1. Parse the file as `serde_json::Value` first.
+2. Read `format_version` (defaults to `0` when the field is missing).
+3. Reject files newer than the current build's constant with a clear
+   "saved by a newer VulVATAR" error, rather than silently dropping
+   unknown fields.
+4. For older files, walk the migration chain `step_overlay` /
+   `step_project` one version at a time until the JSON matches the
+   current schema, then deserialise into the typed struct.
+
+No actual migrators exist yet — every released file is at v1 — but the
+plumbing is in place and unit-tested (see `persistence::tests`). When
+a v2 lands, register the v1 → v2 transformation in the relevant
+`step_*` match arm and bump the `*_FORMAT_VERSION` constant.
+
 ## Reload Validation
 
 On project load, the application should validate:

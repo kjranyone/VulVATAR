@@ -220,15 +220,94 @@ pub struct ClothOverlayFile {
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Currently-shipping schema version for `.vvtproj` project files. Bump
+/// whenever a non-additive change lands and add a migrator entry to
+/// [`migrate_project_json`].
+pub const PROJECT_FORMAT_VERSION: u32 = 1;
+
+/// Currently-shipping schema version for `.vvtcloth` overlay files.
+/// Bump whenever a non-additive change lands and add a migrator entry
+/// to [`migrate_cloth_overlay_json`].
+pub const OVERLAY_FORMAT_VERSION: u32 = 1;
+
+/// Currently-shipping schema version for `.vvtlib` avatar-library files.
+pub const LIBRARY_FORMAT_VERSION: u32 = 1;
+
+/// Currently-shipping schema version for the autosave recovery snapshot.
+pub const RECOVERY_FORMAT_VERSION: u32 = 1;
+
 fn app_tag() -> String {
     format!("VulVATAR {}", APP_VERSION)
+}
+
+/// Walk a JSON document up the cloth-overlay version chain until it
+/// matches [`OVERLAY_FORMAT_VERSION`]. Each iteration looks up the
+/// migrator for `(version → version + 1)` and bumps the counter.
+///
+/// No migrators exist yet — every released file is already at v1. When
+/// a v2 lands, register its migrator in the match below; the chain
+/// then handles `v0 → v1 → v2` automatically.
+fn migrate_cloth_overlay_json(
+    json: serde_json::Value,
+    from_version: u32,
+) -> Result<serde_json::Value, String> {
+    let mut current = json;
+    let mut version = from_version;
+    while version < OVERLAY_FORMAT_VERSION {
+        current = step_overlay(current, version)?;
+        version += 1;
+    }
+    Ok(current)
+}
+
+fn step_overlay(_json: serde_json::Value, version: u32) -> Result<serde_json::Value, String> {
+    match version {
+        // Future migrators land here:
+        //   1 => v1_to_v2(json),
+        v => Err(format!(
+            "no migrator registered for cloth overlay v{} → v{}",
+            v,
+            v + 1
+        )),
+    }
+}
+
+/// See [`migrate_cloth_overlay_json`]. Same shape for project files.
+fn migrate_project_json(
+    json: serde_json::Value,
+    from_version: u32,
+) -> Result<serde_json::Value, String> {
+    let mut current = json;
+    let mut version = from_version;
+    while version < PROJECT_FORMAT_VERSION {
+        current = step_project(current, version)?;
+        version += 1;
+    }
+    Ok(current)
+}
+
+fn step_project(_json: serde_json::Value, version: u32) -> Result<serde_json::Value, String> {
+    match version {
+        v => Err(format!(
+            "no migrator registered for project v{} → v{}",
+            v,
+            v + 1
+        )),
+    }
+}
+
+fn read_format_version(json: &serde_json::Value) -> u32 {
+    json.get("format_version")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(0)
 }
 
 impl ProjectFile {
     /// Snapshot the current project state into a serializable project file.
     pub fn from_state(state: &ProjectState) -> Self {
         Self {
-            format_version: 1,
+            format_version: PROJECT_FORMAT_VERSION,
             created_with: app_tag(),
             last_saved_with: app_tag(),
 
@@ -371,18 +450,42 @@ pub fn save_project(state: &ProjectState, path: &Path) -> Result<(), String> {
 /// Load a project file from disk and return the deserialized state plus
 /// validation warnings. The caller is responsible for applying the returned
 /// `ProjectState` to its own structures (e.g. `GuiApp`).
+///
+/// Two-stage parse mirrors [`load_cloth_overlay`]: inspect
+/// `format_version` first, run migrations for older files, then
+/// deserialize. Newer-than-supported files are rejected.
 pub fn load_project(path: &Path) -> Result<(ProjectState, ProjectLoadWarnings), String> {
     let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let project: ProjectFile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let json: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("parse project JSON: {}", e))?;
 
-    let mut warnings = ProjectLoadWarnings::default();
-
-    if project.format_version != 1 {
-        warnings.warnings.push(format!(
-            "unsupported format_version {}, expected 1",
-            project.format_version
+    let from_version = read_format_version(&json);
+    if from_version > PROJECT_FORMAT_VERSION {
+        return Err(format!(
+            "project '{}' was saved by a newer VulVATAR \
+             (format_version {}); this build only supports up to v{}",
+            path.display(),
+            from_version,
+            PROJECT_FORMAT_VERSION
         ));
     }
+
+    let json = if from_version < PROJECT_FORMAT_VERSION {
+        info!(
+            "persistence: migrating project '{}' from v{} to v{}",
+            path.display(),
+            from_version,
+            PROJECT_FORMAT_VERSION
+        );
+        migrate_project_json(json, from_version)?
+    } else {
+        json
+    };
+
+    let project: ProjectFile = serde_json::from_value(json)
+        .map_err(|e| format!("decode project (post-migration): {}", e))?;
+
+    let mut warnings = ProjectLoadWarnings::default();
     if let Some(ref p) = project.avatar_source_path {
         if p.trim().is_empty() {
             warnings.warnings.push(
@@ -402,9 +505,42 @@ pub fn load_project(path: &Path) -> Result<(ProjectState, ProjectLoadWarnings), 
 }
 
 /// Read a cloth overlay file from disk, deserializing the full ClothAsset data if present.
+///
+/// Two-stage parse: first as `serde_json::Value` so we can inspect
+/// `format_version` and run migrations for older files; then into the
+/// typed `ClothOverlayFile`. Files saved by a *newer* build of VulVATAR
+/// (format_version > [`OVERLAY_FORMAT_VERSION`]) are rejected with a
+/// clear error rather than silently dropping unknown fields.
 pub fn load_cloth_overlay(path: &Path) -> Result<ClothOverlayFile, String> {
     let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let overlay: ClothOverlayFile = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let json: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("parse cloth overlay JSON: {}", e))?;
+
+    let from_version = read_format_version(&json);
+    if from_version > OVERLAY_FORMAT_VERSION {
+        return Err(format!(
+            "cloth overlay '{}' was saved by a newer VulVATAR \
+             (format_version {}); this build only supports up to v{}",
+            path.display(),
+            from_version,
+            OVERLAY_FORMAT_VERSION
+        ));
+    }
+
+    let json = if from_version < OVERLAY_FORMAT_VERSION {
+        info!(
+            "persistence: migrating cloth overlay '{}' from v{} to v{}",
+            path.display(),
+            from_version,
+            OVERLAY_FORMAT_VERSION
+        );
+        migrate_cloth_overlay_json(json, from_version)?
+    } else {
+        json
+    };
+
+    let overlay: ClothOverlayFile = serde_json::from_value(json)
+        .map_err(|e| format!("decode cloth overlay (post-migration): {}", e))?;
     info!(
         "persistence: loaded cloth overlay '{}' from {} (has cloth_asset: {})",
         overlay.overlay_name,
@@ -569,7 +705,7 @@ pub fn save_avatar_library(
         None
     };
     let mut file = AvatarLibraryFile {
-        format_version: 1,
+        format_version: LIBRARY_FORMAT_VERSION,
         created_with: app_tag(),
         last_saved_with: app_tag(),
         library: library.clone(),
@@ -789,7 +925,7 @@ impl RecoveryManager {
             .as_secs();
 
         let snapshot = RecoverySnapshot {
-            format_version: 1,
+            format_version: RECOVERY_FORMAT_VERSION,
             created_with: app_tag(),
             timestamp_secs: now,
             project: project_state.map(ProjectFile::from_state),
@@ -844,25 +980,25 @@ impl RecoveryManager {
 }
 
 pub fn validate_recovery(snapshot: &RecoverySnapshot) -> Result<(), String> {
-    if snapshot.format_version != 1 {
+    if snapshot.format_version != RECOVERY_FORMAT_VERSION {
         return Err(format!(
-            "unsupported recovery format_version {}",
-            snapshot.format_version
+            "unsupported recovery format_version {} (expected {})",
+            snapshot.format_version, RECOVERY_FORMAT_VERSION
         ));
     }
     if let Some(ref project) = snapshot.project {
-        if project.format_version != 1 {
+        if project.format_version != PROJECT_FORMAT_VERSION {
             return Err(format!(
-                "unsupported project format_version {} in recovery",
-                project.format_version
+                "unsupported project format_version {} in recovery (expected {})",
+                project.format_version, PROJECT_FORMAT_VERSION
             ));
         }
     }
     if let Some(ref overlay) = snapshot.overlay {
-        if overlay.format_version != 1 {
+        if overlay.format_version != OVERLAY_FORMAT_VERSION {
             return Err(format!(
-                "unsupported overlay format_version {} in recovery",
-                overlay.format_version
+                "unsupported overlay format_version {} in recovery (expected {})",
+                overlay.format_version, OVERLAY_FORMAT_VERSION
             ));
         }
     }
@@ -964,4 +1100,109 @@ pub fn save_scene_presets(presets: &[ScenePreset]) -> Result<(), String> {
     atomic_write(&path, &json)?;
     info!("persistence: saved {} scene presets", presets.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn read_format_version_defaults_to_zero_when_missing() {
+        let no_field = json!({"foo": "bar"});
+        assert_eq!(read_format_version(&no_field), 0);
+    }
+
+    #[test]
+    fn read_format_version_picks_up_field() {
+        let with_field = json!({"format_version": 7});
+        assert_eq!(read_format_version(&with_field), 7);
+    }
+
+    #[test]
+    fn migrate_cloth_overlay_at_current_version_is_passthrough() {
+        let original = json!({"format_version": OVERLAY_FORMAT_VERSION, "overlay_name": "x"});
+        let migrated =
+            migrate_cloth_overlay_json(original.clone(), OVERLAY_FORMAT_VERSION).unwrap();
+        assert_eq!(migrated, original);
+    }
+
+    #[test]
+    fn migrate_cloth_overlay_from_v0_surfaces_missing_migrator() {
+        // No v0 → v1 migrator is currently registered. This test documents
+        // the framework's failure mode: we want a clear error rather than
+        // a silent accept, and we want the chain to fire on a real older
+        // version. When a v2 lands, this test will need to be updated to
+        // use whatever the *new* "below current" version is.
+        let original = json!({"overlay_name": "x"});
+        let err = migrate_cloth_overlay_json(original, 0)
+            .expect_err("expected error from un-migratable v0");
+        assert!(
+            err.contains("no migrator"),
+            "expected 'no migrator' message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_cloth_overlay_rejects_future_version() {
+        let dir = std::env::temp_dir().join("vulvatar_overlay_future_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("future.vvtcloth");
+        let body = json!({
+            "format_version": OVERLAY_FORMAT_VERSION + 99,
+            "created_with": "test",
+            "last_saved_with": "test",
+            "overlay_name": "future",
+            "target_avatar_path": null,
+            "cloth_asset": null,
+        });
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        let err = load_cloth_overlay(&path).expect_err("future version should be rejected");
+        assert!(
+            err.contains("newer VulVATAR"),
+            "expected 'newer VulVATAR' message, got: {}",
+            err
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_cloth_overlay_at_current_version_round_trips() {
+        let dir = std::env::temp_dir().join("vulvatar_overlay_current_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("current.vvtcloth");
+        let body = json!({
+            "format_version": OVERLAY_FORMAT_VERSION,
+            "created_with": "test",
+            "last_saved_with": "test",
+            "overlay_name": "current",
+            "target_avatar_path": null,
+            "cloth_asset": null,
+        });
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        let overlay = load_cloth_overlay(&path).expect("v1 should load directly");
+        assert_eq!(overlay.overlay_name, "current");
+        assert_eq!(overlay.format_version, OVERLAY_FORMAT_VERSION);
+        assert!(overlay.cloth_asset.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_project_rejects_future_version() {
+        let dir = std::env::temp_dir().join("vulvatar_project_future_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("future.vvtproj");
+        // Minimal future-version body — we only need format_version high
+        // enough to trigger the early reject before deserialisation.
+        let body = json!({"format_version": PROJECT_FORMAT_VERSION + 99});
+        std::fs::write(&path, serde_json::to_string(&body).unwrap()).unwrap();
+        let err = load_project(&path).expect_err("future project should reject");
+        assert!(
+            err.contains("newer VulVATAR"),
+            "expected 'newer VulVATAR' message, got: {}",
+            err
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

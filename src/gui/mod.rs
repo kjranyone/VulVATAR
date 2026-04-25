@@ -1134,7 +1134,7 @@ impl eframe::App for GuiApp {
                     .active_avatar()
                     .map(|a| a.asset.source_path.to_string_lossy().into_owned());
                 Some(crate::persistence::ClothOverlayFile {
-                    format_version: 1,
+                    format_version: crate::persistence::OVERLAY_FORMAT_VERSION,
                     created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
                     last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
                     overlay_name,

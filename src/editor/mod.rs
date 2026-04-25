@@ -77,7 +77,7 @@ impl EditorSession {
             .map(|a| a.source_path.to_string_lossy().into_owned());
 
         let file = ClothOverlayFile {
-            format_version: 1,
+            format_version: crate::persistence::OVERLAY_FORMAT_VERSION,
             created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
             last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
             overlay_name,
