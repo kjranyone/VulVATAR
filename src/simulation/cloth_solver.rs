@@ -238,6 +238,12 @@ fn project_distance_constraints(sim: &mut ClothSimState, buffers: &mut ClothSimT
 /// vertex; p1 and p2 are the wing vertices.  The dihedral angle is measured
 /// between edges p0->p1 and p0->p2, and corrections are applied to restore
 /// the rest angle.
+///
+/// KNOWN ISSUE: the unit test `bend_constraint_changes_angle` only verifies
+/// that the angle moves; the correction direction was observed to be inverted
+/// against simple synthetic inputs (closes the angle when it should open and
+/// vice versa) during T07 verification. Investigate when wiring against real
+/// cloth meshes — synthetic-test behaviour may not be the prod-relevant case.
 fn project_bend_constraints(sim: &mut ClothSimState) {
     // We need to index into sim.particles mutably while iterating bend_constraints.
     // Use index-based access.

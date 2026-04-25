@@ -45,6 +45,13 @@ Remaining items below are still deferred.
 
 - [x] **Image background** — load image as viewport background (RenderFrameInput.background_image_path)
 - [x] **Ground alignment helper** — snap avatar to ground plane (Application::snap_avatar_to_ground)
+- [ ] **Output color space (sRGB / Linear sRGB)** — GUI → app wiring is trivial,
+  but `src/renderer/output_export.rs` hardcodes `color_space: "srgb"`. A real
+  switch needs render-target format selection, MToon shader output gamma
+  branching, and MF sample `MF_MT_VIDEO_PRIMARIES` / `MF_MT_TRANSFER_FUNCTION`
+  attributes — i.e. an end-to-end renderer color-management pass, not a single
+  combo wire-up. Originally tracked as T11 phase B-5 and deferred there as
+  out-of-scope for that task.
 
 ### Webcam Tracking
 
