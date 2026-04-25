@@ -206,8 +206,58 @@ expect as the default for a software camera.
 
 ## Shared memory ABI
 
-`Global\VulVATAR_VirtualCamera`, little-endian, 32-byte header
-followed by RGBA pixels:
+**Backing.** Producer and consumer share frames through a **file-backed
+memory mapping**:
+
+```
+%ProgramData%\VulVATAR\camera_frame_buffer.bin
+```
+
+Both processes open the file by path with FILE_SHARE_READ |
+FILE_SHARE_WRITE | FILE_SHARE_DELETE, then call
+`CreateFileMappingW(file_handle, ...)` with no kernel-namespace name.
+The kernel detects that two mappings are backed by the same file region
+and shares the underlying physical pages between them. Cross-session
+data flow happens at the file system level — not the kernel object
+namespace — even though FrameServer's svchost (Session 0,
+`NT AUTHORITY\LocalService`) and the producer (Session 1+, interactive
+user) live in different sessions.
+
+**Why not a `Global\` named section.** That was the obvious approach
+and it does not work for non-elevated developer flows. A normal
+interactive user under UAC does *not* hold `SeCreateGlobalPrivilege` in
+their filtered token, so any `CreateFileMappingW` with a `Global\<name>`
+prefix returns `ERROR_ACCESS_DENIED (5)` regardless of
+SECURITY_ATTRIBUTES, integrity label, or name uniqueness — verified
+empirically:
+
+| Backing | Name | Result |
+|---|---|---|
+| pagefile | `Global\fresh_uuid` | FAIL ERROR_ACCESS_DENIED |
+| pagefile | `Local\fresh_uuid` | OK |
+| pagefile | (anonymous) | OK |
+| **file** | (anonymous) | **OK** ← used here |
+| file | `Global\fresh_uuid` | FAIL ERROR_ACCESS_DENIED |
+
+`Local\` would work but is per-session, so svchost in Session 0 can't
+see it. The remaining viable choice is a file-backed unnamed mapping.
+Microsoft documents this explicitly: a `Global\` create from a
+non-Session-0 process without `SeCreateGlobalPrivilege` returns
+`ERROR_ACCESS_DENIED`.
+
+**File ACL.** `dev.ps1` option 7 creates the directory and grants
+`NT AUTHORITY\LocalService:(OI)(CI)(RX)`. Inheritance ensures the
+producer's `frame_buffer.bin` picks up the LocalService grant
+automatically — no per-file icacls step needed.
+
+**Cache behaviour.** The producer opens the file with
+`FILE_ATTRIBUTE_TEMPORARY` so the cache manager keeps dirty pages in
+RAM. With frame data overwritten 60 times per second, almost nothing
+ever reaches disk; the file is functionally a RAM-resident IPC
+buffer with a path.
+
+**Wire format** (little-endian, 32-byte header followed by RGBA
+pixels):
 
 ```
 offset 0   u32  magic      = 0x5643_4D46  ("FMCV")
@@ -219,30 +269,10 @@ offset 28  u32  flags      (bit 0 = PRESERVE_ALPHA; NV12 ignores)
 offset 32  ...  width * height * 4 RGBA bytes
 ```
 
-### Security descriptor
-
-`CreateFileMappingW` is called with a SECURITY_ATTRIBUTES carrying the
-SDDL:
-
-```
-D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GR;;;LS)
-```
-
-- `SY` System / `BA` Builtin Admins / `IU` Interactive Users → Generic All
-- `LS` Local Service → Generic Read
-
-FrameServer's svchost runs as `LocalService` and only needs read
-access. Without the explicit grant, the default DACL excludes
-`LocalService` and svchost cannot `OpenFileMappingW` the producer-
-created object.
-
-### `Global\` vs `Local\` namespace
-
-The object must live in the `Global\` namespace so FrameServer
-(different session than the interactive user) can see it. Creating
-`Global\` objects requires the `SeCreateGlobalPrivilege`, which
-interactive user tokens carry by default; a Session-0 service would
-not have it (doesn't apply to us).
+The producer extends the file via `set_len` whenever the configured
+output resolution requires more bytes than the current file size. The
+consumer detects extension by polling `metadata().len()` on each
+`ensure_mapping` call and remaps if the file has grown.
 
 ## Registration + install
 
@@ -281,15 +311,21 @@ resolves it via HKLM when a client activates the device.
 
 `Install-MfCameraSystem` does, in order:
 
-1. `cargo build -p vulvatar-mf-camera` (with `-C target-feature=+crt-static`)
-2. Copy the new DLL to `Program Files` under a fresh timestamp
-3. `icacls` grant `LocalService:(RX)` + verify the grant landed
-4. Remove any legacy HKCU registration
-5. Write HKLM `CLSID` + `InprocServer32` + `ThreadingModel=Both`
-6. **Stop and restart the `FrameServer` service** — svchost pins a
-   DLL's `IClassFactory` for its lifetime, so a fresh HKLM
-   registration alone leaves Meet/Chrome consuming the previously-
-   loaded DLL until the next reboot.
+1. `Build-MfCameraDll` — `cargo build -p vulvatar-mf-camera` in the
+   non-elevated caller shell (keeps `target/` out of Admin ownership)
+2. If the caller isn't elevated: `Start-Process -Verb RunAs` launches
+   a new PowerShell with `-RegisterMfCamera`, prompting for UAC once.
+3. In the elevated shell, `Register-MfCameraSystem` runs:
+   - Copy the new DLL to `Program Files` under a fresh timestamp
+   - `icacls` grant `LocalService:(RX)` + verify the grant landed
+   - Create `%ProgramData%\VulVATAR\` and grant inherited
+     `LocalService:(OI)(CI)(RX)` for the frame-buffer discovery file
+   - Remove any legacy HKCU registration
+   - Write HKLM `CLSID` + `InprocServer32` + `ThreadingModel=Both`
+   - **Stop and restart the `FrameServer` service** — svchost pins a
+     DLL's `IClassFactory` for its lifetime, so a fresh HKLM
+     registration alone leaves Meet/Chrome consuming the previously-
+     loaded DLL until the next reboot.
 
 ### Host-side registration
 

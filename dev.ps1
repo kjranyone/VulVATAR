@@ -1,5 +1,6 @@
 param(
-    [int]$Select = 0
+    [int]$Select = 0,
+    [switch]$RegisterMfCamera
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,11 +39,7 @@ function Test-Admin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Install-MfCameraSystem {
-    if (!(Test-Admin)) {
-        throw "HKLM virtual camera registration requires an elevated PowerShell. Run this menu as Administrator, then select this command once."
-    }
-
+function Build-MfCameraDll {
     Write-Host "Building MediaFoundation virtual camera DLL..." -ForegroundColor Cyan
     $oldRustFlags = $env:RUSTFLAGS
     try {
@@ -52,12 +49,25 @@ function Install-MfCameraSystem {
             $env:RUSTFLAGS = "$oldRustFlags -C target-feature=+crt-static"
         }
         cargo build -p vulvatar-mf-camera
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build -p vulvatar-mf-camera failed (exit $LASTEXITCODE)"
+        }
     } finally {
         if ($null -eq $oldRustFlags) {
             Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
         } else {
             $env:RUSTFLAGS = $oldRustFlags
         }
+    }
+}
+
+# Split from Install-MfCameraSystem so the HKLM/icacls/FrameServer work
+# can run in a separate elevated PowerShell without re-running cargo
+# build as Admin (which would leave target/ files owned by Admin and
+# break subsequent non-elevated cargo invocations).
+function Register-MfCameraSystem {
+    if (!(Test-Admin)) {
+        throw "Register-MfCameraSystem must be invoked from an elevated PowerShell."
     }
 
     $clsid = "{B5F1C320-2B8F-4A9C-9BDC-43B0E8E6B2E1}"
@@ -94,6 +104,23 @@ function Install-MfCameraSystem {
         throw "icacls reported success but the LOCAL SERVICE grant is not visible on $target.`nicacls output:`n$verify"
     }
     Write-Host "LOCAL SERVICE grant confirmed." -ForegroundColor Green
+
+    # Frame-buffer directory. vulvatar.exe (Medium-integrity, no
+    # SeCreateGlobalPrivilege under UAC filtering) cannot create
+    # `Global\` named sections, so the producer / consumer instead
+    # share frames through a file-backed mapping at
+    #   $env:ProgramData\VulVATAR\camera_frame_buffer.bin
+    # Inherited LocalService:(RX) on the directory means whatever file
+    # vulvatar.exe creates inside automatically inherits read access
+    # for the MF camera DLL hosted in FrameServer's svchost.
+    $bufferDir = Join-Path $env:ProgramData "VulVATAR"
+    Write-Host "Setting up frame-buffer dir: $bufferDir" -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force -Path $bufferDir | Out-Null
+    $aclDirOutput = icacls.exe $bufferDir /grant 'NT AUTHORITY\LocalService:(OI)(CI)(RX)' 2>&1 | Out-String
+    Write-Host $aclDirOutput.TrimEnd() -ForegroundColor DarkGray
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls grant LocalService on $bufferDir failed (exit $LASTEXITCODE). MF camera DLL will not be able to read the frame buffer."
+    }
 
     $key = "HKLM:\Software\Classes\CLSID\$clsid"
     $inproc = Join-Path $key "InprocServer32"
@@ -134,6 +161,46 @@ function Install-MfCameraSystem {
     }
 
     Write-Host "You can now run VulVATAR without elevation until you rebuild/reinstall this DLL." -ForegroundColor DarkGray
+}
+
+function Install-MfCameraSystem {
+    # Always build in the caller's (non-elevated) shell so target/ stays
+    # owned by the developer. Only the registration step needs Admin.
+    Build-MfCameraDll
+
+    if (Test-Admin) {
+        Register-MfCameraSystem
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Registration step requires Administrator privileges." -ForegroundColor Yellow
+    Write-Host "A UAC prompt will appear; accept it to continue." -ForegroundColor Yellow
+
+    $scriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        throw "Cannot determine script path for elevation — run dev.ps1 from its file path, not dot-sourced."
+    }
+    $workDir = (Get-Location).Path
+    $escapedScript = $scriptPath.Replace("'", "''")
+    $escapedWork = $workDir.Replace("'", "''")
+    # -NoExit keeps the elevated window open so the user can read icacls
+    # / FrameServer output and any errors. They close it manually.
+    $inner = "Set-Location -LiteralPath '$escapedWork'; & '$escapedScript' -RegisterMfCamera"
+    try {
+        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-NoExit",
+            "-Command", $inner
+        ) -ErrorAction Stop | Out-Null
+    } catch {
+        throw "Failed to launch elevated registration: $($_.Exception.Message). If you cancelled the UAC prompt, re-run this menu entry and accept it."
+    }
+
+    Write-Host ""
+    Write-Host "An elevated PowerShell window is now running the registration step." -ForegroundColor Green
+    Write-Host "Check that window for icacls / HKLM / FrameServer output; close it when done." -ForegroundColor DarkGray
 }
 
 function Uninstall-MfCamera {
@@ -200,6 +267,13 @@ function Invoke-DevCommand {
     Write-Host "> $cmd" -ForegroundColor Yellow
     Write-Host ""
     Invoke-Expression $cmd
+}
+
+if ($RegisterMfCamera) {
+    # Entry point used by the elevated PowerShell spawned from
+    # Install-MfCameraSystem when the outer menu was not running as Admin.
+    Register-MfCameraSystem
+    return
 }
 
 if ($Select -ne 0) {

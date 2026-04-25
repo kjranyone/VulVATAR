@@ -624,7 +624,11 @@ mod win32_shmem {
     use super::{AlphaMode, OutputFrame, OutputSinkWriter};
     use log::{debug, info};
     use std::ffi::{c_void, OsStr};
+    use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
     use std::ptr;
 
     const PAGE_READWRITE: u32 = 0x04;
@@ -780,6 +784,9 @@ mod win32_shmem {
         fn new() -> Result<Self, String> {
             // Interactive users write the frames; FrameServer runs as
             // LocalService and only needs read access to consume them.
+            // (Used by the SharedMemory sink only — VirtualCamera now
+            // uses Win32FileBackedSharedMemorySink to sidestep the
+            // SeCreateGlobalPrivilege gate on `Global\` named sections.)
             let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GR;;;LS)";
             let wide: Vec<u16> = OsStr::new(sddl)
                 .encode_wide()
@@ -911,10 +918,255 @@ mod win32_shmem {
             unsafe { self.unmap() };
         }
     }
+
+    // -----------------------------------------------------------------
+    // Win32FileBackedSharedMemorySink
+    //
+    // A file-backed mapping bypasses the `Global\` namespace entirely:
+    // both producer (this sink) and consumer (the MF virtual camera DLL
+    // hosted in svchost / LocalService) open the same file by path and
+    // create unnamed mappings of it. The kernel shares the underlying
+    // physical pages between the two mappings — verified empirically:
+    //   producer wrote 0xDEADBEEF → consumer read 0xDEADBEEF
+    //   producer wrote 0xCAFEBABE → consumer read 0xCAFEBABE (live)
+    //
+    // Why this matters: a non-elevated interactive token under UAC
+    // filtering does NOT carry SeCreateGlobalPrivilege, so any
+    // `CreateFileMappingW(... "Global\\X")` from such a process fails
+    // with ERROR_ACCESS_DENIED regardless of SECURITY_ATTRIBUTES or
+    // name uniqueness. File-backed mappings do not consult that
+    // privilege because they're not creating a named kernel object.
+    //
+    // The file lives at `%ProgramData%\VulVATAR\camera_frame_buffer.bin`,
+    // which `dev.ps1` option 7 sets up with inherited
+    // `NT AUTHORITY\LocalService:(RX)` so svchost can read it.
+    //
+    // Cache behaviour: the file is opened with FILE_ATTRIBUTE_TEMPORARY
+    // so the cache manager keeps the dirty pages in RAM and doesn't
+    // bother flushing to disk for transient frame data overwritten at
+    // 60 Hz.
+    // -----------------------------------------------------------------
+
+    const FILE_SHARE_RW: u32 = 0x1 | 0x2; // FILE_SHARE_READ | FILE_SHARE_WRITE
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+
+    pub fn virtual_camera_file_path() -> PathBuf {
+        let dir = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        dir.join("VulVATAR").join("camera_frame_buffer.bin")
+    }
+
+    pub struct Win32FileBackedSharedMemorySink {
+        file: Option<File>,
+        mapping_handle: isize,
+        view: *mut c_void,
+        file_path: PathBuf,
+        mapped_size: usize,
+        sequence: u64,
+        logged_first_write: bool,
+    }
+
+    unsafe impl Send for Win32FileBackedSharedMemorySink {}
+
+    impl Win32FileBackedSharedMemorySink {
+        pub fn new(file_path: PathBuf) -> Self {
+            Self {
+                file: None,
+                mapping_handle: 0,
+                view: ptr::null_mut(),
+                file_path,
+                mapped_size: 0,
+                sequence: 0,
+                logged_first_write: false,
+            }
+        }
+
+        fn open_file(path: &Path) -> std::io::Result<File> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .share_mode(FILE_SHARE_RW)
+                .attributes(FILE_ATTRIBUTE_TEMPORARY)
+                .open(path)
+        }
+
+        fn ensure_mapping(&mut self, payload_size: usize) -> Result<(), String> {
+            let total = SHMEM_HEADER_SIZE + payload_size;
+            if total <= self.mapped_size && !self.view.is_null() {
+                return Ok(());
+            }
+
+            unsafe { self.unmap_section() };
+
+            if self.file.is_none() {
+                let f = Self::open_file(&self.file_path).map_err(|e| {
+                    format!(
+                        "Win32FileBackedSink: open '{}' failed: {} \
+                         (run dev.ps1 option 7 once to set up the directory + ACL)",
+                        self.file_path.display(),
+                        e
+                    )
+                })?;
+                self.file = Some(f);
+            }
+
+            let file = self.file.as_ref().unwrap();
+            file.set_len(total as u64).map_err(|e| {
+                format!(
+                    "Win32FileBackedSink: set_len({}) on '{}' failed: {}",
+                    total,
+                    self.file_path.display(),
+                    e
+                )
+            })?;
+
+            let file_handle = file.as_raw_handle() as isize;
+            let handle = unsafe {
+                CreateFileMappingW(
+                    file_handle,
+                    ptr::null_mut(),
+                    PAGE_READWRITE,
+                    (total >> 32) as u32,
+                    total as u32,
+                    ptr::null(),
+                )
+            };
+            if handle == 0 {
+                let err = unsafe { GetLastError() };
+                return Err(format!(
+                    "Win32FileBackedSink: CreateFileMappingW(file='{}', size={}) \
+                     failed (GetLastError={})",
+                    self.file_path.display(),
+                    total,
+                    err
+                ));
+            }
+
+            let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total) };
+            if view.is_null() {
+                let err = unsafe { GetLastError() };
+                unsafe { CloseHandle(handle) };
+                return Err(format!(
+                    "Win32FileBackedSink: MapViewOfFile('{}') failed (GetLastError={})",
+                    self.file_path.display(),
+                    err
+                ));
+            }
+
+            self.mapping_handle = handle;
+            self.view = view;
+            self.mapped_size = total;
+            Ok(())
+        }
+
+        unsafe fn unmap_section(&mut self) {
+            if !self.view.is_null() {
+                unsafe { UnmapViewOfFile(self.view as *const c_void) };
+                self.view = ptr::null_mut();
+            }
+            if self.mapping_handle != 0 {
+                unsafe { CloseHandle(self.mapping_handle) };
+                self.mapping_handle = 0;
+            }
+            self.mapped_size = 0;
+            // Keep `self.file` open: closing it would force the
+            // consumer to reopen on the next frame, which is a waste
+            // when we're just resizing.
+        }
+    }
+
+    impl OutputSinkWriter for Win32FileBackedSharedMemorySink {
+        fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
+            let pixel_data = match &frame.pixel_data {
+                Some(data) => data,
+                None => return Err("Win32FileBackedSink: frame has no pixel data".into()),
+            };
+
+            let width = frame.extent[0];
+            let height = frame.extent[1];
+            let data_len = pixel_data.len();
+
+            self.ensure_mapping(data_len)?;
+
+            let mut flags: u32 = 0;
+            if !matches!(frame.alpha_mode, AlphaMode::Opaque) {
+                flags |= SHMEM_FLAG_PRESERVE_ALPHA;
+            }
+
+            unsafe {
+                let base = self.view as *mut u8;
+
+                let magic = SHMEM_MAGIC.to_le_bytes();
+                ptr::copy_nonoverlapping(magic.as_ptr(), base, 4);
+
+                let w_bytes = width.to_le_bytes();
+                ptr::copy_nonoverlapping(w_bytes.as_ptr(), base.add(4), 4);
+
+                let h_bytes = height.to_le_bytes();
+                ptr::copy_nonoverlapping(h_bytes.as_ptr(), base.add(8), 4);
+
+                let seq_bytes = self.sequence.to_le_bytes();
+                ptr::copy_nonoverlapping(seq_bytes.as_ptr(), base.add(12), 8);
+
+                let ts_bytes = frame.timestamp.to_le_bytes();
+                ptr::copy_nonoverlapping(ts_bytes.as_ptr(), base.add(20), 8);
+
+                let flag_bytes = flags.to_le_bytes();
+                ptr::copy_nonoverlapping(flag_bytes.as_ptr(), base.add(28), 4);
+
+                ptr::copy_nonoverlapping(
+                    pixel_data.as_ptr(),
+                    base.add(SHMEM_HEADER_SIZE),
+                    data_len,
+                );
+            }
+
+            debug!(
+                "Win32FileBackedSink: wrote {} bytes to '{}' (seq={}, {}x{})",
+                data_len,
+                self.file_path.display(),
+                self.sequence,
+                width,
+                height,
+            );
+            if !self.logged_first_write {
+                info!(
+                    "Win32FileBackedSink: first write {} bytes to '{}' (seq={}, {}x{})",
+                    data_len,
+                    self.file_path.display(),
+                    self.sequence,
+                    width,
+                    height,
+                );
+                self.logged_first_write = true;
+            }
+
+            self.sequence += 1;
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "win32-file-backed-shared-memory"
+        }
+    }
+
+    impl Drop for Win32FileBackedSharedMemorySink {
+        fn drop(&mut self) {
+            unsafe { self.unmap_section() };
+            // self.file drops here, closing the file handle.
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
-use win32_shmem::Win32NamedSharedMemorySink;
+use win32_shmem::{
+    virtual_camera_file_path, Win32FileBackedSharedMemorySink, Win32NamedSharedMemorySink,
+};
 
 // ---------------------------------------------------------------------------
 // Factory helper
@@ -936,7 +1188,9 @@ pub fn create_sink_writer(sink: &FrameSink) -> Box<dyn OutputSinkWriter> {
         FrameSink::VirtualCamera => {
             #[cfg(target_os = "windows")]
             {
-                Box::new(Win32NamedSharedMemorySink::new("VulVATAR_VirtualCamera"))
+                Box::new(Win32FileBackedSharedMemorySink::new(
+                    virtual_camera_file_path(),
+                ))
             }
             #[cfg(not(target_os = "windows"))]
             {

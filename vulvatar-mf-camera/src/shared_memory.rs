@@ -1,5 +1,6 @@
-//! Reader for the named shared-memory frame buffer that
-//! `vulvatar::output::frame_sink::Win32NamedSharedMemorySink` writes into.
+//! Reader for the file-backed frame buffer that
+//! `vulvatar::output::frame_sink::Win32FileBackedSharedMemorySink` writes
+//! into.
 //!
 //! Wire format (little-endian, 32-byte header followed by RGBA pixels):
 //! ```text
@@ -8,26 +9,40 @@
 //! offset 8   u32  height
 //! offset 12  u64  sequence  (incremented on every frame)
 //! offset 20  u64  timestamp (frame timestamp; nanoseconds since some epoch)
-//! offset 28  u32  reserved  (padding to 32 bytes)
+//! offset 28  u32  flags     (bit 0 = PRESERVE_ALPHA; NV12 ignores)
 //! offset 32  ...  width * height * 4 RGBA bytes
 //! ```
 //!
-//! The named object lives in the `Global\` namespace so the FrameServer
-//! service process can see what the interactive `vulvatar.exe` writes.
+//! Both producer and consumer open the file at
+//! `%ProgramData%\VulVATAR\camera_frame_buffer.bin` and create unnamed
+//! file-backed mappings of it. The kernel shares the underlying physical
+//! pages between the two mappings even though they're created by
+//! processes in different sessions (interactive user vs LocalService
+//! svchost), so cross-session data flow happens at the file system
+//! level — not the kernel object namespace. This sidesteps the
+//! `SeCreateGlobalPrivilege` gate that blocks `Global\` named sections
+//! from non-elevated interactive tokens under UAC filtering.
 
 use core::sync::atomic::{AtomicI64, Ordering};
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+use std::fs::File;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Memory::{
-    MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
+    PAGE_READONLY,
 };
 
-const SHMEM_NAME: &str = "Global\\VulVATAR_VirtualCamera";
 const SHMEM_HEADER_SIZE: usize = 32;
 const SHMEM_MAGIC: u32 = 0x5643_4D46;
+
+/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE so we never
+/// lock the producer out of writing or rotating the file.
+const FILE_SHARE_RWD: u32 = 0x7;
 
 /// Bit 0 of the producer-written `flags` u32 at header offset 28. When
 /// set, the RGB32 conversion path keeps the source RGBA's alpha byte
@@ -53,14 +68,15 @@ pub struct FrameView {
 
 pub struct SharedMemoryReader {
     state: Mutex<Inner>,
-    /// Last sequence handed back by [`Self::read_if_new`] — exposed as an
-    /// atomic so the hot path doesn't need to lock just to see whether a
-    /// new frame is available. Protected by `state` for writes.
     last_sequence: AtomicI64,
 }
 
 struct Inner {
-    handle: HANDLE,
+    /// Held open for the lifetime of the mapping. Reopened on each
+    /// `ensure_mapping` if it was dropped (producer file disappeared).
+    file: Option<File>,
+    /// CreateFileMappingW handle. Cleared on remap.
+    mapping: HANDLE,
     view: Option<MEMORY_MAPPED_VIEW_ADDRESS>,
     mapped_size: usize,
 }
@@ -71,7 +87,8 @@ impl SharedMemoryReader {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(Inner {
-                handle: HANDLE(core::ptr::null_mut()),
+                file: None,
+                mapping: HANDLE(core::ptr::null_mut()),
                 view: None,
                 mapped_size: 0,
             }),
@@ -80,7 +97,7 @@ impl SharedMemoryReader {
     }
 
     /// Read the latest frame from the shared memory. Returns `None` when
-    /// the producer has not published any frame yet (mapping doesn't
+    /// the producer has not published any frame yet (file doesn't
     /// exist, or magic field still zero).
     pub fn read_latest(&self) -> Option<FrameView> {
         let mut state = self.state.lock().ok()?;
@@ -100,8 +117,8 @@ impl SharedMemoryReader {
             .checked_mul(4)?;
         let total_size = SHMEM_HEADER_SIZE + pixel_bytes;
         if total_size > state.mapped_size {
-            // The producer enlarged the mapping; remap and retry next call.
-            unsafe { unmap(&mut state) };
+            // The producer enlarged the file; remap and retry next call.
+            unsafe { unmap_section(&mut state) };
             return None;
         }
 
@@ -130,7 +147,7 @@ impl SharedMemoryReader {
 impl Drop for SharedMemoryReader {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
-            unsafe { unmap(&mut state) };
+            unsafe { unmap_all(&mut state) };
         }
     }
 }
@@ -166,60 +183,96 @@ unsafe fn read_header(ptr: *const u8) -> Option<Header> {
     })
 }
 
+fn camera_file_path() -> PathBuf {
+    let dir = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    dir.join("VulVATAR").join("camera_frame_buffer.bin")
+}
+
 /// Try to open or grow the mapping. Returns `false` if the producer is
-/// not running (no mapping by that name exists).
+/// not running (file doesn't exist) or if the file is too small to even
+/// contain a header.
 fn ensure_mapping(state: &mut Inner) -> bool {
-    if state.view.is_some() && state.mapped_size >= SHMEM_HEADER_SIZE {
-        return true;
+    if state.file.is_none() {
+        let path = camera_file_path();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_RWD)
+            .open(&path);
+        match f {
+            Ok(f) => state.file = Some(f),
+            Err(_) => return false,
+        }
     }
 
-    unsafe { unmap(state) };
-
-    // Try a generous default-sized view (header + 1920×1080 RGBA). The
-    // producer writes whatever real size the renderer is configured for;
-    // if it's larger we'll re-map on the next call.
-    let initial_size = SHMEM_HEADER_SIZE + 1920 * 1080 * 4;
-    let wide_name: Vec<u16> = OsStr::new(SHMEM_NAME)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let handle = unsafe {
-        OpenFileMappingW(
-            FILE_MAP_READ.0,
-            false,
-            windows::core::PCWSTR(wide_name.as_ptr()),
-        )
+    // Scope the borrow tightly so we can call &mut state methods below.
+    let file_size = match state.file.as_ref().unwrap().metadata() {
+        Ok(m) => m.len() as usize,
+        Err(_) => {
+            // Lost access to the file (deleted underneath us, etc).
+            // Drop everything so the next call starts clean.
+            unsafe { unmap_all(state) };
+            return false;
+        }
     };
-    let handle = match handle {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    if handle.is_invalid() {
+    if file_size < SHMEM_HEADER_SIZE {
         return false;
     }
 
-    let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, initial_size) };
+    // Fast path: existing mapping still covers the current file size.
+    if state.view.is_some() && state.mapped_size >= file_size {
+        return true;
+    }
+
+    unsafe { unmap_section(state) };
+
+    // Re-borrow the file just to grab its raw handle. The HANDLE we
+    // build here doesn't extend the borrow past this statement — it's
+    // an opaque pointer-sized value that the kernel resolves independently.
+    let file_handle = HANDLE(
+        state.file.as_ref().unwrap().as_raw_handle() as *mut core::ffi::c_void,
+    );
+    let mapping = unsafe {
+        // dwMaximumSizeHigh=0, dwMaximumSizeLow=0 → kernel uses current
+        // file size, which is exactly what we want.
+        CreateFileMappingW(file_handle, None, PAGE_READONLY, 0, 0, PCWSTR::null())
+    };
+    let mapping = match mapping {
+        Ok(h) if !h.is_invalid() => h,
+        _ => return false,
+    };
+
+    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, file_size) };
     if view.Value.is_null() {
         unsafe {
-            let _ = CloseHandle(handle);
+            let _ = CloseHandle(mapping);
         }
         return false;
     }
 
-    state.handle = handle;
+    state.mapping = mapping;
     state.view = Some(view);
-    state.mapped_size = initial_size;
+    state.mapped_size = file_size;
     true
 }
 
-unsafe fn unmap(state: &mut Inner) {
+/// Drop the section + view but keep the file handle open. Called when
+/// the file has grown and we need to remap to the new size.
+unsafe fn unmap_section(state: &mut Inner) {
     if let Some(view) = state.view.take() {
         let _ = UnmapViewOfFile(view);
     }
-    if !state.handle.is_invalid() {
-        let _ = CloseHandle(state.handle);
-        state.handle = HANDLE(core::ptr::null_mut());
+    if !state.mapping.is_invalid() {
+        let _ = CloseHandle(state.mapping);
+        state.mapping = HANDLE(core::ptr::null_mut());
     }
     state.mapped_size = 0;
+}
+
+/// Drop everything including the file handle. Called on Drop or when
+/// the file becomes unreachable.
+unsafe fn unmap_all(state: &mut Inner) {
+    unsafe { unmap_section(state) };
+    state.file = None;
 }
