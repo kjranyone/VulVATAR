@@ -34,7 +34,7 @@ Remaining items below are still deferred.
 
 ### Cloth Authoring
 
-- [ ] **Multiple cloth overlays per avatar** — attach more than one overlay
+- [x] **Multiple cloth overlays per avatar** — data model already plural; UI now shows per-slot id/particle-count with Remove button, "Load Overlay File..." attaches a .vvtcloth directly into a new slot, and the attached set is persisted to ProjectFile.cloth_overlay_paths so save/load round-trips
 - [x] **Cloth LoD authoring** — ClothLoDLevel + ClothLoDConfig + distance-based auto-select + simulation integration
 - [x] **Wind authoring tools** — directional/gust wind presets (WindPresetLibrary with 4 presets + WindPreset::sample_at)
 - [x] **Overlay version migration** — load_cloth_overlay / load_project now run a two-stage parse (Value → version check → optional migration → typed deserialize). Future-version files reject with a clear "newer VulVATAR" error; older files walk a `step_*` migration chain. Plumbing is in place + tested; no actual migrators registered yet because every released file is at v1.
