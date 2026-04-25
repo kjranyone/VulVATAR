@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod cloth_rebind;
 pub mod vrm;
 
 use serde::{Deserialize, Serialize};
