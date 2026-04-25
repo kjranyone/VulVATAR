@@ -576,10 +576,29 @@ impl TrackingWorker {
             }
         };
 
-        // Initialize inference engine (use default wholebody model)
+        // Initialize inference engine. Prefer the highest-quality CIGPose
+        // model available in models/, and use YOLOX person crop if present.
         #[cfg(feature = "inference")]
-        let mut pose_estimator =
-            inference::CigPoseInference::new("models/cigpose-m_coco-wholebody_256x192.onnx").ok();
+        let mut pose_estimator = match inference::CigPoseInference::from_models_dir("models") {
+            Ok(mut estimator) => {
+                let warnings = estimator.take_load_warnings();
+                if !warnings.is_empty() {
+                    mailbox.report_error(format!(
+                        "Pose tracking quality warning: {}. Run ./dev.ps1 setup to install the full model bundle.",
+                        warnings.join("; ")
+                    ));
+                }
+                Some(estimator)
+            }
+            Err(e) => {
+                error!("tracking-worker: inference disabled: {}", e);
+                mailbox.report_error(format!(
+                    "Pose model unavailable: {} Falling back to low-quality HSV tracking.",
+                    e
+                ));
+                None
+            }
+        };
         #[cfg(not(feature = "inference"))]
         let mut pose_estimator: Option<inference::CigPoseInference> = None;
 

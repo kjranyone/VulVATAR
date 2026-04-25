@@ -5,26 +5,48 @@ use super::{DetectionAnnotation, FacePose, SourceExpression, SourceJoint, Source
 #[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
 #[cfg(feature = "inference")]
-use log::{error, info};
+use log::{error, info, warn};
 #[cfg(feature = "inference")]
 use ndarray::Array4;
 #[cfg(feature = "inference")]
 use ort::session::Session;
 #[cfg(feature = "inference")]
 use ort::value::{Shape, TensorRef};
+#[cfg(feature = "inference")]
+use serde_json::Value as JsonValue;
+#[cfg(feature = "inference")]
+use std::fs;
+#[cfg(feature = "inference")]
+use std::path::{Path, PathBuf};
 
 pub struct CigPoseInference {
     #[cfg(feature = "inference")]
     session: Session,
     #[cfg(feature = "inference")]
+    input_name: String,
+    #[cfg(feature = "inference")]
+    detector: Option<YoloxDetector>,
+    #[cfg(feature = "inference")]
+    load_warnings: Vec<String>,
+    #[cfg(feature = "inference")]
     input_w: u32,
     #[cfg(feature = "inference")]
     input_h: u32,
+    #[cfg(feature = "inference")]
+    split_ratio: f32,
 }
 
 impl CigPoseInference {
     #[cfg(feature = "inference")]
     pub fn new(model_path: &str) -> std::result::Result<Self, String> {
+        Self::new_with_detector(model_path, None)
+    }
+
+    #[cfg(feature = "inference")]
+    pub fn new_with_detector(
+        model_path: &str,
+        detector_path: Option<&str>,
+    ) -> std::result::Result<Self, String> {
         info!("Loading CIGPose model from {}", model_path);
 
         let session = Session::builder()
@@ -34,11 +56,70 @@ impl CigPoseInference {
             .commit_from_file(model_path)
             .map_err(|e| format!("ORT load error: {}", e))?;
 
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|input| input.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        let config = read_pose_model_config(&session, model_path);
+        info!(
+            "CIGPose model config: {}x{}, split_ratio={}",
+            config.input_w, config.input_h, config.split_ratio
+        );
+
+        let mut load_warnings = Vec::new();
+        let detector = match detector_path {
+            Some(path) => match YoloxDetector::new(path) {
+                Ok(detector) => {
+                    info!("Loaded YOLOX person detector from {}", path);
+                    Some(detector)
+                }
+                Err(e) => {
+                    let warning = format!("YOLOX detector disabled: {}", e);
+                    warn!("{}", warning);
+                    load_warnings.push(warning);
+                    None
+                }
+            },
+            None => {
+                let warning = "YOLOX detector not found; CIGPose will use a full-frame person crop"
+                    .to_string();
+                warn!("{}", warning);
+                load_warnings.push(warning);
+                None
+            }
+        };
+
         Ok(Self {
             session,
-            input_w: 192,
-            input_h: 256,
+            input_name,
+            detector,
+            load_warnings,
+            input_w: config.input_w,
+            input_h: config.input_h,
+            split_ratio: config.split_ratio,
         })
+    }
+
+    #[cfg(feature = "inference")]
+    pub fn from_models_dir(models_dir: impl AsRef<Path>) -> std::result::Result<Self, String> {
+        let models_dir = models_dir.as_ref();
+        let model_path = find_best_pose_model(models_dir).ok_or_else(|| {
+            format!(
+                "No CIGPose ONNX model found in {}. Run ./dev.ps1 setup.",
+                models_dir.display()
+            )
+        })?;
+        let detector_path = models_dir.join("yolox_nano.onnx");
+        let detector = detector_path
+            .is_file()
+            .then(|| detector_path.to_string_lossy().to_string());
+        Self::new_with_detector(&model_path.to_string_lossy(), detector.as_deref())
+    }
+
+    #[cfg(feature = "inference")]
+    pub fn take_load_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.load_warnings)
     }
 
     #[cfg(not(feature = "inference"))]
@@ -70,59 +151,75 @@ impl CigPoseInference {
         height: u32,
         frame_index: u64,
     ) -> PoseEstimate {
-        let (tensor, aspect) =
-            preprocess_frame(rgb_data, width, height, self.input_w, self.input_h);
+        let expected_len = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(3);
+        if rgb_data.len() < expected_len || width == 0 || height == 0 {
+            return empty_estimate(frame_index);
+        }
+
+        let bbox = self
+            .detector
+            .as_mut()
+            .and_then(|detector| detector.detect_best_person(rgb_data, width, height))
+            .unwrap_or_else(|| PersonBBox::full_frame(width, height));
+
+        let (tensor, crop_region) =
+            preprocess_person(rgb_data, width, height, bbox, self.input_w, self.input_h);
 
         let input = match TensorRef::from_array_view(&tensor) {
             Ok(v) => v,
             Err(e) => {
                 error!("TensorRef creation failed: {}", e);
-                return PoseEstimate {
-                    skeleton: SourceSkeleton::empty(frame_index),
-                    annotation: DetectionAnnotation::default(),
-                };
+                return empty_estimate(frame_index);
             }
         };
 
-        let outputs = match self.session.run(ort::inputs![input]) {
+        let outputs = match self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])
+        {
             Ok(out) => out,
             Err(e) => {
                 error!("ONNX inference failed: {}", e);
-                return PoseEstimate {
-                    skeleton: SourceSkeleton::empty(frame_index),
-                    annotation: DetectionAnnotation::default(),
-                };
+                return empty_estimate(frame_index);
             }
         };
 
-        let (shape_x, data_x) = match outputs["simcc_x"].try_extract_tensor::<f32>() {
+        if outputs.len() < 2 {
+            error!(
+                "ONNX inference returned {} outputs, expected at least 2",
+                outputs.len()
+            );
+            return empty_estimate(frame_index);
+        }
+
+        let output_x = outputs.get("simcc_x").unwrap_or(&outputs[0]);
+        let output_y = outputs.get("simcc_y").unwrap_or(&outputs[1]);
+
+        let (shape_x, data_x) = match output_x.try_extract_tensor::<f32>() {
             Ok(v) => v,
             Err(e) => {
                 error!("ONNX simcc_x extraction failed: {}", e);
-                return PoseEstimate {
-                    skeleton: SourceSkeleton::empty(frame_index),
-                    annotation: DetectionAnnotation::default(),
-                };
+                return empty_estimate(frame_index);
             }
         };
-        let (_shape_y, data_y) = match outputs["simcc_y"].try_extract_tensor::<f32>() {
+        let (_shape_y, data_y) = match output_y.try_extract_tensor::<f32>() {
             Ok(v) => v,
             Err(e) => {
                 error!("ONNX simcc_y extraction failed: {}", e);
-                return PoseEstimate {
-                    skeleton: SourceSkeleton::empty(frame_index),
-                    annotation: DetectionAnnotation::default(),
-                };
+                return empty_estimate(frame_index);
             }
         };
 
-        let split_ratio = 2.0;
-        let kpts = decode_simcc_from_slice(data_x, data_y, shape_x, split_ratio);
+        let model_kpts = decode_simcc_from_slice(data_x, data_y, shape_x, self.split_ratio);
+        let frame_kpts =
+            remap_keypoints_to_frame(model_kpts, crop_region, self.input_w, self.input_h);
 
-        let skeleton =
-            map_to_source_skeleton(&kpts, self.input_w, self.input_h, aspect, frame_index);
+        let aspect = width as f32 / height as f32;
+        let skeleton = map_to_source_skeleton(&frame_kpts, width, height, aspect, frame_index);
 
-        let annotation = build_annotation(kpts, self.input_w, self.input_h, width, height);
+        let annotation = build_annotation(frame_kpts, width, height, Some(bbox));
 
         PoseEstimate {
             skeleton,
@@ -132,42 +229,466 @@ impl CigPoseInference {
 }
 
 #[cfg(feature = "inference")]
-fn preprocess_frame(
-    rgb_data: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> (Array4<f32>, f32) {
-    let mut tensor = Array4::<f32>::zeros((1, 3, dst_h as usize, dst_w as usize));
+#[derive(Clone, Copy, Debug)]
+struct PoseModelConfig {
+    input_w: u32,
+    input_h: u32,
+    split_ratio: f32,
+}
 
-    let scale_x = src_w as f32 / dst_w as f32;
-    let scale_y = src_h as f32 / dst_h as f32;
-    let aspect = src_w as f32 / src_h as f32;
-
-    // Standard ImageNet normalization used by MMPose
-    let mean = [0.485, 0.456, 0.406];
-    let std = [0.229, 0.224, 0.225];
-
-    for y in 0..dst_h {
-        let src_y = ((y as f32 * scale_y) as u32).min(src_h - 1);
-        for x in 0..dst_w {
-            let src_x = ((x as f32 * scale_x) as u32).min(src_w - 1);
-            let offset = ((src_y * src_w + src_x) * 3) as usize;
-
-            if offset + 2 < rgb_data.len() {
-                let r = (rgb_data[offset] as f32 / 255.0 - mean[0]) / std[0];
-                let g = (rgb_data[offset + 1] as f32 / 255.0 - mean[1]) / std[1];
-                let b = (rgb_data[offset + 2] as f32 / 255.0 - mean[2]) / std[2];
-
-                tensor[[0, 0, y as usize, x as usize]] = r;
-                tensor[[0, 1, y as usize, x as usize]] = g;
-                tensor[[0, 2, y as usize, x as usize]] = b;
+#[cfg(feature = "inference")]
+fn read_pose_model_config(session: &Session, model_path: &str) -> PoseModelConfig {
+    let fallback = config_from_filename(model_path);
+    if let Ok(metadata) = session.metadata() {
+        if let Some(meta_str) = metadata.custom("cigpose_meta") {
+            if let Ok(meta) = serde_json::from_str::<JsonValue>(&meta_str) {
+                let input_w = meta
+                    .get("input_w")
+                    .and_then(JsonValue::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or(fallback.input_w);
+                let input_h = meta
+                    .get("input_h")
+                    .and_then(JsonValue::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or(fallback.input_h);
+                let split_ratio = meta
+                    .get("split_ratio")
+                    .and_then(JsonValue::as_f64)
+                    .map(|v| v as f32)
+                    .unwrap_or(fallback.split_ratio);
+                return PoseModelConfig {
+                    input_w,
+                    input_h,
+                    split_ratio,
+                };
             }
         }
     }
+    fallback
+}
 
-    (tensor, aspect)
+#[cfg(feature = "inference")]
+fn config_from_filename(model_path: &str) -> PoseModelConfig {
+    let name = Path::new(model_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if name.contains("384x288") {
+        PoseModelConfig {
+            input_w: 288,
+            input_h: 384,
+            split_ratio: 2.0,
+        }
+    } else {
+        PoseModelConfig {
+            input_w: 192,
+            input_h: 256,
+            split_ratio: 2.0,
+        }
+    }
+}
+
+#[cfg(feature = "inference")]
+fn find_best_pose_model(models_dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(models_dir).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let score = pose_model_score(&path)?;
+            Some((score, path))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, path)| path)
+}
+
+#[cfg(feature = "inference")]
+fn pose_model_score(path: &Path) -> Option<i32> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if !name.starts_with("cigpose-") || !name.ends_with(".onnx") {
+        return None;
+    }
+
+    let mut score = 0;
+    score += if name.contains("384x288") {
+        10_000
+    } else if name.contains("256x192") {
+        5_000
+    } else {
+        1_000
+    };
+    score += if name.contains("coco-ubody") {
+        500
+    } else if name.contains("wholebody") {
+        300
+    } else {
+        0
+    };
+    score += if name.starts_with("cigpose-x") {
+        300
+    } else if name.starts_with("cigpose-l") {
+        200
+    } else if name.starts_with("cigpose-m") {
+        100
+    } else {
+        0
+    };
+    Some(score)
+}
+
+#[cfg(feature = "inference")]
+fn empty_estimate(frame_index: u64) -> PoseEstimate {
+    PoseEstimate {
+        skeleton: SourceSkeleton::empty(frame_index),
+        annotation: DetectionAnnotation::default(),
+    }
+}
+
+#[cfg(feature = "inference")]
+#[derive(Clone, Copy, Debug)]
+struct PersonBBox {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+}
+
+#[cfg(feature = "inference")]
+impl PersonBBox {
+    fn full_frame(width: u32, height: u32) -> Self {
+        Self {
+            x1: 0.0,
+            y1: 0.0,
+            x2: width as f32,
+            y2: height as f32,
+        }
+    }
+
+    fn area(&self) -> f32 {
+        (self.x2 - self.x1).max(0.0) * (self.y2 - self.y1).max(0.0)
+    }
+}
+
+#[cfg(feature = "inference")]
+#[derive(Clone, Copy, Debug)]
+struct CropRegion {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+}
+
+#[cfg(feature = "inference")]
+fn preprocess_person(
+    rgb_data: &[u8],
+    src_w: u32,
+    src_h: u32,
+    bbox: PersonBBox,
+    dst_w: u32,
+    dst_h: u32,
+) -> (Array4<f32>, CropRegion) {
+    let mut tensor = Array4::<f32>::zeros((1, 3, dst_h as usize, dst_w as usize));
+
+    let crop = person_crop_region(bbox, src_w, src_h, dst_w, dst_h);
+    let crop_w = (crop.x2 - crop.x1).max(1.0);
+    let crop_h = (crop.y2 - crop.y1).max(1.0);
+
+    // CIGPose/MMPose ImageNet normalization in 0..255 RGB space.
+    let mean = [123.675, 116.28, 103.53];
+    let std = [58.395, 57.12, 57.375];
+
+    for y in 0..dst_h {
+        let v = if dst_h > 1 {
+            y as f32 / (dst_h - 1) as f32
+        } else {
+            0.0
+        };
+        let src_y = crop.y1 + v * (crop_h - 1.0);
+        for x in 0..dst_w {
+            let u = if dst_w > 1 {
+                x as f32 / (dst_w - 1) as f32
+            } else {
+                0.0
+            };
+            let src_x = crop.x1 + u * (crop_w - 1.0);
+            let [r, g, b] = sample_bilinear_rgb(rgb_data, src_w, src_h, src_x, src_y);
+
+            tensor[[0, 0, y as usize, x as usize]] = (r - mean[0]) / std[0];
+            tensor[[0, 1, y as usize, x as usize]] = (g - mean[1]) / std[1];
+            tensor[[0, 2, y as usize, x as usize]] = (b - mean[2]) / std[2];
+        }
+    }
+
+    (tensor, crop)
+}
+
+#[cfg(feature = "inference")]
+fn person_crop_region(
+    bbox: PersonBBox,
+    src_w: u32,
+    src_h: u32,
+    model_w: u32,
+    model_h: u32,
+) -> CropRegion {
+    let cx = (bbox.x1 + bbox.x2) * 0.5;
+    let cy = (bbox.y1 + bbox.y2) * 0.5;
+    let mut bw = (bbox.x2 - bbox.x1).max(1.0);
+    let mut bh = (bbox.y2 - bbox.y1).max(1.0);
+    let target_aspect = model_w as f32 / model_h as f32;
+
+    if bw / bh > target_aspect {
+        bh = bw / target_aspect;
+    } else {
+        bw = bh * target_aspect;
+    }
+    bw *= 1.25;
+    bh *= 1.25;
+
+    CropRegion {
+        x1: (cx - bw * 0.5).clamp(0.0, src_w.saturating_sub(1) as f32),
+        y1: (cy - bh * 0.5).clamp(0.0, src_h.saturating_sub(1) as f32),
+        x2: (cx + bw * 0.5).clamp(1.0, src_w as f32),
+        y2: (cy + bh * 0.5).clamp(1.0, src_h as f32),
+    }
+}
+
+#[cfg(feature = "inference")]
+fn sample_bilinear_rgb(rgb_data: &[u8], width: u32, height: u32, x: f32, y: f32) -> [f32; 3] {
+    let x = x.clamp(0.0, width.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, height.saturating_sub(1) as f32);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+
+    let p00 = pixel_rgb(rgb_data, width, x0, y0);
+    let p10 = pixel_rgb(rgb_data, width, x1, y0);
+    let p01 = pixel_rgb(rgb_data, width, x0, y1);
+    let p11 = pixel_rgb(rgb_data, width, x1, y1);
+
+    let mut out = [0.0; 3];
+    for c in 0..3 {
+        let top = p00[c] * (1.0 - tx) + p10[c] * tx;
+        let bottom = p01[c] * (1.0 - tx) + p11[c] * tx;
+        out[c] = top * (1.0 - ty) + bottom * ty;
+    }
+    out
+}
+
+#[cfg(feature = "inference")]
+fn pixel_rgb(rgb_data: &[u8], width: u32, x: u32, y: u32) -> [f32; 3] {
+    let i = ((y * width + x) * 3) as usize;
+    if i + 2 >= rgb_data.len() {
+        return [0.0, 0.0, 0.0];
+    }
+    [
+        rgb_data[i] as f32,
+        rgb_data[i + 1] as f32,
+        rgb_data[i + 2] as f32,
+    ]
+}
+
+#[cfg(feature = "inference")]
+struct YoloxDetector {
+    session: Session,
+    input_name: String,
+    input_size: u32,
+    conf_thresh: f32,
+    grids: Vec<[f32; 2]>,
+    strides: Vec<f32>,
+}
+
+#[cfg(feature = "inference")]
+impl YoloxDetector {
+    fn new(model_path: &str) -> std::result::Result<Self, String> {
+        let session = Session::builder()
+            .map_err(|e| format!("ORT detector build error: {}", e))?
+            .with_intra_threads(2)
+            .map_err(|e| format!("ORT detector threads error: {}", e))?
+            .commit_from_file(model_path)
+            .map_err(|e| format!("ORT detector load error: {}", e))?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|input| input.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        let input_size = 416;
+        let (grids, strides) = build_yolox_grids(input_size);
+        Ok(Self {
+            session,
+            input_name,
+            input_size,
+            conf_thresh: 0.5,
+            grids,
+            strides,
+        })
+    }
+
+    fn detect_best_person(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Option<PersonBBox> {
+        let (tensor, ratio) = preprocess_yolox_letterbox(rgb_data, width, height, self.input_size);
+        let input = match TensorRef::from_array_view(&tensor) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("YOLOX TensorRef creation failed: {}", e);
+                return None;
+            }
+        };
+        let outputs = match self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])
+        {
+            Ok(out) => out,
+            Err(e) => {
+                warn!("YOLOX inference failed: {}", e);
+                return None;
+            }
+        };
+        if outputs.len() == 0 {
+            warn!("YOLOX inference returned no outputs");
+            return None;
+        }
+        let first = &outputs[0];
+        let (shape, data) = match first.try_extract_tensor::<f32>() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("YOLOX output extraction failed: {}", e);
+                return None;
+            }
+        };
+        decode_best_yolox_person(
+            data,
+            shape,
+            &self.grids,
+            &self.strides,
+            ratio,
+            width,
+            height,
+            self.conf_thresh,
+        )
+    }
+}
+
+#[cfg(feature = "inference")]
+fn build_yolox_grids(input_size: u32) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let mut grids = Vec::new();
+    let mut strides = Vec::new();
+    for stride in [8u32, 16, 32] {
+        let g = input_size / stride;
+        for y in 0..g {
+            for x in 0..g {
+                grids.push([x as f32, y as f32]);
+                strides.push(stride as f32);
+            }
+        }
+    }
+    (grids, strides)
+}
+
+#[cfg(feature = "inference")]
+fn preprocess_yolox_letterbox(
+    rgb_data: &[u8],
+    src_w: u32,
+    src_h: u32,
+    input_size: u32,
+) -> (Array4<f32>, f32) {
+    let mut tensor =
+        Array4::<f32>::from_elem((1, 3, input_size as usize, input_size as usize), 114.0);
+    let ratio = (input_size as f32 / src_h as f32).min(input_size as f32 / src_w as f32);
+    let dst_w = ((src_w as f32 * ratio) as u32).max(1).min(input_size);
+    let dst_h = ((src_h as f32 * ratio) as u32).max(1).min(input_size);
+
+    for y in 0..dst_h {
+        let src_y = y as f32 / ratio;
+        for x in 0..dst_w {
+            let src_x = x as f32 / ratio;
+            let [r, g, b] = sample_bilinear_rgb(rgb_data, src_w, src_h, src_x, src_y);
+            tensor[[0, 0, y as usize, x as usize]] = r;
+            tensor[[0, 1, y as usize, x as usize]] = g;
+            tensor[[0, 2, y as usize, x as usize]] = b;
+        }
+    }
+
+    (tensor, ratio)
+}
+
+#[cfg(feature = "inference")]
+#[allow(clippy::too_many_arguments)]
+fn decode_best_yolox_person(
+    data: &[f32],
+    shape: &Shape,
+    grids: &[[f32; 2]],
+    strides: &[f32],
+    ratio: f32,
+    frame_w: u32,
+    frame_h: u32,
+    conf_thresh: f32,
+) -> Option<PersonBBox> {
+    if shape.len() < 3 || ratio <= 0.0 {
+        return None;
+    }
+    let rows = shape[1] as usize;
+    let cols = shape[2] as usize;
+    if rows == 0 || cols < 6 || data.len() < rows.saturating_mul(cols) {
+        return None;
+    }
+
+    let frame_area = (frame_w as f32 * frame_h as f32).max(1.0);
+    let frame_center = [frame_w as f32 * 0.5, frame_h as f32 * 0.5];
+    let half_diag = (frame_center[0].hypot(frame_center[1])).max(1.0);
+    let mut best: Option<(f32, PersonBBox)> = None;
+    for row in 0..rows.min(grids.len()).min(strides.len()) {
+        let base = row * cols;
+        let objectness = data[base + 4];
+        let person_class = data[base + 5];
+        let score = objectness * person_class;
+        if score < conf_thresh {
+            continue;
+        }
+
+        let stride = strides[row];
+        let grid = grids[row];
+        let cx = (data[base] + grid[0]) * stride;
+        let cy = (data[base + 1] + grid[1]) * stride;
+        let bw = data[base + 2].clamp(-10.0, 10.0).exp() * stride;
+        let bh = data[base + 3].clamp(-10.0, 10.0).exp() * stride;
+
+        let bbox = PersonBBox {
+            x1: ((cx - bw * 0.5) / ratio).clamp(0.0, frame_w as f32),
+            y1: ((cy - bh * 0.5) / ratio).clamp(0.0, frame_h as f32),
+            x2: ((cx + bw * 0.5) / ratio).clamp(0.0, frame_w as f32),
+            y2: ((cy + bh * 0.5) / ratio).clamp(0.0, frame_h as f32),
+        };
+        if bbox.area() < 16.0 {
+            continue;
+        }
+
+        // VulVATAR is a single-operator app: prefer the confident person
+        // closest to the camera center, with a mild penalty for tiny boxes.
+        let bbox_center = [(bbox.x1 + bbox.x2) * 0.5, (bbox.y1 + bbox.y2) * 0.5];
+        let center_dist = ((bbox_center[0] - frame_center[0])
+            .hypot(bbox_center[1] - frame_center[1])
+            / half_diag)
+            .clamp(0.0, 1.0);
+        let center_weight = (1.0 - 0.45 * center_dist).clamp(0.2, 1.0);
+        let area_weight = (bbox.area() / frame_area).sqrt().clamp(0.25, 1.0);
+        let selection_score = score * center_weight * area_weight;
+
+        match best {
+            Some((best_score, _)) if best_score >= selection_score => {}
+            _ => best = Some((selection_score, bbox)),
+        }
+    }
+
+    best.map(|(_, bbox)| bbox)
 }
 
 #[cfg(feature = "inference")]
@@ -217,10 +738,24 @@ fn decode_simcc_from_slice(
 
         let x = max_x_idx as f32 / split_ratio;
         let y = max_y_idx as f32 / split_ratio;
-        let conf = max_x_val.max(max_y_val);
+        let conf = max_x_val.min(max_y_val);
         kpts.push((x, y, conf));
     }
     kpts
+}
+
+#[cfg(feature = "inference")]
+fn remap_keypoints_to_frame(
+    kpts: Vec<(f32, f32, f32)>,
+    crop: CropRegion,
+    model_w: u32,
+    model_h: u32,
+) -> Vec<(f32, f32, f32)> {
+    let scale_x = (crop.x2 - crop.x1) / model_w as f32;
+    let scale_y = (crop.y2 - crop.y1) / model_h as f32;
+    kpts.into_iter()
+        .map(|(x, y, c)| (x * scale_x + crop.x1, y * scale_y + crop.y1, c))
+        .collect()
 }
 
 /// COCO-wholebody body-only skeleton connections (for the GUI overlay).
@@ -246,21 +781,21 @@ const SKELETON_CONNECTIONS: [(usize, usize); 16] = [
 #[cfg(feature = "inference")]
 fn build_annotation(
     kpts: Vec<(f32, f32, f32)>,
-    model_w: u32,
-    model_h: u32,
-    _orig_w: u32,
-    _orig_h: u32,
+    orig_w: u32,
+    orig_h: u32,
+    bbox: Option<PersonBBox>,
 ) -> DetectionAnnotation {
-    let mw = model_w as f32;
-    let mh = model_h as f32;
+    let ow = orig_w as f32;
+    let oh = orig_h as f32;
     let norm_kpts: Vec<(f32, f32, f32)> = kpts
         .into_iter()
-        .map(|(x, y, c)| (x / mw, y / mh, c))
+        .map(|(x, y, c)| (x / ow, y / oh, c))
         .collect();
+    let bounding_box = bbox.map(|b| (b.x1 / ow, b.y1 / oh, b.x2 / ow, b.y2 / oh));
     DetectionAnnotation {
         keypoints: norm_kpts,
         skeleton: SKELETON_CONNECTIONS.to_vec(),
-        bounding_box: None,
+        bounding_box,
     }
 }
 
@@ -382,11 +917,31 @@ fn map_to_source_skeleton(
     // the mirror-style VTuber interaction "lift my left arm → the arm on
     // my left in the screen lifts" falls out of matching signs on X
     // between source joints (image space) and avatar rest world.
-    sk.put_joint(HumanoidBone::RightShoulder, to_joint(shoulders_l), min_body_conf);
-    sk.put_joint(HumanoidBone::LeftShoulder, to_joint(shoulders_r), min_body_conf);
-    sk.put_joint(HumanoidBone::RightUpperArm, to_joint(shoulders_l), min_body_conf);
-    sk.put_joint(HumanoidBone::LeftUpperArm, to_joint(shoulders_r), min_body_conf);
-    sk.put_joint(HumanoidBone::RightLowerArm, to_joint(elbow_l), min_body_conf);
+    sk.put_joint(
+        HumanoidBone::RightShoulder,
+        to_joint(shoulders_l),
+        min_body_conf,
+    );
+    sk.put_joint(
+        HumanoidBone::LeftShoulder,
+        to_joint(shoulders_r),
+        min_body_conf,
+    );
+    sk.put_joint(
+        HumanoidBone::RightUpperArm,
+        to_joint(shoulders_l),
+        min_body_conf,
+    );
+    sk.put_joint(
+        HumanoidBone::LeftUpperArm,
+        to_joint(shoulders_r),
+        min_body_conf,
+    );
+    sk.put_joint(
+        HumanoidBone::RightLowerArm,
+        to_joint(elbow_l),
+        min_body_conf,
+    );
     sk.put_joint(HumanoidBone::LeftLowerArm, to_joint(elbow_r), min_body_conf);
     sk.put_joint(HumanoidBone::RightHand, to_joint(wrist_l), min_body_conf);
     sk.put_joint(HumanoidBone::LeftHand, to_joint(wrist_r), min_body_conf);

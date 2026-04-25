@@ -7,16 +7,24 @@ $ErrorActionPreference = "Stop"
 
 function Install-Models {
     Write-Host "Setting up ONNX models..." -ForegroundColor Cyan
-    $modelName = "cigpose-m_coco-wholebody_256x192.onnx"
-    $modelPath = "models\$modelName"
+    $preferredModel = "cigpose-x_coco-ubody_384x288.onnx"
+    $fallbackModel = "cigpose-m_coco-wholebody_256x192.onnx"
+    $detectorName = "yolox_nano.onnx"
+    $preferredModelPath = "models\$preferredModel"
+    $fallbackModelPath = "models\$fallbackModel"
+    $detectorPath = "models\$detectorName"
     
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
     }
 
-    if (Test-Path $modelPath) {
-        Write-Host "Model $modelName already exists. Skipping download." -ForegroundColor Green
+    if ((Test-Path $preferredModelPath) -and (Test-Path $detectorPath)) {
+        Write-Host "Preferred pose model and detector already exist. Skipping download." -ForegroundColor Green
         return
+    }
+
+    if ((Test-Path $fallbackModelPath) -and !(Test-Path $preferredModelPath)) {
+        Write-Host "Fallback model exists, but preferred 384x288 model or detector is missing. Downloading model bundle..." -ForegroundColor Yellow
     }
 
     $zipPath = "cigpose_models.zip"
