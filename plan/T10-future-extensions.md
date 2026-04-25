@@ -37,7 +37,7 @@ Remaining items below are still deferred.
 - [ ] **Multiple cloth overlays per avatar** — attach more than one overlay
 - [x] **Cloth LoD authoring** — ClothLoDLevel + ClothLoDConfig + distance-based auto-select + simulation integration
 - [x] **Wind authoring tools** — directional/gust wind presets (WindPresetLibrary with 4 presets + WindPreset::sample_at)
-- [ ] **Overlay version migration** — upgrade old overlay formats
+- [x] **Overlay version migration** — load_cloth_overlay / load_project now run a two-stage parse (Value → version check → optional migration → typed deserialize). Future-version files reject with a clear "newer VulVATAR" error; older files walk a `step_*` migration chain. Plumbing is in place + tested; no actual migrators registered yet because every released file is at v1.
 - [ ] **Partial rebinding after avatar reimport** — smart re-link when avatar changes
 - [ ] **Offline bake / cache generation** — pre-compute simulation data for testing
 
