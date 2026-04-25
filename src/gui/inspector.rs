@@ -1752,6 +1752,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 material_count: Option<usize>,
                 vrm_title: Option<String>,
                 vrm_author: Option<String>,
+                thumbnail_path: Option<std::path::PathBuf>,
             }
 
             let entries: Vec<LibraryRow> = {
@@ -1769,6 +1770,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         material_count: e.material_count,
                         vrm_title: e.vrm_title.clone(),
                         vrm_author: e.vrm_author.clone(),
+                        thumbnail_path: e.thumbnail_path.clone(),
                     }
                 };
                 if state.library_search_query.is_empty() {
@@ -1822,6 +1824,22 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 let star = if row.favorite { "\u{2605}" } else { "\u{2606}" };
                                 if ui.button(egui::RichText::new(star).size(14.0)).clicked() {
                                     toggle_fav_idx = Some(row.idx);
+                                }
+
+                                // 64×64 thumbnail. egui_extras' file:// loader
+                                // decodes PNG/JPEG via the `image` crate and
+                                // caches the GPU texture across frames, so the
+                                // per-frame cost is negligible after the first
+                                // display.
+                                if let Some(thumb_path) = row.thumbnail_path.as_ref() {
+                                    if thumb_path.exists() {
+                                        let uri = format!("file://{}", thumb_path.display());
+                                        ui.add(
+                                            egui::Image::new(uri)
+                                                .max_size(egui::vec2(64.0, 64.0))
+                                                .fit_to_exact_size(egui::vec2(64.0, 64.0)),
+                                        );
+                                    }
                                 }
 
                                 ui.vertical(|ui| {

@@ -301,7 +301,11 @@ pub struct GuiApp {
 }
 
 impl GuiApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Lets `ui.image("file://...")` decode PNG/JPEG via the `image`
+        // crate. Required for thumbnail rendering in the avatar library
+        // inspector — without this, file:// URIs return UnknownLoader.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut app = Box::new(Application::new());
         app.bootstrap();
         app.avatar_library = crate::persistence::load_avatar_library();
@@ -458,7 +462,9 @@ impl GuiApp {
 
             folder_watcher: None,
             watched_avatar_dirs: Vec::new(),
-            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::default(),
+            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
+                crate::persistence::thumbnails_dir(),
+            ),
 
             avatar_load_job: None,
         };
@@ -471,6 +477,30 @@ impl GuiApp {
             } else {
                 warn!("avatar autostart path does not exist: {}", path.display());
             }
+        }
+
+        // Backfill placeholder thumbnails for library entries that have
+        // none on disk (legacy library data + entries whose VRM lacked an
+        // embedded cover image). Cheap — a 128×128 procedural draw per
+        // entry. Only writes new files.
+        let mut library_dirty = false;
+        for entry in state.app.avatar_library.entries.iter_mut() {
+            let needs = entry
+                .thumbnail_path
+                .as_ref()
+                .map_or(true, |p| !p.exists());
+            if needs {
+                if let Some(path) = state
+                    .thumbnail_gen
+                    .generate_and_save_placeholder(&entry.name)
+                {
+                    entry.thumbnail_path = Some(path);
+                    library_dirty = true;
+                }
+            }
+        }
+        if library_dirty {
+            let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
         }
 
         // Restore watched-folder subscriptions persisted from a previous
@@ -892,6 +922,15 @@ impl GuiApp {
                                         &asset,
                                         self.thumbnail_gen.output_dir(),
                                     );
+                                    if entry
+                                        .thumbnail_path
+                                        .as_ref()
+                                        .map_or(true, |p| !p.exists())
+                                    {
+                                        entry.thumbnail_path = self
+                                            .thumbnail_gen
+                                            .generate_and_save_placeholder(&entry.name);
+                                    }
                                 }
                             }
                             self.app.avatar_library.add(entry);

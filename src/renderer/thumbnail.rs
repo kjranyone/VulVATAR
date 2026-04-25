@@ -333,6 +333,30 @@ impl ThumbnailGenerator {
         }
     }
 
+    /// Generate the default placeholder for `avatar_name` and write it
+    /// to [`Self::thumbnail_path_for`]. Returns the path on success.
+    /// Failures are logged but never fatal — every avatar should still
+    /// load even if thumbnail I/O is broken.
+    pub fn generate_and_save_placeholder(&self, avatar_name: &str) -> Option<PathBuf> {
+        let request = ThumbnailRequest {
+            avatar_name: avatar_name.to_string(),
+            ..Default::default()
+        };
+        let result = self.generate_placeholder(&request);
+        let path = self.thumbnail_path_for(avatar_name);
+        match self.save_to_disk(&result, &path) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                log::warn!(
+                    "thumbnail: failed to save placeholder for '{}': {}",
+                    avatar_name,
+                    e
+                );
+                None
+            }
+        }
+    }
+
     pub fn save_to_disk(&self, result: &ThumbnailResult, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

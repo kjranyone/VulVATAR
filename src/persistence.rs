@@ -443,6 +443,15 @@ fn watched_folders_path() -> std::path::PathBuf {
     path
 }
 
+/// Where avatar-library thumbnails (real VRM-embedded ones + generated
+/// placeholders) are written. Co-located with the library file so a
+/// user moving their config dir takes thumbnails along automatically.
+pub fn thumbnails_dir() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("thumbnails");
+    path
+}
+
 pub fn load_watched_folders() -> Vec<std::path::PathBuf> {
     let path = watched_folders_path();
     if !path.exists() {

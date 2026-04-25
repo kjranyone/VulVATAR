@@ -31,6 +31,15 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
 
     let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
     entry.update_from_asset_with_thumbnail_dir(&asset, state.thumbnail_gen.output_dir());
+    // VRM didn't carry an embedded cover image — fall back to a generated
+    // placeholder so the library row has *something* to display.
+    if entry
+        .thumbnail_path
+        .as_ref()
+        .map_or(true, |p| !p.exists())
+    {
+        entry.thumbnail_path = state.thumbnail_gen.generate_and_save_placeholder(&entry.name);
+    }
     state.app.avatar_library.add(entry);
     let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
 
