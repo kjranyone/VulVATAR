@@ -616,7 +616,13 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     };
                     #[cfg(not(feature = "webcam"))]
                     let backend = crate::tracking::CameraBackend::Synthetic;
-                    state.app.start_tracking_with_params(backend, w, h, fps);
+                    state.app.start_tracking_with_params_full(
+                        backend,
+                        w,
+                        h,
+                        fps,
+                        state.tracking.lower_body_tracking_enabled,
+                    );
                 }
             });
             if ui
@@ -681,7 +687,13 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 };
                 #[cfg(not(feature = "webcam"))]
                 let backend = crate::tracking::CameraBackend::Synthetic;
-                state.app.start_tracking_with_params(backend, w, h, fps);
+                state.app.start_tracking_with_params_full(
+                    backend,
+                    w,
+                    h,
+                    fps,
+                    state.tracking.lower_body_tracking_enabled,
+                );
                 state.push_notification(format!("Camera restarted: {}x{} @ {} fps", w, h, fps));
             }
         });
@@ -743,6 +755,20 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .checkbox(&mut state.tracking.face_tracking_enabled, "Face Tracking")
                 .changed()
             {
+                state.project_dirty = true;
+            }
+            let lower_body_resp = ui
+                .checkbox(
+                    &mut state.tracking.lower_body_tracking_enabled,
+                    "Lower-body Tracking",
+                )
+                .on_hover_text(
+                    "When on, the model picker prefers a wholebody CIGPose ONNX so leg \
+                     keypoints are emitted. Trade-off: wholebody variants are usually \
+                     smaller-resolution and detect hands less crisply than the same-tier \
+                     ubody model. Restart tracking to apply.",
+                );
+            if lower_body_resp.changed() {
                 state.project_dirty = true;
             }
             if let Some(tracking) = &state.app.last_tracking_pose {

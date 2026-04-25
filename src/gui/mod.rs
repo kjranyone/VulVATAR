@@ -116,6 +116,11 @@ pub struct TrackingGuiState {
     pub tracking_mirror: bool,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
+    /// When true, the inference layer's model picker prefers a CIGPose
+    /// `wholebody` variant over `ubody` so hip/knee/ankle keypoints are
+    /// emitted and the leg humanoid bones get driven. Toggle takes
+    /// effect on the next start-tracking; mid-session it's a no-op.
+    pub lower_body_tracking_enabled: bool,
     pub smoothing_strength: f32,
     pub confidence_threshold: f32,
 }
@@ -383,6 +388,7 @@ impl GuiApp {
                 tracking_mirror: true,
                 hand_tracking_enabled: false,
                 face_tracking_enabled: true,
+                lower_body_tracking_enabled: false,
                 smoothing_strength: 0.5,
                 confidence_threshold: 0.5,
             },
@@ -630,6 +636,7 @@ impl GuiApp {
             confidence_threshold: self.tracking.confidence_threshold,
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
+            lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             camera_index: self.camera_index,
             show_camera_wipe: self.show_camera_wipe,
             show_detection_annotations: self.show_detection_annotations,
@@ -808,6 +815,7 @@ impl GuiApp {
         self.tracking.confidence_threshold = state.confidence_threshold;
         self.tracking.hand_tracking_enabled = state.hand_tracking_enabled;
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
+        self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.camera_index = state.camera_index;
         self.show_camera_wipe = state.show_camera_wipe;
         self.show_detection_annotations = state.show_detection_annotations;
@@ -1165,6 +1173,7 @@ impl eframe::App for GuiApp {
                 material_mode_index: self.rendering.material_mode_index,
                 hand_tracking_enabled: self.tracking.hand_tracking_enabled,
                 face_tracking_enabled: self.tracking.face_tracking_enabled,
+                lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
                 frame_dt,
             };
             self.app.run_frame(&frame_config);

@@ -34,6 +34,7 @@ pub struct FrameConfig {
     pub material_mode_index: usize,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
+    pub lower_body_tracking_enabled: bool,
     pub frame_dt: f32,
 }
 
@@ -926,6 +927,19 @@ impl Application {
         height: u32,
         fps: u32,
     ) {
+        self.start_tracking_with_params_full(backend, width, height, fps, false);
+    }
+
+    /// Same as [`Self::start_tracking_with_params`] but plumbs through the
+    /// `prefer_lower_body` flag to the pose-model picker.
+    pub fn start_tracking_with_params_full(
+        &mut self,
+        backend: CameraBackend,
+        width: u32,
+        height: u32,
+        fps: u32,
+        prefer_lower_body: bool,
+    ) {
         if let Some(ref mut worker) = self.tracking_worker {
             if worker.is_running() {
                 worker.stop();
@@ -934,7 +948,7 @@ impl Application {
         }
         let shared_mailbox = self.tracking.shared_mailbox();
         let mut worker = TrackingWorker::new(shared_mailbox);
-        worker.start_with_params(backend, width, height, fps);
+        worker.start_with_params_full(backend, width, height, fps, prefer_lower_body);
         if worker.is_running() {
             info!("app: tracking worker started");
         } else {

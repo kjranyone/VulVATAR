@@ -39,6 +39,7 @@ pub struct ProjectState {
     pub confidence_threshold: f32,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
+    pub lower_body_tracking_enabled: bool,
     pub camera_index: usize,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
@@ -143,6 +144,8 @@ pub struct TrackingConfig {
     pub hand_tracking_enabled: bool,
     #[serde(default)]
     pub face_tracking_enabled: bool,
+    #[serde(default)]
+    pub lower_body_tracking_enabled: bool,
     #[serde(default)]
     pub camera_index: usize,
     #[serde(default)]
@@ -345,6 +348,7 @@ impl ProjectFile {
                 confidence_threshold: state.confidence_threshold,
                 hand_tracking_enabled: state.hand_tracking_enabled,
                 face_tracking_enabled: state.face_tracking_enabled,
+                lower_body_tracking_enabled: state.lower_body_tracking_enabled,
                 camera_index: state.camera_index,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
@@ -406,6 +410,7 @@ impl ProjectFile {
             confidence_threshold: self.tracking.confidence_threshold,
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
+            lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             camera_index: self.tracking.camera_index,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,

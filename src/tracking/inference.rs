@@ -103,8 +103,23 @@ impl CigPoseInference {
 
     #[cfg(feature = "inference")]
     pub fn from_models_dir(models_dir: impl AsRef<Path>) -> std::result::Result<Self, String> {
+        Self::from_models_dir_with_pref(models_dir, false)
+    }
+
+    /// Same as [`Self::from_models_dir`], but the `prefer_lower_body`
+    /// flag flips the default model preference (ubody → wholebody) so
+    /// hip/knee/ankle keypoints actually get emitted. Use when the GUI
+    /// "Track lower body" toggle is on. Trade-off: wholebody variants
+    /// are typically smaller-resolution and detect hands less precisely
+    /// than the same-tier ubody model, so leg tracking costs hand
+    /// fidelity.
+    #[cfg(feature = "inference")]
+    pub fn from_models_dir_with_pref(
+        models_dir: impl AsRef<Path>,
+        prefer_lower_body: bool,
+    ) -> std::result::Result<Self, String> {
         let models_dir = models_dir.as_ref();
-        let model_path = find_best_pose_model(models_dir).ok_or_else(|| {
+        let model_path = find_best_pose_model(models_dir, prefer_lower_body).ok_or_else(|| {
             format!(
                 "No CIGPose ONNX model found in {}. Run ./dev.ps1 setup.",
                 models_dir.display()
@@ -290,14 +305,14 @@ fn config_from_filename(model_path: &str) -> PoseModelConfig {
 }
 
 #[cfg(feature = "inference")]
-fn find_best_pose_model(models_dir: &Path) -> Option<PathBuf> {
+fn find_best_pose_model(models_dir: &Path, prefer_lower_body: bool) -> Option<PathBuf> {
     let entries = fs::read_dir(models_dir).ok()?;
     entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_file())
         .filter_map(|path| {
-            let score = pose_model_score(&path)?;
+            let score = pose_model_score(&path, prefer_lower_body)?;
             Some((score, path))
         })
         .max_by_key(|(score, _)| *score)
@@ -305,7 +320,7 @@ fn find_best_pose_model(models_dir: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(feature = "inference")]
-fn pose_model_score(path: &Path) -> Option<i32> {
+fn pose_model_score(path: &Path, prefer_lower_body: bool) -> Option<i32> {
     let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     if !name.starts_with("cigpose-") || !name.ends_with(".onnx") {
         return None;
@@ -319,10 +334,18 @@ fn pose_model_score(path: &Path) -> Option<i32> {
     } else {
         1_000
     };
+    // Body coverage preference: ubody is higher fidelity for the upper
+    // body (preferred default for sitting VTubers), wholebody adds legs
+    // at some cost. The prefer_lower_body flag flips which one wins.
+    let (ubody_bonus, wholebody_bonus) = if prefer_lower_body {
+        (300, 500)
+    } else {
+        (500, 300)
+    };
     score += if name.contains("coco-ubody") {
-        500
+        ubody_bonus
     } else if name.contains("wholebody") {
-        300
+        wholebody_bonus
     } else {
         0
     };

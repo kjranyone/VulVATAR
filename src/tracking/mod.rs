@@ -424,6 +424,21 @@ impl TrackingWorker {
 
     /// Like [`Self::start`] but allows specifying the webcam resolution and fps.
     pub fn start_with_params(&mut self, backend: CameraBackend, width: u32, height: u32, fps: u32) {
+        self.start_with_params_full(backend, width, height, fps, false);
+    }
+
+    /// Same as [`Self::start_with_params`] but allows opting into a
+    /// wholebody pose model (legs/feet keypoints) at the cost of upper-
+    /// body fidelity. Only consulted at start time — toggling the flag
+    /// while the worker is running is a no-op.
+    pub fn start_with_params_full(
+        &mut self,
+        backend: CameraBackend,
+        width: u32,
+        height: u32,
+        fps: u32,
+        prefer_lower_body: bool,
+    ) {
         if self.handle.is_some() {
             return;
         }
@@ -449,6 +464,7 @@ impl TrackingWorker {
                     width,
                     height,
                     fps,
+                    prefer_lower_body,
                 );
             })
             .expect("failed to spawn tracking-worker thread");
@@ -494,10 +510,11 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
+        prefer_lower_body: bool,
     ) {
         match backend {
             CameraBackend::Synthetic => {
-                let _ = (width, height, fps);
+                let _ = (width, height, fps, prefer_lower_body);
                 ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(&mailbox, &running, frame_interval);
             }
@@ -512,6 +529,7 @@ impl TrackingWorker {
                     width,
                     height,
                     fps,
+                    prefer_lower_body,
                 );
             }
         }
@@ -552,6 +570,7 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
+        prefer_lower_body: bool,
     ) {
         info!(
             "tracking-worker: opening webcam {} ({}x{} @ {} fps)",
@@ -579,7 +598,10 @@ impl TrackingWorker {
         // Initialize inference engine. Prefer the highest-quality CIGPose
         // model available in models/, and use YOLOX person crop if present.
         #[cfg(feature = "inference")]
-        let mut pose_estimator = match inference::CigPoseInference::from_models_dir("models") {
+        let mut pose_estimator = match inference::CigPoseInference::from_models_dir_with_pref(
+            "models",
+            prefer_lower_body,
+        ) {
             Ok(mut estimator) => {
                 let warnings = estimator.take_load_warnings();
                 if !warnings.is_empty() {
