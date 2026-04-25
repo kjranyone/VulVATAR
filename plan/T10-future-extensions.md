@@ -52,7 +52,7 @@ Legend: `[x]` done, `[~]` partial, `[ ]` not started.
 
 ### Webcam Tracking
 
-- [~] **Hand tracking** — inference plumbing landed: `CigPoseInference::from_models_dir` auto-picks the best CIGPose ONNX in `models/`, an optional YOLOX person crop (`YoloxDetector`) bounds the inference region, and the `cigpose-x_coco-ubody_384x288` model exposes hand keypoints. **Still TODO**: map decoded hand keypoints to humanoid finger bones in the retargeting layer so the avatar's fingers actually move.
+- [x] **Hand tracking** — finger-level tracking from webcam. CIGPose ubody/wholebody emits 21 keypoints per hand; `map_hand_keypoints` in `src/tracking/inference.rs` writes the proximal/intermediate/distal of all five fingers per hand into `SourceSkeleton.joints` and the fingertips into `SourceSkeleton.fingertips`, with the mirror swap (user's anatomical left → avatar's right). The pose solver's `DRIVEN_BONES` enumerates each finger bone and uses `Tip::Fingertip` for the distals so the chain solves base→tip. End-to-end: open hand / fist / peace sign all visibly drive the avatar.
 - [ ] **Lower-body tracking** — `cigpose-x_coco-ubody_*` is upper-body-only by construction, so this requires either a different CIGPose variant (e.g. `*_coco-wholebody`) or a separate lower-body model. Defer until hand tracking retargeting lands and we know which model we want long-term.
 - [ ] **GPU inference backend** — `ort` builds against CPU EP today. Switching to DirectML / CUDA needs an `ExecutionProvider` choice in `Session::builder()`, a runtime fallback when the GPU EP fails to create, and a build flag to gate the backend so headless CI keeps passing without GPU drivers.
 
