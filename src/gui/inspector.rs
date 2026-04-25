@@ -423,6 +423,45 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
+                if ui.button("Load Overlay File...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("VulVATAR Cloth Overlay", &["vvtcloth"])
+                        .set_title("Load cloth overlay into a new slot")
+                        .pick_file()
+                    {
+                        let load_result = crate::persistence::load_cloth_overlay(&path);
+                        let asset_opt = match load_result {
+                            Ok(file) => file.cloth_asset,
+                            Err(e) => {
+                                state.push_notification(format!(
+                                    "Failed to load overlay '{}': {}",
+                                    path.display(),
+                                    e
+                                ));
+                                None
+                            }
+                        };
+                        if let Some(cloth_asset) = asset_opt {
+                            if let Some(avatar) = state.app.active_avatar_mut() {
+                                let overlay_id = crate::asset::ClothOverlayId(
+                                    (avatar.cloth_overlay_count() as u64) + 2,
+                                );
+                                let idx = avatar.attach_cloth_overlay(overlay_id);
+                                avatar.init_cloth_overlay(idx, &cloth_asset);
+                                state.push_notification(format!(
+                                    "Attached overlay from '{}' as slot #{}",
+                                    path.display(),
+                                    idx
+                                ));
+                            }
+                        } else {
+                            state.push_notification(format!(
+                                "Overlay file '{}' has no cloth asset payload",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
             });
             if let Some(avatar) = state.app.active_avatar_mut() {
                 ui.checkbox(&mut avatar.cloth_enabled, "Enable Cloth");
