@@ -63,7 +63,7 @@ Remaining items below are still deferred.
 
 - [ ] **Thumbnail generation** — render avatar thumbnails for library browser
 - [x] **Drag-and-drop import** — drop VRM files onto window (egui raw.dropped_files)
-- [ ] **Folder watching** — auto-update library when files change
+- [x] **Folder watching** — auto-update library when files change (FolderWatcher with notify backend, inspector UI to add/remove watched dirs, persisted to %APPDATA%\\VulVATAR\\watched_folders.json)
 - [x] **VRM metadata import** — title, author, version, thumbnail from VRM extensions (fields on AvatarLibraryEntry, surfaced in library inspector; thumbnail bytes saved to `thumbnail_dir`)
 - [x] **Library categories/folders** — organize entries into groups (AvatarLibrary::categories / by_category)
 - [x] **Library catalog export/import** — share library databases (export_catalog / import_catalog)
