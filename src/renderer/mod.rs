@@ -51,6 +51,18 @@ pub struct RenderResult {
     pub exported_frame: Option<output_export::ExportedFrame>,
 }
 
+/// Output of a one-shot thumbnail render. Carries decoded RGBA pixels
+/// directly so the caller can hand them straight to a PNG encoder
+/// without unwrapping the regular `RenderResult` / `ExportedFrame` chain.
+#[derive(Clone, Debug)]
+pub struct ThumbnailRenderResult {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly-packed RGBA8 (premultiplied alpha if the frame had a
+    /// transparent background).
+    pub rgba_pixels: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RenderStats {
     pub instance_count: u32,
@@ -181,6 +193,13 @@ impl VulkanRenderer {
             pending_readback: None,
             skinning_cache: Vec::new(),
         }
+    }
+
+    /// Crate-visible alias for [`Self::harvest_pending_readback`] so the
+    /// render thread can drain the pipelined readback before slotting in
+    /// a synchronous thumbnail render. See `RenderCommand::RenderThumbnail`.
+    pub(crate) fn harvest_pending(&mut self) -> Result<Option<RenderResult>, String> {
+        self.harvest_pending_readback()
     }
 
     /// Wait on any pending readback and return its data as a `RenderResult`.
@@ -1172,6 +1191,53 @@ impl VulkanRenderer {
             stats,
             exported_frame: None,
         }))
+    }
+
+    /// Render a single offscreen frame at thumbnail resolution and
+    /// synchronously block on the GPU until its CPU readback is ready.
+    /// Differs from [`Self::render`] in two ways:
+    ///
+    /// - The pipelined "harvest the previous frame" pattern is bypassed:
+    ///   the caller (render thread) is expected to have drained any
+    ///   in-flight regular-frame readback already, so the
+    ///   `pending_readback` slot is empty on entry.
+    /// - The fence wait + buffer copy happens before the call returns,
+    ///   so the result reflects *this* submission, not the next one.
+    ///
+    /// Used by `RenderCommand::RenderThumbnail`.
+    pub(crate) fn render_thumbnail(
+        &mut self,
+        input: &RenderFrameInput,
+    ) -> Result<ThumbnailRenderResult, String> {
+        // Submit. render() returns a RenderResult that's empty in the
+        // typical case (we drained pending_readback before calling), so
+        // the only side effect we care about is that pending_readback
+        // is now populated with the thumbnail's submission.
+        let _empty = self.render(input)?;
+
+        let harvested = self
+            .harvest_pending_readback()?
+            .ok_or_else(|| "render_thumbnail: no pending readback after submit".to_string())?;
+        let exported = harvested
+            .exported_frame
+            .ok_or_else(|| "render_thumbnail: no exported_frame on RenderResult".to_string())?;
+        let pixels = match exported.pixel_data {
+            output_export::ExportedPixelData::CpuReadback(arc) => match Arc::try_unwrap(arc) {
+                Ok(v) => v,
+                Err(arc) => (*arc).clone(),
+            },
+            _ => {
+                return Err(
+                    "render_thumbnail: exported pixel data isn't CPU readback".to_string()
+                )
+            }
+        };
+
+        Ok(ThumbnailRenderResult {
+            width: exported.extent[0],
+            height: exported.extent[1],
+            rgba_pixels: pixels,
+        })
     }
 
     /// Get or create a reusable skinning buffer + descriptor set for the given
