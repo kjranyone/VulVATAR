@@ -58,7 +58,7 @@ Legend: `[x]` done, `[~]` partial, `[ ]` not started.
 
 ### Model Library
 
-- [~] **Thumbnail generation** — placeholder thumbnails (procedural circle + 5x7 pixel-font label) generated for every library entry on load and on legacy backfill, displayed at 64×64 in the library inspector via egui_extras file:// loader. **Real rendered thumbnails** (actual VRM avatar pose rendered offscreen) remain TODO — needs a `RenderCommand::Thumbnail` variant on the render thread + readback wiring.
+- [x] **Thumbnail generation** — two-tier: a placeholder PNG is written for every library entry on load (procedural circle + 5x7 pixel-font label), and `finalize_avatar_load` then kicks a `RenderCommand::RenderThumbnail` whose synchronous render thread output overwrites the placeholder. The library inspector picks up the new pixels next frame via `egui::Context::forget_image`. Builder lives in `GuiApp::build_thumbnail_frame_input` (front-on auto-frame, fixed studio lighting, transparent background, 128×128).
 - [x] **Drag-and-drop import** — drop VRM files onto window (egui raw.dropped_files)
 - [x] **Folder watching** — auto-update library when files change (FolderWatcher with notify backend, inspector UI to add/remove watched dirs, persisted to %APPDATA%\\VulVATAR\\watched_folders.json)
 - [x] **VRM metadata import** — title, author, version, thumbnail from VRM extensions (fields on AvatarLibraryEntry, surfaced in library inspector; thumbnail bytes saved to `thumbnail_dir`)
