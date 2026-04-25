@@ -79,6 +79,25 @@ pub fn camera_resolution_for_index(index: usize) -> (u32, u32) {
     }
 }
 
+/// Encode a [`ThumbnailRenderResult`] (raw RGBA8 + extent) as PNG at
+/// `path`. Creates the parent directory if needed. Used by GuiApp's
+/// `poll_thumbnail_jobs` to finalise a real-render thumbnail produced
+/// on the render thread.
+fn save_thumbnail_png(
+    path: &std::path::Path,
+    thumb: &crate::renderer::ThumbnailRenderResult,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create thumbnail dir '{}': {}", parent.display(), e))?;
+    }
+    let img = image::RgbaImage::from_raw(thumb.width, thumb.height, thumb.rgba_pixels.clone())
+        .ok_or_else(|| "thumbnail RGBA buffer length didn't match width*height*4".to_string())?;
+    img.save(path)
+        .map_err(|e| format!("save thumbnail PNG '{}': {}", path.display(), e))?;
+    Ok(())
+}
+
 /// Map a `tracking.camera_framerate_index` to the actual fps value.
 pub fn camera_fps_for_index(index: usize) -> u32 {
     if index == 1 {
@@ -300,6 +319,13 @@ pub struct GuiApp {
     pub watched_avatar_dirs: Vec<std::path::PathBuf>,
     pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
 
+    /// Pending real-render thumbnail jobs, keyed by the destination PNG
+    /// path. Each entry's receiver completes when the render thread has
+    /// finished its synchronous thumbnail render. `update` drains them
+    /// once per frame, writes the PNG, and tells egui to forget the
+    /// cached texture for that file:// URI so the new pixels show up.
+    pub pending_thumbnail_jobs: Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>)>,
+
     /// Background avatar load in progress, if any. Set by `top_bar::load_*`
     /// helpers, polled and cleared by `update`.
     pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
@@ -471,6 +497,7 @@ impl GuiApp {
             thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
                 crate::persistence::thumbnails_dir(),
             ),
+            pending_thumbnail_jobs: Vec::new(),
 
             avatar_load_job: None,
         };
@@ -992,6 +1019,187 @@ impl GuiApp {
         }
     }
 
+    /// Build a `RenderFrameInput` for a one-shot thumbnail render of
+    /// `avatar`. Camera is auto-framed to the avatar's bounding box,
+    /// lighting is a fixed studio default (so all entries compare
+    /// fairly), background is transparent (PNG with alpha), and the
+    /// pose is whatever the avatar already has. Output extent matches
+    /// `crate::renderer::thumbnail::THUMBNAIL_*`.
+    fn build_thumbnail_frame_input(
+        &self,
+        avatar: &crate::avatar::AvatarInstance,
+    ) -> crate::renderer::frame_input::RenderFrameInput {
+        use crate::asset::AlphaMode;
+        use crate::renderer::frame_input::*;
+        use crate::renderer::material::MaterialUploadRequest;
+        use std::sync::Arc;
+
+        let extent = [
+            crate::renderer::thumbnail::THUMBNAIL_WIDTH,
+            crate::renderer::thumbnail::THUMBNAIL_HEIGHT,
+        ];
+
+        let mesh_instances: Vec<RenderMeshInstance> = avatar
+            .asset
+            .meshes
+            .iter()
+            .flat_map(|mesh| {
+                mesh.primitives.iter().map(move |prim| {
+                    let material_asset = avatar
+                        .asset
+                        .materials
+                        .iter()
+                        .find(|m| m.id == prim.material_id);
+                    let material_binding = material_asset
+                        .map(MaterialUploadRequest::from_asset_material)
+                        .unwrap_or_else(MaterialUploadRequest::default_material);
+                    let outline = OutlineSnapshot {
+                        enabled: material_binding.outline_width > 0.0,
+                        width: material_binding.outline_width,
+                        color: material_binding.outline_color,
+                    };
+                    let alpha_mode = match material_binding.alpha_mode {
+                        AlphaMode::Opaque => RenderAlphaMode::Opaque,
+                        AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
+                        AlphaMode::Blend => RenderAlphaMode::Blend,
+                    };
+                    let cull_mode = if material_binding.double_sided {
+                        RenderCullMode::DoubleSided
+                    } else {
+                        RenderCullMode::BackFace
+                    };
+                    RenderMeshInstance {
+                        mesh_id: mesh.id,
+                        primitive_id: prim.id,
+                        material_binding,
+                        bounds: prim.bounds.clone(),
+                        alpha_mode,
+                        cull_mode,
+                        outline,
+                        primitive_data: Some(Arc::new(prim.clone())),
+                        morph_weights: Vec::new(),
+                    }
+                })
+            })
+            .collect();
+
+        // Auto-frame the avatar from the front (yaw=0, pitch=0) so all
+        // entries share a comparable view.
+        let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+        let fov_deg: f32 = 30.0;
+        let (pan_y, distance) = autoframe_aabb(&avatar.asset.root_aabb, fov_deg, aspect);
+        let cam = crate::app::ViewportCamera {
+            yaw_deg: 0.0,
+            pitch_deg: 0.0,
+            pan: [0.0, pan_y],
+            distance,
+            fov_deg,
+        };
+        let (view, eye_pos) = crate::app::Application::build_view_matrix(&cam);
+        let projection =
+            crate::app::Application::build_projection_matrix(fov_deg, aspect, 0.1, 1000.0);
+
+        RenderFrameInput {
+            camera: CameraState {
+                view,
+                projection,
+                position_ws: eye_pos,
+                viewport_extent: extent,
+            },
+            // Studio lighting: hard-coded so thumbnails are visually
+            // consistent across avatars regardless of the user's current
+            // scene lighting (which may be tuned for streaming, not
+            // library browsing).
+            lighting: LightingState {
+                main_light_dir_ws: [-0.3, -0.7, -0.5],
+                main_light_color: [1.0, 1.0, 1.0],
+                main_light_intensity: 1.0,
+                ambient_term: [0.3, 0.3, 0.3],
+            },
+            instances: vec![RenderAvatarInstance {
+                instance_id: avatar.id,
+                world_transform: avatar.world_transform.clone(),
+                mesh_instances,
+                skinning_matrices: avatar.pose.skinning_matrices.clone(),
+                cloth_deform: None,
+                debug_flags: RenderDebugFlags::default(),
+            }],
+            output_request: OutputTargetRequest {
+                preview_enabled: true,
+                output_enabled: true, // force the readback path
+                extent,
+                color_space: RenderColorSpace::Srgb,
+                alpha_mode: RenderOutputAlpha::Premultiplied,
+                export_mode: RenderExportMode::CpuReadback,
+            },
+            background_image_path: None,
+            show_ground_grid: false,
+            background_color: [0.0, 0.0, 0.0],
+            transparent_background: true,
+        }
+    }
+
+    /// Submit a thumbnail render request to the render thread for the
+    /// active avatar and queue the receiver for later polling. No-op
+    /// when there's no render thread or no active avatar.
+    pub fn kick_thumbnail_job(&mut self, output_path: std::path::PathBuf) {
+        let Some(avatar) = self.app.active_avatar() else {
+            return;
+        };
+        // Snapshot the frame input here while we still have an immutable
+        // borrow of `self.app`.
+        let input = self.build_thumbnail_frame_input(avatar);
+        let Some(rt) = self.app.render_thread.as_ref() else {
+            return;
+        };
+        let rx = rt.request_thumbnail(input);
+        self.pending_thumbnail_jobs.push((output_path, rx));
+    }
+
+    /// Drain any thumbnail jobs whose render thread response has
+    /// arrived. Each completed job overwrites the destination PNG and
+    /// invalidates egui's `file://` cache for that path so the new
+    /// pixels appear in the library inspector on the next frame.
+    fn poll_thumbnail_jobs(&mut self, ctx: &egui::Context) {
+        let mut still_pending = Vec::with_capacity(self.pending_thumbnail_jobs.len());
+        for (path, rx) in std::mem::take(&mut self.pending_thumbnail_jobs) {
+            match rx.try_recv() {
+                Ok(Ok(thumb)) => {
+                    if let Err(e) = save_thumbnail_png(&path, &thumb) {
+                        warn!(
+                            "thumbnail: failed to write '{}': {}",
+                            path.display(),
+                            e
+                        );
+                    } else {
+                        info!("thumbnail: wrote real-render PNG to {}", path.display());
+                        // Invalidate egui's image-loader cache so the
+                        // library inspector picks up the new bytes
+                        // instead of serving the placeholder texture.
+                        ctx.forget_image(&format!("file://{}", path.display()));
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "thumbnail: render failed for '{}': {}",
+                        path.display(),
+                        e
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    still_pending.push((path, rx));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!(
+                        "thumbnail: response channel disconnected for '{}'",
+                        path.display()
+                    );
+                }
+            }
+        }
+        self.pending_thumbnail_jobs = still_pending;
+    }
+
     fn poll_folder_watcher(&mut self) {
         if let Some(ref mut fw) = self.folder_watcher {
             let events = fw.poll().to_vec();
@@ -1074,6 +1282,7 @@ impl eframe::App for GuiApp {
         }
 
         self.poll_folder_watcher();
+        self.poll_thumbnail_jobs(ctx);
         self.poll_avatar_load_job();
 
         // Sync GUI-driven state into the application before running the frame.

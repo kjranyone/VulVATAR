@@ -553,7 +553,7 @@ impl Application {
     }
 
     /// Build a view matrix from orbital camera parameters (yaw, pitch, distance, pan).
-    fn build_view_matrix(cam: &ViewportCamera) -> (crate::asset::Mat4, [f32; 3]) {
+    pub(crate) fn build_view_matrix(cam: &ViewportCamera) -> (crate::asset::Mat4, [f32; 3]) {
         let yaw = cam.yaw_deg.to_radians();
         let pitch = cam.pitch_deg.to_radians();
         let (sy, cy) = (yaw.sin(), yaw.cos());
@@ -618,7 +618,7 @@ impl Application {
     }
 
     /// Build a perspective projection matrix from FOV (degrees) and aspect ratio.
-    fn build_projection_matrix(
+    pub(crate) fn build_projection_matrix(
         fov_deg: f32,
         aspect: f32,
         near: f32,

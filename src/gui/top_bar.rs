@@ -56,6 +56,17 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     state.add_recent_avatar(path.to_path_buf());
     info!("avatar loaded: {}", path.display());
     state.push_notification(format!("Loaded avatar: {}", path.display()));
+
+    // Kick a real-render thumbnail of the just-loaded avatar. Render
+    // thread completes asynchronously; poll_thumbnail_jobs picks up
+    // the result on a subsequent frame and overwrites the placeholder
+    // PNG. The library inspector then shows the rendered version.
+    let avatar_name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "avatar".to_string());
+    let thumb_path = state.thumbnail_gen.thumbnail_path_for(&avatar_name);
+    state.kick_thumbnail_job(thumb_path);
 }
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
