@@ -860,7 +860,10 @@ impl GuiApp {
                             {
                                 let loader = loader;
                                 if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {
-                                    entry.update_from_asset(&asset);
+                                    entry.update_from_asset_with_thumbnail_dir(
+                                        &asset,
+                                        self.thumbnail_gen.output_dir(),
+                                    );
                                 }
                             }
                             self.app.avatar_library.add(entry);

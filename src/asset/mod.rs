@@ -239,6 +239,35 @@ pub struct VrmMeta {
     /// identifier should inspect `spec_version`.
     pub license: Option<String>,
     pub copyright_information: Option<String>,
+    /// Author-supplied thumbnail embedded in the VRM file, resolved at load
+    /// time. VRM 1.0 stores a glTF *image* index; VRM 0.x stores a glTF
+    /// *texture* index — the loader resolves both to raw encoded bytes
+    /// (PNG / JPEG) so consumers don't have to know the source convention.
+    /// `None` when the file omits a thumbnail or the index is unresolvable.
+    pub thumbnail: Option<EmbeddedThumbnail>,
+}
+
+/// Encoded thumbnail bytes lifted out of a VRM. Carries the MIME type so a
+/// consumer that wants to write the bytes back to disk can pick the correct
+/// extension without re-decoding.
+#[derive(Clone, Debug)]
+pub struct EmbeddedThumbnail {
+    /// e.g. `"image/png"`, `"image/jpeg"`. Empty when the source glTF image
+    /// omitted `mimeType` (rare); consumers should default to PNG.
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl EmbeddedThumbnail {
+    /// File extension to pair with [`Self::bytes`] when writing to disk.
+    /// Falls back to `"png"` for unknown / missing MIME types.
+    pub fn extension(&self) -> &'static str {
+        match self.mime_type.as_str() {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/webp" => "webp",
+            _ => "png",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

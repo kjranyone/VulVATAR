@@ -1664,32 +1664,45 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .active_avatar()
                 .map(|a| a.asset.source_path.clone());
 
-            let entries: Vec<(
-                usize,
-                String,
-                std::path::PathBuf,
-                bool,
-                bool,
-                Option<usize>,
-                Option<usize>,
-            )> = {
+            // Local row struct to keep the entries collector readable now
+            // that we surface VRM metadata (title / author) alongside the
+            // existing display fields. The library view runs once per
+            // frame so the per-entry clones are cheap.
+            struct LibraryRow {
+                idx: usize,
+                name: String,
+                path: std::path::PathBuf,
+                favorite: bool,
+                exists: bool,
+                mesh_count: Option<usize>,
+                material_count: Option<usize>,
+                vrm_title: Option<String>,
+                vrm_author: Option<String>,
+            }
+
+            let entries: Vec<LibraryRow> = {
                 let lib = &state.app.avatar_library;
+                let to_row = |idx: usize,
+                              e: &crate::app::avatar_library::AvatarLibraryEntry|
+                 -> LibraryRow {
+                    LibraryRow {
+                        idx,
+                        name: e.name.clone(),
+                        path: e.path.clone(),
+                        favorite: e.favorite,
+                        exists: e.exists(),
+                        mesh_count: e.mesh_count,
+                        material_count: e.material_count,
+                        vrm_title: e.vrm_title.clone(),
+                        vrm_author: e.vrm_author.clone(),
+                    }
+                };
                 if state.library_search_query.is_empty() {
                     lib.entries
                         .iter()
                         .enumerate()
                         .filter(|(_, e)| state.library_show_missing || e.exists())
-                        .map(|(i, e)| {
-                            (
-                                i,
-                                e.name.clone(),
-                                e.path.clone(),
-                                e.favorite,
-                                e.exists(),
-                                e.mesh_count,
-                                e.material_count,
-                            )
-                        })
+                        .map(|(i, e)| to_row(i, e))
                         .collect()
                 } else {
                     lib.search(&state.library_search_query)
@@ -1697,25 +1710,14 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .filter(|e| state.library_show_missing || e.exists())
                         .filter_map(|e| {
                             let idx = lib.entries.iter().position(|x| x.path == e.path)?;
-                            Some((
-                                idx,
-                                e.name.clone(),
-                                e.path.clone(),
-                                e.favorite,
-                                e.exists(),
-                                e.mesh_count,
-                                e.material_count,
-                            ))
+                            Some(to_row(idx, e))
                         })
                         .collect()
                 }
             };
 
             let total = entries.len();
-            let available = entries
-                .iter()
-                .filter(|(_, _, _, _, exists, _, _)| *exists)
-                .count();
+            let available = entries.iter().filter(|r| r.exists).count();
             ui.label(format!("{} models ({} available)", total, available));
 
             let mut load_path: Option<std::path::PathBuf> = None;
@@ -1725,15 +1727,15 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             egui::ScrollArea::vertical()
                 .max_height(300.0)
                 .show(ui, |ui| {
-                    for (idx, name, path, favorite, exists, mesh_count, mat_count) in &entries {
+                    for row in &entries {
                         let is_current =
-                            current_avatar_path.as_ref().map_or(false, |p| *p == *path);
+                            current_avatar_path.as_ref().map_or(false, |p| *p == row.path);
 
                         let frame = if is_current {
                             egui::Frame::group(ui.style())
                                 .fill(egui::Color32::from_rgba_unmultiplied(60, 80, 120, 200))
                                 .stroke((1.0, egui::Color32::from_rgb(100, 150, 255)))
-                        } else if !*exists {
+                        } else if !row.exists {
                             egui::Frame::group(ui.style())
                                 .fill(egui::Color32::from_rgba_unmultiplied(80, 40, 40, 200))
                                 .stroke((1.0, egui::Color32::from_rgb(180, 60, 60)))
@@ -1743,27 +1745,48 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                         let response = frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let star = if *favorite { "\u{2605}" } else { "\u{2606}" };
+                                let star = if row.favorite { "\u{2605}" } else { "\u{2606}" };
                                 if ui.button(egui::RichText::new(star).size(14.0)).clicked() {
-                                    toggle_fav_idx = Some(*idx);
+                                    toggle_fav_idx = Some(row.idx);
                                 }
 
                                 ui.vertical(|ui| {
                                     ui.set_min_width(ui.available_width() - 60.0);
                                     let name_color = if is_current {
                                         egui::Color32::from_rgb(140, 190, 255)
-                                    } else if !*exists {
+                                    } else if !row.exists {
                                         egui::Color32::from_rgb(180, 100, 100)
                                     } else {
                                         egui::Color32::WHITE
                                     };
-                                    ui.label(egui::RichText::new(name).color(name_color));
+                                    ui.label(egui::RichText::new(&row.name).color(name_color));
+
+                                    // VRM-supplied title (only when distinct from the
+                                    // file-stem name, so we don't echo).
+                                    if let Some(title) = row.vrm_title.as_deref() {
+                                        if !title.is_empty() && title != row.name {
+                                            ui.label(
+                                                egui::RichText::new(title)
+                                                    .italics()
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(180, 200, 220)),
+                                            );
+                                        }
+                                    }
 
                                     let mut info = String::new();
-                                    if let Some(mc) = mesh_count {
+                                    if let Some(author) = row.vrm_author.as_deref() {
+                                        if !author.is_empty() {
+                                            info.push_str(&format!("by {}", author));
+                                        }
+                                    }
+                                    if let Some(mc) = row.mesh_count {
+                                        if !info.is_empty() {
+                                            info.push_str(" \u{2022} ");
+                                        }
                                         info.push_str(&format!("{} meshes", mc));
                                     }
-                                    if let Some(mc) = mat_count {
+                                    if let Some(mc) = row.material_count {
                                         if !info.is_empty() {
                                             info.push_str(", ");
                                         }
@@ -1778,16 +1801,16 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                     }
 
                                     ui.label(
-                                        egui::RichText::new(path.to_string_lossy().as_ref())
+                                        egui::RichText::new(row.path.to_string_lossy().as_ref())
                                             .small()
                                             .color(egui::Color32::DARK_GRAY),
                                     );
                                 });
 
                                 ui.vertical(|ui| {
-                                    if *exists {
+                                    if row.exists {
                                         if ui.button("Load").clicked() {
-                                            load_path = Some(path.clone());
+                                            load_path = Some(row.path.clone());
                                         }
                                     } else {
                                         ui.label(
@@ -1797,14 +1820,14 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                         );
                                     }
                                     if ui.button("Remove").clicked() {
-                                        remove_idx = Some(*idx);
+                                        remove_idx = Some(row.idx);
                                     }
                                 });
                             })
                         });
 
                         if response.response.clicked() {
-                            state.library_selected_index = Some(*idx);
+                            state.library_selected_index = Some(row.idx);
                         }
                     }
                 });

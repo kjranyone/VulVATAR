@@ -104,6 +104,10 @@ mod v0 {
         pub license_name: Option<String>,
         #[serde(default, rename = "otherLicenseUrl")]
         pub other_license_url: Option<String>,
+        /// VRM 0.x stores the thumbnail as a glTF *texture* index. Some
+        /// exporters emit `-1` for "no thumbnail" so the type is signed.
+        #[serde(default)]
+        pub texture: Option<i64>,
     }
 
     #[derive(Debug, Clone, Default, Deserialize)]
@@ -253,6 +257,10 @@ mod v1 {
         pub license_url: Option<String>,
         #[serde(default, rename = "thirdPartyLicenses")]
         pub third_party_licenses: Option<String>,
+        /// VRM 1.0 stores the thumbnail as a glTF *image* index (not a
+        /// texture index — this differs from 0.x).
+        #[serde(default, rename = "thumbnailImage")]
+        pub thumbnail_image: Option<u32>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -594,7 +602,13 @@ impl VrmAssetLoader {
         }
 
         on_progress(LoadStage::SpringBones);
-        let parsed = parse_vrm_extensions(&ext_map, &nodes, &mesh_to_node)?;
+        let mut parsed = parse_vrm_extensions(&ext_map, &nodes, &mesh_to_node)?;
+
+        // Resolve the thumbnail hint to encoded image bytes while we still
+        // hold `gltf_doc` and `blob`. The library code persists these to
+        // disk later — we only want to do the glTF traversal once.
+        parsed.meta.thumbnail =
+            resolve_thumbnail(&gltf_doc.document, blob, &parsed.thumbnail_hint);
 
         // VRM 0.x stores the model facing -Z; VRM 1.x (and the rest of this
         // engine) expects +Z. Bake a 180° Y rotation into each root node so
@@ -1529,6 +1543,10 @@ struct ParsedVrm {
     expressions: ExpressionAssetSet,
     springs: Vec<SpringBoneAsset>,
     colliders: Vec<ColliderAsset>,
+    /// Where in the glTF document the VRM file says its thumbnail lives.
+    /// Resolved into raw bytes after `parse_vrm_extensions` returns,
+    /// where the caller has access to `gltf::Document` + the binary blob.
+    thumbnail_hint: ThumbnailHint,
 }
 
 impl ParsedVrm {
@@ -1541,8 +1559,18 @@ impl ParsedVrm {
             },
             springs: vec![],
             colliders: vec![],
+            thumbnail_hint: ThumbnailHint::default(),
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ThumbnailHint {
+    /// VRM 1.0: index into `doc.images()` (glTF *image*, not texture).
+    image_index: Option<usize>,
+    /// VRM 0.x: index into `doc.textures()`. The texture's `.source()` is
+    /// the image index we ultimately read.
+    texture_index: Option<usize>,
 }
 
 fn parse_vrm_extensions(
@@ -1585,7 +1613,7 @@ fn parse_v1_extensions(
             VrmLoadError::JsonParse(e)
         })?;
 
-    let meta = build_v1_meta(&vrmc_vrm);
+    let (meta, thumbnail_hint) = build_v1_meta(&vrmc_vrm);
     let humanoid = Some(build_v1_humanoid(&vrmc_vrm.humanoid)?);
     let expressions = vrmc_vrm
         .expressions
@@ -1612,12 +1640,56 @@ fn parse_v1_extensions(
         expressions,
         springs,
         colliders,
+        thumbnail_hint,
     })
 }
 
-fn build_v1_meta(ext: &v1::VrmExtension) -> VrmMeta {
+/// Resolve a [`ThumbnailHint`] to the encoded image bytes (PNG / JPEG)
+/// embedded in the VRM. Returns `None` when the hint is empty, the index
+/// is out of range, the image source is an external URI we can't read,
+/// or the buffer slice is unreachable. Logs but does not error — a
+/// missing thumbnail must not fail the avatar load.
+fn resolve_thumbnail(
+    doc: &gltf::Document,
+    blob: Option<&[u8]>,
+    hint: &ThumbnailHint,
+) -> Option<EmbeddedThumbnail> {
+    let image = if let Some(image_idx) = hint.image_index {
+        doc.images().nth(image_idx)
+    } else if let Some(tex_idx) = hint.texture_index {
+        doc.textures().nth(tex_idx).map(|tex| tex.source())
+    } else {
+        return None;
+    }?;
+
+    match image.source() {
+        gltf::image::Source::View { view, mime_type } => {
+            let start = view.offset();
+            let end = start + view.length();
+            let bytes = blob.and_then(|b| b.get(start..end))?;
+            Some(EmbeddedThumbnail {
+                mime_type: mime_type.to_string(),
+                bytes: bytes.to_vec(),
+            })
+        }
+        gltf::image::Source::Uri { uri, .. } => {
+            // VRM thumbnails are virtually always embedded in the .glb
+            // binary chunk; URI references are unusual but legal here.
+            log::warn!(
+                "VRM thumbnail at uri '{uri}' is external; skipping (no source-relative resolver)",
+            );
+            None
+        }
+    }
+}
+
+fn build_v1_meta(ext: &v1::VrmExtension) -> (VrmMeta, ThumbnailHint) {
     let meta = ext.meta.clone().unwrap_or_default();
-    VrmMeta {
+    let hint = ThumbnailHint {
+        image_index: meta.thumbnail_image.map(|i| i as usize),
+        texture_index: None,
+    };
+    let vrm_meta = VrmMeta {
         spec_version: VrmSpecVersion::V1,
         spec_version_raw: ext.spec_version.clone(),
         title: meta.name,
@@ -1627,7 +1699,9 @@ fn build_v1_meta(ext: &v1::VrmExtension) -> VrmMeta {
         references: meta.references.unwrap_or_default(),
         license: meta.license_url,
         copyright_information: meta.copyright_information,
-    }
+        thumbnail: None,
+    };
+    (vrm_meta, hint)
 }
 
 fn build_v1_humanoid(humanoid: &v1::Humanoid) -> Result<HumanoidMap, VrmLoadError> {
@@ -1837,7 +1911,7 @@ fn parse_v0_extensions(
         VrmLoadError::JsonParse(e)
     })?;
 
-    let meta = build_v0_meta(&root);
+    let (meta, thumbnail_hint) = build_v0_meta(&root);
     let humanoid = root.humanoid.as_ref().map(build_v0_humanoid);
     let expressions = root
         .blend_shape_master
@@ -1858,10 +1932,11 @@ fn parse_v0_extensions(
         expressions,
         springs,
         colliders,
+        thumbnail_hint,
     })
 }
 
-fn build_v0_meta(root: &v0::VrmRoot) -> VrmMeta {
+fn build_v0_meta(root: &v0::VrmRoot) -> (VrmMeta, ThumbnailHint) {
     let meta = root.meta.clone().unwrap_or_default();
     // VRM 0.x `author` is a single string; multi-author files put names as a
     // comma-separated list. Split so Inspector and library entries treat each
@@ -1876,7 +1951,16 @@ fn build_v0_meta(root: &v0::VrmRoot) -> VrmMeta {
         })
         .unwrap_or_default();
     let references = meta.reference.into_iter().collect();
-    VrmMeta {
+    // Some VRM 0.x exporters emit `-1` for "no thumbnail"; guard against that.
+    let texture_index = meta
+        .texture
+        .filter(|i| *i >= 0)
+        .map(|i| i as usize);
+    let hint = ThumbnailHint {
+        image_index: None,
+        texture_index,
+    };
+    let vrm_meta = VrmMeta {
         spec_version: VrmSpecVersion::V0,
         spec_version_raw: root.spec_version.clone(),
         title: meta.title,
@@ -1886,7 +1970,9 @@ fn build_v0_meta(root: &v0::VrmRoot) -> VrmMeta {
         references,
         license: meta.license_name.or(meta.other_license_url),
         copyright_information: None,
-    }
+        thumbnail: None,
+    };
+    (vrm_meta, hint)
 }
 
 fn build_v0_humanoid(humanoid: &v0::Humanoid) -> HumanoidMap {

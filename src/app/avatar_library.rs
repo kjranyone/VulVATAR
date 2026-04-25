@@ -55,6 +55,27 @@ impl AvatarLibraryEntry {
     }
 
     pub fn update_from_asset(&mut self, asset: &crate::asset::AvatarAsset) {
+        self.update_from_asset_inner(asset, None);
+    }
+
+    /// Same as [`Self::update_from_asset`] but additionally writes the
+    /// VRM-embedded thumbnail (if any) to `thumbnail_dir/<safe_name>.<ext>`
+    /// and stores its path on `self.thumbnail_path`. The directory is
+    /// created if missing. Errors are logged but never fail the update —
+    /// the avatar is still importable when the thumbnail can't be saved.
+    pub fn update_from_asset_with_thumbnail_dir(
+        &mut self,
+        asset: &crate::asset::AvatarAsset,
+        thumbnail_dir: &Path,
+    ) {
+        self.update_from_asset_inner(asset, Some(thumbnail_dir));
+    }
+
+    fn update_from_asset_inner(
+        &mut self,
+        asset: &crate::asset::AvatarAsset,
+        thumbnail_dir: Option<&Path>,
+    ) {
         self.name = asset
             .source_path
             .file_stem()
@@ -76,7 +97,42 @@ impl AvatarLibraryEntry {
             Some(meta.authors.join(", "))
         };
         self.vrm_version = Some(meta.spec_version.label().to_string());
+
+        if let (Some(dir), Some(thumb)) = (thumbnail_dir, meta.thumbnail.as_ref()) {
+            match write_vrm_thumbnail(dir, &self.name, thumb) {
+                Ok(path) => self.thumbnail_path = Some(path),
+                Err(e) => log::warn!(
+                    "library: failed to write VRM thumbnail for '{}' to {}: {}",
+                    self.name,
+                    dir.display(),
+                    e
+                ),
+            }
+        }
     }
+}
+
+fn write_vrm_thumbnail(
+    dir: &Path,
+    avatar_name: &str,
+    thumb: &crate::asset::EmbeddedThumbnail,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    // Sanitise the filename the same way ThumbnailGenerator does so the
+    // two paths are interoperable. Only ASCII alphanumeric, '-', '_'.
+    let safe: String = avatar_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("{}.{}", safe, thumb.extension()));
+    std::fs::write(&path, &thumb.bytes)?;
+    Ok(path)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
