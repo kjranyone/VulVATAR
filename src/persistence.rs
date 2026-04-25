@@ -429,6 +429,63 @@ fn library_path() -> std::path::PathBuf {
     path
 }
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct WatchedFoldersFile {
+    #[serde(default)]
+    pub format_version: u32,
+    #[serde(default)]
+    pub paths: Vec<std::path::PathBuf>,
+}
+
+fn watched_folders_path() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("watched_folders.json");
+    path
+}
+
+pub fn load_watched_folders() -> Vec<std::path::PathBuf> {
+    let path = watched_folders_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str::<WatchedFoldersFile>(&data) {
+            Ok(file) => file.paths,
+            Err(e) => {
+                error!(
+                    "persistence: failed to parse watched folders at {}: {}",
+                    path.display(),
+                    e
+                );
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            error!(
+                "persistence: failed to read watched folders at {}: {}",
+                path.display(),
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+pub fn save_watched_folders(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    let path = watched_folders_path();
+    let file = WatchedFoldersFile {
+        format_version: 1,
+        paths: paths.to_vec(),
+    };
+    let data = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("serialise watched folders: {}", e))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    atomic_write(&path, &data)
+        .map_err(|e| format!("write watched folders: {}", e))
+}
+
 fn recent_avatars_path() -> std::path::PathBuf {
     let mut path = app_data_dir();
     path.push("recent_avatars.json");

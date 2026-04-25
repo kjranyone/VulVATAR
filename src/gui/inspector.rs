@@ -1632,6 +1632,76 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
 }
 
+fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
+    egui::CollapsingHeader::new("Watched folders")
+        .default_open(false)
+        .show(ui, |ui| {
+            // The list is a snapshot — we collect paths up front so the
+            // mutating Remove path doesn't trip the egui borrow on
+            // state.watched_avatar_dirs while iterating.
+            let watched: Vec<std::path::PathBuf> = state.watched_avatar_dirs.clone();
+
+            if watched.is_empty() {
+                ui.label(
+                    egui::RichText::new("No folders watched. New VRM files added to a watched folder are auto-imported into the library.")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+
+            let mut to_remove: Option<std::path::PathBuf> = None;
+            for path in &watched {
+                ui.horizontal(|ui| {
+                    let exists = path.exists();
+                    let label = path.to_string_lossy().into_owned();
+                    let color = if exists {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(180, 100, 100)
+                    };
+                    ui.label(egui::RichText::new(label).color(color));
+                    if !exists {
+                        ui.label(
+                            egui::RichText::new("(missing)")
+                                .small()
+                                .color(egui::Color32::RED),
+                        );
+                    }
+                    if ui.button("Stop").clicked() {
+                        to_remove = Some(path.clone());
+                    }
+                });
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button("Watch folder...").clicked() {
+                    if let Some(picked) = rfd::FileDialog::new()
+                        .set_title("Watch folder for new VRM files")
+                        .pick_folder()
+                    {
+                        if let Err(e) = state.start_watching_folder(picked.clone()) {
+                            state.push_notification(format!(
+                                "Failed to watch {}: {}",
+                                picked.display(),
+                                e
+                            ));
+                        }
+                    }
+                }
+            });
+
+            if let Some(path) = to_remove {
+                if let Err(e) = state.stop_watching_folder(&path) {
+                    state.push_notification(format!(
+                        "Failed to stop watching {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+            }
+        });
+}
+
 fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Model Library")
         .default_open(true)
@@ -1656,6 +1726,10 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             });
 
             ui.checkbox(&mut state.library_show_missing, "Show missing files");
+
+            ui.separator();
+
+            draw_watched_folders(ui, state);
 
             ui.separator();
 

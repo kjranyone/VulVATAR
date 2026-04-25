@@ -473,6 +473,29 @@ impl GuiApp {
             }
         }
 
+        // Restore watched-folder subscriptions persisted from a previous
+        // session. Each call may fail (path went missing, permissions
+        // changed, etc); failures get a notification and the path is
+        // dropped from the live list. The persisted file is rewritten
+        // afterwards so a missing folder doesn't keep coming back.
+        for path in crate::persistence::load_watched_folders() {
+            if !path.exists() {
+                state.push_notification(format!(
+                    "Watched folder no longer exists, dropping: {}",
+                    path.display()
+                ));
+                continue;
+            }
+            if let Err(e) = state.start_watching_folder(path.clone()) {
+                state.push_notification(format!(
+                    "Failed to restore watch on {}: {}",
+                    path.display(),
+                    e
+                ));
+            }
+        }
+        let _ = crate::persistence::save_watched_folders(&state.watched_avatar_dirs);
+
         state
     }
 }
@@ -778,6 +801,9 @@ impl GuiApp {
     }
 
     pub fn start_watching_folder(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        if self.watched_avatar_dirs.iter().any(|p| p == &path) {
+            return Ok(()); // idempotent
+        }
         if self.folder_watcher.is_none() {
             self.folder_watcher = Some(crate::app::folder_watcher::FolderWatcher::new());
         }
@@ -786,6 +812,7 @@ impl GuiApp {
             fw.watch(&path, true)?;
             self.watched_avatar_dirs.push(path.clone());
             self.push_notification(format!("Watching folder: {}", path.display()));
+            let _ = crate::persistence::save_watched_folders(&self.watched_avatar_dirs);
         }
         Ok(())
     }
@@ -795,6 +822,7 @@ impl GuiApp {
             fw.unwatch(path)?;
             self.watched_avatar_dirs.retain(|p| p != path);
             self.push_notification(format!("Stopped watching: {}", path.display()));
+            let _ = crate::persistence::save_watched_folders(&self.watched_avatar_dirs);
             if self.watched_avatar_dirs.is_empty() {
                 self.folder_watcher = None;
             }
