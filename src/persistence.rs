@@ -230,6 +230,12 @@ pub struct ClothOverlayFile {
     pub target_avatar_path: Option<String>,
     /// Full cloth asset data for complete serialization round-trip.
     pub cloth_asset: Option<crate::asset::ClothAsset>,
+    /// Audit marker recorded when `cloth_rebind::rebind_overlay`
+    /// rewrote internal IDs against a re-imported avatar. `None` for
+    /// overlays that have never been auto-rebound. `serde(default)`
+    /// keeps older `.vvtcloth` files loadable without a format bump.
+    #[serde(default)]
+    pub last_rebound_with: Option<String>,
 }
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

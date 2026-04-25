@@ -9,7 +9,7 @@ pub mod top_bar;
 pub mod viewport;
 pub mod viewport_overlay;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,25 @@ pub fn camera_resolution_for_index(index: usize) -> (u32, u32) {
         2 => (1920, 1080),
         _ => (640, 480),
     }
+}
+
+/// Re-serialise a `.vvtcloth` after a Partial rebind so the on-disk
+/// IDs match the new avatar going forward. Reads the existing file
+/// first to preserve everything outside of `cloth_asset` and the
+/// audit fields (`last_saved_with`, `last_rebound_with`).
+fn save_rebound_overlay(
+    path: &std::path::Path,
+    cloth_asset: &crate::asset::ClothAsset,
+) -> Result<(), String> {
+    let mut file = crate::persistence::load_cloth_overlay(path)?;
+    file.cloth_asset = Some(cloth_asset.clone());
+    let app_tag = format!("VulVATAR {}", env!("CARGO_PKG_VERSION"));
+    file.last_saved_with = app_tag.clone();
+    file.last_rebound_with = Some(app_tag);
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("serialise rebound overlay: {}", e))?;
+    crate::persistence::atomic_write(path, &json)
+        .map_err(|e| format!("write rebound overlay '{}': {}", path.display(), e))
 }
 
 /// Encode a [`ThumbnailRenderResult`] (raw RGBA8 + extent) as PNG at
@@ -882,10 +901,10 @@ impl GuiApp {
     /// Re-attach each cloth overlay listed in the project file to the
     /// active avatar. Each path is loaded via
     /// [`crate::persistence::load_cloth_overlay`] (which handles version
-    /// migration) and then attached + initialised on a fresh slot,
-    /// preserving its source path so a subsequent save round-trips.
-    /// Failures are surfaced as notifications and skip that single
-    /// overlay rather than aborting the whole apply.
+    /// migration), routed through the rebinder so reimported avatars
+    /// don't break the binding by-id, and then attached + initialised
+    /// on a fresh slot. Failed rebinds surface as notifications and
+    /// skip that single overlay rather than aborting the whole apply.
     fn restore_cloth_overlay_paths(&mut self, paths: &[String]) {
         if paths.is_empty() {
             return;
@@ -930,8 +949,11 @@ impl GuiApp {
             return;
         }
 
-        if let Some(avatar) = self.app.active_avatar_mut() {
-            for (path, cloth_asset) in resolved {
+        for (path, mut cloth_asset) in resolved {
+            if !self.attempt_overlay_rebind(&path, &mut cloth_asset) {
+                continue; // rebind reported Failed; skip attach
+            }
+            if let Some(avatar) = self.app.active_avatar_mut() {
                 let overlay_id = crate::asset::ClothOverlayId(
                     (avatar.cloth_overlay_count() as u64) + 2,
                 );
@@ -940,6 +962,62 @@ impl GuiApp {
                 if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
                     slot.source_path = Some(path);
                 }
+            }
+        }
+    }
+
+    /// Run the cloth-rebind pass against the active avatar and route
+    /// the report status: Clean → silent debug log; Partial → user
+    /// notification + write-back to disk with `last_rebound_with`
+    /// stamp; Failed → notification, return `false` so the caller
+    /// skips attaching the overlay.
+    pub(crate) fn attempt_overlay_rebind(
+        &mut self,
+        path: &std::path::Path,
+        cloth_asset: &mut crate::asset::ClothAsset,
+    ) -> bool {
+        use crate::asset::cloth_rebind::{rebind_overlay, RebindStatus};
+
+        let report = match self.app.active_avatar() {
+            Some(avatar) => rebind_overlay(cloth_asset, &avatar.asset),
+            None => return true, // no avatar to rebind against; nothing to do
+        };
+
+        match report.status {
+            RebindStatus::Clean => {
+                debug!(
+                    "rebind: '{}' clean ({} node refs, {} primitive refs walked)",
+                    path.display(),
+                    report.node_remappings.len(),
+                    report.primitive_remappings.len()
+                );
+                true
+            }
+            RebindStatus::Partial => {
+                self.push_notification(format!(
+                    "Rebound overlay '{}': {} nodes + {} primitives resolved by name",
+                    path.display(),
+                    report.node_remappings.len(),
+                    report.primitive_remappings.len(),
+                ));
+                if let Err(e) = save_rebound_overlay(path, cloth_asset) {
+                    warn!(
+                        "rebind: failed to write back rebound overlay '{}': {}",
+                        path.display(),
+                        e
+                    );
+                }
+                true
+            }
+            RebindStatus::Failed => {
+                self.push_notification(format!(
+                    "Could not auto-bind overlay '{}': {} unresolved + {} geometry mismatches. \
+                     Overlay was not attached.",
+                    path.display(),
+                    report.unresolved.len(),
+                    report.fatal_geometry_changes.len(),
+                ));
+                false
             }
         }
     }
@@ -1441,6 +1519,7 @@ impl eframe::App for GuiApp {
                     overlay_name,
                     target_avatar_path,
                     cloth_asset: self.app.editor.overlay_asset.clone(),
+                    last_rebound_with: None,
                 })
             } else {
                 None

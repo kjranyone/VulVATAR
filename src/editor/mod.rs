@@ -83,6 +83,7 @@ impl EditorSession {
             overlay_name,
             target_avatar_path,
             cloth_asset: self.overlay_asset.clone(),
+            last_rebound_with: None,
         };
 
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;

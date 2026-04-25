@@ -441,8 +441,18 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 None
                             }
                         };
-                        if let Some(cloth_asset) = asset_opt {
-                            if let Some(avatar) = state.app.active_avatar_mut() {
+                        if let Some(mut cloth_asset) = asset_opt {
+                            // Resolve the overlay's stored IDs against the
+                            // currently-loaded avatar. If the avatar was
+                            // re-exported and the IDs drifted, the rebinder
+                            // rewrites them by name. A Failed status (refs
+                            // we can't resolve at any tier) skips the attach.
+                            if !state.attempt_overlay_rebind(&path, &mut cloth_asset) {
+                                state.push_notification(format!(
+                                    "Overlay '{}' was not attached (rebind failed).",
+                                    path.display()
+                                ));
+                            } else if let Some(avatar) = state.app.active_avatar_mut() {
                                 let overlay_id = crate::asset::ClothOverlayId(
                                     (avatar.cloth_overlay_count() as u64) + 2,
                                 );
