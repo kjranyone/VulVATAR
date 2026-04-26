@@ -269,24 +269,46 @@ fn app_tag() -> String {
     format!("VulVATAR {}", APP_VERSION)
 }
 
+/// Generic version-chain walker. Repeatedly applies `step(json, version)`
+/// while incrementing the version counter, until `target_version` is
+/// reached. Each `step` is responsible for the `version → version + 1`
+/// transformation.
+///
+/// Extracted so it can be unit-tested with a fake `step` — the real
+/// `step_overlay` / `step_project` match arms have nothing in them yet
+/// (every released file is already at the current version), so without
+/// a generic helper the loop logic itself never fires under test, and
+/// would only meet the wild on the day a v2 ships.
+fn migrate_chain<StepFn>(
+    json: serde_json::Value,
+    from_version: u32,
+    target_version: u32,
+    step: StepFn,
+) -> Result<serde_json::Value, String>
+where
+    StepFn: Fn(serde_json::Value, u32) -> Result<serde_json::Value, String>,
+{
+    let mut current = json;
+    let mut version = from_version;
+    while version < target_version {
+        current = step(current, version)?;
+        version += 1;
+    }
+    Ok(current)
+}
+
 /// Walk a JSON document up the cloth-overlay version chain until it
 /// matches [`OVERLAY_FORMAT_VERSION`]. Each iteration looks up the
 /// migrator for `(version → version + 1)` and bumps the counter.
 ///
 /// No migrators exist yet — every released file is already at v1. When
-/// a v2 lands, register its migrator in the match below; the chain
+/// a v2 lands, register its migrator in [`step_overlay`]; the chain
 /// then handles `v0 → v1 → v2` automatically.
 fn migrate_cloth_overlay_json(
     json: serde_json::Value,
     from_version: u32,
 ) -> Result<serde_json::Value, String> {
-    let mut current = json;
-    let mut version = from_version;
-    while version < OVERLAY_FORMAT_VERSION {
-        current = step_overlay(current, version)?;
-        version += 1;
-    }
-    Ok(current)
+    migrate_chain(json, from_version, OVERLAY_FORMAT_VERSION, step_overlay)
 }
 
 fn step_overlay(_json: serde_json::Value, version: u32) -> Result<serde_json::Value, String> {
@@ -306,13 +328,7 @@ fn migrate_project_json(
     json: serde_json::Value,
     from_version: u32,
 ) -> Result<serde_json::Value, String> {
-    let mut current = json;
-    let mut version = from_version;
-    while version < PROJECT_FORMAT_VERSION {
-        current = step_project(current, version)?;
-        version += 1;
-    }
-    Ok(current)
+    migrate_chain(json, from_version, PROJECT_FORMAT_VERSION, step_project)
 }
 
 fn step_project(_json: serde_json::Value, version: u32) -> Result<serde_json::Value, String> {
@@ -1183,6 +1199,61 @@ mod tests {
     fn read_format_version_picks_up_field() {
         let with_field = json!({"format_version": 7});
         assert_eq!(read_format_version(&with_field), 7);
+    }
+
+    #[test]
+    fn migrate_chain_applies_each_step_with_correct_version_in_order() {
+        // Real migrators don't exist yet — without this fake-stepper
+        // exercise, the loop's "apply step → bump version → repeat" logic
+        // would only fire for the first time on the day a v2 lands. Use a
+        // stepper that records the (version → output) sequence so we can
+        // verify each step sees the previous step's result with the right
+        // version label.
+        let stepper = |mut v: serde_json::Value, version: u32| -> Result<_, String> {
+            let key = format!("step_{}", version);
+            v.as_object_mut().unwrap().insert(key, json!(version));
+            Ok(v)
+        };
+        let result = migrate_chain(json!({"start": true}), 0, 3, stepper).unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("start"), Some(&json!(true)));
+        assert_eq!(obj.get("step_0"), Some(&json!(0)));
+        assert_eq!(obj.get("step_1"), Some(&json!(1)));
+        assert_eq!(obj.get("step_2"), Some(&json!(2)));
+        // Target version is 3 → step at version 3 must NOT be called.
+        assert!(!obj.contains_key("step_3"));
+    }
+
+    #[test]
+    fn migrate_chain_propagates_step_error_and_stops() {
+        // If a stepper returns an error mid-chain, the loop must abort
+        // immediately — no later steps fire and the original error
+        // bubbles up unmodified.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let stepper = |v: serde_json::Value, version: u32| -> Result<_, String> {
+            calls.borrow_mut().push(version);
+            if version == 1 {
+                Err(format!("boom at v{}", version))
+            } else {
+                Ok(v)
+            }
+        };
+        let err = migrate_chain(json!({}), 0, 4, stepper).unwrap_err();
+        assert!(err.contains("v1"), "expected error to mention v1, got: {}", err);
+        // Stepper called for v0 (success) and v1 (failure) only — v2/v3 must
+        // not be reached after the error.
+        assert_eq!(*calls.borrow(), vec![0, 1]);
+    }
+
+    #[test]
+    fn migrate_chain_at_target_does_not_invoke_step() {
+        // from == to is the "already current" case. The stepper must not
+        // be called at all — invoking it would corrupt up-to-date files.
+        let stepper = |_: serde_json::Value, _: u32| -> Result<_, String> {
+            panic!("stepper should not be called when from_version == target_version");
+        };
+        let result = migrate_chain(json!({"x": 1}), 5, 5, stepper).unwrap();
+        assert_eq!(result, json!({"x": 1}));
     }
 
     #[test]
