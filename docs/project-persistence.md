@@ -172,10 +172,25 @@ Bumping any of these requires registering a migrator in the matching
    `step_project` one version at a time until the JSON matches the
    current schema, then deserialise into the typed struct.
 
-No actual migrators exist yet — every released file is at v1 — but the
-plumbing is in place and unit-tested (see `persistence::tests`). When
-a v2 lands, register the v1 → v2 transformation in the relevant
-`step_*` match arm and bump the `*_FORMAT_VERSION` constant.
+No actual migrators exist yet — every released file is at v1 — but
+the plumbing is in place and unit-tested. Both `migrate_cloth_overlay_json`
+and `migrate_project_json` delegate to a shared
+`migrate_chain<F>(json, from, target, step)` helper, and the helper
+itself is exercised against a fake `step` in three unit tests
+(`migrate_chain_*` in `persistence::tests`):
+
+- sequential application — each step sees the prior step's output and
+  the right version label, target_version is exclusive.
+- error propagation — a stepper that fails at v1 stops the chain
+  immediately; v2/v3 are not invoked.
+- `from == target` — the stepper is panic-asserted-not-called, so the
+  "already current" path can never accidentally corrupt up-to-date
+  files.
+
+When a v2 lands, register the v1 → v2 transformation in the relevant
+`step_*` match arm and bump the `*_FORMAT_VERSION` constant — the
+loop body is already covered, so the only new test surface is the
+specific transformation.
 
 ## Reload Validation
 
@@ -233,6 +248,15 @@ For the first pass, external source references are simpler, but the project load
 - avoid positional encodings
 - keep stable IDs visible in serialized data
 - make unsupported extra fields ignorable where practical
+- when a field needs `#[serde(default)]` for backwards compat, point
+  it at a named function that returns the canonical default rather
+  than `f32::default()` / `bool::default()`. A bare `#[serde(default)]`
+  on `confidence_threshold` previously fell back to `0.0` for
+  pre-existing-field projects, silently disabling keypoint filtering
+  on load until the user touched the slider; the canonical default
+  (`tracking::DEFAULT_CONFIDENCE_THRESHOLD`) is the right answer and
+  the missing-field deserialisation is now pinned by a unit test
+  (`tracking_config_supplies_canonical_confidence_when_field_missing`).
 
 ## Failure Modes To Avoid
 
@@ -241,3 +265,5 @@ For the first pass, external source references are simpler, but the project load
 - silently dropping unknown fields during migration
 - rebinding overlays to the wrong mesh by import order
 - treating cache files as authoritative user data
+- bare `#[serde(default)]` on a field whose `Default` is meaningless
+  for the GUI — see Serialization Guidance above.

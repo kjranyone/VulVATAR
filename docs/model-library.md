@@ -78,11 +78,50 @@ The library browser appears as a collapsible section ("Model Library") in the Pr
 - `GuiApp` holds search state, selected index, and tag buffer for the library UI
 - Library persistence is handled via `persistence::load_avatar_library` / `save_avatar_library`
 
+## Folder Watching
+
+Every directory added via *Watched folders* is registered with a
+`notify`-backed watcher in the avatar library inspector; new `.vrm`
+files appearing under a watched directory get auto-imported with a
+notification toast. The watcher's debounce is fixed at 100 ms and
+only handles flat directories (recursion is off).
+
+### Limitations
+
+`notify`'s recommended backend is local-filesystem-only by design:
+
+- **UNC / SMB shares** — server-side change events typically don't
+  reach the client on Windows; new files can sit on the share until
+  the user manually pokes the library.
+- **OneDrive / Google Drive / Dropbox** — cloud-sync clients land
+  files in stages (placeholder → real bytes) and the events
+  collapse under the debounce as `Modified` rather than `Created`,
+  so the VRM-Created filter rejects them.
+- **Symlinks / NTFS junctions** — propagation across the link is
+  platform-dependent.
+
+For these cases, the inspector exposes a manual **Refresh** button
+that walks every watched directory, calls the same import path the
+notify-driven poll uses (`GuiApp::import_vrm_into_library_if_missing`),
+and reports the count of newly-imported files. Operators on
+cloud-synced setups should treat Refresh as routine, not as a
+recovery step.
+
+## Avatar Load Cache
+
+The library is independent from the on-disk parse cache at
+`%APPDATA%\VulVATAR\cache\*.vvtcache` — see `src/asset/cache.rs`.
+On `Application::new`, `evict_to_count(DEFAULT_MAX_CACHE_ENTRIES = 20)`
+drops the oldest-mtime entries past the cap. When eviction fires it
+logs `evicted N entries — freed X.X MB (cache now Y.Y MB, cap M)` so
+the cap's real meaning ("how much disk does 20 entries cost?") is
+visible per the operator's own avatars rather than guessed at from a
+docstring estimate.
+
 ## Future Extensions
 
-- Thumbnail generation and display
 - Drag-and-drop import
-- Folder watching for automatic library updates
-- Import metadata from VRM extension data (title, author, version, thumbnail)
+- Import metadata from VRM extension data (title, author, version,
+  thumbnail) — partially landed; tags and category remain manual.
 - Library categories or folders
 - Export/import of library catalogs
