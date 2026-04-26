@@ -8,6 +8,7 @@ pub mod material;
 pub mod mtoon;
 pub mod output_export;
 pub mod pipeline;
+mod pipeline_lint_tests;
 pub mod targets;
 pub mod thumbnail;
 pub mod upload;

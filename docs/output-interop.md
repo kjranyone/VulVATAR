@@ -141,3 +141,46 @@ The GUI should expose:
 - blocking rendering on sink-side latency
 - making CPU readback the default path by accident
 - hiding fallback activation from the user
+
+## Manual QA — Output Color Space
+
+These checks are not automated (no Vulkan device or sample VRM in CI).
+Run them before shipping any change that touches `pipeline.rs` shader
+sources, `color_attachment_format`, or the output sink path.
+
+### Visual Matrix
+
+1. `cargo run --bin render_matrix -- <some.vrm>` produces four PNGs:
+   `srgb_opaque`, `srgb_transparent`, `linear_opaque`, `linear_transparent`.
+2. Open them side-by-side. The two sRGB renders should look like the
+   avatar in the GUI viewport. The two linear renders should look
+   noticeably darker (un-encoded linear values).
+3. Watch for tell-tale regressions:
+   - **Double encode** (sRGB cell looks washed-out / pale): a manual
+     `pow(c, 1/2.2)` slipped into a fragment shader on top of the
+     sRGB attachment format.
+   - **No encode** (sRGB cell looks dark, like the linear cell): the
+     attachment format is wrong (UNORM where SRGB was expected) or the
+     shader stopped writing linear.
+   - **Alpha bleed** in the transparent cells: pre-multiplied vs.
+     straight alpha got crossed.
+
+### OBS Handoff
+
+The Windows virtual-camera path tags frames with
+`MF_MT_TRANSFER_FUNCTION`; downstream consumers (OBS, Discord,
+Teams) read it to decide how to interpret the bytes. The CI lint
+catches *shader-side* gamma regressions but cannot verify that the
+metadata reaches the consumer correctly.
+
+1. Start VulVATAR with the virtual-camera output sink active.
+2. Open OBS Studio, add a Video Capture Device source, pick the
+   VulVATAR virtual camera.
+3. Compare the OBS preview against the VulVATAR GUI viewport. They
+   should match. A consistent hue / brightness shift means OBS is
+   re-applying a transfer curve (or skipping one we expected it to
+   apply) — check `MF_MT_TRANSFER_FUNCTION` in `mfenum`'s output and
+   the format VulVATAR is publishing.
+4. Repeat with the linear output mode active. OBS preview should
+   look noticeably darker; if it looks identical to the sRGB run,
+   the metadata isn't being honoured downstream.
