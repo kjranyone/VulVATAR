@@ -36,7 +36,23 @@ use std::time::SystemTime;
 const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// Bump on incompatible header / wire-format changes.
 const VVT_CACHE_VERSION: u32 = 1;
-/// Default cap for `evict_to_count`. Configurable from callers.
+/// Default cap on the number of `.vvtcache` files retained under
+/// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
+/// drops the oldest-mtime entries on next startup.
+///
+/// **Sizing rationale.** A `.vvtcache` is bincode of one
+/// [`AvatarAsset`] — skeleton + meshes + materials + animation
+/// clips. Most VRoid-style VRMs land in the 20–60 MB range per
+/// entry. 20 entries × ~40 MB ≈ 800 MB on average, which is the
+/// rough ceiling we're willing to trade for fast warm-start across
+/// the user's recently-touched avatars without spamming their AppData
+/// with gigabytes.
+///
+/// A static "expect ~X MB" number drifts as the asset format evolves,
+/// so [`evict_to_count`] also logs the actual bytes freed on each
+/// eviction — the most truthful reading of "what does this cap mean
+/// on my hardware?" comes from the operator's own logs after they hit
+/// the cap.
 pub const DEFAULT_MAX_CACHE_ENTRIES: usize = 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -337,44 +353,54 @@ pub fn clear_all() -> Result<usize, String> {
 /// Called from `Application::new` on startup so the cache doesn't grow
 /// unbounded. Errors are logged + swallowed because eviction is
 /// best-effort.
+///
+/// On firing, logs `evicted N entries — freed X MB (cache now Y MB,
+/// cap M)`. The freed-bytes figure is the truthful number that
+/// answers "what does the cap mean on my hardware?" — the docstring
+/// on [`DEFAULT_MAX_CACHE_ENTRIES`] gives a rough order-of-magnitude
+/// estimate, but operators should trust their own logs over the
+/// estimate.
 pub fn evict_to_count(max_count: usize) {
     let dir = crate::persistence::cache_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return,
     };
-    let mut files: Vec<(PathBuf, SystemTime)> = entries
+    let mut files: Vec<(PathBuf, SystemTime, u64)> = entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
             if path.extension().and_then(|s| s.to_str()) != Some("vvtcache") {
                 return None;
             }
-            let mtime = e
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            Some((path, mtime))
+            let metadata = e.metadata().ok()?;
+            let mtime = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
+            let size = metadata.len();
+            Some((path, mtime, size))
         })
         .collect();
     if files.len() <= max_count {
         return;
     }
+    let total_bytes_before: u64 = files.iter().map(|(_, _, sz)| *sz).sum();
     // Newest first: keep the head, drop the tail.
     files.sort_by(|a, b| b.1.cmp(&a.1));
     let mut evicted = 0;
-    for (path, _) in files.into_iter().skip(max_count) {
+    let mut freed_bytes: u64 = 0;
+    for (path, _, size) in files.into_iter().skip(max_count) {
         if let Err(e) = fs::remove_file(&path) {
             warn!("cache: evict '{}' failed: {}", path.display(), e);
         } else {
             evicted += 1;
+            freed_bytes += size;
         }
     }
     if evicted > 0 {
+        let freed_mb = freed_bytes as f64 / (1024.0 * 1024.0);
+        let now_mb = (total_bytes_before.saturating_sub(freed_bytes)) as f64 / (1024.0 * 1024.0);
         info!(
-            "cache: evicted {} entries (cap {})",
-            evicted, max_count
+            "cache: evicted {} entries — freed {:.1} MB (cache now {:.1} MB, cap {})",
+            evicted, freed_mb, now_mb, max_count
         );
     }
 }
