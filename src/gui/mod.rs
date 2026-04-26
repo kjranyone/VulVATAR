@@ -580,6 +580,156 @@ impl GuiApp {
 
         state
     }
+
+    /// Build a minimal `GuiApp` for unit/integration tests. Identical to
+    /// [`GuiApp::new`] in shape, but skips:
+    ///
+    /// * `eframe::CreationContext` (no egui context available in tests)
+    /// * disk reads (avatar library, scene presets, recent avatars,
+    ///   recovery snapshot, watched folders) — start with empty state
+    /// * system probes (`list_cameras`, `list_audio_devices`) — empty
+    ///   vecs, since the test doesn't drive the GUI
+    /// * environment-driven autostart (autoload avatar, virtual-camera)
+    ///
+    /// The test can then populate `app.avatars` directly and exercise
+    /// methods on this harness without spinning up the full GUI.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let app = Box::new(Application::new());
+        Self {
+            mode: AppMode::Preview,
+            app,
+            paused: false,
+            frame_count: 0,
+            project_path: None,
+
+            last_frame_instant: Instant::now(),
+            frame_time_ms: 0.0,
+            fps: 0.0,
+
+            recent_avatars: Vec::new(),
+
+            project_dirty: false,
+
+            autosave_interval: None,
+            last_autosave: Instant::now(),
+
+            recovery_manager: crate::persistence::RecoveryManager::new(120),
+            overlay_dirty: false,
+
+            hotkeys: hotkey::HotkeyMap::new(),
+            profiles: profile::ProfileLibrary::new(),
+            wind_presets: profile::WindPresetLibrary::new(),
+
+            notifications: Vec::new(),
+
+            transform: TransformState {
+                position: [0.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0],
+                scale: 1.0,
+            },
+            camera_orbit: CameraOrbitState {
+                yaw_deg: 0.0,
+                pitch_deg: 0.0,
+                pan: [0.0, 0.0],
+                distance: 5.0,
+                target_distance: 5.0,
+            },
+            tracking: TrackingGuiState {
+                toggle_tracking: true,
+                camera_resolution_index: 0,
+                camera_framerate_index: 0,
+                tracking_mirror: true,
+                hand_tracking_enabled: false,
+                face_tracking_enabled: true,
+                lower_body_tracking_enabled: false,
+                smoothing_strength: 0.5,
+                confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
+            },
+            rendering: RenderingGuiState {
+                material_mode_index: 2,
+                background_color: [0.1, 0.1, 0.1],
+                transparent_background: true,
+                camera_fov: 60.0,
+                main_light_dir: [0.5, -1.0, 0.3],
+                main_light_intensity: 1.0,
+                ambient_intensity: [0.2, 0.2, 0.2],
+                toon_ramp_threshold: 0.5,
+                shadow_softness: 0.1,
+                outline_enabled: true,
+                outline_width: 0.01,
+                outline_color: [0.0, 0.0, 0.0],
+                alpha_preview: false,
+                toggle_spring: true,
+                toggle_cloth: false,
+                toggle_collision_debug: false,
+                toggle_skeleton_debug: false,
+            },
+            output: OutputGuiState {
+                output_resolution_index: 0,
+                output_framerate_index: 0,
+                output_has_alpha: true,
+                output_color_space_index: 0,
+            },
+
+            camera_index: 0,
+            available_cameras: Vec::new(),
+            show_camera_wipe: false,
+            show_detection_annotations: true,
+            camera_wipe_texture: None,
+            camera_wipe_seq: 0,
+            camera_wipe_rgba_buf: Vec::new(),
+
+            lipsync: LipSyncGuiState {
+                available_mics: Vec::new(),
+                volume_threshold: 0.01,
+                smoothing: 0.5,
+                current_volume: 0.0,
+            },
+
+            animation_playing: false,
+
+            cloth_sim_playing: false,
+            cloth_rename_buf: String::new(),
+            cloth_save_status: None,
+
+            region_selection: None,
+            viewport_overlay: viewport_overlay::ViewportOverlayState::default(),
+            cloth_material_pick_index: 0,
+            cloth_distance_stiffness: 1.0,
+            cloth_bend_enabled: true,
+            cloth_bend_stiffness: 0.5,
+            cloth_collider_toggles: Vec::new(),
+            cloth_pin_node_index: 0,
+            cloth_autosave_consent: None,
+            inspector_open: true,
+            expression_weights: Vec::new(),
+
+            scene_presets: Vec::new(),
+            scene_preset_index: None,
+            scene_preset_name: String::new(),
+
+            viewport_texture: None,
+            viewport_last_frame: 0,
+            viewport_cursor_grabbed: false,
+            viewport_drag_origin: None,
+
+            library_search_query: String::new(),
+            library_selected_index: None,
+            library_rename_buf: String::new(),
+            library_tag_buf: String::new(),
+            library_show_missing: false,
+
+            folder_watcher: None,
+            watched_avatar_dirs: Vec::new(),
+            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
+                std::env::temp_dir().join("vulvatar_test_thumbs"),
+            ),
+            pending_thumbnail_jobs: Vec::new(),
+
+            avatar_load_job: None,
+        }
+    }
 }
 
 impl GuiApp {
@@ -1626,5 +1776,252 @@ impl eframe::App for GuiApp {
         crate::persistence::RecoveryManager::clear_recovery();
         info!("gui: window closing, initiating application shutdown");
         self.app.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod rebind_integration_tests {
+    //! End-to-end coverage for the partial-rebinding path on avatar
+    //! reimport. The cloth_rebind algorithm is already unit-tested
+    //! (`src/asset/cloth_rebind.rs`); these tests exercise the GUI-side
+    //! dispatch + persistence layer through a real `.vvtcloth` file
+    //! and a real `GuiApp`.
+    //!
+    //! Coverage matrix:
+    //!
+    //! * **Clean** (name match, primary tier) — verified via
+    //!   `restore_cloth_overlay_paths`: overlay is attached, no
+    //!   notification, on-disk file untouched.
+    //! * **Failed** (unresolved name) — overlay is *not* attached,
+    //!   "Could not auto-bind" notification fires, on-disk file
+    //!   untouched.
+    //! * **Partial** (secondary/tertiary tier resolution) — currently
+    //!   unreachable through the resolver: see the TODO at
+    //!   `cloth_rebind.rs:198-204`. The persistence leg
+    //!   (`save_rebound_overlay` writing `last_rebound_with`) is
+    //!   covered by a focused IO test below; once tier-2/3 resolution
+    //!   lands, replace that with a true E2E Partial test.
+    use super::*;
+    use crate::asset::{
+        Aabb, AssetSourceHash, AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, ClothPin,
+        ExpressionAssetSet, NodeId, NodeRef, SkeletonAsset, SkeletonNode, Transform, VrmMeta,
+    };
+    use crate::avatar::{AvatarInstance, AvatarInstanceId};
+    use std::sync::Arc;
+
+    fn make_skeleton_node(id: u64, name: &str) -> SkeletonNode {
+        SkeletonNode {
+            id: NodeId(id),
+            name: name.to_string(),
+            parent: None,
+            children: vec![],
+            rest_local: Transform::default(),
+            humanoid_bone: None,
+        }
+    }
+
+    fn make_avatar_with_node(node_id: u64, node_name: &str) -> Arc<AvatarAsset> {
+        let node = make_skeleton_node(node_id, node_name);
+        Arc::new(AvatarAsset {
+            id: AvatarAssetId(1),
+            source_path: std::path::PathBuf::from("test.vrm"),
+            source_hash: AssetSourceHash([0u8; 32]),
+            skeleton: SkeletonAsset {
+                root_nodes: vec![NodeId(node_id)],
+                nodes: vec![node],
+                inverse_bind_matrices: vec![],
+            },
+            meshes: vec![],
+            materials: vec![],
+            humanoid: None,
+            spring_bones: vec![],
+            colliders: vec![],
+            default_expressions: ExpressionAssetSet { expressions: vec![] },
+            animation_clips: vec![],
+            node_to_mesh: std::collections::HashMap::new(),
+            vrm_meta: VrmMeta::default(),
+            root_aabb: Aabb::empty(),
+            loaded_from_cache: false,
+        })
+    }
+
+    fn install_avatar(harness: &mut GuiApp, asset: Arc<AvatarAsset>) {
+        harness
+            .app
+            .add_avatar(AvatarInstance::new(AvatarInstanceId(1), asset));
+    }
+
+    fn make_overlay_pinning_to(name: &str, old_id: u64) -> ClothAsset {
+        let mut overlay =
+            ClothAsset::new_empty(ClothOverlayId(0), AvatarAssetId(1), AssetSourceHash([0u8; 32]));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: NodeRef {
+                id: NodeId(old_id),
+                name: name.to_string(),
+            },
+            offset: [0.0, 0.0, 0.0],
+        });
+        overlay
+    }
+
+    /// Write an overlay to disk in the canonical `ClothOverlayFile`
+    /// envelope so `load_cloth_overlay` can read it back.
+    fn write_overlay_file(path: &std::path::Path, asset: &ClothAsset) {
+        let file = crate::persistence::ClothOverlayFile {
+            format_version: crate::persistence::OVERLAY_FORMAT_VERSION,
+            created_with: "test".to_string(),
+            last_saved_with: "test".to_string(),
+            overlay_name: "test_overlay".to_string(),
+            target_avatar_path: None,
+            cloth_asset: Some(asset.clone()),
+            last_rebound_with: None,
+        };
+        let json = serde_json::to_string_pretty(&file).expect("serialise overlay file");
+        crate::persistence::atomic_write(path, &json).expect("write overlay file");
+    }
+
+    /// Allocate a unique tempdir per test so concurrent runs don't
+    /// collide on Windows.
+    fn make_tempdir(suffix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("vulvatar_rebind_test_{}_{}", suffix, nanos));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    #[test]
+    fn clean_rebind_attaches_silently_and_does_not_touch_disk() {
+        // Avatar exposes a "Hips" node at id=10. The overlay was authored
+        // when the same name lived at id=99 — id-only validation would
+        // break, but name-based primary-tier resolution should rebind it
+        // cleanly, attach the overlay, and leave the file alone.
+        let mut harness = GuiApp::for_test();
+        install_avatar(&mut harness, make_avatar_with_node(10, "Hips"));
+
+        let dir = make_tempdir("clean");
+        let overlay_path = dir.join("clean.vvtcloth");
+        let overlay_asset = make_overlay_pinning_to("Hips", 99);
+        write_overlay_file(&overlay_path, &overlay_asset);
+
+        let paths = vec![overlay_path.to_string_lossy().to_string()];
+        harness.restore_cloth_overlay_paths(&paths);
+
+        // Attached on the active avatar.
+        let avatar = harness.app.active_avatar().expect("active avatar");
+        assert_eq!(
+            avatar.cloth_overlay_count(),
+            1,
+            "Clean rebind should still attach the overlay"
+        );
+
+        // No notification — Clean is a silent path.
+        assert!(
+            harness.notifications.is_empty(),
+            "Clean rebind should not push a notification, got: {:?}",
+            harness.notifications
+        );
+
+        // On-disk file's last_rebound_with stays None — Clean does not
+        // trigger save_rebound_overlay.
+        let on_disk = crate::persistence::load_cloth_overlay(&overlay_path)
+            .expect("reload overlay after Clean rebind");
+        assert!(
+            on_disk.last_rebound_with.is_none(),
+            "Clean must not stamp last_rebound_with"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_rebind_skips_attach_and_pushes_notification() {
+        // Avatar lacks the named bone the overlay was authored against —
+        // primary tier fails, no fallback is wired up yet, so the
+        // dispatcher must skip attach, post the "Could not auto-bind"
+        // toast, and leave the file alone.
+        let mut harness = GuiApp::for_test();
+        install_avatar(&mut harness, make_avatar_with_node(10, "DifferentBone"));
+
+        let dir = make_tempdir("failed");
+        let overlay_path = dir.join("failed.vvtcloth");
+        let overlay_asset = make_overlay_pinning_to("MissingBone", 99);
+        write_overlay_file(&overlay_path, &overlay_asset);
+
+        let paths = vec![overlay_path.to_string_lossy().to_string()];
+        harness.restore_cloth_overlay_paths(&paths);
+
+        // Did NOT attach.
+        let avatar = harness.app.active_avatar().expect("active avatar");
+        assert_eq!(
+            avatar.cloth_overlay_count(),
+            0,
+            "Failed rebind must not attach the overlay"
+        );
+
+        // Notification fired with the Failed-path message.
+        assert_eq!(
+            harness.notifications.len(),
+            1,
+            "Failed rebind should post exactly one notification"
+        );
+        let msg = &harness.notifications[0].0;
+        assert!(
+            msg.contains("Could not auto-bind"),
+            "expected 'Could not auto-bind' in notification, got: {}",
+            msg
+        );
+
+        // Disk file unchanged — Failed does not call save_rebound_overlay.
+        let on_disk = crate::persistence::load_cloth_overlay(&overlay_path)
+            .expect("reload overlay after Failed rebind");
+        assert!(on_disk.last_rebound_with.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_rebound_overlay_stamps_last_rebound_with_on_disk() {
+        // Persistence-leg coverage for the (currently unreachable) Partial
+        // dispatch path: when the dispatcher *would* call this on Partial,
+        // it must produce a file whose last_rebound_with is set and whose
+        // cloth_asset payload is the rebound (not the original) one. We
+        // exercise the IO directly because the algorithm cannot yet
+        // produce a Partial report — see the module docstring.
+        let dir = make_tempdir("save");
+        let overlay_path = dir.join("partial.vvtcloth");
+        let original_asset = make_overlay_pinning_to("Hips", 99);
+        write_overlay_file(&overlay_path, &original_asset);
+
+        // Simulate the dispatcher having already rewritten the IDs in
+        // memory before save (matching what the Partial branch does).
+        let mut rebound_asset = original_asset.clone();
+        rebound_asset.pins[0].binding_node.id = NodeId(7);
+
+        save_rebound_overlay(&overlay_path, &rebound_asset).expect("save_rebound_overlay");
+
+        let on_disk = crate::persistence::load_cloth_overlay(&overlay_path)
+            .expect("reload after save_rebound_overlay");
+        let stamp = on_disk
+            .last_rebound_with
+            .as_ref()
+            .expect("save_rebound_overlay must stamp last_rebound_with");
+        assert!(
+            stamp.starts_with("VulVATAR "),
+            "stamp should be 'VulVATAR <version>', got: {}",
+            stamp
+        );
+        // last_saved_with is updated too — both should match.
+        assert_eq!(&on_disk.last_saved_with, stamp);
+        // Payload reflects the rebound IDs, not the originals.
+        let saved_asset = on_disk
+            .cloth_asset
+            .expect("cloth_asset preserved through save");
+        assert_eq!(saved_asset.pins[0].binding_node.id, NodeId(7));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
