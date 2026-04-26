@@ -537,7 +537,93 @@ impl VrmAssetLoader {
     ) -> Result<Arc<AvatarAsset>, VrmLoadError> {
         on_progress(LoadStage::Reading);
         let file_data = std::fs::read(path)?;
-        self.load_from_bytes_with_progress(&file_data, PathBuf::from(path), on_progress)
+
+        // Avatar load cache (B1, plan/T10-future-extensions.md). Try the
+        // cached parse first; on hit, re-decode textures from the source
+        // bytes (Option B: textures aren't included in the cache file) and
+        // return without redoing the rest of the glTF / VRM extension /
+        // skin / spring-bone / animation work. On miss, proceed to the
+        // full parse and best-effort cache the result for next time.
+        let source_path = PathBuf::from(path);
+        if let Ok(Some(mut cached)) = crate::asset::cache::try_load(&source_path) {
+            log::info!("avatar cache: hit for {}", source_path.display());
+            on_progress(LoadStage::Materials {
+                current: 0,
+                total: cached.materials.len(),
+            });
+            // Texture rehydration. If the parse fails (corrupt file), drop
+            // the cache hit and fall through to the regular parse path so
+            // the user sees the real error rather than a half-loaded asset.
+            match gltf::Gltf::from_slice(&file_data) {
+                Ok(gltf_doc) => {
+                    let blob = gltf_doc.blob.as_deref();
+                    let source_path_clone = cached.source_path.clone();
+                    Self::rehydrate_textures(&mut cached, &gltf_doc.document, blob, &source_path_clone);
+                    cached.id = AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed));
+                    cached.set_loaded_from_cache(true);
+                    return Ok(Arc::new(cached));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "avatar cache: hit but source re-parse failed ({}); falling back to full parse",
+                        e
+                    );
+                }
+            }
+        }
+
+        let asset = self.load_from_bytes_with_progress(&file_data, source_path.clone(), on_progress)?;
+        // Best-effort persist. If serialisation or write fails the user
+        // still gets the freshly-parsed asset; the next load just misses
+        // again.
+        if let Err(e) = crate::asset::cache::save(&source_path, &asset) {
+            log::warn!(
+                "avatar cache: save for '{}' failed: {}",
+                source_path.display(),
+                e
+            );
+        }
+        Ok(asset)
+    }
+
+    /// Walk every `TextureBinding` on `asset` and repopulate its
+    /// `pixel_data` from the freshly-parsed glTF document. Used by the
+    /// cache hit path: `TextureBinding.pixel_data` carries
+    /// `#[serde(skip)]` (see `src/asset/mod.rs`) so the cache file
+    /// stays compact, which means the renderer would otherwise see
+    /// `pixel_data == None` and fall back to its placeholder white
+    /// texture. The function reuses `texture_binding_from_info` so the
+    /// URI / decode path matches the regular load.
+    fn rehydrate_textures(
+        asset: &mut AvatarAsset,
+        gltf_doc: &gltf::Document,
+        blob: Option<&[u8]>,
+        source_path: &Path,
+    ) {
+        let mut decoded: HashMap<String, (Arc<Vec<u8>>, (u32, u32))> = HashMap::new();
+        for texture in gltf_doc.textures() {
+            let binding = Self::texture_binding_from_info(&texture, blob, source_path);
+            if let Some(pixels) = binding.pixel_data {
+                decoded.insert(binding.uri, (pixels, binding.dimensions));
+            }
+        }
+
+        let patch = |tb: &mut Option<TextureBinding>| {
+            if let Some(tb) = tb.as_mut() {
+                if let Some((pixels, dims)) = decoded.get(&tb.uri) {
+                    tb.pixel_data = Some(Arc::clone(pixels));
+                    tb.dimensions = *dims;
+                }
+            }
+        };
+
+        for mat in &mut asset.materials {
+            patch(&mut mat.texture_bindings.base_color_texture);
+            patch(&mut mat.texture_bindings.normal_map_texture);
+            patch(&mut mat.texture_bindings.shade_ramp_texture);
+            patch(&mut mat.texture_bindings.emissive_texture);
+            patch(&mut mat.texture_bindings.matcap_texture);
+        }
     }
 
     pub fn load_from_bytes(
@@ -667,6 +753,7 @@ impl VrmAssetLoader {
             node_to_mesh,
             vrm_meta: parsed.meta,
             root_aabb,
+            loaded_from_cache: false,
         };
 
         Ok(Arc::new(asset))

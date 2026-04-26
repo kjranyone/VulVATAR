@@ -18,12 +18,15 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2,
     IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor,
     IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample, MFGetSystemTime,
-    MFVideoFormat_NV12, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_SUBTYPE, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
+    MFVideoFormat_NV12, MFVideoPrimaries_BT709, MFVideoTransFunc_10, MFVideoTransFunc_sRGB,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE,
+    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
 };
 
 use crate::media_source::DEFAULT_FPS;
-use crate::shared_memory::{SharedMemoryReader, FRAME_FLAG_PRESERVE_ALPHA};
+use crate::shared_memory::{
+    SharedMemoryReader, FRAME_FLAG_LINEAR_COLOR_SPACE, FRAME_FLAG_PRESERVE_ALPHA,
+};
 use crate::{dll_add_ref, dll_release};
 
 const GUID_NULL_VALUE: GUID = GUID::from_u128(0);
@@ -220,9 +223,11 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
             s
         } else {
             // Direct path — keep the existing MFCreateMemoryBuffer flow.
-            match self.shared_memory.read_latest() {
+            let mut linear_color_space = false;
+            let s = match self.shared_memory.read_latest() {
                 Some(view) => {
                     let preserve_alpha = view.flags & FRAME_FLAG_PRESERVE_ALPHA != 0;
+                    linear_color_space = view.flags & FRAME_FLAG_LINEAR_COLOR_SPACE != 0;
                     let resampled;
                     let (rgba, w, h) = if view.width == format.width && view.height == format.height
                     {
@@ -272,7 +277,10 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
                         build_black_sample_rgb32(format.width, format.height, time, dur)?
                     }
                 }
-            }
+            };
+            // See `fill_allocated_sample` for why this is best-effort.
+            let _ = tag_sample_color_metadata(&s, linear_color_space);
+            s
         };
 
         if let Some(tok) = token {
@@ -321,6 +329,17 @@ impl VulvatarMediaStream {
             .as_ref()
             .map(|v| v.flags & FRAME_FLAG_PRESERVE_ALPHA != 0)
             .unwrap_or(false);
+        // Stage 4 of output color space: tag the IMFSample with
+        // MF_MT_VIDEO_PRIMARIES and MF_MT_TRANSFER_FUNCTION so downstream
+        // clients that consult sample-level colour attributes (OBS, some
+        // browsers) see what the producer rendered. Errors are swallowed:
+        // the colour metadata is best-effort, the pixel data is the
+        // load-bearing part.
+        let linear_color_space = view
+            .as_ref()
+            .map(|v| v.flags & FRAME_FLAG_LINEAR_COLOR_SPACE != 0)
+            .unwrap_or(false);
+        let _ = tag_sample_color_metadata(sample, linear_color_space);
 
         if let Some(ref v) = view {
             crate::t!(
@@ -750,6 +769,29 @@ fn resample_rgba_nearest(
 /// stashed on the returned sample under this attribute key.
 #[allow(non_upper_case_globals)]
 const MFSampleExtension_Token: GUID = GUID::from_u128(0x8294da66_f328_4805_b551_00deb4c57a61);
+
+/// Stage 4 (output color space): stamp the IMFSample with
+/// `MF_MT_VIDEO_PRIMARIES` (always BT.709 — sRGB and linear sRGB share
+/// the same primaries) and `MF_MT_TRANSFER_FUNCTION` (sRGB or linear,
+/// based on the producer's flag). IMFSample inherits IMFAttributes, so
+/// `SetUINT32` is the right call. Returns the underlying HRESULT on
+/// failure; callers (`fill_allocated_sample`, the direct path) treat
+/// failure as best-effort and keep the pixel data flowing.
+fn tag_sample_color_metadata(
+    sample: &IMFSample,
+    linear_color_space: bool,
+) -> windows::core::Result<()> {
+    let transfer_func = if linear_color_space {
+        MFVideoTransFunc_10
+    } else {
+        MFVideoTransFunc_sRGB
+    };
+    unsafe {
+        sample.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+        sample.SetUINT32(&MF_MT_TRANSFER_FUNCTION, transfer_func.0 as u32)?;
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // NV12 path

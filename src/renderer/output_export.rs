@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::renderer::frame_input::{OutputTargetRequest, RenderExportMode};
+use crate::renderer::frame_input::{OutputTargetRequest, RenderColorSpace, RenderExportMode};
 use crate::renderer::frame_pool::FramePool;
 use crate::renderer::gpu_handle::{GpuHandleExporter, SharedHandle};
 use std::collections::HashSet;
@@ -65,7 +65,11 @@ pub struct ExportMetadata {
     pub width: u32,
     pub height: u32,
     pub has_alpha: bool,
-    pub color_space: String,
+    /// Output colour space the renderer produced this frame in. Filled from
+    /// the corresponding `OutputTargetRequest.color_space` rather than
+    /// hardcoded — downstream sinks (MF virtual camera, image-sequence
+    /// manifests) read this when tagging frames.
+    pub color_space: RenderColorSpace,
     pub timestamp_nanos: u64,
 }
 
@@ -188,6 +192,8 @@ impl OutputExporter {
         let token_id = self.export_count;
         self.export_count += 1;
 
+        let color_space = request.output_request.color_space.clone();
+
         match &shared_frame.shared_handle {
             SharedHandle::Win32Kmt { handle: _ } => ExportResult {
                 exported_frame: Some(ExportedFrame {
@@ -200,7 +206,7 @@ impl OutputExporter {
                         width,
                         height,
                         has_alpha: true,
-                        color_space: "srgb".to_string(),
+                        color_space: color_space.clone(),
                         timestamp_nanos,
                     },
                     handoff_path: crate::output::HandoffPath::GpuSharedFrame,
@@ -237,7 +243,7 @@ impl OutputExporter {
                             width,
                             height,
                             has_alpha: true,
-                            color_space: "srgb".to_string(),
+                            color_space: color_space.clone(),
                             timestamp_nanos,
                         },
                         handoff_path: crate::output::HandoffPath::SharedMemory,
@@ -256,7 +262,7 @@ impl OutputExporter {
                         width,
                         height,
                         has_alpha: true,
-                        color_space: "srgb".to_string(),
+                        color_space,
                         timestamp_nanos,
                     },
                     handoff_path: crate::output::HandoffPath::GpuSharedFrame,
@@ -496,7 +502,7 @@ impl OutputExporter {
                     width,
                     height,
                     has_alpha: true,
-                    color_space: "srgb".to_string(),
+                    color_space: request.output_request.color_space.clone(),
                     timestamp_nanos,
                 },
                 handoff_path: crate::output::HandoffPath::CpuReadback,

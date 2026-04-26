@@ -37,10 +37,11 @@ use windows::Win32::Media::MediaFoundation::{
     MF_DEVICEMFT_SENSORPROFILE_COLLECTION, MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES,
     MF_DEVICESTREAM_FRAMESERVER_SHARED, MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID,
     MF_E_INVALIDSTREAMNUMBER, MF_E_INVALID_STATE_TRANSITION, MF_E_SHUTDOWN,
-    MF_E_UNSUPPORTED_SERVICE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
-    MF_MT_SUBTYPE,
+    MFVideoPrimaries_BT709, MFVideoTransFunc_sRGB, MF_E_UNSUPPORTED_SERVICE,
+    MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE, MF_MT_SUBTYPE,
+    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES,
 };
 
 use crate::media_stream::VulvatarMediaStream;
@@ -1117,6 +1118,14 @@ fn build_media_type(
         mt.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(width, height))?;
         mt.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(fps, 1))?;
         mt.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1))?;
+        // Stage 4 (output color space): advertise BT.709 + sRGB transfer
+        // as the negotiated baseline. The producer can override to linear
+        // on a per-sample basis via `tag_sample_color_metadata` in
+        // media_stream.rs, but having the media-type defaults explicit
+        // makes the negotiation deterministic for clients that only
+        // consult the descriptor.
+        mt.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+        mt.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_sRGB.0 as u32)?;
         if *subtype == MFVideoFormat_NV12 {
             let sample_size = width.saturating_mul(height).saturating_mul(3) / 2;
             mt.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;

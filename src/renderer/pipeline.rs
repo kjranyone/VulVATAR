@@ -41,6 +41,23 @@ pub struct GpuVertex {
 // ---------------------------------------------------------------------------
 // Shader modules
 // ---------------------------------------------------------------------------
+//
+// Gamma policy (Stage 3 audit, output color space):
+//   All fragment shaders below write **linear** values to `out_color`.
+//   - With an sRGB-format colour attachment (the default `Srgb` output mode)
+//     the GPU applies the linear→sRGB transfer curve on store automatically.
+//   - With a UNORM-format colour attachment (the `LinearSrgb` output mode)
+//     the GPU stores the linear value verbatim — that is what users opting
+//     into a linear pipeline want.
+//
+//   Texture sampling: VRM textures are uploaded with `R8G8B8A8_SRGB`, so
+//   `texture(...)` reads return linear values regardless of the output
+//   target format. No manual `pow(x, 2.2)` decode is required in any
+//   fragment shader.
+//
+//   The outline fragment shader writes raw push-constant RGB; those values
+//   originate from egui's RGB colour picker, which is a pre-existing
+//   colour-management caveat unrelated to the output colour-space switch.
 
 pub mod vs {
     vulkano_shaders::shader! {

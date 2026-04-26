@@ -91,6 +91,7 @@ struct PendingReadbackState {
     extent: [u32; 2],
     timestamp_nanos: u64,
     stats: RenderStats,
+    color_space: frame_input::RenderColorSpace,
 }
 
 const READBACK_RING_SIZE: usize = 2;
@@ -125,6 +126,12 @@ pub struct VulkanRenderer {
     offscreen_depth_view: Option<Arc<ImageView>>,
     offscreen_framebuffer: Option<Arc<Framebuffer>>,
     current_extent: [u32; 2],
+    /// Colour space the offscreen render target + render_pass are currently
+    /// built for. Compared against `input.output_request.color_space` at the
+    /// top of `render()` and triggers a rebuild of render_pass + pipelines +
+    /// offscreen targets if the user changed it. Default `Srgb` matches the
+    /// historical hardcoded format and keeps existing projects unaffected.
+    current_color_space: frame_input::RenderColorSpace,
     camera_ring: Option<CameraRing>,
     thumb_cache: Option<ThumbnailCache>,
 
@@ -184,6 +191,7 @@ impl VulkanRenderer {
             offscreen_depth_view: None,
             offscreen_framebuffer: None,
             current_extent: [1920, 1080],
+            current_color_space: frame_input::RenderColorSpace::Srgb,
             camera_ring: None,
             thumb_cache: None,
 
@@ -227,7 +235,7 @@ impl VulkanRenderer {
                 width: pending.extent[0],
                 height: pending.extent[1],
                 has_alpha: true,
-                color_space: "srgb".to_string(),
+                color_space: pending.color_space.clone(),
                 timestamp_nanos: pending.timestamp_nanos,
             },
             handoff_path: crate::output::HandoffPath::CpuReadback,
@@ -427,28 +435,11 @@ impl VulkanRenderer {
             Default::default(),
         ));
 
-        let render_pass = vulkano::single_pass_renderpass!(
-            device.clone(),
-            attachments: {
-                color: {
-                    format: Format::R8G8B8A8_SRGB,
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: Store,
-                },
-                depth_stencil: {
-                    format: Format::D32_SFLOAT_S8_UINT,
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
-            },
-            pass: {
-                color: [color],
-                depth_stencil: {depth_stencil},
-            },
-        )
-        .expect("failed to create render pass");
+        // Build the render pass for the renderer's currently configured
+        // colour space. Defaults to sRGB; a user-driven switch to Linear
+        // sRGB triggers a render-pass + pipeline rebuild later via
+        // `apply_color_space`.
+        let render_pass = Self::build_render_pass(device.clone(), &self.current_color_space);
 
         let extent = self.current_extent;
         let viewport = Viewport {
@@ -591,16 +582,40 @@ impl VulkanRenderer {
             return Ok(());
         }
 
+        let render_pass = self
+            .render_pass
+            .as_ref()
+            .ok_or("renderer: no render pass")?
+            .clone();
+
+        self.rebuild_pipelines_and_targets(render_pass, new_extent)
+            .map_err(|e| format!("resize: {e}"))?;
+
+        // Invalidate pre-allocated readback buffers (extent changed).
+        self.staging_buffers = [None, None];
+        self.readback_buffers = [None, None];
+
+        info!("renderer: resized to {}x{}", new_extent[0], new_extent[1]);
+        Ok(())
+    }
+
+    /// Recreate the seven graphics pipelines, the offscreen colour/depth
+    /// images, the framebuffer, and the camera ring against the supplied
+    /// render pass and extent. Used by both `resize` (extent change with
+    /// the same render pass) and `apply_color_space` (render pass swapped
+    /// to a different colour-attachment format). The thumbnail cache holds
+    /// a pipeline keyed to the previous render pass, so it is invalidated
+    /// here too.
+    fn rebuild_pipelines_and_targets(
+        &mut self,
+        render_pass: Arc<RenderPass>,
+        extent: [u32; 2],
+    ) -> Result<(), String> {
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
         let memory_allocator = self
             .memory_allocator
             .as_ref()
             .ok_or("renderer: no memory allocator")?
-            .clone();
-        let render_pass = self
-            .render_pass
-            .as_ref()
-            .ok_or("renderer: no render pass")?
             .clone();
 
         let (color_img, color_view, depth_img, depth_view, framebuffer) =
@@ -608,12 +623,12 @@ impl VulkanRenderer {
                 device.clone(),
                 memory_allocator,
                 render_pass.clone(),
-                new_extent,
+                extent,
             );
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
-            extent: [new_extent[0] as f32, new_extent[1] as f32],
+            extent: [extent[0] as f32, extent[1] as f32],
             depth_range: 0.0..=1.0,
         };
         use vulkano::pipeline::graphics::rasterization::CullMode;
@@ -624,7 +639,7 @@ impl VulkanRenderer {
             CullMode::Back,
             frame_input::RenderAlphaMode::Opaque,
         )
-        .map_err(|e| format!("resize: failed to create graphics pipeline: {e}"))?;
+        .map_err(|e| format!("failed to create graphics pipeline: {e}"))?;
 
         let gfx_pipeline_blend = pipeline::create_graphics_pipeline(
             device.clone(),
@@ -633,7 +648,7 @@ impl VulkanRenderer {
             CullMode::Back,
             frame_input::RenderAlphaMode::Blend,
         )
-        .map_err(|e| format!("resize: failed to create blend graphics pipeline: {e}"))?;
+        .map_err(|e| format!("failed to create blend graphics pipeline: {e}"))?;
 
         let no_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
@@ -642,7 +657,7 @@ impl VulkanRenderer {
             CullMode::None,
             frame_input::RenderAlphaMode::Opaque,
         )
-        .map_err(|e| format!("resize: failed to create no-cull pipeline: {e}"))?;
+        .map_err(|e| format!("failed to create no-cull pipeline: {e}"))?;
 
         let no_cull_pipeline_blend = pipeline::create_graphics_pipeline(
             device.clone(),
@@ -651,7 +666,7 @@ impl VulkanRenderer {
             CullMode::None,
             frame_input::RenderAlphaMode::Blend,
         )
-        .map_err(|e| format!("resize: failed to create blend no-cull pipeline: {e}"))?;
+        .map_err(|e| format!("failed to create blend no-cull pipeline: {e}"))?;
 
         let front_cull_pipeline = pipeline::create_graphics_pipeline(
             device.clone(),
@@ -660,7 +675,7 @@ impl VulkanRenderer {
             CullMode::Front,
             frame_input::RenderAlphaMode::Opaque,
         )
-        .map_err(|e| format!("resize: failed to create front-cull pipeline: {e}"))?;
+        .map_err(|e| format!("failed to create front-cull pipeline: {e}"))?;
 
         let front_cull_pipeline_blend = pipeline::create_graphics_pipeline(
             device.clone(),
@@ -669,10 +684,10 @@ impl VulkanRenderer {
             CullMode::Front,
             frame_input::RenderAlphaMode::Blend,
         )
-        .map_err(|e| format!("resize: failed to create blend front-cull pipeline: {e}"))?;
+        .map_err(|e| format!("failed to create blend front-cull pipeline: {e}"))?;
 
         let outline_pipeline = pipeline::create_outline_pipeline(device, render_pass, viewport)
-            .map_err(|e| format!("resize: failed to create outline pipeline: {e}"))?;
+            .map_err(|e| format!("failed to create outline pipeline: {e}"))?;
 
         self.offscreen_color = Some(color_img);
         self.offscreen_color_view = Some(color_view);
@@ -686,7 +701,7 @@ impl VulkanRenderer {
         self.pipeline_front_cull = Some(front_cull_pipeline);
         self.pipeline_front_cull_blend = Some(front_cull_pipeline_blend);
         self.outline_pipeline = Some(outline_pipeline.clone());
-        self.current_extent = new_extent;
+        self.current_extent = extent;
 
         if let (Some(ma), Some(dsa)) = (&self.memory_allocator, &self.descriptor_set_allocator) {
             self.camera_ring = Some(CameraRing::new(ma, dsa, &gfx_pipeline, &outline_pipeline));
@@ -696,11 +711,45 @@ impl VulkanRenderer {
             ps.graphics_pipeline = Some(gfx_pipeline);
         }
 
-        // Invalidate pre-allocated readback buffers (extent changed).
-        self.staging_buffers = [None, None];
-        self.readback_buffers = [None, None];
+        // The thumbnail pipeline is bound to the previous render pass; drop
+        // the cache so the next thumbnail render rebuilds against the new
+        // pass without a "incompatible render pass" panic.
+        self.thumb_cache = None;
 
-        info!("renderer: resized to {}x{}", new_extent[0], new_extent[1]);
+        Ok(())
+    }
+
+    /// Switch the renderer's output colour space at runtime. Rebuilds the
+    /// render pass with the new colour-attachment format, then routes
+    /// through `rebuild_pipelines_and_targets` so all dependent state
+    /// (pipelines, offscreen targets, camera ring, thumb cache) ends up
+    /// compatible. No-op when the renderer is already on `target_cs`.
+    pub fn apply_color_space(
+        &mut self,
+        target_cs: frame_input::RenderColorSpace,
+    ) -> Result<(), String> {
+        if !self.initialized {
+            return Ok(());
+        }
+        if target_cs == self.current_color_space {
+            return Ok(());
+        }
+
+        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
+        let new_render_pass = Self::build_render_pass(device, &target_cs);
+        self.render_pass = Some(new_render_pass.clone());
+
+        let extent = self.current_extent;
+        self.rebuild_pipelines_and_targets(new_render_pass, extent)
+            .map_err(|e| format!("apply_color_space: {e}"))?;
+
+        info!(
+            "renderer: switched output colour space {:?} -> {:?} (target {:?})",
+            self.current_color_space,
+            target_cs,
+            Self::color_attachment_format(&target_cs),
+        );
+        self.current_color_space = target_cs;
         Ok(())
     }
 
@@ -722,6 +771,12 @@ impl VulkanRenderer {
                 exported_frame: None,
             });
         }
+
+        // Adopt the user's selected output colour space before any per-frame
+        // GPU work. The path is a no-op when the renderer already matches,
+        // so the cost only applies on actual user toggles.
+        self.apply_color_space(input.output_request.color_space.clone())
+            .map_err(|e| format!("render: color space switch failed: {e}"))?;
 
         let requested_extent = input.output_request.extent;
         if requested_extent != self.current_extent
@@ -1181,6 +1236,7 @@ impl VulkanRenderer {
             extent,
             timestamp_nanos,
             stats: stats.clone(),
+            color_space: input.output_request.color_space.clone(),
         });
 
         // ── Return the *previous* frame's result ────────────────────────
@@ -1771,6 +1827,73 @@ impl VulkanRenderer {
         .expect("failed to create index buffer")
     }
 
+    /// Vulkan colour-attachment format that backs a given output colour
+    /// space. Stage 2 picks between the GPU's automatic linear→sRGB encoder
+    /// (`R8G8B8A8_SRGB`) and a no-encode UNORM target. Shaders write linear
+    /// values in both cases — the difference is whether the GPU applies the
+    /// transfer curve at store time.
+    pub(crate) fn color_attachment_format(cs: &frame_input::RenderColorSpace) -> Format {
+        match cs {
+            frame_input::RenderColorSpace::Srgb => Format::R8G8B8A8_SRGB,
+            frame_input::RenderColorSpace::LinearSrgb => Format::R8G8B8A8_UNORM,
+        }
+    }
+
+    /// Build a render pass whose colour attachment matches the requested
+    /// output colour space. Two arms because `single_pass_renderpass!` is a
+    /// macro that doesn't accept a runtime `Format` value.
+    fn build_render_pass(
+        device: Arc<Device>,
+        color_space: &frame_input::RenderColorSpace,
+    ) -> Arc<RenderPass> {
+        match color_space {
+            frame_input::RenderColorSpace::Srgb => vulkano::single_pass_renderpass!(
+                device,
+                attachments: {
+                    color: {
+                        format: Format::R8G8B8A8_SRGB,
+                        samples: 1,
+                        load_op: Clear,
+                        store_op: Store,
+                    },
+                    depth_stencil: {
+                        format: Format::D32_SFLOAT_S8_UINT,
+                        samples: 1,
+                        load_op: Clear,
+                        store_op: DontCare,
+                    },
+                },
+                pass: {
+                    color: [color],
+                    depth_stencil: {depth_stencil},
+                },
+            )
+            .expect("failed to create sRGB render pass"),
+            frame_input::RenderColorSpace::LinearSrgb => vulkano::single_pass_renderpass!(
+                device,
+                attachments: {
+                    color: {
+                        format: Format::R8G8B8A8_UNORM,
+                        samples: 1,
+                        load_op: Clear,
+                        store_op: Store,
+                    },
+                    depth_stencil: {
+                        format: Format::D32_SFLOAT_S8_UINT,
+                        samples: 1,
+                        load_op: Clear,
+                        store_op: DontCare,
+                    },
+                },
+                pass: {
+                    color: [color],
+                    depth_stencil: {depth_stencil},
+                },
+            )
+            .expect("failed to create linear render pass"),
+        }
+    }
+
     fn create_offscreen_targets(
         device: Arc<Device>,
         memory_allocator: Arc<StandardMemoryAllocator>,
@@ -1783,9 +1906,19 @@ impl VulkanRenderer {
         Arc<ImageView>,
         Arc<Framebuffer>,
     ) {
+        // The first colour attachment of the render pass dictates the
+        // output target format. Reading it back here keeps the offscreen
+        // image and the render pass guaranteed-compatible after a colour
+        // space switch.
+        let color_format = render_pass
+            .attachments()
+            .first()
+            .map(|a| a.format)
+            .unwrap_or(Format::R8G8B8A8_SRGB);
+
         let mut color_create_info = ImageCreateInfo {
             image_type: ImageType::Dim2d,
-            format: Format::R8G8B8A8_SRGB,
+            format: color_format,
             extent: [extent[0], extent[1], 1],
             usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
             ..Default::default()
@@ -1796,7 +1929,7 @@ impl VulkanRenderer {
             use vulkano::image::ImageFormatInfo;
             use vulkano::memory::{ExternalMemoryHandleType, ExternalMemoryHandleTypes};
             let fmt_info = ImageFormatInfo {
-                format: Format::R8G8B8A8_SRGB,
+                format: color_format,
                 image_type: ImageType::Dim2d,
                 usage: ImageUsage::COLOR_ATTACHMENT
                     | ImageUsage::TRANSFER_SRC
@@ -1813,9 +1946,15 @@ impl VulkanRenderer {
             if external_ok {
                 color_create_info.external_memory_handle_types =
                     ExternalMemoryHandleTypes::OPAQUE_WIN32_KMT;
-                info!("renderer: exportable color image with OPAQUE_WIN32_KMT");
+                info!(
+                    "renderer: exportable color image ({:?}) with OPAQUE_WIN32_KMT",
+                    color_format
+                );
             } else {
-                warn!("renderer: external memory unsupported for color target, skipping");
+                warn!(
+                    "renderer: external memory unsupported for {:?} color target, skipping",
+                    color_format
+                );
             }
         }
 
@@ -1875,6 +2014,15 @@ impl VulkanRenderer {
         if !self.initialized {
             return Err("renderer: not initialized".to_string());
         }
+
+        // Thumbnails are written to disk as PNG and viewed by file browsers
+        // that expect sRGB-encoded bytes. The thumbnail caller pins
+        // `output_request.color_space = Srgb`; honour that here so a user
+        // who has the main output on Linear sRGB still gets a correctly
+        // encoded thumbnail. Costs one render-pass rebuild on the way in
+        // and one on the next regular render, but thumbnails are infrequent.
+        self.apply_color_space(input.output_request.color_space.clone())
+            .map_err(|e| format!("thumbnail: color space switch failed: {e}"))?;
 
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
         let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();

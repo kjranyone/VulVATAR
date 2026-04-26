@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use super::{AlphaMode, OutputFrame};
+use super::{AlphaMode, OutputColorSpace, OutputFrame};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameSink {
@@ -621,7 +621,7 @@ impl OutputSinkWriter for NullSink {
 
 #[cfg(target_os = "windows")]
 mod win32_shmem {
-    use super::{AlphaMode, OutputFrame, OutputSinkWriter};
+    use super::{AlphaMode, OutputColorSpace, OutputFrame, OutputSinkWriter};
     use log::{debug, info};
     use std::ffi::{c_void, OsStr};
     use std::fs::File;
@@ -833,6 +833,24 @@ mod win32_shmem {
     /// asks the consumer to preserve the source RGBA alpha channel rather
     /// than forcing the output to opaque. NV12 paths ignore the flag.
     const SHMEM_FLAG_PRESERVE_ALPHA: u32 = 1 << 0;
+    /// Stage 4 (output color space): bit 1 of the same `flags` field tells
+    /// the consumer that the producer wrote linear-RGB pixels rather than
+    /// sRGB-encoded pixels. The MF DLL passes this through as
+    /// `MF_MT_TRANSFER_FUNCTION = MFVideoTransFunc_10` on the IMFSample so
+    /// downstream clients that honour sample-level colour attributes don't
+    /// double-encode. Default (bit clear) means sRGB.
+    const SHMEM_FLAG_LINEAR_COLOR_SPACE: u32 = 1 << 1;
+
+    fn flags_for_frame(frame: &OutputFrame) -> u32 {
+        let mut flags = 0u32;
+        if !matches!(frame.alpha_mode, AlphaMode::Opaque) {
+            flags |= SHMEM_FLAG_PRESERVE_ALPHA;
+        }
+        if matches!(frame.color_space, OutputColorSpace::LinearSrgb) {
+            flags |= SHMEM_FLAG_LINEAR_COLOR_SPACE;
+        }
+        flags
+    }
 
     impl OutputSinkWriter for Win32NamedSharedMemorySink {
         fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
@@ -847,13 +865,10 @@ mod win32_shmem {
 
             self.ensure_mapping(data_len)?;
 
-            // Pack alpha intent into the header `flags` field at offset 28.
-            // OutputFrame.alpha_mode is set by the host (App::process_render_result)
-            // from the GUI's "RGBA (with alpha)" toggle.
-            let mut flags: u32 = 0;
-            if !matches!(frame.alpha_mode, AlphaMode::Opaque) {
-                flags |= SHMEM_FLAG_PRESERVE_ALPHA;
-            }
+            // Pack alpha + colour-space intent into the header `flags` field
+            // at offset 28. OutputFrame.{alpha_mode, color_space} are set by
+            // the host (App::process_render_result) from the GUI toggles.
+            let flags = flags_for_frame(frame);
 
             unsafe {
                 // Cast to `*mut u8` so byte-offset arithmetic is well-defined.
@@ -1093,10 +1108,7 @@ mod win32_shmem {
 
             self.ensure_mapping(data_len)?;
 
-            let mut flags: u32 = 0;
-            if !matches!(frame.alpha_mode, AlphaMode::Opaque) {
-                flags |= SHMEM_FLAG_PRESERVE_ALPHA;
-            }
+            let flags = flags_for_frame(frame);
 
             unsafe {
                 let base = self.view as *mut u8;

@@ -9,7 +9,8 @@
 //! offset 8   u32  height
 //! offset 12  u64  sequence  (incremented on every frame)
 //! offset 20  u64  timestamp (frame timestamp; nanoseconds since some epoch)
-//! offset 28  u32  flags     (bit 0 = PRESERVE_ALPHA; NV12 ignores)
+//! offset 28  u32  flags     (bit 0 = PRESERVE_ALPHA; NV12 ignores,
+//!                            bit 1 = LINEAR_COLOR_SPACE)
 //! offset 32  ...  width * height * 4 RGBA bytes
 //! ```
 //!
@@ -48,6 +49,14 @@ const FILE_SHARE_RWD: u32 = 0x7;
 /// set, the RGB32 conversion path keeps the source RGBA's alpha byte
 /// instead of forcing 0xFF; NV12 paths ignore this (no alpha channel).
 pub const FRAME_FLAG_PRESERVE_ALPHA: u32 = 1 << 0;
+
+/// Bit 1 of the producer-written `flags` u32. When set, the producer
+/// rendered to a linear-RGB target (no sRGB encode on store) and clients
+/// that respect colour metadata should treat the pixels as
+/// `MFVideoTransFunc_10` (linear). When clear, pixels are sRGB-encoded.
+/// Used to tag the IMFSample with `MF_MT_TRANSFER_FUNCTION` per frame so
+/// downstream clients don't double-encode.
+pub const FRAME_FLAG_LINEAR_COLOR_SPACE: u32 = 1 << 1;
 
 /// One frame view returned from the shared memory.
 pub struct FrameView {

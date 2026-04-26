@@ -1262,6 +1262,7 @@ mod tests {
             node_to_mesh: Default::default(),
             vrm_meta: Default::default(),
             root_aabb: crate::asset::Aabb::empty(),
+            loaded_from_cache: false,
         })
     }
 

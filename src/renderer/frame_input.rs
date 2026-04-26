@@ -160,6 +160,19 @@ pub enum RenderColorSpace {
     LinearSrgb,
 }
 
+impl RenderColorSpace {
+    /// Stable lowercase tag used in logs and in `ExportMetadata` for sinks
+    /// that still want a string (e.g. JSON manifests). The matching MF media
+    /// type attributes for the virtual camera path are picked up directly
+    /// from the enum, not from this string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RenderColorSpace::Srgb => "srgb",
+            RenderColorSpace::LinearSrgb => "linear-srgb",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RenderOutputAlpha {
     Opaque,

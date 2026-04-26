@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod cache;
 pub mod cloth_rebind;
 pub mod vrm;
 
@@ -44,7 +45,7 @@ pub struct AttachmentClassId(pub u64);
 // ---------------------------------------------------------------------------
 
 /// Which transform property a channel targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnimationProperty {
     Translation,
     Rotation,
@@ -52,7 +53,7 @@ pub enum AnimationProperty {
 }
 
 /// Interpolation mode between keyframes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterpolationMode {
     Step,
     Linear,
@@ -60,7 +61,7 @@ pub enum InterpolationMode {
 }
 
 /// A single keyframe within an animation channel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Keyframe {
     /// Time in seconds from the start of the clip.
     pub time: f32,
@@ -75,7 +76,7 @@ pub struct Keyframe {
 }
 
 /// One channel targets a single property of a single node.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnimationChannel {
     pub target_node: NodeId,
     pub property: AnimationProperty,
@@ -83,7 +84,7 @@ pub struct AnimationChannel {
 }
 
 /// An animation clip containing one or more channels.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnimationClip {
     pub id: AnimationClipId,
     pub name: String,
@@ -98,7 +99,7 @@ pub struct ClothRegionTag(pub u64);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssetSourceHash(pub [u8; 32]);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transform {
     pub translation: Vec3,
     pub rotation: Quat,
@@ -151,7 +152,7 @@ impl Transform {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Aabb {
     pub min: Vec3,
     pub max: Vec3,
@@ -201,7 +202,7 @@ impl Aabb {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VrmSpecVersion {
     /// VRM 0.x (legacy `VRM` extension).
     V0,
@@ -224,7 +225,7 @@ impl VrmSpecVersion {
 
 /// Metadata extracted from the VRM file's meta block. Fields from VRM 0.x
 /// and 1.x are unified here; empty when the field is absent in the source.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VrmMeta {
     pub spec_version: VrmSpecVersion,
     /// Optional explicit spec version string from the file (e.g. "1.0").
@@ -251,7 +252,7 @@ pub struct VrmMeta {
 /// Encoded thumbnail bytes lifted out of a VRM. Carries the MIME type so a
 /// consumer that wants to write the bytes back to disk can pick the correct
 /// extension without re-decoding.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EmbeddedThumbnail {
     /// e.g. `"image/png"`, `"image/jpeg"`. Empty when the source glTF image
     /// omitted `mimeType` (rare); consumers should default to PNG.
@@ -271,7 +272,7 @@ impl EmbeddedThumbnail {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AvatarAsset {
     pub id: AvatarAssetId,
     pub source_path: PathBuf,
@@ -290,16 +291,30 @@ pub struct AvatarAsset {
     /// Union of all primitive AABBs in model/rest-pose space. Used for camera
     /// framing and debug visualisation.
     pub root_aabb: Aabb,
+    /// Runtime-only flag set when the avatar was rehydrated from the
+    /// `%APPDATA%\VulVATAR\cache\<hash>.vvtcache` file. Surfaced in the
+    /// inspector as a `Cached` / `Fresh load` badge so users can see
+    /// when the avatar load skipped the full parse path. Excluded from
+    /// the cache itself — every fresh deserialisation starts at `false`
+    /// and the loader sets it to `true` only on the cache-hit branch.
+    #[serde(skip)]
+    pub loaded_from_cache: bool,
 }
 
-#[derive(Clone, Debug)]
+impl AvatarAsset {
+    pub fn set_loaded_from_cache(&mut self, value: bool) {
+        self.loaded_from_cache = value;
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkeletonAsset {
     pub nodes: Vec<SkeletonNode>,
     pub root_nodes: Vec<NodeId>,
     pub inverse_bind_matrices: Vec<Mat4>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkeletonNode {
     pub id: NodeId,
     pub name: String,
@@ -309,14 +324,14 @@ pub struct SkeletonNode {
     pub humanoid_bone: Option<HumanoidBone>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeshAsset {
     pub id: MeshId,
     pub name: String,
     pub primitives: Vec<MeshPrimitiveAsset>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VertexData {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
@@ -326,14 +341,14 @@ pub struct VertexData {
 }
 
 /// Per-vertex deltas for a single morph target (blend shape).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MorphTargetDelta {
     pub name: String,
     pub position_deltas: Vec<Vec3>,
     pub normal_deltas: Vec<Vec3>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeshPrimitiveAsset {
     pub id: PrimitiveId,
     pub vertex_count: u32,
@@ -348,20 +363,20 @@ pub struct MeshPrimitiveAsset {
     pub morph_targets: Vec<MorphTargetDelta>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkinBinding {
     pub joint_nodes: Vec<NodeId>,
     pub inverse_bind_matrices: Vec<Mat4>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AlphaMode {
     Opaque,
     Mask(f32),
     Blend,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MaterialAsset {
     pub id: MaterialId,
     pub name: String,
@@ -374,14 +389,14 @@ pub struct MaterialAsset {
     pub mtoon_params: Option<MtoonStagedParams>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MaterialMode {
     Unlit,
     SimpleLit,
     ToonLike,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MaterialTextureSet {
     pub base_color_texture: Option<TextureBinding>,
     pub normal_map_texture: Option<TextureBinding>,
@@ -390,14 +405,20 @@ pub struct MaterialTextureSet {
     pub matcap_texture: Option<TextureBinding>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextureBinding {
     pub uri: String,
+    /// Decoded RGBA pixel bytes. Excluded from the avatar load cache
+    /// (Option B in `plan/handover.md`): the cache stays small, and the
+    /// loader re-decodes textures from the source VRM on cache hit.
+    /// Cache loaders MUST repopulate this before handing the asset to
+    /// the renderer.
+    #[serde(skip)]
     pub pixel_data: Option<Arc<Vec<u8>>>,
     pub dimensions: (u32, u32),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToonMaterialParams {
     pub ramp_threshold: f32,
     pub shadow_softness: f32,
@@ -405,12 +426,12 @@ pub struct ToonMaterialParams {
     pub outline_color: Vec3,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HumanoidMap {
     pub bone_map: std::collections::HashMap<HumanoidBone, NodeId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HumanoidBone {
     Hips,
     Spine,
@@ -465,13 +486,13 @@ pub enum HumanoidBone {
     RightLittleDistal,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExpressionAssetSet {
     pub expressions: Vec<ExpressionDef>,
 }
 
 /// Links a VRM expression to one or more morph targets on specific meshes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExpressionMorphBind {
     /// glTF node index that owns the target mesh.
     pub node_index: usize,
@@ -481,7 +502,7 @@ pub struct ExpressionMorphBind {
     pub weight: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExpressionDef {
     pub name: String,
     pub weight: f32,
@@ -489,7 +510,7 @@ pub struct ExpressionDef {
     pub morph_binds: Vec<ExpressionMorphBind>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpringBoneAsset {
     pub chain_root: NodeId,
     pub joints: Vec<NodeId>,
@@ -507,12 +528,12 @@ pub struct SpringBoneAsset {
     pub joint_gravity_power: Vec<f32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColliderRef {
     pub id: ColliderId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColliderAsset {
     pub id: ColliderId,
     pub node: NodeId,
@@ -742,7 +763,7 @@ impl ClothAsset {
 // MToon staged parameters (pure data, no GPU types)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MtoonStagedParams {
     pub shade_color: Vec4,
     pub shade_shift: f32,
@@ -766,12 +787,12 @@ pub struct MtoonStagedParams {
     pub uv_anim_rotation_speed: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MtoonTextureSlot {
     pub uri: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MtoonOutlineWidthMode {
     None,
     WorldCoordinates,

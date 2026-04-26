@@ -478,6 +478,7 @@ mod tests {
             node_to_mesh: std::collections::HashMap::new(),
             vrm_meta: VrmMeta::default(),
             root_aabb: Aabb::empty(),
+            loaded_from_cache: false,
         }
     }
 

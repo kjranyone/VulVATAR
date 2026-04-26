@@ -256,7 +256,29 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(true)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
-                ui.label(format!("Source: {}", avatar.asset.source_path.display()));
+                ui.horizontal(|ui| {
+                    ui.label(format!("Source: {}", avatar.asset.source_path.display()));
+                    if avatar.asset.loaded_from_cache {
+                        ui.label(
+                            egui::RichText::new("Cached")
+                                .small()
+                                .color(egui::Color32::from_rgb(80, 200, 120))
+                                .background_color(egui::Color32::from_rgb(20, 50, 30)),
+                        )
+                        .on_hover_text(
+                            "Loaded from %APPDATA%\\VulVATAR\\cache. \
+                             First load of this VRM was the slow path; \
+                             subsequent loads skip glTF parsing and \
+                             rebuild materials' textures from the source.",
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Fresh load")
+                                .small()
+                                .color(egui::Color32::from_rgb(220, 220, 220)),
+                        );
+                    }
+                });
                 ui.label(format!("ID: {}", avatar.asset.id.0));
                 ui.label(format!("Meshes: {}", avatar.asset.meshes.len()));
                 ui.label(format!("Materials: {}", avatar.asset.materials.len()));
@@ -1797,6 +1819,47 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
 }
 
+/// `Avatar Load Cache` panel: surfaces the on-disk cache populated by
+/// `src/asset/cache.rs` so users can see how big it has grown and wipe it
+/// without having to open Explorer. Co-located with `Watched folders`
+/// because both are admin-style controls for the avatar library data
+/// stored under `%APPDATA%\VulVATAR`.
+fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
+    egui::CollapsingHeader::new("Avatar Load Cache")
+        .default_open(false)
+        .show(ui, |ui| {
+            let stats = crate::asset::cache::stats();
+            let dir = crate::persistence::cache_dir();
+            ui.label(format!("Location: {}", dir.display()));
+            ui.label(format!(
+                "Entries: {} ({:.1} MB)",
+                stats.entry_count,
+                stats.total_bytes as f64 / 1024.0 / 1024.0
+            ));
+            ui.label(
+                egui::RichText::new(
+                    "Each VRM that has been loaded successfully is cached here. \
+                     Subsequent loads of the same file skip glTF parsing and \
+                     re-decode textures from the source bytes.",
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Clear cache").clicked() {
+                    match crate::asset::cache::clear_all() {
+                        Ok(n) => {
+                            state.push_notification(format!("Cleared {} cache entries", n));
+                        }
+                        Err(e) => {
+                            state.push_notification(format!("Cache clear failed: {}", e));
+                        }
+                    }
+                }
+            });
+        });
+}
+
 fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new("Model Library")
         .default_open(true)
@@ -1825,6 +1888,10 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.separator();
 
             draw_watched_folders(ui, state);
+
+            ui.separator();
+
+            draw_avatar_cache(ui, state);
 
             ui.separator();
 

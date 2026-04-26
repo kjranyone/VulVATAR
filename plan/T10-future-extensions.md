@@ -36,19 +36,34 @@ Legend: `[x]` done, `[~]` partial, `[ ]` not started.
 - [x] **Wind authoring tools** — directional/gust wind presets (WindPresetLibrary with 4 presets + WindPreset::sample_at)
 - [x] **Overlay version migration** — load_cloth_overlay / load_project now run a two-stage parse (Value → version check → optional migration → typed deserialize). Future-version files reject with a clear "newer VulVATAR" error; older files walk a `step_*` migration chain. Plumbing is in place + tested; no actual migrators registered yet because every released file is at v1.
 - [x] **Partial rebinding after avatar reimport** — `src/asset/cloth_rebind.rs` walks every ref in a ClothAsset (pin / collision / render-binding nodes & primitives + the declarative stable_refs metadata) and rewrites the internal IDs by name against a fresh AvatarAsset. PrimitiveRef adopts the `"<mesh_name>#<index>"` naming convention since glTF doesn't name primitives. Returns a RebindReport with Clean/Partial/Failed status; Partial writes the overlay back to disk with a `last_rebound_with` audit stamp on ClothOverlayFile. Both "Load Overlay File..." (inspector) and project apply (restore_cloth_overlay_paths) route through the rebinder; Failed entries are not attached. Eight unit tests cover the matrix.
-- [ ] **Offline bake / cache generation** — pre-compute simulation data for testing
+- [x] **Offline bake / cache generation** — landed as the avatar load cache (option B1
+  in `plan/handover.md`). `src/asset/cache.rs` + `VrmAssetLoader::load` cache the parsed
+  `AvatarAsset` to `%APPDATA%\VulVATAR\cache\<source_hash>.vvtcache` (bincode + per-version
+  parser invalidation). Texture pixel data is excluded (`#[serde(skip)]` on
+  `TextureBinding.pixel_data`); the loader rehydrates textures from the source bytes
+  on cache hit. Inspector exposes a `Cached` / `Fresh load` badge per avatar plus an
+  `Avatar Load Cache` section under the Model Library with size/clear controls.
+  Startup runs `cache::evict_to_count(DEFAULT_MAX_CACHE_ENTRIES)`. Cloth rest-pose
+  bake (B2) and library thumbnail batch (B3) from the handover were skipped per
+  design discussion — low value relative to load-time speed-up.
 
 ### Renderer
 
 - [x] **Image background** — load image as viewport background (RenderFrameInput.background_image_path)
 - [x] **Ground alignment helper** — snap avatar to ground plane (Application::snap_avatar_to_ground)
-- [ ] **Output color space (sRGB / Linear sRGB)** — GUI → app wiring is trivial,
-  but `src/renderer/output_export.rs` hardcodes `color_space: "srgb"`. A real
-  switch needs render-target format selection, MToon shader output gamma
-  branching, and MF sample `MF_MT_VIDEO_PRIMARIES` / `MF_MT_TRANSFER_FUNCTION`
-  attributes — i.e. an end-to-end renderer color-management pass, not a single
-  combo wire-up. Originally tracked as T11 phase B-5 and deferred there as
-  out-of-scope for that task.
+- [x] **Output color space (sRGB / Linear sRGB)** — full pipeline now honours the
+  GUI combo. Stage 1 plumbed `Application.output_color_space` → `OutputTargetRequest`
+  → `ExportMetadata` and `OutputFrame.color_space`. Stage 2 added
+  `VulkanRenderer::apply_color_space` to swap render-pass + pipelines + offscreen
+  target between `R8G8B8A8_SRGB` and `R8G8B8A8_UNORM` on user toggle. Stage 3
+  audited fragment shaders to confirm linear writes (no manual encode); finding
+  is documented inline at `src/renderer/pipeline.rs`. Stage 4 added
+  `SHMEM_FLAG_LINEAR_COLOR_SPACE` to the file-backed shared-memory header and made
+  `vulvatar-mf-camera` tag each `IMFSample` with `MF_MT_VIDEO_PRIMARIES` +
+  `MF_MT_TRANSFER_FUNCTION` (sRGB or `MFVideoTransFunc_10` per producer flag).
+  Stage 5 added `cargo run --bin render_matrix -- <input.vrm>` which renders the
+  same scene in all four (color space × transparent background) cells for manual
+  smoke testing.
 
 ### Webcam Tracking
 

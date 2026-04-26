@@ -52,6 +52,10 @@ pub struct FrameInputConfig {
     /// avatar pixels are non-zero. When false, the render target is cleared
     /// to `(background_color, 1)` so the output is opaque.
     pub transparent_background: bool,
+    /// User-selected output colour space. Stage 1 only routes this through
+    /// to `OutputTargetRequest.color_space` and metadata; render target
+    /// format / shader gamma changes land in later stages.
+    pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -127,6 +131,13 @@ pub struct Application {
     /// alpha channel (true) or force opaque (false). Synced from the GUI
     /// `output.output_has_alpha` toggle every frame.
     pub output_preserve_alpha: bool,
+    /// User's selected output colour space (sRGB / Linear sRGB). Synced from
+    /// the GUI `output.output_color_space_index` each frame and forwarded
+    /// to the renderer through `OutputTargetRequest.color_space`. Stage 1
+    /// routes the value end-to-end into the export metadata; downstream
+    /// effects on render target format and MF media type land in later
+    /// stages.
+    pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
     /// Solid background colour the Vulkan renderer clears to when
     /// `transparent_background` is false. Synced from the Inspector's
     /// "Scene Background" panel each frame.
@@ -231,6 +242,11 @@ impl Application {
     }
 
     pub fn new() -> Self {
+        // Avatar load cache eviction. Best-effort sweep on startup so the
+        // cache directory under %APPDATA%\VulVATAR\cache doesn't grow
+        // unbounded as the user iterates on different VRMs.
+        crate::asset::cache::evict_to_count(crate::asset::cache::DEFAULT_MAX_CACHE_ENTRIES);
+
         Self {
             render_thread: None,
             physics: PhysicsWorld::new(),
@@ -254,6 +270,7 @@ impl Application {
             viewport_lighting: LightingState::default(),
             output_extent: None,
             output_preserve_alpha: false,
+            output_color_space: crate::renderer::frame_input::RenderColorSpace::Srgb,
             background_color: [0.1, 0.1, 0.1],
             transparent_background: true,
             tracking_worker: None,
@@ -466,6 +483,7 @@ impl Application {
                 output_extent,
                 background_color: self.background_color,
                 transparent_background: self.transparent_background,
+                output_color_space: self.output_color_space.clone(),
             };
             let frame_input = Self::build_frame_input_multi(
                 &self.avatars,
@@ -512,6 +530,17 @@ impl Application {
             crate::output::AlphaMode::Premultiplied
         } else {
             crate::output::AlphaMode::Opaque
+        };
+        // Carry the renderer's output colour space through to the OutputFrame
+        // so the output worker (and its sinks) see what the user picked
+        // rather than the default Srgb that `OutputFrame::new` stamps in.
+        output_frame.color_space = match exported.export_metadata.color_space {
+            crate::renderer::frame_input::RenderColorSpace::Srgb => {
+                crate::output::OutputColorSpace::Srgb
+            }
+            crate::renderer::frame_input::RenderColorSpace::LinearSrgb => {
+                crate::output::OutputColorSpace::LinearSrgb
+            }
         };
 
         match exported.pixel_data {
@@ -809,7 +838,7 @@ impl Application {
                 preview_enabled: true,
                 output_enabled: true,
                 extent: output_extent,
-                color_space: crate::renderer::frame_input::RenderColorSpace::Srgb,
+                color_space: fi_config.output_color_space.clone(),
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: RenderExportMode::CpuReadback,
             },
@@ -1388,6 +1417,7 @@ mod tests {
             node_to_mesh: Default::default(),
             vrm_meta: Default::default(),
             root_aabb: crate::asset::Aabb::empty(),
+            loaded_from_cache: false,
         });
 
         let mut inst = AvatarInstance::new(AvatarInstanceId(1), asset);

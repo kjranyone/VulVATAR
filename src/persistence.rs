@@ -612,6 +612,16 @@ pub fn thumbnails_dir() -> std::path::PathBuf {
     path
 }
 
+/// Where serialised `AvatarAsset` snapshots produced by
+/// `src/asset/cache.rs` live. One `<source_hash_hex>.vvtcache` per VRM,
+/// keyed by the SHA-256 of the source file. Lives alongside thumbnails
+/// so the user can wipe / move both together.
+pub fn cache_dir() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("cache");
+    path
+}
+
 pub fn load_watched_folders() -> Vec<std::path::PathBuf> {
     let path = watched_folders_path();
     if !path.exists() {

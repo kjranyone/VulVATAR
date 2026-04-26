@@ -1428,6 +1428,15 @@ impl eframe::App for GuiApp {
         // process_render_result to tag OutputFrame.alpha_mode.
         self.app.output_preserve_alpha = self.output.output_has_alpha;
 
+        // Forward the user's colour space pick so the renderer's
+        // OutputTargetRequest carries it. Stage 1 plumbing: the value
+        // reaches ExportMetadata + OutputFrame.color_space; format /
+        // shader / MF media type changes land in later stages.
+        self.app.output_color_space = match self.output.output_color_space_index {
+            1 => crate::renderer::frame_input::RenderColorSpace::LinearSrgb,
+            _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
+        };
+
         if !self.paused {
             let real_dt = (self.frame_time_ms / 1000.0) as f32;
             // Clamp dt to avoid huge steps on first frame or after pauses.
