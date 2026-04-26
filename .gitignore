@@ -4,6 +4,7 @@
 # Local asset staging
 /assets/
 !/assets/.gitkeep
+!/assets/NotoSansJP-Regular.otf
 
 # Editor and OS noise
 /.vscode/

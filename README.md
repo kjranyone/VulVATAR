@@ -45,3 +45,25 @@ See [architecture.md](/C:/lib/github/kjranyone/VulVATAR/docs/architecture.md) fo
 3. design the first MToon-like material parameter set
 4. choose the first cloth target region for the POC
 5. define the first tracking target set and output sink contract
+
+## License
+
+VulVATAR is licensed under the GNU General Public License v3.0. See
+[LICENSE](LICENSE) for the full license text.
+
+If you distribute a built binary, provide the corresponding source code
+for that binary as required by GPL-3.0.
+
+## Third-party components
+
+VulVATAR uses third-party libraries and model assets under their own
+licenses. In particular:
+
+- CIGPose / `cigpose-onnx` pose models: Apache-2.0
+  - https://github.com/53mins/CIGPose
+  - https://github.com/namas191297/cigpose-onnx
+- YOLOX-Nano detector model included in the `cigpose-onnx` model bundle:
+  Apache-2.0
+- ONNX Runtime: MIT
+  - https://github.com/microsoft/onnxruntime
+- Rust crate dependencies: see each crate's license metadata.

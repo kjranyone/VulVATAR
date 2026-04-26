@@ -1,6 +1,7 @@
 use eframe::egui;
 
 use crate::gui::GuiApp;
+use crate::t;
 use crate::renderer::debug::{self, DebugDrawList};
 
 /// Simple projection helper that maps a 3D world-space point to 2D viewport
@@ -311,14 +312,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 painter.text(
                     egui::pos2(center.x, center.y - 20.0),
                     egui::Align2::CENTER_CENTER,
-                    "Viewport",
+                    t!("viewport.viewport"),
                     egui::FontId::proportional(20.0),
                     egui::Color32::from_rgb(100, 100, 115),
                 );
                 painter.text(
                     egui::pos2(center.x, center.y + 20.0),
                     egui::Align2::CENTER_CENTER,
-                    "Vulkano render target",
+                    t!("viewport.render_target"),
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_rgb(75, 75, 85),
                 );
@@ -366,12 +367,12 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             };
 
             if drag_orbit {
-                state.camera_orbit.yaw_deg += delta.x * 0.3;
-                state.camera_orbit.pitch_deg += delta.y * 0.3;
+                state.camera_orbit.yaw_deg += delta.x * state.settings.orbit_sensitivity;
+                state.camera_orbit.pitch_deg += delta.y * state.settings.orbit_sensitivity;
                 state.project_dirty = true;
             }
             if drag_pan {
-                let scale = 0.002 * state.camera_orbit.distance * 0.2;
+                let scale = 0.002 * state.camera_orbit.distance * 0.2 * state.settings.pan_sensitivity;
                 state.camera_orbit.pan[0] += delta.x * scale;
                 state.camera_orbit.pan[1] -= delta.y * scale;
                 state.project_dirty = true;
@@ -380,7 +381,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll.abs() > 0.0 {
                     state.camera_orbit.target_distance = (state.camera_orbit.target_distance
-                        - scroll * state.camera_orbit.target_distance * 0.1)
+                        - scroll * state.camera_orbit.target_distance * state.settings.zoom_sensitivity)
                         .max(0.1);
                     state.project_dirty = true;
                 }
@@ -608,15 +609,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             }
 
             // Show camera info overlay.
-            let info = format!(
-                "Eye: [{:.2}, {:.2}, {:.2}]  Yaw: {:.1}  Pitch: {:.1}  Dist: {:.2}",
-                cam_pos[0],
-                cam_pos[1],
-                cam_pos[2],
-                state.camera_orbit.yaw_deg,
-                state.camera_orbit.pitch_deg,
-                state.camera_orbit.distance,
-            );
+            let info = t!("viewport.camera_info", x = format!("{:.2}", cam_pos[0]), y = format!("{:.2}", cam_pos[1]), z = format!("{:.2}", cam_pos[2]), yaw = format!("{:.1}", state.camera_orbit.yaw_deg), pitch = format!("{:.1}", state.camera_orbit.pitch_deg), dist = format!("{:.2}", state.camera_orbit.distance));
             painter.text(
                 egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
                 egui::Align2::LEFT_BOTTOM,
@@ -637,17 +630,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 .iter()
                                 .flat_map(|m| m.primitives.iter())
                                 .find(|p| p.id == sel.target_primitive)
-                                .map(|p| format!("Primitive {}", p.id.0))
-                                .unwrap_or_else(|| format!("Primitive {}", sel.target_primitive.0));
+                                .map(|p| t!("viewport.primitive", id = p.id.0))
+                                .unwrap_or_else(|| t!("viewport.primitive", id = sel.target_primitive.0));
 
                             let vert_count = sel.selected_vertices.len();
                             let lines = [
-                                format!("Selected: {} vertices", vert_count),
-                                format!("Target: {}", prim_label),
-                                format!(
-                                    "Range: {}..{}",
-                                    sel.selected_vertex_range.0, sel.selected_vertex_range.1
-                                ),
+                                t!("viewport.selected", count = vert_count),
+                                t!("viewport.target", label = prim_label),
+                                t!("viewport.range", start = sel.selected_vertex_range.0, end = sel.selected_vertex_range.1),
                             ];
 
                             let mut y = rect.top() + 6.0;
@@ -666,7 +656,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                             painter.text(
                                 egui::pos2(rect.left() + 8.0, rect.top() + 6.0),
                                 egui::Align2::LEFT_TOP,
-                                "No region selected",
+                                t!("viewport.no_region"),
                                 egui::FontId::monospace(12.0),
                                 egui::Color32::from_rgba_unmultiplied(180, 180, 180, 160),
                             );

@@ -60,6 +60,7 @@ ort = { version = "2.0.0-rc.12", optional = true }
 ndarray = { version = "0.17.2", optional = true }
 cpal = { version = "0.17", optional = true }
 rustfft = { version = "6.4", optional = true }
+rust-i18n = "3"
 
 # Dev builds: optimise crates that handle bulk pixel data so that
 # 8 MB copies/uploads are not 40x slower than release.

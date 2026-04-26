@@ -1,13 +1,14 @@
 use eframe::egui;
 
 use crate::gui::{AppMode, GuiApp};
+use crate::t;
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     if !state.inspector_open {
         return;
     }
 
-    let mode_label = state.mode.label().to_owned();
+    let mode_label = state.mode.label();
 
     egui::Window::new(&mode_label)
         .id(egui::Id::new("inspector_window"))
@@ -35,14 +36,15 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                             AppMode::Rendering => draw_rendering(ui, state),
                             AppMode::Output => draw_output(ui, state),
                             AppMode::ClothAuthoring => draw_cloth_authoring(ui, state),
+                            AppMode::Settings => draw_settings(ui, state),
                         }
 
                         ui.separator();
-                        egui::CollapsingHeader::new("Camera Transform")
+                        egui::CollapsingHeader::new(t!("inspector.camera_transform"))
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label("Yaw:");
+                                    ui.label(t!("inspector.yaw"));
                                     if ui
                                         .add(
                                             egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
@@ -52,7 +54,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     {
                                         state.project_dirty = true;
                                     }
-                                    ui.label("Pitch:");
+                                    ui.label(t!("inspector.pitch"));
                                     if ui
                                         .add(
                                             egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
@@ -64,7 +66,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     }
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label("Distance:");
+                                    ui.label(t!("inspector.distance"));
                                     if ui
                                         .add(
                                             egui::DragValue::new(&mut state.camera_orbit.distance)
@@ -77,7 +79,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     }
                                 });
                                 ui.horizontal(|ui| {
-                                    ui.label("Pan X:");
+                                    ui.label(t!("inspector.pan_x"));
                                     if ui
                                         .add(
                                             egui::DragValue::new(&mut state.camera_orbit.pan[0])
@@ -87,7 +89,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     {
                                         state.project_dirty = true;
                                     }
-                                    ui.label("Y:");
+                                    ui.label(t!("inspector.pan_y"));
                                     if ui
                                         .add(
                                             egui::DragValue::new(&mut state.camera_orbit.pan[1])
@@ -98,7 +100,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                         state.project_dirty = true;
                                     }
                                 });
-                                if ui.button("Reset Camera").clicked() {
+                                if ui.button(t!("inspector.reset_camera")).clicked() {
                                     state.camera_orbit.yaw_deg = 0.0;
                                     state.camera_orbit.pitch_deg = 0.0;
                                     state.camera_orbit.distance = 5.0;
@@ -112,7 +114,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 }
 
 fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Current Avatar")
+    egui::CollapsingHeader::new(t!("inspector.current_avatar"))
         .default_open(true)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
@@ -125,7 +127,7 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
                     crate::asset::VrmSpecVersion::Unknown => egui::Color32::from_rgb(200, 100, 100),
                 };
                 ui.horizontal(|ui| {
-                    ui.label("Spec:");
+                    ui.label(t!("inspector.spec"));
                     ui.label(
                         egui::RichText::new(meta.spec_version.label())
                             .strong()
@@ -142,9 +144,7 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 if meta.spec_version == crate::asset::VrmSpecVersion::V0 {
                     ui.label(
-                        egui::RichText::new(
-                            "Note: VRM 0.x — humanoid/expressions/springs not loaded by this build.",
-                        )
+                        egui::RichText::new(t!("inspector.vrm0x_note"))
                         .small()
                         .color(egui::Color32::from_rgb(220, 180, 100)),
                     );
@@ -152,7 +152,7 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 let title = meta.title.as_deref().unwrap_or("—");
                 ui.horizontal(|ui| {
-                    ui.label("Title:");
+                    ui.label(t!("inspector.title"));
                     ui.label(title);
                 });
                 let authors = if meta.authors.is_empty() {
@@ -161,35 +161,35 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
                     meta.authors.join(", ")
                 };
                 ui.horizontal(|ui| {
-                    ui.label("Authors:");
+                    ui.label(t!("inspector.authors"));
                     ui.label(authors);
                 });
                 if let Some(v) = &meta.model_version {
                     ui.horizontal(|ui| {
-                        ui.label("Model version:");
+                        ui.label(t!("inspector.model_version"));
                         ui.label(v);
                     });
                 }
                 if let Some(c) = &meta.contact_information {
                     ui.horizontal(|ui| {
-                        ui.label("Contact:");
+                        ui.label(t!("inspector.contact"));
                         ui.label(c);
                     });
                 }
                 if let Some(l) = &meta.license {
                     ui.horizontal(|ui| {
-                        ui.label("License:");
+                        ui.label(t!("inspector.license"));
                         ui.label(l);
                     });
                 }
                 if let Some(cr) = &meta.copyright_information {
                     ui.horizontal(|ui| {
-                        ui.label("Copyright:");
+                        ui.label(t!("inspector.copyright"));
                         ui.label(cr);
                     });
                 }
                 if !meta.references.is_empty() {
-                    ui.collapsing("References", |ui| {
+                    ui.collapsing(t!("inspector.references"), |ui| {
                         for r in &meta.references {
                             ui.label(
                                 egui::RichText::new(r).small().color(egui::Color32::GRAY),
@@ -200,48 +200,41 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(format!("Source: {}", asset.source_path.display()))
+                    egui::RichText::new(t!("inspector.source", path = asset.source_path.display().to_string()))
                         .small()
                         .color(egui::Color32::GRAY),
                 );
                 ui.horizontal(|ui| {
-                    ui.label(format!("Meshes: {}", asset.meshes.len()));
-                    ui.label(format!("Materials: {}", asset.materials.len()));
+                    ui.label(t!("inspector.meshes", count = asset.meshes.len()));
+                    ui.label(t!("inspector.materials", count = asset.materials.len()));
                 });
                 ui.horizontal(|ui| {
-                    ui.label(format!("Spring chains: {}", asset.spring_bones.len()));
-                    ui.label(format!("Colliders: {}", asset.colliders.len()));
+                    ui.label(t!("inspector.spring_chains", count = asset.spring_bones.len()));
+                    ui.label(t!("inspector.colliders", count = asset.colliders.len()));
                 });
                 ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Humanoid: {}",
-                        if asset.humanoid.is_some() { "yes" } else { "no" }
-                    ));
-                    ui.label(format!(
-                        "Expressions: {}",
-                        asset.default_expressions.expressions.len()
-                    ));
-                    ui.label(format!(
-                        "Animations: {}",
-                        asset.animation_clips.len()
-                    ));
+                    ui.label(
+                        if asset.humanoid.is_some() { t!("inspector.humanoid_yes") } else { t!("inspector.humanoid_no") }
+                    );
+                    ui.label(t!("inspector.expressions", count = asset.default_expressions.expressions.len()));
+                    ui.label(t!("inspector.animations", count = asset.animation_clips.len()));
                 });
 
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reload").clicked() {
+                    if ui.button(t!("inspector.reload")).clicked() {
                         state.app.reload_avatar();
                     }
-                    if ui.button("Detach").clicked() {
+                    if ui.button(t!("inspector.detach")).clicked() {
                         if !state.app.avatars.is_empty() {
                             state.app.remove_avatar_at(state.app.active_avatar_index);
                         }
                     }
                 });
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
                 ui.label(
-                    egui::RichText::new("Use the library below or the top bar to load one.")
+                    egui::RichText::new(t!("inspector.no_avatar_hint"))
                         .small()
                         .color(egui::Color32::GRAY),
                 );
@@ -252,59 +245,50 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Avatar Asset")
+    egui::CollapsingHeader::new(t!("inspector.avatar_asset"))
         .default_open(true)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
                 ui.horizontal(|ui| {
-                    ui.label(format!("Source: {}", avatar.asset.source_path.display()));
+                    ui.label(t!("inspector.source", path = avatar.asset.source_path.display().to_string()));
                     if avatar.asset.loaded_from_cache {
                         ui.label(
-                            egui::RichText::new("Cached")
+                            egui::RichText::new(t!("inspector.cached"))
                                 .small()
                                 .color(egui::Color32::from_rgb(80, 200, 120))
                                 .background_color(egui::Color32::from_rgb(20, 50, 30)),
                         )
                         .on_hover_text(
-                            "Loaded from %APPDATA%\\VulVATAR\\cache. \
-                             First load of this VRM was the slow path; \
-                             subsequent loads skip glTF parsing and \
-                             rebuild materials' textures from the source.",
+                            t!("inspector.cached_tooltip"),
                         );
                     } else {
                         ui.label(
-                            egui::RichText::new("Fresh load")
+                            egui::RichText::new(t!("inspector.fresh_load"))
                                 .small()
                                 .color(egui::Color32::from_rgb(220, 220, 220)),
                         );
                     }
                 });
-                ui.label(format!("ID: {}", avatar.asset.id.0));
-                ui.label(format!("Meshes: {}", avatar.asset.meshes.len()));
-                ui.label(format!("Materials: {}", avatar.asset.materials.len()));
-                ui.label(format!(
-                    "Spring Chains: {}",
-                    avatar.asset.spring_bones.len()
-                ));
-                ui.label(format!("Colliders: {}", avatar.asset.colliders.len()));
+                ui.label(t!("inspector.id", id = avatar.asset.id.0));
+                ui.label(t!("inspector.meshes", count = avatar.asset.meshes.len()));
+                ui.label(t!("inspector.materials", count = avatar.asset.materials.len()));
+                ui.label(t!("inspector.spring_chains", count = avatar.asset.spring_bones.len()));
+                ui.label(t!("inspector.colliders", count = avatar.asset.colliders.len()));
                 if let Some(cloth_id) = &avatar.attached_cloth {
-                    ui.label(format!("Primary Cloth Overlay: {}", cloth_id.0));
+                    ui.label(t!("inspector.primary_cloth", id = cloth_id.0));
                 } else {
-                    ui.label("Primary Cloth Overlay: None");
+                    ui.label(t!("inspector.primary_cloth_none"));
                 }
-                ui.label(format!(
-                    "Additional Cloth Overlays: {}",
-                    avatar.cloth_overlay_count()
-                ));
+                ui.label(t!("inspector.additional_cloth", count = avatar.cloth_overlay_count()));
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Reload").clicked() {
+                if ui.button(t!("inspector.reload")).clicked() {
                     state.app.reload_avatar();
                 }
-                if ui.button("Detach").clicked() {
+                if ui.button(t!("inspector.detach")).clicked() {
                     if !state.app.avatars.is_empty() {
                         state.app.remove_avatar_at(state.app.active_avatar_index);
                     }
@@ -312,10 +296,10 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             });
         });
 
-    egui::CollapsingHeader::new("Transform")
+    egui::CollapsingHeader::new(t!("inspector.transform"))
         .default_open(true)
         .show(ui, |ui| {
-            ui.label("Position");
+            ui.label(t!("inspector.position"));
             ui.horizontal(|ui| {
                 if ui
                     .add(
@@ -348,7 +332,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.project_dirty = true;
                 }
             });
-            ui.label("Rotation");
+            ui.label(t!("inspector.rotation"));
             ui.horizontal(|ui| {
                 if ui
                     .add(
@@ -382,7 +366,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("Scale");
+                ui.label(t!("inspector.scale"));
                 if ui
                     .add(
                         egui::DragValue::new(&mut state.transform.scale)
@@ -394,7 +378,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.project_dirty = true;
                 }
             });
-            if ui.button("Reset Transform").clicked() {
+            if ui.button(t!("inspector.reset_transform")).clicked() {
                 state.transform.position = [0.0, 0.0, 0.0];
                 state.transform.rotation = [0.0, 0.0, 0.0];
                 state.transform.scale = 1.0;
@@ -402,11 +386,11 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new("Cloth Attachment")
+    egui::CollapsingHeader::new(t!("inspector.cloth_attachment"))
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Attach Primary").clicked() {
+                if ui.button(t!("inspector.attach_primary")).clicked() {
                     let overlay_id = state
                         .app
                         .editor
@@ -416,14 +400,14 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         avatar.attach_cloth(overlay_id);
                     }
                 }
-                if ui.button("Detach Primary").clicked() {
+                if ui.button(t!("inspector.detach_primary")).clicked() {
                     if let Some(avatar) = state.app.active_avatar_mut() {
                         avatar.detach_cloth();
                     }
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("Add Overlay Slot").clicked() {
+                if ui.button(t!("inspector.add_overlay_slot")).clicked() {
                     let sim_mesh = state
                         .app
                         .editor
@@ -445,9 +429,9 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
-                if ui.button("Load Overlay File...").clicked() {
+                if ui.button(t!("inspector.load_overlay_file")).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("VulVATAR Cloth Overlay", &["vvtcloth"])
+                        .add_filter(&t!("top_bar.filter_cloth"), &["vvtcloth"])
                         .set_title("Load cloth overlay into a new slot")
                         .pick_file()
                     {
@@ -455,11 +439,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         let asset_opt = match load_result {
                             Ok(file) => file.cloth_asset,
                             Err(e) => {
-                                state.push_notification(format!(
-                                    "Failed to load overlay '{}': {}",
-                                    path.display(),
-                                    e
-                                ));
+                                state.push_notification(t!("inspector.failed_load_overlay", path = path.display().to_string(), error = e.to_string()));
                                 None
                             }
                         };
@@ -470,10 +450,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                             // rewrites them by name. A Failed status (refs
                             // we can't resolve at any tier) skips the attach.
                             if !state.attempt_overlay_rebind(&path, &mut cloth_asset) {
-                                state.push_notification(format!(
-                                    "Overlay '{}' was not attached (rebind failed).",
-                                    path.display()
-                                ));
+                                state.push_notification(t!("inspector.overlay_rebind_failed", path = path.display().to_string()));
                             } else if let Some(avatar) = state.app.active_avatar_mut() {
                                 let overlay_id = crate::asset::ClothOverlayId(
                                     (avatar.cloth_overlay_count() as u64) + 2,
@@ -483,23 +460,16 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
                                     slot.source_path = Some(path.clone());
                                 }
-                                state.push_notification(format!(
-                                    "Attached overlay from '{}' as slot #{}",
-                                    path.display(),
-                                    idx
-                                ));
+                                state.push_notification(t!("inspector.overlay_attached", path = path.display().to_string(), index = idx));
                             }
                         } else {
-                            state.push_notification(format!(
-                                "Overlay file '{}' has no cloth asset payload",
-                                path.display()
-                            ));
+                            state.push_notification(t!("inspector.overlay_no_payload", path = path.display().to_string()));
                         }
                     }
                 }
             });
             if let Some(avatar) = state.app.active_avatar_mut() {
-                ui.checkbox(&mut avatar.cloth_enabled, "Enable Cloth");
+                ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.enable_cloth"));
                 // Defer removal until after the iter_mut borrow ends —
                 // can't mutate the Vec we're iterating.
                 let mut remove_slot: Option<usize> = None;
@@ -514,7 +484,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 slot.sim.particle_count()
                             ),
                         );
-                        if ui.button("Remove").clicked() {
+                                    if ui.button(t!("inspector.remove")).clicked() {
                             remove_slot = Some(i);
                         }
                     });
@@ -525,13 +495,13 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new("Scene Background")
+    egui::CollapsingHeader::new(t!("inspector.scene_background"))
         .default_open(false)
         .show(ui, |ui| {
             if ui
                 .checkbox(
                     &mut state.rendering.transparent_background,
-                    "Transparent Background",
+                    t!("inspector.transparent_background"),
                 )
                 .changed()
             {
@@ -539,7 +509,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             if !state.rendering.transparent_background {
                 ui.horizontal(|ui| {
-                    ui.label("Color");
+                    ui.label(t!("inspector.color"));
                     if ui
                         .color_edit_button_rgb(&mut state.rendering.background_color)
                         .changed()
@@ -550,26 +520,26 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new("Runtime Toggles")
+    egui::CollapsingHeader::new(t!("inspector.runtime_toggles"))
         .default_open(false)
         .show(ui, |ui| {
             if ui
-                .checkbox(&mut state.rendering.toggle_spring, "Spring Enabled")
+                .checkbox(&mut state.rendering.toggle_spring, t!("inspector.spring_enabled"))
                 .changed()
             {
                 state.project_dirty = true;
             }
             if ui
-                .checkbox(&mut state.rendering.toggle_cloth, "Cloth Enabled")
+                .checkbox(&mut state.rendering.toggle_cloth, t!("inspector.cloth_enabled"))
                 .changed()
             {
                 state.project_dirty = true;
             }
             ui.checkbox(
                 &mut state.rendering.toggle_collision_debug,
-                "Collision Debug",
+                t!("inspector.collision_debug"),
             );
-            ui.checkbox(&mut state.rendering.toggle_skeleton_debug, "Skeleton Debug");
+            ui.checkbox(&mut state.rendering.toggle_skeleton_debug, t!("inspector.skeleton_debug"));
         });
 
     draw_expression_control(ui, state);
@@ -577,14 +547,14 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
 
 fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     if ui
-        .checkbox(&mut state.tracking.toggle_tracking, "Tracking Enabled")
+        .checkbox(&mut state.tracking.toggle_tracking, t!("tracking.enabled"))
         .changed()
     {
         state.project_dirty = true;
     }
     ui.add_space(4.0);
 
-    egui::CollapsingHeader::new("Input Device")
+    egui::CollapsingHeader::new(t!("tracking.input_device"))
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -594,12 +564,12 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .iter()
                     .find(|c| c.index == state.camera_index)
                     .map(|c| format!("{}: {}", c.index, c.name))
-                    .unwrap_or_else(|| format!("Camera {}", state.camera_index));
-                egui::ComboBox::from_label("Camera")
+                    .unwrap_or_else(|| t!("tracking.camera_n", index = state.camera_index).to_string());
+                egui::ComboBox::from_label(t!("tracking.camera"))
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
                         if state.available_cameras.is_empty() {
-                            ui.label("No cameras detected. Click 🔄 to scan.");
+                            ui.label(t!("tracking.no_cameras"));
                         } else {
                             for cam in &state.available_cameras {
                                 let label = format!("{}: {}", cam.index, cam.name);
@@ -630,13 +600,13 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let active = state.is_tracking_active();
                 let ready = state.is_tracking_ready();
                 if active && ready {
-                    if ui.button("Stop Camera").clicked() {
+                    if ui.button(t!("tracking.stop_camera")).clicked() {
                         state.app.stop_tracking();
                     }
                 } else if active {
                     // Camera is initialising — show a disabled placeholder.
-                    ui.add_enabled(false, egui::Button::new("Preparing..."));
-                } else if ui.button("Start Camera").clicked() {
+                    ui.add_enabled(false, egui::Button::new(t!("tracking.preparing")));
+                } else if ui.button(t!("tracking.start_camera")).clicked() {
                     let (w, h) = crate::gui::camera_resolution_for_index(
                         state.tracking.camera_resolution_index,
                     );
@@ -658,21 +628,21 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             });
             if ui
-                .checkbox(&mut state.show_camera_wipe, "Camera Wipe (PIP)")
+                .checkbox(&mut state.show_camera_wipe, t!("tracking.camera_wipe"))
                 .changed()
             {
                 state.project_dirty = true;
             }
             if state.show_camera_wipe {
                 if ui
-                    .checkbox(&mut state.show_detection_annotations, "Show Annotations")
+                    .checkbox(&mut state.show_detection_annotations, t!("tracking.show_annotations"))
                     .changed()
                 {
                     state.project_dirty = true;
                 }
             }
             let prev_res = state.tracking.camera_resolution_index;
-            egui::ComboBox::from_label("Resolution")
+            egui::ComboBox::from_label(t!("tracking.resolution"))
                 .selected_text(
                     *["640x480", "1280x720", "1920x1080"]
                         .get(state.tracking.camera_resolution_index)
@@ -692,7 +662,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.project_dirty = true;
             }
             let prev_fps = state.tracking.camera_framerate_index;
-            egui::ComboBox::from_label("Frame Rate")
+            egui::ComboBox::from_label(t!("tracking.frame_rate"))
                 .selected_text(
                     *["30 fps", "60 fps"]
                         .get(state.tracking.camera_framerate_index)
@@ -726,35 +696,35 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     fps,
                     state.tracking.lower_body_tracking_enabled,
                 );
-                state.push_notification(format!("Camera restarted: {}x{} @ {} fps", w, h, fps));
+                state.push_notification(t!("tracking.camera_restarted", w = w, h = h, fps = fps));
             }
         });
 
-    egui::CollapsingHeader::new("Capture Format")
+    egui::CollapsingHeader::new(t!("tracking.capture_format"))
         .default_open(false)
         .show(ui, |ui| {
             if ui
-                .checkbox(&mut state.tracking.tracking_mirror, "Mirror Preview")
+                .checkbox(&mut state.tracking.tracking_mirror, t!("tracking.mirror_preview"))
                 .changed()
             {
                 state.project_dirty = true;
             }
         });
 
-    egui::CollapsingHeader::new("Inference Status")
+    egui::CollapsingHeader::new(t!("tracking.inference_status"))
         .default_open(true)
         .show(ui, |ui| {
             let camera_running = state.is_tracking_active();
             let camera_ready = state.is_tracking_ready();
             let tracking_on = state.tracking.toggle_tracking;
             let (status_color, status_text) = if camera_running && !camera_ready {
-                (egui::Color32::YELLOW, "Preparing camera...")
+                (egui::Color32::YELLOW, t!("tracking.preparing_camera").to_string())
             } else if camera_running && tracking_on {
-                (egui::Color32::GREEN, "Running")
+                (egui::Color32::GREEN, t!("tracking.running").to_string())
             } else if camera_running {
-                (egui::Color32::YELLOW, "Camera active (tracking paused)")
+                (egui::Color32::YELLOW, t!("tracking.camera_active_paused").to_string())
             } else {
-                (egui::Color32::GRAY, "Stopped")
+                (egui::Color32::GRAY, t!("tracking.stopped").to_string())
             };
             ui.label(egui::RichText::new(status_text).color(status_color));
             if camera_running {
@@ -764,7 +734,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .as_ref()
                     .map(|w| w.active_backend().label())
                     .unwrap_or("Unknown");
-                ui.label(format!("Camera: {}", camera_label));
+                ui.label(t!("tracking.camera_label", label = camera_label.to_string()));
 
                 // Inference backend (ONNX execution provider) — surfaces a
                 // silent CPU fallback when DirectML registration fails. Set
@@ -776,28 +746,28 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .as_ref()
                     .and_then(|w| w.mailbox().inference_backend_label())
                 {
-                    ui.label(format!("Inference: {}", label));
+                    ui.label(t!("tracking.inference_label", label = label.to_string()));
                 }
             }
 
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.label(format!("Timestamp: {}", tracking.source_timestamp));
             } else {
-                ui.label("No tracking data");
+                ui.label(t!("tracking.no_tracking_data"));
             }
         });
 
-    egui::CollapsingHeader::new("Retargeting")
+    egui::CollapsingHeader::new(t!("tracking.retargeting"))
         .default_open(true)
         .show(ui, |ui| {
             if ui
-                .checkbox(&mut state.tracking.hand_tracking_enabled, "Hand Tracking")
+                .checkbox(&mut state.tracking.hand_tracking_enabled, t!("tracking.hand_tracking"))
                 .changed()
             {
                 state.project_dirty = true;
             }
             if ui
-                .checkbox(&mut state.tracking.face_tracking_enabled, "Face Tracking")
+                .checkbox(&mut state.tracking.face_tracking_enabled, t!("tracking.face_tracking"))
                 .changed()
             {
                 state.project_dirty = true;
@@ -805,46 +775,43 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             let lower_body_resp = ui
                 .checkbox(
                     &mut state.tracking.lower_body_tracking_enabled,
-                    "Lower-body Tracking",
+                    t!("tracking.lower_body"),
                 )
                 .on_hover_text(
-                    "When on, the model picker prefers a wholebody CIGPose ONNX so leg \
-                     keypoints are emitted. Trade-off: wholebody variants are usually \
-                     smaller-resolution and detect hands less crisply than the same-tier \
-                     ubody model. Restart tracking to apply.",
+                    t!("tracking.lower_body_tooltip"),
                 );
             if lower_body_resp.changed() {
                 state.project_dirty = true;
             }
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.separator();
-                ui.label("Confidence");
-                draw_confidence_bar(ui, "Overall", tracking.overall_confidence);
+                ui.label(t!("tracking.confidence"));
+                draw_confidence_bar(ui, &t!("tracking.confidence_overall"), tracking.overall_confidence);
                 if let Some(face) = tracking.face {
-                    draw_confidence_bar(ui, "Face", face.confidence);
+                    draw_confidence_bar(ui, &t!("tracking.confidence_face"), face.confidence);
                 }
                 use crate::asset::HumanoidBone;
                 let joint_conf = |b: HumanoidBone| -> f32 {
                     tracking.joints.get(&b).map(|j| j.confidence).unwrap_or(0.0)
                 };
-                draw_confidence_bar(ui, "Left Shoulder", joint_conf(HumanoidBone::LeftShoulder));
+                draw_confidence_bar(ui, &t!("tracking.confidence_left_shoulder"), joint_conf(HumanoidBone::LeftShoulder));
                 draw_confidence_bar(
                     ui,
-                    "Right Shoulder",
+                    &t!("tracking.confidence_right_shoulder"),
                     joint_conf(HumanoidBone::RightShoulder),
                 );
-                draw_confidence_bar(ui, "Left Hand", joint_conf(HumanoidBone::LeftHand));
-                draw_confidence_bar(ui, "Right Hand", joint_conf(HumanoidBone::RightHand));
+                draw_confidence_bar(ui, &t!("tracking.confidence_left_hand"), joint_conf(HumanoidBone::LeftHand));
+                draw_confidence_bar(ui, &t!("tracking.confidence_right_hand"), joint_conf(HumanoidBone::RightHand));
             }
         });
 
-    egui::CollapsingHeader::new("Smoothing and Confidence")
+    egui::CollapsingHeader::new(t!("tracking.smoothing_confidence"))
         .default_open(false)
         .show(ui, |ui| {
             if ui
                 .add(
                     egui::Slider::new(&mut state.tracking.smoothing_strength, 0.0..=1.0)
-                        .text("Smoothing"),
+                        .text(t!("tracking.smoothing")),
                 )
                 .changed()
             {
@@ -853,7 +820,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             if ui
                 .add(
                     egui::Slider::new(&mut state.tracking.confidence_threshold, 0.0..=1.0)
-                        .text("Threshold"),
+                        .text(t!("tracking.threshold")),
                 )
                 .changed()
             {
@@ -861,7 +828,7 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new("Lip Sync")
+    egui::CollapsingHeader::new(t!("tracking.lip_sync"))
         .default_open(false)
         .show(ui, |ui| {
             draw_lipsync(ui, state);
@@ -886,19 +853,19 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
             .iter()
             .find(|m| m.index == active_mic)
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("Device {}", active_mic));
-        egui::ComboBox::from_label("Microphone")
+            .unwrap_or_else(|| t!("tracking.device_n", index = active_mic).to_string());
+        egui::ComboBox::from_label(t!("tracking.microphone"))
             .selected_text(selected_mic)
             .show_ui(ui, |ui| {
                 if state.lipsync.available_mics.is_empty() {
-                    ui.label("No devices found. Click Refresh to scan.");
+                    ui.label(t!("tracking.no_mics"));
                 } else {
                     for mic in &state.lipsync.available_mics {
                         ui.selectable_value(&mut new_mic, mic.index, &mic.name);
                     }
                 }
             });
-        if ui.button("Refresh").clicked() {
+        if ui.button(t!("tracking.refresh")).clicked() {
             refresh_clicked = true;
         }
     });
@@ -908,10 +875,8 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 
     if new_mic != active_mic {
-        // Goes through requested setter so a failed mic switch still
-        // updates the user's preference (next attempt won't revert).
         if let Err(e) = state.app.set_requested_lipsync(requested_enabled, new_mic) {
-            state.push_notification(format!("Lip sync mic switch failed: {e}"));
+            state.push_notification(t!("tracking.lip_sync_mic_failed", error = e.to_string()));
         }
         state.project_dirty = true;
     }
@@ -919,19 +884,18 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.add_space(4.0);
 
     let mut new_enabled = requested_enabled;
-    if ui.checkbox(&mut new_enabled, "Enable Lip Sync").changed() {
+    if ui.checkbox(&mut new_enabled, t!("tracking.enable_lip_sync")).changed() {
         match state.app.set_requested_lipsync(new_enabled, active_mic) {
             Ok(()) => {
                 state.project_dirty = true;
                 if new_enabled {
-                    state.push_notification("Lip sync started.".to_string());
+                    state.push_notification(t!("tracking.lip_sync_started").to_string());
                 } else {
-                    state.push_notification("Lip sync stopped.".to_string());
+                    state.push_notification(t!("tracking.lip_sync_stopped").to_string());
                 }
             }
             Err(e) => {
-                // requested stays at new_enabled; runtime didn't make it.
-                state.push_notification(format!("Lip sync failed: {e}"));
+                state.push_notification(t!("tracking.lip_sync_failed", error = e.to_string()));
                 state.project_dirty = true;
             }
         }
@@ -940,7 +904,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     if requested_enabled && !runtime_enabled {
         ui.colored_label(
             egui::Color32::from_rgb(220, 160, 80),
-            "(requested, but audio device couldn't open)",
+            t!("tracking.requested_but_failed"),
         );
     }
 
@@ -956,7 +920,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
             // that returns Ok, so just call it to reset App state.
             let _ = state.app.set_requested_lipsync(false, active_mic);
             state.push_notification(
-                "Lip sync unavailable: build with --features lipsync".to_string(),
+                t!("tracking.lip_sync_unavailable").to_string(),
             );
         }
     }
@@ -981,13 +945,13 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         2.0,
         fill_color,
     );
-    ui.label(format!("Volume: {:.3}", vol));
+    ui.label(t!("tracking.volume", vol = format!("{:.3}", vol)));
 
     ui.add_space(4.0);
     if ui
         .add(
             egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
-                .text("Threshold")
+                .text(t!("tracking.threshold"))
                 .logarithmic(true),
         )
         .changed()
@@ -995,7 +959,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         state.project_dirty = true;
     }
     if ui
-        .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text("Smoothing"))
+        .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text(t!("tracking.smoothing")))
         .changed()
     {
         state.project_dirty = true;
@@ -1017,37 +981,37 @@ fn draw_confidence_bar(ui: &mut egui::Ui, label: &str, value: f32) {
 }
 
 fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Material Mode")
+    egui::CollapsingHeader::new(t!("inspector.material_mode"))
         .default_open(true)
         .show(ui, |ui| {
             if ui
-                .radio_value(&mut state.rendering.material_mode_index, 0, "Unlit")
+                .radio_value(&mut state.rendering.material_mode_index, 0, t!("inspector.unlit"))
                 .changed()
             {
                 state.project_dirty = true;
             }
             if ui
-                .radio_value(&mut state.rendering.material_mode_index, 1, "Simple Lit")
+                .radio_value(&mut state.rendering.material_mode_index, 1, t!("inspector.simple_lit"))
                 .changed()
             {
                 state.project_dirty = true;
             }
             if ui
-                .radio_value(&mut state.rendering.material_mode_index, 2, "Toon-like")
+                .radio_value(&mut state.rendering.material_mode_index, 2, t!("inspector.toon_like"))
                 .changed()
             {
                 state.project_dirty = true;
             }
         });
 
-    egui::CollapsingHeader::new("Toon Controls")
+    egui::CollapsingHeader::new(t!("inspector.toon_controls"))
         .default_open(true)
         .show(ui, |ui| {
             if ui
                 .add_enabled(
                     state.rendering.material_mode_index == 2,
                     egui::Slider::new(&mut state.rendering.toon_ramp_threshold, 0.0..=1.0)
-                        .text("Ramp Threshold"),
+                        .text(t!("inspector.ramp_threshold")),
                 )
                 .changed()
             {
@@ -1057,7 +1021,7 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .add_enabled(
                     state.rendering.material_mode_index == 2,
                     egui::Slider::new(&mut state.rendering.shadow_softness, 0.0..=1.0)
-                        .text("Shadow Softness"),
+                        .text(t!("inspector.shadow_softness")),
                 )
                 .changed()
             {
@@ -1065,11 +1029,11 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new("Outline Controls")
+    egui::CollapsingHeader::new(t!("inspector.outline_controls"))
         .default_open(false)
         .show(ui, |ui| {
             if ui
-                .checkbox(&mut state.rendering.outline_enabled, "Enable Outline")
+                .checkbox(&mut state.rendering.outline_enabled, t!("inspector.enable_outline"))
                 .changed()
             {
                 state.project_dirty = true;
@@ -1077,7 +1041,7 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             if ui
                 .add_enabled(
                     state.rendering.outline_enabled,
-                    egui::Slider::new(&mut state.rendering.outline_width, 0.0..=0.1).text("Width"),
+                    egui::Slider::new(&mut state.rendering.outline_width, 0.0..=0.1).text(t!("inspector.width")),
                 )
                 .changed()
             {
@@ -1085,16 +1049,16 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.add_enabled_ui(state.rendering.outline_enabled, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Color");
+                    ui.label(t!("inspector.color"));
                     ui.color_edit_button_rgb(&mut state.rendering.outline_color);
                 });
             });
         });
 
-    egui::CollapsingHeader::new("Lighting")
+    egui::CollapsingHeader::new(t!("inspector.lighting"))
         .default_open(true)
         .show(ui, |ui| {
-            ui.label("Light Direction");
+            ui.label(t!("inspector.light_direction"));
             ui.horizontal(|ui| {
                 if ui
                     .add(
@@ -1130,47 +1094,44 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             if ui
                 .add(
                     egui::Slider::new(&mut state.rendering.main_light_intensity, 0.0..=5.0)
-                        .text("Intensity"),
+                        .text(t!("inspector.intensity")),
                 )
                 .changed()
             {
                 state.project_dirty = true;
             }
             ui.horizontal(|ui| {
-                ui.label("Ambient");
+                ui.label(t!("inspector.ambient"));
                 ui.color_edit_button_rgb(&mut state.rendering.ambient_intensity);
             });
         });
 
-    egui::CollapsingHeader::new("Composition")
+    egui::CollapsingHeader::new(t!("inspector.composition"))
         .default_open(false)
         .show(ui, |ui| {
             if ui
                 .add(
                     egui::Slider::new(&mut state.rendering.camera_fov, 10.0..=120.0)
-                        .text("Camera FOV"),
+                        .text(t!("inspector.camera_fov")),
                 )
                 .changed()
             {
                 state.project_dirty = true;
             }
-            ui.checkbox(&mut state.rendering.alpha_preview, "Alpha Preview");
+            ui.checkbox(&mut state.rendering.alpha_preview, t!("inspector.alpha_preview"));
         });
 
-    egui::CollapsingHeader::new("Physics")
+    egui::CollapsingHeader::new(t!("inspector.physics"))
         .default_open(false)
         .show(ui, |ui| {
             let rapier_active = state.app.physics.rapier_initialized();
             if rapier_active {
-                ui.label(egui::RichText::new("Rapier: Active").color(egui::Color32::GREEN));
+                ui.label(egui::RichText::new(t!("inspector.rapier_active")).color(egui::Color32::GREEN));
             } else {
-                ui.label(egui::RichText::new("Rapier: Not initialized").color(egui::Color32::GRAY));
+                ui.label(egui::RichText::new(t!("inspector.rapier_not_init")).color(egui::Color32::GRAY));
             }
             if let Some(pos) = state.app.physics.character_position() {
-                ui.label(format!(
-                    "Character: ({:.2}, {:.2}, {:.2})",
-                    pos[0], pos[1], pos[2]
-                ));
+                ui.label(t!("inspector.character", x = format!("{:.2}", pos[0]), y = format!("{:.2}", pos[1]), z = format!("{:.2}", pos[2])));
             }
         });
 
@@ -1180,11 +1141,11 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
-    let sink_names = [
-        "Virtual Camera",
-        "Shared Texture",
-        "Shared Memory",
-        "Image Sequence",
+    let sink_names: [String; 4] = [
+        t!("status.sink_virtual_camera"),
+        t!("status.sink_shared_texture"),
+        t!("status.sink_shared_memory"),
+        t!("status.sink_image_sequence"),
     ];
 
     // Combo binds to the user's REQUESTED sink (Phase D). If the runtime
@@ -1195,25 +1156,22 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
     let active_idx = state.app.output.active_sink().to_gui_index();
     let mut new_idx = requested_idx;
 
-    egui::CollapsingHeader::new("Sink Selection")
+    egui::CollapsingHeader::new(t!("inspector.output_sink"))
         .default_open(true)
         .show(ui, |ui| {
-            egui::ComboBox::from_label("Output Sink")
-                .selected_text(*sink_names.get(requested_idx).unwrap_or(&"Unknown"))
+            egui::ComboBox::from_label(t!("inspector.output_sink_label"))
+                .selected_text(sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("Unknown"))
                 .show_ui(ui, |ui| {
                     for (i, name) in sink_names.iter().enumerate() {
-                        ui.selectable_value(&mut new_idx, i, *name);
+                        ui.selectable_value(&mut new_idx, i, &*name);
                     }
                 });
-            // Surface the runtime / requested mismatch so the user knows
-            // their selection isn't actually live (e.g. MF init failed).
             if active_idx != requested_idx {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 160, 80),
-                    format!(
-                        "(running on {} — requested {} unavailable)",
-                        sink_names.get(active_idx).unwrap_or(&"?"),
-                        sink_names.get(requested_idx).unwrap_or(&"?"),
+                    t!("inspector.sink_mismatch",
+                        active = sink_names.get(active_idx).and_then(|s: &String| Some(s.as_str())).unwrap_or("?"),
+                        requested = sink_names.get(requested_idx).and_then(|s: &String| Some(s.as_str())).unwrap_or("?"),
                     ),
                 );
             }
@@ -1223,14 +1181,11 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         let want_sink = FrameSink::from_gui_index(new_idx);
         match state.app.set_requested_sink(want_sink) {
             Ok(()) => {
-                state.push_notification(format!("Output sink changed to {}", sink_names[new_idx]));
+                state.push_notification(t!("inspector.output_sink_changed", name = sink_names[new_idx].to_string()));
                 state.project_dirty = true;
             }
             Err(e) => {
-                // requested_sink was still updated; runtime stays on
-                // whatever fallback was previously active. Notify the user
-                // and mark dirty so the requested choice is persisted.
-                state.push_notification(format!("Output sink change failed: {e}"));
+                state.push_notification(t!("inspector.output_sink_failed", error = e.to_string()));
                 state.project_dirty = true;
             }
         }
@@ -1241,10 +1196,10 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
     let prev_alpha = state.output.output_has_alpha;
     let prev_cs = state.output.output_color_space_index;
 
-    egui::CollapsingHeader::new("Frame Format")
+    egui::CollapsingHeader::new(t!("inspector.frame_format"))
         .default_open(true)
         .show(ui, |ui| {
-            egui::ComboBox::from_label("Resolution")
+            egui::ComboBox::from_label(t!("tracking.resolution"))
                 .selected_text(
                     *["1920x1080", "1280x720", "640x480"]
                         .get(state.output.output_resolution_index)
@@ -1255,7 +1210,7 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.selectable_value(&mut state.output.output_resolution_index, 1, "1280x720");
                     ui.selectable_value(&mut state.output.output_resolution_index, 2, "640x480");
                 });
-            egui::ComboBox::from_label("Frame Rate")
+            egui::ComboBox::from_label(t!("tracking.frame_rate"))
                 .selected_text(
                     *["60 fps", "30 fps"]
                         .get(state.output.output_framerate_index)
@@ -1265,19 +1220,21 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.selectable_value(&mut state.output.output_framerate_index, 0, "60 fps");
                     ui.selectable_value(&mut state.output.output_framerate_index, 1, "30 fps");
                 });
-            ui.checkbox(&mut state.output.output_has_alpha, "RGBA (with alpha)");
-            egui::ComboBox::from_label("Color Space")
+            ui.checkbox(&mut state.output.output_has_alpha, t!("inspector.rgba_alpha"));
+            let cs_names: [String; 2] = [t!("inspector.srgb"), t!("inspector.linear_srgb")];
+            egui::ComboBox::from_label(t!("inspector.color_space"))
                 .selected_text(
-                    *["sRGB", "Linear sRGB"]
+                    cs_names
                         .get(state.output.output_color_space_index)
-                        .unwrap_or(&"Unknown"),
+                        .map(|s: &String| s.as_str())
+                        .unwrap_or("Unknown"),
                 )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.output.output_color_space_index, 0, "sRGB");
+                    ui.selectable_value(&mut state.output.output_color_space_index, 0, &*cs_names[0]);
                     ui.selectable_value(
                         &mut state.output.output_color_space_index,
                         1,
-                        "Linear sRGB",
+                        &*cs_names[1],
                     );
                 });
         });
@@ -1290,38 +1247,35 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         state.project_dirty = true;
     }
 
-    egui::CollapsingHeader::new("Synchronization")
+    egui::CollapsingHeader::new(t!("inspector.synchronization"))
         .default_open(false)
         .show(ui, |ui| {
-            ui.label("Handoff: GPU Shared Frame");
-            ui.label("Fallback: CPU Readback");
-            ui.label(egui::RichText::new("GPU path active").color(egui::Color32::GREEN));
+            ui.label(t!("inspector.handoff_gpu"));
+            ui.label(t!("inspector.fallback_cpu"));
+            ui.label(egui::RichText::new(t!("inspector.gpu_active")).color(egui::Color32::GREEN));
         });
 
-    egui::CollapsingHeader::new("Diagnostics")
+    egui::CollapsingHeader::new(t!("inspector.diagnostics"))
         .default_open(true)
         .show(ui, |ui| {
-            ui.label(egui::RichText::new("Connected").color(egui::Color32::GREEN));
-            ui.label(format!("Queue Depth: {}", state.app.output.queue_depth()));
-            ui.label(format!(
-                "Dropped Frames: {}",
-                state.app.output.dropped_count()
-            ));
+            ui.label(egui::RichText::new(t!("inspector.connected")).color(egui::Color32::GREEN));
+            ui.label(t!("inspector.queue_depth", depth = state.app.output.queue_depth()));
+            ui.label(t!("inspector.dropped_frames", count = state.app.output.dropped_count()));
         });
 }
 
 fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Cloth Overlay")
+    egui::CollapsingHeader::new(t!("inspector.cloth_overlay"))
         .default_open(true)
         .show(ui, |ui| {
             if state.app.editor.is_dirty() {
-                ui.label(egui::RichText::new("Unsaved changes").color(egui::Color32::YELLOW));
+                ui.label(egui::RichText::new(t!("inspector.unsaved_changes")).color(egui::Color32::YELLOW));
             } else {
-                ui.label("No unsaved changes");
+                ui.label(t!("inspector.no_unsaved"));
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("New Overlay").clicked() {
+                if ui.button(t!("inspector.new_overlay")).clicked() {
                     let asset = state.app.active_avatar().map(|a| a.asset.clone());
                     if let Some(asset) = asset {
                         let avatar_id = asset.id;
@@ -1330,25 +1284,25 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         state.app.editor.create_overlay(avatar_id, avatar_hash);
                     }
                 }
-                if ui.button("Save Overlay").clicked() {
+                if ui.button(t!("inspector.save_overlay")).clicked() {
                     let _ = state.app.editor.save_overlay(None);
                 }
             });
 
             let mut autosave_enabled = state.cloth_autosave_consent.unwrap_or(false);
             if ui
-                .checkbox(&mut autosave_enabled, "Auto-save cloth overlay")
+                .checkbox(&mut autosave_enabled, t!("inspector.autosave_cloth"))
                 .changed()
             {
                 state.cloth_autosave_consent = Some(autosave_enabled);
             }
         });
 
-    egui::CollapsingHeader::new("Simulation Mesh")
+    egui::CollapsingHeader::new(t!("inspector.sim_mesh"))
         .default_open(false)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
-                ui.label("Select garment region to author");
+                ui.label(t!("inspector.select_garment"));
 
                 ui.horizontal(|ui| {
                     let mat_names: Vec<String> = avatar
@@ -1368,7 +1322,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 ui.selectable_value(&mut state.cloth_material_pick_index, i, name);
                             }
                         });
-                    if ui.button("Select by Material").clicked() {
+                    if ui.button(t!("inspector.select_by_material")).clicked() {
                         if let Some(mat) =
                             avatar.asset.materials.get(state.cloth_material_pick_index)
                         {
@@ -1384,17 +1338,17 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button("Grow Selection").clicked() {
+                    if ui.button(t!("inspector.grow_selection")).clicked() {
                         if let Some(ref mut sel) = state.region_selection {
                             sel.grow_selection(&avatar.asset);
                         }
                     }
-                    if ui.button("Shrink Selection").clicked() {
+                    if ui.button(t!("inspector.shrink_selection")).clicked() {
                         if let Some(ref mut sel) = state.region_selection {
                             sel.shrink_selection(&avatar.asset);
                         }
                     }
-                    if ui.button("Clear Selection").clicked() {
+                    if ui.button(t!("inspector.clear_selection")).clicked() {
                         state.region_selection = None;
                     }
                 });
@@ -1403,20 +1357,17 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 if let Some(ref sel) = state.region_selection {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Selected: {} vertices",
-                            sel.selected_vertices.len()
-                        ))
+                        egui::RichText::new(t!("inspector.selected_vertices", count = sel.selected_vertices.len()))
                         .color(egui::Color32::from_rgb(255, 220, 80)),
                     );
-                    ui.label(format!("Primitive: {}", sel.target_primitive.0));
+                    ui.label(t!("inspector.primitive", id = sel.target_primitive.0));
                 } else {
-                    ui.label("No region selected");
+                    ui.label(t!("inspector.no_region"));
                 }
 
                 ui.add_space(4.0);
 
-                if ui.button("Generate Sim Mesh").clicked() {
+                if ui.button(t!("inspector.generate_sim_mesh")).clicked() {
                     if let Some(ref sel) = state.region_selection {
                         let verts: Vec<usize> = sel.selected_vertices.iter().copied().collect();
                         if let Some(sim_mesh) = crate::editor::cloth_authoring::generate_sim_mesh(
@@ -1427,23 +1378,23 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                             if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                                 overlay.simulation_mesh = sim_mesh;
                                 state.app.editor.set_dirty();
-                                state.push_notification("Sim mesh generated".to_string());
+                                state.push_notification(t!("inspector.sim_mesh_generated").to_string());
                             }
                         }
                     }
                 }
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
             }
         });
 
-    egui::CollapsingHeader::new("Pin Binding")
+    egui::CollapsingHeader::new(t!("inspector.pin_binding"))
         .default_open(false)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
                 let nodes = &avatar.asset.skeleton.nodes;
                 if nodes.is_empty() {
-                    ui.label("No skeleton nodes");
+                    ui.label(t!("inspector.no_skeleton_nodes"));
                 } else {
                     if state.cloth_pin_node_index >= nodes.len() {
                         state.cloth_pin_node_index = 0;
@@ -1471,7 +1422,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     let pin_node_name = nodes[state.cloth_pin_node_index].name.clone();
 
                     ui.horizontal(|ui| {
-                        if ui.button("Create Pin Set").clicked() {
+                        if ui.button(t!("inspector.create_pin_set")).clicked() {
                             if state.region_selection.is_some() {
                                 if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                                     let sim_mesh = &overlay.simulation_mesh;
@@ -1494,16 +1445,16 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                             };
                                             overlay.pins.push(pin);
                                             state.app.editor.set_dirty();
-                                            state.push_notification("Pin set created".to_string());
+                                            state.push_notification(t!("inspector.pin_set_created").to_string());
                                         } else {
                                             state.push_notification(
-                                                "No pinned vertices in sim mesh".to_string(),
+                                                t!("inspector.no_pinned_verts").to_string(),
                                             );
                                         }
                                     }
                                 }
                             } else {
-                                state.push_notification("Select a region first".to_string());
+                                state.push_notification(t!("inspector.select_region_first").to_string());
                             }
                         }
                     });
@@ -1536,36 +1487,30 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
             }
         });
 
-    egui::CollapsingHeader::new("Constraints")
+    egui::CollapsingHeader::new(t!("inspector.constraints"))
         .default_open(false)
         .show(ui, |ui| {
             ui.add(
                 egui::Slider::new(&mut state.cloth_distance_stiffness, 0.0..=1.0)
-                    .text("Distance Stiffness"),
+                    .text(t!("inspector.distance_stiffness")),
             );
-            ui.checkbox(&mut state.cloth_bend_enabled, "Bend Constraints");
+            ui.checkbox(&mut state.cloth_bend_enabled, t!("inspector.bend_constraints"));
             if state.cloth_bend_enabled {
                 ui.add(
                     egui::Slider::new(&mut state.cloth_bend_stiffness, 0.0..=1.0)
-                        .text("Bend Stiffness"),
+                        .text(t!("inspector.bend_stiffness")),
                 );
             }
 
             if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                 ui.add_space(4.0);
-                ui.label(format!(
-                    "Distance constraints: {}",
-                    overlay.constraints.distance_constraints.len()
-                ));
-                ui.label(format!(
-                    "Bend constraints: {}",
-                    overlay.constraints.bend_constraints.len()
-                ));
-                if ui.button("Apply Constraints").clicked() {
+                ui.label(t!("inspector.distance_constraints", count = overlay.constraints.distance_constraints.len()));
+                ui.label(t!("inspector.bend_constraints_count", count = overlay.constraints.bend_constraints.len()));
+                if ui.button(t!("inspector.apply_constraints")).clicked() {
                     for dc in &mut overlay.constraints.distance_constraints {
                         dc.stiffness = state.cloth_distance_stiffness;
                     }
@@ -1576,14 +1521,14 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         overlay.constraints.bend_constraints.clear();
                     }
                     state.app.editor.set_dirty();
-                    state.push_notification("Constraints applied".to_string());
+                    state.push_notification(t!("inspector.constraints_applied").to_string());
                 }
             } else {
-                ui.label("No overlay active");
+                ui.label(t!("inspector.no_overlay_active"));
             }
         });
 
-    egui::CollapsingHeader::new("Collision Proxies")
+    egui::CollapsingHeader::new(t!("inspector.collision_proxies"))
         .default_open(false)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
@@ -1592,7 +1537,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.cloth_collider_toggles = vec![true; collider_count];
                 }
                 if collider_count == 0 {
-                    ui.label("No colliders in avatar");
+                    ui.label(t!("inspector.no_colliders"));
                 } else {
                     for (i, collider) in avatar.asset.colliders.iter().enumerate() {
                         let node_name = avatar
@@ -1618,27 +1563,27 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
             }
         });
 
-    egui::CollapsingHeader::new("Viewport")
+    egui::CollapsingHeader::new(t!("inspector.viewport"))
         .default_open(false)
         .show(ui, |ui| {
             super::viewport_overlay::draw_viewport_controls(ui, &mut state.viewport_overlay);
         });
 
-    egui::CollapsingHeader::new("Solver Parameters")
+    egui::CollapsingHeader::new(t!("inspector.solver_params"))
         .default_open(false)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar_mut() {
                 if let Some(ref mut sim) = avatar.cloth_sim {
                     ui.horizontal(|ui| {
-                        ui.label("Iterations:");
+                        ui.label(t!("inspector.iterations"));
                         ui.add(egui::DragValue::new(&mut sim.solver_iterations).range(1..=32));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Gravity:");
+                        ui.label(t!("inspector.gravity"));
                         ui.add(
                             egui::DragValue::new(&mut sim.gravity[1])
                                 .speed(0.1)
@@ -1646,7 +1591,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Damping:");
+                        ui.label(t!("inspector.damping"));
                         ui.add(
                             egui::DragValue::new(&mut sim.damping)
                                 .speed(0.01)
@@ -1654,7 +1599,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Collision Margin:");
+                        ui.label(t!("inspector.collision_margin"));
                         ui.add(
                             egui::DragValue::new(&mut sim.collision_margin)
                                 .speed(0.001)
@@ -1662,17 +1607,17 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Wind Response:");
+                        ui.label(t!("inspector.wind_response"));
                         ui.add(
                             egui::DragValue::new(&mut sim.wind_response)
                                 .speed(0.1)
                                 .range(0.0..=10.0),
                         );
                     });
-                    ui.checkbox(&mut sim.self_collision, "Self-Collision");
+                    ui.checkbox(&mut sim.self_collision, t!("inspector.self_collision"));
                     if sim.self_collision {
                         ui.horizontal(|ui| {
-                            ui.label("Self-Collision Radius:");
+                            ui.label(t!("inspector.self_collision_radius"));
                             ui.add(
                                 egui::DragValue::new(&mut sim.self_collision_radius)
                                     .speed(0.001)
@@ -1681,21 +1626,18 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         });
                     }
                     ui.add_space(4.0);
-                    ui.label(format!("Particles: {}", sim.particle_count()));
-                    ui.label(format!(
-                        "Distance constraints: {}",
-                        sim.distance_constraints.len()
-                    ));
-                    ui.label(format!("Bend constraints: {}", sim.bend_constraints.len()));
-                    ui.label(format!("Pin targets: {}", sim.pin_targets.len()));
+                    ui.label(t!("inspector.particles", count = sim.particle_count()));
+                    ui.label(t!("inspector.distance_constraints", count = sim.distance_constraints.len()));
+                    ui.label(t!("inspector.bend_constraints_count", count = sim.bend_constraints.len()));
+                    ui.label(t!("inspector.pin_targets", count = sim.pin_targets.len()));
                 } else {
-                    ui.label("No primary cloth simulation active");
+                    ui.label(t!("inspector.no_cloth_sim"));
                 }
 
                 if let Some(avatar) = state.app.active_avatar() {
                     if !avatar.cloth_overlays.is_empty() {
                         ui.add_space(4.0);
-                        ui.label("Overlay Slots:");
+                        ui.label(t!("inspector.overlay_slots"));
                         for (i, slot) in avatar.cloth_overlays.iter().enumerate() {
                             ui.label(format!(
                                 "  #{}: {} particles, enabled={}",
@@ -1707,28 +1649,28 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
             }
         });
 
-    egui::CollapsingHeader::new("Preview")
+    egui::CollapsingHeader::new(t!("inspector.preview"))
         .default_open(false)
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar_mut() {
-                ui.checkbox(&mut avatar.cloth_enabled, "Cloth Simulation");
+                ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.cloth_simulation"));
 
                 ui.horizontal(|ui| {
                     if state.cloth_sim_playing {
-                        if ui.button("Pause").clicked() {
+                        if ui.button(t!("inspector.pause")).clicked() {
                             state.cloth_sim_playing = false;
                         }
-                    } else if ui.button("Play").clicked() {
+                    } else if ui.button(t!("inspector.play")).clicked() {
                         state.cloth_sim_playing = true;
                     }
-                    if ui.button("Step").clicked() {
+                    if ui.button(t!("inspector.step")).clicked() {
                         crate::simulation::cloth_solver::step_cloth(1.0 / 60.0, avatar, &[]);
                     }
-                    if ui.button("Reset").clicked() {
+                    if ui.button(t!("inspector.reset")).clicked() {
                         avatar.cloth_sim = None;
                         avatar.cloth_sim_buffers = None;
                     }
@@ -1737,15 +1679,12 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(4.0);
 
                 if let Some(ref cs) = avatar.cloth_state {
-                    ui.label(format!("Primary sim positions: {}", cs.sim_positions.len()));
-                    ui.label(format!(
-                        "Primary deform version: {}",
-                        cs.deform_output.version
-                    ));
+                    ui.label(t!("inspector.primary_sim_positions", count = cs.sim_positions.len()));
+                    ui.label(t!("inspector.primary_deform", version = cs.deform_output.version));
                 } else if !avatar.cloth_overlays.is_empty() {
-                    ui.label("Primary cloth state: None (overlays only)");
+                    ui.label(t!("inspector.primary_state_none"));
                 } else {
-                    ui.label("No cloth state");
+                    ui.label(t!("inspector.no_cloth_state"));
                 }
 
                 for (i, slot) in avatar.cloth_overlays.iter().enumerate() {
@@ -1757,13 +1696,13 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ));
                 }
             } else {
-                ui.label("No avatar loaded");
+                ui.label(t!("inspector.no_avatar_loaded"));
             }
         });
 }
 
 fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Watched folders")
+    egui::CollapsingHeader::new(t!("watched_folders.heading"))
         .default_open(false)
         .show(ui, |ui| {
             // The list is a snapshot — we collect paths up front so the
@@ -1773,7 +1712,7 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             if watched.is_empty() {
                 ui.label(
-                    egui::RichText::new("No folders watched. New VRM files added to a watched folder are auto-imported into the library.")
+                    egui::RichText::new(t!("watched_folders.empty_hint"))
                         .small()
                         .color(egui::Color32::GRAY),
                 );
@@ -1792,42 +1731,35 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.label(egui::RichText::new(label).color(color));
                     if !exists {
                         ui.label(
-                            egui::RichText::new("(missing)")
+                            egui::RichText::new(t!("watched_folders.missing"))
                                 .small()
                                 .color(egui::Color32::RED),
                         );
                     }
-                    if ui.button("Stop").clicked() {
+                    if ui.button(t!("watched_folders.stop")).clicked() {
                         to_remove = Some(path.clone());
                     }
                 });
             }
 
             ui.horizontal(|ui| {
-                if ui.button("Watch folder...").clicked() {
+                if ui.button(t!("watched_folders.watch_folder")).clicked() {
                     if let Some(picked) = rfd::FileDialog::new()
-                        .set_title("Watch folder for new VRM files")
+                        .set_title(t!("dialog.watch_folder_dialog"))
                         .pick_folder()
                     {
                         if let Err(e) = state.start_watching_folder(picked.clone()) {
-                            state.push_notification(format!(
-                                "Failed to watch {}: {}",
-                                picked.display(),
-                                e
-                            ));
+                            state.push_notification(t!("watched_folders.failed_watch", path = picked.display().to_string(), error = e.to_string()));
                         }
                     }
                 }
                 let refresh_resp = ui.add_enabled(
                     !watched.is_empty(),
-                    egui::Button::new("Refresh"),
+                    egui::Button::new(t!("tracking.refresh")),
                 );
                 if refresh_resp
                     .on_hover_text(
-                        "Manually scan every watched folder for new VRM files. \
-                         Use this when files arrive via cloud sync (OneDrive, etc.) \
-                         or a network share — the auto-watcher's notify backend \
-                         can miss events on those filesystems.",
+                        t!("watched_folders.refresh_tooltip"),
                     )
                     .clicked()
                 {
@@ -1838,10 +1770,7 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
             if !watched.is_empty() {
                 ui.label(
                     egui::RichText::new(
-                        "Local filesystem recommended. Cloud-sync folders \
-                         (OneDrive, Google Drive, Dropbox) and network shares \
-                         are best-effort — use Refresh if files don't appear \
-                         automatically.",
+                        t!("watched_folders.cloud_hint"),
                     )
                     .small()
                     .color(egui::Color32::GRAY),
@@ -1850,11 +1779,7 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             if let Some(path) = to_remove {
                 if let Err(e) = state.stop_watching_folder(&path) {
-                    state.push_notification(format!(
-                        "Failed to stop watching {}: {}",
-                        path.display(),
-                        e
-                    ));
+                    state.push_notification(t!("watched_folders.failed_stop", path = path.display().to_string(), error = e.to_string()));
                 }
             }
         });
@@ -1866,34 +1791,28 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// because both are admin-style controls for the avatar library data
 /// stored under `%APPDATA%\VulVATAR`.
 fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Avatar Load Cache")
+    egui::CollapsingHeader::new(t!("avatar_cache.heading"))
         .default_open(false)
         .show(ui, |ui| {
             let stats = crate::asset::cache::stats();
             let dir = crate::persistence::cache_dir();
-            ui.label(format!("Location: {}", dir.display()));
-            ui.label(format!(
-                "Entries: {} ({:.1} MB)",
-                stats.entry_count,
-                stats.total_bytes as f64 / 1024.0 / 1024.0
-            ));
+            ui.label(t!("avatar_cache.location", path = dir.display().to_string()));
+            ui.label(t!("avatar_cache.entries", count = stats.entry_count, size = format!("{:.1}", stats.total_bytes as f64 / 1024.0 / 1024.0)));
             ui.label(
                 egui::RichText::new(
-                    "Each VRM that has been loaded successfully is cached here. \
-                     Subsequent loads of the same file skip glTF parsing and \
-                     re-decode textures from the source bytes.",
+                    t!("avatar_cache.cache_description"),
                 )
                 .small()
                 .color(egui::Color32::GRAY),
             );
             ui.horizontal(|ui| {
-                if ui.button("Clear cache").clicked() {
+                if ui.button(t!("avatar_cache.clear_cache")).clicked() {
                     match crate::asset::cache::clear_all() {
                         Ok(n) => {
-                            state.push_notification(format!("Cleared {} cache entries", n));
+                            state.push_notification(t!("avatar_cache.cleared", count = n));
                         }
                         Err(e) => {
-                            state.push_notification(format!("Cache clear failed: {}", e));
+                            state.push_notification(t!("avatar_cache.clear_failed", error = e.to_string()));
                         }
                     }
                 }
@@ -1902,29 +1821,29 @@ fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Model Library")
+    egui::CollapsingHeader::new(t!("inspector.model_library"))
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut state.library_search_query);
                 if state.library_search_query.is_empty() {
-                    ui.label("Search");
+                    ui.label(t!("inspector.search"));
                 }
             });
 
             ui.horizontal(|ui| {
-                if ui.button("Sort: Name").clicked() {
+                if ui.button(t!("inspector.sort_name")).clicked() {
                     state.app.avatar_library.sort_by_name();
                 }
-                if ui.button("Sort: Recent").clicked() {
+                if ui.button(t!("inspector.sort_recent")).clicked() {
                     state.app.avatar_library.sort_by_last_loaded();
                 }
-                if ui.button("Favorites First").clicked() {
+                if ui.button(t!("inspector.favorites_first")).clicked() {
                     state.app.avatar_library.sort_favorites_first();
                 }
             });
 
-            ui.checkbox(&mut state.library_show_missing, "Show missing files");
+            ui.checkbox(&mut state.library_show_missing, t!("inspector.show_missing"));
 
             ui.separator();
 
@@ -1997,7 +1916,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             let total = entries.len();
             let available = entries.iter().filter(|r| r.exists).count();
-            ui.label(format!("{} models ({} available)", total, available));
+            ui.label(t!("inspector.models_count", total = total, available = available));
 
             let mut load_path: Option<std::path::PathBuf> = None;
             let mut remove_idx: Option<usize> = None;
@@ -2104,17 +2023,17 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                                 ui.vertical(|ui| {
                                     if row.exists {
-                                        if ui.button("Load").clicked() {
+                                        if ui.button(t!("inspector.load")).clicked() {
                                             load_path = Some(row.path.clone());
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("MISSING")
+                                            egui::RichText::new(t!("inspector.missing"))
                                                 .small()
                                                 .color(egui::Color32::RED),
                                         );
                                     }
-                                    if ui.button("Remove").clicked() {
+                        if ui.button(t!("inspector.remove")).clicked() {
                                         remove_idx = Some(row.idx);
                                     }
                                 });
@@ -2138,7 +2057,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                     let path = state.app.avatar_library.entries[idx].path.clone();
                     state.app.avatar_library.remove(&path);
                     let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
-                    state.push_notification("Removed from library".to_string());
+                    state.push_notification(t!("inspector.removed_library").to_string());
                 }
             }
 
@@ -2157,15 +2076,15 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             if let Some(idx) = state.library_selected_index {
                 if idx < state.app.avatar_library.entries.len() {
-                    ui.label(egui::RichText::new("Details").strong());
+                    ui.label(egui::RichText::new(t!("inspector.details")).strong());
 
                     let entry = &mut state.app.avatar_library.entries[idx];
                     ui.horizontal(|ui| {
-                        ui.label("Name:");
+                        ui.label(t!("inspector.name"));
                         ui.text_edit_singleline(&mut entry.name);
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Tags:");
+                        ui.label(t!("inspector.tags"));
                         ui.text_edit_singleline(&mut state.library_tag_buf);
                         if ui.button("+").clicked() && !state.library_tag_buf.is_empty() {
                             tag_to_add = Some(state.library_tag_buf.clone());
@@ -2187,10 +2106,10 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                     let entry = &mut state.app.avatar_library.entries[idx];
                     ui.horizontal(|ui| {
-                        ui.label("Notes:");
+                        ui.label(t!("inspector.notes"));
                         ui.text_edit_multiline(&mut entry.notes);
                     });
-                    if ui.button("Save Details").clicked() {
+                    if ui.button(t!("inspector.save_details")).clicked() {
                         details_save_requested = true;
                     }
                 }
@@ -2215,17 +2134,17 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             if details_save_requested {
                 let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
-                state.push_notification("Library entry updated".to_string());
+                state.push_notification(t!("inspector.library_updated").to_string());
             }
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Purge Missing").clicked() {
+                if ui.button(t!("inspector.purge_missing")).clicked() {
                     let removed = state.app.avatar_library.purge_missing();
                     let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
-                    state.push_notification(format!("Purged {} missing entries", removed));
+                    state.push_notification(t!("inspector.purged_entries", count = removed));
                 }
-                if ui.button("Add File...").clicked() {
+                if ui.button(t!("inspector.add_file")).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("VRM 1.0", &["vrm"])
                         .pick_file()
@@ -2234,7 +2153,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                             crate::app::avatar_library::AvatarLibraryEntry::from_path(&path);
                         state.app.avatar_library.add(entry);
                         let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
-                        state.push_notification(format!("Added to library: {}", path.display()));
+                        state.push_notification(t!("inspector.added_library", path = path.display().to_string()));
                     }
                 }
             });
@@ -2242,11 +2161,11 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new("Scene Presets")
+    egui::CollapsingHeader::new(t!("inspector.scene_presets"))
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Save Preset").clicked() {
+                if ui.button(t!("inspector.save_preset")).clicked() {
                     let preset = crate::persistence::ScenePreset {
                         name: state.scene_preset_name.clone(),
                         lighting: crate::persistence::ScenePresetLighting {
@@ -2276,23 +2195,23 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                         ..preset
                     });
                     let _ = crate::persistence::save_scene_presets(&state.scene_presets);
-                    state.push_notification(format!("Saved scene preset: {}", name));
+                    state.push_notification(t!("inspector.saved_preset", name = name));
                 }
-                if ui.button("Delete Selected").clicked() {
+                if ui.button(t!("inspector.delete_selected")).clicked() {
                     if let Some(idx) = state.scene_preset_index {
                         if idx < state.scene_presets.len() {
                             let name = state.scene_presets[idx].name.clone();
                             state.scene_presets.remove(idx);
                             state.scene_preset_index = None;
                             let _ = crate::persistence::save_scene_presets(&state.scene_presets);
-                            state.push_notification(format!("Deleted preset: {}", name));
+                            state.push_notification(t!("inspector.deleted_preset", name = name));
                         }
                     }
                 }
             });
 
             ui.horizontal(|ui| {
-                ui.label("Name:");
+                ui.label(t!("inspector.name"));
                 ui.text_edit_singleline(&mut state.scene_preset_name);
             });
 
@@ -2330,12 +2249,12 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.rendering.outline_enabled = preset.rendering.outline_enabled;
                     state.rendering.outline_width = preset.rendering.outline_width;
                     state.rendering.outline_color = preset.rendering.outline_color;
-                    state.push_notification(format!("Loaded scene preset: {}", preset.name));
+                    state.push_notification(t!("inspector.loaded_preset", name = preset.name));
                     state.project_dirty = true;
                 }
             }
 
-            ui.label(format!("{} preset(s) saved", state.scene_presets.len()));
+            ui.label(t!("inspector.presets_count", count = state.scene_presets.len()));
         });
 }
 
@@ -2354,14 +2273,14 @@ fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
         state.expression_weights = expressions.iter().map(|e| e.weight).collect();
     }
 
-    egui::CollapsingHeader::new("Expression Control")
+    egui::CollapsingHeader::new(t!("inspector.expression_control"))
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Reset All").clicked() {
+                if ui.button(t!("inspector.reset_all")).clicked() {
                     state.expression_weights.fill(0.0);
                 }
-                if ui.button("Set All 50%").clicked() {
+                if ui.button(t!("inspector.set_all_50")).clicked() {
                     state.expression_weights.fill(0.5);
                 }
             });
@@ -2416,6 +2335,73 @@ fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
 
             ui.separator();
-            ui.label(format!("{} expression(s) loaded", expressions.len()));
+            ui.label(t!("inspector.expressions_loaded", count = expressions.len()));
+        });
+}
+
+fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
+    let locales = crate::i18n::available_locales();
+    let current_locale = state.settings.locale.clone();
+
+    egui::CollapsingHeader::new(t!("settings.heading"))
+        .default_open(true)
+        .show(ui, |ui| {
+            let selected_name = crate::i18n::locale_display_name(&current_locale);
+            egui::ComboBox::from_label(t!("settings.language"))
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    for code in &locales {
+                        let name = crate::i18n::locale_display_name(code);
+                        if ui.selectable_label(current_locale == *code, name).clicked() {
+                            state.settings.locale = code.to_string();
+                            crate::i18n::set_locale(code);
+                        }
+                    }
+                });
+        });
+
+    ui.add_space(4.0);
+
+    egui::CollapsingHeader::new(t!("settings.viewport_controls"))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.add(
+                egui::Slider::new(&mut state.settings.zoom_sensitivity, 0.01..=0.5)
+                    .text(t!("settings.zoom_sensitivity")),
+            );
+            ui.add(
+                egui::Slider::new(&mut state.settings.orbit_sensitivity, 0.05..=1.0)
+                    .text(t!("settings.orbit_sensitivity")),
+            );
+            ui.add(
+                egui::Slider::new(&mut state.settings.pan_sensitivity, 0.1..=5.0)
+                    .text(t!("settings.pan_sensitivity")),
+            );
+        });
+
+    ui.add_space(4.0);
+
+    egui::CollapsingHeader::new(t!("settings.autosave"))
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut secs = state.settings.autosave_interval_secs.unwrap_or(0);
+            let changed = ui
+                .add(
+                    egui::Slider::new(&mut secs, 0..=3600)
+                        .text(t!("settings.autosave_interval")),
+                )
+                .changed();
+            if changed {
+                if secs == 0 {
+                    state.settings.autosave_interval_secs = None;
+                    state.autosave_interval = None;
+                } else {
+                    state.settings.autosave_interval_secs = Some(secs);
+                    state.autosave_interval = Some(std::time::Duration::from_secs(secs));
+                }
+            }
+            if state.settings.autosave_interval_secs.is_none() {
+                ui.label(t!("settings.autosave_disabled"));
+            }
         });
 }

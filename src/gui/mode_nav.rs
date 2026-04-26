@@ -1,6 +1,7 @@
 use eframe::egui;
 
 use crate::gui::{AppMode, GuiApp};
+use crate::t;
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     egui::SidePanel::left("mode_nav")
@@ -8,7 +9,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
         .default_width(140.0)
         .show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.heading("Modes");
+            ui.heading(t!("app.modes_heading"));
             ui.separator();
             ui.add_space(4.0);
 
@@ -28,7 +29,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             ui.separator();
             ui.add_space(4.0);
             if ui
-                .selectable_label(!state.inspector_open, "Hide Panel")
+                .selectable_label(!state.inspector_open, t!("app.hide_panel"))
                 .clicked()
             {
                 state.inspector_open = false;

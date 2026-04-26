@@ -7,6 +7,7 @@ use log::info;
 use crate::asset::AvatarAsset;
 use crate::gui::avatar_load::{AfterLoad, AvatarLoadJob};
 use crate::gui::GuiApp;
+use crate::t;
 use crate::persistence;
 
 /// Kick off a background avatar load. The heavy CPU work (file I/O,
@@ -15,10 +16,10 @@ use crate::persistence;
 /// [`finalize_avatar_load`].
 pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
     if state.avatar_load_job.is_some() {
-        state.push_notification("Avatar load already in progress.".to_string());
+        state.push_notification(t!("top_bar.avatar_load_in_progress"));
         return;
     }
-    state.push_notification(format!("Loading avatar: {}", path.display()));
+    state.push_notification(t!("top_bar.loading_avatar", path = path.display().to_string()));
     state.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
 
@@ -55,7 +56,7 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     state.app.add_avatar(instance);
     state.add_recent_avatar(path.to_path_buf());
     info!("avatar loaded: {}", path.display());
-    state.push_notification(format!("Loaded avatar: {}", path.display()));
+    state.push_notification(t!("top_bar.loaded_avatar", path = path.display().to_string()));
 
     // Kick a real-render thumbnail of the just-loaded avatar. Render
     // thread completes asynchronously; poll_thumbnail_jobs picks up
@@ -72,9 +73,9 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     // E12: Show dirty indicator in the title heading.
     let title = if state.project_dirty {
-        "VulVATAR *"
+        t!("top_bar.title_dirty")
     } else {
-        "VulVATAR"
+        t!("top_bar.title")
     };
 
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -82,9 +83,9 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             ui.heading(title);
             ui.separator();
 
-            if ui.button("Open Avatar").clicked() {
+            if ui.button(t!("top_bar.open_avatar")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("VRM 1.0", &["vrm"])
+                    .add_filter(&t!("top_bar.filter_vrm"), &["vrm"])
                     .pick_file()
                 {
                     load_avatar_from_path(state, &path);
@@ -92,9 +93,9 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             }
 
             // E11: Recent avatars menu.
-            ui.menu_button("Recent", |ui| {
+            ui.menu_button(t!("top_bar.recent"), |ui| {
                 if state.recent_avatars.is_empty() {
-                    ui.label("No recent avatars");
+                    ui.label(t!("top_bar.no_recent"));
                 } else {
                     let mut load_path: Option<std::path::PathBuf> = None;
                     for path in &state.recent_avatars {
@@ -111,9 +112,9 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             ui.separator();
 
-            if ui.button("Open Project").clicked() {
+            if ui.button(t!("top_bar.open_project")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("VulVATAR Project", &["vvtproj"])
+                    .add_filter(&t!("top_bar.filter_project"), &["vvtproj"])
                     .pick_file()
                 {
                     match persistence::load_project(&path) {
@@ -132,10 +133,9 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                             }
                                         }
                                         Err(e) => {
-                                            state.push_notification(format!(
-                                                "Failed to load cloth overlay '{}': {}",
-                                                overlay_path_str, e
-                                            ));
+                                            state.push_notification(
+                                                t!("top_bar.failed_load_overlay", path = overlay_path_str.to_string(), error = e.to_string()),
+                                            );
                                         }
                                     }
                                 }
@@ -154,22 +154,20 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 .as_ref()
                                 .filter(|p| !std::path::Path::new(p).exists())
                             {
-                                state.push_notification(format!(
-                                    "Avatar source file not found: '{}'",
-                                    missing
-                                ));
+                                state.push_notification(
+                                    t!("top_bar.avatar_not_found", path = missing.to_string()),
+                                );
                             }
 
                             if let Some(avatar_path) = avatar_to_load {
                                 if state.avatar_load_job.is_some() {
                                     state.push_notification(
-                                        "Avatar load already in progress.".to_string(),
+                                        t!("top_bar.avatar_load_in_progress"),
                                     );
                                 } else {
-                                    state.push_notification(format!(
-                                        "Loading project '{}'…",
-                                        path.display()
-                                    ));
+                                    state.push_notification(
+                                        t!("top_bar.loading_project", path = path.display().to_string()),
+                                    );
                                     state.avatar_load_job = Some(AvatarLoadJob::spawn(
                                         avatar_path,
                                         AfterLoad::ApplyProject {
@@ -184,16 +182,15 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 state.project_path = Some(path.clone());
                                 state.project_dirty = false;
                                 for w in &load_warnings.warnings {
-                                    state.push_notification(format!("Warning: {}", w));
+                                    state.push_notification(t!("toast.warning", msg = w.to_string()));
                                 }
-                                state.push_notification(format!(
-                                    "Opened project: {}",
-                                    path.display()
-                                ));
+                                state.push_notification(
+                                    t!("top_bar.opened_project", path = path.display().to_string()),
+                                );
                             }
                         }
                         Err(e) => {
-                            state.push_notification(format!("Failed to load project: {}", e));
+                            state.push_notification(t!("top_bar.failed_load_project", error = e.to_string()));
                         }
                     }
                 }
@@ -207,16 +204,16 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         Ok(()) => {
                             // E12: Clear dirty on save.
                             state.project_dirty = false;
-                            state.push_notification("Project saved.".to_string());
+                            state.push_notification(t!("top_bar.project_saved"));
                         }
                         Err(e) => {
-                            state.push_notification(format!("Save project failed: {}", e));
+                            state.push_notification(t!("top_bar.save_failed", error = e.to_string()));
                         }
                     }
                 } else {
                     // No path yet -- behave like Save As.
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("VulVATAR Project", &["vvtproj"])
+                        .add_filter(&t!("top_bar.filter_project"), &["vvtproj"])
                         .set_file_name("project.vvtproj")
                         .save_file()
                     {
@@ -224,10 +221,10 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                             Ok(()) => {
                                 state.project_path = Some(path);
                                 state.project_dirty = false;
-                                state.push_notification("Project saved.".to_string());
+                                state.push_notification(t!("top_bar.project_saved"));
                             }
                             Err(e) => {
-                                state.push_notification(format!("Save project failed: {}", e));
+                                state.push_notification(t!("top_bar.save_failed", error = e.to_string()));
                             }
                         }
                     }
@@ -236,7 +233,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             if ui.button("Save As").clicked() {
                 let ps = state.to_project_state();
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("VulVATAR Project", &["vvtproj"])
+                    .add_filter(&t!("top_bar.filter_project"), &["vvtproj"])
                     .set_file_name("project.vvtproj")
                     .save_file()
                 {
@@ -244,10 +241,10 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         Ok(()) => {
                             state.project_path = Some(path);
                             state.project_dirty = false;
-                            state.push_notification("Project saved.".to_string());
+                            state.push_notification(t!("top_bar.project_saved"));
                         }
                         Err(e) => {
-                            state.push_notification(format!("Save as failed: {}", e));
+                            state.push_notification(t!("top_bar.save_as_failed", error = e.to_string()));
                         }
                     }
                 }
@@ -255,9 +252,9 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             ui.separator();
 
-            if ui.button("Open Overlay").clicked() {
+            if ui.button(t!("top_bar.open_overlay")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("VulVATAR Cloth Overlay", &["vvtcloth"])
+                    .add_filter(&t!("top_bar.filter_cloth"), &["vvtcloth"])
                     .pick_file()
                 {
                     match persistence::load_cloth_overlay(&path) {
@@ -267,39 +264,38 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 state.app.editor.dirty = false;
                             }
                             state.app.editor.overlay_path = Some(path.clone());
-                            state.push_notification(format!(
-                                "Opened overlay '{}' (format v{})",
-                                overlay.overlay_name, overlay.format_version
-                            ));
+                            state.push_notification(
+                                t!("top_bar.opened_overlay", name = overlay.overlay_name.to_string(), version = overlay.format_version),
+                            );
                         }
                         Err(e) => {
-                            state.push_notification(format!("Failed to load cloth overlay: {}", e));
+                            state.push_notification(t!("top_bar.failed_load_cloth", error = e.to_string()));
                         }
                     }
                 }
             }
-            if ui.button("Save Overlay").clicked() {
+            if ui.button(t!("top_bar.save_overlay_button")).clicked() {
                 match state.app.editor.save_overlay(None) {
-                    Ok(()) => state.push_notification("Overlay saved.".to_string()),
-                    Err(e) => state.push_notification(format!("Save overlay failed: {}", e)),
+                    Ok(()) => state.push_notification(t!("top_bar.overlay_saved")),
+                    Err(e) => state.push_notification(t!("top_bar.save_overlay_failed", error = e.to_string())),
                 }
             }
 
             ui.separator();
 
             if state.paused {
-                if ui.button("Resume").clicked() {
+                if ui.button(t!("top_bar.resume")).clicked() {
                     state.paused = false;
                 }
             } else {
-                if ui.button("Pause").clicked() {
+                if ui.button(t!("top_bar.pause")).clicked() {
                     state.paused = true;
                 }
             }
 
             ui.separator();
 
-            ui.label("Profile:");
+            ui.label(t!("top_bar.profile"));
             let active_idx = state.profiles.active_index.unwrap_or(0);
             let profile_names: Vec<String> = state
                 .profiles
@@ -329,7 +325,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     let name = profile.name.clone();
                     state.profiles.set_active(i);
                     state.apply_profile(&profile);
-                    state.push_notification(format!("Switched to profile: {}", name));
+                    state.push_notification(t!("top_bar.switched_profile", name = name));
                 }
             }
         });

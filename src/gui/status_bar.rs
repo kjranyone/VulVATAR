@@ -1,13 +1,14 @@
 use eframe::egui;
 
 use crate::gui::GuiApp;
+use crate::t;
 
 pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             let avatar_label = match state.app.active_avatar() {
                 Some(avatar) => avatar.asset.source_path.to_string_lossy().to_string(),
-                None => "No avatar".to_string(),
+                None => t!("app.no_avatar"),
             };
             ui.label(&avatar_label);
 
@@ -25,60 +26,62 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 if tracking_enabled {
                     (
                         egui::Color32::GREEN,
-                        format!("Tracking: Active ({})", backend_label),
+                        t!("status.tracking_active", backend = backend_label.to_string()),
                     )
                 } else {
                     (
                         egui::Color32::YELLOW,
-                        format!("Tracking: Paused ({})", backend_label),
+                        t!("status.tracking_paused", backend = backend_label.to_string()),
                     )
                 }
             } else {
-                (egui::Color32::GRAY, "Tracking: Stopped".to_string())
+                (egui::Color32::GRAY, t!("status.tracking_stopped"))
             };
             ui.label(egui::RichText::new(tracking_text).color(tracking_color));
 
             ui.separator();
 
-            let sink_names = [
-                "Virtual Camera",
-                "Shared Texture",
-                "Shared Memory",
-                "Image Sequence",
+            let sink_names: [String; 4] = [
+                t!("status.sink_virtual_camera"),
+                t!("status.sink_shared_texture"),
+                t!("status.sink_shared_memory"),
+                t!("status.sink_image_sequence"),
             ];
             let sink_label = sink_names
                 .get(state.app.output.active_sink().to_gui_index())
-                .unwrap_or(&"Unknown");
-            ui.label(format!("Output: {}", sink_label));
+                .cloned()
+                .unwrap_or_else(|| t!("status.sink_unknown"));
+            ui.label(t!("status.output_label", sink = sink_label.to_string()));
 
             ui.separator();
 
-            ui.label(format!(
-                "Queue: {}  Dropped: {}",
-                state.app.output.queue_depth(),
-                state.app.output.dropped_count()
+            ui.label(t!(
+                "status.queue_dropped",
+                queue = state.app.output.queue_depth(),
+                dropped = state.app.output.dropped_count()
             ));
 
             ui.separator();
 
-            ui.label(format!("Frame: {}", state.frame_count));
+            ui.label(t!("status.frame", frame = state.frame_count));
 
             ui.separator();
 
-            ui.label(format!(
-                "FPS: {:.0}  ({:.1} ms)",
-                state.fps, state.frame_time_ms
+            ui.label(t!(
+                "status.fps",
+                fps = format!("{:.0}", state.fps),
+                ms = format!("{:.1}", state.frame_time_ms)
             ));
 
             // E12: Dirty indicator
             if state.project_dirty {
                 ui.separator();
-                ui.label(egui::RichText::new("* Modified").color(egui::Color32::YELLOW));
+                ui.label(egui::RichText::new(t!("status.modified")).color(egui::Color32::YELLOW));
             }
 
             if state.paused {
                 ui.label(
-                    egui::RichText::new("PAUSED")
+                    egui::RichText::new(t!("status.paused"))
                         .color(egui::Color32::YELLOW)
                         .strong(),
                 );

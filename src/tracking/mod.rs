@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::t;
 
 #[cfg(feature = "webcam")]
 mod webcam;
@@ -116,6 +117,12 @@ impl TrackingCalibration {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TrackingErrorLevel {
+    Warning,
+    Blocking,
+}
+
 // ---------------------------------------------------------------------------
 // TrackingMailbox
 // ---------------------------------------------------------------------------
@@ -132,7 +139,7 @@ struct TrackingMailboxInner {
     latest_annotation: Option<DetectionAnnotation>,
     sequence: u64,
     last_update_nanos: u64,
-    pending_error: Option<String>,
+    pending_error: Option<(String, TrackingErrorLevel)>,
     /// One-line label of the inference backend in use (e.g. "DirectML",
     /// "CPU", "CPU (DirectML unavailable: ...)"). `None` when no
     /// inference engine is loaded — e.g. synthetic mode, or before the
@@ -202,13 +209,13 @@ impl TrackingMailbox {
     }
 
     /// Report a non-fatal error from the worker thread (shown as GUI toast).
-    pub fn report_error(&self, msg: String) {
+    pub fn report_error(&self, msg: impl Into<String>, level: TrackingErrorLevel) {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.pending_error = Some(msg);
+        inner.pending_error = Some((msg.into(), level));
     }
 
     /// Drain the latest pending error (returns it only once).
-    pub fn drain_error(&self) -> Option<String> {
+    pub fn drain_error(&self) -> Option<(String, TrackingErrorLevel)> {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         inner.pending_error.take()
     }
@@ -629,10 +636,7 @@ impl TrackingWorker {
                     "tracking-worker: failed to open camera {}: {}",
                     camera_index, e
                 );
-                mailbox.report_error(format!(
-                    "Camera {} open failed: {}. Check if another app is using the camera.",
-                    camera_index, e
-                ));
+                mailbox.report_error(t!("tracking.error_camera_open", index = camera_index, error = e.to_string()), TrackingErrorLevel::Blocking);
                 warn!("tracking-worker: falling back to synthetic backend");
                 ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(mailbox, running, interval);
@@ -650,20 +654,14 @@ impl TrackingWorker {
             Ok(mut estimator) => {
                 let warnings = estimator.take_load_warnings();
                 if !warnings.is_empty() {
-                    mailbox.report_error(format!(
-                        "Pose tracking quality warning: {}. Run ./dev.ps1 setup to install the full model bundle.",
-                        warnings.join("; ")
-                    ));
+                    mailbox.report_error(t!("tracking.error_model_warning", warnings = warnings.join("; ")), TrackingErrorLevel::Warning);
                 }
                 mailbox.set_inference_backend_label(Some(estimator.backend().label()));
                 Some(estimator)
             }
             Err(e) => {
                 error!("tracking-worker: inference disabled: {}", e);
-                mailbox.report_error(format!(
-                    "Pose model unavailable: {} Falling back to low-quality HSV tracking.",
-                    e
-                ));
+                mailbox.report_error(t!("tracking.error_model_unavailable", error = e.to_string()), TrackingErrorLevel::Blocking);
                 None
             }
         };
@@ -704,11 +702,7 @@ impl TrackingWorker {
                             "tracking-worker: {} consecutive grab failures, stopping worker",
                             consecutive_errors
                         );
-                        mailbox.report_error(format!(
-                            "Camera stopped after {} consecutive read errors. \
-                             Another app may be using the camera, or the device was disconnected.",
-                            consecutive_errors
-                        ));
+                        mailbox.report_error(t!("tracking.error_camera_stopped", count = consecutive_errors), TrackingErrorLevel::Blocking);
                         return;
                     }
                 }

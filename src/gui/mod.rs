@@ -11,13 +11,27 @@ pub mod viewport_overlay;
 
 use log::{debug, info, warn};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::app::{Application, RuntimeToggles};
+use crate::t;
 use crate::persistence::ProjectState;
-use crate::tracking::{TrackingSmoothingParams, DEFAULT_CONFIDENCE_THRESHOLD};
+use crate::tracking::{TrackingErrorLevel, TrackingSmoothingParams, DEFAULT_CONFIDENCE_THRESHOLD};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Error,
+}
+
+pub struct Notification {
+    pub message: String,
+    pub created: Instant,
+    pub level: NotificationLevel,
+}
 
 pub struct TransformState {
     pub position: [f32; 3],
@@ -252,6 +266,14 @@ pub struct OutputGuiState {
     pub output_color_space_index: usize,
 }
 
+pub struct SettingsGuiState {
+    pub locale: String,
+    pub zoom_sensitivity: f32,
+    pub orbit_sensitivity: f32,
+    pub pan_sensitivity: f32,
+    pub autosave_interval_secs: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMode {
     Avatar,
@@ -260,26 +282,29 @@ pub enum AppMode {
     Rendering,
     Output,
     ClothAuthoring,
+    Settings,
 }
 
 impl AppMode {
-    pub const ALL: [AppMode; 6] = [
+    pub const ALL: [AppMode; 7] = [
         AppMode::Avatar,
         AppMode::Preview,
         AppMode::TrackingSetup,
         AppMode::Rendering,
         AppMode::Output,
         AppMode::ClothAuthoring,
+        AppMode::Settings,
     ];
 
-    pub fn label(&self) -> &str {
+    pub fn label(&self) -> String {
         match self {
-            AppMode::Avatar => "Avatar",
-            AppMode::Preview => "Preview",
-            AppMode::TrackingSetup => "Tracking Setup",
-            AppMode::Rendering => "Rendering",
-            AppMode::Output => "Output",
-            AppMode::ClothAuthoring => "Cloth Authoring",
+            AppMode::Avatar => t!("app.modes.avatar"),
+            AppMode::Preview => t!("app.modes.preview"),
+            AppMode::TrackingSetup => t!("app.modes.tracking_setup"),
+            AppMode::Rendering => t!("app.modes.rendering"),
+            AppMode::Output => t!("app.modes.output"),
+            AppMode::ClothAuthoring => t!("app.modes.cloth_authoring"),
+            AppMode::Settings => t!("app.modes.settings"),
         }
     }
 }
@@ -316,13 +341,14 @@ pub struct GuiApp {
     pub wind_presets: profile::WindPresetLibrary,
 
     // M10: Notification/toast system
-    pub notifications: Vec<(String, Instant)>,
+    pub notifications: Vec<Notification>,
 
     pub transform: TransformState,
     pub camera_orbit: CameraOrbitState,
     pub tracking: TrackingGuiState,
     pub rendering: RenderingGuiState,
     pub output: OutputGuiState,
+    pub settings: SettingsGuiState,
 
     pub camera_index: usize,
     pub available_cameras: Vec<crate::tracking::CameraInfo>,
@@ -400,6 +426,37 @@ impl GuiApp {
         // crate. Required for thumbnail rendering in the avatar library
         // inspector — without this, file:// URIs return UnknownLoader.
         egui_extras::install_image_loaders(&cc.egui_ctx);
+
+        let font_path = std::path::Path::new("assets/NotoSansJP-Regular.otf");
+        if font_path.exists() {
+            match std::fs::read(font_path) {
+                Ok(data) => {
+                    let mut fonts = egui::FontDefinitions::default();
+                    fonts.font_data.insert(
+                        "noto_sans_jp".into(),
+                        Arc::new(egui::FontData::from_owned(data)),
+                    );
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .push("noto_sans_jp".into());
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .push("noto_sans_jp".into());
+                    cc.egui_ctx.set_fonts(fonts);
+                    info!("loaded CJK font: {}", font_path.display());
+                }
+                Err(e) => warn!("failed to read CJK font {}: {e}", font_path.display()),
+            }
+        } else {
+            warn!(
+                "CJK font not found at {} — multibyte characters will not render",
+                font_path.display()
+            );
+        }
         let mut app = Box::new(Application::new());
         app.bootstrap();
         app.avatar_library = crate::persistence::load_avatar_library();
@@ -507,6 +564,14 @@ impl GuiApp {
                 output_color_space_index: 0,
             },
 
+            settings: SettingsGuiState {
+                locale: crate::i18n::locale(),
+                zoom_sensitivity: 0.1,
+                orbit_sensitivity: 0.3,
+                pan_sensitivity: 1.0,
+                autosave_interval_secs: Some(300),
+            },
+
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
             show_camera_wipe: false,
@@ -606,18 +671,11 @@ impl GuiApp {
         // afterwards so a missing folder doesn't keep coming back.
         for path in crate::persistence::load_watched_folders() {
             if !path.exists() {
-                state.push_notification(format!(
-                    "Watched folder no longer exists, dropping: {}",
-                    path.display()
-                ));
+                state.push_notification(t!("toast.watched_folder_missing", path = path.display().to_string()));
                 continue;
             }
             if let Err(e) = state.start_watching_folder(path.clone()) {
-                state.push_notification(format!(
-                    "Failed to restore watch on {}: {}",
-                    path.display(),
-                    e
-                ));
+                state.push_notification(t!("toast.failed_restore_watch", path = path.display().to_string(), error = e.to_string()));
             }
         }
         let _ = crate::persistence::save_watched_folders(&state.watched_avatar_dirs);
@@ -716,6 +774,14 @@ impl GuiApp {
                 output_color_space_index: 0,
             },
 
+            settings: SettingsGuiState {
+                locale: "en".to_string(),
+                zoom_sensitivity: 0.1,
+                orbit_sensitivity: 0.3,
+                pan_sensitivity: 1.0,
+                autosave_interval_secs: None,
+            },
+
             camera_index: 0,
             available_cameras: Vec::new(),
             show_camera_wipe: false,
@@ -796,8 +862,22 @@ impl GuiApp {
     }
 
     /// Push a notification message that will auto-dismiss after 5 seconds.
-    pub fn push_notification(&mut self, msg: String) {
-        self.notifications.push((msg, Instant::now()));
+    pub fn push_notification(&mut self, msg: impl Into<String>) {
+        self.notifications.push(Notification {
+            message: msg.into(),
+            created: Instant::now(),
+            level: NotificationLevel::Info,
+        });
+    }
+
+    /// Push an error notification that will auto-dismiss after 15 seconds
+    /// with a red-tinted background.
+    pub fn push_error_notification(&mut self, msg: impl Into<String>) {
+        self.notifications.push(Notification {
+            message: msg.into(),
+            created: Instant::now(),
+            level: NotificationLevel::Error,
+        });
     }
 
     /// Add a path to the recent avatars list (max 10, dedup, most recent first).
@@ -910,6 +990,12 @@ impl GuiApp {
             output_framerate_index: self.output.output_framerate_index,
             output_has_alpha: self.output.output_has_alpha,
             output_color_space_index: self.output.output_color_space_index,
+
+            settings_locale: self.settings.locale.clone(),
+            settings_zoom_sensitivity: self.settings.zoom_sensitivity,
+            settings_orbit_sensitivity: self.settings.orbit_sensitivity,
+            settings_pan_sensitivity: self.settings.pan_sensitivity,
+            settings_autosave_interval_secs: self.settings.autosave_interval_secs,
         }
     }
 
@@ -929,11 +1015,11 @@ impl GuiApp {
         use crate::output::FrameSink;
         let want_sink = FrameSink::from_gui_index(sink_index);
         if let Err(e) = self.app.set_requested_sink(want_sink) {
-            self.push_notification(format!("Virtual Camera unavailable: {e}"));
+            self.push_notification(t!("toast.virtual_camera_unavailable", error = e.to_string()));
         }
         if let Err(e) = self.app.set_requested_lipsync(lipsync_enabled, lipsync_mic) {
             warn!("lipsync apply failed: {e}");
-            self.push_notification(format!("Lip sync failed: {e}"));
+            self.push_notification(t!("toast.lipsync_failed", error = e.to_string()));
         }
     }
 
@@ -964,9 +1050,9 @@ impl GuiApp {
         if self.hotkeys.check(hotkey::HotkeyAction::TogglePause, ctx) {
             self.paused = !self.paused;
             self.push_notification(if self.paused {
-                "Paused".to_string()
+                t!("toast.paused")
             } else {
-                "Resumed".to_string()
+                t!("toast.resumed")
             });
         }
         if self
@@ -1014,14 +1100,14 @@ impl GuiApp {
                 match crate::persistence::save_project(&ps, path) {
                     Ok(()) => {
                         self.project_dirty = false;
-                        self.push_notification("Project saved.".to_string());
+                        self.push_notification(t!("toast.project_saved"));
                     }
                     Err(e) => {
-                        self.push_notification(format!("Save failed: {}", e));
+                        self.push_notification(t!("toast.save_failed", error = e.to_string()));
                     }
                 }
             } else {
-                self.push_notification("No project path set. Use Save As.".to_string());
+                self.push_notification(t!("toast.no_project_path"));
             }
         }
         if self.hotkeys.check(hotkey::HotkeyAction::LoadAvatar, ctx) {
@@ -1083,6 +1169,14 @@ impl GuiApp {
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
 
+        self.settings.locale = state.settings_locale.clone();
+        self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;
+        self.settings.orbit_sensitivity = state.settings_orbit_sensitivity;
+        self.settings.pan_sensitivity = state.settings_pan_sensitivity;
+        self.settings.autosave_interval_secs = state.settings_autosave_interval_secs;
+        crate::i18n::set_locale(&self.settings.locale);
+        self.autosave_interval = self.settings.autosave_interval_secs.map(std::time::Duration::from_secs);
+
         self.apply_pipeline_bound_settings(
             state.output_sink_index,
             state.lipsync_enabled,
@@ -1110,29 +1204,19 @@ impl GuiApp {
             .filter_map(|p| {
                 let path = std::path::PathBuf::from(p);
                 if !path.exists() {
-                    self.push_notification(format!(
-                        "Cloth overlay '{}' not found, skipping",
-                        path.display()
-                    ));
+                    self.push_notification(t!("toast.cloth_overlay_not_found", path = path.display().to_string()));
                     return None;
                 }
                 match crate::persistence::load_cloth_overlay(&path) {
                     Ok(file) => match file.cloth_asset {
                         Some(asset) => Some((path, asset)),
                         None => {
-                            self.push_notification(format!(
-                                "Cloth overlay '{}' has no payload, skipping",
-                                path.display()
-                            ));
+                            self.push_notification(t!("toast.cloth_overlay_no_payload", path = path.display().to_string()));
                             None
                         }
                     },
                     Err(e) => {
-                        self.push_notification(format!(
-                            "Failed to load cloth overlay '{}': {}",
-                            path.display(),
-                            e
-                        ));
+                        self.push_notification(t!("toast.failed_load_cloth_overlay", path = path.display().to_string(), error = e.to_string()));
                         None
                     }
                 }
@@ -1188,12 +1272,7 @@ impl GuiApp {
                 true
             }
             RebindStatus::Partial => {
-                self.push_notification(format!(
-                    "Rebound overlay '{}': {} nodes + {} primitives resolved by name",
-                    path.display(),
-                    report.node_remappings.len(),
-                    report.primitive_remappings.len(),
-                ));
+                self.push_notification(t!("toast.rebound_overlay", path = path.display().to_string(), nodes = report.node_remappings.len(), primitives = report.primitive_remappings.len()));
                 if let Err(e) = save_rebound_overlay(path, cloth_asset) {
                     warn!(
                         "rebind: failed to write back rebound overlay '{}': {}",
@@ -1204,13 +1283,7 @@ impl GuiApp {
                 true
             }
             RebindStatus::Failed => {
-                self.push_notification(format!(
-                    "Could not auto-bind overlay '{}': {} unresolved + {} geometry mismatches. \
-                     Overlay was not attached.",
-                    path.display(),
-                    report.unresolved.len(),
-                    report.fatal_geometry_changes.len(),
-                ));
+                self.push_notification(t!("toast.could_not_rebind", path = path.display().to_string(), unresolved = report.unresolved.len(), geometry = report.fatal_geometry_changes.len()));
                 false
             }
         }
@@ -1231,7 +1304,7 @@ impl GuiApp {
         if let Some(ref mut fw) = self.folder_watcher {
             fw.watch(&path, true)?;
             self.watched_avatar_dirs.push(path.clone());
-            self.push_notification(format!("Watching folder: {}", path.display()));
+            self.push_notification(t!("toast.watched_folder", path = path.display().to_string()));
             let _ = crate::persistence::save_watched_folders(&self.watched_avatar_dirs);
         }
         Ok(())
@@ -1241,7 +1314,7 @@ impl GuiApp {
         if let Some(ref mut fw) = self.folder_watcher {
             fw.unwatch(path)?;
             self.watched_avatar_dirs.retain(|p| p != path);
-            self.push_notification(format!("Stopped watching: {}", path.display()));
+            self.push_notification(t!("toast.stopped_watching", path = path.display().to_string()));
             let _ = crate::persistence::save_watched_folders(&self.watched_avatar_dirs);
             if self.watched_avatar_dirs.is_empty() {
                 self.folder_watcher = None;
@@ -1276,17 +1349,13 @@ impl GuiApp {
                     self.project_path = Some(project_path.clone());
                     self.project_dirty = false;
                     for w in &warnings.warnings {
-                        self.push_notification(format!("Warning: {}", w));
+                        self.push_notification(t!("toast.warning", msg = w.to_string()));
                     }
-                    self.push_notification(format!("Opened project: {}", project_path.display()));
+                    self.push_notification(t!("toast.opened_project", path = project_path.display().to_string()));
                 }
             }
             avatar_load::LoadOutcome::Error(e) => {
-                self.push_notification(format!(
-                    "Failed to load avatar '{}': {}",
-                    job.path.display(),
-                    e
-                ));
+                self.push_notification(t!("toast.failed_load_avatar", path = job.path.display().to_string(), error = e.to_string()));
             }
         }
     }
@@ -1480,10 +1549,12 @@ impl GuiApp {
                 }
             }
         }
-        for vrm_path in newly_added {
-            self.push_notification(format!("New VRM detected: {}", vrm_path.display()));
+        for vrm_path in &newly_added {
+            self.push_notification(t!("toast.new_vrm_detected", path = vrm_path.display().to_string()));
         }
-        let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+        if !newly_added.is_empty() {
+            let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+        }
     }
 
     /// Walk every watched directory and import any `.vrm` files that
@@ -1526,14 +1597,9 @@ impl GuiApp {
         }
         if imported > 0 {
             let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
-            self.push_notification(format!(
-                "Refreshed watched folders: imported {} new VRM file(s)",
-                imported
-            ));
+            self.push_notification(t!("toast.refreshed_imported", count = imported));
         } else {
-            self.push_notification(
-                "Refreshed watched folders: no new files found".to_string(),
-            );
+            self.push_notification(t!("toast.refreshed_none"));
         }
     }
 
@@ -1607,8 +1673,11 @@ impl eframe::App for GuiApp {
 
         self.process_hotkeys(ctx);
 
-        if let Some(err) = self.app.tracking.mailbox().drain_error() {
-            self.push_notification(err);
+        if let Some((err, level)) = self.app.tracking.mailbox().drain_error() {
+            match level {
+                TrackingErrorLevel::Blocking => self.push_error_notification(err),
+                TrackingErrorLevel::Warning => self.push_notification(err),
+            }
         }
 
         self.poll_folder_watcher();
@@ -1737,11 +1806,11 @@ impl eframe::App for GuiApp {
                         Ok(()) => {
                             self.project_dirty = false;
                             self.last_autosave = Instant::now();
-                            self.push_notification("Autosaved project.".to_string());
+                            self.push_notification(t!("toast.autosaved"));
                         }
                         Err(e) => {
                             self.last_autosave = Instant::now();
-                            self.push_notification(format!("Autosave failed: {}", e));
+                            self.push_notification(t!("toast.autosave_failed", error = e.to_string()));
                         }
                     }
                 }
@@ -1795,24 +1864,24 @@ impl eframe::App for GuiApp {
 
         // Cloth overlay autosave consent dialog
         if self.app.editor.overlay_asset.is_some() && self.cloth_autosave_consent.is_none() {
-            egui::Window::new("Cloth Autosave Consent")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.label(
-                        "A cloth overlay is active. Allow it to be included in recovery snapshots?",
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
-                            self.cloth_autosave_consent = Some(true);
-                        }
-                        if ui.button("No").clicked() {
-                            self.cloth_autosave_consent = Some(false);
-                        }
-                    });
+        egui::Window::new(t!("dialog.cloth_autosave_title"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    t!("dialog.cloth_autosave_body"),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t!("dialog.yes")).clicked() {
+                        self.cloth_autosave_consent = Some(true);
+                    }
+                    if ui.button(t!("dialog.no")).clicked() {
+                        self.cloth_autosave_consent = Some(false);
+                    }
                 });
+            });
         }
 
         top_bar::draw(ctx, self);
@@ -1829,7 +1898,7 @@ impl eframe::App for GuiApp {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| job.path.display().to_string());
-            egui::Window::new("Loading avatar")
+            egui::Window::new(t!("dialog.loading_avatar"))
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .collapsible(false)
                 .resizable(false)
@@ -1845,23 +1914,41 @@ impl eframe::App for GuiApp {
         }
 
         // M10: Draw notification toasts and expire old ones.
-        self.notifications
-            .retain(|(_, created)| created.elapsed().as_secs_f32() < 5.0);
+        self.notifications.retain(|n| {
+            let ttl = match n.level {
+                NotificationLevel::Info => 5.0,
+                NotificationLevel::Error => 15.0,
+            };
+            n.created.elapsed().as_secs_f32() < ttl
+        });
         if !self.notifications.is_empty() {
             egui::Area::new(egui::Id::new("notifications"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -40.0))
                 .show(ctx, |ui| {
-                    for (msg, created) in &self.notifications {
-                        let age = created.elapsed().as_secs_f32();
-                        let alpha = if age > 4.0 {
-                            ((5.0 - age) * 255.0) as u8
+                    for n in &self.notifications {
+                        let ttl = match n.level {
+                            NotificationLevel::Info => 5.0,
+                            NotificationLevel::Error => 15.0,
+                        };
+                        let fade_start = ttl - 1.0;
+                        let age = n.created.elapsed().as_secs_f32();
+                        let alpha = if age > fade_start {
+                            ((ttl - age) * 255.0) as u8
                         } else {
                             255u8
                         };
+                        let bg = match n.level {
+                            NotificationLevel::Info => {
+                                egui::Color32::from_rgba_unmultiplied(40, 40, 40, alpha)
+                            }
+                            NotificationLevel::Error => {
+                                egui::Color32::from_rgba_unmultiplied(120, 30, 30, alpha)
+                            }
+                        };
                         egui::Frame::group(ui.style())
-                            .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, alpha))
+                            .fill(bg)
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(msg).color(
+                                ui.label(egui::RichText::new(&n.message).color(
                                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
                                 ));
                             });

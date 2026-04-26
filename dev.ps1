@@ -5,6 +5,44 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Install-Font {
+    Write-Host "Setting up CJK font (Noto Sans JP)..." -ForegroundColor Cyan
+    $fontName = "NotoSansJP-Regular.otf"
+    $fontDir = "assets"
+    $fontPath = "$fontDir\$fontName"
+
+    if (!(Test-Path $fontDir)) {
+        New-Item -ItemType Directory -Force -Path $fontDir | Out-Null
+    }
+
+    if (Test-Path $fontPath) {
+        Write-Host "CJK font already exists. Skipping download." -ForegroundColor Green
+        return
+    }
+
+    $zipUrl = "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/16_NotoSansJP.zip"
+    $zipPath = "$fontDir\notosansjp.zip"
+
+    Write-Host "Downloading NotoSansJP subset OTFs (~27 MB)..."
+    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+
+    Write-Host "Extracting $fontName..."
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
+    try {
+        $entry = $zip.Entries | Where-Object { $_.Name -eq $fontName }
+        if ($null -eq $entry) {
+            throw "$fontName not found in archive"
+        }
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Resolve-Path $fontDir).Path + "\$fontName", $true)
+    } finally {
+        $zip.Dispose()
+    }
+
+    Remove-Item $zipPath -Force
+    Write-Host "CJK font installed: $fontPath" -ForegroundColor Green
+}
+
 function Install-Models {
     Write-Host "Setting up ONNX models..." -ForegroundColor Cyan
     $preferredModel = "cigpose-x_coco-ubody_384x288.onnx"
@@ -235,7 +273,7 @@ function Uninstall-MfCamera {
 }
 
 $commands = @(
-    @{ Label = "setup (download pose models)"; Cmd = "Install-Models" },
+    @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-Font" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
     @{ Label = "run (debug)";      Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run' },

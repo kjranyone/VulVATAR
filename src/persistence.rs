@@ -72,6 +72,13 @@ pub struct ProjectState {
     pub output_framerate_index: usize,
     pub output_has_alpha: bool,
     pub output_color_space_index: usize,
+
+    // Settings
+    pub settings_locale: String,
+    pub settings_zoom_sensitivity: f32,
+    pub settings_orbit_sensitivity: f32,
+    pub settings_pan_sensitivity: f32,
+    pub settings_autosave_interval_secs: Option<u64>,
 }
 
 /// Serializable project state saved as `.vvtproj`.
@@ -104,6 +111,8 @@ pub struct ProjectFile {
     #[serde(default)]
     pub lipsync: LipSyncConfig,
     pub output: OutputConfig,
+    #[serde(default)]
+    pub settings: SettingsConfig,
 }
 
 /// Warnings produced during project reload validation.
@@ -227,6 +236,36 @@ pub struct OutputConfig {
     pub has_alpha: bool,
     #[serde(default)]
     pub color_space_index: usize,
+}
+
+fn default_zoom_sensitivity() -> f32 {
+    0.1
+}
+
+fn default_orbit_sensitivity() -> f32 {
+    0.3
+}
+
+fn default_pan_sensitivity() -> f32 {
+    1.0
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct SettingsConfig {
+    #[serde(default = "default_locale")]
+    pub locale: String,
+    #[serde(default = "default_zoom_sensitivity")]
+    pub zoom_sensitivity: f32,
+    #[serde(default = "default_orbit_sensitivity")]
+    pub orbit_sensitivity: f32,
+    #[serde(default = "default_pan_sensitivity")]
+    pub pan_sensitivity: f32,
+    #[serde(default)]
+    pub autosave_interval_secs: Option<u64>,
+}
+
+fn default_locale() -> String {
+    "en".to_string()
 }
 
 /// Full cloth overlay file for `.vvtcloth` files, including the complete ClothAsset data.
@@ -413,6 +452,13 @@ impl ProjectFile {
                 has_alpha: state.output_has_alpha,
                 color_space_index: state.output_color_space_index,
             },
+            settings: SettingsConfig {
+                locale: state.settings_locale.clone(),
+                zoom_sensitivity: state.settings_zoom_sensitivity,
+                orbit_sensitivity: state.settings_orbit_sensitivity,
+                pan_sensitivity: state.settings_pan_sensitivity,
+                autosave_interval_secs: state.settings_autosave_interval_secs,
+            },
         }
     }
 
@@ -471,6 +517,12 @@ impl ProjectFile {
             output_framerate_index: self.output.framerate_index,
             output_has_alpha: self.output.has_alpha,
             output_color_space_index: self.output.color_space_index,
+
+            settings_locale: self.settings.locale.clone(),
+            settings_zoom_sensitivity: self.settings.zoom_sensitivity,
+            settings_orbit_sensitivity: self.settings.orbit_sensitivity,
+            settings_pan_sensitivity: self.settings.pan_sensitivity,
+            settings_autosave_interval_secs: self.settings.autosave_interval_secs,
         }
     }
 }

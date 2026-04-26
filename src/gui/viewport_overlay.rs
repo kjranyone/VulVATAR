@@ -2,6 +2,7 @@ use eframe::egui;
 
 use crate::asset::AvatarAsset;
 use crate::editor::cloth_authoring::RegionSelection;
+use crate::t;
 
 pub struct ViewportOverlayState {
     pub show_wireframe: bool,
@@ -41,18 +42,19 @@ pub fn draw_selection_overlay(
                 .iter()
                 .flat_map(|m| m.primitives.iter())
                 .find(|p| p.id == sel.target_primitive)
-                .map(|p| format!("Primitive {}", p.id.0))
-                .unwrap_or_else(|| format!("Primitive {}", sel.target_primitive.0));
+                .map(|p| t!("viewport.primitive", id = p.id.0))
+                .unwrap_or_else(|| t!("viewport.primitive", id = sel.target_primitive.0));
 
             let vert_count = sel.selected_vertices.len();
-            let range_label = format!(
-                "Range: {}..{}",
-                sel.selected_vertex_range.0, sel.selected_vertex_range.1
+            let range_label = t!(
+                "viewport.range",
+                start = sel.selected_vertex_range.0,
+                end = sel.selected_vertex_range.1
             );
 
             let lines = [
-                format!("Selected: {} vertices", vert_count),
-                format!("Target: {}", prim_label),
+                t!("viewport.selected", count = vert_count),
+                t!("viewport.target", label = prim_label),
                 range_label,
             ];
 
@@ -72,7 +74,7 @@ pub fn draw_selection_overlay(
             painter.text(
                 egui::pos2(rect.left() + 8.0, rect.top() + 6.0),
                 egui::Align2::LEFT_TOP,
-                "No region selected",
+                t!("viewport.no_region"),
                 egui::FontId::monospace(12.0),
                 egui::Color32::from_rgba_unmultiplied(180, 180, 180, 160),
             );
@@ -82,15 +84,15 @@ pub fn draw_selection_overlay(
 
 pub fn draw_viewport_controls(ui: &mut egui::Ui, overlay_state: &mut ViewportOverlayState) {
     ui.horizontal(|ui| {
-        ui.checkbox(&mut overlay_state.show_wireframe, "Wireframe");
-        ui.checkbox(&mut overlay_state.show_sim_mesh, "Sim Mesh");
+        ui.checkbox(&mut overlay_state.show_wireframe, t!("inspector.wireframe"));
+        ui.checkbox(&mut overlay_state.show_sim_mesh, t!("inspector.sim_mesh_label"));
     });
     ui.horizontal(|ui| {
-        ui.checkbox(&mut overlay_state.show_render_mesh, "Render Mesh");
-        ui.checkbox(&mut overlay_state.show_pins, "Pins");
+        ui.checkbox(&mut overlay_state.show_render_mesh, t!("inspector.render_mesh"));
+        ui.checkbox(&mut overlay_state.show_pins, t!("inspector.pins"));
     });
     ui.horizontal(|ui| {
-        ui.checkbox(&mut overlay_state.show_constraints, "Constraints");
-        ui.checkbox(&mut overlay_state.show_collision_proxies, "Colliders");
+        ui.checkbox(&mut overlay_state.show_constraints, t!("inspector.constraints_label"));
+        ui.checkbox(&mut overlay_state.show_collision_proxies, t!("inspector.colliders_label"));
     });
 }
