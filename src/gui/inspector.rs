@@ -758,13 +758,26 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             };
             ui.label(egui::RichText::new(status_text).color(status_color));
             if camera_running {
-                let backend_label = state
+                let camera_label = state
                     .app
                     .tracking_worker
                     .as_ref()
                     .map(|w| w.active_backend().label())
                     .unwrap_or("Unknown");
-                ui.label(format!("Backend: {}", backend_label));
+                ui.label(format!("Camera: {}", camera_label));
+
+                // Inference backend (ONNX execution provider) — surfaces a
+                // silent CPU fallback when DirectML registration fails. Set
+                // by the worker once CIGPose finishes loading; absent during
+                // synthetic mode or before init completes.
+                if let Some(label) = state
+                    .app
+                    .tracking_worker
+                    .as_ref()
+                    .and_then(|w| w.mailbox().inference_backend_label())
+                {
+                    ui.label(format!("Inference: {}", label));
+                }
             }
 
             if let Some(tracking) = &state.app.last_tracking_pose {

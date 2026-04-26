@@ -133,6 +133,11 @@ struct TrackingMailboxInner {
     sequence: u64,
     last_update_nanos: u64,
     pending_error: Option<String>,
+    /// One-line label of the inference backend in use (e.g. "DirectML",
+    /// "CPU", "CPU (DirectML unavailable: ...)"). `None` when no
+    /// inference engine is loaded — e.g. synthetic mode, or before the
+    /// worker has finished init.
+    inference_backend_label: Option<String>,
 }
 
 fn now_nanos() -> u64 {
@@ -161,6 +166,7 @@ impl TrackingMailbox {
                 sequence: 0,
                 last_update_nanos: 0,
                 pending_error: None,
+                inference_backend_label: None,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -205,6 +211,21 @@ impl TrackingMailbox {
     pub fn drain_error(&self) -> Option<String> {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         inner.pending_error.take()
+    }
+
+    /// Set the inference-backend label. Called once by the worker after
+    /// `CigPoseInference` finishes loading its model. `None` resets it
+    /// (e.g. when tracking stops or the engine is destroyed).
+    pub fn set_inference_backend_label(&self, label: Option<String>) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.inference_backend_label = label;
+    }
+
+    /// Read the inference-backend label. Cheap clone so the GUI thread
+    /// can render without holding the lock.
+    pub fn inference_backend_label(&self) -> Option<String> {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.inference_backend_label.clone()
     }
 
     /// Thread-safe read: takes &self, locks the mutex, clones the pose.
@@ -556,6 +577,9 @@ impl TrackingWorker {
         }
         // Ensure running is cleared when the thread exits for any reason.
         running.store(false, Ordering::SeqCst);
+        // Clear the backend label so the inspector hides the row instead
+        // of showing a stale value from the previous session.
+        mailbox.set_inference_backend_label(None);
     }
 
     /// Generate synthetic tracking data in a loop.
@@ -631,6 +655,7 @@ impl TrackingWorker {
                         warnings.join("; ")
                     ));
                 }
+                mailbox.set_inference_backend_label(Some(estimator.backend().label()));
                 Some(estimator)
             }
             Err(e) => {

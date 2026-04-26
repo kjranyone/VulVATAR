@@ -21,6 +21,39 @@ use std::fs;
 #[cfg(feature = "inference")]
 use std::path::{Path, PathBuf};
 
+/// Which ONNX Runtime execution provider the session ended up on. Surfaced
+/// to the GUI so users can tell whether the GPU path is active or whether
+/// DirectML failed to register and tracking quietly fell back to CPU
+/// (which is much slower).
+#[derive(Clone, Debug)]
+pub enum InferenceBackend {
+    /// DirectML EP registered successfully. GPU-accelerated.
+    DirectMl,
+    /// CPU EP, deliberately — either the `inference-gpu` cargo feature is
+    /// off, or DirectML was never attempted for this build.
+    Cpu,
+    /// CPU EP because DirectML failed at registration (no DX12 hardware,
+    /// missing DLL, driver issue). Slower than `DirectMl` and slower than
+    /// the user expects from a GPU-feature build, so we surface the
+    /// reason verbatim.
+    CpuFromDirectMlFailure { reason: String },
+}
+
+impl InferenceBackend {
+    /// One-line label suitable for the inspector. Mirrors the wording in
+    /// the plan spec ("Backend: DirectML" / "Backend: CPU (DirectML
+    /// unavailable)").
+    pub fn label(&self) -> String {
+        match self {
+            Self::DirectMl => "DirectML".to_string(),
+            Self::Cpu => "CPU".to_string(),
+            Self::CpuFromDirectMlFailure { reason } => {
+                format!("CPU (DirectML unavailable: {})", reason)
+            }
+        }
+    }
+}
+
 pub struct CigPoseInference {
     #[cfg(feature = "inference")]
     session: Session,
@@ -38,6 +71,8 @@ pub struct CigPoseInference {
     split_ratio: f32,
     #[cfg(feature = "inference")]
     face_smoother: FaceExpressionSmoother,
+    #[cfg(feature = "inference")]
+    backend: InferenceBackend,
 }
 
 impl CigPoseInference {
@@ -53,7 +88,7 @@ impl CigPoseInference {
     ) -> std::result::Result<Self, String> {
         info!("Loading CIGPose model from {}", model_path);
 
-        let session = build_session(model_path, 4, "CIGPose")?;
+        let (session, backend) = build_session(model_path, 4, "CIGPose")?;
 
         let input_name = session
             .inputs()
@@ -98,6 +133,7 @@ impl CigPoseInference {
             input_h: config.input_h,
             split_ratio: config.split_ratio,
             face_smoother: FaceExpressionSmoother::new(),
+            backend,
         })
     }
 
@@ -135,6 +171,11 @@ impl CigPoseInference {
     #[cfg(feature = "inference")]
     pub fn take_load_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.load_warnings)
+    }
+
+    #[cfg(feature = "inference")]
+    pub fn backend(&self) -> &InferenceBackend {
+        &self.backend
     }
 
     #[cfg(not(feature = "inference"))]
@@ -262,34 +303,62 @@ struct PoseModelConfig {
 
 /// Build an ORT [`Session`] with a small thread pool, optionally
 /// routing through the DirectML execution provider when the
-/// `inference-gpu` cargo feature is enabled. ORT walks the EP list in
-/// order at registration time, so DirectML attempts to claim the
-/// graph first and CPU is the implicit fallback. If DirectML
-/// registration fails (no DX12 hardware, missing DLL, driver issue),
-/// we emit a warning and retry on a CPU-only builder so a broken GPU
-/// path doesn't kill tracking.
-#[cfg(feature = "inference")]
-fn build_session(model_path: &str, intra_threads: usize, label: &str) -> Result<Session, String> {
-    #[cfg(feature = "inference-gpu")]
-    {
-        match try_build_directml_session(model_path, intra_threads) {
-            Ok(session) => {
-                info!(
-                    "{} session created via DirectML execution provider ({})",
-                    label, model_path
-                );
-                return Ok(session);
-            }
-            Err(e) => {
-                warn!(
-                    "{} DirectML EP registration failed for '{}': {}. \
-                     Falling back to CPU.",
-                    label, model_path, e
-                );
-            }
+/// `inference-gpu` cargo feature is enabled. If DirectML registration
+/// fails (no DX12 hardware, missing DLL, driver issue), we emit a
+/// warning and retry on a CPU-only builder so a broken GPU path
+/// doesn't kill tracking.
+///
+/// Returns the session alongside the EP that was actually used so the
+/// caller can surface this to the UI — a silent CPU fallback is the
+/// difference between "tracking is fine" and "tracking is fine but
+/// taking 10× longer than the user expected".
+#[cfg(all(feature = "inference", feature = "inference-gpu"))]
+fn build_session(
+    model_path: &str,
+    intra_threads: usize,
+    label: &str,
+) -> Result<(Session, InferenceBackend), String> {
+    match try_build_directml_session(model_path, intra_threads) {
+        Ok(session) => {
+            info!(
+                "{} session created via DirectML execution provider ({})",
+                label, model_path
+            );
+            Ok((session, InferenceBackend::DirectMl))
+        }
+        Err(e) => {
+            warn!(
+                "{} DirectML EP registration failed for '{}': {}. \
+                 Falling back to CPU.",
+                label, model_path, e
+            );
+            let session = build_cpu_session(model_path, intra_threads, label)?;
+            Ok((
+                session,
+                InferenceBackend::CpuFromDirectMlFailure { reason: e },
+            ))
         }
     }
+}
 
+/// CPU-only build path used when the `inference-gpu` feature is off.
+/// Mirrors the GPU build's fallback behavior so the EP list is identical.
+#[cfg(all(feature = "inference", not(feature = "inference-gpu")))]
+fn build_session(
+    model_path: &str,
+    intra_threads: usize,
+    label: &str,
+) -> Result<(Session, InferenceBackend), String> {
+    let session = build_cpu_session(model_path, intra_threads, label)?;
+    Ok((session, InferenceBackend::Cpu))
+}
+
+#[cfg(feature = "inference")]
+fn build_cpu_session(
+    model_path: &str,
+    intra_threads: usize,
+    label: &str,
+) -> Result<Session, String> {
     let session = Session::builder()
         .map_err(|e| format!("ORT build error ({}): {}", label, e))?
         .with_intra_threads(intra_threads)
@@ -597,7 +666,11 @@ struct YoloxDetector {
 #[cfg(feature = "inference")]
 impl YoloxDetector {
     fn new(model_path: &str) -> std::result::Result<Self, String> {
-        let session = build_session(model_path, 2, "YOLOX")?;
+        // YOLOX runs on the same EP as CIGPose in practice (DirectML
+        // registration is process-wide); the backend tag from this build
+        // is intentionally discarded — CigPoseInference's tag is the
+        // canonical one shown in the UI.
+        let (session, _backend) = build_session(model_path, 2, "YOLOX")?;
         let input_name = session
             .inputs()
             .first()
