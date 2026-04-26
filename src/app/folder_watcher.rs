@@ -1,3 +1,33 @@
+//! Filesystem watcher for the avatar library auto-import path. Wraps
+//! the `notify` crate's `RecommendedWatcher` with a fixed-window
+//! debounce and a VRM-extension filter so the GUI's library inspector
+//! can react to new `.vrm` files without polling.
+//!
+//! ## Limitations
+//!
+//! `notify`'s recommended backend is **local-filesystem-only by
+//! design**. The following cases are **best-effort** and should not
+//! be relied on:
+//!
+//! * **UNC / SMB shares** (`\\server\share\...`) — file events from
+//!   the server side may not be delivered at all on Windows. A copy
+//!   landing on a network drive can sit there until a manual refresh
+//!   pokes the library.
+//! * **OneDrive / Google Drive / Dropbox folders** — cloud-sync
+//!   clients perform a "place-holder swap" (the file appears in
+//!   stages: tombstone → real bytes), and the events arrive in
+//!   bursts that the 100 ms debounce can collapse into a single
+//!   `Modified` rather than `Created`. The library may end up with
+//!   the file recorded but a thumbnail still pointing at zero bytes.
+//! * **Symlinks** (NTFS junctions, POSIX symlinks) — whether events
+//!   on the link target propagate through the link is platform- and
+//!   filesystem-dependent. Don't assume both sides see changes.
+//!
+//! For these cases, the GUI exposes a manual **Refresh** action
+//! (`GuiApp::refresh_watched_folders`) that walks every watched
+//! directory and imports any `.vrm` files not yet in the library.
+//! Operators on cloud-synced setups should prefer that as a routine,
+//! not as a recovery step.
 #![allow(dead_code)]
 use log::warn;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};

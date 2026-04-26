@@ -1818,7 +1818,35 @@ fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
+                let refresh_resp = ui.add_enabled(
+                    !watched.is_empty(),
+                    egui::Button::new("Refresh"),
+                );
+                if refresh_resp
+                    .on_hover_text(
+                        "Manually scan every watched folder for new VRM files. \
+                         Use this when files arrive via cloud sync (OneDrive, etc.) \
+                         or a network share — the auto-watcher's notify backend \
+                         can miss events on those filesystems.",
+                    )
+                    .clicked()
+                {
+                    state.refresh_watched_folders();
+                }
             });
+
+            if !watched.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Local filesystem recommended. Cloud-sync folders \
+                         (OneDrive, Google Drive, Dropbox) and network shares \
+                         are best-effort — use Refresh if files don't appear \
+                         automatically.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            }
 
             if let Some(path) = to_remove {
                 if let Err(e) = state.stop_watching_folder(&path) {

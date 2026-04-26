@@ -1464,48 +1464,115 @@ impl GuiApp {
     }
 
     fn poll_folder_watcher(&mut self) {
-        if let Some(ref mut fw) = self.folder_watcher {
-            let events = fw.poll().to_vec();
-            let vrm_events = crate::app::folder_watcher::FolderWatcher::filter_vrm(&events);
-            for event in vrm_events {
-                if event.kind == crate::app::folder_watcher::FolderWatchEventKind::Created {
-                    for vrm_path in &event.paths {
-                        if !self.app.avatar_library.find_by_path(vrm_path).is_some() {
-                            let mut entry =
-                                crate::app::avatar_library::AvatarLibraryEntry::from_path(vrm_path);
-                            if let Ok(loader) =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    crate::asset::vrm::VrmAssetLoader::new()
-                                }))
-                            {
-                                let loader = loader;
-                                if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {
-                                    entry.update_from_asset_with_thumbnail_dir(
-                                        &asset,
-                                        self.thumbnail_gen.output_dir(),
-                                    );
-                                    if entry
-                                        .thumbnail_path
-                                        .as_ref()
-                                        .map_or(true, |p| !p.exists())
-                                    {
-                                        entry.thumbnail_path = self
-                                            .thumbnail_gen
-                                            .generate_and_save_placeholder(&entry.name);
-                                    }
-                                }
-                            }
-                            self.app.avatar_library.add(entry);
-                            self.push_notification(format!(
-                                "New VRM detected: {}",
-                                vrm_path.display()
-                            ));
-                        }
-                    }
+        let Some(ref mut fw) = self.folder_watcher else {
+            return;
+        };
+        let events = fw.poll().to_vec();
+        let vrm_events = crate::app::folder_watcher::FolderWatcher::filter_vrm(&events);
+        let mut newly_added: Vec<std::path::PathBuf> = Vec::new();
+        for event in vrm_events {
+            if event.kind != crate::app::folder_watcher::FolderWatchEventKind::Created {
+                continue;
+            }
+            for vrm_path in &event.paths {
+                if self.import_vrm_into_library_if_missing(vrm_path) {
+                    newly_added.push(vrm_path.clone());
                 }
             }
-            let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
         }
+        for vrm_path in newly_added {
+            self.push_notification(format!("New VRM detected: {}", vrm_path.display()));
+        }
+        let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+    }
+
+    /// Walk every watched directory and import any `.vrm` files that
+    /// are not already in the library. The escape hatch for cases
+    /// where the notify-based watcher misses an event — see
+    /// `folder_watcher.rs` module docstring for which environments
+    /// (UNC, OneDrive, symlinks) need this routinely.
+    pub fn refresh_watched_folders(&mut self) {
+        let dirs: Vec<std::path::PathBuf> = self.watched_avatar_dirs.clone();
+        let mut imported = 0usize;
+        for dir in &dirs {
+            if !dir.exists() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        "refresh_watched_folders: read_dir '{}' failed: {}",
+                        dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_vrm = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("vrm"))
+                    .unwrap_or(false);
+                if !is_vrm {
+                    continue;
+                }
+                if self.import_vrm_into_library_if_missing(&path) {
+                    imported += 1;
+                }
+            }
+        }
+        if imported > 0 {
+            let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+            self.push_notification(format!(
+                "Refreshed watched folders: imported {} new VRM file(s)",
+                imported
+            ));
+        } else {
+            self.push_notification(
+                "Refreshed watched folders: no new files found".to_string(),
+            );
+        }
+    }
+
+    /// Add `vrm_path` to the avatar library if it isn't already there.
+    /// Best-effort load: a panicking VRM loader, a malformed file, or
+    /// a missing thumbnail all degrade gracefully — the entry still
+    /// goes into the library with a placeholder thumbnail so the user
+    /// sees *something*. Returns `true` iff the library grew by one.
+    ///
+    /// Shared by [`poll_folder_watcher`](Self::poll_folder_watcher)
+    /// and [`refresh_watched_folders`](Self::refresh_watched_folders)
+    /// so notify-driven and manual paths produce identical outcomes.
+    fn import_vrm_into_library_if_missing(&mut self, vrm_path: &std::path::Path) -> bool {
+        if self.app.avatar_library.find_by_path(vrm_path).is_some() {
+            return false;
+        }
+        let mut entry =
+            crate::app::avatar_library::AvatarLibraryEntry::from_path(vrm_path);
+        if let Ok(loader) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::asset::vrm::VrmAssetLoader::new()
+        })) {
+            if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {
+                entry.update_from_asset_with_thumbnail_dir(
+                    &asset,
+                    self.thumbnail_gen.output_dir(),
+                );
+                if entry
+                    .thumbnail_path
+                    .as_ref()
+                    .map_or(true, |p| !p.exists())
+                {
+                    entry.thumbnail_path = self
+                        .thumbnail_gen
+                        .generate_and_save_placeholder(&entry.name);
+                }
+            }
+        }
+        self.app.avatar_library.add(entry);
+        true
     }
 }
 
@@ -2170,5 +2237,106 @@ mod thumbnail_failure_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod folder_refresh_tests {
+    //! Cover the manual-Refresh escape hatch added because the notify
+    //! backend can miss events on cloud-sync / network-share folders
+    //! (see `app/folder_watcher.rs` module docstring). The
+    //! `import_vrm_into_library_if_missing` helper is the shared
+    //! library-side action; both notify-poll and Refresh route
+    //! through it, so tests here cover both code paths' outcomes.
+    use super::*;
+
+    fn make_tempdir(suffix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("vulvatar_folder_refresh_{}_{}", suffix, nanos));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    #[test]
+    fn import_skips_path_already_in_library() {
+        let dir = make_tempdir("skip_existing");
+        let vrm_path = dir.join("already.vrm");
+        std::fs::write(&vrm_path, b"placeholder bytes").expect("seed file");
+
+        let mut harness = GuiApp::for_test();
+        harness
+            .app
+            .avatar_library
+            .add(crate::app::avatar_library::AvatarLibraryEntry::from_path(&vrm_path));
+        let before = harness.app.avatar_library.entries.len();
+
+        let added = harness.import_vrm_into_library_if_missing(&vrm_path);
+        assert!(!added, "an already-tracked path must not be re-added");
+        assert_eq!(
+            harness.app.avatar_library.entries.len(),
+            before,
+            "library size must not grow when path is already tracked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_imports_new_vrm_files_in_watched_folder() {
+        // Watcher's notify backend may have missed a Created event;
+        // Refresh must walk the directory and import the VRM anyway.
+        // The VRM body is intentionally invalid bytes — the loader
+        // panic-catches and the entry still goes in with a placeholder
+        // thumbnail, matching the auto-watch path's behavior.
+        let dir = make_tempdir("refresh_new");
+        let vrm_path = dir.join("missed.vrm");
+        std::fs::write(&vrm_path, b"not a real vrm").expect("seed VRM");
+
+        let mut harness = GuiApp::for_test();
+        harness.watched_avatar_dirs.push(dir.clone());
+        let before = harness.app.avatar_library.entries.len();
+
+        harness.refresh_watched_folders();
+
+        let after = harness.app.avatar_library.entries.len();
+        assert_eq!(
+            after,
+            before + 1,
+            "Refresh must import the watched-folder VRM that was missed"
+        );
+        assert!(
+            harness.app.avatar_library.find_by_path(&vrm_path).is_some(),
+            "library entry for the imported file must be locatable by path"
+        );
+
+        // A subsequent refresh is a no-op — the file is already tracked.
+        harness.refresh_watched_folders();
+        assert_eq!(
+            harness.app.avatar_library.entries.len(),
+            before + 1,
+            "second Refresh must not duplicate the entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_with_no_watched_folders_is_noop() {
+        let mut harness = GuiApp::for_test();
+        let before = harness.app.avatar_library.entries.len();
+        harness.refresh_watched_folders();
+        assert_eq!(harness.app.avatar_library.entries.len(), before);
+        // The "no new files" notification is the only side effect.
+        assert!(
+            harness
+                .notifications
+                .iter()
+                .any(|(msg, _)| msg.contains("no new files")),
+            "Refresh on an empty watch list must still post the no-new-files toast"
+        );
     }
 }
