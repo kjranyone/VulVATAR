@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
-use super::{DetectionAnnotation, FacePose, SourceExpression, SourceJoint, SourceSkeleton};
+use super::face_expression::{FaceExpressionSmoother, FACE_LANDMARK_COUNT};
+#[cfg(feature = "inference")]
+use super::{DetectionAnnotation, FacePose, SourceJoint, SourceSkeleton};
 #[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
 #[cfg(feature = "inference")]
@@ -34,6 +36,8 @@ pub struct CigPoseInference {
     input_h: u32,
     #[cfg(feature = "inference")]
     split_ratio: f32,
+    #[cfg(feature = "inference")]
+    face_smoother: FaceExpressionSmoother,
 }
 
 impl CigPoseInference {
@@ -93,6 +97,7 @@ impl CigPoseInference {
             input_w: config.input_w,
             input_h: config.input_h,
             split_ratio: config.split_ratio,
+            face_smoother: FaceExpressionSmoother::new(),
         })
     }
 
@@ -227,7 +232,16 @@ impl CigPoseInference {
             remap_keypoints_to_frame(model_kpts, crop_region, self.input_w, self.input_h);
 
         let aspect = width as f32 / height as f32;
-        let skeleton = map_to_source_skeleton(&frame_kpts, width, height, aspect, frame_index);
+        let mut skeleton =
+            map_to_source_skeleton(&frame_kpts, width, height, aspect, frame_index);
+
+        // Drive expression weights from the face block via the smoother. The
+        // smoother holds asymmetric attack/release state per channel, so a
+        // raw "open mouth" frame ramps up over a few frames instead of
+        // snapping. Coordinates are normalised to the same y-up image space
+        // used by the rest of the skeleton.
+        let face_block = face_block_from_keypoints(&frame_kpts, width, height, aspect);
+        skeleton.expressions = self.face_smoother.update(&face_block);
 
         let annotation = build_annotation(frame_kpts, width, height, Some(bbox));
 
@@ -908,6 +922,8 @@ mod coco {
     pub const LEFT_ANKLE: usize = 15;
     pub const RIGHT_ANKLE: usize = 16;
 
+    /// Start index of the dense iBUG 68-point face block.
+    pub const FACE_BLOCK_START: usize = 23;
     pub const LEFT_HAND_START: usize = 91;
     pub const RIGHT_HAND_START: usize = 112;
 
@@ -1082,11 +1098,34 @@ fn map_to_source_skeleton(
     // visible".
     sk.overall_confidence = nose.2.max(shoulders_l.2).max(shoulders_r.2);
 
-    // CIGPose does not currently emit expression weights; leave the vector
-    // empty so the expression solver holds previous values.
-    sk.expressions = Vec::<SourceExpression>::new();
+    // Expressions are populated by the caller via FaceExpressionSmoother
+    // (the smoother needs persistent state across frames, which this stateless
+    // mapping cannot hold). Default-empty here is fine — caller overwrites.
 
     sk
+}
+
+/// Slice the dense iBUG 68-point face block out of CIGPose's flat keypoint
+/// list, normalising to the same y-up image space the skeleton uses. Returns
+/// an empty Vec if the keypoint list is too short — the smoother will then
+/// see "no face" and decay any active weights.
+#[cfg(feature = "inference")]
+fn face_block_from_keypoints(
+    kpts: &[(f32, f32, f32)],
+    input_w: u32,
+    input_h: u32,
+    aspect: f32,
+) -> Vec<(f32, f32, f32)> {
+    let end = coco::FACE_BLOCK_START + FACE_LANDMARK_COUNT;
+    if kpts.len() < end {
+        return Vec::new();
+    }
+    let to_norm_x = |x: f32| ((x / input_w as f32) * 2.0 - 1.0) * aspect;
+    let to_norm_y = |y: f32| 1.0 - (y / input_h as f32) * 2.0;
+    kpts[coco::FACE_BLOCK_START..end]
+        .iter()
+        .map(|&(x, y, c)| (to_norm_x(x), to_norm_y(y), c))
+        .collect()
 }
 
 /// Derive yaw/pitch/roll from facial keypoints (nose, eyes, ears).

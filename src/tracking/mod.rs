@@ -13,6 +13,8 @@ mod pose_estimation;
 pub mod inference;
 pub mod source_skeleton;
 
+mod face_expression;
+
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
