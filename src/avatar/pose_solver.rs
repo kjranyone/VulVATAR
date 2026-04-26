@@ -49,8 +49,8 @@ impl Default for SolverParams {
     fn default() -> Self {
         Self {
             rotation_blend: 0.7,
-            joint_confidence_threshold: 0.3,
-            face_confidence_threshold: 0.3,
+            joint_confidence_threshold: crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD,
+            face_confidence_threshold: crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD,
         }
     }
 }

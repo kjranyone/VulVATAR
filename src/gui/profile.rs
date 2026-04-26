@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamProfile {
     pub name: String,
@@ -26,7 +28,7 @@ impl StreamProfile {
             name: "Streaming".to_string(),
             tracking_mirror: true,
             smoothing_strength: 0.5,
-            confidence_threshold: 0.3,
+            confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             light_direction: [0.5, -0.7, 0.3],
             light_intensity: 1.0,
             ambient: [0.2, 0.2, 0.2],
@@ -40,6 +42,10 @@ impl StreamProfile {
         }
     }
 
+    /// Loose-confidence preset for offline capture: a lower threshold
+    /// admits more low-confidence keypoints, giving the post-edit pass
+    /// extra raw signal to smooth or cherry-pick from. Live twitchiness
+    /// is acceptable here because the recording will be re-cut.
     pub fn recording_default() -> Self {
         Self {
             name: "Recording".to_string(),
@@ -59,6 +65,11 @@ impl StreamProfile {
         }
     }
 
+    /// Strict-confidence preset for live performance: a higher threshold
+    /// drops noisy keypoints so the avatar stops moving rather than
+    /// twitching when tracking degrades. Trades responsiveness for
+    /// stability — a frozen bone reads better on stream than a wobbling
+    /// one.
     pub fn performance_default() -> Self {
         Self {
             name: "Performance".to_string(),

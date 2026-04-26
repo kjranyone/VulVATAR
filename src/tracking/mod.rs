@@ -17,6 +17,25 @@ mod face_expression;
 
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
+/// Single source of truth for the per-keypoint confidence threshold default.
+///
+/// Tracker output exposes a `confidence ∈ [0, 1]` per joint and per face
+/// pose; the solver discards anything below this floor. The value is a
+/// trade-off:
+///
+/// * **Lower** (toward 0.1) admits more noisy keypoints, which can drive
+///   the avatar from low-quality input but produces more twitchy motion.
+/// * **Higher** (toward 0.5+) restricts to confident detections only —
+///   smoother motion, but bones can freeze when the camera/lighting is
+///   poor.
+///
+/// `0.3` is the project-wide canonical mid-point. The runtime default
+/// ([`TrackingSmoothingParams::default`] / [`SolverParams::default`]),
+/// the first-launch GUI value, the "Streaming" preset, and the
+/// persistence fallback all reference this constant. Two presets
+/// intentionally diverge — see their constructors for rationale.
+pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.3;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TrackingSourceId(pub u64);
 
@@ -68,8 +87,8 @@ impl Default for TrackingSmoothingParams {
         Self {
             rotation_blend: 0.7,
             expression_blend: 0.8,
-            joint_confidence_threshold: 0.3,
-            face_confidence_threshold: 0.3,
+            joint_confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
+            face_confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             stale_timeout_nanos: 200_000_000,
         }
     }

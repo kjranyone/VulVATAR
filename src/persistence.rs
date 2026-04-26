@@ -116,6 +116,15 @@ fn default_true() -> bool {
     true
 }
 
+/// Fallback for `TrackingConfig::confidence_threshold` when the field is
+/// missing from a saved project (older serializations). Without this, serde's
+/// `f32::default()` would return `0.0`, which silently disables confidence
+/// filtering — every keypoint passes, including spurious ones, making
+/// freshly-loaded projects feel twitchy until the user touches the slider.
+fn default_confidence_threshold() -> f32 {
+    crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TransformState {
     #[serde(default)]
@@ -138,7 +147,7 @@ pub struct TrackingConfig {
     pub camera_framerate_index: usize,
     #[serde(default)]
     pub smoothing_strength: f32,
-    #[serde(default)]
+    #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f32,
     #[serde(default)]
     pub hand_tracking_enabled: bool,
@@ -1140,6 +1149,29 @@ pub fn save_scene_presets(presets: &[ScenePreset]) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tracking_config_supplies_canonical_confidence_when_field_missing() {
+        // Older saved projects predate the confidence_threshold field.
+        // Without an explicit serde default, missing-field deserialization
+        // would silently produce 0.0 (no filtering) — masking noisy keypoints
+        // until the user nudges the slider. Make sure the canonical default
+        // wins instead.
+        let bare = json!({});
+        let cfg: TrackingConfig =
+            serde_json::from_value(bare).expect("missing field should default, not error");
+        assert_eq!(
+            cfg.confidence_threshold,
+            crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn tracking_config_round_trips_explicit_confidence() {
+        let saved = json!({"confidence_threshold": 0.42});
+        let cfg: TrackingConfig = serde_json::from_value(saved).unwrap();
+        assert!((cfg.confidence_threshold - 0.42).abs() < 1e-6);
+    }
 
     #[test]
     fn read_format_version_defaults_to_zero_when_missing() {

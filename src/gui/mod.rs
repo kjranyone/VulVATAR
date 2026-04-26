@@ -17,7 +17,7 @@ use eframe::egui;
 
 use crate::app::{Application, RuntimeToggles};
 use crate::persistence::ProjectState;
-use crate::tracking::TrackingSmoothingParams;
+use crate::tracking::{TrackingSmoothingParams, DEFAULT_CONFIDENCE_THRESHOLD};
 
 pub struct TransformState {
     pub position: [f32; 3],
@@ -435,7 +435,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 smoothing_strength: 0.5,
-                confidence_threshold: 0.5,
+                confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
