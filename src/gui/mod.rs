@@ -117,6 +117,50 @@ fn save_thumbnail_png(
     Ok(())
 }
 
+/// Decide what to do with a single thumbnail render response, separated
+/// from [`GuiApp::poll_thumbnail_jobs`] so the failure-path contract is
+/// testable without an `egui::Context`.
+///
+/// Returns `Ok(())` iff a fresh PNG was successfully written — only
+/// then should the caller invalidate egui's image cache for that path.
+///
+/// **Failure-path contract**: if the render thread reported an error,
+/// or the encode step itself fails, **no on-disk file is touched**.
+/// A pre-existing placeholder PNG (written eagerly on avatar import)
+/// stays in place so the library inspector keeps showing *something*
+/// instead of going blank on a transient GPU hiccup. The caller must
+/// not, in either branch, replace or unlink the file outside this
+/// helper.
+fn handle_thumbnail_response(
+    path: &std::path::Path,
+    response: Result<crate::renderer::ThumbnailRenderResult, String>,
+) -> Result<(), String> {
+    match response {
+        Ok(thumb) => match save_thumbnail_png(path, &thumb) {
+            Ok(()) => {
+                info!("thumbnail: wrote real-render PNG to {}", path.display());
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "thumbnail: failed to write '{}': {} (keeping any existing placeholder)",
+                    path.display(),
+                    e
+                );
+                Err(e)
+            }
+        },
+        Err(e) => {
+            warn!(
+                "thumbnail: render failed for '{}': {} (keeping any existing placeholder)",
+                path.display(),
+                e
+            );
+            Err(e)
+        }
+    }
+}
+
 /// Map a `tracking.camera_framerate_index` to the actual fps value.
 pub fn camera_fps_for_index(index: usize) -> u32 {
     if index == 1 {
@@ -1385,41 +1429,32 @@ impl GuiApp {
     }
 
     /// Drain any thumbnail jobs whose render thread response has
-    /// arrived. Each completed job overwrites the destination PNG and
-    /// invalidates egui's `file://` cache for that path so the new
-    /// pixels appear in the library inspector on the next frame.
+    /// arrived. On success the destination PNG is overwritten and
+    /// egui's `file://` cache for that path is invalidated so the new
+    /// pixels appear in the library inspector on the next frame. On
+    /// failure (render error, write error, or channel disconnect) the
+    /// existing on-disk PNG — typically a placeholder written on
+    /// avatar import — is left untouched. See
+    /// [`handle_thumbnail_response`] for the exact contract.
     fn poll_thumbnail_jobs(&mut self, ctx: &egui::Context) {
         let mut still_pending = Vec::with_capacity(self.pending_thumbnail_jobs.len());
         for (path, rx) in std::mem::take(&mut self.pending_thumbnail_jobs) {
             match rx.try_recv() {
-                Ok(Ok(thumb)) => {
-                    if let Err(e) = save_thumbnail_png(&path, &thumb) {
-                        warn!(
-                            "thumbnail: failed to write '{}': {}",
-                            path.display(),
-                            e
-                        );
-                    } else {
-                        info!("thumbnail: wrote real-render PNG to {}", path.display());
-                        // Invalidate egui's image-loader cache so the
-                        // library inspector picks up the new bytes
-                        // instead of serving the placeholder texture.
+                Ok(response) => {
+                    if handle_thumbnail_response(&path, response).is_ok() {
+                        // Cache invalidation is gated on a successful
+                        // write only — on failure we keep the existing
+                        // placeholder texture so the inspector doesn't
+                        // flash to nothing.
                         ctx.forget_image(&format!("file://{}", path.display()));
                     }
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        "thumbnail: render failed for '{}': {}",
-                        path.display(),
-                        e
-                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     still_pending.push((path, rx));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     warn!(
-                        "thumbnail: response channel disconnected for '{}'",
+                        "thumbnail: response channel disconnected for '{}' (keeping any existing placeholder)",
                         path.display()
                     );
                 }
@@ -2021,6 +2056,118 @@ mod rebind_integration_tests {
             .cloth_asset
             .expect("cloth_asset preserved through save");
         assert_eq!(saved_asset.pins[0].binding_node.id, NodeId(7));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_failure_tests {
+    //! Pin the failure-path contract for [`super::handle_thumbnail_response`]:
+    //! when the render thread reports a failure (or the encode itself
+    //! errors), no on-disk PNG is touched. A placeholder written by the
+    //! avatar-import path stays in place so the library inspector keeps
+    //! showing *something* when the GPU briefly misbehaves.
+    //!
+    //! Without this guarantee, a transient thumbnail failure would
+    //! delete the placeholder and the library would flash empty
+    //! squares — that is the regression these tests prevent.
+
+    use super::handle_thumbnail_response;
+    use crate::renderer::ThumbnailRenderResult;
+
+    fn make_tempdir(suffix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("vulvatar_thumb_failure_{}_{}", suffix, nanos));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    /// 4x4 RGBA test image (64 bytes) with a deterministic gradient so a
+    /// successful round-trip is identifiable against the bytes.
+    fn make_thumbnail() -> ThumbnailRenderResult {
+        let w = 4u32;
+        let h = 4u32;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.push(((x * 64) & 0xff) as u8);
+                rgba.push(((y * 64) & 0xff) as u8);
+                rgba.push(0x40);
+                rgba.push(0xff);
+            }
+        }
+        ThumbnailRenderResult {
+            width: w,
+            height: h,
+            rgba_pixels: rgba,
+        }
+    }
+
+    #[test]
+    fn render_failure_does_not_create_a_file() {
+        let dir = make_tempdir("noprior");
+        let path = dir.join("thumb.png");
+        assert!(!path.exists());
+
+        let outcome = handle_thumbnail_response(&path, Err("simulated GPU OOM".to_string()));
+        assert!(outcome.is_err(), "failure response must surface as Err");
+        assert!(
+            !path.exists(),
+            "render failure must not materialise an empty PNG"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_failure_preserves_existing_placeholder() {
+        // Avatar import already wrote a placeholder; a subsequent
+        // real-render failure must not overwrite or unlink it.
+        let dir = make_tempdir("preserve");
+        let path = dir.join("thumb.png");
+        let placeholder_bytes: &[u8] = b"placeholder-bytes";
+        std::fs::write(&path, placeholder_bytes).expect("seed placeholder");
+
+        let outcome = handle_thumbnail_response(
+            &path,
+            Err("simulated render thread panic".to_string()),
+        );
+        assert!(outcome.is_err());
+
+        let after = std::fs::read(&path).expect("placeholder still readable");
+        assert_eq!(
+            after, placeholder_bytes,
+            "render failure must leave the placeholder bytes verbatim"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_success_writes_png_and_overwrites_placeholder() {
+        // Sanity: the success path actually does write — otherwise the
+        // failure-path tests would pass for the wrong reason (helper
+        // never writes anything).
+        let dir = make_tempdir("success");
+        let path = dir.join("thumb.png");
+        std::fs::write(&path, b"placeholder").expect("seed placeholder");
+
+        let outcome = handle_thumbnail_response(&path, Ok(make_thumbnail()));
+        assert!(outcome.is_ok());
+
+        let bytes = std::fs::read(&path).expect("PNG written");
+        // PNG magic header — confirms the placeholder was replaced with
+        // a real PNG, not just untouched.
+        assert!(
+            bytes.len() > 8 && bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "success path must write a real PNG; got first bytes {:?}",
+            &bytes[..bytes.len().min(8)]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
