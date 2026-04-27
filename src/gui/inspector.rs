@@ -225,10 +225,10 @@ fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
                     if ui.button(t!("inspector.reload")).clicked() {
                         state.app.reload_avatar();
                     }
-                    if ui.button(t!("inspector.detach")).clicked() {
-                        if !state.app.avatars.is_empty() {
-                            state.app.remove_avatar_at(state.app.active_avatar_index);
-                        }
+                    if ui.button(t!("inspector.detach")).clicked()
+                        && !state.app.avatars.is_empty()
+                    {
+                        state.app.remove_avatar_at(state.app.active_avatar_index);
                     }
                 });
             } else {
@@ -288,10 +288,10 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 if ui.button(t!("inspector.reload")).clicked() {
                     state.app.reload_avatar();
                 }
-                if ui.button(t!("inspector.detach")).clicked() {
-                    if !state.app.avatars.is_empty() {
-                        state.app.remove_avatar_at(state.app.active_avatar_index);
-                    }
+                if ui.button(t!("inspector.detach")).clicked()
+                    && !state.app.avatars.is_empty()
+                {
+                    state.app.remove_avatar_at(state.app.active_avatar_index);
                 }
             });
         });
@@ -431,7 +431,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
                 if ui.button(t!("inspector.load_overlay_file")).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(&t!("top_bar.filter_cloth"), &["vvtcloth"])
+                        .add_filter(t!("top_bar.filter_cloth"), &["vvtcloth"])
                         .set_title("Load cloth overlay into a new slot")
                         .pick_file()
                     {
@@ -633,13 +633,12 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_dirty = true;
             }
-            if state.show_camera_wipe {
-                if ui
+            if state.show_camera_wipe
+                && ui
                     .checkbox(&mut state.show_detection_annotations, t!("tracking.show_annotations"))
                     .changed()
-                {
-                    state.project_dirty = true;
-                }
+            {
+                state.project_dirty = true;
             }
             let prev_res = state.tracking.camera_resolution_index;
             egui::ComboBox::from_label(t!("tracking.resolution"))
@@ -1163,15 +1162,15 @@ fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .selected_text(sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("Unknown"))
                 .show_ui(ui, |ui| {
                     for (i, name) in sink_names.iter().enumerate() {
-                        ui.selectable_value(&mut new_idx, i, &*name);
+                        ui.selectable_value(&mut new_idx, i, name);
                     }
                 });
             if active_idx != requested_idx {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 160, 80),
                     t!("inspector.sink_mismatch",
-                        active = sink_names.get(active_idx).and_then(|s: &String| Some(s.as_str())).unwrap_or("?"),
-                        requested = sink_names.get(requested_idx).and_then(|s: &String| Some(s.as_str())).unwrap_or("?"),
+                        active = sink_names.get(active_idx).map(|s: &String| s.as_str()).unwrap_or("?"),
+                        requested = sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("?"),
                     ),
                 );
             }
@@ -1401,8 +1400,7 @@ fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                     let node_names: Vec<String> = nodes
                         .iter()
-                        .enumerate()
-                        .map(|(_i, n)| format!("{} (id {})", n.name, n.id.0))
+                        .map(|n| format!("{} (id {})", n.name, n.id.0))
                         .collect();
                     let selected_text = node_names
                         .get(state.cloth_pin_node_index)
@@ -1927,7 +1925,7 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .show(ui, |ui| {
                     for row in &entries {
                         let is_current =
-                            current_avatar_path.as_ref().map_or(false, |p| *p == row.path);
+                            current_avatar_path.as_ref().is_some_and(|p| *p == row.path);
 
                         let frame = if is_current {
                             egui::Frame::group(ui.style())
@@ -2149,8 +2147,13 @@ fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .add_filter("VRM 1.0", &["vrm"])
                         .pick_file()
                     {
-                        let entry =
+                        let mut entry =
                             crate::app::avatar_library::AvatarLibraryEntry::from_path(&path);
+                        if entry.thumbnail_path.as_ref().is_none_or(|p| !p.exists()) {
+                            entry.thumbnail_path = state
+                                .thumbnail_gen
+                                .generate_and_save_placeholder(&entry.name);
+                        }
                         state.app.avatar_library.add(entry);
                         let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
                         state.push_notification(t!("inspector.added_library", path = path.display().to_string()));

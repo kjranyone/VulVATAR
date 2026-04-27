@@ -187,10 +187,17 @@ impl DirectShowSourceFilter {
             let name: HSTRING = self.shared_memory_name.clone().into();
             let buf_size = self.frame_buffer.len() as u64 + 4096;
 
+            // Pass a permissive DACL so the interactive-user producer
+            // (vulvatar.exe) can still write the section if this DLL —
+            // hosted in a consumer process under a different token — wins
+            // the CreateFileMappingW race. See shmem_security.rs.
+            let security =
+                super::shmem_security::PermissiveSharedMemorySecurity::new()?;
+
             unsafe {
                 let handle = CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
-                    None,
+                    Some(security.as_win_ptr()),
                     PAGE_READWRITE,
                     (buf_size >> 32) as u32,
                     buf_size as u32,

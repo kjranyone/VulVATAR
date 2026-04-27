@@ -22,7 +22,7 @@ inference = ["ort", "ndarray"]
 # registration failure. Pulls in a DirectML-enabled ONNX Runtime
 # binary, so it's Windows-only and not in the default feature set.
 inference-gpu = ["inference", "ort/directml"]
-virtual-camera = ["windows"]
+virtual-camera = []
 lipsync = ["cpal", "rustfft"]
 
 [dependencies]
@@ -54,7 +54,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Foundation",
-], optional = true }
+] }
 notify = "7"
 ort = { version = "2.0.0-rc.12", optional = true }
 ndarray = { version = "0.17.2", optional = true }

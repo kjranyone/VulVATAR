@@ -64,6 +64,7 @@ pub(crate) fn dll_release() {
 /// stale marker and we know not to trust subsequent diagnostics.
 const BUILD_MARKER: &str = concat!("nv12-stride-aware-via-2dbuffer ", file!(), ":", line!());
 
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
@@ -119,6 +120,7 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
 }
 
 /// `DllInstall` — honours `regsvr32 /i:user` (per-user) vs `/i:"machine"`.
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "system" fn DllInstall(install: BOOL, cmd_line: *const u16) -> HRESULT {
     let scope = parse_scope(cmd_line);

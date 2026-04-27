@@ -133,7 +133,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaStream_Impl {
         flags: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
     ) -> windows::core::Result<IMFMediaEvent> {
         let queue = self.inner.lock().unwrap().event_queue.clone();
-        unsafe { queue.GetEvent(flags.0 as u32) }
+        unsafe { queue.GetEvent(flags.0) }
     }
 
     fn BeginGetEvent(
@@ -380,9 +380,8 @@ impl VulvatarMediaStream {
             None => (None, None, format.width, format.height),
         };
         let rgba_ref: Option<&[u8]> = rgba_slice
-            .as_ref()
-            .map(|v| v.as_slice())
-            .or_else(|| rgba_owned_resample.as_deref());
+            .as_deref()
+            .or(rgba_owned_resample.as_deref());
 
         let pixel_writer = PixelWriter {
             rgba: rgba_ref,
@@ -445,7 +444,7 @@ fn write_with_2d_buffer(
             nv12_size(writer.width, writer.height) as u32
         } else {
             write_rgb32_strided(scanline, pitch, writer);
-            (writer.width * writer.height * 4) as u32
+            writer.width * writer.height * 4
         }
     };
     unsafe { buffer.Unlock2D()? };

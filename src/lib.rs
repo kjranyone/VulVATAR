@@ -1,6 +1,7 @@
 pub mod app;
 pub mod asset;
 pub mod avatar;
+#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 pub mod dshow_dll;
 pub mod editor;
 pub mod gui;

@@ -67,6 +67,12 @@ pub struct HotkeyMap {
     bindings: HashMap<HotkeyAction, KeyBinding>,
 }
 
+impl Default for HotkeyMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HotkeyMap {
     pub fn new() -> Self {
         let mut map = Self {

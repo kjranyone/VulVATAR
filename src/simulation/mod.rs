@@ -253,6 +253,12 @@ impl PhysicsWorld {
     }
 }
 
+impl Default for PhysicsWorld {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Rapier integration (behind feature flag)
 // ===========================================================================
@@ -466,5 +472,12 @@ impl RapierWorld {
         ];
         let normal = [-direction[0], -direction[1], -direction[2]];
         Some((hit_point, normal))
+    }
+}
+
+#[cfg(feature = "rapier")]
+impl Default for RapierWorld {
+    fn default() -> Self {
+        Self::new()
     }
 }

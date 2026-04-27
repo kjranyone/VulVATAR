@@ -80,6 +80,12 @@ pub struct OutputExporter {
     frame_pool: FramePool,
 }
 
+impl Default for OutputExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutputExporter {
     pub fn new() -> Self {
         Self {
@@ -112,6 +118,7 @@ impl OutputExporter {
         &mut self.frame_pool
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn export(
         &mut self,
         request: &ExportRequest,
@@ -154,6 +161,7 @@ impl OutputExporter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn export_gpu(
         &mut self,
         request: &ExportRequest,
@@ -363,6 +371,7 @@ impl OutputExporter {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn export_readback(
         &mut self,
         request: &ExportRequest,

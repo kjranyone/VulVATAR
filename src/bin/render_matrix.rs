@@ -165,7 +165,7 @@ fn build_frame_input(
                     mesh_id: mesh.id,
                     primitive_id: prim.id,
                     material_binding,
-                    bounds: prim.bounds.clone(),
+                    bounds: prim.bounds,
                     alpha_mode,
                     cull_mode,
                     outline: Default::default(),

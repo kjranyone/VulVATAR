@@ -152,6 +152,12 @@ impl ProfileLibrary {
     }
 }
 
+impl Default for ProfileLibrary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindPreset {
     pub name: String,
@@ -275,6 +281,12 @@ impl WindPresetLibrary {
                 }
             }
         }
+    }
+}
+
+impl Default for WindPresetLibrary {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

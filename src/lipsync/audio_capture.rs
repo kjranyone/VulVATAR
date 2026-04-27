@@ -219,7 +219,7 @@ mod inner {
             let rate = ANALYSIS_SAMPLE_RATE
                 .max(range.min_sample_rate())
                 .min(range.max_sample_rate());
-            Ok(range.clone().with_sample_rate(rate))
+            Ok((*range).with_sample_rate(rate))
         }
     }
 

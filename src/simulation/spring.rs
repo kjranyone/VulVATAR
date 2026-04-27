@@ -15,11 +15,12 @@ use crate::simulation::cloth::ResolvedCollider;
 /// 4. Normalizes the result to preserve bone length
 /// 5. Resolves sphere/capsule collider penetrations
 /// 6. Writes solved rotations back into the avatar's local transforms
-
+///
 /// Verlet position update for a single joint.
 ///
 /// Computes the next position from the current and previous positions using
 /// velocity (with drag), stiffness pull toward the rest pose, and gravity.
+#[allow(clippy::too_many_arguments)]
 fn verlet_integrate_joint(
     current: &Vec3,
     previous: &Vec3,
@@ -77,6 +78,7 @@ fn resolve_sphere_collision(
 
 /// Resolve capsule collision for a joint.  The capsule is defined by a
 /// center, axis direction, half-height, and radius.
+#[allow(clippy::too_many_arguments)]
 fn resolve_capsule_collision(
     next: &Vec3,
     collider_center: &Vec3,

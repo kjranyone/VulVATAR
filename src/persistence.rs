@@ -351,15 +351,14 @@ fn migrate_cloth_overlay_json(
 }
 
 fn step_overlay(_json: serde_json::Value, version: u32) -> Result<serde_json::Value, String> {
-    match version {
-        // Future migrators land here:
-        //   1 => v1_to_v2(json),
-        v => Err(format!(
-            "no migrator registered for cloth overlay v{} → v{}",
-            v,
-            v + 1
-        )),
-    }
+    // Future migrators land here:
+    //   1 => v1_to_v2(json),
+    let v = version;
+    Err(format!(
+        "no migrator registered for cloth overlay v{} → v{}",
+        v,
+        v + 1
+    ))
 }
 
 /// See [`migrate_cloth_overlay_json`]. Same shape for project files.
@@ -371,13 +370,12 @@ fn migrate_project_json(
 }
 
 fn step_project(_json: serde_json::Value, version: u32) -> Result<serde_json::Value, String> {
-    match version {
-        v => Err(format!(
-            "no migrator registered for project v{} → v{}",
-            v,
-            v + 1
-        )),
-    }
+    let v = version;
+    Err(format!(
+        "no migrator registered for project v{} → v{}",
+        v,
+        v + 1
+    ))
 }
 
 fn read_format_version(json: &serde_json::Value) -> u32 {
@@ -915,7 +913,7 @@ fn load_or_backup<T: serde::de::DeserializeOwned>(primary: &std::path::Path) -> 
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     if path.exists() {
-        let _ = std::fs::copy(path, &backup_path_for(path));
+        let _ = std::fs::copy(path, backup_path_for(path));
     }
 
     let parent = path.parent().unwrap_or(Path::new("."));

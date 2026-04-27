@@ -1,6 +1,7 @@
 #![cfg(all(target_os = "windows", feature = "virtual-camera"))]
 #![allow(unused)]
 #![allow(static_mut_refs)]
+#![allow(clippy::missing_safety_doc)]
 
 use windows::core::*;
 use windows::Win32::Foundation::*;

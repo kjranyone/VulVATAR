@@ -1,7 +1,6 @@
 /// Shared math utilities used across simulation, avatar, and other subsystems.
 ///
 /// These replace the previously duplicated per-module vec3/quat/geometry helpers.
-
 pub type Vec3 = [f32; 3];
 pub type Quat = [f32; 4];
 

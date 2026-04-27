@@ -1,8 +1,13 @@
+#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 pub mod directshow_filter;
+#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 pub mod dshow_source;
 pub mod frame_sink;
 #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 pub mod mf_virtual_camera;
+#[cfg(target_os = "windows")]
+pub mod shmem_security;
+#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 pub mod virtual_camera_native;
 
 pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter};
@@ -139,7 +144,7 @@ pub struct OutputRouter {
     last_forward_at: Option<Instant>,
 
     /// Channel sender to the background output worker.
-    worker_tx: Option<mpsc::Sender<WorkerMessage>>,
+    worker_tx: Option<mpsc::SyncSender<WorkerMessage>>,
     /// Join handle for the background worker thread.
     worker_handle: Option<thread::JoinHandle<()>>,
     logged_first_publish: bool,
@@ -148,7 +153,7 @@ pub struct OutputRouter {
 impl OutputRouter {
     pub fn new(sink: FrameSink) -> Self {
         let writer = create_sink_writer(&sink);
-        let (tx, rx) = mpsc::channel::<WorkerMessage>();
+        let (tx, rx) = mpsc::sync_channel::<WorkerMessage>(1);
         let handle = Self::spawn_worker(rx, writer);
 
         Self {
@@ -302,7 +307,7 @@ impl OutputRouter {
         // from the local queue so the queue does not grow unboundedly.
         if let Some(queued) = self.queue.pop_front() {
             if let Some(ref tx) = self.worker_tx {
-                let _ = tx.send(WorkerMessage::Frame(queued));
+                let _ = tx.try_send(WorkerMessage::Frame(queued));
             }
         }
     }

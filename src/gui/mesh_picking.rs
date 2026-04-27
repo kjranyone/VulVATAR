@@ -135,10 +135,9 @@ impl Bvh {
 
         let mid = tris.len() / 2;
         tris.select_nth_unstable_by(mid, |a, b| {
-            let ca = (a.v0[axis] + a.v1[axis] + a.v2[axis])
+            (a.v0[axis] + a.v1[axis] + a.v2[axis])
                 .partial_cmp(&(b.v0[axis] + b.v1[axis] + b.v2[axis]))
-                .unwrap_or(std::cmp::Ordering::Equal);
-            ca
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let (left_slice, right_slice) = tris.split_at_mut(mid);
@@ -182,6 +181,7 @@ impl Bvh {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn query_node(
         &self,
         node: &BvhNode,
@@ -198,8 +198,7 @@ impl Bvh {
                     return f32::MAX;
                 }
                 let mut local_best = max_dist;
-                for i in *start..(*start + *count) {
-                    let t = &tris[i];
+                for t in &tris[*start..*start + *count] {
                     if let Some((t_dist, _u, _v)) =
                         ray_triangle_intersect(origin, dir, t.v0, t.v1, t.v2)
                     {
@@ -354,7 +353,7 @@ fn ray_triangle_intersect(
         ray_origin[2] - v0[2],
     ];
     let u = f * dot(s, h);
-    if u < 0.0 || u > 1.0 {
+    if !(0.0..=1.0).contains(&u) {
         return None;
     }
 

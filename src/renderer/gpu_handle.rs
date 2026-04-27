@@ -31,6 +31,12 @@ pub struct GpuHandleExporter {
     device: Option<Arc<Device>>,
 }
 
+impl Default for GpuHandleExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GpuHandleExporter {
     pub fn new() -> Self {
         Self {

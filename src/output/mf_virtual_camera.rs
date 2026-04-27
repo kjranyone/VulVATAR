@@ -120,6 +120,12 @@ impl MfVirtualCamera {
     }
 }
 
+impl Default for MfVirtualCamera {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for MfVirtualCamera {
     fn drop(&mut self) {
         self.stop();

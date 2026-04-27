@@ -26,7 +26,7 @@ pub struct DirectShowFilterConfig {
 impl Default for DirectShowFilterConfig {
     fn default() -> Self {
         Self {
-            clsid: "{B5F1C320-2B8F-4A9C-9BDC-43B0E8E6B2E1}",
+            clsid: "{D7A3C420-5E91-4F8A-ABCD-52C1E7D9A4F3}",
             friendly_name: "VulVATAR Virtual Camera".to_string(),
             device_path: "\\\\.\\VulVATAR_VirtualCamera".to_string(),
             width: 1920,

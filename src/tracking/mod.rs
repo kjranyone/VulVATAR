@@ -40,20 +40,15 @@ pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.3;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TrackingSourceId(pub u64);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum TrackingImageFormat {
     Rgb8,
     Bgr8,
+    #[default]
     Rgba8,
     Bgra8,
     Nv12,
     Yuyv,
-}
-
-impl Default for TrackingImageFormat {
-    fn default() -> Self {
-        Self::Rgba8
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -178,7 +173,15 @@ impl TrackingMailbox {
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
     }
+}
 
+impl Default for TrackingMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrackingMailbox {
     /// Thread-safe publish: takes &self, locks the mutex internally.
     pub fn publish(&self, pose: SourceSkeleton) {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -304,9 +307,10 @@ pub struct PoseEstimate {
 // ---------------------------------------------------------------------------
 
 /// Selects the capture backend for the tracking source.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum CameraBackend {
     /// Generate synthetic tracking data (no real camera needed).
+    #[default]
     Synthetic,
     /// Capture from a real webcam at the given device index.
     /// Only available when compiled with the `webcam` cargo feature.
@@ -322,12 +326,6 @@ impl CameraBackend {
             #[cfg(feature = "webcam")]
             Self::Webcam { .. } => "Webcam",
         }
-    }
-}
-
-impl Default for CameraBackend {
-    fn default() -> Self {
-        Self::Synthetic
     }
 }
 
@@ -377,7 +375,15 @@ impl TrackingSource {
             backend: CameraBackend::default(),
         }
     }
+}
 
+impl Default for TrackingSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrackingSource {
     /// Create a tracking source with a specific backend.
     pub fn with_backend(backend: CameraBackend) -> Self {
         Self {
@@ -550,6 +556,7 @@ impl TrackingWorker {
 
     // -- internal -----------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn worker_loop(
         backend: CameraBackend,
         mailbox: TrackingMailbox,
@@ -613,6 +620,7 @@ impl TrackingWorker {
 
     /// Capture from a real webcam and run simplified pose estimation.
     #[cfg(feature = "webcam")]
+    #[allow(clippy::too_many_arguments)]
     fn run_webcam(
         camera_index: usize,
         mailbox: &TrackingMailbox,

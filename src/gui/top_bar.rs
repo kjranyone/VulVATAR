@@ -37,7 +37,7 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     if entry
         .thumbnail_path
         .as_ref()
-        .map_or(true, |p| !p.exists())
+        .is_none_or(|p| !p.exists())
     {
         entry.thumbnail_path = state.thumbnail_gen.generate_and_save_placeholder(&entry.name);
     }
@@ -85,7 +85,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             if ui.button(t!("top_bar.open_avatar")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(&t!("top_bar.filter_vrm"), &["vrm"])
+                    .add_filter(t!("top_bar.filter_vrm"), &["vrm"])
                     .pick_file()
                 {
                     load_avatar_from_path(state, &path);
@@ -114,7 +114,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             if ui.button(t!("top_bar.open_project")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(&t!("top_bar.filter_project"), &["vvtproj"])
+                    .add_filter(t!("top_bar.filter_project"), &["vvtproj"])
                     .pick_file()
                 {
                     match persistence::load_project(&path) {
@@ -213,7 +213,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 } else {
                     // No path yet -- behave like Save As.
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(&t!("top_bar.filter_project"), &["vvtproj"])
+                        .add_filter(t!("top_bar.filter_project"), &["vvtproj"])
                         .set_file_name("project.vvtproj")
                         .save_file()
                     {
@@ -233,7 +233,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             if ui.button("Save As").clicked() {
                 let ps = state.to_project_state();
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(&t!("top_bar.filter_project"), &["vvtproj"])
+                    .add_filter(t!("top_bar.filter_project"), &["vvtproj"])
                     .set_file_name("project.vvtproj")
                     .save_file()
                 {
@@ -254,7 +254,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             if ui.button(t!("top_bar.open_overlay")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(&t!("top_bar.filter_cloth"), &["vvtcloth"])
+                    .add_filter(t!("top_bar.filter_cloth"), &["vvtcloth"])
                     .pick_file()
                 {
                     match persistence::load_cloth_overlay(&path) {
@@ -287,10 +287,8 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 if ui.button(t!("top_bar.resume")).clicked() {
                     state.paused = false;
                 }
-            } else {
-                if ui.button(t!("top_bar.pause")).clicked() {
-                    state.paused = true;
-                }
+            } else if ui.button(t!("top_bar.pause")).clicked() {
+                state.paused = true;
             }
 
             ui.separator();

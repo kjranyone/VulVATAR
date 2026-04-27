@@ -107,8 +107,8 @@ mod inner {
             let mut mfcc = Vec::with_capacity(n_mfcc);
             for i in 1..=n_mfcc {
                 let mut sum = 0.0f32;
-                for j in 0..n_mels {
-                    sum += mel_db[j]
+                for (j, &mel) in mel_db.iter().enumerate() {
+                    sum += mel
                         * ((j as f32 + 0.5) * i as f32 * std::f32::consts::PI / n_mels as f32)
                             .cos();
                 }

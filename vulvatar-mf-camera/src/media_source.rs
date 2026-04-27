@@ -133,6 +133,7 @@ impl VulvatarMediaSource {
                 state: SourceState::Stopped,
                 stream: None,
             }),
+            #[allow(clippy::arc_with_non_send_sync)]
             stream_allocator: Arc::new(Mutex::new(None)),
         })
     }
@@ -279,7 +280,7 @@ impl IMFMediaEventGenerator_Impl for VulvatarMediaSource_Impl {
     ) -> windows::core::Result<IMFMediaEvent> {
         crate::t!("Source::GetEvent flags={:#x}", flags.0);
         let inner = self.initialised()?;
-        unsafe { inner.event_queue.GetEvent(flags.0 as u32) }
+        unsafe { inner.event_queue.GetEvent(flags.0) }
     }
 
     fn BeginGetEvent(
@@ -661,8 +662,8 @@ unsafe fn write_extended_prop_privacy_off(data: *mut core::ffi::c_void, data_len
     // offset 32 u64 Value = 0 (privacy not currently engaged)
     if n >= 40 {
         let bytes = 0u64.to_le_bytes();
-        for i in 0..8 {
-            *dst.add(32 + i) = bytes[i];
+        for (i, &b) in bytes.iter().enumerate() {
+            *dst.add(32 + i) = b;
         }
     }
 }
@@ -673,16 +674,16 @@ unsafe fn write_header_fields(dst: *mut u8, n: usize, size: u32) {
     let write_u32 = |offset: usize, value: u32| {
         if offset + 4 <= n {
             let bytes = value.to_le_bytes();
-            for i in 0..4 {
-                *dst.add(offset + i) = bytes[i];
+            for (i, &b) in bytes.iter().enumerate() {
+                *dst.add(offset + i) = b;
             }
         }
     };
     let write_u64 = |offset: usize, value: u64| {
         if offset + 8 <= n {
             let bytes = value.to_le_bytes();
-            for i in 0..8 {
-                *dst.add(offset + i) = bytes[i];
+            for (i, &b) in bytes.iter().enumerate() {
+                *dst.add(offset + i) = b;
             }
         }
     };

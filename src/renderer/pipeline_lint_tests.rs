@@ -29,7 +29,7 @@
 //! checklist in `docs/output-interop.md`.
 
 #[cfg(test)]
-mod pipeline_lint_tests {
+mod lint_checks {
     use crate::renderer::frame_input::RenderColorSpace;
     use crate::renderer::VulkanRenderer;
     use vulkano::format::Format;

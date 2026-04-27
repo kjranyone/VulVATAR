@@ -210,6 +210,12 @@ impl SharedTextureSink {
     }
 }
 
+impl Default for SharedTextureSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutputSinkWriter for SharedTextureSink {
     fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
         let _ = fs::remove_file(&self.ready_path);
@@ -245,6 +251,12 @@ impl VirtualCameraSink {
             frame_path,
             sequence: 0,
         }
+    }
+}
+
+impl Default for VirtualCameraSink {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -319,7 +331,7 @@ impl RingBufferSharedMemorySink {
             path,
             ready_path,
             sequence: 0,
-            slot_count: slot_count.max(1).min(RING_MAX_SLOTS),
+            slot_count: slot_count.clamp(1, RING_MAX_SLOTS),
             slot_size: 0,
         }
     }
@@ -390,7 +402,7 @@ impl OutputSinkWriter for RingBufferSharedMemorySink {
         let width = frame.extent[0];
         let height = frame.extent[1];
         let slot_payload = 8 + pixel_data.len();
-        let slot_total = ((slot_payload + 15) / 16) * 16;
+        let slot_total = slot_payload.div_ceil(16) * 16;
 
         let mut file = self.ensure_file(slot_total)?;
 
@@ -460,6 +472,12 @@ impl VirtualCameraFileSink {
             width: 0,
             height: 0,
         }
+    }
+}
+
+impl Default for VirtualCameraFileSink {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -548,6 +566,12 @@ impl SharedMemoryFileSink {
     }
 }
 
+impl Default for SharedMemoryFileSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutputSinkWriter for SharedMemoryFileSink {
     fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
         let pixel_data = match &frame.pixel_data {
@@ -631,9 +655,12 @@ mod win32_shmem {
     use std::path::{Path, PathBuf};
     use std::ptr;
 
+    use crate::output::shmem_security::{
+        PermissiveSharedMemorySecurity, RawSecurityAttributes,
+    };
+
     const PAGE_READWRITE: u32 = 0x04;
     const FILE_MAP_ALL_ACCESS: u32 = 0xF001F;
-    const SDDL_REVISION_1: u32 = 1;
 
     // Win32 GetLastError codes used to diagnose CreateFileMappingW failures.
     // Documented under WinError.h.
@@ -643,7 +670,7 @@ mod win32_shmem {
     extern "system" {
         fn CreateFileMappingW(
             hFile: isize,
-            lpFileMappingAttributes: *mut SecurityAttributes,
+            lpFileMappingAttributes: *mut RawSecurityAttributes,
             flProtect: u32,
             dwMaximumSizeHigh: u32,
             dwMaximumSizeLow: u32,
@@ -663,22 +690,6 @@ mod win32_shmem {
         fn CloseHandle(hObject: isize) -> i32;
 
         fn GetLastError() -> u32;
-
-        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            string_security_descriptor: *const u16,
-            string_sd_revision: u32,
-            security_descriptor: *mut *mut c_void,
-            security_descriptor_size: *mut u32,
-        ) -> i32;
-
-        fn LocalFree(mem: *mut c_void) -> *mut c_void;
-    }
-
-    #[repr(C)]
-    struct SecurityAttributes {
-        n_length: u32,
-        security_descriptor: *mut c_void,
-        inherit_handle: i32,
     }
 
     const SHMEM_HEADER_SIZE: usize = 32;
@@ -720,7 +731,7 @@ mod win32_shmem {
                 .chain(std::iter::once(0))
                 .collect();
 
-            let mut security = MappingSecurity::new()?;
+            let mut security = PermissiveSharedMemorySecurity::new()?;
             let handle = unsafe {
                 CreateFileMappingW(
                     -1isize,
@@ -772,60 +783,6 @@ mod win32_shmem {
                 self.handle = 0;
             }
             self.mapped_size = 0;
-        }
-    }
-
-    struct MappingSecurity {
-        descriptor: *mut c_void,
-        attributes: SecurityAttributes,
-    }
-
-    impl MappingSecurity {
-        fn new() -> Result<Self, String> {
-            // Interactive users write the frames; FrameServer runs as
-            // LocalService and only needs read access to consume them.
-            // (Used by the SharedMemory sink only — VirtualCamera now
-            // uses Win32FileBackedSharedMemorySink to sidestep the
-            // SeCreateGlobalPrivilege gate on `Global\` named sections.)
-            let sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GR;;;LS)";
-            let wide: Vec<u16> = OsStr::new(sddl)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let mut descriptor: *mut c_void = ptr::null_mut();
-            let ok = unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    wide.as_ptr(),
-                    SDDL_REVISION_1,
-                    &mut descriptor,
-                    ptr::null_mut(),
-                )
-            };
-            if ok == 0 || descriptor.is_null() {
-                return Err("ConvertStringSecurityDescriptorToSecurityDescriptorW failed".into());
-            }
-            Ok(Self {
-                descriptor,
-                attributes: SecurityAttributes {
-                    n_length: std::mem::size_of::<SecurityAttributes>() as u32,
-                    security_descriptor: descriptor,
-                    inherit_handle: 0,
-                },
-            })
-        }
-
-        fn as_mut_ptr(&mut self) -> *mut SecurityAttributes {
-            &mut self.attributes
-        }
-    }
-
-    impl Drop for MappingSecurity {
-        fn drop(&mut self) {
-            if !self.descriptor.is_null() {
-                unsafe {
-                    let _ = LocalFree(self.descriptor);
-                }
-            }
         }
     }
 
@@ -1113,6 +1070,9 @@ mod win32_shmem {
             unsafe {
                 let base = self.view as *mut u8;
 
+                let seq_in_progress = (self.sequence * 2 + 1).to_le_bytes();
+                ptr::copy_nonoverlapping(seq_in_progress.as_ptr(), base.add(12), 8);
+
                 let magic = SHMEM_MAGIC.to_le_bytes();
                 ptr::copy_nonoverlapping(magic.as_ptr(), base, 4);
 
@@ -1121,9 +1081,6 @@ mod win32_shmem {
 
                 let h_bytes = height.to_le_bytes();
                 ptr::copy_nonoverlapping(h_bytes.as_ptr(), base.add(8), 4);
-
-                let seq_bytes = self.sequence.to_le_bytes();
-                ptr::copy_nonoverlapping(seq_bytes.as_ptr(), base.add(12), 8);
 
                 let ts_bytes = frame.timestamp.to_le_bytes();
                 ptr::copy_nonoverlapping(ts_bytes.as_ptr(), base.add(20), 8);
@@ -1136,6 +1093,10 @@ mod win32_shmem {
                     base.add(SHMEM_HEADER_SIZE),
                     data_len,
                 );
+
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Release);
+                let seq_committed = (self.sequence * 2 + 2).to_le_bytes();
+                ptr::copy_nonoverlapping(seq_committed.as_ptr(), base.add(12), 8);
             }
 
             debug!(

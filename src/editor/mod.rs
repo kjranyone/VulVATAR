@@ -23,6 +23,12 @@ pub struct EditorSession {
     next_overlay_id: u64,
 }
 
+impl Default for EditorSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EditorSession {
     pub fn new() -> Self {
         Self {

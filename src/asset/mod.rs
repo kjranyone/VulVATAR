@@ -792,17 +792,12 @@ pub struct MtoonTextureSlot {
     pub uri: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MtoonOutlineWidthMode {
+    #[default]
     None,
     WorldCoordinates,
     ScreenCoordinates,
-}
-
-impl Default for MtoonOutlineWidthMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 pub fn identity_matrix() -> Mat4 {

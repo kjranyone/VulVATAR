@@ -172,6 +172,12 @@ pub struct MaterialUploader {
     cache: HashMap<(MeshId, PrimitiveId), MaterialCacheEntry>,
 }
 
+impl Default for MaterialUploader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MaterialUploader {
     pub fn new() -> Self {
         Self {
@@ -189,6 +195,7 @@ impl MaterialUploader {
     /// The descriptor set contains:
     /// - binding 0: material uniform buffer
     /// - binding 1: combined image sampler (base color texture)
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_to_gpu(
         &mut self,
         cache_key: Option<(MeshId, PrimitiveId)>,

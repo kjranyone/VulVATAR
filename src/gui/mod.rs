@@ -21,12 +21,13 @@ use crate::t;
 use crate::persistence::ProjectState;
 use crate::tracking::{TrackingErrorLevel, TrackingSmoothingParams, DEFAULT_CONFIDENCE_THRESHOLD};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationLevel {
     Info,
     Error,
 }
 
+#[derive(Debug)]
 pub struct Notification {
     pub message: String,
     pub created: Instant,
@@ -418,6 +419,10 @@ pub struct GuiApp {
     /// Background avatar load in progress, if any. Set by `top_bar::load_*`
     /// helpers, polled and cleared by `update`.
     pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
+
+    /// When true, `save_avatar_library` and other persistence writes are
+    /// suppressed so unit tests never clobber the user's real data.
+    test_no_persist: bool,
 }
 
 impl GuiApp {
@@ -628,6 +633,7 @@ impl GuiApp {
             pending_thumbnail_jobs: Vec::new(),
 
             avatar_load_job: None,
+            test_no_persist: false,
         };
 
         if let Some(path) = std::env::var_os("VULVATAR_AUTOSTART_AVATAR") {
@@ -649,7 +655,7 @@ impl GuiApp {
             let needs = entry
                 .thumbnail_path
                 .as_ref()
-                .map_or(true, |p| !p.exists());
+                .is_none_or(|p| !p.exists());
             if needs {
                 if let Some(path) = state
                     .thumbnail_gen
@@ -838,10 +844,10 @@ impl GuiApp {
             pending_thumbnail_jobs: Vec::new(),
 
             avatar_load_job: None,
+            test_no_persist: true,
         }
     }
 }
-
 impl GuiApp {
     /// Whether the tracking worker is actually running, derived from the
     /// real worker state instead of the GUI toggle flag.
@@ -849,7 +855,7 @@ impl GuiApp {
         self.app
             .tracking_worker
             .as_ref()
-            .map_or(false, |w| w.is_running())
+            .is_some_and(|w| w.is_running())
     }
 
     /// Whether the tracking worker has finished initialisation and is
@@ -858,7 +864,7 @@ impl GuiApp {
         self.app
             .tracking_worker
             .as_ref()
-            .map_or(false, |w| w.is_ready())
+            .is_some_and(|w| w.is_ready())
     }
 
     /// Push a notification message that will auto-dismiss after 5 seconds.
@@ -1413,7 +1419,7 @@ impl GuiApp {
                         mesh_id: mesh.id,
                         primitive_id: prim.id,
                         material_binding,
-                        bounds: prim.bounds.clone(),
+                        bounds: prim.bounds,
                         alpha_mode,
                         cull_mode,
                         outline,
@@ -1552,7 +1558,7 @@ impl GuiApp {
         for vrm_path in &newly_added {
             self.push_notification(t!("toast.new_vrm_detected", path = vrm_path.display().to_string()));
         }
-        if !newly_added.is_empty() {
+        if !newly_added.is_empty() && !self.test_no_persist {
             let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
         }
     }
@@ -1596,7 +1602,9 @@ impl GuiApp {
             }
         }
         if imported > 0 {
-            let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+            if !self.test_no_persist {
+                let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+            }
             self.push_notification(t!("toast.refreshed_imported", count = imported));
         } else {
             self.push_notification(t!("toast.refreshed_none"));
@@ -1626,16 +1634,16 @@ impl GuiApp {
                     &asset,
                     self.thumbnail_gen.output_dir(),
                 );
-                if entry
-                    .thumbnail_path
-                    .as_ref()
-                    .map_or(true, |p| !p.exists())
-                {
-                    entry.thumbnail_path = self
-                        .thumbnail_gen
-                        .generate_and_save_placeholder(&entry.name);
-                }
             }
+        }
+        if entry
+            .thumbnail_path
+            .as_ref()
+            .is_none_or(|p| !p.exists())
+        {
+            entry.thumbnail_path = self
+                .thumbnail_gen
+                .generate_and_save_placeholder(&entry.name);
         }
         self.app.avatar_library.add(entry);
         true
@@ -2157,7 +2165,7 @@ mod rebind_integration_tests {
             1,
             "Failed rebind should post exactly one notification"
         );
-        let msg = &harness.notifications[0].0;
+        let msg = &harness.notifications[0].message;
         assert!(
             msg.contains("Could not auto-bind"),
             "expected 'Could not auto-bind' in notification, got: {}",
@@ -2422,7 +2430,7 @@ mod folder_refresh_tests {
             harness
                 .notifications
                 .iter()
-                .any(|(msg, _)| msg.contains("no new files")),
+                .any(|n| n.message.contains("no new files")),
             "Refresh on an empty watch list must still post the no-new-files toast"
         );
     }

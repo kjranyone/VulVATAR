@@ -557,11 +557,11 @@ mod tests {
         // Brows: at eye_y + ~0.05, lifted by brow_lift.
         let r_brow_y = r_eye_cy + 0.05 + brow_lift * 0.05;
         let l_brow_y = l_eye_cy + 0.05 + brow_lift * 0.05;
-        for i in 17..=21 {
-            face[i] = (r_eye_cx + ((i - 17) as f32 - 2.0) * 0.02, r_brow_y, 1.0);
+        for (idx, i) in (17..=21).enumerate() {
+            face[i] = (r_eye_cx + (idx as f32 - 2.0) * 0.02, r_brow_y, 1.0);
         }
-        for i in 22..=26 {
-            face[i] = (l_eye_cx + ((i - 22) as f32 - 2.0) * 0.02, l_brow_y, 1.0);
+        for (idx, i) in (22..=26).enumerate() {
+            face[i] = (l_eye_cx + (idx as f32 - 2.0) * 0.02, l_brow_y, 1.0);
         }
 
         face

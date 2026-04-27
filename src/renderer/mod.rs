@@ -8,6 +8,7 @@ pub mod material;
 pub mod mtoon;
 pub mod output_export;
 pub mod pipeline;
+#[allow(clippy::module_inception)]
 mod pipeline_lint_tests;
 pub mod targets;
 pub mod thumbnail;
@@ -97,6 +98,7 @@ struct PendingReadbackState {
 
 const READBACK_RING_SIZE: usize = 2;
 
+#[allow(clippy::type_complexity)]
 pub struct VulkanRenderer {
     initialized: bool,
     output_exporter: OutputExporter,
@@ -158,6 +160,12 @@ struct ThumbnailCache {
     framebuffer: Arc<Framebuffer>,
     color_image: Arc<Image>,
     readback_buffer: Subbuffer<[u8]>,
+}
+
+impl Default for VulkanRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VulkanRenderer {
@@ -259,6 +267,7 @@ impl VulkanRenderer {
     /// - `readback` is a host-cached buffer for fast CPU reads; the render
     ///   command buffer also contains a `copy_buffer` from staging→readback
     ///   so that the CPU never reads uncached VRAM.
+    #[allow(clippy::type_complexity)]
     fn ensure_readback_buffers(
         &mut self,
         extent: [u32; 2],
@@ -949,11 +958,7 @@ impl VulkanRenderer {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
                 vec![mat4_cols_identity()]
             } else {
-                instance
-                    .skinning_matrices
-                    .iter()
-                    .copied()
-                    .collect()
+                instance.skinning_matrices.to_vec()
             };
 
             let mat_count = skinning_mats.len();
@@ -1654,6 +1659,7 @@ impl VulkanRenderer {
             .collect()
     }
 
+    #[allow(clippy::type_complexity)]
     fn upload_mesh(
         &mut self,
         mesh_id: MeshId,
@@ -1895,6 +1901,7 @@ impl VulkanRenderer {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn create_offscreen_targets(
         device: Arc<Device>,
         memory_allocator: Arc<StandardMemoryAllocator>,
@@ -2059,7 +2066,7 @@ impl VulkanRenderer {
         if self
             .thumb_cache
             .as_ref()
-            .map_or(true, |c| c.extent != extent)
+            .is_none_or(|c| c.extent != extent)
         {
             let viewport = Viewport {
                 offset: [0.0, 0.0],
@@ -2152,7 +2159,7 @@ impl VulkanRenderer {
         let camera_set_layout = thumb_pipeline
             .layout()
             .set_layouts()
-            .get(0)
+            .first()
             .ok_or("thumbnail: no set 0")?
             .clone();
         let camera_set = DescriptorSet::new(
@@ -2199,11 +2206,7 @@ impl VulkanRenderer {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
                 vec![mat4_cols_identity()]
             } else {
-                instance
-                    .skinning_matrices
-                    .iter()
-                    .copied()
-                    .collect()
+                instance.skinning_matrices.to_vec()
             };
 
             let skinning_buffer = Buffer::from_iter(
@@ -2384,6 +2387,7 @@ impl VulkanRenderer {
         Ok(pixels)
     }
 
+    #[allow(clippy::type_complexity)]
     fn create_placeholder_mesh(
         memory_allocator: Arc<StandardMemoryAllocator>,
     ) -> (Subbuffer<[GpuVertex]>, Subbuffer<[u32]>, u32) {
@@ -2498,13 +2502,13 @@ impl CameraRing {
         let main_layout = main_pipeline
             .layout()
             .set_layouts()
-            .get(0)
+            .first()
             .expect("main pipeline has no set 0")
             .clone();
         let outline_layout = outline_pipeline
             .layout()
             .set_layouts()
-            .get(0)
+            .first()
             .expect("outline pipeline has no set 0")
             .clone();
 

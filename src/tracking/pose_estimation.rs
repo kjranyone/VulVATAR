@@ -38,7 +38,7 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
 
             let (h, s, v) = rgb_to_hsv(r, g, b);
             let is_skin =
-                (h <= 50.0 || h >= 340.0) && s >= 0.15 && s <= 0.75 && v >= 0.2 && v <= 0.95;
+                !(50.0..340.0).contains(&h) && (0.15..=0.75).contains(&s) && (0.2..=0.95).contains(&v);
 
             if is_skin {
                 skin_pixel_count += 1;
@@ -80,7 +80,7 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
     let norm_x = (centroid_x / width as f32) * 2.0 - 1.0;
     let norm_y = 1.0 - (centroid_y / height as f32) * 2.0;
 
-    let confidence = (skin_ratio / 0.25).min(1.0).max(0.1);
+    let confidence = (skin_ratio / 0.25).clamp(0.1, 1.0);
     skeleton.face = Some(FacePose {
         yaw: -norm_x * 0.3,
         pitch: norm_y * 0.2,

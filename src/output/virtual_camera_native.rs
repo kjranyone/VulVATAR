@@ -219,9 +219,16 @@ impl VirtualCameraNative {
             None => return Err("no shared buffer name".to_string()),
         };
 
+        // Pass a permissive DACL so the interactive-user producer can
+        // still write the section if a consumer (FrameServer-hosted MF
+        // DLL under LocalService) wins the CreateFileMappingW race.
+        // See shmem_security.rs.
+        let security =
+            super::shmem_security::PermissiveSharedMemorySecurity::new()?;
+
         let handle = CreateFileMappingW(
             INVALID_HANDLE_VALUE,
-            None,
+            Some(security.as_win_ptr()),
             PAGE_READWRITE,
             (total_size >> 32) as u32,
             total_size as u32,

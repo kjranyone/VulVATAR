@@ -135,7 +135,7 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
         enforce_pins(&mut slot.sim);
         compute_normals(&mut slot.sim);
         derive_velocity(&mut slot.sim, dt);
-        write_back(&mut slot.sim, &mut slot.state);
+        write_back(&slot.sim, &mut slot.state);
     }
 }
 
@@ -641,9 +641,8 @@ fn write_back(sim: &ClothSimState, cloth_state: &mut crate::avatar::ClothState) 
         deform.deformed_normals = Some(vec![[0.0; 3]; n]);
         deform.deformed_normals.as_mut().unwrap()
     };
-    for i in 0..n.min(sim.computed_normals.len()) {
-        normals_vec[i] = sim.computed_normals[i];
-    }
+    let copy_len = n.min(sim.computed_normals.len());
+    normals_vec[..copy_len].copy_from_slice(&sim.computed_normals[..copy_len]);
 
     deform.version += 1;
 
@@ -664,8 +663,7 @@ mod tests {
     fn make_simple_sim(particle_count: usize) -> ClothSimState {
         let particles = (0..particle_count)
             .map(|i| {
-                let p = ClothParticle::new([i as f32, 0.0, 0.0], false);
-                p
+                ClothParticle::new([i as f32, 0.0, 0.0], false)
             })
             .collect();
         ClothSimState {
@@ -1550,7 +1548,11 @@ mod tests {
         let mut buffers = ClothSimTempBuffers::new(particle_count);
         let budget = std::time::Duration::from_millis(5);
         let mut steps_completed = 0u32;
-        let max_steps = 1000u32;
+        // Sized so even very fast CPUs can't complete the loop within
+        // `budget`; the test asserts the budget check breaks us out
+        // before max_steps. Was 1000 — completed in <5ms on modern
+        // desktop CPUs and tripped the assertion below.
+        let max_steps = 10_000_000u32;
 
         let start = std::time::Instant::now();
         for _ in 0..max_steps {

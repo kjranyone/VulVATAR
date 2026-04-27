@@ -170,7 +170,7 @@ unsafe fn direct_dll_probe() {
             return;
         }
     };
-    let proc = GetProcAddress(module, PCSTR(b"DllGetClassObject\0".as_ptr()));
+    let proc = GetProcAddress(module, PCSTR(c"DllGetClassObject".as_ptr().cast()));
     let Some(proc) = proc else {
         println!("GetProcAddress(DllGetClassObject) failed");
         return;

@@ -198,8 +198,13 @@ pub struct Application {
     logged_first_render_result: bool,
 }
 
+impl Default for Application {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Application {
-    /// Get a reference to the active avatar (the one at `active_avatar_index`).
     pub fn active_avatar(&self) -> Option<&AvatarInstance> {
         self.avatars.get(self.active_avatar_index)
     }
@@ -220,14 +225,12 @@ impl Application {
             self.avatars.remove(index);
             if self.avatars.is_empty() {
                 self.active_avatar_index = 0;
-            } else {
-                if index < self.active_avatar_index {
-                    self.active_avatar_index -= 1;
-                } else if index == self.active_avatar_index
-                    && self.active_avatar_index >= self.avatars.len()
-                {
-                    self.active_avatar_index = self.avatars.len() - 1;
-                }
+            } else if index < self.active_avatar_index {
+                self.active_avatar_index -= 1;
+            } else if index == self.active_avatar_index
+                && self.active_avatar_index >= self.avatars.len()
+            {
+                self.active_avatar_index = self.avatars.len() - 1;
             }
         }
     }
@@ -872,7 +875,7 @@ impl Application {
         let worker_running = self
             .tracking_worker
             .as_ref()
-            .map_or(false, |w| w.is_running());
+            .is_some_and(|w| w.is_running());
 
         if worker_running {
             // Non-blocking read from the shared mailbox populated by the worker.
@@ -901,16 +904,6 @@ impl Application {
     /// (notification) and roll their requested-sink shadow back to a
     /// known-good fallback like `SharedMemory`.
     pub fn ensure_output_sink_runtime(&mut self, sink: FrameSink) -> Result<(), String> {
-        if self.output.active_sink() != &sink {
-            info!(
-                "output: swapping sink {:?} -> {:?}",
-                self.output.active_sink(),
-                sink
-            );
-            self.output.shutdown();
-            self.output = OutputRouter::new(sink.clone());
-        }
-
         #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
         {
             use crate::output::mf_virtual_camera::MfVirtualCamera;
@@ -926,9 +919,6 @@ impl Application {
                         self.mf_virtual_camera = Some(cam);
                     }
                 }
-                // Enumerate non-VC variants explicitly so adding a future
-                // FrameSink variant trips a compile error here, forcing the
-                // author to decide whether the new sink needs MF teardown.
                 FrameSink::SharedTexture | FrameSink::SharedMemory | FrameSink::ImageSequence => {
                     if self.mf_virtual_camera.take().is_some() {
                         info!("output: MediaFoundation virtual camera unregistered");
@@ -936,6 +926,17 @@ impl Application {
                 }
             }
         }
+
+        if self.output.active_sink() != &sink {
+            info!(
+                "output: swapping sink {:?} -> {:?}",
+                self.output.active_sink(),
+                sink
+            );
+            self.output.shutdown();
+            self.output = OutputRouter::new(sink.clone());
+        }
+
         Ok(())
     }
 
@@ -1287,7 +1288,7 @@ mod tests {
         );
         let ndc_z = clip[2] / clip[3];
         assert!(
-            ndc_z >= -0.01 && ndc_z <= 0.01,
+            (-0.01..=0.01).contains(&ndc_z),
             "near plane should map to z_ndc=0, got z_ndc={}",
             ndc_z
         );
@@ -1301,7 +1302,7 @@ mod tests {
         assert!(clip[3].abs() > 0.001, "w_clip should be nonzero");
         let ndc_z = clip[2] / clip[3];
         assert!(
-            ndc_z >= 0.99 && ndc_z <= 1.01,
+            (0.99..=1.01).contains(&ndc_z),
             "far plane should map to z_ndc=1, got z_ndc={}",
             ndc_z
         );
@@ -1324,7 +1325,7 @@ mod tests {
         );
         let ndc_z = clip[2] / clip[3];
         assert!(
-            ndc_z >= 0.0 && ndc_z <= 1.0,
+            (0.0..=1.0).contains(&ndc_z),
             "avatar at origin should be in Vulkan clip range [0,1], got z_ndc={} (eye={:?}, view_pt={:?}, clip={:?})",
             ndc_z, eye, view_point, clip
         );
@@ -1456,7 +1457,7 @@ mod tests {
             ray.origin[2] - v0[2],
         ];
         let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
-        if u < 0.0 || u > 1.0 {
+        if !(0.0..=1.0).contains(&u) {
             return None;
         }
         let q = [
@@ -1503,7 +1504,7 @@ mod tests {
                                 let mat = skin_mats
                                     .get(ji[j] as usize)
                                     .copied()
-                                    .unwrap_or_else(|| crate::asset::identity_matrix());
+                                    .unwrap_or_else(crate::asset::identity_matrix);
                                 let w = p[0] * mat[0][0]
                                     + p[1] * mat[1][0]
                                     + p[2] * mat[2][0]
@@ -1526,7 +1527,7 @@ mod tests {
                         let v1 = apply_skin(tri[1] as usize);
                         let v2 = apply_skin(tri[2] as usize);
                         if let Some(t) = ray_triangle_intersect(ray, v0, v1, v2) {
-                            if best.as_ref().map_or(true, |b| t < b.t) {
+                            if best.as_ref().is_none_or(|b| t < b.t) {
                                 let pt = [
                                     ray.origin[0] + t * ray.dir[0],
                                     ray.origin[1] + t * ray.dir[1],

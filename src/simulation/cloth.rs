@@ -41,7 +41,7 @@ impl SpatialHashGrid {
             return;
         }
         let key = self.cell_key(position);
-        self.cells.entry(key).or_insert_with(Vec::new).push(index);
+        self.cells.entry(key).or_default().push(index);
     }
 
     /// Return indices of all particles whose cell overlaps the query sphere.
@@ -491,8 +491,9 @@ pub fn resolve_scene_colliders(scene_colliders: &[SceneColliderAsset]) -> Vec<Re
         .collect()
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum ClothLoDLevel {
+    #[default]
     Full,
     Half,
     Quarter,
@@ -525,12 +526,6 @@ impl ClothLoDLevel {
             ClothLoDLevel::Quarter => "Quarter",
             ClothLoDLevel::Custom { .. } => "Custom",
         }
-    }
-}
-
-impl Default for ClothLoDLevel {
-    fn default() -> Self {
-        ClothLoDLevel::Full
     }
 }
 

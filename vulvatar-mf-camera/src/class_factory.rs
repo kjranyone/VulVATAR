@@ -52,7 +52,7 @@ impl IClassFactory_Impl for VulvatarClassFactory_Impl {
             // activate view before calling ActivateObject, then reads them
             // through the source view during FsProxy setup.
             let source_unk: IUnknown = VulvatarMediaSource::new()
-                .map_err(windows::core::Error::from)?
+                ?
                 .into();
             let hr = source_unk.query(iid, ppv);
             crate::t!("ClassFactory::CreateInstance: source.query -> {:?}", hr);

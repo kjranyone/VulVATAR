@@ -24,7 +24,7 @@
 //! `SeCreateGlobalPrivilege` gate that blocks `Global\` named sections
 //! from non-elevated interactive tokens under UAC filtering.
 
-use core::sync::atomic::{AtomicI64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicI64, Ordering};
 use std::fs::File;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
@@ -116,8 +116,18 @@ impl SharedMemoryReader {
 
         let view = state.view.as_ref()?;
         let header_ptr = view.Value as *const u8;
+
+        let seq1 = unsafe { read_sequence(header_ptr) };
+        if seq1 & 1 != 0 {
+            return None;
+        }
+
         let header = unsafe { read_header(header_ptr)? };
         if header.magic != SHMEM_MAGIC || header.width == 0 || header.height == 0 {
+            return None;
+        }
+
+        if header.sequence != seq1 {
             return None;
         }
 
@@ -126,7 +136,6 @@ impl SharedMemoryReader {
             .checked_mul(4)?;
         let total_size = SHMEM_HEADER_SIZE + pixel_bytes;
         if total_size > state.mapped_size {
-            // The producer enlarged the file; remap and retry next call.
             unsafe { unmap_section(&mut state) };
             return None;
         }
@@ -140,12 +149,20 @@ impl SharedMemoryReader {
             );
         }
 
+        compiler_fence(Ordering::Acquire);
+        let seq2 = unsafe { read_sequence(header_ptr) };
+        if seq1 != seq2 {
+            return None;
+        }
+
+        let frame_sequence = seq1 / 2;
+
         self.last_sequence
-            .store(header.sequence as i64, Ordering::Release);
+            .store(frame_sequence as i64, Ordering::Release);
         Some(FrameView {
             width: header.width,
             height: header.height,
-            sequence: header.sequence,
+            sequence: frame_sequence,
             timestamp_ns: header.timestamp,
             flags: header.flags,
             pixels,
@@ -190,6 +207,12 @@ unsafe fn read_header(ptr: *const u8) -> Option<Header> {
         timestamp: read_u64(20),
         flags: read_u32(28),
     })
+}
+
+unsafe fn read_sequence(ptr: *const u8) -> u64 {
+    let mut buf = [0u8; 8];
+    core::ptr::copy_nonoverlapping(ptr.add(12), buf.as_mut_ptr(), 8);
+    u64::from_le_bytes(buf)
 }
 
 fn camera_file_path() -> PathBuf {
@@ -240,7 +263,7 @@ fn ensure_mapping(state: &mut Inner) -> bool {
     // build here doesn't extend the borrow past this statement — it's
     // an opaque pointer-sized value that the kernel resolves independently.
     let file_handle = HANDLE(
-        state.file.as_ref().unwrap().as_raw_handle() as *mut core::ffi::c_void,
+        state.file.as_ref().unwrap().as_raw_handle(),
     );
     let mapping = unsafe {
         // dwMaximumSizeHigh=0, dwMaximumSizeLow=0 → kernel uses current

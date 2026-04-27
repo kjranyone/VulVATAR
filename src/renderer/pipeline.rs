@@ -450,16 +450,11 @@ pub struct PipelineKey {
     pub vertex_layout: VertexLayout,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum VertexLayout {
+    #[default]
     Skinned,
     Static,
-}
-
-impl Default for VertexLayout {
-    fn default() -> Self {
-        Self::Skinned
-    }
 }
 
 impl PipelineKey {

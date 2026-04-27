@@ -5,6 +5,7 @@ use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 
+#[allow(clippy::type_complexity)]
 pub fn create_offscreen_targets(
     memory_allocator: Arc<StandardMemoryAllocator>,
     render_pass: Arc<RenderPass>,
