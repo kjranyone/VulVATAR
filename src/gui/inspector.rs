@@ -2358,6 +2358,16 @@ fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
                         if ui.selectable_label(current_locale == *code, name).clicked() {
                             state.settings.locale = code.to_string();
                             crate::i18n::set_locale(code);
+                            // Reorder the CJK font fallback chain so the
+                            // newly-active locale's native shape wins per
+                            // glyph (e.g. 飞 vs 飛). No-op if the user
+                            // hasn't run dev.ps1 Install-Font yet — they
+                            // see the warn line at startup either way.
+                            if let Some(fonts) =
+                                crate::gui::build_cjk_font_definitions(code)
+                            {
+                                ui.ctx().set_fonts(fonts);
+                            }
                         }
                     }
                 });

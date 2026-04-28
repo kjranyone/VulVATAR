@@ -21,6 +21,82 @@ use crate::t;
 use crate::persistence::ProjectState;
 use crate::tracking::{TrackingErrorLevel, TrackingSmoothingParams, DEFAULT_CONFIDENCE_THRESHOLD};
 
+/// Build an `egui::FontDefinitions` whose fallback chain matches the
+/// active locale's preferred CJK font, falling back through the others.
+///
+/// Returns `None` when none of the three Noto Sans CJK subsets are
+/// installed under `assets/` — egui then keeps its default Latin-only
+/// fonts. Run `dev.ps1` `Install-Font` to download them.
+///
+/// Locale-aware ordering matters because most CJK Unified Ideographs
+/// exist in all three fonts but render with different glyph shapes
+/// (e.g. 飞 vs 飛, simplified vs traditional vs Japanese forms). The
+/// first font in the chain wins per glyph, so the locale's "native"
+/// font goes first and the others come after as tofu-prevention
+/// fallbacks (Hangul → KR only; Korean-locale users see SC-only chars
+/// via the SC fallback rather than missing glyphs).
+pub(crate) fn build_cjk_font_definitions(locale: &str) -> Option<egui::FontDefinitions> {
+    let candidates: &[(&str, &str)] = &[
+        ("noto_sans_jp", "NotoSansJP-Regular.otf"),
+        ("noto_sans_kr", "NotoSansKR-Regular.otf"),
+        ("noto_sans_sc", "NotoSansSC-Regular.otf"),
+    ];
+
+    let mut fonts = egui::FontDefinitions::default();
+    let mut available: Vec<&str> = Vec::new();
+
+    for (name, file) in candidates {
+        let path = std::path::Path::new("assets").join(file);
+        if !path.exists() {
+            warn!(
+                "CJK font missing: {} — run dev.ps1 Install-Font",
+                path.display()
+            );
+            continue;
+        }
+        match std::fs::read(&path) {
+            Ok(data) => {
+                fonts.font_data.insert(
+                    (*name).into(),
+                    Arc::new(egui::FontData::from_owned(data)),
+                );
+                available.push(name);
+                info!("loaded CJK font: {}", path.display());
+            }
+            Err(e) => warn!("failed to read CJK font {}: {e}", path.display()),
+        }
+    }
+
+    if available.is_empty() {
+        return None;
+    }
+
+    let (primary, fallbacks): (&str, &[&str]) = match locale {
+        "ko" => ("noto_sans_kr", &["noto_sans_jp", "noto_sans_sc"]),
+        "zh" => ("noto_sans_sc", &["noto_sans_jp", "noto_sans_kr"]),
+        _ => ("noto_sans_jp", &["noto_sans_kr", "noto_sans_sc"]),
+    };
+
+    let mut chain: Vec<&str> = Vec::new();
+    for name in std::iter::once(primary).chain(fallbacks.iter().copied()) {
+        if available.iter().any(|n| *n == name) {
+            chain.push(name);
+        }
+    }
+
+    for name in chain {
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push(name.into());
+        }
+    }
+
+    Some(fonts)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationLevel {
     Info,
@@ -432,35 +508,8 @@ impl GuiApp {
         // inspector — without this, file:// URIs return UnknownLoader.
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
-        let font_path = std::path::Path::new("assets/NotoSansJP-Regular.otf");
-        if font_path.exists() {
-            match std::fs::read(font_path) {
-                Ok(data) => {
-                    let mut fonts = egui::FontDefinitions::default();
-                    fonts.font_data.insert(
-                        "noto_sans_jp".into(),
-                        Arc::new(egui::FontData::from_owned(data)),
-                    );
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Proportional)
-                        .or_default()
-                        .push("noto_sans_jp".into());
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Monospace)
-                        .or_default()
-                        .push("noto_sans_jp".into());
-                    cc.egui_ctx.set_fonts(fonts);
-                    info!("loaded CJK font: {}", font_path.display());
-                }
-                Err(e) => warn!("failed to read CJK font {}: {e}", font_path.display()),
-            }
-        } else {
-            warn!(
-                "CJK font not found at {} — multibyte characters will not render",
-                font_path.display()
-            );
+        if let Some(fonts) = build_cjk_font_definitions(&crate::i18n::locale()) {
+            cc.egui_ctx.set_fonts(fonts);
         }
         let mut app = Box::new(Application::new());
         app.bootstrap();

@@ -6,41 +6,56 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Install-Font {
-    Write-Host "Setting up CJK font (Noto Sans JP)..." -ForegroundColor Cyan
-    $fontName = "NotoSansJP-Regular.otf"
+    # Load JP / KR / SC subsets so the egui font fallback chain covers
+    # Hangul (only in KR) and SC-specific glyph forms in addition to
+    # Japanese kana/kanji. Without KR, Korean text renders as tofu;
+    # without SC, simplified-only characters fall back to JP shapes.
+    Write-Host "Setting up CJK fonts (Noto Sans JP/KR/SC)..." -ForegroundColor Cyan
     $fontDir = "assets"
-    $fontPath = "$fontDir\$fontName"
 
     if (!(Test-Path $fontDir)) {
         New-Item -ItemType Directory -Force -Path $fontDir | Out-Null
     }
 
-    if (Test-Path $fontPath) {
-        Write-Host "CJK font already exists. Skipping download." -ForegroundColor Green
-        return
-    }
-
-    $zipUrl = "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/16_NotoSansJP.zip"
-    $zipPath = "$fontDir\notosansjp.zip"
-
-    Write-Host "Downloading NotoSansJP subset OTFs (~27 MB)..."
-    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
-
-    Write-Host "Extracting $fontName..."
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
-    try {
-        $entry = $zip.Entries | Where-Object { $_.Name -eq $fontName }
-        if ($null -eq $entry) {
-            throw "$fontName not found in archive"
-        }
-        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Resolve-Path $fontDir).Path + "\$fontName", $true)
-    } finally {
-        $zip.Dispose()
-    }
 
-    Remove-Item $zipPath -Force
-    Write-Host "CJK font installed: $fontPath" -ForegroundColor Green
+    $fonts = @(
+        @{ Zip = "16_NotoSansJP.zip"; Otf = "NotoSansJP-Regular.otf" },
+        @{ Zip = "17_NotoSansKR.zip"; Otf = "NotoSansKR-Regular.otf" },
+        @{ Zip = "18_NotoSansSC.zip"; Otf = "NotoSansSC-Regular.otf" }
+    )
+
+    foreach ($f in $fonts) {
+        $fontPath = "$fontDir\$($f.Otf)"
+        if (Test-Path $fontPath) {
+            Write-Host "  $($f.Otf) already present, skipping" -ForegroundColor Green
+            continue
+        }
+
+        $zipUrl = "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/$($f.Zip)"
+        $zipPath = "$fontDir\$($f.Zip)"
+
+        Write-Host "  Downloading $($f.Zip)..."
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+
+        $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
+        try {
+            $entry = $zip.Entries | Where-Object { $_.Name -eq $f.Otf }
+            if ($null -eq $entry) {
+                throw "$($f.Otf) not found in $($f.Zip)"
+            }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
+                $entry,
+                (Resolve-Path $fontDir).Path + "\$($f.Otf)",
+                $true
+            )
+        } finally {
+            $zip.Dispose()
+        }
+
+        Remove-Item $zipPath -Force
+        Write-Host "  Installed: $fontPath" -ForegroundColor Green
+    }
 }
 
 function Install-Models {
@@ -324,6 +339,13 @@ if ($RegisterMfCamera) {
 
 if ($Select -ne 0) {
     Invoke-DevCommand -Index $Select
+    return
+}
+
+# When dot-sourced (e.g. `. .\dev.ps1; Install-Font`) skip the
+# interactive menu loop — sourcing must only register the helper
+# functions. Detected via $MyInvocation.InvocationName == '.'.
+if ($MyInvocation.InvocationName -eq '.') {
     return
 }
 
