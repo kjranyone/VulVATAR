@@ -647,25 +647,17 @@ impl OutputSinkWriter for NullSink {
 mod win32_shmem {
     use super::{AlphaMode, OutputColorSpace, OutputFrame, OutputSinkWriter};
     use log::{debug, info};
-    use std::ffi::{c_void, OsStr};
+    use std::ffi::c_void;
     use std::fs::File;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::ptr;
 
-    use crate::output::shmem_security::{
-        PermissiveSharedMemorySecurity, RawSecurityAttributes,
-    };
+    use crate::output::shmem_security::RawSecurityAttributes;
 
     const PAGE_READWRITE: u32 = 0x04;
     const FILE_MAP_ALL_ACCESS: u32 = 0xF001F;
-
-    // Win32 GetLastError codes used to diagnose CreateFileMappingW failures.
-    // Documented under WinError.h.
-    const ERROR_PRIVILEGE_NOT_HELD: u32 = 0x522; // 1314
-    const ERROR_ACCESS_DENIED: u32 = 0x5; // 5
 
     extern "system" {
         fn CreateFileMappingW(
@@ -695,97 +687,6 @@ mod win32_shmem {
     const SHMEM_HEADER_SIZE: usize = 32;
     const SHMEM_MAGIC: u32 = 0x5643_4D46;
 
-    pub struct Win32NamedSharedMemorySink {
-        handle: isize,
-        view: *mut c_void,
-        name: String,
-        mapped_size: usize,
-        sequence: u64,
-        logged_first_write: bool,
-    }
-
-    unsafe impl Send for Win32NamedSharedMemorySink {}
-
-    impl Win32NamedSharedMemorySink {
-        pub fn new(name: &str) -> Self {
-            Self {
-                handle: 0,
-                view: ptr::null_mut(),
-                name: format!("Global\\{}", name),
-                mapped_size: 0,
-                sequence: 0,
-                logged_first_write: false,
-            }
-        }
-
-        fn ensure_mapping(&mut self, size: usize) -> Result<(), String> {
-            let total = SHMEM_HEADER_SIZE + size;
-            if total <= self.mapped_size && !self.view.is_null() {
-                return Ok(());
-            }
-
-            unsafe { self.unmap() };
-
-            let wide_name: Vec<u16> = OsStr::new(&self.name)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let mut security = PermissiveSharedMemorySecurity::new()?;
-            let handle = unsafe {
-                CreateFileMappingW(
-                    -1isize,
-                    security.as_mut_ptr(),
-                    PAGE_READWRITE,
-                    (total >> 32) as u32,
-                    total as u32,
-                    wide_name.as_ptr(),
-                )
-            };
-
-            if handle == 0 {
-                let err = unsafe { GetLastError() };
-                let hint = match err {
-                    ERROR_PRIVILEGE_NOT_HELD => " (SeCreateGlobalPrivilege missing — run as a normal interactive user, not from a non-Session-0 service or a stripped token)",
-                    ERROR_ACCESS_DENIED => " (an existing object with the same name has a stricter DACL — check whether another process already opened it)",
-                    _ => "",
-                };
-                return Err(format!(
-                    "CreateFileMappingW failed for '{}' (GetLastError={}){}",
-                    self.name, err, hint,
-                ));
-            }
-
-            let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total) };
-
-            if view.is_null() {
-                let err = unsafe { GetLastError() };
-                unsafe { CloseHandle(handle) };
-                return Err(format!(
-                    "MapViewOfFile failed for '{}' (GetLastError={})",
-                    self.name, err
-                ));
-            }
-
-            self.handle = handle;
-            self.view = view;
-            self.mapped_size = total;
-            Ok(())
-        }
-
-        unsafe fn unmap(&mut self) {
-            if !self.view.is_null() {
-                unsafe { UnmapViewOfFile(self.view as *const c_void) };
-                self.view = ptr::null_mut();
-            }
-            if self.handle != 0 {
-                unsafe { CloseHandle(self.handle) };
-                self.handle = 0;
-            }
-            self.mapped_size = 0;
-        }
-    }
-
     /// Phase B-4: bit 0 in the shared-memory header `flags` u32 (offset 28)
     /// asks the consumer to preserve the source RGBA alpha channel rather
     /// than forcing the output to opaque. NV12 paths ignore the flag.
@@ -807,88 +708,6 @@ mod win32_shmem {
             flags |= SHMEM_FLAG_LINEAR_COLOR_SPACE;
         }
         flags
-    }
-
-    impl OutputSinkWriter for Win32NamedSharedMemorySink {
-        fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
-            let pixel_data = match &frame.pixel_data {
-                Some(data) => data,
-                None => return Err("Win32ShmemSink: frame has no pixel data".into()),
-            };
-
-            let width = frame.extent[0];
-            let height = frame.extent[1];
-            let data_len = pixel_data.len();
-
-            self.ensure_mapping(data_len)?;
-
-            // Pack alpha + colour-space intent into the header `flags` field
-            // at offset 28. OutputFrame.{alpha_mode, color_space} are set by
-            // the host (App::process_render_result) from the GUI toggles.
-            let flags = flags_for_frame(frame);
-
-            unsafe {
-                // Cast to `*mut u8` so byte-offset arithmetic is well-defined.
-                // (Historical note: this used to be `*mut ()` which made
-                // `base.add(N)` a no-op since `size_of::<()>() == 0` —
-                // every header field overwrote offset 0, the on-wire magic
-                // was garbled, the DLL discarded every frame, and Frame
-                // Server tore the camera down. The struct now stores
-                // `*mut c_void` so the type system can't recreate that
-                // bug, but the explicit `*mut u8` cast keeps the intent
-                // visible.)
-                let base = self.view as *mut u8;
-
-                let magic = SHMEM_MAGIC.to_le_bytes();
-                ptr::copy_nonoverlapping(magic.as_ptr(), base, 4);
-
-                let w_bytes = width.to_le_bytes();
-                ptr::copy_nonoverlapping(w_bytes.as_ptr(), base.add(4), 4);
-
-                let h_bytes = height.to_le_bytes();
-                ptr::copy_nonoverlapping(h_bytes.as_ptr(), base.add(8), 4);
-
-                let seq_bytes = self.sequence.to_le_bytes();
-                ptr::copy_nonoverlapping(seq_bytes.as_ptr(), base.add(12), 8);
-
-                let ts_bytes = frame.timestamp.to_le_bytes();
-                ptr::copy_nonoverlapping(ts_bytes.as_ptr(), base.add(20), 8);
-
-                let flag_bytes = flags.to_le_bytes();
-                ptr::copy_nonoverlapping(flag_bytes.as_ptr(), base.add(28), 4);
-
-                ptr::copy_nonoverlapping(
-                    pixel_data.as_ptr(),
-                    base.add(SHMEM_HEADER_SIZE),
-                    data_len,
-                );
-            }
-
-            debug!(
-                "Win32ShmemSink: wrote {} bytes to '{}' (seq={}, {}x{})",
-                data_len, self.name, self.sequence, width, height,
-            );
-            if !self.logged_first_write {
-                info!(
-                    "Win32ShmemSink: first write {} bytes to '{}' (seq={}, {}x{})",
-                    data_len, self.name, self.sequence, width, height,
-                );
-                self.logged_first_write = true;
-            }
-
-            self.sequence += 1;
-            Ok(())
-        }
-
-        fn name(&self) -> &str {
-            "win32-named-shared-memory"
-        }
-    }
-
-    impl Drop for Win32NamedSharedMemorySink {
-        fn drop(&mut self) {
-            unsafe { self.unmap() };
-        }
     }
 
     // -----------------------------------------------------------------
@@ -927,6 +746,20 @@ mod win32_shmem {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         dir.join("VulVATAR").join("camera_frame_buffer.bin")
+    }
+
+    /// Distinct path for the SharedMemory sink so it doesn't collide
+    /// with the VirtualCamera sink when the user toggles between them.
+    /// Using a file-backed mapping here as well sidesteps the
+    /// `Global\` named-section DACL race that plagued
+    /// `Win32NamedSharedMemorySink` (see commit a4e2c66 — fix only
+    /// covered the create-time race; existing-object handles created
+    /// by other tokens still produced ERROR_ACCESS_DENIED).
+    pub fn shared_memory_file_path() -> PathBuf {
+        let dir = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        dir.join("VulVATAR").join("shared_memory_buffer.bin")
     }
 
     pub struct Win32FileBackedSharedMemorySink {
@@ -1138,7 +971,7 @@ mod win32_shmem {
 
 #[cfg(target_os = "windows")]
 use win32_shmem::{
-    virtual_camera_file_path, Win32FileBackedSharedMemorySink, Win32NamedSharedMemorySink,
+    shared_memory_file_path, virtual_camera_file_path, Win32FileBackedSharedMemorySink,
 };
 
 // ---------------------------------------------------------------------------
@@ -1149,9 +982,17 @@ pub fn create_sink_writer(sink: &FrameSink) -> Box<dyn OutputSinkWriter> {
     match sink {
         FrameSink::ImageSequence => Box::new(ImageSequenceSink::new("output_frames")),
         FrameSink::SharedMemory => {
+            // Was Win32NamedSharedMemorySink (Global\VulVATAR_Output);
+            // file-backed sidesteps the DACL race that survived even
+            // the permissive-SDDL fix when an existing object lingered
+            // in the kernel namespace (see frame_sink.rs::win32_shmem
+            // header). No in-tree consumer reads the named section, so
+            // changing the transport breaks nothing.
             #[cfg(target_os = "windows")]
             {
-                Box::new(Win32NamedSharedMemorySink::new("VulVATAR_Output"))
+                Box::new(Win32FileBackedSharedMemorySink::new(
+                    shared_memory_file_path(),
+                ))
             }
             #[cfg(not(target_os = "windows"))]
             {

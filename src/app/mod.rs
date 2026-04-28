@@ -527,8 +527,8 @@ impl Application {
 
         output_frame.handoff_path = exported.handoff_path.clone();
         // Phase B-4: tag the frame with the user's alpha preference so the
-        // downstream sink (Win32NamedSharedMemorySink → DLL) knows whether
-        // to preserve or clobber the alpha channel.
+        // downstream sink (Win32FileBackedSharedMemorySink → DLL) knows
+        // whether to preserve or clobber the alpha channel.
         output_frame.alpha_mode = if self.output_preserve_alpha {
             crate::output::AlphaMode::Premultiplied
         } else {

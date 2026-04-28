@@ -68,8 +68,9 @@ pub struct VulvatarMediaStream {
     /// the mutex. Initialised to MF_STREAM_STATE_RUNNING (the stream
     /// starts alive; Pause/Stop transitions are driven by the source).
     stream_state: AtomicI32,
-    /// Reader for the named shared-memory frame buffer the host process
-    /// fills via `vulvatar::output::frame_sink::Win32NamedSharedMemorySink`.
+    /// Reader for the file-backed shared-memory frame buffer the host
+    /// process fills via
+    /// `vulvatar::output::frame_sink::Win32FileBackedSharedMemorySink`.
     shared_memory: SharedMemoryReader,
     /// Cached negotiated format. Resolved from the stream descriptor's
     /// media-type handler the first time `RequestSample` runs and reused
