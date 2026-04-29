@@ -2566,28 +2566,28 @@ mod metadata_tests {
         source.joints.insert(
             HumanoidBone::LeftShoulder,
             SourceJoint {
-                position: [-0.2, 1.4],
+                position: [-0.2, 1.4, 0.0],
                 confidence: 1.0,
             },
         );
         source.joints.insert(
             HumanoidBone::LeftUpperArm,
             SourceJoint {
-                position: [-0.2, 1.4],
+                position: [-0.2, 1.4, 0.0],
                 confidence: 1.0,
             },
         );
         source.joints.insert(
             HumanoidBone::LeftLowerArm,
             SourceJoint {
-                position: [-0.4, 1.7],
+                position: [-0.4, 1.7, 0.0],
                 confidence: 1.0,
             },
         );
         source.joints.insert(
             HumanoidBone::RightShoulder,
             SourceJoint {
-                position: [0.2, 1.4],
+                position: [0.2, 1.4, 0.0],
                 confidence: 1.0,
             },
         );
@@ -2721,7 +2721,7 @@ mod metadata_tests {
             source.joints.insert(
                 bone,
                 SourceJoint {
-                    position: [x, y],
+                    position: [x, y, 0.0],
                     confidence: 1.0,
                 },
             );
@@ -2734,7 +2734,7 @@ mod metadata_tests {
         source.fingertips.insert(
             HumanoidBone::RightIndexDistal,
             SourceJoint {
-                position: [-0.44, -0.12],
+                position: [-0.44, -0.12, 0.0],
                 confidence: 1.0,
             },
         );

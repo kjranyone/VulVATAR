@@ -750,14 +750,14 @@ fn synthetic_pose(frame_index: u64, t: f32) -> SourceSkeleton {
     sk.joints.insert(
         HumanoidBone::LeftShoulder,
         SourceJoint {
-            position: [-0.15 + sx, 1.4],
+            position: [-0.15 + sx, 1.4, 0.0],
             confidence: 0.88,
         },
     );
     sk.joints.insert(
         HumanoidBone::RightShoulder,
         SourceJoint {
-            position: [0.15 + sx, 1.4],
+            position: [0.15 + sx, 1.4, 0.0],
             confidence: 0.88,
         },
     );

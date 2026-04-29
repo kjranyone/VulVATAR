@@ -1053,8 +1053,15 @@ fn map_to_source_skeleton(
     let kpt = |i: usize| -> (f32, f32, f32) { kpts.get(i).copied().unwrap_or((0.0, 0.0, 0.0)) };
     let to_norm_x = |x: f32| ((x / input_w as f32) * 2.0 - 1.0) * aspect;
     let to_norm_y = |y: f32| 1.0 - (y / input_h as f32) * 2.0;
+    // The CIGPose backend is 2D-only — the new 3D `SourceJoint` schema
+    // is filled in with `z = 0` here. This entire `inference.rs` is
+    // scheduled for replacement by the MediaPipe Holistic pipeline in
+    // P28-P32; until then the avatar simply runs without depth (legs
+    // and arms collapse to the image plane), which is acceptable for
+    // the migration window because lift-based depth recovery has
+    // already been removed.
     let to_joint = |k: (f32, f32, f32)| SourceJoint {
-        position: [to_norm_x(k.0), to_norm_y(k.1)],
+        position: [to_norm_x(k.0), to_norm_y(k.1), 0.0],
         confidence: k.2,
     };
 
@@ -1142,6 +1149,7 @@ fn map_to_source_skeleton(
             position: [
                 (to_norm_x(hip_l.0) + to_norm_x(hip_r.0)) * 0.5,
                 (to_norm_y(hip_l.1) + to_norm_y(hip_r.1)) * 0.5,
+                0.0,
             ],
             confidence: hip_l.2.min(hip_r.2),
         };
@@ -1401,7 +1409,7 @@ fn map_hand_keypoints(
             .copied()
             .unwrap_or((0.0, 0.0, 0.0));
         SourceJoint {
-            position: [to_norm_x(k.0), to_norm_y(k.1)],
+            position: [to_norm_x(k.0), to_norm_y(k.1), 0.0],
             confidence: k.2,
         }
     };
