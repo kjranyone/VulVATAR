@@ -1,12 +1,22 @@
 //! Solve avatar bone rotations from a [`SourceSkeleton`].
 //!
-//! The solver is driven by three ideas:
+//! The solver is driven by four ideas:
 //!
-//! 1. **Rest-relative.** Every output rotation is expressed as a delta from
+//! 1. **Tree-walked 2D→3D lift.** Per-bone direction matching alone leaks
+//!    detector noise across the kinematic chain — each child reconstructs
+//!    its own Z independently and the implied position diverges from
+//!    `parent_3d + bone_3d`. Instead we lift every joint into 3D *once
+//!    per frame* in tree order, anchoring each child's depth to its
+//!    parent's depth (`child_z = parent_z + ±√(L² − d²)`, sign chosen for
+//!    temporal continuity). A bone's source direction is then
+//!    `child_3d − parent_3d`, which is by construction consistent with the
+//!    parent's already-resolved 3D position.
+//!
+//! 2. **Rest-relative.** Every output rotation is expressed as a delta from
 //!    the avatar's rest pose, so models whose bones have non-identity rest
 //!    rotations (most real VRMs) are not destroyed by the write.
 //!
-//! 2. **Direction matching.** For chain bones (upper/lower arm, leg, spine)
+//! 3. **Direction matching.** For chain bones (upper/lower arm, leg, spine)
 //!    we read the bone's *rest world direction* (from its world position to
 //!    its tip's world position) and rotate it to match the source skeleton's
 //!    observed direction in camera space. The minimum-arc quaternion is
@@ -14,7 +24,7 @@
 //!    bone's parent-local frame so the result respects the skeleton
 //!    hierarchy.
 //!
-//! 3. **Face pose is independent.** The head rotation comes from facial
+//! 4. **Face pose is independent.** The head rotation comes from facial
 //!    keypoints (yaw/pitch/roll), not from the nose-to-shoulder vector.
 //!    It is applied as a rest-relative local delta on the Head bone.
 //!
@@ -133,6 +143,19 @@ pub struct PoseSolverState {
     fingertip_filters: HashMap<HumanoidBone, OneEuroFilterState>,
     /// Per-bone Schmitt hysteresis state for joint confidence.
     joint_active: HashMap<HumanoidBone, bool>,
+    /// Last frame's signed Z offset along each bone in the 2D→3D lift,
+    /// keyed by the *parent* of the lift step (which is the bone being
+    /// driven by that step). Used to pick the sign of the next frame's
+    /// Z reconstruction for chain continuity: sqrt() always yields a
+    /// non-negative magnitude, but the limb may be in front of or
+    /// behind its parent. We pick whichever sign keeps the offset
+    /// closest to last frame's value, so a limb that is "forward" stays
+    /// forward across detector noise rather than flipping back and
+    /// forth between ±Z.
+    bone_prev_z_offset: HashMap<HumanoidBone, f32>,
+    /// Same idea for fingertips, keyed by the distal bone whose tip
+    /// they represent (matches `SourceSkeleton::fingertips`).
+    fingertip_prev_z_offset: HashMap<HumanoidBone, f32>,
     /// Wall-clock timestamp of the previous solve, used to derive `dt`
     /// for the dt-aware blend / decay / 1€ filter. `None` until the
     /// first call.
@@ -153,20 +176,25 @@ impl PoseSolverState {
         self.joint_filters.clear();
         self.fingertip_filters.clear();
         self.joint_active.clear();
+        self.bone_prev_z_offset.clear();
+        self.fingertip_prev_z_offset.clear();
         self.last_solve_instant = None;
     }
 
     /// Discard the per-frame motion smoothing state (1€ filter,
-    /// hysteresis active flags, last-solve timestamp) without
-    /// touching the longer-running calibration (`bone_max_2d`,
-    /// `shoulder_span_max_2d`). Useful when the next solve call
-    /// represents a new subject pose that should not blend with
-    /// whatever was last seen — e.g. between a calibration-priming
-    /// frame and the actual test frame in `diagnose_pose`.
+    /// hysteresis active flags, last-solve timestamp, sign continuity
+    /// of the lift's Z offsets) without touching the longer-running
+    /// calibration (`bone_max_2d`, `shoulder_span_max_2d`). Useful
+    /// when the next solve call represents a new subject pose that
+    /// should not blend with whatever was last seen — e.g. between a
+    /// calibration-priming frame and the actual test frame in
+    /// `diagnose_pose`.
     pub fn reset_motion_smoothing(&mut self) {
         self.joint_filters.clear();
         self.fingertip_filters.clear();
         self.joint_active.clear();
+        self.bone_prev_z_offset.clear();
+        self.fingertip_prev_z_offset.clear();
         self.last_solve_instant = None;
     }
 }
@@ -376,6 +404,442 @@ const DRIVEN_BONES: &[(HumanoidBone, Tip)] = &[
     (HumanoidBone::RightLittleDistal, Tip::Fingertip),
 ];
 
+/// Result of the per-frame 2D→3D lift. Each joint's 3D position is
+/// computed in tree order so a child's depth is anchored to its
+/// parent's depth: `child_3d.z = parent_3d.z + ±√(L² − d²)`. The sign
+/// is chosen for temporal continuity (closest to last frame's offset),
+/// so the limb does not flip across the image plane on detector noise.
+///
+/// `joints_3d` covers the body skeleton (Hips, shoulders, arms, legs,
+/// fingers). `fingertips_3d` covers the auxiliary fingertip / toe tips
+/// keyed by their distal bone (matches `SourceSkeleton::fingertips`).
+/// `shoulder_mid_3d` is the lifted shoulder midpoint, used as the tip
+/// of the Spine bone.
+#[derive(Default)]
+struct LiftedSkeleton {
+    joints_3d: HashMap<HumanoidBone, [f32; 3]>,
+    fingertips_3d: HashMap<HumanoidBone, [f32; 3]>,
+    shoulder_mid_3d: Option<[f32; 3]>,
+}
+
+/// Tree-walk order for the lift. Each entry is `(parent, child,
+/// calib_key)` — the calibration key is usually the bone being driven
+/// (i.e. the parent for body chains, the distal bone for finger
+/// chains), and is used to look up the running max 2D length in
+/// `state.bone_max_2d`.
+///
+/// Order matters: a child must come after its parent so the parent's
+/// 3D position is already filled in when we reach the child. We do not
+/// include the shoulders themselves here — they are handled inline
+/// because they share the shoulder midpoint's Z by construction (the
+/// shoulder line is roughly horizontal in body frame).
+const LIFT_CHAINS: &[(HumanoidBone, HumanoidBone, HumanoidBone)] = &[
+    // Arms: parent is the shoulder/upper-arm joint already placed by
+    // the shoulder-mid step. Calibration key is the bone being driven
+    // (UpperArm direction comes from UpperArm→LowerArm length, etc.).
+    (
+        HumanoidBone::LeftUpperArm,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftUpperArm,
+    ),
+    (
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftHand,
+        HumanoidBone::LeftLowerArm,
+    ),
+    (
+        HumanoidBone::RightUpperArm,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightUpperArm,
+    ),
+    (
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightHand,
+        HumanoidBone::RightLowerArm,
+    ),
+    // Legs.
+    (
+        HumanoidBone::Hips,
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::LeftUpperLeg,
+    ),
+    (
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::LeftUpperLeg,
+    ),
+    (
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::LeftFoot,
+        HumanoidBone::LeftLowerLeg,
+    ),
+    (
+        HumanoidBone::Hips,
+        HumanoidBone::RightUpperLeg,
+        HumanoidBone::RightUpperLeg,
+    ),
+    (
+        HumanoidBone::RightUpperLeg,
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::RightUpperLeg,
+    ),
+    (
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::RightFoot,
+        HumanoidBone::RightLowerLeg,
+    ),
+    // Fingers (left).
+    (
+        HumanoidBone::LeftHand,
+        HumanoidBone::LeftThumbProximal,
+        HumanoidBone::LeftHand,
+    ),
+    (
+        HumanoidBone::LeftThumbProximal,
+        HumanoidBone::LeftThumbIntermediate,
+        HumanoidBone::LeftThumbProximal,
+    ),
+    (
+        HumanoidBone::LeftThumbIntermediate,
+        HumanoidBone::LeftThumbDistal,
+        HumanoidBone::LeftThumbIntermediate,
+    ),
+    (
+        HumanoidBone::LeftHand,
+        HumanoidBone::LeftIndexProximal,
+        HumanoidBone::LeftHand,
+    ),
+    (
+        HumanoidBone::LeftIndexProximal,
+        HumanoidBone::LeftIndexIntermediate,
+        HumanoidBone::LeftIndexProximal,
+    ),
+    (
+        HumanoidBone::LeftIndexIntermediate,
+        HumanoidBone::LeftIndexDistal,
+        HumanoidBone::LeftIndexIntermediate,
+    ),
+    (
+        HumanoidBone::LeftHand,
+        HumanoidBone::LeftMiddleProximal,
+        HumanoidBone::LeftHand,
+    ),
+    (
+        HumanoidBone::LeftMiddleProximal,
+        HumanoidBone::LeftMiddleIntermediate,
+        HumanoidBone::LeftMiddleProximal,
+    ),
+    (
+        HumanoidBone::LeftMiddleIntermediate,
+        HumanoidBone::LeftMiddleDistal,
+        HumanoidBone::LeftMiddleIntermediate,
+    ),
+    (
+        HumanoidBone::LeftHand,
+        HumanoidBone::LeftRingProximal,
+        HumanoidBone::LeftHand,
+    ),
+    (
+        HumanoidBone::LeftRingProximal,
+        HumanoidBone::LeftRingIntermediate,
+        HumanoidBone::LeftRingProximal,
+    ),
+    (
+        HumanoidBone::LeftRingIntermediate,
+        HumanoidBone::LeftRingDistal,
+        HumanoidBone::LeftRingIntermediate,
+    ),
+    (
+        HumanoidBone::LeftHand,
+        HumanoidBone::LeftLittleProximal,
+        HumanoidBone::LeftHand,
+    ),
+    (
+        HumanoidBone::LeftLittleProximal,
+        HumanoidBone::LeftLittleIntermediate,
+        HumanoidBone::LeftLittleProximal,
+    ),
+    (
+        HumanoidBone::LeftLittleIntermediate,
+        HumanoidBone::LeftLittleDistal,
+        HumanoidBone::LeftLittleIntermediate,
+    ),
+    // Fingers (right).
+    (
+        HumanoidBone::RightHand,
+        HumanoidBone::RightThumbProximal,
+        HumanoidBone::RightHand,
+    ),
+    (
+        HumanoidBone::RightThumbProximal,
+        HumanoidBone::RightThumbIntermediate,
+        HumanoidBone::RightThumbProximal,
+    ),
+    (
+        HumanoidBone::RightThumbIntermediate,
+        HumanoidBone::RightThumbDistal,
+        HumanoidBone::RightThumbIntermediate,
+    ),
+    (
+        HumanoidBone::RightHand,
+        HumanoidBone::RightIndexProximal,
+        HumanoidBone::RightHand,
+    ),
+    (
+        HumanoidBone::RightIndexProximal,
+        HumanoidBone::RightIndexIntermediate,
+        HumanoidBone::RightIndexProximal,
+    ),
+    (
+        HumanoidBone::RightIndexIntermediate,
+        HumanoidBone::RightIndexDistal,
+        HumanoidBone::RightIndexIntermediate,
+    ),
+    (
+        HumanoidBone::RightHand,
+        HumanoidBone::RightMiddleProximal,
+        HumanoidBone::RightHand,
+    ),
+    (
+        HumanoidBone::RightMiddleProximal,
+        HumanoidBone::RightMiddleIntermediate,
+        HumanoidBone::RightMiddleProximal,
+    ),
+    (
+        HumanoidBone::RightMiddleIntermediate,
+        HumanoidBone::RightMiddleDistal,
+        HumanoidBone::RightMiddleIntermediate,
+    ),
+    (
+        HumanoidBone::RightHand,
+        HumanoidBone::RightRingProximal,
+        HumanoidBone::RightHand,
+    ),
+    (
+        HumanoidBone::RightRingProximal,
+        HumanoidBone::RightRingIntermediate,
+        HumanoidBone::RightRingProximal,
+    ),
+    (
+        HumanoidBone::RightRingIntermediate,
+        HumanoidBone::RightRingDistal,
+        HumanoidBone::RightRingIntermediate,
+    ),
+    (
+        HumanoidBone::RightHand,
+        HumanoidBone::RightLittleProximal,
+        HumanoidBone::RightHand,
+    ),
+    (
+        HumanoidBone::RightLittleProximal,
+        HumanoidBone::RightLittleIntermediate,
+        HumanoidBone::RightLittleProximal,
+    ),
+    (
+        HumanoidBone::RightLittleIntermediate,
+        HumanoidBone::RightLittleDistal,
+        HumanoidBone::RightLittleIntermediate,
+    ),
+];
+
+/// Distal bones whose fingertip / toe tip lives in
+/// `SourceSkeleton::fingertips`. Each one's lifted 3D parent is the
+/// distal bone itself.
+const LIFT_FINGERTIP_PARENTS: &[HumanoidBone] = &[
+    HumanoidBone::LeftThumbDistal,
+    HumanoidBone::LeftIndexDistal,
+    HumanoidBone::LeftMiddleDistal,
+    HumanoidBone::LeftRingDistal,
+    HumanoidBone::LeftLittleDistal,
+    HumanoidBone::RightThumbDistal,
+    HumanoidBone::RightIndexDistal,
+    HumanoidBone::RightMiddleDistal,
+    HumanoidBone::RightRingDistal,
+    HumanoidBone::RightLittleDistal,
+    HumanoidBone::LeftFoot,
+    HumanoidBone::RightFoot,
+];
+
+/// Lift the source skeleton's 2D joints to 3D in tree order.
+///
+/// Each child's depth is anchored to its parent's depth. The 2D length
+/// of each bone is calibrated against a per-bone running max so the
+/// foreshortening Z is `√(L_max² − d_observed²)`, with the sign
+/// (positive = toward camera, negative = away from camera) chosen to
+/// minimise the change from the previous frame's signed offset. The
+/// magnitude alone is fully determined by 2D; only the sign carries
+/// across frames, and its decision is local (per bone) — enough to
+/// stop a small detector wiggle at d≈L from oscillating between ±Z
+/// while still letting a real limb flip cleanly when the wiggle is
+/// large enough to dominate.
+fn lift_2d_to_3d(
+    source: &SourceSkeleton,
+    state: &mut PoseSolverState,
+    threshold: f32,
+) -> LiftedSkeleton {
+    let mut lifted = LiftedSkeleton::default();
+
+    // 1. Hips at z=0 — the lift's anchor. Without Hips we cannot
+    //    propagate any chain.
+    let Some(hips) = source.joints.get(&HumanoidBone::Hips) else {
+        return lifted;
+    };
+    if hips.confidence < threshold {
+        return lifted;
+    }
+    lifted
+        .joints_3d
+        .insert(HumanoidBone::Hips, [hips.position[0], hips.position[1], 0.0]);
+
+    // 2. Spine: shoulder midpoint as the Spine bone's tip. Calibrate
+    //    against the Spine bone's running max. Both shoulders inherit
+    //    the midpoint's Z (we do not separately resolve the inter-
+    //    shoulder Z difference here — body_yaw on Hips already accounts
+    //    for the rotated shoulder line, and the per-arm lift then picks
+    //    up the residual depth).
+    if let (Some(ls), Some(rs)) = (
+        source.joints.get(&HumanoidBone::LeftShoulder),
+        source.joints.get(&HumanoidBone::RightShoulder),
+    ) {
+        if ls.confidence >= threshold && rs.confidence >= threshold {
+            let mid_2d = [
+                (ls.position[0] + rs.position[0]) * 0.5,
+                (ls.position[1] + rs.position[1]) * 0.5,
+            ];
+            let hips_3d = lifted.joints_3d[&HumanoidBone::Hips];
+            let mid_3d = lift_step(state, &hips_3d, mid_2d, HumanoidBone::Spine);
+            lifted.shoulder_mid_3d = Some(mid_3d);
+            // Shoulders and upper arms share Z with the midpoint.
+            for (bone, pos_2d) in [
+                (HumanoidBone::LeftShoulder, ls.position),
+                (HumanoidBone::LeftUpperArm, ls.position),
+                (HumanoidBone::RightShoulder, rs.position),
+                (HumanoidBone::RightUpperArm, rs.position),
+            ] {
+                lifted
+                    .joints_3d
+                    .insert(bone, [pos_2d[0], pos_2d[1], mid_3d[2]]);
+            }
+        }
+    }
+
+    // 3. Walk the rest of the chain in declared order.
+    for &(parent, child, calib_key) in LIFT_CHAINS {
+        let Some(parent_3d) = lifted.joints_3d.get(&parent).copied() else {
+            continue;
+        };
+        let Some(child_joint) = source.joints.get(&child) else {
+            continue;
+        };
+        if child_joint.confidence < threshold {
+            continue;
+        }
+        let child_3d = lift_step(state, &parent_3d, child_joint.position, calib_key);
+        lifted.joints_3d.insert(child, child_3d);
+    }
+
+    // 4. Fingertips / toe tips. Each one's parent is the distal bone
+    //    itself (e.g. LeftThumbDistal → fingertip). The calibration
+    //    key is the parent (matching the existing Tip::Fingertip path
+    //    that uses `state.bone_max_2d.get(&distal_bone)`).
+    for &distal in LIFT_FINGERTIP_PARENTS {
+        let Some(parent_3d) = lifted.joints_3d.get(&distal).copied() else {
+            continue;
+        };
+        let Some(tip_joint) = source.fingertips.get(&distal) else {
+            continue;
+        };
+        if tip_joint.confidence < threshold {
+            continue;
+        }
+        let tip_3d = lift_step_fingertip(state, &parent_3d, tip_joint.position, distal);
+        lifted.fingertips_3d.insert(distal, tip_3d);
+    }
+
+    lifted
+}
+
+/// Lift one body-skeleton step: place `child_2d` in 3D anchored to
+/// `parent_3d`. Updates `state.bone_max_2d[calib_key]` (running max of
+/// observed 2D length) and `state.bone_prev_z_offset[calib_key]`
+/// (signed Z offset, persisted for sign continuity).
+fn lift_step(
+    state: &mut PoseSolverState,
+    parent_3d: &[f32; 3],
+    child_2d: [f32; 2],
+    calib_key: HumanoidBone,
+) -> [f32; 3] {
+    let dx = child_2d[0] - parent_3d[0];
+    let dy = child_2d[1] - parent_3d[1];
+    let observed_sq = dx * dx + dy * dy;
+    let observed = observed_sq.sqrt();
+    let calibration = state
+        .bone_max_2d
+        .get(&calib_key)
+        .copied()
+        .unwrap_or(0.0)
+        .max(observed);
+    state.bone_max_2d.insert(calib_key, calibration);
+    let delta_sq = calibration * calibration - observed_sq;
+    let z_mag = if delta_sq > 1e-8 { delta_sq.sqrt() } else { 0.0 };
+    let prev = state.bone_prev_z_offset.get(&calib_key).copied().unwrap_or(0.0);
+    let z_signed = pick_continuous_z(prev, z_mag);
+    state.bone_prev_z_offset.insert(calib_key, z_signed);
+    [child_2d[0], child_2d[1], parent_3d[2] + z_signed]
+}
+
+/// Same as [`lift_step`] but writes into the fingertip Z map so finger
+/// continuity does not collide with the body-bone keys (a finger
+/// distal bone keys both into `bone_max_2d` for its own length and
+/// `bone_prev_z_offset` — the fingertip extension uses the same
+/// `bone_max_2d` slot but a separate prev-z slot to keep its sign
+/// independent from the bone's own Z motion).
+fn lift_step_fingertip(
+    state: &mut PoseSolverState,
+    parent_3d: &[f32; 3],
+    tip_2d: [f32; 2],
+    calib_key: HumanoidBone,
+) -> [f32; 3] {
+    let dx = tip_2d[0] - parent_3d[0];
+    let dy = tip_2d[1] - parent_3d[1];
+    let observed_sq = dx * dx + dy * dy;
+    let observed = observed_sq.sqrt();
+    let calibration = state
+        .bone_max_2d
+        .get(&calib_key)
+        .copied()
+        .unwrap_or(0.0)
+        .max(observed);
+    state.bone_max_2d.insert(calib_key, calibration);
+    let delta_sq = calibration * calibration - observed_sq;
+    let z_mag = if delta_sq > 1e-8 { delta_sq.sqrt() } else { 0.0 };
+    let prev = state
+        .fingertip_prev_z_offset
+        .get(&calib_key)
+        .copied()
+        .unwrap_or(0.0);
+    let z_signed = pick_continuous_z(prev, z_mag);
+    state.fingertip_prev_z_offset.insert(calib_key, z_signed);
+    [tip_2d[0], tip_2d[1], parent_3d[2] + z_signed]
+}
+
+/// Choose the sign of `z_mag` (≥ 0) that keeps the offset as close as
+/// possible to `prev`. On a fresh state (`prev == 0`) this defaults to
+/// `+z_mag`, matching the original "always toward camera" behaviour.
+#[inline]
+fn pick_continuous_z(prev: f32, z_mag: f32) -> f32 {
+    if z_mag <= 0.0 {
+        return 0.0;
+    }
+    let diff_pos = (z_mag - prev).abs();
+    let diff_neg = (-z_mag - prev).abs();
+    if diff_pos <= diff_neg {
+        z_mag
+    } else {
+        -z_mag
+    }
+}
+
 /// Solve a single frame.
 ///
 /// `local_transforms` is modified in place. Rotations for bones that the
@@ -424,6 +888,13 @@ pub fn solve_avatar_pose(
         }
         state.shoulder_span_max_2d *= factor;
     }
+
+    // 2D → 3D lift (tree walk). Each child's depth is anchored to its
+    // parent's depth, so the source direction we feed into the per-
+    // bone direction match is by construction consistent with the
+    // parent's already-resolved 3D position. The lift updates the
+    // running-max calibration as a side effect.
+    let lifted = lift_2d_to_3d(source, state, params.joint_confidence_threshold);
 
     // Update shoulder-span max so we can later detect side/rear views.
     // Computed every frame (regardless of any per-bone gating) so the
@@ -503,26 +974,32 @@ pub fn solve_avatar_pose(
     }
 
     // --- 1. Body chain: direction-match each driven bone. ---
+    //
+    // Each bone's source direction comes from the lifted 3D positions
+    // (`child_3d − parent_3d`) rather than per-bone reconstruction.
+    // This guarantees chain consistency: if the upper-arm has been
+    // placed at z = +0.15, the lower-arm's source direction starts
+    // from that same z (rather than independently picking up its own
+    // arbitrary z), so kinematic-chain noise — legs zig-zagging in
+    // 3D, finger curling out of a closed fist — is suppressed at the
+    // lift step instead of leaking into per-bone rotation matches.
+    //
+    // The Y-flip baked onto VRM 0.x roots already handles the
+    // "avatar faces camera" orientation, so comparing rest_world
+    // directions with camera-space lifted vectors works uniformly
+    // across VRM 0.x and 1.x.
     for &(bone, tip) in DRIVEN_BONES {
-        let Some(source_base) = get_joint_2d(source, bone) else {
+        let Some(source_base_3d) = source_3d_for_bone(bone, &lifted) else {
             continue;
         };
-        let source_tip_2d = match tip {
-            Tip::Joint(tip_bone) => get_joint_2d(source, tip_bone),
-            Tip::ShoulderMidpoint => shoulder_midpoint(source),
-            Tip::Fingertip => source.fingertips.get(&bone).map(|j| JointRef {
-                position: j.position,
-                confidence: j.confidence,
-            }),
+        let source_tip_3d = match tip {
+            Tip::Joint(tip_bone) => source_3d_for_bone(tip_bone, &lifted),
+            Tip::ShoulderMidpoint => lifted.shoulder_mid_3d,
+            Tip::Fingertip => lifted.fingertips_3d.get(&bone).copied(),
         };
-        let Some(source_tip) = source_tip_2d else {
+        let Some(source_tip_3d) = source_tip_3d else {
             continue;
         };
-        if source_base.confidence < params.joint_confidence_threshold
-            || source_tip.confidence < params.joint_confidence_threshold
-        {
-            continue;
-        }
 
         let Some(node_id) = humanoid.bone_map.get(&bone).copied() else {
             continue;
@@ -594,54 +1071,10 @@ pub fn solve_avatar_pose(
             continue;
         }
 
-        // Recover the source direction with Z (depth toward/away from
-        // camera). The 2D detector only gives dx/dy in the image plane,
-        // but a fully T-posed arm pointing toward the camera projects to
-        // a tiny 2D vector — without the Z component the solver folds
-        // the avatar's arm to lie in the image plane regardless.
-        //
-        // Z is recovered from foreshortening: if the bone's
-        // un-foreshortened 2D length is `L`, and we observe length `d`,
-        // then `|Z| = sqrt(L² − d²)` in source units. `L` comes from
-        // (a) per-frame anthropometric scaling against torso 2D length,
-        // and (b) running max of observed length on this bone in
-        // `state.bone_max_2d` — whichever is larger. The previous
-        // approach used the avatar's rest-pose bone length as `L`, which
-        // breaks for stylised rigs whose proportions differ from the
-        // subject; this one calibrates against the *subject's own*
-        // proportions and so is invariant to avatar choice.
-        //
-        // Sign of Z defaults to +Z (toward camera), matching the typical
-        // VTuber gesture of reaching toward the lens. Arms behind the
-        // body are usually occluded with low confidence and are dropped
-        // earlier by the threshold check.
-        //
-        // The Y-flip baked onto VRM 0.x roots already handles the
-        // "avatar faces camera" orientation, so comparing rest_world
-        // directions with camera-space source vectors works uniformly
-        // across VRM 0.x and 1.x.
-        let dx = source_tip.position[0] - source_base.position[0];
-        let dy = source_tip.position[1] - source_base.position[1];
-        let observed_2d_sq = dx * dx + dy * dy;
-        if observed_2d_sq < 1e-8 {
+        let source_dir = vec3_normalize(&vec3_sub(&source_tip_3d, &source_base_3d));
+        if source_dir == [0.0, 0.0, 0.0] {
             continue;
         }
-        let observed_2d = observed_2d_sq.sqrt();
-
-        let calibration = state
-            .bone_max_2d
-            .get(&bone)
-            .copied()
-            .unwrap_or(0.0)
-            .max(observed_2d);
-        state.bone_max_2d.insert(bone, calibration);
-        let delta_sq = calibration * calibration - observed_2d_sq;
-        let z = if delta_sq > 1e-8 {
-            delta_sq.sqrt()
-        } else {
-            0.0
-        };
-        let source_dir = vec3_normalize(&[dx, dy, z]);
 
         let delta_world = quat_from_vectors(&rest_dir, &source_dir);
         let rest_world_rot = rest_world[node_idx].rotation;
@@ -905,37 +1338,11 @@ fn compute_world_transforms(
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Tiny view struct used internally so every bone endpoint (base or tip) goes
-/// through the same confidence-gating path regardless of whether it comes
-/// from a single joint or a derived midpoint.
-struct JointRef {
-    position: [f32; 2],
-    confidence: f32,
-}
-
-type TipRef = JointRef;
-
-fn get_joint_2d(source: &SourceSkeleton, bone: HumanoidBone) -> Option<JointRef> {
-    source.joints.get(&bone).map(|j| JointRef {
-        position: j.position,
-        confidence: j.confidence,
-    })
-}
-
-fn shoulder_midpoint(source: &SourceSkeleton) -> Option<TipRef> {
-    let (Some(l), Some(r)) = (
-        source.joints.get(&HumanoidBone::LeftShoulder),
-        source.joints.get(&HumanoidBone::RightShoulder),
-    ) else {
-        return None;
-    };
-    Some(JointRef {
-        position: [
-            (l.position[0] + r.position[0]) * 0.5,
-            (l.position[1] + r.position[1]) * 0.5,
-        ],
-        confidence: l.confidence.min(r.confidence),
-    })
+/// Look up a humanoid bone's lifted 3D position. Returns `None` when
+/// the lift skipped the bone (low confidence, missing parent in the
+/// chain, etc.).
+fn source_3d_for_bone(bone: HumanoidBone, lifted: &LiftedSkeleton) -> Option<[f32; 3]> {
+    lifted.joints_3d.get(&bone).copied()
 }
 
 fn midpoint(a: &Vec3, b: &Vec3) -> Vec3 {
