@@ -88,6 +88,8 @@ tracking:
   face_tracking: "フェイストラッキング"
   lower_body: "下半身トラッキング"
   lower_body_tooltip: "オンにすると、モデル選択時に全身CIGPose ONNXが優先され、脚のキーポイントが出力されます。トレードオフ: 全身バリアントは通常解像度が低く、同階層のubodyモデルよりも手の検出精度が低下します。トラッキングの再開で反映されます。"
+  recalibrate: "再キャリブレーション"
+  recalibrate_tooltip: "ボーンごとの短縮較正（observed 2D長の running max）を破棄して、被験者の骨長を学習し直します。クリック後はTポーズ（腕を水平に、手のひらは前向き）を数秒保持してください — その間に running max が再シードされ、次回以降のZ復元（前後方向の動き）に利用されます。"
   confidence: "信頼度"
   confidence_overall: "全体"
   confidence_face: "顔"

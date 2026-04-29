@@ -782,6 +782,16 @@ fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             if lower_body_resp.changed() {
                 state.project_dirty = true;
             }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .button(t!("tracking.recalibrate"))
+                    .on_hover_text(t!("tracking.recalibrate_tooltip"))
+                    .clicked()
+                {
+                    state.app.recalibrate_pose_solver();
+                }
+            });
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.separator();
                 ui.label(t!("tracking.confidence"));
