@@ -624,15 +624,24 @@ pub fn solve_avatar_pose(
 /// At rest the avatar's left shoulder sits at +X (camera-right under
 /// the VRM Y180 flip) and the right shoulder at −X, so the
 /// `Left − Right` shoulder vector projected onto the XZ plane points
-/// along +X. As the subject rotates around their vertical axis the
-/// 3D-native tracker reports this same vector tilted in XZ — the
-/// in-plane angle against +X is exactly the body's facing yaw.
+/// along +X at rest. As the subject rotates around their vertical axis
+/// the 3D-native tracker reports this same vector tilted in XZ.
 ///
-/// `quat_from_euler_ypr(0, +y, 0)` rotates +X → −Z, i.e. positive yaw
-/// rotates the avatar's left side from camera-right toward camera-rear.
-/// We therefore feed `atan2(−bz, bx)` so subject-rotated-to-their-right
-/// (LeftShoulder receding into −Z) yields a positive `body_yaw` and
-/// the avatar follows.
+/// VulVATAR is selfie-style: subject's left/right are swapped against
+/// the avatar's left/right via the mirror mapping in
+/// [`super::tracking::mediapipe::MEDIAPIPE_TO_HUMANOID`], so the body
+/// yaw must be applied in the **opposite** sense. Subject rotating
+/// CCW (their left side coming toward camera) should make the avatar
+/// rotate CW from the user's POV looking at the screen — i.e. the
+/// avatar's apparent rotation in selfie video matches what the user
+/// would see in a mirror.
+///
+/// `atan2(bz, bx)` (note: not `-bz`) gives `+θ_subject` mirrored to
+/// `−θ_subject` for the avatar. Front and back poses are unchanged
+/// (yaw 0 and ±π are sign-invariant); only the intermediate angles
+/// flip, which is exactly where the previous formula was producing
+/// the wrong-direction body rotation (e.g. 315° three-quarter view
+/// rendering the avatar as a 45° puppet instead of a 45° mirror).
 ///
 /// Returns `None` when either shoulder is below the confidence
 /// threshold so the caller can skip the rotation entirely instead of
@@ -652,7 +661,7 @@ fn compute_body_yaw_3d(source: &SourceSkeleton, threshold: f32) -> Option<f32> {
     if (bx * bx + bz * bz).sqrt() < 0.05 {
         return None;
     }
-    Some((-bz).atan2(bx))
+    Some(bz.atan2(bx))
 }
 
 fn apply_face_pose(
