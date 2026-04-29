@@ -555,17 +555,31 @@ pub fn solve_avatar_pose(
             continue;
         }
 
-        let delta_world = quat_from_vectors(&rest_dir, &source_dir);
-        let rest_world_rot = rest_world[node_idx].rotation;
-        let new_world_rot = quat_mul(&delta_world, &rest_world_rot);
-
-        // Convert the world-space new rotation into a parent-local one
-        // using the parent's *current* world rotation (which already
-        // reflects any earlier driven bones in this frame).
+        // The bone's *current* rest direction must include any rotation
+        // the parent has already picked up this frame (notably the Hips
+        // body-yaw applied above). Without this rebase, a +y spine
+        // matching a +y source-dir under a 180°-yawed Hips would still
+        // emit a 180° local twist to "cancel out" the parent yaw —
+        // mirroring the spine's local frame and inverting all the
+        // child bones' geometry, leaving the back-pose avatar with its
+        // arms folded inside the torso.
         let parent_world_rot = skeleton.nodes[node_idx]
             .parent
             .map(|NodeId(p)| current_world[p as usize].rotation)
             .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let parent_rest_world_rot = skeleton.nodes[node_idx]
+            .parent
+            .map(|NodeId(p)| rest_world[p as usize].rotation)
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let parent_yaw_delta =
+            quat_mul(&parent_world_rot, &quat_conjugate(&parent_rest_world_rot));
+        let rest_dir_current = quat_rotate_vec3(&parent_yaw_delta, &rest_dir);
+        let rest_world_rot = rest_world[node_idx].rotation;
+        let current_rest_world_rot = quat_mul(&parent_yaw_delta, &rest_world_rot);
+
+        let delta_world = quat_from_vectors(&rest_dir_current, &source_dir);
+        let new_world_rot = quat_mul(&delta_world, &current_rest_world_rot);
+
         let new_local_rot = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
         let prev_local_rot = local_transforms[node_idx].rotation;
