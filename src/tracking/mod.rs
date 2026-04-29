@@ -12,6 +12,7 @@ mod webcam;
 mod pose_estimation;
 
 pub mod inference;
+pub mod mediapipe;
 pub mod source_skeleton;
 
 mod face_expression;
@@ -652,13 +653,14 @@ impl TrackingWorker {
             }
         };
 
-        // Initialize inference engine. Prefer the highest-quality CIGPose
-        // model available in models/, and use YOLOX person crop if present.
+        // Initialize the MediaPipe Pose Landmarker. The legacy
+        // `prefer_lower_body` flag is no longer meaningful because
+        // BlazePose always tracks the full body — kept in the function
+        // signature for now to avoid touching every caller, but the
+        // value is ignored.
+        let _ = prefer_lower_body;
         #[cfg(feature = "inference")]
-        let mut pose_estimator = match inference::CigPoseInference::from_models_dir_with_pref(
-            "models",
-            prefer_lower_body,
-        ) {
+        let mut pose_estimator = match mediapipe::MediaPipeInference::from_models_dir("models") {
             Ok(mut estimator) => {
                 let warnings = estimator.take_load_warnings();
                 if !warnings.is_empty() {
@@ -674,7 +676,7 @@ impl TrackingWorker {
             }
         };
         #[cfg(not(feature = "inference"))]
-        let mut pose_estimator: Option<inference::CigPoseInference> = None;
+        let mut pose_estimator: Option<mediapipe::MediaPipeInference> = None;
 
         info!("tracking-worker: webcam opened successfully");
         ready.store(true, Ordering::SeqCst);
