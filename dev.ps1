@@ -66,18 +66,14 @@ function Install-Models {
     # bundles which inflate to 100s of MB by including every precision
     # × backend variant.
     #
-    #   * Body  — opencv/pose_estimation_mediapipe       (5.5 MB, 33 3D landmarks)
-    #   * Palm  — opencv/palm_detection_mediapipe        (3.9 MB, hand bbox)
-    #   * Hand  — opencv/handpose_estimation_mediapipe   (3.9 MB, 21 3D landmarks)
+    #   * Body       — opencv/pose_estimation_mediapipe       (5.5 MB, 33 3D landmarks)
+    #   * Palm       — opencv/palm_detection_mediapipe        (3.9 MB, hand bbox)
+    #   * Hand       — opencv/handpose_estimation_mediapipe   (3.9 MB, 21 3D landmarks)
+    #   * Face mesh  — PINTO 410 FaceMeshV2                   (4.8 MB, 478 landmarks)
+    #   * Blendshape — PINTO 390 BlendshapeV2                 (1.8 MB, 52 ARKit weights)
     #
     # Replaces the old CIGPose (~1 GB) + YOLOX (~10 MB) bundle. Total
-    # download is ~13 MB.
-    #
-    # Face landmarker / blendshapes are deferred to P3 — there is no
-    # first-party-quality face-mesh ONNX export on Hugging Face yet, so
-    # we will fetch from PINTO 282 (Wasabi mirror) when that phase
-    # lands. Until then the Head bone runs from face-pose Euler angles
-    # that the body landmarker derives from the head/shoulder joints.
+    # download is ~20 MB.
     Write-Host "Setting up MediaPipe Holistic ONNX models..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
@@ -91,6 +87,25 @@ function Install-Models {
         @{ Url = "https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/main/handpose_estimation_mediapipe_2023feb.onnx";
            OutName = "hand_landmark.onnx" }
     )
+
+    # Face mesh + blendshape from PINTO_model_zoo. PINTO ships the
+    # MediaPipe FaceMeshV2 (478 landmarks) and BlendshapeV2 (52 ARKit
+    # weights) as separate ONNX files inside a single tar.gz each.
+    # The OpenCV HF org does not yet publish these particular models,
+    # so we fall back to PINTO's Wasabi S3 mirror.
+    Install-PintoArchive -Name "MediaPipe FaceMeshV2 (478 landmarks)" `
+        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/410_FaceMeshV2/resources.tar.gz" `
+        -KeepGlobs @("face_landmarks_detector_1x3x256x256.onnx")
+    Install-PintoArchive -Name "MediaPipe BlendshapeV2 (52 ARKit blendshapes)" `
+        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/390_BlendShapeV2/resources.tar.gz" `
+        -KeepGlobs @("face_blendshapes.onnx")
+
+    # Rename to the project-canonical filenames the loader expects.
+    if ((Test-Path "models\face_landmarks_detector_1x3x256x256.onnx") -and
+        (-not (Test-Path "models\face_landmark.onnx"))) {
+        Move-Item "models\face_landmarks_detector_1x3x256x256.onnx" "models\face_landmark.onnx"
+        Write-Host "    renamed to face_landmark.onnx" -ForegroundColor Green
+    }
 
     Write-Host "MediaPipe ONNX models installed successfully." -ForegroundColor Green
 }

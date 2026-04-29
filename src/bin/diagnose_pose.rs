@@ -568,6 +568,17 @@ fn dump_source_skeleton(skeleton: &SourceSkeleton, out_path: &Path) -> Result<()
             face.confidence,
         );
     }
+    if !skeleton.expressions.is_empty() {
+        let _ = writeln!(s, "expressions (52 ARKit blendshapes + VRM presets):");
+        let mut exprs: Vec<_> = skeleton.expressions.iter().collect();
+        exprs.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        for e in exprs.iter().take(20) {
+            let _ = writeln!(s, "  {:>22}  weight={:.3}", e.name, e.weight);
+        }
+        if exprs.len() > 20 {
+            let _ = writeln!(s, "  … ({} more, weights ≤ {:.3})", exprs.len() - 20, exprs[20].weight);
+        }
+    }
     std::fs::write(out_path, s).map_err(|e| format!("write '{}': {e}", out_path.display()))
 }
 

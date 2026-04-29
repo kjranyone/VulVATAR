@@ -26,14 +26,16 @@ graph TD;
 
 ## Models
 
-All three ONNX files live in `models/` and are fetched by `dev.ps1`'s
-`Install-Models` step (curl from Hugging Face, ~13 MB total):
+All five ONNX files live in `models/` and are fetched by `dev.ps1`'s
+`Install-Models` step (~20 MB total):
 
-| File                  | Source                                    | Size  | Role                            |
-|-----------------------|-------------------------------------------|-------|---------------------------------|
-| `pose_landmark.onnx`  | `opencv/pose_estimation_mediapipe`        | 5.5MB | 33 body + 6 aux landmarks (3D)  |
-| `palm_detection.onnx` | `opencv/palm_detection_mediapipe`         | 3.9MB | Hand bbox detector (unused MVP) |
-| `hand_landmark.onnx`  | `opencv/handpose_estimation_mediapipe`    | 3.9MB | 21 hand landmarks per side (3D) |
+| File                    | Source                                  | Size  | Role                                |
+|-------------------------|-----------------------------------------|-------|-------------------------------------|
+| `pose_landmark.onnx`    | `opencv/pose_estimation_mediapipe`      | 5.5MB | 33 body + 6 aux landmarks (3D)      |
+| `palm_detection.onnx`   | `opencv/palm_detection_mediapipe`       | 3.9MB | Hand bbox detector (unused MVP)     |
+| `hand_landmark.onnx`    | `opencv/handpose_estimation_mediapipe`  | 3.9MB | 21 hand landmarks per side (3D)     |
+| `face_landmark.onnx`    | PINTO 410 FaceMeshV2                    | 4.8MB | 478 dense face landmarks (256x256)  |
+| `face_blendshapes.onnx` | PINTO 390 BlendshapeV2                  | 1.8MB | 146 landmarks → 52 ARKit blendshapes|
 
 The palm detector ships with the bundle but is not yet wired in: the
 hand-bbox derivation uses BlazePose's auxiliary hand markers (wrist +
@@ -116,14 +118,40 @@ the frame — the avatar's body still tracks.
 cargo build --features "webcam inference inference-gpu"
 ```
 
+### 4. Face Landmarker + Blendshape
+
+If `face_landmark.onnx` and `face_blendshapes.onnx` are both present,
+the face bbox is derived from BlazePose's 11 face-region landmarks
+(nose, eyes, ears, mouth corners), padded by 1.7×, and cropped &
+resized to 256×256 NCHW. FaceMeshV2 emits:
+
+1. `Identity`   `(1, 1, 1, 1434)` — 478 × (x, y, z) in 256-pixel space
+2. `Identity_1` `(1, 1, 1, 1)`    — face confidence (sigmoid-pre)
+3. `Identity_2` `(1, 1)`          — auxiliary score (unused)
+
+The 478 landmarks are subset to 146 specific indices
+(`kLandmarksSubsetIdxs` from MediaPipe's `face_blendshapes_graph.cc`),
+normalised by 256, and fed to BlendshapeV2 which emits 52 ARKit
+blendshape coefficients. We pass these through verbatim under their
+ARKit names (`mouthSmileLeft`, `eyeBlinkLeft`, `jawOpen`, …) and
+*also* aggregate VRM 1.0 preset names so a stock rig with no custom
+blendshapes still gets `blink` / `aa` / `happy` / `sad` / `surprised`
+motion. Selfie mirror applies: subject's left eye drives `blinkRight`.
+
+Confidence threshold is 0.4 (sigmoid). Head pose (`SourceSkeleton::face`)
+is intentionally left empty in v1 — FaceMeshV2's Z is in arbitrary
+face-relative pixel units, so a usable yaw/pitch/roll requires
+camera-intrinsic unprojection or BlazePose's 3D world face landmarks.
+The avatar's head bone falls back to whatever the spine direction
+implies, which is good enough for most poses.
+
 ## Limitations & Future Work
 
-1. **Face blendshapes.** No ARKit-style 52-blendshape head is wired
-   yet. The Pose Landmarker emits a few face landmarks (nose, eyes,
-   ears, mouth corners) which could feed a basic head pose, but full
-   expression coverage needs the dedicated MediaPipe Face Landmarker
-   ONNX export. Until that lands, head rotation defaults to whatever
-   the spine direction implies and `expressions` is empty.
+1. **Head pose from face landmarks.** Currently `SourceSkeleton::face`
+   stays `None` even when the face inference path runs. Adding
+   yaw/pitch/roll via BlazePose's 3D world face landmarks (indices
+   0..=10) is a small follow-up that would let the head bone respond
+   to head-tilt independently of the spine.
 2. **Single-person only.** BlazePose Heavy does not emit per-person
    bboxes — there is one implicit subject per frame. Multi-person
    support would require wiring in the `palm_detection` model (for

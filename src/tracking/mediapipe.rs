@@ -120,6 +120,86 @@ const HAND_CONFIDENCE_THRESHOLD: f32 = 0.4;
 #[cfg(feature = "inference")]
 const HAND_BBOX_PAD: f32 = 1.6;
 
+/// Input dimensions for the FaceMeshV2 landmarker (PINTO export of
+/// MediaPipe `face_landmarks_detector` — input is `(1, 3, 256, 256)` NCHW).
+#[cfg(feature = "inference")]
+const FACE_INPUT_SIZE: u32 = 256;
+
+/// Number of landmarks emitted by FaceMeshV2 (the dense face mesh).
+#[cfg(feature = "inference")]
+const FACE_LANDMARK_COUNT: usize = 478;
+
+/// Number of landmarks the BlendshapeV2 input expects (a fixed subset
+/// of the 478 mesh landmarks; see [`FACE_BLENDSHAPE_LANDMARK_SUBSET`]).
+#[cfg(feature = "inference")]
+const FACE_BLENDSHAPE_INPUT_COUNT: usize = 146;
+
+/// Number of ARKit-style blendshape coefficients emitted by
+/// BlendshapeV2 (matches Apple's 52-blendshape spec, with index 0 the
+/// `_neutral` baseline that we drop).
+#[cfg(feature = "inference")]
+const FACE_BLENDSHAPE_COUNT: usize = 52;
+
+/// Padding multiplier when deriving the face bbox from BlazePose's
+/// face landmarks (nose / eyes / ears / mouth corners). BlazePose does
+/// not return forehead or chin tips, so we pad generously to ensure
+/// the full head fits in the crop.
+#[cfg(feature = "inference")]
+const FACE_BBOX_PAD: f32 = 1.7;
+
+/// Confidence floor for accepting a face inference result (post sigmoid).
+#[cfg(feature = "inference")]
+const FACE_CONFIDENCE_THRESHOLD: f32 = 0.4;
+
+/// Indices into FaceMeshV2's 478 landmarks that BlendshapeV2 expects
+/// as its 146-point input. Sourced verbatim from MediaPipe's
+/// `face_blendshapes_graph.cc` (`kLandmarksSubsetIdxs`).
+#[cfg(feature = "inference")]
+const FACE_BLENDSHAPE_LANDMARK_SUBSET: [u16; FACE_BLENDSHAPE_INPUT_COUNT] = [
+    0, 1, 4, 5, 6, 7, 8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52, 53, 54, 55, 58,
+    61, 63, 65, 66, 67, 70, 78, 80, 81, 82, 84, 87, 88, 91, 93, 95, 103, 105, 107,
+    109, 127, 132, 133, 136, 144, 145, 146, 148, 149, 150, 152, 153, 154, 155, 157,
+    158, 159, 160, 161, 162, 163, 168, 172, 173, 176, 178, 181, 185, 191, 195, 197,
+    234, 246, 249, 251, 263, 267, 269, 270, 276, 282, 283, 284, 285, 288, 291, 293,
+    295, 296, 297, 300, 308, 310, 311, 312, 314, 317, 318, 321, 323, 324, 332, 334,
+    336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379, 380, 381, 382, 384,
+    385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466, 468,
+    469, 470, 471, 472, 473, 474, 475, 476, 477,
+];
+
+/// ARKit-compatible blendshape names in BlendshapeV2's output order.
+/// Index 0 (`_neutral`) is a baseline scalar the model emits but that
+/// no avatar consumes directly — we keep it in the array so positional
+/// indexing matches the model and the array length is a clean 52.
+#[cfg(feature = "inference")]
+const FACE_BLENDSHAPE_NAMES: [&str; FACE_BLENDSHAPE_COUNT] = [
+    "_neutral",
+    "browDownLeft", "browDownRight", "browInnerUp",
+    "browOuterUpLeft", "browOuterUpRight",
+    "cheekPuff", "cheekSquintLeft", "cheekSquintRight",
+    "eyeBlinkLeft", "eyeBlinkRight",
+    "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft", "eyeLookInRight",
+    "eyeLookOutLeft", "eyeLookOutRight",
+    "eyeLookUpLeft", "eyeLookUpRight",
+    "eyeSquintLeft", "eyeSquintRight",
+    "eyeWideLeft", "eyeWideRight",
+    "jawForward", "jawLeft", "jawOpen", "jawRight",
+    "mouthClose",
+    "mouthDimpleLeft", "mouthDimpleRight",
+    "mouthFrownLeft", "mouthFrownRight",
+    "mouthFunnel", "mouthLeft",
+    "mouthLowerDownLeft", "mouthLowerDownRight",
+    "mouthPressLeft", "mouthPressRight",
+    "mouthPucker", "mouthRight",
+    "mouthRollLower", "mouthRollUpper",
+    "mouthShrugLower", "mouthShrugUpper",
+    "mouthSmileLeft", "mouthSmileRight",
+    "mouthStretchLeft", "mouthStretchRight",
+    "mouthUpperUpLeft", "mouthUpperUpRight",
+    "noseSneerLeft", "noseSneerRight",
+];
+
 pub struct MediaPipeInference {
     #[cfg(feature = "inference")]
     pose_session: Session,
@@ -141,6 +221,24 @@ pub struct MediaPipeInference {
     /// Hand model output order: (landmarks, conf, handedness, landmarks_word).
     #[cfg(feature = "inference")]
     hand_output_names: Vec<String>,
+    /// Optional MediaPipe FaceMeshV2 + BlendshapeV2 sessions. Loaded
+    /// when both `face_landmark.onnx` and `face_blendshapes.onnx` are
+    /// present; if either is missing the avatar's head and expressions
+    /// stay at neutral. Shape: face_landmarks output[0] is
+    /// `(1, 1, 1, 1434)` — 478 × (x, y, z); blendshapes input
+    /// `(1, 146, 2)`, output `(52,)`.
+    #[cfg(feature = "inference")]
+    face_session: Option<Session>,
+    #[cfg(feature = "inference")]
+    face_input_name: Option<String>,
+    #[cfg(feature = "inference")]
+    face_output_names: Vec<String>,
+    #[cfg(feature = "inference")]
+    blendshape_session: Option<Session>,
+    #[cfg(feature = "inference")]
+    blendshape_input_name: Option<String>,
+    #[cfg(feature = "inference")]
+    blendshape_output_names: Vec<String>,
     #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
@@ -237,6 +335,97 @@ impl MediaPipeInference {
             (None, None, Vec::new())
         };
 
+        // Optional FaceMeshV2 + BlendshapeV2. Both must be present for
+        // expression weights to flow; if either is missing the
+        // expression channel stays empty and the head bone falls back
+        // to whatever the spine implies.
+        let face_path = models_dir.join("face_landmark.onnx");
+        let blendshape_path = models_dir.join("face_blendshapes.onnx");
+        let (face_session, face_input_name, face_output_names) = match face_path.is_file() {
+            true => {
+                info!("Loading MediaPipe FaceMeshV2 from {}", face_path.display());
+                match build_session(&face_path.to_string_lossy(), 2, "MediaPipe Face") {
+                    Ok((s, _b)) => {
+                        let f_input = s
+                            .inputs()
+                            .first()
+                            .map(|i| i.name().to_string())
+                            .unwrap_or_else(|| "input".to_string());
+                        let f_outputs: Vec<String> = s
+                            .outputs()
+                            .iter()
+                            .map(|o| o.name().to_string())
+                            .collect();
+                        info!(
+                            "MediaPipe Face I/O: input='{}', outputs={:?}",
+                            f_input, f_outputs
+                        );
+                        (Some(s), Some(f_input), f_outputs)
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "FaceMeshV2 failed to load: {}. Expressions will not animate.",
+                            e
+                        );
+                        warn!("{}", msg);
+                        load_warnings.push(msg);
+                        (None, None, Vec::new())
+                    }
+                }
+            }
+            false => {
+                let msg = format!(
+                    "FaceMeshV2 model not found at {}. Expressions will not animate. Run dev.ps1 setup.",
+                    face_path.display()
+                );
+                warn!("{}", msg);
+                load_warnings.push(msg);
+                (None, None, Vec::new())
+            }
+        };
+        let (blendshape_session, blendshape_input_name, blendshape_output_names) =
+            if face_session.is_some() && blendshape_path.is_file() {
+                info!(
+                    "Loading MediaPipe BlendshapeV2 from {}",
+                    blendshape_path.display()
+                );
+                match build_session(&blendshape_path.to_string_lossy(), 1, "MediaPipe Blendshape") {
+                    Ok((s, _b)) => {
+                        let b_input = s
+                            .inputs()
+                            .first()
+                            .map(|i| i.name().to_string())
+                            .unwrap_or_else(|| "input_points".to_string());
+                        let b_outputs: Vec<String> =
+                            s.outputs().iter().map(|o| o.name().to_string()).collect();
+                        info!(
+                            "MediaPipe Blendshape I/O: input='{}', outputs={:?}",
+                            b_input, b_outputs
+                        );
+                        (Some(s), Some(b_input), b_outputs)
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "BlendshapeV2 failed to load: {}. Expressions will not animate.",
+                            e
+                        );
+                        warn!("{}", msg);
+                        load_warnings.push(msg);
+                        (None, None, Vec::new())
+                    }
+                }
+            } else {
+                if face_session.is_some() {
+                    let msg = format!(
+                        "BlendshapeV2 model not found at {}. Expressions will not animate.",
+                        blendshape_path.display()
+                    );
+                    warn!("{}", msg);
+                    load_warnings.push(msg);
+                }
+                (None, None, Vec::new())
+            };
+
         Ok(Self {
             pose_session: session,
             pose_input_name: input_name,
@@ -244,6 +433,12 @@ impl MediaPipeInference {
             hand_session,
             hand_input_name,
             hand_output_names,
+            face_session,
+            face_input_name,
+            face_output_names,
+            blendshape_session,
+            blendshape_input_name,
+            blendshape_output_names,
             load_warnings,
             backend,
         })
@@ -410,6 +605,14 @@ impl MediaPipeInference {
             }
         }
 
+        // Face inference (FaceMeshV2 → 478 landmarks, then BlendshapeV2
+        // → 52 ARKit blendshape weights). Same graceful-skip semantics
+        // as hand inference: any failure leaves expressions empty for
+        // this frame.
+        if self.face_session.is_some() {
+            self.run_face(rgb_data, width, height, &screen, &letterbox, &mut skeleton);
+        }
+
         // Build an annotation overlay so the GUI's keypoint debug view
         // still works. We emit the 33 body landmarks; auxiliary 33-39
         // are skipped to avoid cluttering the overlay.
@@ -491,6 +694,127 @@ impl MediaPipeInference {
         };
         let hand_world = decode_hand_world(&world_data);
         attach_hand_to_skeleton(sk, &hand_world, body_wrist_pos, side, hand_conf);
+    }
+
+    /// Run FaceMeshV2 → BlendshapeV2, populating `sk.face` and
+    /// `sk.expressions`. Same graceful-skip semantics as the hand
+    /// path: any failure leaves both fields untouched.
+    #[cfg(feature = "inference")]
+    fn run_face(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        screen: &[ScreenLandmark],
+        letterbox: &LetterboxRect,
+        sk: &mut SourceSkeleton,
+    ) {
+        let bbox = match derive_face_bbox(screen, letterbox, width, height) {
+            Some(b) => b,
+            None => return,
+        };
+        let face_tensor = crop_face_to_tensor(rgb_data, width, height, &bbox);
+        let face_input_view = match TensorRef::from_array_view(&face_tensor) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("MediaPipe Face: TensorRef creation failed: {}", e);
+                return;
+            }
+        };
+        let face_input_name = match self.face_input_name.as_deref() {
+            Some(n) => n.to_string(),
+            None => return,
+        };
+        let landmarks_out_name = self.face_output_names.first().cloned();
+        let conf_out_name = self.face_output_names.get(1).cloned();
+
+        let face_session = match self.face_session.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let face_outputs = match face_session.run(
+            ort::inputs![face_input_name.as_str() => face_input_view],
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                error!("MediaPipe Face: ONNX run failed: {}", e);
+                return;
+            }
+        };
+        let conf_value = conf_out_name
+            .as_deref()
+            .and_then(|n| face_outputs.get(n))
+            .and_then(|v| v.try_extract_tensor::<f32>().ok())
+            .and_then(|(_, data)| data.first().copied());
+        let face_conf = conf_value.map(sigmoid).unwrap_or(0.0);
+        if face_conf < FACE_CONFIDENCE_THRESHOLD {
+            return;
+        }
+        let landmarks_data: Option<Vec<f32>> = landmarks_out_name
+            .as_deref()
+            .and_then(|n| face_outputs.get(n))
+            .and_then(|v| v.try_extract_tensor::<f32>().ok())
+            .map(|(_, data)| data.to_vec());
+        // Drop the face outputs (and the session borrow they hold)
+        // before we touch the blendshape session.
+        drop(face_outputs);
+        let landmarks_data = match landmarks_data {
+            Some(d) => d,
+            None => return,
+        };
+        let landmarks = decode_face_landmarks(&landmarks_data);
+        // Suppress unused-warning while head-pose is body-driven.
+        let _ = (&bbox, width, height);
+
+        // Head pose (yaw / pitch / roll) is intentionally **not**
+        // populated here. FaceMeshV2's Z is in arbitrary
+        // face-relative pixel-equivalent units, so deriving an
+        // accurate yaw from it without per-frame camera-intrinsic
+        // unprojection would only fight the body model's own face
+        // landmarks. The avatar's head bone falls back to the spine
+        // direction in the absence of `sk.face`, which is good
+        // enough for v1 — proper head pose is a follow-up using
+        // BlazePose's 3D world face landmarks (indices 0..=10).
+
+        // Blendshapes
+        if self.blendshape_session.is_some() {
+            let bs_input = prepare_blendshape_input(&landmarks);
+            let bs_input_view = match TensorRef::from_array_view(&bs_input) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("MediaPipe Blendshape: TensorRef creation failed: {}", e);
+                    return;
+                }
+            };
+            let bs_input_name = match self.blendshape_input_name.as_deref() {
+                Some(n) => n.to_string(),
+                None => return,
+            };
+            let bs_output_name = self.blendshape_output_names.first().cloned();
+            let bs_session = match self.blendshape_session.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            let bs_outputs = match bs_session.run(
+                ort::inputs![bs_input_name.as_str() => bs_input_view],
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    error!("MediaPipe Blendshape: ONNX run failed: {}", e);
+                    return;
+                }
+            };
+            let bs_data: Option<Vec<f32>> = bs_output_name
+                .as_deref()
+                .and_then(|n| bs_outputs.get(n))
+                .and_then(|v| v.try_extract_tensor::<f32>().ok())
+                .map(|(_, data)| data.to_vec());
+            drop(bs_outputs);
+            if let Some(d) = bs_data {
+                let weights = decode_blendshapes(&d);
+                sk.expressions = map_blendshapes_to_expressions(&weights);
+            }
+        }
     }
 }
 
@@ -1191,6 +1515,278 @@ fn attach_hand_to_skeleton(
             },
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Face inference (Phase 3)
+//
+// FaceMeshV2 (478 landmarks, 256×256 NCHW) + BlendshapeV2 (146 subset
+// → 52 ARKit blendshape coefficients). The face bbox is derived from
+// BlazePose's head landmarks (0=nose, 1..=8 eyes/ears, 9..=10 mouth
+// corners) — generously padded because BlazePose has no forehead /
+// chin point and the bbox would otherwise clip the top of the head.
+//
+// Head pose (yaw / pitch / roll) is computed from BlazePose's *world*
+// face landmarks (3D, hip-relative) — not the FaceMeshV2 output, whose
+// Z is in arbitrary pixel-depth units. Blendshape weights are mapped
+// to VRM 1.0 expression names where there is a clean correspondence
+// (blink, mouth presets) and passed through verbatim otherwise so the
+// avatar's expression set can pick up names like `mouthSmileLeft`
+// directly when the rig defines them.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "inference")]
+#[derive(Clone, Copy, Debug)]
+struct FaceBbox {
+    /// Top-left source pixel.
+    x: f32,
+    y: f32,
+    /// Square side length in source pixels.
+    size: f32,
+}
+
+/// Derive a face bbox from BlazePose's 11 face-region landmarks
+/// (indices 0..=10: nose, eyes, ears, mouth corners). Returns `None`
+/// when fewer than 4 landmarks clear the visibility threshold or when
+/// the bbox would lie wholly outside the source image.
+#[cfg(feature = "inference")]
+fn derive_face_bbox(
+    screen: &[ScreenLandmark],
+    rect: &LetterboxRect,
+    source_w: u32,
+    source_h: u32,
+) -> Option<FaceBbox> {
+    let mut points: Vec<(f32, f32)> = Vec::with_capacity(11);
+    for idx in 0..=10 {
+        let Some(sl) = screen.get(idx) else { continue };
+        let conf = sl.visibility.min(sl.presence);
+        if conf < POSE_VISIBILITY_THRESHOLD {
+            continue;
+        }
+        let Some((sx, sy)) = rect.target_to_source(sl.x, sl.y) else { continue };
+        points.push((sx, sy));
+    }
+    if points.len() < 4 {
+        return None;
+    }
+    let cx = points.iter().map(|p| p.0).sum::<f32>() / points.len() as f32;
+    let cy = points.iter().map(|p| p.1).sum::<f32>() / points.len() as f32;
+    let max_d = points
+        .iter()
+        .map(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+        .fold(0.0_f32, f32::max);
+    let half = (max_d * FACE_BBOX_PAD).max(16.0);
+    let size = half * 2.0;
+    if cx + half < 0.0 || cy + half < 0.0 {
+        return None;
+    }
+    if cx - half > source_w as f32 || cy - half > source_h as f32 {
+        return None;
+    }
+    Some(FaceBbox {
+        x: cx - half,
+        y: cy - half,
+        size,
+    })
+}
+
+/// Crop the source RGB image to the face bbox and produce an NCHW
+/// `[1, 3, 256, 256]` float tensor in `[0, 1]`. Out-of-image samples
+/// are zero-padded.
+///
+/// Note: shape is **NCHW** (channels-first) for FaceMeshV2 — the body
+/// and hand models above use NHWC. The PINTO export of
+/// `face_landmarks_detector` keeps the canonical TensorFlow Lite
+/// channels-last layout repacked, but the OpenCV TensorFlow.js export
+/// flipped it; we match the PINTO copy we ship.
+#[cfg(feature = "inference")]
+fn crop_face_to_tensor(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    bbox: &FaceBbox,
+) -> Array4<f32> {
+    let target = FACE_INPUT_SIZE as usize;
+    let mut tensor = Array4::<f32>::zeros((1, 3, target, target));
+    let stride = (width as usize) * 3;
+    let scale = bbox.size / target as f32;
+    for dy in 0..target {
+        let sy = (bbox.y + (dy as f32 + 0.5) * scale) as i32;
+        if sy < 0 || sy >= height as i32 {
+            continue;
+        }
+        for dx in 0..target {
+            let sx = (bbox.x + (dx as f32 + 0.5) * scale) as i32;
+            if sx < 0 || sx >= width as i32 {
+                continue;
+            }
+            let src_idx = (sy as usize) * stride + (sx as usize) * 3;
+            if src_idx + 2 >= rgb.len() {
+                continue;
+            }
+            tensor[(0, 0, dy, dx)] = rgb[src_idx] as f32 / 255.0;
+            tensor[(0, 1, dy, dx)] = rgb[src_idx + 1] as f32 / 255.0;
+            tensor[(0, 2, dy, dx)] = rgb[src_idx + 2] as f32 / 255.0;
+        }
+    }
+    tensor
+}
+
+/// Decode the FaceMeshV2 landmarks output `(1, 1, 1, 1434)` into 478
+/// × `[x, y, z]`. Coordinates are in 256-pixel space (matching the
+/// model input), with z in pixel-equivalent depth units relative to
+/// the face's geometric centre.
+#[cfg(feature = "inference")]
+fn decode_face_landmarks(data: &[f32]) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(FACE_LANDMARK_COUNT);
+    for i in 0..FACE_LANDMARK_COUNT {
+        let base = i * 3;
+        if base + 2 >= data.len() {
+            break;
+        }
+        out.push([data[base], data[base + 1], data[base + 2]]);
+    }
+    out
+}
+
+/// Build the BlendshapeV2 input tensor `(1, 146, 2)` by selecting the
+/// 146-landmark subset and dividing x/y by the face crop input size
+/// to get normalised `[0, 1]` coordinates.
+#[cfg(feature = "inference")]
+fn prepare_blendshape_input(landmarks: &[[f32; 3]]) -> ndarray::Array3<f32> {
+    let mut tensor = ndarray::Array3::<f32>::zeros((1, FACE_BLENDSHAPE_INPUT_COUNT, 2));
+    let scale = 1.0 / FACE_INPUT_SIZE as f32;
+    for (out_i, &mp_idx) in FACE_BLENDSHAPE_LANDMARK_SUBSET.iter().enumerate() {
+        if let Some(p) = landmarks.get(mp_idx as usize) {
+            tensor[(0, out_i, 0)] = p[0] * scale;
+            tensor[(0, out_i, 1)] = p[1] * scale;
+        }
+    }
+    tensor
+}
+
+/// Decode the BlendshapeV2 output `(52,)` into a fixed array.
+#[cfg(feature = "inference")]
+fn decode_blendshapes(data: &[f32]) -> [f32; FACE_BLENDSHAPE_COUNT] {
+    let mut out = [0.0_f32; FACE_BLENDSHAPE_COUNT];
+    let n = data.len().min(FACE_BLENDSHAPE_COUNT);
+    out[..n].copy_from_slice(&data[..n]);
+    out
+}
+
+/// Map the 52 ARKit-style blendshape weights to a list of
+/// [`SourceExpression`] entries for the avatar to consume. We emit:
+///
+/// * Verbatim ARKit names for the 51 non-`_neutral` channels — VRM 1.0
+///   custom expressions can match these exactly when the rig defines
+///   them.
+/// * VRM 1.0 preset aggregations (`blinkLeft`, `blinkRight`, `aa`,
+///   `happy`, `sad`, `surprised`) so even a stock VRM with no custom
+///   blendshapes shows live facial motion. Mirror convention applies:
+///   the subject's left eye drives `blinkRight`.
+#[cfg(feature = "inference")]
+fn map_blendshapes_to_expressions(
+    weights: &[f32; FACE_BLENDSHAPE_COUNT],
+) -> Vec<super::SourceExpression> {
+    let mut out: Vec<super::SourceExpression> = Vec::with_capacity(FACE_BLENDSHAPE_COUNT + 8);
+    // 1. Pass-through ARKit names (skip index 0 = `_neutral`).
+    for (i, name) in FACE_BLENDSHAPE_NAMES.iter().enumerate().skip(1) {
+        out.push(super::SourceExpression {
+            name: (*name).to_string(),
+            weight: weights[i].clamp(0.0, 1.0),
+        });
+    }
+    // 2. VRM 1.0 preset aggregations. These are *additional* entries
+    //    so a rig that maps the ARKit names directly is unaffected;
+    //    a rig that only knows VRM presets still gets sensible motion.
+    let blink_left_subj = weights[9].clamp(0.0, 1.0);   // eyeBlinkLeft (subject)
+    let blink_right_subj = weights[10].clamp(0.0, 1.0); // eyeBlinkRight
+    // Selfie mirror: subject's left eye → avatar's right eye.
+    out.push(super::SourceExpression { name: "blinkRight".into(), weight: blink_left_subj });
+    out.push(super::SourceExpression { name: "blinkLeft".into(),  weight: blink_right_subj });
+    out.push(super::SourceExpression {
+        name: "blink".into(),
+        weight: ((blink_left_subj + blink_right_subj) * 0.5).clamp(0.0, 1.0),
+    });
+    let jaw_open = weights[25].clamp(0.0, 1.0);
+    out.push(super::SourceExpression { name: "aa".into(), weight: jaw_open });
+    let smile = ((weights[44] + weights[45]) * 0.5).clamp(0.0, 1.0);
+    out.push(super::SourceExpression { name: "happy".into(), weight: smile });
+    let frown = ((weights[30] + weights[31]) * 0.5).clamp(0.0, 1.0);
+    out.push(super::SourceExpression { name: "sad".into(), weight: frown });
+    // Surprise = brow inner up *and* mouth open, AND-gated.
+    let brow_up = weights[3].clamp(0.0, 1.0);
+    let surprise = (brow_up * jaw_open).sqrt();
+    out.push(super::SourceExpression { name: "surprised".into(), weight: surprise });
+    out
+}
+
+/// Derive a [`FacePose`] (yaw / pitch / roll) from BlazePose's *world*
+/// face landmarks. We use the body model's 3D output rather than
+/// FaceMeshV2 because the latter's Z axis is arbitrary face-relative
+/// pixels — not aligned with the source-skeleton frame. BlazePose's
+/// face landmarks are noisy but consistent with the rest of the body
+/// world, which is what the head bone solver needs.
+///
+/// * yaw — angle of the line from `right_ear → left_ear` projected on
+///   the XZ plane.
+/// * roll — tilt of the line `right_eye → left_eye` in the XY plane.
+/// * pitch — vertical position of the nose relative to the mid-eye
+///   point, normalised by ear-to-ear distance.
+///
+/// All angles are returned in radians with the sign convention
+/// expected by `quat_from_euler_ypr`.
+#[cfg(feature = "inference")]
+#[allow(dead_code)]
+fn derive_face_pose_from_body_world(
+    body_world: &[[f32; 3]],
+    overall_conf: f32,
+) -> Option<super::FacePose> {
+    let nose = body_world.get(0)?;
+    let l_eye = body_world.get(2)?;
+    let r_eye = body_world.get(5)?;
+    let l_ear = body_world.get(7)?;
+    let r_ear = body_world.get(8)?;
+    // Apply the same axis flip as build_source_skeleton (negate xyz).
+    let flip = |p: &[f32; 3]| [-p[0], -p[1], -p[2]];
+    let nose = flip(nose);
+    let l_eye = flip(l_eye);
+    let r_eye = flip(r_eye);
+    let l_ear = flip(l_ear);
+    let r_ear = flip(r_ear);
+
+    // Selfie mirror: subject's "left ear" sits on the source +x side
+    // (after flip), which is the *avatar's* left. So the ear vector
+    // points from right_ear (-x side) to left_ear (+x side).
+    let ear_dx = l_ear[0] - r_ear[0];
+    let ear_dz = l_ear[2] - r_ear[2];
+    let ear_dist = (ear_dx * ear_dx + ear_dz * ear_dz).sqrt();
+    if ear_dist < 0.02 {
+        return None;
+    }
+    // yaw: positive = head turning around +Y so the subject looks
+    // toward camera-right (the avatar's left). atan2(-dz, dx) gives
+    // exactly that sign.
+    let yaw = (-ear_dz).atan2(ear_dx);
+    // roll: angle of the eye line in the XY plane. Positive roll =
+    // head tilts toward the avatar's left ear (toward +x).
+    let eye_dx = l_eye[0] - r_eye[0];
+    let eye_dy = l_eye[1] - r_eye[1];
+    let roll = eye_dy.atan2(eye_dx);
+    // pitch: signed offset of the nose below the mid-eye line,
+    // normalised by face width. Negative offset (nose above eyes) →
+    // head tilted back; positive offset → chin down.
+    let mid_eye_y = (l_eye[1] + r_eye[1]) * 0.5;
+    let face_width = (eye_dx * eye_dx + eye_dy * eye_dy).sqrt().max(0.01);
+    let pitch_signal = (mid_eye_y - nose[1]) / face_width;
+    let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
+
+    Some(super::FacePose {
+        yaw,
+        pitch,
+        roll,
+        confidence: overall_conf.clamp(0.0, 1.0),
+    })
 }
 
 /// Edge list for the BlazePose 33-point skeleton, suitable for the
