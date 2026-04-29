@@ -994,6 +994,12 @@ mod coco {
     pub const RIGHT_KNEE: usize = 14;
     pub const LEFT_ANKLE: usize = 15;
     pub const RIGHT_ANKLE: usize = 16;
+    pub const LEFT_BIG_TOE: usize = 17;
+    pub const LEFT_SMALL_TOE: usize = 18;
+    pub const LEFT_HEEL: usize = 19;
+    pub const RIGHT_BIG_TOE: usize = 20;
+    pub const RIGHT_SMALL_TOE: usize = 21;
+    pub const RIGHT_HEEL: usize = 22;
 
     /// Start index of the dense iBUG 68-point face block.
     pub const FACE_BLOCK_START: usize = 23;
@@ -1113,6 +1119,22 @@ fn map_to_source_skeleton(
     sk.put_joint(HumanoidBone::LeftLowerLeg, to_joint(knee_r), min_body_conf);
     sk.put_joint(HumanoidBone::RightFoot, to_joint(ankle_l), min_body_conf);
     sk.put_joint(HumanoidBone::LeftFoot, to_joint(ankle_r), min_body_conf);
+
+    // Foot tip targets (big toe). The solver looks at
+    // `fingertips[Foot]` for the foot bone's tip direction; with this
+    // populated the foot can rotate to point where the subject's toes
+    // point instead of being stuck in T-pose orientation.
+    let big_toe_l = kpt(coco::LEFT_BIG_TOE);
+    let big_toe_r = kpt(coco::RIGHT_BIG_TOE);
+    if big_toe_l.2 > 0.0 {
+        // Mirror: subject-LEFT toe drives avatar-Right foot.
+        sk.fingertips
+            .insert(HumanoidBone::RightFoot, to_joint(big_toe_l));
+    }
+    if big_toe_r.2 > 0.0 {
+        sk.fingertips
+            .insert(HumanoidBone::LeftFoot, to_joint(big_toe_r));
+    }
 
     // Hips: midpoint of the two hip keypoints. Spine's base.
     if hip_l.2 > 0.0 && hip_r.2 > 0.0 {

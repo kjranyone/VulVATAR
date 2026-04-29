@@ -273,6 +273,13 @@ const DRIVEN_BONES: &[(HumanoidBone, Tip)] = &[
         HumanoidBone::RightLowerLeg,
         Tip::Joint(HumanoidBone::RightFoot),
     ),
+    // Feet — driven from COCO big-toe keypoints stashed in
+    // `SourceSkeleton::fingertips` (same auxiliary slot the finger
+    // distal bones use). Without this the foot bone is stuck in
+    // rest orientation and toes point straight forward regardless
+    // of how the lower leg has rotated.
+    (HumanoidBone::LeftFoot, Tip::Fingertip),
+    (HumanoidBone::RightFoot, Tip::Fingertip),
     // Left fingers — each finger is a 3-bone chain whose tip comes from
     // the next joint down the finger (the Distal bone uses the fingertip
     // auxiliary position).
