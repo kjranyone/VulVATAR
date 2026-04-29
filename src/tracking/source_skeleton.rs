@@ -15,10 +15,10 @@
 //!   camera*. The body's hip midpoint is the depth origin (`z = 0`); a
 //!   joint reaching toward the lens has `z > 0`.
 //!
-//! With a 3D-native backend (MediaPipe Pose / Hand / Face Landmarker) the
-//! solver consumes the depth directly — no foreshortening reconstruction
-//! needed. Backends that only output 2D must populate `z = 0` and accept
-//! that the solver cannot disambiguate forward / backward limbs.
+//! With a 3D-native backend (RTMW3D whole-body) the solver consumes
+//! the depth directly — no foreshortening reconstruction needed.
+//! Backends that only output 2D must populate `z = 0` and accept that
+//! the solver cannot disambiguate forward / backward limbs.
 
 use std::collections::HashMap;
 
@@ -30,9 +30,9 @@ use crate::asset::HumanoidBone;
 ///   docs for axis conventions). For backends that only produce 2D
 ///   keypoints, set `z = 0`.
 /// * `confidence` — detector-reported confidence in `[0, 1]`. For
-///   MediaPipe-style outputs this is conventionally `visibility *
-///   presence` so a single threshold compares "joint actually in frame
-///   and not occluded".
+///   SimCC-style outputs (RTMW3D) this is the sigmoid of the heatmap
+///   peak, so a single threshold gates "joint actually in frame and
+///   well-localised".
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SourceJoint {
     pub position: [f32; 3],
@@ -50,9 +50,10 @@ pub struct SourceJoint {
 ///   head moves toward +Z (i.e. the chin drops — "looking down").
 /// * **`roll`** — positive rolls around +Z so the head leans toward +X.
 ///
-/// Will be superseded by the facial transformation matrix from
-/// MediaPipe Face Landmarker once Phase 3 lands; kept as a transitional
-/// representation while the solver continues to consume Euler angles.
+/// The face track is currently empty — RTMW3D emits 68 face landmarks
+/// (indices 23-90) but they are not yet decoded into yaw/pitch/roll;
+/// the head bone falls back to spine direction. Phase C (SMIRK) will
+/// drive this field along with ARKit blendshape weights.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FacePose {
     pub yaw: f32,

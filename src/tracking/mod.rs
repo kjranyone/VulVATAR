@@ -11,7 +11,6 @@ mod webcam;
 
 mod pose_estimation;
 
-pub mod mediapipe;
 pub mod rtmw3d;
 pub mod source_skeleton;
 
@@ -223,7 +222,7 @@ impl TrackingMailbox {
     }
 
     /// Set the inference-backend label. Called once by the worker after
-    /// `MediaPipeInference` finishes loading its model. `None` resets it
+    /// `Rtmw3dInference` finishes loading its model. `None` resets it
     /// (e.g. when tracking stops or the engine is destroyed).
     pub fn set_inference_backend_label(&self, label: Option<String>) {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -651,11 +650,10 @@ impl TrackingWorker {
             }
         };
 
-        // Initialize the MediaPipe Pose Landmarker. The legacy
-        // `prefer_lower_body` flag is no longer meaningful because
-        // BlazePose always tracks the full body — kept in the function
-        // signature for now to avoid touching every caller, but the
-        // value is ignored.
+        // Initialize the RTMW3D inference engine. The legacy
+        // `prefer_lower_body` flag has been a no-op since the move
+        // to whole-body 3D models — kept in the function signature
+        // to avoid touching every caller, but the value is ignored.
         let _ = prefer_lower_body;
         #[cfg(feature = "inference")]
         let mut pose_estimator = match rtmw3d::Rtmw3dInference::from_models_dir("models") {

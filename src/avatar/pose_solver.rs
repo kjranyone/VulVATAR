@@ -2,8 +2,8 @@
 //!
 //! The solver consumes 3D joint positions directly (the upstream tracker
 //! is responsible for producing depth — see
-//! [`crate::tracking::mediapipe::MediaPipeInference`], which drives the
-//! MediaPipe Holistic pipeline). Three ideas:
+//! [`crate::tracking::rtmw3d::Rtmw3dInference`], which drives the
+//! RTMW3D whole-body 3D pipeline). Three ideas:
 //!
 //! 1. **Rest-relative.** Every output rotation is expressed as a delta
 //!    from the avatar's rest pose, so models whose bones have non-identity
@@ -595,10 +595,10 @@ pub fn solve_avatar_pose(
         current_world[node_idx].rotation = updated_world;
     }
 
-    // Face pose: drive the Head bone independently. The MediaPipe Face
-    // Landmarker tracks head orientation reliably even at oblique views,
-    // so the old "gate by shoulder ratio" sentinel is no longer needed —
-    // we trust whatever the tracker emits if its confidence clears the
+    // Face pose: drive the Head bone independently. The face track
+    // emits head orientation reliably even at oblique views, so the
+    // old "gate by shoulder ratio" sentinel is no longer needed — we
+    // trust whatever the tracker emits if its confidence clears the
     // threshold.
     if let Some(face) = source.face {
         if face.confidence >= params.face_confidence_threshold {
@@ -629,8 +629,8 @@ pub fn solve_avatar_pose(
 ///
 /// VulVATAR is selfie-style: subject's left/right are swapped against
 /// the avatar's left/right via the mirror mapping in
-/// [`super::tracking::mediapipe::MEDIAPIPE_TO_HUMANOID`], so the body
-/// yaw must be applied in the **opposite** sense. Subject rotating
+/// `tracking::rtmw3d::COCO_BODY`, so the body yaw must be applied in
+/// the **opposite** sense. Subject rotating
 /// CCW (their left side coming toward camera) should make the avatar
 /// rotate CW from the user's POV looking at the screen — i.e. the
 /// avatar's apparent rotation in selfie video matches what the user

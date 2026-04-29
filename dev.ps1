@@ -59,127 +59,29 @@ function Install-Font {
 }
 
 function Install-Models {
-    # Pulls the MediaPipe Holistic ONNX bundle. Sourced from the OpenCV
-    # Hugging Face org because they publish small (~5 MB each), single-
-    # file ONNX exports of MediaPipe's pose / palm / hand-landmark
-    # models — far leaner than PINTO_model_zoo's `resources*.tar.gz`
-    # bundles which inflate to 100s of MB by including every precision
-    # × backend variant.
+    # Pulls the RTMW3D-x ONNX (Apache-2). One model emits 133
+    # COCO-Wholebody keypoints in 3D — body 17 + foot 6 + face 68 +
+    # 21+21 hands — which removes the need for a separate hand or
+    # palm detector. We feed the camera frame directly to the model
+    # without a person bbox detector (Kinemotion-style); VulVATAR is
+    # single-subject VTubing so the implicit "centre subject"
+    # assumption holds.
     #
-    #   * Body       — unity/inference-engine-blaze-pose (heavy)  (53 MB, 33 3D landmarks)
-    #   * Palm       — opencv/palm_detection_mediapipe            (3.9 MB, hand bbox)
-    #   * Hand       — opencv/handpose_estimation_mediapipe       (3.9 MB, 21 3D landmarks)
-    #   * Face mesh  — PINTO 410 FaceMeshV2                       (4.8 MB, 478 landmarks)
-    #   * Blendshape — PINTO 390 BlendshapeV2                     (1.8 MB, 52 ARKit weights)
+    #   * RTMW3D-x — Soykaf/RTMW3D-x (370 MB, 133 3D landmarks)
     #
-    # The Unity heavy-tier BlazePose (55 MB) markedly outperforms
-    # OpenCV's lite export (5.5 MB) on three-quarter / side / back
-    # views — the lite model loses limb localization at >45° body
-    # rotation, which propagated to garbage avatar poses on common
-    # VTubing angles. The I/O signature is identical so it's a drop-in
-    # swap for `pose_landmark.onnx`. Total download is ~67 MB.
-    Write-Host "Setting up MediaPipe Holistic ONNX models..." -ForegroundColor Cyan
+    # Soykaf's HuggingFace mirror hosts the official mmpose export
+    # (`rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx`).
+    Write-Host "Setting up RTMW3D ONNX model..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
     }
 
-    Install-DirectFiles -Name "MediaPipe pose+hand bundle" -Files @(
-        @{ Url = "https://huggingface.co/unity/inference-engine-blaze-pose/resolve/main/models/pose_landmarks_detector_heavy.onnx";
-           OutName = "pose_landmark.onnx" }
-        @{ Url = "https://huggingface.co/opencv/palm_detection_mediapipe/resolve/main/palm_detection_mediapipe_2023feb.onnx";
-           OutName = "palm_detection.onnx" }
-        @{ Url = "https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/main/handpose_estimation_mediapipe_2023feb.onnx";
-           OutName = "hand_landmark.onnx" }
+    Install-DirectFiles -Name "RTMW3D-x whole-body 3D pose" -Files @(
+        @{ Url = "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx";
+           OutName = "rtmw3d.onnx" }
     )
 
-    # Face mesh + blendshape from PINTO_model_zoo. PINTO ships the
-    # MediaPipe FaceMeshV2 (478 landmarks) and BlendshapeV2 (52 ARKit
-    # weights) as separate ONNX files inside a single tar.gz each.
-    # The OpenCV HF org does not yet publish these particular models,
-    # so we fall back to PINTO's Wasabi S3 mirror.
-    Install-PintoArchive -Name "MediaPipe FaceMeshV2 (478 landmarks)" `
-        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/410_FaceMeshV2/resources.tar.gz" `
-        -KeepGlobs @("face_landmarks_detector_1x3x256x256.onnx")
-    Install-PintoArchive -Name "MediaPipe BlendshapeV2 (52 ARKit blendshapes)" `
-        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/390_BlendShapeV2/resources.tar.gz" `
-        -KeepGlobs @("face_blendshapes.onnx")
-
-    # Rename to the project-canonical filenames the loader expects.
-    if ((Test-Path "models\face_landmarks_detector_1x3x256x256.onnx") -and
-        (-not (Test-Path "models\face_landmark.onnx"))) {
-        Move-Item "models\face_landmarks_detector_1x3x256x256.onnx" "models\face_landmark.onnx"
-        Write-Host "    renamed to face_landmark.onnx" -ForegroundColor Green
-    }
-
-    Write-Host "MediaPipe ONNX models installed successfully." -ForegroundColor Green
-}
-
-# Download a PINTO_model_zoo `resources*.tar.gz` archive, extract to a
-# temp dir, copy ONNX files matching `KeepGlobs` into `models\`, and
-# remove the temp dir. PINTO archives often bundle 10+ variants per
-# model; keeping only the ones we need keeps `models\` lean.
-function Install-PintoArchive {
-    param(
-        [Parameter(Mandatory)] [string]$Name,
-        [Parameter(Mandatory)] [string]$ArchiveUrl,
-        [Parameter(Mandatory)] [string[]]$KeepGlobs
-    )
-
-    # If every kept glob already resolves to at least one file in
-    # models/, the bundle is already installed — skip the redownload.
-    $allPresent = $true
-    foreach ($glob in $KeepGlobs) {
-        $matched = Get-ChildItem -Path "models\$glob" -ErrorAction SilentlyContinue
-        if (-not $matched) {
-            $allPresent = $false
-            break
-        }
-    }
-    if ($allPresent) {
-        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
-        return
-    }
-
-    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-    try {
-        $archivePath = Join-Path $tempDir "resources.tar.gz"
-        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
-        # curl.exe is more reliable than Invoke-WebRequest for archives
-        # in the 100MB+ range — IWR's progress UI slows the transfer to a
-        # crawl and (on flaky links) can return without writing the full
-        # body, leaving tar to error out with "Truncated tar archive".
-        # `--fail` exits non-zero on HTTP errors; `-L` follows redirects.
-        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
-        }
-
-        Write-Host "    extracting..." -ForegroundColor DarkGray
-        # tar.exe has shipped with Windows 10 1803+ and Windows 11.
-        # PowerShell's Expand-Archive does not handle .tar.gz natively.
-        $tarOutput = & tar.exe -xzf $archivePath -C $tempDir 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "tar -xzf failed for $Name (exit $LASTEXITCODE): $tarOutput"
-        }
-
-        $copied = 0
-        foreach ($glob in $KeepGlobs) {
-            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
-            foreach ($file in $matched) {
-                $dest = Join-Path "models" $file.Name
-                Copy-Item -Path $file.FullName -Destination $dest -Force
-                Write-Host "    kept $($file.Name)" -ForegroundColor Green
-                $copied++
-            }
-        }
-        if ($copied -eq 0) {
-            throw "$Name archive contained no files matching: $($KeepGlobs -join ', ')"
-        }
-    } finally {
-        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    Write-Host "RTMW3D ONNX model installed successfully." -ForegroundColor Green
 }
 
 # Download individual .onnx files directly. Used for sources that

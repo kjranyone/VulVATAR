@@ -1,117 +1,121 @@
-# ONNX Full-Body Tracking Pipeline
+# ONNX Whole-Body Tracking Pipeline
 
 This document describes the design and implementation of the ONNX
-Runtime-based full-body tracking pipeline used in VulVATAR.
+Runtime-based whole-body tracking pipeline used in VulVATAR.
 
 ## Architecture Overview
 
-The tracking system uses **MediaPipe Holistic** ONNX exports — a
-3D-native cascaded pipeline (Pose → Hand) running on a background
-`TrackingWorker` thread so it never blocks the main rendering loop.
+The tracking system uses **RTMW3D** (mmpose / OpenMMLab) — a
+3D-native single-model whole-body pose estimator running on a
+background `TrackingWorker` thread so it never blocks the main
+rendering loop.
 
 ```mermaid
 graph TD;
-    Camera[Webcam / Video Source] --> |RGB Frame| Letterbox[Letterbox to 256×256]
-    Letterbox --> |NHWC [1,256,256,3]| Pose[Pose Landmarker ONNX]
-    Pose --> |39 × screen + 39 × world| Skeleton[Source Skeleton]
-    Pose --> |Body bbox: 15/17/19/21| BodyL[Hand bbox - subject left]
-    Pose --> |Body bbox: 16/18/20/22| BodyR[Hand bbox - subject right]
-    BodyL --> |224×224 crop| HandL[Hand Landmarker ONNX]
-    BodyR --> |224×224 crop| HandR[Hand Landmarker ONNX]
-    HandL --> |21 × world| Skeleton
-    HandR --> |21 × world| Skeleton
-    Skeleton --> |3D joints| Solver[pose_solver]
+    Camera[Webcam / Video Source] --> |RGB Frame| Resize[Resize to 288×384]
+    Resize --> |NCHW [1,3,384,288]| RTMW3D[RTMW3D ONNX]
+    RTMW3D --> |SimCC X/Y/Z heatmaps| Decode[argmax decode]
+    Decode --> |133 × (nx, ny, nz)| Skeleton[Source Skeleton]
+    Skeleton --> |body 17 + foot 6 + hand 21+21| Solver[pose_solver]
     Solver --> Mailbox[Tracking Mailbox]
 ```
 
-## Models
+## Model
 
-All five ONNX files live in `models/` and are fetched by `dev.ps1`'s
-`Install-Models` step (~67 MB total):
+A single ONNX file under `models/` (~370 MB), fetched by `dev.ps1`'s
+`Install-Models` step:
 
-| File                    | Source                                  | Size  | Role                                |
-|-------------------------|-----------------------------------------|-------|-------------------------------------|
-| `pose_landmark.onnx`    | `unity/inference-engine-blaze-pose` (heavy) | 53 MB | 33 body + 6 aux landmarks (3D)  |
-| `palm_detection.onnx`   | `opencv/palm_detection_mediapipe`       | 3.9MB | Hand bbox detector (unused MVP)     |
-| `hand_landmark.onnx`    | `opencv/handpose_estimation_mediapipe`  | 3.9MB | 21 hand landmarks per side (3D)     |
-| `face_landmark.onnx`    | PINTO 410 FaceMeshV2                    | 4.8MB | 478 dense face landmarks (256x256)  |
-| `face_blendshapes.onnx` | PINTO 390 BlendshapeV2                  | 1.8MB | 146 landmarks → 52 ARKit blendshapes|
+| File          | Source                | Size    | Role                                |
+|---------------|-----------------------|---------|-------------------------------------|
+| `rtmw3d.onnx` | `Soykaf/RTMW3D-x` HF  | 370 MB  | 133 COCO-Wholebody keypoints (3D)   |
 
-The pose model is BlazePose **heavy**, not lite — the lite export
-(5.5 MB on `opencv/pose_estimation_mediapipe`) loses limb localization
-quality at >45° body rotation, which dragged avatar quality on common
-VTubing angles (3/4 view, side profile, back) significantly. The
-heavy variant has the same I/O signature so swapping is transparent
-to the loader.
+Soykaf's HuggingFace mirror hosts the official mmpose export
+(`rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx`,
+Apache-2). The model is the heavy "x" tier — the lighter "l" tier
+exists but RTMW3D-x's higher MPJPE on COCO-Wholebody is what gets us
+the front-facing yaw stability we need.
 
-The palm detector ships with the bundle but is not yet wired in: the
-hand-bbox derivation uses BlazePose's auxiliary hand markers (wrist +
-pinky/index/thumb knuckles, indices 15/17/19/21 for subject's left and
-16/18/20/22 for right) padded by 1.6×. This is enough for non-overlap
-hand poses; the palm detector is held in reserve for occluded hands.
+VulVATAR does **not** ship a person-bbox detector. RTMW3D is a
+top-down model and ordinarily expects a tightly cropped person, but
+for single-subject VTubing the camera is already framed on the user
+— Kinemotion (UE5.5) demonstrated that direct frame input gives
+adequate quality, and that's what this implementation does. If
+multi-person or extreme-distance support becomes a requirement, a
+detector (YOLOX-m or RTMDet) can be wired in front of RTMW3D without
+schema changes.
 
 ## Pipeline
 
-### 1. Pose Landmarker
+### 1. Preprocessing
 
-`tracking::mediapipe::MediaPipeInference::estimate_pose` letterboxes
-the source frame to 256×256 (preserve aspect, zero-pad shorter side)
-and runs the BlazePose Heavy export. Five outputs (positional, set by
-the OpenCV ONNX export):
+`tracking::rtmw3d::preprocess` resizes the source frame to 288×384
+(W×H) NCHW with ImageNet mean/std normalization. The aspect is
+squashed (no letterbox); the model is robust to it for centred-subject
+input. We use nearest-neighbour resampling on the critical frame path
+to avoid pulling in a heavyweight imaging crate; it can be upgraded
+to bilinear later for a small accuracy bump on tiny subjects.
 
-1. `landmarks`      `(1, 195)`    — 39 × (x, y, z, vis, pres) screen coords
-2. `conf`           `(1, 1)`      — overall pose confidence (sigmoid-pre)
-3. `mask`           `(1, 256, 256, 1)` — body segmentation (unused)
-4. `heatmap`        `(1, 256, 256, 39)` — per-joint heatmaps (unused)
-5. `landmarks_word` `(1, 117)`    — 39 × (x, y, z) metric, hip-relative
+### 2. SimCC decode
 
-Visibility/presence are sigmoid-pre on disk; the loader applies σ
-before thresholding. Joint confidence = `min(visibility, presence)`.
+RTMW3D emits three SimCC (Simulated Coordinate Classification)
+heatmaps in positional order:
 
-### 2. Mirror & Retarget
+1. `simcc_x` `(1, 133, 576)`  — argmax bin → x ∈ [0, 1]
+2. `simcc_y` `(1, 133, 768)`  — argmax bin → y ∈ [0, 1]
+3. `simcc_z` `(1, 133, 576)`  — argmax bin → z ∈ [0, 1]
 
-MediaPipe labels are subject-POV (their `LEFT_SHOULDER` is on the
-subject's left). VulVATAR uses the selfie-style mirror — the avatar's
-RIGHT side is on the subject's LEFT side — so MediaPipe's index 11
-(LEFT_SHOULDER) maps to `HumanoidBone::RightShoulder`. See
-`MEDIAPIPE_TO_HUMANOID` in `tracking::mediapipe`.
+We argmax each axis per joint and take the smaller of the X / Y peak
+values (post sigmoid) as the per-joint confidence. The Z peak is
+ignored for confidence — its position localises depth, not the
+detection itself.
 
-The world output is in metric metres with the hip midpoint as origin,
-X=subject-right, Y=down, Z=away-from-camera. We axis-flip all three
-components to land in the source-skeleton convention
-(x ∈ [-aspect, +aspect] camera-space-right, y ∈ [-1, +1] Y-up,
-+z toward camera). The Hips bone takes the midpoint of the two upper-leg
-landmarks; toe tips (indices 31, 32) feed the `fingertips` map keyed
-by `HumanoidBone::*Foot` so the foot heel-to-toe direction is solvable.
+Note: the rtmlib reference implementation converts `nz` to metric
+metres via `(z_index / 144 - 1) * 2.1745`. We deliberately skip this
+step. The pose solver consumes bone *directions*, not absolute
+positions, so the metric scale is never load-bearing — keeping z in
+normalised `[0, 1]` units sidesteps having to characterise the
+model's true z-range and matches the Kinemotion (UE5.5) reference
+implementation's approach.
 
-### 3. Hand Landmarker
+### 3. SourceSkeleton mapping
 
-For each side that has a tracked body wrist (`RightHand` for subject
-left, `LeftHand` for subject right), the bbox is built from the four
-auxiliary body landmarks for that hand (centroid + max distance × 1.6
-padding), then cropped & resized to 224×224 NHWC.
+The 133 keypoints map to humanoid bones with COCO-Wholebody indices:
 
-Hand model outputs four tensors:
+| Index range | Group        | Used                                     |
+|-------------|--------------|------------------------------------------|
+| 0–16        | Body 17      | Shoulders / arms / hips / legs           |
+| 17–22       | Foot 6       | Big-toe tips → `fingertips[*Foot]`       |
+| 23–90       | Face 68      | **Currently unused** (Phase C: SMIRK)    |
+| 91–111      | Left hand    | 15 phalanges + 5 tip slots (avatar Right)|
+| 112–132     | Right hand   | 15 phalanges + 5 tip slots (avatar Left) |
 
-1. `landmarks`      `(1, 63)` — 21 × (x, y, z) screen
-2. `conf`           `(1, 1)`  — hand confidence (sigmoid-pre)
-3. `handedness`     `(1, 1)`  — left/right (ignored: bbox tells us)
-4. `landmarks_word` `(1, 63)` — 21 × (x, y, z) metric, hand-center origin
+Selfie mirror is applied at mapping: subject's anatomical-left limbs
+(COCO indices 5, 7, 9, 11, 13, 15 and the 91-111 hand) drive the
+avatar's `Right*` bones, so the on-screen avatar mirrors the user.
+See `COCO_BODY` and `attach_hand` in `tracking::rtmw3d`.
 
-We use the world output for finger geometry. Same axis flip as the
-body, then we translate so landmark 0 (wrist) coincides with the body
-wrist position. Indices 1..=20 fan out to the 15 finger phalanges
-(`{Thumb,Index,Middle,Ring,Little} × {Proximal,Intermediate,Distal}`)
-plus 5 distal-tip entries that go into `SourceSkeleton::fingertips`
-keyed by the distal bone.
+The hip mid-point (average of indices 11 and 12) is the depth origin.
+All emitted positions are hip-relative, in source-space `[-aspect,
++aspect] × [-1, 1] × z` coords with `+z` toward the camera.
 
-Hand confidence threshold is 0.4 (sigmoid). On low confidence, missing
-bbox, or any ORT error, that side's fingers stay at rest pose for
-the frame — the avatar's body still tracks.
+### 4. Coordinate-system conversion
+
+Image-space → source-space:
+
+| Source axis | Formula                                 |
+|-------------|-----------------------------------------|
+| `src.x`     | `-(nx - hip_nx) * 2 * aspect`           |
+| `src.y`     | `-(ny - hip_ny) * 2`  (Y-down → Y-up)   |
+| `src.z`     | `-(nz - hip_nz) * 2`                    |
+
+The x-axis is *negated* on top of the aspect scaling so that COCO's
+anatomical-left keypoints (which appear at high image-x because the
+subject faces the camera) end up at source `-x` — that's where the
+avatar's `Right*` bones rest after the VRM 0.x Y180 root flip.
 
 ## Feature Flags
 
-- `inference` — enables ONNX Runtime + the `MediaPipeInference` path.
+- `inference` — enables ONNX Runtime + the `Rtmw3dInference` path.
   Without it, the worker falls back to a simple skin-colour HSV
   centroid in `tracking::pose_estimation` (no body joints, just a
   rough face pose) so the GUI still has a heartbeat.
@@ -125,45 +129,28 @@ the frame — the avatar's body still tracks.
 cargo build --features "webcam inference inference-gpu"
 ```
 
-### 4. Face Landmarker + Blendshape
-
-If `face_landmark.onnx` and `face_blendshapes.onnx` are both present,
-the face bbox is derived from BlazePose's 11 face-region landmarks
-(nose, eyes, ears, mouth corners), padded by 1.7×, and cropped &
-resized to 256×256 NCHW. FaceMeshV2 emits:
-
-1. `Identity`   `(1, 1, 1, 1434)` — 478 × (x, y, z) in 256-pixel space
-2. `Identity_1` `(1, 1, 1, 1)`    — face confidence (sigmoid-pre)
-3. `Identity_2` `(1, 1)`          — auxiliary score (unused)
-
-The 478 landmarks are subset to 146 specific indices
-(`kLandmarksSubsetIdxs` from MediaPipe's `face_blendshapes_graph.cc`),
-normalised by 256, and fed to BlendshapeV2 which emits 52 ARKit
-blendshape coefficients. We pass these through verbatim under their
-ARKit names (`mouthSmileLeft`, `eyeBlinkLeft`, `jawOpen`, …) and
-*also* aggregate VRM 1.0 preset names so a stock rig with no custom
-blendshapes still gets `blink` / `aa` / `happy` / `sad` / `surprised`
-motion. Selfie mirror applies: subject's left eye drives `blinkRight`.
-
-Confidence threshold is 0.4 (sigmoid). Head pose (`SourceSkeleton::face`)
-is intentionally left empty in v1 — FaceMeshV2's Z is in arbitrary
-face-relative pixel units, so a usable yaw/pitch/roll requires
-camera-intrinsic unprojection or BlazePose's 3D world face landmarks.
-The avatar's head bone falls back to whatever the spine direction
-implies, which is good enough for most poses.
-
 ## Limitations & Future Work
 
-1. **Head pose from face landmarks.** Currently `SourceSkeleton::face`
-   stays `None` even when the face inference path runs. Adding
-   yaw/pitch/roll via BlazePose's 3D world face landmarks (indices
-   0..=10) is a small follow-up that would let the head bone respond
-   to head-tilt independently of the spine.
-2. **Single-person only.** BlazePose Heavy does not emit per-person
-   bboxes — there is one implicit subject per frame. Multi-person
-   support would require wiring in the `palm_detection` model (for
-   bbox proposals) plus a separate person detector.
-3. **Letterbox resampling.** Preprocessing still uses nearest-neighbour
-   downscaling on the critical frame path to avoid pulling in a
-   heavyweight imaging crate. Can be upgraded to bilinear via shaders
-   or `imageops` for a small accuracy bump on tiny subjects.
+1. **Face / blendshapes are empty.** RTMW3D emits 68 face landmarks
+   (indices 23-90) that this implementation does not yet decode.
+   The head bone falls back to spine direction, and ARKit blendshape
+   coefficients (smile / blink / jaw / brow) are not produced. The
+   Phase C plan is to add a SMIRK FLAME-regression head that emits
+   FLAME params, plus a FLAME-50 → ARKit-52 retarget matrix.
+2. **Occluded-hand depth.** Monocular 3D pose places hands behind
+   the body when an instrument or object occludes the wrist
+   (e.g. guitar strumming hand). RTMW3D handles this better than
+   the previous BlazePose pipeline but not perfectly. A planned
+   follow-up: temporal hold + arm-length sanity clamp on
+   low-confidence wrist keypoints.
+3. **Single-person only.** RTMW3D is a top-down model and we drive
+   it with the full camera frame. With more than one person in
+   frame the keypoint outputs will average over both subjects.
+   Multi-person support would require a YOLOX or RTMDet person
+   detector running in front of RTMW3D per detected bbox.
+4. **Aspect distortion.** Preprocessing squashes the camera frame
+   (typically 16:9) into the model's 4:3 input without letterbox.
+   At wide aspect ratios this slightly compresses limbs in y; in
+   practice the model is robust enough that the rendered avatar
+   doesn't show the distortion, but a letterbox path is easy to
+   add if it becomes a problem.

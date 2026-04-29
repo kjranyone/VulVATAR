@@ -59,12 +59,10 @@ for that binary as required by GPL-3.0.
 VulVATAR uses third-party libraries and model assets under their own
 licenses. In particular:
 
-- MediaPipe Pose / Hand / Face Landmarker models (Apache-2.0), distributed
-  by Google AI Edge and re-exported as ONNX by the OpenCV community:
-  - https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
-  - https://huggingface.co/opencv/pose_estimation_mediapipe
-  - https://huggingface.co/opencv/palm_detection_mediapipe
-  - https://huggingface.co/opencv/handpose_estimation_mediapipe
+- RTMW3D-x whole-body 3D pose estimation model (Apache-2.0), trained
+  by OpenMMLab / mmpose and re-distributed as ONNX by Soykaf:
+  - https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose3d
+  - https://huggingface.co/Soykaf/RTMW3D-x
 - ONNX Runtime: MIT
   - https://github.com/microsoft/onnxruntime
 - Rust crate dependencies: see each crate's license metadata.

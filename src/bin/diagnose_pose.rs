@@ -1,6 +1,6 @@
 //! Pose-tracking visual diagnostic CLI.
 //!
-//! Loads an input image, runs MediaPipe Holistic inference on it
+//! Loads an input image, runs RTMW3D whole-body inference on it
 //! (body + hands), applies the result to a VRM via
 //! `pose_solver::solve_avatar_pose`, and dumps the rendered avatar to
 //! PNG. Used to verify whether the solver's bone rotations match the
