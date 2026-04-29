@@ -7,7 +7,7 @@ use crate::asset::{
 };
 use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::AvatarPose;
-use crate::avatar::pose_solver::ResolvedExpressionWeight;
+use crate::avatar::pose_solver::{PoseSolverState, ResolvedExpressionWeight};
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 
 /// Multiply two column-major 4x4 matrices: result = a * b.
@@ -43,6 +43,10 @@ pub struct AvatarInstance {
     pub cloth_sim_buffers: Option<ClothSimTempBuffers>,
     pub cloth_overlays: Vec<ClothOverlaySlot>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
+    /// Per-bone calibration carried between solver frames so 2D
+    /// foreshortening can be inverted into Z. See
+    /// [`PoseSolverState`] for details.
+    pub pose_solver_state: PoseSolverState,
     /// Pre-built `Arc<MeshPrimitiveAsset>` per (mesh, primitive) to avoid
     /// cloning vertex data every frame. Built once in `AvatarInstance::new`.
     pub primitive_arcs: Vec<Vec<Arc<MeshPrimitiveAsset>>>,
@@ -160,6 +164,7 @@ impl AvatarInstance {
             cloth_sim_buffers: None,
             cloth_overlays: Vec::new(),
             expression_weights: Vec::new(),
+            pose_solver_state: PoseSolverState::default(),
             primitive_arcs,
         }
     }

@@ -2526,7 +2526,7 @@ mod metadata_tests {
     ///      still feed the right joint.
     #[test]
     fn sample_vrm0_solver_drives_head_and_arm() {
-        use crate::avatar::pose_solver::{solve_avatar_pose, SolverParams};
+        use crate::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
         use crate::avatar::{AvatarInstance, AvatarInstanceId};
         use crate::tracking::source_skeleton::{FacePose, SourceJoint, SourceSkeleton};
 
@@ -2604,12 +2604,14 @@ mod metadata_tests {
             joint_confidence_threshold: 0.1,
             face_confidence_threshold: 0.1,
         };
+        let mut solver_state = PoseSolverState::default();
         solve_avatar_pose(
             &source,
             &avatar.asset.skeleton,
             avatar.asset.humanoid.as_ref(),
             &mut avatar.pose.local_transforms,
             &params,
+            &mut solver_state,
         );
 
         let head_after = avatar.pose.local_transforms[head_idx].rotation;
@@ -2669,7 +2671,7 @@ mod metadata_tests {
     /// image-space position.
     #[test]
     fn sample_vrm0_solver_bends_fingers() {
-        use crate::avatar::pose_solver::{solve_avatar_pose, SolverParams};
+        use crate::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
         use crate::avatar::{AvatarInstance, AvatarInstanceId};
         use crate::tracking::source_skeleton::{SourceJoint, SourceSkeleton};
 
@@ -2743,12 +2745,14 @@ mod metadata_tests {
             joint_confidence_threshold: 0.1,
             face_confidence_threshold: 0.1,
         };
+        let mut solver_state = PoseSolverState::default();
         solve_avatar_pose(
             &source,
             &avatar.asset.skeleton,
             avatar.asset.humanoid.as_ref(),
             &mut avatar.pose.local_transforms,
             &params,
+            &mut solver_state,
         );
 
         let new_prox = avatar.pose.local_transforms[prox].rotation;

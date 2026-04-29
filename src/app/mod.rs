@@ -441,6 +441,7 @@ impl Application {
                     humanoid,
                     &mut avatar.pose.local_transforms,
                     &solver_params,
+                    &mut avatar.pose_solver_state,
                 );
 
                 if face_tracking_enabled {

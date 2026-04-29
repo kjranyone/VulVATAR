@@ -55,6 +55,54 @@ impl Default for SolverParams {
     }
 }
 
+/// Per-bone calibration state carried between solver frames so we can
+/// recover Z (depth toward/away from camera) from 2D foreshortening.
+///
+/// The fundamental problem: a single 2D view does not reveal depth, so
+/// when the subject extends an arm forward the 2D shoulder→wrist vector
+/// becomes very short and the solver — without this state — collapses
+/// the avatar's arm to lie in the image plane regardless of the true
+/// pose. Recovering Z requires knowing the bone's *un-foreshortened* 2D
+/// length so we can compute `|Z| = sqrt(L_full² − L_observed²)`.
+///
+/// `L_full` is learned per-bone as a running max of observed 2D length
+/// on that bone. The very first observation seeds the calibration to
+/// itself, so the initial frame has Z = 0 (matching the previous
+/// stateless behaviour); as the subject moves and at some point fully
+/// extends the limb in the image plane the max grows and unlocks Z
+/// recovery for subsequent foreshortened frames.
+///
+/// **Why running max and not avatar bone length:** an anime/stylised
+/// avatar's arm-to-shoulder ratio is usually different from a human's,
+/// so calibrating against `rest_world` distances systematically
+/// over-shoots `expected_2d > observed_2d` and folds limbs forward
+/// even at T-pose. Calibrating against the *subject's own* observed
+/// extents is invariant to avatar choice.
+///
+/// **Single-shot callers** (tests, diagnose CLI) accumulate no history
+/// and so always run with Z = 0 unless they explicitly prime the state
+/// with a calibration frame first (see `diagnose_pose --prime`).
+#[derive(Clone, Debug, Default)]
+pub struct PoseSolverState {
+    /// Maximum 2D length (in source image-space units) ever observed for
+    /// each bone. Initialized empty; entries appear lazily as bones are
+    /// solved.
+    bone_max_2d: HashMap<HumanoidBone, f32>,
+}
+
+impl PoseSolverState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset all per-bone calibration. Call when the subject changes
+    /// (different person, or large jump after a tracking dropout) so
+    /// stale max values do not pin Z high for a small new subject.
+    pub fn reset(&mut self) {
+        self.bone_max_2d.clear();
+    }
+}
+
 /// Source points that define a bone's *tip* — what the bone is pointing
 /// at. For most bones it's the next humanoid joint down the chain; torso
 /// bones use the shoulder midpoint; distal finger bones use the fingertip
@@ -215,6 +263,7 @@ pub fn solve_avatar_pose(
     humanoid: Option<&HumanoidMap>,
     local_transforms: &mut [Transform],
     params: &SolverParams,
+    state: &mut PoseSolverState,
 ) {
     let Some(humanoid) = humanoid else {
         return;
@@ -327,11 +376,27 @@ pub fn solve_avatar_pose(
             continue;
         }
 
-        // Source direction lives in the camera's image plane; treat it as
-        // a 3D vector with Z = 0. Turning toward/away from the camera is
-        // not observable from a single 2D view and is left to other
-        // signals (face pose for the head, spring bones for secondary
-        // motion).
+        // Recover the source direction with Z (depth toward/away from
+        // camera). The 2D detector only gives dx/dy in the image plane,
+        // but a fully T-posed arm pointing toward the camera projects to
+        // a tiny 2D vector — without the Z component the solver folds
+        // the avatar's arm to lie in the image plane regardless.
+        //
+        // Z is recovered from foreshortening: if the bone's
+        // un-foreshortened 2D length is `L`, and we observe length `d`,
+        // then `|Z| = sqrt(L² − d²)` in source units. `L` comes from
+        // (a) per-frame anthropometric scaling against torso 2D length,
+        // and (b) running max of observed length on this bone in
+        // `state.bone_max_2d` — whichever is larger. The previous
+        // approach used the avatar's rest-pose bone length as `L`, which
+        // breaks for stylised rigs whose proportions differ from the
+        // subject; this one calibrates against the *subject's own*
+        // proportions and so is invariant to avatar choice.
+        //
+        // Sign of Z defaults to +Z (toward camera), matching the typical
+        // VTuber gesture of reaching toward the lens. Arms behind the
+        // body are usually occluded with low confidence and are dropped
+        // earlier by the threshold check.
         //
         // The Y-flip baked onto VRM 0.x roots already handles the
         // "avatar faces camera" orientation, so comparing rest_world
@@ -339,13 +404,26 @@ pub fn solve_avatar_pose(
         // across VRM 0.x and 1.x.
         let dx = source_tip.position[0] - source_base.position[0];
         let dy = source_tip.position[1] - source_base.position[1];
-        let source_dir_mag_sq = dx * dx + dy * dy;
-        if source_dir_mag_sq < 1e-8 {
+        let observed_2d_sq = dx * dx + dy * dy;
+        if observed_2d_sq < 1e-8 {
             continue;
         }
-        // Source image y-up already matches world +Y; world +Z points at
-        // camera, so "into the screen" is rest_world -Z.
-        let source_dir = vec3_normalize(&[dx, dy, 0.0]);
+        let observed_2d = observed_2d_sq.sqrt();
+
+        let calibration = state
+            .bone_max_2d
+            .get(&bone)
+            .copied()
+            .unwrap_or(0.0)
+            .max(observed_2d);
+        state.bone_max_2d.insert(bone, calibration);
+        let delta_sq = calibration * calibration - observed_2d_sq;
+        let z = if delta_sq > 1e-8 {
+            delta_sq.sqrt()
+        } else {
+            0.0
+        };
+        let source_dir = vec3_normalize(&[dx, dy, z]);
 
         let delta_world = quat_from_vectors(&rest_dir, &source_dir);
         let rest_world_rot = rest_world[node_idx].rotation;
