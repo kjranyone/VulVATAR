@@ -297,6 +297,25 @@ pub fn solve_avatar_pose(
         _ => 1.0,
     };
 
+    // Body yaw: how far the subject's torso has rotated around the
+    // vertical axis. We don't see this directly from 2D, but two
+    // signals together pin it down:
+    //
+    //   * Shoulder-span foreshortening gives magnitude. A full span
+    //     means yaw = 0 (facing camera) or yaw = ±180° (facing away);
+    //     a fully-collapsed span means side profile (yaw = ±90°).
+    //
+    //   * The horizontal sign of (RightShoulder.x − LeftShoulder.x)
+    //     flips between front-half and rear-half of the rotation
+    //     because COCO's left/right labels are subject-POV: when the
+    //     subject faces away their left side now lands on camera-left.
+    //
+    //   * For left/right disambiguation (90° vs 270°, etc.) we use
+    //     the *sign* of the face yaw when the face is still visible
+    //     enough for the inference to return a pose; otherwise we fall
+    //     back to a default sign.
+    let body_yaw = compute_body_yaw_signed(source, state, body_facing_camera_ratio);
+
     // Rest-pose world transforms, computed from the skeleton's rest_local
     // values. These are the ground truth we measure bone directions against;
     // if the avatar has any offset rotations baked into rest pose (common
@@ -311,6 +330,34 @@ pub fn solve_avatar_pose(
     // bone so that a child's new local rotation is computed relative to
     // its parent's updated world rotation.
     let mut current_world = compute_world_transforms(skeleton, |i| local_transforms[i].clone());
+
+    // --- 0. Body root yaw: rotate Hips around Y so the avatar's torso
+    //         faces the same way as the subject. Skipped when calibration
+    //         has not yet seen a wider shoulder span than the current
+    //         frame (running max == observed → ratio = 1 → yaw = 0).
+    if body_yaw.abs() > 0.01 {
+        if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {
+            let hips_idx = hips_node.0 as usize;
+            if hips_idx < skeleton.nodes.len() {
+                let yaw_delta_world = quat_from_euler_ypr(0.0, body_yaw, 0.0);
+                let rest_world_rot = rest_world[hips_idx].rotation;
+                let new_world_rot = quat_mul(&yaw_delta_world, &rest_world_rot);
+                let parent_world_rot = skeleton.nodes[hips_idx]
+                    .parent
+                    .map(|NodeId(p)| current_world[p as usize].rotation)
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                let new_local_rot = quat_normalize(&quat_mul(
+                    &quat_conjugate(&parent_world_rot),
+                    &new_world_rot,
+                ));
+                let prev_local_rot = local_transforms[hips_idx].rotation;
+                local_transforms[hips_idx].rotation =
+                    quat_slerp_short(&prev_local_rot, &new_local_rot, params.rotation_blend);
+                let updated_world = quat_mul(&parent_world_rot, &local_transforms[hips_idx].rotation);
+                current_world[hips_idx].rotation = updated_world;
+            }
+        }
+    }
 
     // --- 1. Body chain: direction-match each driven bone. ---
     for &(bone, tip) in DRIVEN_BONES {
@@ -511,6 +558,99 @@ fn current_shoulder_span_2d(source: &SourceSkeleton) -> Option<f32> {
     let dx = l.position[0] - r.position[0];
     let dy = l.position[1] - r.position[1];
     Some((dx * dx + dy * dy).sqrt())
+}
+
+/// Estimate the subject's body yaw (rotation around the vertical
+/// world axis) in radians.
+///
+/// Convention: 0 = facing camera, ±π = facing away, +π/2 = subject
+/// rotated to their right (camera sees their left side), −π/2 = the
+/// mirror.
+///
+/// Two signals combine:
+/// * `body_facing_camera_ratio` (current shoulder span / running max)
+///   gives the magnitude through `acos(ratio)`. Front/rear are
+///   disambiguated by the horizontal sign of `R.x − L.x`: COCO labels
+///   are subject-POV so the sign flips at 90°/270° crossings.
+/// * Left/right (90° vs 270°) is taken from the sign of the face-pose
+///   yaw when one was detected; otherwise default to +.
+fn compute_body_yaw_signed(
+    source: &SourceSkeleton,
+    _state: &PoseSolverState,
+    ratio: f32,
+) -> f32 {
+    let (Some(l), Some(r)) = (
+        source.joints.get(&HumanoidBone::LeftShoulder),
+        source.joints.get(&HumanoidBone::RightShoulder),
+    ) else {
+        return 0.0;
+    };
+    // Magnitude of yaw based on how foreshortened the shoulders are.
+    let mag_front_half = ratio.clamp(0.0, 1.0).acos();
+    let lr_dx = r.position[0] - l.position[0];
+    // Empirically (see sample_data/all_diag/*/source_skeleton.txt) the
+    // detector emits `LeftShoulder` on camera-left and `RightShoulder`
+    // on camera-right at front view: `R.x − L.x` is positive at 0°,
+    // sweeps through ~0 at ±90° (side profile), and goes negative at
+    // 180° (rear). So front-half ⇔ lr_dx ≥ 0, rear-half ⇔ lr_dx < 0.
+    let yaw_unsigned = if lr_dx >= 0.0 {
+        mag_front_half
+    } else {
+        std::f32::consts::PI - mag_front_half
+    };
+    // Sign: +ve = avatar rotates to its right (mirror of subject
+    // turning to their right). Two complementary signals:
+    //
+    //   * Face yaw (when detected). A face turned to camera-+X has
+    //     positive yaw; the subject is therefore rotating to their
+    //     left. Avatar should rotate to its right → +ve sign. So
+    //     `sign = sign(face.yaw)`.
+    //
+    //   * At side / rear views the face inference rejects, but the
+    //     hand confidence asymmetry survives: the visible side has
+    //     the high-confidence hand. Empirically (sample_data
+    //     rotation series) `LeftHand` retains high confidence at
+    //     "left-side profile" 90° rotations and `RightHand` at the
+    //     mirror-symmetric 270° rotations. We use the difference to
+    //     pick the sign.
+    let sign = if let Some(face) = source.face {
+        if face.confidence > 0.0 && face.yaw.abs() > 0.05 {
+            face.yaw.signum()
+        } else {
+            hand_visibility_sign(source)
+        }
+    } else {
+        hand_visibility_sign(source)
+    };
+    sign * yaw_unsigned
+}
+
+/// Pick a body-yaw sign from hand-confidence asymmetry. At side
+/// profile only one hand is in front of the body and detected
+/// crisply; the other is occluded with low confidence. Returns +1
+/// when the LEFT-labelled hand wins, -1 when the RIGHT-labelled hand
+/// wins, and a default of +1 when the difference is too small to
+/// trust.
+fn hand_visibility_sign(source: &SourceSkeleton) -> f32 {
+    const ASYM_MIN: f32 = 0.1;
+    let l = source
+        .joints
+        .get(&HumanoidBone::LeftHand)
+        .map(|j| j.confidence)
+        .unwrap_or(0.0);
+    let r = source
+        .joints
+        .get(&HumanoidBone::RightHand)
+        .map(|j| j.confidence)
+        .unwrap_or(0.0);
+    let diff = l - r;
+    if diff.abs() < ASYM_MIN {
+        1.0
+    } else if diff > 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
 }
 
 fn apply_face_pose(
