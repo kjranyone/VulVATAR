@@ -27,15 +27,22 @@ graph TD;
 ## Models
 
 All five ONNX files live in `models/` and are fetched by `dev.ps1`'s
-`Install-Models` step (~20 MB total):
+`Install-Models` step (~67 MB total):
 
 | File                    | Source                                  | Size  | Role                                |
 |-------------------------|-----------------------------------------|-------|-------------------------------------|
-| `pose_landmark.onnx`    | `opencv/pose_estimation_mediapipe`      | 5.5MB | 33 body + 6 aux landmarks (3D)      |
+| `pose_landmark.onnx`    | `unity/inference-engine-blaze-pose` (heavy) | 53 MB | 33 body + 6 aux landmarks (3D)  |
 | `palm_detection.onnx`   | `opencv/palm_detection_mediapipe`       | 3.9MB | Hand bbox detector (unused MVP)     |
 | `hand_landmark.onnx`    | `opencv/handpose_estimation_mediapipe`  | 3.9MB | 21 hand landmarks per side (3D)     |
 | `face_landmark.onnx`    | PINTO 410 FaceMeshV2                    | 4.8MB | 478 dense face landmarks (256x256)  |
 | `face_blendshapes.onnx` | PINTO 390 BlendshapeV2                  | 1.8MB | 146 landmarks → 52 ARKit blendshapes|
+
+The pose model is BlazePose **heavy**, not lite — the lite export
+(5.5 MB on `opencv/pose_estimation_mediapipe`) loses limb localization
+quality at >45° body rotation, which dragged avatar quality on common
+VTubing angles (3/4 view, side profile, back) significantly. The
+heavy variant has the same I/O signature so swapping is transparent
+to the loader.
 
 The palm detector ships with the bundle but is not yet wired in: the
 hand-bbox derivation uses BlazePose's auxiliary hand markers (wrist +

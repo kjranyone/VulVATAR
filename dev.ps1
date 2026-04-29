@@ -66,21 +66,25 @@ function Install-Models {
     # bundles which inflate to 100s of MB by including every precision
     # × backend variant.
     #
-    #   * Body       — opencv/pose_estimation_mediapipe       (5.5 MB, 33 3D landmarks)
-    #   * Palm       — opencv/palm_detection_mediapipe        (3.9 MB, hand bbox)
-    #   * Hand       — opencv/handpose_estimation_mediapipe   (3.9 MB, 21 3D landmarks)
-    #   * Face mesh  — PINTO 410 FaceMeshV2                   (4.8 MB, 478 landmarks)
-    #   * Blendshape — PINTO 390 BlendshapeV2                 (1.8 MB, 52 ARKit weights)
+    #   * Body       — unity/inference-engine-blaze-pose (heavy)  (53 MB, 33 3D landmarks)
+    #   * Palm       — opencv/palm_detection_mediapipe            (3.9 MB, hand bbox)
+    #   * Hand       — opencv/handpose_estimation_mediapipe       (3.9 MB, 21 3D landmarks)
+    #   * Face mesh  — PINTO 410 FaceMeshV2                       (4.8 MB, 478 landmarks)
+    #   * Blendshape — PINTO 390 BlendshapeV2                     (1.8 MB, 52 ARKit weights)
     #
-    # Replaces the old CIGPose (~1 GB) + YOLOX (~10 MB) bundle. Total
-    # download is ~20 MB.
+    # The Unity heavy-tier BlazePose (55 MB) markedly outperforms
+    # OpenCV's lite export (5.5 MB) on three-quarter / side / back
+    # views — the lite model loses limb localization at >45° body
+    # rotation, which propagated to garbage avatar poses on common
+    # VTubing angles. The I/O signature is identical so it's a drop-in
+    # swap for `pose_landmark.onnx`. Total download is ~67 MB.
     Write-Host "Setting up MediaPipe Holistic ONNX models..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
     }
 
     Install-DirectFiles -Name "MediaPipe pose+hand bundle" -Files @(
-        @{ Url = "https://huggingface.co/opencv/pose_estimation_mediapipe/resolve/main/pose_estimation_mediapipe_2023mar.onnx";
+        @{ Url = "https://huggingface.co/unity/inference-engine-blaze-pose/resolve/main/models/pose_landmarks_detector_heavy.onnx";
            OutName = "pose_landmark.onnx" }
         @{ Url = "https://huggingface.co/opencv/palm_detection_mediapipe/resolve/main/palm_detection_mediapipe_2023feb.onnx";
            OutName = "palm_detection.onnx" }
