@@ -88,6 +88,11 @@ pub struct PoseSolverState {
     /// each bone. Initialized empty; entries appear lazily as bones are
     /// solved.
     bone_max_2d: HashMap<HumanoidBone, f32>,
+    /// Maximum 2D shoulder span (||LeftShoulder − RightShoulder||) ever
+    /// observed. Used to detect side / rear views: when the current
+    /// span is much smaller than the max the body has yawed away from
+    /// the camera and face-pose keypoints are unreliable.
+    shoulder_span_max_2d: f32,
 }
 
 impl PoseSolverState {
@@ -100,8 +105,16 @@ impl PoseSolverState {
     /// stale max values do not pin Z high for a small new subject.
     pub fn reset(&mut self) {
         self.bone_max_2d.clear();
+        self.shoulder_span_max_2d = 0.0;
     }
 }
+
+/// Body-yaw foreshortening fraction. `1.0` means shoulders fully visible
+/// (facing camera); `0.0` means side profile. Below this threshold the
+/// face-pose detector is unreliable (only one ear/eye visible) and we
+/// suppress face yaw/pitch/roll. Tuned so 45° three-quarter views still
+/// pass.
+const FACE_GATE_SHOULDER_RATIO: f32 = 0.45;
 
 /// Source points that define a bone's *tip* — what the bone is pointing
 /// at. For most bones it's the next humanoid joint down the chain; torso
@@ -267,6 +280,21 @@ pub fn solve_avatar_pose(
 ) {
     let Some(humanoid) = humanoid else {
         return;
+    };
+
+    // Update shoulder-span max so we can later detect side/rear views.
+    // Computed every frame (regardless of any per-bone gating) so the
+    // running max tracks the subject's true shoulder span across
+    // sessions of front-facing motion.
+    let shoulder_span_now = current_shoulder_span_2d(source);
+    if let Some(span) = shoulder_span_now {
+        if span > state.shoulder_span_max_2d {
+            state.shoulder_span_max_2d = span;
+        }
+    }
+    let body_facing_camera_ratio = match (shoulder_span_now, state.shoulder_span_max_2d) {
+        (Some(now), max) if max > 1e-6 => (now / max).clamp(0.0, 1.0),
+        _ => 1.0,
     };
 
     // Rest-pose world transforms, computed from the skeleton's rest_local
@@ -449,23 +477,40 @@ pub fn solve_avatar_pose(
     }
 
     // --- 2. Face pose: drive the Head bone independently. ---
-    if let Some(face) = source.face {
-        if face.confidence >= params.face_confidence_threshold {
-            if let Some(head_node) = humanoid.bone_map.get(&HumanoidBone::Head).copied() {
-                let head_idx = head_node.0 as usize;
-                if head_idx < skeleton.nodes.len() {
-                    apply_face_pose(
-                        face,
-                        head_idx,
-                        skeleton,
-                        local_transforms,
-                        &current_world,
-                        params.rotation_blend,
-                    );
+    //
+    // Skip when the body has yawed enough that the face-pose detector
+    // can no longer see both eyes/ears (single-side landmarks produce
+    // wildly wrong yaw/pitch/roll, which otherwise rotate the head into
+    // a back-of-camera position at side profile / rear views).
+    if body_facing_camera_ratio >= FACE_GATE_SHOULDER_RATIO {
+        if let Some(face) = source.face {
+            if face.confidence >= params.face_confidence_threshold {
+                if let Some(head_node) = humanoid.bone_map.get(&HumanoidBone::Head).copied() {
+                    let head_idx = head_node.0 as usize;
+                    if head_idx < skeleton.nodes.len() {
+                        apply_face_pose(
+                            face,
+                            head_idx,
+                            skeleton,
+                            local_transforms,
+                            &current_world,
+                            params.rotation_blend,
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// Current 2D shoulder span (||L − R|| in source image coords), if both
+/// shoulders are present.
+fn current_shoulder_span_2d(source: &SourceSkeleton) -> Option<f32> {
+    let l = source.joints.get(&HumanoidBone::LeftShoulder)?;
+    let r = source.joints.get(&HumanoidBone::RightShoulder)?;
+    let dx = l.position[0] - r.position[0];
+    let dy = l.position[1] - r.position[1];
+    Some((dx * dx + dy * dy).sqrt())
 }
 
 fn apply_face_pose(

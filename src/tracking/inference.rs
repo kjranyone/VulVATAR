@@ -1239,6 +1239,19 @@ fn face_pose_from_keypoints(
         return None;
     }
 
+    // COCO labels are from the subject's POV. When the subject faces
+    // camera, subject-left lands on viewer-right, so `left_ear.x` is
+    // larger than `right_ear.x` — i.e. `right_ear.x − left_ear.x < 0`.
+    // When the subject faces *away* the sides flip and the difference
+    // turns positive. Use that sign to reject rear views before they
+    // poison the yaw / pitch / roll triple. Same logic for eyes.
+    if have_ears && right_ear[0] - left_ear[0] > 0.0 {
+        return None;
+    }
+    if !have_ears && have_eyes && right_eye[0] - left_eye[0] > 0.0 {
+        return None;
+    }
+
     // Roll + face width. Prefer ears (wider baseline, more stable) and
     // fall back to eyes with a rough 2× scale factor to compensate for the
     // shorter eye-to-eye distance.
@@ -1260,7 +1273,18 @@ fn face_pose_from_keypoints(
         (left_eye[0] + right_eye[0]) * 0.5
     };
     let half_face = (face_width * 0.5).max(1e-4);
-    let yaw_ratio = ((nose[0] - head_center_x) / half_face).clamp(-1.0, 1.0);
+    let raw_yaw_ratio = (nose[0] - head_center_x) / half_face;
+    // Reject cases where the nose is past the side of the face — the
+    // detector is hallucinating a "face" on a rear/side view where the
+    // nose isn't actually visible. Without this guard rear views
+    // produce a clamped ±60° yaw that rotates the avatar's head into a
+    // back-of-camera orientation. A small slack (1.05) lets through
+    // legitimate sharp head turns near the limit of the geometric
+    // model.
+    if raw_yaw_ratio.abs() > 1.05 {
+        return None;
+    }
+    let yaw_ratio = raw_yaw_ratio.clamp(-1.0, 1.0);
     let yaw = yaw_ratio.asin().clamp(-1.05, 1.05);
 
     // Pitch: in image coords (y-up), neutral-posed nose sits below the eye
