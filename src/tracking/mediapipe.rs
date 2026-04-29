@@ -564,35 +564,54 @@ fn build_source_skeleton(
         ])
     });
 
-    let aspect = (width as f32) / (height as f32);
-    let to_source = |sl: &ScreenLandmark, mp_index: usize| -> Option<SourceJoint> {
+    // Use world coordinates for the entire 3D position — mixing
+    // screen-x/y with world-z splits the source between two model
+    // heads that do not perfectly agree, which slumps the rendered
+    // avatar's depth into ill-defined hybrid units. World output is
+    // already hip-relative metric, so the solver's direction-matching
+    // gets a self-consistent 3D vector. We still keep screen for the
+    // GUI overlay (separate code path).
+    //
+    // MediaPipe world conventions (real-world Cartesian, hip-relative):
+    //   * x: subject's left (anatomical) → MediaPipe +x
+    //   * y: down                        → MediaPipe +y (Y-down)
+    //   * z: away from camera            → MediaPipe +z
+    //
+    // VulVATAR source-space (avatar convention, post Y180 root flip):
+    //   * x: avatar's left  / camera-right  → +x
+    //   * y: up                              → +y
+    //   * z: toward camera                   → +z
+    //
+    // Selfie mirror: subject's anatomical left side (e.g. their left
+    // hand on the right side of the screen for the user) drives the
+    // *avatar's* right bones — so MediaPipe LEFT_* (index 11/13/15,
+    // subject's left) is mapped to avatar Right* in
+    // [`MEDIAPIPE_TO_HUMANOID`]. After that mapping, the SourceSkeleton
+    // entry called "RightShoulder" carries the world position of the
+    // subject's anatomical *left* shoulder, which sits at MediaPipe +x.
+    // The avatar's right shoulder rest_world is at world −x (avatar's
+    // anatomical right under the VRM Y180 flip), so the source
+    // x-axis must be **negated** for the bone-direction match to land
+    // the right way round. Y is negated to flip Y-down → Y-up, and Z
+    // is negated so `+z = toward camera`.
+    let to_source = |_sl: &ScreenLandmark, mp_index: usize| -> Option<SourceJoint> {
         // Visibility * presence acts as the joint confidence — both
         // need to be high for the point to be trusted.
-        let conf = sl.visibility.min(sl.presence);
-        let (sx, sy) = rect.target_to_source(sl.x, sl.y)?;
-        // Normalize source pixels into the project's [-aspect, +aspect]
-        // / [-1, +1] convention (Y-up). Mirror flip horizontally —
-        // VTuber selfie style: subject moves left → avatar moves to
-        // its right (camera-left of screen).
-        let nx = -((sx / width as f32) * 2.0 - 1.0) * aspect;
-        let ny = 1.0 - (sy / height as f32) * 2.0;
-
-        // World-z is in metric units (~ same scale as world-x/y, and
-        // world-x is in roughly torso half-widths). Pull the z from
-        // world output and rebase to hip; flip sign so +z points
-        // toward camera (MediaPipe's convention is +z = away from
-        // camera).
-        let nz = world
-            .and_then(|w| w.get(mp_index).copied())
-            .zip(hip_world_mid)
-            .map(|(p, h)| -(p[2] - h[2]))
-            .unwrap_or(0.0);
-
+        let conf = _sl.visibility.min(_sl.presence);
+        let world_pos = world?.get(mp_index).copied()?;
+        let hip = hip_world_mid?;
+        let nx = -(world_pos[0] - hip[0]);
+        let ny = -(world_pos[1] - hip[1]);
+        let nz = -(world_pos[2] - hip[2]);
         Some(SourceJoint {
             position: [nx, ny, nz],
             confidence: conf,
         })
     };
+    // Width/height parameters retained for future use (e.g. rendering
+    // the source skeleton overlaid on the input image); silence the
+    // dead-code warning explicitly.
+    let _ = (width, height);
 
     // Body bones.
     for &(mp_idx, bone) in MEDIAPIPE_TO_HUMANOID {

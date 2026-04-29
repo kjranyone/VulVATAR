@@ -43,7 +43,7 @@ use vulvatar_lib::renderer::frame_input::{
 };
 use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
 use vulvatar_lib::renderer::VulkanRenderer;
-use vulvatar_lib::tracking::inference::CigPoseInference;
+use vulvatar_lib::tracking::mediapipe::MediaPipeInference;
 use vulvatar_lib::tracking::source_skeleton::SourceSkeleton;
 use vulvatar_lib::tracking::DetectionAnnotation;
 
@@ -98,8 +98,8 @@ fn main() -> Result<(), String> {
 
     // 2. Run inference (and any prime frames).
     eprintln!("loading models from models/");
-    let mut infer = CigPoseInference::from_models_dir("models")
-        .map_err(|e| format!("load CigPoseInference: {e}"))?;
+    let mut infer = MediaPipeInference::from_models_dir("models")
+        .map_err(|e| format!("load MediaPipeInference: {e}"))?;
     let warnings = infer.take_load_warnings();
     for w in &warnings {
         eprintln!("model load warning: {w}");
@@ -528,15 +528,35 @@ fn dump_source_skeleton(skeleton: &SourceSkeleton, out_path: &Path) -> Result<()
         "source_ts={} overall_confidence={:.3}",
         skeleton.source_timestamp, skeleton.overall_confidence,
     );
-    let _ = writeln!(s, "joints (image-space, x∈[-aspect,+aspect] Y-up):");
+    let _ = writeln!(s, "joints (image-space, x∈[-aspect,+aspect] Y-up, +z toward camera):");
     let mut entries: Vec<_> = skeleton.joints.iter().collect();
     entries.sort_by_key(|(b, _)| format!("{:?}", b));
     for (bone, joint) in entries {
         let _ = writeln!(
             s,
-            "  {:>22?}  pos=({:>+7.3}, {:>+7.3})  conf={:.3}",
-            bone, joint.position[0], joint.position[1], joint.confidence,
+            "  {:>22?}  pos=({:>+7.3}, {:>+7.3}, {:>+7.3})  conf={:.3}",
+            bone,
+            joint.position[0],
+            joint.position[1],
+            joint.position[2],
+            joint.confidence,
         );
+    }
+    if !skeleton.fingertips.is_empty() {
+        let _ = writeln!(s, "fingertips (toe / finger tips, keyed by parent bone):");
+        let mut tips: Vec<_> = skeleton.fingertips.iter().collect();
+        tips.sort_by_key(|(b, _)| format!("{:?}", b));
+        for (bone, joint) in tips {
+            let _ = writeln!(
+                s,
+                "  {:>22?}  pos=({:>+7.3}, {:>+7.3}, {:>+7.3})  conf={:.3}",
+                bone,
+                joint.position[0],
+                joint.position[1],
+                joint.position[2],
+                joint.confidence,
+            );
+        }
     }
     if let Some(face) = skeleton.face {
         let _ = writeln!(

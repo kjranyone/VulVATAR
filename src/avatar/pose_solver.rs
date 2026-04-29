@@ -399,6 +399,43 @@ pub fn solve_avatar_pose(
     // its parent's updated world rotation.
     let mut current_world = compute_world_transforms(skeleton, |i| local_transforms[i].clone());
 
+    // Body root yaw: rotate Hips around Y so the avatar's torso faces
+    // the same way as the subject. With a 3D-native tracker this falls
+    // out cleanly from the shoulder line in the XZ plane: at rest the
+    // shoulder line points along +X (avatar's left → camera-right),
+    // and as the subject rotates around their vertical axis the line
+    // tilts in XZ so its yaw against the rest +X axis encodes the
+    // body's facing direction directly.
+    if let Some(body_yaw) = compute_body_yaw_3d(source, params.joint_confidence_threshold) {
+        if body_yaw.abs() > 0.01 {
+            if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {
+                let hips_idx = hips_node.0 as usize;
+                if hips_idx < skeleton.nodes.len() {
+                    let yaw_delta_world = quat_from_euler_ypr(0.0, body_yaw, 0.0);
+                    let rest_world_rot = rest_world[hips_idx].rotation;
+                    let new_world_rot = quat_mul(&yaw_delta_world, &rest_world_rot);
+                    let parent_world_rot = skeleton.nodes[hips_idx]
+                        .parent
+                        .map(|NodeId(p)| current_world[p as usize].rotation)
+                        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                    let new_local_rot = quat_normalize(&quat_mul(
+                        &quat_conjugate(&parent_world_rot),
+                        &new_world_rot,
+                    ));
+                    let prev_local_rot = local_transforms[hips_idx].rotation;
+                    local_transforms[hips_idx].rotation = quat_slerp_short(
+                        &prev_local_rot,
+                        &new_local_rot,
+                        dt_aware_blend(params.rotation_blend, dt),
+                    );
+                    let updated_world =
+                        quat_mul(&parent_world_rot, &local_transforms[hips_idx].rotation);
+                    current_world[hips_idx].rotation = updated_world;
+                }
+            }
+        }
+    }
+
     // Body chain: direction-match each driven bone using 3D source positions.
     for &(bone, tip) in DRIVEN_BONES {
         let Some(source_base) = source.joints.get(&bone) else {
@@ -565,6 +602,42 @@ pub fn solve_avatar_pose(
             }
         }
     }
+}
+
+/// Body yaw, derived from the 3D shoulder line.
+///
+/// At rest the avatar's left shoulder sits at +X (camera-right under
+/// the VRM Y180 flip) and the right shoulder at −X, so the
+/// `Left − Right` shoulder vector projected onto the XZ plane points
+/// along +X. As the subject rotates around their vertical axis the
+/// 3D-native tracker reports this same vector tilted in XZ — the
+/// in-plane angle against +X is exactly the body's facing yaw.
+///
+/// `quat_from_euler_ypr(0, +y, 0)` rotates +X → −Z, i.e. positive yaw
+/// rotates the avatar's left side from camera-right toward camera-rear.
+/// We therefore feed `atan2(−bz, bx)` so subject-rotated-to-their-right
+/// (LeftShoulder receding into −Z) yields a positive `body_yaw` and
+/// the avatar follows.
+///
+/// Returns `None` when either shoulder is below the confidence
+/// threshold so the caller can skip the rotation entirely instead of
+/// snapping the body to whatever stale value comes through.
+fn compute_body_yaw_3d(source: &SourceSkeleton, threshold: f32) -> Option<f32> {
+    let l = source.joints.get(&HumanoidBone::LeftShoulder)?;
+    let r = source.joints.get(&HumanoidBone::RightShoulder)?;
+    if l.confidence < threshold || r.confidence < threshold {
+        return None;
+    }
+    let bx = l.position[0] - r.position[0];
+    let bz = l.position[2] - r.position[2];
+    // Dead-zone: with both shoulders close together (subject in
+    // exact side profile), bx is tiny and atan2 amplifies any noise
+    // into wild yaw flips. Require a minimum span before we trust
+    // the angle.
+    if (bx * bx + bz * bz).sqrt() < 0.05 {
+        return None;
+    }
+    Some((-bz).atan2(bx))
 }
 
 fn apply_face_pose(
