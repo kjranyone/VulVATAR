@@ -12,6 +12,7 @@ mod webcam;
 mod pose_estimation;
 
 pub mod mediapipe;
+pub mod rtmw3d;
 pub mod source_skeleton;
 
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
@@ -657,7 +658,7 @@ impl TrackingWorker {
         // value is ignored.
         let _ = prefer_lower_body;
         #[cfg(feature = "inference")]
-        let mut pose_estimator = match mediapipe::MediaPipeInference::from_models_dir("models") {
+        let mut pose_estimator = match rtmw3d::Rtmw3dInference::from_models_dir("models") {
             Ok(mut estimator) => {
                 let warnings = estimator.take_load_warnings();
                 if !warnings.is_empty() {
@@ -673,7 +674,7 @@ impl TrackingWorker {
             }
         };
         #[cfg(not(feature = "inference"))]
-        let mut pose_estimator: Option<mediapipe::MediaPipeInference> = None;
+        let mut pose_estimator: Option<rtmw3d::Rtmw3dInference> = None;
 
         info!("tracking-worker: webcam opened successfully");
         ready.store(true, Ordering::SeqCst);

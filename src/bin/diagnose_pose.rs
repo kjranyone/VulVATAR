@@ -43,7 +43,7 @@ use vulvatar_lib::renderer::frame_input::{
 };
 use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
 use vulvatar_lib::renderer::VulkanRenderer;
-use vulvatar_lib::tracking::mediapipe::MediaPipeInference;
+use vulvatar_lib::tracking::rtmw3d::Rtmw3dInference;
 use vulvatar_lib::tracking::source_skeleton::SourceSkeleton;
 use vulvatar_lib::tracking::DetectionAnnotation;
 
@@ -98,8 +98,8 @@ fn main() -> Result<(), String> {
 
     // 2. Run inference (and any prime frames).
     eprintln!("loading models from models/");
-    let mut infer = MediaPipeInference::from_models_dir("models")
-        .map_err(|e| format!("load MediaPipeInference: {e}"))?;
+    let mut infer = Rtmw3dInference::from_models_dir("models")
+        .map_err(|e| format!("load Rtmw3dInference: {e}"))?;
     let warnings = infer.take_load_warnings();
     for w in &warnings {
         eprintln!("model load warning: {w}");
