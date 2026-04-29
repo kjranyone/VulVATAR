@@ -101,6 +101,25 @@ const POSE_LANDMARK_COUNT: usize = 39;
 #[cfg(feature = "inference")]
 const POSE_VISIBILITY_THRESHOLD: f32 = 0.3;
 
+/// Input dimensions for the hand landmarker (OpenCV ONNX export).
+#[cfg(feature = "inference")]
+const HAND_INPUT_SIZE: u32 = 224;
+
+/// Number of landmarks emitted by the hand model.
+#[cfg(feature = "inference")]
+const HAND_LANDMARK_COUNT: usize = 21;
+
+/// Confidence floor for accepting a hand inference result.
+#[cfg(feature = "inference")]
+const HAND_CONFIDENCE_THRESHOLD: f32 = 0.4;
+
+/// Padding multiplier when deriving the hand bbox from body
+/// landmarks. The wrist + finger auxiliary points sit at the inner
+/// edge of the hand crop, so we pad outward enough to also include
+/// the fingertips.
+#[cfg(feature = "inference")]
+const HAND_BBOX_PAD: f32 = 1.6;
+
 pub struct MediaPipeInference {
     #[cfg(feature = "inference")]
     pose_session: Session,
@@ -112,6 +131,16 @@ pub struct MediaPipeInference {
     /// declared output list directly rather than hard-coding strings.
     #[cfg(feature = "inference")]
     pose_output_names: Vec<String>,
+    /// Optional MediaPipe Hand Landmarker session. Loaded when
+    /// `hand_landmark.onnx` is present in the models dir; absent → hand
+    /// inference is silently skipped (fingers stay at rest pose).
+    #[cfg(feature = "inference")]
+    hand_session: Option<Session>,
+    #[cfg(feature = "inference")]
+    hand_input_name: Option<String>,
+    /// Hand model output order: (landmarks, conf, handedness, landmarks_word).
+    #[cfg(feature = "inference")]
+    hand_output_names: Vec<String>,
     #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
@@ -157,11 +186,65 @@ impl MediaPipeInference {
             );
         }
 
+        // Optional hand landmarker. Missing file → skip silently with a
+        // warning surfaced to the GUI; the avatar will pose body but
+        // leave fingers at rest until the user runs Install-Models.
+        let hand_path = models_dir.join("hand_landmark.onnx");
+        let mut load_warnings = Vec::new();
+        let (hand_session, hand_input_name, hand_output_names) = if hand_path.is_file() {
+            info!(
+                "Loading MediaPipe Hand Landmarker from {}",
+                hand_path.display()
+            );
+            match build_session(&hand_path.to_string_lossy(), 2, "MediaPipe Hand") {
+                Ok((session, _hand_backend)) => {
+                    let h_input = session
+                        .inputs()
+                        .first()
+                        .map(|i| i.name().to_string())
+                        .unwrap_or_else(|| "input".to_string());
+                    let h_outputs: Vec<String> = session
+                        .outputs()
+                        .iter()
+                        .map(|o| o.name().to_string())
+                        .collect();
+                    info!(
+                        "MediaPipe Hand I/O: input='{}', outputs={:?}",
+                        h_input, h_outputs
+                    );
+                    if h_outputs.len() < 4 {
+                        warn!(
+                            "MediaPipe Hand Landmarker reports {} outputs, expected 4",
+                            h_outputs.len()
+                        );
+                    }
+                    (Some(session), Some(h_input), h_outputs)
+                }
+                Err(e) => {
+                    let msg = format!("Hand landmarker failed to load: {}. Fingers will not animate.", e);
+                    warn!("{}", msg);
+                    load_warnings.push(msg);
+                    (None, None, Vec::new())
+                }
+            }
+        } else {
+            let msg = format!(
+                "Hand landmarker model not found at {}. Fingers will not animate. Run dev.ps1 setup.",
+                hand_path.display()
+            );
+            warn!("{}", msg);
+            load_warnings.push(msg);
+            (None, None, Vec::new())
+        };
+
         Ok(Self {
             pose_session: session,
             pose_input_name: input_name,
             pose_output_names: output_names,
-            load_warnings: Vec::new(),
+            hand_session,
+            hand_input_name,
+            hand_output_names,
+            load_warnings,
             backend,
         })
     }
@@ -249,12 +332,18 @@ impl MediaPipeInference {
         // graph. We need outputs[0] (landmarks) and outputs[4]
         // (landmarks_word). `conf` (outputs[1]) is the overall pose
         // confidence — used to gate the whole skeleton.
-        let landmarks_screen_data = match landmarks_name
+        //
+        // We clone every borrowed tensor slice to owned `Vec<f32>` here
+        // so `outputs` (which holds a mutable borrow of `pose_session`,
+        // and transitively of `self`) can be dropped before we kick off
+        // hand inference further down — `hand_session.run` needs its
+        // own mutable borrow of `self`.
+        let landmarks_screen_data: Vec<f32> = match landmarks_name
             .as_deref()
             .and_then(|n| outputs.get(n))
             .and_then(|v| v.try_extract_tensor::<f32>().ok())
         {
-            Some((_, data)) => data,
+            Some((_, data)) => data.to_vec(),
             None => {
                 error!("MediaPipe Pose: missing or unreadable landmarks output");
                 return empty_estimate(frame_index);
@@ -265,11 +354,14 @@ impl MediaPipeInference {
             .and_then(|n| outputs.get(n))
             .and_then(|v| v.try_extract_tensor::<f32>().ok())
             .and_then(|(_, data)| data.first().copied());
-        let world_data = world_name
+        let world_data: Option<Vec<f32>> = world_name
             .as_deref()
             .and_then(|n| outputs.get(n))
             .and_then(|v| v.try_extract_tensor::<f32>().ok())
             .map(|(_, data)| data.to_vec());
+        // Release the &mut borrow on self.pose_session before later
+        // mutable use of self (notably hand inference below).
+        drop(outputs);
 
         let pose_conf = conf_value.map(sigmoid).unwrap_or(0.0);
         if pose_conf < POSE_VISIBILITY_THRESHOLD {
@@ -280,11 +372,11 @@ impl MediaPipeInference {
 
         // Decode 39 × 5 (screen) and 39 × 3 (world). Apply sigmoid to
         // the visibility/presence pair on the screen output.
-        let screen = decode_landmarks_screen(landmarks_screen_data);
+        let screen = decode_landmarks_screen(&landmarks_screen_data);
         let world = world_data.as_deref().map(decode_landmarks_world);
 
         // Map MediaPipe landmarks → source-space SourceSkeleton.
-        let skeleton = build_source_skeleton(
+        let mut skeleton = build_source_skeleton(
             frame_index,
             pose_conf,
             &screen,
@@ -293,6 +385,30 @@ impl MediaPipeInference {
             height,
             &letterbox,
         );
+
+        // Hand inference per side, if the hand model is loaded and the
+        // body wrist for that side is tracked. Failures degrade
+        // gracefully: a missing hand leaves the avatar's fingers at
+        // rest pose for that frame.
+        if self.hand_session.is_some() {
+            for side in [HandSide::SubjectLeft, HandSide::SubjectRight] {
+                let avatar_wrist_bone = side.avatar_wrist();
+                let Some(wrist_joint) = skeleton.joints.get(&avatar_wrist_bone).copied()
+                else {
+                    continue;
+                };
+                self.run_hand_for_side(
+                    rgb_data,
+                    width,
+                    height,
+                    &screen,
+                    &letterbox,
+                    side,
+                    wrist_joint.position,
+                    &mut skeleton,
+                );
+            }
+        }
 
         // Build an annotation overlay so the GUI's keypoint debug view
         // still works. We emit the 33 body landmarks; auxiliary 33-39
@@ -303,6 +419,78 @@ impl MediaPipeInference {
             annotation,
             skeleton,
         }
+    }
+
+    /// Run the hand landmarker for a single side, populating finger
+    /// joints + fingertips on `sk`. Silent on failure — missing hand
+    /// inference just leaves the corresponding fingers at rest pose.
+    #[cfg(feature = "inference")]
+    fn run_hand_for_side(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        screen: &[ScreenLandmark],
+        letterbox: &LetterboxRect,
+        side: HandSide,
+        body_wrist_pos: [f32; 3],
+        sk: &mut SourceSkeleton,
+    ) {
+        let bbox = match derive_hand_bbox(screen, side, letterbox, width, height) {
+            Some(b) => b,
+            None => return,
+        };
+        let tensor = crop_hand_to_tensor(rgb_data, width, height, &bbox);
+        let input = match TensorRef::from_array_view(&tensor) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("MediaPipe Hand: TensorRef creation failed: {}", e);
+                return;
+            }
+        };
+        let input_name = match self.hand_input_name.as_deref() {
+            Some(n) => n.to_string(),
+            None => return,
+        };
+        // Snapshot output names so the immutable borrow of self.hand_output_names
+        // does not conflict with the &mut Session borrow inside `run`.
+        let world_name = self.hand_output_names.get(3).cloned();
+        let conf_name = self.hand_output_names.get(1).cloned();
+
+        let hand_session = match self.hand_session.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let outputs = match hand_session.run(ort::inputs![input_name.as_str() => input]) {
+            Ok(out) => out,
+            Err(e) => {
+                error!("MediaPipe Hand: ONNX run failed ({:?}): {}", side, e);
+                return;
+            }
+        };
+        let conf_value = conf_name
+            .as_deref()
+            .and_then(|n| outputs.get(n))
+            .and_then(|v| v.try_extract_tensor::<f32>().ok())
+            .and_then(|(_, data)| data.first().copied());
+        let hand_conf = match conf_value {
+            Some(c) => sigmoid(c),
+            None => 0.0,
+        };
+        if hand_conf < HAND_CONFIDENCE_THRESHOLD {
+            return;
+        }
+        let world_data = world_name
+            .as_deref()
+            .and_then(|n| outputs.get(n))
+            .and_then(|v| v.try_extract_tensor::<f32>().ok())
+            .map(|(_, data)| data.to_vec());
+        let world_data = match world_data {
+            Some(d) => d,
+            None => return,
+        };
+        let hand_world = decode_hand_world(&world_data);
+        attach_hand_to_skeleton(sk, &hand_world, body_wrist_pos, side, hand_conf);
     }
 }
 
@@ -542,7 +730,7 @@ fn build_source_skeleton(
     world: Option<&[[f32; 3]]>,
     width: u32,
     height: u32,
-    rect: &LetterboxRect,
+    _rect: &LetterboxRect,
 ) -> SourceSkeleton {
     let mut sk = SourceSkeleton::empty(frame_index);
     sk.overall_confidence = pose_conf;
@@ -684,6 +872,324 @@ fn build_annotation(
         keypoints,
         skeleton,
         bounding_box: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hand inference (Phase 2)
+//
+// The MediaPipe Hand Landmarker is a 224×224 single-hand 3D landmarker.
+// We run it once per detected hand (up to twice per frame) using a
+// body-derived bounding box: BlazePose emits four auxiliary landmarks
+// per hand (wrist + pinky/index/thumb knuckles) which are tight enough
+// to skip the standalone palm detector for non-overlapping hand poses.
+//
+// Outputs (positional, set by the OpenCV ONNX export):
+//   0. landmarks (1, 63)        — 21 × (x, y, z) screen, x/y in 224-pixel space
+//   1. conf      (1, 1)         — overall hand confidence (post-sigmoid)
+//   2. handedness(1, 1)         — 0 = left, 1 = right (we ignore: bbox tells us)
+//   3. world     (1, 63)        — 21 × (x, y, z) metric, hand-center origin
+//
+// We use the WORLD output for finger geometry (same coord system as
+// body world: x right, y down, z away from camera, all in meters).
+// After axis flip and a translation that snaps `wrist[0]` onto the
+// body's wrist position, the per-finger directions feed the solver
+// using the same "joint position = bone start" convention as the body
+// chain — the existing finger entries in [`POSE_BONES_TIPS`] handle
+// the rest.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "inference")]
+#[derive(Clone, Copy, Debug)]
+enum HandSide {
+    /// Subject's anatomical left hand. Body landmarks 15/17/19/21
+    /// drive the bbox; the result is mapped to avatar **Right** fingers
+    /// (selfie mirror).
+    SubjectLeft,
+    /// Subject's anatomical right hand → avatar Left fingers.
+    SubjectRight,
+}
+
+#[cfg(feature = "inference")]
+impl HandSide {
+    fn body_landmark_indices(self) -> [usize; 4] {
+        match self {
+            // wrist, pinky, index, thumb (BlazePose body model)
+            HandSide::SubjectLeft => [15, 17, 19, 21],
+            HandSide::SubjectRight => [16, 18, 20, 22],
+        }
+    }
+
+    fn avatar_wrist(self) -> HumanoidBone {
+        match self {
+            HandSide::SubjectLeft => HumanoidBone::RightHand,
+            HandSide::SubjectRight => HumanoidBone::LeftHand,
+        }
+    }
+
+    fn joint_mapping(self) -> &'static [(usize, HumanoidBone)] {
+        match self {
+            HandSide::SubjectLeft => HAND_JOINTS_AVATAR_RIGHT,
+            HandSide::SubjectRight => HAND_JOINTS_AVATAR_LEFT,
+        }
+    }
+
+    fn tip_mapping(self) -> &'static [(usize, HumanoidBone)] {
+        match self {
+            HandSide::SubjectLeft => HAND_TIPS_AVATAR_RIGHT,
+            HandSide::SubjectRight => HAND_TIPS_AVATAR_LEFT,
+        }
+    }
+}
+
+/// Hand-landmark index → avatar bone, for the avatar's *right* finger
+/// chain. Subject's left hand inference fills these slots (mirror).
+///
+/// MediaPipe hand landmark indices:
+///   0      = WRIST (handled separately as anchor)
+///   1..=4  = THUMB:  CMC, MCP, IP, TIP
+///   5..=8  = INDEX:  MCP, PIP, DIP, TIP
+///   9..=12 = MIDDLE: MCP, PIP, DIP, TIP
+///   13..=16= RING:   MCP, PIP, DIP, TIP
+///   17..=20= PINKY:  MCP, PIP, DIP, TIP
+///
+/// The `*Distal` bone's tip is in [`HAND_TIPS_*`] (keyed by distal
+/// bone). The proximal/intermediate joints carry positions of the
+/// joints they *start at*, matching the body convention where
+/// `joints[Bone].position = start of Bone`.
+#[cfg(feature = "inference")]
+const HAND_JOINTS_AVATAR_RIGHT: &[(usize, HumanoidBone)] = &[
+    (1, HumanoidBone::RightThumbProximal),
+    (2, HumanoidBone::RightThumbIntermediate),
+    (3, HumanoidBone::RightThumbDistal),
+    (5, HumanoidBone::RightIndexProximal),
+    (6, HumanoidBone::RightIndexIntermediate),
+    (7, HumanoidBone::RightIndexDistal),
+    (9, HumanoidBone::RightMiddleProximal),
+    (10, HumanoidBone::RightMiddleIntermediate),
+    (11, HumanoidBone::RightMiddleDistal),
+    (13, HumanoidBone::RightRingProximal),
+    (14, HumanoidBone::RightRingIntermediate),
+    (15, HumanoidBone::RightRingDistal),
+    (17, HumanoidBone::RightLittleProximal),
+    (18, HumanoidBone::RightLittleIntermediate),
+    (19, HumanoidBone::RightLittleDistal),
+];
+
+#[cfg(feature = "inference")]
+const HAND_TIPS_AVATAR_RIGHT: &[(usize, HumanoidBone)] = &[
+    (4, HumanoidBone::RightThumbDistal),
+    (8, HumanoidBone::RightIndexDistal),
+    (12, HumanoidBone::RightMiddleDistal),
+    (16, HumanoidBone::RightRingDistal),
+    (20, HumanoidBone::RightLittleDistal),
+];
+
+#[cfg(feature = "inference")]
+const HAND_JOINTS_AVATAR_LEFT: &[(usize, HumanoidBone)] = &[
+    (1, HumanoidBone::LeftThumbProximal),
+    (2, HumanoidBone::LeftThumbIntermediate),
+    (3, HumanoidBone::LeftThumbDistal),
+    (5, HumanoidBone::LeftIndexProximal),
+    (6, HumanoidBone::LeftIndexIntermediate),
+    (7, HumanoidBone::LeftIndexDistal),
+    (9, HumanoidBone::LeftMiddleProximal),
+    (10, HumanoidBone::LeftMiddleIntermediate),
+    (11, HumanoidBone::LeftMiddleDistal),
+    (13, HumanoidBone::LeftRingProximal),
+    (14, HumanoidBone::LeftRingIntermediate),
+    (15, HumanoidBone::LeftRingDistal),
+    (17, HumanoidBone::LeftLittleProximal),
+    (18, HumanoidBone::LeftLittleIntermediate),
+    (19, HumanoidBone::LeftLittleDistal),
+];
+
+#[cfg(feature = "inference")]
+const HAND_TIPS_AVATAR_LEFT: &[(usize, HumanoidBone)] = &[
+    (4, HumanoidBone::LeftThumbDistal),
+    (8, HumanoidBone::LeftIndexDistal),
+    (12, HumanoidBone::LeftMiddleDistal),
+    (16, HumanoidBone::LeftRingDistal),
+    (20, HumanoidBone::LeftLittleDistal),
+];
+
+/// Square crop of the source image, in source-pixel coordinates.
+#[cfg(feature = "inference")]
+#[derive(Clone, Copy, Debug)]
+struct HandBbox {
+    /// Top-left corner in source pixels (may be negative if the bbox
+    /// extends past the left/top edge of the source — we clamp later).
+    x: f32,
+    y: f32,
+    /// Side length in source pixels (square).
+    size: f32,
+}
+
+/// Derive a square hand bounding box from the body's auxiliary hand
+/// landmarks (wrist, pinky, index, thumb). Returns `None` when the
+/// landmarks are too occluded or the bbox would be degenerately small.
+///
+/// Strategy: take the four hand-region body landmarks in source-pixel
+/// space, compute their centroid, then expand to a square that
+/// contains all four points padded by [`HAND_BBOX_PAD`]. The pad
+/// multiplier accounts for the fact that BlazePose's "pinky/index/thumb"
+/// markers sit at the *knuckles* — fingertips extend further out and
+/// would otherwise be cropped off.
+#[cfg(feature = "inference")]
+fn derive_hand_bbox(
+    screen: &[ScreenLandmark],
+    side: HandSide,
+    rect: &LetterboxRect,
+    source_w: u32,
+    source_h: u32,
+) -> Option<HandBbox> {
+    let indices = side.body_landmark_indices();
+    let mut points: Vec<(f32, f32)> = Vec::with_capacity(4);
+    let mut min_conf = 1.0_f32;
+    for idx in indices {
+        let sl = screen.get(idx)?;
+        let conf = sl.visibility.min(sl.presence);
+        if conf < POSE_VISIBILITY_THRESHOLD {
+            return None;
+        }
+        min_conf = min_conf.min(conf);
+        let (sx, sy) = rect.target_to_source(sl.x, sl.y)?;
+        points.push((sx, sy));
+    }
+    if points.is_empty() {
+        return None;
+    }
+
+    let cx = points.iter().map(|p| p.0).sum::<f32>() / points.len() as f32;
+    let cy = points.iter().map(|p| p.1).sum::<f32>() / points.len() as f32;
+    let max_d = points
+        .iter()
+        .map(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+        .fold(0.0_f32, f32::max);
+    let half = (max_d * HAND_BBOX_PAD).max(8.0);
+    let size = half * 2.0;
+
+    // Reject bboxes wholly outside the image (the wrist might be
+    // tracked but visually clipped).
+    if cx + half < 0.0 || cy + half < 0.0 {
+        return None;
+    }
+    if cx - half > source_w as f32 || cy - half > source_h as f32 {
+        return None;
+    }
+    Some(HandBbox {
+        x: cx - half,
+        y: cy - half,
+        size,
+    })
+}
+
+/// Crop the source RGB image to the hand bbox, resizing to 224×224
+/// NHWC `[0,1]`. Out-of-image samples are zero-padded (model is robust
+/// to black borders).
+#[cfg(feature = "inference")]
+fn crop_hand_to_tensor(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    bbox: &HandBbox,
+) -> Array4<f32> {
+    let target = HAND_INPUT_SIZE as usize;
+    let mut tensor = Array4::<f32>::zeros((1, target, target, 3));
+    let stride = (width as usize) * 3;
+    let scale = bbox.size / target as f32;
+    for dy in 0..target {
+        let sy = (bbox.y + (dy as f32 + 0.5) * scale) as i32;
+        if sy < 0 || sy >= height as i32 {
+            continue;
+        }
+        for dx in 0..target {
+            let sx = (bbox.x + (dx as f32 + 0.5) * scale) as i32;
+            if sx < 0 || sx >= width as i32 {
+                continue;
+            }
+            let src_idx = (sy as usize) * stride + (sx as usize) * 3;
+            if src_idx + 2 >= rgb.len() {
+                continue;
+            }
+            tensor[(0, dy, dx, 0)] = rgb[src_idx] as f32 / 255.0;
+            tensor[(0, dy, dx, 1)] = rgb[src_idx + 1] as f32 / 255.0;
+            tensor[(0, dy, dx, 2)] = rgb[src_idx + 2] as f32 / 255.0;
+        }
+    }
+    tensor
+}
+
+/// Decode the (1, 63) hand world-landmarks output into 21 × `[x, y, z]`.
+/// Units: metres, hand-center origin (per MediaPipe spec). Coordinate
+/// axes match the body world output (X right, Y down, Z away from
+/// camera) so the same axis flip applies before adding into the source
+/// skeleton.
+#[cfg(feature = "inference")]
+fn decode_hand_world(data: &[f32]) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(HAND_LANDMARK_COUNT);
+    for i in 0..HAND_LANDMARK_COUNT {
+        let base = i * 3;
+        if base + 2 >= data.len() {
+            break;
+        }
+        out.push([data[base], data[base + 1], data[base + 2]]);
+    }
+    out
+}
+
+/// Translate the 21 hand-center-relative world landmarks so that
+/// landmark 0 (wrist) coincides with the body's wrist joint, then
+/// insert the per-bone joints + per-distal tips into `sk` keyed by
+/// avatar-side bones.
+///
+/// `body_wrist_pos` must already be in source-skeleton coords (the
+/// post-flip frame: x ∈ [-aspect, +aspect], y up, +z toward camera).
+/// The hand world axes are flipped here to match.
+#[cfg(feature = "inference")]
+fn attach_hand_to_skeleton(
+    sk: &mut SourceSkeleton,
+    hand_world: &[[f32; 3]],
+    body_wrist_pos: [f32; 3],
+    side: HandSide,
+    hand_conf: f32,
+) {
+    if hand_world.len() < HAND_LANDMARK_COUNT {
+        return;
+    }
+    // Same axis flip as body world: meters with X right/Y down/Z away
+    // → source-skeleton X left+ / Y up / Z toward-camera.
+    let flip = |p: [f32; 3]| -> [f32; 3] { [-p[0], -p[1], -p[2]] };
+    let wrist_flipped = flip(hand_world[0]);
+    let offset = [
+        body_wrist_pos[0] - wrist_flipped[0],
+        body_wrist_pos[1] - wrist_flipped[1],
+        body_wrist_pos[2] - wrist_flipped[2],
+    ];
+    let to_source = |idx: usize| -> [f32; 3] {
+        let f = flip(hand_world[idx]);
+        [f[0] + offset[0], f[1] + offset[1], f[2] + offset[2]]
+    };
+
+    for &(mp_idx, bone) in side.joint_mapping() {
+        let pos = to_source(mp_idx);
+        sk.joints.insert(
+            bone,
+            SourceJoint {
+                position: pos,
+                confidence: hand_conf,
+            },
+        );
+    }
+    for &(mp_idx, distal_bone) in side.tip_mapping() {
+        let pos = to_source(mp_idx);
+        sk.fingertips.insert(
+            distal_bone,
+            SourceJoint {
+                position: pos,
+                confidence: hand_conf,
+            },
+        );
     }
 }
 
