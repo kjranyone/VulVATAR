@@ -59,11 +59,12 @@ for that binary as required by GPL-3.0.
 VulVATAR uses third-party libraries and model assets under their own
 licenses. In particular:
 
-- CIGPose / `cigpose-onnx` pose models: Apache-2.0
-  - https://github.com/53mins/CIGPose
-  - https://github.com/namas191297/cigpose-onnx
-- YOLOX-Nano detector model included in the `cigpose-onnx` model bundle:
-  Apache-2.0
+- MediaPipe Pose / Hand / Face Landmarker models (Apache-2.0), distributed
+  by Google AI Edge and re-exported as ONNX by the OpenCV community:
+  - https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
+  - https://huggingface.co/opencv/pose_estimation_mediapipe
+  - https://huggingface.co/opencv/palm_detection_mediapipe
+  - https://huggingface.co/opencv/handpose_estimation_mediapipe
 - ONNX Runtime: MIT
   - https://github.com/microsoft/onnxruntime
 - Rust crate dependencies: see each crate's license metadata.

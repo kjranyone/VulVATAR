@@ -59,39 +59,132 @@ function Install-Font {
 }
 
 function Install-Models {
-    Write-Host "Setting up ONNX models..." -ForegroundColor Cyan
-    $preferredModel = "cigpose-x_coco-ubody_384x288.onnx"
-    $fallbackModel = "cigpose-m_coco-wholebody_256x192.onnx"
-    $detectorName = "yolox_nano.onnx"
-    $preferredModelPath = "models\$preferredModel"
-    $fallbackModelPath = "models\$fallbackModel"
-    $detectorPath = "models\$detectorName"
-    
+    # Pulls the MediaPipe Holistic ONNX bundle. Sourced from the OpenCV
+    # Hugging Face org because they publish small (~5 MB each), single-
+    # file ONNX exports of MediaPipe's pose / palm / hand-landmark
+    # models — far leaner than PINTO_model_zoo's `resources*.tar.gz`
+    # bundles which inflate to 100s of MB by including every precision
+    # × backend variant.
+    #
+    #   * Body  — opencv/pose_estimation_mediapipe       (5.5 MB, 33 3D landmarks)
+    #   * Palm  — opencv/palm_detection_mediapipe        (3.9 MB, hand bbox)
+    #   * Hand  — opencv/handpose_estimation_mediapipe   (3.9 MB, 21 3D landmarks)
+    #
+    # Replaces the old CIGPose (~1 GB) + YOLOX (~10 MB) bundle. Total
+    # download is ~13 MB.
+    #
+    # Face landmarker / blendshapes are deferred to P3 — there is no
+    # first-party-quality face-mesh ONNX export on Hugging Face yet, so
+    # we will fetch from PINTO 282 (Wasabi mirror) when that phase
+    # lands. Until then the Head bone runs from face-pose Euler angles
+    # that the body landmarker derives from the head/shoulder joints.
+    Write-Host "Setting up MediaPipe Holistic ONNX models..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
     }
 
-    if ((Test-Path $preferredModelPath) -and (Test-Path $detectorPath)) {
-        Write-Host "Preferred pose model and detector already exist. Skipping download." -ForegroundColor Green
+    Install-DirectFiles -Name "MediaPipe pose+hand bundle" -Files @(
+        @{ Url = "https://huggingface.co/opencv/pose_estimation_mediapipe/resolve/main/pose_estimation_mediapipe_2023mar.onnx";
+           OutName = "pose_landmark.onnx" }
+        @{ Url = "https://huggingface.co/opencv/palm_detection_mediapipe/resolve/main/palm_detection_mediapipe_2023feb.onnx";
+           OutName = "palm_detection.onnx" }
+        @{ Url = "https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/main/handpose_estimation_mediapipe_2023feb.onnx";
+           OutName = "hand_landmark.onnx" }
+    )
+
+    Write-Host "MediaPipe ONNX models installed successfully." -ForegroundColor Green
+}
+
+# Download a PINTO_model_zoo `resources*.tar.gz` archive, extract to a
+# temp dir, copy ONNX files matching `KeepGlobs` into `models\`, and
+# remove the temp dir. PINTO archives often bundle 10+ variants per
+# model; keeping only the ones we need keeps `models\` lean.
+function Install-PintoArchive {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string]$ArchiveUrl,
+        [Parameter(Mandatory)] [string[]]$KeepGlobs
+    )
+
+    # If every kept glob already resolves to at least one file in
+    # models/, the bundle is already installed — skip the redownload.
+    $allPresent = $true
+    foreach ($glob in $KeepGlobs) {
+        $matched = Get-ChildItem -Path "models\$glob" -ErrorAction SilentlyContinue
+        if (-not $matched) {
+            $allPresent = $false
+            break
+        }
+    }
+    if ($allPresent) {
+        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
         return
     }
 
-    if ((Test-Path $fallbackModelPath) -and !(Test-Path $preferredModelPath)) {
-        Write-Host "Fallback model exists, but preferred 384x288 model or detector is missing. Downloading model bundle..." -ForegroundColor Yellow
+    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    try {
+        $archivePath = Join-Path $tempDir "resources.tar.gz"
+        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
+        # curl.exe is more reliable than Invoke-WebRequest for archives
+        # in the 100MB+ range — IWR's progress UI slows the transfer to a
+        # crawl and (on flaky links) can return without writing the full
+        # body, leaving tar to error out with "Truncated tar archive".
+        # `--fail` exits non-zero on HTTP errors; `-L` follows redirects.
+        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
+        }
+
+        Write-Host "    extracting..." -ForegroundColor DarkGray
+        # tar.exe has shipped with Windows 10 1803+ and Windows 11.
+        # PowerShell's Expand-Archive does not handle .tar.gz natively.
+        $tarOutput = & tar.exe -xzf $archivePath -C $tempDir 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar -xzf failed for $Name (exit $LASTEXITCODE): $tarOutput"
+        }
+
+        $copied = 0
+        foreach ($glob in $KeepGlobs) {
+            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
+            foreach ($file in $matched) {
+                $dest = Join-Path "models" $file.Name
+                Copy-Item -Path $file.FullName -Destination $dest -Force
+                Write-Host "    kept $($file.Name)" -ForegroundColor Green
+                $copied++
+            }
+        }
+        if ($copied -eq 0) {
+            throw "$Name archive contained no files matching: $($KeepGlobs -join ', ')"
+        }
+    } finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
 
-    $zipPath = "cigpose_models.zip"
-    Write-Host "Downloading cigpose_models.zip (this may take a while as it is >1GB)..."
-    Invoke-WebRequest -Uri "https://github.com/namas191297/cigpose-onnx/releases/latest/download/cigpose_models.zip" -OutFile $zipPath
+# Download individual .onnx files directly. Used for sources that
+# publish pre-built ONNX as release assets (no archive unpacking).
+function Install-DirectFiles {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [array]$Files
+    )
 
-    Write-Host "Extracting..."
-    # Warning: The zip contains many models. Expand-Archive might take time.
-    Expand-Archive -Path $zipPath -DestinationPath "models" -Force
-
-    Write-Host "Cleaning up zip archive..."
-    Remove-Item $zipPath -Force
-
-    Write-Host "ONNX Models installed successfully." -ForegroundColor Green
+    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
+    foreach ($f in $Files) {
+        $dest = Join-Path "models" $f.OutName
+        if (Test-Path $dest) {
+            Write-Host "    $($f.OutName): already installed, skipping" -ForegroundColor Green
+            continue
+        }
+        Write-Host "    downloading $($f.Url)" -ForegroundColor DarkGray
+        & curl.exe --fail --silent --show-error --location $f.Url -o $dest
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed for $($f.OutName) (exit $LASTEXITCODE): $($f.Url)"
+        }
+        Write-Host "    kept $($f.OutName)" -ForegroundColor Green
+    }
 }
 
 function Test-Admin {
