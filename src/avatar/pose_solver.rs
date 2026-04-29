@@ -613,8 +613,13 @@ fn compute_body_yaw_signed(
     //     "left-side profile" 90° rotations and `RightHand` at the
     //     mirror-symmetric 270° rotations. We use the difference to
     //     pick the sign.
+    // The face inference returns `confidence = 0` on rear views to
+    // signal "magnitude unreliable but sign of yaw still tracks the
+    // subject's rotation direction" — so we accept yaw sign even at
+    // zero confidence here, while the head-bone driver has already
+    // skipped via the face-confidence threshold.
     let sign = if let Some(face) = source.face {
-        if face.confidence > 0.0 && face.yaw.abs() > 0.05 {
+        if face.yaw.abs() > 0.05 {
             face.yaw.signum()
         } else {
             hand_visibility_sign(source)
@@ -625,14 +630,16 @@ fn compute_body_yaw_signed(
     sign * yaw_unsigned
 }
 
-/// Pick a body-yaw sign from hand-confidence asymmetry. At side
-/// profile only one hand is in front of the body and detected
-/// crisply; the other is occluded with low confidence. Returns +1
-/// when the LEFT-labelled hand wins, -1 when the RIGHT-labelled hand
-/// wins, and a default of +1 when the difference is too small to
-/// trust.
+/// Pick a body-yaw sign from hand-confidence asymmetry. Side-profile
+/// occludes one hand entirely so the diff can be large; rear-3/4
+/// keeps both hands visible and the diff shrinks but its sign still
+/// tracks which side has rotated forward toward the camera.
+///
+/// Returns +1 when the LEFT-labelled hand wins (subject's left side
+/// is closer to camera), -1 when RIGHT wins, and +1 as the
+/// fallback when the diff is below the noise floor.
 fn hand_visibility_sign(source: &SourceSkeleton) -> f32 {
-    const ASYM_MIN: f32 = 0.1;
+    const ASYM_MIN: f32 = 0.02;
     let l = source
         .joints
         .get(&HumanoidBone::LeftHand)

@@ -1243,14 +1243,14 @@ fn face_pose_from_keypoints(
     // camera, subject-left lands on viewer-right, so `left_ear.x` is
     // larger than `right_ear.x` — i.e. `right_ear.x − left_ear.x < 0`.
     // When the subject faces *away* the sides flip and the difference
-    // turns positive. Use that sign to reject rear views before they
-    // poison the yaw / pitch / roll triple. Same logic for eyes.
-    if have_ears && right_ear[0] - left_ear[0] > 0.0 {
-        return None;
-    }
-    if !have_ears && have_eyes && right_eye[0] - left_eye[0] > 0.0 {
-        return None;
-    }
+    // turns positive. We don't drop the pose entirely on rear views:
+    // the magnitude is unreliable but the *sign* of the nose offset
+    // still tracks subject body yaw and the solver uses it for
+    // 135° / 225° disambiguation. Returning confidence = 0 keeps the
+    // sign visible while preventing `apply_face_pose` from rotating
+    // the head with the bogus magnitude.
+    let rear_view = (have_ears && right_ear[0] - left_ear[0] > 0.0)
+        || (!have_ears && have_eyes && right_eye[0] - left_eye[0] > 0.0);
 
     // Roll + face width. Prefer ears (wider baseline, more stable) and
     // fall back to eyes with a rough 2× scale factor to compensate for the
@@ -1311,7 +1311,13 @@ fn face_pose_from_keypoints(
         0.0
     };
 
-    let confidence = {
+    let confidence = if rear_view {
+        // Magnitudes (yaw/pitch/roll) are unreliable on the back of
+        // the head; force `apply_face_pose` to skip via the
+        // confidence threshold. Yaw sign is still preserved on the
+        // returned `FacePose` for downstream body-yaw sign use.
+        0.0
+    } else {
         let mut c = nose[2];
         if have_eyes {
             c = c.min(left_eye[2]).min(right_eye[2]);
