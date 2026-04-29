@@ -1,112 +1,134 @@
 # ONNX Full-Body Tracking Pipeline
 
-This document describes the design and implementation of the ONNX Runtime-based full-body tracking pipeline used in VulVATAR.
+This document describes the design and implementation of the ONNX
+Runtime-based full-body tracking pipeline used in VulVATAR.
 
 ## Architecture Overview
 
-The tracking system has been upgraded from a basic skin-color HSV thresholding to an ML-based inference pipeline using **CIGPose**. The implementation operates independently in a background `TrackingWorker` thread to prevent blocking the main rendering loop.
+The tracking system uses **MediaPipe Holistic** ONNX exports — a
+3D-native cascaded pipeline (Pose → Hand) running on a background
+`TrackingWorker` thread so it never blocks the main rendering loop.
 
 ```mermaid
 graph TD;
-    Camera[Webcam / Video Source] --> |RGB Frame| Preprocess[Preprocessing]
-    Preprocess --> |NCHW Tensor [1,3,H,W]| ORT[ONNX Runtime Session]
-    ORT --> |simcc_x, simcc_y| Decode[SimCC Decoding]
-    Decode --> |[x,y,conf] * 133| Map[Rig Retargeting]
-    Map --> |TrackingRigPose| Mailbox[Tracking Mailbox]
+    Camera[Webcam / Video Source] --> |RGB Frame| Letterbox[Letterbox to 256×256]
+    Letterbox --> |NHWC [1,256,256,3]| Pose[Pose Landmarker ONNX]
+    Pose --> |39 × screen + 39 × world| Skeleton[Source Skeleton]
+    Pose --> |Body bbox: 15/17/19/21| BodyL[Hand bbox - subject left]
+    Pose --> |Body bbox: 16/18/20/22| BodyR[Hand bbox - subject right]
+    BodyL --> |224×224 crop| HandL[Hand Landmarker ONNX]
+    BodyR --> |224×224 crop| HandR[Hand Landmarker ONNX]
+    HandL --> |21 × world| Skeleton
+    HandR --> |21 × world| Skeleton
+    Skeleton --> |3D joints| Solver[pose_solver]
+    Solver --> Mailbox[Tracking Mailbox]
 ```
 
-## Current Baseline Implementation
+## Models
 
-The pipeline has been initially implemented as a "baseline" utilizing `cigpose-onnx`.
+All three ONNX files live in `models/` and are fetched by `dev.ps1`'s
+`Install-Models` step (curl from Hugging Face, ~13 MB total):
 
-### 1. Requirements & Dependencies
-- **Engine:** `ort` (Rust wrapper for ONNX Runtime v2.x).
-- **Tensor Operations:** `ndarray`.
-- **Target OS:** Windows (Execution parallelized natively via ORT; the
-  DirectML execution provider is registered first when built with the
-  `inference-gpu` feature, falling back to the CPU EP if registration
-  fails. The Inspector's *Inference Status* panel surfaces which EP
-  the session ended up on — `DirectML`, `CPU`, or
-  `CPU (DirectML unavailable: …)` — so a silent CPU fallback is
-  visible to the operator.
-- **Model:** `cigpose-m_coco-wholebody_256x192.onnx` (133 keypoints covering body, face, and hands).
+| File                  | Source                                    | Size  | Role                            |
+|-----------------------|-------------------------------------------|-------|---------------------------------|
+| `pose_landmark.onnx`  | `opencv/pose_estimation_mediapipe`        | 5.5MB | 33 body + 6 aux landmarks (3D)  |
+| `palm_detection.onnx` | `opencv/palm_detection_mediapipe`         | 3.9MB | Hand bbox detector (unused MVP) |
+| `hand_landmark.onnx`  | `opencv/handpose_estimation_mediapipe`    | 3.9MB | 21 hand landmarks per side (3D) |
 
-### 2. Pipeline Steps
+The palm detector ships with the bundle but is not yet wired in: the
+hand-bbox derivation uses BlazePose's auxiliary hand markers (wrist +
+pinky/index/thumb knuckles, indices 15/17/19/21 for subject's left and
+16/18/20/22 for right) padded by 1.6×. This is enough for non-overlap
+hand poses; the palm detector is held in reserve for occluded hands.
 
-#### Preprocessing
-- Currently, the entire webcam frame is used (assuming the user is decently centered).
-- A custom high-performance Nearest-Neighbor downscaling algorithm translates the input to the model's required `192x256` dimension.
-- The tensor is normalized using ImageNet configurations (`mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]`).
+## Pipeline
 
-#### Inference
-- Executed on a dedicated thread, outputting `simcc_x` and `simcc_y` logs.
+### 1. Pose Landmarker
 
-#### SimCC Decoding
-- Calculates the `argmax` over the X and Y coordinate bins.
-- Scales the resultant coordinates down by the model's `split_ratio` (default `2.0`) to retrieve pixel-space keypoints.
-- Calculates point confidence using the logarithmic response.
+`tracking::mediapipe::MediaPipeInference::estimate_pose` letterboxes
+the source frame to 256×256 (preserve aspect, zero-pad shorter side)
+and runs the BlazePose Heavy export. Five outputs (positional, set by
+the OpenCV ONNX export):
 
-#### TrackingRigPose Mapping
-- Extracts specific keypoints from the 133-point COCO-Wholebody mapping:
-  - `0`: Nose.
-  - `5, 6`: Left / Right Shoulder.
-  - `7, 8`: Elbows, etc.
-- Maps the predicted points into the normalized Screen-Space `[-1, 1]` with aspect ratio corrections.
-- Approximates Head Orientation (yaw/pitch/roll) using offset locations (e.g., nose).
+1. `landmarks`      `(1, 195)`    — 39 × (x, y, z, vis, pres) screen coords
+2. `conf`           `(1, 1)`      — overall pose confidence (sigmoid-pre)
+3. `mask`           `(1, 256, 256, 1)` — body segmentation (unused)
+4. `heatmap`        `(1, 256, 256, 39)` — per-joint heatmaps (unused)
+5. `landmarks_word` `(1, 117)`    — 39 × (x, y, z) metric, hip-relative
 
-#### Expression Weights from Face Landmarks
-CIGPose does not emit ARKit-style blendshape weights. The face block
-(iBUG 68-point, indices 23..=90 of the 133-point output) is fed
-through `tracking::face_expression::FaceExpressionSmoother` to
-derive a small VRM 1.0 preset subset:
+Visibility/presence are sigmoid-pre on disk; the loader applies σ
+before thresholding. Joint confidence = `min(visibility, presence)`.
 
-- `blinkLeft` / `blinkRight` / `blink` — Eye Aspect Ratio (EAR) per
-  eye, with an input-side Schmitt trigger to debounce noisy frames.
-- `aa` — Mouth Aspect Ratio (MAR), inner-mouth height over outer
-  width.
-- `happy` — mouth-corner elevation above the mouth-center y axis,
-  normalised by face width.
-- `surprised` — brow lift above the eye line, AND-gated against
-  `aa` so a raised brow alone does not register as surprise.
+### 2. Mirror & Retarget
 
-The smoother holds per-channel state (asymmetric attack/release time
-constants, `Instant`-driven dt) so live output eases rather than
-jitters. ARKit 52-blendshape coverage is intentionally out of scope
-for v1 — adding it would mean a separate face-only ONNX model in
-the pipeline.
+MediaPipe labels are subject-POV (their `LEFT_SHOULDER` is on the
+subject's left). VulVATAR uses the selfie-style mirror — the avatar's
+RIGHT side is on the subject's LEFT side — so MediaPipe's index 11
+(LEFT_SHOULDER) maps to `HumanoidBone::RightShoulder`. See
+`MEDIAPIPE_TO_HUMANOID` in `tracking::mediapipe`.
 
-Subject ↔ avatar mirroring follows the body convention (subject-left
-keypoints drive avatar-right bones), so iBUG's "left eye" — the
-subject's left — drives `blinkRight` on the avatar.
+The world output is in metric metres with the hip midpoint as origin,
+X=subject-right, Y=down, Z=away-from-camera. We axis-flip all three
+components to land in the source-skeleton convention
+(x ∈ [-aspect, +aspect] camera-space-right, y ∈ [-1, +1] Y-up,
++z toward camera). The Hips bone takes the midpoint of the two upper-leg
+landmarks; toe tips (indices 31, 32) feed the `fingertips` map keyed
+by `HumanoidBone::*Foot` so the foot heel-to-toe direction is solvable.
 
-## Feature Flag
+### 3. Hand Landmarker
 
-The full ML-baseline requires the `inference` feature to compile in order to prevent forcing large AI dependencies on lightweight builds.
+For each side that has a tracked body wrist (`RightHand` for subject
+left, `LeftHand` for subject right), the bbox is built from the four
+auxiliary body landmarks for that hand (centroid + max distance × 1.6
+padding), then cropped & resized to 224×224 NHWC.
+
+Hand model outputs four tensors:
+
+1. `landmarks`      `(1, 63)` — 21 × (x, y, z) screen
+2. `conf`           `(1, 1)`  — hand confidence (sigmoid-pre)
+3. `handedness`     `(1, 1)`  — left/right (ignored: bbox tells us)
+4. `landmarks_word` `(1, 63)` — 21 × (x, y, z) metric, hand-center origin
+
+We use the world output for finger geometry. Same axis flip as the
+body, then we translate so landmark 0 (wrist) coincides with the body
+wrist position. Indices 1..=20 fan out to the 15 finger phalanges
+(`{Thumb,Index,Middle,Ring,Little} × {Proximal,Intermediate,Distal}`)
+plus 5 distal-tip entries that go into `SourceSkeleton::fingertips`
+keyed by the distal bone.
+
+Hand confidence threshold is 0.4 (sigmoid). On low confidence, missing
+bbox, or any ORT error, that side's fingers stay at rest pose for
+the frame — the avatar's body still tracks.
+
+## Feature Flags
+
+- `inference` — enables ONNX Runtime + the `MediaPipeInference` path.
+  Without it, the worker falls back to a simple skin-colour HSV
+  centroid in `tracking::pose_estimation` (no body joints, just a
+  rough face pose) so the GUI still has a heartbeat.
+- `inference-gpu` — additionally registers the DirectML execution
+  provider before the CPU fallback. The Inspector's *Inference Status*
+  panel surfaces which EP the live session is running on
+  (`DirectML`, `CPU`, or `CPU (DirectML unavailable: …)`), so a silent
+  CPU fallback is visible.
 
 ```bash
-cargo build --features "webcam inference"
+cargo build --features "webcam inference inference-gpu"
 ```
 
-If the `inference` feature is explicitly omitted, the pipeline safely falls back to the previous simple skin-color heuristic.
+## Limitations & Future Work
 
-## Future Work & Limitations
-
-1. **Resampling quality.** Preprocessing still uses nearest-neighbor
+1. **Face blendshapes.** No ARKit-style 52-blendshape head is wired
+   yet. The Pose Landmarker emits a few face landmarks (nose, eyes,
+   ears, mouth corners) which could feed a basic head pose, but full
+   expression coverage needs the dedicated MediaPipe Face Landmarker
+   ONNX export. Until that lands, head rotation defaults to whatever
+   the spine direction implies and `expressions` is empty.
+2. **Single-person only.** BlazePose Heavy does not emit per-person
+   bboxes — there is one implicit subject per frame. Multi-person
+   support would require wiring in the `palm_detection` model (for
+   bbox proposals) plus a separate person detector.
+3. **Letterbox resampling.** Preprocessing still uses nearest-neighbour
    downscaling on the critical frame path to avoid pulling in a
    heavyweight imaging crate. Can be upgraded to bilinear via shaders
-   or `imageops` for a small accuracy bump.
-2. **ARKit-grade expression coverage.** The face_expression heuristic
-   covers ~6 VRM presets — enough for "the avatar is alive" but not a
-   replacement for a dedicated face blendshape model. A separate
-   face-only ONNX (e.g. MediaPipe FaceLandmarker with blendshapes)
-   would be a second pipeline stage, not a swap-in.
-3. **Lower-body fidelity trade-off.** The `wholebody` CIGPose variant
-   emits hip/knee/ankle keypoints but at lower input resolution, so
-   the *Lower-body Tracking* toggle costs hand fidelity on the same
-   tier of model. Resolution-matched whole-body models would close
-   that gap.
-
-YOLOX person-crop integration and DirectML EP registration both
-shipped with T9 / T10 and are no longer aspirational. The Inspector's
-*Inference Status* panel reports which EP the live session is
-running on.
+   or `imageops` for a small accuracy bump on tiny subjects.

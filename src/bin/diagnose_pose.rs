@@ -1,11 +1,11 @@
 //! Pose-tracking visual diagnostic CLI.
 //!
-//! Loads an input image, runs CIGPose+YOLOX inference on it, applies
-//! the result to a VRM via `pose_solver::solve_avatar_pose`, and dumps
-//! the rendered avatar to PNG. Used to verify whether the solver's
-//! bone rotations match the input pose visually — the fastest way to
-//! catch axis-handedness / mirror / sign-flip bugs the unit tests
-//! don't cover.
+//! Loads an input image, runs MediaPipe Holistic inference on it
+//! (body + hands), applies the result to a VRM via
+//! `pose_solver::solve_avatar_pose`, and dumps the rendered avatar to
+//! PNG. Used to verify whether the solver's bone rotations match the
+//! input pose visually — the fastest way to catch axis-handedness /
+//! mirror / sign-flip bugs the unit tests don't cover.
 //!
 //! Usage:
 //!   cargo run --release --bin diagnose_pose -- \

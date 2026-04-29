@@ -11,11 +11,8 @@ mod webcam;
 
 mod pose_estimation;
 
-pub mod inference;
 pub mod mediapipe;
 pub mod source_skeleton;
-
-mod face_expression;
 
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
@@ -225,7 +222,7 @@ impl TrackingMailbox {
     }
 
     /// Set the inference-backend label. Called once by the worker after
-    /// `CigPoseInference` finishes loading its model. `None` resets it
+    /// `MediaPipeInference` finishes loading its model. `None` resets it
     /// (e.g. when tracking stops or the engine is destroyed).
     pub fn set_inference_backend_label(&self, label: Option<String>) {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());

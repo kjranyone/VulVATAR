@@ -317,8 +317,8 @@ Then enable VirtualCamera sink and confirm:
 README now states:
 
 - VulVATAR: GPL-3.0
-- CIGPose / `cigpose-onnx` models: Apache-2.0
-- YOLOX-Nano detector model: Apache-2.0
+- MediaPipe Pose / Hand ONNX exports (via `opencv/*_mediapipe` on
+  Hugging Face): Apache-2.0
 - ONNX Runtime: MIT
 
 This is unrelated to the implementation breakage, but should remain in the

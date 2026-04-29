@@ -6,7 +6,7 @@
 //! bare-minimum [`SourceSkeleton`] (no body joints, just a face pose
 //! derived from the centroid) so the downstream solver has something to
 //! work with. Proper pose estimation comes from
-//! [`super::inference::CigPoseInference`].
+//! [`super::mediapipe::MediaPipeInference`].
 
 use super::{DetectionAnnotation, FacePose, PoseEstimate, SourceSkeleton};
 

@@ -1,8 +1,9 @@
 //! Solve avatar bone rotations from a [`SourceSkeleton`].
 //!
 //! The solver consumes 3D joint positions directly (the upstream tracker
-//! is responsible for producing depth — see [`crate::tracking::inference`]
-//! which now drives a MediaPipe Holistic pipeline). Three ideas:
+//! is responsible for producing depth — see
+//! [`crate::tracking::mediapipe::MediaPipeInference`], which drives the
+//! MediaPipe Holistic pipeline). Three ideas:
 //!
 //! 1. **Rest-relative.** Every output rotation is expressed as a delta
 //!    from the avatar's rest pose, so models whose bones have non-identity

@@ -32,5 +32,4 @@ models/*.onnx
 *.stderr.log
 
 # Misc
-cigpose_models.zip
 nul
