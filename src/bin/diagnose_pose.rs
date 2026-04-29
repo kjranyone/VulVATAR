@@ -149,6 +149,12 @@ fn main() -> Result<(), String> {
         );
     }
 
+    // The prime calls left filter / hysteresis state pointing at
+    // those frames; treat the test image as a fresh observation so
+    // the 1€ filter does not blend prime's pose into the result.
+    // Per-bone running-max calibration is preserved.
+    solver_state.reset_motion_smoothing();
+
     eprintln!("running inference…");
     let estimate = infer.estimate_pose(rgb.as_raw(), iw, ih, 0);
     eprintln!(

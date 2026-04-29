@@ -23,6 +23,7 @@
 //! writes rotations; translations and scales are left untouched.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::asset::{HumanoidBone, HumanoidMap, NodeId, Quat, SkeletonAsset, Transform, Vec3};
 use crate::math_utils::{
@@ -30,6 +31,38 @@ use crate::math_utils::{
     quat_rotate_vec3, vec3_normalize, vec3_sub,
 };
 use crate::tracking::source_skeleton::{FacePose, SourceSkeleton};
+
+/// Reference frame period used to convert the GUI's frame-rate-naive
+/// `rotation_blend` slider into a time-constant. With the slider at
+/// `b` and the system actually running at `dt_ref`, the per-frame α
+/// becomes `1 − exp(−dt/τ)` with `τ = −dt_ref / ln(1 − b)`. The
+/// slider semantics stay intact — `b` reads as "what α you'd see at
+/// the reference rate" — but the actual smoothing is now invariant
+/// to frame-rate jitter.
+const ROTATION_BLEND_REFERENCE_DT: f32 = 1.0 / 30.0;
+
+/// Time constant (seconds) for exponential decay of per-bone running
+/// max calibration. Spike-resistance: a single large outlier max
+/// loses 1/e of its lead in this many seconds while a sustained real
+/// peak gets refreshed every frame and never decays. Tuned so a
+/// minute-long pose gap (user steps away) still has most of the
+/// calibration intact when they return.
+const RUNNING_MAX_DECAY_TAU_SEC: f32 = 60.0;
+
+/// Schmitt hysteresis ratio. A joint becomes "active" when its
+/// confidence rises above `threshold` and stays active until it
+/// drops below `threshold * SCHMITT_EXIT_RATIO`. Prevents chatter
+/// when raw confidence wiggles around the threshold boundary.
+const SCHMITT_EXIT_RATIO: f32 = 0.8;
+
+/// 1€ filter constants. `min_cutoff` is the cutoff at zero motion
+/// (lower → smoother at rest); `beta` is the velocity-coupling gain
+/// (higher → faster response when the joint moves); `d_cutoff` is
+/// the cutoff used to low-pass the velocity estimate. Defaults
+/// follow the original 1€ paper's pose-tracking recommendations.
+const ONE_EURO_MIN_CUTOFF_HZ: f32 = 1.0;
+const ONE_EURO_BETA: f32 = 0.05;
+const ONE_EURO_D_CUTOFF_HZ: f32 = 1.0;
 
 /// Input knobs for the solver. All fields have sensible defaults; callers
 /// only need to tweak when surfacing UI sliders.
@@ -93,6 +126,17 @@ pub struct PoseSolverState {
     /// span is much smaller than the max the body has yawed away from
     /// the camera and face-pose keypoints are unreliable.
     shoulder_span_max_2d: f32,
+    /// Per-bone 1€ filter state for joint position smoothing.
+    joint_filters: HashMap<HumanoidBone, OneEuroFilterState>,
+    /// Separate filter state map for fingertip auxiliary positions
+    /// (keyed by the distal bone, same as `SourceSkeleton::fingertips`).
+    fingertip_filters: HashMap<HumanoidBone, OneEuroFilterState>,
+    /// Per-bone Schmitt hysteresis state for joint confidence.
+    joint_active: HashMap<HumanoidBone, bool>,
+    /// Wall-clock timestamp of the previous solve, used to derive `dt`
+    /// for the dt-aware blend / decay / 1€ filter. `None` until the
+    /// first call.
+    last_solve_instant: Option<Instant>,
 }
 
 impl PoseSolverState {
@@ -106,7 +150,68 @@ impl PoseSolverState {
     pub fn reset(&mut self) {
         self.bone_max_2d.clear();
         self.shoulder_span_max_2d = 0.0;
+        self.joint_filters.clear();
+        self.fingertip_filters.clear();
+        self.joint_active.clear();
+        self.last_solve_instant = None;
     }
+
+    /// Discard the per-frame motion smoothing state (1€ filter,
+    /// hysteresis active flags, last-solve timestamp) without
+    /// touching the longer-running calibration (`bone_max_2d`,
+    /// `shoulder_span_max_2d`). Useful when the next solve call
+    /// represents a new subject pose that should not blend with
+    /// whatever was last seen — e.g. between a calibration-priming
+    /// frame and the actual test frame in `diagnose_pose`.
+    pub fn reset_motion_smoothing(&mut self) {
+        self.joint_filters.clear();
+        self.fingertip_filters.clear();
+        self.joint_active.clear();
+        self.last_solve_instant = None;
+    }
+}
+
+/// 1€ filter state for a single 2D keypoint stream. See
+/// [Casiez et al. 2012](https://hal.inria.fr/hal-00670496).
+#[derive(Clone, Copy, Debug, Default)]
+struct OneEuroFilterState {
+    initialized: bool,
+    pos: [f32; 2],
+    vel: [f32; 2],
+}
+
+impl OneEuroFilterState {
+    /// Apply the filter to a raw position and return the smoothed
+    /// position. `dt` is seconds since the previous update for this
+    /// stream. Self-initializes on the first call (no smoothing).
+    fn apply(&mut self, raw: [f32; 2], dt: f32) -> [f32; 2] {
+        if !self.initialized || dt <= 0.0 {
+            self.initialized = true;
+            self.pos = raw;
+            self.vel = [0.0, 0.0];
+            return raw;
+        }
+        // Velocity from raw delta, then low-pass it via d_cutoff.
+        let raw_vel = [(raw[0] - self.pos[0]) / dt, (raw[1] - self.pos[1]) / dt];
+        let alpha_d = one_euro_alpha(dt, ONE_EURO_D_CUTOFF_HZ);
+        self.vel[0] += alpha_d * (raw_vel[0] - self.vel[0]);
+        self.vel[1] += alpha_d * (raw_vel[1] - self.vel[1]);
+        // Position cutoff scales with velocity magnitude — high-speed
+        // motion gets a higher cutoff (less smoothing, more responsive).
+        let speed = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
+        let cutoff = ONE_EURO_MIN_CUTOFF_HZ + ONE_EURO_BETA * speed;
+        let alpha = one_euro_alpha(dt, cutoff);
+        self.pos[0] += alpha * (raw[0] - self.pos[0]);
+        self.pos[1] += alpha * (raw[1] - self.pos[1]);
+        self.pos
+    }
+}
+
+#[inline]
+fn one_euro_alpha(dt: f32, cutoff_hz: f32) -> f32 {
+    let tau = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz.max(1e-6));
+    let raw_alpha = 1.0 / (1.0 + tau / dt.max(1e-6));
+    raw_alpha.clamp(0.0, 1.0)
 }
 
 /// Body-yaw foreshortening fraction. `1.0` means shoulders fully visible
@@ -282,6 +387,37 @@ pub fn solve_avatar_pose(
         return;
     };
 
+    // Compute per-frame dt against the previous solve; clamp so a
+    // long pause (debugger, GC stall) does not produce a huge α that
+    // snaps the avatar to whatever stale or noisy data arrived first.
+    // On the very first call we have no reference, so substitute the
+    // 30 fps reference period — the slider value then maps to itself
+    // on frame zero, matching the pre-smoothing behaviour.
+    let now = Instant::now();
+    let dt = match state.last_solve_instant {
+        Some(prev) => (now - prev).as_secs_f32().clamp(0.0, 0.25),
+        None => ROTATION_BLEND_REFERENCE_DT,
+    };
+    state.last_solve_instant = Some(now);
+
+    // Apply the 1€ filter + Schmitt hysteresis on every keypoint
+    // before any geometry runs. Working on a local clone keeps
+    // `&SourceSkeleton` immutable for callers (tests, other consumers).
+    let source_owned = preprocess_source(source, state, dt, params);
+    let source = &source_owned;
+
+    // Decay the per-bone running max so transient detector spikes do
+    // not pin Z high indefinitely. Real, sustained peaks get
+    // refreshed every frame and never decay; outliers wash out over
+    // RUNNING_MAX_DECAY_TAU_SEC. Also decays shoulder-span max.
+    if dt > 0.0 {
+        let factor = (-dt / RUNNING_MAX_DECAY_TAU_SEC).exp();
+        for v in state.bone_max_2d.values_mut() {
+            *v *= factor;
+        }
+        state.shoulder_span_max_2d *= factor;
+    }
+
     // Update shoulder-span max so we can later detect side/rear views.
     // Computed every frame (regardless of any per-bone gating) so the
     // running max tracks the subject's true shoulder span across
@@ -352,7 +488,7 @@ pub fn solve_avatar_pose(
                 ));
                 let prev_local_rot = local_transforms[hips_idx].rotation;
                 local_transforms[hips_idx].rotation =
-                    quat_slerp_short(&prev_local_rot, &new_local_rot, params.rotation_blend);
+                    quat_slerp_short(&prev_local_rot, &new_local_rot, dt_aware_blend(params.rotation_blend, dt));
                 let updated_world = quat_mul(&parent_world_rot, &local_transforms[hips_idx].rotation);
                 current_world[hips_idx].rotation = updated_world;
             }
@@ -514,8 +650,11 @@ pub fn solve_avatar_pose(
         let new_local_rot = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
         let prev_local_rot = local_transforms[node_idx].rotation;
-        local_transforms[node_idx].rotation =
-            quat_slerp_short(&prev_local_rot, &new_local_rot, params.rotation_blend);
+        local_transforms[node_idx].rotation = quat_slerp_short(
+            &prev_local_rot,
+            &new_local_rot,
+            dt_aware_blend(params.rotation_blend, dt),
+        );
 
         // Keep the world rotation cache in sync so child bones in this
         // same pass see the updated parent orientation.
@@ -541,7 +680,7 @@ pub fn solve_avatar_pose(
                             skeleton,
                             local_transforms,
                             &current_world,
-                            params.rotation_blend,
+                            dt_aware_blend(params.rotation_blend, dt),
                         );
                     }
                 }
@@ -798,6 +937,74 @@ fn midpoint(a: &Vec3, b: &Vec3) -> Vec3 {
         (a[1] + b[1]) * 0.5,
         (a[2] + b[2]) * 0.5,
     ]
+}
+
+/// Convert the GUI's frame-rate-naive `rotation_blend` slider value
+/// into a dt-aware α. The slider's intent is "what fraction of the
+/// new pose to absorb each frame at the reference rate"; reframing
+/// it as a time-constant means the same slider value behaves
+/// identically whether the camera ships 30 or 60 fps and whether
+/// the renderer hitches occasionally.
+#[inline]
+fn dt_aware_blend(slider_blend: f32, dt: f32) -> f32 {
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    let b = slider_blend.clamp(0.0, 1.0);
+    if b >= 1.0 {
+        return 1.0;
+    }
+    if b <= 0.0 {
+        return 0.0;
+    }
+    let tau = -ROTATION_BLEND_REFERENCE_DT / (1.0 - b).ln();
+    1.0 - (-dt / tau).exp()
+}
+
+/// Apply the 1€ filter to every joint and fingertip position, then
+/// gate confidences via per-bone Schmitt hysteresis. Returns a
+/// fresh `SourceSkeleton` so `&SourceSkeleton` callers don't need to
+/// hand over a mutable reference.
+fn preprocess_source(
+    source: &SourceSkeleton,
+    state: &mut PoseSolverState,
+    dt: f32,
+    params: &SolverParams,
+) -> SourceSkeleton {
+    let mut out = source.clone();
+
+    let enter = params.joint_confidence_threshold;
+    let exit = enter * SCHMITT_EXIT_RATIO;
+
+    for (bone, joint) in out.joints.iter_mut() {
+        let filt = state.joint_filters.entry(*bone).or_default();
+        let smoothed = filt.apply(joint.position, dt);
+        joint.position = smoothed;
+        // Schmitt hysteresis: a single dropout below `enter` does
+        // not turn the joint off as long as it stays above `exit`.
+        let active = state.joint_active.entry(*bone).or_insert(false);
+        let raw = joint.confidence;
+        if *active {
+            if raw < exit {
+                *active = false;
+                joint.confidence = 0.0;
+            }
+        } else if raw >= enter {
+            *active = true;
+        } else {
+            joint.confidence = 0.0;
+        }
+    }
+
+    for (bone, joint) in out.fingertips.iter_mut() {
+        let filt = state.fingertip_filters.entry(*bone).or_default();
+        joint.position = filt.apply(joint.position, dt);
+        // Fingertips don't go through the body-bone DRIVEN_BONES list
+        // for confidence gating directly — the distal bone owns the
+        // gate — so we only smooth the position here.
+    }
+
+    out
 }
 
 // Slerp / lerp
