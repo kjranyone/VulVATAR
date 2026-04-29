@@ -63,6 +63,11 @@ licenses. In particular:
   by OpenMMLab / mmpose and re-distributed as ONNX by Soykaf:
   - https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose3d
   - https://huggingface.co/Soykaf/RTMW3D-x
+- MediaPipe FaceMeshV2 (478 face landmarks) and BlendshapeV2 (52 ARKit
+  blendshape coefficients) by Google AI Edge (Apache-2.0), packaged
+  as ONNX in PINTO_model_zoo:
+  - https://github.com/PINTO0309/PINTO_model_zoo/tree/main/410_FaceMeshV2
+  - https://github.com/PINTO0309/PINTO_model_zoo/tree/main/390_BlendShapeV2
 - ONNX Runtime: MIT
   - https://github.com/microsoft/onnxruntime
 - Rust crate dependencies: see each crate's license metadata.

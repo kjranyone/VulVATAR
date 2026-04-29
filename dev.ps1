@@ -59,19 +59,19 @@ function Install-Font {
 }
 
 function Install-Models {
-    # Pulls the RTMW3D-x ONNX (Apache-2). One model emits 133
-    # COCO-Wholebody keypoints in 3D — body 17 + foot 6 + face 68 +
-    # 21+21 hands — which removes the need for a separate hand or
-    # palm detector. We feed the camera frame directly to the model
-    # without a person bbox detector (Kinemotion-style); VulVATAR is
-    # single-subject VTubing so the implicit "centre subject"
-    # assumption holds.
+    # Pulls RTMW3D-x for body / hands and MediaPipe FaceMeshV2 +
+    # BlendshapeV2 for face expression.
     #
-    #   * RTMW3D-x — Soykaf/RTMW3D-x (370 MB, 133 3D landmarks)
+    #   * RTMW3D-x   — Soykaf/RTMW3D-x          (370 MB, 133 3D landmarks)
+    #   * FaceMesh   — PINTO 410 FaceMeshV2     (4.8 MB, 478 face landmarks)
+    #   * Blendshape — PINTO 390 BlendshapeV2   (1.8 MB, 52 ARKit weights)
     #
-    # Soykaf's HuggingFace mirror hosts the official mmpose export
-    # (`rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx`).
-    Write-Host "Setting up RTMW3D ONNX model..." -ForegroundColor Cyan
+    # RTMW3D's body keypoints 0..=4 (nose / eyes / ears) are used to
+    # crop the face for FaceMesh, so we don't need a separate face
+    # detector. The 52 ARKit blendshape coefficients drive the avatar's
+    # expression channel directly (with a few VRM 1.0 preset
+    # aggregations layered on for stock rigs).
+    Write-Host "Setting up VulVATAR ONNX models..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
     }
@@ -81,7 +81,94 @@ function Install-Models {
            OutName = "rtmw3d.onnx" }
     )
 
-    Write-Host "RTMW3D ONNX model installed successfully." -ForegroundColor Green
+    # Face mesh + blendshape from PINTO_model_zoo. PINTO ships
+    # MediaPipe FaceMeshV2 (478 landmarks) and BlendshapeV2 (52 ARKit
+    # weights) as separate ONNX files inside per-project tar.gz
+    # archives. The OpenCV HF org does not publish these particular
+    # models, so we fall back to PINTO's Wasabi S3 mirror.
+    Install-PintoArchive -Name "MediaPipe FaceMeshV2 (478 landmarks)" `
+        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/410_FaceMeshV2/resources.tar.gz" `
+        -KeepGlobs @("face_landmarks_detector_1x3x256x256.onnx")
+    Install-PintoArchive -Name "MediaPipe BlendshapeV2 (52 ARKit blendshapes)" `
+        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/390_BlendShapeV2/resources.tar.gz" `
+        -KeepGlobs @("face_blendshapes.onnx")
+
+    # Rename to the canonical filename the loader expects.
+    if ((Test-Path "models\face_landmarks_detector_1x3x256x256.onnx") -and
+        (-not (Test-Path "models\face_landmark.onnx"))) {
+        Move-Item "models\face_landmarks_detector_1x3x256x256.onnx" "models\face_landmark.onnx"
+        Write-Host "    renamed to face_landmark.onnx" -ForegroundColor Green
+    }
+
+    Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
+}
+
+# Download a PINTO_model_zoo `resources*.tar.gz` archive, extract to a
+# temp dir, copy ONNX files matching `KeepGlobs` into `models\`, and
+# remove the temp dir. PINTO archives often bundle 10+ variants per
+# model; keeping only the ones we need keeps `models\` lean.
+function Install-PintoArchive {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string]$ArchiveUrl,
+        [Parameter(Mandatory)] [string[]]$KeepGlobs
+    )
+
+    # If every kept glob already resolves to at least one file in
+    # models/, the bundle is already installed — skip the redownload.
+    $allPresent = $true
+    foreach ($glob in $KeepGlobs) {
+        $matched = Get-ChildItem -Path "models\$glob" -ErrorAction SilentlyContinue
+        if (-not $matched) {
+            $allPresent = $false
+            break
+        }
+    }
+    if ($allPresent) {
+        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    try {
+        $archivePath = Join-Path $tempDir "resources.tar.gz"
+        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
+        # curl.exe is more reliable than Invoke-WebRequest for archives
+        # in the 100MB+ range — IWR's progress UI slows the transfer to a
+        # crawl and (on flaky links) can return without writing the full
+        # body, leaving tar to error out with "Truncated tar archive".
+        # `--fail` exits non-zero on HTTP errors; `-L` follows redirects.
+        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
+        }
+
+        Write-Host "    extracting..." -ForegroundColor DarkGray
+        # tar.exe has shipped with Windows 10 1803+ and Windows 11.
+        # PowerShell's Expand-Archive does not handle .tar.gz natively.
+        $tarOutput = & tar.exe -xzf $archivePath -C $tempDir 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar -xzf failed for $Name (exit $LASTEXITCODE): $tarOutput"
+        }
+
+        $copied = 0
+        foreach ($glob in $KeepGlobs) {
+            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
+            foreach ($file in $matched) {
+                $dest = Join-Path "models" $file.Name
+                Copy-Item -Path $file.FullName -Destination $dest -Force
+                Write-Host "    kept $($file.Name)" -ForegroundColor Green
+                $copied++
+            }
+        }
+        if ($copied -eq 0) {
+            throw "$Name archive contained no files matching: $($KeepGlobs -join ', ')"
+        }
+    } finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Download individual .onnx files directly. Used for sources that

@@ -11,6 +11,7 @@ mod webcam;
 
 mod pose_estimation;
 
+pub mod face_mediapipe;
 pub mod rtmw3d;
 pub mod source_skeleton;
 

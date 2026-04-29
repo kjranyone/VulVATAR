@@ -20,14 +20,16 @@ graph TD;
     Solver --> Mailbox[Tracking Mailbox]
 ```
 
-## Model
+## Models
 
-A single ONNX file under `models/` (~370 MB), fetched by `dev.ps1`'s
-`Install-Models` step:
+Three ONNX files under `models/` (~377 MB total), fetched by
+`dev.ps1`'s `Install-Models` step:
 
-| File          | Source                | Size    | Role                                |
-|---------------|-----------------------|---------|-------------------------------------|
-| `rtmw3d.onnx` | `Soykaf/RTMW3D-x` HF  | 370 MB  | 133 COCO-Wholebody keypoints (3D)   |
+| File                    | Source                       | Size    | Role                                                  |
+|-------------------------|------------------------------|---------|-------------------------------------------------------|
+| `rtmw3d.onnx`           | `Soykaf/RTMW3D-x` HF         | 370 MB  | 133 COCO-Wholebody keypoints (3D)                     |
+| `face_landmark.onnx`    | PINTO 410 FaceMeshV2         | 4.8 MB  | 478 dense face landmarks                              |
+| `face_blendshapes.onnx` | PINTO 390 BlendshapeV2       | 1.8 MB  | 146 face landmarks → 52 ARKit blendshape coefficients |
 
 Soykaf's HuggingFace mirror hosts the official mmpose export
 (`rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx`,
@@ -129,15 +131,43 @@ avatar's `Right*` bones rest after the VRM 0.x Y180 root flip.
 cargo build --features "webcam inference inference-gpu"
 ```
 
+## Face cascade
+
+If `face_landmark.onnx` and `face_blendshapes.onnx` are present, a
+face inference cascade runs after the body track:
+
+1. **Face bbox derivation.** RTMW3D's 68 face landmarks (indices
+   23..=90, dlib 68-point convention with jawline / brows / nose /
+   eyes / mouth) define a centroid and `max_d` to the farthest
+   landmark; the bbox is centred on the centroid with `1.3× max_d`
+   half-size. The face-68 set spans the whole face including chin,
+   so unlike the body-track 5-point face landmarks (nose / eyes /
+   ears) the bbox does not clip the lower face.
+2. **FaceMeshV2** runs on a 256×256 NCHW crop, emitting 478 dense
+   face landmarks plus a per-frame face-presence confidence (sigmoid
+   threshold 0.4).
+3. **BlendshapeV2** receives a 146-landmark subset of the FaceMesh
+   output (the canonical `kLandmarksSubsetIdxs` from MediaPipe's
+   `face_blendshapes_graph.cc`) and emits 52 ARKit-style blendshape
+   coefficients.
+4. The 52 weights are passed through verbatim under their ARKit
+   names (`mouthSmileLeft`, `eyeBlinkLeft`, `jawOpen`, …) and *also*
+   aggregated into VRM 1.0 preset names (`blink` / `aa` / `happy` /
+   `sad` / `surprised`) so a stock rig with no custom expressions
+   still gets live facial motion. Selfie mirror applies — the
+   subject's left eye drives `blinkRight`.
+
+Head pose (yaw / pitch / roll) is computed independently from
+RTMW3D's body face keypoints (0=nose, 1=left_eye, 2=right_eye,
+3=left_ear, 4=right_ear) which already sit in source-skeleton 3D
+coords. Using FaceMeshV2's z output for head pose is avoided
+because that z is in arbitrary face-relative pixel units —
+re-projecting it into the body frame would need camera intrinsics
+we don't have.
+
 ## Limitations & Future Work
 
-1. **Face / blendshapes are empty.** RTMW3D emits 68 face landmarks
-   (indices 23-90) that this implementation does not yet decode.
-   The head bone falls back to spine direction, and ARKit blendshape
-   coefficients (smile / blink / jaw / brow) are not produced. The
-   Phase C plan is to add a SMIRK FLAME-regression head that emits
-   FLAME params, plus a FLAME-50 → ARKit-52 retarget matrix.
-2. **Occluded-hand depth.** Monocular 3D pose places hands behind
+1. **Occluded-hand depth.** Monocular 3D pose places hands behind
    the body when an instrument or object occludes the wrist
    (e.g. guitar strumming hand). RTMW3D handles this better than
    the previous BlazePose pipeline but not perfectly. A planned

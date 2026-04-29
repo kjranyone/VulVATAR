@@ -38,7 +38,9 @@
 
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
-use super::{DetectionAnnotation, SourceJoint, SourceSkeleton};
+use super::face_mediapipe::FaceMeshInference;
+#[cfg(feature = "inference")]
+use super::{DetectionAnnotation, FacePose, SourceJoint, SourceSkeleton};
 #[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
 #[cfg(feature = "inference")]
@@ -225,6 +227,13 @@ pub struct Rtmw3dInference {
     input_name: String,
     #[cfg(feature = "inference")]
     output_names: Vec<String>,
+    /// Optional MediaPipe FaceMeshV2 + BlendshapeV2 pipeline. Loaded
+    /// when `face_landmark.onnx` and `face_blendshapes.onnx` are
+    /// present in the same `models/` directory; absent → expression
+    /// channel stays empty and the head bone falls back to whatever
+    /// the spine direction implies.
+    #[cfg(feature = "inference")]
+    face_mesh: Option<FaceMeshInference>,
     #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
@@ -271,11 +280,23 @@ impl Rtmw3dInference {
             );
         }
 
+        let mut load_warnings = Vec::new();
+        let face_mesh = match FaceMeshInference::try_from_models_dir(models_dir) {
+            Ok(opt) => opt,
+            Err(e) => {
+                let msg = format!("Face inference failed to load: {}. Expressions disabled.", e);
+                warn!("{}", msg);
+                load_warnings.push(msg);
+                None
+            }
+        };
+
         Ok(Self {
             session,
             input_name,
             output_names,
-            load_warnings: Vec::new(),
+            face_mesh,
+            load_warnings,
             backend,
         })
     }
@@ -388,7 +409,25 @@ impl Rtmw3dInference {
         drop(outputs);
 
         let joints = decode_simcc(&simcc_x, &simcc_y, &simcc_z);
-        let skeleton = build_source_skeleton(frame_index, &joints, width, height);
+        let mut skeleton = build_source_skeleton(frame_index, &joints, width, height);
+
+        // Head pose (yaw/pitch/roll) from RTMW3D's body face keypoints
+        // 0..=4. These are already in source-skeleton 3D coords, so
+        // the angles fall straight into the solver's frame without
+        // any unprojection.
+        skeleton.face = derive_face_pose_from_body(&skeleton, &joints);
+
+        // Face crop → MediaPipe FaceMesh → BlendshapeV2. The bbox is
+        // derived from RTMW3D's face-68 landmarks (indices 23..=90)
+        // so the cascade does not need its own face detector.
+        if let Some(face) = self.face_mesh.as_mut() {
+            if let Some(bbox) = build_face_bbox_from_joints(&joints, width, height) {
+                if let Some(exprs) = face.estimate(rgb_data, width, height, &bbox) {
+                    skeleton.expressions = exprs;
+                }
+            }
+        }
+
         let annotation = build_annotation(&joints);
         PoseEstimate {
             annotation,
@@ -746,6 +785,120 @@ fn attach_hand<F>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Head pose & face bbox derivation
+// ---------------------------------------------------------------------------
+
+/// Derive head yaw / pitch / roll from RTMW3D's body face keypoints
+/// (0=nose, 1=left_eye, 2=right_eye, 3=left_ear, 4=right_ear) in
+/// source-skeleton 3D coords. Returns `None` if any keypoint is below
+/// the confidence floor or the eye/ear spans are too small to give a
+/// reliable angle.
+///
+/// All values are already mirrored at the source level (subject's
+/// left ear ends up at source `+x`), so the sign conventions match
+/// `quat_from_euler_ypr`.
+#[cfg(feature = "inference")]
+fn derive_face_pose_from_body(skeleton: &SourceSkeleton, joints: &[DecodedJoint]) -> Option<FacePose> {
+    if joints.len() < 5 {
+        return None;
+    }
+    for j in joints.iter().take(5) {
+        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+            return None;
+        }
+    }
+    // We need positions in source-skeleton coords. The COCO body
+    // keypoints 0..=4 are not stored in `skeleton.joints` (only
+    // shoulders / arms / legs are), so reconstruct via the same
+    // `to_source` math. We extract hip mid from the stored Hips
+    // joint (which is `(0, 0, 0)` by definition of the origin),
+    // then read the 5 face keypoints in normalised space and run
+    // them through the same axis flip used elsewhere.
+    let hip = (joints[11].nx + joints[12].nx) * 0.5;
+    let aspect = skeleton
+        .joints
+        .get(&HumanoidBone::LeftShoulder)
+        .or_else(|| skeleton.joints.get(&HumanoidBone::RightShoulder))
+        .map(|s| s.position[0].abs())
+        .unwrap_or(0.0)
+        / ((joints[5].nx - joints[6].nx).abs() / 2.0).max(1e-3);
+    // Conservative aspect estimate: if we can't read it from the
+    // stored shoulders fall back to assuming square (1.0).
+    let aspect = if aspect.is_finite() && aspect > 0.5 && aspect < 4.0 { aspect } else { 1.0 };
+    let to_src = |j: &DecodedJoint| -> [f32; 3] {
+        let sx = -(j.nx - hip) * aspect;
+        let sy = -(j.ny - (joints[11].ny + joints[12].ny) * 0.5);
+        let sz = -(j.nz - (joints[11].nz + joints[12].nz) * 0.5);
+        [sx, sy, sz]
+    };
+    // Subject-POV indices map to avatar-POV after `to_src` (selfie
+    // mirror): subject's left → avatar's right and vice versa. Bind
+    // the avatar-frame names directly so the geometry below reads
+    // without sign confusion.
+    let nose = to_src(&joints[0]);
+    let avatar_right_eye = to_src(&joints[1]); // subject left eye
+    let avatar_left_eye = to_src(&joints[2]);  // subject right eye
+    let avatar_right_ear = to_src(&joints[3]); // subject left ear
+    let avatar_left_ear = to_src(&joints[4]);  // subject right ear
+
+    // Ear line points avatar_left_ear → avatar_right_ear along +x at
+    // rest, so dx = left.x - right.x is positive when the head faces
+    // camera. As the head turns to camera-right (avatar yaw +) the
+    // line tilts in XZ so dz becomes positive too. yaw = atan2(dz, dx).
+    let ear_dx = avatar_left_ear[0] - avatar_right_ear[0];
+    let ear_dz = avatar_left_ear[2] - avatar_right_ear[2];
+    let ear_dist = (ear_dx * ear_dx + ear_dz * ear_dz).sqrt();
+    if ear_dist < 0.01 {
+        return None;
+    }
+    let yaw = ear_dz.atan2(ear_dx);
+
+    // Eye line: same handedness. Roll positive = head tilts toward
+    // avatar's left ear (avatar's left eye drops below the right).
+    let eye_dx = avatar_left_eye[0] - avatar_right_eye[0];
+    let eye_dy = avatar_left_eye[1] - avatar_right_eye[1];
+    let roll = eye_dy.atan2(eye_dx);
+
+    let mid_eye_y = (avatar_left_eye[1] + avatar_right_eye[1]) * 0.5;
+    let face_width = (eye_dx * eye_dx + eye_dy * eye_dy).sqrt().max(0.01);
+    let pitch_signal = (mid_eye_y - nose[1]) / face_width;
+    let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
+
+    let conf = joints[..5].iter().map(|j| j.score).fold(1.0_f32, f32::min);
+    Some(FacePose {
+        yaw,
+        pitch,
+        roll,
+        confidence: conf,
+    })
+}
+
+/// Pixel-space face bbox derived from RTMW3D's 68 face landmarks
+/// (indices 23..=90, dlib 68-point convention with jawline / brows /
+/// nose / eyes / mouth). Body keypoints 0..=4 (nose / eyes / ears)
+/// give a centroid that's too high on the face — they cluster on the
+/// upper half so 1.7× padding overshoots above the head and clips
+/// the chin. The face-68 set spans the whole face including mouth
+/// and jaw, so its centroid lands on the actual face centre. Returns
+/// `None` when too few face keypoints clear the confidence floor.
+#[cfg(feature = "inference")]
+fn build_face_bbox_from_joints(
+    joints: &[DecodedJoint],
+    width: u32,
+    height: u32,
+) -> Option<super::face_mediapipe::FaceBbox> {
+    let mut points_px: Vec<(f32, f32)> = Vec::with_capacity(68);
+    for i in 23..=90 {
+        let Some(j) = joints.get(i) else { continue };
+        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+            continue;
+        }
+        points_px.push((j.nx * width as f32, j.ny * height as f32));
+    }
+    super::face_mediapipe::derive_face_bbox(&points_px, width, height)
+}
+
 #[cfg(feature = "inference")]
 fn build_annotation(joints: &[DecodedJoint]) -> DetectionAnnotation {
     // Emit the body 17 in image-normalised coords for the GUI overlay.
@@ -783,7 +936,7 @@ fn coco_body_edges() -> Vec<(usize, usize)> {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "inference-gpu")]
-fn build_session(
+pub(super) fn build_session(
     model_path: &str,
     intra_threads: usize,
     label: &str,
@@ -811,7 +964,7 @@ fn build_session(
 }
 
 #[cfg(all(feature = "inference", not(feature = "inference-gpu")))]
-fn build_session(
+pub(super) fn build_session(
     model_path: &str,
     intra_threads: usize,
     label: &str,
