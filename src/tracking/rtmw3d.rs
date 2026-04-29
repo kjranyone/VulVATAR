@@ -118,14 +118,23 @@ const JOINT_CONFIDENCE_THRESHOLD: f32 = 0.3;
 #[cfg(feature = "inference")]
 const COCO_BODY: &[(usize, HumanoidBone)] = &[
     // (index, avatar bone). Subject's left → avatar Right.
+    //
+    // Wrist slots (`LeftHand`, `RightHand`) are *not* listed here.
+    // The body track and the dedicated hand track within RTMW3D
+    // disagree about wrist position by up to ~0.4 in normalised z
+    // when an object occludes the wrist (e.g. the body track
+    // hallucinated a guitar-strumming wrist behind the torso while
+    // the hand track placed it correctly at chest level). The hand
+    // track is trained on hand-specific data and is more reliable in
+    // those scenarios, so we drive `LeftHand` / `RightHand` from
+    // the hand subset's wrist keypoint (index 91 / 112) inside
+    // `attach_hand` below.
     (5, HumanoidBone::RightShoulder),
     (5, HumanoidBone::RightUpperArm),
     (6, HumanoidBone::LeftShoulder),
     (6, HumanoidBone::LeftUpperArm),
     (7, HumanoidBone::RightLowerArm),
     (8, HumanoidBone::LeftLowerArm),
-    (9, HumanoidBone::RightHand),
-    (10, HumanoidBone::LeftHand),
     (11, HumanoidBone::RightUpperLeg),
     (12, HumanoidBone::LeftUpperLeg),
     (13, HumanoidBone::RightLowerLeg),
@@ -600,11 +609,13 @@ fn build_source_skeleton(
     // Hands. COCO Wholebody indices 91..=111 are the subject's left
     // hand, and 112..=132 are the subject's right hand. Within each
     // group the local index runs 0..=20 (0 = wrist). Selfie mirror:
-    // subject's left → avatar Right* fingers.
+    // subject's left → avatar Right* fingers, and the wrist landmark
+    // becomes the avatar's `RightHand` / `LeftHand` bone position.
     attach_hand(
         &mut sk,
         joints,
         91,
+        HumanoidBone::RightHand,
         HAND_PHALANGES_RIGHT,
         HAND_TIPS_RIGHT,
         &to_source,
@@ -613,6 +624,7 @@ fn build_source_skeleton(
         &mut sk,
         joints,
         112,
+        HumanoidBone::LeftHand,
         HAND_PHALANGES_LEFT,
         HAND_TIPS_LEFT,
         &to_source,
@@ -641,20 +653,62 @@ fn attach_hand<F>(
     sk: &mut SourceSkeleton,
     joints: &[DecodedJoint],
     base_index: usize,
+    wrist_bone: HumanoidBone,
     phalanges: &[(usize, HumanoidBone)],
     tips: &[(usize, HumanoidBone)],
     to_source: &F,
 ) where
     F: Fn(&DecodedJoint) -> [f32; 3],
 {
-    let wrist_idx = base_index;
-    if wrist_idx >= joints.len() {
+    // Wrist position = centroid of the four finger MCP joints (index,
+    // middle, ring, little — local indices 5, 9, 13, 17). The thumb
+    // CMC sits anatomically away from the MCP line so it's excluded.
+    //
+    // We *do not* use either the body track's wrist keypoint
+    // (index 9 / 10) or the hand-track's own wrist (index 91 / 112)
+    // because both are unreliable when the wrist is occluded — e.g.
+    // a guitar strumming hand whose wrist is hidden behind the
+    // instrument lands ~0.3 units behind the torso in normalised z.
+    // The MCPs anchor on the visible knuckles, so averaging four of
+    // them produces a stable hand position that respects the actual
+    // monocular geometry. The centroid sits ~half a hand-length
+    // forward of the true wrist; that's biomechanically slightly
+    // wrong but visually invisible and the avatar's solver re-anchors
+    // the chain at the same point regardless.
+    const MCP_LOCALS: [usize; 4] = [5, 9, 13, 17];
+    let mut sum = [0.0_f32; 3];
+    let mut min_conf = f32::INFINITY;
+    let mut found = 0_u32;
+    for &local in &MCP_LOCALS {
+        let global = base_index + local;
+        if global >= joints.len() {
+            continue;
+        }
+        let j = &joints[global];
+        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+            continue;
+        }
+        let p = to_source(j);
+        sum[0] += p[0];
+        sum[1] += p[1];
+        sum[2] += p[2];
+        min_conf = min_conf.min(j.score);
+        found += 1;
+    }
+    if found < 3 {
+        // Need at least 3 of 4 MCPs to call this hand tracked.
+        // Fewer than that → drop the whole hand chain for the frame
+        // so the solver leaves fingers at rest.
         return;
     }
-    let wrist_j = &joints[wrist_idx];
-    if wrist_j.score < JOINT_CONFIDENCE_THRESHOLD {
-        return;
-    }
+    let inv = 1.0 / found as f32;
+    sk.joints.insert(
+        wrist_bone,
+        SourceJoint {
+            position: [sum[0] * inv, sum[1] * inv, sum[2] * inv],
+            confidence: min_conf,
+        },
+    );
 
     for &(local_idx, bone) in phalanges {
         let global = base_index + local_idx;
