@@ -34,7 +34,10 @@
 
 #![allow(dead_code)]
 
-#[cfg(feature = "inference")]
+// FaceBbox and SourceExpression are referenced by both the real
+// (inference) and stub (no-inference) `estimate` impls, so they must
+// be visible regardless of feature flag — otherwise the
+// no-default-features build cannot resolve the stub's signature.
 use super::SourceExpression;
 #[cfg(feature = "inference")]
 use log::{error, info, warn};
@@ -133,7 +136,10 @@ const FACE_BLENDSHAPE_NAMES: [&str; FACE_BLENDSHAPE_COUNT] = [
 ];
 
 /// Pixel-space face bbox (image-relative).
-#[cfg(feature = "inference")]
+///
+/// Visible regardless of the `inference` feature flag so the stub
+/// `estimate()` impl below can refer to it without a build break in
+/// the `--no-default-features` configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct FaceBbox {
     pub x: f32,
