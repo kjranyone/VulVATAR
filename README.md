@@ -63,6 +63,9 @@ licenses. In particular:
   by OpenMMLab / mmpose and re-distributed as ONNX by Soykaf:
   - https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose3d
   - https://huggingface.co/Soykaf/RTMW3D-x
+- YOLOX-m Human-Art tuned person detector (Apache-2.0), exported as
+  ONNX by OpenMMLab and bundled in mmpose's `rtmposev1` ONNX SDK:
+  - https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose
 - MediaPipe FaceMeshV2 (478 face landmarks) and BlendshapeV2 (52 ARKit
   blendshape coefficients) by Google AI Edge (Apache-2.0), packaged
   as ONNX in PINTO_model_zoo:

@@ -59,12 +59,19 @@ function Install-Font {
 }
 
 function Install-Models {
-    # Pulls RTMW3D-x for body / hands and MediaPipe FaceMeshV2 +
-    # BlendshapeV2 for face expression.
+    # Pulls RTMW3D-x for body / hands, MediaPipe FaceMeshV2 +
+    # BlendshapeV2 for face expression, and YOLOX-m for human-art
+    # person detection.
     #
-    #   * RTMW3D-x   — Soykaf/RTMW3D-x          (370 MB, 133 3D landmarks)
-    #   * FaceMesh   — PINTO 410 FaceMeshV2     (4.8 MB, 478 face landmarks)
-    #   * Blendshape — PINTO 390 BlendshapeV2   (1.8 MB, 52 ARKit weights)
+    #   * RTMW3D-x   — Soykaf/RTMW3D-x              (370 MB, 133 3D landmarks)
+    #   * FaceMesh   — PINTO 410 FaceMeshV2         (4.8 MB, 478 face landmarks)
+    #   * Blendshape — PINTO 390 BlendshapeV2       (1.8 MB, 52 ARKit weights)
+    #   * YOLOX-m    — mmpose rtmposev1 onnx_sdk    (94 MB,  human-art bbox)
+    #
+    # YOLOX-m is optional — without it, RTMW3D runs on the whole frame
+    # (Kinemotion-style). With it, we crop to the largest detected
+    # person bbox before RTMW3D so small / distant subjects get model-
+    # input-resolution treatment.
     #
     # RTMW3D's body keypoints 0..=4 (nose / eyes / ears) are used to
     # crop the face for FaceMesh, so we don't need a separate face
@@ -80,6 +87,11 @@ function Install-Models {
         @{ Url = "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx";
            OutName = "rtmw3d.onnx" }
     )
+
+    Install-ZipArchive -Name "YOLOX-m human-art person detector" `
+        -ArchiveUrl "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip" `
+        -KeepGlobs @("end2end.onnx") `
+        -RenameMap @{ "end2end.onnx" = "yolox.onnx" }
 
     # Face mesh + blendshape from PINTO_model_zoo. PINTO ships
     # MediaPipe FaceMeshV2 (478 landmarks) and BlendshapeV2 (52 ARKit
@@ -101,6 +113,67 @@ function Install-Models {
     }
 
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
+}
+
+# Download a `.zip` archive, extract to a temp dir, copy ONNX files
+# matching `KeepGlobs` into `models\`, optionally renaming via
+# `RenameMap`, and remove the temp dir. Used for OpenMMLab mmdeploy
+# bundles that ship as zip rather than tar.gz.
+function Install-ZipArchive {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string]$ArchiveUrl,
+        [Parameter(Mandatory)] [string[]]$KeepGlobs,
+        [hashtable]$RenameMap = @{}
+    )
+
+    # Resolve the post-rename target file name for each glob and skip
+    # the download if every target is already present.
+    $allPresent = $true
+    foreach ($glob in $KeepGlobs) {
+        $finalName = if ($RenameMap.ContainsKey($glob)) { $RenameMap[$glob] } else { $glob }
+        if (-not (Test-Path "models\$finalName")) {
+            $allPresent = $false
+            break
+        }
+    }
+    if ($allPresent) {
+        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    try {
+        $archivePath = Join-Path $tempDir "archive.zip"
+        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
+        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
+        }
+
+        Write-Host "    extracting..." -ForegroundColor DarkGray
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $tempDir)
+
+        $copied = 0
+        foreach ($glob in $KeepGlobs) {
+            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
+            foreach ($file in $matched) {
+                $finalName = if ($RenameMap.ContainsKey($glob)) { $RenameMap[$glob] } else { $file.Name }
+                $dest = Join-Path "models" $finalName
+                Copy-Item -Path $file.FullName -Destination $dest -Force
+                Write-Host "    kept $finalName" -ForegroundColor Green
+                $copied++
+            }
+        }
+        if ($copied -eq 0) {
+            throw "$Name archive contained no files matching: $($KeepGlobs -join ', ')"
+        }
+    } finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Download a PINTO_model_zoo `resources*.tar.gz` archive, extract to a

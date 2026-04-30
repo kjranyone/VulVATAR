@@ -14,6 +14,8 @@ mod pose_estimation;
 pub mod face_mediapipe;
 pub mod rtmw3d;
 pub mod source_skeleton;
+#[cfg(feature = "inference")]
+pub mod yolox;
 
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 

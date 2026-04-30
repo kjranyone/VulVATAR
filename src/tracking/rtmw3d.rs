@@ -40,6 +40,8 @@ use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
+use super::yolox::{PersonBbox, YoloxPersonDetector};
+#[cfg(feature = "inference")]
 use super::{DetectionAnnotation, FacePose, SourceJoint, SourceSkeleton};
 #[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
@@ -265,6 +267,13 @@ pub struct Rtmw3dInference {
     /// the spine direction implies.
     #[cfg(feature = "inference")]
     face_mesh: Option<FaceMeshInference>,
+    /// Optional YOLOX-m human-art person detector. When present the
+    /// camera frame is cropped to the largest detected person before
+    /// being fed to RTMW3D — this is the principled fix for
+    /// small-subject / off-centre / partial-occlusion cases. Absent →
+    /// whole-frame inference (Kinemotion-style).
+    #[cfg(feature = "inference")]
+    person_detector: Option<YoloxPersonDetector>,
     #[cfg(feature = "inference")]
     left_wrist: WristTracker,
     #[cfg(feature = "inference")]
@@ -326,11 +335,32 @@ impl Rtmw3dInference {
             }
         };
 
+        let person_detector = match YoloxPersonDetector::try_from_models_dir(models_dir) {
+            Ok(Some(d)) => {
+                info!("YOLOX person detector loaded ({})", d.backend().label());
+                Some(d)
+            }
+            Ok(None) => {
+                info!("YOLOX person detector not found — using whole-frame RTMW3D");
+                None
+            }
+            Err(e) => {
+                let msg = format!(
+                    "YOLOX person detector failed to load: {}. Falling back to whole-frame.",
+                    e
+                );
+                warn!("{}", msg);
+                load_warnings.push(msg);
+                None
+            }
+        };
+
         Ok(Self {
             session,
             input_name,
             output_names,
             face_mesh,
+            person_detector,
             left_wrist: WristTracker::default(),
             right_wrist: WristTracker::default(),
             load_warnings,
@@ -386,8 +416,55 @@ impl Rtmw3dInference {
             return empty_estimate(frame_index);
         }
 
+        // YOLOX-m person crop. When a person is detected we crop the
+        // frame around them (with padding) before feeding it to RTMW3D
+        // — this is the principled fix for small-subject / off-centre /
+        // partial-occlusion inputs. Joints come back in *crop* nx/ny
+        // and are remapped to original-frame coords below so the rest
+        // of the pipeline (face bbox, source skeleton, solver) sees a
+        // consistent coordinate system regardless of crop state.
+        //
+        // Falls through to whole-frame inference when no person is
+        // detected or YOLOX is unavailable.
+        let (infer_rgb_owned, infer_rgb_slice, infer_w, infer_h, crop_origin) = {
+            let bbox_opt = self
+                .person_detector
+                .as_mut()
+                .and_then(|d| d.detect_largest_person(rgb_data, width, height));
+            match bbox_opt {
+                Some(bbox) => {
+                    // 25% pad: YOLOX bboxes are tight to the visible
+                    // body silhouette, but RTMW3D needs slack for
+                    // outstretched arms and cross-step legs that may
+                    // briefly extend past the bbox between frames.
+                    // Tested at 10% — produced regressions on walking
+                    // / cross-step poses where the leading limb fell
+                    // outside the crop.
+                    let (cx1, cy1, cx2, cy2) = pad_and_clamp_bbox(&bbox, width, height, 0.25);
+                    let cw = (cx2 - cx1) as u32;
+                    let ch = (cy2 - cy1) as u32;
+                    info!(
+                        "RTMW3D: YOLOX bbox=[{:.0},{:.0},{:.0},{:.0}] score={:.2} → crop {}x{} (orig {}x{})",
+                        bbox.x1, bbox.y1, bbox.x2, bbox.y2, bbox.score, cw, ch, width, height
+                    );
+                    if cw < 32 || ch < 32 {
+                        // Bbox too small to crop usefully — fall through.
+                        (None, rgb_data, width, height, None)
+                    } else {
+                        let crop = crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
+                        (Some(crop), &[][..], cw, ch, Some((cx1 as f32, cy1 as f32, cw as f32, ch as f32)))
+                    }
+                }
+                None => (None, rgb_data, width, height, None),
+            }
+        };
+        let infer_rgb: &[u8] = match &infer_rgb_owned {
+            Some(buf) => buf.as_slice(),
+            None => infer_rgb_slice,
+        };
+
         // Preprocess to 288×384 NCHW with ImageNet normalization.
-        let tensor = preprocess(rgb_data, width, height);
+        let tensor = preprocess(infer_rgb, infer_w, infer_h);
         let input = match TensorRef::from_array_view(&tensor) {
             Ok(v) => v,
             Err(e) => {
@@ -445,7 +522,19 @@ impl Rtmw3dInference {
         };
         drop(outputs);
 
-        let joints = decode_simcc(&simcc_x, &simcc_y, &simcc_z);
+        let mut joints = decode_simcc(&simcc_x, &simcc_y, &simcc_z);
+        if let Some((ox, oy, cw, ch)) = crop_origin {
+            // Remap crop-space (nx, ny) ∈ [0, 1]² back to original-frame
+            // (nx, ny). nz is depth — left as-is (model emits it
+            // hip-centred and pose_solver consumes only relative bone
+            // directions, so the absolute z scale is not load-bearing).
+            let inv_w = 1.0 / width as f32;
+            let inv_h = 1.0 / height as f32;
+            for j in joints.iter_mut() {
+                j.nx = (ox + j.nx * cw) * inv_w;
+                j.ny = (oy + j.ny * ch) * inv_h;
+            }
+        }
         let mut skeleton = build_source_skeleton(frame_index, &joints, width, height);
 
         // Per-side wrist sanity check + temporal hold. Run before
@@ -504,35 +593,122 @@ fn empty_estimate(frame_index: u64) -> PoseEstimate {
 }
 
 // ---------------------------------------------------------------------------
+// YOLOX crop helpers
+// ---------------------------------------------------------------------------
+
+/// Pad the YOLOX-detected bbox by `pad_ratio` on each side and clamp to
+/// the frame. 10% padding works in practice — tight enough to keep the
+/// subject filling the model input, loose enough to capture limbs that
+/// briefly extend past the YOLOX box (waving arms, cross-step legs).
+#[cfg(feature = "inference")]
+fn pad_and_clamp_bbox(
+    bbox: &PersonBbox,
+    width: u32,
+    height: u32,
+    pad_ratio: f32,
+) -> (u32, u32, u32, u32) {
+    let bw = (bbox.x2 - bbox.x1).max(1.0);
+    let bh = (bbox.y2 - bbox.y1).max(1.0);
+    let cx = (bbox.x1 + bbox.x2) * 0.5;
+    let cy = (bbox.y1 + bbox.y2) * 0.5;
+    let half_w = bw * 0.5 * (1.0 + pad_ratio);
+    let half_h = bh * 0.5 * (1.0 + pad_ratio);
+    let x1 = (cx - half_w).max(0.0).floor() as u32;
+    let y1 = (cy - half_h).max(0.0).floor() as u32;
+    let x2 = (cx + half_w).min(width as f32).ceil() as u32;
+    let y2 = (cy + half_h).min(height as f32).ceil() as u32;
+    (x1, y1, x2, y2)
+}
+
+/// Copy the rectangle `[(ox, oy), (ox+cw, oy+ch))` out of `rgb`
+/// (`width × height × 3` u8) into a contiguous tightly-packed buffer.
+/// Caller has already clamped the rectangle into the source bounds.
+#[cfg(feature = "inference")]
+fn crop_rgb(rgb: &[u8], width: u32, _height: u32, ox: u32, oy: u32, cw: u32, ch: u32) -> Vec<u8> {
+    let stride = (width as usize) * 3;
+    let crop_stride = (cw as usize) * 3;
+    let mut out = Vec::with_capacity(crop_stride * (ch as usize));
+    for y in 0..(ch as usize) {
+        let src_row = (oy as usize + y) * stride + (ox as usize) * 3;
+        out.extend_from_slice(&rgb[src_row..src_row + crop_stride]);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Preprocessing
 // ---------------------------------------------------------------------------
 
 /// Resize source RGB to `INPUT_W × INPUT_H` NCHW with ImageNet
 /// normalization. Aspect is squashed (no letterbox); the model is
-/// tolerant of it for centred-subject input.
+/// tolerant of it for centred-subject input. Bilinear sampling so
+/// small / distant subjects don't lose keypoint detail to nearest's
+/// quantisation.
 #[cfg(feature = "inference")]
 fn preprocess(rgb: &[u8], src_w: u32, src_h: u32) -> Array4<f32> {
     let dst_w = INPUT_W as usize;
     let dst_h = INPUT_H as usize;
     let mut tensor = Array4::<f32>::zeros((1, 3, dst_h, dst_w));
-    let inv_dx = src_w as f32 / dst_w as f32;
-    let inv_dy = src_h as f32 / dst_h as f32;
+    if src_w == 0 || src_h == 0 {
+        return tensor;
+    }
+    let src_w_us = src_w as usize;
+    let src_h_us = src_h as usize;
+    let max_x = src_w_us.saturating_sub(1);
+    let max_y = src_h_us.saturating_sub(1);
+    let scale_x = src_w as f32 / dst_w as f32;
+    let scale_y = src_h as f32 / dst_h as f32;
+    let stride = src_w_us * 3;
+    let expected_len = stride * src_h_us;
+    if rgb.len() < expected_len {
+        return tensor;
+    }
+
+    let inv_std_r = 1.0 / STD_RGB[0];
+    let inv_std_g = 1.0 / STD_RGB[1];
+    let inv_std_b = 1.0 / STD_RGB[2];
+
     for dy in 0..dst_h {
-        let sy = ((dy as f32 + 0.5) * inv_dy) as usize;
-        let sy = sy.min((src_h as usize).saturating_sub(1));
+        // OpenCV-style pixel-centre sampling: dst (dy + 0.5) maps to
+        // src ((dy + 0.5) * scale_y - 0.5).
+        let fy = ((dy as f32) + 0.5) * scale_y - 0.5;
+        let y0f = fy.floor();
+        let wy1 = (fy - y0f).clamp(0.0, 1.0);
+        let wy0 = 1.0 - wy1;
+        let y0 = (y0f as i32).clamp(0, max_y as i32) as usize;
+        let y1 = ((y0f as i32) + 1).clamp(0, max_y as i32) as usize;
+        let row0 = y0 * stride;
+        let row1 = y1 * stride;
         for dx in 0..dst_w {
-            let sx = ((dx as f32 + 0.5) * inv_dx) as usize;
-            let sx = sx.min((src_w as usize).saturating_sub(1));
-            let si = (sy * src_w as usize + sx) * 3;
-            if si + 2 >= rgb.len() {
-                continue;
-            }
-            let r = rgb[si] as f32;
-            let g = rgb[si + 1] as f32;
-            let b = rgb[si + 2] as f32;
-            tensor[(0, 0, dy, dx)] = (r - MEAN_RGB[0]) / STD_RGB[0];
-            tensor[(0, 1, dy, dx)] = (g - MEAN_RGB[1]) / STD_RGB[1];
-            tensor[(0, 2, dy, dx)] = (b - MEAN_RGB[2]) / STD_RGB[2];
+            let fx = ((dx as f32) + 0.5) * scale_x - 0.5;
+            let x0f = fx.floor();
+            let wx1 = (fx - x0f).clamp(0.0, 1.0);
+            let wx0 = 1.0 - wx1;
+            let x0 = (x0f as i32).clamp(0, max_x as i32) as usize;
+            let x1 = ((x0f as i32) + 1).clamp(0, max_x as i32) as usize;
+            let i00 = row0 + x0 * 3;
+            let i01 = row0 + x1 * 3;
+            let i10 = row1 + x0 * 3;
+            let i11 = row1 + x1 * 3;
+            let w00 = wy0 * wx0;
+            let w01 = wy0 * wx1;
+            let w10 = wy1 * wx0;
+            let w11 = wy1 * wx1;
+            let r = rgb[i00] as f32 * w00
+                + rgb[i01] as f32 * w01
+                + rgb[i10] as f32 * w10
+                + rgb[i11] as f32 * w11;
+            let g = rgb[i00 + 1] as f32 * w00
+                + rgb[i01 + 1] as f32 * w01
+                + rgb[i10 + 1] as f32 * w10
+                + rgb[i11 + 1] as f32 * w11;
+            let b = rgb[i00 + 2] as f32 * w00
+                + rgb[i01 + 2] as f32 * w01
+                + rgb[i10 + 2] as f32 * w10
+                + rgb[i11 + 2] as f32 * w11;
+            tensor[(0, 0, dy, dx)] = (r - MEAN_RGB[0]) * inv_std_r;
+            tensor[(0, 1, dy, dx)] = (g - MEAN_RGB[1]) * inv_std_g;
+            tensor[(0, 2, dy, dx)] = (b - MEAN_RGB[2]) * inv_std_b;
         }
     }
     tensor
