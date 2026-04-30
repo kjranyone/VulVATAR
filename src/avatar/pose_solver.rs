@@ -84,10 +84,14 @@ pub struct SolverParams {
 
 impl Default for SolverParams {
     fn default() -> Self {
+        // Mirrors `TrackingSmoothingParams::default`: confidence
+        // thresholds default to `0.0` so the GUI sliders are the
+        // single source of truth for filtering. See the explanation
+        // there for the rationale.
         Self {
             rotation_blend: 0.7,
-            joint_confidence_threshold: crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD,
-            face_confidence_threshold: crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD,
+            joint_confidence_threshold: 0.0,
+            face_confidence_threshold: 0.0,
         }
     }
 }
@@ -895,7 +899,19 @@ pub fn solve_expressions(
     avatar_expressions: &crate::asset::ExpressionAssetSet,
     previous: Option<&[ResolvedExpressionWeight]>,
     expression_blend: f32,
+    face_confidence_threshold: f32,
 ) -> Vec<ResolvedExpressionWeight> {
+    // Gate on the face mesh's own confidence (the FaceMesh model
+    // outputs an "is this a face" sigmoid). When the gate fails we
+    // return the previous weights verbatim — leaves the avatar's
+    // expression frozen at the last good value rather than snapping
+    // to neutral, which is what users expect when the face briefly
+    // turns away from camera.
+    let face_conf = source.face_mesh_confidence.unwrap_or(0.0);
+    if face_conf < face_confidence_threshold {
+        return previous.map(|p| p.to_vec()).unwrap_or_default();
+    }
+
     let prev_map: HashMap<&str, f32> = previous
         .map(|p| p.iter().map(|w| (w.name.as_str(), w.weight)).collect())
         .unwrap_or_default();

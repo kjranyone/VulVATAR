@@ -46,7 +46,7 @@ use super::{DetectionAnnotation, FacePose, SourceJoint, SourceSkeleton};
 #[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
 #[cfg(feature = "inference")]
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 #[cfg(feature = "inference")]
 use ndarray::Array4;
 #[cfg(feature = "inference")]
@@ -98,12 +98,18 @@ const MEAN_RGB: [f32; 3] = [123.675, 116.28, 103.53];
 #[cfg(feature = "inference")]
 const STD_RGB: [f32; 3] = [58.395, 57.12, 57.375];
 
-/// Per-joint confidence floor. SimCC max scores cluster around 1–10 for
-/// confident detections; the heatmaps are pre-softmax logits, so we map
-/// to `[0, 1]` via sigmoid before thresholding so this constant matches
-/// `DEFAULT_CONFIDENCE_THRESHOLD` semantics.
+/// "Detection actually exists" floor. Used only for *structural* gates
+/// inside this module — choosing whether hips are visible enough to
+/// anchor the source-skeleton origin, whether a hand has enough MCPs
+/// for centroid, etc. **Not** a per-joint quality threshold: those
+/// belong on the solver (`SolverParams::joint_confidence_threshold`)
+/// so the GUI slider actually does something. RTMW3D's SimCC max-bin
+/// scores after sigmoid put background / occluded joints near zero,
+/// so a pinhole-sized floor is enough to reject "the model emitted
+/// something for an invisible point" without hiding real signal from
+/// the downstream solver.
 #[cfg(feature = "inference")]
-const JOINT_CONFIDENCE_THRESHOLD: f32 = 0.3;
+const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
 // ---------------------------------------------------------------------------
 // COCO-Wholebody 133 keypoint indices
@@ -416,7 +422,9 @@ impl Rtmw3dInference {
             return empty_estimate(frame_index);
         }
 
-        // YOLOX-m person crop. When a person is detected we crop the
+        let t_total = std::time::Instant::now();
+
+        // YOLOX-nano person crop. When a person is detected we crop the
         // frame around them (with padding) before feeding it to RTMW3D
         // — this is the principled fix for small-subject / off-centre /
         // partial-occlusion inputs. Joints come back in *crop* nx/ny
@@ -426,6 +434,7 @@ impl Rtmw3dInference {
         //
         // Falls through to whole-frame inference when no person is
         // detected or YOLOX is unavailable.
+        let t_yolox = std::time::Instant::now();
         let (infer_rgb_owned, infer_rgb_slice, infer_w, infer_h, crop_origin) = {
             let bbox_opt = self
                 .person_detector
@@ -443,7 +452,7 @@ impl Rtmw3dInference {
                     let (cx1, cy1, cx2, cy2) = pad_and_clamp_bbox(&bbox, width, height, 0.25);
                     let cw = (cx2 - cx1) as u32;
                     let ch = (cy2 - cy1) as u32;
-                    info!(
+                    debug!(
                         "RTMW3D: YOLOX bbox=[{:.0},{:.0},{:.0},{:.0}] score={:.2} → crop {}x{} (orig {}x{})",
                         bbox.x1, bbox.y1, bbox.x2, bbox.y2, bbox.score, cw, ch, width, height
                     );
@@ -462,9 +471,12 @@ impl Rtmw3dInference {
             Some(buf) => buf.as_slice(),
             None => infer_rgb_slice,
         };
+        let dt_yolox = t_yolox.elapsed();
 
         // Preprocess to 288×384 NCHW with ImageNet normalization.
+        let t_pre = std::time::Instant::now();
         let tensor = preprocess(infer_rgb, infer_w, infer_h);
+        let dt_pre = t_pre.elapsed();
         let input = match TensorRef::from_array_view(&tensor) {
             Ok(v) => v,
             Err(e) => {
@@ -478,6 +490,7 @@ impl Rtmw3dInference {
         let y_name = self.output_names.get(1).cloned();
         let z_name = self.output_names.get(2).cloned();
 
+        let t_run = std::time::Instant::now();
         let outputs = match self
             .session
             .run(ort::inputs![self.input_name.as_str() => input])
@@ -488,6 +501,7 @@ impl Rtmw3dInference {
                 return empty_estimate(frame_index);
             }
         };
+        let dt_run = t_run.elapsed();
 
         let extract = |name: &Option<String>, expected_len: usize| -> Option<Vec<f32>> {
             let n = name.as_deref()?;
@@ -522,6 +536,7 @@ impl Rtmw3dInference {
         };
         drop(outputs);
 
+        let t_decode = std::time::Instant::now();
         let mut joints = decode_simcc(&simcc_x, &simcc_y, &simcc_z);
         if let Some((ox, oy, cw, ch)) = crop_origin {
             // Remap crop-space (nx, ny) ∈ [0, 1]² back to original-frame
@@ -560,17 +575,48 @@ impl Rtmw3dInference {
         // the angles fall straight into the solver's frame without
         // any unprojection.
         skeleton.face = derive_face_pose_from_body(&skeleton, &joints);
+        let dt_decode = t_decode.elapsed();
 
         // Face crop → MediaPipe FaceMesh → BlendshapeV2. The bbox is
         // derived from RTMW3D's face-68 landmarks (indices 23..=90)
-        // so the cascade does not need its own face detector.
+        // so the cascade does not need its own face detector. The face
+        // mesh's own confidence is folded into `skeleton.face.confidence`
+        // by taking the max of the body-derived value (5 face landmarks)
+        // and the mesh-model value — they're independent "is the face
+        // visible" signals so the higher one is the better evidence.
+        // The solver's `face_confidence_threshold` then gates head
+        // rotation *and* expressions against this single number.
+        let t_face = std::time::Instant::now();
         if let Some(face) = self.face_mesh.as_mut() {
             if let Some(bbox) = build_face_bbox_from_joints(&joints, width, height) {
-                if let Some(exprs) = face.estimate(rgb_data, width, height, &bbox) {
+                if let Some((exprs, mesh_conf)) =
+                    face.estimate(rgb_data, width, height, &bbox)
+                {
                     skeleton.expressions = exprs;
+                    skeleton.face_mesh_confidence = Some(mesh_conf);
+                    // Boost the head-pose confidence with the mesh's
+                    // independent "is this a face" signal so the solver
+                    // gate doesn't reject head rotation just because
+                    // the body-side 5 landmarks happened to score low
+                    // on this frame.
+                    if let Some(ref mut fp) = skeleton.face {
+                        fp.confidence = fp.confidence.max(mesh_conf);
+                    }
                 }
             }
         }
+        let dt_face = t_face.elapsed();
+
+        let dt_total = t_total.elapsed();
+        debug!(
+            "RTMW3D timing: total={:>5.1}ms yolox={:>5.1}ms pre={:>4.1}ms run={:>5.1}ms decode={:>4.1}ms face={:>4.1}ms",
+            dt_total.as_secs_f32() * 1000.0,
+            dt_yolox.as_secs_f32() * 1000.0,
+            dt_pre.as_secs_f32() * 1000.0,
+            dt_run.as_secs_f32() * 1000.0,
+            dt_decode.as_secs_f32() * 1000.0,
+            dt_face.as_secs_f32() * 1000.0,
+        );
 
         let annotation = build_annotation(&joints);
         PoseEstimate {
@@ -793,18 +839,46 @@ fn build_source_skeleton(
         return sk;
     }
 
-    // Hip mid in normalised model space (COCO 11 = subject's left hip,
-    // 12 = subject's right hip).
+    // Origin selection. Hips (COCO 11/12) are the canonical choice
+    // because every body bone direction is most stable when measured
+    // from the pelvis. But VTuber webcam framing very commonly cuts
+    // the lower body — so when hips are not visible we fall back to
+    // shoulder mid (COCO 5/6), which is essentially always in frame
+    // for upper-body shots. The solver consumes *relative* bone
+    // directions so the absolute origin location does not matter as
+    // long as it is the same point each frame.
+    //
+    // If neither pair is visible the subject is either out of frame
+    // or so poorly detected that any rotation we infer would be
+    // garbage; only then do we bail.
     let lh = &joints[11];
     let rh = &joints[12];
     let hip_score = lh.score.min(rh.score);
-    if hip_score < JOINT_CONFIDENCE_THRESHOLD {
-        // No reliable hip → no usable origin → bail.
-        return sk;
-    }
-    let hip_nx = (lh.nx + rh.nx) * 0.5;
-    let hip_ny = (lh.ny + rh.ny) * 0.5;
-    let hip_nz = (lh.nz + rh.nz) * 0.5;
+    let hip_visible = hip_score >= KEYPOINT_VISIBILITY_FLOOR;
+
+    let (origin_nx, origin_ny, origin_nz) = if hip_visible {
+        (
+            (lh.nx + rh.nx) * 0.5,
+            (lh.ny + rh.ny) * 0.5,
+            (lh.nz + rh.nz) * 0.5,
+        )
+    } else {
+        let ls = &joints[5];
+        let rs = &joints[6];
+        let shoulder_score = ls.score.min(rs.score);
+        if shoulder_score < KEYPOINT_VISIBILITY_FLOOR {
+            // No reliable hips *and* no reliable shoulders — there is
+            // no anatomical anchor we trust. Leave the skeleton empty
+            // so the solver leaves the avatar at rest pose this
+            // frame instead of latching onto noise.
+            return sk;
+        }
+        (
+            (ls.nx + rs.nx) * 0.5,
+            (ls.ny + rs.ny) * 0.5,
+            (ls.nz + rs.nz) * 0.5,
+        )
+    };
 
     // Source-space coord conversion. Aspect is recovered by scaling
     // the x axis: image x in [0, 1] maps to source x in
@@ -821,9 +895,9 @@ fn build_source_skeleton(
     // that hold.
     let aspect = width as f32 / height.max(1) as f32;
     let to_source = |j: &DecodedJoint| -> [f32; 3] {
-        let sx = -(j.nx - hip_nx) * (2.0 * aspect);
-        let sy = -(j.ny - hip_ny) * 2.0;
-        let sz = -(j.nz - hip_nz) * 2.0;
+        let sx = -(j.nx - origin_nx) * (2.0 * aspect);
+        let sy = -(j.ny - origin_ny) * 2.0;
+        let sz = -(j.nz - origin_nz) * 2.0;
         [sx, sy, sz]
     };
 
@@ -831,22 +905,44 @@ fn build_source_skeleton(
     // when the code path skips downstream consumers of those values.
     let _ = (width, height);
 
-    // Hips
-    sk.joints.insert(
-        HumanoidBone::Hips,
-        SourceJoint {
-            position: [0.0, 0.0, 0.0],
-            confidence: hip_score,
-        },
-    );
+    // Hips: only emit when the hip pair was actually detected. When
+    // the origin came from the shoulder fallback above, the avatar's
+    // pelvis bone is left at rest pose — the solver decides what
+    // (if anything) to do with the absent Hips entry.
+    if hip_visible {
+        sk.joints.insert(
+            HumanoidBone::Hips,
+            SourceJoint {
+                position: [0.0, 0.0, 0.0],
+                confidence: hip_score,
+            },
+        );
+    }
 
-    // Body bones.
+    // Body bones. Emit every keypoint with its actual confidence and
+    // let the downstream solver apply its (user-tunable) confidence
+    // threshold. Filtering here would pre-empt the GUI slider, which
+    // is exactly what hid the upper-body framing case from the user
+    // before this rewrite.
+    //
+    // Exception: when the hip pair was not detected (= we fell back
+    // to shoulder origin, meaning the lower body is structurally out
+    // of frame), drop the lower-body indices (hips through ankles,
+    // COCO 11..=16). The model still emits hallucinated guesses for
+    // those joints — usually clustered near the bottom of the crop —
+    // and they pass the visibility floor at low scores. Without this
+    // skip the avatar's legs flail as the model's hallucinations
+    // wander frame to frame.
+    const LOWER_BODY_FIRST_IDX: usize = 11;
     for &(idx, bone) in COCO_BODY {
         if idx >= joints.len() {
             continue;
         }
+        if !hip_visible && idx >= LOWER_BODY_FIRST_IDX {
+            continue;
+        }
         let j = &joints[idx];
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
             continue;
         }
         sk.joints.insert(
@@ -858,22 +954,26 @@ fn build_source_skeleton(
         );
     }
 
-    // Foot tips.
-    for &(idx, bone) in COCO_FOOT_TIPS {
-        if idx >= joints.len() {
-            continue;
+    // Foot tips. Same upper-body-only suppression: if hips weren't
+    // visible the toes definitely aren't — anything the model emits
+    // for COCO 17..=22 (toe / heel landmarks) is a hallucination.
+    if hip_visible {
+        for &(idx, bone) in COCO_FOOT_TIPS {
+            if idx >= joints.len() {
+                continue;
+            }
+            let j = &joints[idx];
+            if j.score < KEYPOINT_VISIBILITY_FLOOR {
+                continue;
+            }
+            sk.fingertips.insert(
+                bone,
+                SourceJoint {
+                    position: to_source(j),
+                    confidence: j.score,
+                },
+            );
         }
-        let j = &joints[idx];
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
-            continue;
-        }
-        sk.fingertips.insert(
-            bone,
-            SourceJoint {
-                position: to_source(j),
-                confidence: j.score,
-            },
-        );
     }
 
     // Hands. COCO Wholebody indices 91..=111 are the subject's left
@@ -955,7 +1055,7 @@ fn attach_hand<F>(
             continue;
         }
         let j = &joints[global];
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
             continue;
         }
         let p = to_source(j);
@@ -986,7 +1086,7 @@ fn attach_hand<F>(
             continue;
         }
         let j = &joints[global];
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
             continue;
         }
         sk.joints.insert(
@@ -1003,7 +1103,7 @@ fn attach_hand<F>(
             continue;
         }
         let j = &joints[global];
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
             continue;
         }
         sk.fingertips.insert(
@@ -1257,8 +1357,14 @@ fn derive_face_pose_from_body(skeleton: &SourceSkeleton, joints: &[DecodedJoint]
     if joints.len() < 5 {
         return None;
     }
+    // Face pose math (ear-line yaw, eye-line roll, eye-to-nose pitch)
+    // is well-defined as long as the keypoints actually exist and the
+    // ear and eye baselines are non-degenerate (checked further down).
+    // The aggregated confidence is the min over the 5 inputs, so the
+    // solver can apply its own face threshold downstream — that's why
+    // we only reject blatant non-detections here, not borderline ones.
     for j in joints.iter().take(5) {
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
     }
@@ -1345,7 +1451,7 @@ fn build_face_bbox_from_joints(
     let mut points_px: Vec<(f32, f32)> = Vec::with_capacity(68);
     for i in 23..=90 {
         let Some(j) = joints.get(i) else { continue };
-        if j.score < JOINT_CONFIDENCE_THRESHOLD {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
             continue;
         }
         points_px.push((j.nx * width as f32, j.ny * height as f32));

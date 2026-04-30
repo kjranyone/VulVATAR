@@ -73,9 +73,15 @@ const FACE_BLENDSHAPE_COUNT: usize = 52;
 #[cfg(feature = "inference")]
 const FACE_BBOX_PAD: f32 = 1.3;
 
-/// Confidence floor for accepting a face inference result (post sigmoid).
-#[cfg(feature = "inference")]
-const FACE_CONFIDENCE_THRESHOLD: f32 = 0.4;
+// (Previously a hardcoded `FACE_CONFIDENCE_THRESHOLD = 0.4` lived here
+// and silently dropped any blendshape result the FaceMesh model was
+// less than 40 % confident about. That hid the GUI-exposed
+// `face_confidence_threshold` slider behind a stricter floor the user
+// could not lower — exactly the same dual-filter pattern that broke
+// upper-body framing on the body track. The gate is gone; `estimate`
+// surfaces the raw post-sigmoid confidence to the caller, who feeds it
+// into the solver alongside the body-derived face confidence so the
+// GUI slider is the single source of truth.)
 
 /// Indices into FaceMeshV2's 478 landmarks that BlendshapeV2 expects
 /// as its 146-point input. Sourced verbatim from MediaPipe's
@@ -237,6 +243,11 @@ impl FaceMeshInference {
     /// Run FaceMesh + Blendshape on `rgb_data` cropped to `bbox`.
     /// Returns `None` on low confidence or any inference error so the
     /// caller can leave the avatar's expression channel empty.
+    /// Run FaceMeshV2 + BlendshapeV2 on the face crop. Returns the
+    /// 52-blendshape mapping plus the FaceMesh model's own
+    /// "is this even a face" confidence (post-sigmoid, in `[0, 1]`).
+    /// Returns `None` only on actual ONNX errors — confidence-based
+    /// filtering is the caller's responsibility.
     #[cfg(feature = "inference")]
     pub fn estimate(
         &mut self,
@@ -244,7 +255,7 @@ impl FaceMeshInference {
         width: u32,
         height: u32,
         bbox: &FaceBbox,
-    ) -> Option<Vec<SourceExpression>> {
+    ) -> Option<(Vec<SourceExpression>, f32)> {
         let face_tensor = crop_face_to_tensor(rgb_data, width, height, bbox);
         let face_input = match TensorRef::from_array_view(&face_tensor) {
             Ok(v) => v,
@@ -272,9 +283,6 @@ impl FaceMeshInference {
             .and_then(|v| v.try_extract_tensor::<f32>().ok())
             .and_then(|(_, data)| data.first().copied());
         let face_conf = conf_value.map(sigmoid).unwrap_or(0.0);
-        if face_conf < FACE_CONFIDENCE_THRESHOLD {
-            return None;
-        }
         let landmarks_data: Vec<f32> = landmarks_name
             .as_deref()
             .and_then(|n| face_outputs.get(n))
@@ -312,7 +320,7 @@ impl FaceMeshInference {
             .map(|(_, data)| data.to_vec())?;
         drop(bs_outputs);
         let weights = decode_blendshapes(&bs_data);
-        Some(map_blendshapes_to_expressions(&weights))
+        Some((map_blendshapes_to_expressions(&weights), face_conf))
     }
 
     #[cfg(not(feature = "inference"))]
@@ -322,7 +330,7 @@ impl FaceMeshInference {
         _: u32,
         _: u32,
         _: &FaceBbox,
-    ) -> Option<Vec<SourceExpression>> {
+    ) -> Option<(Vec<SourceExpression>, f32)> {
         None
     }
 

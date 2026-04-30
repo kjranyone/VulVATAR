@@ -1,11 +1,13 @@
-//! YOLOX-m human-art person detector — pre-stage to RTMW3D so we can
-//! crop the camera frame to the actual subject before feeding it to the
-//! 288×384 pose model.
+//! YOLOX-nano person detector — pre-stage to RTMW3D so we can crop the
+//! camera frame to the actual subject before feeding it to the 288×384
+//! pose model.
 //!
-//! The mmpose `rtmposev1` ONNX SDK ships an `end2end.onnx` for
-//! YOLOX-m fine-tuned on Human-Art. The export bakes NMS into the graph,
-//! so the post-processing here is just a max-score gather rather than a
-//! full NMS implementation.
+//! Uses the standard mmdeploy YOLOX export with NMS baked into the
+//! graph, so the post-processing here is just a max-score gather rather
+//! than a full NMS implementation. The nano backbone (~3.6 MB) is fast
+//! enough to run every frame on CPU and accurate enough for VTuber-style
+//! single-subject framing — the heavier YOLOX-m (~100 MB) was profiled
+//! at ~800 ms on CPU which alone blew the per-frame budget.
 //!
 //! ## Why bbox first
 //!
@@ -18,14 +20,26 @@
 //! person and confidence drops. YOLOX gives us a tight crop so the
 //! subject always fills the model input.
 //!
-//! ## Schema
+//! ## Schema (Megvii official YOLOX-nano export, raw head)
 //!
-//!   input  `(1, 3, 640, 640)` Float32 — BGR, raw [0, 255], letterboxed
-//!   dets   `(1, N, 5)` Float32       — `[x1, y1, x2, y2, score]` post-NMS
-//!   labels `(1, N)` Int64            — class index (0 = person)
+//!   input   `(1, 3, 416, 416)` Float32 — BGR, raw [0, 255], letterboxed
+//!   output  `(1, 3549, 85)` Float32    — per-anchor head output:
+//!                                       `[cx, cy, w, h, obj, cls0..cls79]`
 //!
-//! Coordinates are in letterbox space; we undo the letterbox here before
-//! returning a bbox in original-image pixel coords.
+//! `3549 = 52² + 26² + 13²` — one row per anchor at strides 8 / 16 / 32
+//! over a 416² input, matching YOLOX's anchor-free decoupled head. `cx`,
+//! `cy`, `w`, `h` are *raw* (need `+ grid * stride` and `exp() * stride`
+//! respectively to land in letterbox pixel space). `obj` and `cls_i`
+//! arrive post-sigmoid.
+//!
+//! NMS is *not* baked in. For VTuber single-subject framing we only need
+//! the top-scoring person bbox, so the decoder argmaxes
+//! `obj × cls[person]` over the 3549 anchors and skips NMS entirely —
+//! cheaper than a generic non-max suppression and fine when we only ever
+//! consume one bbox per frame.
+//!
+//! Coordinates land in letterbox space; we undo the letterbox here
+//! before returning a bbox in original-image pixel coords.
 
 #![cfg(feature = "inference")]
 #![allow(dead_code)]
@@ -38,13 +52,18 @@ use std::path::Path;
 
 use super::rtmw3d::{build_session, InferenceBackend};
 
-const INPUT_SIZE: u32 = 640;
+const INPUT_SIZE: u32 = 416;
 const PAD_VALUE: u8 = 114;
-/// Person bbox detection floor. The mmdeploy export bakes NMS in with a
-/// score threshold of 0.05 — we'd rather discard low-confidence persons
-/// than feed a noisy bbox to RTMW3D.
+/// YOLOX strides for the three FPN levels at the standard config.
+/// Matches the official `tools/export_onnx.py` head.
+const STRIDES: [u32; 3] = [8, 16, 32];
+/// Person bbox detection floor. Combined `obj × cls[person]` score, both
+/// of which arrive post-sigmoid, so this is a probability threshold.
 const PERSON_SCORE_THRESHOLD: f32 = 0.30;
-const PERSON_CLASS_ID: i64 = 0;
+/// COCO class index for "person".
+const PERSON_CLASS_ID: usize = 0;
+/// Total channels per anchor: 4 bbox + 1 obj + 80 COCO classes.
+const ANCHOR_CHANNELS: usize = 85;
 
 /// Detected person bounding box in *original image pixel* coords, post
 /// letterbox-undo.
@@ -78,11 +97,11 @@ pub struct YoloxPersonDetector {
 }
 
 impl YoloxPersonDetector {
-    /// Try to load `models/yolox.onnx`. Returns `Ok(None)` if the file
-    /// is missing — caller should treat detection as optional and fall
-    /// back to whole-frame inference.
+    /// Try to load `models/yolox_nano.onnx`. Returns `Ok(None)` if the
+    /// file is missing — caller should treat detection as optional and
+    /// fall back to whole-frame inference.
     pub fn try_from_models_dir(dir: &Path) -> Result<Option<Self>, String> {
-        let path = dir.join("yolox.onnx");
+        let path = dir.join("yolox_nano.onnx");
         if !path.exists() {
             return Ok(None);
         }
@@ -101,11 +120,8 @@ impl YoloxPersonDetector {
             .iter()
             .map(|o| o.name().to_string())
             .collect();
-        if output_names.len() < 2 {
-            return Err(format!(
-                "YOLOX: expected ≥2 outputs (dets, labels), got {}",
-                output_names.len()
-            ));
+        if output_names.is_empty() {
+            return Err("YOLOX: no outputs declared".to_string());
         }
         Ok(Some(Self {
             session,
@@ -147,8 +163,7 @@ impl YoloxPersonDetector {
             }
         };
 
-        let dets_name = self.output_names[0].clone();
-        let labels_name = self.output_names[1].clone();
+        let output_name = self.output_names[0].clone();
         let outputs = match self
             .session
             .run(ort::inputs![self.input_name.as_str() => input])
@@ -160,75 +175,107 @@ impl YoloxPersonDetector {
             }
         };
 
-        let dets = outputs.get(dets_name.as_str())?;
-        let (dets_shape, dets_data) = dets.try_extract_tensor::<f32>().ok()?;
-        let labels = outputs.get(labels_name.as_str())?;
-        let (labels_shape, labels_data) = labels.try_extract_tensor::<i64>().ok()?;
+        let head = outputs.get(output_name.as_str())?;
+        let (head_shape, head_data) = head.try_extract_tensor::<f32>().ok()?;
 
-        // dets: (1, N, 5), labels: (1, N).
-        if dets_shape.len() != 3 || dets_shape[2] != 5 {
-            warn!("YOLOX: unexpected dets shape {:?}", dets_shape);
-            return None;
-        }
-        let n = dets_shape[1] as usize;
-        if labels_shape.len() < 2 || (labels_shape[1] as usize) != n {
+        // Expect (1, N, 85) where N = Σ (input/stride)² over strides.
+        if head_shape.len() != 3 || head_shape[2] as usize != ANCHOR_CHANNELS {
             warn!(
-                "YOLOX: dets/labels mismatch: dets={:?} labels={:?}",
-                dets_shape, labels_shape
+                "YOLOX: unexpected output shape {:?} (want [1, N, {}])",
+                head_shape, ANCHOR_CHANNELS
             );
             return None;
         }
-        if dets_data.len() < n * 5 || labels_data.len() < n {
+        let n = head_shape[1] as usize;
+        let expected_n: usize = STRIDES
+            .iter()
+            .map(|s| {
+                let g = (INPUT_SIZE / s) as usize;
+                g * g
+            })
+            .sum();
+        if n != expected_n {
+            warn!(
+                "YOLOX: anchor count mismatch: got {}, expected {} for {}×{} with strides {:?}",
+                n, expected_n, INPUT_SIZE, INPUT_SIZE, STRIDES
+            );
+            return None;
+        }
+        if head_data.len() < n * ANCHOR_CHANNELS {
             return None;
         }
 
-        // Pick the highest-score *person* (label == 0) above threshold.
-        // We use score as the picker rather than bbox area because the
-        // mmdeploy NMS already returns dets sorted by score; in practice
-        // the top-scoring person is the "main subject" we want to track.
+        // Find the top-scoring person across all 3549 anchors.
+        // We can skip NMS because we only ever consume one bbox per
+        // frame (downstream RTMW3D needs the single largest subject);
+        // the argmax already gives us that without sorting overlaps.
+        let inv_scale = 1.0 / scale.max(1e-6);
         let mut best: Option<PersonBbox> = None;
-        for i in 0..n {
-            if labels_data[i] != PERSON_CLASS_ID {
-                continue;
-            }
-            let base = i * 5;
-            let score = dets_data[base + 4];
-            if score < PERSON_SCORE_THRESHOLD {
-                continue;
-            }
-            // Letterbox-space → original-image-space.
-            let lx1 = dets_data[base];
-            let ly1 = dets_data[base + 1];
-            let lx2 = dets_data[base + 2];
-            let ly2 = dets_data[base + 3];
-            let inv = 1.0 / scale.max(1e-6);
-            let x1 = ((lx1 - pad_x) * inv).clamp(0.0, width as f32);
-            let y1 = ((ly1 - pad_y) * inv).clamp(0.0, height as f32);
-            let x2 = ((lx2 - pad_x) * inv).clamp(0.0, width as f32);
-            let y2 = ((ly2 - pad_y) * inv).clamp(0.0, height as f32);
-            if x2 <= x1 || y2 <= y1 {
-                continue;
-            }
-            let bbox = PersonBbox {
-                x1,
-                y1,
-                x2,
-                y2,
-                score,
-            };
-            match best {
-                None => best = Some(bbox),
-                Some(prev) if score > prev.score => best = Some(bbox),
-                _ => {}
+        let mut anchor_idx: usize = 0;
+        for &stride in &STRIDES {
+            let grid = (INPUT_SIZE / stride) as usize;
+            let stride_f = stride as f32;
+            for gy in 0..grid {
+                for gx in 0..grid {
+                    let base = anchor_idx * ANCHOR_CHANNELS;
+                    anchor_idx += 1;
+
+                    // obj and cls already pass through sigmoid in the
+                    // YOLOX head's forward pass — see Megvii reference
+                    // `yolox/models/yolo_head.py::forward`. So `score`
+                    // is a true probability product.
+                    let obj = head_data[base + 4];
+                    let cls = head_data[base + 5 + PERSON_CLASS_ID];
+                    let score = obj * cls;
+                    if score < PERSON_SCORE_THRESHOLD {
+                        continue;
+                    }
+
+                    // bbox decode: cx, cy are raw offsets within the
+                    // grid cell; w, h are raw exp arguments.
+                    let raw_cx = head_data[base];
+                    let raw_cy = head_data[base + 1];
+                    let raw_w = head_data[base + 2];
+                    let raw_h = head_data[base + 3];
+                    let cx = (raw_cx + gx as f32) * stride_f;
+                    let cy = (raw_cy + gy as f32) * stride_f;
+                    let w = raw_w.exp() * stride_f;
+                    let h = raw_h.exp() * stride_f;
+
+                    // Letterbox-space → original-image-space.
+                    let lx1 = cx - 0.5 * w;
+                    let ly1 = cy - 0.5 * h;
+                    let lx2 = cx + 0.5 * w;
+                    let ly2 = cy + 0.5 * h;
+                    let x1 = ((lx1 - pad_x) * inv_scale).clamp(0.0, width as f32);
+                    let y1 = ((ly1 - pad_y) * inv_scale).clamp(0.0, height as f32);
+                    let x2 = ((lx2 - pad_x) * inv_scale).clamp(0.0, width as f32);
+                    let y2 = ((ly2 - pad_y) * inv_scale).clamp(0.0, height as f32);
+                    if x2 <= x1 || y2 <= y1 {
+                        continue;
+                    }
+                    let bbox = PersonBbox {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        score,
+                    };
+                    match best {
+                        None => best = Some(bbox),
+                        Some(prev) if score > prev.score => best = Some(bbox),
+                        _ => {}
+                    }
+                }
             }
         }
         best
     }
 }
 
-/// Letterbox to 640×640 with 114 padding, BGR raw [0, 255]. Returns the
-/// NCHW tensor plus the scale + pad offsets needed to map detections
-/// back to original image coords.
+/// Letterbox to `INPUT_SIZE × INPUT_SIZE` with 114 padding, BGR raw
+/// [0, 255]. Returns the NCHW tensor plus the scale + pad offsets
+/// needed to map detections back to original image coords.
 fn preprocess(rgb: &[u8], src_w: u32, src_h: u32) -> (Array4<f32>, f32, f32, f32) {
     let dst = INPUT_SIZE as usize;
     let mut tensor = Array4::<f32>::from_elem((1, 3, dst, dst), PAD_VALUE as f32);

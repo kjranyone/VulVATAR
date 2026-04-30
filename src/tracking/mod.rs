@@ -19,23 +19,14 @@ pub mod yolox;
 
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
-/// Single source of truth for the per-keypoint confidence threshold default.
-///
-/// Tracker output exposes a `confidence ∈ [0, 1]` per joint and per face
-/// pose; the solver discards anything below this floor. The value is a
-/// trade-off:
-///
-/// * **Lower** (toward 0.1) admits more noisy keypoints, which can drive
-///   the avatar from low-quality input but produces more twitchy motion.
-/// * **Higher** (toward 0.5+) restricts to confident detections only —
-///   smoother motion, but bones can freeze when the camera/lighting is
-///   poor.
-///
-/// `0.3` is the project-wide canonical mid-point. The runtime default
-/// ([`TrackingSmoothingParams::default`] / [`SolverParams::default`]),
-/// the first-launch GUI value, the "Streaming" preset, and the
-/// persistence fallback all reference this constant. Two presets
-/// intentionally diverge — see their constructors for rationale.
+/// Mid-point reference value for the per-keypoint confidence
+/// threshold. Used by named tracking presets ("Streaming" etc.) as a
+/// sane middle that filters obvious noise without freezing bones in
+/// modest lighting. The runtime `Default` impl is *not* this value —
+/// `TrackingSmoothingParams::default` sets thresholds to `0.0` so a
+/// fresh install has no hidden gate, with the GUI sliders as the
+/// single point of control. See the comment in that `Default` impl
+/// for the rationale.
 pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -81,11 +72,19 @@ pub struct TrackingSmoothingParams {
 
 impl Default for TrackingSmoothingParams {
     fn default() -> Self {
+        // Confidence thresholds default to *no gate* (`0.0`). The
+        // tracker's internal structural sanity is preserved (hip /
+        // shoulder origin choice, hand-MCP quorum, wrist anatomy
+        // check) but the user-tunable quality filters are off out
+        // of the box: every keypoint the model emits drives the
+        // avatar. Users dial the GUI sliders up if their lighting
+        // produces too much noise — better than the previous default
+        // hiding most of the keypoints from new users.
         Self {
             rotation_blend: 0.7,
             expression_blend: 0.8,
-            joint_confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
-            face_confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
+            joint_confidence_threshold: 0.0,
+            face_confidence_threshold: 0.0,
             stale_timeout_nanos: 200_000_000,
         }
     }

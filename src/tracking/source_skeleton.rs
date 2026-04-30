@@ -97,6 +97,13 @@ pub struct SourceSkeleton {
     pub fingertips: HashMap<HumanoidBone, SourceJoint>,
     pub face: Option<FacePose>,
     pub expressions: Vec<SourceExpression>,
+    /// Optional FaceMesh-model "is this a face" confidence (post sigmoid)
+    /// for the frame's face crop. Distinct from `face.confidence`, which
+    /// is body-derived (min over the 5 COCO face landmarks): this one
+    /// is the dedicated face-mesh model's own output and is what the
+    /// solver gates `expressions` on via `face_confidence_threshold`.
+    /// `None` when no face mesh ran (no face crop, no model).
+    pub face_mesh_confidence: Option<f32>,
     /// Overall scalar detection confidence (used for stale/quality gating
     /// upstream). `0.0` means "no person detected".
     pub overall_confidence: f32,
@@ -110,6 +117,7 @@ impl SourceSkeleton {
             fingertips: HashMap::new(),
             face: None,
             expressions: Vec::new(),
+            face_mesh_confidence: None,
             overall_confidence: 0.0,
         }
     }

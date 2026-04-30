@@ -450,6 +450,7 @@ impl Application {
                         &avatar.asset.default_expressions,
                         Some(&avatar.expression_weights),
                         smoothing_params.expression_blend,
+                        smoothing_params.face_confidence_threshold,
                     );
                     avatar.expression_weights = new_weights;
                 }

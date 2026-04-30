@@ -13,14 +13,15 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["webcam", "lipsync", "rapier", "inference", "virtual-camera"]
+default = ["webcam", "lipsync", "rapier", "inference", "inference-gpu", "virtual-camera"]
 webcam = ["nokhwa"]
 rapier = ["rapier3d"]
 inference = ["ort", "ndarray"]
-# Routes ORT through the DirectML execution provider when running on
-# DirectX 12-capable Windows hardware, falling back to CPU on EP
-# registration failure. Pulls in a DirectML-enabled ONNX Runtime
-# binary, so it's Windows-only and not in the default feature set.
+# Routes ORT through the DirectML execution provider, falling back to
+# CPU on EP registration failure. The whole project is Windows-only
+# (MF Virtual Camera, vulkano on D3D12), and the pose model (RTMW3D-x,
+# ~370 MB) is unusably slow on CPU — measured ~1 fps end-to-end —
+# so DirectML is the only practical path and ships in default features.
 inference-gpu = ["inference", "ort/directml"]
 virtual-camera = []
 lipsync = ["cpal", "rustfft"]
