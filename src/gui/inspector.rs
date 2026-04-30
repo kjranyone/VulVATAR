@@ -75,6 +75,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                         )
                                         .changed()
                                     {
+                                        // The per-frame zoom path lerps `distance` toward
+                                        // `target_distance` (mouse-wheel feel), so editing
+                                        // `distance` alone gets pulled back to the old
+                                        // target every frame. Snap both fields so the
+                                        // typed value sticks.
+                                        state.camera_orbit.target_distance =
+                                            state.camera_orbit.distance;
                                         state.project_dirty = true;
                                     }
                                 });
@@ -104,6 +111,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     state.camera_orbit.yaw_deg = 0.0;
                                     state.camera_orbit.pitch_deg = 0.0;
                                     state.camera_orbit.distance = 5.0;
+                                    state.camera_orbit.target_distance = 5.0;
                                     state.camera_orbit.pan = [0.0, 0.0];
                                     state.project_dirty = true;
                                 }
