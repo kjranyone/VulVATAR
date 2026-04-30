@@ -6,22 +6,22 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
 
 ## Sets
 
-- `basic_pose_samples/anime/`
+- `basic_pose_samples/photorealistic/`
   - 5 basic full-body pose samples.
   - Includes T-pose, single-leg balance, squat, side lunge, and walking stride.
   - Useful for quick pose-estimation smoke tests without props.
 
-- `gothic_lolita_rotation/anime/`
+- `gothic_lolita_rotation/photorealistic/`
   - 8 frames of an adult woman in gothic lolita fashion.
   - Covers a 360 degree turn at 45 degree increments.
   - Useful for checking pose stability with layered clothing and silhouette complexity.
 
-- `mocap_suit_rotation/anime/`
+- `mocap_suit_rotation/photorealistic/`
   - 16 frames of an adult woman in a motion-capture style suit with joint markers.
   - Covers a 360 degree turn at 22.5 degree increments.
   - Useful as the clearest synthetic rotation reference for body-joint annotation.
 
-- `mocap_suit_rotation/interpolated_anime/`
+- `mocap_suit_rotation/interpolated_photorealistic/`
   - 8 additional 22.5 degree offset frames.
   - Kept separately because these were generated as interpolation-angle supplements.
 
