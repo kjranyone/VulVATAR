@@ -37,8 +37,9 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
             let b = rgb_data[base + 2] as f32 / 255.0;
 
             let (h, s, v) = rgb_to_hsv(r, g, b);
-            let is_skin =
-                !(50.0..340.0).contains(&h) && (0.15..=0.75).contains(&s) && (0.2..=0.95).contains(&v);
+            let is_skin = !(50.0..340.0).contains(&h)
+                && (0.15..=0.75).contains(&s)
+                && (0.2..=0.95).contains(&v);
 
             if is_skin {
                 skin_pixel_count += 1;

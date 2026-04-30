@@ -91,15 +91,14 @@ const FACE_BBOX_PAD: f32 = 1.3;
 /// `face_blendshapes_graph.cc` (`kLandmarksSubsetIdxs`).
 #[cfg(feature = "inference")]
 const FACE_BLENDSHAPE_LANDMARK_SUBSET: [u16; FACE_BLENDSHAPE_INPUT_COUNT] = [
-    0, 1, 4, 5, 6, 7, 8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52, 53, 54, 55, 58,
-    61, 63, 65, 66, 67, 70, 78, 80, 81, 82, 84, 87, 88, 91, 93, 95, 103, 105, 107,
-    109, 127, 132, 133, 136, 144, 145, 146, 148, 149, 150, 152, 153, 154, 155, 157,
-    158, 159, 160, 161, 162, 163, 168, 172, 173, 176, 178, 181, 185, 191, 195, 197,
-    234, 246, 249, 251, 263, 267, 269, 270, 276, 282, 283, 284, 285, 288, 291, 293,
-    295, 296, 297, 300, 308, 310, 311, 312, 314, 317, 318, 321, 323, 324, 332, 334,
-    336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379, 380, 381, 382, 384,
-    385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466, 468,
-    469, 470, 471, 472, 473, 474, 475, 476, 477,
+    0, 1, 4, 5, 6, 7, 8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52, 53, 54, 55, 58, 61, 63, 65,
+    66, 67, 70, 78, 80, 81, 82, 84, 87, 88, 91, 93, 95, 103, 105, 107, 109, 127, 132, 133, 136,
+    144, 145, 146, 148, 149, 150, 152, 153, 154, 155, 157, 158, 159, 160, 161, 162, 163, 168, 172,
+    173, 176, 178, 181, 185, 191, 195, 197, 234, 246, 249, 251, 263, 267, 269, 270, 276, 282, 283,
+    284, 285, 288, 291, 293, 295, 296, 297, 300, 308, 310, 311, 312, 314, 317, 318, 321, 323, 324,
+    332, 334, 336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379, 380, 381, 382, 384, 385,
+    386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466, 468, 469, 470, 471, 472,
+    473, 474, 475, 476, 477,
 ];
 
 /// ARKit-compatible blendshape names in BlendshapeV2's output order.
@@ -109,30 +108,57 @@ const FACE_BLENDSHAPE_LANDMARK_SUBSET: [u16; FACE_BLENDSHAPE_INPUT_COUNT] = [
 #[cfg(feature = "inference")]
 const FACE_BLENDSHAPE_NAMES: [&str; FACE_BLENDSHAPE_COUNT] = [
     "_neutral",
-    "browDownLeft", "browDownRight", "browInnerUp",
-    "browOuterUpLeft", "browOuterUpRight",
-    "cheekPuff", "cheekSquintLeft", "cheekSquintRight",
-    "eyeBlinkLeft", "eyeBlinkRight",
-    "eyeLookDownLeft", "eyeLookDownRight",
-    "eyeLookInLeft", "eyeLookInRight",
-    "eyeLookOutLeft", "eyeLookOutRight",
-    "eyeLookUpLeft", "eyeLookUpRight",
-    "eyeSquintLeft", "eyeSquintRight",
-    "eyeWideLeft", "eyeWideRight",
-    "jawForward", "jawLeft", "jawOpen", "jawRight",
+    "browDownLeft",
+    "browDownRight",
+    "browInnerUp",
+    "browOuterUpLeft",
+    "browOuterUpRight",
+    "cheekPuff",
+    "cheekSquintLeft",
+    "cheekSquintRight",
+    "eyeBlinkLeft",
+    "eyeBlinkRight",
+    "eyeLookDownLeft",
+    "eyeLookDownRight",
+    "eyeLookInLeft",
+    "eyeLookInRight",
+    "eyeLookOutLeft",
+    "eyeLookOutRight",
+    "eyeLookUpLeft",
+    "eyeLookUpRight",
+    "eyeSquintLeft",
+    "eyeSquintRight",
+    "eyeWideLeft",
+    "eyeWideRight",
+    "jawForward",
+    "jawLeft",
+    "jawOpen",
+    "jawRight",
     "mouthClose",
-    "mouthDimpleLeft", "mouthDimpleRight",
-    "mouthFrownLeft", "mouthFrownRight",
-    "mouthFunnel", "mouthLeft",
-    "mouthLowerDownLeft", "mouthLowerDownRight",
-    "mouthPressLeft", "mouthPressRight",
-    "mouthPucker", "mouthRight",
-    "mouthRollLower", "mouthRollUpper",
-    "mouthShrugLower", "mouthShrugUpper",
-    "mouthSmileLeft", "mouthSmileRight",
-    "mouthStretchLeft", "mouthStretchRight",
-    "mouthUpperUpLeft", "mouthUpperUpRight",
-    "noseSneerLeft", "noseSneerRight",
+    "mouthDimpleLeft",
+    "mouthDimpleRight",
+    "mouthFrownLeft",
+    "mouthFrownRight",
+    "mouthFunnel",
+    "mouthLeft",
+    "mouthLowerDownLeft",
+    "mouthLowerDownRight",
+    "mouthPressLeft",
+    "mouthPressRight",
+    "mouthPucker",
+    "mouthRight",
+    "mouthRollLower",
+    "mouthRollUpper",
+    "mouthShrugLower",
+    "mouthShrugUpper",
+    "mouthSmileLeft",
+    "mouthSmileRight",
+    "mouthStretchLeft",
+    "mouthStretchRight",
+    "mouthUpperUpLeft",
+    "mouthUpperUpRight",
+    "noseSneerLeft",
+    "noseSneerRight",
 ];
 
 /// Pixel-space face bbox (image-relative).
@@ -170,9 +196,7 @@ impl FaceMeshInference {
     /// body and hands without it. Returns `Err` only on a load
     /// failure that the caller should surface to the user.
     #[cfg(feature = "inference")]
-    pub fn try_from_models_dir(
-        models_dir: impl AsRef<Path>,
-    ) -> Result<Option<Self>, String> {
+    pub fn try_from_models_dir(models_dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
         let models_dir = models_dir.as_ref();
         let face_path = models_dir.join("face_landmark.onnx");
         let blend_path = models_dir.join("face_blendshapes.onnx");
@@ -187,11 +211,8 @@ impl FaceMeshInference {
         }
 
         info!("Loading FaceMeshV2 from {}", face_path.display());
-        let (face_session, backend) = super::rtmw3d::build_session(
-            &face_path.to_string_lossy(),
-            2,
-            "FaceMeshV2",
-        )?;
+        let (face_session, backend) =
+            super::rtmw3d::build_session(&face_path.to_string_lossy(), 2, "FaceMeshV2")?;
         let face_input_name = face_session
             .inputs()
             .first()
@@ -208,11 +229,8 @@ impl FaceMeshInference {
         );
 
         info!("Loading BlendshapeV2 from {}", blend_path.display());
-        let (blendshape_session, _) = super::rtmw3d::build_session(
-            &blend_path.to_string_lossy(),
-            2,
-            "BlendshapeV2",
-        )?;
+        let (blendshape_session, _) =
+            super::rtmw3d::build_session(&blend_path.to_string_lossy(), 2, "BlendshapeV2")?;
         let blendshape_input_name = blendshape_session
             .inputs()
             .first()
@@ -240,9 +258,7 @@ impl FaceMeshInference {
     }
 
     #[cfg(not(feature = "inference"))]
-    pub fn try_from_models_dir(
-        _: impl AsRef<std::path::Path>,
-    ) -> Result<Option<Self>, String> {
+    pub fn try_from_models_dir(_: impl AsRef<std::path::Path>) -> Result<Option<Self>, String> {
         Ok(None)
     }
 
@@ -383,12 +399,7 @@ pub fn derive_face_bbox(
 }
 
 #[cfg(feature = "inference")]
-fn crop_face_to_tensor(
-    rgb: &[u8],
-    width: u32,
-    height: u32,
-    bbox: &FaceBbox,
-) -> Array4<f32> {
+fn crop_face_to_tensor(rgb: &[u8], width: u32, height: u32, bbox: &FaceBbox) -> Array4<f32> {
     let target = FACE_INPUT_SIZE as usize;
     let mut tensor = Array4::<f32>::zeros((1, 3, target, target));
     let stride = (width as usize) * 3;
@@ -470,9 +481,7 @@ fn sigmoid(x: f32) -> f32 {
 /// Selfie mirror is honoured: the subject's left eye drives
 /// `blinkRight`.
 #[cfg(feature = "inference")]
-fn map_blendshapes_to_expressions(
-    weights: &[f32; FACE_BLENDSHAPE_COUNT],
-) -> Vec<SourceExpression> {
+fn map_blendshapes_to_expressions(weights: &[f32; FACE_BLENDSHAPE_COUNT]) -> Vec<SourceExpression> {
     let mut out: Vec<SourceExpression> = Vec::with_capacity(FACE_BLENDSHAPE_COUNT + 8);
     for (i, name) in FACE_BLENDSHAPE_NAMES.iter().enumerate().skip(1) {
         out.push(SourceExpression {
@@ -480,22 +489,40 @@ fn map_blendshapes_to_expressions(
             weight: weights[i].clamp(0.0, 1.0),
         });
     }
-    let blink_left_subj = weights[9].clamp(0.0, 1.0);   // eyeBlinkLeft (subject)
+    let blink_left_subj = weights[9].clamp(0.0, 1.0); // eyeBlinkLeft (subject)
     let blink_right_subj = weights[10].clamp(0.0, 1.0);
-    out.push(SourceExpression { name: "blinkRight".into(), weight: blink_left_subj });
-    out.push(SourceExpression { name: "blinkLeft".into(),  weight: blink_right_subj });
+    out.push(SourceExpression {
+        name: "blinkRight".into(),
+        weight: blink_left_subj,
+    });
+    out.push(SourceExpression {
+        name: "blinkLeft".into(),
+        weight: blink_right_subj,
+    });
     out.push(SourceExpression {
         name: "blink".into(),
         weight: ((blink_left_subj + blink_right_subj) * 0.5).clamp(0.0, 1.0),
     });
     let jaw_open = weights[25].clamp(0.0, 1.0);
-    out.push(SourceExpression { name: "aa".into(), weight: jaw_open });
+    out.push(SourceExpression {
+        name: "aa".into(),
+        weight: jaw_open,
+    });
     let smile = ((weights[44] + weights[45]) * 0.5).clamp(0.0, 1.0);
-    out.push(SourceExpression { name: "happy".into(), weight: smile });
+    out.push(SourceExpression {
+        name: "happy".into(),
+        weight: smile,
+    });
     let frown = ((weights[30] + weights[31]) * 0.5).clamp(0.0, 1.0);
-    out.push(SourceExpression { name: "sad".into(), weight: frown });
+    out.push(SourceExpression {
+        name: "sad".into(),
+        weight: frown,
+    });
     let brow_up = weights[3].clamp(0.0, 1.0);
     let surprise = (brow_up * jaw_open).sqrt();
-    out.push(SourceExpression { name: "surprised".into(), weight: surprise });
+    out.push(SourceExpression {
+        name: "surprised".into(),
+        weight: surprise,
+    });
     out
 }

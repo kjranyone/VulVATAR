@@ -115,6 +115,163 @@ function Install-Models {
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
 }
 
+function Install-ExperimentalPoseModels {
+    # Optional models for the provider-based CIGPose + metric-depth
+    # pipeline. CIGPose is downloaded from the cigpose-onnx release
+    # bundle and normalized to models\cigpose.onnx. Metric-depth models
+    # vary a lot in size, license, and ONNX packaging, so the URL is
+    # supplied by environment variables instead of hardcoded here.
+    Write-Host "Setting up experimental pose-provider ONNX models..." -ForegroundColor Cyan
+    if (!(Test-Path "models")) {
+        New-Item -ItemType Directory -Force -Path "models" | Out-Null
+    }
+
+    Install-ZipArchive -Name "CIGPose-x UBody whole-body 2D pose" `
+        -ArchiveUrl "https://github.com/namas191297/cigpose-onnx/releases/latest/download/cigpose_models.zip" `
+        -KeepGlobs @("cigpose-x_coco-ubody_384x288.onnx") `
+        -RenameMap @{ "cigpose-x_coco-ubody_384x288.onnx" = "cigpose.onnx" }
+
+    Install-MetricDepthModelFromEnv
+
+    Write-Host ""
+    Write-Host "Experimental provider examples:" -ForegroundColor Cyan
+    Write-Host '  $env:VULVATAR_POSE_PROVIDER="cigpose-metric-depth"' -ForegroundColor DarkGray
+    Write-Host '  $env:VULVATAR_METRIC_DEPTH_KIND="unidepth-v2"  # or moge / depth-pro / custom' -ForegroundColor DarkGray
+    Write-Host '  $env:VULVATAR_METRIC_DEPTH_MODEL="models\unidepth_v2.onnx"' -ForegroundColor DarkGray
+}
+
+function Install-MetricDepthModelFromEnv {
+    $url = $env:VULVATAR_METRIC_DEPTH_URL
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        Write-Host "  Metric depth model: no VULVATAR_METRIC_DEPTH_URL set; skipping" -ForegroundColor Yellow
+        Write-Host "    Set VULVATAR_METRIC_DEPTH_URL to a UniDepthV2 / MoGe / Depth Pro ONNX URL to download it." -ForegroundColor DarkGray
+        Write-Host "    Optional: VULVATAR_METRIC_DEPTH_OUT, VULVATAR_METRIC_DEPTH_DATA_URL, VULVATAR_METRIC_DEPTH_DATA_OUT." -ForegroundColor DarkGray
+        return
+    }
+
+    $kind = $env:VULVATAR_METRIC_DEPTH_KIND
+    if ([string]::IsNullOrWhiteSpace($kind)) {
+        $kind = "custom"
+    }
+
+    $outName = $env:VULVATAR_METRIC_DEPTH_OUT
+    if ([string]::IsNullOrWhiteSpace($outName)) {
+        switch -Regex ($kind.ToLowerInvariant()) {
+            '^(unidepth|unidepth-v2|unidepthv2)$' { $outName = "unidepth_v2.onnx"; break }
+            '^moge$' { $outName = "moge.onnx"; break }
+            '^(depth-pro|depthpro)$' { $outName = "depth_pro.onnx"; break }
+            default { $outName = "metric_depth.onnx"; break }
+        }
+    }
+
+    $files = @(
+        @{ Url = $url; OutName = $outName }
+    )
+
+    $dataUrl = $env:VULVATAR_METRIC_DEPTH_DATA_URL
+    if (-not [string]::IsNullOrWhiteSpace($dataUrl)) {
+        $dataOut = $env:VULVATAR_METRIC_DEPTH_DATA_OUT
+        if ([string]::IsNullOrWhiteSpace($dataOut)) {
+            try {
+                $dataOut = [System.IO.Path]::GetFileName(([System.Uri]$dataUrl).AbsolutePath)
+            } catch {
+                $dataOut = "$outName.data"
+            }
+        }
+        $files += @{ Url = $dataUrl; OutName = $dataOut }
+    }
+
+    Install-DirectFiles -Name "Metric depth model ($kind)" -Files $files
+}
+
+function Select-PoseProvider {
+    $current = $env:VULVATAR_POSE_PROVIDER
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        $current = "rtmw3d"
+    }
+
+    Write-Host ""
+    Write-Host "Select pose provider for this run:" -ForegroundColor Cyan
+    Write-Host "   1. RTMW3D (default/current stable)" -ForegroundColor Green
+    Write-Host "   2. CIGPose + metric depth (experimental)" -ForegroundColor Yellow
+    Write-Host "   0. keep current: $current" -ForegroundColor DarkGray
+    $choice = Read-Host "Provider"
+
+    switch ($choice) {
+        "0" {
+            Write-Host "Using existing provider: $current" -ForegroundColor DarkGray
+        }
+        "2" {
+            $env:VULVATAR_POSE_PROVIDER = "cigpose-metric-depth"
+            Select-MetricDepthKind
+            Test-ExperimentalPoseModelFiles
+        }
+        default {
+            $env:VULVATAR_POSE_PROVIDER = "rtmw3d"
+            Write-Host "Using pose provider: rtmw3d" -ForegroundColor Green
+        }
+    }
+}
+
+function Select-MetricDepthKind {
+    $current = $env:VULVATAR_METRIC_DEPTH_KIND
+    if ([string]::IsNullOrWhiteSpace($current)) {
+        $current = "unidepth-v2"
+    }
+
+    Write-Host ""
+    Write-Host "Select metric depth backend:" -ForegroundColor Cyan
+    Write-Host "   1. UniDepthV2" -ForegroundColor Green
+    Write-Host "   2. MoGe" -ForegroundColor Green
+    Write-Host "   3. Depth Pro" -ForegroundColor Green
+    Write-Host "   0. keep current: $current" -ForegroundColor DarkGray
+    $choice = Read-Host "Metric depth"
+
+    switch ($choice) {
+        "0" { $env:VULVATAR_METRIC_DEPTH_KIND = $current }
+        "2" { $env:VULVATAR_METRIC_DEPTH_KIND = "moge" }
+        "3" { $env:VULVATAR_METRIC_DEPTH_KIND = "depth-pro" }
+        default { $env:VULVATAR_METRIC_DEPTH_KIND = "unidepth-v2" }
+    }
+
+    Write-Host "Using pose provider: cigpose-metric-depth ($env:VULVATAR_METRIC_DEPTH_KIND)" -ForegroundColor Yellow
+}
+
+function Get-DefaultMetricDepthModelPath {
+    $kind = $env:VULVATAR_METRIC_DEPTH_KIND
+    if ([string]::IsNullOrWhiteSpace($kind)) {
+        $kind = "unidepth-v2"
+    }
+
+    switch -Regex ($kind.ToLowerInvariant()) {
+        '^(unidepth|unidepth-v2|unidepthv2)$' { return "models\unidepth_v2.onnx" }
+        '^moge$' { return "models\moge.onnx" }
+        '^(depth-pro|depthpro)$' { return "models\depth_pro.onnx" }
+        default { return "models\metric_depth.onnx" }
+    }
+}
+
+function Test-ExperimentalPoseModelFiles {
+    $metricModel = $env:VULVATAR_METRIC_DEPTH_MODEL
+    if ([string]::IsNullOrWhiteSpace($metricModel)) {
+        $metricModel = Get-DefaultMetricDepthModelPath
+    }
+
+    $missing = @()
+    if (-not (Test-Path "models\cigpose.onnx")) {
+        $missing += "models\cigpose.onnx"
+    }
+    if (-not (Test-Path $metricModel)) {
+        $missing += $metricModel
+    }
+
+    if ($missing.Count -gt 0) {
+        Write-Host "  WARNING: experimental provider model files are missing:" -ForegroundColor Yellow
+        $missing | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
+        Write-Host "  Run menu entry 'setup experimental pose provider models' or set VULVATAR_*_MODEL paths." -ForegroundColor DarkGray
+    }
+}
+
 # Download a `.zip` archive, extract to a temp dir, copy ONNX files
 # matching `KeepGlobs` into `models\`, optionally renaming via
 # `RenameMap`, and remove the temp dir. Used for OpenMMLab mmdeploy
@@ -691,9 +848,10 @@ $commands = @(
     @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-Font" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
-    @{ Label = "run (debug)";      Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run' },
-    @{ Label = "run (debug+lipsync)"; Cmd = '$env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
-    @{ Label = "run (release)";    Cmd = "cargo run --release" },
+    @{ Label = "run (debug)";      Cmd = 'Select-PoseProvider; $env:RUST_LOG="vulvatar=info"; cargo run' },
+    @{ Label = "run (debug+lipsync)"; Cmd = 'Select-PoseProvider; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
+    @{ Label = "run (release)";    Cmd = "Select-PoseProvider; cargo run --release" },
+    @{ Label = "setup experimental pose provider models"; Cmd = "Install-ExperimentalPoseModels" },
     @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
     @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
     @{ Label = "package installer (unsigned)";        Cmd = "Build-Distribution" },

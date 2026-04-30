@@ -1,15 +1,18 @@
 #![allow(dead_code)]
+#[cfg(feature = "webcam")]
+use crate::t;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::t;
 
 #[cfg(feature = "webcam")]
 mod webcam;
 
+pub mod cigpose_metric_depth;
 mod pose_estimation;
+pub mod provider;
 
 pub mod face_mediapipe;
 pub mod rtmw3d;
@@ -644,7 +647,14 @@ impl TrackingWorker {
                     "tracking-worker: failed to open camera {}: {}",
                     camera_index, e
                 );
-                mailbox.report_error(t!("tracking.error_camera_open", index = camera_index, error = e.to_string()), TrackingErrorLevel::Blocking);
+                mailbox.report_error(
+                    t!(
+                        "tracking.error_camera_open",
+                        index = camera_index,
+                        error = e.to_string()
+                    ),
+                    TrackingErrorLevel::Blocking,
+                );
                 warn!("tracking-worker: falling back to synthetic backend");
                 ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(mailbox, running, interval);
@@ -652,29 +662,38 @@ impl TrackingWorker {
             }
         };
 
-        // Initialize the RTMW3D inference engine. The legacy
+        // Initialize the pose provider. The legacy
         // `prefer_lower_body` flag has been a no-op since the move
         // to whole-body 3D models — kept in the function signature
         // to avoid touching every caller, but the value is ignored.
         let _ = prefer_lower_body;
         #[cfg(feature = "inference")]
-        let mut pose_estimator = match rtmw3d::Rtmw3dInference::from_models_dir("models") {
-            Ok(mut estimator) => {
-                let warnings = estimator.take_load_warnings();
+        let mut pose_provider = match provider::create_pose_provider_from_env("models") {
+            Ok(mut provider) => {
+                let warnings = provider.take_load_warnings();
                 if !warnings.is_empty() {
-                    mailbox.report_error(t!("tracking.error_model_warning", warnings = warnings.join("; ")), TrackingErrorLevel::Warning);
+                    mailbox.report_error(
+                        t!(
+                            "tracking.error_model_warning",
+                            warnings = warnings.join("; ")
+                        ),
+                        TrackingErrorLevel::Warning,
+                    );
                 }
-                mailbox.set_inference_backend_label(Some(estimator.backend().label()));
-                Some(estimator)
+                mailbox.set_inference_backend_label(Some(provider.label()));
+                Some(provider)
             }
             Err(e) => {
                 error!("tracking-worker: inference disabled: {}", e);
-                mailbox.report_error(t!("tracking.error_model_unavailable", error = e.to_string()), TrackingErrorLevel::Blocking);
+                mailbox.report_error(
+                    t!("tracking.error_model_unavailable", error = e.to_string()),
+                    TrackingErrorLevel::Blocking,
+                );
                 None
             }
         };
         #[cfg(not(feature = "inference"))]
-        let mut pose_estimator: Option<rtmw3d::Rtmw3dInference> = None;
+        let mut pose_provider: Option<Box<dyn provider::PoseProvider>> = None;
 
         info!("tracking-worker: webcam opened successfully");
         ready.store(true, Ordering::SeqCst);
@@ -691,8 +710,8 @@ impl TrackingWorker {
                     let width = capture.width();
                     let height = capture.height();
 
-                    let estimate = if let Some(ref mut estimator) = pose_estimator {
-                        estimator.estimate_pose(&rgb_data, width, height, frame_index)
+                    let estimate = if let Some(ref mut provider) = pose_provider {
+                        provider.estimate_pose(&rgb_data, width, height, frame_index)
                     } else {
                         pose_estimation::estimate_pose(&rgb_data, width, height, frame_index)
                     };
@@ -710,7 +729,10 @@ impl TrackingWorker {
                             "tracking-worker: {} consecutive grab failures, stopping worker",
                             consecutive_errors
                         );
-                        mailbox.report_error(t!("tracking.error_camera_stopped", count = consecutive_errors), TrackingErrorLevel::Blocking);
+                        mailbox.report_error(
+                            t!("tracking.error_camera_stopped", count = consecutive_errors),
+                            TrackingErrorLevel::Blocking,
+                        );
                         return;
                     }
                 }
