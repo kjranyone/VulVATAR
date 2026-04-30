@@ -57,14 +57,31 @@ pub(crate) fn dll_release() {
     DLL_OBJECT_COUNT.fetch_sub(1, Ordering::SeqCst);
 }
 
-/// `DllGetClassObject` — COM entry point. Returns an `IClassFactory` for
-/// our single media source class.
 /// Build-time identifier baked into the DLL. If the FrameServer reuses an
 /// older scratch copy, the trace at the top of each run will show the
 /// stale marker and we know not to trust subsequent diagnostics.
 const BUILD_MARKER: &str = concat!("nv12-stride-aware-via-2dbuffer ", file!(), ":", line!());
 
-#[allow(clippy::missing_safety_doc)]
+/// `DllGetClassObject` — COM entry point. Returns an `IClassFactory` for
+/// our single media source class. Called by the COM SCM (and Frame
+/// Server's FsProxy when it instantiates the source via the CLSID).
+///
+/// # Safety
+///
+/// The caller must follow the [COM `DllGetClassObject` contract][1]:
+///
+/// * `rclsid` and `riid` are either null or properly aligned, valid
+///   pointers to readable `GUID` values for the duration of the call.
+/// * `ppv` is either null or a properly aligned, valid pointer to a
+///   writable `*mut c_void` location for the duration of the call. We
+///   write `null_mut()` early as a defensive default per
+///   [Rule 7 of the COM rules][2].
+///
+/// We treat all three nulls as `E_POINTER` rather than UB so a buggy
+/// SCM or test harness fails cleanly instead of segfaulting.
+///
+/// [1]: https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-dllgetclassobject
+/// [2]: https://learn.microsoft.com/en-us/windows/win32/com/rules-for-implementing-queryinterface
 #[no_mangle]
 pub unsafe extern "system" fn DllGetClassObject(
     rclsid: *const GUID,
@@ -120,7 +137,20 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT {
 }
 
 /// `DllInstall` — honours `regsvr32 /i:user` (per-user) vs `/i:"machine"`.
-#[allow(clippy::missing_safety_doc)]
+///
+/// # Safety
+///
+/// Per the [COM `DllInstall` contract][1]:
+///
+/// * `cmd_line` is either null or a valid pointer to a null-terminated
+///   UTF-16 wide string for the duration of the call.
+/// * The caller's read/write access to `cmd_line` follows COM string
+///   ownership rules — we only read, never write or free.
+///
+/// `parse_scope` enforces a 256-`u16` upper bound on the scan to prevent
+/// a runaway read if the caller forgets the null terminator.
+///
+/// [1]: https://learn.microsoft.com/en-us/windows/win32/api/olectl/nf-olectl-dllinstall
 #[no_mangle]
 pub unsafe extern "system" fn DllInstall(install: BOOL, cmd_line: *const u16) -> HRESULT {
     let scope = parse_scope(cmd_line);
@@ -136,6 +166,12 @@ pub unsafe extern "system" fn DllInstall(install: BOOL, cmd_line: *const u16) ->
 }
 
 /// Parse the `pszCmdLine` argument passed by `regsvr32 /i:<string>`.
+///
+/// # Safety
+///
+/// `cmd_line` must be either null or a valid pointer to a
+/// null-terminated UTF-16 wide string. The scan is bounded to 256
+/// `u16`s so a missing terminator merely truncates instead of UB.
 unsafe fn parse_scope(cmd_line: *const u16) -> registry::Scope {
     if cmd_line.is_null() {
         return registry::Scope::PerUser;
