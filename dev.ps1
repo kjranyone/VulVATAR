@@ -461,6 +461,232 @@ function Uninstall-MfCamera {
     # clean up.
 }
 
+# Locate signtool.exe. Prefer PATH; fall back to the latest x64 build
+# under the Windows 10 SDK install. Returns the absolute path or throws.
+function Find-SignTool {
+    $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    if (Test-Path $sdkRoot) {
+        $candidates = Get-ChildItem -Path $sdkRoot -Recurse -Filter signtool.exe -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*\x64\signtool.exe' } |
+            Sort-Object FullName -Descending
+        if ($candidates) { return $candidates[0].FullName }
+    }
+    throw "signtool.exe not found. Install the Windows 10/11 SDK (or add signtool.exe to PATH)."
+}
+
+# Locate iscc.exe (Inno Setup compiler). Returns the absolute path or throws.
+function Find-IsccTool {
+    $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe",
+        "${env:ProgramFiles}\Inno Setup 6\iscc.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    throw "iscc.exe not found. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php (or add iscc.exe to PATH)."
+}
+
+# Find the (single) currently-valid code-signing certificate. Sectigo
+# USB tokens (SafeNet eToken / Authentic Key) surface their cert in
+# CurrentUser\My through the eToken CSP/CNG when plugged in, so the
+# cert appearing in the store is exactly equivalent to "token is
+# inserted and unlocked at the OS layer". Filtering by EKU
+# 1.3.6.1.5.5.7.3.3 (Code Signing) keeps SSL/email certs on the same
+# token from being picked accidentally.
+function Find-CodeSigningCertificate {
+    $now = Get-Date
+    $codeSigningOid = '1.3.6.1.5.5.7.3.3'
+    foreach ($store in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\My')) {
+        $certs = Get-ChildItem -Path $store -ErrorAction SilentlyContinue | Where-Object {
+            $_.HasPrivateKey -and
+            $_.NotAfter -gt $now -and
+            $_.NotBefore -lt $now -and
+            (($_.EnhancedKeyUsageList | Where-Object { $_.ObjectId -eq $codeSigningOid }) -ne $null)
+        }
+        if ($certs) { return @($certs)[0] }
+    }
+    return $null
+}
+
+# Block until a USB code-signing token is detected, or fail after
+# $TimeoutSeconds. Polling the cert store at 2s intervals is cheap
+# (Get-ChildItem on a small store) and avoids any reliance on
+# WMI / Win32_USB device-arrival events.
+function Wait-ForCodeSigningCertificate {
+    param([int]$TimeoutSeconds = 120)
+
+    $cert = Find-CodeSigningCertificate
+    if ($cert) {
+        Write-Host "Code-signing cert: $($cert.Subject)" -ForegroundColor Green
+        Write-Host "  thumbprint: $($cert.Thumbprint)" -ForegroundColor DarkGray
+        Write-Host "  not after:  $($cert.NotAfter)" -ForegroundColor DarkGray
+        return $cert
+    }
+
+    Write-Host "Insert the code-signing USB token. Polling for ${TimeoutSeconds}s..." -ForegroundColor Yellow
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        $cert = Find-CodeSigningCertificate
+        if ($cert) {
+            Write-Host "Detected: $($cert.Subject)" -ForegroundColor Green
+            Write-Host "  thumbprint: $($cert.Thumbprint)" -ForegroundColor DarkGray
+            return $cert
+        }
+    }
+    throw "No code-signing certificate found in CurrentUser\My or LocalMachine\My within ${TimeoutSeconds}s. Is the USB token plugged in?"
+}
+
+# Sign one or more files with the supplied cert. signtool accepts
+# multiple files in a single invocation, which lets the SafeNet PIN
+# dialog appear once for the whole batch (the developer types the
+# PIN once and signtool reuses the unlocked private key handle for
+# every file in the list).
+function Invoke-SignTool {
+    param(
+        [Parameter(Mandatory)] [string]$SignTool,
+        [Parameter(Mandatory)] $Cert,
+        [Parameter(Mandatory)] [string[]]$Files
+    )
+
+    $timestampUrl = if ($env:VULVATAR_SIGN_TIMESTAMP_URL) {
+        $env:VULVATAR_SIGN_TIMESTAMP_URL
+    } else {
+        'http://timestamp.sectigo.com'
+    }
+
+    $signArgs = @(
+        'sign',
+        '/sha1', $Cert.Thumbprint,
+        '/tr',   $timestampUrl,
+        '/td',   'sha256',
+        '/fd',   'sha256',
+        '/v'
+    ) + $Files
+
+    Write-Host "  signtool sign /sha1 $($Cert.Thumbprint) /tr $timestampUrl /td sha256 /fd sha256 ..." -ForegroundColor DarkGray
+    foreach ($f in $Files) { Write-Host "    $f" -ForegroundColor DarkGray }
+    & $SignTool @signArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool failed (exit $LASTEXITCODE). If the SafeNet PIN dialog timed out or was cancelled, re-run."
+    }
+}
+
+# Verify the asset/model files installer\vulvatar.iss copies into the
+# install image are present. cargo handles the binaries; the asset
+# pipeline (fonts + ONNX) is a manual `setup` step the developer has
+# to have run once. Failing fast here beats iscc reporting "file not
+# found" 30s into the compile.
+function Test-DistributionPrereqs {
+    $required = @(
+        "assets\NotoSansJP-Regular.otf",
+        "assets\NotoSansKR-Regular.otf",
+        "assets\NotoSansSC-Regular.otf",
+        "models\rtmw3d.onnx",
+        "models\yolox.onnx",
+        "models\face_landmark.onnx",
+        "models\face_blendshapes.onnx"
+    )
+    $missing = $required | Where-Object { -not (Test-Path $_) }
+    if ($missing) {
+        Write-Host "Missing files required for installer build:" -ForegroundColor Red
+        $missing | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+        throw "Run the 'setup' menu entry first to download fonts + ONNX models."
+    }
+}
+
+# Run cargo with $env:RUSTFLAGS extended to include +crt-static, then
+# restore RUSTFLAGS. Used for the camera DLL so it has no VC runtime
+# dependency when FrameServer's svchost loads it.
+function Invoke-CargoStaticCrt {
+    param([Parameter(Mandatory)] [string[]]$CargoArgs)
+
+    $oldRustFlags = $env:RUSTFLAGS
+    try {
+        if ([string]::IsNullOrWhiteSpace($oldRustFlags)) {
+            $env:RUSTFLAGS = "-C target-feature=+crt-static"
+        } elseif ($oldRustFlags -notmatch "crt-static") {
+            $env:RUSTFLAGS = "$oldRustFlags -C target-feature=+crt-static"
+        }
+        & cargo @CargoArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo $($CargoArgs -join ' ') failed (exit $LASTEXITCODE)"
+        }
+    } finally {
+        if ($null -eq $oldRustFlags) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $oldRustFlags
+        }
+    }
+}
+
+# Build the redistributable installer. With `-Sign`, Authenticode-sign
+# the release binaries and the produced setup .exe via signtool +
+# whichever code-signing cert is currently in the user's cert store
+# (typically a Sectigo USB token). Two PIN prompts total: one for the
+# binary batch, one for the installer.
+function Build-Distribution {
+    param([switch]$Sign)
+
+    Test-DistributionPrereqs
+    $iscc = Find-IsccTool
+
+    if ($Sign) {
+        $signtool = Find-SignTool
+        $cert     = Wait-ForCodeSigningCertificate
+    }
+
+    # 1. Main app — default CRT linkage. ORT's prebuilt onnxruntime.lib
+    #    expects /MD; forcing /MT here would hit CRT symbol conflicts at
+    #    link time.
+    Write-Host "[1/5] cargo build --release..." -ForegroundColor Cyan
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit $LASTEXITCODE)" }
+
+    # 2. Camera DLL — static CRT. svchost loads this in Session 0 with
+    #    its own DLL search rules; static CRT removes any VC runtime
+    #    dependency from the dependency walk.
+    Write-Host "[2/5] Rebuilding vulvatar-mf-camera with +crt-static..." -ForegroundColor Cyan
+    Invoke-CargoStaticCrt -CargoArgs @('build', '--release', '-p', 'vulvatar-mf-camera')
+
+    # 3. Sign release binaries (single signtool call → one PIN prompt).
+    if ($Sign) {
+        Write-Host "[3/5] Signing release binaries (PIN prompt 1/2)..." -ForegroundColor Cyan
+        Invoke-SignTool -SignTool $signtool -Cert $cert -Files @(
+            "target\release\vulvatar.exe",
+            "target\release\vulvatar_mf_camera.dll"
+        )
+    } else {
+        Write-Host "[3/5] Skipping binary signing (unsigned build)." -ForegroundColor DarkGray
+    }
+
+    # 4. Build the installer. iscc resolves OutputDir relative to the
+    #    .iss location, so output lands in installer\output\.
+    Write-Host "[4/5] Compiling Inno Setup installer..." -ForegroundColor Cyan
+    & $iscc "installer\vulvatar.iss"
+    if ($LASTEXITCODE -ne 0) { throw "iscc failed (exit $LASTEXITCODE)" }
+
+    $setupExe = Get-ChildItem "installer\output\VulVATAR-Setup-*.exe" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $setupExe) { throw "Setup .exe not found in installer\output\." }
+
+    # 5. Sign the installer itself.
+    if ($Sign) {
+        Write-Host "[5/5] Signing installer (PIN prompt 2/2)..." -ForegroundColor Cyan
+        Invoke-SignTool -SignTool $signtool -Cert $cert -Files @($setupExe.FullName)
+        Write-Host "Signed installer: $($setupExe.FullName)" -ForegroundColor Green
+    } else {
+        Write-Host "[5/5] Unsigned installer: $($setupExe.FullName)" -ForegroundColor Yellow
+    }
+}
+
 $commands = @(
     @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-Font" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
@@ -470,6 +696,8 @@ $commands = @(
     @{ Label = "run (release)";    Cmd = "cargo run --release" },
     @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
     @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
+    @{ Label = "package installer (unsigned)";        Cmd = "Build-Distribution" },
+    @{ Label = "package installer (signed, USB token)"; Cmd = "Build-Distribution -Sign" },
     @{ Label = "test";             Cmd = "cargo test" },
     @{ Label = "clippy";           Cmd = "cargo clippy" },
     @{ Label = "fmt";              Cmd = "cargo fmt" },

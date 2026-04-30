@@ -31,5 +31,8 @@ models/*.onnx
 *.stdout.log
 *.stderr.log
 
+# Inno Setup installer build output
+/installer/output/
+
 # Misc
 nul
