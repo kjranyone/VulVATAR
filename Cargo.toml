@@ -10,7 +10,7 @@ default-run = "vulvatar"
 [lib]
 name = "vulvatar_lib"
 path = "src/lib.rs"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = ["webcam", "lipsync", "rapier", "inference", "inference-gpu", "virtual-camera"]

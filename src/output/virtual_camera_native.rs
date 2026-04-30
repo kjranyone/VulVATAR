@@ -337,53 +337,6 @@ impl VirtualCameraNative {
         }
     }
 
-    pub fn register_directshow_filter(&mut self) -> Result<(), String> {
-        #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
-        {
-            let filter_name = format!(
-                "VulVATAR Virtual Camera {}x{}",
-                self.config.width, self.config.height
-            );
-
-            let msg = format!(
-                "DirectShow filter '{}' registration not yet implemented. Use register() for Media Foundation.",
-                filter_name
-            );
-            info!("virtual-camera: {}", msg);
-            self.state = VirtualCameraState::Failed(msg.clone());
-            Err(msg)
-        }
-
-        #[cfg(not(all(target_os = "windows", feature = "virtual-camera")))]
-        {
-            let msg =
-                "DirectShow filter registration requires the `virtual-camera` feature on Windows"
-                    .to_string();
-            self.state = VirtualCameraState::Failed(msg.clone());
-            Err(msg)
-        }
-    }
-
-    pub fn unregister_directshow_filter(&mut self) -> Result<(), String> {
-        #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
-        {
-            info!("virtual-camera: unregistering DirectShow filter");
-            self.unregister();
-            Ok(())
-        }
-
-        #[cfg(not(all(target_os = "windows", feature = "virtual-camera")))]
-        {
-            Err(
-                "DirectShow unregistration requires the `virtual-camera` feature on Windows"
-                    .to_string(),
-            )
-        }
-    }
-
-    pub fn is_directshow_registered(&self) -> bool {
-        matches!(self.state, VirtualCameraState::Registered { .. })
-    }
 }
 
 impl Drop for VirtualCameraNative {
@@ -450,21 +403,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn virtual_camera_directshow_not_registered_initially() {
-        let cam = VirtualCameraNative::new(VirtualCameraConfig::default());
-        assert!(!cam.is_directshow_registered());
-    }
-
-    #[test]
-    fn virtual_camera_directshow_register_requires_feature() {
-        let mut cam = VirtualCameraNative::new(VirtualCameraConfig::default());
-        let result = cam.register_directshow_filter();
-        #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
-        {
-            let _ = result;
-        }
-        #[cfg(not(all(target_os = "windows", feature = "virtual-camera")))]
-        assert!(result.is_err());
-    }
 }
