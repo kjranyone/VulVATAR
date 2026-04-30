@@ -191,8 +191,8 @@ impl OneEuroFilterState {
             (raw[2] - self.pos[2]) / dt,
         ];
         let alpha_d = one_euro_alpha(dt, ONE_EURO_D_CUTOFF_HZ);
-        for i in 0..3 {
-            self.vel[i] += alpha_d * (raw_vel[i] - self.vel[i]);
+        for (vel, raw_vel) in self.vel.iter_mut().zip(raw_vel.iter()) {
+            *vel += alpha_d * (raw_vel - *vel);
         }
         // Position cutoff scales with velocity magnitude — high-speed
         // motion gets a higher cutoff (less smoothing, more responsive).
@@ -202,8 +202,8 @@ impl OneEuroFilterState {
             .sqrt();
         let cutoff = ONE_EURO_MIN_CUTOFF_HZ + ONE_EURO_BETA * speed;
         let alpha = one_euro_alpha(dt, cutoff);
-        for i in 0..3 {
-            self.pos[i] += alpha * (raw[i] - self.pos[i]);
+        for (pos, raw) in self.pos.iter_mut().zip(raw.iter()) {
+            *pos += alpha * (raw - *pos);
         }
         self.pos
     }

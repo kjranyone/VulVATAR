@@ -79,7 +79,7 @@ pub(crate) fn build_cjk_font_definitions(locale: &str) -> Option<egui::FontDefin
 
     let mut chain: Vec<&str> = Vec::new();
     for name in std::iter::once(primary).chain(fallbacks.iter().copied()) {
-        if available.iter().any(|n| *n == name) {
+        if available.contains(&name) {
             chain.push(name);
         }
     }

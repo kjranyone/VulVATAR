@@ -452,8 +452,8 @@ impl Rtmw3dInference {
                     // / cross-step poses where the leading limb fell
                     // outside the crop.
                     let (cx1, cy1, cx2, cy2) = pad_and_clamp_bbox(&bbox, width, height, 0.25);
-                    let cw = (cx2 - cx1) as u32;
-                    let ch = (cy2 - cy1) as u32;
+                    let cw = cx2 - cx1;
+                    let ch = cy2 - cy1;
                     debug!(
                         "RTMW3D: YOLOX bbox=[{:.0},{:.0},{:.0},{:.0}] score={:.2} → crop {}x{} (orig {}x{})",
                         bbox.x1, bbox.y1, bbox.x2, bbox.y2, bbox.score, cw, ch, width, height

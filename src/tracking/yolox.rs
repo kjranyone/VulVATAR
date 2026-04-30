@@ -40,8 +40,12 @@
 //!
 //! Coordinates land in letterbox space; we undo the letterbox here
 //! before returning a bbox in original-image pixel coords.
+//!
+//! The `cfg(feature = "inference")` gate lives on the `mod yolox`
+//! declaration in `tracking::mod.rs` — duplicating it here as an inner
+//! attribute caused clippy `duplicated_attributes` once both layers were
+//! enabled, so we keep the gate single-sourced.
 
-#![cfg(feature = "inference")]
 #![allow(dead_code)]
 
 use log::warn;
