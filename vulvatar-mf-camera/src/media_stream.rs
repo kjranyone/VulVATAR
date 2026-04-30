@@ -380,8 +380,12 @@ impl VulvatarMediaStream {
             }
             None => (None, None, format.width, format.height),
         };
+        // `rgba_slice` is `Option<Arc<Vec<u8>>>` after the seq-lock cache
+        // refactor. `as_deref()` peels Arc → Vec, then `.map(.as_slice)`
+        // peels to `&[u8]` so both branches share the same slice type.
         let rgba_ref: Option<&[u8]> = rgba_slice
             .as_deref()
+            .map(|v: &Vec<u8>| v.as_slice())
             .or(rgba_owned_resample.as_deref());
 
         let pixel_writer = PixelWriter {

@@ -29,7 +29,7 @@ use std::fs::File;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -59,6 +59,7 @@ pub const FRAME_FLAG_PRESERVE_ALPHA: u32 = 1 << 0;
 pub const FRAME_FLAG_LINEAR_COLOR_SPACE: u32 = 1 << 1;
 
 /// One frame view returned from the shared memory.
+#[derive(Clone)]
 pub struct FrameView {
     pub width: u32,
     pub height: u32,
@@ -71,13 +72,36 @@ pub struct FrameView {
     pub timestamp_ns: u64,
     /// Producer-supplied flags (see `FRAME_FLAG_*` constants).
     pub flags: u32,
-    /// RGBA pixels. `len() == width * height * 4`.
-    pub pixels: Vec<u8>,
+    /// RGBA pixels. `len() == width * height * 4`. Wrapped in `Arc` so
+    /// the cached-last-frame path (see `SharedMemoryReader::read_latest`)
+    /// can clone a `FrameView` without copying the pixel buffer — at
+    /// 1080p that's an 8 MB memcpy we'd otherwise pay every time the
+    /// seq-lock retry hits.
+    pub pixels: Arc<Vec<u8>>,
+}
+
+/// Maximum number of consecutive `read_fresh` failures we hide by
+/// returning the cached frame instead. Picked so a producer that has
+/// stopped (VulVATAR closed, render thread hung) surfaces as black
+/// within roughly a second at 30 fps, instead of silently freezing the
+/// last visible frame forever.
+const MAX_CACHE_REPEATS: u32 = 30;
+
+struct CacheState {
+    last_good: Option<FrameView>,
+    misses_since_good: u32,
 }
 
 pub struct SharedMemoryReader {
     state: Mutex<Inner>,
     last_sequence: AtomicI64,
+    /// Repeats the previous good frame when `read_fresh` returns `None`,
+    /// up to [`MAX_CACHE_REPEATS`] consecutive failures. The MF stream
+    /// otherwise inserts a fully-black sample on every miss, which
+    /// shows up as visible black flicker whenever the writer commits
+    /// during the reader's pixel-copy window — see `media_stream.rs`
+    /// `RequestSample` paths.
+    cache: Mutex<CacheState>,
 }
 
 struct Inner {
@@ -102,13 +126,40 @@ impl SharedMemoryReader {
                 mapped_size: 0,
             }),
             last_sequence: AtomicI64::new(-1),
+            cache: Mutex::new(CacheState {
+                last_good: None,
+                misses_since_good: 0,
+            }),
         }
+    }
+
+    /// Read the latest frame, falling back to a cached copy of the
+    /// previous good frame when the underlying [`Self::read_fresh`]
+    /// returns `None` because of a writer/reader seq-lock race.
+    /// Returns `None` only when (a) no frame has ever been read, or
+    /// (b) the producer has been silent for more than
+    /// [`MAX_CACHE_REPEATS`] consecutive requests.
+    pub fn read_latest(&self) -> Option<FrameView> {
+        if let Some(view) = self.read_fresh() {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.last_good = Some(view.clone());
+                cache.misses_since_good = 0;
+            }
+            return Some(view);
+        }
+
+        let mut cache = self.cache.lock().ok()?;
+        if cache.misses_since_good >= MAX_CACHE_REPEATS {
+            return None;
+        }
+        cache.misses_since_good += 1;
+        cache.last_good.clone()
     }
 
     /// Read the latest frame from the shared memory. Returns `None` when
     /// the producer has not published any frame yet (file doesn't
     /// exist, or magic field still zero).
-    pub fn read_latest(&self) -> Option<FrameView> {
+    fn read_fresh(&self) -> Option<FrameView> {
         let mut state = self.state.lock().ok()?;
         if !ensure_mapping(&mut state) {
             return None;
@@ -165,7 +216,7 @@ impl SharedMemoryReader {
             sequence: frame_sequence,
             timestamp_ns: header.timestamp,
             flags: header.flags,
-            pixels,
+            pixels: Arc::new(pixels),
         })
     }
 }
