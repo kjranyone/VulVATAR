@@ -23,7 +23,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
 };
 
-use crate::media_source::DEFAULT_FPS;
+use crate::media_source::{AllocatorHandle, DEFAULT_FPS};
 use crate::shared_memory::{
     SharedMemoryReader, FRAME_FLAG_LINEAR_COLOR_SPACE, FRAME_FLAG_PRESERVE_ALPHA,
 };
@@ -82,8 +82,10 @@ pub struct VulvatarMediaStream {
     cached_format: Mutex<Option<CurrentFormat>>,
     /// Frame Server-provided sample allocator. Shared with the source so
     /// a stream created during `GetStreamAttributes` still sees a later
-    /// `SetDefaultAllocator` call before `Start`.
-    allocator: Arc<Mutex<Option<IMFVideoSampleAllocatorEx>>>,
+    /// `SetDefaultAllocator` call before `Start`. The `AllocatorHandle`
+    /// newtype carries the Send + Sync assertion (MTA threading) — see
+    /// `media_source::AllocatorHandle` for the safety reasoning.
+    allocator: Arc<Mutex<Option<AllocatorHandle>>>,
     /// Whether `IMFVideoSampleAllocatorEx::InitializeSampleAllocator` has
     /// been called for the currently-negotiated media type. The pool only
     /// needs to be initialised once unless the format changes mid-stream,
@@ -98,11 +100,11 @@ struct StreamInner {
 }
 
 impl VulvatarMediaStream {
-    pub fn new(
+    pub(crate) fn new(
         parent_source: IMFMediaSource,
         descriptor: IMFStreamDescriptor,
         event_queue: IMFMediaEventQueue,
-        allocator: Arc<Mutex<Option<IMFVideoSampleAllocatorEx>>>,
+        allocator: Arc<Mutex<Option<AllocatorHandle>>>,
     ) -> windows::core::Result<Self> {
         dll_add_ref();
         let attributes: IMFAttributes = descriptor.cast()?;
@@ -205,7 +207,17 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
         //     MF_SOURCE_READERF_ENDOFSTREAM otherwise.
         //   - direct CoCreateInstance path (no allocator was set): build
         //     the sample with MFCreateMemoryBuffer + MFCreateSample.
-        let allocator_opt = self.allocator.lock().unwrap().clone();
+        //
+        // Snapshot the COM interface out of the AllocatorHandle wrapper
+        // while we still hold the Mutex, so the lock is released before
+        // the (potentially blocking) AllocateSample / fill_allocated_sample
+        // path runs.
+        let allocator_opt: Option<IMFVideoSampleAllocatorEx> = self
+            .allocator
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| h.0.clone());
 
         let sample: IMFSample = if let Some(allocator) = allocator_opt {
             if !self.allocator_initialized.load(Ordering::Acquire) {

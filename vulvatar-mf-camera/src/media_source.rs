@@ -69,6 +69,50 @@ enum SourceState {
     Shutdown,
 }
 
+/// Newtype wrapper around the Frame Server-provided sample allocator
+/// that asserts `Send + Sync` so the `Arc<Mutex<Option<_>>>` shared with
+/// the media stream type-checks without `#[allow(clippy::arc_with_non_send_sync)]`.
+///
+/// SAFETY: `IMFVideoSampleAllocatorEx` is implemented inside Frame
+/// Server (the FsProxy host living in `svchost.exe` under
+/// `LocalService`). Frame Server initialises COM as MTA, and MTA-resident
+/// COM objects are required by the COM contract to be thread-safe
+/// — every interface method must accept calls from any thread that
+/// holds an outstanding reference, without external serialization.
+/// Our two access sites both run on Frame Server-dispatched MTA threads:
+///
+///   * `IMFSampleAllocatorControl::SetDefaultAllocator` (writer) — the
+///     bridge-setup thread when FsProxy first hands us the allocator.
+///   * `IMFMediaStream::RequestSample` (reader) — the per-frame request
+///     pump, a different thread.
+///
+/// The `Mutex` we wrap this in only serializes the `Option<...>` slot
+/// transition and `Arc` ref-count traffic; the underlying interface
+/// is callable concurrently from both contexts. The `windows` crate
+/// makes every `Interface` `!Send + !Sync` because it can't statically
+/// distinguish MTA from STA — we know our deployment is MTA, so the
+/// `unsafe impl`s below are sound for *this particular* allocator.
+pub(crate) struct AllocatorHandle(pub(crate) IMFVideoSampleAllocatorEx);
+
+unsafe impl Send for AllocatorHandle {}
+unsafe impl Sync for AllocatorHandle {}
+
+impl Clone for AllocatorHandle {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// Compile-time assertion that the actual storage shape we share with
+/// [`crate::media_stream::VulvatarMediaStream`] really is Send + Sync.
+/// Catches regressions where someone removes the `unsafe impl`s above
+/// or restructures the wrapper without realising it broke the
+/// cross-thread sharing contract.
+const _ASSERT_ALLOCATOR_HANDLE_SHARING: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Arc<Mutex<Option<AllocatorHandle>>>>();
+};
+
 #[implement(
     IMFActivate,
     IMFMediaSourceEx,
@@ -99,7 +143,11 @@ pub struct VulvatarMediaSource {
     /// `RequestSample` can `AllocateSample` from the Frame Server pool
     /// rather than `MFCreateMemoryBuffer` — only allocator-pool
     /// samples are cross-process marshalable.
-    stream_allocator: Arc<Mutex<Option<IMFVideoSampleAllocatorEx>>>,
+    ///
+    /// Wrapped in [`AllocatorHandle`] so the `Arc<Mutex<Option<_>>>`
+    /// type-checks; see that type's safety comment for the
+    /// thread-affinity reasoning.
+    stream_allocator: Arc<Mutex<Option<AllocatorHandle>>>,
 }
 
 struct Inner {
@@ -133,7 +181,6 @@ impl VulvatarMediaSource {
                 state: SourceState::Stopped,
                 stream: None,
             }),
-            #[allow(clippy::arc_with_non_send_sync)]
             stream_allocator: Arc::new(Mutex::new(None)),
         })
     }
@@ -1009,7 +1056,7 @@ impl IMFSampleAllocatorControl_Impl for VulvatarMediaSource_Impl {
         );
         let alloc = allocator.ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
         let video_alloc: IMFVideoSampleAllocatorEx = alloc.cast()?;
-        *self.stream_allocator.lock().unwrap() = Some(video_alloc);
+        *self.stream_allocator.lock().unwrap() = Some(AllocatorHandle(video_alloc));
         // If the stream was constructed BEFORE Frame Server gave us the
         // allocator (unlikely but possible), the stream won't have the
         // current allocator. We don't currently push it after the fact —
