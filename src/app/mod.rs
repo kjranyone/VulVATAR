@@ -394,8 +394,9 @@ impl Application {
 
         let toggles = &config.toggles;
         let smoothing_params = &config.smoothing;
-        let _hand_tracking_enabled = config.hand_tracking_enabled;
+        let hand_tracking_enabled = config.hand_tracking_enabled;
         let face_tracking_enabled = config.face_tracking_enabled;
+        let lower_body_tracking_enabled = config.lower_body_tracking_enabled;
         let frame_dt = config.frame_dt;
         let material_mode_index = config.material_mode_index;
 
@@ -426,6 +427,9 @@ impl Application {
             rotation_blend: smoothing_params.rotation_blend,
             joint_confidence_threshold: smoothing_params.joint_confidence_threshold,
             face_confidence_threshold: smoothing_params.face_confidence_threshold,
+            hand_tracking_enabled,
+            face_tracking_enabled,
+            lower_body_tracking_enabled,
         };
 
         for avatar in self.avatars.iter_mut() {

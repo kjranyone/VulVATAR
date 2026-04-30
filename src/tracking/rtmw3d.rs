@@ -42,6 +42,8 @@ use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
 use super::yolox::{PersonBbox, YoloxPersonDetector};
 #[cfg(feature = "inference")]
+use super::source_skeleton::HandOrientation;
+#[cfg(feature = "inference")]
 use super::{DetectionAnnotation, FacePose, SourceJoint, SourceSkeleton};
 #[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
@@ -1114,6 +1116,81 @@ fn attach_hand<F>(
             },
         );
     }
+
+    // Palm orientation. Without this, the wrist bone's twist around
+    // its length axis is unconstrained — the LowerArm direction-match
+    // sets a wrist position but no rotation, so finger MCPs end up
+    // shortest-arc'd from a random starting twist and the avatar's
+    // fingers appear rotated 90° at the base. Solve by deriving a
+    // full forward+up basis from the four MCP knuckles plus the
+    // hand-track wrist:
+    //
+    //   raw_forward = middle_mcp - wrist           (palm-direction)
+    //   across      = index_mcp  - pinky_mcp       (palm-width)
+    //   normal      = across × raw_forward         (palm plane normal)
+    //   forward     = normal × across              (re-orthogonalised)
+    //
+    // Cross-orthogonalising the forward axis against the normal
+    // means a noisy hand-track wrist Z (the upstream comment warns
+    // it can land 0.3 units behind the torso under occlusion) only
+    // perturbs the normal slightly without tilting the in-palm
+    // forward direction.
+    let l_wrist = base_index;
+    let l_middle = base_index + 9;
+    let l_index = base_index + 5;
+    let l_pinky = base_index + 17;
+    if l_wrist < joints.len()
+        && l_middle < joints.len()
+        && l_index < joints.len()
+        && l_pinky < joints.len()
+        && joints[l_wrist].score >= KEYPOINT_VISIBILITY_FLOOR
+        && joints[l_middle].score >= KEYPOINT_VISIBILITY_FLOOR
+        && joints[l_index].score >= KEYPOINT_VISIBILITY_FLOOR
+        && joints[l_pinky].score >= KEYPOINT_VISIBILITY_FLOOR
+    {
+        let wrist_pos = to_source(&joints[l_wrist]);
+        let middle_pos = to_source(&joints[l_middle]);
+        let index_pos = to_source(&joints[l_index]);
+        let pinky_pos = to_source(&joints[l_pinky]);
+        let raw_forward = sub3(middle_pos, wrist_pos);
+        let across = sub3(index_pos, pinky_pos);
+        let normal_raw = [
+            across[1] * raw_forward[2] - across[2] * raw_forward[1],
+            across[2] * raw_forward[0] - across[0] * raw_forward[2],
+            across[0] * raw_forward[1] - across[1] * raw_forward[0],
+        ];
+        let normal_len = length3(normal_raw);
+        if normal_len > 1e-6 {
+            let normal = [
+                normal_raw[0] / normal_len,
+                normal_raw[1] / normal_len,
+                normal_raw[2] / normal_len,
+            ];
+            let forward_raw = [
+                normal[1] * across[2] - normal[2] * across[1],
+                normal[2] * across[0] - normal[0] * across[2],
+                normal[0] * across[1] - normal[1] * across[0],
+            ];
+            let forward_len = length3(forward_raw);
+            if forward_len > 1e-6 {
+                let forward = [
+                    forward_raw[0] / forward_len,
+                    forward_raw[1] / forward_len,
+                    forward_raw[2] / forward_len,
+                ];
+                let orientation = HandOrientation {
+                    forward,
+                    up: normal,
+                    confidence: min_conf,
+                };
+                match wrist_bone {
+                    HumanoidBone::LeftHand => sk.left_hand_orientation = Some(orientation),
+                    HumanoidBone::RightHand => sk.right_hand_orientation = Some(orientation),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,8 +1483,45 @@ fn derive_face_pose_from_body(skeleton: &SourceSkeleton, joints: &[DecodedJoint]
     // rest, so dx = left.x - right.x is positive when the head faces
     // camera. As the head turns to camera-right (avatar yaw +) the
     // line tilts in XZ so dz becomes positive too. yaw = atan2(dz, dx).
-    let ear_dx = avatar_left_ear[0] - avatar_right_ear[0];
-    let ear_dz = avatar_left_ear[2] - avatar_right_ear[2];
+    //
+    // Back-ear robustness: when the head turns past ~45° one ear
+    // becomes occluded and RTMW3D's SimCC head will still emit a
+    // 3D position for it, but the Z component is essentially
+    // hallucinated — typically pinned near the visible ear's depth,
+    // collapsing `ear_dz` toward zero and stalling the avatar's yaw
+    // tracking right when it should be most active. Detect that
+    // case by score asymmetry and reconstruct the back ear as the
+    // visible ear reflected through the nose's XZ position. Nose
+    // is forward of the head's actual rotation axis so this introduces
+    // a small constant bias in `ear_dz`; the per-session calibration
+    // (`TrackingCalibration::apply_calibration`) absorbs the bias at
+    // the neutral pose, leaving the *delta* — which is all the avatar
+    // head bone consumes — close to correct.
+    const EAR_OCCLUSION_RATIO: f32 = 0.5;
+    let s_right_ear = joints[3].score;
+    let s_left_ear = joints[4].score;
+    let (right_ear_xz, left_ear_xz) =
+        if s_right_ear < s_left_ear * EAR_OCCLUSION_RATIO {
+            // Subject's left ear (joint 3 / avatar_right_ear) occluded.
+            let recon = [
+                2.0 * nose[0] - avatar_left_ear[0],
+                avatar_left_ear[1],
+                2.0 * nose[2] - avatar_left_ear[2],
+            ];
+            (recon, avatar_left_ear)
+        } else if s_left_ear < s_right_ear * EAR_OCCLUSION_RATIO {
+            // Subject's right ear (joint 4 / avatar_left_ear) occluded.
+            let recon = [
+                2.0 * nose[0] - avatar_right_ear[0],
+                avatar_right_ear[1],
+                2.0 * nose[2] - avatar_right_ear[2],
+            ];
+            (avatar_right_ear, recon)
+        } else {
+            (avatar_right_ear, avatar_left_ear)
+        };
+    let ear_dx = left_ear_xz[0] - right_ear_xz[0];
+    let ear_dz = left_ear_xz[2] - right_ear_xz[2];
     let ear_dist = (ear_dx * ear_dx + ear_dz * ear_dz).sqrt();
     if ear_dist < 0.01 {
         return None;

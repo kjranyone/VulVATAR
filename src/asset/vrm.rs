@@ -2603,6 +2603,7 @@ mod metadata_tests {
             rotation_blend: 1.0,
             joint_confidence_threshold: 0.1,
             face_confidence_threshold: 0.1,
+            ..Default::default()
         };
         let mut solver_state = PoseSolverState::default();
         solve_avatar_pose(
@@ -2744,6 +2745,7 @@ mod metadata_tests {
             rotation_blend: 1.0,
             joint_confidence_threshold: 0.1,
             face_confidence_threshold: 0.1,
+            ..Default::default()
         };
         let mut solver_state = PoseSolverState::default();
         solve_avatar_pose(

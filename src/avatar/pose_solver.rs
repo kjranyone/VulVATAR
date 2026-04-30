@@ -39,10 +39,10 @@ use std::time::Instant;
 
 use crate::asset::{HumanoidBone, HumanoidMap, NodeId, Quat, SkeletonAsset, Transform, Vec3};
 use crate::math_utils::{
-    quat_conjugate, quat_from_euler_ypr, quat_from_vectors, quat_mul, quat_normalize,
-    quat_rotate_vec3, vec3_normalize, vec3_sub,
+    quat_conjugate, quat_from_basis_pair, quat_from_euler_ypr, quat_from_vectors, quat_mul,
+    quat_normalize, quat_rotate_vec3, vec3_cross, vec3_normalize, vec3_sub,
 };
-use crate::tracking::source_skeleton::{FacePose, SourceSkeleton};
+use crate::tracking::source_skeleton::{FacePose, HandOrientation, SourceSkeleton};
 
 /// Reference frame period used to convert the GUI's frame-rate-naive
 /// `rotation_blend` slider into a time-constant. With the slider at
@@ -80,6 +80,20 @@ pub struct SolverParams {
     pub joint_confidence_threshold: f32,
     /// Minimum face-pose confidence below which the face pose is ignored.
     pub face_confidence_threshold: f32,
+    /// Drive the wrist + 30 finger bones from the source skeleton. When
+    /// false the wrist is left at whatever shortest-arc the LowerArm
+    /// chain settled it at and the fingers stay at rest pose.
+    pub hand_tracking_enabled: bool,
+    /// Apply the head-bone face-pose rotation derived from facial
+    /// landmarks. When false the head bone is left at rest (parented
+    /// to whatever the spine chain produced).
+    pub face_tracking_enabled: bool,
+    /// Drive the upper / lower leg and foot bones. When false the legs
+    /// stay at rest pose regardless of what the tracker emits — useful
+    /// when only the upper body is in frame and the user wants to keep
+    /// the avatar's legs static rather than have hallucinated COCO
+    /// 11-22 keypoints flail them around.
+    pub lower_body_tracking_enabled: bool,
 }
 
 impl Default for SolverParams {
@@ -87,11 +101,16 @@ impl Default for SolverParams {
         // Mirrors `TrackingSmoothingParams::default`: confidence
         // thresholds default to `0.0` so the GUI sliders are the
         // single source of truth for filtering. See the explanation
-        // there for the rationale.
+        // there for the rationale. Retargeting flags default to `true`
+        // so non-GUI callers (image-based diagnose scripts, tests) get
+        // the full pipeline; the GUI passes whatever the user toggled.
         Self {
             rotation_blend: 0.7,
             joint_confidence_threshold: 0.0,
             face_confidence_threshold: 0.0,
+            hand_tracking_enabled: true,
+            face_tracking_enabled: true,
+            lower_body_tracking_enabled: true,
         }
     }
 }
@@ -442,7 +461,62 @@ pub fn solve_avatar_pose(
     }
 
     // Body chain: direction-match each driven bone using 3D source positions.
+    // Wrist orientation pass is fired just-in-time at the body→fingers
+    // transition: the wrist bone is not in DRIVEN_BONES, so without
+    // this hook every finger MCP starts from a wrist whose twist around
+    // its length axis is whatever the LowerArm shortest-arc happened
+    // to leave it at — and since `quat_from_vectors` picks twist=0
+    // around the new direction, the chain typically ends up rotated
+    // 90° at the finger base (palm sideways instead of where the
+    // subject's palm is actually pointing). The just-in-time pass
+    // installs a full 3-DoF wrist rotation derived from the four MCPs
+    // (palm plane normal) before the first finger entry runs.
+    let mut wrists_oriented = false;
     for &(bone, tip) in DRIVEN_BONES {
+        // GUI retargeting toggles. `hand_tracking_enabled` skips both the
+        // wrist 3-DoF orientation pass and every finger bone, so the hand
+        // chain stays at rest pose. `lower_body_tracking_enabled` skips the
+        // upper/lower leg + foot direction-match entries so the legs stay
+        // at rest pose regardless of whether the tracker emitted leg
+        // keypoints — the user's "I only have my upper body in frame"
+        // intent is honoured even when COCO 11-22 happen to have score.
+        if is_finger_bone(bone) && !params.hand_tracking_enabled {
+            continue;
+        }
+        if is_lower_body_bone(bone) && !params.lower_body_tracking_enabled {
+            continue;
+        }
+        if !wrists_oriented && is_finger_bone(bone) {
+            solve_wrist_orientation(
+                HumanoidBone::LeftHand,
+                HumanoidBone::LeftMiddleProximal,
+                HumanoidBone::LeftIndexProximal,
+                HumanoidBone::LeftLittleProximal,
+                source.left_hand_orientation,
+                skeleton,
+                humanoid,
+                &rest_world,
+                &mut current_world,
+                local_transforms,
+                params,
+                dt,
+            );
+            solve_wrist_orientation(
+                HumanoidBone::RightHand,
+                HumanoidBone::RightMiddleProximal,
+                HumanoidBone::RightIndexProximal,
+                HumanoidBone::RightLittleProximal,
+                source.right_hand_orientation,
+                skeleton,
+                humanoid,
+                &rest_world,
+                &mut current_world,
+                local_transforms,
+                params,
+                dt,
+            );
+            wrists_oriented = true;
+        }
         let Some(source_base) = source.joints.get(&bone) else {
             continue;
         };
@@ -603,23 +677,126 @@ pub fn solve_avatar_pose(
     // emits head orientation reliably even at oblique views, so the
     // old "gate by shoulder ratio" sentinel is no longer needed — we
     // trust whatever the tracker emits if its confidence clears the
-    // threshold.
-    if let Some(face) = source.face {
-        if face.confidence >= params.face_confidence_threshold {
-            if let Some(head_node) = humanoid.bone_map.get(&HumanoidBone::Head).copied() {
-                let head_idx = head_node.0 as usize;
-                if head_idx < skeleton.nodes.len() {
-                    apply_face_pose(
-                        face,
-                        head_idx,
-                        skeleton,
-                        local_transforms,
-                        &current_world,
-                        dt_aware_blend(params.rotation_blend, dt),
-                    );
+    // threshold. The GUI's `face_tracking_enabled` toggle additionally
+    // gates this whole block — when off, the head bone stays parented
+    // to whatever rotation the spine chain produced.
+    if params.face_tracking_enabled {
+        if let Some(face) = source.face {
+            if face.confidence >= params.face_confidence_threshold {
+                if let Some(head_node) = humanoid.bone_map.get(&HumanoidBone::Head).copied() {
+                    let head_idx = head_node.0 as usize;
+                    if head_idx < skeleton.nodes.len() {
+                        apply_face_pose(
+                            face,
+                            head_idx,
+                            skeleton,
+                            local_transforms,
+                            &current_world,
+                            dt_aware_blend(params.rotation_blend, dt),
+                        );
+                    }
                 }
             }
         }
+    }
+
+    if thumb_debug_enabled() {
+        log_thumb_diagnostics(source, skeleton, humanoid, local_transforms, &rest_world);
+    }
+}
+
+/// Cached `VULVATAR_DEBUG_THUMB` flag. Reading the env var costs a
+/// syscall on every solve; a `OnceLock` lets us amortise that to once
+/// per process while still allowing tests to run without the env set.
+fn thumb_debug_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("VULVATAR_DEBUG_THUMB").is_some())
+}
+
+/// Per-frame thumb diagnostic log. Emits one line per hand at info
+/// level so the user can see it without raising RUST_LOG to debug.
+/// Goal is to disambiguate "RTMW3D failed to detect thumb keypoints"
+/// from "keypoints are detected but the rotation is too small".
+///
+/// For each side we log:
+/// * The 3D source position of CMC / MCP / IP / tip (or `none` if
+///   the joint was gated out).
+/// * The metacarpal and phalanx segment lengths in source-space units
+///   — should be ~0.04-0.10 for an in-frame hand.
+/// * The angle between the bone's current local rotation and its rest
+///   local rotation, in degrees. Direction-match writes the local
+///   rotation; if the angle is small while the user is doing a thumbs-up,
+///   the math attenuated the signal. If the angle is reasonable but the
+///   visible avatar thumb still doesn't move, the rest-pose orientation
+///   of the bone may be wrong (rigging issue).
+fn log_thumb_diagnostics(
+    source: &SourceSkeleton,
+    skeleton: &SkeletonAsset,
+    humanoid: &HumanoidMap,
+    local_transforms: &[Transform],
+    _rest_world: &[WorldXform],
+) {
+    use HumanoidBone::*;
+    fn fmt_pos(p: Option<&[f32; 3]>) -> String {
+        match p {
+            Some(v) => format!("({:+.3},{:+.3},{:+.3})", v[0], v[1], v[2]),
+            None => "none".to_string(),
+        }
+    }
+    fn seg_len(a: Option<&[f32; 3]>, b: Option<&[f32; 3]>) -> String {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                format!("{:.3}", (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
+            }
+            _ => "—".to_string(),
+        }
+    }
+    fn rot_angle_deg(
+        bone: HumanoidBone,
+        skeleton: &SkeletonAsset,
+        humanoid: &HumanoidMap,
+        local_transforms: &[Transform],
+    ) -> String {
+        let Some(node) = humanoid.bone_map.get(&bone).copied() else {
+            return "—".to_string();
+        };
+        let idx = node.0 as usize;
+        if idx >= skeleton.nodes.len() {
+            return "—".to_string();
+        }
+        let cur = local_transforms[idx].rotation;
+        let rest = skeleton.nodes[idx].rest_local.rotation;
+        // Rotation that takes rest into cur: delta = cur * conjugate(rest).
+        let delta = quat_mul(&cur, &quat_conjugate(&rest));
+        // Quaternion angle is 2 * acos(|w|); abs() picks the shortest arc.
+        let w = delta[3].abs().min(1.0);
+        let angle = 2.0 * w.acos() * (180.0 / std::f32::consts::PI);
+        format!("{:5.1}°", angle)
+    }
+
+    for (label, prox, inter, dist) in [
+        ("L", LeftThumbProximal, LeftThumbIntermediate, LeftThumbDistal),
+        ("R", RightThumbProximal, RightThumbIntermediate, RightThumbDistal),
+    ] {
+        let p_cmc = source.joints.get(&prox).map(|j| &j.position);
+        let p_mcp = source.joints.get(&inter).map(|j| &j.position);
+        let p_ip = source.joints.get(&dist).map(|j| &j.position);
+        let p_tip = source.fingertips.get(&dist).map(|j| &j.position);
+        log::info!(
+            "thumb[{}] src CMC={} MCP={} IP={} tip={} | seg meta={} prox={} dist={} | rot prox={} inter={} dist={}",
+            label,
+            fmt_pos(p_cmc),
+            fmt_pos(p_mcp),
+            fmt_pos(p_ip),
+            fmt_pos(p_tip),
+            seg_len(p_cmc, p_mcp),
+            seg_len(p_mcp, p_ip),
+            seg_len(p_ip, p_tip),
+            rot_angle_deg(prox, skeleton, humanoid, local_transforms),
+            rot_angle_deg(inter, skeleton, humanoid, local_transforms),
+            rot_angle_deg(dist, skeleton, humanoid, local_transforms),
+        );
     }
 }
 
@@ -840,6 +1017,161 @@ fn preprocess_source(
     }
 
     out
+}
+
+/// True for the six lower-body bones the solver drives (per-side
+/// upper-leg, lower-leg, foot). Gated by
+/// `SolverParams::lower_body_tracking_enabled` so the user can keep
+/// the avatar's legs locked to rest pose when the camera only frames
+/// the upper body.
+fn is_lower_body_bone(b: HumanoidBone) -> bool {
+    use HumanoidBone::*;
+    matches!(
+        b,
+        LeftUpperLeg | LeftLowerLeg | LeftFoot | RightUpperLeg | RightLowerLeg | RightFoot
+    )
+}
+
+/// True for the 30 finger bones (5 fingers × 3 phalanges × 2 hands).
+/// Used by `solve_avatar_pose` to detect the body→finger transition
+/// in the `DRIVEN_BONES` iteration so the wrist orientation pass can
+/// fire once at the right moment.
+fn is_finger_bone(b: HumanoidBone) -> bool {
+    use HumanoidBone::*;
+    matches!(
+        b,
+        LeftThumbProximal | LeftThumbIntermediate | LeftThumbDistal
+        | LeftIndexProximal | LeftIndexIntermediate | LeftIndexDistal
+        | LeftMiddleProximal | LeftMiddleIntermediate | LeftMiddleDistal
+        | LeftRingProximal | LeftRingIntermediate | LeftRingDistal
+        | LeftLittleProximal | LeftLittleIntermediate | LeftLittleDistal
+        | RightThumbProximal | RightThumbIntermediate | RightThumbDistal
+        | RightIndexProximal | RightIndexIntermediate | RightIndexDistal
+        | RightMiddleProximal | RightMiddleIntermediate | RightMiddleDistal
+        | RightRingProximal | RightRingIntermediate | RightRingDistal
+        | RightLittleProximal | RightLittleIntermediate | RightLittleDistal
+    )
+}
+
+/// Drive a wrist bone with a full 3-DoF rotation derived from the
+/// tracker's `HandOrientation` (forward + palm-normal pair). Without
+/// this pass the wrist's twist axis is unconstrained — the LowerArm
+/// chain settles a wrist *position* via direction-match but its
+/// rotation around the LowerArm→wrist axis is whatever shortest-arc
+/// picked, leaving the avatar's fingers rotated 90° at the base.
+///
+/// Both rest and source bases are computed the same way (cross-
+/// orthogonalised forward+up from wrist + 3 MCPs) so the bias from
+/// using the hand-track wrist (which has noisy Z under occlusion)
+/// cancels between the two basis pairs.
+#[allow(clippy::too_many_arguments)]
+fn solve_wrist_orientation(
+    wrist_bone: HumanoidBone,
+    middle_proximal: HumanoidBone,
+    index_proximal: HumanoidBone,
+    pinky_proximal: HumanoidBone,
+    source_orientation: Option<HandOrientation>,
+    skeleton: &SkeletonAsset,
+    humanoid: &HumanoidMap,
+    rest_world: &[WorldXform],
+    current_world: &mut [WorldXform],
+    local_transforms: &mut [Transform],
+    params: &SolverParams,
+    dt: f32,
+) {
+    let Some(orient) = source_orientation else {
+        return;
+    };
+    if orient.confidence < params.joint_confidence_threshold {
+        return;
+    }
+
+    let Some(wrist_node) = humanoid.bone_map.get(&wrist_bone).copied() else {
+        return;
+    };
+    let Some(middle_node) = humanoid.bone_map.get(&middle_proximal).copied() else {
+        return;
+    };
+    let Some(index_node) = humanoid.bone_map.get(&index_proximal).copied() else {
+        return;
+    };
+    let Some(pinky_node) = humanoid.bone_map.get(&pinky_proximal).copied() else {
+        return;
+    };
+
+    let wrist_idx = wrist_node.0 as usize;
+    let middle_idx = middle_node.0 as usize;
+    let index_idx = index_node.0 as usize;
+    let pinky_idx = pinky_node.0 as usize;
+    if wrist_idx >= skeleton.nodes.len()
+        || middle_idx >= rest_world.len()
+        || index_idx >= rest_world.len()
+        || pinky_idx >= rest_world.len()
+    {
+        return;
+    }
+
+    // Rest basis: forward = middle MCP relative to wrist, up = palm
+    // plane normal. Same construction as `attach_hand` so the basis
+    // pair maps cleanly with `quat_from_basis_pair`.
+    let rest_wrist = rest_world[wrist_idx].position;
+    let rest_middle = rest_world[middle_idx].position;
+    let rest_index = rest_world[index_idx].position;
+    let rest_pinky = rest_world[pinky_idx].position;
+    let rest_raw_fwd = vec3_sub(&rest_middle, &rest_wrist);
+    let rest_across = vec3_sub(&rest_index, &rest_pinky);
+    let rest_normal_raw = vec3_cross(&rest_across, &rest_raw_fwd);
+    let rest_up = vec3_normalize(&rest_normal_raw);
+    if rest_up == [0.0; 3] {
+        return;
+    }
+    let rest_fwd = vec3_normalize(&vec3_cross(&rest_up, &rest_across));
+    if rest_fwd == [0.0; 3] {
+        return;
+    }
+
+    // Walk the parent's accumulated yaw delta into the rest basis,
+    // mirroring the body chain's `parent_yaw_delta` rebase. Without
+    // this the wrist would fight the spine yaw for the chain's
+    // overall rotation when the subject turns their body.
+    let parent_world_rot = skeleton.nodes[wrist_idx]
+        .parent
+        .map(|NodeId(p)| current_world[p as usize].rotation)
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let parent_rest_world_rot = skeleton.nodes[wrist_idx]
+        .parent
+        .map(|NodeId(p)| rest_world[p as usize].rotation)
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let parent_yaw_delta =
+        quat_mul(&parent_world_rot, &quat_conjugate(&parent_rest_world_rot));
+    let rest_fwd_current = quat_rotate_vec3(&parent_yaw_delta, &rest_fwd);
+    let rest_up_current = quat_rotate_vec3(&parent_yaw_delta, &rest_up);
+    let current_rest_world_rot =
+        quat_mul(&parent_yaw_delta, &rest_world[wrist_idx].rotation);
+
+    // Full 3-DoF basis-pair alignment.
+    let delta_world = quat_from_basis_pair(
+        &rest_fwd_current,
+        &rest_up_current,
+        &orient.forward,
+        &orient.up,
+    );
+    let new_world_rot = quat_mul(&delta_world, &current_rest_world_rot);
+    let new_local_rot =
+        quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
+
+    let prev_local_rot = local_transforms[wrist_idx].rotation;
+    local_transforms[wrist_idx].rotation = quat_slerp_short(
+        &prev_local_rot,
+        &new_local_rot,
+        dt_aware_blend(params.rotation_blend, dt),
+    );
+
+    // Refresh the world cache so the finger entries about to run
+    // see the wrist's full orientation, not the stale rest pose.
+    let updated_world =
+        quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
+    current_world[wrist_idx].rotation = updated_world;
 }
 
 // Slerp / lerp

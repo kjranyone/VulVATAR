@@ -543,11 +543,24 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_dirty = true;
             }
-            ui.checkbox(
-                &mut state.rendering.toggle_collision_debug,
-                t!("inspector.collision_debug"),
-            );
-            ui.checkbox(&mut state.rendering.toggle_skeleton_debug, t!("inspector.skeleton_debug"));
+            if ui
+                .checkbox(
+                    &mut state.rendering.toggle_collision_debug,
+                    t!("inspector.collision_debug"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .checkbox(
+                    &mut state.rendering.toggle_skeleton_debug,
+                    t!("inspector.skeleton_debug"),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
         });
 
     draw_expression_control(ui, state);
@@ -1135,7 +1148,12 @@ fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_dirty = true;
             }
-            ui.checkbox(&mut state.rendering.alpha_preview, t!("inspector.alpha_preview"));
+            if ui
+                .checkbox(&mut state.rendering.alpha_preview, t!("inspector.alpha_preview"))
+                .changed()
+            {
+                state.project_dirty = true;
+            }
         });
 
     egui::CollapsingHeader::new(t!("inspector.physics"))
@@ -2411,28 +2429,4 @@ fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
 
     ui.add_space(4.0);
-
-    egui::CollapsingHeader::new(t!("settings.autosave"))
-        .default_open(false)
-        .show(ui, |ui| {
-            let mut secs = state.settings.autosave_interval_secs.unwrap_or(0);
-            let changed = ui
-                .add(
-                    egui::Slider::new(&mut secs, 0..=3600)
-                        .text(t!("settings.autosave_interval")),
-                )
-                .changed();
-            if changed {
-                if secs == 0 {
-                    state.settings.autosave_interval_secs = None;
-                    state.autosave_interval = None;
-                } else {
-                    state.settings.autosave_interval_secs = Some(secs);
-                    state.autosave_interval = Some(std::time::Duration::from_secs(secs));
-                }
-            }
-            if state.settings.autosave_interval_secs.is_none() {
-                ui.label(t!("settings.autosave_disabled"));
-            }
-        });
 }

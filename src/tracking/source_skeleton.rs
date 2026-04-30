@@ -71,6 +71,22 @@ pub struct SourceExpression {
     pub weight: f32,
 }
 
+/// Full orientation of a tracked hand. `forward` is the wrist→fingers
+/// axis (typically wrist → middle MCP) and `up` is the palm normal
+/// (away from the back of the hand, toward where the fingernails
+/// face when curled up). Both are unit vectors in source-skeleton
+/// coords. The pair is computed by the tracker from the four MCP
+/// landmarks and used by the solver to drive the wrist bone's full
+/// 3-DoF rotation — without `up`, finger MCPs end up with arbitrary
+/// 90° twist because the wrist→tip direction alone leaves the
+/// twist axis under-constrained.
+#[derive(Clone, Copy, Debug)]
+pub struct HandOrientation {
+    pub forward: [f32; 3],
+    pub up: [f32; 3],
+    pub confidence: f32,
+}
+
 /// One tracker sample.
 ///
 /// Body joints are sparse: only the humanoid bones for which the detector
@@ -97,6 +113,12 @@ pub struct SourceSkeleton {
     pub fingertips: HashMap<HumanoidBone, SourceJoint>,
     pub face: Option<FacePose>,
     pub expressions: Vec<SourceExpression>,
+    /// Full 3-DoF orientation of the left hand (wrist) when the hand
+    /// track produced enough MCP landmarks to define a palm plane.
+    /// `None` when the hand is not tracked or the MCPs are too
+    /// degenerate to extract a palm normal.
+    pub left_hand_orientation: Option<HandOrientation>,
+    pub right_hand_orientation: Option<HandOrientation>,
     /// Optional FaceMesh-model "is this a face" confidence (post sigmoid)
     /// for the frame's face crop. Distinct from `face.confidence`, which
     /// is body-derived (min over the 5 COCO face landmarks): this one
@@ -117,6 +139,8 @@ impl SourceSkeleton {
             fingertips: HashMap::new(),
             face: None,
             expressions: Vec::new(),
+            left_hand_orientation: None,
+            right_hand_orientation: None,
             face_mesh_confidence: None,
             overall_confidence: 0.0,
         }

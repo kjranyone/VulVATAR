@@ -138,6 +138,7 @@ fn main() -> Result<(), String> {
             rotation_blend: 1.0,
             joint_confidence_threshold: 0.1,
             face_confidence_threshold: 0.1,
+            ..Default::default()
         };
         solve_avatar_pose(
             &pestimate.skeleton,
@@ -215,6 +216,7 @@ fn make_avatar(
             rotation_blend: 1.0,
             joint_confidence_threshold: 0.1,
             face_confidence_threshold: 0.1,
+            ..Default::default()
         };
         solve_avatar_pose(
             src,

@@ -404,8 +404,10 @@ pub struct GuiApp {
     // E12: Project dirty state
     pub project_dirty: bool,
 
-    // E14: Autosave
-    pub autosave_interval: Option<Duration>,
+    // Immediate-save throttle clock. Updated each time the project is
+    // saved; the per-frame block compares `last_autosave.elapsed()`
+    // against `AUTOSAVE_THROTTLE` to decide whether the next dirty
+    // mutation should hit disk yet.
     pub last_autosave: Instant,
 
     // Crash recovery
@@ -557,7 +559,6 @@ impl GuiApp {
 
             project_dirty: false,
 
-            autosave_interval: Some(Duration::from_secs(300)), // 5 minutes
             last_autosave: Instant::now(),
 
             recovery_manager: crate::persistence::RecoveryManager::new(120),
@@ -695,6 +696,34 @@ impl GuiApp {
             }
         }
 
+        // Implicit "last session" restore: if the user never saved a
+        // project, we still want their checkbox / slider values to
+        // survive a quit. The same path is written by the per-frame
+        // autosave block whenever `project_dirty` is set and
+        // `project_path` is `None`. Leave `project_path` unset so the
+        // user doesn't see a phantom file in the title bar — they
+        // never opened one.
+        let last_session = crate::persistence::last_session_path();
+        if state.project_path.is_none() && last_session.exists() {
+            match crate::persistence::load_project(&last_session) {
+                Ok((project_state, _warnings)) => {
+                    state.apply_project_state(&project_state);
+                    state.project_dirty = false;
+                    info!(
+                        "persistence: restored last session from {}",
+                        last_session.display()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "persistence: could not restore last session at {}: {}",
+                        last_session.display(),
+                        e
+                    );
+                }
+            }
+        }
+
         // Backfill placeholder thumbnails for library entries that have
         // none on disk (legacy library data + entries whose VRM lacked an
         // embedded cover image). Cheap — a 128×128 procedural draw per
@@ -768,7 +797,6 @@ impl GuiApp {
 
             project_dirty: false,
 
-            autosave_interval: None,
             last_autosave: Instant::now(),
 
             recovery_manager: crate::persistence::RecoveryManager::new(120),
@@ -1030,6 +1058,9 @@ impl GuiApp {
             transparent_background: self.rendering.transparent_background,
             toggle_spring: self.rendering.toggle_spring,
             toggle_cloth: self.rendering.toggle_cloth,
+            toggle_collision_debug: self.rendering.toggle_collision_debug,
+            toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,
+            alpha_preview: self.rendering.alpha_preview,
 
             // Save user **intent** (Phase D), not the currently-running
             // state. If MF init failed this session, runtime is on a
@@ -1215,6 +1246,9 @@ impl GuiApp {
         self.rendering.transparent_background = state.transparent_background;
         self.rendering.toggle_spring = state.toggle_spring;
         self.rendering.toggle_cloth = state.toggle_cloth;
+        self.rendering.toggle_collision_debug = state.toggle_collision_debug;
+        self.rendering.toggle_skeleton_debug = state.toggle_skeleton_debug;
+        self.rendering.alpha_preview = state.alpha_preview;
 
         self.lipsync.volume_threshold = state.lipsync_volume_threshold;
         self.lipsync.smoothing = state.lipsync_smoothing;
@@ -1230,7 +1264,6 @@ impl GuiApp {
         self.settings.pan_sensitivity = state.settings_pan_sensitivity;
         self.settings.autosave_interval_secs = state.settings_autosave_interval_secs;
         crate::i18n::set_locale(&self.settings.locale);
-        self.autosave_interval = self.settings.autosave_interval_secs.map(std::time::Duration::from_secs);
 
         self.apply_pipeline_bound_settings(
             state.output_sink_index,
@@ -1854,22 +1887,35 @@ impl eframe::App for GuiApp {
             self.frame_count += 1;
         }
 
-        // E14: Autosave - save if enabled, project is dirty, and enough time has passed.
-        if let Some(interval) = self.autosave_interval {
-            if self.project_dirty && self.last_autosave.elapsed() >= interval {
-                if let Some(ref path) = self.project_path.clone() {
-                    let project_state = self.to_project_state();
-                    match crate::persistence::save_project(&project_state, path) {
-                        Ok(()) => {
-                            self.project_dirty = false;
-                            self.last_autosave = Instant::now();
-                            self.push_notification(t!("toast.autosaved"));
-                        }
-                        Err(e) => {
-                            self.last_autosave = Instant::now();
-                            self.push_notification(t!("toast.autosave_failed", error = e.to_string()));
-                        }
-                    }
+        // Immediate-save throttle: write project state to disk within
+        // `AUTOSAVE_THROTTLE` of the last mutation that flipped
+        // `project_dirty`. The user toggles a checkbox; ~250 ms later it
+        // hits disk; quitting the app a second after that does not lose
+        // the change. Slider drags re-trigger every frame but the
+        // throttle caps writes at ~4/s — at <2 KB per write the I/O is
+        // negligible. When `project_path` is `None` (the common case —
+        // user never ran File > Save As) we fall back to the implicit
+        // `last_session.vvtproj` so non-power-users get persistence too.
+        // No toast: a "saved" notification firing 4× a second during a
+        // slider drag would be UI spam.
+        const AUTOSAVE_THROTTLE: Duration = Duration::from_millis(250);
+        if self.project_dirty && self.last_autosave.elapsed() >= AUTOSAVE_THROTTLE {
+            let path = self
+                .project_path
+                .clone()
+                .unwrap_or_else(crate::persistence::last_session_path);
+            let project_state = self.to_project_state();
+            match crate::persistence::save_project(&project_state, &path) {
+                Ok(()) => {
+                    self.project_dirty = false;
+                    self.last_autosave = Instant::now();
+                }
+                Err(e) => {
+                    // Bump the timestamp so a persistent failure (read-only
+                    // disk, missing directory) doesn't pin the GUI in a
+                    // tight save-fail loop. The next mutation will retry.
+                    self.last_autosave = Instant::now();
+                    self.push_notification(t!("toast.autosave_failed", error = e.to_string()));
                 }
             }
         }
@@ -2018,6 +2064,26 @@ impl eframe::App for GuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Flush a pending dirty save synchronously. The per-frame
+        // throttle waits 250ms before writing, so a user who flips a
+        // checkbox and immediately Alt+F4s would otherwise lose the
+        // change. Falls back to `last_session.vvtproj` when the user
+        // never opened a project file.
+        if self.project_dirty {
+            let path = self
+                .project_path
+                .clone()
+                .unwrap_or_else(crate::persistence::last_session_path);
+            let project_state = self.to_project_state();
+            if let Err(e) = crate::persistence::save_project(&project_state, &path) {
+                warn!(
+                    "persistence: final save on exit failed at {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+
         let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
         crate::persistence::RecoveryManager::clear_recovery();
         info!("gui: window closing, initiating application shutdown");

@@ -59,6 +59,9 @@ pub struct ProjectState {
     pub transparent_background: bool,
     pub toggle_spring: bool,
     pub toggle_cloth: bool,
+    pub toggle_collision_debug: bool,
+    pub toggle_skeleton_debug: bool,
+    pub alpha_preview: bool,
 
     // Lip sync config
     pub lipsync_enabled: bool,
@@ -160,7 +163,12 @@ pub struct TrackingConfig {
     pub confidence_threshold: f32,
     #[serde(default)]
     pub hand_tracking_enabled: bool,
-    #[serde(default)]
+    /// `default_true`: matches the GUI's initial value
+    /// (`TrackingGuiState`). Without this, projects that predate the
+    /// retargeting block (or were saved before face tracking landed)
+    /// load with face tracking silently disabled, which the user
+    /// experiences as "the head no longer follows me after upgrading".
+    #[serde(default = "default_true")]
     pub face_tracking_enabled: bool,
     #[serde(default)]
     pub lower_body_tracking_enabled: bool,
@@ -202,6 +210,12 @@ pub struct RenderingConfig {
     pub toggle_spring: bool,
     #[serde(default)]
     pub toggle_cloth: bool,
+    #[serde(default)]
+    pub toggle_collision_debug: bool,
+    #[serde(default)]
+    pub toggle_skeleton_debug: bool,
+    #[serde(default)]
+    pub alpha_preview: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -436,6 +450,9 @@ impl ProjectFile {
                 transparent_background: state.transparent_background,
                 toggle_spring: state.toggle_spring,
                 toggle_cloth: state.toggle_cloth,
+                toggle_collision_debug: state.toggle_collision_debug,
+                toggle_skeleton_debug: state.toggle_skeleton_debug,
+                alpha_preview: state.alpha_preview,
             },
             lipsync: LipSyncConfig {
                 enabled: state.lipsync_enabled,
@@ -504,6 +521,9 @@ impl ProjectFile {
             transparent_background: self.rendering.transparent_background,
             toggle_spring: self.rendering.toggle_spring,
             toggle_cloth: self.rendering.toggle_cloth,
+            toggle_collision_debug: self.rendering.toggle_collision_debug,
+            toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,
+            alpha_preview: self.rendering.alpha_preview,
 
             lipsync_enabled: self.lipsync.enabled,
             lipsync_mic_device_index: self.lipsync.mic_device_index,
@@ -743,6 +763,17 @@ pub fn save_watched_folders(paths: &[std::path::PathBuf]) -> Result<(), String> 
 fn recent_avatars_path() -> std::path::PathBuf {
     let mut path = app_data_dir();
     path.push("recent_avatars.json");
+    path
+}
+
+/// Path of the implicit "last session" project file. The GUI writes here
+/// every time `project_dirty` flips, even when the user has never run
+/// File > Save As — so quitting after toggling a checkbox preserves the
+/// change for the next launch. Lives next to `avatar_library.vvtlib` and
+/// recovery snapshots under `%APPDATA%\VulVATAR`.
+pub fn last_session_path() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("last_session.vvtproj");
     path
 }
 
