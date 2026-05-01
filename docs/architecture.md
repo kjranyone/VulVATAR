@@ -617,55 +617,106 @@ Exit criteria:
 - `src/tracking/`: webcam tracking and retargeting inputs
 - `src/output/`: OBS-facing and external frame sink integration
 
-The next likely additions are:
+The implementations the original baseline anticipated are all in
+place; large modules have since grown into directory modules with
+per-concern sibling files:
 
-- `src/avatar/animation.rs`
-- `src/avatar/retargeting.rs`
+- `src/avatar/animation.rs`, `src/avatar/instance.rs`, `src/avatar/pose.rs`
 - `src/editor/cloth_authoring.rs`
-- `src/renderer/material.rs`
-- `src/renderer/mtoon.rs`
+- `src/renderer/material.rs`, `src/renderer/mtoon.rs`
 - `src/simulation/spring.rs`
-- `src/simulation/cloth_solver.rs`
+- `src/simulation/cloth_solver/{mod,integrator,constraints,collision,output,tests}.rs`
+- `src/asset/vrm/{mod,extensions,gltf_decode,mtoon,v0,v1,metadata_tests}.rs`
+- `src/tracking/rtmw3d/{mod,consts,decode,preprocess,skeleton,wrist,face,annotation,session,math}.rs`
+- `src/gui/inspector/{mod,avatar,preview,tracking,rendering,output,cloth,library,settings}.rs`
 
 ## Recommended Directory Structure
 
-The crate should stop being flat once real implementation begins. A scalable starting point is:
+The crate started flat and now follows the per-concern directory
+pattern. Split by responsibility inside each top-level domain rather
+than letting any single file grow past ~1.5 kLOC.
 
 ```text
 src/
   main.rs
   app/
     mod.rs
+    render.rs
+    tracking_lifecycle.rs
+    lipsync.rs
+    output_sink.rs
+    avatar_library.rs
+    bake_cache.rs
+    folder_watcher.rs
+    render_thread.rs
   asset/
     mod.rs
-    vrm.rs
+    cache.rs
+    cloth_rebind.rs
+    vrm/
+      mod.rs
+      extensions.rs
+      gltf_decode.rs
+      mtoon.rs
+      v0.rs
+      v1.rs
   editor/
     mod.rs
+    cloth_authoring.rs
   avatar/
     mod.rs
+    instance.rs
+    pose.rs
+    pose_solver.rs
   simulation/
     mod.rs
     cloth.rs
+    cloth_solver/
+      mod.rs
+      integrator.rs
+      constraints.rs
+      collision.rs
+      output.rs
+    spring.rs
   renderer/
     mod.rs
+    pipeline.rs
+    material.rs
+    mtoon.rs
+    frame_input.rs
+    frame_pool.rs
+    output_export.rs
+    thumbnail.rs
+    debug.rs
+    gpu_handle.rs
   tracking/
     mod.rs
+    provider.rs
+    rtmw3d/...
+    face_mediapipe.rs
+    yolox.rs
+    cigpose_metric_depth.rs
+    pose_estimation.rs
+  gui/
+    mod.rs
+    inspector/...
+    viewport.rs
+    top_bar.rs
+    status_bar.rs
+    mesh_picking.rs
+    profile.rs
   output/
     mod.rs
+    frame_sink.rs
+    virtual_camera_native.rs
 ```
 
-As the codebase grows, split by responsibility inside each top-level domain rather than adding more top-level files.
+Good examples of per-domain splits:
 
-Good examples:
-
-- `src/avatar/pose.rs`
-- `src/avatar/instance.rs`
-- `src/avatar/retargeting.rs`
-- `src/simulation/spring.rs`
-- `src/simulation/cloth_solver.rs`
-- `src/renderer/pipeline.rs`
-- `src/renderer/material.rs`
-- `src/output/frame_sink.rs`
+- `src/avatar/pose.rs`, `instance.rs`, `pose_solver.rs`
+- `src/simulation/cloth_solver/{integrator,constraints,collision,output}.rs`
+- `src/renderer/{pipeline,material,mtoon,output_export}.rs`
+- `src/output/{frame_sink,virtual_camera_native}.rs`
 
 Bad direction:
 

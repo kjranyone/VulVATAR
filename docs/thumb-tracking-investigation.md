@@ -12,8 +12,8 @@ by the eventual fix's commit message).
 * COCO-WholeBody hand keypoint indices (1=CMC, 2=MCP, 3=IP, 4=tip) map
   cleanly to `LeftThumbProximal / Intermediate / Distal` and
   `fingertips[LeftThumbDistal]` — see `HAND_PHALANGES_LEFT` /
-  `HAND_TIPS_LEFT` in `src/tracking/rtmw3d.rs`. Naming follows VRM 0.x
-  where `ThumbProximal` is the thumb metacarpal in anatomy.
+  `HAND_TIPS_LEFT` in `src/tracking/rtmw3d/consts.rs`. Naming follows
+  VRM 0.x where `ThumbProximal` is the thumb metacarpal in anatomy.
 * The wrist orientation pass (`solve_wrist_orientation` in
   `pose_solver.rs`) uses index/middle/pinky MCPs to derive the palm
   plane — the thumb is intentionally excluded so it cannot bias the
