@@ -439,9 +439,10 @@ impl Application {
     ///
     /// Shutdown order (per `docs/threading-model.md`):
     /// 1. Stop tracking worker (no new tracking data)
-    /// 2. Render a final frame if needed
-    /// 3. Stop output worker (drain remaining frames)
-    /// 4. Drop renderer resources (handled by Rust drop order)
+    /// 2. Drop MF virtual camera (Frame Server releases camera before
+    ///    we tear down the producer it reads from)
+    /// 3. Stop output worker (drain remaining frames + close producer)
+    /// 4. Stop render thread (drains pending work, releases GPU resources)
     ///
     /// Safe to call multiple times; subsequent calls are no-ops.
     pub fn shutdown(&mut self) {
@@ -462,13 +463,34 @@ impl Application {
         //    doing further work).
         self.running = false;
 
-        // 3. Shut down the output router, which drains remaining frames and
+        // 3. Drop the MF virtual camera *before* the output worker. The
+        //    camera's media source is the Frame Server's reader of our
+        //    producer-side shmem mapping; if we let `output.shutdown()`
+        //    invalidate that mapping while the camera is still
+        //    registered, Frame Server can issue one final `RequestSample`
+        //    against torn-down memory. `MfVirtualCamera::Drop` calls
+        //    `Stop()` + `Remove()`, after which Frame Server has released
+        //    its handle and the producer is safe to retire.
+        //
+        //    Field-order Drop on Application would tear down `output`
+        //    *before* `mf_virtual_camera` (declaration order: output
+        //    line 104, mf_virtual_camera line 150), so we must do this
+        //    explicitly here regardless of whether `shutdown` is called
+        //    directly or via `Drop`.
+        #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
+        {
+            if self.mf_virtual_camera.take().is_some() {
+                info!("app: MediaFoundation virtual camera unregistered");
+            }
+        }
+
+        // 4. Shut down the output router, which drains remaining frames and
         //    joins the output worker thread.
         info!("app: stopping output worker...");
         self.output.shutdown();
         info!("app: output worker stopped");
 
-        // 4. Shut down the render thread, which drains pending work and
+        // 5. Shut down the render thread, which drains pending work and
         //    releases GPU resources.
         if let Some(ref mut rt) = self.render_thread {
             info!("app: stopping render thread...");
