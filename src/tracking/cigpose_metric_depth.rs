@@ -323,12 +323,21 @@ impl PoseProvider for CigposeMetricDepthProvider {
 
     fn estimate_pose(
         &mut self,
-        rgb_data: &[u8],
-        width: u32,
-        height: u32,
-        frame_index: u64,
+        _rgb_data: &[u8],
+        _width: u32,
+        _height: u32,
+        _frame_index: u64,
     ) -> PoseEstimate {
-        super::pose_estimation::estimate_pose(rgb_data, width, height, frame_index)
+        // `from_models_dir` always returns Err today, so no instance of
+        // this provider can reach the worker loop. Keep the impl present
+        // so `Box<dyn PoseProvider>` coercion still works for the
+        // factory dispatch, but flag the dead path explicitly instead of
+        // silently producing a synthetic estimate that would mask the
+        // "not implemented" error from construction.
+        unreachable!(
+            "CigposeMetricDepthProvider::from_models_dir always errors today; \
+             estimate_pose should not be reachable until the ONNX decoders land"
+        )
     }
 }
 
