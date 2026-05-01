@@ -68,6 +68,7 @@ impl LoadStage {
 //   - VRMC_springBone.colliders: sphere or capsule
 
 mod extensions;
+mod mtoon;
 mod v0;
 mod v1;
 
@@ -115,14 +116,6 @@ impl From<serde_json::Error> for VrmLoadError {
 }
 
 pub struct VrmAssetLoader;
-
-struct MtoonTextureIndices {
-    shade_color_texture: Option<usize>,
-    emissive_texture: Option<usize>,
-    rim_texture: Option<usize>,
-    matcap_texture: Option<usize>,
-    uv_anim_mask_texture: Option<usize>,
-}
 
 impl VrmAssetLoader {
     pub fn new() -> Self {
@@ -683,7 +676,7 @@ impl VrmAssetLoader {
                 let mut matcap_texture_binding = None;
 
                 let (toon_params, mtoon_params) = if let Some(mtoon) = mtoon_ext {
-                    let (toon, mut staged, tex_indices) = Self::parse_mtoon_params(mtoon);
+                    let (toon, mut staged, tex_indices) = mtoon::parse_mtoon_params(mtoon);
 
                     shade_ramp_texture = tex_indices
                         .shade_color_texture
@@ -847,117 +840,6 @@ impl VrmAssetLoader {
             pixel_data,
             dimensions,
         }
-    }
-
-    fn parse_mtoon_params(
-        mtoon: &serde_json::Value,
-    ) -> (ToonMaterialParams, MtoonStagedParams, MtoonTextureIndices) {
-        use crate::asset::{MtoonOutlineWidthMode, MtoonStagedParams};
-
-        let get_f32 = |key: &str| mtoon.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
-        let get_color3 = |key: &str| -> [f32; 3] {
-            mtoon
-                .get(key)
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    [
-                        arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                        arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                        arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                    ]
-                })
-                .unwrap_or([0.0; 3])
-        };
-        let get_color3_as_4 = |key: &str| -> [f32; 4] {
-            mtoon
-                .get(key)
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    [
-                        arr.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                        arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                        arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-                        1.0f32,
-                    ]
-                })
-                .unwrap_or([0.0, 0.0, 0.0, 0.0])
-        };
-
-        let shade_color = get_color3_as_4("shadeColorFactor");
-        let shade_shift = get_f32("shadingShiftFactor").unwrap_or(0.0);
-        let shade_toony = get_f32("shadingToonyFactor").unwrap_or(0.9);
-        let gi_equalization = get_f32("giEqualizationFactor").unwrap_or(0.9);
-
-        let outline_width_mode_str = mtoon
-            .get("outlineWidthMode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("none");
-        let outline_width_mode = match outline_width_mode_str {
-            "worldCoordinates" => MtoonOutlineWidthMode::WorldCoordinates,
-            "screenCoordinates" => MtoonOutlineWidthMode::ScreenCoordinates,
-            _ => MtoonOutlineWidthMode::None,
-        };
-        let outline_width = get_f32("outlineWidthFactor").unwrap_or(0.0);
-        let outline_color = get_color3("outlineColorFactor");
-
-        let rim_color = get_color3_as_4("parametricRimColorFactor");
-        let rim_fresnel_power = get_f32("parametricRimFresnelPowerFactor").unwrap_or(5.0);
-        let rim_lift = get_f32("parametricRimLiftFactor").unwrap_or(0.0);
-        let rim_lighting_mix = get_f32("rimLightingMixFactor").unwrap_or(1.0);
-
-        let emissive_color = get_color3_as_4("emissiveFactor");
-
-        let uv_anim_scroll_x = get_f32("uvAnimationScrollXSpeedFactor").unwrap_or(0.0);
-        let uv_anim_scroll_y = get_f32("uvAnimationScrollYSpeedFactor").unwrap_or(0.0);
-        let uv_anim_rotation = get_f32("uvAnimationRotationSpeedFactor").unwrap_or(0.0);
-
-        let get_tex_index = |key: &str| {
-            mtoon.get(key).and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.get("index").and_then(|idx| idx.as_u64()))
-                    .map(|v| v as usize)
-            })
-        };
-
-        let tex_indices = MtoonTextureIndices {
-            shade_color_texture: get_tex_index("shadeColorTexture"),
-            emissive_texture: get_tex_index("emissiveTexture"),
-            rim_texture: get_tex_index("rimTexture"),
-            matcap_texture: get_tex_index("matcapTexture"),
-            uv_anim_mask_texture: get_tex_index("uvAnimMaskTexture"),
-        };
-
-        let toon_params = ToonMaterialParams {
-            ramp_threshold: (1.0 - shade_toony).max(0.01),
-            shadow_softness: (1.0 - shade_toony) * 0.5,
-            outline_width,
-            outline_color,
-        };
-
-        let staged = MtoonStagedParams {
-            shade_color,
-            shade_shift,
-            shade_toony,
-            lit_color: [1.0, 1.0, 1.0, 1.0],
-            gi_equalization,
-            matcap_texture: None,
-            rim_texture: None,
-            rim_color,
-            rim_lighting_mix,
-            rim_fresnel_power,
-            rim_lift,
-            emissive_texture: None,
-            emissive_color,
-            outline_width_mode,
-            outline_color,
-            outline_width,
-            uv_anim_mask_texture: None,
-            uv_anim_scroll_x_speed: uv_anim_scroll_x,
-            uv_anim_scroll_y_speed: uv_anim_scroll_y,
-            uv_anim_rotation_speed: uv_anim_rotation,
-        };
-
-        (toon_params, staged, tex_indices)
     }
 
     fn build_skin_bindings(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<(usize, SkinBinding)> {
