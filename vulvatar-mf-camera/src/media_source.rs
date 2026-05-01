@@ -9,7 +9,7 @@
 #![allow(unused_variables)]
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, OnceLock,
 };
 
@@ -159,6 +159,12 @@ struct Inner {
 struct MutableState {
     state: SourceState,
     stream: Option<IMFMediaStream>,
+    /// Sibling handles to the live stream, kept here so `Source::Shutdown`
+    /// can stop the stream's event queue and arm its post-shutdown latch
+    /// without having to downcast the IMFMediaStream COM pointer back
+    /// into our impl type.
+    stream_event_queue: Option<IMFMediaEventQueue>,
+    stream_shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl VulvatarMediaSource {
@@ -180,6 +186,8 @@ impl VulvatarMediaSource {
             mutable: Mutex::new(MutableState {
                 state: SourceState::Stopped,
                 stream: None,
+                stream_event_queue: None,
+                stream_shutdown: None,
             }),
             stream_allocator: Arc::new(Mutex::new(None)),
         })
@@ -200,10 +208,19 @@ impl VulvatarMediaSource {
         let event_queue = unsafe { MFCreateEventQueue()? };
         let descriptor = inner.stream_descriptor.clone();
         let allocator = self.stream_allocator.clone();
-        let s2: IMFMediaStream2 =
-            VulvatarMediaStream::new(parent, descriptor, event_queue, allocator)?.into();
+        let stream_shutdown = Arc::new(AtomicBool::new(false));
+        let s2: IMFMediaStream2 = VulvatarMediaStream::new(
+            parent,
+            descriptor,
+            event_queue.clone(),
+            allocator,
+            stream_shutdown.clone(),
+        )?
+        .into();
         let s: IMFMediaStream = s2.cast()?;
         state.stream = Some(s.clone());
+        state.stream_event_queue = Some(event_queue);
+        state.stream_shutdown = Some(stream_shutdown);
         Ok(s)
     }
 
@@ -481,10 +498,29 @@ impl IMFMediaSource_Impl for VulvatarMediaSource_Impl {
                 let _ = inner.event_queue.Shutdown();
             }
         }
-        // Single critical section: setting Shutdown state and dropping the
-        // stream reference must be atomic, otherwise another thread can
-        // observe Shutdown with a still-live stream and act on it.
+        // Single critical section: setting Shutdown state, arming the
+        // stream's shutdown latch, and dropping the stream reference must
+        // be atomic, otherwise another thread can observe Shutdown with a
+        // still-live stream and act on it.
+        //
+        // Per IMFMediaSource::Shutdown spec the source is also responsible
+        // for terminating the *stream's* event queue (not just its own).
+        // Frame Server keeps an out-of-process clone of IMFMediaStream,
+        // so even after we drop our `state.stream` reference its calls
+        // can still land on the stream impl. The shutdown flag tells
+        // RequestSample to bail with MF_E_SHUTDOWN immediately, and
+        // shutting the event queue down disposes of any queued events
+        // and unblocks waiters in `BeginGetEvent` / `GetEvent` with
+        // MF_E_SHUTDOWN, matching the MF lifecycle contract.
         let mut state = self.mutable.lock().unwrap();
+        if let Some(flag) = state.stream_shutdown.take() {
+            flag.store(true, Ordering::Release);
+        }
+        if let Some(queue) = state.stream_event_queue.take() {
+            unsafe {
+                let _ = queue.Shutdown();
+            }
+        }
         state.state = SourceState::Shutdown;
         state.stream = None;
         Ok(())

@@ -19,8 +19,9 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor,
     IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample, MFGetSystemTime,
     MFVideoFormat_NV12, MFVideoPrimaries_BT709, MFVideoTransFunc_10, MFVideoTransFunc_sRGB,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE,
-    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES, MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
+    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES, MF_STREAM_STATE,
+    MF_STREAM_STATE_RUNNING,
 };
 
 use crate::media_source::{AllocatorHandle, DEFAULT_FPS};
@@ -91,6 +92,16 @@ pub struct VulvatarMediaStream {
     /// needs to be initialised once unless the format changes mid-stream,
     /// which our SUPPORTED_FORMATS list doesn't currently allow.
     allocator_initialized: AtomicBool,
+    /// Source-driven shutdown latch. The source flips this in
+    /// `IMFMediaSource::Shutdown` (along with `IMFMediaEventQueue::Shutdown`
+    /// on the stream's event queue, kept on the source side). Frame Server
+    /// holds its own clone of `IMFMediaStream` and may issue one final
+    /// `RequestSample` after the source has shut down; reading the flag
+    /// at the top of `RequestSample` lets us bail out with
+    /// `MF_E_SHUTDOWN` before touching allocator state, the shared-memory
+    /// reader, or the event queue. The flag is shared via `Arc` so the
+    /// source and stream see the same atomic bit.
+    is_shutdown: Arc<AtomicBool>,
 }
 
 struct StreamInner {
@@ -105,6 +116,7 @@ impl VulvatarMediaStream {
         descriptor: IMFStreamDescriptor,
         event_queue: IMFMediaEventQueue,
         allocator: Arc<Mutex<Option<AllocatorHandle>>>,
+        is_shutdown: Arc<AtomicBool>,
     ) -> windows::core::Result<Self> {
         dll_add_ref();
         let attributes: IMFAttributes = descriptor.cast()?;
@@ -120,6 +132,7 @@ impl VulvatarMediaStream {
             cached_format: Mutex::new(None),
             allocator,
             allocator_initialized: AtomicBool::new(false),
+            is_shutdown,
         })
     }
 }
@@ -184,6 +197,16 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
     }
 
     fn RequestSample(&self, token: Option<&IUnknown>) -> windows::core::Result<()> {
+        // Frame Server can race a final RequestSample against the source's
+        // Shutdown — the source flips `is_shutdown`, but Frame Server's
+        // own clone of IMFMediaStream is still alive in its address
+        // space. Returning MF_E_SHUTDOWN immediately keeps us out of the
+        // allocator / shared-memory paths whose backing state is already
+        // being torn down.
+        if self.is_shutdown.load(Ordering::Acquire) {
+            crate::t!("Stream::RequestSample post-Shutdown -> MF_E_SHUTDOWN");
+            return Err(MF_E_SHUTDOWN.into());
+        }
         crate::t!("Stream::RequestSample");
 
         let format = self.current_format();
