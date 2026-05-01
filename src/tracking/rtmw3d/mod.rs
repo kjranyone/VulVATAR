@@ -59,6 +59,12 @@ mod wrist;
 
 #[cfg(feature = "inference")]
 pub(in crate::tracking) use session::build_session;
+// Crop helpers shared with the CIGPose+MoGe-2 provider's optional
+// YOLOX person-crop pre-stage. The functions don't depend on RTMW3D
+// internals; they're here purely because that's where they were
+// originally written. Promotion-only re-export, no logic change.
+#[cfg(feature = "inference")]
+pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
 
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;

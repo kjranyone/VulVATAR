@@ -10,11 +10,12 @@ use std::path::Path;
 use super::cigpose_metric_depth::CigposeMetricDepthProvider;
 use super::PoseEstimate;
 
+/// Selects which tracking pipeline runs. Set to `rtmw3d` (default) or
+/// `cigpose-metric-depth`. Other env-based knobs (custom model paths,
+/// metric-depth backend selection) were removed when the
+/// CIGPose+MoGe-2 pipeline replaced the multi-backend experimental
+/// flow — both providers now read fixed `models/<name>.onnx` paths.
 pub const POSE_PROVIDER_ENV: &str = "VULVATAR_POSE_PROVIDER";
-pub const CIGPOSE_MODEL_ENV: &str = "VULVATAR_CIGPOSE_MODEL";
-pub const METRIC_DEPTH_MODEL_ENV: &str = "VULVATAR_METRIC_DEPTH_MODEL";
-pub const METRIC_DEPTH_KIND_ENV: &str = "VULVATAR_METRIC_DEPTH_KIND";
-pub const LEGACY_DEPTH_MODEL_ENV: &str = "VULVATAR_DEPTH_MODEL";
 
 /// Runtime pose-estimation implementation used by the tracking worker.
 pub trait PoseProvider {
