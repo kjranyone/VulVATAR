@@ -800,7 +800,7 @@ fn log_thumb_diagnostics(
     }
 }
 
-/// Body yaw, derived from the 3D shoulder line.
+/// Body yaw, derived from the 3D torso-width vector.
 ///
 /// At rest the avatar's left shoulder sits at +X (camera-right under
 /// the VRM Y180 flip) and the right shoulder at −X, so the
@@ -824,21 +824,53 @@ fn log_thumb_diagnostics(
 /// the wrong-direction body rotation (e.g. 315° three-quarter view
 /// rendering the avatar as a 45° puppet instead of a 45° mirror).
 ///
-/// Returns `None` when either shoulder is below the confidence
-/// threshold so the caller can skip the rotation entirely instead of
-/// snapping the body to whatever stale value comes through.
+/// **Sample combination.** RTMW3D's per-joint depth resolution for two
+/// close points collapses Δz to the noise floor at ~45°/315° three-
+/// quarter views (see `plan/body-twist-yaw-investigation.md`): the
+/// shoulder pair alone reports Δz ≈ 0.004 in selfie space, yielding
+/// avatar yaw of ~1° instead of the expected ~45°. We mitigate by
+/// also reading the hip pair as an independent vote on torso-width
+/// orientation: hips sit anatomically below the shoulders so their
+/// per-joint depth noise is uncorrelated at this scale, and a
+/// confidence-weighted mean of the two `(bx, bz)` samples roughly
+/// halves the noise floor. When only one pair clears the confidence
+/// gate the function falls back to that single pair.
+///
+/// Returns `None` when neither pair clears the confidence threshold
+/// so the caller can skip the rotation entirely instead of snapping
+/// the body to whatever stale value comes through.
 fn compute_body_yaw_3d(source: &SourceSkeleton, threshold: f32) -> Option<f32> {
-    let l = source.joints.get(&HumanoidBone::LeftShoulder)?;
-    let r = source.joints.get(&HumanoidBone::RightShoulder)?;
-    if l.confidence < threshold || r.confidence < threshold {
+    use HumanoidBone::*;
+    let pairs = [
+        (LeftShoulder, RightShoulder),
+        (LeftUpperLeg, RightUpperLeg),
+    ];
+    let mut sum_bx = 0.0_f32;
+    let mut sum_bz = 0.0_f32;
+    let mut sum_w = 0.0_f32;
+    for (left_bone, right_bone) in pairs {
+        let Some(l) = source.joints.get(&left_bone) else {
+            continue;
+        };
+        let Some(r) = source.joints.get(&right_bone) else {
+            continue;
+        };
+        if l.confidence < threshold || r.confidence < threshold {
+            continue;
+        }
+        let weight = l.confidence.min(r.confidence);
+        sum_bx += (l.position[0] - r.position[0]) * weight;
+        sum_bz += (l.position[2] - r.position[2]) * weight;
+        sum_w += weight;
+    }
+    if sum_w <= 0.0 {
         return None;
     }
-    let bx = l.position[0] - r.position[0];
-    let bz = l.position[2] - r.position[2];
-    // Dead-zone: with both shoulders close together (subject in
-    // exact side profile), bx is tiny and atan2 amplifies any noise
-    // into wild yaw flips. Require a minimum span before we trust
-    // the angle.
+    let bx = sum_bx / sum_w;
+    let bz = sum_bz / sum_w;
+    // Dead-zone: with the torso-width vector tiny (subject in exact
+    // side profile), atan2 amplifies any noise into wild yaw flips.
+    // Require a minimum span before we trust the angle.
     if (bx * bx + bz * bz).sqrt() < 0.05 {
         return None;
     }
@@ -1265,4 +1297,76 @@ pub fn solve_expressions(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod body_yaw_tests {
+    use super::*;
+    use crate::tracking::source_skeleton::SourceJoint;
+
+    fn put(sk: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3], confidence: f32) {
+        sk.joints.insert(bone, SourceJoint { position: pos, confidence });
+    }
+
+    /// Three-quarter view (~45°): the shoulder-only signal collapses to
+    /// the SimCC noise floor (Δz ≈ 0.004 between shoulders) and the old
+    /// implementation produced sub-degree yaw, but the hip Δz is an
+    /// order of magnitude larger at this pose so the combined signal
+    /// must register a clearly non-zero yaw. Numbers here are the
+    /// measured 45° row from `plan/body-twist-yaw-investigation.md`.
+    #[test]
+    fn three_quarter_view_uses_hip_signal_when_shoulders_collapse() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.059, 0.486, -0.083], 1.0);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.155, 0.486, -0.087], 1.0);
+        put(&mut sk, HumanoidBone::LeftUpperLeg, [0.046, -0.004, -0.007], 1.0);
+        put(&mut sk, HumanoidBone::RightUpperLeg, [-0.046, 0.004, 0.007], 1.0);
+
+        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("torso pair clears threshold");
+        let yaw_deg = yaw.to_degrees().abs();
+        // Old shoulder-only output for this pose was ~0.93°; the
+        // weighted hip+shoulder mean must lift it well past that.
+        assert!(
+            yaw_deg > 1.5,
+            "combined-pair yaw should beat shoulder-only floor of ~1°, got {yaw_deg:.2}°"
+        );
+    }
+
+    /// When only the shoulder pair is present (lower-body cropped out
+    /// of frame), the function must still return that pair's reading
+    /// rather than `None`. Front pose has bx large and bz near zero so
+    /// yaw should be ≈0.
+    #[test]
+    fn shoulder_only_falls_back_to_single_pair() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.4, 0.0], 1.0);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.4, 0.0], 1.0);
+
+        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("shoulder-only fallback");
+        assert!(yaw.abs() < 0.05, "front-pose shoulder span should give ~0 yaw, got {yaw}");
+    }
+
+    /// No torso joints visible at all → `None` so the caller doesn't
+    /// snap the avatar to a stale value.
+    #[test]
+    fn no_torso_joints_returns_none() {
+        let sk = SourceSkeleton::empty(0);
+        assert!(compute_body_yaw_3d(&sk, 0.1).is_none());
+    }
+
+    /// Both shoulders present but below the confidence threshold while
+    /// hips are confident: the function must skip the shoulders and
+    /// return the hip-only reading.
+    #[test]
+    fn low_confidence_pair_is_skipped() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.4, 0.0], 0.05);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.4, 0.0], 0.05);
+        put(&mut sk, HumanoidBone::LeftUpperLeg, [0.18, 0.0, 0.05], 1.0);
+        put(&mut sk, HumanoidBone::RightUpperLeg, [-0.18, 0.0, -0.05], 1.0);
+
+        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("hip pair carries the signal");
+        // Hip-only: bx=0.36, bz=0.10 → atan2(0.10, 0.36) ≈ 0.27 rad.
+        assert!((yaw - 0.27).abs() < 0.02, "hip-only yaw mismatch: {yaw}");
+    }
 }

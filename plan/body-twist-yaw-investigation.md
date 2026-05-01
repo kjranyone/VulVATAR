@@ -111,11 +111,23 @@ MediaPipe Pose Landmarker (BlazePose GHUM 3D) や Sapiens に置換。
 A だけで実用上問題なくなるか検証。不足するようなら C を信頼度ゲート付きで追加。
 B/D はその後の選択肢。
 
+## 進捗
+
+- **Option A 実装済 (2026-05-01)**。`compute_body_yaw_3d` を肩ペアと腰
+  ペアの信頼度重み付き平均で合成するよう変更。`pose_solver.rs` 内に
+  `body_yaw_tests` モジュールを追加し、(1) 上の 45° 計測値を使った
+  「肩のみの ~1° よりは大きく出る」回帰テスト、(2) 肩のみ frame での
+  シングルペアフォールバック、(3) 全 None 入力、(4) 肩低信頼度+腰高信頼度の
+  4 ケースを green。実機検証 (`gothic_lolita_rotation/photorealistic/`
+  8 枚) は別途。
+- B / C / D は未着手。A の効果を実機で見てから判断。
+
 ## 影響ファイル
 
-- `src/avatar/pose_solver.rs:731-747` (`compute_body_yaw_3d`) — A 適用箇所。
-  - 引数に `joints` の他 entry を読めるようにし、重み付き平均で `bx`/`bz` を合成。
-  - dead-zone 閾値 (現 0.05) も信号合成に応じて見直す可能性あり。
+- `src/avatar/pose_solver.rs` `compute_body_yaw_3d` — A 適用済 (重み付き
+  平均で `bx`/`bz` を合成、片方ペアのみ confident でもフォールバック)。
+- dead-zone 閾値 (現 0.05) は据え置き。実測でなお過剰トリガするようなら
+  再調整。
 
 ## 後始末
 
@@ -124,8 +136,8 @@ B/D はその後の選択肢。
 
 ## 一次資料
 
-- `pose_solver.rs:731-747` `compute_body_yaw_3d`
-- `pose_solver.rs:433-461` Hips 適用パス
-- `tracking/rtmw3d.rs:898-904` ソース座標変換 (`to_source`)
-- `tracking/rtmw3d.rs:131-156` `COCO_BODY` (selfie mirror マッピング)
-- `validation_images/gothic_lolita_rotation/anime/` 計測対象画像
+- `pose_solver.rs` `compute_body_yaw_3d` (現在は肩+腰ペア合成版)
+- `pose_solver.rs` Hips 適用パス (`solve_avatar_pose` 内)
+- `tracking/rtmw3d/skeleton.rs` ソース座標変換 (`build_source_skeleton`)
+- `tracking/rtmw3d/consts.rs` `COCO_BODY` (selfie mirror マッピング)
+- `validation_images/gothic_lolita_rotation/photorealistic/` 計測対象画像
