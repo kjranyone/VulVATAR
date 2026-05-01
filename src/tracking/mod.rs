@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #[cfg(feature = "webcam")]
 use crate::t;
 use log::{error, info, warn};
@@ -363,8 +362,6 @@ pub fn list_cameras() -> Vec<CameraInfo> {
 // ---------------------------------------------------------------------------
 
 pub struct TrackingSource {
-    source_id: TrackingSourceId,
-    frame_index: u64,
     mailbox: TrackingMailbox,
     backend: CameraBackend,
 }
@@ -372,8 +369,6 @@ pub struct TrackingSource {
 impl TrackingSource {
     pub fn new() -> Self {
         Self {
-            source_id: TrackingSourceId(1),
-            frame_index: 0,
             mailbox: TrackingMailbox::new(),
             backend: CameraBackend::default(),
         }

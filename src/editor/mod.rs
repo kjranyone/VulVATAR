@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod cloth_authoring;
 
 use log::info;

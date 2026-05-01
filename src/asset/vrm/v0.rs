@@ -7,6 +7,14 @@
 //! flattens spring parameters across each chain. The field is also
 //! spelled `stiffiness` (sic) — preserved verbatim so files written by
 //! Unity-era exporters continue to parse.
+//!
+//! Several fields here (`exporter_version`, `is_binary`, `comment`,
+//! `center`, ...) are deserialised for schema completeness but never
+//! read downstream. They document the on-disk shape; the
+//! `#![allow(dead_code)]` below silences the lint at file scope rather
+//! than per-field.
+
+#![allow(dead_code)]
 
 use serde::Deserialize;
 

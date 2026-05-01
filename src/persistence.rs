@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

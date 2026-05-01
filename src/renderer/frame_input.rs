@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::asset::Mat4;
 use crate::avatar::AvatarInstanceId;
 use crate::renderer::material::MaterialUploadRequest;

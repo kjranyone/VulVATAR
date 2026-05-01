@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod cache;
 pub mod cloth_rebind;
 pub mod vrm;

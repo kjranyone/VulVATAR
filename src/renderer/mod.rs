@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod debug;
 pub mod frame_input;
 pub mod frame_pool;
@@ -101,10 +99,18 @@ const READBACK_RING_SIZE: usize = 2;
 #[allow(clippy::type_complexity)]
 pub struct VulkanRenderer {
     initialized: bool,
+    /// GPU export path (CpuReadback / GpuExport / SharedMemory). The
+    /// instance is constructed and held here, but no render-loop call
+    /// site delegates to it yet — kept so the wiring can be flipped on
+    /// without re-creating the underlying frame pool / handle exporter.
+    #[allow(dead_code)]
     output_exporter: OutputExporter,
     material_uploader: material::MaterialUploader,
     active_pipeline: Option<pipeline::PipelineState>,
     frame_counter: u64,
+    /// MToon feature-coverage flags. Populated at construction with
+    /// `initial_poc()` for diagnostics; no read-side yet.
+    #[allow(dead_code)]
     mtoon_status: mtoon::MtoonCompatibilityStatus,
     mesh_cache: HashMap<(MeshId, PrimitiveId), (Subbuffer<[GpuVertex]>, Subbuffer<[u32]>, u32)>,
     texture_cache: HashMap<String, Arc<ImageView>>,

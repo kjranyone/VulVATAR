@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! HSV skin-tone pose estimation fallback.
 //!
 //! Used only when the `inference` feature is disabled — a stand-in detector

@@ -32,7 +32,6 @@
 //! significant. BlendshapeV2 maps directly into ARKit, the path is
 //! load-tested, and the model is Apache-2.
 
-#![allow(dead_code)]
 
 // FaceBbox and SourceExpression are referenced by both the real
 // (inference) and stub (no-inference) `estimate` impls, so they must

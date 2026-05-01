@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::renderer::frame_input::{RenderAlphaMode, RenderCullMode};
 use crate::renderer::material::MaterialShaderMode;
 use std::sync::Arc;

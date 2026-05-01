@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 
 use crate::asset::{ClothAsset, ColliderShape, Mat4, SceneColliderAsset, Vec3};
@@ -10,7 +9,6 @@ use crate::asset::{ClothAsset, ColliderShape, Mat4, SceneColliderAsset, Vec3};
 /// Uniform-grid spatial hash for fast neighbour queries among cloth particles.
 #[derive(Clone, Debug)]
 pub struct SpatialHashGrid {
-    cell_size: f32,
     inv_cell_size: f32,
     cells: HashMap<(i32, i32, i32), Vec<usize>>,
 }
@@ -19,7 +17,6 @@ impl SpatialHashGrid {
     pub fn new(cell_size: f32) -> Self {
         let cell_size = cell_size.max(1e-6);
         Self {
-            cell_size,
             inv_cell_size: 1.0 / cell_size,
             cells: HashMap::new(),
         }

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::asset::{
     AnimationChannel, AnimationClip, AnimationClipId, AnimationProperty, InterpolationMode,
     Keyframe, Transform, Vec4,

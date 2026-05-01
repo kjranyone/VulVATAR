@@ -38,8 +38,6 @@
 //! as `pub(in crate::tracking)` for the YOLOX + FaceMesh sessions to
 //! share the DirectML-fall-back-to-CPU EP-selection logic.
 
-#![allow(dead_code)]
-
 #[cfg(feature = "inference")]
 mod annotation;
 #[cfg(feature = "inference")]

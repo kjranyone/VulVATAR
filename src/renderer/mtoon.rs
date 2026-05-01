@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Re-export MToon staged parameter types from the asset module.
 // These are pure-data types with no GPU dependencies, so they live in `asset`.
 // The re-exports are kept for backward compatibility even if nothing currently uses them.

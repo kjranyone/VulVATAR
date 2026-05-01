@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod cloth;
 pub mod cloth_solver;
 pub mod spring;

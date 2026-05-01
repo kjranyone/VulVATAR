@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::asset::{ClothSimulationMesh, ColliderAsset, ColliderShape, Mat4, SkeletonAsset, Vec3};
 
 /// A single colored line segment in world space.

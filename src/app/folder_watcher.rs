@@ -1,7 +1,7 @@
 //! Filesystem watcher for the avatar library auto-import path. Wraps
-//! the `notify` crate's `RecommendedWatcher` with a fixed-window
-//! debounce and a VRM-extension filter so the GUI's library inspector
-//! can react to new `.vrm` files without polling.
+//! the `notify` crate's `RecommendedWatcher` with per-poll dedup of
+//! `(kind, paths)` events and a VRM-extension filter so the GUI's
+//! library inspector can react to new `.vrm` files without polling.
 //!
 //! ## Limitations
 //!
@@ -16,8 +16,8 @@
 //! * **OneDrive / Google Drive / Dropbox folders** — cloud-sync
 //!   clients perform a "place-holder swap" (the file appears in
 //!   stages: tombstone → real bytes), and the events arrive in
-//!   bursts that the 100 ms debounce can collapse into a single
-//!   `Modified` rather than `Created`. The library may end up with
+//!   bursts that the dedup pass collapses into a single event when
+//!   they share a `(kind, paths)` tuple. The library may end up with
 //!   the file recorded but a thumbnail still pointing at zero bytes.
 //! * **Symlinks** (NTFS junctions, POSIX symlinks) — whether events
 //!   on the link target propagate through the link is platform- and
@@ -28,7 +28,6 @@
 //! directory and imports any `.vrm` files not yet in the library.
 //! Operators on cloud-synced setups should prefer that as a routine,
 //! not as a recovery step.
-#![allow(dead_code)]
 use log::warn;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
@@ -66,7 +65,6 @@ pub struct FolderWatcher {
     watcher: RecommendedWatcher,
     rx: Receiver<FolderWatchEvent>,
     watched_paths: Vec<PathBuf>,
-    debounce: Duration,
     last_events: Vec<FolderWatchEvent>,
 }
 
@@ -75,7 +73,12 @@ impl FolderWatcher {
         Self::with_debounce(Duration::from_millis(100))
     }
 
-    pub fn with_debounce(debounce: Duration) -> Self {
+    /// `_debounce` is currently a no-op — the watcher emits events as
+    /// they arrive and only dedups by `(kind, paths)` in `poll()`. The
+    /// parameter is preserved on the public API so callers (and the
+    /// existing test) keep compiling; if a real time-window debounce
+    /// is added later it should consume this argument.
+    pub fn with_debounce(_debounce: Duration) -> Self {
         let (tx, rx): (SyncSender<FolderWatchEvent>, Receiver<FolderWatchEvent>) =
             sync_channel(256);
 
@@ -101,7 +104,6 @@ impl FolderWatcher {
             watcher,
             rx,
             watched_paths: Vec::new(),
-            debounce,
             last_events: Vec::new(),
         }
     }

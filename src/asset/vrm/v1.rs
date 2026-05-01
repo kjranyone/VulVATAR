@@ -13,6 +13,13 @@
 //! * `VRMC_springBone.springs[].joints[]` carries per-joint stiffness /
 //!   drag / gravity in camelCase.
 //! * Colliders may be sphere or capsule (0.x is sphere-only).
+//!
+//! A few fields here (e.g. `third_party_licenses`) are deserialised
+//! for schema completeness but never read downstream; the file-level
+//! `#![allow(dead_code)]` below silences the lint rather than
+//! sprinkling per-field markers.
+
+#![allow(dead_code)]
 
 use serde::Deserialize;
 use std::collections::HashMap;

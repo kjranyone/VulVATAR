@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use ash::vk;
 use log::{info, warn};
 use std::sync::Arc;

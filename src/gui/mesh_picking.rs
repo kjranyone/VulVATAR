@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::asset::{AvatarAsset, PrimitiveId};
 
 #[derive(Clone, Debug)]
@@ -69,7 +68,6 @@ impl BvhAabb {
 }
 
 struct TriRecord {
-    primitive_index: usize,
     triangle_index: u32,
     i0: usize,
     i1: usize,
@@ -241,7 +239,7 @@ impl Bvh {
 
 fn build_bvh(avatar: &AvatarAsset) -> Bvh {
     let mut tris = Vec::new();
-    for (pi, mesh) in avatar.meshes.iter().enumerate() {
+    for mesh in &avatar.meshes {
         for prim in &mesh.primitives {
             let vertices = match &prim.vertices {
                 Some(v) => v,
@@ -263,7 +261,6 @@ fn build_bvh(avatar: &AvatarAsset) -> Bvh {
                     continue;
                 }
                 tris.push(TriRecord {
-                    primitive_index: pi,
                     triangle_index: t as u32,
                     i0,
                     i1,

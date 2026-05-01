@@ -126,13 +126,11 @@ struct AvatarResolver<'a> {
     nodes_by_name: HashMap<&'a str, &'a SkeletonNode>,
     nodes_by_humanoid: HashMap<HumanoidBone, &'a SkeletonNode>,
     nodes_by_path: HashMap<String, &'a SkeletonNode>,
-    nodes_by_id: HashMap<NodeId, &'a SkeletonNode>,
     meshes_by_name: HashMap<&'a str, &'a MeshAsset>,
     /// Primitives keyed by `(mesh_name, primitive_index_within_mesh)`.
     /// glTF doesn't name primitives, so this is the most stable
     /// identity we can synthesise.
     primitives_by_position: HashMap<(String, usize), &'a MeshPrimitiveAsset>,
-    primitives_by_id: HashMap<PrimitiveId, &'a MeshPrimitiveAsset>,
 }
 
 impl<'a> AvatarResolver<'a> {
@@ -164,11 +162,9 @@ impl<'a> AvatarResolver<'a> {
             .map(|m| (m.name.as_str(), m))
             .collect();
         let mut primitives_by_position = HashMap::new();
-        let mut primitives_by_id = HashMap::new();
         for mesh in &avatar.meshes {
             for (idx, prim) in mesh.primitives.iter().enumerate() {
                 primitives_by_position.insert((mesh.name.clone(), idx), prim);
-                primitives_by_id.insert(prim.id, prim);
             }
         }
 
@@ -176,10 +172,8 @@ impl<'a> AvatarResolver<'a> {
             nodes_by_name,
             nodes_by_humanoid,
             nodes_by_path,
-            nodes_by_id,
             meshes_by_name,
             primitives_by_position,
-            primitives_by_id,
         }
     }
 

@@ -44,7 +44,6 @@
 //! attribute caused clippy `duplicated_attributes` once both layers were
 //! enabled, so we keep the gate single-sourced.
 
-#![allow(dead_code)]
 
 use log::{info, warn};
 use ndarray::Array4;

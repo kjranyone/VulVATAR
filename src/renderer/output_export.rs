@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::renderer::frame_input::{OutputTargetRequest, RenderColorSpace, RenderExportMode};
 use crate::renderer::frame_pool::FramePool;
 use crate::renderer::gpu_handle::{GpuHandleExporter, SharedHandle};

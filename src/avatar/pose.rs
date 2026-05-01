@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::asset::{identity_matrix, Mat4, Transform};
 
 pub type FrameTimestamp = u64;
