@@ -65,6 +65,12 @@ impl Application {
             face_tracking_enabled,
             lower_body_tracking_enabled,
             root_translation_enabled,
+            // Pose calibration captured via the `Calibrate Pose ▼` modal
+            // (`docs/calibration-ux.md`). The solver uses it to seed the
+            // root-translation EMA reference so the avatar's neutral
+            // position is the user's calibrated stance, not whatever the
+            // first hip-visible frame happened to read.
+            pose_calibration: self.tracking_calibration.pose.clone(),
             ..SolverParams::default()
         };
 

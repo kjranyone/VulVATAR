@@ -160,13 +160,36 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
 // Skeleton building
 // ---------------------------------------------------------------------------
 
+/// Per-call options that the depth-aware providers thread through
+/// from the tracking-worker (and ultimately from
+/// `Application::tracking_calibration`) into the skeleton builder.
+///
+/// Wired here as a struct rather than positional args so future
+/// calibration-derived knobs (dynamic c-clamp range, anchor-bias
+/// rejection thresholds) can be added without touching every call
+/// site again.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuildOptions {
+    /// `true` when the user calibrated in `Upper Body Only` mode and
+    /// hip detection should be skipped — even when the hip pair clears
+    /// the visibility floor, treat it as untrustworthy (almost
+    /// certainly a desk surface or chair seat masquerading as a hip
+    /// keypoint). `false` preserves the existing
+    /// hip-preferred / shoulder-fallback behaviour.
+    pub force_shoulder_anchor: bool,
+}
+
 /// Resolve the body anchor origin in metric camera-space coords.
 /// Hip mid is preferred (CIGPose 11/12); falls back to shoulder mid
 /// (5/6) for upper-body crops. Returns `None` when neither pair is
 /// usable — the frame produces no skeleton.
+///
+/// `opts.force_shoulder_anchor = true` skips the hip branch entirely;
+/// see [`BuildOptions`] for the defensive rationale.
 pub(super) fn resolve_origin_metric(
     joints: &[DecodedJoint2d],
     depth: &MoGeFrame,
+    opts: BuildOptions,
 ) -> Option<([f32; 3], /*anchor_was_hip*/ bool, /*anchor_score*/ f32)> {
     if joints.len() < NUM_JOINTS {
         return None;
@@ -181,12 +204,14 @@ pub(super) fn resolve_origin_metric(
         ])
     };
 
-    let lh = &joints[11];
-    let rh = &joints[12];
-    let hip_score = lh.score.min(rh.score);
-    if hip_score >= KEYPOINT_VISIBILITY_FLOOR {
-        if let Some(o) = try_pair(lh, rh) {
-            return Some((o, true, hip_score));
+    if !opts.force_shoulder_anchor {
+        let lh = &joints[11];
+        let rh = &joints[12];
+        let hip_score = lh.score.min(rh.score);
+        if hip_score >= KEYPOINT_VISIBILITY_FLOOR {
+            if let Some(o) = try_pair(lh, rh) {
+                return Some((o, true, hip_score));
+            }
         }
     }
 

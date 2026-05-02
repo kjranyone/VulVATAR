@@ -108,6 +108,13 @@ pub struct SolverParams {
     /// rtmw3d-only emits normalised image units, so the comfortable
     /// value differs per provider). Defaults pick a moderate follow.
     pub root_translation_sensitivity: [f32; 3],
+    /// Optional pose-calibration capture from the `Calibrate Pose ▼`
+    /// modal. When present, the solver uses the captured anchor as
+    /// the explicit EMA reference seed for root translation —
+    /// replacing the auto-EMA's "first hip-visible frame" heuristic
+    /// with a user-acknowledged neutral position. Falls through to
+    /// the auto-EMA when `None`. See `docs/calibration-ux.md`.
+    pub pose_calibration: Option<crate::tracking::PoseCalibration>,
 }
 
 impl Default for SolverParams {
@@ -132,6 +139,7 @@ impl Default for SolverParams {
             // dampened so a 0.5 m forward step doesn't shove the avatar
             // through the camera plane.
             root_translation_sensitivity: [0.6, 0.6, 0.3],
+            pose_calibration: None,
         }
     }
 }
@@ -498,10 +506,41 @@ pub fn solve_avatar_pose(
     // motion still reads while accidental drift gets absorbed.
     if params.root_translation_enabled {
         if let Some(raw_offset) = source.root_offset {
+            // Calibration-aware EMA seed. When the user has captured
+            // an explicit pose calibration (see docs/calibration-ux.md)
+            // *and* the runtime anchor type matches the calibration's
+            // mode (hip ↔ FullBody, shoulder ↔ UpperBody), use the
+            // calibrated anchor as the reference instead of letting
+            // the auto-EMA latch onto whatever the first frame
+            // happened to read. Mismatched anchor types fall through
+            // to the auto-EMA path — calibrating in T-pose then
+            // sitting at a desk yields hip→shoulder anchor switching,
+            // and the calibrated hip values would no longer apply.
+            if state.root_reference.is_none() {
+                if let Some(cal) = params.pose_calibration.as_ref() {
+                    let anchor_type_matches = match cal.mode {
+                        crate::tracking::CalibrationMode::FullBody => {
+                            source.root_anchor_is_hip
+                        }
+                        crate::tracking::CalibrationMode::UpperBody => {
+                            !source.root_anchor_is_hip
+                        }
+                    };
+                    if anchor_type_matches {
+                        state.root_reference = Some([
+                            cal.anchor_x,
+                            cal.anchor_y,
+                            cal.anchor_depth_m.unwrap_or(0.0),
+                        ]);
+                    }
+                }
+            }
+
             // EMA blend factor: the reference should drift slowly
             // (~10 s effective horizon at 30 fps). Faster on the very
-            // first hip-visible frame so the calibration locks in
-            // quickly without introducing a big initial jump.
+            // first hip-visible frame (no calibration-derived seed
+            // either) so the auto-EMA locks in quickly without
+            // introducing a big initial jump.
             let alpha = if state.root_reference.is_none() {
                 1.0
             } else {

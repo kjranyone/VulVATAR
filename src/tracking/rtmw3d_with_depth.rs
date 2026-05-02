@@ -441,7 +441,14 @@ impl Rtmw3dWithDepthProvider {
 
         // Phase 5: skeleton from depth.
         let t_skel = std::time::Instant::now();
-        let mut skeleton = match resolve_origin_metric(&joints_2d, &metric_frame) {
+        // BuildOptions::default() = "no calibration in effect at the
+        // depth-pipeline layer" — the calibration is currently applied
+        // only solver-side (root-translation EMA seed). Wired through
+        // here as the seam where Upper Body calibration would force
+        // the shoulder anchor when threading the calibration into the
+        // worker becomes worthwhile.
+        let opts = super::skeleton_from_depth::BuildOptions::default();
+        let mut skeleton = match resolve_origin_metric(&joints_2d, &metric_frame, opts) {
             Some((origin, was_hip, score)) => build_skeleton(
                 frame_index,
                 &joints_2d,

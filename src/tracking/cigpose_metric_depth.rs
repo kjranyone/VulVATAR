@@ -268,7 +268,11 @@ impl CigposeMetricDepthProvider {
         let dt_moge = t_moge.elapsed();
 
         let t_skel = std::time::Instant::now();
-        let (mut skeleton, origin_opt) = match resolve_origin_metric(&joints_2d, &depth_frame) {
+        // See `rtmw3d_with_depth` for the same comment: calibration is
+        // currently applied solver-side only; depth-pipeline anchor
+        // forcing remains a future enhancement.
+        let opts = super::skeleton_from_depth::BuildOptions::default();
+        let (mut skeleton, origin_opt) = match resolve_origin_metric(&joints_2d, &depth_frame, opts) {
             Some((origin, anchor_was_hip, anchor_score)) => {
                 let sk = build_skeleton(
                     frame_index,
