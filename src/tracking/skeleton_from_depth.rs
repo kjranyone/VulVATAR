@@ -370,6 +370,8 @@ pub(super) fn build_skeleton(
         &to_source,
     );
 
+    apply_anatomical_z_clamps(&mut sk);
+
     let mut sum = 0.0_f32;
     let mut n = 0_u32;
     for j in joints.iter().take(17) {
@@ -532,6 +534,161 @@ fn attach_hand<F>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Anatomical Z-plausibility clamps
+// ---------------------------------------------------------------------------
+
+/// Per-bone maximum |Δz| between a child joint and its parent joint
+/// in source-space. These are the z-axis projections of the bone's
+/// full length — reached only when the bone points exactly at or
+/// directly away from the camera. Loose adult-body upper bounds keep
+/// genuine fully-extended reaches untouched.
+///
+/// Why this exists: in side-profile / rear-facing poses, RTMW3D still
+/// emits a high-confidence keypoint for the occluded elbow / wrist
+/// (the model is trained to predict joint position even under
+/// occlusion). DAv2's per-pixel depth at that 2D position can land
+/// on a near-zero `d_raw` (background, clothing shadow, hair). The
+/// metric back-projection `z = c / d_raw` then explodes to tens of
+/// metres, and the avatar solver interprets the implausible elbow as
+/// an arm pointing 20 m through the chest. Bulk diagnostic over
+/// rotation sequences measured 5–10 such anomalies per 16-frame run
+/// — exactly the frames where the user turns sideways briefly.
+///
+/// The clamp preserves the *sign* of the depth-derived Z (so the arm
+/// still moves the right direction) and only caps the *magnitude* to
+/// the anatomical bound. Less information loss than snap-to-parent.
+const MAX_TORSO_DZ_M: f32 = 0.50; // hip mid → shoulder
+const MAX_UPPER_ARM_DZ_M: f32 = 0.45; // shoulder → elbow
+const MAX_LOWER_ARM_DZ_M: f32 = 0.40; // elbow → hand-wrist
+const MAX_UPPER_LEG_DZ_M: f32 = 0.55; // hip → knee
+const MAX_LOWER_LEG_DZ_M: f32 = 0.50; // knee → ankle
+const MAX_FOOT_DZ_M: f32 = 0.25; // ankle → toe tip
+
+/// Clamp `child.position[2]` so it lies within `parent.z ± max_dz`.
+/// No-op when either joint is missing or the constraint is already
+/// satisfied. Sign of `(child.z − parent.z)` is preserved.
+fn clamp_z_to_parent(
+    sk: &mut SourceSkeleton,
+    parent: HumanoidBone,
+    child: HumanoidBone,
+    max_dz: f32,
+) {
+    let parent_z = match sk.joints.get(&parent) {
+        Some(p) => p.position[2],
+        None => return,
+    };
+    if let Some(c) = sk.joints.get_mut(&child) {
+        let dz = c.position[2] - parent_z;
+        if dz.abs() > max_dz {
+            c.position[2] = parent_z + dz.signum() * max_dz;
+        }
+    }
+}
+
+/// Same as [`clamp_z_to_parent`] but for fingertip / toe-tip entries
+/// stored in `sk.fingertips` (keyed by the bone they extend from).
+fn clamp_fingertip_z_to_parent(
+    sk: &mut SourceSkeleton,
+    parent: HumanoidBone,
+    fingertip_key: HumanoidBone,
+    max_dz: f32,
+) {
+    let parent_z = match sk.joints.get(&parent) {
+        Some(p) => p.position[2],
+        None => return,
+    };
+    if let Some(c) = sk.fingertips.get_mut(&fingertip_key) {
+        let dz = c.position[2] - parent_z;
+        if dz.abs() > max_dz {
+            c.position[2] = parent_z + dz.signum() * max_dz;
+        }
+    }
+}
+
+/// Walk the skeleton from origin outward, capping each bone's Z
+/// projection against its parent's. Hips at z=0 by construction (when
+/// hip-anchored); shoulders at z=0 in upper-body framing. Either way
+/// the chain originates at zero, so each subsequent clamp narrows the
+/// reachable Z range to anatomical bounds.
+fn apply_anatomical_z_clamps(sk: &mut SourceSkeleton) {
+    // Torso: shoulders against hips. RightShoulder + RightUpperArm
+    // alias to the same depth sample (idx 5), and likewise for left
+    // (idx 6) — clamp both for consistency.
+    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::LeftShoulder, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::RightShoulder, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::LeftUpperArm, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::RightUpperArm, MAX_TORSO_DZ_M);
+
+    // Arms: elbow vs shoulder, hand vs elbow.
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::LeftLowerArm,
+        MAX_UPPER_ARM_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::RightShoulder,
+        HumanoidBone::RightLowerArm,
+        MAX_UPPER_ARM_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftHand,
+        MAX_LOWER_ARM_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightHand,
+        MAX_LOWER_ARM_DZ_M,
+    );
+
+    // Legs: knee vs hip, ankle vs knee.
+    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::LeftUpperLeg, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::RightUpperLeg, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::LeftLowerLeg,
+        MAX_UPPER_LEG_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::RightUpperLeg,
+        HumanoidBone::RightLowerLeg,
+        MAX_UPPER_LEG_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::LeftFoot,
+        MAX_LOWER_LEG_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::RightFoot,
+        MAX_LOWER_LEG_DZ_M,
+    );
+
+    // Toe tips (in `sk.fingertips`, keyed by the foot bone).
+    clamp_fingertip_z_to_parent(
+        sk,
+        HumanoidBone::LeftFoot,
+        HumanoidBone::LeftFoot,
+        MAX_FOOT_DZ_M,
+    );
+    clamp_fingertip_z_to_parent(
+        sk,
+        HumanoidBone::RightFoot,
+        HumanoidBone::RightFoot,
+        MAX_FOOT_DZ_M,
+    );
+}
+
 #[inline]
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -692,5 +849,76 @@ mod tests {
         let frame = dummy_frame(644, 476, [0.0, 0.0, 1.0]);
         assert!(sample_metric_point(&frame, -0.1, 0.5).is_none());
         assert!(sample_metric_point(&frame, 1.1, 0.5).is_none());
+    }
+
+    fn jt(z: f32) -> SourceJoint {
+        SourceJoint {
+            position: [0.0, 0.0, z],
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn z_clamp_caps_runaway_elbow_to_anatomical_bound() {
+        // Simulates an occluded elbow whose DAv2 sample landed on a
+        // near-zero d_raw and back-projected to z = -22 m. Shoulder
+        // at 0.30 m forward of hips. Expected: clamped to
+        // shoulder ± MAX_UPPER_ARM_DZ_M, sign preserved (-22 → forward),
+        // so elbow.z = shoulder.z + (-MAX_UPPER_ARM_DZ_M) = -0.15.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::Hips, jt(0.0));
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.30));
+        sk.joints.insert(HumanoidBone::LeftLowerArm, jt(-22.0));
+        apply_anatomical_z_clamps(&mut sk);
+        let elbow_z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        let expected = 0.30 + (-1.0) * MAX_UPPER_ARM_DZ_M;
+        assert!(
+            (elbow_z - expected).abs() < 1e-5,
+            "elbow.z {} != expected {}",
+            elbow_z,
+            expected
+        );
+    }
+
+    #[test]
+    fn z_clamp_no_op_when_within_bounds() {
+        // Realistic arms-forward pose: elbow 22 cm forward of shoulder.
+        // Well within MAX_UPPER_ARM_DZ_M = 0.45 m, so untouched.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::Hips, jt(0.0));
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.10));
+        sk.joints.insert(HumanoidBone::LeftLowerArm, jt(0.32));
+        apply_anatomical_z_clamps(&mut sk);
+        assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 0.32).abs() < 1e-5);
+    }
+
+    #[test]
+    fn z_clamp_skips_missing_parent() {
+        // Upper-body framing: hips absent. Shoulder/elbow clamps that
+        // depend on hips become no-ops; shoulder→elbow clamp still runs.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(2.0)); // would be capped if hips present
+        sk.joints.insert(HumanoidBone::LeftLowerArm, jt(2.10));
+        apply_anatomical_z_clamps(&mut sk);
+        // Shoulder unchanged (no parent in sk.joints).
+        assert!((sk.joints[&HumanoidBone::LeftShoulder].position[2] - 2.0).abs() < 1e-5);
+        // Elbow within bound of shoulder (Δ=0.10 < 0.45) → unchanged.
+        assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 2.10).abs() < 1e-5);
+    }
+
+    #[test]
+    fn z_clamp_propagates_through_chain() {
+        // Hip 0, Shoulder clamped 0→0.50, Elbow then clamped against
+        // (clamped) shoulder to 0.95, Hand against (clamped) elbow to 1.35.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::Hips, jt(0.0));
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(5.0));
+        sk.joints.insert(HumanoidBone::LeftUpperArm, jt(5.0));
+        sk.joints.insert(HumanoidBone::LeftLowerArm, jt(5.0));
+        sk.joints.insert(HumanoidBone::LeftHand, jt(5.0));
+        apply_anatomical_z_clamps(&mut sk);
+        assert!((sk.joints[&HumanoidBone::LeftShoulder].position[2] - 0.50).abs() < 1e-5);
+        assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 0.95).abs() < 1e-5);
+        assert!((sk.joints[&HumanoidBone::LeftHand].position[2] - 1.35).abs() < 1e-5);
     }
 }

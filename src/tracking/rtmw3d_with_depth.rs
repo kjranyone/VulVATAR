@@ -224,8 +224,17 @@ pub struct Rtmw3dWithDepthProvider {
 }
 
 impl Rtmw3dWithDepthProvider {
+    /// Snapshot the EMA-smoothed scale `c` for diagnostics. Returns
+    /// `None` until the first successful calibration. Called by
+    /// temporal-sequence diagnostics that want to plot scale stability
+    /// across a sorted run of frames.
     #[cfg(feature = "inference")]
-    pub(super) fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
+    pub fn scale_c_ema(&self) -> Option<f32> {
+        self.scale_c_ema
+    }
+
+    #[cfg(feature = "inference")]
+    pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = models_dir.as_ref();
         let dav2_model_path = dir.join("dav2_small.onnx");
 
@@ -273,7 +282,7 @@ impl Rtmw3dWithDepthProvider {
     }
 
     #[cfg(not(feature = "inference"))]
-    pub(super) fn from_models_dir(_: impl AsRef<Path>) -> Result<Self, String> {
+    pub fn from_models_dir(_: impl AsRef<Path>) -> Result<Self, String> {
         Err("RTMW3D+DAv2 provider requires the `inference` cargo feature".to_string())
     }
 }
