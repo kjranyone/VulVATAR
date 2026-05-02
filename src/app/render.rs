@@ -30,6 +30,7 @@ impl Application {
         let hand_tracking_enabled = config.hand_tracking_enabled;
         let face_tracking_enabled = config.face_tracking_enabled;
         let lower_body_tracking_enabled = config.lower_body_tracking_enabled;
+        let root_translation_enabled = config.root_translation_enabled;
         let frame_dt = config.frame_dt;
         let material_mode_index = config.material_mode_index;
 
@@ -63,6 +64,8 @@ impl Application {
             hand_tracking_enabled,
             face_tracking_enabled,
             lower_body_tracking_enabled,
+            root_translation_enabled,
+            ..SolverParams::default()
         };
 
         for avatar in self.avatars.iter_mut() {

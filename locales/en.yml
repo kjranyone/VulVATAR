@@ -88,6 +88,8 @@ tracking:
   face_tracking: "Face Tracking"
   lower_body: "Lower-body Tracking"
   lower_body_tooltip: "When on, the model picker prefers a wholebody CIGPose ONNX so leg keypoints are emitted. Trade-off: wholebody variants are usually smaller-resolution and detect hands less crisply than the same-tier ubody model. Restart tracking to apply."
+  root_translation: "Follow Subject Position"
+  root_translation_tooltip: "When on, the avatar's hip translates to follow the subject's side-step / lean / crouch. When off, the avatar pivots in place — useful when the rendered framing should stay locked regardless of how the subject drifts in front of the camera."
   recalibrate: "Recalibrate"
   recalibrate_tooltip: "Discard the per-bone foreshortening calibration so the solver re-learns the subject's bone lengths. After clicking, hold a T-pose (arms horizontal, palms forward) for a moment so the running max can be re-seeded."
   confidence: "Confidence"

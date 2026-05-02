@@ -240,6 +240,16 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             if lower_body_resp.changed() {
                 state.project_dirty = true;
             }
+            if ui
+                .checkbox(
+                    &mut state.tracking.root_translation_enabled,
+                    t!("tracking.root_translation"),
+                )
+                .on_hover_text(t!("tracking.root_translation_tooltip"))
+                .changed()
+            {
+                state.project_dirty = true;
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 if ui

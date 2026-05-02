@@ -261,6 +261,16 @@ pub(super) fn build_skeleton(
         };
         sk.joints.insert(HumanoidBone::Hips, hip_joint);
         sk.joints.insert(HumanoidBone::Spine, hip_joint);
+
+        // Root offset: hip mid in source-space units. For depth-aware
+        // paths this is the calibrated metric position (METERS) of the
+        // pelvic anchor in camera space, axes flipped to match the
+        // source-skeleton convention (selfie-mirror x, y-up, z toward
+        // camera). The solver subtracts a slow EMA reference so the
+        // translation feature is per-setup self-calibrating — what the
+        // avatar follows is *deviation* from where the subject normally
+        // stands, not absolute camera coords.
+        sk.root_offset = Some([-origin[0], -origin[1], -origin[2]]);
     }
 
     const LOWER_BODY_FIRST_IDX: usize = 11;

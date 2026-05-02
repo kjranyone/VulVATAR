@@ -94,6 +94,20 @@ pub struct SolverParams {
     /// the avatar's legs static rather than have hallucinated COCO
     /// 11-22 keypoints flail them around.
     pub lower_body_tracking_enabled: bool,
+    /// Translate the avatar's `Hips` bone in addition to rotating it,
+    /// so the avatar follows the subject's side-step / lean / crouch.
+    /// When false the avatar pivots in place — useful when the rendered
+    /// output should stay framed regardless of how the subject drifts
+    /// in front of the camera.
+    pub root_translation_enabled: bool,
+    /// Per-axis sensitivity for the root translation. Multiplied
+    /// against the source-skeleton `root_offset` deviation (relative
+    /// to a slow EMA reference) before being added to the Hips rest
+    /// local position. `1.0` follows the subject 1:1 in source-space
+    /// units (note that depth-aware providers emit METERS while
+    /// rtmw3d-only emits normalised image units, so the comfortable
+    /// value differs per provider). Defaults pick a moderate follow.
+    pub root_translation_sensitivity: [f32; 3],
 }
 
 impl Default for SolverParams {
@@ -111,6 +125,13 @@ impl Default for SolverParams {
             hand_tracking_enabled: true,
             face_tracking_enabled: true,
             lower_body_tracking_enabled: true,
+            root_translation_enabled: true,
+            // 0.6 horizontal/vertical, 0.3 depth: in-plane motion reads
+            // most naturally at near-1:1 follow, while depth (already in
+            // metric metres for depth-aware providers) needs to be
+            // dampened so a 0.5 m forward step doesn't shove the avatar
+            // through the camera plane.
+            root_translation_sensitivity: [0.6, 0.6, 0.3],
         }
     }
 }
@@ -135,6 +156,12 @@ pub struct PoseSolverState {
     /// Wall-clock timestamp of the previous solve, used to derive `dt`
     /// for the dt-aware blend / 1€ filter. `None` until the first call.
     last_solve_instant: Option<Instant>,
+    /// Slow EMA of the source-skeleton `root_offset`, used as the
+    /// "where the subject normally stands" reference. The avatar's
+    /// Hips is translated by `(root_offset − reference) * sensitivity`
+    /// so the feature self-calibrates to the user's typical pose.
+    /// `None` until the first hip-visible frame.
+    root_reference: Option<[f32; 3]>,
 }
 
 impl PoseSolverState {
@@ -161,6 +188,7 @@ impl PoseSolverState {
         self.fingertip_filters.clear();
         self.joint_active.clear();
         self.last_solve_instant = None;
+        self.root_reference = None;
     }
 }
 
@@ -455,6 +483,81 @@ pub fn solve_avatar_pose(
                     let updated_world =
                         quat_mul(&parent_world_rot, &local_transforms[hips_idx].rotation);
                     current_world[hips_idx].rotation = updated_world;
+                }
+            }
+        }
+    }
+
+    // Body root translation: shift the avatar's `Hips` so the avatar
+    // follows the subject's side-step / lean-in / crouch instead of
+    // pivoting in place. We compare the current `root_offset` against
+    // a slow EMA reference (the user's "neutral standing position"),
+    // multiply the deviation by the per-axis sensitivity, and add it
+    // to the rest local position. The EMA self-calibrates over the
+    // first few seconds, then drifts slowly enough that intentional
+    // motion still reads while accidental drift gets absorbed.
+    if params.root_translation_enabled {
+        if let Some(raw_offset) = source.root_offset {
+            // EMA blend factor: the reference should drift slowly
+            // (~10 s effective horizon at 30 fps). Faster on the very
+            // first hip-visible frame so the calibration locks in
+            // quickly without introducing a big initial jump.
+            let alpha = if state.root_reference.is_none() {
+                1.0
+            } else {
+                (dt / 10.0).clamp(0.0, 0.2)
+            };
+            let prev_ref = state.root_reference.unwrap_or(raw_offset);
+            let new_ref = [
+                prev_ref[0] + alpha * (raw_offset[0] - prev_ref[0]),
+                prev_ref[1] + alpha * (raw_offset[1] - prev_ref[1]),
+                prev_ref[2] + alpha * (raw_offset[2] - prev_ref[2]),
+            ];
+            state.root_reference = Some(new_ref);
+
+            let dev = [
+                raw_offset[0] - new_ref[0],
+                raw_offset[1] - new_ref[1],
+                raw_offset[2] - new_ref[2],
+            ];
+            let sens = params.root_translation_sensitivity;
+            let translation_delta = [
+                dev[0] * sens[0],
+                dev[1] * sens[1],
+                dev[2] * sens[2],
+            ];
+
+            if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {
+                let hips_idx = hips_node.0 as usize;
+                if hips_idx < skeleton.nodes.len() {
+                    let rest_pos = skeleton.nodes[hips_idx].rest_local.translation;
+                    let target = [
+                        rest_pos[0] + translation_delta[0],
+                        rest_pos[1] + translation_delta[1],
+                        rest_pos[2] + translation_delta[2],
+                    ];
+                    // Same dt-aware blend the rotation pass uses, so
+                    // translation responsiveness scales with the user's
+                    // `rotation_blend` setting (one fewer slider).
+                    let blend = dt_aware_blend(params.rotation_blend, dt);
+                    let prev = local_transforms[hips_idx].translation;
+                    local_transforms[hips_idx].translation = [
+                        prev[0] + blend * (target[0] - prev[0]),
+                        prev[1] + blend * (target[1] - prev[1]),
+                        prev[2] + blend * (target[2] - prev[2]),
+                    ];
+                    // Refresh the world transform so any downstream
+                    // bone that reads `current_world[hips_idx].position`
+                    // sees the translated origin.
+                    let parent_world_pos = skeleton.nodes[hips_idx]
+                        .parent
+                        .map(|NodeId(p)| current_world[p as usize].position)
+                        .unwrap_or([0.0, 0.0, 0.0]);
+                    current_world[hips_idx].position = [
+                        parent_world_pos[0] + local_transforms[hips_idx].translation[0],
+                        parent_world_pos[1] + local_transforms[hips_idx].translation[1],
+                        parent_world_pos[2] + local_transforms[hips_idx].translation[2],
+                    ];
                 }
             }
         }

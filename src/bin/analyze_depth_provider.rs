@@ -78,8 +78,13 @@ fn main() -> Result<(), String> {
 
         let row = build_row(image_path, w, h, &est.skeleton);
         let line = serde_json_line(&row);
+        let root_str = est
+            .skeleton
+            .root_offset
+            .map(|r| format!("({:.2},{:.2},{:.2})", r[0], r[1], r[2]))
+            .unwrap_or_else(|| "none".to_string());
         eprintln!(
-            "[{i:>3}] {} → face={} hand_l={} hand_r={} shoulders={}",
+            "[{i:>3}] {} → face={} hand_l={} hand_r={} shoulders={} root={}",
             image_path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -87,7 +92,8 @@ fn main() -> Result<(), String> {
             row.face_summary(),
             yes_no(est.skeleton.left_hand_orientation.is_some()),
             yes_no(est.skeleton.right_hand_orientation.is_some()),
-            row.shoulder_summary()
+            row.shoulder_summary(),
+            root_str,
         );
         out_lines.push(line);
     }

@@ -129,6 +129,19 @@ pub struct SourceSkeleton {
     /// Overall scalar detection confidence (used for stale/quality gating
     /// upstream). `0.0` means "no person detected".
     pub overall_confidence: f32,
+    /// Hip pelvic anchor offset from a neutral camera-frame reference
+    /// (image centre for 2D-only providers; the calibration-anchor
+    /// metric position for depth-aware providers). Used by
+    /// [`crate::avatar::pose_solver`] to translate the avatar's `Hips`
+    /// bone so the avatar follows the subject's side-step / lean-in /
+    /// crouch motion instead of just spinning in place.
+    ///
+    /// `None` when the hip pair was not detected — solver leaves the
+    /// avatar at its rest position. When `Some`, components are in the
+    /// same source-space units as the joint positions:
+    /// `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`, `z` in metric units
+    /// (depth-aware) or `0` (rtmw3d-only).
+    pub root_offset: Option<[f32; 3]>,
 }
 
 impl SourceSkeleton {
@@ -143,6 +156,7 @@ impl SourceSkeleton {
             right_hand_orientation: None,
             face_mesh_confidence: None,
             overall_confidence: 0.0,
+            root_offset: None,
         }
     }
 

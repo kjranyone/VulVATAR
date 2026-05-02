@@ -29,6 +29,7 @@ pub struct FrameConfig {
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
+    pub root_translation_enabled: bool,
     pub frame_dt: f32,
 }
 

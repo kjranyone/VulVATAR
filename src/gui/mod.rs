@@ -294,6 +294,10 @@ pub struct TrackingGuiState {
     /// emitted and the leg humanoid bones get driven. Toggle takes
     /// effect on the next start-tracking; mid-session it's a no-op.
     pub lower_body_tracking_enabled: bool,
+    /// When true, the avatar's `Hips` follows the subject's side-step /
+    /// lean / crouch (translation, on top of body-yaw rotation). When
+    /// false the avatar pivots in place, keeping the framing stable.
+    pub root_translation_enabled: bool,
     pub smoothing_strength: f32,
     pub confidence_threshold: f32,
 }
@@ -590,6 +594,7 @@ impl GuiApp {
                 hand_tracking_enabled: false,
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
+                root_translation_enabled: true,
                 smoothing_strength: 0.5,
                 confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             },
@@ -828,6 +833,7 @@ impl GuiApp {
                 hand_tracking_enabled: false,
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
+                root_translation_enabled: true,
                 smoothing_strength: 0.5,
                 confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             },
@@ -1040,6 +1046,7 @@ impl GuiApp {
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
+            root_translation_enabled: self.tracking.root_translation_enabled,
             camera_index: self.camera_index,
             show_camera_wipe: self.show_camera_wipe,
             show_detection_annotations: self.show_detection_annotations,
@@ -1228,6 +1235,7 @@ impl GuiApp {
         self.tracking.hand_tracking_enabled = state.hand_tracking_enabled;
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
+        self.tracking.root_translation_enabled = state.root_translation_enabled;
         self.camera_index = state.camera_index;
         self.show_camera_wipe = state.show_camera_wipe;
         self.show_detection_annotations = state.show_detection_annotations;
@@ -1881,6 +1889,7 @@ impl eframe::App for GuiApp {
                 hand_tracking_enabled: self.tracking.hand_tracking_enabled,
                 face_tracking_enabled: self.tracking.face_tracking_enabled,
                 lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
+                root_translation_enabled: self.tracking.root_translation_enabled,
                 frame_dt,
             };
             self.app.run_frame(&frame_config);
