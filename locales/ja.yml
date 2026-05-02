@@ -63,6 +63,28 @@ top_bar:
   save_as_failed: "名前を付けて保存に失敗: %{error}"
   switched_profile: "プロファイルを切り替えました: %{name}"
 
+calibration:
+  button: "ポーズキャリブ ▼"
+  title: "ポーズキャリブレーション"
+  mode_full_body: "全身"
+  mode_upper_body: "上半身のみ"
+  pose_full_body: "Tポーズ (両腕を水平、手のひら正面、足は肩幅) で立ってください。"
+  pose_upper_body: "両手を体側に下ろし、肩の力を抜いてカメラ正面を向いてください。"
+  step_hold_still: "Step 1: ポーズを取ってください"
+  step_collecting: "Step 2: その姿勢のまま — 計測中"
+  step_done: "完了！"
+  step_done_body: "キャリブレーション完了。間もなく閉じます…"
+  time_left: "残り %{time} 秒"
+  done: "計測完了"
+  confidence: "信頼度:"
+  anchor_visible: "ポーズ検出:"
+  samples: "蓄積サンプル数:"
+  cancel: "キャンセル"
+  capture_now: "今すぐ計測完了"
+  no_frame: "カメラフレーム待機中…"
+  status_calibrated: "キャリブ済み — %{mode}"
+  status_uncalibrated: "未キャリブレーション — 自動EMA動作中"
+
 tracking:
   enabled: "トラッキング有効"
   input_device: "入力デバイス"

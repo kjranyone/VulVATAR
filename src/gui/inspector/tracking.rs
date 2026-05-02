@@ -259,7 +259,50 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 {
                     state.app.recalibrate_pose_solver();
                 }
+                // Pose calibration menu (Phase B). Opens a fullscreen
+                // modal in either Full Body or Upper Body mode; the
+                // depth pipeline / solver consume the captured anchor
+                // values from `Application::tracking_calibration.pose`
+                // once Phase D lands.
+                ui.menu_button(t!("calibration.button"), |ui| {
+                    if ui.button(t!("calibration.mode_full_body")).clicked() {
+                        state
+                            .calibration_modal
+                            .open(crate::tracking::CalibrationMode::FullBody);
+                        ui.close_menu();
+                    }
+                    if ui.button(t!("calibration.mode_upper_body")).clicked() {
+                        state
+                            .calibration_modal
+                            .open(crate::tracking::CalibrationMode::UpperBody);
+                        ui.close_menu();
+                    }
+                });
             });
+            // Calibration status line. Phase E will format this with
+            // captured-at age, mode label, depth, and confidence; for
+            // now it just announces "calibrated / not calibrated".
+            if let Some(ref pose) = state.app.tracking_calibration.pose {
+                ui.label(
+                    egui::RichText::new(t!(
+                        "calibration.status_calibrated",
+                        mode = match pose.mode {
+                            crate::tracking::CalibrationMode::FullBody =>
+                                t!("calibration.mode_full_body"),
+                            crate::tracking::CalibrationMode::UpperBody =>
+                                t!("calibration.mode_upper_body"),
+                        }
+                    ))
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(120, 220, 140)),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(t!("calibration.status_uncalibrated"))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(170, 170, 170)),
+                );
+            }
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.separator();
                 ui.label(t!("tracking.confidence"));

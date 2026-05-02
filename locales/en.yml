@@ -63,6 +63,28 @@ top_bar:
   save_as_failed: "Save as failed: %{error}"
   switched_profile: "Switched to profile: %{name}"
 
+calibration:
+  button: "Calibrate Pose ▼"
+  title: "Pose Calibration"
+  mode_full_body: "Full Body"
+  mode_upper_body: "Upper Body Only"
+  pose_full_body: "Stand in T-pose (arms horizontal, palms forward, feet shoulder-width)."
+  pose_upper_body: "Hands at sides, shoulders relaxed, facing the camera."
+  step_hold_still: "Step 1: get into the pose"
+  step_collecting: "Step 2: hold steady — capturing"
+  step_done: "Done!"
+  step_done_body: "Calibration captured. Closing in a moment…"
+  time_left: "%{time} s left"
+  done: "Captured"
+  confidence: "Confidence:"
+  anchor_visible: "Pose detected:"
+  samples: "Samples captured:"
+  cancel: "Cancel"
+  capture_now: "Capture Now"
+  no_frame: "Waiting for camera frame…"
+  status_calibrated: "Calibrated — %{mode}"
+  status_uncalibrated: "Pose not calibrated — auto-EMA active"
+
 tracking:
   enabled: "Tracking Enabled"
   input_device: "Input Device"

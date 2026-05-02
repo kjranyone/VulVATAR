@@ -1,4 +1,5 @@
 pub mod avatar_load;
+pub mod calibration_modal;
 pub mod components;
 pub mod hotkey;
 pub mod inspector;
@@ -487,6 +488,14 @@ pub struct GuiApp {
     pub camera_wipe_seq: u64,
     pub camera_wipe_rgba_buf: Vec<u8>,
 
+    // Pose-calibration modal (Phase B). Independent texture + buffer so
+    // toggling the camera-wipe PIP while calibrating doesn't tear
+    // either preview.
+    pub calibration_modal: calibration_modal::CalibrationModalState,
+    pub calibration_preview_texture: Option<egui::TextureHandle>,
+    pub calibration_preview_seq: u64,
+    pub calibration_preview_rgba_buf: Vec<u8>,
+
     // Lip sync
     pub lipsync: LipSyncGuiState,
 
@@ -690,6 +699,11 @@ impl GuiApp {
             camera_wipe_texture: None,
             camera_wipe_seq: 0,
             camera_wipe_rgba_buf: Vec::new(),
+
+            calibration_modal: calibration_modal::CalibrationModalState::default(),
+            calibration_preview_texture: None,
+            calibration_preview_seq: 0,
+            calibration_preview_rgba_buf: Vec::new(),
 
             lipsync: LipSyncGuiState {
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
@@ -928,6 +942,11 @@ impl GuiApp {
             camera_wipe_texture: None,
             camera_wipe_seq: 0,
             camera_wipe_rgba_buf: Vec::new(),
+
+            calibration_modal: calibration_modal::CalibrationModalState::default(),
+            calibration_preview_texture: None,
+            calibration_preview_seq: 0,
+            calibration_preview_rgba_buf: Vec::new(),
 
             lipsync: LipSyncGuiState {
                 available_mics: Vec::new(),
@@ -2044,6 +2063,11 @@ impl eframe::App for GuiApp {
         status_bar::draw(ctx, self);
         inspector::draw(ctx, self);
         viewport::draw(ctx, self);
+
+        // Pose-calibration modal. Rendered after viewport so the dim
+        // overlay covers the entire viewport interior, not just the
+        // inspector panel. No-op when the modal is closed.
+        calibration_modal::draw_modal(ctx, self);
 
         // Loading-spinner overlay while a background avatar load is in flight.
         if let Some(job) = self.avatar_load_job.as_ref() {

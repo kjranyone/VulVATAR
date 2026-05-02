@@ -65,6 +65,12 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Uses the same `cam_fov70_dist280_h130_fullbody75` filename-title camera annotation as the fixed-camera webcam set.
   - All images are fully clothed, non-sexual synthetic validation assets.
 
+- `reiwa_idol_chest_silhouette_variation/photorealistic_fixed_camera_frilly_idol/`
+  - 9 photorealistic fixed-camera webcam-style frames using a more frilly idol-stage costume.
+  - Uses the same chest-size and pose matrix as `photorealistic_fixed_camera/`, but adds layered ruffles, puff sleeves, bows, shoulder frills, and a tiered skirt.
+  - Useful for checking whether idol-style costume volume around the chest, shoulders, and waist changes pose inference.
+  - All images are fully clothed, non-sexual synthetic validation assets.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.
