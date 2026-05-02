@@ -151,6 +151,8 @@ struct Row {
     right_shoulder: Option<JointRow>,
     left_upper_arm: Option<JointRow>,
     right_upper_arm: Option<JointRow>,
+    left_lower_arm: Option<JointRow>,
+    right_lower_arm: Option<JointRow>,
     left_hand: Option<JointRow>,
     right_hand: Option<JointRow>,
     left_hand_orient: Option<OrientRow>,
@@ -239,6 +241,8 @@ fn build_row(image_path: &Path, width: u32, height: u32, sk: &SourceSkeleton) ->
         right_shoulder: joint(HumanoidBone::RightShoulder),
         left_upper_arm: joint(HumanoidBone::LeftUpperArm),
         right_upper_arm: joint(HumanoidBone::RightUpperArm),
+        left_lower_arm: joint(HumanoidBone::LeftLowerArm),
+        right_lower_arm: joint(HumanoidBone::RightLowerArm),
         left_hand: joint(HumanoidBone::LeftHand),
         right_hand: joint(HumanoidBone::RightHand),
         left_hand_orient: orient(sk.left_hand_orientation.as_ref()),
@@ -279,6 +283,8 @@ fn serde_json_line(r: &Row) -> String {
     push_joint(&mut s, "right_shoulder", r.right_shoulder.as_ref());
     push_joint(&mut s, "left_upper_arm", r.left_upper_arm.as_ref());
     push_joint(&mut s, "right_upper_arm", r.right_upper_arm.as_ref());
+    push_joint(&mut s, "left_lower_arm", r.left_lower_arm.as_ref());
+    push_joint(&mut s, "right_lower_arm", r.right_lower_arm.as_ref());
     push_joint(&mut s, "left_hand", r.left_hand.as_ref());
     push_joint(&mut s, "right_hand", r.right_hand.as_ref());
     push_orient(&mut s, "left_hand_orient", r.left_hand_orient.as_ref());

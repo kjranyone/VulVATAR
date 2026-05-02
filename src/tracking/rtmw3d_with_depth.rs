@@ -132,6 +132,26 @@ const ASSUMED_VERTICAL_FOV_DEG: f32 = 60.0;
 #[cfg(feature = "inference")]
 const DEPTH_REFRESH_PERIOD: u64 = 2;
 
+/// EMA blend factor for the calibration scalar `c`. The subject↔camera
+/// distance is a slow physical quantity (changes on the order of
+/// seconds), but the per-frame `c` solver is sensitive to ±1px
+/// shoulder-keypoint jitter — DAv2's d_raw at the shoulder pixel
+/// changes by ~1% per pixel of motion, which translates 1:1 into
+/// `c = D/√geom`. Bulk diagnostic over 135 validation images measured
+/// `c` stdev = 1.59 over a 1.1–8.4 range, i.e. frame-to-frame the
+/// scale can swing 5–10% even when the subject is still. That swing
+/// multiplies every metric Z (shoulder, elbow, wrist, hip) uniformly,
+/// which the avatar solver perceives as the entire skeleton "breathing"
+/// in/out — and the elbow Z signal we care about (~5–10cm at typical
+/// hands-near-body framing) drowns in that breath.
+///
+/// 0.15 = ~6-frame time constant at the depth-worker rate (15 Hz with
+/// REFRESH_PERIOD=2). Aggressive enough to track real subject motion
+/// (subjects don't reposition meaningfully in <400 ms), gentle enough
+/// to flatten per-frame jitter.
+#[cfg(feature = "inference")]
+const SCALE_C_EMA_ALPHA: f32 = 0.15;
+
 /// Single mailbox slot wrapped in `Mutex<Option<...>>`. Used for both
 /// the inbox (from caller → worker, drain-old via try_recv loop) and
 /// outbox (from worker → caller, sticky latest result via Arc).
@@ -191,6 +211,16 @@ pub struct Rtmw3dWithDepthProvider {
     /// the user-acknowledged "I'm only showing my upper body"
     /// declaration.
     pose_calibration: Option<crate::tracking::PoseCalibration>,
+    /// EMA-smoothed calibration scalar from the previous frame. Used
+    /// to dampen per-frame `c` jitter that otherwise breathes the
+    /// entire metric skeleton in/out (see [`SCALE_C_EMA_ALPHA`]).
+    /// `None` until the first successful calibration. Independent of
+    /// the user-driven `pose_calibration` above — that one seeds the
+    /// solver / anchor selection, this one smooths the per-frame
+    /// `calibrate_scale` output regardless of whether the user has
+    /// captured an explicit pose calibration.
+    #[cfg(feature = "inference")]
+    scale_c_ema: Option<f32>,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -238,6 +268,7 @@ impl Rtmw3dWithDepthProvider {
             dav2_model_path,
             load_warnings: warnings,
             pose_calibration: None,
+            scale_c_ema: None,
         })
     }
 
@@ -431,8 +462,15 @@ impl Rtmw3dWithDepthProvider {
         // map. For typical streaming motion the depth-vs-keypoint
         // misalignment is sub-keypoint and absorbed by the
         // sample-window median.
+        //
+        // After getting the raw `c`, blend it into the EMA so the
+        // metric frame uses a temporally-smoothed scale. Without this,
+        // shoulder-keypoint jitter swings `c` ±5–10% per frame and the
+        // entire metric skeleton breathes uniformly, drowning the
+        // ~5–10cm elbow-Z signal we depend on at hands-near-body
+        // framings.
         let t_calib = std::time::Instant::now();
-        let calib = match calibrate_scale(
+        let mut calib = match calibrate_scale(
             &joints_2d,
             dav2_frame,
             width,
@@ -441,14 +479,43 @@ impl Rtmw3dWithDepthProvider {
         ) {
             Some(c) => c,
             None => {
-                warn!("RTMW3D+DAv2: calibration anchor unavailable — falling back to RTMW3D synthetic z");
-                return rtmw_est;
+                // Calibration failed this frame (anchor occluded,
+                // degenerate side-profile, etc). Fall back to the EMA
+                // value if we have one — keeps tracking alive instead
+                // of dropping all metric Z to RTMW3D synthetic. Cold
+                // start (no EMA yet) still falls through to the
+                // RTMW3D-only estimate.
+                if let Some(prev) = self.scale_c_ema {
+                    warn!(
+                        "RTMW3D+DAv2: calibration unavailable this frame — reusing EMA scale_c={:.4}",
+                        prev
+                    );
+                    Calibration {
+                        scale_c: prev,
+                        h_half: (ASSUMED_VERTICAL_FOV_DEG.to_radians() * 0.5).tan()
+                            * (width as f32 / height.max(1) as f32),
+                        v_half: (ASSUMED_VERTICAL_FOV_DEG.to_radians() * 0.5).tan(),
+                        anchor_label: "ema-fallback",
+                        d_raw_a: f32::NAN,
+                        d_raw_b: f32::NAN,
+                    }
+                } else {
+                    warn!("RTMW3D+DAv2: calibration anchor unavailable (cold) — falling back to RTMW3D synthetic z");
+                    return rtmw_est;
+                }
             }
         };
+        let raw_c = calib.scale_c;
+        let smoothed_c = match self.scale_c_ema {
+            Some(prev) => prev * (1.0 - SCALE_C_EMA_ALPHA) + raw_c * SCALE_C_EMA_ALPHA,
+            None => raw_c, // Cold start: snap to first measurement.
+        };
+        self.scale_c_ema = Some(smoothed_c);
+        calib.scale_c = smoothed_c;
         let dt_calib = t_calib.elapsed();
         debug!(
-            "RTMW3D+DAv2 calibration: anchor={} d_raw=({:.4}, {:.4}) → c={:.4}",
-            calib.anchor_label, calib.d_raw_a, calib.d_raw_b, calib.scale_c
+            "RTMW3D+DAv2 calibration: anchor={} d_raw=({:.4}, {:.4}) → c_raw={:.4} c_ema={:.4}",
+            calib.anchor_label, calib.d_raw_a, calib.d_raw_b, raw_c, smoothed_c
         );
 
         // Phase 4: build a MoGeFrame-shaped point cloud out of DAv2 +
@@ -539,26 +606,26 @@ fn empty_estimate(frame_index: u64) -> PoseEstimate {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "inference")]
-struct Calibration {
+pub struct Calibration {
     /// Scalar `c` such that `z_metric = c / d_raw` for any DAv2
     /// inverse-depth sample. Determined by the anchor pair.
-    scale_c: f32,
+    pub scale_c: f32,
     /// Half-tangent of horizontal FOV, used to convert pixel
     /// position to camera-space x: `x = (nx − 0.5) · 2·h_half · z`.
-    h_half: f32,
+    pub h_half: f32,
     /// Half-tangent of vertical FOV (counterpart of h_half).
-    v_half: f32,
+    pub v_half: f32,
     /// Diagnostic-only: which body anchor was used and its raw
     /// inverse-depth values. Lets the diagnostic binary print
     /// "shoulder span / hip span / fallback" without re-running the
     /// chooser logic.
-    anchor_label: &'static str,
-    d_raw_a: f32,
-    d_raw_b: f32,
+    pub anchor_label: &'static str,
+    pub d_raw_a: f32,
+    pub d_raw_b: f32,
 }
 
 #[cfg(feature = "inference")]
-fn calibrate_scale(
+pub fn calibrate_scale(
     joints: &[DecodedJoint2d],
     dav2: &DepthAnythingFrame,
     src_w: u32,
@@ -588,7 +655,13 @@ fn calibrate_scale(
     // through to the next anchor (or to "no calibration this frame",
     // which the provider handles by passing through RTMW3D's synthetic
     // z).
-    const MIN_ANCHOR_2D_SEPARATION: f32 = 0.05;
+    //
+    // 0.05 was too permissive: bulk diagnostic over 135 validation
+    // images showed scale_c spans 1.1–8.4 (8× variation), with the
+    // outliers all sitting at separations 0.05–0.07 (3/4-rotation
+    // poses). 0.08 catches them and falls through to hip-span (or
+    // none-this-frame, which the EMA below preserves).
+    const MIN_ANCHOR_2D_SEPARATION: f32 = 0.08;
 
     // Calibrated `c` plausibility window. Webcam subjects sit
     // 0.5–4 m from camera; with shoulder span ≈ 0.4 m, `c = D/√geom`
@@ -688,7 +761,7 @@ fn calibrate_scale(
 /// out-of-domain) are stored as NaN — `sample_metric_point`'s window
 /// median ignores them naturally.
 #[cfg(feature = "inference")]
-fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibration) -> MoGeFrame {
+pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibration) -> MoGeFrame {
     let w = dav2.width;
     let h = dav2.height;
     let pixel_count = (w as usize) * (h as usize);

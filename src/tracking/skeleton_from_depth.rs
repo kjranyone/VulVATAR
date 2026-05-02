@@ -22,13 +22,13 @@ use super::{FacePose, SourceJoint, SourceSkeleton};
 /// Per-keypoint visibility floor — anything below is treated as "no
 /// detection" rather than a low-confidence detection. The user-tunable
 /// `joint_confidence_threshold` slider lives in the solver.
-pub(super) const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
+pub const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
 /// Half-size of the square depth-sampling window when reading metric
 /// depth at a 2D keypoint. Small enough to track fingers without
 /// dragging in neighbouring depth, large enough that single-pixel
 /// model artefacts get out-voted by the median.
-pub(super) const SAMPLE_RADIUS_PX: i32 = 3;
+pub const SAMPLE_RADIUS_PX: i32 = 3;
 
 const NUM_JOINTS: usize = 133;
 
@@ -119,7 +119,19 @@ pub(super) const HAND_TIPS_LEFT: &[(usize, HumanoidBone)] = &[
 /// `(nx, ny)` keypoint with a local-window median. Returns `None` when
 /// the keypoint falls outside the frame or every sample in the window
 /// is masked / non-finite.
-pub(super) fn sample_metric_point(frame: &MoGeFrame, nx: f32, ny: f32) -> Option<[f32; 3]> {
+pub fn sample_metric_point(frame: &MoGeFrame, nx: f32, ny: f32) -> Option<[f32; 3]> {
+    sample_metric_point_with_radius(frame, nx, ny, SAMPLE_RADIUS_PX)
+}
+
+/// Variant of [`sample_metric_point`] that takes the median window
+/// half-size as an argument. Used by diagnostics to compare radius=0
+/// (single pixel) / 1 (3×3) / 3 (7×7, the runtime default).
+pub fn sample_metric_point_with_radius(
+    frame: &MoGeFrame,
+    nx: f32,
+    ny: f32,
+    radius_px: i32,
+) -> Option<[f32; 3]> {
     if !nx.is_finite() || !ny.is_finite() {
         return None;
     }
@@ -130,12 +142,12 @@ pub(super) fn sample_metric_point(frame: &MoGeFrame, nx: f32, ny: f32) -> Option
     if cx < 0 || cy < 0 || cx >= w || cy >= h {
         return None;
     }
-    let cap = ((SAMPLE_RADIUS_PX * 2 + 1) * (SAMPLE_RADIUS_PX * 2 + 1)) as usize;
+    let cap = ((radius_px * 2 + 1) * (radius_px * 2 + 1)) as usize;
     let mut xs = Vec::with_capacity(cap);
     let mut ys = Vec::with_capacity(cap);
     let mut zs = Vec::with_capacity(cap);
-    for yy in (cy - SAMPLE_RADIUS_PX).max(0)..=(cy + SAMPLE_RADIUS_PX).min(h - 1) {
-        for xx in (cx - SAMPLE_RADIUS_PX).max(0)..=(cx + SAMPLE_RADIUS_PX).min(w - 1) {
+    for yy in (cy - radius_px).max(0)..=(cy + radius_px).min(h - 1) {
+        for xx in (cx - radius_px).max(0)..=(cx + radius_px).min(w - 1) {
             let idx = yy as usize * frame.width as usize + xx as usize;
             let [px, py, pz] = frame.points_m[idx];
             if px.is_finite() && py.is_finite() && pz.is_finite() && pz > 0.0 {

@@ -20,7 +20,7 @@ mod pose_estimation;
 pub mod provider;
 pub mod rtmw3d_with_depth;
 #[cfg(feature = "inference")]
-mod skeleton_from_depth;
+pub mod skeleton_from_depth;
 
 pub mod calibration;
 pub mod face_mediapipe;
