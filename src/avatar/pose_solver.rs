@@ -40,7 +40,7 @@ use std::time::Instant;
 use crate::asset::{HumanoidBone, HumanoidMap, NodeId, Quat, SkeletonAsset, Transform, Vec3};
 use crate::math_utils::{
     quat_conjugate, quat_from_basis_pair, quat_from_euler_ypr, quat_from_vectors, quat_mul,
-    quat_normalize, quat_rotate_vec3, vec3_cross, vec3_normalize, vec3_sub,
+    quat_normalize, quat_rotate_vec3, swing_twist_decompose, vec3_cross, vec3_normalize, vec3_sub,
 };
 use crate::tracking::source_skeleton::{FacePose, HandOrientation, SourceSkeleton};
 
@@ -1295,21 +1295,93 @@ fn solve_wrist_orientation(
         &orient.up,
     );
     let new_world_rot = quat_mul(&delta_world, &current_rest_world_rot);
-    let new_local_rot =
-        quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
-    let prev_local_rot = local_transforms[wrist_idx].rotation;
-    local_transforms[wrist_idx].rotation = quat_slerp_short(
-        &prev_local_rot,
-        &new_local_rot,
-        dt_aware_blend(params.rotation_blend, dt),
-    );
+    // Anatomical twist redistribution. The radius rotates over the
+    // ulna inside the forearm, so what looks like "wrist rotation" to
+    // a viewer is actually shared between the forearm and the wrist
+    // joint — split roughly 50/50 in a real arm. If we apply the
+    // entire `delta_world` to the Hand bone alone (which is what the
+    // body chain's separate LowerArm direction-match leaves us with),
+    // pronation past ~30° looks like the wrist has been snapped off
+    // its parent: the hand twists while the forearm sleeve stays put.
+    //
+    // Decompose `delta_world` into (swing, twist) around the forearm
+    // length axis (LowerArm origin → wrist origin in world space) and
+    // hand half of the twist over to the LowerArm. The Hand still
+    // ends up at `new_world_rot` because its local rotation is
+    // recomputed against the updated parent.
+    //
+    // The LowerArm is the wrist's direct parent in standard humanoid
+    // rigs (UpperArm → LowerArm → Hand). When that's not the case
+    // (or the forearm length is degenerate) we skip the redistribution
+    // and apply the full delta to the Hand alone — the same behaviour
+    // that shipped before this change.
+    const FOREARM_TWIST_SHARE: f32 = 0.5;
+    let blend = dt_aware_blend(params.rotation_blend, dt);
 
-    // Refresh the world cache so the finger entries about to run
-    // see the wrist's full orientation, not the stale rest pose.
-    let updated_world =
-        quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
-    current_world[wrist_idx].rotation = updated_world;
+    let lower_arm_idx = skeleton.nodes[wrist_idx].parent.map(|NodeId(p)| p as usize);
+    let twist_axis = lower_arm_idx.and_then(|la_idx| {
+        let lower_arm_pos = current_world[la_idx].position;
+        let wrist_pos = current_world[wrist_idx].position;
+        let raw = vec3_sub(&wrist_pos, &lower_arm_pos);
+        let normalized = vec3_normalize(&raw);
+        if normalized == [0.0; 3] { None } else { Some(normalized) }
+    });
+
+    if let (Some(la_idx), Some(axis)) = (lower_arm_idx, twist_axis) {
+        let (_, twist_world) = swing_twist_decompose(&delta_world, &axis);
+        let half_twist = quat_slerp_short(&[0.0, 0.0, 0.0, 1.0], &twist_world, FOREARM_TWIST_SHARE);
+
+        // LowerArm's new world rotation = pre-multiply its current
+        // world by the half-twist (twist axis is in world space, so
+        // the twist composes on the LEFT).
+        let lower_arm_world_old = current_world[la_idx].rotation;
+        let lower_arm_world_new = quat_mul(&half_twist, &lower_arm_world_old);
+
+        // Recompose into LowerArm.local against ITS parent (UpperArm).
+        let upper_arm_world_rot = skeleton.nodes[la_idx]
+            .parent
+            .map(|NodeId(p)| current_world[p as usize].rotation)
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let lower_arm_local_target = quat_normalize(&quat_mul(
+            &quat_conjugate(&upper_arm_world_rot),
+            &lower_arm_world_new,
+        ));
+        let lower_arm_prev_local = local_transforms[la_idx].rotation;
+        local_transforms[la_idx].rotation =
+            quat_slerp_short(&lower_arm_prev_local, &lower_arm_local_target, blend);
+        let actual_lower_arm_world =
+            quat_mul(&upper_arm_world_rot, &local_transforms[la_idx].rotation);
+        current_world[la_idx].rotation = actual_lower_arm_world;
+
+        // Hand.local against the now-twisted LowerArm world. The
+        // Hand's *world* target is unchanged (`new_world_rot`); only
+        // the parent moved, so the local representation shifts to
+        // compensate and the visible chain still hits the desired
+        // wrist orientation.
+        let hand_local_target = quat_normalize(&quat_mul(
+            &quat_conjugate(&actual_lower_arm_world),
+            &new_world_rot,
+        ));
+        let prev_local_rot = local_transforms[wrist_idx].rotation;
+        local_transforms[wrist_idx].rotation =
+            quat_slerp_short(&prev_local_rot, &hand_local_target, blend);
+        let updated_world =
+            quat_mul(&actual_lower_arm_world, &local_transforms[wrist_idx].rotation);
+        current_world[wrist_idx].rotation = updated_world;
+    } else {
+        // Fallback: forearm degenerate or no parent — apply the full
+        // delta to the Hand alone, preserving the pre-redistribution
+        // behaviour for edge cases.
+        let new_local_rot =
+            quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
+        let prev_local_rot = local_transforms[wrist_idx].rotation;
+        local_transforms[wrist_idx].rotation =
+            quat_slerp_short(&prev_local_rot, &new_local_rot, blend);
+        let updated_world =
+            quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
+        current_world[wrist_idx].rotation = updated_world;
+    }
 }
 
 // Slerp / lerp

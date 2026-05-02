@@ -91,6 +91,27 @@ pub fn quat_conjugate(q: &Quat) -> Quat {
     [-q[0], -q[1], -q[2], q[3]]
 }
 
+/// Decompose a rotation quaternion into a swing + twist around `axis`,
+/// such that `swing * twist == q`. Used to extract the "rotation around
+/// a bone's length axis" component from a full 3-DoF rotation so that
+/// twist can be redistributed between bones (e.g. the forearm
+/// pronation/supination component of a wrist rotation, which
+/// anatomically lives in the radius/ulna and not the wrist itself).
+///
+/// `axis` must be a unit vector. The "swing" component contains all
+/// rotation that is *not* around `axis`; the "twist" component contains
+/// only rotation around `axis`.
+pub fn swing_twist_decompose(q: &Quat, axis: &Vec3) -> (Quat, Quat) {
+    let dot = q[0] * axis[0] + q[1] * axis[1] + q[2] * axis[2];
+    let proj = [dot * axis[0], dot * axis[1], dot * axis[2]];
+    // The twist quaternion is the projection of q's vector part onto
+    // `axis`, paired with q's scalar part. Normalize because the
+    // projection loses unit length.
+    let twist = quat_normalize(&[proj[0], proj[1], proj[2], q[3]]);
+    let swing = quat_mul(q, &quat_conjugate(&twist));
+    (swing, twist)
+}
+
 /// Rotate a vector by a unit quaternion: `v' = q * v * q^*`.
 pub fn quat_rotate_vec3(q: &Quat, v: &Vec3) -> Vec3 {
     // Optimized form: v' = v + 2 * q.xyz × (q.xyz × v + q.w * v)

@@ -58,6 +58,13 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Split into the same `face_head/`, `shoulders/`, `wrists_hands/`, `torso_hips/`, and `orientation/` categories.
   - Prefer this set when comparing pose changes without camera framing changes.
 
+- `reiwa_idol_chest_silhouette_variation/photorealistic_fixed_camera/`
+  - 9 photorealistic fixed-camera webcam-style frames for checking whether chest silhouette changes affect pose inference.
+  - Split into `small_chest/`, `medium_chest/`, and `large_chest/`, with the same 3 pose labels in each group:
+    `front_neutral`, `front_arms_crossed`, and `three_quarter_torso_twist`.
+  - Uses the same `cam_fov70_dist280_h130_fullbody75` filename-title camera annotation as the fixed-camera webcam set.
+  - All images are fully clothed, non-sexual synthetic validation assets.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.
