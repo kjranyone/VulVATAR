@@ -189,6 +189,16 @@ pub struct BuildOptions {
     /// keypoint). `false` preserves the existing
     /// hip-preferred / shoulder-fallback behaviour.
     pub force_shoulder_anchor: bool,
+    /// Per-subject expected upper-arm length (shoulder → elbow) in
+    /// metres, derived from `PoseCalibration::shoulder_span_m`. Drives
+    /// the bone-length-aware Z reconstruction in
+    /// [`reconstruct_arm_z_magnitudes`]. `None` falls back to the
+    /// `EXPECTED_UPPER_ARM_M` adult-average constant.
+    pub subject_upper_arm_m: Option<f32>,
+    /// Per-subject expected lower-arm length (elbow → wrist) in
+    /// metres, derived from `PoseCalibration::shoulder_span_m`. `None`
+    /// falls back to the `EXPECTED_LOWER_ARM_M` adult-average constant.
+    pub subject_lower_arm_m: Option<f32>,
 }
 
 /// Build [`BuildOptions`] from the depth-providers' cached
@@ -202,8 +212,20 @@ pub(super) fn build_options_from_calibration(
     let force_shoulder_anchor = calibration
         .map(|c| matches!(c.mode, super::CalibrationMode::UpperBody))
         .unwrap_or(false);
+    // Adult anatomy ratios pinned to shoulder span: upper arm = 0.75 ×,
+    // forearm = 0.625 ×. These are population averages; per-subject
+    // variance is ~±10% which is well within reconstruction's
+    // tolerance (we only use the magnitude to disambiguate sign-noise
+    // from real depth signals, so a 10% body-scale mismatch shifts the
+    // reconstructed elbow Z by 3 cm — invisible at the avatar scale).
+    let (subject_upper_arm_m, subject_lower_arm_m) = calibration
+        .and_then(|c| c.shoulder_span_m)
+        .map(|span| (Some(span * 0.75), Some(span * 0.625)))
+        .unwrap_or((None, None));
     BuildOptions {
         force_shoulder_anchor,
+        subject_upper_arm_m,
+        subject_lower_arm_m,
     }
 }
 
@@ -273,6 +295,7 @@ pub(super) fn build_skeleton(
     origin: [f32; 3],
     anchor_was_hip: bool,
     anchor_score: f32,
+    opts: BuildOptions,
 ) -> SourceSkeleton {
     let mut sk = SourceSkeleton::empty(frame_index);
     if joints.len() < NUM_JOINTS {
@@ -370,6 +393,13 @@ pub(super) fn build_skeleton(
         &to_source,
     );
 
+    // Order matters: reconstruction must run on the ORIGINAL depth
+    // values (small dz from skin/cloth low contrast → reconstruct to
+    // anatomical magnitude). The clamp afterwards caps any remaining
+    // huge values from occluded keypoints. Reversing the order would
+    // make reconstruction see clamp-enlarged dz=0.45 as "already
+    // plausible" and skip — defeating the outfit-normalisation.
+    reconstruct_arm_z_magnitudes(&mut sk, opts);
     apply_anatomical_z_clamps(&mut sk);
 
     let mut sum = 0.0_f32;
@@ -689,6 +719,139 @@ fn apply_anatomical_z_clamps(sk: &mut SourceSkeleton) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Anatomical bone-length Z reconstruction (arms only)
+// ---------------------------------------------------------------------------
+
+/// Adult anatomical reference for the upper arm (shoulder → elbow).
+/// Pinned to the same body scale as `ASSUMED_SHOULDER_SPAN_M` =
+/// 0.40 m used by the depth calibrator: shoulder-span × 0.75.
+const EXPECTED_UPPER_ARM_M: f32 = 0.30;
+/// Adult anatomical reference for the forearm (elbow → wrist/hand).
+/// shoulder-span × 0.625.
+const EXPECTED_LOWER_ARM_M: f32 = 0.25;
+
+/// If the depth-derived 3D bone length is below this fraction of the
+/// anatomical expectation, treat it as a magnitude underestimate
+/// (the typical sleeveless-vs-long-sleeve case where DAv2 sees less
+/// depth contrast at the elbow) and reconstruct.
+const UNDERESTIMATE_RATIO: f32 = 0.7;
+
+/// Minimum |Δz| to trust the depth signal's *sign*. Below this, the
+/// raw value is dominated by noise and reconstructing to a full
+/// expected magnitude would force the bone forward or backward
+/// arbitrarily. Leaving the small dz alone lets the bone sit near
+/// the camera plane, which matches what a noisy depth signal
+/// physically represents.
+///
+/// Empirically tuned via the high_skin vs frilly outfit comparison
+/// (9 pose cells × 2 sides = 18 measurements per setting):
+///   floor 0.02 → mean angle diff 26.8° / max 69° (best)
+///   floor 0.08 → 33.7° / 111° (sign-flip risk on near-zero readings)
+///   no reconstruction → 35.1° / 93°
+/// 0.02 wins because the depth-pipeline rarely produces |dz| < 2 cm
+/// without genuinely meaning "arm in image plane" — the threshold
+/// catches that case while leaving room to amplify the 5–10 cm
+/// sleeveless underestimates.
+const MIN_DZ_FOR_SIGN: f32 = 0.02;
+
+/// For each arm bone (shoulder→elbow, elbow→hand), check whether the
+/// depth-derived 3D length is suspiciously short. If so, keep the
+/// 2D component (X/Y, well-tracked from RTMW3D) and reconstruct the
+/// Z magnitude from the anatomical bone length, taking the sign from
+/// the raw depth signal.
+///
+/// **Why**: bulk diagnostic on the high_skin vs frilly outfit
+/// comparison (same scene, same pose, only sleeve difference) measured
+/// |Δz_elbow_high − Δz_elbow_frilly| up to 17 cm. DAv2-Small sees
+/// less depth contrast on bare skin than on a fabric-vs-skin
+/// boundary, so sleeveless arms underestimate the elbow's forward
+/// extension by 25–73 %. The depth signal's *sign* is reliable
+/// (forward arms read forward); only the *magnitude* is sleeve-
+/// dependent. Reconstructing magnitude from anatomy makes the
+/// avatar's bone direction outfit-independent.
+///
+/// Skipped when the raw depth length is already plausible (≥ 70 % of
+/// expected; long-sleeve / good-contrast case) and when the raw |Δz|
+/// is below the noise floor (sign unreliable).
+///
+/// Arms only: legs are typically clothed (pants/skirt depth contrast
+/// is good), and the user's reported issue was elbow Z specifically.
+fn reconstruct_arm_z_magnitudes(sk: &mut SourceSkeleton, opts: BuildOptions) {
+    let upper = opts.subject_upper_arm_m.unwrap_or(EXPECTED_UPPER_ARM_M);
+    let lower = opts.subject_lower_arm_m.unwrap_or(EXPECTED_LOWER_ARM_M);
+    reconstruct_bone_z(
+        sk,
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::LeftLowerArm,
+        upper,
+    );
+    reconstruct_bone_z(
+        sk,
+        HumanoidBone::RightShoulder,
+        HumanoidBone::RightLowerArm,
+        upper,
+    );
+    reconstruct_bone_z(
+        sk,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftHand,
+        lower,
+    );
+    reconstruct_bone_z(
+        sk,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightHand,
+        lower,
+    );
+}
+
+fn reconstruct_bone_z(
+    sk: &mut SourceSkeleton,
+    parent: HumanoidBone,
+    child: HumanoidBone,
+    expected_length_m: f32,
+) {
+    let parent_pos = match sk.joints.get(&parent) {
+        Some(p) => p.position,
+        None => return,
+    };
+    let cj = match sk.joints.get_mut(&child) {
+        Some(c) => c,
+        None => return,
+    };
+    let dx = cj.position[0] - parent_pos[0];
+    let dy = cj.position[1] - parent_pos[1];
+    let dz_raw = cj.position[2] - parent_pos[2];
+    let xy_len_sq = dx * dx + dy * dy;
+    let depth_3d_len_sq = xy_len_sq + dz_raw * dz_raw;
+    let exp_sq = expected_length_m * expected_length_m;
+    let threshold_sq = (UNDERESTIMATE_RATIO * expected_length_m).powi(2);
+
+    if depth_3d_len_sq >= threshold_sq {
+        // Depth-derived bone is roughly anatomical length. Trust it
+        // — long-sleeve / good-contrast case.
+        return;
+    }
+    if dz_raw.abs() < MIN_DZ_FOR_SIGN {
+        // Depth signal too weak to trust the sign. Leave dz near zero
+        // — corresponds physically to "arm in image plane".
+        return;
+    }
+    if xy_len_sq >= exp_sq {
+        // 2D extent already accounts for the full bone length — the
+        // arm is exactly perpendicular to the camera. No Z component.
+        cj.position[2] = parent_pos[2];
+        return;
+    }
+    // Reconstruct: keep 2D position, set Z so the 3D bone length
+    // equals the anatomical expectation. Sign follows the depth
+    // signal so forward arms stay forward.
+    let dz_target = (exp_sq - xy_len_sq).sqrt();
+    let sign = if dz_raw >= 0.0 { 1.0 } else { -1.0 };
+    cj.position[2] = parent_pos[2] + sign * dz_target;
+}
+
 #[inline]
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -904,6 +1067,140 @@ mod tests {
         assert!((sk.joints[&HumanoidBone::LeftShoulder].position[2] - 2.0).abs() < 1e-5);
         // Elbow within bound of shoulder (Δ=0.10 < 0.45) → unchanged.
         assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 2.10).abs() < 1e-5);
+    }
+
+    #[test]
+    fn z_reconstruct_amplifies_underestimated_forward_arm() {
+        // Sleeveless case: shoulder at origin, elbow with weak forward
+        // depth (10 cm — above the sign-trust floor of 8 cm) but in 2D
+        // the elbow is almost directly in front of the shoulder (xy ≈ 0).
+        // Anatomical upper arm = 0.30 m, so elbow Z should be
+        // reconstructed to +0.30 m forward.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.0));
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.0, 0.0, 0.10],
+                confidence: 1.0,
+            },
+        );
+        reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!(
+            (z - EXPECTED_UPPER_ARM_M).abs() < 1e-5,
+            "elbow z should be reconstructed to {}, got {}",
+            EXPECTED_UPPER_ARM_M,
+            z,
+        );
+    }
+
+    #[test]
+    fn z_reconstruct_uses_subject_arm_length_when_provided() {
+        // PoseCalibration with measured shoulder span = 0.50 m
+        // (taller-than-average user). Derived upper arm = 0.375 m.
+        // With xy ≈ 0 and a weak forward signal, reconstruction should
+        // target 0.375, not the 0.30 hardcoded default.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.0));
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.0, 0.0, 0.10],
+                confidence: 1.0,
+            },
+        );
+        let opts = BuildOptions {
+            subject_upper_arm_m: Some(0.375),
+            subject_lower_arm_m: Some(0.3125),
+            ..Default::default()
+        };
+        reconstruct_arm_z_magnitudes(&mut sk, opts);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!(
+            (z - 0.375).abs() < 1e-5,
+            "elbow z should match subject_upper_arm_m=0.375, got {}",
+            z,
+        );
+    }
+
+    #[test]
+    fn z_reconstruct_skips_when_depth_already_plausible() {
+        // Long-sleeve case: depth-derived 3D length 0.226 m (xy=0.05,
+        // dz=0.22). 0.226 ≥ 0.7 × 0.30 = 0.21, so reconstruction
+        // skips — depth is trusted.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.0));
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.05, 0.0, 0.22],
+                confidence: 1.0,
+            },
+        );
+        reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
+        assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 0.22).abs() < 1e-5);
+    }
+
+    #[test]
+    fn z_reconstruct_skips_when_dz_below_sign_floor() {
+        // Arm in image plane with negligible Z signal. Reconstruction
+        // would otherwise jam the arm forward arbitrarily; instead we
+        // leave the small dz alone.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.0));
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.05, 0.05, 0.005], // |dz| < MIN_DZ_FOR_SIGN
+                confidence: 1.0,
+            },
+        );
+        reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
+        assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 0.005).abs() < 1e-5);
+    }
+
+    #[test]
+    fn z_reconstruct_t_pose_unchanged() {
+        // T-pose arm: xy distance ≈ upper arm length, dz tiny.
+        // depth_3d_len ≈ xy ≈ 0.30m, well above the 0.21m
+        // underestimate threshold → reconstruction skips, the dz
+        // signal (whatever it is) passes through untouched.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.0));
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [EXPECTED_UPPER_ARM_M, 0.0, 0.05],
+                confidence: 1.0,
+            },
+        );
+        reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
+        assert!((sk.joints[&HumanoidBone::LeftLowerArm].position[2] - 0.05).abs() < 1e-5);
+    }
+
+    #[test]
+    fn z_reconstruct_preserves_backward_sign() {
+        // Arm reaching back (negative Z in source space): dz_raw = -0.10
+        // above the sign-trust floor, sleeveless underestimate of the
+        // true 0.30 m. Reconstructed magnitude should also be negative.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftShoulder, jt(0.0));
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.0, 0.0, -0.10],
+                confidence: 1.0,
+            },
+        );
+        reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!(
+            (z + EXPECTED_UPPER_ARM_M).abs() < 1e-5,
+            "elbow z should be -{}, got {}",
+            EXPECTED_UPPER_ARM_M,
+            z,
+        );
     }
 
     #[test]

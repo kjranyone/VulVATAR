@@ -551,6 +551,7 @@ impl Rtmw3dWithDepthProvider {
                 origin,
                 was_hip,
                 score,
+                opts,
             ),
             None => {
                 warn!("RTMW3D+DAv2: no body anchor — emitting empty skeleton");

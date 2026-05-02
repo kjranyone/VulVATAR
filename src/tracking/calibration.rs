@@ -105,6 +105,17 @@ pub struct PoseCalibration {
     /// dynamic `MIN_C / MAX_C` clamp in `skeleton_from_depth`.
     /// `None` for non-depth providers.
     pub anchor_depth_jitter_m: Option<f32>,
+    /// Median per-subject 3D shoulder span (LeftShoulder ↔
+    /// RightShoulder distance) in source-space metres, gathered
+    /// across the calibration window. Drives bone-length-aware Z
+    /// reconstruction in `skeleton_from_depth` so the avatar's arm
+    /// pose becomes outfit-independent (sleeveless skin contrast in
+    /// DAv2 produces a smaller depth signal than long sleeves; the
+    /// reconstruction normalises magnitude to anatomical bone length).
+    /// `None` when fewer than 3 frames produced a finite reading or
+    /// for older saves that predate the field.
+    #[serde(default)]
+    pub shoulder_span_m: Option<f32>,
     /// Optional per-axis range data captured by the multi-step
     /// calibration extension (steps 2–5: step left/right, lean
     /// in/out). When present, the solver derives per-axis

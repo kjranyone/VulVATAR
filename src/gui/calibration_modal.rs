@@ -69,6 +69,16 @@ pub struct AnchorSample {
     /// so the surfaced calibration confidence reflects the gathered
     /// samples, not just the first frame's reading.
     pub confidence: f32,
+    /// Per-frame measured shoulder span (3D distance between
+    /// LeftShoulder and RightShoulder joints, in source-space metres
+    /// for depth-aware providers). `None` when either shoulder was
+    /// missing this frame, or for rtmw3d-only paths where source
+    /// positions are not metric. Aggregated by `aggregate()` as the
+    /// median of finite samples to give a per-subject body-scale
+    /// reference that the depth pipeline uses for bone-length-aware
+    /// Z reconstruction (see
+    /// [`crate::tracking::skeleton_from_depth::reconstruct_arm_z_magnitudes`]).
+    pub shoulder_span_m: Option<f32>,
 }
 
 /// Internal state of the modal. `Closed` means it is not rendered at
@@ -795,6 +805,7 @@ fn finalize_range_collection(
                         anchor_depth_m: None,
                         confidence: 0.0,
                         anchor_depth_jitter_m: None,
+                        shoulder_span_m: None,
                         x_range_observed: None,
                         z_range_observed: None,
                     }
@@ -853,6 +864,17 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         None
     };
 
+    // Median the per-frame measured shoulder spans. Only emit when at
+    // least three frames produced a finite reading — single-frame
+    // medians are trivially the value itself and don't earn the
+    // robustness the median provides.
+    let mut spans: Vec<f32> = samples.iter().filter_map(|s| s.shoulder_span_m).collect();
+    let shoulder_span_m = if spans.len() >= 3 {
+        Some(median_inplace(&mut spans))
+    } else {
+        None
+    };
+
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -867,6 +889,7 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         anchor_depth_m,
         confidence: median_conf,
         anchor_depth_jitter_m,
+        shoulder_span_m,
         // Range fields only get populated when the user opts into
         // the optional range-capture step from the AnchorDone prompt;
         // the anchor-only path leaves them None and the solver falls
@@ -880,6 +903,28 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
 /// of the two middles for even length). Returns `0.0` for an empty
 /// slice — callers gate on `MIN_SAMPLES` before reaching here, so
 /// that branch should be unreachable in practice.
+/// Measure the source-space 3D distance between LeftShoulder and
+/// RightShoulder joints. Returns `None` when either shoulder is
+/// missing (off-frame, low confidence, etc) or when the result is
+/// non-positive (rtmw3d-only path emits z=0 across joints, so the
+/// 3D distance reduces to the 2D shoulder span — still a reasonable
+/// body-scale proxy for that path, but we gate on positive finite
+/// values for safety).
+fn measure_shoulder_span(pose: &crate::tracking::SourceSkeleton) -> Option<f32> {
+    use crate::asset::HumanoidBone;
+    let l = pose.joints.get(&HumanoidBone::LeftShoulder)?.position;
+    let r = pose.joints.get(&HumanoidBone::RightShoulder)?.position;
+    let dx = l[0] - r[0];
+    let dy = l[1] - r[1];
+    let dz = l[2] - r[2];
+    let span = (dx * dx + dy * dy + dz * dz).sqrt();
+    if span.is_finite() && span > 0.0 {
+        Some(span)
+    } else {
+        None
+    }
+}
+
 fn median_inplace(values: &mut [f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -1015,6 +1060,7 @@ fn refresh_anchor_telemetry(
                         samples.push(AnchorSample {
                             position: pos,
                             confidence: pose.overall_confidence,
+                            shoulder_span_m: measure_shoulder_span(pose),
                         });
                     }
                 }

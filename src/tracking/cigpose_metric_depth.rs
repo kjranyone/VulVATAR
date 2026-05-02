@@ -292,6 +292,7 @@ impl CigposeMetricDepthProvider {
                     origin,
                     anchor_was_hip,
                     anchor_score,
+                    opts,
                 );
                 (sk, Some(origin))
             }

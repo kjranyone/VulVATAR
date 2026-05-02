@@ -368,6 +368,7 @@ mod profile_roundtrip_tests {
                 anchor_depth_m: Some(1.875),
                 confidence: 0.875,
                 anchor_depth_jitter_m: Some(0.025),
+                shoulder_span_m: Some(0.412),
                 x_range_observed: Some(0.6),
                 z_range_observed: Some(0.35),
             }),

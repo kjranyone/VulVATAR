@@ -148,6 +148,7 @@ fn pose_calibration_to_dto(
         anchor_depth_m: cal.anchor_depth_m,
         confidence: cal.confidence,
         anchor_depth_jitter_m: cal.anchor_depth_jitter_m,
+        shoulder_span_m: cal.shoulder_span_m,
         x_range_observed: cal.x_range_observed,
         z_range_observed: cal.z_range_observed,
     }
@@ -179,6 +180,7 @@ fn dto_to_pose_calibration(
         anchor_depth_m: dto.anchor_depth_m,
         confidence: dto.confidence,
         anchor_depth_jitter_m: dto.anchor_depth_jitter_m,
+        shoulder_span_m: dto.shoulder_span_m,
         x_range_observed: dto.x_range_observed,
         z_range_observed: dto.z_range_observed,
     })
@@ -257,6 +259,8 @@ pub struct PoseCalibrationDto {
     pub anchor_depth_m: Option<f32>,
     pub confidence: f32,
     pub anchor_depth_jitter_m: Option<f32>,
+    #[serde(default)]
+    pub shoulder_span_m: Option<f32>,
     #[serde(default)]
     pub x_range_observed: Option<f32>,
     #[serde(default)]
