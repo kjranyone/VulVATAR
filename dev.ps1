@@ -169,9 +169,9 @@ function Select-PoseProvider {
 
     Write-Host ""
     Write-Host "Select pose provider (current: $current)" -ForegroundColor Cyan
-    Write-Host "   1. rtmw3d              (fast ~25 fps, prior-based z, default)" -ForegroundColor Green
-    Write-Host "   2. rtmw3d-with-depth   (fast, calibrated metric z via DAv2-Small)" -ForegroundColor Green
-    Write-Host "   3. cigpose-metric-depth (slow ~3 fps, true metric z via MoGe-2)" -ForegroundColor Yellow
+    Write-Host "   1. rtmw3d              (~48 fps, prior-based z, default)" -ForegroundColor Green
+    Write-Host "   2. rtmw3d-with-depth   (~40 fps, calibrated metric z via DAv2-Small async)" -ForegroundColor Green
+    Write-Host "   3. cigpose-metric-depth (~5 fps, true metric z via MoGe-2 ViT-S)" -ForegroundColor Yellow
     Write-Host "   0. keep current" -ForegroundColor DarkGray
     $choice = Read-Host "Provider"
 

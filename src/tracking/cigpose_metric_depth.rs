@@ -291,12 +291,20 @@ impl CigposeMetricDepthProvider {
 
         if let Some(face_mesh) = self.face_mesh.as_mut() {
             if let Some(bbox) = build_face_bbox_from_joints_2d(&joints_2d, width, height) {
-                if let Some((exprs, mesh_conf)) =
+                if let Some((exprs, mesh_conf, mesh_face_pose)) =
                     face_mesh.estimate(rgb_data, width, height, &bbox)
                 {
                     skeleton.expressions = exprs;
                     skeleton.face_mesh_confidence = Some(mesh_conf);
-                    if let Some(ref mut fp) = skeleton.face {
+                    // Prefer FaceMesh's dense-landmark pose over the
+                    // CIGPose+MoGe-derived one — same rationale as
+                    // the rtmw3d-with-depth path: the 5 face
+                    // landmarks DAv2-sampled from a small head region
+                    // are too noisy for stable yaw across rotations.
+                    if let Some(mut fp) = mesh_face_pose {
+                        fp.confidence = mesh_conf;
+                        skeleton.face = Some(fp);
+                    } else if let Some(ref mut fp) = skeleton.face {
                         fp.confidence = fp.confidence.max(mesh_conf);
                     }
                 }

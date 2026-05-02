@@ -16,6 +16,7 @@ use crate::asset::HumanoidBone;
 use super::cigpose::DecodedJoint2d;
 use super::face_mediapipe::{derive_face_bbox, FaceBbox};
 use super::metric_depth::MoGeFrame;
+use super::source_skeleton::HandOrientation;
 use super::{FacePose, SourceJoint, SourceSkeleton};
 
 /// Per-keypoint visibility floor — anything below is treated as "no
@@ -323,29 +324,49 @@ fn attach_hand<F>(
 ) where
     F: Fn([f32; 3]) -> [f32; 3],
 {
-    const MCP_LOCALS: [usize; 4] = [5, 9, 13, 17];
-    let mut sum = [0.0_f32; 3];
-    let mut min_conf = f32::INFINITY;
-    let mut found = 0_u32;
-    for &local in &MCP_LOCALS {
+    // Sample the four MCP knuckles in source-space and the
+    // hand-track wrist (idx 0) — the wrist position emitted to the
+    // skeleton is the MCP centroid (more reliable under occlusion
+    // than the hand-track wrist), but the wrist landmark itself is
+    // needed to build the palm-orientation basis below.
+    const INDEX_MCP_LOCAL: usize = 5;
+    const MIDDLE_MCP_LOCAL: usize = 9;
+    const PINKY_MCP_LOCAL: usize = 17;
+    const MCP_LOCALS: [usize; 4] = [INDEX_MCP_LOCAL, MIDDLE_MCP_LOCAL, 13, PINKY_MCP_LOCAL];
+
+    let sample_local = |local: usize| -> Option<([f32; 3], f32)> {
         let global = base_index + local;
         if global >= joints.len() {
-            continue;
+            return None;
         }
         let j = &joints[global];
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
-            continue;
+            return None;
         }
-        let p_cam = match sample_metric_point(depth, j.nx, j.ny) {
-            Some(p) => p,
-            None => continue,
-        };
-        let p = to_source(p_cam);
-        sum[0] += p[0];
-        sum[1] += p[1];
-        sum[2] += p[2];
-        min_conf = min_conf.min(j.score);
-        found += 1;
+        let p_cam = sample_metric_point(depth, j.nx, j.ny)?;
+        Some((to_source(p_cam), j.score))
+    };
+
+    let mut sum = [0.0_f32; 3];
+    let mut min_conf = f32::INFINITY;
+    let mut found = 0_u32;
+    let mut index_mcp_pos: Option<[f32; 3]> = None;
+    let mut middle_mcp_pos: Option<[f32; 3]> = None;
+    let mut pinky_mcp_pos: Option<[f32; 3]> = None;
+    for &local in &MCP_LOCALS {
+        if let Some((p, score)) = sample_local(local) {
+            sum[0] += p[0];
+            sum[1] += p[1];
+            sum[2] += p[2];
+            min_conf = min_conf.min(score);
+            found += 1;
+            match local {
+                INDEX_MCP_LOCAL => index_mcp_pos = Some(p),
+                MIDDLE_MCP_LOCAL => middle_mcp_pos = Some(p),
+                PINKY_MCP_LOCAL => pinky_mcp_pos = Some(p),
+                _ => {}
+            }
+        }
     }
     if found < 3 {
         return;
@@ -358,6 +379,46 @@ fn attach_hand<F>(
             confidence: min_conf,
         },
     );
+
+    // Palm orientation basis. Mirrors the standard rtmw3d hand
+    // orientation derivation (see `tracking::rtmw3d::skeleton`):
+    //
+    //   raw_forward = middle_mcp − wrist        (wrist → middle finger)
+    //   across      = index_mcp  − pinky_mcp    (across the palm)
+    //   normal      = across × raw_forward       (palm plane normal)
+    //   forward     = normal × across            (re-orthogonalised)
+    //
+    // Cross-orthogonalising forward against the normal means a noisy
+    // hand-track wrist Z (occluded wrists routinely land behind the
+    // torso) only perturbs the normal slightly without tilting the
+    // in-palm forward direction. Without `HandOrientation` set, the
+    // solver falls back to shortest-arc twist which is undefined
+    // around the wrist↔fingertip axis — visually random hand roll.
+    if let (Some(wri_p), Some(mid_p), Some(idx_p), Some(pin_p)) = (
+        sample_local(0).map(|(p, _)| p),
+        middle_mcp_pos,
+        index_mcp_pos,
+        pinky_mcp_pos,
+    ) {
+        let raw_forward = sub3(mid_p, wri_p);
+        let across = sub3(idx_p, pin_p);
+        let normal_raw = cross3(across, raw_forward);
+        if let Some(normal) = normalize3(normal_raw) {
+            let forward_raw = cross3(normal, across);
+            if let Some(forward) = normalize3(forward_raw) {
+                let orientation = HandOrientation {
+                    forward,
+                    up: normal,
+                    confidence: min_conf,
+                };
+                match wrist_bone {
+                    HumanoidBone::LeftHand => sk.left_hand_orientation = Some(orientation),
+                    HumanoidBone::RightHand => sk.right_hand_orientation = Some(orientation),
+                    _ => {}
+                }
+            }
+        }
+    }
 
     for &(local_idx, bone) in phalanges {
         let global = base_index + local_idx;
@@ -396,6 +457,30 @@ fn attach_hand<F>(
                 },
             );
         }
+    }
+}
+
+#[inline]
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline]
+fn normalize3(v: [f32; 3]) -> Option<[f32; 3]> {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-6 {
+        Some([v[0] / len, v[1] / len, v[2] / len])
+    } else {
+        None
     }
 }
 

@@ -37,6 +37,7 @@
 // (inference) and stub (no-inference) `estimate` impls, so they must
 // be visible regardless of feature flag — otherwise the
 // no-default-features build cannot resolve the stub's signature.
+use super::source_skeleton::FacePose;
 use super::SourceExpression;
 #[cfg(feature = "inference")]
 use log::{error, info, warn};
@@ -321,7 +322,7 @@ impl FaceMeshInference {
         width: u32,
         height: u32,
         bbox: &FaceBbox,
-    ) -> Option<(Vec<SourceExpression>, f32)> {
+    ) -> Option<(Vec<SourceExpression>, f32, Option<FacePose>)> {
         let face_tensor = crop_face_to_tensor(rgb_data, width, height, bbox);
         let face_input = match TensorRef::from_array_view(&face_tensor) {
             Ok(v) => v,
@@ -386,7 +387,16 @@ impl FaceMeshInference {
             .map(|(_, data)| data.to_vec())?;
         drop(bs_outputs);
         let weights = decode_blendshapes(&bs_data);
-        Some((map_blendshapes_to_expressions(&weights), face_conf))
+        // Head pose from the dense 478 landmarks. Much higher fidelity
+        // than the 5-landmark body-derived pose: FaceMesh runs on a
+        // dedicated 256×256 face crop and emits depth at each landmark
+        // anchored on a learnt canonical face mesh, so the cheek and
+        // ear-line baselines have real Z separation even at 3/4 turns
+        // (the dead-zone where the body-derived pose's `ear_dz`
+        // collapses to noise). `face_conf` already gates this — the
+        // caller folds it into the FacePose's confidence.
+        let face_pose = derive_face_pose_from_landmarks(&landmarks);
+        Some((map_blendshapes_to_expressions(&weights), face_conf, face_pose))
     }
 
     #[cfg(not(feature = "inference"))]
@@ -396,7 +406,7 @@ impl FaceMeshInference {
         _: u32,
         _: u32,
         _: &FaceBbox,
-    ) -> Option<(Vec<SourceExpression>, f32)> {
+    ) -> Option<(Vec<SourceExpression>, f32, Option<FacePose>)> {
         None
     }
 
@@ -468,6 +478,124 @@ fn crop_face_to_tensor(rgb: &[u8], width: u32, height: u32, bbox: &FaceBbox) -> 
         }
     }
     tensor
+}
+
+/// Derive head pose (yaw / pitch / roll) from the dense 478 FaceMesh
+/// landmarks.
+///
+/// FaceMesh runs on a dedicated 256×256 face crop and emits depth at
+/// each landmark anchored on a learnt canonical face mesh, so the
+/// cheek-to-cheek baseline has real Z separation across the full 0–
+/// 360° head turn — including the 22.5° / 45° / 67.5° "3/4 view"
+/// dead-zone where the body-derived `derive_face_pose_from_body`
+/// collapses (its 5-landmark ear/eye line has near-uniform nz at
+/// those poses, so `ear_dz.atan2(ear_dx)` returns near zero).
+///
+/// MediaPipe FaceMesh is view-invariant: indices reference fixed
+/// anatomical positions on the canonical face regardless of head
+/// orientation or input mirroring. Coordinates are in 256-pixel face-
+/// crop space with z in pixel-equivalent depth units (smaller z =
+/// closer to camera, per MediaPipe's documented convention).
+///
+/// Sign conventions match the source-skeleton frame
+/// (see `source_skeleton::FacePose`): `+yaw` turns the head toward
+/// camera-space `+X` (subject's anatomical right after the standard
+/// `to_source` flip), `+pitch` drops the chin (looking down),
+/// `+roll` leans the head toward `+X`.
+#[cfg(feature = "inference")]
+pub(super) fn derive_face_pose_from_landmarks(landmarks: &[[f32; 3]]) -> Option<FacePose> {
+    if landmarks.len() < 478 {
+        return None;
+    }
+
+    // MediaPipe FaceMesh canonical landmark indices.
+    const NOSE_TIP: usize = 1;
+    const RIGHT_EYE_OUTER: usize = 33; // subject's anatomical right
+    const LEFT_EYE_OUTER: usize = 263; // subject's anatomical left
+    const RIGHT_CHEEK: usize = 234;
+    const LEFT_CHEEK: usize = 454;
+
+    let nose = landmarks[NOSE_TIP];
+    let r_eye = landmarks[RIGHT_EYE_OUTER];
+    let l_eye = landmarks[LEFT_EYE_OUTER];
+    let r_cheek = landmarks[RIGHT_CHEEK];
+    let l_cheek = landmarks[LEFT_CHEEK];
+
+    // YAW from 2D nose offset relative to cheek midpoint.
+    //
+    // The PINTO export's z signal turns out to be ~4× weaker than
+    // x/y in scale on this network — a measured 45° head turn in
+    // the validation set yields only ~13° via the clean
+    // `cheek_dz.atan2(cheek_dx)` formula. So z-based yaw, while
+    // sign-correct and noise-free, is too dampened to be useful.
+    //
+    // Instead exploit the rigid-perspective observation that as
+    // the head rotates around its vertical axis the nose tip
+    // sweeps left/right relative to the cheek midpoint:
+    //
+    //   yaw_signal = (nose.x − cheek_midpoint.x) / face_half_width
+    //
+    // Source convention: `+yaw = head toward +X` (subject's anat
+    // right, after the standard `to_source` flip on non-mirrored
+    // camera input). At rest the right cheek (idx 234) sits at
+    // LOW image X and the left cheek (idx 454) at HIGH image X,
+    // so when the subject turns toward their anat right the nose
+    // sweeps toward LOW image X (`nose.x − center < 0`). We negate
+    // the signal so this case yields positive source yaw.
+    let cheek_dx = l_cheek[0] - r_cheek[0];
+    if cheek_dx.abs() < 5.0 {
+        return None;
+    }
+    let face_half_width = (cheek_dx.abs() * 0.5).max(10.0);
+    let cheek_mid_x = (r_cheek[0] + l_cheek[0]) * 0.5;
+    let nose_offset_x = nose[0] - cheek_mid_x;
+    // Clamp at ±2.0 (atan ≈ 63°) rather than ±3.0 (atan ≈ 72°): the
+    // larger range only mattered for back/3/4 views where face
+    // confidence collapses to ~0 anyway, and 72° saturation produced
+    // visually jarring overshoot when the FaceMesh confidence briefly
+    // spiked during head transitions through profile.
+    let yaw_signal = nose_offset_x / face_half_width;
+    let yaw = -yaw_signal.clamp(-2.0, 2.0).atan();
+
+    // PITCH from nose vs eye-mid Y. Image y-down: when subject looks
+    // down, the nose drops below the eye line (`y[nose] - eye_mid_y
+    // > 0`). Source `+pitch` = chin drops, so the sign matches
+    // directly without a flip.
+    //
+    // Anatomical baseline subtraction: at a frontal neutral pose the
+    // nose tip naturally sits below the eye line by ~50% of inter-eye
+    // distance, which under the raw formula maps to a constant
+    // `+25–27°` pitch reading. Measured across the validation set:
+    //   gothic 0°/shoulders/wrists/torso (8 neutral frames): mean ≈ 26°
+    //   tan(26°) ≈ 0.49
+    // Subtracting that constant from the *signal* (not the angle)
+    // preserves linearity through the atan and yields ≈ 0° at neutral
+    // and ≈ −20° for the head_pitch_up_020 test frame.
+    const PITCH_NEUTRAL_SIGNAL: f32 = 0.49;
+    let eye_mid_y = (r_eye[1] + l_eye[1]) * 0.5;
+    let face_width = ((l_eye[0] - r_eye[0]).powi(2) + (l_eye[1] - r_eye[1]).powi(2))
+        .sqrt()
+        .max(20.0);
+    let pitch_signal = (nose[1] - eye_mid_y) / face_width - PITCH_NEUTRAL_SIGNAL;
+    let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
+
+    // ROLL from eye-line Y-X. Image y-down: when subject tilts head
+    // to their anatomical right, the right eye (idx 33, low image X)
+    // drops in image (`y[33] > y[263]`). Source `+roll` = head leans
+    // toward +X (anat right), so we want positive in this case;
+    // `atan2(y[33] − y[263], x[263] − x[33])` does this directly
+    // (both numerator and denominator positive).
+    let roll = (r_eye[1] - l_eye[1]).atan2(l_eye[0] - r_eye[0]);
+
+    Some(FacePose {
+        yaw,
+        pitch,
+        roll,
+        // Confidence overwritten by caller with `face_mesh_confidence`
+        // (the FaceMesh model's "is this a face" sigmoid). The pose
+        // itself doesn't carry an independent quality signal.
+        confidence: 1.0,
+    })
 }
 
 /// Decode the FaceMeshV2 landmarks output into 478 × `[x, y, z]`.

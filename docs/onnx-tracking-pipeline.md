@@ -1,19 +1,45 @@
 # ONNX Whole-Body Tracking Pipeline
 
 This document describes the design and implementation of the ONNX
-Runtime-based whole-body tracking pipeline used in VulVATAR.
+Runtime-based whole-body tracking pipeline used in VulVATAR. The
+default `rtmw3d` provider is the focus of this document — see
+[`pose-provider-benchmark.md`](pose-provider-benchmark.md) for the
+two depth-aware alternatives and the throughput / quality
+trade-offs between them.
+
+## Provider selection
+
+VulVATAR ships three interchangeable pose providers behind the
+`PoseProvider` trait in `src/tracking/provider.rs`. Selection is
+runtime via the `VULVATAR_POSE_PROVIDER` environment variable
+(defaults to `rtmw3d`). `dev.ps1`'s `Select-PoseProvider` step
+exposes this in the dev menu and downloads the right model set
+on demand.
+
+| Provider | env value | Median walltime | Mean fps | Z source |
+|---|---|---:|---:|---|
+| **`rtmw3d`** (default) | `rtmw3d` | 18 ms | **48** | Body-prior synthetic z (RTMW3D's SimCC Z heatmap, normalised) |
+| **`rtmw3d-with-depth`** | `rtmw3d-with-depth` | 24 ms | **41** | Calibrated metric z: DAv2-Small relative depth + body-anchor 1-DoF solve, async worker |
+| **`cigpose-metric-depth`** | `cigpose-metric-depth` | 220 ms | 5 | True metric z: MoGe-2 ViT-S Apache-2.0 metric depth (reference path) |
+
+The two depth-aware providers reuse the SourceSkeleton / pose-solver
+machinery described in §3–§5 below; only the joint-z derivation
+differs. See `src/tracking/skeleton_from_depth.rs` for the shared
+"depth grid → skeleton" stage they both consume.
 
 ## Architecture Overview
 
-The tracking system uses **RTMW3D** (mmpose / OpenMMLab) — a
-3D-native single-model whole-body pose estimator running on a
-background `TrackingWorker` thread so it never blocks the main
-rendering loop.
+`rtmw3d` is the default — a 3D-native single-model whole-body pose
+estimator (mmpose / OpenMMLab) running on a background
+`TrackingWorker` thread so it never blocks the main rendering loop.
+YOLOX person detection runs on its own worker thread (see "Async
+workers" below), so the only synchronous GPU pass per frame is the
+RTMW3D-x model itself.
 
 ```mermaid
 graph TD;
-    Camera[Webcam / Video Source] --> |RGB Frame| Yolox[YOLOX-m person bbox]
-    Yolox --> |bbox + 25% pad| Crop[Crop to subject]
+    Camera[Webcam / Video Source] --> |RGB Frame| YoloxAsync[YOLOX-m person bbox<br/>async worker, 1/4 rate]
+    YoloxAsync --> |latest bbox + 25% pad| Crop[Crop to subject]
     Crop --> |RGB crop| Resize[Resize to 288×384]
     Resize --> |NCHW [1,3,384,288]| RTMW3D[RTMW3D ONNX]
     RTMW3D --> |SimCC X/Y/Z heatmaps| Decode[argmax decode]
@@ -25,8 +51,11 @@ graph TD;
 
 ## Models
 
-Four ONNX files under `models/` (~478 MB total), fetched by
-`dev.ps1`'s `Install-Models` step:
+Five ONNX files cover all three providers; only what the active
+provider needs is downloaded by `dev.ps1`'s `Select-PoseProvider`
+step.
+
+### Default (`rtmw3d`) — `Install-Models`
 
 | File                    | Source                       | Size    | Role                                                  |
 |-------------------------|------------------------------|---------|-------------------------------------------------------|
@@ -34,6 +63,26 @@ Four ONNX files under `models/` (~478 MB total), fetched by
 | `yolox.onnx`            | mmpose `rtmposev1` onnx_sdk  | 101 MB  | Human-Art tuned YOLOX-m person bbox detector          |
 | `face_landmark.onnx`    | PINTO 410 FaceMeshV2         | 4.8 MB  | 478 dense face landmarks                              |
 | `face_blendshapes.onnx` | PINTO 390 BlendshapeV2       | 1.8 MB  | 146 face landmarks → 52 ARKit blendshape coefficients |
+
+### Plus for `rtmw3d-with-depth` — `Install-DepthAnythingSmall`
+
+| File              | Source                              | Size   | Role                              |
+|-------------------|-------------------------------------|--------|-----------------------------------|
+| `dav2_small.onnx` | `onnx-community/depth-anything-v2-small` HF | 99 MB | Relative monocular depth (DPT + DINOv2-S, Apache 2.0) |
+
+Locked to a 392×294 input (multiples of 14 = DINOv2 patch size,
+~588 image tokens); run on a worker thread so it overlaps with
+RTMW3D on the calling thread. Calibrated to metric scale via a
+single-DoF body-anchor solve (shoulder span ≈ 0.40 m, hip span
+fallback). Details in
+[`pose-provider-benchmark.md`](pose-provider-benchmark.md).
+
+### Plus for `cigpose-metric-depth` — `Install-ExperimentalPoseModels`
+
+| File             | Source                                   | Size    | Role                                          |
+|------------------|------------------------------------------|---------|-----------------------------------------------|
+| `cigpose.onnx`   | `namas191297/cigpose-onnx` GH releases   | 240 MB  | CIGPose-x UBody 2D landmarks (133, transformer) |
+| `moge_v2.onnx`   | `Ruicheng/moge-2-vits-normal-onnx` HF   | 141 MB  | MoGe-2 ViT-S true-metric point cloud (MIT)    |
 
 Soykaf's HuggingFace mirror hosts the official mmpose RTMW3D export
 (`rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx`,
@@ -74,6 +123,33 @@ the subject filling most of the model input.
 YOLOX is preprocessed with letterbox to 640×640, BGR raw `[0, 255]`,
 no normalization — matching mmdetection's default YOLOX preprocessing
 config.
+
+#### Async workers
+
+YOLOX (and DAv2 in the depth-aware provider) run on dedicated
+background threads with a drain-old `mpsc::channel` inbox and a
+sticky `Arc<DetectResult>` outbox. The main RTMW3D pipeline:
+
+- submits a frame on every `YOLOX_REFRESH_PERIOD = 4` frames (cold
+  start always submits so `wait_latest` doesn't deadlock),
+- always reads the latest available result via `Arc` clone (cheap),
+- never pays the 22 ms YOLOX walltime on the critical path past
+  the cold-start frame.
+
+The cached bbox lags by 1–2 frames in steady state; the 25%
+downstream pad already absorbs the few-pixel subject motion that
+accumulates over that window. See
+`src/tracking/rtmw3d/yolox_worker.rs` and the matching DAv2 worker
+inside `src/tracking/rtmw3d_with_depth.rs`.
+
+#### FaceMesh EP per provider
+
+The small FaceMesh + Blendshape cascade (4.8 + 1.8 MB) is sensitive
+to DirectML EP queue contention: when DAv2 / MoGe is colocated on
+DirectML the cascade inflates from ~3 ms to ~13 ms. Each provider
+opts in via `FaceMeshEp::Auto` (DirectML, default for `rtmw3d`) or
+`FaceMeshEp::ForceCpu` (depth-aware providers). CPU runs the
+cascade in ~7 ms uncontested.
 
 ### 1. RTMW3D preprocessing
 

@@ -515,17 +515,25 @@ impl Rtmw3dInference {
         let t_face = std::time::Instant::now();
         if let Some(face_mesh) = self.face_mesh.as_mut() {
             if let Some(bbox) = face::build_face_bbox_from_joints(&joints, width, height) {
-                if let Some((exprs, mesh_conf)) =
+                if let Some((exprs, mesh_conf, mesh_face_pose)) =
                     face_mesh.estimate(rgb_data, width, height, &bbox)
                 {
                     skeleton.expressions = exprs;
                     skeleton.face_mesh_confidence = Some(mesh_conf);
-                    // Boost the head-pose confidence with the mesh's
-                    // independent "is this a face" signal so the solver
-                    // gate doesn't reject head rotation just because
-                    // the body-side 5 landmarks happened to score low
-                    // on this frame.
-                    if let Some(ref mut fp) = skeleton.face {
+                    // Prefer FaceMesh's dense-landmark pose when
+                    // available — it has real Z separation across
+                    // the full 360° head turn including the 22.5°–
+                    // 67.5° "3/4 view" dead-zone where the body-
+                    // derived ear-line pose collapses to ~0 yaw
+                    // (the 5 RTMW3D face landmarks lose nz contrast
+                    // at those angles). Fall back to the body-derived
+                    // pose otherwise. Stamp the FaceMesh model's
+                    // confidence onto the result so the solver can
+                    // still gate against it.
+                    if let Some(mut fp) = mesh_face_pose {
+                        fp.confidence = mesh_conf;
+                        skeleton.face = Some(fp);
+                    } else if let Some(ref mut fp) = skeleton.face {
                         fp.confidence = fp.confidence.max(mesh_conf);
                     }
                 }

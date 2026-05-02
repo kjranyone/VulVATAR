@@ -45,6 +45,12 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Uses the same pose IDs and labels where possible.
   - Useful for checking domain shift between illustration-like inputs and realistic studio-photo inputs.
 
+- `reiwa_idol_webcam_capture/photorealistic/`
+  - 15 photorealistic webcam-style frames of a fictional adult woman in Reiwa-era Japanese idol-inspired rehearsal fashion.
+  - Split into `face_head/`, `shoulders/`, `wrists_hands/`, `torso_hips/`, and `orientation/`.
+  - Filenames annotate head yaw/pitch/roll, shoulder elevation, wrist orientation, torso/hip twist, and full-body facing direction.
+  - Useful for validating webcam-like pose tracking where facial motion, shoulder motion, hand rotation, waist twist, and body orientation are unstable.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.

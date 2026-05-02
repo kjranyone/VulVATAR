@@ -87,7 +87,7 @@ use super::metric_depth::MoGeFrame;
 use super::rtmw3d::Rtmw3dInference;
 #[cfg(feature = "inference")]
 use super::skeleton_from_depth::{
-    build_skeleton, derive_face_pose_metric, resolve_origin_metric, SAMPLE_RADIUS_PX,
+    build_skeleton, resolve_origin_metric, SAMPLE_RADIUS_PX,
 };
 #[cfg(feature = "inference")]
 use log::{debug, info, warn};
@@ -439,35 +439,34 @@ impl Rtmw3dWithDepthProvider {
         let metric_frame = build_metric_frame_from_dav2(dav2_frame, &calib);
         let dt_metric = t_metric.elapsed();
 
-        // Phase 5: skeleton + head pose, same logic as cigpose+moge.
+        // Phase 5: skeleton from depth.
         let t_skel = std::time::Instant::now();
-        let (mut skeleton, origin_opt) = match resolve_origin_metric(&joints_2d, &metric_frame) {
-            Some((origin, was_hip, score)) => {
-                let sk = build_skeleton(
-                    frame_index,
-                    &joints_2d,
-                    &metric_frame,
-                    origin,
-                    was_hip,
-                    score,
-                );
-                (sk, Some(origin))
-            }
+        let mut skeleton = match resolve_origin_metric(&joints_2d, &metric_frame) {
+            Some((origin, was_hip, score)) => build_skeleton(
+                frame_index,
+                &joints_2d,
+                &metric_frame,
+                origin,
+                was_hip,
+                score,
+            ),
             None => {
                 warn!("RTMW3D+DAv2: no body anchor — emitting empty skeleton");
-                (SourceSkeleton::empty(frame_index), None)
+                SourceSkeleton::empty(frame_index)
             }
         };
-        if let Some(origin) = origin_opt {
-            skeleton.face = derive_face_pose_metric(&joints_2d, &metric_frame, origin);
-        }
         let dt_skel = t_skel.elapsed();
 
-        // Phase 6: inherit RTMW3D's FaceMesh cascade output. The
-        // expressions + mesh confidence are independent of the body
-        // depth pipeline, so reusing them avoids running FaceMesh
-        // twice. Boost the new face_pose's confidence with the mesh
-        // signal — same logic as the other providers.
+        // Phase 6: inherit RTMW3D's face pose + FaceMesh cascade
+        // output. The face track in particular is much better when
+        // taken from RTMW3D's own body-derived `derive_face_pose_from_body`
+        // (which uses the model's nz heatmap trained on face geometry)
+        // than from `derive_face_pose_metric` over DAv2 — the head is
+        // small in DAv2's 392×294 grid so per-pixel depth at the 5
+        // face landmarks is near-uniform noise. Expressions + mesh
+        // confidence have nothing to do with the body depth pipeline,
+        // so reusing them also avoids running FaceMesh twice.
+        skeleton.face = rtmw_est.skeleton.face;
         skeleton.expressions = std::mem::take(&mut rtmw_est.skeleton.expressions);
         skeleton.face_mesh_confidence = rtmw_est.skeleton.face_mesh_confidence;
         if let (Some(ref mut fp), Some(mesh_conf)) =
@@ -550,6 +549,27 @@ fn calibrate_scale(
         (11, 12, "hip-span", ASSUMED_HIP_SPAN_M),
     ];
 
+    // 2D anchor-pair separation must clear this fraction of frame
+    // diagonal before we trust the calibration. Side-profile views
+    // collapse the shoulder pair (and often hip pair too) onto
+    // near-overlapping pixels, where DAv2 returns the same depth for
+    // both points and `geom` shrinks toward zero — `c = D / √geom`
+    // then explodes, multiplying every metric coordinate by the
+    // resulting huge scalar (we observed shoulder-Y ≈ 3.5 m for a
+    // standing subject in a side-profile sweep). Requiring a minimum
+    // 2D separation rejects these degenerate configurations and falls
+    // through to the next anchor (or to "no calibration this frame",
+    // which the provider handles by passing through RTMW3D's synthetic
+    // z).
+    const MIN_ANCHOR_2D_SEPARATION: f32 = 0.05;
+
+    // Calibrated `c` plausibility window. Webcam subjects sit
+    // 0.5–4 m from camera; with shoulder span ≈ 0.4 m, `c = D/√geom`
+    // typically lands 1–6. Outside [0.3, 15] is almost certainly the
+    // degenerate-anchor pathology described above leaking through.
+    const MIN_C: f32 = 0.3;
+    const MAX_C: f32 = 15.0;
+
     for &(idx_a, idx_b, label, distance_m) in candidates {
         let a = joints.get(idx_a)?;
         let b = joints.get(idx_b)?;
@@ -558,6 +578,16 @@ fn calibrate_scale(
         {
             continue;
         }
+
+        // 2D separation guard. `(nx, ny)` are in normalised image
+        // coords so the comparison is resolution-independent.
+        let dnx = a.nx - b.nx;
+        let dny = a.ny - b.ny;
+        let pair_dist_2d = (dnx * dnx + dny * dny).sqrt();
+        if pair_dist_2d < MIN_ANCHOR_2D_SEPARATION {
+            continue;
+        }
+
         let d_a = match dav2.sample_inverse_depth(a.nx, a.ny, SAMPLE_RADIUS_PX) {
             Some(v) if v > 1e-3 => v,
             _ => continue,
@@ -578,6 +608,9 @@ fn calibrate_scale(
         }
         let scale_c = distance_m / geom.sqrt();
         if !scale_c.is_finite() || scale_c <= 0.0 {
+            continue;
+        }
+        if !(MIN_C..=MAX_C).contains(&scale_c) {
             continue;
         }
         return Some(Calibration {
