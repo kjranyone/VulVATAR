@@ -1,19 +1,18 @@
-//! 2D detection annotation for the GUI camera-preview overlay. Just
-//! the body-17 keypoints in image-normalised coords plus the COCO
-//! body skeleton edge list — the renderer reads it without further
-//! transforms.
+//! 2D detection annotation for the GUI camera-preview overlay and
+//! downstream consumers. Carries the full COCO-Wholebody 133 keypoints
+//! in image-normalised coords; the skeleton edge list still describes
+//! only the body-17 topology so the GUI renderer keeps working without
+//! changes. Depth-aware providers (`rtmw3d-with-depth`) read the full
+//! 133 to back-project hands and face.
 
 use super::super::DetectionAnnotation;
 use super::decode::DecodedJoint;
 
 pub(super) fn build_annotation(joints: &[DecodedJoint]) -> DetectionAnnotation {
-    // Emit the body 17 in image-normalised coords for the GUI overlay.
-    // Edges follow the COCO body topology so the existing renderer can
-    // draw it without changes.
-    let mut keypoints = Vec::with_capacity(17);
-    for j in joints.iter().take(17) {
-        keypoints.push((j.nx, j.ny, j.score));
-    }
+    let keypoints = joints
+        .iter()
+        .map(|j| (j.nx, j.ny, j.score))
+        .collect();
     DetectionAnnotation {
         keypoints,
         skeleton: coco_body_edges(),

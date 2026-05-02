@@ -56,14 +56,24 @@ mod session;
 mod skeleton;
 #[cfg(feature = "inference")]
 mod wrist;
+#[cfg(feature = "inference")]
+mod yolox_worker;
 
 #[cfg(feature = "inference")]
-pub(in crate::tracking) use session::build_session;
+pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
+// Crop helpers shared with the CIGPose+MoGe-2 provider's optional
+// YOLOX person-crop pre-stage. The functions don't depend on RTMW3D
+// internals; they're here purely because that's where they were
+// originally written. Promotion-only re-export, no logic change.
+#[cfg(feature = "inference")]
+pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
 
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
 use super::yolox::YoloxPersonDetector;
+#[cfg(feature = "inference")]
+use yolox_worker::YoloxWorker;
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{DetectionAnnotation, SourceSkeleton};
@@ -103,6 +113,18 @@ impl InferenceBackend {
     }
 }
 
+/// Submit a frame to the YOLOX worker on every Nth call. Detection
+/// itself runs asynchronously in a background thread, so the main
+/// pipeline never waits for it past the cold-start frame — we just
+/// read the worker's sticky outbox each call and use whatever bbox
+/// it last produced (typically 1–2 frames stale).
+///
+/// At 30 fps and N=4, YOLOX submits at 7.5 fps. The 25% downstream
+/// pad on the bbox absorbs the few-pixel subject motion that
+/// accumulates between submits.
+#[cfg(feature = "inference")]
+const YOLOX_REFRESH_PERIOD: u64 = 4;
+
 pub struct Rtmw3dInference {
     #[cfg(feature = "inference")]
     session: Session,
@@ -117,13 +139,17 @@ pub struct Rtmw3dInference {
     /// the spine direction implies.
     #[cfg(feature = "inference")]
     face_mesh: Option<FaceMeshInference>,
-    /// Optional YOLOX-m human-art person detector. When present the
-    /// camera frame is cropped to the largest detected person before
-    /// being fed to RTMW3D — this is the principled fix for
-    /// small-subject / off-centre / partial-occlusion cases. Absent →
-    /// whole-frame inference (Kinemotion-style).
+    /// Optional YOLOX-m human-art person detector running on a
+    /// background thread. When present the camera frame is cropped
+    /// to the largest detected person before being fed to RTMW3D —
+    /// the principled fix for small-subject / off-centre /
+    /// partial-occlusion cases. Absent → whole-frame inference
+    /// (Kinemotion-style). The worker pattern (mpsc inbox + sticky
+    /// `Arc<DetectResult>` outbox) means the main pipeline never
+    /// blocks on detection past the cold-start frame, hiding YOLOX's
+    /// ~22 ms cost behind the rest of the pipeline.
     #[cfg(feature = "inference")]
-    person_detector: Option<YoloxPersonDetector>,
+    yolox_worker: Option<YoloxWorker>,
     #[cfg(feature = "inference")]
     left_wrist: wrist::WristTracker,
     #[cfg(feature = "inference")]
@@ -137,9 +163,28 @@ pub struct Rtmw3dInference {
 impl Rtmw3dInference {
     /// Instantiate from `models_dir` (typically `models/`). Looks for
     /// `rtmw3d.onnx` and tries to register the DirectML EP, falling
-    /// back to CPU on EP failure.
+    /// back to CPU on EP failure. FaceMesh + Blendshape go on
+    /// DirectML (Auto) — best when no other heavy GPU model is
+    /// active. Depth-aware providers should use
+    /// [`Self::from_models_dir_with_face_ep`] with `ForceCpu` to
+    /// avoid GPU contention.
     #[cfg(feature = "inference")]
     pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
+        Self::from_models_dir_with_face_ep(
+            models_dir,
+            super::face_mediapipe::FaceMeshEp::Auto,
+        )
+    }
+
+    /// Same as [`Self::from_models_dir`] but with explicit FaceMesh
+    /// EP. Used by `rtmw3d-with-depth` to force FaceMesh onto CPU,
+    /// where it runs uncontended at ~7 ms instead of 13+ ms when
+    /// fighting DAv2 for the DirectML command queue.
+    #[cfg(feature = "inference")]
+    pub fn from_models_dir_with_face_ep(
+        models_dir: impl AsRef<Path>,
+        face_ep: super::face_mediapipe::FaceMeshEp,
+    ) -> Result<Self, String> {
         let models_dir = models_dir.as_ref();
         let model_path = models_dir.join("rtmw3d.onnx");
         if !model_path.is_file() {
@@ -174,7 +219,7 @@ impl Rtmw3dInference {
         }
 
         let mut load_warnings = Vec::new();
-        let face_mesh = match FaceMeshInference::try_from_models_dir(models_dir) {
+        let face_mesh = match FaceMeshInference::try_from_models_dir(models_dir, face_ep) {
             Ok(opt) => opt,
             Err(e) => {
                 let msg = format!(
@@ -189,7 +234,10 @@ impl Rtmw3dInference {
 
         let person_detector = match YoloxPersonDetector::try_from_models_dir(models_dir) {
             Ok(Some(d)) => {
-                info!("YOLOX person detector loaded ({})", d.backend().label());
+                info!(
+                    "YOLOX person detector loaded ({}) — running on background thread",
+                    d.backend().label()
+                );
                 Some(d)
             }
             Ok(None) => {
@@ -206,13 +254,17 @@ impl Rtmw3dInference {
                 None
             }
         };
+        let yolox_worker = match person_detector {
+            Some(d) => Some(YoloxWorker::spawn(d)?),
+            None => None,
+        };
 
         Ok(Self {
             session,
             input_name,
             output_names,
             face_mesh,
-            person_detector,
+            yolox_worker,
             left_wrist: wrist::WristTracker::default(),
             right_wrist: wrist::WristTracker::default(),
             load_warnings,
@@ -282,10 +334,23 @@ impl Rtmw3dInference {
         // detected or YOLOX is unavailable.
         let t_yolox = std::time::Instant::now();
         let (infer_rgb_owned, infer_rgb_slice, infer_w, infer_h, crop_origin, annotation_bbox) = {
-            let bbox_opt = self
-                .person_detector
-                .as_mut()
-                .and_then(|d| d.detect_largest_person(rgb_data, width, height));
+            // Submit a detect request to the YOLOX worker on every
+            // `YOLOX_REFRESH_PERIOD`-th frame (or always on cold
+            // start so the very first call doesn't deadlock waiting
+            // on `wait_latest`). The worker drains older queued
+            // requests so it always processes the freshest submitted
+            // frame. Either way, we then read the latest sticky
+            // result — typically from 1–2 frames ago, which is well
+            // within the 25% downstream pad.
+            let bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
+                let cold_start = !worker.has_result();
+                if cold_start || frame_index % YOLOX_REFRESH_PERIOD == 0 {
+                    worker.submit(rgb_data, width, height);
+                }
+                worker.wait_latest().bbox
+            } else {
+                None
+            };
             match bbox_opt {
                 Some(bbox) => {
                     // 25% pad: YOLOX bboxes are tight to the visible

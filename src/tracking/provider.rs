@@ -8,13 +8,19 @@
 use std::path::Path;
 
 use super::cigpose_metric_depth::CigposeMetricDepthProvider;
+use super::rtmw3d_with_depth::Rtmw3dWithDepthProvider;
 use super::PoseEstimate;
 
+/// Selects which tracking pipeline runs. Set to one of:
+///
+/// * `rtmw3d` (default) — single-pass 3D body+hands+face, fast,
+///   z is hip-relative synthetic from a body prior.
+/// * `rtmw3d-with-depth` — RTMW3D 2D + Depth Anything V2 Small
+///   relative depth + body-anchor calibration. Real measured z, sized
+///   for ~30 fps streaming.
+/// * `cigpose-metric-depth` — CIGPose 2D + MoGe-2 true metric
+///   depth. Highest depth accuracy, slow (~3 fps) — reference path.
 pub const POSE_PROVIDER_ENV: &str = "VULVATAR_POSE_PROVIDER";
-pub const CIGPOSE_MODEL_ENV: &str = "VULVATAR_CIGPOSE_MODEL";
-pub const METRIC_DEPTH_MODEL_ENV: &str = "VULVATAR_METRIC_DEPTH_MODEL";
-pub const METRIC_DEPTH_KIND_ENV: &str = "VULVATAR_METRIC_DEPTH_KIND";
-pub const LEGACY_DEPTH_MODEL_ENV: &str = "VULVATAR_DEPTH_MODEL";
 
 /// Runtime pose-estimation implementation used by the tracking worker.
 pub trait PoseProvider {
@@ -38,6 +44,7 @@ pub trait PoseProvider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoseProviderKind {
     Rtmw3d,
+    Rtmw3dWithDepth,
     CigposeMetricDepth,
 }
 
@@ -46,7 +53,7 @@ impl PoseProviderKind {
         let raw = std::env::var(POSE_PROVIDER_ENV).unwrap_or_else(|_| "rtmw3d".to_string());
         Self::parse(&raw).ok_or_else(|| {
             format!(
-                "unknown pose provider '{}'. Set {} to one of: rtmw3d, cigpose-metric-depth",
+                "unknown pose provider '{}'. Set {} to one of: rtmw3d, rtmw3d-with-depth, cigpose-metric-depth",
                 raw, POSE_PROVIDER_ENV
             )
         })
@@ -56,6 +63,11 @@ impl PoseProviderKind {
         let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
         match normalized.as_str() {
             "" | "rtmw3d" | "rtmpose3d" => Some(Self::Rtmw3d),
+            "rtmw3d-with-depth"
+            | "rtmw3d-depth"
+            | "rtmw3d-da"
+            | "rtmw3d-dav2"
+            | "rtmw3d+dav2" => Some(Self::Rtmw3dWithDepth),
             "cig-depth"
             | "cigpose-depth"
             | "cigpose-depth-anything"
@@ -79,6 +91,8 @@ pub fn create_pose_provider(
 ) -> Result<Box<dyn PoseProvider>, String> {
     match kind {
         PoseProviderKind::Rtmw3d => create_rtmw3d_provider(models_dir),
+        PoseProviderKind::Rtmw3dWithDepth => Rtmw3dWithDepthProvider::from_models_dir(models_dir)
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
         PoseProviderKind::CigposeMetricDepth => {
             CigposeMetricDepthProvider::from_models_dir(models_dir)
                 .map(|p| Box::new(p) as Box<dyn PoseProvider>)
@@ -153,6 +167,18 @@ mod tests {
         assert_eq!(
             PoseProviderKind::parse("cigpose-metric-depth"),
             Some(PoseProviderKind::CigposeMetricDepth)
+        );
+        assert_eq!(
+            PoseProviderKind::parse("rtmw3d-with-depth"),
+            Some(PoseProviderKind::Rtmw3dWithDepth)
+        );
+        assert_eq!(
+            PoseProviderKind::parse("rtmw3d_with_depth"),
+            Some(PoseProviderKind::Rtmw3dWithDepth)
+        );
+        assert_eq!(
+            PoseProviderKind::parse("rtmw3d-da"),
+            Some(PoseProviderKind::Rtmw3dWithDepth)
         );
     }
 

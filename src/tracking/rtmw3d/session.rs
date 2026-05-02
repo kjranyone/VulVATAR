@@ -62,6 +62,21 @@ fn build_cpu_session(
     Ok(session)
 }
 
+/// Force a session onto the CPU EP regardless of `inference-gpu`.
+/// Used for small models (FaceMesh ~4.8 MB, Blendshape ~1.8 MB) that
+/// otherwise fight DirectML for GPU command queue when a heavier
+/// model (DAv2 / RTMW3D / MoGe) is running concurrently. CPU is fast
+/// enough for these on modern hardware (single-digit ms) and fully
+/// removes the contention.
+pub(in crate::tracking) fn build_session_cpu_only(
+    model_path: &str,
+    intra_threads: usize,
+    label: &str,
+) -> Result<(Session, InferenceBackend), String> {
+    let session = build_cpu_session(model_path, intra_threads, label)?;
+    Ok((session, InferenceBackend::Cpu))
+}
+
 #[cfg(feature = "inference-gpu")]
 fn try_build_directml_session(model_path: &str, intra_threads: usize) -> Result<Session, String> {
     let builder = Session::builder().map_err(|e| format!("builder: {}", e))?;

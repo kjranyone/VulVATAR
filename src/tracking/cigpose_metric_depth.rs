@@ -1,428 +1,361 @@
-//! Experimental CIGPose + metric-depth tracking pipeline.
+//! Experimental CIGPose 2D + MoGe-2 metric-depth tracking pipeline.
 //!
-//! The core idea is to keep CIGPose responsible for stable 2D whole-body
-//! keypoints, then use UniDepthV2 / MoGe / Depth Pro style metric depth or a
-//! point cloud to create 3D joint candidates by projection. Bone constraints
-//! and temporal filtering should operate after this module has produced those
-//! metric candidates.
+//! CIGPose emits 133 COCO-Wholebody keypoints in 2D image coordinates;
+//! MoGe-2 emits a per-pixel metric point cloud (in metres). For each
+//! 2D keypoint we sample MoGe's point cloud at the corresponding
+//! pixel and use the resulting `(X, Y, Z)` as the joint's
+//! source-space position.
+//!
+//! ## Trade-off vs other providers
+//!
+//! * **vs `rtmw3d` (default)** — RTMW3D's z is hip-relative synthetic
+//!   from a body prior baked into the model. CIGPose+MoGe uses
+//!   *measured* monocular depth, so forward / backward limb motion is
+//!   more faithful. Cost: two ONNX sessions, much slower than RTMW3D.
+//! * **vs `rtmw3d-with-depth`** — The 30-fps streaming sibling. That
+//!   one trades MoGe's true-metric output for DAv2-Small's
+//!   relative-then-calibrated-metric depth and gets a ~5× speedup,
+//!   at the cost of an absolute-scale guess (shoulder span = 0.40 m).
+//!   This provider keeps MoGe's true-metric path and is the right
+//!   reference when accuracy matters more than fps.
+//!
+//! ## Pipeline
+//!
+//! 1. **YOLOX** person crop (optional). 1.25× pad, same pre-stage as
+//!    RTMW3D. CIGPose runs on the crop; 2D keypoints get remapped to
+//!    whole-frame normalised coords below so MoGe (always whole-frame)
+//!    can be sampled in a single coordinate system.
+//! 2. **CIGPose** 2D inference → 133 COCO-Wholebody keypoints.
+//! 3. **MoGe-2** metric depth on whole frame → 644×476 point cloud.
+//! 4. **Skeleton** built via [`super::skeleton_from_depth`]: hip mid
+//!    as origin, selfie-mirror axis flips, hand chains.
+//! 5. **Head pose** derived from face landmarks 0..=4 + MoGe samples.
+//! 6. **FaceMesh + BlendshapeV2** cascade (optional) → expressions.
 
 use std::path::{Path, PathBuf};
 
-use super::provider::{
-    PoseProvider, CIGPOSE_MODEL_ENV, LEGACY_DEPTH_MODEL_ENV, METRIC_DEPTH_KIND_ENV,
-    METRIC_DEPTH_MODEL_ENV,
+use super::provider::PoseProvider;
+use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
+
+#[cfg(feature = "inference")]
+use super::cigpose::{CigposeInference, NUM_JOINTS};
+#[cfg(feature = "inference")]
+use super::face_mediapipe::FaceMeshInference;
+#[cfg(feature = "inference")]
+use super::metric_depth::MoGe2Inference;
+#[cfg(feature = "inference")]
+use super::skeleton_from_depth::{
+    build_face_bbox_from_joints_2d, build_skeleton, derive_face_pose_metric, resolve_origin_metric,
 };
-use super::PoseEstimate;
+#[cfg(feature = "inference")]
+use super::yolox::YoloxPersonDetector;
+#[cfg(feature = "inference")]
+use log::{debug, info, warn};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetricDepthKind {
-    UniDepthV2,
-    MoGe,
-    DepthPro,
-    Custom,
-}
-
-impl MetricDepthKind {
-    pub fn from_env() -> Self {
-        let raw = std::env::var(METRIC_DEPTH_KIND_ENV).unwrap_or_else(|_| "unidepth-v2".into());
-        Self::parse(&raw).unwrap_or(Self::Custom)
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
-        match normalized.as_str() {
-            "unidepth" | "unidepth-v2" | "unidepthv2" => Some(Self::UniDepthV2),
-            "moge" => Some(Self::MoGe),
-            "depth-pro" | "depthpro" => Some(Self::DepthPro),
-            "custom" => Some(Self::Custom),
-            _ => None,
-        }
-    }
-
-    fn default_model_name(self) -> &'static str {
-        match self {
-            Self::UniDepthV2 => "unidepth_v2.onnx",
-            Self::MoGe => "moge.onnx",
-            Self::DepthPro => "depth_pro.onnx",
-            Self::Custom => "metric_depth.onnx",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::UniDepthV2 => "UniDepthV2",
-            Self::MoGe => "MoGe",
-            Self::DepthPro => "Depth Pro",
-            Self::Custom => "MetricDepth",
-        }
-    }
-}
-
-/// Pinhole camera intrinsics in pixel units.
-#[derive(Clone, Copy, Debug)]
-pub struct CameraIntrinsics {
-    pub fx: f32,
-    pub fy: f32,
-    pub cx: f32,
-    pub cy: f32,
-}
-
-impl CameraIntrinsics {
-    pub fn from_vertical_fov(width: u32, height: u32, fov_y_radians: f32) -> Option<Self> {
-        if width == 0 || height == 0 || !fov_y_radians.is_finite() || fov_y_radians <= 0.0 {
-            return None;
-        }
-        let fy = (height as f32 * 0.5) / (fov_y_radians * 0.5).tan();
-        if !fy.is_finite() || fy <= 0.0 {
-            return None;
-        }
-        Some(Self {
-            fx: fy,
-            fy,
-            cx: (width as f32 - 1.0) * 0.5,
-            cy: (height as f32 - 1.0) * 0.5,
-        })
-    }
-
-    pub fn back_project(&self, x_px: f32, y_px: f32, depth_m: f32) -> Option<[f32; 3]> {
-        if !depth_m.is_finite() || depth_m <= 0.0 || self.fx <= 0.0 || self.fy <= 0.0 {
-            return None;
-        }
-        Some([
-            (x_px - self.cx) / self.fx * depth_m,
-            (y_px - self.cy) / self.fy * depth_m,
-            depth_m,
-        ])
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct JointObservation2d {
-    pub x_px: f32,
-    pub y_px: f32,
-    pub confidence: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Joint3dCandidate {
-    pub position_m: [f32; 3],
-    pub confidence: f32,
-}
-
-/// Metric depth output for one frame. `depth_m` is row-major metres. When a
-/// model emits a point cloud directly, `point_cloud_m` should contain the same
-/// number of pixels and is preferred over depth back-projection.
-pub struct MetricDepthFrame<'a> {
-    pub width: u32,
-    pub height: u32,
-    pub depth_m: &'a [f32],
-    pub point_cloud_m: Option<&'a [[f32; 3]]>,
-}
-
-/// Project a 2D joint into a metric 3D candidate using a small local window.
-///
-/// The local median makes this robust against single-pixel depth spikes around
-/// wrists/fingers while preserving the metric coordinate frame for shoulders,
-/// hips, and torso yaw.
-pub fn project_keypoint_to_3d(
-    frame: &MetricDepthFrame<'_>,
-    intrinsics: CameraIntrinsics,
-    keypoint: JointObservation2d,
-    sample_radius_px: u32,
-) -> Option<Joint3dCandidate> {
-    if keypoint.confidence <= 0.0 || !keypoint.x_px.is_finite() || !keypoint.y_px.is_finite() {
-        return None;
-    }
-    let x = keypoint.x_px.round() as i32;
-    let y = keypoint.y_px.round() as i32;
-    let radius = sample_radius_px as i32;
-    let width = frame.width as i32;
-    let height = frame.height as i32;
-    if width <= 0 || height <= 0 || x < 0 || y < 0 || x >= width || y >= height {
-        return None;
-    }
-    let expected = frame.width as usize * frame.height as usize;
-    if frame.depth_m.len() < expected {
-        return None;
-    }
-    if let Some(points) = frame.point_cloud_m {
-        if points.len() >= expected {
-            if let Some(position_m) =
-                sample_point_cloud(points, frame.width, frame.height, x, y, radius)
-            {
-                return Some(Joint3dCandidate {
-                    position_m,
-                    confidence: keypoint.confidence.clamp(0.0, 1.0),
-                });
-            }
-        }
-    }
-
-    let depth_m = sample_depth(frame.depth_m, frame.width, frame.height, x, y, radius)?;
-    let position_m = intrinsics.back_project(keypoint.x_px, keypoint.y_px, depth_m)?;
-    Some(Joint3dCandidate {
-        position_m,
-        confidence: keypoint.confidence.clamp(0.0, 1.0),
-    })
-}
-
-fn sample_depth(
-    depth_m: &[f32],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    radius: i32,
-) -> Option<f32> {
-    let mut values = Vec::new();
-    for yy in (y - radius).max(0)..=(y + radius).min(height as i32 - 1) {
-        for xx in (x - radius).max(0)..=(x + radius).min(width as i32 - 1) {
-            let idx = yy as usize * width as usize + xx as usize;
-            let depth = depth_m[idx];
-            if depth.is_finite() && depth > 0.0 {
-                values.push(depth);
-            }
-        }
-    }
-    median(values)
-}
-
-fn sample_point_cloud(
-    points: &[[f32; 3]],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    radius: i32,
-) -> Option<[f32; 3]> {
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    let mut zs = Vec::new();
-    for yy in (y - radius).max(0)..=(y + radius).min(height as i32 - 1) {
-        for xx in (x - radius).max(0)..=(x + radius).min(width as i32 - 1) {
-            let idx = yy as usize * width as usize + xx as usize;
-            let [px, py, pz] = points[idx];
-            if px.is_finite() && py.is_finite() && pz.is_finite() && pz > 0.0 {
-                xs.push(px);
-                ys.push(py);
-                zs.push(pz);
-            }
-        }
-    }
-    Some([median(xs)?, median(ys)?, median(zs)?])
-}
-
-fn median(mut values: Vec<f32>) -> Option<f32> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(|a, b| a.total_cmp(b));
-    Some(values[values.len() / 2])
-}
-
-/// Tunables for converting 2D keypoints + metric depth into source-space 3D.
-#[derive(Clone, Debug)]
-pub struct CigposeMetricDepthParams {
-    /// Half-size of the square depth/point-cloud sampling window.
-    pub sample_radius_px: u32,
-    /// Candidate blend per frame after bone constraints.
-    pub temporal_blend: f32,
-    /// Maximum accepted per-frame joint-depth jump in metres before filtering.
-    pub max_depth_jump_m: f32,
-}
-
-impl Default for CigposeMetricDepthParams {
-    fn default() -> Self {
-        Self {
-            sample_radius_px: 4,
-            temporal_blend: 0.35,
-            max_depth_jump_m: 0.35,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CigposeMetricDepthConfig {
-    pub cigpose_model: PathBuf,
-    pub metric_depth_model: PathBuf,
-    pub metric_depth_kind: MetricDepthKind,
-    pub params: CigposeMetricDepthParams,
-}
-
-impl CigposeMetricDepthConfig {
-    pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Self {
-        let models_dir = models_dir.as_ref();
-        let metric_depth_kind = MetricDepthKind::from_env();
-        let cigpose_model = std::env::var_os(CIGPOSE_MODEL_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| models_dir.join("cigpose.onnx"));
-        let metric_depth_model = std::env::var_os(METRIC_DEPTH_MODEL_ENV)
-            .or_else(|| std::env::var_os(LEGACY_DEPTH_MODEL_ENV))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| models_dir.join(metric_depth_kind.default_model_name()));
-        Self {
-            cigpose_model,
-            metric_depth_model,
-            metric_depth_kind,
-            params: CigposeMetricDepthParams::default(),
-        }
-    }
-
-    pub fn validate_models(&self) -> Result<(), String> {
-        let mut missing = Vec::new();
-        if !self.cigpose_model.is_file() {
-            missing.push(format!(
-                "CIGPose model not found at {}",
-                self.cigpose_model.display()
-            ));
-        }
-        if !self.metric_depth_model.is_file() {
-            missing.push(format!(
-                "{} metric depth model not found at {}",
-                self.metric_depth_kind.label(),
-                self.metric_depth_model.display()
-            ));
-        }
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "{}. Run the dev.ps1 experimental pose-provider setup, provide ONNX exports via {} and {}, or place cigpose.onnx and the metric depth ONNX in models/.",
-                missing.join("; "),
-                CIGPOSE_MODEL_ENV,
-                METRIC_DEPTH_MODEL_ENV
-            ))
-        }
-    }
-}
-
-/// Provider implementation for the CIGPose 2D + metric-depth path.
-///
-/// It is intentionally not a silent fallback: until the CIGPose and metric
-/// depth ONNX decoders are wired, selecting this provider returns a startup
-/// error instead of producing synthetic or RTMW3D output under the new label.
 pub struct CigposeMetricDepthProvider {
-    config: CigposeMetricDepthConfig,
+    #[cfg(feature = "inference")]
+    cigpose: CigposeInference,
+    #[cfg(feature = "inference")]
+    moge: MoGe2Inference,
+    #[cfg(feature = "inference")]
+    person_detector: Option<YoloxPersonDetector>,
+    #[cfg(feature = "inference")]
+    face_mesh: Option<FaceMeshInference>,
+    #[allow(dead_code)]
+    cigpose_model_path: PathBuf,
+    #[allow(dead_code)]
+    moge_model_path: PathBuf,
+    load_warnings: Vec<String>,
 }
 
 impl CigposeMetricDepthProvider {
+    #[cfg(feature = "inference")]
     pub(super) fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
-        let config = CigposeMetricDepthConfig::from_models_dir(models_dir);
-        config.validate_models()?;
-        Err(
-            "CIGPose+MetricDepth provider is registered, but its ONNX runtime decoders are not implemented yet"
-                .to_string(),
-        )
+        let dir = models_dir.as_ref();
+        let cigpose_model_path = dir.join("cigpose.onnx");
+        let moge_model_path = dir.join("moge_v2.onnx");
+
+        let cigpose = CigposeInference::from_model_path(&cigpose_model_path)?;
+        let moge = MoGe2Inference::from_model_path(&moge_model_path)?;
+
+        let mut load_warnings = Vec::new();
+        let person_detector = match YoloxPersonDetector::try_from_models_dir(dir) {
+            Ok(Some(d)) => {
+                info!("YOLOX person detector loaded ({})", d.backend().label());
+                Some(d)
+            }
+            Ok(None) => {
+                info!("YOLOX person detector not found — CIGPose will run whole-frame");
+                None
+            }
+            Err(e) => {
+                let msg = format!(
+                    "YOLOX person detector failed to load: {}. Falling back to whole-frame CIGPose.",
+                    e
+                );
+                warn!("{}", msg);
+                load_warnings.push(msg);
+                None
+            }
+        };
+
+        // Force CPU EP for FaceMesh: MoGe-2 (~175 ms) on DirectML
+        // would otherwise inflate the small face cascade via GPU
+        // queue contention.
+        let face_mesh = match FaceMeshInference::try_from_models_dir(
+            dir,
+            super::face_mediapipe::FaceMeshEp::ForceCpu,
+        ) {
+            Ok(opt) => opt,
+            Err(e) => {
+                let msg = format!(
+                    "Face inference failed to load: {}. Expressions disabled.",
+                    e
+                );
+                warn!("{}", msg);
+                load_warnings.push(msg);
+                None
+            }
+        };
+
+        info!(
+            "CIGPose+MoGe-2 provider ready (CIGPose: {}, MoGe-2: {}, YOLOX: {}, FaceMesh: {})",
+            cigpose.backend().label(),
+            moge.backend().label(),
+            if person_detector.is_some() { "on" } else { "off" },
+            if face_mesh.is_some() { "on" } else { "off" },
+        );
+
+        Ok(Self {
+            cigpose,
+            moge,
+            person_detector,
+            face_mesh,
+            cigpose_model_path,
+            moge_model_path,
+            load_warnings,
+        })
+    }
+
+    #[cfg(not(feature = "inference"))]
+    pub(super) fn from_models_dir(_: impl AsRef<Path>) -> Result<Self, String> {
+        Err("CIGPose+MoGe-2 provider requires the `inference` cargo feature".to_string())
     }
 }
 
 impl PoseProvider for CigposeMetricDepthProvider {
     fn label(&self) -> String {
-        format!("CIGPose+{}", self.config.metric_depth_kind.label())
+        #[cfg(feature = "inference")]
+        {
+            format!("CIGPose+MoGe-2 / {}", self.cigpose.backend().label())
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            "CIGPose+MoGe-2 (inference disabled)".to_string()
+        }
+    }
+
+    fn take_load_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.load_warnings)
     }
 
     fn estimate_pose(
         &mut self,
-        _rgb_data: &[u8],
-        _width: u32,
-        _height: u32,
-        _frame_index: u64,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        frame_index: u64,
     ) -> PoseEstimate {
-        // `from_models_dir` always returns Err today, so no instance of
-        // this provider can reach the worker loop. Keep the impl present
-        // so `Box<dyn PoseProvider>` coercion still works for the
-        // factory dispatch, but flag the dead path explicitly instead of
-        // silently producing a synthetic estimate that would mask the
-        // "not implemented" error from construction.
-        unreachable!(
-            "CigposeMetricDepthProvider::from_models_dir always errors today; \
-             estimate_pose should not be reachable until the ONNX decoders land"
-        )
+        #[cfg(feature = "inference")]
+        return self.estimate_pose_internal(rgb_data, width, height, frame_index);
+
+        #[cfg(not(feature = "inference"))]
+        {
+            let _ = (rgb_data, width, height);
+            empty_estimate(frame_index)
+        }
+    }
+}
+
+#[cfg(feature = "inference")]
+impl CigposeMetricDepthProvider {
+    fn estimate_pose_internal(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        frame_index: u64,
+    ) -> PoseEstimate {
+        let expected_len = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(3);
+        if rgb_data.len() < expected_len || width == 0 || height == 0 {
+            return empty_estimate(frame_index);
+        }
+
+        let t_total = std::time::Instant::now();
+
+        let t_yolox = std::time::Instant::now();
+        let (cig_owned, cig_input_slice, cig_w, cig_h, crop_origin, annotation_bbox) = {
+            let bbox_opt = self
+                .person_detector
+                .as_mut()
+                .and_then(|d| d.detect_largest_person(rgb_data, width, height));
+            match bbox_opt {
+                Some(bbox) => {
+                    let (cx1, cy1, cx2, cy2) = super::rtmw3d::pad_and_clamp_bbox(
+                        &bbox, width, height, 0.25,
+                    );
+                    let cw = cx2 - cx1;
+                    let ch = cy2 - cy1;
+                    debug!(
+                        "CIGPose+MoGe: YOLOX bbox=[{:.0},{:.0},{:.0},{:.0}] score={:.2} → crop {}x{} (orig {}x{})",
+                        bbox.x1, bbox.y1, bbox.x2, bbox.y2, bbox.score, cw, ch, width, height
+                    );
+                    if cw < 32 || ch < 32 {
+                        (None, rgb_data, width, height, None, None)
+                    } else {
+                        let crop = super::rtmw3d::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
+                        let ann = Some((
+                            bbox.x1 / width as f32,
+                            bbox.y1 / height as f32,
+                            bbox.x2 / width as f32,
+                            bbox.y2 / height as f32,
+                        ));
+                        (
+                            Some(crop),
+                            &[][..],
+                            cw,
+                            ch,
+                            Some((cx1 as f32, cy1 as f32, cw as f32, ch as f32)),
+                            ann,
+                        )
+                    }
+                }
+                None => (None, rgb_data, width, height, None, None),
+            }
+        };
+        let cig_input: &[u8] = match &cig_owned {
+            Some(buf) => buf.as_slice(),
+            None => cig_input_slice,
+        };
+        let dt_yolox = t_yolox.elapsed();
+
+        let t_cig = std::time::Instant::now();
+        let mut joints_2d = self.cigpose.estimate(cig_input, cig_w, cig_h);
+        let dt_cig = t_cig.elapsed();
+        if joints_2d.len() < NUM_JOINTS {
+            return empty_estimate(frame_index);
+        }
+
+        if let Some((ox, oy, cw, ch)) = crop_origin {
+            let inv_w = 1.0 / width as f32;
+            let inv_h = 1.0 / height as f32;
+            for j in joints_2d.iter_mut() {
+                j.nx = (ox + j.nx * cw) * inv_w;
+                j.ny = (oy + j.ny * ch) * inv_h;
+            }
+        }
+
+        let t_moge = std::time::Instant::now();
+        let depth_frame = match self.moge.estimate(rgb_data, width, height) {
+            Some(f) => f,
+            None => {
+                warn!("CIGPose+MoGe-2: depth pass returned no frame this tick");
+                return empty_estimate(frame_index);
+            }
+        };
+        let dt_moge = t_moge.elapsed();
+
+        let t_skel = std::time::Instant::now();
+        let (mut skeleton, origin_opt) = match resolve_origin_metric(&joints_2d, &depth_frame) {
+            Some((origin, anchor_was_hip, anchor_score)) => {
+                let sk = build_skeleton(
+                    frame_index,
+                    &joints_2d,
+                    &depth_frame,
+                    origin,
+                    anchor_was_hip,
+                    anchor_score,
+                );
+                (sk, Some(origin))
+            }
+            None => (SourceSkeleton::empty(frame_index), None),
+        };
+        let dt_skel = t_skel.elapsed();
+
+        let t_face = std::time::Instant::now();
+        if let Some(origin) = origin_opt {
+            skeleton.face = derive_face_pose_metric(&joints_2d, &depth_frame, origin);
+        }
+
+        if let Some(face_mesh) = self.face_mesh.as_mut() {
+            if let Some(bbox) = build_face_bbox_from_joints_2d(&joints_2d, width, height) {
+                if let Some((exprs, mesh_conf)) =
+                    face_mesh.estimate(rgb_data, width, height, &bbox)
+                {
+                    skeleton.expressions = exprs;
+                    skeleton.face_mesh_confidence = Some(mesh_conf);
+                    if let Some(ref mut fp) = skeleton.face {
+                        fp.confidence = fp.confidence.max(mesh_conf);
+                    }
+                }
+            }
+        }
+        let dt_face = t_face.elapsed();
+
+        let mut annotation = build_annotation(&joints_2d);
+        annotation.bounding_box = annotation_bbox;
+
+        let dt_total = t_total.elapsed();
+        debug!(
+            "CIGPose+MoGe timing: total={:>5.1}ms yolox={:>5.1}ms cig={:>5.1}ms moge={:>5.1}ms skel={:>4.1}ms face={:>4.1}ms",
+            dt_total.as_secs_f32() * 1000.0,
+            dt_yolox.as_secs_f32() * 1000.0,
+            dt_cig.as_secs_f32() * 1000.0,
+            dt_moge.as_secs_f32() * 1000.0,
+            dt_skel.as_secs_f32() * 1000.0,
+            dt_face.as_secs_f32() * 1000.0,
+        );
+
+        PoseEstimate {
+            annotation,
+            skeleton,
+        }
+    }
+}
+
+fn empty_estimate(frame_index: u64) -> PoseEstimate {
+    PoseEstimate {
+        annotation: DetectionAnnotation {
+            keypoints: Vec::new(),
+            skeleton: Vec::new(),
+            bounding_box: None,
+        },
+        skeleton: SourceSkeleton::empty(frame_index),
+    }
+}
+
+#[cfg(feature = "inference")]
+fn build_annotation(joints: &[super::cigpose::DecodedJoint2d]) -> DetectionAnnotation {
+    let keypoints = joints
+        .iter()
+        .map(|j| (j.nx, j.ny, j.score))
+        .collect::<Vec<_>>();
+    DetectionAnnotation {
+        keypoints,
+        skeleton: Vec::new(),
+        bounding_box: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        project_keypoint_to_3d, CameraIntrinsics, JointObservation2d, MetricDepthFrame,
-        MetricDepthKind,
-    };
-
     #[test]
-    fn parses_metric_depth_kind_aliases() {
-        assert_eq!(
-            MetricDepthKind::parse("unidepth_v2"),
-            Some(MetricDepthKind::UniDepthV2)
-        );
-        assert_eq!(MetricDepthKind::parse("moge"), Some(MetricDepthKind::MoGe));
-        assert_eq!(
-            MetricDepthKind::parse("depth-pro"),
-            Some(MetricDepthKind::DepthPro)
-        );
-    }
-
-    #[test]
-    fn projects_keypoint_with_metric_depth() {
-        let depth = vec![2.0; 9];
-        let frame = MetricDepthFrame {
-            width: 3,
-            height: 3,
-            depth_m: &depth,
-            point_cloud_m: None,
-        };
-        let intrinsics = CameraIntrinsics {
-            fx: 2.0,
-            fy: 2.0,
-            cx: 1.0,
-            cy: 1.0,
-        };
-        let joint = project_keypoint_to_3d(
-            &frame,
-            intrinsics,
-            JointObservation2d {
-                x_px: 2.0,
-                y_px: 1.0,
-                confidence: 0.8,
-            },
-            0,
-        )
-        .unwrap();
-        assert_eq!(joint.position_m, [1.0, 0.0, 2.0]);
-        assert_eq!(joint.confidence, 0.8);
-    }
-
-    #[test]
-    fn prefers_point_cloud_when_available() {
-        let depth = vec![2.0; 4];
-        let points = vec![
-            [0.0, 0.0, 2.0],
-            [1.0, 0.0, 2.0],
-            [0.0, 1.0, 2.0],
-            [7.0, 8.0, 9.0],
-        ];
-        let frame = MetricDepthFrame {
-            width: 2,
-            height: 2,
-            depth_m: &depth,
-            point_cloud_m: Some(&points),
-        };
-        let intrinsics = CameraIntrinsics {
-            fx: 1.0,
-            fy: 1.0,
-            cx: 0.0,
-            cy: 0.0,
-        };
-        let joint = project_keypoint_to_3d(
-            &frame,
-            intrinsics,
-            JointObservation2d {
-                x_px: 1.0,
-                y_px: 1.0,
-                confidence: 1.0,
-            },
-            0,
-        )
-        .unwrap();
-        assert_eq!(joint.position_m, [7.0, 8.0, 9.0]);
+    fn empty_estimate_is_well_formed() {
+        let est = super::empty_estimate(42);
+        assert_eq!(est.skeleton.source_timestamp, 42);
+        assert!(est.skeleton.joints.is_empty());
+        assert!(est.annotation.keypoints.is_empty());
     }
 }

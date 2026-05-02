@@ -9,9 +9,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "webcam")]
 mod webcam;
 
+#[cfg(feature = "inference")]
+pub mod cigpose;
 pub mod cigpose_metric_depth;
+#[cfg(feature = "inference")]
+pub mod depth_anything;
+#[cfg(feature = "inference")]
+pub mod metric_depth;
 mod pose_estimation;
 pub mod provider;
+pub mod rtmw3d_with_depth;
+#[cfg(feature = "inference")]
+mod skeleton_from_depth;
 
 pub mod face_mediapipe;
 pub mod rtmw3d;
