@@ -172,6 +172,19 @@ pub struct FaceBbox {
     pub size: f32,
 }
 
+/// Which execution provider to use for FaceMesh + Blendshape.
+///
+/// `Auto` is right when nothing else heavy uses DirectML (standalone
+/// `rtmw3d` provider): GPU runs the small face cascade in ~3 ms.
+/// `ForceCpu` is right when DAv2 / MoGe is colocated on DirectML
+/// (depth-aware providers): ~7 ms on CPU avoids the 13 ms-tier
+/// inflation we observed under DirectML EP queue contention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceMeshEp {
+    Auto,
+    ForceCpu,
+}
+
 pub struct FaceMeshInference {
     #[cfg(feature = "inference")]
     face_session: Session,
@@ -194,8 +207,13 @@ impl FaceMeshInference {
     /// missing — face inference is optional, the avatar still tracks
     /// body and hands without it. Returns `Err` only on a load
     /// failure that the caller should surface to the user.
+    ///
+    /// `face_ep` selects DirectML (Auto) vs CPU. See [`FaceMeshEp`].
     #[cfg(feature = "inference")]
-    pub fn try_from_models_dir(models_dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
+    pub fn try_from_models_dir(
+        models_dir: impl AsRef<Path>,
+        face_ep: FaceMeshEp,
+    ) -> Result<Option<Self>, String> {
         let models_dir = models_dir.as_ref();
         let face_path = models_dir.join("face_landmark.onnx");
         let blend_path = models_dir.join("face_blendshapes.onnx");
@@ -209,9 +227,21 @@ impl FaceMeshInference {
             return Ok(None);
         }
 
-        info!("Loading FaceMeshV2 from {}", face_path.display());
-        let (face_session, backend) =
-            super::rtmw3d::build_session(&face_path.to_string_lossy(), 2, "FaceMeshV2")?;
+        let ep_label = match face_ep {
+            FaceMeshEp::Auto => "Auto",
+            FaceMeshEp::ForceCpu => "CPU EP",
+        };
+        info!("Loading FaceMeshV2 from {} ({})", face_path.display(), ep_label);
+        let (face_session, backend) = match face_ep {
+            FaceMeshEp::Auto => {
+                super::rtmw3d::build_session(&face_path.to_string_lossy(), 2, "FaceMeshV2")?
+            }
+            FaceMeshEp::ForceCpu => super::rtmw3d::build_session_cpu_only(
+                &face_path.to_string_lossy(),
+                2,
+                "FaceMeshV2",
+            )?,
+        };
         let face_input_name = face_session
             .inputs()
             .first()
@@ -227,9 +257,21 @@ impl FaceMeshInference {
             face_input_name, face_output_names
         );
 
-        info!("Loading BlendshapeV2 from {}", blend_path.display());
-        let (blendshape_session, _) =
-            super::rtmw3d::build_session(&blend_path.to_string_lossy(), 2, "BlendshapeV2")?;
+        info!(
+            "Loading BlendshapeV2 from {} ({})",
+            blend_path.display(),
+            ep_label
+        );
+        let (blendshape_session, _) = match face_ep {
+            FaceMeshEp::Auto => {
+                super::rtmw3d::build_session(&blend_path.to_string_lossy(), 2, "BlendshapeV2")?
+            }
+            FaceMeshEp::ForceCpu => super::rtmw3d::build_session_cpu_only(
+                &blend_path.to_string_lossy(),
+                2,
+                "BlendshapeV2",
+            )?,
+        };
         let blendshape_input_name = blendshape_session
             .inputs()
             .first()
@@ -257,7 +299,10 @@ impl FaceMeshInference {
     }
 
     #[cfg(not(feature = "inference"))]
-    pub fn try_from_models_dir(_: impl AsRef<std::path::Path>) -> Result<Option<Self>, String> {
+    pub fn try_from_models_dir(
+        _: impl AsRef<std::path::Path>,
+        _: FaceMeshEp,
+    ) -> Result<Option<Self>, String> {
         Ok(None)
     }
 

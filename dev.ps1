@@ -142,6 +142,25 @@ function Install-ExperimentalPoseModels {
     )
 }
 
+function Install-DepthAnythingSmall {
+    # Depth Anything V2 Small (DPT + DINOv2-S backbone, ~99 MB fp32).
+    # Apache 2.0 licensed. Used by the rtmw3d-with-depth provider as
+    # the relative-depth source — RTMW3D supplies fast 2D landmarks +
+    # face cascade, this fills in measured per-pixel depth which the
+    # provider then calibrates to approximate metric via the body
+    # anchor (shoulder span ≈ 0.40 m). Designed for 30 fps streaming
+    # where MoGe-2's true-metric pass at ~200 ms is too heavy.
+    Write-Host "Setting up Depth Anything V2 Small ONNX..." -ForegroundColor Cyan
+    if (!(Test-Path "models")) {
+        New-Item -ItemType Directory -Force -Path "models" | Out-Null
+    }
+
+    Install-DirectFiles -Name "Depth Anything V2 Small (relative depth)" -Files @(
+        @{ Url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx";
+           OutName = "dav2_small.onnx" }
+    )
+}
+
 function Select-PoseProvider {
     $current = $env:VULVATAR_POSE_PROVIDER
     if ([string]::IsNullOrWhiteSpace($current)) {
@@ -149,17 +168,34 @@ function Select-PoseProvider {
     }
 
     Write-Host ""
-    Write-Host "Pose provider (current: $current)" -ForegroundColor Cyan
-    $choice = Read-Host "Use experimental CIGPose + MoGe-2 metric depth? [y/N]"
+    Write-Host "Select pose provider (current: $current)" -ForegroundColor Cyan
+    Write-Host "   1. rtmw3d              (fast ~25 fps, prior-based z, default)" -ForegroundColor Green
+    Write-Host "   2. rtmw3d-with-depth   (fast, calibrated metric z via DAv2-Small)" -ForegroundColor Green
+    Write-Host "   3. cigpose-metric-depth (slow ~3 fps, true metric z via MoGe-2)" -ForegroundColor Yellow
+    Write-Host "   0. keep current" -ForegroundColor DarkGray
+    $choice = Read-Host "Provider"
 
-    if ($choice -match '^[yY]') {
-        $env:VULVATAR_POSE_PROVIDER = "cigpose-metric-depth"
-        Install-Models
-        Install-ExperimentalPoseModels
-    } else {
-        $env:VULVATAR_POSE_PROVIDER = "rtmw3d"
-        Write-Host "Using pose provider: rtmw3d" -ForegroundColor Green
-        Install-Models
+    switch ($choice) {
+        "0" {
+            Write-Host "Keeping pose provider: $current" -ForegroundColor DarkGray
+        }
+        "2" {
+            $env:VULVATAR_POSE_PROVIDER = "rtmw3d-with-depth"
+            Write-Host "Using pose provider: rtmw3d-with-depth" -ForegroundColor Green
+            Install-Models
+            Install-DepthAnythingSmall
+        }
+        "3" {
+            $env:VULVATAR_POSE_PROVIDER = "cigpose-metric-depth"
+            Write-Host "Using pose provider: cigpose-metric-depth" -ForegroundColor Yellow
+            Install-Models
+            Install-ExperimentalPoseModels
+        }
+        default {
+            $env:VULVATAR_POSE_PROVIDER = "rtmw3d"
+            Write-Host "Using pose provider: rtmw3d" -ForegroundColor Green
+            Install-Models
+        }
     }
 }
 
