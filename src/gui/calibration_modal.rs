@@ -225,6 +225,11 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     // hold reverts to Closed.
     const DONE_LINGER_SECONDS: f32 = 1.5;
     advance_state(state);
+    // Pick up any torso template the worker has just published. This
+    // arrives 1–2 frames after `Collecting → AnchorDone` because the
+    // worker drains its buffer + publishes during its next loop
+    // iteration (~33 ms later). The poll is no-op until then.
+    poll_torso_template(state);
     if let CalibrationModalState::Done { shown_at, .. } = &state.calibration_modal {
         if shown_at.elapsed().as_secs_f32() > DONE_LINGER_SECONDS {
             state.calibration_modal.close();
@@ -466,6 +471,12 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         // have to wait the full 10s.
         ui.horizontal(|ui| {
             if ui.button(t!("calibration.cancel")).clicked() {
+                // Discard any in-flight torso capture buffer too —
+                // without this, a partial buffer would silently
+                // leak into the next capture's `take_torso_template`
+                // call (whose seq edge-detect would surface stale
+                // half-window data as a fresh template).
+                state.app.tracking.mailbox().set_torso_capture(false);
                 state.calibration_modal.close();
             }
             match state.calibration_modal {
@@ -540,6 +551,13 @@ fn advance_state(state: &mut GuiApp) {
         CalibrationModalState::HoldStill {
             mode, started_at, ..
         } if now.duration_since(*started_at).as_secs_f32() >= HOLD_STILL_SECONDS => {
+            // Tell the depth-pipeline provider to start accumulating
+            // per-frame torso depth samples for the template. The
+            // worker forwards this to `set_torso_capture(true)` on
+            // its next iteration; the actual capture work runs
+            // inside `estimate_pose` for the duration of the
+            // Collecting window.
+            state.app.tracking.mailbox().set_torso_capture(true);
             Some(CalibrationModalState::Collecting {
                 mode: *mode,
                 started_at: now,
@@ -668,6 +686,16 @@ fn finalize_collection(
         _ => Vec::new(),
     };
 
+    // Tell the worker to stop accumulating torso template samples
+    // and to publish whatever's in its buffer. The publish lands on
+    // the mailbox 1–2 frames later; `poll_torso_template` (called
+    // every frame from `draw_modal`) picks it up and stitches it
+    // onto the in-flight calibration.
+    //
+    // We send the toggle even on the Insufficient path so the
+    // worker doesn't hold a stale buffer across a failed capture.
+    state.app.tracking.mailbox().set_torso_capture(false);
+
     if samples.len() < MIN_SAMPLES {
         return CalibrationModalState::Done {
             mode,
@@ -726,6 +754,78 @@ fn persist_calibration(state: &mut GuiApp, calibration: PoseCalibration) {
             profile.pose_calibration = Some(calibration);
             state.profiles_dirty = true;
         }
+    }
+}
+
+/// Poll the tracking mailbox for a worker-published torso depth
+/// template and stitch it onto every place that holds the in-flight
+/// `PoseCalibration`. No-op until the worker publishes (which
+/// happens 1–2 frames after `Collecting → AnchorDone` because the
+/// publish goes through the worker loop).
+///
+/// Stitching points (in order):
+/// 1. The active profile's `pose_calibration` (so the persisted
+///    calibration on disk includes the template once
+///    `profiles_dirty` autosaves it).
+/// 2. `Application::tracking_calibration.pose` (so the live solver
+///    / depth pipeline see the enriched calibration starting next
+///    frame).
+/// 3. The mailbox's calibration channel (so the depth provider's
+///    `set_calibration` sees the enriched value and can use the
+///    template for inference-time bias correction in Step 1E).
+/// 4. The modal-state's local calibration copy in AnchorDone /
+///    RangeHoldStill / RangeCollecting / Done::Success — the
+///    success-display body text can then mention "torso template
+///    captured" and the user knows the rich version landed.
+fn poll_torso_template(state: &mut GuiApp) {
+    let Some((template, seq)) = state
+        .app
+        .tracking
+        .mailbox()
+        .take_torso_template(state.calibration_torso_template_seq)
+    else {
+        return;
+    };
+    state.calibration_torso_template_seq = seq;
+
+    // Stitch onto the active profile (and mark it dirty so the next
+    // autosave persists the enriched calibration).
+    let mut updated: Option<PoseCalibration> = None;
+    if let Some(idx) = state.profiles.active_index {
+        if let Some(profile) = state.profiles.profiles.get_mut(idx) {
+            if let Some(cal) = profile.pose_calibration.as_mut() {
+                cal.torso_depth_template = Some(template.clone());
+                state.profiles_dirty = true;
+                updated = Some(cal.clone());
+            }
+        }
+    }
+    // Mirror onto Application + mailbox so live consumers see the
+    // template on the very next frame.
+    if let Some(ref cal) = updated {
+        state.app.tracking_calibration.pose = Some(cal.clone());
+        state
+            .app
+            .tracking
+            .mailbox()
+            .set_calibration(Some(cal.clone()));
+    }
+    // Mirror onto the modal's own carried calibration so the
+    // success-display reflects the template (the modal renders
+    // `calibration.torso_depth_template.is_some()` as a status
+    // line in Step 1F's UI work).
+    match &mut state.calibration_modal {
+        CalibrationModalState::AnchorDone { calibration, .. }
+        | CalibrationModalState::RangeHoldStill { calibration, .. }
+        | CalibrationModalState::RangeCollecting { calibration, .. } => {
+            calibration.torso_depth_template = Some(template.clone());
+        }
+        CalibrationModalState::Done { outcome, .. } => {
+            if let DoneOutcome::Success { calibration, .. } = outcome {
+                calibration.torso_depth_template = Some(template);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -808,6 +908,7 @@ fn finalize_range_collection(
                         shoulder_span_m: None,
                         x_range_observed: None,
                         z_range_observed: None,
+                        torso_depth_template: None,
                     }
                 }),
                 now,
@@ -896,6 +997,14 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         // back to its static per-axis sensitivity defaults.
         x_range_observed: None,
         z_range_observed: None,
+        // Torso depth template is captured asynchronously by the
+        // depth provider during the same collection window and
+        // stitched back into the calibration *after* this aggregate
+        // call by `attach_torso_template_if_ready` — the anchor
+        // aggregate happens on every provider (including rtmw3d-only,
+        // which has no depth template), so we leave this `None` here
+        // and let the depth-aware path overwrite it.
+        torso_depth_template: None,
     }
 }
 

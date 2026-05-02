@@ -72,6 +72,13 @@ pub struct CigposeMetricDepthProvider {
     /// calibration so a phantom hip detection can't override the
     /// user's framing declaration.
     pose_calibration: Option<crate::tracking::PoseCalibration>,
+    /// Active torso-template capture buffer. See
+    /// `Rtmw3dWithDepthProvider::torso_capture` — same role:
+    /// accumulates per-frame torso-bbox depth samples while the GUI
+    /// calibration modal is in `Collecting`, finalised by
+    /// `take_torso_template`.
+    #[cfg(feature = "inference")]
+    torso_capture: Option<super::skeleton_from_depth::TorsoCaptureBuffer>,
 }
 
 impl CigposeMetricDepthProvider {
@@ -141,6 +148,7 @@ impl CigposeMetricDepthProvider {
             moge_model_path,
             load_warnings,
             pose_calibration: None,
+            torso_capture: None,
         })
     }
 
@@ -168,6 +176,32 @@ impl PoseProvider for CigposeMetricDepthProvider {
 
     fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
         self.pose_calibration = calibration;
+    }
+
+    fn set_torso_capture(&mut self, enabled: bool) {
+        #[cfg(feature = "inference")]
+        {
+            self.torso_capture = if enabled {
+                Some(super::skeleton_from_depth::TorsoCaptureBuffer::new())
+            } else {
+                None
+            };
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            let _ = enabled;
+        }
+    }
+
+    fn take_torso_template(&mut self) -> Option<crate::tracking::TorsoDepthTemplate> {
+        #[cfg(feature = "inference")]
+        {
+            self.torso_capture.take().and_then(|buf| buf.finalize())
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            None
+        }
     }
 
     fn estimate_pose(
@@ -278,12 +312,26 @@ impl CigposeMetricDepthProvider {
         };
         let dt_moge = t_moge.elapsed();
 
+        // Torso-template capture (active only during calibration).
+        // Same gating as the rtmw3d-with-depth provider: the buffer's
+        // `add_frame` returns `false` when shoulder + hip aren't all
+        // above the visibility floor, so partial-pose frames are
+        // silently skipped.
+        if let Some(buf) = self.torso_capture.as_mut() {
+            let _ = buf.add_frame(&joints_2d, &depth_frame);
+        }
+
         let t_skel = std::time::Instant::now();
         // BuildOptions derived from the active pose calibration
         // (Upper Body mode forces shoulder anchor — see
         // `Rtmw3dWithDepthProvider` for the rationale).
         let opts = build_options_from_calibration(self.pose_calibration.as_ref());
-        let (mut skeleton, origin_opt) = match resolve_origin_metric(&joints_2d, &depth_frame, opts) {
+        let (mut skeleton, origin_opt) = match resolve_origin_metric(
+            &joints_2d,
+            &depth_frame,
+            opts,
+            self.pose_calibration.as_ref(),
+        ) {
             Some((origin, anchor_was_hip, anchor_score)) => {
                 let sk = build_skeleton(
                     frame_index,
@@ -293,6 +341,7 @@ impl CigposeMetricDepthProvider {
                     anchor_was_hip,
                     anchor_score,
                     opts,
+                    self.pose_calibration.as_ref(),
                 );
                 (sk, Some(origin))
             }

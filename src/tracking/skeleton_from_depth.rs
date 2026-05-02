@@ -168,6 +168,505 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
     Some(values[values.len() / 2])
 }
 
+/// Sample a torso-anchor keypoint (shoulder / hip) using the **back
+/// percentile** of the depth window instead of the median. The
+/// `BACK_PERCENTILE_FRACTION` deepest fraction of pixels in the window
+/// is selected, and the median of *those* pixels is returned.
+///
+/// **Why**: the unmasked median fails when something close to the
+/// camera (a hand crossing in front of the chest, a palm resting on
+/// the shoulder) covers the majority of the sample window. The
+/// median then collapses onto the occluder's depth, and the shoulder
+/// reads as `z > 0` (in front of the camera plane) — physically
+/// impossible for a torso anchor. The back-percentile approach
+/// exploits the anatomical prior that **the torso is the deepest
+/// part of any near-keypoint geometry**: even when a hand covers
+/// most of the window, the few pixels at the edges that still see
+/// the actual shoulder live at the *back* of the depth distribution.
+/// Taking the median of the deepest 25% gives those pixels the
+/// floor.
+///
+/// **Why this isn't safe for non-torso keypoints**: a wrist held in
+/// front of the body has `wrist_depth < torso_depth`. Applying the
+/// back-percentile to the wrist would push it backward onto the
+/// torso's depth — a regression. So this function is wired *only*
+/// to shoulder (COCO 5, 6) and hip (COCO 11, 12) samples in
+/// `resolve_origin_metric` and `build_skeleton::resolve`. The other
+/// 13 body keypoints, plus all face / hand keypoints, continue to
+/// use the vanilla median sample which trusts the keypoint position.
+pub fn sample_metric_point_back_percentile(
+    frame: &MoGeFrame,
+    nx: f32,
+    ny: f32,
+) -> Option<[f32; 3]> {
+    sample_metric_point_back_percentile_with_radius(frame, nx, ny, SAMPLE_RADIUS_PX)
+}
+
+/// Fraction of *person-surface* pixels (counting from the deepest)
+/// considered for the back-percentile median. 25% means: after the
+/// background-rejection pass narrows the window to person pixels,
+/// take the deepest 25% of those and median them. Tuned so the
+/// occluder-dominant case (hand covers >50% of window) still
+/// recovers via the rear edge pixels, while the no-occlusion case
+/// (uniform shoulder depth across the whole window) reduces to
+/// approximately the unmasked median.
+const BACK_PERCENTILE_FRACTION: f32 = 0.25;
+
+/// Half-width of the "person surface" depth band centred on the
+/// window's coarse median. Pixels outside this band (typically
+/// background — wall behind subject, often 1–3 m further than the
+/// torso) are excluded from the back-percentile selection so the
+/// "deepest fraction" doesn't end up reading the wall instead of
+/// the shoulder. 0.50 m comfortably covers a person's front-to-back
+/// thickness (~30 cm at the chest) while rejecting any meaningful
+/// background gap. Larger values (1.0+ m) start admitting walls
+/// in tight rooms; smaller values (0.20 m) start clipping the body
+/// itself when an occluder hand pulls the coarse median forward.
+const SURFACE_BAND_HALF_M: f32 = 0.50;
+
+/// Variant of [`sample_metric_point_back_percentile`] that takes the
+/// window half-size as an argument. Mirrors the
+/// [`sample_metric_point_with_radius`] split for diagnostic use.
+pub fn sample_metric_point_back_percentile_with_radius(
+    frame: &MoGeFrame,
+    nx: f32,
+    ny: f32,
+    radius_px: i32,
+) -> Option<[f32; 3]> {
+    if !nx.is_finite() || !ny.is_finite() {
+        return None;
+    }
+    let w = frame.width as i32;
+    let h = frame.height as i32;
+    let cx = (nx * frame.width as f32).round() as i32;
+    let cy = (ny * frame.height as f32).round() as i32;
+    if cx < 0 || cy < 0 || cx >= w || cy >= h {
+        return None;
+    }
+    let cap = ((radius_px * 2 + 1) * (radius_px * 2 + 1)) as usize;
+    let mut samples: Vec<[f32; 3]> = Vec::with_capacity(cap);
+    for yy in (cy - radius_px).max(0)..=(cy + radius_px).min(h - 1) {
+        for xx in (cx - radius_px).max(0)..=(cx + radius_px).min(w - 1) {
+            let idx = yy as usize * frame.width as usize + xx as usize;
+            let [px, py, pz] = frame.points_m[idx];
+            if px.is_finite() && py.is_finite() && pz.is_finite() && pz > 0.0 {
+                samples.push([px, py, pz]);
+            }
+        }
+    }
+    if samples.is_empty() {
+        return None;
+    }
+
+    // Step 1 — coarse person-surface depth from the unmasked median.
+    // This is the same value `sample_metric_point` would return; we
+    // reuse it as an anchor for the surface-band filter below. When
+    // an occluder dominates the window the coarse median sits on
+    // the occluder's depth, but the *band* around it (±0.5 m) still
+    // reaches back to the shoulder behind it; the band only excludes
+    // genuine background (wall 1+ m further).
+    let mut all_z: Vec<f32> = samples.iter().map(|p| p[2]).collect();
+    all_z.sort_by(|a, b| a.total_cmp(b));
+    let coarse_z = all_z[all_z.len() / 2];
+
+    // Step 2 — keep only pixels within the person-surface band. The
+    // band is centred on `coarse_z` and ±SURFACE_BAND_HALF_M wide.
+    // Background pixels (wall behind subject, depth-map void filled
+    // with implausible values) fall outside this band and are
+    // discarded so they don't poison the back-percentile in step 3.
+    let surface: Vec<&[f32; 3]> = samples
+        .iter()
+        .filter(|p| (p[2] - coarse_z).abs() <= SURFACE_BAND_HALF_M)
+        .collect();
+
+    // Empty surface band is unreachable in practice — at minimum
+    // the pixel that produced `coarse_z` itself is in the band — but
+    // guard against numerical edge cases (NaN propagation, etc.) by
+    // falling back to the unmasked sample.
+    if surface.is_empty() {
+        return sample_metric_point_with_radius(frame, nx, ny, radius_px);
+    }
+
+    // Step 3 — sort surface pixels by depth and take the deepest
+    // BACK_PERCENTILE_FRACTION. With background gone, this reads
+    // the actual shoulder/hip surface at the rear edge of the
+    // person's silhouette, which is robust to a foreground hand /
+    // arm occluding most of the window.
+    let mut surface_owned: Vec<[f32; 3]> = surface.iter().map(|&&p| p).collect();
+    surface_owned.sort_by(|a, b| a[2].total_cmp(&b[2]));
+    let back_count = ((surface_owned.len() as f32) * BACK_PERCENTILE_FRACTION)
+        .ceil()
+        .max(1.0) as usize;
+    let back_count = back_count.min(surface_owned.len());
+    let back_slice = &surface_owned[surface_owned.len() - back_count..];
+
+    // Per-axis median of the back slice. Sorting each axis
+    // independently rather than picking the centroid of the same
+    // pixel: x / y of the same back-most z pixel can land on the
+    // shoulder edge rather than the centre, while the per-axis
+    // median centres the (x, y, z) result on the back slice's
+    // centre of mass.
+    let xs: Vec<f32> = back_slice.iter().map(|p| p[0]).collect();
+    let ys: Vec<f32> = back_slice.iter().map(|p| p[1]).collect();
+    let zs: Vec<f32> = back_slice.iter().map(|p| p[2]).collect();
+    Some([median(xs)?, median(ys)?, median(zs)?])
+}
+
+// ---------------------------------------------------------------------------
+// Torso depth template capture
+// ---------------------------------------------------------------------------
+
+/// Running accumulator for `TorsoDepthTemplate` capture during a
+/// calibration window. Each `add_frame` call samples one cell per
+/// grid position and appends the depth to the matching per-cell
+/// bucket; `finalize` reduces each bucket via median to produce
+/// the on-disk template.
+///
+/// Memory cost is bounded: `GRID_SIZE × GRID_SIZE × frames × 4
+/// bytes`. At 32×32 cells × 60 frames (2 s × 30 fps) × 4 = 240 KB
+/// per capture window, well below the 4 KB final on-disk size and
+/// utterly insignificant for a transient buffer.
+pub struct TorsoCaptureBuffer {
+    /// Per-cell accumulated depths. Length = `GRID_SIZE × GRID_SIZE`,
+    /// row-major. Cells with no admitted samples (depth-map void or
+    /// no qualifying frame in the window) finalize to `f32::NAN`.
+    cells: Vec<Vec<f32>>,
+    /// Bbox extents averaged across admitted frames. We average rather
+    /// than take a single frame's because the subject drifts slightly
+    /// during the 2-second window — averaging gives the template a
+    /// "centred" bbox over the capture period.
+    bbox_acc: [f32; 4],
+    /// Number of frames whose data was admitted into `cells` /
+    /// `bbox_acc`. Used at finalize time to (a) bail with `None` if
+    /// zero, and (b) divide `bbox_acc` for the average.
+    frame_count: u32,
+}
+
+impl TorsoCaptureBuffer {
+    /// Grid resolution. Mirrors `TorsoDepthTemplate::GRID_SIZE` so
+    /// callers can pre-size their loops without coupling to the
+    /// calibration module's constant.
+    pub const GRID: usize =
+        crate::tracking::TorsoDepthTemplate::GRID_SIZE as usize;
+
+    pub fn new() -> Self {
+        let cell_count = Self::GRID * Self::GRID;
+        Self {
+            cells: (0..cell_count).map(|_| Vec::new()).collect(),
+            bbox_acc: [0.0; 4],
+            frame_count: 0,
+        }
+    }
+
+    /// Sample one frame into the buffer. Returns `true` when the
+    /// frame met the bar (all four torso anchors above floor, bbox
+    /// non-degenerate, at least one cell got a finite sample) and
+    /// `false` when it was skipped.
+    ///
+    /// **What "all four torso anchors" means**: shoulders (COCO 5/6)
+    /// plus hips (COCO 11/12). When the user calibrates in Upper
+    /// Body mode the hips might be hidden — for now we still require
+    /// all four, since the torso bbox needs the hip pair to know
+    /// where the bottom of the torso ends. A future Upper Body-only
+    /// variant could fall back to "shoulder line + a fixed offset"
+    /// or to MediaPipe's torso segmentation, but that's outside the
+    /// minimum-version scope.
+    pub fn add_frame(
+        &mut self,
+        joints: &[DecodedJoint2d],
+        frame: &MoGeFrame,
+    ) -> bool {
+        if joints.len() < NUM_JOINTS {
+            return false;
+        }
+        let ls = &joints[5];
+        let rs = &joints[6];
+        let lh = &joints[11];
+        let rh = &joints[12];
+        let min_score = ls.score.min(rs.score).min(lh.score).min(rh.score);
+        if min_score < KEYPOINT_VISIBILITY_FLOOR {
+            return false;
+        }
+
+        // Bbox in image-relative coordinates. Pad slightly outward
+        // (5%) so cells near the keypoints capture a bit of skin /
+        // collar / waistband margin rather than being clipped at
+        // the exact joint pixel — small padding tolerates the
+        // running-mean bbox drift across the capture window without
+        // shifting cells off the body itself.
+        const BBOX_PAD: f32 = 0.05;
+        let min_nx_raw = ls.nx.min(rs.nx).min(lh.nx).min(rh.nx);
+        let max_nx_raw = ls.nx.max(rs.nx).max(lh.nx).max(rh.nx);
+        let min_ny_raw = ls.ny.min(rs.ny).min(lh.ny).min(rh.ny);
+        let max_ny_raw = ls.ny.max(rs.ny).max(lh.ny).max(rh.ny);
+        let bbox_w = max_nx_raw - min_nx_raw;
+        let bbox_h = max_ny_raw - min_ny_raw;
+        if bbox_w < 0.05 || bbox_h < 0.05 {
+            return false;
+        }
+        let pad_x = bbox_w * BBOX_PAD;
+        let pad_y = bbox_h * BBOX_PAD;
+        let min_nx = (min_nx_raw - pad_x).clamp(0.0, 1.0);
+        let max_nx = (max_nx_raw + pad_x).clamp(0.0, 1.0);
+        let min_ny = (min_ny_raw - pad_y).clamp(0.0, 1.0);
+        let max_ny = (max_ny_raw + pad_y).clamp(0.0, 1.0);
+
+        // Sample one pixel per cell at the cell's centre. Single-
+        // pixel sample is fine here because the median over the
+        // capture window absorbs per-frame depth-map noise — using
+        // the 7×7 window-median per cell would just be redundant
+        // smoothing.
+        let grid = Self::GRID;
+        let grid_f = grid as f32;
+        let mut frame_admitted = false;
+        for gy in 0..grid {
+            for gx in 0..grid {
+                // Cell centre in image-relative coords.
+                let cell_nx = min_nx + ((gx as f32 + 0.5) / grid_f) * (max_nx - min_nx);
+                let cell_ny = min_ny + ((gy as f32 + 0.5) / grid_f) * (max_ny - min_ny);
+                let cx = (cell_nx * frame.width as f32).round() as i32;
+                let cy = (cell_ny * frame.height as f32).round() as i32;
+                if cx < 0 || cy < 0 || cx >= frame.width as i32 || cy >= frame.height as i32 {
+                    continue;
+                }
+                let pixel_idx = cy as usize * frame.width as usize + cx as usize;
+                let [_, _, pz] = frame.points_m[pixel_idx];
+                if pz.is_finite() && pz > 0.0 {
+                    self.cells[gy * grid + gx].push(pz);
+                    frame_admitted = true;
+                }
+            }
+        }
+
+        if !frame_admitted {
+            return false;
+        }
+        self.bbox_acc[0] += min_nx;
+        self.bbox_acc[1] += min_ny;
+        self.bbox_acc[2] += max_nx;
+        self.bbox_acc[3] += max_ny;
+        self.frame_count += 1;
+        true
+    }
+
+    pub fn frame_count(&self) -> u32 {
+        self.frame_count
+    }
+
+    /// Reduce the per-cell accumulated depths via median and return
+    /// the immutable on-disk template. `None` when no frames were
+    /// admitted — caller should treat that as "no template available
+    /// for this calibration" and fall back to anchor-only behaviour.
+    pub fn finalize(self) -> Option<crate::tracking::TorsoDepthTemplate> {
+        if self.frame_count == 0 {
+            return None;
+        }
+        let n = self.frame_count as f32;
+        let bbox = [
+            self.bbox_acc[0] / n,
+            self.bbox_acc[1] / n,
+            self.bbox_acc[2] / n,
+            self.bbox_acc[3] / n,
+        ];
+        let depths: Vec<f32> = self
+            .cells
+            .into_iter()
+            .map(|mut bucket| {
+                if bucket.is_empty() {
+                    f32::NAN
+                } else {
+                    bucket.sort_by(|a, b| a.total_cmp(b));
+                    bucket[bucket.len() / 2]
+                }
+            })
+            .collect();
+        Some(crate::tracking::TorsoDepthTemplate {
+            width: Self::GRID as u32,
+            height: Self::GRID as u32,
+            depths_m: depths,
+            bbox_normalized: bbox,
+        })
+    }
+}
+
+impl Default for TorsoCaptureBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute the current frame's torso bounding box from the four
+/// torso anchor keypoints (shoulders 5/6 + hips 11/12). Returns
+/// `[min_nx, min_ny, max_nx, max_ny]` with the same 5% padding the
+/// capture path uses, or `None` when any anchor is below the
+/// visibility floor or the bbox is degenerate.
+///
+/// Single-sourced so the inference-time bias path
+/// (`compute_torso_bias`) and the capture path
+/// (`TorsoCaptureBuffer::add_frame`) agree on bbox extents bit-for-bit;
+/// a divergence here would shift the cell-grid registration and the
+/// bias would be reading the wrong template cells.
+pub fn current_torso_bbox(joints: &[DecodedJoint2d]) -> Option<[f32; 4]> {
+    if joints.len() < NUM_JOINTS {
+        return None;
+    }
+    let ls = &joints[5];
+    let rs = &joints[6];
+    let lh = &joints[11];
+    let rh = &joints[12];
+    let min_score = ls.score.min(rs.score).min(lh.score).min(rh.score);
+    if min_score < KEYPOINT_VISIBILITY_FLOOR {
+        return None;
+    }
+    const BBOX_PAD: f32 = 0.05;
+    let min_nx_raw = ls.nx.min(rs.nx).min(lh.nx).min(rh.nx);
+    let max_nx_raw = ls.nx.max(rs.nx).max(lh.nx).max(rh.nx);
+    let min_ny_raw = ls.ny.min(rs.ny).min(lh.ny).min(rh.ny);
+    let max_ny_raw = ls.ny.max(rs.ny).max(lh.ny).max(rh.ny);
+    let bbox_w = max_nx_raw - min_nx_raw;
+    let bbox_h = max_ny_raw - min_ny_raw;
+    if bbox_w < 0.05 || bbox_h < 0.05 {
+        return None;
+    }
+    let pad_x = bbox_w * BBOX_PAD;
+    let pad_y = bbox_h * BBOX_PAD;
+    Some([
+        (min_nx_raw - pad_x).clamp(0.0, 1.0),
+        (min_ny_raw - pad_y).clamp(0.0, 1.0),
+        (max_nx_raw + pad_x).clamp(0.0, 1.0),
+        (max_ny_raw + pad_y).clamp(0.0, 1.0),
+    ])
+}
+
+/// Maximum allowed deviation between current-frame and template depth
+/// for a cell to contribute to the bias estimate. Cells outside this
+/// band are treated as occluder (closer than template) or background
+/// (much further than template) and silently dropped. Same physical
+/// reasoning as `SURFACE_BAND_HALF_M` in the back-percentile sample:
+/// the human torso is ~30 cm front-to-back, ±0.5 m comfortably
+/// covers that plus moderate forward/back drift since calibration.
+const TEMPLATE_BIAS_BAND_M: f32 = 0.5;
+
+/// Compute the current-frame torso depth bias against a calibrated
+/// template. Returns `Some(bias_m)` such that
+/// `current_torso_depth ≈ template_torso_depth + bias` over the
+/// pixels that are actually showing the torso (occluders + background
+/// rejected by the `TEMPLATE_BIAS_BAND_M` gate).
+///
+/// **Algorithm**:
+/// 1. Build current-frame torso bbox from shoulders + hips.
+/// 2. For each template cell:
+///    a. Skip if `template_depth` is NaN (the cell never got a
+///       valid sample during calibration).
+///    b. Compute the cell's centre position in image coords by
+///       projecting `(rel_x, rel_y)` through the *current* bbox.
+///    c. Sample the current frame's depth at that pixel.
+///    d. Skip if the sample is non-finite or out of frame.
+///    e. Skip if `|current − template| > TEMPLATE_BIAS_BAND_M`
+///       (occluder / background reject).
+///    f. Otherwise, append `current − template` to the bias pool.
+/// 3. Return median(pool) if pool is non-empty, else `None`.
+///
+/// **Why median over mean**: occluder pixels that *just barely*
+/// fall inside the band (e.g. a hand whose depth is 40 cm closer
+/// than the chest behind it) will skew the mean noticeably; the
+/// median absorbs them as long as they're a minority. With ~half
+/// the torso typically visible even under heavy occlusion, the
+/// median is robust.
+pub fn compute_torso_bias(
+    template: &crate::tracking::TorsoDepthTemplate,
+    joints: &[DecodedJoint2d],
+    frame: &MoGeFrame,
+) -> Option<f32> {
+    let bbox = current_torso_bbox(joints)?;
+    let cur_w = bbox[2] - bbox[0];
+    let cur_h = bbox[3] - bbox[1];
+    if cur_w < 0.05 || cur_h < 0.05 {
+        return None;
+    }
+    let grid_w = template.width as usize;
+    let grid_h = template.height as usize;
+    if template.depths_m.len() != grid_w * grid_h {
+        return None;
+    }
+
+    let mut diffs: Vec<f32> = Vec::with_capacity(grid_w * grid_h);
+    let grid_w_f = grid_w as f32;
+    let grid_h_f = grid_h as f32;
+    for gy in 0..grid_h {
+        for gx in 0..grid_w {
+            let template_z = template.depths_m[gy * grid_w + gx];
+            if !template_z.is_finite() {
+                continue;
+            }
+            // Cell centre as a position within the current bbox.
+            let rel_x = (gx as f32 + 0.5) / grid_w_f;
+            let rel_y = (gy as f32 + 0.5) / grid_h_f;
+            let cell_nx = bbox[0] + rel_x * cur_w;
+            let cell_ny = bbox[1] + rel_y * cur_h;
+            let cx = (cell_nx * frame.width as f32).round() as i32;
+            let cy = (cell_ny * frame.height as f32).round() as i32;
+            if cx < 0 || cy < 0 || cx >= frame.width as i32 || cy >= frame.height as i32 {
+                continue;
+            }
+            let pixel_idx = cy as usize * frame.width as usize + cx as usize;
+            let [_, _, current_z] = frame.points_m[pixel_idx];
+            if !current_z.is_finite() || current_z <= 0.0 {
+                continue;
+            }
+            let diff = current_z - template_z;
+            if diff.abs() > TEMPLATE_BIAS_BAND_M {
+                continue;
+            }
+            diffs.push(diff);
+        }
+    }
+
+    if diffs.is_empty() {
+        return None;
+    }
+    diffs.sort_by(|a, b| a.total_cmp(b));
+    Some(diffs[diffs.len() / 2])
+}
+
+/// Look up a torso anchor's depth from the calibrated template
+/// at the keypoint's current image position. The keypoint's
+/// `(nx, ny)` is mapped into the *current* bbox's local coordinate
+/// system, then re-projected onto the template grid (the template
+/// stores its own bbox so the mapping is a pure rescale, not a
+/// per-frame fit). Returns `None` when the keypoint falls outside
+/// the bbox or the corresponding template cell is NaN (no
+/// calibration sample admitted there).
+pub fn template_depth_at_keypoint(
+    template: &crate::tracking::TorsoDepthTemplate,
+    bbox: &[f32; 4],
+    nx: f32,
+    ny: f32,
+) -> Option<f32> {
+    let bbox_w = bbox[2] - bbox[0];
+    let bbox_h = bbox[3] - bbox[1];
+    if bbox_w < 1e-4 || bbox_h < 1e-4 {
+        return None;
+    }
+    // Position within the current bbox, [0, 1] × [0, 1].
+    let rel_x = (nx - bbox[0]) / bbox_w;
+    let rel_y = (ny - bbox[1]) / bbox_h;
+    if !(0.0..=1.0).contains(&rel_x) || !(0.0..=1.0).contains(&rel_y) {
+        return None;
+    }
+    // Round to the nearest grid cell. Single-cell lookup rather than
+    // bilinear: at 32×32 the cell footprint is ~3% of bbox width,
+    // smaller than a typical shoulder keypoint's per-frame jitter,
+    // so interpolation buys nothing. Larger grids in future Step 3
+    // experiments may want bilinear.
+    let gx = (rel_x * template.width as f32) as usize;
+    let gy = (rel_y * template.height as f32) as usize;
+    let gx = gx.min(template.width as usize - 1);
+    let gy = gy.min(template.height as usize - 1);
+    let cell_z = template.depths_m[gy * template.width as usize + gx];
+    cell_z.is_finite().then_some(cell_z)
+}
+
 // ---------------------------------------------------------------------------
 // Skeleton building
 // ---------------------------------------------------------------------------
@@ -240,13 +739,54 @@ pub(super) fn resolve_origin_metric(
     joints: &[DecodedJoint2d],
     depth: &MoGeFrame,
     opts: BuildOptions,
+    calibration: Option<&crate::tracking::PoseCalibration>,
 ) -> Option<([f32; 3], /*anchor_was_hip*/ bool, /*anchor_score*/ f32)> {
     if joints.len() < NUM_JOINTS {
         return None;
     }
+    // Pre-compute torso bias if the calibration carries a template.
+    // Cached once per frame because both anchor pairs (hip + shoulder
+    // fallback) share the same bias — the bias describes the whole
+    // torso's z drift since calibration, not a per-keypoint offset.
+    let template_bias = calibration
+        .and_then(|c| c.torso_depth_template.as_ref())
+        .and_then(|t| {
+            let bbox = current_torso_bbox(joints)?;
+            compute_torso_bias(t, joints, depth).map(|b| (t, bbox, b))
+        });
+
+    // Anchor pairs (hip 11/12 and shoulder 5/6) use either:
+    //   (a) **template + bias** when calibration has a torso template
+    //       *and* the keypoint maps to a non-NaN template cell. This
+    //       is robust to heavy occlusion (palms covering shoulders,
+    //       arms crossed over chest) because the bias is computed
+    //       over the *visible* torso surface and the template
+    //       supplies the per-anchor depth from calibration.
+    //   (b) the **back-percentile** sample as a fallback. Used when
+    //       no calibration exists, or when the template cell at the
+    //       keypoint is NaN, or the bias couldn't be computed (no
+    //       visible torso pixels matched the band).
+    let sample = |kpt: &DecodedJoint2d| -> Option<[f32; 3]> {
+        if let Some((template, bbox, bias)) = template_bias.as_ref() {
+            if let Some(template_z) =
+                template_depth_at_keypoint(template, bbox, kpt.nx, kpt.ny)
+            {
+                // Keep x / y from the back-percentile sample (image-
+                // plane location is what we trust the keypoint
+                // detector for), but replace z with the calibrated
+                // template depth shifted by the current frame's
+                // bias. This is what survives occlusion of the
+                // keypoint itself.
+                let xy = sample_metric_point_back_percentile(depth, kpt.nx, kpt.ny)?;
+                return Some([xy[0], xy[1], template_z + bias]);
+            }
+        }
+        sample_metric_point_back_percentile(depth, kpt.nx, kpt.ny)
+    };
+
     let try_pair = |a: &DecodedJoint2d, b: &DecodedJoint2d| -> Option<[f32; 3]> {
-        let l = sample_metric_point(depth, a.nx, a.ny)?;
-        let r = sample_metric_point(depth, b.nx, b.ny)?;
+        let l = sample(a)?;
+        let r = sample(b)?;
         Some([
             (l[0] + r[0]) * 0.5,
             (l[1] + r[1]) * 0.5,
@@ -296,6 +836,7 @@ pub(super) fn build_skeleton(
     anchor_was_hip: bool,
     anchor_score: f32,
     opts: BuildOptions,
+    calibration: Option<&crate::tracking::PoseCalibration>,
 ) -> SourceSkeleton {
     let mut sk = SourceSkeleton::empty(frame_index);
     if joints.len() < NUM_JOINTS {
@@ -310,6 +851,28 @@ pub(super) fn build_skeleton(
         ]
     };
 
+    // Same template-bias precompute as in `resolve_origin_metric`.
+    // Torso bbox + bias depend only on the current frame's joints
+    // and depth map, so caching here avoids re-computing per anchor
+    // sample.
+    let template_bias = calibration
+        .and_then(|c| c.torso_depth_template.as_ref())
+        .and_then(|t| {
+            let bbox = current_torso_bbox(joints)?;
+            compute_torso_bias(t, joints, depth).map(|b| (t, bbox, b))
+        });
+
+    // Sample policy by keypoint:
+    //   * Shoulders (5, 6) and hips (11, 12) — torso anchors. When a
+    //     calibrated template is available *and* the keypoint maps to
+    //     a non-NaN template cell, use template-z + bias. Otherwise
+    //     fall back to back-percentile (which itself falls back to
+    //     vanilla median when surface band collapses).
+    //   * Every other body keypoint (face / elbows / wrists / knees /
+    //     ankles) uses the vanilla median. Applying the
+    //     back-percentile or template-bias correction to a wrist
+    //     held in front of the body would push it backward onto the
+    //     torso depth — a regression in the no-occlusion case.
     let resolve = |idx: usize| -> Option<SourceJoint> {
         if idx >= joints.len() {
             return None;
@@ -318,7 +881,23 @@ pub(super) fn build_skeleton(
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
-        let pos_cam = sample_metric_point(depth, j.nx, j.ny)?;
+        let pos_cam = if matches!(idx, 5 | 6 | 11 | 12) {
+            // Torso anchor path.
+            if let Some((template, bbox, bias)) = template_bias.as_ref() {
+                if let Some(template_z) =
+                    template_depth_at_keypoint(template, bbox, j.nx, j.ny)
+                {
+                    let xy = sample_metric_point_back_percentile(depth, j.nx, j.ny)?;
+                    [xy[0], xy[1], template_z + bias]
+                } else {
+                    sample_metric_point_back_percentile(depth, j.nx, j.ny)?
+                }
+            } else {
+                sample_metric_point_back_percentile(depth, j.nx, j.ny)?
+            }
+        } else {
+            sample_metric_point(depth, j.nx, j.ny)?
+        };
         Some(SourceJoint {
             position: to_source(pos_cam),
             confidence: j.score,

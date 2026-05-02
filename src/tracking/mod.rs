@@ -29,7 +29,7 @@ pub mod source_skeleton;
 #[cfg(feature = "inference")]
 pub mod yolox;
 
-pub use calibration::{CalibrationMode, PoseCalibration};
+pub use calibration::{CalibrationMode, PoseCalibration, TorsoDepthTemplate};
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -173,6 +173,26 @@ struct TrackingMailboxInner {
     /// call on iterations where nothing changed (avoids the per-frame
     /// `Option::clone` of the calibration).
     calibration_seq: u64,
+    /// GUI-driven flag: `true` while the calibration modal is in its
+    /// `Collecting` state and the depth provider should accumulate
+    /// per-frame torso-bbox depth samples for `TorsoDepthTemplate`
+    /// capture. The worker forwards transitions to the provider via
+    /// `PoseProvider::set_torso_capture` and harvests the finished
+    /// template via `take_torso_template` when the flag flips off.
+    torso_capture_enabled: bool,
+    /// Bumped each time `set_torso_capture` writes; same edge-detect
+    /// rationale as `calibration_seq`.
+    torso_capture_seq: u64,
+    /// Worker → GUI: the most recently published torso template,
+    /// posted by the worker after a `Collecting` window closes.
+    /// Consumed by the calibration modal's `take_torso_template`
+    /// poll which stitches it onto the in-flight `PoseCalibration`
+    /// during `finalize_collection`.
+    torso_template_collected: Option<TorsoDepthTemplate>,
+    /// Bumped each time `publish_torso_template` writes. The GUI's
+    /// poll uses the same `seq` pattern to consume each template
+    /// exactly once and avoid double-stitching.
+    torso_template_seq: u64,
 }
 
 fn now_nanos() -> u64 {
@@ -204,6 +224,10 @@ impl TrackingMailbox {
                 inference_backend_label: None,
                 calibration: None,
                 calibration_seq: 0,
+                torso_capture_enabled: false,
+                torso_capture_seq: 0,
+                torso_template_collected: None,
+                torso_template_seq: 0,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -279,6 +303,61 @@ impl TrackingMailbox {
         let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         if inner.calibration_seq != last_seen_seq {
             Some((inner.calibration.clone(), inner.calibration_seq))
+        } else {
+            None
+        }
+    }
+
+    /// GUI-side push: toggle the per-frame torso depth capture on or
+    /// off. Same replace-don't-queue semantics as `set_calibration`;
+    /// rapid toggles (e.g. modal open → cancel → re-open) collapse
+    /// to whichever transition the worker observes first.
+    pub fn set_torso_capture(&self, enabled: bool) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.torso_capture_enabled = enabled;
+        inner.torso_capture_seq += 1;
+    }
+
+    /// Worker-side poll for the torso-capture toggle. Same edge-detect
+    /// pattern as `poll_calibration`. Returns `Some((enabled, seq))`
+    /// only when the GUI flipped the flag since `last_seen_seq`.
+    pub fn poll_torso_capture(&self, last_seen_seq: u64) -> Option<(bool, u64)> {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.torso_capture_seq != last_seen_seq {
+            Some((inner.torso_capture_enabled, inner.torso_capture_seq))
+        } else {
+            None
+        }
+    }
+
+    /// Worker-side push: publish a finished torso template back to
+    /// the GUI for stitching onto the in-flight `PoseCalibration`.
+    /// Replaces the previous template (if any) — only the most
+    /// recent capture matters; if a user runs two captures in rapid
+    /// succession the second one wins.
+    pub fn publish_torso_template(&self, template: TorsoDepthTemplate) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.torso_template_collected = Some(template);
+        inner.torso_template_seq += 1;
+    }
+
+    /// GUI-side consume: take the most recently published torso
+    /// template if the worker published a new one since
+    /// `last_seen_seq`. Returns `Some((template, seq))` exactly once
+    /// per worker publish; subsequent calls with the new `seq`
+    /// return `None` until the next publish. The template is
+    /// consumed (cleared from the mailbox) so a stale capture from
+    /// an earlier session can't leak into a later one.
+    pub fn take_torso_template(
+        &self,
+        last_seen_seq: u64,
+    ) -> Option<(TorsoDepthTemplate, u64)> {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.torso_template_seq != last_seen_seq {
+            inner
+                .torso_template_collected
+                .take()
+                .map(|t| (t, inner.torso_template_seq))
         } else {
             None
         }
@@ -758,6 +837,11 @@ impl TrackingWorker {
         // `Some`, so per-frame cost is one mutex-guarded integer
         // compare in the hot path.
         let mut last_calibration_seq: u64 = 0;
+        // Same edge-detect pattern for the torso-capture toggle.
+        // The actual capture work happens inside the provider's
+        // `estimate_pose` (one Option-is-some branch per frame), so
+        // this loop only needs to forward on/off transitions.
+        let mut last_torso_capture_seq: u64 = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
         while running.load(Ordering::SeqCst) {
@@ -774,6 +858,27 @@ impl TrackingWorker {
                 {
                     provider.set_calibration(cal);
                     last_calibration_seq = seq;
+                }
+                // Torso-capture toggle. On `true` we just enable the
+                // provider's per-frame accumulation. On `false` we
+                // first drain whatever's in the buffer (via
+                // `take_torso_template`) and publish it back to the
+                // GUI before disabling — that's the canonical
+                // finalize path. A drained `None` (no qualifying
+                // frames during the window) silently skips the
+                // publish and the modal falls back to anchor-only.
+                if let Some((enabled, seq)) =
+                    mailbox.poll_torso_capture(last_torso_capture_seq)
+                {
+                    if enabled {
+                        provider.set_torso_capture(true);
+                    } else {
+                        if let Some(template) = provider.take_torso_template() {
+                            mailbox.publish_torso_template(template);
+                        }
+                        provider.set_torso_capture(false);
+                    }
+                    last_torso_capture_seq = seq;
                 }
             }
 

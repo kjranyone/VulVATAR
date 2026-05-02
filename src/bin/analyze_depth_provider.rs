@@ -5,8 +5,18 @@
 //!
 //! Usage:
 //!   cargo run --bin analyze_depth_provider --features inference -- \
-//!       <provider> <image_or_dir> [--out <file.jsonl>]
+//!       <provider> <image_or_dir> \
+//!       [--out <file.jsonl>] \
+//!       [--calibrate-with <prime.png>]
 //!     <provider> = rtmw3d | rtmw3d-with-depth | cigpose-metric-depth
+//!
+//! `--calibrate-with`: prime a torso-depth-template calibration from
+//! the given image (typically a clean front-neutral pose with no
+//! occluders) by running 10 inference frames over it with
+//! `set_torso_capture(true)`, harvesting the template, and feeding it
+//! back via `set_calibration`. Subsequent target-image inferences
+//! then use the template-based bias correction in
+//! `skeleton_from_depth`. No-op for non-depth providers.
 //!
 //! Defaults to rtmw3d-with-depth + the basic_pose_samples directory if
 //! no args are given. Output is line-delimited JSON for grep / jq.
@@ -29,9 +39,11 @@ fn main() -> Result<(), String> {
         .next()
         .unwrap_or_else(|| "validation_images/basic_pose_samples/photorealistic".to_string());
     let mut out_path: Option<PathBuf> = None;
+    let mut calibrate_with: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => out_path = args.next().map(PathBuf::from),
+            "--calibrate-with" => calibrate_with = args.next().map(PathBuf::from),
             other => return Err(format!("unknown arg '{other}'")),
         }
     }
@@ -55,6 +67,71 @@ fn main() -> Result<(), String> {
     eprintln!("provider label: {}", provider.label());
     for w in provider.take_load_warnings() {
         eprintln!("warning: {w}");
+    }
+
+    // Optional torso-template calibration prime. Runs the prime image
+    // through the provider 10 times with `set_torso_capture(true)`,
+    // then harvests the template via `take_torso_template` and folds
+    // it into a synthetic `PoseCalibration` that gets pushed back to
+    // the provider via `set_calibration`. Subsequent target-image
+    // inference uses this calibration for template-based bias
+    // correction in shoulder/hip samples.
+    if let Some(prime_path) = calibrate_with.as_ref() {
+        eprintln!("calibrate-with: {}", prime_path.display());
+        let prime_img =
+            image::open(prime_path).map_err(|e| format!("open prime: {e}"))?;
+        let prime_rgb = prime_img.to_rgb8();
+        let (pw, ph) = (prime_rgb.width(), prime_rgb.height());
+
+        provider.set_torso_capture(true);
+        // 10 frames is enough for the per-cell median to stabilise on
+        // a static prime image; the production calibration window
+        // captures ~60 frames over 2 seconds at 30 fps.
+        for i in 0..10 {
+            let _ = provider.estimate_pose(prime_rgb.as_raw(), pw, ph, i as u64);
+        }
+        let template = provider.take_torso_template();
+        provider.set_torso_capture(false);
+
+        match template {
+            Some(t) => {
+                eprintln!(
+                    "calibrate-with: torso template captured ({}×{}, {} valid cells)",
+                    t.width,
+                    t.height,
+                    t.depths_m.iter().filter(|d| d.is_finite()).count()
+                );
+                // Synthetic calibration: only the torso template field
+                // matters for the inference-time bias path; the other
+                // fields (anchor x/y/depth, jitter, ranges) drive
+                // unrelated solver paths that aren't tested here. Set
+                // them to zero/None so they don't affect anything.
+                let cal = vulvatar_lib::tracking::PoseCalibration {
+                    mode: vulvatar_lib::tracking::CalibrationMode::FullBody,
+                    captured_at: String::new(),
+                    captured_at_unix: 0,
+                    frame_count: 10,
+                    anchor_x: 0.0,
+                    anchor_y: 0.0,
+                    anchor_depth_m: None,
+                    confidence: 1.0,
+                    anchor_depth_jitter_m: None,
+                    shoulder_span_m: None,
+                    x_range_observed: None,
+                    z_range_observed: None,
+                    torso_depth_template: Some(t),
+                };
+                provider.set_calibration(Some(cal));
+            }
+            None => {
+                eprintln!(
+                    "calibrate-with: WARNING — no torso template produced \
+                     (check that the prime image has a clearly visible \
+                     full-body pose with both shoulders and hips above \
+                     the visibility floor)"
+                );
+            }
+        }
     }
 
     let mut out_lines: Vec<String> = Vec::with_capacity(images.len());

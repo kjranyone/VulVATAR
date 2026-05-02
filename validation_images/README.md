@@ -86,6 +86,12 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Uses a modest sleeveless gothic idol outfit with visible shoulders, arms, and legs for RGB skin-region validation.
   - All images are adult, fully clothed, non-sexual synthetic validation assets.
 
+- `hand_shoulder_occlusion/photorealistic_fixed_camera/`
+  - 6 photorealistic fixed-camera front-facing frames for shoulder keypoint occlusion tests.
+  - Poses place one or both hands directly on or in front of shoulder landmarks, including same-side hand-on-shoulder, cross-body hand-to-opposite-shoulder, both-hands-on-shoulders, and open palms in front of both shoulders.
+  - `annotations.csv` records the occluded shoulder landmark and hand occluder for each frame.
+  - Useful for checking false shoulder/hand detections when hand and shoulder coordinates overlap in RGB inference.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.

@@ -221,6 +221,13 @@ pub struct Rtmw3dWithDepthProvider {
     /// captured an explicit pose calibration.
     #[cfg(feature = "inference")]
     scale_c_ema: Option<f32>,
+    /// Active torso-template capture buffer, set by the GUI while
+    /// the calibration modal is in `Collecting`. `Some` means each
+    /// successful frame contributes one sample per cell to the
+    /// running median; `None` means the per-frame capture path is
+    /// skipped (no overhead in normal streaming).
+    #[cfg(feature = "inference")]
+    torso_capture: Option<super::skeleton_from_depth::TorsoCaptureBuffer>,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -278,6 +285,7 @@ impl Rtmw3dWithDepthProvider {
             load_warnings: warnings,
             pose_calibration: None,
             scale_c_ema: None,
+            torso_capture: None,
         })
     }
 
@@ -361,6 +369,39 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
 
     fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
         self.pose_calibration = calibration;
+    }
+
+    fn set_torso_capture(&mut self, enabled: bool) {
+        #[cfg(feature = "inference")]
+        {
+            // Toggling on starts a fresh buffer; toggling off
+            // discards any in-flight buffer (the canonical exit is
+            // through `take_torso_template`, which moves the buffer
+            // out and finalises it). This drop-on-off path covers
+            // user-initiated cancel of the calibration modal mid-
+            // capture, where we don't want stale partial data to
+            // leak into the next capture.
+            self.torso_capture = if enabled {
+                Some(super::skeleton_from_depth::TorsoCaptureBuffer::new())
+            } else {
+                None
+            };
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            let _ = enabled;
+        }
+    }
+
+    fn take_torso_template(&mut self) -> Option<crate::tracking::TorsoDepthTemplate> {
+        #[cfg(feature = "inference")]
+        {
+            self.torso_capture.take().and_then(|buf| buf.finalize())
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            None
+        }
     }
 
     fn estimate_pose(
@@ -535,6 +576,16 @@ impl Rtmw3dWithDepthProvider {
         let metric_frame = build_metric_frame_from_dav2(dav2_frame, &calib);
         let dt_metric = t_metric.elapsed();
 
+        // Phase 4.5 (active only during calibration capture): contribute
+        // one frame of torso-template data. The buffer's `add_frame`
+        // gates on shoulder + hip visibility internally — frames
+        // where the four torso anchors aren't all above the floor
+        // are silently skipped. Cost when no capture is active is
+        // a single Option::is_some branch.
+        if let Some(buf) = self.torso_capture.as_mut() {
+            let _ = buf.add_frame(&joints_2d, &metric_frame);
+        }
+
         // Phase 5: skeleton from depth.
         let t_skel = std::time::Instant::now();
         // BuildOptions derived from the active pose calibration. Upper
@@ -543,7 +594,12 @@ impl Rtmw3dWithDepthProvider {
         // override the user-acknowledged "I'm only showing my upper
         // body" declaration.
         let opts = build_options_from_calibration(self.pose_calibration.as_ref());
-        let mut skeleton = match resolve_origin_metric(&joints_2d, &metric_frame, opts) {
+        let mut skeleton = match resolve_origin_metric(
+            &joints_2d,
+            &metric_frame,
+            opts,
+            self.pose_calibration.as_ref(),
+        ) {
             Some((origin, was_hip, score)) => build_skeleton(
                 frame_index,
                 &joints_2d,
@@ -552,6 +608,7 @@ impl Rtmw3dWithDepthProvider {
                 was_hip,
                 score,
                 opts,
+                self.pose_calibration.as_ref(),
             ),
             None => {
                 warn!("RTMW3D+DAv2: no body anchor — emitting empty skeleton");

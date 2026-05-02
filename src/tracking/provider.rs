@@ -49,6 +49,41 @@ pub trait PoseProvider {
     /// metric calibration scale against the captured jitter range.
     /// The default no-op covers providers without a depth path.
     fn set_calibration(&mut self, _calibration: Option<crate::tracking::PoseCalibration>) {}
+
+    /// Toggle per-frame torso depth capture on/off. While enabled the
+    /// depth-aware providers accumulate one `TorsoDepthGridFrame`
+    /// per inference frame (subject to the visibility-floor gate)
+    /// into an internal buffer. The GUI calibration-modal flips this
+    /// on at the start of `Collecting`, off when the window closes,
+    /// then calls [`take_torso_template`] to harvest the
+    /// median-aggregated result.
+    ///
+    /// **Why a stateful capture mode rather than streaming the depth
+    /// map every frame**: the depth map is large (frame.width ×
+    /// frame.height × 12 bytes for the point cloud) and the calibration
+    /// window only happens for ~2 seconds out of an entire session.
+    /// Keeping the capture local to the provider means we don't pay
+    /// the per-frame mailbox-cloning cost for the 99.9% of frames
+    /// where no calibration is in flight.
+    ///
+    /// Default no-op covers providers without a depth path (rtmw3d-only).
+    fn set_torso_capture(&mut self, _enabled: bool) {}
+
+    /// Drain the accumulated torso depth template from the provider
+    /// and return its median-aggregated form, or `None` when no
+    /// frames cleared the visibility floor during the most recent
+    /// capture window. Resets the internal buffer so a subsequent
+    /// capture starts clean.
+    ///
+    /// The GUI calibration-modal calls this once when transitioning
+    /// `Collecting → AnchorDone`, stitches the result onto the
+    /// `PoseCalibration` it just finalized, and re-publishes the
+    /// enriched calibration via the mailbox.
+    ///
+    /// Default no-op covers providers without a depth path.
+    fn take_torso_template(&mut self) -> Option<crate::tracking::TorsoDepthTemplate> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

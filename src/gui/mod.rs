@@ -502,6 +502,12 @@ pub struct GuiApp {
     pub calibration_preview_texture: Option<egui::TextureHandle>,
     pub calibration_preview_seq: u64,
     pub calibration_preview_rgba_buf: Vec<u8>,
+    /// Last `torso_template_seq` we consumed from the tracking
+    /// mailbox. Drives one-shot stitching of the worker-published
+    /// `TorsoDepthTemplate` onto the in-flight `PoseCalibration` —
+    /// see `calibration_modal::poll_torso_template`. Initialised to
+    /// 0 so the first publish (seq starts at 1) is always picked up.
+    pub calibration_torso_template_seq: u64,
 
     // Lip sync
     pub lipsync: LipSyncGuiState,
@@ -719,6 +725,7 @@ impl GuiApp {
             calibration_preview_texture: None,
             calibration_preview_seq: 0,
             calibration_preview_rgba_buf: Vec::new(),
+            calibration_torso_template_seq: 0,
 
             lipsync: LipSyncGuiState {
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
@@ -979,6 +986,7 @@ impl GuiApp {
             calibration_preview_texture: None,
             calibration_preview_seq: 0,
             calibration_preview_rgba_buf: Vec::new(),
+            calibration_torso_template_seq: 0,
 
             lipsync: LipSyncGuiState {
                 available_mics: Vec::new(),

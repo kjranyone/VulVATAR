@@ -371,6 +371,15 @@ mod profile_roundtrip_tests {
                 shoulder_span_m: Some(0.412),
                 x_range_observed: Some(0.6),
                 z_range_observed: Some(0.35),
+                // Tiny 2×2 template is enough to round-trip-check
+                // the serde plumbing; the inference-time path uses
+                // 32×32 grids in production.
+                torso_depth_template: Some(crate::tracking::TorsoDepthTemplate {
+                    width: 2,
+                    height: 2,
+                    depths_m: vec![1.80, 1.85, 1.78, 1.83],
+                    bbox_normalized: [0.30, 0.20, 0.70, 0.65],
+                }),
             }),
         }
     }
@@ -446,6 +455,34 @@ mod profile_roundtrip_tests {
                     (Some(a), Some(b)) => approx_eq(a, b, "pose.z_range_observed"),
                     (None, None) => {}
                     _ => panic!("pose.z_range_observed presence drifted across round-trip"),
+                }
+                // Torso template — every field, including each cell of
+                // depths_m, must round-trip. A silent drop here would
+                // be a calibration-loss bug across an app restart.
+                match (&rc.torso_depth_template, &oc.torso_depth_template) {
+                    (Some(rt), Some(ot)) => {
+                        assert_eq!(rt.width, ot.width, "torso template width");
+                        assert_eq!(rt.height, ot.height, "torso template height");
+                        assert_eq!(
+                            rt.depths_m.len(),
+                            ot.depths_m.len(),
+                            "torso template cell count"
+                        );
+                        for (i, (a, b)) in
+                            rt.depths_m.iter().zip(ot.depths_m.iter()).enumerate()
+                        {
+                            approx_eq(*a, *b, &format!("torso template depths_m[{}]", i));
+                        }
+                        for i in 0..4 {
+                            approx_eq(
+                                rt.bbox_normalized[i],
+                                ot.bbox_normalized[i],
+                                &format!("torso template bbox_normalized[{}]", i),
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                    _ => panic!("pose.torso_depth_template presence drifted across round-trip"),
                 }
             }
             (None, None) => {}
