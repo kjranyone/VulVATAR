@@ -71,6 +71,12 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Useful for checking whether idol-style costume volume around the chest, shoulders, and waist changes pose inference.
   - All images are fully clothed, non-sexual synthetic validation assets.
 
+- `reiwa_idol_chest_silhouette_variation/photorealistic_fixed_camera_high_skin/`
+  - 9 photorealistic fixed-camera webcam-style frames with increased visible skin area for RGB pose inference.
+  - Uses the same chest-size and pose matrix as `photorealistic_fixed_camera/`, but switches to a modest sleeveless idol dance outfit with visible shoulders, arms, and legs.
+  - Useful for checking whether RGB skin-region visibility improves or destabilizes pose inference.
+  - All images are adult, fully clothed, non-sexual synthetic validation assets.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.
