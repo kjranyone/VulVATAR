@@ -1,14 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamProfile {
     pub name: String,
     pub tracking_mirror: bool,
-    pub smoothing_strength: f32,
-    pub confidence_threshold: f32,
     pub light_direction: [f32; 3],
     pub light_intensity: f32,
     pub ambient: [f32; 3],
@@ -26,8 +22,6 @@ impl StreamProfile {
         Self {
             name: "Streaming".to_string(),
             tracking_mirror: true,
-            smoothing_strength: 0.5,
-            confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             light_direction: [0.5, -0.7, 0.3],
             light_intensity: 1.0,
             ambient: [0.2, 0.2, 0.2],
@@ -41,16 +35,12 @@ impl StreamProfile {
         }
     }
 
-    /// Loose-confidence preset for offline capture: a lower threshold
-    /// admits more low-confidence keypoints, giving the post-edit pass
-    /// extra raw signal to smooth or cherry-pick from. Live twitchiness
-    /// is acceptable here because the recording will be re-cut.
+    /// Offline capture preset: mirror disabled, lighting tuned for
+    /// post-edit colour grading.
     pub fn recording_default() -> Self {
         Self {
             name: "Recording".to_string(),
             tracking_mirror: false,
-            smoothing_strength: 0.3,
-            confidence_threshold: 0.2,
             light_direction: [0.4, -0.8, 0.5],
             light_intensity: 1.2,
             ambient: [0.3, 0.3, 0.3],
@@ -64,17 +54,12 @@ impl StreamProfile {
         }
     }
 
-    /// Strict-confidence preset for live performance: a higher threshold
-    /// drops noisy keypoints so the avatar stops moving rather than
-    /// twitching when tracking degrades. Trades responsiveness for
-    /// stability — a frozen bone reads better on stream than a wobbling
-    /// one.
+    /// Live performance preset: mirror enabled, warmer ambient and
+    /// softer key for on-stream readability.
     pub fn performance_default() -> Self {
         Self {
             name: "Performance".to_string(),
             tracking_mirror: true,
-            smoothing_strength: 0.7,
-            confidence_threshold: 0.5,
             light_direction: [0.5, -0.7, 0.3],
             light_intensity: 0.8,
             ambient: [0.4, 0.4, 0.4],
@@ -344,8 +329,6 @@ mod profile_roundtrip_tests {
         StreamProfile {
             name: "RoundTripFixture".to_string(),
             tracking_mirror: false,
-            smoothing_strength: 0.625,
-            confidence_threshold: 0.375,
             light_direction: [0.125, -0.5, 0.875],
             light_intensity: 1.5,
             ambient: [0.0625, 0.125, 0.1875],
@@ -387,12 +370,6 @@ mod profile_roundtrip_tests {
         let o = &original.profiles[0];
         assert_eq!(r.name, o.name);
         assert_eq!(r.tracking_mirror, o.tracking_mirror);
-        approx_eq(r.smoothing_strength, o.smoothing_strength, "smoothing_strength");
-        approx_eq(
-            r.confidence_threshold,
-            o.confidence_threshold,
-            "confidence_threshold",
-        );
         approx_eq_arr3(r.light_direction, o.light_direction, "light_direction");
         approx_eq(r.light_intensity, o.light_intensity, "light_intensity");
         approx_eq_arr3(r.ambient, o.ambient, "ambient");
@@ -423,7 +400,7 @@ mod profile_roundtrip_tests {
                 },
                 StreamProfile {
                     name: "Second".to_string(),
-                    smoothing_strength: 0.125,
+                    camera_fov: 12.5,
                     ..make_distinctive_profile()
                 },
                 StreamProfile {
@@ -443,9 +420,9 @@ mod profile_roundtrip_tests {
         assert_eq!(restored.profiles[0].name, "First");
         assert_eq!(restored.profiles[1].name, "Second");
         approx_eq(
-            restored.profiles[1].smoothing_strength,
-            0.125,
-            "Second.smoothing_strength",
+            restored.profiles[1].camera_fov,
+            12.5,
+            "Second.camera_fov",
         );
         assert_eq!(restored.profiles[2].name, "Third");
         assert_eq!(restored.profiles[2].output_sink_index, 9);

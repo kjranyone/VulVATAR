@@ -34,8 +34,6 @@ pub struct ProjectState {
     pub tracking_mirror: bool,
     pub camera_resolution_index: usize,
     pub camera_framerate_index: usize,
-    pub smoothing_strength: f32,
-    pub confidence_threshold: f32,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
@@ -128,15 +126,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Fallback for `TrackingConfig::confidence_threshold` when the field is
-/// missing from a saved project (older serializations). Without this, serde's
-/// `f32::default()` would return `0.0`, which silently disables confidence
-/// filtering — every keypoint passes, including spurious ones, making
-/// freshly-loaded projects feel twitchy until the user touches the slider.
-fn default_confidence_threshold() -> f32 {
-    crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD
-}
-
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TransformState {
     #[serde(default)]
@@ -157,10 +146,6 @@ pub struct TrackingConfig {
     pub camera_resolution_index: usize,
     #[serde(default)]
     pub camera_framerate_index: usize,
-    #[serde(default)]
-    pub smoothing_strength: f32,
-    #[serde(default = "default_confidence_threshold")]
-    pub confidence_threshold: f32,
     #[serde(default)]
     pub hand_tracking_enabled: bool,
     /// `default_true`: matches the GUI's initial value
@@ -428,8 +413,6 @@ impl ProjectFile {
                 mirror: state.tracking_mirror,
                 camera_resolution_index: state.camera_resolution_index,
                 camera_framerate_index: state.camera_framerate_index,
-                smoothing_strength: state.smoothing_strength,
-                confidence_threshold: state.confidence_threshold,
                 hand_tracking_enabled: state.hand_tracking_enabled,
                 face_tracking_enabled: state.face_tracking_enabled,
                 lower_body_tracking_enabled: state.lower_body_tracking_enabled,
@@ -501,8 +484,6 @@ impl ProjectFile {
             tracking_mirror: self.tracking.mirror,
             camera_resolution_index: self.tracking.camera_resolution_index,
             camera_framerate_index: self.tracking.camera_framerate_index,
-            smoothing_strength: self.tracking.smoothing_strength,
-            confidence_threshold: self.tracking.confidence_threshold,
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
@@ -1252,26 +1233,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tracking_config_supplies_canonical_confidence_when_field_missing() {
-        // Older saved projects predate the confidence_threshold field.
-        // Without an explicit serde default, missing-field deserialization
-        // would silently produce 0.0 (no filtering) — masking noisy keypoints
-        // until the user nudges the slider. Make sure the canonical default
-        // wins instead.
-        let bare = json!({});
+    fn tracking_config_silently_drops_legacy_smoothing_fields() {
+        // `smoothing_strength` and `confidence_threshold` were removed
+        // when the GUI sliders went away. Older `.vvtproj` files still
+        // carry them; serde must accept the unknown fields and load
+        // the rest of the config rather than failing the load.
+        let legacy = json!({
+            "smoothing_strength": 0.7,
+            "confidence_threshold": 0.4,
+            "mirror": true,
+        });
         let cfg: TrackingConfig =
-            serde_json::from_value(bare).expect("missing field should default, not error");
-        assert_eq!(
-            cfg.confidence_threshold,
-            crate::tracking::DEFAULT_CONFIDENCE_THRESHOLD
-        );
-    }
-
-    #[test]
-    fn tracking_config_round_trips_explicit_confidence() {
-        let saved = json!({"confidence_threshold": 0.42});
-        let cfg: TrackingConfig = serde_json::from_value(saved).unwrap();
-        assert!((cfg.confidence_threshold - 0.42).abs() < 1e-6);
+            serde_json::from_value(legacy).expect("legacy fields must be ignored on load");
+        assert!(cfg.mirror, "non-removed fields still load");
     }
 
     #[test]

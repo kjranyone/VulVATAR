@@ -250,13 +250,8 @@ For the first pass, external source references are simpler, but the project load
 - make unsupported extra fields ignorable where practical
 - when a field needs `#[serde(default)]` for backwards compat, point
   it at a named function that returns the canonical default rather
-  than `f32::default()` / `bool::default()`. A bare `#[serde(default)]`
-  on `confidence_threshold` previously fell back to `0.0` for
-  pre-existing-field projects, silently disabling keypoint filtering
-  on load until the user touched the slider; the canonical default
-  (`tracking::DEFAULT_CONFIDENCE_THRESHOLD`) is the right answer and
-  the missing-field deserialisation is now pinned by a unit test
-  (`tracking_config_supplies_canonical_confidence_when_field_missing`).
+  than `f32::default()` / `bool::default()` whenever the bare default
+  would silently degrade behaviour on load.
 
 ## Failure Modes To Avoid
 

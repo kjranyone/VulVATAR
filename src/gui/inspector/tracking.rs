@@ -282,29 +282,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new(t!("tracking.smoothing_confidence"))
-        .default_open(false)
-        .show(ui, |ui| {
-            if ui
-                .add(
-                    egui::Slider::new(&mut state.tracking.smoothing_strength, 0.0..=1.0)
-                        .text(t!("tracking.smoothing")),
-                )
-                .changed()
-            {
-                state.project_dirty = true;
-            }
-            if ui
-                .add(
-                    egui::Slider::new(&mut state.tracking.confidence_threshold, 0.0..=1.0)
-                        .text(t!("tracking.threshold")),
-                )
-                .changed()
-            {
-                state.project_dirty = true;
-            }
-        });
-
     egui::CollapsingHeader::new(t!("tracking.lip_sync"))
         .default_open(false)
         .show(ui, |ui| {

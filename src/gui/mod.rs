@@ -1,10 +1,12 @@
 pub mod avatar_load;
+pub mod components;
 pub mod hotkey;
 pub mod inspector;
 pub mod mesh_picking;
 pub mod mode_nav;
 pub mod profile;
 pub mod status_bar;
+pub mod theme;
 pub mod top_bar;
 pub mod viewport;
 pub mod viewport_overlay;
@@ -19,7 +21,7 @@ use eframe::egui;
 use crate::app::{Application, RuntimeToggles};
 use crate::t;
 use crate::persistence::ProjectState;
-use crate::tracking::{TrackingErrorLevel, TrackingSmoothingParams, DEFAULT_CONFIDENCE_THRESHOLD};
+use crate::tracking::{TrackingErrorLevel, TrackingSmoothingParams};
 
 /// Build an `egui::FontDefinitions` whose fallback chain matches the
 /// active locale's preferred CJK font, falling back through the others.
@@ -35,17 +37,17 @@ use crate::tracking::{TrackingErrorLevel, TrackingSmoothingParams, DEFAULT_CONFI
 /// font goes first and the others come after as tofu-prevention
 /// fallbacks (Hangul → KR only; Korean-locale users see SC-only chars
 /// via the SC fallback rather than missing glyphs).
-pub(crate) fn build_cjk_font_definitions(locale: &str) -> Option<egui::FontDefinitions> {
-    let candidates: &[(&str, &str)] = &[
+pub(crate) fn build_font_definitions(locale: &str) -> Option<egui::FontDefinitions> {
+    let cjk_candidates: &[(&str, &str)] = &[
         ("noto_sans_jp", "NotoSansJP-Regular.otf"),
         ("noto_sans_kr", "NotoSansKR-Regular.otf"),
         ("noto_sans_sc", "NotoSansSC-Regular.otf"),
     ];
 
     let mut fonts = egui::FontDefinitions::default();
-    let mut available: Vec<&str> = Vec::new();
+    let mut available_cjk: Vec<&str> = Vec::new();
 
-    for (name, file) in candidates {
+    for (name, file) in cjk_candidates {
         let path = std::path::Path::new("assets").join(file);
         if !path.exists() {
             warn!(
@@ -60,14 +62,46 @@ pub(crate) fn build_cjk_font_definitions(locale: &str) -> Option<egui::FontDefin
                     (*name).into(),
                     Arc::new(egui::FontData::from_owned(data)),
                 );
-                available.push(name);
+                available_cjk.push(name);
                 info!("loaded CJK font: {}", path.display());
             }
             Err(e) => warn!("failed to read CJK font {}: {e}", path.display()),
         }
     }
 
-    if available.is_empty() {
+    // Material Symbols Rounded — drives the icon glyphs surfaced via
+    // `theme::typography::icon`. Optional: when the file is missing
+    // the GUI degrades to tofu in icon slots but keeps working, so
+    // dev workflows don't break before Install-Font has run.
+    let symbols_path = std::path::Path::new("assets").join("MaterialSymbolsRounded.ttf");
+    let icon_loaded = if symbols_path.exists() {
+        match std::fs::read(&symbols_path) {
+            Ok(data) => {
+                fonts.font_data.insert(
+                    "material_symbols".into(),
+                    Arc::new(egui::FontData::from_owned(data)),
+                );
+                fonts.families.insert(
+                    egui::FontFamily::Name(theme::ICON_FAMILY.into()),
+                    vec!["material_symbols".to_string()],
+                );
+                info!("loaded icon font: {}", symbols_path.display());
+                true
+            }
+            Err(e) => {
+                warn!("failed to read icon font {}: {e}", symbols_path.display());
+                false
+            }
+        }
+    } else {
+        warn!(
+            "icon font missing: {} — run dev.ps1 Install-Font",
+            symbols_path.display()
+        );
+        false
+    };
+
+    if available_cjk.is_empty() && !icon_loaded {
         return None;
     }
 
@@ -79,7 +113,7 @@ pub(crate) fn build_cjk_font_definitions(locale: &str) -> Option<egui::FontDefin
 
     let mut chain: Vec<&str> = Vec::new();
     for name in std::iter::once(primary).chain(fallbacks.iter().copied()) {
-        if available.contains(&name) {
+        if available_cjk.contains(&name) {
             chain.push(name);
         }
     }
@@ -101,6 +135,20 @@ pub(crate) fn build_cjk_font_definitions(locale: &str) -> Option<egui::FontDefin
 pub enum NotificationLevel {
     Info,
     Error,
+}
+
+/// Which sort the user picked in the Model Library card. The library
+/// itself doesn't store this — it just exposes mutating
+/// `sort_by_name` / `sort_by_last_loaded` / `sort_favorites_first`
+/// methods — so the GUI tracks the current visual state separately
+/// to drive the chip "selected" rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibrarySortMode {
+    #[default]
+    None,
+    Name,
+    Recent,
+    Favorites,
 }
 
 #[derive(Debug)]
@@ -298,8 +346,6 @@ pub struct TrackingGuiState {
     /// lean / crouch (translation, on top of body-yaw rotation). When
     /// false the avatar pivots in place, keeping the framing stable.
     pub root_translation_enabled: bool,
-    pub smoothing_strength: f32,
-    pub confidence_threshold: f32,
 }
 
 pub struct LipSyncGuiState {
@@ -486,6 +532,12 @@ pub struct GuiApp {
     pub library_rename_buf: String,
     pub library_tag_buf: String,
     pub library_show_missing: bool,
+    /// Which sort mode the user last selected via the chip row. Used
+    /// purely for the chip's "selected" rendering — the actual entry
+    /// order is mutated in place by `AvatarLibrary::sort_*`, so this
+    /// field doesn't drive sorting; it just remembers what the user
+    /// clicked so the chip stays highlighted.
+    pub library_sort_mode: LibrarySortMode,
 
     pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
     pub watched_avatar_dirs: Vec<std::path::PathBuf>,
@@ -514,9 +566,10 @@ impl GuiApp {
         // inspector — without this, file:// URIs return UnknownLoader.
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
-        if let Some(fonts) = build_cjk_font_definitions(&crate::i18n::locale()) {
+        if let Some(fonts) = build_font_definitions(&crate::i18n::locale()) {
             cc.egui_ctx.set_fonts(fonts);
         }
+        theme::apply(&cc.egui_ctx);
         let mut app = Box::new(Application::new());
         app.bootstrap();
         app.avatar_library = crate::persistence::load_avatar_library();
@@ -595,8 +648,6 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
-                smoothing_strength: 0.5,
-                confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
@@ -679,6 +730,7 @@ impl GuiApp {
             library_rename_buf: String::new(),
             library_tag_buf: String::new(),
             library_show_missing: false,
+            library_sort_mode: LibrarySortMode::None,
 
             folder_watcher: None,
             watched_avatar_dirs: Vec::new(),
@@ -834,8 +886,6 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
-                smoothing_strength: 0.5,
-                confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
@@ -918,6 +968,7 @@ impl GuiApp {
             library_rename_buf: String::new(),
             library_tag_buf: String::new(),
             library_show_missing: false,
+            library_sort_mode: LibrarySortMode::None,
 
             folder_watcher: None,
             watched_avatar_dirs: Vec::new(),
@@ -1041,8 +1092,6 @@ impl GuiApp {
             tracking_mirror: self.tracking.tracking_mirror,
             camera_resolution_index: self.tracking.camera_resolution_index,
             camera_framerate_index: self.tracking.camera_framerate_index,
-            smoothing_strength: self.tracking.smoothing_strength,
-            confidence_threshold: self.tracking.confidence_threshold,
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
@@ -1118,8 +1167,6 @@ impl GuiApp {
 
     pub fn apply_profile(&mut self, profile: &profile::StreamProfile) {
         self.tracking.tracking_mirror = profile.tracking_mirror;
-        self.tracking.smoothing_strength = profile.smoothing_strength;
-        self.tracking.confidence_threshold = profile.confidence_threshold;
         self.rendering.main_light_dir = profile.light_direction;
         self.rendering.main_light_intensity = profile.light_intensity;
         self.rendering.ambient_intensity = profile.ambient;
@@ -1230,8 +1277,6 @@ impl GuiApp {
         self.tracking.tracking_mirror = state.tracking_mirror;
         self.tracking.camera_resolution_index = state.camera_resolution_index;
         self.tracking.camera_framerate_index = state.camera_framerate_index;
-        self.tracking.smoothing_strength = state.smoothing_strength;
-        self.tracking.confidence_threshold = state.confidence_threshold;
         self.tracking.hand_tracking_enabled = state.hand_tracking_enabled;
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
@@ -1874,17 +1919,7 @@ impl eframe::App for GuiApp {
 
             let frame_config = crate::app::FrameConfig {
                 toggles: self.runtime_toggles(),
-                smoothing: TrackingSmoothingParams {
-                    // "Smoothing strength" in the GUI is the inverse of the
-                    // solver's blend toward the new value: 0 = instant snap,
-                    // 1 = never move.
-                    rotation_blend: (1.0 - self.tracking.smoothing_strength).clamp(0.05, 1.0),
-                    expression_blend: (1.0 - self.tracking.smoothing_strength * 0.6)
-                        .clamp(0.05, 1.0),
-                    joint_confidence_threshold: self.tracking.confidence_threshold,
-                    face_confidence_threshold: self.tracking.confidence_threshold,
-                    ..TrackingSmoothingParams::default()
-                },
+                smoothing: TrackingSmoothingParams::default(),
                 material_mode_index: self.rendering.material_mode_index,
                 hand_tracking_enabled: self.tracking.hand_tracking_enabled,
                 face_tracking_enabled: self.tracking.face_tracking_enabled,

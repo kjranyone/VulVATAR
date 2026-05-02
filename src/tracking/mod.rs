@@ -30,16 +30,6 @@ pub mod yolox;
 
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
-/// Mid-point reference value for the per-keypoint confidence
-/// threshold. Used by named tracking presets ("Streaming" etc.) as a
-/// sane middle that filters obvious noise without freezing bones in
-/// modest lighting. The runtime `Default` impl is *not* this value —
-/// `TrackingSmoothingParams::default` sets thresholds to `0.0` so a
-/// fresh install has no hidden gate, with the GUI sliders as the
-/// single point of control. See the comment in that `Default` impl
-/// for the rationale.
-pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.3;
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TrackingSourceId(pub u64);
 
@@ -83,16 +73,19 @@ pub struct TrackingSmoothingParams {
 
 impl Default for TrackingSmoothingParams {
     fn default() -> Self {
-        // Confidence thresholds default to *no gate* (`0.0`). The
-        // tracker's internal structural sanity is preserved (hip /
-        // shoulder origin choice, hand-MCP quorum, wrist anatomy
-        // check) but the user-tunable quality filters are off out
-        // of the box: every keypoint the model emits drives the
-        // avatar. Users dial the GUI sliders up if their lighting
-        // produces too much noise — better than the previous default
-        // hiding most of the keypoints from new users.
+        // `rotation_blend = 1.0` snaps each frame straight to the
+        // direction-matched output. The 1€ filter on joint positions
+        // (`pose_solver::preprocess_source`) already smooths jitter
+        // adaptively, so a separate per-frame rotation LPF on top
+        // just adds blanket lag. `joint_confidence_threshold = 0.0`
+        // delegates noise gating to the structural floors that already
+        // run upstream (`KEYPOINT_VISIBILITY_FLOOR`, hip/shoulder
+        // origin choice, hand-MCP quorum, wrist anatomy check).
+        // `expression_blend` stays smoothed because there is no 1€ on
+        // expression weights — without this LPF, ARKit blendshapes
+        // chatter visibly.
         Self {
-            rotation_blend: 0.7,
+            rotation_blend: 1.0,
             expression_blend: 0.8,
             joint_confidence_threshold: 0.0,
             face_confidence_threshold: 0.0,

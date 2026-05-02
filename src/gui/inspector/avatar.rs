@@ -1,137 +1,318 @@
 use eframe::egui;
 
+use crate::gui::components::{card, card_action_icon, kv_grid, kv_row, outlined_button};
+use crate::gui::theme::{color, icon as ic, space, typography};
 use crate::gui::GuiApp;
 use crate::t;
 
 use super::library;
 
 pub(super) fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new(t!("inspector.current_avatar"))
-        .default_open(true)
-        .show(ui, |ui| {
+    draw_model_information_card(ui, state);
+    library::draw_model_library(ui, state);
+    draw_camera_transform_card(ui, state);
+}
+
+fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
+    let (_, refresh_clicked) = crate::gui::components::card_with_action(
+        ui,
+        t!("inspector.model_information"),
+        |ui| card_action_icon(ui, ic::REFRESH, &t!("inspector.reload")).clicked(),
+        |ui| {
             if let Some(avatar) = state.app.active_avatar() {
                 let asset = &avatar.asset;
                 let meta = &asset.vrm_meta;
 
-                let version_color = match meta.spec_version {
-                    crate::asset::VrmSpecVersion::V1 => egui::Color32::from_rgb(120, 200, 140),
-                    crate::asset::VrmSpecVersion::V0 => egui::Color32::from_rgb(220, 180, 100),
-                    crate::asset::VrmSpecVersion::Unknown => egui::Color32::from_rgb(200, 100, 100),
+                // Spec version pill — distinct from kv rows so the
+                // version badge reads at a glance, like the
+                // "musette" title in the mockup.
+                let (chip_bg, chip_fg) = match meta.spec_version {
+                    crate::asset::VrmSpecVersion::V1 => (
+                        egui::Color32::from_rgb(220, 246, 226),
+                        egui::Color32::from_rgb(28, 110, 50),
+                    ),
+                    crate::asset::VrmSpecVersion::V0 => (
+                        egui::Color32::from_rgb(252, 240, 218),
+                        egui::Color32::from_rgb(150, 95, 20),
+                    ),
+                    crate::asset::VrmSpecVersion::Unknown => (
+                        color::ERROR_CONTAINER,
+                        color::ON_ERROR_CONTAINER,
+                    ),
                 };
                 ui.horizontal(|ui| {
-                    ui.label(t!("inspector.spec"));
-                    ui.label(
-                        egui::RichText::new(meta.spec_version.label())
-                            .strong()
-                            .color(version_color),
-                    );
-                    if let Some(raw) = &meta.spec_version_raw {
-                        ui.label(
-                            egui::RichText::new(format!("({})", raw))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
+                    let label_text = match &meta.spec_version_raw {
+                        Some(raw) => format!("VRM {} ({})", meta.spec_version.label(), raw),
+                        None => format!("VRM {}", meta.spec_version.label()),
+                    };
+                    egui::Frame {
+                        fill: chip_bg,
+                        rounding: egui::Rounding::same(crate::gui::theme::radius::PILL),
+                        inner_margin: egui::Margin::symmetric(space::SM, 2.0),
+                        ..Default::default()
                     }
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(label_text)
+                                .font(typography::label())
+                                .color(chip_fg)
+                                .strong(),
+                        );
+                    });
                 });
 
                 if meta.spec_version == crate::asset::VrmSpecVersion::V0 {
+                    ui.add_space(space::XS);
                     ui.label(
                         egui::RichText::new(t!("inspector.vrm0x_note"))
-                        .small()
-                        .color(egui::Color32::from_rgb(220, 180, 100)),
+                            .font(typography::caption())
+                            .color(color::WARNING),
                     );
                 }
+                ui.add_space(space::SM);
 
-                let title = meta.title.as_deref().unwrap_or("—");
-                ui.horizontal(|ui| {
-                    ui.label(t!("inspector.title"));
-                    ui.label(title);
-                });
+                // Metadata key/value rows
+                kv_row(
+                    ui,
+                    t!("inspector.title"),
+                    egui::RichText::new(meta.title.as_deref().unwrap_or("—"))
+                        .font(typography::body())
+                        .color(color::ON_SURFACE),
+                );
                 let authors = if meta.authors.is_empty() {
                     "—".to_string()
                 } else {
                     meta.authors.join(", ")
                 };
-                ui.horizontal(|ui| {
-                    ui.label(t!("inspector.authors"));
-                    ui.label(authors);
-                });
+                kv_row(
+                    ui,
+                    t!("inspector.authors"),
+                    egui::RichText::new(authors)
+                        .font(typography::body())
+                        .color(color::ON_SURFACE),
+                );
                 if let Some(v) = &meta.model_version {
-                    ui.horizontal(|ui| {
-                        ui.label(t!("inspector.model_version"));
-                        ui.label(v);
-                    });
+                    kv_row(ui, t!("inspector.model_version"), v.as_str());
                 }
                 if let Some(c) = &meta.contact_information {
-                    ui.horizontal(|ui| {
-                        ui.label(t!("inspector.contact"));
-                        ui.label(c);
-                    });
+                    kv_row(ui, t!("inspector.contact"), c.as_str());
                 }
                 if let Some(l) = &meta.license {
-                    ui.horizontal(|ui| {
-                        ui.label(t!("inspector.license"));
-                        ui.label(l);
-                    });
+                    kv_row(
+                        ui,
+                        t!("inspector.license"),
+                        egui::RichText::new(l)
+                            .font(typography::body())
+                            .color(color::PRIMARY),
+                    );
                 }
                 if let Some(cr) = &meta.copyright_information {
-                    ui.horizontal(|ui| {
-                        ui.label(t!("inspector.copyright"));
-                        ui.label(cr);
-                    });
+                    kv_row(ui, t!("inspector.copyright"), cr.as_str());
                 }
+                kv_row(
+                    ui,
+                    t!("inspector.source_label"),
+                    egui::RichText::new(asset.source_path.display().to_string())
+                        .font(typography::caption())
+                        .color(color::PRIMARY),
+                );
+
                 if !meta.references.is_empty() {
+                    ui.add_space(space::XS);
                     ui.collapsing(t!("inspector.references"), |ui| {
                         for r in &meta.references {
                             ui.label(
-                                egui::RichText::new(r).small().color(egui::Color32::GRAY),
+                                egui::RichText::new(r)
+                                    .font(typography::caption())
+                                    .color(color::ON_SURFACE_VARIANT),
                             );
                         }
                     });
                 }
 
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(t!("inspector.source", path = asset.source_path.display().to_string()))
-                        .small()
-                        .color(egui::Color32::GRAY),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(t!("inspector.meshes", count = asset.meshes.len()));
-                    ui.label(t!("inspector.materials", count = asset.materials.len()));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(t!("inspector.spring_chains", count = asset.spring_bones.len()));
-                    ui.label(t!("inspector.colliders", count = asset.colliders.len()));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        if asset.humanoid.is_some() { t!("inspector.humanoid_yes") } else { t!("inspector.humanoid_no") }
-                    );
-                    ui.label(t!("inspector.expressions", count = asset.default_expressions.expressions.len()));
-                    ui.label(t!("inspector.animations", count = asset.animation_clips.len()));
-                });
+                ui.add_space(space::MD);
 
-                ui.add_space(4.0);
+                // Stats grid (matches the four-column block in mockup).
+                kv_grid(
+                    ui,
+                    &[
+                        (
+                            t!("inspector.meshes_label").as_str(),
+                            asset.meshes.len().to_string(),
+                        ),
+                        (
+                            t!("inspector.materials_label").as_str(),
+                            asset.materials.len().to_string(),
+                        ),
+                        (
+                            t!("inspector.springs_label").as_str(),
+                            asset.spring_bones.len().to_string(),
+                        ),
+                        (
+                            t!("inspector.colliders_label").as_str(),
+                            asset.colliders.len().to_string(),
+                        ),
+                    ],
+                );
+                ui.add_space(space::SM);
+                kv_grid(
+                    ui,
+                    &[
+                        (
+                            t!("inspector.humanoids_label").as_str(),
+                            if asset.humanoid.is_some() {
+                                t!("inspector.humanoid_yes_short")
+                            } else {
+                                t!("inspector.humanoid_no_short")
+                            },
+                        ),
+                        (
+                            t!("inspector.expressions_label").as_str(),
+                            asset.default_expressions.expressions.len().to_string(),
+                        ),
+                        (
+                            t!("inspector.animations_label").as_str(),
+                            asset.animation_clips.len().to_string(),
+                        ),
+                    ],
+                );
+
+                ui.add_space(space::MD);
+
                 ui.horizontal(|ui| {
-                    if ui.button(t!("inspector.reload")).clicked() {
+                    if outlined_button(
+                        ui,
+                        Some(ic::REFRESH),
+                        &t!("inspector.reload"),
+                        color::PRIMARY,
+                    )
+                    .clicked()
+                    {
                         state.app.reload_avatar();
                     }
-                    if ui.button(t!("inspector.detach")).clicked()
+                    if outlined_button(
+                        ui,
+                        Some(ic::REMOVE),
+                        &t!("inspector.detach"),
+                        color::ERROR,
+                    )
+                    .clicked()
                         && !state.app.avatars.is_empty()
                     {
                         state.app.remove_avatar_at(state.app.active_avatar_index);
                     }
                 });
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                ui.label(
+                    egui::RichText::new(t!("inspector.no_avatar_loaded"))
+                        .font(typography::body())
+                        .color(color::ON_SURFACE_VARIANT),
+                );
                 ui.label(
                     egui::RichText::new(t!("inspector.no_avatar_hint"))
-                        .small()
-                        .color(egui::Color32::GRAY),
+                        .font(typography::caption())
+                        .color(color::ON_SURFACE_MUTED),
                 );
             }
-        });
+        },
+    );
 
-    library::draw_model_library(ui, state);
+    if refresh_clicked {
+        state.app.reload_avatar();
+    }
+}
+
+fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
+    card(ui, t!("inspector.camera_transform"), |ui| {
+        kv_grid(
+            ui,
+            &[
+                (
+                    t!("inspector.yaw").as_str(),
+                    format!("{:.3}", state.camera_orbit.yaw_deg),
+                ),
+                (
+                    t!("inspector.pitch").as_str(),
+                    format!("{:.3}", state.camera_orbit.pitch_deg),
+                ),
+                (
+                    t!("inspector.distance").as_str(),
+                    format!("{:.4}", state.camera_orbit.distance),
+                ),
+            ],
+        );
+        ui.add_space(space::SM);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
+                        .speed(0.5)
+                        .prefix(format!("{}: ", t!("inspector.yaw"))),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
+                        .speed(0.5)
+                        .prefix(format!("{}: ", t!("inspector.pitch"))),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut state.camera_orbit.distance)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix(format!("{}: ", t!("inspector.distance"))),
+                )
+                .changed()
+            {
+                state.camera_orbit.target_distance = state.camera_orbit.distance;
+                state.project_dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::DragValue::new(&mut state.camera_orbit.pan[0])
+                        .speed(0.01)
+                        .prefix(format!("{}: ", t!("inspector.pan_x"))),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut state.camera_orbit.pan[1])
+                        .speed(0.01)
+                        .prefix(format!("{}: ", t!("inspector.pan_y"))),
+                )
+                .changed()
+            {
+                state.project_dirty = true;
+            }
+        });
+        ui.add_space(space::SM);
+        if outlined_button(
+            ui,
+            Some(ic::HISTORY),
+            &t!("inspector.reset_camera"),
+            color::PRIMARY,
+        )
+        .clicked()
+        {
+            state.camera_orbit.yaw_deg = 0.0;
+            state.camera_orbit.pitch_deg = 0.0;
+            state.camera_orbit.distance = 5.0;
+            state.camera_orbit.target_distance = 5.0;
+            state.camera_orbit.pan = [0.0, 0.0];
+            state.project_dirty = true;
+        }
+    });
 }

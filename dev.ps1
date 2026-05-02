@@ -56,6 +56,24 @@ function Install-Font {
         Remove-Item $zipPath -Force
         Write-Host "  Installed: $fontPath" -ForegroundColor Green
     }
+
+    # Material Symbols Rounded variable font — drives the GUI's icon
+    # glyphs (mode-nav, top-bar actions, status indicators). Single
+    # ~3.7 MB file from Google's official material-design-icons repo;
+    # static-weight builds aren't published, so the variable font is
+    # the only embeddable distribution path.
+    $symbolsPath = "$fontDir\MaterialSymbolsRounded.ttf"
+    if (Test-Path $symbolsPath) {
+        Write-Host "  MaterialSymbolsRounded.ttf already present, skipping" -ForegroundColor Green
+    } else {
+        $symbolsUrl = "https://github.com/google/material-design-icons/raw/master/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.ttf"
+        Write-Host "  Downloading MaterialSymbolsRounded.ttf..."
+        & curl.exe --fail --silent --show-error --location $symbolsUrl -o $symbolsPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed for MaterialSymbolsRounded.ttf (exit $LASTEXITCODE)"
+        }
+        Write-Host "  Installed: $symbolsPath" -ForegroundColor Green
+    }
 }
 
 function Install-Models {

@@ -25,7 +25,7 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
                             // hasn't run dev.ps1 Install-Font yet — they
                             // see the warn line at startup either way.
                             if let Some(fonts) =
-                                crate::gui::build_cjk_font_definitions(code)
+                                crate::gui::build_font_definitions(code)
                             {
                                 ui.ctx().set_fonts(fonts);
                             }
