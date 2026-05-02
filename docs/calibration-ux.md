@@ -176,34 +176,69 @@ The same calibration is honoured but the depth field is ignored. The `anchor_x` 
 
 ## Persistence
 
-### Project file
+### Per-profile storage
+
+Calibration lives on `StreamProfile.pose_calibration`
+(`src/gui/profile.rs`), which is persisted to
+`%APPDATA%\VulVATAR\profiles.json` (Windows) /
+`~/Library/Application Support/VulVATAR/profiles.json` (macOS) /
+`~/.local/share/VulVATAR/profiles.json` (Linux). The profile library
+follows the *user* across projects, so a single user with separate
+"home desk" / "office desk" / "show stage" profiles can carry one
+captured calibration per setup and switching the profile dropdown
+snaps the depth pipeline to the right baseline immediately.
+
+Save flow: `Calibrate Pose ▼ → finalize → persist_calibration()`
+writes to (a) `Application.tracking_calibration.pose` for the live
+solver, (b) the tracking mailbox for the depth-pipeline provider's
+c-clamp / anchor-mode, and (c) the active profile + sets
+`profiles_dirty`. The per-frame autosave block flushes
+`profiles.json` on the next tick.
+
+Load flow: `GuiApp` constructor calls
+`crate::persistence::load_profiles()` (falling back to built-in
+presets on parse failure) and seeds the active profile's
+calibration into Application + mailbox. Switching profiles via
+the top-bar dropdown invokes `apply_profile` which does the same
+push for the newly-active profile (with `None` deliberately
+clearing any prior setup's calibration so the auto-EMA falls back
+to its first-frame seed instead of carrying over a stale baseline).
+
+### Legacy project-file rescue
+
+Earlier versions stored calibration on the project file
+(`ProjectState.pose_calibration` / `TrackingConfig.pose_calibration`).
+The on-disk DTO field is still defined but marked
+`#[serde(default, skip_serializing_if = "Option::is_none")]` — new
+saves never emit it, but old project files can still be parsed.
+When `GuiApp::load_state` sees a legacy `Some(_)` *and* the
+currently-active profile has no calibration yet, it migrates the
+value onto the profile and marks the library dirty so the rescue
+lands in `profiles.json` on the next autosave. When the profile
+already has a calibration, the legacy value is discarded — the
+user has since calibrated under the per-profile model and that
+takes precedence.
+
+### DTO
 
 ```rust
-// src/persistence.rs — TrackingConfig
-#[serde(default)]
-pub pose_calibration: Option<PoseCalibrationDto>,
-
-// New DTO (mirrors PoseCalibration; separated so persistence can evolve
-// the on-disk schema independently of the in-memory struct):
+// src/persistence.rs — PoseCalibrationDto (unchanged shape, only the
+// storage location moved from the project file to profiles.json):
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PoseCalibrationDto {
     pub mode: String,           // "full_body" / "upper_body"
     pub captured_at: String,    // ISO-8601
+    pub captured_at_unix: u64,
     pub frame_count: usize,
     pub anchor_x: f32,
     pub anchor_y: f32,
     pub anchor_depth_m: Option<f32>,
     pub confidence: f32,
     pub anchor_depth_jitter_m: Option<f32>,
+    pub x_range_observed: Option<f32>,
+    pub z_range_observed: Option<f32>,
 }
 ```
-
-### Restore on project load
-
-`GuiApp::load_state` (the existing project loader) populates
-`Application::tracking_calibration.pose` from the DTO. From there,
-`apply_calibration` (already invoked per-frame on the source skeleton)
-forwards the calibration to the solver and to `skeleton_from_depth`.
 
 ## UI status line
 
@@ -230,9 +265,48 @@ Pose not calibrated — auto-EMA active
 | C     | Capture loop: frame collection, median computation, confidence gating  |
 | D     | Solver / provider integration: anchor mode, c-clamp, EMA seed         |
 | E     | Persistence: save/load + status line + "calibrated N min ago" rendering |
+| F     | Multi-step capture: optional X/Z range step → per-axis sensitivity in solver |
+| G     | Per-profile storage: calibration moves from project file to `profiles.json` so each setup carries its own baseline |
+
+## Multi-step capture (Phase F)
+
+After the anchor capture finishes, the modal pauses on an
+`AnchorDone` prompt offering two choices:
+
+- **Skip & Finish** — commits the anchor-only calibration and closes
+  the modal. The solver falls back to its static
+  `[0.6, 0.6, 0.3]` per-axis sensitivity for root translation.
+- **Capture Range ▶** — enters a 10-second range capture preceded
+  by a 1.5-second hold-still pre-roll. The user steps left, right,
+  leans toward the camera, then back. Per-frame source `(x, z)` is
+  folded into running min/max; on completion the per-axis
+  peak-to-peak deltas become `x_range_observed` /
+  `z_range_observed` on the in-flight `PoseCalibration`.
+
+The solver derives per-axis sensitivity from the observed range:
+
+```text
+sens_x = clamp(TARGET_AVATAR_X / (range_x / 2), [0.3, 2.5])
+sens_z = clamp(TARGET_AVATAR_Z / (range_z / 2), [0.15, 1.0])
+```
+
+with `TARGET_AVATAR_X = 0.5` and `TARGET_AVATAR_Z = 0.3` so the
+avatar's hip reaches roughly `±TARGET` units when the subject hits
+their captured extremes. A user with a narrow room (small ±X) gets
+a higher gain so a 30 cm step still reads as meaningful avatar
+motion; a user with a large studio gets a lower gain so a full sweep
+still keeps the avatar within frame.
+
+Floors:
+- `MIN_RANGE_OBSERVED = 0.05` — captured sweeps below this are
+  treated as "user barely moved" and the field is left as `None`.
+- `MIN_RANGE_SAMPLES = 10` — the entire range step is discarded
+  below this so a near-empty 10-second window doesn't poison the
+  derived sensitivity.
+
+The Z range field is only emitted when the anchor was already
+metric (depth-aware providers); rtmw3d-only paths leave it `None`.
 
 ## Open questions / future work
 
-- **Per-profile calibration**: today the top-bar Profile concept is global — calibration is project-scoped. If profiles ever become per-user, the calibration field should move under the profile.
-- **Multi-step capture**: future modes ("step left, step right" for X range, "lean in / out" for Z range) can extend `PoseCalibration` with per-axis ranges. The single T-pose / hands-at-sides flow is the MVP.
 - **Person segmentation** as an alternative to calibration: a future option could replace this UX with an automatic per-pixel mask that excludes background depth. Calibration remains useful as an explicit baseline regardless.

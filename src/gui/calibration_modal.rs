@@ -30,12 +30,21 @@ use crate::tracking::{CalibrationMode, PoseCalibration};
 /// table; tuned so the user has time to settle into the pose without
 /// the modal feeling sluggish.
 ///
-/// `HOLD_STILL_SECONDS`: countdown before the actual capture begins.
-/// `COLLECTION_SECONDS`: capture window duration. At 30 fps this
-/// yields ~60 sample frames; the median over that window absorbs
+/// `HOLD_STILL_SECONDS`: countdown before the anchor capture begins.
+/// `COLLECTION_SECONDS`: anchor-capture window duration. At 30 fps
+/// this yields ~60 sample frames; the median over that window absorbs
 /// per-frame keypoint jitter.
+/// `RANGE_HOLD_STILL_SECONDS`: shorter prep before the optional range
+/// capture (the user already saw the long countdown for step 1, so
+/// step 2 only needs a beat to start moving).
+/// `RANGE_COLLECTION_SECONDS`: range-capture window. Long enough for
+/// the user to step left, right, lean in, lean back without rushing —
+/// the per-axis min/max is what gets recorded so a single full sweep
+/// is enough.
 const HOLD_STILL_SECONDS: f32 = 1.0;
 const COLLECTION_SECONDS: f32 = 2.0;
+const RANGE_HOLD_STILL_SECONDS: f32 = 1.5;
+const RANGE_COLLECTION_SECONDS: f32 = 10.0;
 
 /// Minimum source-skeleton overall confidence for a sample to be
 /// admitted into the median pool. Below this, the keypoints are too
@@ -77,12 +86,12 @@ pub enum CalibrationModalState {
         last_anchor_seen: bool,
         last_confidence: f32,
     },
-    /// Active sample collection. Per-frame `AnchorSample` rows are
-    /// appended each time the mailbox sequence advances *and* the
+    /// Active anchor sample collection. Per-frame `AnchorSample` rows
+    /// are appended each time the mailbox sequence advances *and* the
     /// frame meets the quality bar (anchor visible, anchor type
     /// matches mode, confidence ≥ `MIN_FRAME_CONF`). The transition
-    /// to `Done` walks `samples` to compute the median calibration
-    /// values.
+    /// to `AnchorDone` walks `samples` to compute the median
+    /// calibration values; failure goes straight to `Done`.
     Collecting {
         mode: CalibrationMode,
         started_at: Instant,
@@ -94,9 +103,57 @@ pub enum CalibrationModalState {
         last_anchor_seen: bool,
         last_confidence: f32,
     },
+    /// Anchor capture succeeded — calibration is already written to
+    /// `Application::tracking_calibration.pose`. Pauses the state
+    /// machine on a "Capture Range?" prompt: user can hit
+    /// `Capture Range ▶` to enter the optional 10-second range step
+    /// (records per-axis min/max, derives `x_range_observed` /
+    /// `z_range_observed`), or `Skip & Finish` to commit the
+    /// anchor-only calibration immediately.
+    ///
+    /// `calibration` is held in this variant rather than re-derived
+    /// on the user's choice so the same aggregate is forwarded to the
+    /// `Done` state (success-display) regardless of the range path.
+    AnchorDone {
+        mode: CalibrationMode,
+        shown_at: Instant,
+        calibration: PoseCalibration,
+    },
+    /// Pre-roll countdown for the range capture. Shorter than the
+    /// anchor pre-roll because the user already settled into the
+    /// modal and just needs a beat to start moving.
+    RangeHoldStill {
+        mode: CalibrationMode,
+        started_at: Instant,
+        calibration: PoseCalibration,
+        last_confidence: f32,
+    },
+    /// 10-second range capture. Per-frame source `(x, z)` is folded
+    /// into running min/max; on transition to `Done` the per-axis
+    /// peak-to-peak deltas become `x_range_observed` /
+    /// `z_range_observed` on the in-flight `PoseCalibration`. The
+    /// solver picks those up to derive per-axis sensitivity from the
+    /// observed range.
+    ///
+    /// `last_seq_consumed` matches `Collecting`'s — same
+    /// "GUI repaints faster than the tracking thread emits frames"
+    /// reason. `samples_seen` is a non-aggregating counter for the
+    /// status pane so the user can tell capture is alive.
+    RangeCollecting {
+        mode: CalibrationMode,
+        started_at: Instant,
+        calibration: PoseCalibration,
+        x_min: f32,
+        x_max: f32,
+        z_min: f32,
+        z_max: f32,
+        samples_seen: usize,
+        last_seq_consumed: u64,
+        last_confidence: f32,
+    },
     /// Calibration finished — either the timer ran out or the user
-    /// hit Capture Now. Either succeeded (≥ `MIN_SAMPLES` admitted
-    /// frames, calibration written to `Application`) or was rejected
+    /// hit Capture Now / Skip & Finish. Either succeeded (anchor
+    /// captured, optionally enriched with range data) or was rejected
     /// (`outcome == DoneOutcome::Insufficient`); status pane shows
     /// the matching message before the modal auto-closes.
     Done {
@@ -197,6 +254,9 @@ fn modal_title(state: &CalibrationModalState) -> String {
     let mode = match state {
         CalibrationModalState::HoldStill { mode, .. }
         | CalibrationModalState::Collecting { mode, .. }
+        | CalibrationModalState::AnchorDone { mode, .. }
+        | CalibrationModalState::RangeHoldStill { mode, .. }
+        | CalibrationModalState::RangeCollecting { mode, .. }
         | CalibrationModalState::Done { mode, .. } => *mode,
         CalibrationModalState::Closed => return String::new(),
     };
@@ -381,25 +441,83 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
         ui.add_space(16.0);
 
-        // Action buttons. `Cancel` always available; `Capture Now` only
-        // during HoldStill / Collecting. Phase C: Capture Now should
-        // require ≥ 5 samples in Collecting state.
+        // Action buttons vary per state:
+        //   HoldStill / Collecting / RangeHoldStill / RangeCollecting
+        //     → Cancel + Capture Now
+        //   AnchorDone
+        //     → Cancel + Skip & Finish + Capture Range ▶
+        //   Done
+        //     → Cancel only (the modal auto-closes after the linger)
+        //
+        // `Capture Now` while in RangeHoldStill / RangeCollecting
+        // truncates the range step early — the same min/max we've
+        // accumulated so far is what gets used, so users with smaller
+        // rooms (or who finished sweeping ahead of the timer) don't
+        // have to wait the full 10s.
         ui.horizontal(|ui| {
             if ui.button(t!("calibration.cancel")).clicked() {
                 state.calibration_modal.close();
             }
-            let allow_capture_now = matches!(
-                state.calibration_modal,
-                CalibrationModalState::HoldStill { .. }
-                    | CalibrationModalState::Collecting { .. }
-            );
-            ui.add_enabled_ui(allow_capture_now, |ui| {
-                if ui.button(t!("calibration.capture_now")).clicked() {
-                    finish_capture(state);
+            match state.calibration_modal {
+                CalibrationModalState::AnchorDone { .. } => {
+                    if ui.button(t!("calibration.skip_and_finish")).clicked() {
+                        skip_range(state);
+                    }
+                    if ui.button(t!("calibration.capture_range")).clicked() {
+                        begin_range_capture(state);
+                    }
                 }
-            });
+                CalibrationModalState::HoldStill { .. }
+                | CalibrationModalState::Collecting { .. }
+                | CalibrationModalState::RangeHoldStill { .. }
+                | CalibrationModalState::RangeCollecting { .. } => {
+                    if ui.button(t!("calibration.capture_now")).clicked() {
+                        finish_capture(state);
+                    }
+                }
+                _ => {}
+            }
         });
     });
+}
+
+/// User chose `Skip & Finish` from the AnchorDone prompt: jump
+/// straight to the success-display Done state with the existing
+/// anchor-only calibration. The calibration was already persisted by
+/// `finalize_collection`, so there's nothing else to write.
+fn skip_range(state: &mut GuiApp) {
+    let now = Instant::now();
+    let next = match &state.calibration_modal {
+        CalibrationModalState::AnchorDone {
+            mode, calibration, ..
+        } => Some(transition_to_done_success(*mode, calibration.clone(), now)),
+        _ => None,
+    };
+    if let Some(s) = next {
+        state.calibration_modal = s;
+    }
+}
+
+/// User chose `Capture Range ▶` from the AnchorDone prompt: roll the
+/// state machine into the range-capture pre-roll. The calibration
+/// from the anchor step is carried forward via the variant payload
+/// so `finalize_range_collection` can update it in place.
+fn begin_range_capture(state: &mut GuiApp) {
+    let now = Instant::now();
+    let next = match &state.calibration_modal {
+        CalibrationModalState::AnchorDone {
+            mode, calibration, ..
+        } => Some(CalibrationModalState::RangeHoldStill {
+            mode: *mode,
+            started_at: now,
+            calibration: calibration.clone(),
+            last_confidence: 0.0,
+        }),
+        _ => None,
+    };
+    if let Some(s) = next {
+        state.calibration_modal = s;
+    }
 }
 
 /// Drive the state machine forward by elapsed time. When the
@@ -424,11 +542,43 @@ fn advance_state(state: &mut GuiApp) {
         CalibrationModalState::Collecting {
             mode, started_at, ..
         } if now.duration_since(*started_at).as_secs_f32() >= COLLECTION_SECONDS => {
-            // Capture window expired: finalise with whatever we
-            // collected. `finalize_collection` handles median +
-            // writing the calibration; the modal then lingers in
-            // `Done` for `DONE_LINGER_SECONDS`.
+            // Anchor window expired: finalise. `finalize_collection`
+            // either transitions us to `AnchorDone` (with the
+            // user-prompt for the optional range step) on success,
+            // or straight to `Done { Insufficient }` when too few
+            // frames cleared the quality bar.
             Some(finalize_collection(state, *mode, now))
+        }
+        CalibrationModalState::RangeHoldStill {
+            mode,
+            started_at,
+            calibration,
+            ..
+        } if now.duration_since(*started_at).as_secs_f32() >= RANGE_HOLD_STILL_SECONDS => {
+            // Seed min/max with +∞ / −∞ so the first incoming sample
+            // unconditionally tightens the bounds. f32::INFINITY here
+            // is fine — the finalize step gates on `samples_seen`
+            // before consuming any of these values.
+            Some(CalibrationModalState::RangeCollecting {
+                mode: *mode,
+                started_at: now,
+                calibration: calibration.clone(),
+                x_min: f32::INFINITY,
+                x_max: f32::NEG_INFINITY,
+                z_min: f32::INFINITY,
+                z_max: f32::NEG_INFINITY,
+                samples_seen: 0,
+                last_seq_consumed: 0,
+                last_confidence: 0.0,
+            })
+        }
+        CalibrationModalState::RangeCollecting {
+            mode, started_at, ..
+        } if now.duration_since(*started_at).as_secs_f32() >= RANGE_COLLECTION_SECONDS => {
+            // Range window expired: fold whatever we observed into
+            // the in-flight calibration and transition to the
+            // success-display.
+            Some(finalize_range_collection(state, *mode, now))
         }
         _ => None,
     };
@@ -437,28 +587,65 @@ fn advance_state(state: &mut GuiApp) {
     }
 }
 
-/// Force the state machine to the `Done` state regardless of timer.
-/// Used by the `Capture Now` button so impatient users don't have to
-/// wait for the full collection window — but the same `MIN_SAMPLES`
-/// floor applies, so impatience can still produce an `Insufficient`
-/// outcome.
+/// Force the active capture step to terminate immediately.
+/// Triggered by the `Capture Now` button. The transition rules are
+/// the same as the timer-expiry path:
+///
+/// - `HoldStill` / `Collecting`  → finalize anchor (same `MIN_SAMPLES`
+///   floor so impatience can still produce `Insufficient`)
+/// - `RangeHoldStill`            → skip range, finish with anchor only
+/// - `RangeCollecting`           → finalize range with whatever
+///   min/max we accumulated
 fn finish_capture(state: &mut GuiApp) {
-    let mode = match &state.calibration_modal {
-        CalibrationModalState::HoldStill { mode, .. }
-        | CalibrationModalState::Collecting { mode, .. } => *mode,
-        _ => return,
-    };
     let now = Instant::now();
-    state.calibration_modal = finalize_collection(state, mode, now);
+    let next = match &state.calibration_modal {
+        CalibrationModalState::HoldStill { mode, .. }
+        | CalibrationModalState::Collecting { mode, .. } => {
+            Some(finalize_collection(state, *mode, now))
+        }
+        CalibrationModalState::RangeHoldStill {
+            mode, calibration, ..
+        } => Some(transition_to_done_success(*mode, calibration.clone(), now)),
+        CalibrationModalState::RangeCollecting { mode, .. } => {
+            Some(finalize_range_collection(state, *mode, now))
+        }
+        _ => None,
+    };
+    if let Some(s) = next {
+        state.calibration_modal = s;
+    }
 }
 
-/// Take whatever's currently in the `Collecting` variant's `samples`
-/// vec, compute the per-axis median + jitter, write the resulting
-/// `PoseCalibration` to `Application::tracking_calibration.pose`, and
-/// return the `Done` variant carrying the success/failure outcome.
+/// Compose a `Done { Success }` state from an already-aggregated
+/// calibration. Used by the `Skip & Finish` and `RangeHoldStill +
+/// Capture Now` paths — both already wrote the anchor calibration to
+/// `Application` during the original `finalize_collection` call, so
+/// here we only need to surface the success display.
+fn transition_to_done_success(
+    mode: CalibrationMode,
+    calibration: PoseCalibration,
+    now: Instant,
+) -> CalibrationModalState {
+    CalibrationModalState::Done {
+        mode,
+        shown_at: now,
+        outcome: DoneOutcome::Success {
+            frame_count: calibration.frame_count,
+            calibration,
+        },
+    }
+}
+
+/// Finalize the *anchor* capture step. Pulls the samples out of the
+/// `Collecting` variant, aggregates them, writes the resulting
+/// `PoseCalibration` to `Application` + the tracking mailbox, and
+/// returns either `AnchorDone` (success, awaiting the user's range
+/// choice) or `Done { Insufficient }` (too few admitted frames).
 ///
-/// Called from both the timer-expired path and the `Capture Now`
-/// path, so the median / write logic stays in one place.
+/// Called from both the anchor-timer-expired path and `Capture Now`,
+/// so the median / write logic stays in one place. Note that the
+/// anchor calibration is *immediately* persisted at this point — the
+/// optional range step only enriches the same record in place.
 fn finalize_collection(
     state: &mut GuiApp,
     mode: CalibrationMode,
@@ -487,21 +674,152 @@ fn finalize_collection(
     // new value next frame. Also push to the tracking mailbox so the
     // worker thread forwards it to the depth-pipeline provider via
     // `set_calibration` — that path enables Upper Body anchor
-    // forcing and (future) jitter-derived c-clamp narrowing.
-    // Marking the project dirty nudges the user to save (auto-save
-    // also picks it up).
-    state.app.tracking_calibration.pose = Some(calibration.clone());
-    state.app.tracking.mailbox().set_calibration(Some(calibration.clone()));
-    state.project_dirty = true;
+    // forcing and jitter-derived c-clamp narrowing. Marking the
+    // project dirty nudges the user to save (auto-save also picks
+    // it up). Pause on `AnchorDone` for the user's range-step
+    // decision; if they hit Skip we ship the same record unchanged,
+    // and if they capture range we update *this same in-memory
+    // record* in place.
+    persist_calibration(state, calibration.clone());
 
-    CalibrationModalState::Done {
+    CalibrationModalState::AnchorDone {
         mode,
         shown_at: now,
-        outcome: DoneOutcome::Success {
-            frame_count: calibration.frame_count,
-            calibration,
-        },
+        calibration,
     }
+}
+
+/// Write a freshly-aggregated `PoseCalibration` to all the places
+/// that need to see it: Application (per-frame solver consumers),
+/// the tracking mailbox (depth-pipeline provider's c-clamp /
+/// anchor-mode), and the *active profile* (so the next app launch
+/// or profile-switch picks it back up). Also flips the autosave
+/// flag so the profile change hits disk on the next frame.
+///
+/// Lives next to `finalize_collection` and `finalize_range_collection`
+/// because both finalisers do the same write — the only difference
+/// between them is what's *in* the calibration, not where it lands.
+/// When no profile is active (degenerate state — the GUI ships with
+/// a default-active profile, but a corrupted profiles.json could
+/// produce an empty library) we still set Application + mailbox so
+/// the calibration applies to the current session, but the value is
+/// lost on restart.
+fn persist_calibration(state: &mut GuiApp, calibration: PoseCalibration) {
+    state.app.tracking_calibration.pose = Some(calibration.clone());
+    state
+        .app
+        .tracking
+        .mailbox()
+        .set_calibration(Some(calibration.clone()));
+    if let Some(idx) = state.profiles.active_index {
+        if let Some(profile) = state.profiles.profiles.get_mut(idx) {
+            profile.pose_calibration = Some(calibration);
+            state.profiles_dirty = true;
+        }
+    }
+}
+
+/// Finalize the *range* capture step. Reads the per-axis min/max out
+/// of the `RangeCollecting` variant, derives `x_range_observed` /
+/// `z_range_observed`, updates the in-flight `PoseCalibration` (and
+/// re-publishes it to `Application` + mailbox), and returns
+/// `Done { Success }`.
+///
+/// "Insufficient" range data is not a failure here — the anchor
+/// calibration was already persisted in `finalize_collection`, so
+/// even a zero-sample range step just leaves the calibration as
+/// anchor-only. Only the per-axis range fields are emitted as `None`
+/// in that case, and the solver falls back to its static
+/// `[0.6, 0.6, 0.3]` default for those axes.
+///
+/// `MIN_RANGE_OBSERVED` floors the recorded range so a user who
+/// barely shifted during the window doesn't poison the solver with a
+/// near-zero divisor on the per-axis sensitivity calc. Also requires
+/// at least `MIN_RANGE_SAMPLES` to have been collected — fewer than
+/// that and the min/max almost certainly reflects per-frame noise
+/// rather than a deliberate sweep.
+fn finalize_range_collection(
+    state: &mut GuiApp,
+    mode: CalibrationMode,
+    now: Instant,
+) -> CalibrationModalState {
+    const MIN_RANGE_OBSERVED: f32 = 0.05;
+    const MIN_RANGE_SAMPLES: usize = 10;
+
+    let (mut calibration, x_range, z_range, samples_seen, z_was_metric) =
+        match &mut state.calibration_modal {
+            CalibrationModalState::RangeCollecting {
+                calibration,
+                x_min,
+                x_max,
+                z_min,
+                z_max,
+                samples_seen,
+                ..
+            } => {
+                let cal = calibration.clone();
+                // INFINITY-seeded sentinels mean no admitted samples;
+                // collapse to a 0 range so the gate below rejects.
+                let x = if x_min.is_finite() && x_max.is_finite() {
+                    (*x_max - *x_min).max(0.0)
+                } else {
+                    0.0
+                };
+                // Z is only meaningful on depth-aware providers — for
+                // rtmw3d-only we never wrote a non-zero z into the
+                // anchor sample, so `(z_max - z_min)` will be ~0 and
+                // we'll discard via MIN_RANGE_OBSERVED below.
+                let z = if z_min.is_finite() && z_max.is_finite() {
+                    (*z_max - *z_min).max(0.0)
+                } else {
+                    0.0
+                };
+                let was_metric = cal.anchor_depth_m.is_some();
+                (cal, x, z, *samples_seen, was_metric)
+            }
+            _ => return transition_to_done_success(
+                mode,
+                state.app.tracking_calibration.pose.clone().unwrap_or_else(|| {
+                    // Should be unreachable: finalize_range only runs
+                    // out of RangeCollecting, which is only entered
+                    // after a successful AnchorDone, which always
+                    // wrote a Some(_) into Application. But return a
+                    // synthetic skipped-state if we somehow get here.
+                    PoseCalibration {
+                        mode,
+                        captured_at: String::new(),
+                        captured_at_unix: 0,
+                        frame_count: 0,
+                        anchor_x: 0.0,
+                        anchor_y: 0.0,
+                        anchor_depth_m: None,
+                        confidence: 0.0,
+                        anchor_depth_jitter_m: None,
+                        x_range_observed: None,
+                        z_range_observed: None,
+                    }
+                }),
+                now,
+            ),
+        };
+
+    if samples_seen >= MIN_RANGE_SAMPLES {
+        if x_range >= MIN_RANGE_OBSERVED {
+            calibration.x_range_observed = Some(x_range);
+        }
+        // Only emit z range when the anchor was metric to begin with;
+        // otherwise the value is meaningless. The
+        // `MIN_RANGE_OBSERVED` floor already rejects rtmw3d-only
+        // residuals, but the explicit gate makes the contract obvious
+        // for downstream readers.
+        if z_was_metric && z_range >= MIN_RANGE_OBSERVED {
+            calibration.z_range_observed = Some(z_range);
+        }
+    }
+
+    persist_calibration(state, calibration.clone());
+
+    transition_to_done_success(mode, calibration, now)
 }
 
 /// Compute the `PoseCalibration` from a non-empty sample vec.
@@ -549,6 +867,12 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         anchor_depth_m,
         confidence: median_conf,
         anchor_depth_jitter_m,
+        // Range fields only get populated when the user opts into
+        // the optional range-capture step from the AnchorDone prompt;
+        // the anchor-only path leaves them None and the solver falls
+        // back to its static per-axis sensitivity defaults.
+        x_range_observed: None,
+        z_range_observed: None,
     }
 }
 
@@ -648,6 +972,16 @@ fn refresh_anchor_telemetry(
             *last_anchor_seen = anchor_seen;
             *last_confidence = confidence;
         }
+        CalibrationModalState::RangeHoldStill {
+            last_confidence, ..
+        } => {
+            *last_confidence = confidence;
+        }
+        CalibrationModalState::RangeCollecting {
+            last_confidence, ..
+        } => {
+            *last_confidence = confidence;
+        }
         _ => {}
     }
 
@@ -687,12 +1021,47 @@ fn refresh_anchor_telemetry(
             }
         }
     }
+
+    // Range-capture path: track per-axis min/max instead of medianing.
+    // We *don't* gate on anchor-kind match here — if the user
+    // calibrated full body but happens to crouch out of hip
+    // visibility mid-sweep, the residual shoulder-anchor sample is
+    // still useful for the X range (and z stays None on rtmw3d-only
+    // anyway). The confidence floor is the only quality gate.
+    if let CalibrationModalState::RangeCollecting {
+        ref mut x_min,
+        ref mut x_max,
+        ref mut z_min,
+        ref mut z_max,
+        ref mut samples_seen,
+        ref mut last_seq_consumed,
+        ..
+    } = state.calibration_modal
+    {
+        if snap.sequence > *last_seq_consumed {
+            *last_seq_consumed = snap.sequence;
+            if let Some(pose) = snap.pose.as_ref() {
+                if pose.overall_confidence >= MIN_FRAME_CONF {
+                    if let Some(pos) = pose.root_offset {
+                        if pos[0] < *x_min { *x_min = pos[0]; }
+                        if pos[0] > *x_max { *x_max = pos[0]; }
+                        if pos[2] < *z_min { *z_min = pos[2]; }
+                        if pos[2] > *z_max { *z_max = pos[2]; }
+                        *samples_seen += 1;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn relevant_mode(state: &CalibrationModalState) -> Option<CalibrationMode> {
     match state {
         CalibrationModalState::HoldStill { mode, .. }
         | CalibrationModalState::Collecting { mode, .. }
+        | CalibrationModalState::AnchorDone { mode, .. }
+        | CalibrationModalState::RangeHoldStill { mode, .. }
+        | CalibrationModalState::RangeCollecting { mode, .. }
         | CalibrationModalState::Done { mode, .. } => Some(*mode),
         CalibrationModalState::Closed => None,
     }
@@ -713,6 +1082,30 @@ fn step_text(state: &CalibrationModalState) -> (String, String) {
                 CalibrationMode::UpperBody => t!("calibration.pose_upper_body"),
             };
             (t!("calibration.step_collecting"), pose)
+        }
+        CalibrationModalState::AnchorDone { calibration, .. } => {
+            // Surface what the anchor capture actually produced so
+            // the user has context before deciding on the optional
+            // range step. Depth gets the same with/without-depth
+            // split as the final Done variant.
+            let body = match calibration.anchor_depth_m {
+                Some(d) => t!(
+                    "calibration.anchor_done_body_with_depth",
+                    frames = format!("{}", calibration.frame_count),
+                    depth = format!("{:.2}", d)
+                ),
+                None => t!(
+                    "calibration.anchor_done_body_no_depth",
+                    frames = format!("{}", calibration.frame_count)
+                ),
+            };
+            (t!("calibration.anchor_done_title"), body)
+        }
+        CalibrationModalState::RangeHoldStill { .. } => {
+            (t!("calibration.range_hold_still"), t!("calibration.range_pose"))
+        }
+        CalibrationModalState::RangeCollecting { .. } => {
+            (t!("calibration.range_collecting"), t!("calibration.range_pose"))
         }
         CalibrationModalState::Done { outcome, .. } => match outcome {
             DoneOutcome::Success { frame_count, calibration } => {
@@ -762,6 +1155,30 @@ fn progress_for(state: &CalibrationModalState) -> (f32, String) {
                 t!("calibration.time_left", time = format!("{:.1}", remaining)),
             )
         }
+        // AnchorDone is user-input gated rather than time-gated, so
+        // the progress bar is fully filled and the label tells the
+        // user we're awaiting their choice.
+        CalibrationModalState::AnchorDone { .. } => {
+            (1.0, t!("calibration.awaiting_choice"))
+        }
+        CalibrationModalState::RangeHoldStill { started_at, .. } => {
+            let elapsed = started_at.elapsed().as_secs_f32();
+            let remaining = (RANGE_HOLD_STILL_SECONDS - elapsed).max(0.0);
+            let progress = (elapsed / RANGE_HOLD_STILL_SECONDS).clamp(0.0, 1.0);
+            (
+                progress,
+                t!("calibration.time_left", time = format!("{:.1}", remaining)),
+            )
+        }
+        CalibrationModalState::RangeCollecting { started_at, .. } => {
+            let elapsed = started_at.elapsed().as_secs_f32();
+            let remaining = (RANGE_COLLECTION_SECONDS - elapsed).max(0.0);
+            let progress = (elapsed / RANGE_COLLECTION_SECONDS).clamp(0.0, 1.0);
+            (
+                progress,
+                t!("calibration.time_left", time = format!("{:.1}", remaining)),
+            )
+        }
         CalibrationModalState::Done { outcome, .. } => match outcome {
             DoneOutcome::Success { .. } => (1.0, t!("calibration.done")),
             DoneOutcome::Insufficient { .. } => (0.0, t!("calibration.failed")),
@@ -783,6 +1200,21 @@ fn telemetry(state: &CalibrationModalState) -> (bool, f32, Option<usize>) {
             samples,
             ..
         } => (*last_anchor_seen, *last_confidence, Some(samples.len())),
+        CalibrationModalState::AnchorDone { calibration, .. } => {
+            // Anchor capture has already finished; the user just
+            // needs to decide on the range step. Surface the
+            // calibration's own confidence rather than the live
+            // frame's (which they may have left to read the prompt).
+            (true, calibration.confidence, Some(calibration.frame_count))
+        }
+        CalibrationModalState::RangeHoldStill {
+            last_confidence, ..
+        } => (true, *last_confidence, None),
+        CalibrationModalState::RangeCollecting {
+            last_confidence,
+            samples_seen,
+            ..
+        } => (true, *last_confidence, Some(*samples_seen)),
         CalibrationModalState::Done { outcome, .. } => match outcome {
             DoneOutcome::Success { frame_count, .. } => (true, 1.0, Some(*frame_count)),
             DoneOutcome::Insufficient { samples_collected } => {

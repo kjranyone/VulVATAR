@@ -148,6 +148,8 @@ fn pose_calibration_to_dto(
         anchor_depth_m: cal.anchor_depth_m,
         confidence: cal.confidence,
         anchor_depth_jitter_m: cal.anchor_depth_jitter_m,
+        x_range_observed: cal.x_range_observed,
+        z_range_observed: cal.z_range_observed,
     }
 }
 
@@ -177,6 +179,8 @@ fn dto_to_pose_calibration(
         anchor_depth_m: dto.anchor_depth_m,
         confidence: dto.confidence,
         anchor_depth_jitter_m: dto.anchor_depth_jitter_m,
+        x_range_observed: dto.x_range_observed,
+        z_range_observed: dto.z_range_observed,
     })
 }
 
@@ -219,11 +223,21 @@ pub struct TrackingConfig {
     pub show_camera_wipe: bool,
     #[serde(default)]
     pub show_detection_annotations: bool,
-    /// Optional pose-calibration capture saved from the
-    /// `Calibrate Pose ▼` modal. `None` for projects that have never
-    /// been calibrated — solver / depth pipeline fall back to auto-EMA
-    /// + hardcoded clamps. See `docs/calibration-ux.md`.
-    #[serde(default)]
+    /// **Legacy field — read-only for migration.** Pose calibration
+    /// has moved to per-profile storage (`StreamProfile.pose_calibration`
+    /// in `gui::profile`) so a user with multiple "home desk" /
+    /// "office desk" profiles can carry a separate calibration per
+    /// setup. This field is kept on the on-disk DTO purely so older
+    /// project files don't lose their captured calibration on first
+    /// open: `GuiApp::load_state` migrates a `Some(_)` here onto the
+    /// currently-active profile (when that profile has no
+    /// calibration yet) and marks the profile library dirty so the
+    /// rescued value lands in `profiles.json` on the next autosave.
+    /// New saves never emit this field thanks to the
+    /// `skip_serializing_if` attribute, so a project saved by this
+    /// version of the app and re-loaded by the same version simply
+    /// won't see this branch take effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pose_calibration: Option<PoseCalibrationDto>,
 }
 
@@ -243,6 +257,10 @@ pub struct PoseCalibrationDto {
     pub anchor_depth_m: Option<f32>,
     pub confidence: f32,
     pub anchor_depth_jitter_m: Option<f32>,
+    #[serde(default)]
+    pub x_range_observed: Option<f32>,
+    #[serde(default)]
+    pub z_range_observed: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -829,6 +847,70 @@ fn recent_avatars_path() -> std::path::PathBuf {
     let mut path = app_data_dir();
     path.push("recent_avatars.json");
     path
+}
+
+/// Where the user's `StreamProfile` library is stored. Lives next to
+/// `last_session.vvtproj` under the OS app-data dir so the same set of
+/// profiles is available across every project the user opens — the
+/// "home desk" / "office desk" / "show stage" lighting + calibration
+/// presets follow the *user*, not whichever scene file they happened
+/// to open last.
+pub fn profiles_path() -> std::path::PathBuf {
+    let mut path = app_data_dir();
+    path.push("profiles.json");
+    path
+}
+
+/// Load the user's saved `ProfileLibrary`. Returns `None` when the file
+/// does not yet exist (first run) or fails to parse — the GUI then
+/// falls back to `ProfileLibrary::default()` (the built-in Streaming
+/// / Recording / Performance presets) so a fresh install or a
+/// corrupted file doesn't lock the user out of the profile dropdown.
+/// A parse failure is logged but otherwise non-fatal.
+pub fn load_profiles() -> Option<crate::gui::profile::ProfileLibrary> {
+    let path = profiles_path();
+    if !path.exists() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str(&data) {
+            Ok(lib) => Some(lib),
+            Err(e) => {
+                error!(
+                    "persistence: failed to parse profiles at {}: {} \
+                     (falling back to built-in presets)",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            error!(
+                "persistence: failed to read profiles at {}: {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Persist the user's `ProfileLibrary`. Called from
+/// `GuiApp::save_profiles_if_dirty` whenever `profiles_dirty` flips —
+/// triggered by `Calibrate Pose ▼` writing into the active profile,
+/// by future profile-edit UI, etc. Atomic write via `atomic_write`
+/// so a mid-write crash never leaves a half-truncated file behind.
+pub fn save_profiles(
+    library: &crate::gui::profile::ProfileLibrary,
+) -> Result<(), String> {
+    let path = profiles_path();
+    let data = serde_json::to_string_pretty(library)
+        .map_err(|e| format!("serialise profiles: {}", e))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    atomic_write(&path, &data).map_err(|e| format!("write profiles: {}", e))
 }
 
 /// Path of the implicit "last session" project file. The GUI writes here

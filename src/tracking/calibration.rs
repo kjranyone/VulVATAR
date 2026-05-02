@@ -102,9 +102,22 @@ pub struct PoseCalibration {
     /// taken under marginal lighting / framing conditions.
     pub confidence: f32,
     /// Per-frame stddev of the captured anchor depth. Drives the
-    /// dynamic `MIN_C / MAX_C` clamp in `skeleton_from_depth` once
-    /// Phase D lands. `None` for non-depth providers.
+    /// dynamic `MIN_C / MAX_C` clamp in `skeleton_from_depth`.
+    /// `None` for non-depth providers.
     pub anchor_depth_jitter_m: Option<f32>,
+    /// Optional per-axis range data captured by the multi-step
+    /// calibration extension (steps 2–5: step left/right, lean
+    /// in/out). When present, the solver derives per-axis
+    /// translation sensitivity from the *observed* range — a user
+    /// with a narrow room (small ±X) gets a higher gain so a
+    /// 30 cm step still moves the avatar across half its
+    /// world-space horizontal envelope. `None` when the user
+    /// skipped the extended steps; solver falls back to the
+    /// static [0.6, 0.6, 0.3] default.
+    #[serde(default)]
+    pub x_range_observed: Option<f32>,
+    #[serde(default)]
+    pub z_range_observed: Option<f32>,
 }
 
 impl PoseCalibration {

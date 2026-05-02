@@ -559,11 +559,55 @@ pub fn solve_avatar_pose(
                 raw_offset[1] - new_ref[1],
                 raw_offset[2] - new_ref[2],
             ];
-            let sens = params.root_translation_sensitivity;
+            // Per-axis sensitivity. The static defaults
+            // (`[0.6, 0.6, 0.3]`) are the right floor when we know
+            // nothing about the user's room, but a calibration that
+            // captured an explicit X/Z range (multi-step calibration:
+            // step left/right, lean in/out) lets us derive the gain
+            // from the *observed* envelope — a user with a narrow
+            // room (small ±X) gets a higher gain so a 30 cm step
+            // still moves the avatar across half its world-space
+            // horizontal envelope, while a large studio gets a lower
+            // gain so motion stays within frame.
+            //
+            // Formula: `sens = TARGET / (range / 2)` so the avatar's
+            // hip reaches `±TARGET` units when the subject reaches
+            // their captured extremes. The half-range is what's
+            // relevant because the EMA reference sits in the middle
+            // of the captured sweep.
+            //
+            // Clamp keeps a tiny captured range (user barely moved)
+            // from producing runaway gain, and a huge one from
+            // dropping below the static default.
+            const TARGET_AVATAR_X: f32 = 0.5;
+            const TARGET_AVATAR_Z: f32 = 0.3;
+            const SENS_X_CLAMP: (f32, f32) = (0.3, 2.5);
+            const SENS_Z_CLAMP: (f32, f32) = (0.15, 1.0);
+
+            let static_sens = params.root_translation_sensitivity;
+            let derived_sens_x = params
+                .pose_calibration
+                .as_ref()
+                .and_then(|c| c.x_range_observed)
+                .map(|range| {
+                    let half = (range * 0.5).max(0.05);
+                    (TARGET_AVATAR_X / half).clamp(SENS_X_CLAMP.0, SENS_X_CLAMP.1)
+                })
+                .unwrap_or(static_sens[0]);
+            let derived_sens_z = params
+                .pose_calibration
+                .as_ref()
+                .and_then(|c| c.z_range_observed)
+                .map(|range| {
+                    let half = (range * 0.5).max(0.05);
+                    (TARGET_AVATAR_Z / half).clamp(SENS_Z_CLAMP.0, SENS_Z_CLAMP.1)
+                })
+                .unwrap_or(static_sens[2]);
+
             let translation_delta = [
-                dev[0] * sens[0],
-                dev[1] * sens[1],
-                dev[2] * sens[2],
+                dev[0] * derived_sens_x,
+                dev[1] * static_sens[1],
+                dev[2] * derived_sens_z,
             ];
 
             if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {

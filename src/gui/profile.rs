@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::tracking::PoseCalibration;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamProfile {
     pub name: String,
@@ -15,6 +17,15 @@ pub struct StreamProfile {
     pub output_sink_index: usize,
     pub output_resolution_index: usize,
     pub output_framerate_index: usize,
+    /// Per-setup pose calibration. Lives on the profile (rather than
+    /// the project file) so the user's "home desk" setup vs.
+    /// "office desk" setup can each carry its own anchor / range
+    /// values and switching profiles snaps the depth pipeline to
+    /// the right baseline. `None` until the user runs `Calibrate
+    /// Pose ▼` while this profile is active. See
+    /// `docs/calibration-ux.md`.
+    #[serde(default)]
+    pub pose_calibration: Option<PoseCalibration>,
 }
 
 impl StreamProfile {
@@ -32,6 +43,7 @@ impl StreamProfile {
             output_sink_index: 0,
             output_resolution_index: 0,
             output_framerate_index: 0,
+            pose_calibration: None,
         }
     }
 
@@ -51,6 +63,7 @@ impl StreamProfile {
             output_sink_index: 3,
             output_resolution_index: 1,
             output_framerate_index: 1,
+            pose_calibration: None,
         }
     }
 
@@ -70,6 +83,7 @@ impl StreamProfile {
             output_sink_index: 0,
             output_resolution_index: 0,
             output_framerate_index: 0,
+            pose_calibration: None,
         }
     }
 }
@@ -339,6 +353,24 @@ mod profile_roundtrip_tests {
             output_sink_index: 2,
             output_resolution_index: 4,
             output_framerate_index: 5,
+            // Distinctive non-default values so a missing-field
+            // deserialization that filled in `None` would be caught
+            // by the assertions below. The captured-at* / frame_count
+            // / anchor / depth fields are all set to specific values
+            // that don't match any preset constructor.
+            pose_calibration: Some(crate::tracking::PoseCalibration {
+                mode: crate::tracking::CalibrationMode::UpperBody,
+                captured_at: "2026-01-15T12:34:56Z".to_string(),
+                captured_at_unix: 1_768_654_496,
+                frame_count: 47,
+                anchor_x: 0.125,
+                anchor_y: -0.0625,
+                anchor_depth_m: Some(1.875),
+                confidence: 0.875,
+                anchor_depth_jitter_m: Some(0.025),
+                x_range_observed: Some(0.6),
+                z_range_observed: Some(0.35),
+            }),
         }
     }
 
@@ -380,6 +412,44 @@ mod profile_roundtrip_tests {
         assert_eq!(r.output_sink_index, o.output_sink_index);
         assert_eq!(r.output_resolution_index, o.output_resolution_index);
         assert_eq!(r.output_framerate_index, o.output_framerate_index);
+
+        // pose_calibration must round-trip every field — the per-axis
+        // anchor + depth + jitter + range values all drive solver
+        // behaviour, so a silent default insertion here would be a
+        // calibration-loss bug across an app restart.
+        match (&r.pose_calibration, &o.pose_calibration) {
+            (Some(rc), Some(oc)) => {
+                assert_eq!(rc.mode, oc.mode);
+                assert_eq!(rc.captured_at, oc.captured_at);
+                assert_eq!(rc.captured_at_unix, oc.captured_at_unix);
+                assert_eq!(rc.frame_count, oc.frame_count);
+                approx_eq(rc.anchor_x, oc.anchor_x, "pose.anchor_x");
+                approx_eq(rc.anchor_y, oc.anchor_y, "pose.anchor_y");
+                match (rc.anchor_depth_m, oc.anchor_depth_m) {
+                    (Some(a), Some(b)) => approx_eq(a, b, "pose.anchor_depth_m"),
+                    (None, None) => {}
+                    _ => panic!("pose.anchor_depth_m presence drifted across round-trip"),
+                }
+                approx_eq(rc.confidence, oc.confidence, "pose.confidence");
+                match (rc.anchor_depth_jitter_m, oc.anchor_depth_jitter_m) {
+                    (Some(a), Some(b)) => approx_eq(a, b, "pose.anchor_depth_jitter_m"),
+                    (None, None) => {}
+                    _ => panic!("pose.anchor_depth_jitter_m presence drifted across round-trip"),
+                }
+                match (rc.x_range_observed, oc.x_range_observed) {
+                    (Some(a), Some(b)) => approx_eq(a, b, "pose.x_range_observed"),
+                    (None, None) => {}
+                    _ => panic!("pose.x_range_observed presence drifted across round-trip"),
+                }
+                match (rc.z_range_observed, oc.z_range_observed) {
+                    (Some(a), Some(b)) => approx_eq(a, b, "pose.z_range_observed"),
+                    (None, None) => {}
+                    _ => panic!("pose.z_range_observed presence drifted across round-trip"),
+                }
+            }
+            (None, None) => {}
+            _ => panic!("pose_calibration presence drifted across round-trip"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
