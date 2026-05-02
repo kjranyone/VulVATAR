@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::gui::components::outlined_button;
+use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -44,10 +46,25 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button(t!("inspector.reload")).clicked() {
+                if outlined_button(
+                    ui,
+                    Some(ic::REFRESH),
+                    &t!("inspector.reload"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     state.app.reload_avatar();
                 }
-                if ui.button(t!("inspector.detach")).clicked()
+                if outlined_button(
+                    ui,
+                    None,
+                    &t!("inspector.detach"),
+                    color::ERROR,
+                    true,
+                )
+                .clicked()
                     && !state.app.avatars.is_empty()
                 {
                     state.app.remove_avatar_at(state.app.active_avatar_index);
@@ -137,7 +154,15 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.project_dirty = true;
                 }
             });
-            if ui.button(t!("inspector.reset_transform")).clicked() {
+            if outlined_button(
+                ui,
+                None,
+                &t!("inspector.reset_transform"),
+                color::PRIMARY,
+                true,
+            )
+            .clicked()
+            {
                 state.transform.position = [0.0, 0.0, 0.0];
                 state.transform.rotation = [0.0, 0.0, 0.0];
                 state.transform.scale = 1.0;
@@ -149,7 +174,15 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button(t!("inspector.attach_primary")).clicked() {
+                if outlined_button(
+                    ui,
+                    None,
+                    &t!("inspector.attach_primary"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     let overlay_id = state
                         .app
                         .editor
@@ -159,14 +192,30 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         avatar.attach_cloth(overlay_id);
                     }
                 }
-                if ui.button(t!("inspector.detach_primary")).clicked() {
+                if outlined_button(
+                    ui,
+                    None,
+                    &t!("inspector.detach_primary"),
+                    color::ERROR,
+                    true,
+                )
+                .clicked()
+                {
                     if let Some(avatar) = state.app.active_avatar_mut() {
                         avatar.detach_cloth();
                     }
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button(t!("inspector.add_overlay_slot")).clicked() {
+                if outlined_button(
+                    ui,
+                    Some(ic::ADD),
+                    &t!("inspector.add_overlay_slot"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     let sim_mesh = state
                         .app
                         .editor
@@ -188,7 +237,15 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
-                if ui.button(t!("inspector.load_overlay_file")).clicked() {
+                if outlined_button(
+                    ui,
+                    Some(ic::FOLDER_OPEN),
+                    &t!("inspector.load_overlay_file"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter(t!("top_bar.filter_cloth"), &["vvtcloth"])
                         .set_title("Load cloth overlay into a new slot")
@@ -243,7 +300,15 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 slot.sim.particle_count()
                             ),
                         );
-                                    if ui.button(t!("inspector.remove")).clicked() {
+                        if outlined_button(
+                            ui,
+                            None,
+                            &t!("inspector.remove"),
+                            color::ERROR,
+                            true,
+                        )
+                        .clicked()
+                        {
                             remove_slot = Some(i);
                         }
                     });
@@ -336,10 +401,26 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button(t!("inspector.reset_all")).clicked() {
+                if outlined_button(
+                    ui,
+                    None,
+                    &t!("inspector.reset_all"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     state.expression_weights.fill(0.0);
                 }
-                if ui.button(t!("inspector.set_all_50")).clicked() {
+                if outlined_button(
+                    ui,
+                    None,
+                    &t!("inspector.set_all_50"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     state.expression_weights.fill(0.5);
                 }
             });

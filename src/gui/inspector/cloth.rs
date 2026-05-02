@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::gui::components::{filled_button, outlined_button};
+use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -14,7 +16,15 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button(t!("inspector.new_overlay")).clicked() {
+                if outlined_button(
+                    ui,
+                    Some(ic::ADD),
+                    &t!("inspector.new_overlay"),
+                    color::PRIMARY,
+                    true,
+                )
+                .clicked()
+                {
                     let asset = state.app.active_avatar().map(|a| a.asset.clone());
                     if let Some(asset) = asset {
                         let avatar_id = asset.id;
@@ -23,7 +33,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         state.app.editor.create_overlay(avatar_id, avatar_hash);
                     }
                 }
-                if ui.button(t!("inspector.save_overlay")).clicked() {
+                if filled_button(ui, Some(ic::SAVE), &t!("inspector.save_overlay"), true).clicked() {
                     let _ = state.app.editor.save_overlay(None);
                 }
             });
@@ -61,7 +71,15 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 ui.selectable_value(&mut state.cloth_material_pick_index, i, name);
                             }
                         });
-                    if ui.button(t!("inspector.select_by_material")).clicked() {
+                    if outlined_button(
+                        ui,
+                        None,
+                        &t!("inspector.select_by_material"),
+                        color::PRIMARY,
+                        true,
+                    )
+                    .clicked()
+                    {
                         if let Some(mat) =
                             avatar.asset.materials.get(state.cloth_material_pick_index)
                         {
@@ -77,17 +95,41 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button(t!("inspector.grow_selection")).clicked() {
+                    if outlined_button(
+                        ui,
+                        None,
+                        &t!("inspector.grow_selection"),
+                        color::PRIMARY,
+                        true,
+                    )
+                    .clicked()
+                    {
                         if let Some(ref mut sel) = state.region_selection {
                             sel.grow_selection(&avatar.asset);
                         }
                     }
-                    if ui.button(t!("inspector.shrink_selection")).clicked() {
+                    if outlined_button(
+                        ui,
+                        None,
+                        &t!("inspector.shrink_selection"),
+                        color::PRIMARY,
+                        true,
+                    )
+                    .clicked()
+                    {
                         if let Some(ref mut sel) = state.region_selection {
                             sel.shrink_selection(&avatar.asset);
                         }
                     }
-                    if ui.button(t!("inspector.clear_selection")).clicked() {
+                    if outlined_button(
+                        ui,
+                        None,
+                        &t!("inspector.clear_selection"),
+                        color::ERROR,
+                        true,
+                    )
+                    .clicked()
+                    {
                         state.region_selection = None;
                     }
                 });
@@ -106,7 +148,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 ui.add_space(4.0);
 
-                if ui.button(t!("inspector.generate_sim_mesh")).clicked() {
+                if filled_button(ui, None, &t!("inspector.generate_sim_mesh"), true).clicked() {
                     if let Some(ref sel) = state.region_selection {
                         let verts: Vec<usize> = sel.selected_vertices.iter().copied().collect();
                         if let Some(sim_mesh) = crate::editor::cloth_authoring::generate_sim_mesh(
@@ -160,7 +202,9 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     let pin_node_name = nodes[state.cloth_pin_node_index].name.clone();
 
                     ui.horizontal(|ui| {
-                        if ui.button(t!("inspector.create_pin_set")).clicked() {
+                        if filled_button(ui, Some(ic::ADD), &t!("inspector.create_pin_set"), true)
+                            .clicked()
+                        {
                             if state.region_selection.is_some() {
                                 if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                                     let sim_mesh = &overlay.simulation_mesh;
@@ -248,7 +292,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(4.0);
                 ui.label(t!("inspector.distance_constraints", count = overlay.constraints.distance_constraints.len()));
                 ui.label(t!("inspector.bend_constraints_count", count = overlay.constraints.bend_constraints.len()));
-                if ui.button(t!("inspector.apply_constraints")).clicked() {
+                if filled_button(ui, None, &t!("inspector.apply_constraints"), true).clicked() {
                     for dc in &mut overlay.constraints.distance_constraints {
                         dc.stiffness = state.cloth_distance_stiffness;
                     }
@@ -399,16 +443,30 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 ui.horizontal(|ui| {
                     if state.cloth_sim_playing {
-                        if ui.button(t!("inspector.pause")).clicked() {
+                        if outlined_button(
+                            ui,
+                            Some(ic::PAUSE),
+                            &t!("inspector.pause"),
+                            color::PRIMARY,
+                            true,
+                        )
+                        .clicked()
+                        {
                             state.cloth_sim_playing = false;
                         }
-                    } else if ui.button(t!("inspector.play")).clicked() {
+                    } else if filled_button(ui, Some(ic::PLAY), &t!("inspector.play"), true)
+                        .clicked()
+                    {
                         state.cloth_sim_playing = true;
                     }
-                    if ui.button(t!("inspector.step")).clicked() {
+                    if outlined_button(ui, None, &t!("inspector.step"), color::PRIMARY, true)
+                        .clicked()
+                    {
                         crate::simulation::cloth_solver::step_cloth(1.0 / 60.0, avatar, &[]);
                     }
-                    if ui.button(t!("inspector.reset")).clicked() {
+                    if outlined_button(ui, None, &t!("inspector.reset"), color::ERROR, true)
+                        .clicked()
+                    {
                         avatar.cloth_sim = None;
                         avatar.cloth_sim_buffers = None;
                     }

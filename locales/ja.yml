@@ -357,6 +357,7 @@ inspector:
   details: "詳細"
   name: "名前:"
   tags: "タグ:"
+  add_tag: "タグを追加"
   notes: "メモ:"
   save_details: "詳細を保存"
   library_updated: "ライブラリエントリを更新しました"

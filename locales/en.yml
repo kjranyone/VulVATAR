@@ -358,6 +358,7 @@ inspector:
   details: "Details"
   name: "Name:"
   tags: "Tags:"
+  add_tag: "Add tag"
   notes: "Notes:"
   save_details: "Save Details"
   library_updated: "Library entry updated"

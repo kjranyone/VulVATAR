@@ -185,6 +185,7 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                         Some(ic::REFRESH),
                         &t!("inspector.reload"),
                         color::PRIMARY,
+                        true,
                     )
                     .clicked()
                     {
@@ -195,6 +196,7 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                         Some(ic::REMOVE),
                         &t!("inspector.detach"),
                         color::ERROR,
+                        true,
                     )
                     .clicked()
                         && !state.app.avatars.is_empty()
@@ -304,6 +306,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
             Some(ic::HISTORY),
             &t!("inspector.reset_camera"),
             color::PRIMARY,
+            true,
         )
         .clicked()
         {

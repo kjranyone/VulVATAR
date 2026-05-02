@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::gui::components::{filled_button, outlined_button};
+use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -175,7 +177,7 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button(t!("inspector.save_preset")).clicked() {
+                if filled_button(ui, Some(ic::SAVE), &t!("inspector.save_preset"), true).clicked() {
                     let preset = crate::persistence::ScenePreset {
                         name: state.scene_preset_name.clone(),
                         lighting: crate::persistence::ScenePresetLighting {
@@ -207,7 +209,15 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                     let _ = crate::persistence::save_scene_presets(&state.scene_presets);
                     state.push_notification(t!("inspector.saved_preset", name = name));
                 }
-                if ui.button(t!("inspector.delete_selected")).clicked() {
+                if outlined_button(
+                    ui,
+                    Some(ic::DELETE),
+                    &t!("inspector.delete_selected"),
+                    color::ERROR,
+                    true,
+                )
+                .clicked()
+                {
                     if let Some(idx) = state.scene_preset_index {
                         if idx < state.scene_presets.len() {
                             let name = state.scene_presets[idx].name.clone();

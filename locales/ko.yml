@@ -315,6 +315,7 @@ inspector:
   details: "Details"
   name: "Name:"
   tags: "Tags:"
+  add_tag: "태그 추가"
   notes: "Notes:"
   save_details: "Save Details"
   library_updated: "Library entry updated"

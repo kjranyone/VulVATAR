@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::gui::components::{card, chip, icon_text, outlined_button};
+use crate::gui::components::{card, chip, icon_button, icon_text, outlined_button};
 use crate::gui::theme::{color, icon as ic, radius, space, typography};
 use crate::gui::{GuiApp, LibrarySortMode};
 use crate::t;
@@ -57,6 +57,7 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                     Some(ic::ADD),
                     &t!("watched_folders.watch_folder"),
                     color::PRIMARY,
+                    true,
                 )
                 .clicked()
                 {
@@ -73,13 +74,15 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
-                let refresh_resp = ui.add_enabled(
+                if outlined_button(
+                    ui,
+                    Some(ic::REFRESH),
+                    &t!("tracking.refresh"),
+                    color::PRIMARY,
                     !watched.is_empty(),
-                    egui::Button::new(t!("tracking.refresh")),
-                );
-                if refresh_resp
-                    .on_hover_text(t!("watched_folders.refresh_tooltip"))
-                    .clicked()
+                )
+                .on_hover_text(t!("watched_folders.refresh_tooltip"))
+                .clicked()
                 {
                     state.refresh_watched_folders();
                 }
@@ -141,6 +144,7 @@ pub(super) fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
                 Some(ic::DELETE),
                 &t!("avatar_cache.clear_cache"),
                 color::ERROR,
+                true,
             )
             .clicked()
             {
@@ -453,6 +457,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                             None,
                                             &t!("inspector.load"),
                                             color::PRIMARY,
+                                            true,
                                         )
                                         .clicked()
                                         {
@@ -530,7 +535,9 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                             .color(color::ON_SURFACE_VARIANT),
                     );
                     ui.text_edit_singleline(&mut state.library_tag_buf);
-                    if ui.button("+").clicked() && !state.library_tag_buf.is_empty() {
+                    if icon_button(ui, ic::ADD, &t!("inspector.add_tag")).clicked()
+                        && !state.library_tag_buf.is_empty()
+                    {
                         tag_to_add = Some(state.library_tag_buf.clone());
                     }
                 });
@@ -562,6 +569,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                     Some(ic::SAVE),
                     &t!("inspector.save_details"),
                     color::PRIMARY,
+                    true,
                 )
                 .clicked()
                 {
@@ -602,6 +610,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 Some(ic::DELETE),
                 &t!("inspector.purge_missing"),
                 color::ERROR,
+                true,
             )
             .clicked()
             {
@@ -614,6 +623,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 Some(ic::ADD),
                 &t!("inspector.add_file"),
                 color::PRIMARY,
+                true,
             )
             .clicked()
             {

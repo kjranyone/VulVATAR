@@ -2157,10 +2157,18 @@ impl eframe::App for GuiApp {
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(t!("dialog.yes")).clicked() {
+                    if components::filled_button(ui, None, &t!("dialog.yes"), true).clicked() {
                         self.cloth_autosave_consent = Some(true);
                     }
-                    if ui.button(t!("dialog.no")).clicked() {
+                    if components::outlined_button(
+                        ui,
+                        None,
+                        &t!("dialog.no"),
+                        theme::color::PRIMARY,
+                        true,
+                    )
+                    .clicked()
+                    {
                         self.cloth_autosave_consent = Some(false);
                     }
                 });

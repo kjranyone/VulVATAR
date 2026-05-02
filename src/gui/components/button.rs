@@ -7,6 +7,11 @@
 //!     tint) and Detach (error tint).
 //!   * [`filled_button`] — solid coloured fill + on-colour label.
 //!     Used for primary CTAs like the viewport's Fullscreen toggle.
+//!
+//! Both accept an `enabled` flag — disabled buttons render with
+//! `ON_SURFACE_MUTED` and do not react to hover/click. Use this for
+//! "Preparing…" placeholders or refresh buttons gated on list
+//! contents.
 
 use eframe::egui::{pos2, Align2, Color32, Response, Rounding, Sense, Stroke, Ui, Vec2};
 
@@ -14,11 +19,18 @@ use crate::gui::theme::{color, radius, space, typography};
 
 const BUTTON_HEIGHT: f32 = 32.0;
 
-pub fn outlined_button(ui: &mut Ui, glyph: Option<char>, label: &str, accent: Color32) -> Response {
+pub fn outlined_button(
+    ui: &mut Ui,
+    glyph: Option<char>,
+    label: &str,
+    accent: Color32,
+    enabled: bool,
+) -> Response {
+    let effective = if enabled { accent } else { color::ON_SURFACE_MUTED };
     let icon_size = 16.0;
     let label_galley = ui
         .painter()
-        .layout_no_wrap(label.to_string(), typography::body(), accent);
+        .layout_no_wrap(label.to_string(), typography::body(), effective);
     let label_w = label_galley.size().x;
     let pad_x = space::MD;
     let icon_w = if glyph.is_some() {
@@ -27,10 +39,15 @@ pub fn outlined_button(ui: &mut Ui, glyph: Option<char>, label: &str, accent: Co
         0.0
     };
     let w = pad_x + icon_w + label_w + pad_x;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, BUTTON_HEIGHT), Sense::click());
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, BUTTON_HEIGHT), sense);
 
-    let bg = if resp.hovered() {
-        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 24)
+    let bg = if enabled && resp.hovered() {
+        Color32::from_rgba_unmultiplied(effective.r(), effective.g(), effective.b(), 24)
     } else {
         Color32::TRANSPARENT
     };
@@ -39,7 +56,7 @@ pub fn outlined_button(ui: &mut Ui, glyph: Option<char>, label: &str, accent: Co
         rect,
         Rounding::same(radius::PILL),
         bg,
-        Stroke::new(1.0, accent),
+        Stroke::new(1.0, effective),
     );
 
     let mut text_x = rect.left() + pad_x;
@@ -49,21 +66,26 @@ pub fn outlined_button(ui: &mut Ui, glyph: Option<char>, label: &str, accent: Co
             Align2::LEFT_CENTER,
             g.to_string(),
             typography::icon(icon_size),
-            accent,
+            effective,
         );
         text_x += icon_size + space::SM;
     }
     let label_pos = pos2(text_x, rect.center().y - label_galley.size().y * 0.5);
-    painter.galley(label_pos, label_galley, accent);
+    painter.galley(label_pos, label_galley, effective);
 
     resp
 }
 
-pub fn filled_button(ui: &mut Ui, glyph: Option<char>, label: &str) -> Response {
+pub fn filled_button(ui: &mut Ui, glyph: Option<char>, label: &str, enabled: bool) -> Response {
+    let fg = if enabled {
+        color::ON_PRIMARY
+    } else {
+        color::ON_SURFACE_MUTED
+    };
     let icon_size = 16.0;
-    let label_galley =
-        ui.painter()
-            .layout_no_wrap(label.to_string(), typography::body(), color::ON_PRIMARY);
+    let label_galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), typography::body(), fg);
     let label_w = label_galley.size().x;
     let pad_x = space::MD;
     let icon_w = if glyph.is_some() {
@@ -72,9 +94,16 @@ pub fn filled_button(ui: &mut Ui, glyph: Option<char>, label: &str) -> Response 
         0.0
     };
     let w = pad_x + icon_w + label_w + pad_x;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, BUTTON_HEIGHT), Sense::click());
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, BUTTON_HEIGHT), sense);
 
-    let bg = if resp.hovered() {
+    let bg = if !enabled {
+        color::SURFACE_VARIANT
+    } else if resp.hovered() {
         color::PRIMARY_HOVER
     } else {
         color::PRIMARY
@@ -89,12 +118,12 @@ pub fn filled_button(ui: &mut Ui, glyph: Option<char>, label: &str) -> Response 
             Align2::LEFT_CENTER,
             g.to_string(),
             typography::icon(icon_size),
-            color::ON_PRIMARY,
+            fg,
         );
         text_x += icon_size + space::SM;
     }
     let label_pos = pos2(text_x, rect.center().y - label_galley.size().y * 0.5);
-    painter.galley(label_pos, label_galley, color::ON_PRIMARY);
+    painter.galley(label_pos, label_galley, fg);
 
     resp
 }

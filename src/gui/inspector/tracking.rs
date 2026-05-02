@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::gui::components::{filled_button, icon_button, outlined_button};
+use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -38,7 +40,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 if state.camera_index != prev_camera {
                     state.project_dirty = true;
                 }
-                if ui.button("🔄").clicked() {
+                if icon_button(ui, ic::REFRESH, &t!("tracking.refresh")).clicked() {
                     state.available_cameras = crate::tracking::list_cameras();
                     if !state
                         .available_cameras
@@ -58,13 +60,25 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let active = state.is_tracking_active();
                 let ready = state.is_tracking_ready();
                 if active && ready {
-                    if ui.button(t!("tracking.stop_camera")).clicked() {
+                    if outlined_button(
+                        ui,
+                        Some(ic::PAUSE),
+                        &t!("tracking.stop_camera"),
+                        color::ERROR,
+                        true,
+                    )
+                    .clicked()
+                    {
                         state.app.stop_tracking();
                     }
                 } else if active {
-                    // Camera is initialising — show a disabled placeholder.
-                    ui.add_enabled(false, egui::Button::new(t!("tracking.preparing")));
-                } else if ui.button(t!("tracking.start_camera")).clicked() {
+                    // Camera is initialising — disabled placeholder uses
+                    // the filled-button silhouette so the layout doesn't
+                    // jump when it flips to Stop.
+                    let _ = filled_button(ui, None, &t!("tracking.preparing"), false);
+                } else if filled_button(ui, Some(ic::PLAY), &t!("tracking.start_camera"), true)
+                    .clicked()
+                {
                     let (w, h) = crate::gui::camera_resolution_for_index(
                         state.tracking.camera_resolution_index,
                     );
@@ -252,10 +266,15 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                if ui
-                    .button(t!("tracking.recalibrate"))
-                    .on_hover_text(t!("tracking.recalibrate_tooltip"))
-                    .clicked()
+                if outlined_button(
+                    ui,
+                    Some(ic::REFRESH),
+                    &t!("tracking.recalibrate"),
+                    color::PRIMARY,
+                    true,
+                )
+                .on_hover_text(t!("tracking.recalibrate_tooltip"))
+                .clicked()
                 {
                     state.app.recalibrate_pose_solver();
                 }
@@ -339,7 +358,15 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             });
-        if ui.button(t!("tracking.refresh")).clicked() {
+        if outlined_button(
+            ui,
+            Some(ic::REFRESH),
+            &t!("tracking.refresh"),
+            color::PRIMARY,
+            true,
+        )
+        .clicked()
+        {
             refresh_clicked = true;
         }
     });
