@@ -41,6 +41,11 @@ pub struct ProjectState {
     pub camera_index: usize,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
+    /// Captured pose-calibration reference. Wired through `Application`'s
+    /// `tracking_calibration.pose` on load; the GUI reads it back through
+    /// the same field so the inspector status line ("Calibrated 2 min
+    /// ago") survives round-tripping. See `docs/calibration-ux.md`.
+    pub pose_calibration: Option<crate::tracking::PoseCalibration>,
 
     // Rendering config
     pub material_mode_index: usize,
@@ -126,6 +131,53 @@ fn default_true() -> bool {
     true
 }
 
+/// Convert the in-memory pose calibration to its on-disk DTO form.
+/// Round-trips through `pose_calibration_from_dto`. Returns `None` when
+/// the in-memory struct represents "no capture yet" so saved projects
+/// don't accumulate empty fields.
+fn pose_calibration_to_dto(
+    cal: &crate::tracking::PoseCalibration,
+) -> PoseCalibrationDto {
+    PoseCalibrationDto {
+        mode: cal.mode.as_str().to_string(),
+        captured_at: cal.captured_at.clone(),
+        frame_count: cal.frame_count,
+        anchor_x: cal.anchor_x,
+        anchor_y: cal.anchor_y,
+        anchor_depth_m: cal.anchor_depth_m,
+        confidence: cal.confidence,
+        anchor_depth_jitter_m: cal.anchor_depth_jitter_m,
+    }
+}
+
+/// Inverse of `pose_calibration_to_dto`. Returns `None` (and logs)
+/// when the stored mode string is unrecognised — keeps a corrupted /
+/// future-version file from blocking the project load.
+fn dto_to_pose_calibration(
+    dto: &PoseCalibrationDto,
+) -> Option<crate::tracking::PoseCalibration> {
+    let mode = match crate::tracking::CalibrationMode::from_str(&dto.mode) {
+        Some(m) => m,
+        None => {
+            warn!(
+                "pose_calibration: unknown mode '{}' in project file, ignoring",
+                dto.mode
+            );
+            return None;
+        }
+    };
+    Some(crate::tracking::PoseCalibration {
+        mode,
+        captured_at: dto.captured_at.clone(),
+        frame_count: dto.frame_count,
+        anchor_x: dto.anchor_x,
+        anchor_y: dto.anchor_y,
+        anchor_depth_m: dto.anchor_depth_m,
+        confidence: dto.confidence,
+        anchor_depth_jitter_m: dto.anchor_depth_jitter_m,
+    })
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct TransformState {
     #[serde(default)]
@@ -165,6 +217,28 @@ pub struct TrackingConfig {
     pub show_camera_wipe: bool,
     #[serde(default)]
     pub show_detection_annotations: bool,
+    /// Optional pose-calibration capture saved from the
+    /// `Calibrate Pose ▼` modal. `None` for projects that have never
+    /// been calibrated — solver / depth pipeline fall back to auto-EMA
+    /// + hardcoded clamps. See `docs/calibration-ux.md`.
+    #[serde(default)]
+    pub pose_calibration: Option<PoseCalibrationDto>,
+}
+
+/// On-disk shape of [`crate::tracking::PoseCalibration`]. Kept as a
+/// separate DTO so the persisted schema can evolve independently of the
+/// in-memory struct (e.g. dropping a field, renaming `mode` enum
+/// variants) without forcing a breaking change to live consumers.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PoseCalibrationDto {
+    pub mode: String,
+    pub captured_at: String,
+    pub frame_count: usize,
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+    pub anchor_depth_m: Option<f32>,
+    pub confidence: f32,
+    pub anchor_depth_jitter_m: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -420,6 +494,7 @@ impl ProjectFile {
                 camera_index: state.camera_index,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
+                pose_calibration: state.pose_calibration.as_ref().map(pose_calibration_to_dto),
             },
             rendering: RenderingConfig {
                 material_mode_index: state.material_mode_index,
@@ -491,6 +566,7 @@ impl ProjectFile {
             camera_index: self.tracking.camera_index,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,
+            pose_calibration: self.tracking.pose_calibration.as_ref().and_then(dto_to_pose_calibration),
 
             material_mode_index: self.rendering.material_mode_index,
             toon_ramp_threshold: self.rendering.toon_ramp_threshold,

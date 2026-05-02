@@ -1099,6 +1099,7 @@ impl GuiApp {
             camera_index: self.camera_index,
             show_camera_wipe: self.show_camera_wipe,
             show_detection_annotations: self.show_detection_annotations,
+            pose_calibration: self.app.tracking_calibration.pose.clone(),
 
             material_mode_index: self.rendering.material_mode_index,
             toon_ramp_threshold: self.rendering.toon_ramp_threshold,
@@ -1284,6 +1285,13 @@ impl GuiApp {
         self.camera_index = state.camera_index;
         self.show_camera_wipe = state.show_camera_wipe;
         self.show_detection_annotations = state.show_detection_annotations;
+        // Pose calibration: restored straight onto Application's tracking
+        // calibration so the solver / depth pipeline can read it from
+        // their existing access point (`apply_calibration` and friends)
+        // without GUI round-tripping. `None` is meaningful — it means the
+        // user never calibrated this project, and the consumers fall
+        // back to their auto-EMA / hardcoded-clamp behaviour.
+        self.app.tracking_calibration.pose = state.pose_calibration.clone();
 
         self.rendering.material_mode_index = state.material_mode_index;
         self.rendering.toon_ramp_threshold = state.toon_ramp_threshold;

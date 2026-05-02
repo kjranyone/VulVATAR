@@ -22,12 +22,14 @@ pub mod rtmw3d_with_depth;
 #[cfg(feature = "inference")]
 mod skeleton_from_depth;
 
+pub mod calibration;
 pub mod face_mediapipe;
 pub mod rtmw3d;
 pub mod source_skeleton;
 #[cfg(feature = "inference")]
 pub mod yolox;
 
+pub use calibration::{CalibrationMode, PoseCalibration};
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -94,19 +96,34 @@ impl Default for TrackingSmoothingParams {
     }
 }
 
-/// Per-session calibration. The only field that survives the SourceSkeleton
-/// rewrite is `neutral_face_pose`: operators calibrate by facing the camera
-/// squarely for a moment, and every subsequent face pose gets this reading
-/// subtracted so that "neutral" really is `yaw = pitch = roll = 0`.
+/// Per-session calibration.
+///
+/// Two independent calibration channels live here:
+/// - `neutral_face_pose` — operators square up to the camera for a moment
+///   and every subsequent face pose has this reading subtracted so
+///   "neutral" really is `yaw = pitch = roll = 0`.
+/// - `pose` — the user runs the `Calibrate Pose ▼` modal once per project
+///   to capture a known-good pelvic / shoulder anchor reference; the
+///   solver uses it to seed the root-translation EMA and
+///   `skeleton_from_depth` uses it to clamp the metric calibration scale
+///   against a desk-in-foreground bias. `None` until the user runs the
+///   modal — consumers fall back to the existing auto-EMA / hardcoded
+///   clamp behaviour. See `docs/calibration-ux.md`.
 #[derive(Clone, Debug, Default)]
 pub struct TrackingCalibration {
     pub neutral_face_pose: FacePose,
+    pub pose: Option<PoseCalibration>,
 }
 
 impl TrackingCalibration {
     /// Subtract the stored neutral face pose from the live sample so the
     /// solver receives deltas relative to calibration, not absolute camera
     /// angles.
+    ///
+    /// The pose calibration is intentionally *not* applied here — it
+    /// drives anchor selection / EMA seeding inside the solver and the
+    /// depth-aware skeleton builder, so it gets read from those call
+    /// sites directly rather than baked into the source sample.
     pub fn apply_calibration(&self, sample: &mut SourceSkeleton) {
         if let Some(ref mut face) = sample.face {
             face.yaw -= self.neutral_face_pose.yaw;
