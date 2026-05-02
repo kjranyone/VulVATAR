@@ -77,6 +77,14 @@ pub struct PoseCalibration {
     /// because the on-disk schema needs a stable, human-readable
     /// representation that survives `serde_json` / version changes.
     pub captured_at: String,
+    /// Unix seconds at capture. Persisted alongside [`Self::captured_at`]
+    /// so the inspector's "Calibrated N min ago" relative-time
+    /// rendering doesn't have to parse the ISO string each frame.
+    /// Both fields are written together by `aggregate()` and consumed
+    /// together; if they disagree (manually-edited project file) the
+    /// unix value wins.
+    #[serde(default)]
+    pub captured_at_unix: u64,
     /// Number of frames whose median produced these values. Below 5
     /// indicates a `Capture Now` cut-short with sparse samples; the
     /// inspector flags the calibration as "low-sample" in that case.

@@ -279,30 +279,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 });
             });
-            // Calibration status line. Phase E will format this with
-            // captured-at age, mode label, depth, and confidence; for
-            // now it just announces "calibrated / not calibrated".
-            if let Some(ref pose) = state.app.tracking_calibration.pose {
-                ui.label(
-                    egui::RichText::new(t!(
-                        "calibration.status_calibrated",
-                        mode = match pose.mode {
-                            crate::tracking::CalibrationMode::FullBody =>
-                                t!("calibration.mode_full_body"),
-                            crate::tracking::CalibrationMode::UpperBody =>
-                                t!("calibration.mode_upper_body"),
-                        }
-                    ))
-                    .size(11.0)
-                    .color(egui::Color32::from_rgb(120, 220, 140)),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new(t!("calibration.status_uncalibrated"))
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(170, 170, 170)),
-                );
-            }
+            draw_calibration_status(ui, state);
             if let Some(tracking) = &state.app.last_tracking_pose {
                 ui.separator();
                 ui.label(t!("tracking.confidence"));
@@ -460,6 +437,120 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         .changed()
     {
         state.project_dirty = true;
+    }
+}
+
+/// Renders the pose-calibration status line(s) under the
+/// Calibrate Pose ▼ button. Three rendering paths:
+///
+/// 1. **Calibrated + matching anchor** (the happy case): green
+///    "Calibrated 5 min ago — Full Body" + a depth/jitter/sample
+///    line so the user can sanity-check the captured values.
+/// 2. **Calibrated + mismatched anchor**: amber warning when the
+///    runtime tracker is currently using the *other* anchor (e.g.
+///    calibrated in T-pose but the user is now seated and only the
+///    shoulders are visible). Solver auto-falls back to EMA in this
+///    case; the warning lets the user re-calibrate intentionally.
+/// 3. **Uncalibrated**: grey "Pose not calibrated — auto-EMA active"
+///    so first-time users know the feature exists.
+fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
+    let pose = match state.app.tracking_calibration.pose.clone() {
+        Some(p) => p,
+        None => {
+            ui.label(
+                egui::RichText::new(t!("calibration.status_uncalibrated"))
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(170, 170, 170)),
+            );
+            return;
+        }
+    };
+
+    let mode_label = match pose.mode {
+        crate::tracking::CalibrationMode::FullBody => t!("calibration.mode_full_body"),
+        crate::tracking::CalibrationMode::UpperBody => t!("calibration.mode_upper_body"),
+    };
+    let age_label = format_age(pose.captured_at_unix);
+
+    // Mismatch detection: if the live tracker is producing an anchor
+    // type that doesn't match the calibration mode, show an amber
+    // warning instead of the green "all good" line. Mismatch is the
+    // user's signal to either re-calibrate or change their framing.
+    let runtime_mismatch = state
+        .app
+        .last_tracking_pose
+        .as_ref()
+        .filter(|p| p.root_offset.is_some())
+        .map(|p| match pose.mode {
+            crate::tracking::CalibrationMode::FullBody => !p.root_anchor_is_hip,
+            crate::tracking::CalibrationMode::UpperBody => p.root_anchor_is_hip,
+        })
+        .unwrap_or(false);
+
+    if runtime_mismatch {
+        ui.label(
+            egui::RichText::new(t!(
+                "calibration.status_mismatch",
+                age = age_label,
+                mode = mode_label
+            ))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(230, 180, 60)),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new(t!(
+                "calibration.status_calibrated",
+                age = age_label,
+                mode = mode_label
+            ))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(120, 220, 140)),
+        );
+    }
+
+    // Detail line: depth + jitter + sample count + confidence. Skipped
+    // when the calibration is from rtmw3d (no depth) — only the sample
+    // / confidence parts are meaningful there.
+    let detail = match (pose.anchor_depth_m, pose.anchor_depth_jitter_m) {
+        (Some(d), Some(j)) => t!(
+            "calibration.status_detail_depth",
+            depth = format!("{:.2}", d),
+            jitter = format!("{:.3}", j),
+            samples = format!("{}", pose.frame_count),
+            confidence = format!("{:.2}", pose.confidence)
+        ),
+        _ => t!(
+            "calibration.status_detail_no_depth",
+            samples = format!("{}", pose.frame_count),
+            confidence = format!("{:.2}", pose.confidence)
+        ),
+    };
+    ui.label(
+        egui::RichText::new(detail)
+            .size(10.0)
+            .color(egui::Color32::from_rgb(150, 150, 160)),
+    );
+}
+
+/// Format a unix timestamp as a relative-age label ("5 min ago",
+/// "just now", "1 day ago"). Future timestamps (clock skew) render as
+/// "just now" rather than "in N min" to keep the status line from
+/// looking broken.
+fn format_age(captured_unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age_secs = now.saturating_sub(captured_unix);
+    if age_secs < 60 {
+        t!("calibration.age_just_now")
+    } else if age_secs < 3600 {
+        t!("calibration.age_minutes", n = format!("{}", age_secs / 60))
+    } else if age_secs < 86_400 {
+        t!("calibration.age_hours", n = format!("{}", age_secs / 3600))
+    } else {
+        t!("calibration.age_days", n = format!("{}", age_secs / 86_400))
     }
 }
 

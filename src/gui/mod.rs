@@ -1310,7 +1310,14 @@ impl GuiApp {
         // without GUI round-tripping. `None` is meaningful — it means the
         // user never calibrated this project, and the consumers fall
         // back to their auto-EMA / hardcoded-clamp behaviour.
+        //
+        // Also push to the tracking mailbox so the worker thread (when
+        // it starts) forwards the calibration to the depth-pipeline
+        // provider for anchor forcing. Updates the calibration_seq even
+        // on `None` so the provider sees explicit "calibration cleared"
+        // when projects without calibration data are loaded.
         self.app.tracking_calibration.pose = state.pose_calibration.clone();
+        self.app.tracking.mailbox().set_calibration(state.pose_calibration.clone());
 
         self.rendering.material_mode_index = state.material_mode_index;
         self.rendering.toon_ramp_threshold = state.toon_ramp_threshold;

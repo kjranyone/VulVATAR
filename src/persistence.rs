@@ -141,6 +141,7 @@ fn pose_calibration_to_dto(
     PoseCalibrationDto {
         mode: cal.mode.as_str().to_string(),
         captured_at: cal.captured_at.clone(),
+        captured_at_unix: cal.captured_at_unix,
         frame_count: cal.frame_count,
         anchor_x: cal.anchor_x,
         anchor_y: cal.anchor_y,
@@ -169,6 +170,7 @@ fn dto_to_pose_calibration(
     Some(crate::tracking::PoseCalibration {
         mode,
         captured_at: dto.captured_at.clone(),
+        captured_at_unix: dto.captured_at_unix,
         frame_count: dto.frame_count,
         anchor_x: dto.anchor_x,
         anchor_y: dto.anchor_y,
@@ -233,6 +235,8 @@ pub struct TrackingConfig {
 pub struct PoseCalibrationDto {
     pub mode: String,
     pub captured_at: String,
+    #[serde(default)]
+    pub captured_at_unix: u64,
     pub frame_count: usize,
     pub anchor_x: f32,
     pub anchor_y: f32,

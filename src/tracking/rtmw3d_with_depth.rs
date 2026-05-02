@@ -87,7 +87,7 @@ use super::metric_depth::MoGeFrame;
 use super::rtmw3d::Rtmw3dInference;
 #[cfg(feature = "inference")]
 use super::skeleton_from_depth::{
-    build_skeleton, resolve_origin_metric, SAMPLE_RADIUS_PX,
+    build_options_from_calibration, build_skeleton, resolve_origin_metric, SAMPLE_RADIUS_PX,
 };
 #[cfg(feature = "inference")]
 use log::{debug, info, warn};
@@ -182,6 +182,15 @@ pub struct Rtmw3dWithDepthProvider {
     #[allow(dead_code)]
     dav2_model_path: PathBuf,
     load_warnings: Vec<String>,
+    /// Latest pose calibration pushed from the GUI via the tracking
+    /// mailbox. `None` means no calibration is active — the depth
+    /// pipeline keeps its default hip-preferred / shoulder-fallback
+    /// anchor selection. When `Some` and the mode is `UpperBody`,
+    /// `BuildOptions::force_shoulder_anchor` is set so a hallucinated
+    /// hip detection (e.g. desk surface in foreground) can't override
+    /// the user-acknowledged "I'm only showing my upper body"
+    /// declaration.
+    pose_calibration: Option<crate::tracking::PoseCalibration>,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -228,6 +237,7 @@ impl Rtmw3dWithDepthProvider {
             depth_backend_label,
             dav2_model_path,
             load_warnings: warnings,
+            pose_calibration: None,
         })
     }
 
@@ -307,6 +317,10 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
 
     fn take_load_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.load_warnings)
+    }
+
+    fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
+        self.pose_calibration = calibration;
     }
 
     fn estimate_pose(
@@ -441,13 +455,12 @@ impl Rtmw3dWithDepthProvider {
 
         // Phase 5: skeleton from depth.
         let t_skel = std::time::Instant::now();
-        // BuildOptions::default() = "no calibration in effect at the
-        // depth-pipeline layer" — the calibration is currently applied
-        // only solver-side (root-translation EMA seed). Wired through
-        // here as the seam where Upper Body calibration would force
-        // the shoulder anchor when threading the calibration into the
-        // worker becomes worthwhile.
-        let opts = super::skeleton_from_depth::BuildOptions::default();
+        // BuildOptions derived from the active pose calibration. Upper
+        // Body calibration sets `force_shoulder_anchor` so a phantom
+        // hip detection (e.g. desk surface in the depth window) can't
+        // override the user-acknowledged "I'm only showing my upper
+        // body" declaration.
+        let opts = build_options_from_calibration(self.pose_calibration.as_ref());
         let mut skeleton = match resolve_origin_metric(&joints_2d, &metric_frame, opts) {
             Some((origin, was_hip, score)) => build_skeleton(
                 frame_index,

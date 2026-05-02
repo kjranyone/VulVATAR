@@ -483,10 +483,15 @@ fn finalize_collection(
 
     let calibration = aggregate(&samples, mode);
 
-    // Write into Application so the depth pipeline / solver / project
-    // file all see the new value next frame. Marking the project dirty
-    // nudges the user to save (the auto-save also picks it up).
+    // Write into Application so the solver / project file see the
+    // new value next frame. Also push to the tracking mailbox so the
+    // worker thread forwards it to the depth-pipeline provider via
+    // `set_calibration` — that path enables Upper Body anchor
+    // forcing and (future) jitter-derived c-clamp narrowing.
+    // Marking the project dirty nudges the user to save (auto-save
+    // also picks it up).
     state.app.tracking_calibration.pose = Some(calibration.clone());
+    state.app.tracking.mailbox().set_calibration(Some(calibration.clone()));
     state.project_dirty = true;
 
     CalibrationModalState::Done {
@@ -530,9 +535,14 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         None
     };
 
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     PoseCalibration {
         mode,
-        captured_at: iso_now(),
+        captured_at: iso_now_from_unix(now_unix),
+        captured_at_unix: now_unix,
         frame_count: samples.len(),
         anchor_x: median_x,
         anchor_y: median_y,
@@ -559,15 +569,12 @@ fn median_inplace(values: &mut [f32]) -> f32 {
     }
 }
 
-/// ISO-8601 UTC timestamp of "now", with second granularity. The
-/// "calibrated N min ago" status (Phase E) parses this back to compute
-/// the age delta. Falls back to a unix-epoch sentinel if the system
-/// clock is somehow before 1970.
-fn iso_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+/// ISO-8601 UTC timestamp string from a unix-seconds value. The
+/// `captured_at_unix` field on `PoseCalibration` is the canonical
+/// timestamp source (used by the inspector for the relative-age
+/// rendering); this string form exists for human-readable
+/// project-file inspection.
+fn iso_now_from_unix(secs: u64) -> String {
     // Hand-rolled formatter to avoid pulling in chrono just for this:
     // YYYY-MM-DDTHH:MM:SSZ. Date math via the standard "days since
     // epoch" Howard Hinnant algorithm.

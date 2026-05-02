@@ -161,6 +161,18 @@ struct TrackingMailboxInner {
     /// inference engine is loaded — e.g. synthetic mode, or before the
     /// worker has finished init.
     inference_backend_label: Option<String>,
+    /// Latest pose-calibration capture pushed from the GUI. The
+    /// tracking worker reads this each iteration and forwards it to
+    /// the provider via `PoseProvider::set_calibration`. Replaces
+    /// (rather than queues) on each write — only the most recent
+    /// value matters; the worker doesn't care about intermediate
+    /// captures the user dismissed.
+    calibration: Option<PoseCalibration>,
+    /// Bumped each time `set_calibration` writes. The worker compares
+    /// against its last-seen value to skip the `set_calibration`
+    /// call on iterations where nothing changed (avoids the per-frame
+    /// `Option::clone` of the calibration).
+    calibration_seq: u64,
 }
 
 fn now_nanos() -> u64 {
@@ -190,6 +202,8 @@ impl TrackingMailbox {
                 last_update_nanos: 0,
                 pending_error: None,
                 inference_backend_label: None,
+                calibration: None,
+                calibration_seq: 0,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -242,6 +256,32 @@ impl TrackingMailbox {
     pub fn drain_error(&self) -> Option<(String, TrackingErrorLevel)> {
         let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         inner.pending_error.take()
+    }
+
+    /// GUI-side push: stash the latest pose calibration so the worker
+    /// thread can pick it up on its next iteration. Replaces (rather
+    /// than queues) — only the most recent value matters; bumping the
+    /// sequence lets the worker skip the per-frame
+    /// `set_calibration` call when nothing changed.
+    pub fn set_calibration(&self, calibration: Option<PoseCalibration>) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.calibration = calibration;
+        inner.calibration_seq += 1;
+    }
+
+    /// Worker-side poll: returns `Some((calibration, seq))` only when
+    /// `seq` has advanced past `last_seen_seq`, so the worker
+    /// processes a calibration update at most once per write.
+    pub fn poll_calibration(
+        &self,
+        last_seen_seq: u64,
+    ) -> Option<(Option<PoseCalibration>, u64)> {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.calibration_seq != last_seen_seq {
+            Some((inner.calibration.clone(), inner.calibration_seq))
+        } else {
+            None
+        }
     }
 
     /// Set the inference-backend label. Called once by the worker after
@@ -713,10 +753,29 @@ impl TrackingWorker {
         ready.store(true, Ordering::SeqCst);
         let mut frame_index: u64 = 0;
         let mut consecutive_errors: u32 = 0;
+        // Last calibration-mailbox sequence we forwarded to the
+        // provider. Updated only when `poll_calibration` returns
+        // `Some`, so per-frame cost is one mutex-guarded integer
+        // compare in the hot path.
+        let mut last_calibration_seq: u64 = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
         while running.load(Ordering::SeqCst) {
             let loop_start = std::time::Instant::now();
+
+            // Forward any newly-captured pose calibration to the
+            // provider. The capture is a rare event (user-initiated
+            // via the modal) so the mismatch branch fires once per
+            // calibration, not once per frame.
+            #[cfg(feature = "inference")]
+            if let Some(ref mut provider) = pose_provider {
+                if let Some((cal, seq)) =
+                    mailbox.poll_calibration(last_calibration_seq)
+                {
+                    provider.set_calibration(cal);
+                    last_calibration_seq = seq;
+                }
+            }
 
             match capture.grab_frame() {
                 Ok(rgb_data) => {

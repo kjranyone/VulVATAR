@@ -39,6 +39,16 @@ pub trait PoseProvider {
         height: u32,
         frame_index: u64,
     ) -> PoseEstimate;
+
+    /// Update the provider's view of the user's pose calibration. The
+    /// tracking worker calls this each iteration with the latest value
+    /// from `Application::tracking_calibration.pose` (forwarded via
+    /// the calibration mailbox); providers that route the depth
+    /// pipeline use it to switch anchor selection (`Upper Body` mode
+    /// forces shoulder anchor) and — eventually — to clamp the
+    /// metric calibration scale against the captured jitter range.
+    /// The default no-op covers providers without a depth path.
+    fn set_calibration(&mut self, _calibration: Option<crate::tracking::PoseCalibration>) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

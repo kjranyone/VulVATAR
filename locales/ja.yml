@@ -87,8 +87,15 @@ calibration:
   cancel: "キャンセル"
   capture_now: "今すぐ計測完了"
   no_frame: "カメラフレーム待機中…"
-  status_calibrated: "キャリブ済み — %{mode}"
+  status_calibrated: "✓ キャリブ済み (%{age}) — %{mode}"
+  status_mismatch: "⚠ %{mode} でキャリブ済み (%{age}) ですが、現在のアンカーが不一致 — 自動EMA動作中"
   status_uncalibrated: "未キャリブレーション — 自動EMA動作中"
+  status_detail_depth: "  深度 %{depth} m、ジッター ±%{jitter} m、%{samples} サンプル、信頼度 %{confidence}"
+  status_detail_no_depth: "  %{samples} サンプル、信頼度 %{confidence}"
+  age_just_now: "たった今"
+  age_minutes: "%{n} 分前"
+  age_hours: "%{n} 時間前"
+  age_days: "%{n} 日前"
 
 tracking:
   enabled: "トラッキング有効"

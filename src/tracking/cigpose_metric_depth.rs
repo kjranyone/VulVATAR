@@ -45,7 +45,8 @@ use super::face_mediapipe::FaceMeshInference;
 use super::metric_depth::MoGe2Inference;
 #[cfg(feature = "inference")]
 use super::skeleton_from_depth::{
-    build_face_bbox_from_joints_2d, build_skeleton, derive_face_pose_metric, resolve_origin_metric,
+    build_face_bbox_from_joints_2d, build_options_from_calibration, build_skeleton,
+    derive_face_pose_metric, resolve_origin_metric,
 };
 #[cfg(feature = "inference")]
 use super::yolox::YoloxPersonDetector;
@@ -66,6 +67,11 @@ pub struct CigposeMetricDepthProvider {
     #[allow(dead_code)]
     moge_model_path: PathBuf,
     load_warnings: Vec<String>,
+    /// See `Rtmw3dWithDepthProvider::pose_calibration` — same role:
+    /// drives `BuildOptions::force_shoulder_anchor` for Upper Body
+    /// calibration so a phantom hip detection can't override the
+    /// user's framing declaration.
+    pose_calibration: Option<crate::tracking::PoseCalibration>,
 }
 
 impl CigposeMetricDepthProvider {
@@ -134,6 +140,7 @@ impl CigposeMetricDepthProvider {
             cigpose_model_path,
             moge_model_path,
             load_warnings,
+            pose_calibration: None,
         })
     }
 
@@ -157,6 +164,10 @@ impl PoseProvider for CigposeMetricDepthProvider {
 
     fn take_load_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.load_warnings)
+    }
+
+    fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
+        self.pose_calibration = calibration;
     }
 
     fn estimate_pose(
@@ -268,10 +279,10 @@ impl CigposeMetricDepthProvider {
         let dt_moge = t_moge.elapsed();
 
         let t_skel = std::time::Instant::now();
-        // See `rtmw3d_with_depth` for the same comment: calibration is
-        // currently applied solver-side only; depth-pipeline anchor
-        // forcing remains a future enhancement.
-        let opts = super::skeleton_from_depth::BuildOptions::default();
+        // BuildOptions derived from the active pose calibration
+        // (Upper Body mode forces shoulder anchor — see
+        // `Rtmw3dWithDepthProvider` for the rationale).
+        let opts = build_options_from_calibration(self.pose_calibration.as_ref());
         let (mut skeleton, origin_opt) = match resolve_origin_metric(&joints_2d, &depth_frame, opts) {
             Some((origin, anchor_was_hip, anchor_score)) => {
                 let sk = build_skeleton(

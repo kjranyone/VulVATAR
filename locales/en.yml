@@ -87,8 +87,15 @@ calibration:
   cancel: "Cancel"
   capture_now: "Capture Now"
   no_frame: "Waiting for camera frame…"
-  status_calibrated: "Calibrated — %{mode}"
+  status_calibrated: "✓ Calibrated %{age} — %{mode}"
+  status_mismatch: "⚠ Calibrated %{age} for %{mode}, but live anchor differs — auto-EMA active"
   status_uncalibrated: "Pose not calibrated — auto-EMA active"
+  status_detail_depth: "  Depth %{depth} m, jitter ±%{jitter} m, %{samples} samples, conf %{confidence}"
+  status_detail_no_depth: "  %{samples} samples, conf %{confidence}"
+  age_just_now: "just now"
+  age_minutes: "%{n} min ago"
+  age_hours: "%{n} h ago"
+  age_days: "%{n} d ago"
 
 tracking:
   enabled: "Tracking Enabled"

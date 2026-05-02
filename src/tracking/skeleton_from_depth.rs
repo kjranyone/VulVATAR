@@ -179,6 +179,22 @@ pub struct BuildOptions {
     pub force_shoulder_anchor: bool,
 }
 
+/// Build [`BuildOptions`] from the depth-providers' cached
+/// `pose_calibration`. Single-sourced so both depth providers
+/// (rtmw3d-with-depth, cigpose-metric-depth) compute the same opts
+/// and any future calibration-derived knob (c-clamp from jitter,
+/// anchor-bias rejection) lands in one place.
+pub(super) fn build_options_from_calibration(
+    calibration: Option<&super::PoseCalibration>,
+) -> BuildOptions {
+    let force_shoulder_anchor = calibration
+        .map(|c| matches!(c.mode, super::CalibrationMode::UpperBody))
+        .unwrap_or(false);
+    BuildOptions {
+        force_shoulder_anchor,
+    }
+}
+
 /// Resolve the body anchor origin in metric camera-space coords.
 /// Hip mid is preferred (CIGPose 11/12); falls back to shoulder mid
 /// (5/6) for upper-body crops. Returns `None` when neither pair is
