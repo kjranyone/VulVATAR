@@ -1,0 +1,1 @@
+CLAUDE.mdを読め
