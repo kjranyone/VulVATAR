@@ -432,7 +432,13 @@ impl Rtmw3dWithDepthProvider {
         // misalignment is sub-keypoint and absorbed by the
         // sample-window median.
         let t_calib = std::time::Instant::now();
-        let calib = match calibrate_scale(&joints_2d, dav2_frame, width, height) {
+        let calib = match calibrate_scale(
+            &joints_2d,
+            dav2_frame,
+            width,
+            height,
+            self.pose_calibration.as_ref(),
+        ) {
             Some(c) => c,
             None => {
                 warn!("RTMW3D+DAv2: calibration anchor unavailable — falling back to RTMW3D synthetic z");
@@ -557,6 +563,7 @@ fn calibrate_scale(
     dav2: &DepthAnythingFrame,
     src_w: u32,
     src_h: u32,
+    pose_calibration: Option<&crate::tracking::PoseCalibration>,
 ) -> Option<Calibration> {
     let v_half = (ASSUMED_VERTICAL_FOV_DEG.to_radians() * 0.5).tan();
     let h_half = v_half * (src_w as f32 / src_h.max(1) as f32);
@@ -633,6 +640,35 @@ fn calibrate_scale(
         if !(MIN_C..=MAX_C).contains(&scale_c) {
             continue;
         }
+
+        // Dynamic plausibility narrowing from pose calibration. The
+        // hardcoded MIN_C / MAX_C above only catches degenerate-anchor
+        // failure (geom near zero); a desk in foreground typically
+        // yields a `scale_c` that's *plausible in absolute terms* but
+        // far off the user's actual standing distance. We compute the
+        // anchor depth this `scale_c` would produce and reject
+        // configurations whose predicted depth deviates more than
+        // `max_deviation` from the captured calibration depth.
+        //
+        // `max_deviation` is the larger of:
+        //   - 30 % of calibration depth (subject genuinely walks closer
+        //     / further by up to a third without re-calibrating), or
+        //   - 3 σ of measured per-frame depth jitter (noise floor for
+        //     a still subject).
+        // — whichever is bigger, so the band is generous on either
+        // axis but doesn't open all the way back up to MIN_C / MAX_C.
+        if let Some(cal) = pose_calibration {
+            if let Some(cal_depth) = cal.anchor_depth_m {
+                let avg_d_raw = (d_a + d_b) * 0.5;
+                let predicted_depth = scale_c / avg_d_raw;
+                let jitter = cal.anchor_depth_jitter_m.unwrap_or(0.05).max(0.05);
+                let max_deviation = (jitter * 3.0).max(cal_depth * 0.30);
+                if (predicted_depth - cal_depth).abs() > max_deviation {
+                    continue;
+                }
+            }
+        }
+
         return Some(Calibration {
             scale_c,
             h_half,
