@@ -77,6 +77,15 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Useful for checking whether RGB skin-region visibility improves or destabilizes pose inference.
   - All images are adult, fully clothed, non-sexual synthetic validation assets.
 
+- `gothic_lolita_chest_silhouette_variation/photorealistic_fixed_camera_high_skin/`
+  - 9 photorealistic fixed-camera studio frames loosely based on the gothic lolita validation character.
+  - Uses `gothic_lolita_rotation/photorealistic/pose_inference_gothic_lolita_rotation_frame_01_front_000deg_full_body_adult_woman_plain_studio_16x9.png`
+    as a character/style reference for hair, headwear, and black-and-white gothic styling.
+  - Split into `small_chest/`, `medium_chest/`, and `large_chest/`, with the same 3 pose labels:
+    `front_neutral`, `front_arms_crossed`, and `three_quarter_torso_twist`.
+  - Uses a modest sleeveless gothic idol outfit with visible shoulders, arms, and legs for RGB skin-region validation.
+  - All images are adult, fully clothed, non-sexual synthetic validation assets.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.
