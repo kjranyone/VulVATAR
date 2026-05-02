@@ -129,19 +129,33 @@ pub struct SourceSkeleton {
     /// Overall scalar detection confidence (used for stale/quality gating
     /// upstream). `0.0` means "no person detected".
     pub overall_confidence: f32,
-    /// Hip pelvic anchor offset from a neutral camera-frame reference
+    /// Body-anchor offset from a neutral camera-frame reference
     /// (image centre for 2D-only providers; the calibration-anchor
     /// metric position for depth-aware providers). Used by
     /// [`crate::avatar::pose_solver`] to translate the avatar's `Hips`
     /// bone so the avatar follows the subject's side-step / lean-in /
-    /// crouch motion instead of just spinning in place.
+    /// crouch motion instead of just spinning in place, and read by
+    /// the pose-calibration modal as the per-frame anchor sample.
     ///
-    /// `None` when the hip pair was not detected — solver leaves the
-    /// avatar at its rest position. When `Some`, components are in the
-    /// same source-space units as the joint positions:
-    /// `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`, `z` in metric units
-    /// (depth-aware) or `0` (rtmw3d-only).
+    /// `None` when *neither* the hip pair *nor* the shoulder pair was
+    /// detected — solver leaves the avatar at its rest position. When
+    /// `Some`, components are in the same source-space units as the
+    /// joint positions: `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`,
+    /// `z` in metric units (depth-aware) or `0` (rtmw3d-only).
+    ///
+    /// Use [`Self::root_anchor_is_hip`] to disambiguate hip vs
+    /// shoulder anchor for downstream consumers (calibration mode
+    /// matching, EMA seed selection).
     pub root_offset: Option<[f32; 3]>,
+    /// `true` when [`Self::root_offset`] was derived from the hip
+    /// pair (COCO 11/12); `false` when it fell back to the shoulder
+    /// pair (COCO 5/6) — the `Upper Body Only` framing where the
+    /// pelvis is below the camera frame. Pose calibration uses this
+    /// to verify the captured anchor matches the user's chosen mode
+    /// and to gate the runtime EMA seeding (a hip-calibrated session
+    /// shouldn't drive translation off a shoulder-anchor frame and
+    /// vice-versa).
+    pub root_anchor_is_hip: bool,
 }
 
 impl SourceSkeleton {
@@ -157,6 +171,7 @@ impl SourceSkeleton {
             face_mesh_confidence: None,
             overall_confidence: 0.0,
             root_offset: None,
+            root_anchor_is_hip: false,
         }
     }
 

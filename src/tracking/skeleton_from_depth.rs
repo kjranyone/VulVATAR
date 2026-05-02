@@ -261,17 +261,22 @@ pub(super) fn build_skeleton(
         };
         sk.joints.insert(HumanoidBone::Hips, hip_joint);
         sk.joints.insert(HumanoidBone::Spine, hip_joint);
-
-        // Root offset: hip mid in source-space units. For depth-aware
-        // paths this is the calibrated metric position (METERS) of the
-        // pelvic anchor in camera space, axes flipped to match the
-        // source-skeleton convention (selfie-mirror x, y-up, z toward
-        // camera). The solver subtracts a slow EMA reference so the
-        // translation feature is per-setup self-calibrating — what the
-        // avatar follows is *deviation* from where the subject normally
-        // stands, not absolute camera coords.
-        sk.root_offset = Some([-origin[0], -origin[1], -origin[2]]);
     }
+
+    // Root offset: anchor mid in metric-camera-space (METERS for the
+    // depth-aware path) with axes flipped to match the source-skeleton
+    // convention (selfie-mirror x, y-up, z toward camera). Emitted
+    // whenever any anchor was detected — hip preferred, with shoulder
+    // fallback for upper-body framing. `root_anchor_is_hip` tells
+    // downstream consumers (calibration mode-matching, EMA seed
+    // selection) which anchor produced the value.
+    //
+    // Solver subtracts a slow EMA reference so the translation feature
+    // is per-setup self-calibrating — what the avatar follows is
+    // *deviation* from where the subject normally stands, not absolute
+    // camera coords.
+    sk.root_offset = Some([-origin[0], -origin[1], -origin[2]]);
+    sk.root_anchor_is_hip = anchor_was_hip;
 
     const LOWER_BODY_FIRST_IDX: usize = 11;
     for &(idx, bone) in COCO_BODY {

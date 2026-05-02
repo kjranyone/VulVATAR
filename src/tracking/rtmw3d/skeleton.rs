@@ -98,21 +98,22 @@ pub(super) fn build_source_skeleton(
     // when the code path skips downstream consumers of those values.
     let _ = (width, height);
 
-    // Root offset: hip mid relative to image centre, in the same
+    // Root offset: anchor mid relative to image centre, in the same
     // source-space units the joints use. This is what lets the solver
     // *translate* the avatar's Hips bone (instead of just rotating it
     // for body yaw) so the avatar follows the subject side-stepping or
-    // leaning into the camera. RTMW3D has no metric depth, so Z is left
-    // at 0 — the depth-aware skeleton builder fills it in for the
-    // CIGPose / DAv2 paths. Only emit when the hip pair was actually
-    // detected; falling back to the shoulder anchor would give the
-    // solver a translation signal that drifts whenever the hips
-    // re-enter frame.
-    if hip_visible {
-        let root_x = -(origin_nx - 0.5) * (2.0 * aspect);
-        let root_y = -(origin_ny - 0.5) * 2.0;
-        sk.root_offset = Some([root_x, root_y, 0.0]);
-    }
+    // leaning into the camera, and it's the per-frame sample the pose-
+    // calibration modal accumulates.
+    //
+    // Emitted whenever any anchor was detected — hip preferred, with
+    // shoulder fallback for upper-body framing. `root_anchor_is_hip`
+    // tells downstream consumers which anchor produced the value so
+    // calibration mode-matching and EMA seed selection can gate
+    // appropriately. RTMW3D has no metric depth, so Z is always 0.
+    let root_x = -(origin_nx - 0.5) * (2.0 * aspect);
+    let root_y = -(origin_ny - 0.5) * 2.0;
+    sk.root_offset = Some([root_x, root_y, 0.0]);
+    sk.root_anchor_is_hip = hip_visible;
 
     // Hips: only emit when the hip pair was actually detected. When
     // the origin came from the shoulder fallback above, the avatar's

@@ -1,22 +1,30 @@
-//! Pose-calibration fullscreen modal (Phase B scaffold).
+//! Pose-calibration fullscreen modal (Phase C: live capture).
 //!
-//! Phase B owns the *UI shell*: state machine, countdown timer, webcam
-//! preview routing, and the Cancel / Capture Now controls. The actual
-//! frame collection + median aggregation is stubbed (Phase C wires it
-//! up to the source-skeleton mailbox), and the captured values are
-//! discarded on close until Phase C hooks them into
-//! `Application::tracking_calibration.pose`.
+//! Phase B owned the UI shell. Phase C wires the capture loop:
+//! per-frame samples are accumulated from the source-skeleton mailbox
+//! during the `Collecting` window, the per-axis **median** + per-frame
+//! **stddev** are computed on transition to `Done`, and the resulting
+//! [`PoseCalibration`] is written into
+//! `Application::tracking_calibration.pose` so persistence (auto-save
+//! + project file) picks it up on the next round-trip.
+//!
+//! The capture rejects low-quality frames at intake — anchor must be
+//! detected, the anchor type must match the chosen mode, and the
+//! source-skeleton overall confidence must clear `MIN_FRAME_CONF`.
+//! "Capture Now" finishes early but still requires `MIN_SAMPLES`
+//! gathered samples to avoid writing a 1-frame "calibration" that's
+//! no better than the auto-EMA's first frame.
 //!
 //! The modal is a true overlay: a dimmed full-viewport rect underneath
 //! a centred `egui::Window` so all background interaction (orbit
 //! controls, inspector clicks) is blocked while calibration is active.
 
 use eframe::egui;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::gui::GuiApp;
 use crate::t;
-use crate::tracking::CalibrationMode;
+use crate::tracking::{CalibrationMode, PoseCalibration};
 
 /// Capture-window timing constants. Mirror the `docs/calibration-ux.md`
 /// table; tuned so the user has time to settle into the pose without
@@ -28,6 +36,31 @@ use crate::tracking::CalibrationMode;
 /// per-frame keypoint jitter.
 const HOLD_STILL_SECONDS: f32 = 1.0;
 const COLLECTION_SECONDS: f32 = 2.0;
+
+/// Minimum source-skeleton overall confidence for a sample to be
+/// admitted into the median pool. Below this, the keypoints are too
+/// noisy to give a reliable anchor reading and would skew the
+/// aggregate even if the median weights down individual outliers.
+const MIN_FRAME_CONF: f32 = 0.5;
+
+/// Smallest sample count the modal will accept as a valid capture.
+/// Below this the auto-EMA's first-frame seed is no worse than what
+/// the median can offer, so we reject and force the user to retry.
+const MIN_SAMPLES: usize = 5;
+
+/// One per-frame anchor reading collected during the capture window.
+/// Stored as `Vec<AnchorSample>` on the `Collecting` variant; the
+/// transition to `Done` walks the vec to compute medians + stddev.
+#[derive(Clone, Copy, Debug)]
+pub struct AnchorSample {
+    /// Source-space anchor position (matches `SourceSkeleton::root_offset`).
+    /// For depth-aware paths z is metric metres; for rtmw3d-only z is 0.
+    pub position: [f32; 3],
+    /// Per-frame `overall_confidence`. Aggregated as a separate median
+    /// so the surfaced calibration confidence reflects the gathered
+    /// samples, not just the first frame's reading.
+    pub confidence: f32,
+}
 
 /// Internal state of the modal. `Closed` means it is not rendered at
 /// all; the other variants drive the per-frame UI under
@@ -44,24 +77,47 @@ pub enum CalibrationModalState {
         last_anchor_seen: bool,
         last_confidence: f32,
     },
-    /// Active sample collection. Phase C will populate `samples` from
-    /// the source-skeleton mailbox; for Phase B we just count frames
-    /// so the progress bar advances.
+    /// Active sample collection. Per-frame `AnchorSample` rows are
+    /// appended each time the mailbox sequence advances *and* the
+    /// frame meets the quality bar (anchor visible, anchor type
+    /// matches mode, confidence ≥ `MIN_FRAME_CONF`). The transition
+    /// to `Done` walks `samples` to compute the median calibration
+    /// values.
     Collecting {
         mode: CalibrationMode,
         started_at: Instant,
-        samples_count: usize,
+        samples: Vec<AnchorSample>,
+        /// Tracks the last mailbox sequence we admitted a sample for,
+        /// so we don't double-count when the GUI repaints faster than
+        /// the tracking thread emits new frames.
+        last_seq_consumed: u64,
         last_anchor_seen: bool,
         last_confidence: f32,
     },
-    /// Brief "Calibrated!" confirmation before the modal auto-closes.
-    /// Phase B uses placeholder values; Phase C fills in the real
-    /// median-aggregated `PoseCalibration`.
+    /// Calibration finished — either the timer ran out or the user
+    /// hit Capture Now. Either succeeded (≥ `MIN_SAMPLES` admitted
+    /// frames, calibration written to `Application`) or was rejected
+    /// (`outcome == DoneOutcome::Insufficient`); status pane shows
+    /// the matching message before the modal auto-closes.
     Done {
         mode: CalibrationMode,
         shown_at: Instant,
-        frame_count: usize,
+        outcome: DoneOutcome,
     },
+}
+
+/// Result of a `Collecting → Done` transition, surfaced on the status
+/// pane so the user knows whether they need to retry.
+#[derive(Clone, Debug)]
+pub enum DoneOutcome {
+    /// Capture succeeded. Carries the aggregated calibration that was
+    /// just written to `Application::tracking_calibration.pose`, used
+    /// only for the post-capture status display.
+    Success { frame_count: usize, calibration: PoseCalibration },
+    /// Capture failed. `samples_collected` is below `MIN_SAMPLES` —
+    /// the modal shows "Capture failed — N samples (need M)" so the
+    /// user can adjust framing / lighting and retry.
+    Insufficient { samples_collected: usize },
 }
 
 impl Default for CalibrationModalState {
@@ -83,6 +139,7 @@ impl CalibrationModalState {
             last_confidence: 0.0,
         };
     }
+
 
     pub fn close(&mut self) {
         *self = CalibrationModalState::Closed;
@@ -345,32 +402,33 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     });
 }
 
-/// Drive the state machine forward by elapsed time.
+/// Drive the state machine forward by elapsed time. When the
+/// collection window expires, finalises the capture (median over
+/// `samples`, write into `Application::tracking_calibration`) and
+/// transitions to `Done` with the appropriate outcome.
 fn advance_state(state: &mut GuiApp) {
     let now = Instant::now();
-    let next = match state.calibration_modal {
+    let next = match &state.calibration_modal {
         CalibrationModalState::HoldStill {
             mode, started_at, ..
-        } if now.duration_since(started_at).as_secs_f32() >= HOLD_STILL_SECONDS => {
+        } if now.duration_since(*started_at).as_secs_f32() >= HOLD_STILL_SECONDS => {
             Some(CalibrationModalState::Collecting {
-                mode,
+                mode: *mode,
                 started_at: now,
-                samples_count: 0,
+                samples: Vec::with_capacity(64),
+                last_seq_consumed: 0,
                 last_anchor_seen: false,
                 last_confidence: 0.0,
             })
         }
         CalibrationModalState::Collecting {
             mode, started_at, ..
-        } if now.duration_since(started_at).as_secs_f32() >= COLLECTION_SECONDS => {
-            // Phase C will return the median-aggregated PoseCalibration
-            // here. For Phase B we just transition to Done with a
-            // placeholder frame count.
-            Some(CalibrationModalState::Done {
-                mode,
-                shown_at: now,
-                frame_count: 0, // TODO(phase-c): real sample count
-            })
+        } if now.duration_since(*started_at).as_secs_f32() >= COLLECTION_SECONDS => {
+            // Capture window expired: finalise with whatever we
+            // collected. `finalize_collection` handles median +
+            // writing the calibration; the modal then lingers in
+            // `Done` for `DONE_LINGER_SECONDS`.
+            Some(finalize_collection(state, *mode, now))
         }
         _ => None,
     };
@@ -381,18 +439,159 @@ fn advance_state(state: &mut GuiApp) {
 
 /// Force the state machine to the `Done` state regardless of timer.
 /// Used by the `Capture Now` button so impatient users don't have to
-/// wait for the full collection window.
+/// wait for the full collection window — but the same `MIN_SAMPLES`
+/// floor applies, so impatience can still produce an `Insufficient`
+/// outcome.
 fn finish_capture(state: &mut GuiApp) {
     let mode = match &state.calibration_modal {
         CalibrationModalState::HoldStill { mode, .. }
         | CalibrationModalState::Collecting { mode, .. } => *mode,
         _ => return,
     };
-    state.calibration_modal = CalibrationModalState::Done {
-        mode,
-        shown_at: Instant::now(),
-        frame_count: 0, // TODO(phase-c): real sample count
+    let now = Instant::now();
+    state.calibration_modal = finalize_collection(state, mode, now);
+}
+
+/// Take whatever's currently in the `Collecting` variant's `samples`
+/// vec, compute the per-axis median + jitter, write the resulting
+/// `PoseCalibration` to `Application::tracking_calibration.pose`, and
+/// return the `Done` variant carrying the success/failure outcome.
+///
+/// Called from both the timer-expired path and the `Capture Now`
+/// path, so the median / write logic stays in one place.
+fn finalize_collection(
+    state: &mut GuiApp,
+    mode: CalibrationMode,
+    now: Instant,
+) -> CalibrationModalState {
+    // Pull the current samples out of the state; HoldStill (Capture
+    // Now hit before any frames were collected) yields an empty vec.
+    let samples: Vec<AnchorSample> = match &mut state.calibration_modal {
+        CalibrationModalState::Collecting { samples, .. } => std::mem::take(samples),
+        _ => Vec::new(),
     };
+
+    if samples.len() < MIN_SAMPLES {
+        return CalibrationModalState::Done {
+            mode,
+            shown_at: now,
+            outcome: DoneOutcome::Insufficient {
+                samples_collected: samples.len(),
+            },
+        };
+    }
+
+    let calibration = aggregate(&samples, mode);
+
+    // Write into Application so the depth pipeline / solver / project
+    // file all see the new value next frame. Marking the project dirty
+    // nudges the user to save (the auto-save also picks it up).
+    state.app.tracking_calibration.pose = Some(calibration.clone());
+    state.project_dirty = true;
+
+    CalibrationModalState::Done {
+        mode,
+        shown_at: now,
+        outcome: DoneOutcome::Success {
+            frame_count: calibration.frame_count,
+            calibration,
+        },
+    }
+}
+
+/// Compute the `PoseCalibration` from a non-empty sample vec.
+/// Per-axis values use the **median** (robust to occasional outliers
+/// like a finger drifting through the hip keypoint window); confidence
+/// is the median per-frame confidence; depth jitter is the per-frame
+/// stddev of the z component (used by Phase D as the dynamic c-clamp
+/// range). For rtmw3d-only samples (z always 0), `anchor_depth_m`
+/// and `anchor_depth_jitter_m` are emitted as `None`.
+fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration {
+    let mut xs: Vec<f32> = samples.iter().map(|s| s.position[0]).collect();
+    let mut ys: Vec<f32> = samples.iter().map(|s| s.position[1]).collect();
+    let mut zs: Vec<f32> = samples.iter().map(|s| s.position[2]).collect();
+    let mut confs: Vec<f32> = samples.iter().map(|s| s.confidence).collect();
+
+    let median_x = median_inplace(&mut xs);
+    let median_y = median_inplace(&mut ys);
+    let median_z = median_inplace(&mut zs);
+    let median_conf = median_inplace(&mut confs);
+
+    // rtmw3d-only paths emit z = 0 unconditionally (no metric depth).
+    // Surface as `None` so consumers don't accidentally treat zero as
+    // a meaningful metric distance.
+    let z_is_metric = zs.iter().any(|&z| z.abs() > 1e-4);
+    let anchor_depth_m = z_is_metric.then_some(median_z);
+    let anchor_depth_jitter_m = if z_is_metric {
+        let mean: f32 = zs.iter().sum::<f32>() / zs.len() as f32;
+        let var: f32 = zs.iter().map(|&z| (z - mean).powi(2)).sum::<f32>() / zs.len() as f32;
+        Some(var.sqrt())
+    } else {
+        None
+    };
+
+    PoseCalibration {
+        mode,
+        captured_at: iso_now(),
+        frame_count: samples.len(),
+        anchor_x: median_x,
+        anchor_y: median_y,
+        anchor_depth_m,
+        confidence: median_conf,
+        anchor_depth_jitter_m,
+    }
+}
+
+/// In-place median: sorts `values` and returns the middle (or average
+/// of the two middles for even length). Returns `0.0` for an empty
+/// slice — callers gate on `MIN_SAMPLES` before reaching here, so
+/// that branch should be unreachable in practice.
+fn median_inplace(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) * 0.5
+    } else {
+        values[mid]
+    }
+}
+
+/// ISO-8601 UTC timestamp of "now", with second granularity. The
+/// "calibrated N min ago" status (Phase E) parses this back to compute
+/// the age delta. Falls back to a unix-epoch sentinel if the system
+/// clock is somehow before 1970.
+fn iso_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Hand-rolled formatter to avoid pulling in chrono just for this:
+    // YYYY-MM-DDTHH:MM:SSZ. Date math via the standard "days since
+    // epoch" Howard Hinnant algorithm.
+    let days = (secs / 86_400) as i64;
+    let secs_in_day = (secs % 86_400) as u32;
+    let hour = secs_in_day / 3_600;
+    let minute = (secs_in_day % 3_600) / 60;
+    let second = secs_in_day % 60;
+
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, m, d, hour, minute, second
+    )
 }
 
 /// Update the cached "anchor visible / confidence" telemetry from the
@@ -445,16 +644,40 @@ fn refresh_anchor_telemetry(
         _ => {}
     }
 
-    // Bump samples_count once per new mailbox sequence so the side
-    // panel reflects active capture progress. Phase C replaces this
-    // with real frame accumulation into a Vec.
+    // During the collection window, append the per-frame anchor +
+    // confidence to the median pool. Three gates apply:
+    //   1. The mailbox sequence must have advanced — otherwise we'd
+    //      double-count the same frame each repaint.
+    //   2. The anchor must match the chosen mode (hip for FullBody,
+    //      shoulder for UpperBody) so a partially-visible subject
+    //      doesn't mix anchor types in the median.
+    //   3. The frame's overall confidence must clear MIN_FRAME_CONF
+    //      so noisy keypoints don't drag the median around.
     if let CalibrationModalState::Collecting {
-        ref mut samples_count,
+        mode,
+        ref mut samples,
+        ref mut last_seq_consumed,
         ..
     } = state.calibration_modal
     {
-        if anchor_seen && confidence >= 0.5 {
-            *samples_count = samples_count.saturating_add(1);
+        if snap.sequence > *last_seq_consumed {
+            *last_seq_consumed = snap.sequence;
+            if let Some(pose) = snap.pose.as_ref() {
+                let anchor_kind_matches = match mode {
+                    CalibrationMode::FullBody => pose.root_anchor_is_hip,
+                    CalibrationMode::UpperBody => !pose.root_anchor_is_hip,
+                };
+                if anchor_kind_matches
+                    && pose.overall_confidence >= MIN_FRAME_CONF
+                {
+                    if let Some(pos) = pose.root_offset {
+                        samples.push(AnchorSample {
+                            position: pos,
+                            confidence: pose.overall_confidence,
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -484,10 +707,30 @@ fn step_text(state: &CalibrationModalState) -> (String, String) {
             };
             (t!("calibration.step_collecting"), pose)
         }
-        CalibrationModalState::Done { .. } => (
-            t!("calibration.step_done"),
-            t!("calibration.step_done_body"),
-        ),
+        CalibrationModalState::Done { outcome, .. } => match outcome {
+            DoneOutcome::Success { frame_count, calibration } => {
+                let body = match calibration.anchor_depth_m {
+                    Some(d) => t!(
+                        "calibration.step_done_body_with_depth",
+                        frames = format!("{}", frame_count),
+                        depth = format!("{:.2}", d)
+                    ),
+                    None => t!(
+                        "calibration.step_done_body_no_depth",
+                        frames = format!("{}", frame_count)
+                    ),
+                };
+                (t!("calibration.step_done"), body)
+            }
+            DoneOutcome::Insufficient { samples_collected } => (
+                t!("calibration.step_failed"),
+                t!(
+                    "calibration.step_failed_body",
+                    samples = format!("{}", samples_collected),
+                    minimum = format!("{}", MIN_SAMPLES)
+                ),
+            ),
+        },
         CalibrationModalState::Closed => (String::new(), String::new()),
     }
 }
@@ -512,7 +755,10 @@ fn progress_for(state: &CalibrationModalState) -> (f32, String) {
                 t!("calibration.time_left", time = format!("{:.1}", remaining)),
             )
         }
-        CalibrationModalState::Done { .. } => (1.0, t!("calibration.done")),
+        CalibrationModalState::Done { outcome, .. } => match outcome {
+            DoneOutcome::Success { .. } => (1.0, t!("calibration.done")),
+            DoneOutcome::Insufficient { .. } => (0.0, t!("calibration.failed")),
+        },
         CalibrationModalState::Closed => (0.0, String::new()),
     }
 }
@@ -527,10 +773,15 @@ fn telemetry(state: &CalibrationModalState) -> (bool, f32, Option<usize>) {
         CalibrationModalState::Collecting {
             last_anchor_seen,
             last_confidence,
-            samples_count,
+            samples,
             ..
-        } => (*last_anchor_seen, *last_confidence, Some(*samples_count)),
-        CalibrationModalState::Done { frame_count, .. } => (true, 1.0, Some(*frame_count)),
+        } => (*last_anchor_seen, *last_confidence, Some(samples.len())),
+        CalibrationModalState::Done { outcome, .. } => match outcome {
+            DoneOutcome::Success { frame_count, .. } => (true, 1.0, Some(*frame_count)),
+            DoneOutcome::Insufficient { samples_collected } => {
+                (false, 0.0, Some(*samples_collected))
+            }
+        },
         CalibrationModalState::Closed => (false, 0.0, None),
     }
 }
