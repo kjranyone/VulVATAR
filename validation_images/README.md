@@ -51,6 +51,13 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Filenames annotate head yaw/pitch/roll, shoulder elevation, wrist orientation, torso/hip twist, and full-body facing direction.
   - Useful for validating webcam-like pose tracking where facial motion, shoulder motion, hand rotation, waist twist, and body orientation are unstable.
 
+- `reiwa_idol_webcam_capture/photorealistic_fixed_camera/`
+  - 15 photorealistic webcam-style frames with a fixed capture setup.
+  - Uses filename-title annotations such as `cam_fov70_dist280_h130_fullbody75` to mark the simulated camera geometry:
+    70 degree horizontal FOV, 2.80 m subject distance, 1.30 m camera height, and full-body framing at about 75% image height.
+  - Split into the same `face_head/`, `shoulders/`, `wrists_hands/`, `torso_hips/`, and `orientation/` categories.
+  - Prefer this set when comparing pose changes without camera framing changes.
+
 ## Notes
 
 - These images are synthetic validation assets, not training data.

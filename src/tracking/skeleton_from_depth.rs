@@ -249,14 +249,18 @@ pub(super) fn build_skeleton(
         })
     };
 
+    // Hips + Spine share the pelvic origin. Spine has no COCO keypoint
+    // but the solver drives its bone via `Hips → ShoulderMidpoint`,
+    // so it needs a source.joints entry for the *base* lookup or
+    // pose_solver silently skips spine bend (no waist bend, no forward
+    // lean) — the same gap that existed in `rtmw3d::skeleton`.
     if anchor_was_hip {
-        sk.joints.insert(
-            HumanoidBone::Hips,
-            SourceJoint {
-                position: [0.0, 0.0, 0.0],
-                confidence: anchor_score,
-            },
-        );
+        let hip_joint = SourceJoint {
+            position: [0.0, 0.0, 0.0],
+            confidence: anchor_score,
+        };
+        sk.joints.insert(HumanoidBone::Hips, hip_joint);
+        sk.joints.insert(HumanoidBone::Spine, hip_joint);
     }
 
     const LOWER_BODY_FIRST_IDX: usize = 11;

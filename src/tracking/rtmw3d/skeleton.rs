@@ -102,14 +102,22 @@ pub(super) fn build_source_skeleton(
     // the origin came from the shoulder fallback above, the avatar's
     // pelvis bone is left at rest pose — the solver decides what
     // (if anything) to do with the absent Hips entry.
+    //
+    // `Spine` shares the same source position as `Hips` (the pelvic
+    // anchor): COCO has no spine keypoint, but the solver drives the
+    // Spine bone via `Hips → ShoulderMidpoint`, so it needs an entry
+    // in `source.joints` for the *base* lookup or it will silently
+    // skip the bone (the solver returns early when `source.joints
+    // .get(&bone)` is None). Without this insertion the avatar never
+    // bends at the waist no matter how far the subject leans forward,
+    // because the spine direction signal never reaches the solver.
     if hip_visible {
-        sk.joints.insert(
-            HumanoidBone::Hips,
-            SourceJoint {
-                position: [0.0, 0.0, 0.0],
-                confidence: hip_score,
-            },
-        );
+        let hip_joint = SourceJoint {
+            position: [0.0, 0.0, 0.0],
+            confidence: hip_score,
+        };
+        sk.joints.insert(HumanoidBone::Hips, hip_joint);
+        sk.joints.insert(HumanoidBone::Spine, hip_joint);
     }
 
     // Body bones. Emit every keypoint with its actual confidence and
