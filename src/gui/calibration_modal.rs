@@ -292,8 +292,11 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(18, 18, 22));
+    // Shrink by half the 2 px stroke width so the outline lands fully
+    // inside the painter's clip rect (otherwise its outer 1 px is
+    // clipped, leaving a hairline-thin / missing border).
     painter.rect_stroke(
-        rect,
+        rect.shrink(1.0),
         6.0,
         egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 130, 200)),
     );

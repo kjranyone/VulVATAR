@@ -52,8 +52,13 @@ pub fn outlined_button(
         Color32::TRANSPARENT
     };
     let painter = ui.painter_at(rect);
+    // Shrink by half the stroke width so the 1 px outline lands fully
+    // inside the allocated rect — egui's `painter_at` clips painting
+    // to the rect bounds, and a stroke is centred on the path so the
+    // outer 0.5 px would otherwise be cut off (visible as a missing
+    // top/left/right edge on the button).
     painter.rect(
-        rect,
+        rect.shrink(0.5),
         Rounding::same(radius::PILL),
         bg,
         Stroke::new(1.0, effective),

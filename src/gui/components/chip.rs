@@ -36,7 +36,10 @@ pub fn chip(ui: &mut Ui, label: &str, selected: bool) -> Response {
     };
 
     let painter = ui.painter_at(rect);
-    painter.rect(rect, Rounding::same(radius::PILL), bg, stroke);
+    // Shrink by 0.5 px so the 1 px stroke (when present) lands fully
+    // inside the painter's clip rect; otherwise the outer half of the
+    // outline is clipped on the unselected / hover variants.
+    painter.rect(rect.shrink(0.5), Rounding::same(radius::PILL), bg, stroke);
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
