@@ -389,6 +389,7 @@ toast:
   no_project_path: "プロジェクトパスが設定されていません。名前を付けて保存を使用してください。"
   autosaved: "プロジェクトを自動保存しました。"
   autosave_failed: "自動保存に失敗: %{error}"
+  library_save_failed: "アバターライブラリの保存に失敗: %{error}"
   virtual_camera_unavailable: "仮想カメラは利用できません: %{error}"
   lipsync_failed: "リップシンク失敗: %{error}"
   new_vrm_detected: "新しいVRMを検出: %{path}"

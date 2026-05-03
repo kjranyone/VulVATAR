@@ -821,7 +821,7 @@ impl GuiApp {
             }
         }
         if library_dirty {
-            let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+            state.save_avatar_library_with_toast();
         }
 
         // Restore watched-folder subscriptions persisted from a previous
@@ -1042,6 +1042,20 @@ impl GuiApp {
             created: Instant::now(),
             level: NotificationLevel::Info,
         });
+    }
+
+    /// Save the avatar library to disk and surface failures as an error
+    /// toast. Every former call site used `let _ = save_avatar_library(...)`
+    /// — silently swallowing the error meant a full disk or read-only
+    /// %APPDATA% would lose the user's library on next launch with no
+    /// indication anything went wrong. Centralised here so the toast
+    /// wording stays consistent and so future call sites can't regress
+    /// to the silent pattern.
+    pub fn save_avatar_library_with_toast(&mut self) {
+        if let Err(e) = crate::persistence::save_avatar_library(&self.app.avatar_library) {
+            warn!("persistence: save_avatar_library failed: {}", e);
+            self.push_error_notification(t!("toast.library_save_failed", error = e.to_string()));
+        }
     }
 
     /// Push an error notification that will auto-dismiss after 15 seconds
@@ -1788,7 +1802,7 @@ impl GuiApp {
             self.push_notification(t!("toast.new_vrm_detected", path = vrm_path.display().to_string()));
         }
         if !newly_added.is_empty() && !self.test_no_persist {
-            let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+            self.save_avatar_library_with_toast();
         }
     }
 
@@ -1832,7 +1846,7 @@ impl GuiApp {
         }
         if imported > 0 {
             if !self.test_no_persist {
-                let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+                self.save_avatar_library_with_toast();
             }
             self.push_notification(t!("toast.refreshed_imported", count = imported));
         } else {
@@ -2273,7 +2287,12 @@ impl eframe::App for GuiApp {
             }
         }
 
-        let _ = crate::persistence::save_avatar_library(&self.app.avatar_library);
+        // No toast on shutdown — the window is already closing and no
+        // notification could be displayed. Log the failure so a missing
+        // library on the next launch can be traced back to a write failure.
+        if let Err(e) = crate::persistence::save_avatar_library(&self.app.avatar_library) {
+            warn!("persistence: shutdown save_avatar_library failed: {}", e);
+        }
         crate::persistence::RecoveryManager::clear_recovery();
         info!("gui: window closing, initiating application shutdown");
         self.app.shutdown();

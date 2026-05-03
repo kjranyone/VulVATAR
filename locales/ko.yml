@@ -389,6 +389,7 @@ toast:
   no_project_path: "No project path set. Use Save As."
   autosaved: "Autosaved project."
   autosave_failed: "Autosave failed: %{error}"
+  library_save_failed: "Avatar library save failed: %{error}"
   virtual_camera_unavailable: "Virtual Camera unavailable: %{error}"
   lipsync_failed: "Lip sync failed: %{error}"
   new_vrm_detected: "New VRM detected: %{path}"

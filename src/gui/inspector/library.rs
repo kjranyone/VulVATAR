@@ -491,7 +491,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             if idx < state.app.avatar_library.entries.len() {
                 let path = state.app.avatar_library.entries[idx].path.clone();
                 state.app.avatar_library.remove(&path);
-                let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+                state.save_avatar_library_with_toast();
                 state.push_notification(t!("inspector.removed_library").to_string());
             }
         }
@@ -499,7 +499,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
         if let Some(idx) = toggle_fav_idx {
             if let Some(entry) = state.app.avatar_library.entries.get_mut(idx) {
                 entry.favorite = !entry.favorite;
-                let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+                state.save_avatar_library_with_toast();
             }
         }
 
@@ -596,7 +596,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         }
         if details_save_requested {
-            let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+            state.save_avatar_library_with_toast();
             state.push_notification(t!("inspector.library_updated").to_string());
         }
 
@@ -615,7 +615,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             .clicked()
             {
                 let removed = state.app.avatar_library.purge_missing();
-                let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+                state.save_avatar_library_with_toast();
                 state.push_notification(t!("inspector.purged_entries", count = removed));
             }
             // Surface the Ctrl+O hotkey alongside the Add button so
@@ -651,7 +651,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                             .generate_and_save_placeholder(&entry.name);
                     }
                     state.app.avatar_library.add(entry);
-                    let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+                    state.save_avatar_library_with_toast();
                     state.push_notification(t!(
                         "inspector.added_library",
                         path = path.display().to_string()

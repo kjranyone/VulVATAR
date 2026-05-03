@@ -74,7 +74,7 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
         entry.thumbnail_path = state.thumbnail_gen.generate_and_save_placeholder(&entry.name);
     }
     state.app.avatar_library.add(entry);
-    let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
+    state.save_avatar_library_with_toast();
 
     let (pan_y, distance) =
         crate::gui::autoframe_aabb(&asset.root_aabb, state.rendering.camera_fov, 1.0);
