@@ -194,6 +194,17 @@ pub(super) fn build_source_skeleton(
         }
     }
 
+    // Spine-chain proxies + Head. The solver drives Chest, UpperChest,
+    // and Neck via derived directions (Spine/Chest = hip->shoulder mid,
+    // UpperChest/Neck = shoulder mid -> Head proxy). None of those
+    // bones have a dedicated COCO keypoint, so without dual-inserts
+    // here `pose_solver`'s `source.joints.get(&bone)` lookup fails on
+    // each and the whole spine chain stays at rest pose — including
+    // for chin-thrust, where Neck is the bone that should bend.
+    inject_spine_chain_proxies(&mut sk, joints, &to_source, hip_visible, hip_score);
+
+    // Hands. COCO Wholebody indices 91..=111 are the subject's left
+
     // Hands. COCO Wholebody indices 91..=111 are the subject's left
     // hand, and 112..=132 are the subject's right hand. Within each
     // group the local index runs 0..=20 (0 = wrist). Selfie mirror:
@@ -405,5 +416,93 @@ fn attach_hand<F>(
                 }
             }
         }
+    }
+}
+
+/// Inserts the spine-chain proxy joints + the Head proxy that
+/// `pose_solver` needs in order to drive Chest, UpperChest, Neck and
+/// (indirectly) the Head bone's pivot.
+///
+/// * `Chest` is dual-inserted at the hip-mid origin (same convention
+///   as `Spine`). Its driving signal is `Tip::ShoulderMidpoint`, so
+///   the source-side base lookup just needs *some* entry — FK rebases
+///   the rest direction so Chest's actual rotation lands near identity
+///   once Spine has absorbed the lower-spine bend.
+/// * `UpperChest` and `Neck` are dual-inserted at the L/R-shoulder
+///   midpoint. Their driving signal (`Tip::HeadFromShoulders`)
+///   overrides the source-side base to the same midpoint, but the
+///   solver still requires the entry-with-confidence check to clear
+///   before it'll touch the bone.
+/// * `Head` is the actual chin-thrust signal: ear midpoint when both
+///   ears clear the visibility floor, with a nose fallback for
+///   three-quarter / profile shots where one ear is occluded. Ear
+///   midpoint is preferred because it sits at roughly the head's
+///   pivot (the atlanto-occipital joint), whereas the nose tip leads
+///   it by ~5 cm and would over-report forward motion.
+fn inject_spine_chain_proxies<F>(
+    sk: &mut SourceSkeleton,
+    joints: &[DecodedJoint],
+    to_source: &F,
+    hip_visible: bool,
+    hip_score: f32,
+) where
+    F: Fn(&DecodedJoint) -> [f32; 3],
+{
+    if hip_visible {
+        sk.joints.insert(
+            HumanoidBone::Chest,
+            SourceJoint {
+                position: [0.0, 0.0, 0.0],
+                confidence: hip_score,
+            },
+        );
+    }
+
+    if let (Some(l), Some(r)) = (
+        sk.joints.get(&HumanoidBone::LeftShoulder).copied(),
+        sk.joints.get(&HumanoidBone::RightShoulder).copied(),
+    ) {
+        let mid = SourceJoint {
+            position: [
+                (l.position[0] + r.position[0]) * 0.5,
+                (l.position[1] + r.position[1]) * 0.5,
+                (l.position[2] + r.position[2]) * 0.5,
+            ],
+            confidence: l.confidence.min(r.confidence),
+        };
+        sk.joints.insert(HumanoidBone::UpperChest, mid);
+        sk.joints.insert(HumanoidBone::Neck, mid);
+    }
+
+    const NOSE_IDX: usize = 0;
+    const LEFT_EAR_IDX: usize = 3;
+    const RIGHT_EAR_IDX: usize = 4;
+
+    let head = match (joints.get(LEFT_EAR_IDX), joints.get(RIGHT_EAR_IDX)) {
+        (Some(l), Some(r))
+            if l.score >= KEYPOINT_VISIBILITY_FLOOR
+                && r.score >= KEYPOINT_VISIBILITY_FLOOR =>
+        {
+            let lp = to_source(l);
+            let rp = to_source(r);
+            Some(SourceJoint {
+                position: [
+                    (lp[0] + rp[0]) * 0.5,
+                    (lp[1] + rp[1]) * 0.5,
+                    (lp[2] + rp[2]) * 0.5,
+                ],
+                confidence: l.score.min(r.score),
+            })
+        }
+        _ => joints.get(NOSE_IDX).and_then(|n| {
+            (n.score >= KEYPOINT_VISIBILITY_FLOOR).then(|| SourceJoint {
+                position: to_source(n),
+                confidence: n.score,
+            })
+        }),
+    };
+
+    if let Some(h) = head {
+        sk.joints.insert(HumanoidBone::Head, h);
     }
 }

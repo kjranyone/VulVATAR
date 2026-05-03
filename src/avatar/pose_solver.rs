@@ -281,6 +281,21 @@ enum Tip {
         outer_source: HumanoidBone,
         avatar_outer: HumanoidBone,
     },
+    /// UpperChest / Neck — the upper-spine + cervical chain that
+    /// captures chin-thrust (head poking forward). COCO has no
+    /// keypoints for individual spine vertebrae or for the neck base,
+    /// so source-side base = L/R-shoulder midpoint and source-side
+    /// tip = `source.joints[Head]`, which the source builder injects
+    /// from the ear midpoint (or nose fallback when an ear is
+    /// occluded). Avatar tip = the Head bone's rest world position.
+    ///
+    /// Both `UpperChest` and `Neck` are driven by the same source
+    /// signal; the FK-aware `rest_dir_current` rebase distributes the
+    /// rotation across them based on each bone's rest-pose lever
+    /// arm, so the upper spine bows slightly while the neck bends
+    /// further — without us having to fabricate intermediate
+    /// keypoints we don't actually observe.
+    HeadFromShoulders,
 }
 
 /// Static description of which bones the solver will try to drive and
@@ -288,7 +303,18 @@ enum Tip {
 /// kinematics pass always sees the parent's updated world rotation before
 /// touching the child.
 const DRIVEN_BONES: &[(HumanoidBone, Tip)] = &[
+    // Spine chain. Ordered parent-first along the actual VRM
+    // hierarchy (Spine -> Chest -> UpperChest -> {Neck, clavicles})
+    // so the FK pass sees each parent's updated world rotation
+    // before touching its children. `Chest` shares Spine's
+    // hip->shoulder signal; FK's `rest_dir_current` rebase makes
+    // its delta near-identity in practice (Spine has already
+    // absorbed the bend), but listing it keeps the bone in the
+    // driven set so any small residual still gets applied instead
+    // of being silently swallowed by the rest pose.
     (HumanoidBone::Spine, Tip::ShoulderMidpoint),
+    (HumanoidBone::Chest, Tip::ShoulderMidpoint),
+    (HumanoidBone::UpperChest, Tip::HeadFromShoulders),
     // Clavicles. Listed before the upper arms so the FK pass updates
     // them first — when the clavicle picks up a shrug, the upper
     // arm's *current* world rotation needs the parent's already-
@@ -308,6 +334,10 @@ const DRIVEN_BONES: &[(HumanoidBone, Tip)] = &[
             avatar_outer: HumanoidBone::RightUpperArm,
         },
     ),
+    // Neck. Sibling of the clavicles under UpperChest. Order vs
+    // clavicles is irrelevant (sibling) — placed after them so the
+    // arm cluster stays contiguous in this list.
+    (HumanoidBone::Neck, Tip::HeadFromShoulders),
     // Upper body
     (
         HumanoidBone::LeftUpperArm,
@@ -789,15 +819,30 @@ pub fn solve_avatar_pose(
                 }
                 tip_joint.position
             }
+            Tip::HeadFromShoulders => {
+                let Some(tip_joint) = source.joints.get(&HumanoidBone::Head) else {
+                    continue;
+                };
+                if tip_joint.confidence < params.joint_confidence_threshold {
+                    continue;
+                }
+                tip_joint.position
+            }
         };
 
         // For most bones the bone's own keypoint is the direction's base.
-        // Clavicle is the exception: the bone keypoint sits at the
-        // OUTER end (= the same point we just took as the tip), so we
-        // override the base with the L/R-shoulder midpoint as an
-        // approximation of the inner clavicle anchor (sternum top).
+        // Two exceptions both override to the L/R-shoulder midpoint:
+        //   * Clavicle — the bone keypoint sits at the OUTER end (=
+        //     the same point we just took as the tip), so without an
+        //     override the direction collapses to zero. Midpoint
+        //     approximates the inner clavicle anchor (sternum top).
+        //   * HeadFromShoulders — UpperChest / Neck have no dedicated
+        //     COCO keypoint; the natural source-side base for the
+        //     "shoulder -> head" chin-thrust signal is the shoulder
+        //     midpoint itself, regardless of which bone in the chain
+        //     is being driven.
         let source_base_pos = match tip {
-            Tip::Clavicle { .. } => {
+            Tip::Clavicle { .. } | Tip::HeadFromShoulders => {
                 let (Some(l), Some(r)) = (
                     source.joints.get(&HumanoidBone::LeftShoulder),
                     source.joints.get(&HumanoidBone::RightShoulder),
@@ -848,6 +893,12 @@ pub fn solve_avatar_pose(
             }
             Tip::Clavicle { avatar_outer, .. } => {
                 let Some(tip_node) = humanoid.bone_map.get(&avatar_outer).copied() else {
+                    continue;
+                };
+                rest_world[tip_node.0 as usize].position
+            }
+            Tip::HeadFromShoulders => {
+                let Some(tip_node) = humanoid.bone_map.get(&HumanoidBone::Head).copied() else {
                     continue;
                 };
                 rest_world[tip_node.0 as usize].position
@@ -2020,6 +2071,281 @@ mod clavicle_tests {
             quat_is_identity(&local[r_idx].rotation),
             "bilateral shrug: right clavicle should stay near identity, got {:?}",
             local[r_idx].rotation
+        );
+    }
+}
+
+#[cfg(test)]
+mod chin_chain_tests {
+    //! Regression tests for the `Tip::HeadFromShoulders` driving path.
+    //! Before this wiring, Neck/UpperChest/Chest were absent from
+    //! `DRIVEN_BONES` and `source.joints` had no Head entry, so a
+    //! chin-thrust (head poking forward toward the camera) produced
+    //! no avatar response at all.
+    use super::*;
+    use crate::asset::{NodeId, SkeletonAsset, SkeletonNode, Transform};
+    use crate::tracking::source_skeleton::SourceJoint;
+    use std::collections::HashMap;
+
+    /// Full upper-body rig with the spine chain populated:
+    ///   Hips -> Spine -> Chest -> UpperChest -> {Neck -> Head,
+    ///                                            LeftShoulder ->
+    ///                                              LeftUpperArm,
+    ///                                            RightShoulder ->
+    ///                                              RightUpperArm}
+    /// All rest translations are pure Y (or pure ±X for clavicles)
+    /// so rest_dir for each chain bone is +Y — straight upright
+    /// spine, no natural curvature. That keeps the chin-thrust math
+    /// simple to reason about: any forward Z in the source direction
+    /// must come out as a forward pitch on UpperChest (Neck residual
+    /// goes near identity in this clean case because parent already
+    /// absorbed the full bend).
+    fn build_full_upper_body_rig() -> (SkeletonAsset, HumanoidMap) {
+        let bones: &[(HumanoidBone, Option<HumanoidBone>, [f32; 3])] = &[
+            (HumanoidBone::Hips, None, [0.0, 0.9, 0.0]),
+            (HumanoidBone::Spine, Some(HumanoidBone::Hips), [0.0, 0.10, 0.0]),
+            (HumanoidBone::Chest, Some(HumanoidBone::Spine), [0.0, 0.10, 0.0]),
+            (
+                HumanoidBone::UpperChest,
+                Some(HumanoidBone::Chest),
+                [0.0, 0.10, 0.0],
+            ),
+            (
+                HumanoidBone::Neck,
+                Some(HumanoidBone::UpperChest),
+                [0.0, 0.10, 0.0],
+            ),
+            (HumanoidBone::Head, Some(HumanoidBone::Neck), [0.0, 0.10, 0.0]),
+            (
+                HumanoidBone::LeftShoulder,
+                Some(HumanoidBone::UpperChest),
+                [0.05, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::LeftUpperArm,
+                Some(HumanoidBone::LeftShoulder),
+                [0.16, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::RightShoulder,
+                Some(HumanoidBone::UpperChest),
+                [-0.05, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::RightUpperArm,
+                Some(HumanoidBone::RightShoulder),
+                [-0.16, 0.0, 0.0],
+            ),
+        ];
+
+        let bone_to_idx: HashMap<HumanoidBone, usize> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, (b, _, _))| (*b, i))
+            .collect();
+
+        let mut nodes: Vec<SkeletonNode> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, (bone, _parent, translation))| SkeletonNode {
+                id: NodeId(i as u64),
+                name: format!("{bone:?}"),
+                parent: None,
+                children: Vec::new(),
+                rest_local: Transform {
+                    translation: *translation,
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: Some(*bone),
+            })
+            .collect();
+
+        for (i, (_, parent, _)) in bones.iter().enumerate() {
+            if let Some(parent_bone) = parent {
+                let parent_idx = bone_to_idx[parent_bone];
+                nodes[i].parent = Some(NodeId(parent_idx as u64));
+                nodes[parent_idx].children.push(NodeId(i as u64));
+            }
+        }
+
+        let skeleton = SkeletonAsset {
+            nodes,
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: Vec::new(),
+        };
+        let humanoid = HumanoidMap {
+            bone_map: bone_to_idx
+                .iter()
+                .map(|(b, i)| (*b, NodeId(*i as u64)))
+                .collect(),
+        };
+        (skeleton, humanoid)
+    }
+
+    fn put(sk: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3]) {
+        sk.joints.insert(
+            bone,
+            SourceJoint {
+                position: pos,
+                confidence: 1.0,
+            },
+        );
+    }
+
+    /// Mirror `inject_spine_chain_proxies` from the source builders
+    /// so the test source carries the same dual-inserts the real
+    /// pipeline emits. Without these the solver's
+    /// `source.joints.get(&bone)` lookup fails for UpperChest / Neck
+    /// and the new driving path is silently skipped.
+    fn inject_chain_proxies(sk: &mut SourceSkeleton) {
+        let l = *sk
+            .joints
+            .get(&HumanoidBone::LeftShoulder)
+            .expect("test source must include LeftShoulder");
+        let r = *sk
+            .joints
+            .get(&HumanoidBone::RightShoulder)
+            .expect("test source must include RightShoulder");
+        let mid = SourceJoint {
+            position: [
+                (l.position[0] + r.position[0]) * 0.5,
+                (l.position[1] + r.position[1]) * 0.5,
+                (l.position[2] + r.position[2]) * 0.5,
+            ],
+            confidence: l.confidence.min(r.confidence),
+        };
+        sk.joints.insert(HumanoidBone::UpperChest, mid);
+        sk.joints.insert(HumanoidBone::Neck, mid);
+    }
+
+    /// Like clavicle_tests::quat_is_identity but with a slightly
+    /// looser tolerance — the chin-chain bones inherit a 1€ filter
+    /// pass + parent-rotation rebase that round-trip through enough
+    /// quaternion arithmetic to push the absolute error past 1e-4.
+    fn quat_is_near_identity(q: &Quat) -> bool {
+        q[0].abs() < 1e-3 && q[1].abs() < 1e-3 && q[2].abs() < 1e-3 && (q[3].abs() - 1.0).abs() < 1e-3
+    }
+
+    fn solve_with(source: &SourceSkeleton) -> (Vec<Transform>, HumanoidMap, SkeletonAsset) {
+        let (skeleton, humanoid) = build_full_upper_body_rig();
+        let mut local: Vec<Transform> =
+            skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        let params = SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.05,
+            ..Default::default()
+        };
+        let mut state = PoseSolverState::new();
+        solve_avatar_pose(source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
+        (local, humanoid, skeleton)
+    }
+
+    /// Head proxy directly above the shoulder midpoint = no chin
+    /// thrust. UpperChest and Neck must stay at rest. This is the
+    /// regression baseline — if the path were buggy, every neutral
+    /// frame would inject a small spurious rotation.
+    #[test]
+    fn rest_head_above_shoulders_leaves_chain_at_identity() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
+        // ShoulderMid = (0, 0.60, 0); Head above it by 0.30 (no Z) —
+        // matches the rest-pose chain (all +Y) so source_dir == rest_dir.
+        put(&mut sk, HumanoidBone::Head, [0.0, 0.90, 0.0]);
+        inject_chain_proxies(&mut sk);
+
+        let (local, humanoid, _skel) = solve_with(&sk);
+        let uc_idx = humanoid.bone_map[&HumanoidBone::UpperChest].0 as usize;
+        let n_idx = humanoid.bone_map[&HumanoidBone::Neck].0 as usize;
+
+        assert!(
+            quat_is_near_identity(&local[uc_idx].rotation),
+            "rest head: UpperChest should stay near identity, got {:?}",
+            local[uc_idx].rotation
+        );
+        assert!(
+            quat_is_near_identity(&local[n_idx].rotation),
+            "rest head: Neck should stay near identity, got {:?}",
+            local[n_idx].rotation
+        );
+    }
+
+    /// Chin thrust: head moved 10 cm forward (+Z toward camera) while
+    /// shoulders stay put. UpperChest must pitch forward enough to
+    /// move the Head bone's world position toward +Z. Before this
+    /// commit the entire chain was at rest pose and the avatar's
+    /// head pivot stayed motionless regardless of how far the
+    /// subject pushed their face out — this test pins the new path.
+    #[test]
+    fn chin_thrust_pitches_chain_forward() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
+        // Head pushed 10 cm forward of where it sits at rest.
+        put(&mut sk, HumanoidBone::Head, [0.0, 0.90, 0.10]);
+        inject_chain_proxies(&mut sk);
+
+        let (local, humanoid, skeleton) = solve_with(&sk);
+        let uc_idx = humanoid.bone_map[&HumanoidBone::UpperChest].0 as usize;
+
+        assert!(
+            !quat_is_near_identity(&local[uc_idx].rotation),
+            "chin thrust: UpperChest must rotate, got {:?}",
+            local[uc_idx].rotation
+        );
+
+        // The avatar's Head bone world position should have moved
+        // forward in Z. Recompute world transforms after the solve to
+        // confirm — the UpperChest rotation must propagate up the
+        // chain to Neck and Head positions via FK.
+        let head_idx = humanoid.bone_map[&HumanoidBone::Head].0 as usize;
+        let world = compute_world_transforms(&skeleton, |i| local[i].clone());
+        let head_z = world[head_idx].position[2];
+        assert!(
+            head_z > 0.04,
+            "chin thrust: Head world Z must move forward (>4 cm), got {head_z}"
+        );
+
+        // Sanity: the Head should still be roughly at its rest height.
+        // A pitch around X drops the Y a little (cos(θ) factor); 10 cm
+        // forward over a 30 cm chain gives θ ≈ 19°, cos(19°) ≈ 0.946,
+        // so Y drops by ~5%. Allow generous slack for FK distribution.
+        let head_y = world[head_idx].position[1];
+        assert!(
+            head_y > 1.10 && head_y < 1.50,
+            "chin thrust: Head world Y should stay near rest height (~1.20), got {head_y}"
+        );
+    }
+
+    /// Lateral head shift (subject leans head left): the chain must
+    /// roll, not pitch. Verifies that the direction-matching is fully
+    /// 3D — pitching for Z, rolling for X — and that we didn't
+    /// accidentally hard-code a chin-thrust-only axis.
+    #[test]
+    fn head_lean_left_rolls_chain_in_x() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
+        // Head shifted +0.10 in X (subject's anatomical right per
+        // selfie-mirror — not important for the test, only the
+        // direction matters).
+        put(&mut sk, HumanoidBone::Head, [0.10, 0.90, 0.0]);
+        inject_chain_proxies(&mut sk);
+
+        let (local, humanoid, skeleton) = solve_with(&sk);
+        let head_idx = humanoid.bone_map[&HumanoidBone::Head].0 as usize;
+        let world = compute_world_transforms(&skeleton, |i| local[i].clone());
+
+        let head_x = world[head_idx].position[0];
+        let head_z = world[head_idx].position[2];
+        assert!(
+            head_x > 0.04,
+            "head lean: Head world X must move toward +X (>4 cm), got {head_x}"
+        );
+        assert!(
+            head_z.abs() < 0.02,
+            "head lean: Head world Z must stay near zero (no spurious pitch), got {head_z}"
         );
     }
 }

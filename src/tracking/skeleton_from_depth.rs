@@ -951,6 +951,14 @@ pub(super) fn build_skeleton(
         }
     }
 
+    // Spine-chain proxies + Head, paralleling `rtmw3d::skeleton`. See
+    // `inject_spine_chain_proxies` there for the rationale; on the
+    // depth-aware path the Z component is metric (meters) instead of
+    // RTMW3D-normalised, but the geometry the solver consumes is the
+    // *direction* between joints, so the units cancel and the same
+    // injection scheme works unchanged.
+    inject_spine_chain_proxies(&mut sk, joints, depth, &to_source, anchor_was_hip, anchor_score);
+
     attach_hand(
         &mut sk,
         joints,
@@ -1140,6 +1148,80 @@ fn attach_hand<F>(
                 },
             );
         }
+    }
+}
+
+/// Depth-aware twin of `rtmw3d::skeleton::inject_spine_chain_proxies`.
+/// Same dual-insert scheme (Chest at hip-mid, UpperChest+Neck at
+/// shoulder midpoint, Head at ear midpoint with nose fallback). Z is
+/// metric (meters) instead of RTMW3D-normalised, but the solver only
+/// reads bone *directions*, so units cancel.
+fn inject_spine_chain_proxies<F>(
+    sk: &mut SourceSkeleton,
+    joints: &[DecodedJoint2d],
+    depth: &MoGeFrame,
+    to_source: &F,
+    anchor_was_hip: bool,
+    anchor_score: f32,
+) where
+    F: Fn([f32; 3]) -> [f32; 3],
+{
+    if anchor_was_hip {
+        sk.joints.insert(
+            HumanoidBone::Chest,
+            SourceJoint {
+                position: [0.0, 0.0, 0.0],
+                confidence: anchor_score,
+            },
+        );
+    }
+
+    if let (Some(l), Some(r)) = (
+        sk.joints.get(&HumanoidBone::LeftShoulder).copied(),
+        sk.joints.get(&HumanoidBone::RightShoulder).copied(),
+    ) {
+        let mid = SourceJoint {
+            position: [
+                (l.position[0] + r.position[0]) * 0.5,
+                (l.position[1] + r.position[1]) * 0.5,
+                (l.position[2] + r.position[2]) * 0.5,
+            ],
+            confidence: l.confidence.min(r.confidence),
+        };
+        sk.joints.insert(HumanoidBone::UpperChest, mid);
+        sk.joints.insert(HumanoidBone::Neck, mid);
+    }
+
+    const NOSE_IDX: usize = 0;
+    const LEFT_EAR_IDX: usize = 3;
+    const RIGHT_EAR_IDX: usize = 4;
+
+    let sample_face = |idx: usize| -> Option<SourceJoint> {
+        let j = joints.get(idx)?;
+        if j.score < KEYPOINT_VISIBILITY_FLOOR {
+            return None;
+        }
+        let p_cam = sample_metric_point(depth, j.nx, j.ny)?;
+        Some(SourceJoint {
+            position: to_source(p_cam),
+            confidence: j.score,
+        })
+    };
+
+    let head = match (sample_face(LEFT_EAR_IDX), sample_face(RIGHT_EAR_IDX)) {
+        (Some(l), Some(r)) => Some(SourceJoint {
+            position: [
+                (l.position[0] + r.position[0]) * 0.5,
+                (l.position[1] + r.position[1]) * 0.5,
+                (l.position[2] + r.position[2]) * 0.5,
+            ],
+            confidence: l.confidence.min(r.confidence),
+        }),
+        _ => sample_face(NOSE_IDX),
+    };
+
+    if let Some(h) = head {
+        sk.joints.insert(HumanoidBone::Head, h);
     }
 }
 
