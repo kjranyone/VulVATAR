@@ -300,10 +300,20 @@ impl OutputRouter {
         }
 
         // Send the most-recently enqueued frame to the worker and drain it
-        // from the local queue so the queue does not grow unboundedly.
+        // from the local queue so the queue does not grow unboundedly. If
+        // the worker channel itself is full (worker thread stalled on
+        // disk I/O / consumer pickup), count the frame as dropped so
+        // `dropped_count` reflects every frame the consumer didn't see —
+        // not just the ones rejected by the local queue policy. Without
+        // this accounting, a stalled shmem reader would silently lose
+        // frames here while the local-queue counter stayed at zero, and
+        // a profiler asking "are we dropping frames?" would be told no.
         if let Some(queued) = self.queue.pop_front() {
             if let Some(ref tx) = self.worker_tx {
-                let _ = tx.try_send(WorkerMessage::Frame(queued));
+                if let Err(e) = tx.try_send(WorkerMessage::Frame(queued)) {
+                    self.dropped_count += 1;
+                    debug!("output: worker channel full, dropping frame: {}", e);
+                }
             }
         }
     }
