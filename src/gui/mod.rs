@@ -393,7 +393,6 @@ pub struct SettingsGuiState {
     pub zoom_sensitivity: f32,
     pub orbit_sensitivity: f32,
     pub pan_sensitivity: f32,
-    pub autosave_interval_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -696,7 +695,6 @@ impl GuiApp {
                 zoom_sensitivity: 0.1,
                 orbit_sensitivity: 0.3,
                 pan_sensitivity: 1.0,
-                autosave_interval_secs: Some(300),
             },
 
             camera_index: 0,
@@ -950,7 +948,6 @@ impl GuiApp {
                 zoom_sensitivity: 0.1,
                 orbit_sensitivity: 0.3,
                 pan_sensitivity: 1.0,
-                autosave_interval_secs: None,
             },
 
             camera_index: 0,
@@ -1178,7 +1175,6 @@ impl GuiApp {
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,
             settings_orbit_sensitivity: self.settings.orbit_sensitivity,
             settings_pan_sensitivity: self.settings.pan_sensitivity,
-            settings_autosave_interval_secs: self.settings.autosave_interval_secs,
             cloth_autosave_consent: self.cloth_autosave_consent,
         }
     }
@@ -1413,7 +1409,6 @@ impl GuiApp {
         self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;
         self.settings.orbit_sensitivity = state.settings_orbit_sensitivity;
         self.settings.pan_sensitivity = state.settings_pan_sensitivity;
-        self.settings.autosave_interval_secs = state.settings_autosave_interval_secs;
         self.cloth_autosave_consent = state.cloth_autosave_consent;
         crate::i18n::set_locale(&self.settings.locale);
 
