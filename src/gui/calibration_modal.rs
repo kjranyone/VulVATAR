@@ -256,6 +256,25 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
         return;
     }
 
+    // Esc dismisses the modal at any non-terminal stage. Without this
+    // the only exit during HoldStill / Collecting / RangeHoldStill /
+    // RangeCollecting was the Cancel button — which goes off-screen
+    // if the user happens to collapse the inspector mid-capture, and
+    // is generally an accessibility miss for keyboard-only users.
+    // The Done state auto-closes after `DONE_LINGER_SECONDS` so we
+    // don't intercept Esc there (let the lingering "Captured!"
+    // message read).
+    if !matches!(state.calibration_modal, CalibrationModalState::Done { .. })
+        && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        // Same teardown as the Cancel button: discard any in-flight
+        // torso capture buffer so a partial window doesn't leak into
+        // the next attempt.
+        state.app.tracking.mailbox().set_torso_capture(false);
+        state.calibration_modal.close();
+        return;
+    }
+
     // Tick the state machine forward. Done after a `DONE_LINGER_SECONDS`
     // hold reverts to Closed.
     const DONE_LINGER_SECONDS: f32 = 1.5;
@@ -290,7 +309,14 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
 
     // Centred modal window. Disabling collapse / resize / movement so
     // the user can only interact via the buttons we provide.
+    // Pin the window's egui id explicitly: by default `Window::new(title)`
+    // hashes the title into the id-source, so any future title that
+    // mutates between frames (e.g. mid-modal mode swap) would reset
+    // window state. The `modal_title` helper happens to return a
+    // constant today — pin the id so a future title rewrite can't
+    // silently regress that.
     egui::Window::new(modal_title(&state.calibration_modal))
+        .id(egui::Id::new("calibration_modal_window"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .collapsible(false)
         .resizable(false)

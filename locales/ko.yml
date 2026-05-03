@@ -47,6 +47,7 @@ top_bar:
   filter_project: "VulVATAR 프로젝트"
   filter_cloth: "VulVATAR 의상 오버레이"
   avatar_load_in_progress: "아바타 로딩이 이미 진행 중입니다."
+  avatar_load_blocked_by_calibration: "새 아바타를 로딩하기 전에 포즈 캘리브레이션을 취소해주세요."
   loading_avatar: "아바타 로딩 중: %{path}"
   loaded_avatar: "아바타 로딩됨: %{path}"
   failed_load_overlay: "의상 오버레이 '%{path}' 로딩 실패: %{error}"

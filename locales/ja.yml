@@ -47,6 +47,7 @@ top_bar:
   filter_project: "VulVATAR プロジェクト"
   filter_cloth: "VulVATAR クロスオーバーレイ"
   avatar_load_in_progress: "アバターの読み込み中です。"
+  avatar_load_blocked_by_calibration: "新しいアバターを読み込む前にポーズキャリブレーションをキャンセルしてください。"
   loading_avatar: "アバターを読み込み中: %{path}"
   loaded_avatar: "アバターを読み込みました: %{path}"
   failed_load_overlay: "クロスオーバーレイ '%{path}' の読み込みに失敗: %{error}"

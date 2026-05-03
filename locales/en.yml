@@ -47,6 +47,7 @@ top_bar:
   filter_project: "VulVATAR Project"
   filter_cloth: "VulVATAR Cloth Overlay"
   avatar_load_in_progress: "Avatar load already in progress."
+  avatar_load_blocked_by_calibration: "Cancel pose calibration before loading a new avatar."
   loading_avatar: "Loading avatar: %{path}"
   loaded_avatar: "Loaded avatar: %{path}"
   failed_load_overlay: "Failed to load cloth overlay '%{path}': %{error}"

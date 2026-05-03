@@ -2199,9 +2199,14 @@ impl eframe::App for GuiApp {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| job.path.display().to_string());
             egui::Window::new(t!("dialog.loading_avatar"))
+                .id(egui::Id::new("avatar_load_modal_window"))
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .collapsible(false)
                 .resizable(false)
+                // Match the calibration modal: live above any
+                // `Order::Middle` scrim and any default-Order Window
+                // so the load progress isn't visually buried by either.
+                .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -2224,6 +2229,13 @@ impl eframe::App for GuiApp {
         if !self.notifications.is_empty() {
             egui::Area::new(egui::Id::new("notifications"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -40.0))
+                // Tooltip ordering puts toasts above every modal
+                // (`Order::Foreground`), the calibration scrim
+                // (`Order::Middle`), and ordinary panels (default
+                // `Order::Middle`). Notifications are read-only
+                // status reports — they should always be visible
+                // regardless of what dialog is open.
+                .order(egui::Order::Tooltip)
                 .show(ctx, |ui| {
                     for n in &self.notifications {
                         let ttl = match n.level {

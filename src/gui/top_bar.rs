@@ -22,6 +22,16 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
         state.push_notification(t!("top_bar.avatar_load_in_progress"));
         return;
     }
+    // Block while a calibration is mid-capture: the load Window
+    // would otherwise pop on top of the calibration scrim, and the
+    // user's HoldStill / Collecting timer would keep advancing
+    // behind a UI they can't reach. Surfacing a notification gives
+    // the user something to act on instead of silently swallowing
+    // the click.
+    if state.calibration_modal.is_open() {
+        state.push_notification(t!("top_bar.avatar_load_blocked_by_calibration"));
+        return;
+    }
     state.push_notification(t!("top_bar.loading_avatar", path = path.display().to_string()));
     state.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
