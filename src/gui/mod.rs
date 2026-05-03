@@ -1199,6 +1199,7 @@ impl GuiApp {
             settings_orbit_sensitivity: self.settings.orbit_sensitivity,
             settings_pan_sensitivity: self.settings.pan_sensitivity,
             settings_autosave_interval_secs: self.settings.autosave_interval_secs,
+            cloth_autosave_consent: self.cloth_autosave_consent,
         }
     }
 
@@ -1441,6 +1442,7 @@ impl GuiApp {
         self.settings.orbit_sensitivity = state.settings_orbit_sensitivity;
         self.settings.pan_sensitivity = state.settings_pan_sensitivity;
         self.settings.autosave_interval_secs = state.settings_autosave_interval_secs;
+        self.cloth_autosave_consent = state.cloth_autosave_consent;
         crate::i18n::set_locale(&self.settings.locale);
 
         self.apply_pipeline_bound_settings(

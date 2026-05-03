@@ -85,6 +85,11 @@ pub struct ProjectState {
     pub settings_orbit_sensitivity: f32,
     pub settings_pan_sensitivity: f32,
     pub settings_autosave_interval_secs: Option<u64>,
+    /// User's answer to the "include cloth overlay in recovery
+    /// snapshots?" prompt. `Some(true)` = opt-in, `Some(false)` = opt-out,
+    /// `None` = never asked. Persisted so the dialog doesn't re-appear
+    /// every launch after the user has already chosen.
+    pub cloth_autosave_consent: Option<bool>,
 }
 
 /// Serializable project state saved as `.vvtproj`.
@@ -399,6 +404,10 @@ pub struct SettingsConfig {
     pub pan_sensitivity: f32,
     #[serde(default)]
     pub autosave_interval_secs: Option<u64>,
+    /// `None` on older project files = the consent dialog will fire
+    /// once on first overlay attach in this session.
+    #[serde(default)]
+    pub cloth_autosave_consent: Option<bool>,
 }
 
 fn default_locale() -> String {
@@ -596,6 +605,7 @@ impl ProjectFile {
                 orbit_sensitivity: state.settings_orbit_sensitivity,
                 pan_sensitivity: state.settings_pan_sensitivity,
                 autosave_interval_secs: state.settings_autosave_interval_secs,
+                cloth_autosave_consent: state.cloth_autosave_consent,
             },
         }
     }
@@ -664,6 +674,7 @@ impl ProjectFile {
             settings_orbit_sensitivity: self.settings.orbit_sensitivity,
             settings_pan_sensitivity: self.settings.pan_sensitivity,
             settings_autosave_interval_secs: self.settings.autosave_interval_secs,
+            cloth_autosave_consent: self.settings.cloth_autosave_consent,
         }
     }
 }
