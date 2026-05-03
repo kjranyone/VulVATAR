@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// TTL on the per-entry `exists()` cache. Library row rendering touches
+/// `e.exists()` twice per frame (once in the missing-filter, once for
+/// the row-construction strikethrough); without caching, a 200-entry
+/// library at 60 fps issued 24k stat()s/sec just to draw the panel.
+/// 2s is short enough that the user rarely notices stale state when
+/// they rename/move a file under the app, but long enough to drop the
+/// stat rate to ~100/sec on a large library.
+const EXISTS_CACHE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AvatarLibraryEntry {
@@ -20,6 +31,13 @@ pub struct AvatarLibraryEntry {
     pub vrm_author: Option<String>,
     pub vrm_version: Option<String>,
     pub thumbnail_path: Option<PathBuf>,
+    /// Last `path.exists()` answer + when we asked. `Cell` so `&self`
+    /// callers can refresh without a `&mut self` ripple — every
+    /// rendering site reads through `&self` and we don't want a
+    /// per-frame stat() to force every caller into mutable.
+    /// Skipped from serde so on-disk JSON stays the canonical shape.
+    #[serde(skip)]
+    exists_cache: Cell<Option<(bool, Instant)>>,
 }
 
 impl AvatarLibraryEntry {
@@ -46,11 +64,20 @@ impl AvatarLibraryEntry {
             vrm_author: None,
             vrm_version: None,
             thumbnail_path: None,
+            exists_cache: Cell::new(None),
         }
     }
 
     pub fn exists(&self) -> bool {
-        self.path.exists()
+        let now = Instant::now();
+        if let Some((value, fetched_at)) = self.exists_cache.get() {
+            if now.duration_since(fetched_at) < EXISTS_CACHE_TTL {
+                return value;
+            }
+        }
+        let value = self.path.exists();
+        self.exists_cache.set(Some((value, now)));
+        value
     }
 
     pub fn update_from_asset(&mut self, asset: &crate::asset::AvatarAsset) {
