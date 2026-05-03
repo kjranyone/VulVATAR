@@ -157,6 +157,17 @@ impl HotkeyMap {
     }
 
     pub fn check(&self, action: HotkeyAction, ctx: &egui::Context) -> bool {
+        // Suppress every binding while a text widget owns keyboard focus.
+        // Without this, Ctrl+S in the rename / preset-name / scene preset
+        // text inputs saves the *project* instead of accepting the
+        // user's text — and an F-key press in a search box jumps the
+        // mode nav out from under the typist. egui's
+        // `wants_keyboard_input` returns true exactly when a focused
+        // widget (TextEdit, slider drag, color picker text entry) is
+        // claiming the next key event, which is the right scope.
+        if ctx.wants_keyboard_input() {
+            return false;
+        }
         self.bindings
             .get(&action)
             .map(|b| b.just_pressed(ctx))
