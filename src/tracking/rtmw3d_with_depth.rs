@@ -90,7 +90,7 @@ use super::skeleton_from_depth::{
     build_options_from_calibration, build_skeleton, resolve_origin_metric, SAMPLE_RADIUS_PX,
 };
 #[cfg(feature = "inference")]
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 /// Anatomical anchor used to calibrate DAv2's relative depth to
 /// metres. Shoulder span (subject's left shoulder ↔ right shoulder)
@@ -194,6 +194,12 @@ pub struct Rtmw3dWithDepthProvider {
     /// Worker thread handle, joined on `Drop`.
     #[cfg(feature = "inference")]
     depth_thread: Option<thread::JoinHandle<()>>,
+    /// One-shot guard so a dead depth thread logs once instead of
+    /// flooding stderr at 30 fps. Flips to true the first time a
+    /// `tx.send` returns SendError. Without this we silently degraded
+    /// to stale-outbox depth forever with no visible signal.
+    #[cfg(feature = "inference")]
+    depth_thread_dead_logged: bool,
     /// Cached for `label()` — backend label is read from the worker-
     /// owned `DepthAnythingV2Inference`, but we don't keep that
     /// instance on the main thread, so cache the string at startup.
@@ -280,6 +286,7 @@ impl Rtmw3dWithDepthProvider {
             depth_tx: Some(depth_tx),
             depth_outbox,
             depth_thread: Some(depth_thread),
+            depth_thread_dead_logged: false,
             depth_backend_label,
             dav2_model_path,
             load_warnings: warnings,
@@ -460,8 +467,20 @@ impl Rtmw3dWithDepthProvider {
                 };
                 // SendError only happens if the worker thread died —
                 // at which point we'll fall back to whatever's left
-                // in the outbox (sticky last result).
-                let _ = tx.send(req);
+                // in the outbox (sticky last result). Log loudly the
+                // first time so a power user diagnosing "tracking
+                // feels stale" sees the cause in the log; gate further
+                // sends behind the same flag so the log isn't
+                // hammered at 30 fps.
+                if let Err(e) = tx.send(req) {
+                    if !self.depth_thread_dead_logged {
+                        error!(
+                            "DAv2 depth worker died (frame {}); falling back to sticky outbox forever: {}",
+                            frame_index, e
+                        );
+                        self.depth_thread_dead_logged = true;
+                    }
+                }
             }
         }
 
