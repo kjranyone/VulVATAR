@@ -28,15 +28,32 @@ use crate::asset::HumanoidBone;
 ///
 /// * `position` — `[x, y, z]` in normalised camera coords (see module
 ///   docs for axis conventions). For backends that only produce 2D
-///   keypoints, set `z = 0`.
+///   keypoints, set `z = 0`. **The `z` component is intended for
+///   *rotation* / direction-vector consumers** (`pose_solver`,
+///   `compute_body_yaw_3d`, etc): for the depth-aware providers it
+///   carries the unbiased relative Z signal (RTMW3D's hip-mid-anchored
+///   nz), not the metric depth value. Metric depth lives on the
+///   separate `metric_depth_m` field below to keep the rotation path
+///   free of metric-depth-model bias.
 /// * `confidence` — detector-reported confidence in `[0, 1]`. For
 ///   SimCC-style outputs (RTMW3D) this is the sigmoid of the heatmap
 ///   peak, so a single threshold gates "joint actually in frame and
 ///   well-localised".
+/// * `metric_depth_m` — absolute camera-space depth in metres, when a
+///   metric depth model (DAv2 / MoGe-2) sampled this keypoint. `None`
+///   for purely 2D providers and for joints that the depth path
+///   couldn't sample (off-frame, low-confidence depth window). Used
+///   by *metric* consumers — root translation Z, bone-length
+///   reconstruction, torso template — that genuinely need
+///   real-world distances. Decoupling this from `position[2]` is
+///   what lets the rotation path use the unbiased relative-Z signal
+///   while metric consumers keep the high-fidelity DAv2 / MoGe-2
+///   measurement.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SourceJoint {
     pub position: [f32; 3],
     pub confidence: f32,
+    pub metric_depth_m: Option<f32>,
 }
 
 /// Head orientation derived from facial keypoints.

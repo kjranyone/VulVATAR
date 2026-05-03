@@ -1693,7 +1693,7 @@ mod body_yaw_tests {
     use crate::tracking::source_skeleton::SourceJoint;
 
     fn put(sk: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3], confidence: f32) {
-        sk.joints.insert(bone, SourceJoint { position: pos, confidence });
+        sk.joints.insert(bone, SourceJoint { position: pos, confidence, metric_depth_m: None });
     }
 
     /// Three-quarter view (~45°): shoulder Δz is tiny (+0.004) but
@@ -1951,6 +1951,7 @@ mod clavicle_tests {
             SourceJoint {
                 position: pos,
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
     }
@@ -2189,6 +2190,7 @@ mod chin_chain_tests {
             SourceJoint {
                 position: pos,
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
     }
@@ -2214,6 +2216,7 @@ mod chin_chain_tests {
                 (l.position[2] + r.position[2]) * 0.5,
             ],
             confidence: l.confidence.min(r.confidence),
+            metric_depth_m: None,
         };
         sk.joints.insert(HumanoidBone::UpperChest, mid);
         sk.joints.insert(HumanoidBone::Neck, mid);

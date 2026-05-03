@@ -132,6 +132,7 @@ pub(super) fn build_source_skeleton(
         let hip_joint = SourceJoint {
             position: [0.0, 0.0, 0.0],
             confidence: hip_score,
+            metric_depth_m: None,
         };
         sk.joints.insert(HumanoidBone::Hips, hip_joint);
         sk.joints.insert(HumanoidBone::Spine, hip_joint);
@@ -168,6 +169,7 @@ pub(super) fn build_source_skeleton(
             SourceJoint {
                 position: to_source(j),
                 confidence: j.score,
+                metric_depth_m: None,
             },
         );
     }
@@ -189,6 +191,7 @@ pub(super) fn build_source_skeleton(
                 SourceJoint {
                     position: to_source(j),
                     confidence: j.score,
+                    metric_depth_m: None,
                 },
             );
         }
@@ -305,6 +308,7 @@ fn attach_hand<F>(
         SourceJoint {
             position: [sum[0] * inv, sum[1] * inv, sum[2] * inv],
             confidence: min_conf,
+            metric_depth_m: None,
         },
     );
 
@@ -322,6 +326,7 @@ fn attach_hand<F>(
             SourceJoint {
                 position: to_source(j),
                 confidence: j.score,
+                metric_depth_m: None,
             },
         );
     }
@@ -339,6 +344,7 @@ fn attach_hand<F>(
             SourceJoint {
                 position: to_source(j),
                 confidence: j.score,
+                metric_depth_m: None,
             },
         );
     }
@@ -454,6 +460,7 @@ fn inject_spine_chain_proxies<F>(
             SourceJoint {
                 position: [0.0, 0.0, 0.0],
                 confidence: hip_score,
+                metric_depth_m: None,
             },
         );
     }
@@ -469,6 +476,7 @@ fn inject_spine_chain_proxies<F>(
                 (l.position[2] + r.position[2]) * 0.5,
             ],
             confidence: l.confidence.min(r.confidence),
+            metric_depth_m: None,
         };
         sk.joints.insert(HumanoidBone::UpperChest, mid);
         sk.joints.insert(HumanoidBone::Neck, mid);
@@ -492,12 +500,14 @@ fn inject_spine_chain_proxies<F>(
                     (lp[2] + rp[2]) * 0.5,
                 ],
                 confidence: l.score.min(r.score),
+                metric_depth_m: None,
             })
         }
         _ => joints.get(NOSE_IDX).and_then(|n| {
             (n.score >= KEYPOINT_VISIBILITY_FLOOR).then(|| SourceJoint {
                 position: to_source(n),
                 confidence: n.score,
+                metric_depth_m: None,
             })
         }),
     };

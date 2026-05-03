@@ -635,6 +635,62 @@ impl Rtmw3dWithDepthProvider {
             fp.confidence = fp.confidence.max(mesh_conf);
         }
 
+        // Phase 7: replace per-joint position[xyz] with RTMW3D's own
+        // source-space coordinates while preserving the metric depth
+        // sampled by Phase 5 in `metric_depth_m`.
+        //
+        // Why: the dav2 path back-projects every pixel through the
+        // depth-model's per-pixel Z to recover (X, Y) in metric metres.
+        // That back-projection inherits DAv2's lateral depth-map bias
+        // — measured at ~22cm L/R asymmetry on photoreal frontal-pose
+        // images even when the actual subject is square-on — and the
+        // bias *propagates into XY*, not just Z, because the
+        // back-projection geometry is `X = (px - cx) * Z / fx`.
+        // Downstream rotation calculations (`compute_body_yaw_3d` and
+        // every direction-vector bone solve in `pose_solver`) read this
+        // skewed XYZ and rotate the avatar to match it, producing
+        // ~50° body-yaw on a frontal pose. The validation set in
+        // `diagnostics/calib_eff_validation/body_yaw_report.md` makes
+        // this concrete: dav2 path mean |yaw error| 51.5° vs RTMW3D
+        // nz-only path 19.6° on the same 23 evaluation images.
+        //
+        // RTMW3D's own SimCC-decoded (nx, ny, nz) is unbiased (its
+        // training disentangles 2D-detection from depth bin), so
+        // overwriting position[xyz] from `rtmw_est.skeleton` reverts
+        // the rotation path to the unbiased signal. The metric depth
+        // (which the back-percentile / torso-template logic in
+        // skeleton_from_depth still produces correctly) survives on
+        // `metric_depth_m` for consumers that legitimately need
+        // real-world distance — root translation Z, bone-length
+        // reconstruction, the torso template itself.
+        //
+        // Joints that exist on `skeleton` but not on
+        // `rtmw_est.skeleton` (e.g. spine-chain proxies built with a
+        // different fallback when one of the source paths failed)
+        // keep their dav2-derived position so we don't regress on
+        // partial-coverage cases.
+        for (bone, joint) in skeleton.joints.iter_mut() {
+            if let Some(rtmw_joint) = rtmw_est.skeleton.joints.get(bone) {
+                joint.position = rtmw_joint.position;
+            }
+        }
+        for (bone, joint) in skeleton.fingertips.iter_mut() {
+            if let Some(rtmw_joint) = rtmw_est.skeleton.fingertips.get(bone) {
+                joint.position = rtmw_joint.position;
+            }
+        }
+        // Hand orientation is also re-derived from RTMW3D's own
+        // (unbiased) hand-keypoint xyz — same rationale as the body
+        // joints. Keep the dav2-built one only as a fallback for
+        // when RTMW3D failed to produce one (low hand-keypoint
+        // confidence on RTMW3D, depth path got something usable).
+        if let Some(rt) = rtmw_est.skeleton.left_hand_orientation {
+            skeleton.left_hand_orientation = Some(rt);
+        }
+        if let Some(rt) = rtmw_est.skeleton.right_hand_orientation {
+            skeleton.right_hand_orientation = Some(rt);
+        }
+
         let dt_total = t_total.elapsed();
         debug!(
             "RTMW3D+DAv2 timing: total={:>5.1}ms rtmw={:>5.1}ms wait={:>4.1}ms calib={:>4.2}ms metric={:>4.1}ms skel={:>4.1}ms (depth_age={} frames, dav2_async={:.1}ms)",

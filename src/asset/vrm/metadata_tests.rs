@@ -229,6 +229,7 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         SourceJoint {
             position: [-0.2, 1.4, 0.0],
             confidence: 1.0,
+            metric_depth_m: None,
         },
     );
     source.joints.insert(
@@ -236,6 +237,7 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         SourceJoint {
             position: [-0.2, 1.4, 0.0],
             confidence: 1.0,
+            metric_depth_m: None,
         },
     );
     source.joints.insert(
@@ -243,6 +245,7 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         SourceJoint {
             position: [-0.4, 1.7, 0.0],
             confidence: 1.0,
+            metric_depth_m: None,
         },
     );
     source.joints.insert(
@@ -250,6 +253,7 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         SourceJoint {
             position: [0.2, 1.4, 0.0],
             confidence: 1.0,
+            metric_depth_m: None,
         },
     );
     source.face = Some(FacePose {
@@ -385,6 +389,7 @@ fn sample_vrm0_solver_bends_fingers() {
             SourceJoint {
                 position: [x, y, 0.0],
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
     };
@@ -398,6 +403,7 @@ fn sample_vrm0_solver_bends_fingers() {
         SourceJoint {
             position: [-0.44, -0.12, 0.0],
             confidence: 1.0,
+            metric_depth_m: None,
         },
     );
     source.overall_confidence = 1.0;

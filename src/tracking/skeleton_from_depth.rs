@@ -898,9 +898,18 @@ pub(super) fn build_skeleton(
         } else {
             sample_metric_point(depth, j.nx, j.ny)?
         };
+        // pos_cam[2] is the absolute camera-space depth in metres
+        // (before the source-space axis flip in to_source). Surface it
+        // on metric_depth_m so the metric consumers (root translation,
+        // bone-length recon, torso template) can read it directly,
+        // independent of how position[2] gets re-written by the
+        // rtmw3d-with-depth merge step that runs after this builder
+        // (the merge swaps position[0..3] for RTMW3D's relative xyz to
+        // unbias the rotation path; metric_depth_m stays as-is).
         Some(SourceJoint {
             position: to_source(pos_cam),
             confidence: j.score,
+            metric_depth_m: Some(pos_cam[2]),
         })
     };
 
@@ -913,6 +922,7 @@ pub(super) fn build_skeleton(
         let hip_joint = SourceJoint {
             position: [0.0, 0.0, 0.0],
             confidence: anchor_score,
+            metric_depth_m: None,
         };
         sk.joints.insert(HumanoidBone::Hips, hip_joint);
         sk.joints.insert(HumanoidBone::Spine, hip_joint);
@@ -1068,6 +1078,7 @@ fn attach_hand<F>(
         SourceJoint {
             position: [sum[0] * inv, sum[1] * inv, sum[2] * inv],
             confidence: min_conf,
+            metric_depth_m: None,
         },
     );
 
@@ -1126,6 +1137,7 @@ fn attach_hand<F>(
                 SourceJoint {
                     position: to_source(p_cam),
                     confidence: j.score,
+                    metric_depth_m: None,
                 },
             );
         }
@@ -1145,6 +1157,7 @@ fn attach_hand<F>(
                 SourceJoint {
                     position: to_source(p_cam),
                     confidence: j.score,
+                    metric_depth_m: None,
                 },
             );
         }
@@ -1172,6 +1185,7 @@ fn inject_spine_chain_proxies<F>(
             SourceJoint {
                 position: [0.0, 0.0, 0.0],
                 confidence: anchor_score,
+                metric_depth_m: None,
             },
         );
     }
@@ -1187,6 +1201,7 @@ fn inject_spine_chain_proxies<F>(
                 (l.position[2] + r.position[2]) * 0.5,
             ],
             confidence: l.confidence.min(r.confidence),
+            metric_depth_m: None,
         };
         sk.joints.insert(HumanoidBone::UpperChest, mid);
         sk.joints.insert(HumanoidBone::Neck, mid);
@@ -1205,6 +1220,7 @@ fn inject_spine_chain_proxies<F>(
         Some(SourceJoint {
             position: to_source(p_cam),
             confidence: j.score,
+            metric_depth_m: None,
         })
     };
 
@@ -1216,6 +1232,7 @@ fn inject_spine_chain_proxies<F>(
                 (l.position[2] + r.position[2]) * 0.5,
             ],
             confidence: l.confidence.min(r.confidence),
+            metric_depth_m: None,
         }),
         _ => sample_face(NOSE_IDX),
     };
@@ -1679,6 +1696,7 @@ mod tests {
         SourceJoint {
             position: [0.0, 0.0, z],
             confidence: 1.0,
+            metric_depth_m: None,
         }
     }
 
@@ -1744,6 +1762,7 @@ mod tests {
             SourceJoint {
                 position: [0.0, 0.0, 0.10],
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
         reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
@@ -1769,6 +1788,7 @@ mod tests {
             SourceJoint {
                 position: [0.0, 0.0, 0.10],
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
         let opts = BuildOptions {
@@ -1797,6 +1817,7 @@ mod tests {
             SourceJoint {
                 position: [0.05, 0.0, 0.22],
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
         reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
@@ -1815,6 +1836,7 @@ mod tests {
             SourceJoint {
                 position: [0.05, 0.05, 0.005], // |dz| < MIN_DZ_FOR_SIGN
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
         reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
@@ -1834,6 +1856,7 @@ mod tests {
             SourceJoint {
                 position: [EXPECTED_UPPER_ARM_M, 0.0, 0.05],
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
         reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());
@@ -1852,6 +1875,7 @@ mod tests {
             SourceJoint {
                 position: [0.0, 0.0, -0.10],
                 confidence: 1.0,
+                metric_depth_m: None,
             },
         );
         reconstruct_arm_z_magnitudes(&mut sk, BuildOptions::default());

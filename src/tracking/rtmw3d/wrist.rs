@@ -124,6 +124,7 @@ pub(super) fn apply_wrist_temporal_hold(
                 SourceJoint {
                     position: prev_pos,
                     confidence: decayed_conf,
+                    metric_depth_m: None,
                 },
             );
             tracker.last_conf = decayed_conf;
@@ -166,6 +167,7 @@ pub(super) fn apply_wrist_temporal_hold(
                 SourceJoint {
                     position: synth_pos,
                     confidence: 0.35,
+                    metric_depth_m: None,
                 },
             );
             tracker.last_pos = None;
