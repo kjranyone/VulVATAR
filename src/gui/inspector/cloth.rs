@@ -349,12 +349,6 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new(t!("inspector.viewport"))
-        .default_open(false)
-        .show(ui, |ui| {
-            crate::gui::viewport_overlay::draw_viewport_controls(ui, &mut state.viewport_overlay);
-        });
-
     egui::CollapsingHeader::new(t!("inspector.solver_params"))
         .default_open(false)
         .show(ui, |ui| {

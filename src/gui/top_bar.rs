@@ -136,13 +136,10 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
 }
 
 fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
-    // Items lay out right-to-left: more_vert first (rightmost), then
-    // streaming combo, then profile indicator.
-    if topbar_icon_button(ui, ic::MORE_VERT, &t!("top_bar.more")).clicked() {
-        // Overflow menu (Save As, Open Avatar, Recent...) comes in a
-        // future PR; stub click for now.
-    }
-    ui.add_space(space::SM);
+    // Items lay out right-to-left: streaming combo first (rightmost),
+    // then profile indicator. The overflow `more_vert` button was a
+    // stub with no menu attached — re-add it once the Save As / Open
+    // Avatar / Recent menu it was meant to host actually exists.
 
     // Profile combo
     let active_idx = state.profiles.active_index.unwrap_or(0);

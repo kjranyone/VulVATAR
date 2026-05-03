@@ -376,10 +376,17 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 
     if new_mic != active_mic {
-        if let Err(e) = state.app.set_requested_lipsync(requested_enabled, new_mic) {
-            state.push_notification(t!("tracking.lip_sync_mic_failed", error = e.to_string()));
+        match state.app.set_requested_lipsync(requested_enabled, new_mic) {
+            Ok(()) => {
+                state.project_dirty = true;
+            }
+            Err(e) => {
+                // Mic device init failed — surface the error but
+                // do *not* mark the project dirty; nothing in
+                // persistable state actually changed.
+                state.push_notification(t!("tracking.lip_sync_mic_failed", error = e.to_string()));
+            }
         }
-        state.project_dirty = true;
     }
 
     ui.add_space(4.0);
@@ -396,8 +403,9 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             }
             Err(e) => {
+                // Same rationale as the mic-change Err arm above —
+                // a failed enable/disable is not a saveable change.
                 state.push_notification(t!("tracking.lip_sync_failed", error = e.to_string()));
-                state.project_dirty = true;
             }
         }
     }

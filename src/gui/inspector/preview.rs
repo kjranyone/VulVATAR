@@ -428,8 +428,15 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
             ui.separator();
 
             let mut changed = false;
-            for (i, expr) in expressions.iter().enumerate() {
-                let weight = state.expression_weights.get_mut(i).unwrap();
+            // Iterate via zip so a length drift between `expressions`
+            // and `expression_weights` (e.g. avatar reload between the
+            // sync check above and this loop) silently truncates
+            // instead of panicking. The sync guard makes the lengths
+            // match on the happy path; this is just defensive.
+            for (expr, weight) in expressions
+                .iter()
+                .zip(state.expression_weights.iter_mut())
+            {
                 ui.horizontal(|ui| {
                     ui.label(&expr.name);
                     let response = ui.add(

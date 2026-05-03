@@ -10,7 +10,6 @@ pub mod status_bar;
 pub mod theme;
 pub mod top_bar;
 pub mod viewport;
-pub mod viewport_overlay;
 
 use log::{debug, info, warn};
 use std::path::PathBuf;
@@ -520,9 +519,8 @@ pub struct GuiApp {
     pub cloth_rename_buf: String,
     pub cloth_save_status: Option<String>,
 
-    // T04: Region selection and viewport overlay state
+    // T04: Region selection state
     pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
-    pub viewport_overlay: viewport_overlay::ViewportOverlayState,
     pub cloth_material_pick_index: usize,
     pub cloth_distance_stiffness: f32,
     pub cloth_bend_enabled: bool,
@@ -741,7 +739,6 @@ impl GuiApp {
             cloth_save_status: None,
 
             region_selection: None,
-            viewport_overlay: viewport_overlay::ViewportOverlayState::default(),
             cloth_material_pick_index: 0,
             cloth_distance_stiffness: 1.0,
             cloth_bend_enabled: true,
@@ -1002,7 +999,6 @@ impl GuiApp {
             cloth_save_status: None,
 
             region_selection: None,
-            viewport_overlay: viewport_overlay::ViewportOverlayState::default(),
             cloth_material_pick_index: 0,
             cloth_distance_stiffness: 1.0,
             cloth_bend_enabled: true,

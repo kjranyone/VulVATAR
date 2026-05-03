@@ -1,5 +1,6 @@
 use eframe::egui;
 
+use crate::gui::theme::color;
 use crate::gui::GuiApp;
 use crate::t;
 use crate::renderer::debug::{self, DebugDrawList};
@@ -192,7 +193,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         egui::Rect::from_center_size(rect.center(), egui::vec2(draw_w, draw_h));
 
                     // Fill letterbox/pillarbox area with background.
-                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
+                    painter.rect_filled(rect, 0.0, color::VIEWPORT_BG);
 
                     // When alpha preview is on, draw a checkerboard behind the
                     // rendered image so transparent areas are visible.
@@ -220,7 +221,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         }
                     } else {
                         // Composite against a solid dark background.
-                        painter.rect_filled(draw_rect, 0.0, egui::Color32::from_rgb(18, 18, 22));
+                        painter.rect_filled(draw_rect, 0.0, color::VIEWPORT_BG);
                     }
 
                     // Draw the rendered image (flip horizontally when mirror preview is on).
@@ -529,11 +530,11 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                             egui::pos2(rect.right() - pip_w - 12.0, rect.bottom() - pip_h - 12.0),
                             egui::vec2(pip_w, pip_h),
                         );
-                        painter.rect_filled(pip_rect, 4.0, egui::Color32::from_rgb(18, 18, 22));
+                        painter.rect_filled(pip_rect, 4.0, color::VIEWPORT_BG);
                         painter.rect_stroke(
                             pip_rect,
                             4.0,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 130, 200)),
+                            egui::Stroke::new(2.0, color::VIEWPORT_OVERLAY_OUTLINE),
                         );
 
                         let uv = if state.tracking.tracking_mirror {
