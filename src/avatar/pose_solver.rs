@@ -262,6 +262,25 @@ enum Tip {
     ShoulderMidpoint,
     /// Tip lives in `SourceSkeleton::fingertips`, keyed by the bone itself.
     Fingertip,
+    /// Clavicle (HumanoidBone::LeftShoulder / RightShoulder) — the
+    /// bone whose tip in the rig sits at the **outer** end (the
+    /// shoulder joint, where the upper arm starts) and whose base
+    /// sits at the **inner** end (sternum top). The COCO source
+    /// keypoints place the shoulder at the OUTER end (idx 5/6); the
+    /// inner end has no dedicated keypoint, so we approximate it as
+    /// the L/R shoulder midpoint. Also overrides the source-side base
+    /// (which would otherwise default to the bone's own keypoint and
+    /// collapse the direction to zero, since that keypoint **is** the
+    /// outer end).
+    ///
+    /// `outer_source` = source keypoint at the clavicle's outer end
+    /// (e.g. `LeftShoulder` for the left clavicle). `avatar_outer` =
+    /// avatar bone whose rest position marks the clavicle's outer
+    /// end in the rig (e.g. `LeftUpperArm`).
+    Clavicle {
+        outer_source: HumanoidBone,
+        avatar_outer: HumanoidBone,
+    },
 }
 
 /// Static description of which bones the solver will try to drive and
@@ -270,6 +289,25 @@ enum Tip {
 /// touching the child.
 const DRIVEN_BONES: &[(HumanoidBone, Tip)] = &[
     (HumanoidBone::Spine, Tip::ShoulderMidpoint),
+    // Clavicles. Listed before the upper arms so the FK pass updates
+    // them first — when the clavicle picks up a shrug, the upper
+    // arm's *current* world rotation needs the parent's already-
+    // applied rotation baked in, which the parent-first ordering
+    // gives us for free.
+    (
+        HumanoidBone::LeftShoulder,
+        Tip::Clavicle {
+            outer_source: HumanoidBone::LeftShoulder,
+            avatar_outer: HumanoidBone::LeftUpperArm,
+        },
+    ),
+    (
+        HumanoidBone::RightShoulder,
+        Tip::Clavicle {
+            outer_source: HumanoidBone::RightShoulder,
+            avatar_outer: HumanoidBone::RightUpperArm,
+        },
+    ),
     // Upper body
     (
         HumanoidBone::LeftUpperArm,
@@ -742,6 +780,38 @@ pub fn solve_avatar_pose(
                 }
                 tip_joint.position
             }
+            Tip::Clavicle { outer_source, .. } => {
+                let Some(tip_joint) = source.joints.get(&outer_source) else {
+                    continue;
+                };
+                if tip_joint.confidence < params.joint_confidence_threshold {
+                    continue;
+                }
+                tip_joint.position
+            }
+        };
+
+        // For most bones the bone's own keypoint is the direction's base.
+        // Clavicle is the exception: the bone keypoint sits at the
+        // OUTER end (= the same point we just took as the tip), so we
+        // override the base with the L/R-shoulder midpoint as an
+        // approximation of the inner clavicle anchor (sternum top).
+        let source_base_pos = match tip {
+            Tip::Clavicle { .. } => {
+                let (Some(l), Some(r)) = (
+                    source.joints.get(&HumanoidBone::LeftShoulder),
+                    source.joints.get(&HumanoidBone::RightShoulder),
+                ) else {
+                    continue;
+                };
+                if l.confidence < params.joint_confidence_threshold
+                    || r.confidence < params.joint_confidence_threshold
+                {
+                    continue;
+                }
+                midpoint(&l.position, &r.position)
+            }
+            _ => source_base.position,
         };
 
         let Some(node_id) = humanoid.bone_map.get(&bone).copied() else {
@@ -775,6 +845,12 @@ pub fn solve_avatar_pose(
                     &rest_world[l.0 as usize].position,
                     &rest_world[r.0 as usize].position,
                 )
+            }
+            Tip::Clavicle { avatar_outer, .. } => {
+                let Some(tip_node) = humanoid.bone_map.get(&avatar_outer).copied() else {
+                    continue;
+                };
+                rest_world[tip_node.0 as usize].position
             }
             Tip::Fingertip => {
                 // Follow the distal bone's first-child descendant until we
@@ -814,7 +890,7 @@ pub fn solve_avatar_pose(
             continue;
         }
 
-        let source_dir = vec3_normalize(&vec3_sub(&source_tip_pos, &source_base.position));
+        let source_dir = vec3_normalize(&vec3_sub(&source_tip_pos, &source_base_pos));
         if source_dir == [0.0, 0.0, 0.0] {
             continue;
         }
