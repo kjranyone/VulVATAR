@@ -32,30 +32,6 @@ pub mod yolox;
 pub use calibration::{CalibrationMode, PoseCalibration, TorsoDepthTemplate};
 pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TrackingSourceId(pub u64);
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub enum TrackingImageFormat {
-    Rgb8,
-    Bgr8,
-    #[default]
-    Rgba8,
-    Bgra8,
-    Nv12,
-    Yuyv,
-}
-
-#[derive(Clone, Debug)]
-pub struct TrackingFrame {
-    pub source_id: TrackingSourceId,
-    pub capture_timestamp: u64,
-    pub frame_size: [u32; 2],
-    pub image_format: TrackingImageFormat,
-    pub body_confidence: f32,
-    pub face_confidence: f32,
-}
-
 /// Smoothing / threshold params consumed by
 /// [`crate::avatar::pose_solver::solve_avatar_pose`] via
 /// [`SolverParams`](crate::avatar::pose_solver::SolverParams).
