@@ -17,6 +17,15 @@ pub enum RenderCommand {
         request: RenderFrameInput,
         respond_to: SyncSender<Result<ThumbnailRenderResult, String>>,
     },
+    /// Drop every entry from the renderer's texture and mesh caches.
+    /// Called by the GUI when an avatar is removed or replaced —
+    /// without this, the previous avatar's GPU textures (typically
+    /// 100–500 MB per VRM) and mesh buffers (50–200 MB) stay
+    /// resident in VRAM until process exit. After the next render
+    /// the active avatar's data re-uploads on demand; the briefly
+    /// re-paid upload cost (~10–30 ms hitch on a fresh swap) is
+    /// strictly cheaper than monotonic VRAM growth across a session.
+    EvictCaches,
     #[allow(dead_code)]
     Resize(u32, u32),
     Shutdown,
@@ -162,6 +171,11 @@ impl RenderThreadInner {
                 }
                 RenderCommand::Resize(w, h) => {
                     let _ = self.renderer.resize([w, h]);
+                }
+                RenderCommand::EvictCaches => {
+                    self.renderer.flush_pending();
+                    self.renderer.clear_caches();
+                    info!("render_thread: caches evicted (avatar swap)");
                 }
                 RenderCommand::Shutdown => {
                     info!("render_thread: shutdown received");

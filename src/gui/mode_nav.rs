@@ -1,5 +1,6 @@
 use eframe::egui::{self, pos2, Align2, Color32, Response, Rounding, Sense, Stroke, Ui, Vec2};
 
+use crate::gui::hotkey::HotkeyAction;
 use crate::gui::theme::{color, icon as ic, radius, space, typography, ICON_FAMILY};
 use crate::gui::{AppMode, GuiApp};
 use crate::t;
@@ -48,6 +49,16 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             for mode in AppMode::ALL {
                 let is_active = state.mode == mode && state.inspector_open;
                 let resp = mode_nav_item(ui, mode_icon(mode), &mode.label(), is_active);
+                // Surface the F-key binding in the row's tooltip so
+                // keyboard shortcuts aren't hidden behind reading the
+                // source. Falls back to label-only when no binding is
+                // mapped (defensive — every mode currently has one).
+                let resp = if let Some(action) = mode_hotkey_action(mode) {
+                    let key = state.hotkeys.label_for(action);
+                    resp.on_hover_text(format!("{} ({})", mode.label(), key))
+                } else {
+                    resp.on_hover_text(mode.label())
+                };
                 if resp.clicked() {
                     if state.mode == mode {
                         state.inspector_open = !state.inspector_open;
@@ -127,4 +138,16 @@ fn mode_icon(mode: AppMode) -> char {
         AppMode::ClothAuthoring => ic::CLOTH_AUTHORING,
         AppMode::Settings => ic::SETTINGS,
     }
+}
+
+fn mode_hotkey_action(mode: AppMode) -> Option<HotkeyAction> {
+    Some(match mode {
+        AppMode::Avatar => HotkeyAction::SwitchModeAvatar,
+        AppMode::Preview => HotkeyAction::SwitchModePreview,
+        AppMode::TrackingSetup => HotkeyAction::SwitchModeTracking,
+        AppMode::Rendering => HotkeyAction::SwitchModeRendering,
+        AppMode::Output => HotkeyAction::SwitchModeOutput,
+        AppMode::ClothAuthoring => HotkeyAction::SwitchModeAuthoring,
+        AppMode::Settings => HotkeyAction::SwitchModeSettings,
+    })
 }

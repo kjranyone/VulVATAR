@@ -63,6 +63,11 @@ pub mod color {
     /// 3D viewport stays dark even in light theme — avatars and
     /// streaming preview read better against a deep background.
     pub const VIEWPORT_BG: Color32 = Color32::from_rgb(20, 20, 26);
+    /// Cool-blue accent used to outline overlay panels inside the
+    /// viewport (camera PIP, calibration preview pane). Distinct from
+    /// the brand purple so the viewport's own affordances don't read
+    /// as just-another-button.
+    pub const VIEWPORT_OVERLAY_OUTLINE: Color32 = Color32::from_rgb(60, 130, 200);
 }
 
 pub mod space {

@@ -618,14 +618,26 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let _ = crate::persistence::save_avatar_library(&state.app.avatar_library);
                 state.push_notification(t!("inspector.purged_entries", count = removed));
             }
-            if outlined_button(
+            // Surface the Ctrl+O hotkey alongside the Add button so
+            // the keyboard shortcut isn't hidden behind reading
+            // hotkey.rs. The button itself adds to the library
+            // (without auto-loading); Ctrl+O picks a file *and*
+            // immediately loads it. Different actions, but they
+            // share the file-picker surface so it's the natural
+            // place to advertise the keyboard alternative.
+            let add_label_with_hotkey = format!(
+                "{} ({})",
+                t!("inspector.add_file"),
+                state.hotkeys.label_for(crate::gui::hotkey::HotkeyAction::LoadAvatar),
+            );
+            let add_resp = outlined_button(
                 ui,
                 Some(ic::ADD),
-                &t!("inspector.add_file"),
+                &add_label_with_hotkey,
                 color::PRIMARY,
                 true,
-            )
-            .clicked()
+            );
+            if add_resp.clicked()
             {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("VRM 1.0", &["vrm"])

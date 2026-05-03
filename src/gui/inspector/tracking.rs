@@ -279,7 +279,17 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 // segment is editable up until Capture begins
                 // (`Collecting` state); the modal disables the
                 // toggle once a sample window has started.
-                if filled_button(ui, None, &t!("calibration.button"), true).clicked() {
+                // Disable the Calibrate launcher while an avatar load
+                // is in progress — the load Window is its own modal,
+                // and stacking the calibration scrim on top would
+                // visually bury the load progress while leaving its
+                // click target reachable through the (paint-only)
+                // scrim. Same gate enforced on the open() side just
+                // below, in case the button somehow fires anyway.
+                let calib_enabled = state.avatar_load_job.is_none();
+                if filled_button(ui, None, &t!("calibration.button"), calib_enabled).clicked()
+                    && calib_enabled
+                {
                     // Reopen at the mode the active profile was last
                     // calibrated with, falling back to FullBody for a
                     // first-time capture (or after a profile that
@@ -376,10 +386,17 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 
     if new_mic != active_mic {
-        if let Err(e) = state.app.set_requested_lipsync(requested_enabled, new_mic) {
-            state.push_notification(t!("tracking.lip_sync_mic_failed", error = e.to_string()));
+        match state.app.set_requested_lipsync(requested_enabled, new_mic) {
+            Ok(()) => {
+                state.project_dirty = true;
+            }
+            Err(e) => {
+                // Mic device init failed — surface the error but
+                // do *not* mark the project dirty; nothing in
+                // persistable state actually changed.
+                state.push_notification(t!("tracking.lip_sync_mic_failed", error = e.to_string()));
+            }
         }
-        state.project_dirty = true;
     }
 
     ui.add_space(4.0);
@@ -396,8 +413,9 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             }
             Err(e) => {
+                // Same rationale as the mic-change Err arm above —
+                // a failed enable/disable is not a saveable change.
                 state.push_notification(t!("tracking.lip_sync_failed", error = e.to_string()));
-                state.project_dirty = true;
             }
         }
     }

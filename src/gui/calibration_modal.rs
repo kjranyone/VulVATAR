@@ -20,8 +20,10 @@
 //! controls, inspector clicks) is blocked while calibration is active.
 
 use eframe::egui;
+use log::warn;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::gui::theme::color;
 use crate::gui::GuiApp;
 use crate::t;
 use crate::tracking::{CalibrationMode, PoseCalibration};
@@ -254,6 +256,25 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
         return;
     }
 
+    // Esc dismisses the modal at any non-terminal stage. Without this
+    // the only exit during HoldStill / Collecting / RangeHoldStill /
+    // RangeCollecting was the Cancel button — which goes off-screen
+    // if the user happens to collapse the inspector mid-capture, and
+    // is generally an accessibility miss for keyboard-only users.
+    // The Done state auto-closes after `DONE_LINGER_SECONDS` so we
+    // don't intercept Esc there (let the lingering "Captured!"
+    // message read).
+    if !matches!(state.calibration_modal, CalibrationModalState::Done { .. })
+        && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        // Same teardown as the Cancel button: discard any in-flight
+        // torso capture buffer so a partial window doesn't leak into
+        // the next attempt.
+        state.app.tracking.mailbox().set_torso_capture(false);
+        state.calibration_modal.close();
+        return;
+    }
+
     // Tick the state machine forward. Done after a `DONE_LINGER_SECONDS`
     // hold reverts to Closed.
     const DONE_LINGER_SECONDS: f32 = 1.5;
@@ -288,7 +309,14 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
 
     // Centred modal window. Disabling collapse / resize / movement so
     // the user can only interact via the buttons we provide.
+    // Pin the window's egui id explicitly: by default `Window::new(title)`
+    // hashes the title into the id-source, so any future title that
+    // mutates between frames (e.g. mid-modal mode swap) would reset
+    // window state. The `modal_title` helper happens to return a
+    // constant today — pin the id so a future title rewrite can't
+    // silently regress that.
     egui::Window::new(modal_title(&state.calibration_modal))
+        .id(egui::Id::new("calibration_modal_window"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .collapsible(false)
         .resizable(false)
@@ -328,14 +356,14 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (rect, _) = ui.allocate_exact_size(preview_size, egui::Sense::hover());
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(18, 18, 22));
+    painter.rect_filled(rect, 6.0, color::VIEWPORT_BG);
     // Shrink by half the 2 px stroke width so the outline lands fully
     // inside the painter's clip rect (otherwise its outer 1 px is
     // clipped, leaving a hairline-thin / missing border).
     painter.rect_stroke(
         rect.shrink(1.0),
         6.0,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 130, 200)),
+        egui::Stroke::new(2.0, color::VIEWPORT_OVERLAY_OUTLINE),
     );
 
     let snap = state.app.tracking.mailbox().snapshot();
@@ -1007,32 +1035,23 @@ fn finalize_range_collection(
                 let was_metric = cal.anchor_depth_m.is_some();
                 (cal, x, z, *samples_seen, was_metric)
             }
-            _ => return transition_to_done_success(
-                mode,
-                state.app.tracking_calibration.pose.clone().unwrap_or_else(|| {
-                    // Should be unreachable: finalize_range only runs
-                    // out of RangeCollecting, which is only entered
-                    // after a successful AnchorDone, which always
-                    // wrote a Some(_) into Application. But return a
-                    // synthetic skipped-state if we somehow get here.
-                    PoseCalibration {
-                        mode,
-                        captured_at: String::new(),
-                        captured_at_unix: 0,
-                        frame_count: 0,
-                        anchor_x: 0.0,
-                        anchor_y: 0.0,
-                        anchor_depth_m: None,
-                        confidence: 0.0,
-                        anchor_depth_jitter_m: None,
-                        shoulder_span_m: None,
-                        x_range_observed: None,
-                        z_range_observed: None,
-                        torso_depth_template: None,
-                    }
-                }),
-                now,
-            ),
+            _ => {
+                // finalize_range only runs out of RangeCollecting,
+                // which is only entered after AnchorDone wrote a
+                // Some(_) into Application. Reaching here means an
+                // earlier transition was buggy or got stomped — log
+                // loudly and bail to Closed instead of fabricating a
+                // junk all-zero PoseCalibration that would silently
+                // overwrite any real one the user already has.
+                if let Some(existing) = state.app.tracking_calibration.pose.clone() {
+                    return transition_to_done_success(mode, existing, now);
+                }
+                warn!(
+                    "calibration: finalize_range entered without an existing pose \
+                     (modal_state mismatch?); closing modal without writing"
+                );
+                return CalibrationModalState::Closed;
+            }
         };
 
     if samples_seen >= MIN_RANGE_SAMPLES {

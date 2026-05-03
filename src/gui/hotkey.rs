@@ -5,12 +5,28 @@ use eframe::egui;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HotkeyAction {
     TogglePause,
-    ToggleTracking,
-    ToggleCloth,
+    /// Ctrl+T flips the `tracking_enabled` checkbox in the Tracking
+    /// inspector. Renamed from `ToggleTracking` so the name doesn't
+    /// imply it switches *to* the Tracking mode (use `SwitchModeTracking`
+    /// — F3 — for that).
+    ToggleTrackingEnabled,
+    /// Ctrl+C toggles cloth simulation rendering. Renamed from
+    /// `ToggleCloth` for the same reason as above.
+    ToggleClothSimulation,
     ResetPose,
     ResetCamera,
+    /// Per-mode F1..F7 nav, ordered to match `AppMode::ALL`. Older
+    /// builds had only F5/F6 (Preview / ClothAuthoring); the rest
+    /// of the modes were unreachable by keyboard, which the
+    /// topology audit flagged as a discoverability gap. F5/F6 are
+    /// preserved for muscle-memory continuity.
+    SwitchModeAvatar,
     SwitchModePreview,
+    SwitchModeTracking,
+    SwitchModeRendering,
+    SwitchModeOutput,
     SwitchModeAuthoring,
+    SwitchModeSettings,
     SaveProject,
     LoadAvatar,
 }
@@ -84,23 +100,51 @@ impl HotkeyMap {
     fn set_defaults(&mut self) {
         self.bindings
             .insert(HotkeyAction::TogglePause, KeyBinding::key(egui::Key::Space));
-        self.bindings
-            .insert(HotkeyAction::ToggleTracking, KeyBinding::ctrl(egui::Key::T));
-        self.bindings
-            .insert(HotkeyAction::ToggleCloth, KeyBinding::ctrl(egui::Key::C));
+        self.bindings.insert(
+            HotkeyAction::ToggleTrackingEnabled,
+            KeyBinding::ctrl(egui::Key::T),
+        );
+        self.bindings.insert(
+            HotkeyAction::ToggleClothSimulation,
+            KeyBinding::ctrl(egui::Key::C),
+        );
         self.bindings.insert(
             HotkeyAction::ResetPose,
             KeyBinding::ctrl_shift(egui::Key::R),
         );
         self.bindings
             .insert(HotkeyAction::ResetCamera, KeyBinding::key(egui::Key::Home));
+        // Per-mode nav — F1..F7 paralleling AppMode::ALL. F5
+        // (Preview) and F6 (Authoring) were the original two
+        // bindings; keep them at the same key so existing muscle
+        // memory survives. The remaining five fill in around them.
+        self.bindings.insert(
+            HotkeyAction::SwitchModeAvatar,
+            KeyBinding::key(egui::Key::F1),
+        );
         self.bindings.insert(
             HotkeyAction::SwitchModePreview,
             KeyBinding::key(egui::Key::F5),
         );
         self.bindings.insert(
+            HotkeyAction::SwitchModeTracking,
+            KeyBinding::key(egui::Key::F2),
+        );
+        self.bindings.insert(
+            HotkeyAction::SwitchModeRendering,
+            KeyBinding::key(egui::Key::F3),
+        );
+        self.bindings.insert(
+            HotkeyAction::SwitchModeOutput,
+            KeyBinding::key(egui::Key::F4),
+        );
+        self.bindings.insert(
             HotkeyAction::SwitchModeAuthoring,
             KeyBinding::key(egui::Key::F6),
+        );
+        self.bindings.insert(
+            HotkeyAction::SwitchModeSettings,
+            KeyBinding::key(egui::Key::F7),
         );
         self.bindings
             .insert(HotkeyAction::SaveProject, KeyBinding::ctrl(egui::Key::S));
@@ -143,8 +187,13 @@ fn key_name(key: egui::Key) -> &'static str {
     match key {
         egui::Key::Space => "Space",
         egui::Key::Home => "Home",
+        egui::Key::F1 => "F1",
+        egui::Key::F2 => "F2",
+        egui::Key::F3 => "F3",
+        egui::Key::F4 => "F4",
         egui::Key::F5 => "F5",
         egui::Key::F6 => "F6",
+        egui::Key::F7 => "F7",
         egui::Key::S => "S",
         egui::Key::T => "T",
         egui::Key::C => "C",

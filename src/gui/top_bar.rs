@@ -22,6 +22,16 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
         state.push_notification(t!("top_bar.avatar_load_in_progress"));
         return;
     }
+    // Block while a calibration is mid-capture: the load Window
+    // would otherwise pop on top of the calibration scrim, and the
+    // user's HoldStill / Collecting timer would keep advancing
+    // behind a UI they can't reach. Surfacing a notification gives
+    // the user something to act on instead of silently swallowing
+    // the click.
+    if state.calibration_modal.is_open() {
+        state.push_notification(t!("top_bar.avatar_load_blocked_by_calibration"));
+        return;
+    }
     state.push_notification(t!("top_bar.loading_avatar", path = path.display().to_string()));
     state.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
@@ -29,6 +39,16 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
 /// UI-thread post-load work: build an `AvatarInstance`, attach it to physics,
 /// register it in the library, and update recent-avatar history.
 pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAsset>) {
+    // If we're replacing an avatar that's already loaded at the same
+    // library slot, the previous asset's GPU textures + meshes are
+    // about to become unreferenced. The renderer caches them by URI
+    // / MeshId and never evicts on its own, so without this nudge
+    // they stay pinned in VRAM until process exit. `add_avatar`
+    // below grows the avatar list rather than replacing in place,
+    // but the active-avatar pointer moves — visual effect is the
+    // same: the prior caches are stale.
+    let had_existing_avatar = state.app.active_avatar().is_some();
+
     let instance_id = crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
     state.app.next_avatar_instance_id += 1;
     state.app.physics.attach_avatar(&asset);
@@ -55,6 +75,9 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
 
     let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
     state.app.add_avatar(instance);
+    if had_existing_avatar {
+        state.app.evict_render_caches();
+    }
     state.add_recent_avatar(path.to_path_buf());
     info!("avatar loaded: {}", path.display());
     state.push_notification(t!("top_bar.loaded_avatar", path = path.display().to_string()));
@@ -136,13 +159,10 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
 }
 
 fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
-    // Items lay out right-to-left: more_vert first (rightmost), then
-    // streaming combo, then profile indicator.
-    if topbar_icon_button(ui, ic::MORE_VERT, &t!("top_bar.more")).clicked() {
-        // Overflow menu (Save As, Open Avatar, Recent...) comes in a
-        // future PR; stub click for now.
-    }
-    ui.add_space(space::SM);
+    // Items lay out right-to-left: streaming combo first (rightmost),
+    // then profile indicator. The overflow `more_vert` button was a
+    // stub with no menu attached — re-add it once the Save As / Open
+    // Avatar / Recent menu it was meant to host actually exists.
 
     // Profile combo
     let active_idx = state.profiles.active_index.unwrap_or(0);

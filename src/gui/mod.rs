@@ -10,7 +10,6 @@ pub mod status_bar;
 pub mod theme;
 pub mod top_bar;
 pub mod viewport;
-pub mod viewport_overlay;
 
 use log::{debug, info, warn};
 use std::path::PathBuf;
@@ -520,9 +519,8 @@ pub struct GuiApp {
     pub cloth_rename_buf: String,
     pub cloth_save_status: Option<String>,
 
-    // T04: Region selection and viewport overlay state
+    // T04: Region selection state
     pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
-    pub viewport_overlay: viewport_overlay::ViewportOverlayState,
     pub cloth_material_pick_index: usize,
     pub cloth_distance_stiffness: f32,
     pub cloth_bend_enabled: bool,
@@ -741,7 +739,6 @@ impl GuiApp {
             cloth_save_status: None,
 
             region_selection: None,
-            viewport_overlay: viewport_overlay::ViewportOverlayState::default(),
             cloth_material_pick_index: 0,
             cloth_distance_stiffness: 1.0,
             cloth_bend_enabled: true,
@@ -1002,7 +999,6 @@ impl GuiApp {
             cloth_save_status: None,
 
             region_selection: None,
-            viewport_overlay: viewport_overlay::ViewportOverlayState::default(),
             cloth_material_pick_index: 0,
             cloth_distance_stiffness: 1.0,
             cloth_bend_enabled: true,
@@ -1280,12 +1276,15 @@ impl GuiApp {
         }
         if self
             .hotkeys
-            .check(hotkey::HotkeyAction::ToggleTracking, ctx)
+            .check(hotkey::HotkeyAction::ToggleTrackingEnabled, ctx)
         {
             self.tracking.toggle_tracking = !self.tracking.toggle_tracking;
             self.project_dirty = true;
         }
-        if self.hotkeys.check(hotkey::HotkeyAction::ToggleCloth, ctx) {
+        if self
+            .hotkeys
+            .check(hotkey::HotkeyAction::ToggleClothSimulation, ctx)
+        {
             self.rendering.toggle_cloth = !self.rendering.toggle_cloth;
             self.project_dirty = true;
         }
@@ -1305,17 +1304,28 @@ impl GuiApp {
             };
             self.project_dirty = true;
         }
-        if self
-            .hotkeys
-            .check(hotkey::HotkeyAction::SwitchModePreview, ctx)
-        {
-            self.mode = AppMode::Preview;
-        }
-        if self
-            .hotkeys
-            .check(hotkey::HotkeyAction::SwitchModeAuthoring, ctx)
-        {
-            self.mode = AppMode::ClothAuthoring;
+        // Per-mode F-key nav. Listed in the same order as
+        // `AppMode::ALL` so the binding-to-mode mapping reads
+        // straight off the enum without surprises.
+        for (action, mode) in [
+            (hotkey::HotkeyAction::SwitchModeAvatar, AppMode::Avatar),
+            (hotkey::HotkeyAction::SwitchModePreview, AppMode::Preview),
+            (
+                hotkey::HotkeyAction::SwitchModeTracking,
+                AppMode::TrackingSetup,
+            ),
+            (hotkey::HotkeyAction::SwitchModeRendering, AppMode::Rendering),
+            (hotkey::HotkeyAction::SwitchModeOutput, AppMode::Output),
+            (
+                hotkey::HotkeyAction::SwitchModeAuthoring,
+                AppMode::ClothAuthoring,
+            ),
+            (hotkey::HotkeyAction::SwitchModeSettings, AppMode::Settings),
+        ] {
+            if self.hotkeys.check(action, ctx) {
+                self.mode = mode;
+                self.inspector_open = true;
+            }
         }
         if self.hotkeys.check(hotkey::HotkeyAction::SaveProject, ctx) {
             let ps = self.to_project_state();
@@ -2203,9 +2213,14 @@ impl eframe::App for GuiApp {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| job.path.display().to_string());
             egui::Window::new(t!("dialog.loading_avatar"))
+                .id(egui::Id::new("avatar_load_modal_window"))
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .collapsible(false)
                 .resizable(false)
+                // Match the calibration modal: live above any
+                // `Order::Middle` scrim and any default-Order Window
+                // so the load progress isn't visually buried by either.
+                .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -2228,6 +2243,13 @@ impl eframe::App for GuiApp {
         if !self.notifications.is_empty() {
             egui::Area::new(egui::Id::new("notifications"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -40.0))
+                // Tooltip ordering puts toasts above every modal
+                // (`Order::Foreground`), the calibration scrim
+                // (`Order::Middle`), and ordinary panels (default
+                // `Order::Middle`). Notifications are read-only
+                // status reports — they should always be visible
+                // regardless of what dialog is open.
+                .order(egui::Order::Tooltip)
                 .show(ctx, |ui| {
                     for n in &self.notifications {
                         let ttl = match n.level {
