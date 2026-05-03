@@ -271,8 +271,14 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     }
 
     // Dim the entire viewport so background widgets read as inactive.
+    // Placed on `Order::Middle` (the default for Windows) so the
+    // calibration `Window` below — explicitly forced to
+    // `Order::Foreground` — paints strictly *above* it. Painting both
+    // on the same Order leaves the in-Order z-position dependent on
+    // insertion / interaction history, which produced the modal
+    // landing *behind* the scrim under some open paths.
     let screen_rect = ctx.screen_rect();
-    let dim_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("calibration_dim"));
+    let dim_layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("calibration_dim"));
     let dim_painter = ctx.layer_painter(dim_layer);
     dim_painter.rect_filled(
         screen_rect,
