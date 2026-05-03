@@ -171,6 +171,15 @@ pub struct PoseSolverState {
     /// so the feature self-calibrates to the user's typical pose.
     /// `None` until the first hip-visible frame.
     root_reference: Option<[f32; 3]>,
+    /// Running max of `|L.shoulder.x − R.shoulder.x|` observed across
+    /// frames. This proxies the subject's true frontal shoulder width:
+    /// the X-span shrinks as the body yaws away from frontal, so the
+    /// historical maximum approximates the un-foreshortened width.
+    /// [`compute_body_yaw_3d`] uses this to recover the yaw magnitude
+    /// from X-foreshortening, which is more stable than RTMW3D's
+    /// per-frame Δz signal at intermediate (~30°–60°) rotations.
+    /// `0.0` until the first confident shoulder pair arrives.
+    running_shoulder_x_span_max: f32,
 }
 
 impl PoseSolverState {
@@ -198,6 +207,12 @@ impl PoseSolverState {
         self.joint_active.clear();
         self.last_solve_instant = None;
         self.root_reference = None;
+        // `running_shoulder_x_span_max` is intentionally NOT reset
+        // here — it captures the subject's anatomical shoulder width
+        // and persists across smoothing resets so a calibration-prime
+        // frame's reading still informs subsequent test frames in the
+        // diagnose_pose workflow (and survives view switches in live
+        // tracking, since the user's anatomy has not changed).
     }
 }
 
@@ -520,6 +535,19 @@ pub fn solve_avatar_pose(
         skeleton.nodes[node_idx].rest_local.clone()
     });
 
+    // Source body yaw, computed early so the IK pole hints (which
+    // describe limb-bend direction in body-local terms — knee bends
+    // forward, elbow bends down) can be rotated into the source frame
+    // before IK runs. Without this rotation the leg IK assumes the
+    // subject is facing the camera and bends knees toward +Z even when
+    // the body has rotated 45°+ to the side, producing a visibly
+    // dislocated leg in three-quarter / profile poses.
+    let body_yaw_source = compute_body_yaw_3d(
+        &source_owned,
+        params.joint_confidence_threshold,
+        &mut state.running_shoulder_x_span_max,
+    );
+
     // Two-bone IK: the tracker's mid-limb keypoint (elbow / knee) is
     // unreliable for foreshortened poses (raised hand, knee-near-camera).
     // Trust the more-reliable shoulder/hip + wrist/ankle keypoints and
@@ -532,6 +560,7 @@ pub fn solve_avatar_pose(
         &rest_world,
         humanoid,
         params.joint_confidence_threshold,
+        body_yaw_source.unwrap_or(0.0),
     );
 
     let source = &source_owned;
@@ -550,7 +579,7 @@ pub fn solve_avatar_pose(
     // and as the subject rotates around their vertical axis the line
     // tilts in XZ so its yaw against the rest +X axis encodes the
     // body's facing direction directly.
-    if let Some(body_yaw) = compute_body_yaw_3d(source, params.joint_confidence_threshold) {
+    if let Some(body_yaw) = body_yaw_source {
         if body_yaw.abs() > 0.01 {
             if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {
                 let hips_idx = hips_node.0 as usize;
@@ -1177,7 +1206,11 @@ fn log_thumb_diagnostics(
 /// Returns `None` when neither pair clears the confidence threshold
 /// so the caller can skip the rotation entirely instead of snapping
 /// the body to whatever stale value comes through.
-fn compute_body_yaw_3d(source: &SourceSkeleton, threshold: f32) -> Option<f32> {
+fn compute_body_yaw_3d(
+    source: &SourceSkeleton,
+    threshold: f32,
+    running_shoulder_x_span_max: &mut f32,
+) -> Option<f32> {
     use HumanoidBone::*;
     // Shoulders first; hips are a fallback for shoulder-cropped frames.
     let pairs = [
@@ -1196,15 +1229,44 @@ fn compute_body_yaw_3d(source: &SourceSkeleton, threshold: f32) -> Option<f32> {
         }
         let bx = l.position[0] - r.position[0];
         let bz = l.position[2] - r.position[2];
+        let span_xz = (bx * bx + bz * bz).sqrt();
         // Dead-zone: with the torso-width vector tiny (subject in
         // exact side profile or hip pair degenerate), atan2 amplifies
         // any noise into wild yaw flips. Require a minimum span
         // before we trust the angle, and let the next pair (or
         // None) take over otherwise.
-        if (bx * bx + bz * bz).sqrt() < 0.05 {
+        if span_xz < 0.05 {
             continue;
         }
-        return Some(bz.atan2(bx));
+        // Update the running max only on the shoulder pair — shoulders
+        // have stable anatomy and clean keypoints; hips are a noisy
+        // fallback signal we don't want polluting the historical
+        // reference. Use `|bx|` so a back-facing pose (bx negative)
+        // also contributes its full extent.
+        let abs_bx = bx.abs();
+        if matches!(left_bone, LeftShoulder) && abs_bx > *running_shoulder_x_span_max {
+            *running_shoulder_x_span_max = abs_bx;
+        }
+        // Yaw recovery from X-foreshortening:
+        //   |bx| / true_x_span = |cos(yaw)|
+        // The "true x-span" is the X-axis shoulder width at frontal pose
+        // (yaw = 0). RTMW3D's per-frame Δz under-estimates depth at
+        // intermediate yaw (~30°–60°) where bz is small; the running
+        // max of the observed X-span captures the un-foreshortened
+        // width and gives a more stable magnitude.
+        let target_span = running_shoulder_x_span_max.max(span_xz);
+        let cos_yaw = (bx / target_span).clamp(-1.0, 1.0);
+        let yaw_magnitude = cos_yaw.acos();
+        // Sign convention: positive yaw = standard right-hand-rule
+        // CCW rotation around +Y (= subject turns to **her left**,
+        // bringing her right side toward camera). For the source's
+        // unmirrored Y-up frame this corresponds to L.shoulder going
+        // *back* (-Z) and R.shoulder coming *forward* (+Z), i.e.
+        // bz = L.z - R.z is **negative**. Hence `yaw_sign = -sign(bz)`.
+        // bz = 0 (exact frontal/back) yields zero magnitude so the
+        // sign choice is moot; pick `+` deterministically.
+        let yaw_sign = if bz <= 0.0 { 1.0 } else { -1.0 };
+        return Some(yaw_sign * yaw_magnitude);
     }
     None
 }
@@ -1356,6 +1418,7 @@ fn apply_2bone_ik_arms_and_legs(
     rest_world: &[WorldXform],
     humanoid: &HumanoidMap,
     threshold: f32,
+    body_yaw_source: f32,
 ) {
     // Avatar-to-source unit conversion: source positions are in
     // image-normalised coordinates while rest_world bone lengths are
@@ -1368,7 +1431,21 @@ fn apply_2bone_ik_arms_and_legs(
         return;
     };
 
-    // Arms: pole = -Y (elbows bend down/back in source space).
+    // Rotate body-local pole hints by the source body yaw so they
+    // describe the limb's bend direction in **source space** for the
+    // current frame. At rest the subject faces the camera so body-
+    // local +Z (forward) coincides with source +Z; once the body
+    // rotates around Y this no longer holds and the static hint pulls
+    // the knee or elbow toward the wrong half-space.
+    let cos_y = body_yaw_source.cos();
+    let sin_y = body_yaw_source.sin();
+    // R_y(yaw) · (0, 0, 1) = (sin yaw, 0, cos yaw). Body-local +Z
+    // becomes this in source space.
+    let leg_pole = [sin_y, 0.0, cos_y];
+    // Arms: body-local -Y (elbow bends down). Y is the rotation axis
+    // so it's invariant under yaw — same vector in source space.
+    let arm_pole = [0.0, -1.0, 0.0];
+
     apply_2bone_ik_chain(
         source,
         rest_world,
@@ -1376,7 +1453,7 @@ fn apply_2bone_ik_arms_and_legs(
         HumanoidBone::LeftShoulder,
         HumanoidBone::LeftLowerArm,
         HumanoidBone::LeftHand,
-        [0.0, -1.0, 0.0],
+        arm_pole,
         threshold,
         scale,
     );
@@ -1387,14 +1464,11 @@ fn apply_2bone_ik_arms_and_legs(
         HumanoidBone::RightShoulder,
         HumanoidBone::RightLowerArm,
         HumanoidBone::RightHand,
-        [0.0, -1.0, 0.0],
+        arm_pole,
         threshold,
         scale,
     );
 
-    // Legs: pole = +Z (knees bend forward in source space; +Z is
-    // toward the camera so the knee leads the shin/ankle path
-    // for any standing or seated pose).
     apply_2bone_ik_chain(
         source,
         rest_world,
@@ -1402,7 +1476,7 @@ fn apply_2bone_ik_arms_and_legs(
         HumanoidBone::LeftUpperLeg,
         HumanoidBone::LeftLowerLeg,
         HumanoidBone::LeftFoot,
-        [0.0, 0.0, 1.0],
+        leg_pole,
         threshold,
         scale,
     );
@@ -1413,7 +1487,7 @@ fn apply_2bone_ik_arms_and_legs(
         HumanoidBone::RightUpperLeg,
         HumanoidBone::RightLowerLeg,
         HumanoidBone::RightFoot,
-        [0.0, 0.0, 1.0],
+        leg_pole,
         threshold,
         scale,
     );
@@ -2061,7 +2135,8 @@ mod body_yaw_tests {
     /// plan/body-twist-yaw-investigation.md row 045°, so any averaging
     /// would flip the result. This regression test pins us to "shoulders
     /// first": the magnitude is small but the sign must be right, never
-    /// wrong.
+    /// wrong. Sign convention: bz > 0 (LEFT shoulder forward) ⇒ subject
+    /// turned to her RIGHT ⇒ R_y CW from above ⇒ negative yaw.
     #[test]
     fn three_quarter_view_keeps_shoulder_sign() {
         let mut sk = SourceSkeleton::empty(0);
@@ -2070,48 +2145,52 @@ mod body_yaw_tests {
         put(&mut sk, HumanoidBone::LeftUpperLeg, [0.046, -0.004, -0.007], 1.0);
         put(&mut sk, HumanoidBone::RightUpperLeg, [-0.046, 0.004, 0.007], 1.0);
 
-        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("shoulder pair clears threshold");
-        // Shoulder-only: bx=+0.214, bz=+0.004 → atan2 ≈ +0.0187 rad ≈ +1.07°.
-        // Averaging hips would push this negative — never let that happen again.
+        let mut span_max = 0.0;
+        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("shoulder pair clears threshold");
+        // Shoulder-only: bx=+0.214, bz=+0.004 → small magnitude (~1°),
+        // sign negative (subject turned right).
         assert!(
-            yaw > 0.0 && yaw < 0.05,
-            "45° shoulder yaw should be small +ε, got {yaw}"
+            yaw < 0.0 && yaw > -0.05,
+            "45° shoulder yaw should be small -ε, got {yaw}"
         );
     }
 
-    /// 90° side profile: large positive yaw (≈ +48°). Sanity-check that
-    /// the function recovers a real yaw signal once Δz comes off the
-    /// noise floor. Real measurement row from the plan.
+    /// 90° side profile: large yaw (≈ -48°). Subject's left shoulder
+    /// forward (bz > 0) ⇒ subject turned to her right ⇒ negative yaw.
+    /// Sanity-check that the function recovers a real yaw signal once
+    /// Δz comes off the noise floor.
     #[test]
-    fn side_profile_90_gives_large_positive_yaw() {
+    fn side_profile_90_gives_large_negative_yaw() {
         let mut sk = SourceSkeleton::empty(0);
         put(&mut sk, HumanoidBone::LeftShoulder, [0.054, 0.534, 0.019], 1.0);
         put(&mut sk, HumanoidBone::RightShoulder, [-0.029, 0.531, -0.075], 1.0);
 
-        let yaw_deg = compute_body_yaw_3d(&sk, 0.1)
+        let mut span_max = 0.0;
+        let yaw_deg = compute_body_yaw_3d(&sk, 0.1, &mut span_max)
             .expect("shoulders")
             .to_degrees();
         assert!(
-            (45.0..55.0).contains(&yaw_deg),
-            "90° side profile expected ≈+48°, got {yaw_deg:.1}°"
+            (-55.0..-45.0).contains(&yaw_deg),
+            "90° side profile expected ≈-48°, got {yaw_deg:.1}°"
         );
     }
 
-    /// 270° side profile: large positive yaw (≈ +62°). Different
-    /// magnitude than 90° because RTMW3D's Z asymmetry biases the two
-    /// side views unequally; both lie in the same atan2 quadrant.
+    /// 270° side profile: large yaw (≈ -62°). Different magnitude than
+    /// 90° because RTMW3D's Z asymmetry biases the two side views
+    /// unequally; both lie in the same negative quadrant.
     #[test]
-    fn side_profile_270_gives_large_positive_yaw() {
+    fn side_profile_270_gives_large_negative_yaw() {
         let mut sk = SourceSkeleton::empty(0);
         put(&mut sk, HumanoidBone::LeftShoulder, [0.031, 0.523, 0.012], 1.0);
         put(&mut sk, HumanoidBone::RightShoulder, [-0.017, 0.523, -0.078], 1.0);
 
-        let yaw_deg = compute_body_yaw_3d(&sk, 0.1)
+        let mut span_max = 0.0;
+        let yaw_deg = compute_body_yaw_3d(&sk, 0.1, &mut span_max)
             .expect("shoulders")
             .to_degrees();
         assert!(
-            (58.0..68.0).contains(&yaw_deg),
-            "270° side profile expected ≈+62°, got {yaw_deg:.1}°"
+            (-68.0..-58.0).contains(&yaw_deg),
+            "270° side profile expected ≈-62°, got {yaw_deg:.1}°"
         );
     }
 
@@ -2123,7 +2202,8 @@ mod body_yaw_tests {
         put(&mut sk, HumanoidBone::LeftShoulder, [-0.166, 0.504, 0.061], 1.0);
         put(&mut sk, HumanoidBone::RightShoulder, [0.140, 0.520, 0.047], 1.0);
 
-        let yaw_deg = compute_body_yaw_3d(&sk, 0.1)
+        let mut span_max = 0.0;
+        let yaw_deg = compute_body_yaw_3d(&sk, 0.1, &mut span_max)
             .expect("shoulders")
             .to_degrees();
         assert!(
@@ -2134,21 +2214,23 @@ mod body_yaw_tests {
 
     /// Both pairs confident but with **disagreeing sign** on Δz — the
     /// pathology that broke Option A averaging. Shoulders give a small
-    /// positive yaw; hips alone would give a negative one. The
-    /// shoulders-first contract requires the result to come out positive.
+    /// negative yaw (subject turned right); hips alone would give a
+    /// positive one (opposite sign). The shoulders-first contract
+    /// requires the result to come out negative.
     #[test]
     fn shoulders_authoritative_when_hips_disagree() {
         let mut sk = SourceSkeleton::empty(0);
-        // Shoulder Δz=+0.004, Δx=+0.214 → ≈+1°.
+        // Shoulder Δz=+0.004, Δx=+0.214 → small magnitude, sign neg.
         put(&mut sk, HumanoidBone::LeftShoulder, [0.107, 0.486, -0.085], 1.0);
         put(&mut sk, HumanoidBone::RightShoulder, [-0.107, 0.486, -0.089], 1.0);
-        // Hip Δz=-0.014, Δx=+0.092 → ≈-8.6° (opposite sign).
+        // Hip Δz=-0.014, Δx=+0.092 → opposite sign (positive).
         put(&mut sk, HumanoidBone::LeftUpperLeg, [0.046, 0.0, -0.007], 1.0);
         put(&mut sk, HumanoidBone::RightUpperLeg, [-0.046, 0.0, 0.007], 1.0);
 
-        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("shoulders win");
+        let mut span_max = 0.0;
+        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("shoulders win");
         assert!(
-            yaw > 0.0,
+            yaw < 0.0,
             "shoulders must dominate even when hips disagree in sign, got {yaw}"
         );
     }
@@ -2161,7 +2243,8 @@ mod body_yaw_tests {
         put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.4, 0.0], 1.0);
         put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.4, 0.0], 1.0);
 
-        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("shoulder-only fallback");
+        let mut span_max = 0.0;
+        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("shoulder-only fallback");
         assert!(
             yaw.abs() < 0.05,
             "front-pose shoulder span should give ~0 yaw, got {yaw}"
@@ -2173,7 +2256,48 @@ mod body_yaw_tests {
     #[test]
     fn no_torso_joints_returns_none() {
         let sk = SourceSkeleton::empty(0);
-        assert!(compute_body_yaw_3d(&sk, 0.1).is_none());
+        let mut span_max = 0.0;
+        assert!(compute_body_yaw_3d(&sk, 0.1, &mut span_max).is_none());
+    }
+
+    /// Foreshortening recovery: once the running max of `|Δx|` has
+    /// captured the subject's true frontal shoulder width, a subsequent
+    /// rotated frame should report a **larger** yaw magnitude than the
+    /// pure-atan2 first call would. This is the live-tracking win — we
+    /// trade single-shot atan2 (matches first-frame behavior in tests
+    /// above) for cumulative magnitude correction across a session.
+    #[test]
+    fn running_max_amplifies_under_rotated_yaw() {
+        let mut span_max = 0.0;
+
+        // Frame 1: subject roughly frontal — primes the running max
+        // with a wide |Δx|.
+        let mut frontal = SourceSkeleton::empty(0);
+        put(&mut frontal, HumanoidBone::LeftShoulder, [0.20, 0.5, 0.0], 1.0);
+        put(&mut frontal, HumanoidBone::RightShoulder, [-0.20, 0.5, 0.0], 1.0);
+        let _ = compute_body_yaw_3d(&frontal, 0.1, &mut span_max);
+        assert!(
+            (span_max - 0.40).abs() < 1e-4,
+            "frontal frame should prime running max to 0.40, got {span_max}"
+        );
+
+        // Frame 2: same subject rotated; bx shrinks (foreshortening)
+        // but bz is small / underestimated by RTMW3D. Pure atan2 would
+        // give ≈ atan2(0.05, 0.20) ≈ 14° magnitude, but with running
+        // max we recover ≈ acos(0.20/0.40) = 60°.
+        let mut rotated = SourceSkeleton::empty(0);
+        put(&mut rotated, HumanoidBone::LeftShoulder, [0.10, 0.5, -0.025], 1.0);
+        put(&mut rotated, HumanoidBone::RightShoulder, [-0.10, 0.5, 0.025], 1.0);
+        let yaw_deg = compute_body_yaw_3d(&rotated, 0.1, &mut span_max)
+            .expect("shoulders")
+            .to_degrees();
+        // Foreshortening recovery: |bx|=0.20, target=0.40,
+        // cos⁻¹(0.5) = 60°. Sign convention: bz<0 (LEFT back, RIGHT
+        // forward) ⇒ subject turned LEFT (CCW) ⇒ POSITIVE yaw.
+        assert!(
+            (yaw_deg - 60.0).abs() < 2.0,
+            "foreshortening recovery should yield ≈ +60°, got {yaw_deg:.1}°"
+        );
     }
 
     /// Shoulders present but below the confidence threshold while hips
@@ -2187,10 +2311,12 @@ mod body_yaw_tests {
         put(&mut sk, HumanoidBone::LeftUpperLeg, [0.18, 0.0, 0.05], 1.0);
         put(&mut sk, HumanoidBone::RightUpperLeg, [-0.18, 0.0, -0.05], 1.0);
 
-        let yaw = compute_body_yaw_3d(&sk, 0.1).expect("hip pair carries the signal");
-        // Hip-only: bx=0.36, bz=0.10 → atan2(0.10, 0.36) ≈ 0.27 rad.
+        let mut span_max = 0.0;
+        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("hip pair carries the signal");
+        // Hip-only: bx=0.36, bz=+0.10 (LEFT forward → subject right turn)
+        // ⇒ negative yaw, magnitude ≈ atan2(0.10, 0.36) ≈ 0.27 rad.
         assert!(
-            (yaw - 0.27).abs() < 0.02,
+            (yaw - (-0.27)).abs() < 0.02,
             "hip-only yaw mismatch: {yaw}"
         );
     }
