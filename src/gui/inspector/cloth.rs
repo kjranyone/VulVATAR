@@ -165,7 +165,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                super::draw_no_avatar_state(ui);
             }
         });
 
@@ -269,7 +269,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                super::draw_no_avatar_state(ui);
             }
         });
 
@@ -345,7 +345,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                super::draw_no_avatar_state(ui);
             }
         });
 
@@ -425,7 +425,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                super::draw_no_avatar_state(ui);
             }
         });
 
@@ -486,7 +486,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ));
                 }
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                super::draw_no_avatar_state(ui);
             }
         });
 }

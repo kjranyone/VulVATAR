@@ -42,7 +42,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
                 ui.label(t!("inspector.additional_cloth", count = avatar.cloth_overlay_count()));
             } else {
-                ui.label(t!("inspector.no_avatar_loaded"));
+                super::draw_no_avatar_state(ui);
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {

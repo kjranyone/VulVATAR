@@ -205,16 +205,7 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 });
             } else {
-                ui.label(
-                    egui::RichText::new(t!("inspector.no_avatar_loaded"))
-                        .font(typography::body())
-                        .color(color::ON_SURFACE_VARIANT),
-                );
-                ui.label(
-                    egui::RichText::new(t!("inspector.no_avatar_hint"))
-                        .font(typography::caption())
-                        .color(color::ON_SURFACE_MUTED),
-                );
+                super::draw_no_avatar_state(ui);
             }
         },
     );

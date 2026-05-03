@@ -1,7 +1,8 @@
 use eframe::egui;
 
-use crate::gui::theme::{color, space};
+use crate::gui::theme::{color, space, typography};
 use crate::gui::{AppMode, GuiApp};
+use crate::t;
 
 mod avatar;
 mod cloth;
@@ -11,6 +12,26 @@ mod preview;
 mod rendering;
 mod settings;
 mod tracking;
+
+/// Render the standard "no avatar loaded" empty state — a primary
+/// label plus a hint pointing to where the user can load one. Used
+/// in every inspector card whose contents only make sense with an
+/// active avatar (preview, cloth pin/binding, cloth simulation
+/// controls, etc). Centralised so the wording / styling stays
+/// consistent across cards instead of each module emitting a bare
+/// `t!("inspector.no_avatar_loaded")` label with no follow-up.
+pub(super) fn draw_no_avatar_state(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new(t!("inspector.no_avatar_loaded"))
+            .font(typography::body())
+            .color(color::ON_SURFACE_VARIANT),
+    );
+    ui.label(
+        egui::RichText::new(t!("inspector.no_avatar_hint"))
+            .font(typography::caption())
+            .color(color::ON_SURFACE_MUTED),
+    );
+}
 
 /// Inspector panel — docked to the left of the viewport, right of the
 /// mode-nav rail. Each mode owns the cards relevant to that mode; the
