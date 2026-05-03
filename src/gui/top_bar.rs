@@ -32,6 +32,17 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
         state.push_notification(t!("top_bar.avatar_load_blocked_by_calibration"));
         return;
     }
+    // If a previous load is still in flight, refuse rather than
+    // replacing the slot. Replacing detaches the prior worker — its
+    // sends start failing silently and its decoded asset is discarded
+    // when it finishes. Eventually harmless (the OS reaps the thread)
+    // but wastes the multi-hundred-MB working set the worker built up.
+    // The user almost certainly didn't mean to abandon the first load,
+    // so a notification is more honest than a silent kick-off.
+    if state.avatar_load_job.is_some() {
+        state.push_notification(t!("top_bar.avatar_load_in_progress"));
+        return;
+    }
     state.push_notification(t!("top_bar.loading_avatar", path = path.display().to_string()));
     state.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
