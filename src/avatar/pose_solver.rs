@@ -40,7 +40,8 @@ use std::time::Instant;
 use crate::asset::{HumanoidBone, HumanoidMap, NodeId, Quat, SkeletonAsset, Transform, Vec3};
 use crate::math_utils::{
     quat_conjugate, quat_from_basis_pair, quat_from_euler_ypr, quat_from_vectors, quat_mul,
-    quat_normalize, quat_rotate_vec3, swing_twist_decompose, vec3_cross, vec3_normalize, vec3_sub,
+    quat_normalize, quat_rotate_vec3, swing_twist_decompose, vec3_cross, vec3_dot, vec3_length,
+    vec3_normalize, vec3_sub,
 };
 use crate::tracking::source_skeleton::{FacePose, HandOrientation, SourceSkeleton};
 
@@ -509,8 +510,7 @@ pub fn solve_avatar_pose(
     // Apply the 1€ filter + Schmitt hysteresis on every keypoint
     // before any geometry runs. Working on a local clone keeps
     // `&SourceSkeleton` immutable for callers (tests, other consumers).
-    let source_owned = preprocess_source(source, state, dt, params);
-    let source = &source_owned;
+    let mut source_owned = preprocess_source(source, state, dt, params);
 
     // Rest-pose world transforms, computed from the skeleton's rest_local
     // values. These are the ground truth we measure bone directions against;
@@ -519,6 +519,22 @@ pub fn solve_avatar_pose(
     let rest_world = compute_world_transforms(skeleton, |node_idx| {
         skeleton.nodes[node_idx].rest_local.clone()
     });
+
+    // Two-bone IK: the tracker's mid-limb keypoint (elbow / knee) is
+    // unreliable for foreshortened poses (raised hand, knee-near-camera).
+    // Trust the more-reliable shoulder/hip + wrist/ankle keypoints and
+    // reconstruct the elbow / knee position geometrically using the
+    // avatar's anatomical bone-length ratios. See `apply_2bone_ik_chain`
+    // for the full rationale and math; the call list below pins which
+    // chains get IK'd and what pole hint each uses.
+    apply_2bone_ik_arms_and_legs(
+        &mut source_owned,
+        &rest_world,
+        humanoid,
+        params.joint_confidence_threshold,
+    );
+
+    let source = &source_owned;
 
     // Current-frame world transforms, starting from whatever is in
     // local_transforms right now (i.e. rest, unless the caller has already
@@ -1286,6 +1302,349 @@ fn compute_world_transforms(
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// 2-bone IK
+// ---------------------------------------------------------------------------
+
+/// Apply two-bone IK to all four limb chains (left/right arm,
+/// left/right leg). Each call replaces the source skeleton's
+/// `middle` joint position (elbow / knee) with one that's
+/// anatomically consistent with the avatar's rest-pose bone lengths
+/// and the trusted base/tip endpoints.
+///
+/// **Why limb-chain IK at all**
+///
+/// The downstream bone-rotation loop in `solve_avatar_pose` consumes
+/// *direction-only* signals: for each bone it computes
+/// `dir = normalize(tip - base)` and rotates the avatar's bone of
+/// fixed (rest-pose) length to point in that direction. There is no
+/// length-preservation or end-effector constraint downstream, so a
+/// wrong middle-keypoint position propagates verbatim into the
+/// avatar: the upper-arm rotates to point at the (wrong) elbow, the
+/// forearm rotates from there to point at the (correctish) wrist,
+/// and the avatar's hand lands at avatar_shoulder + L_upper *
+/// dir_upper + L_lower * dir_lower — geometrically inconsistent with
+/// where the *real* hand was in the source frame.
+///
+/// The validation case that exposed this: subject raises right hand
+/// to upper chest (palm to camera). RTMW3D detects shoulder and
+/// wrist 2D positions correctly, but the elbow keypoint lands at
+/// hip-mid level — well below where it physically is. The implied
+/// source bone lengths come out forearm > upper-arm (anatomically
+/// reversed), and the avatar's rendered hand lands ~at the hip
+/// instead of upper chest because of the bad elbow direction
+/// dragging the upper-arm down.
+///
+/// **Why arms get pole = -Y, legs get pole = +Z**
+///
+/// The IK has two solutions for the elbow/knee position (both sides
+/// of the chord). The pole hint disambiguates. Default arm pose has
+/// the elbow bending "down/back" relative to the shoulder-wrist
+/// chord (think wave gesture, hand-on-hip, arms-folded — all bend
+/// the elbow toward -Y in source space). Default leg pose has the
+/// knee bending forward (running, sitting, kneeling — all bend the
+/// knee toward +Z, i.e. away from the camera in source-space
+/// convention where +Z is toward camera). These hints break down for
+/// extreme poses (back-handed wave, knee bending sideways), but
+/// `apply_2bone_ik_chain` adapts the hint toward the original
+/// keypoint position when one is available — so a slightly-off
+/// elbow detection still preserves the side it was on.
+fn apply_2bone_ik_arms_and_legs(
+    source: &mut SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    threshold: f32,
+) {
+    // Avatar-to-source unit conversion: source positions are in
+    // image-normalised coordinates while rest_world bone lengths are
+    // in avatar-space (typically metres for VRM 1.0). Use shoulder
+    // span as the calibration: it's the most reliably-detected pair
+    // across pose variations and is essentially the same anatomical
+    // measurement on both sides of the conversion.
+    let Some(scale) = compute_avatar_to_source_scale(source, rest_world, humanoid)
+    else {
+        return;
+    };
+
+    // Arms: pole = -Y (elbows bend down/back in source space).
+    apply_2bone_ik_chain(
+        source,
+        rest_world,
+        humanoid,
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftHand,
+        [0.0, -1.0, 0.0],
+        threshold,
+        scale,
+    );
+    apply_2bone_ik_chain(
+        source,
+        rest_world,
+        humanoid,
+        HumanoidBone::RightShoulder,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightHand,
+        [0.0, -1.0, 0.0],
+        threshold,
+        scale,
+    );
+
+    // Legs: pole = +Z (knees bend forward in source space; +Z is
+    // toward the camera so the knee leads the shin/ankle path
+    // for any standing or seated pose).
+    apply_2bone_ik_chain(
+        source,
+        rest_world,
+        humanoid,
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::LeftFoot,
+        [0.0, 0.0, 1.0],
+        threshold,
+        scale,
+    );
+    apply_2bone_ik_chain(
+        source,
+        rest_world,
+        humanoid,
+        HumanoidBone::RightUpperLeg,
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::RightFoot,
+        [0.0, 0.0, 1.0],
+        threshold,
+        scale,
+    );
+}
+
+/// Single-chain 2-bone IK: shoulder → elbow → wrist (or hip → knee →
+/// ankle). Replaces `middle`'s position in `source` with one that
+/// satisfies the avatar's rest-pose bone-length ratios while keeping
+/// the base + tip endpoints fixed.
+///
+/// No-op when:
+/// - The base or tip is missing or below `threshold` confidence
+/// - Avatar bone lengths can't be looked up from `rest_world`
+/// - Chord (base→tip) is degenerately short (< 1mm) or exceeds the
+///   maximum reach by more than 5%; the latter typically means the
+///   keypoint detector wildly misplaced one of the endpoints, and IK
+///   forced into a degenerate elbow at the chord midpoint would look
+///   worse than leaving the original wrong elbow alone.
+/// - The pole hint is parallel to the chord (e.g. arm pointing
+///   straight down with pole = -Y), so the perpendicular component
+///   collapses and the elbow's bend direction is undetermined.
+///
+/// `pole_hint_source` is in source coords. The function projects it
+/// onto the plane perpendicular to the chord and uses the projection
+/// as the elbow's bend direction. If the original middle position is
+/// available, the hint is biased toward whichever side of the chord
+/// the original was on — so a slightly-off keypoint that's on the
+/// correct side still produces the right bend direction.
+#[allow(clippy::too_many_arguments)]
+fn apply_2bone_ik_chain(
+    source: &mut SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    base: HumanoidBone,
+    middle: HumanoidBone,
+    tip: HumanoidBone,
+    pole_hint_source: Vec3,
+    threshold: f32,
+    avatar_to_source_scale: f32,
+) {
+    let Some(base_joint) = source.joints.get(&base).copied() else {
+        return;
+    };
+    if base_joint.confidence < threshold {
+        return;
+    }
+    let Some(tip_joint) = source.joints.get(&tip).copied() else {
+        return;
+    };
+    if tip_joint.confidence < threshold {
+        return;
+    }
+    let base_pos = base_joint.position;
+    let tip_pos = tip_joint.position;
+
+    // Avatar's anatomical bone-length **ratio** from rest pose. We
+    // deliberately don't use avatar bone lengths *directly*: the
+    // global avatar-to-source scale derived from shoulder span is
+    // accurate at the shoulder line but doesn't transfer cleanly to
+    // the leg chain (a person's leg-to-shoulder ratio varies by ±10%
+    // per individual, and per-frame perspective compresses it
+    // differently). Forcing avatar-scaled bone lengths onto a
+    // standing leg whose source-implied length doesn't match (chord
+    // < scaled max_reach) creates a phantom bend at the knee — the
+    // IK has to bend *somewhere* to fit the bones into the chord.
+    //
+    // Instead, take the source's **implied total chain length**
+    // (l_upper_implied + l_lower_implied) and re-distribute it
+    // using only the avatar's *ratio*. This preserves the source's
+    // body-scale signal while fixing the proportion error that
+    // RTMW3D's keypoint-detection inaccuracy introduced.
+    let Some(base_node) = humanoid.bone_map.get(&base).copied() else {
+        return;
+    };
+    let Some(middle_node) = humanoid.bone_map.get(&middle).copied() else {
+        return;
+    };
+    let Some(tip_node) = humanoid.bone_map.get(&tip).copied() else {
+        return;
+    };
+    let base_idx = base_node.0 as usize;
+    let middle_idx = middle_node.0 as usize;
+    let tip_idx = tip_node.0 as usize;
+    if base_idx >= rest_world.len()
+        || middle_idx >= rest_world.len()
+        || tip_idx >= rest_world.len()
+    {
+        return;
+    }
+    let l_upper_avatar = vec3_length(&vec3_sub(
+        &rest_world[middle_idx].position,
+        &rest_world[base_idx].position,
+    ));
+    let l_lower_avatar = vec3_length(&vec3_sub(
+        &rest_world[tip_idx].position,
+        &rest_world[middle_idx].position,
+    ));
+    if l_upper_avatar < 1e-4 || l_lower_avatar < 1e-4 {
+        return;
+    }
+    let avatar_ratio_upper_total = l_upper_avatar / (l_upper_avatar + l_lower_avatar);
+
+    // Source's implied total chain length, derived from the
+    // currently-detected (possibly inaccurate) middle position.
+    // We use this as the budget the IK must redistribute over the
+    // upper + lower bones. The middle keypoint's *position* may be
+    // wrong, but its summed-distance-from-base-via-itself-to-tip
+    // tracks the actual subject geometry better than any avatar
+    // scaling does — see the rationale block above.
+    let original_middle = source.joints.get(&middle).map(|j| j.position);
+    let total_implied = if let Some(orig) = original_middle {
+        vec3_length(&vec3_sub(&orig, &base_pos))
+            + vec3_length(&vec3_sub(&tip_pos, &orig))
+    } else {
+        return; // No middle keypoint to derive total from; can't IK.
+    };
+    let l_upper = total_implied * avatar_ratio_upper_total;
+    let l_lower = total_implied - l_upper;
+
+    // The avatar_to_source_scale parameter is intentionally unused
+    // here — see the rationale block above. Kept on the signature so
+    // callers don't have to recompute it per chain in the future
+    // (e.g. for a metric-aware IK variant if root translation needs
+    // it).
+    let _ = avatar_to_source_scale;
+
+    // Chord = base → tip in source coords.
+    let chord = vec3_sub(&tip_pos, &base_pos);
+    let chord_len = vec3_length(&chord);
+    let max_reach = l_upper + l_lower;
+    if chord_len < 1e-3 || chord_len > max_reach * 1.05 {
+        return;
+    }
+    // Clamp slightly under max_reach to avoid sin_alpha → 0 numerical
+    // collapse at full extension (pole_unit becomes meaningless).
+    let chord_eff = chord_len.min(max_reach * 0.999);
+    let chord_unit = [
+        chord[0] / chord_len,
+        chord[1] / chord_len,
+        chord[2] / chord_len,
+    ];
+
+    // Law of cosines: angle α at base between chord and base→middle.
+    let cos_alpha = ((l_upper * l_upper + chord_eff * chord_eff
+        - l_lower * l_lower)
+        / (2.0 * l_upper * chord_eff))
+        .clamp(-1.0, 1.0);
+    let sin_alpha = (1.0 - cos_alpha * cos_alpha).max(0.0).sqrt();
+
+    // Project the static pole hint onto the plane perpendicular to
+    // the chord — that gives the actual bend direction in source
+    // space. We deliberately don't adapt the hint to the original
+    // middle's offset: when the keypoint is correctly detected and
+    // sits near the chord (e.g. arm hanging straight at side, chord
+    // ≈ -Y, original elbow with tiny perpendicular component), the
+    // adaptive hint is dominated by detection noise and produces a
+    // wrong-direction bend that visibly distorts the avatar's pose.
+    // The static hint stays consistent and degrades gracefully:
+    // for chords parallel to the hint (arm straight down with hint
+    // = -Y) the perpendicular collapses and IK aborts, leaving the
+    // already-correct keypoint untouched.
+    let dot = vec3_dot(&pole_hint_source, &chord_unit);
+    let pole_perp = [
+        pole_hint_source[0] - chord_unit[0] * dot,
+        pole_hint_source[1] - chord_unit[1] * dot,
+        pole_hint_source[2] - chord_unit[2] * dot,
+    ];
+    let pole_len = vec3_length(&pole_perp);
+    if pole_len < 1e-4 {
+        // Pole parallel to chord; bend direction undetermined.
+        return;
+    }
+    let pole_unit = [
+        pole_perp[0] / pole_len,
+        pole_perp[1] / pole_len,
+        pole_perp[2] / pole_len,
+    ];
+
+    let middle_pos = [
+        base_pos[0] + l_upper * (cos_alpha * chord_unit[0] + sin_alpha * pole_unit[0]),
+        base_pos[1] + l_upper * (cos_alpha * chord_unit[1] + sin_alpha * pole_unit[1]),
+        base_pos[2] + l_upper * (cos_alpha * chord_unit[2] + sin_alpha * pole_unit[2]),
+    ];
+
+    if let Some(j) = source.joints.get_mut(&middle) {
+        j.position = middle_pos;
+    }
+}
+
+/// Avatar-to-source coordinate-scale factor, derived from the ratio
+/// of source-vs-avatar shoulder spans on the **horizontal X axis only**.
+/// Used by `apply_2bone_ik_chain` to convert avatar-unit bone lengths
+/// (metres for VRM 1.0) into source-coordinate-unit bone lengths so
+/// the IK math stays in one consistent space.
+///
+/// X-only (rather than full 3D) because the source skeleton's Z is
+/// the (relative) RTMW3D nz signal and includes per-frame depth
+/// noise / bias, which inflates the 3D shoulder span estimate.
+/// Avatar rest-pose shoulders sit at the same Z (T-pose), so the
+/// avatar side has no Z component anyway — comparing 3D source
+/// against 1D avatar would systematically over-scale and inflate
+/// the IK bone-length, pushing the elbow further out than it
+/// belongs.
+///
+/// Returns `None` when either shoulder is missing or the spans are
+/// degenerate (subject in extreme side profile, bad detection
+/// frame). Caller skips IK on that frame in either case.
+fn compute_avatar_to_source_scale(
+    source: &SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+) -> Option<f32> {
+    let l_node = humanoid.bone_map.get(&HumanoidBone::LeftShoulder)?;
+    let r_node = humanoid.bone_map.get(&HumanoidBone::RightShoulder)?;
+    let l_idx = l_node.0 as usize;
+    let r_idx = r_node.0 as usize;
+    if l_idx >= rest_world.len() || r_idx >= rest_world.len() {
+        return None;
+    }
+    let avatar_span_x =
+        (rest_world[l_idx].position[0] - rest_world[r_idx].position[0]).abs();
+    if avatar_span_x < 1e-4 {
+        return None;
+    }
+    let l_src = source.joints.get(&HumanoidBone::LeftShoulder)?;
+    let r_src = source.joints.get(&HumanoidBone::RightShoulder)?;
+    let source_span_x = (l_src.position[0] - r_src.position[0]).abs();
+    if source_span_x < 1e-4 {
+        return None;
+    }
+    Some(source_span_x / avatar_span_x)
 }
 
 // ---------------------------------------------------------------------------
