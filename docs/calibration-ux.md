@@ -18,7 +18,7 @@ This document specifies an explicit calibration step, modeled on existing VTuber
 ## User flow
 
 ### Entry point
-A `Calibrate Pose ▼` split button next to the existing `Recalibrate` button in the Tracking inspector. The dropdown offers two modes:
+A `Calibrate Pose ▼` split button in the Tracking inspector. (An earlier prototype lived next to a `Recalibrate` button; that vestigial button was removed once `Calibrate Pose ▼` itself became the canonical capture entry point — running it again overwrites the active profile's calibration.) The dropdown offers two modes:
 
 - **Full Body** — subject visible from feet to head; calibration captures the hip pelvic anchor.
 - **Upper Body Only** — subject visible from waist (or chest) up; calibration captures the shoulder midpoint anchor.
@@ -222,8 +222,11 @@ takes precedence.
 ### DTO
 
 ```rust
-// src/persistence.rs — PoseCalibrationDto (unchanged shape, only the
-// storage location moved from the project file to profiles.json):
+// src/persistence.rs — PoseCalibrationDto. The storage location moved
+// from the project file to profiles.json (see "Per-profile storage"
+// above); the shape evolved to add the optional torso depth template
+// for depth-aware providers and the shoulder span used by the
+// scale-invariant arm-length recovery in skeleton_from_depth.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PoseCalibrationDto {
     pub mode: String,           // "full_body" / "upper_body"
@@ -235,8 +238,19 @@ pub struct PoseCalibrationDto {
     pub anchor_depth_m: Option<f32>,
     pub confidence: f32,
     pub anchor_depth_jitter_m: Option<f32>,
+    /// Median shoulder-pair separation in meters during the capture
+    /// window. Used by `skeleton_from_depth` as the reference for the
+    /// subject-specific arm-length scale recovery — without it the
+    /// solver falls back to a population-average length.
+    pub shoulder_span_m: Option<f32>,
     pub x_range_observed: Option<f32>,
     pub z_range_observed: Option<f32>,
+    /// Optional small (e.g. 32×32) per-pixel depth grid sampled over
+    /// the captured torso bbox. Lets the depth-aware providers
+    /// detect frame-to-frame deviation from the calibrated torso
+    /// shape (desk, chair back, monitor) and fall back to anchor-only
+    /// rather than tracking a contaminated metric depth read.
+    pub torso_depth_template: Option<TorsoDepthTemplateDto>,
 }
 ```
 
