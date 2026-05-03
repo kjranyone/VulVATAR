@@ -1785,3 +1785,241 @@ mod body_yaw_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod clavicle_tests {
+    //! Regression tests for the `Tip::Clavicle` driving path. The
+    //! shoulder humanoid bones (the clavicles) used to be absent from
+    //! `DRIVEN_BONES` entirely, so a shrug never reached the avatar.
+    //! These tests pin the contract: a raised source-side shoulder
+    //! produces a non-identity rotation on that side's clavicle bone,
+    //! and the rotation tilts the bone toward the raised direction.
+    use super::*;
+    use crate::asset::{NodeId, SkeletonAsset, SkeletonNode, Transform};
+    use crate::tracking::source_skeleton::SourceJoint;
+    use std::collections::HashMap;
+
+    /// Build a tiny but topologically real upper-body rig:
+    ///   Hips -> Spine -> {LeftShoulder -> LeftUpperArm -> LeftLowerArm,
+    ///                     RightShoulder -> RightUpperArm -> RightLowerArm}
+    /// Rest pose keeps shoulder line and clavicles flat along ±X so
+    /// `rest_dir` for each clavicle equals the rest source-side
+    /// direction (= ±X). That alignment lets us assert clean identity
+    /// rotations on rest-pose inputs without a "rig vs source rest
+    /// pose mismatch" baseline angle leaking in.
+    fn build_upper_body_rig() -> (SkeletonAsset, HumanoidMap) {
+        let bones: &[(HumanoidBone, Option<HumanoidBone>, [f32; 3])] = &[
+            (HumanoidBone::Hips, None, [0.0, 0.9, 0.0]),
+            (HumanoidBone::Spine, Some(HumanoidBone::Hips), [0.0, 0.5, 0.0]),
+            (
+                HumanoidBone::LeftShoulder,
+                Some(HumanoidBone::Spine),
+                [0.05, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::LeftUpperArm,
+                Some(HumanoidBone::LeftShoulder),
+                [0.16, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::LeftLowerArm,
+                Some(HumanoidBone::LeftUpperArm),
+                [0.29, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::RightShoulder,
+                Some(HumanoidBone::Spine),
+                [-0.05, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::RightUpperArm,
+                Some(HumanoidBone::RightShoulder),
+                [-0.16, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::RightLowerArm,
+                Some(HumanoidBone::RightUpperArm),
+                [-0.29, 0.0, 0.0],
+            ),
+        ];
+
+        let bone_to_idx: HashMap<HumanoidBone, usize> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, (b, _, _))| (*b, i))
+            .collect();
+
+        let mut nodes: Vec<SkeletonNode> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, (bone, _parent, translation))| SkeletonNode {
+                id: NodeId(i as u64),
+                name: format!("{bone:?}"),
+                parent: None,
+                children: Vec::new(),
+                rest_local: Transform {
+                    translation: *translation,
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: Some(*bone),
+            })
+            .collect();
+
+        for (i, (_, parent, _)) in bones.iter().enumerate() {
+            if let Some(parent_bone) = parent {
+                let parent_idx = bone_to_idx[parent_bone];
+                nodes[i].parent = Some(NodeId(parent_idx as u64));
+                nodes[parent_idx].children.push(NodeId(i as u64));
+            }
+        }
+
+        let skeleton = SkeletonAsset {
+            nodes,
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: Vec::new(),
+        };
+        let humanoid = HumanoidMap {
+            bone_map: bone_to_idx
+                .iter()
+                .map(|(b, i)| (*b, NodeId(*i as u64)))
+                .collect(),
+        };
+        (skeleton, humanoid)
+    }
+
+    /// Initial local_transforms = clone of rest_local, matching the
+    /// post-`build_base_pose` precondition the solver expects.
+    fn rest_local_transforms(skeleton: &SkeletonAsset) -> Vec<Transform> {
+        skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect()
+    }
+
+    fn put(sk: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3]) {
+        sk.joints.insert(
+            bone,
+            SourceJoint {
+                position: pos,
+                confidence: 1.0,
+            },
+        );
+    }
+
+    fn quat_is_identity(q: &Quat) -> bool {
+        q[0].abs() < 1e-4 && q[1].abs() < 1e-4 && q[2].abs() < 1e-4 && (q[3].abs() - 1.0).abs() < 1e-4
+    }
+
+    fn solve_with(source: &SourceSkeleton) -> (Vec<Transform>, HumanoidMap, SkeletonAsset) {
+        let (skeleton, humanoid) = build_upper_body_rig();
+        let mut local = rest_local_transforms(&skeleton);
+        let params = SolverParams {
+            // Snap directly — no smoothing — so the assertion measures
+            // the solver's output, not blend lag.
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.05,
+            ..Default::default()
+        };
+        let mut state = PoseSolverState::new();
+        solve_avatar_pose(source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
+        (local, humanoid, skeleton)
+    }
+
+    /// Symmetric "rest" shoulders → clavicles must end at identity (or
+    /// near-identity given quaternion arithmetic). This is the
+    /// regression baseline: if the new path were buggy and emitted a
+    /// rotation even for a rest pose, downstream rendering would
+    /// twitch on every neutral frame.
+    #[test]
+    fn rest_shoulders_leave_clavicles_at_identity() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.40, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.40, 0.0]);
+
+        let (local, humanoid, _skel) = solve_with(&sk);
+
+        let l_idx = humanoid.bone_map[&HumanoidBone::LeftShoulder].0 as usize;
+        let r_idx = humanoid.bone_map[&HumanoidBone::RightShoulder].0 as usize;
+        assert!(
+            quat_is_identity(&local[l_idx].rotation),
+            "rest pose: left clavicle should stay near identity, got {:?}",
+            local[l_idx].rotation
+        );
+        assert!(
+            quat_is_identity(&local[r_idx].rotation),
+            "rest pose: right clavicle should stay near identity, got {:?}",
+            local[r_idx].rotation
+        );
+    }
+
+    /// Left shoulder raised 10 cm above the right (one-sided shrug):
+    /// the left clavicle bone must rotate to tilt toward +Y. Before
+    /// the `Tip::Clavicle` wiring this rotation was identity for any
+    /// input — the bone wasn't in `DRIVEN_BONES`, so the avatar's
+    /// shoulder line stayed flat regardless of what the tracker saw.
+    #[test]
+    fn left_shrug_lifts_left_clavicle_toward_plus_y() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.50, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.40, 0.0]);
+
+        let (local, humanoid, _skel) = solve_with(&sk);
+        let l_idx = humanoid.bone_map[&HumanoidBone::LeftShoulder].0 as usize;
+        let r_idx = humanoid.bone_map[&HumanoidBone::RightShoulder].0 as usize;
+
+        assert!(
+            !quat_is_identity(&local[l_idx].rotation),
+            "shrug should produce a non-identity left-clavicle rotation, got {:?}",
+            local[l_idx].rotation
+        );
+
+        // Apply the local rotation to the clavicle's rest direction
+        // (= +X in this rig). The result must move *upward* in Y —
+        // that's what makes the shoulder visibly rise on the avatar.
+        let rest_dir = [1.0, 0.0, 0.0];
+        let rotated = quat_rotate_vec3(&local[l_idx].rotation, &rest_dir);
+        assert!(
+            rotated[1] > 0.05,
+            "left shrug should tilt left clavicle upward in Y; rotated={:?}",
+            rotated
+        );
+
+        // The opposite side's clavicle moves the *other* way, because
+        // the midpoint also lifts when only the left rises — this
+        // matches what the tracker observes and what we want the
+        // avatar to mimic.
+        let r_rest_dir = [-1.0, 0.0, 0.0];
+        let r_rotated = quat_rotate_vec3(&local[r_idx].rotation, &r_rest_dir);
+        assert!(
+            r_rotated[1] < -0.01,
+            "left-only shrug should tilt right clavicle slightly down; rotated={:?}",
+            r_rotated
+        );
+    }
+
+    /// Bilateral shrug: both shoulders rise the same amount → midpoint
+    /// rises too, so neither clavicle's direction relative to the
+    /// midpoint changes. The clavicle bones therefore stay at
+    /// identity. This is the "user shrugged both shoulders" case —
+    /// in practice the avatar's overall body height (Hips translation)
+    /// is what reflects this, not the clavicles.
+    #[test]
+    fn bilateral_shrug_leaves_clavicles_near_identity() {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.50, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.50, 0.0]);
+
+        let (local, humanoid, _skel) = solve_with(&sk);
+        let l_idx = humanoid.bone_map[&HumanoidBone::LeftShoulder].0 as usize;
+        let r_idx = humanoid.bone_map[&HumanoidBone::RightShoulder].0 as usize;
+
+        assert!(
+            quat_is_identity(&local[l_idx].rotation),
+            "bilateral shrug: left clavicle should stay near identity, got {:?}",
+            local[l_idx].rotation
+        );
+        assert!(
+            quat_is_identity(&local[r_idx].rotation),
+            "bilateral shrug: right clavicle should stay near identity, got {:?}",
+            local[r_idx].rotation
+        );
+    }
+}
