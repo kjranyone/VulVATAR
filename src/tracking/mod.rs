@@ -56,9 +56,18 @@ pub struct TrackingFrame {
     pub face_confidence: f32,
 }
 
-/// Smoothing/threshold params that the GUI exposes as sliders. Consumed by
+/// Smoothing / threshold params consumed by
 /// [`crate::avatar::pose_solver::solve_avatar_pose`] via
 /// [`SolverParams`](crate::avatar::pose_solver::SolverParams).
+///
+/// **Not user-tunable.** The GUI always constructs a `Default::default()`
+/// — the upstream 1€ filter and structural keypoint floors already cover
+/// the cases sliders here would address, so adding controls would invite
+/// users to "tune" away tracking that's already correctly behaved. The
+/// doc-comment used to claim the GUI exposed sliders for these; that was
+/// aspirational and never landed. If a future workflow genuinely needs
+/// per-user tuning (per-camera setups vary in confidence noise floors,
+/// for example), wire it through `tracking_smoothing` on `Application`.
 #[derive(Clone, Debug)]
 pub struct TrackingSmoothingParams {
     /// Per-frame blend factor toward the new rotation. Maps directly to
