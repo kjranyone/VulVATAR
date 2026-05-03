@@ -1112,7 +1112,19 @@ fn load_or_backup<T: serde::de::DeserializeOwned>(primary: &std::path::Path) -> 
 
 pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     if path.exists() {
-        let _ = std::fs::copy(path, backup_path_for(path));
+        // Backup-copy is best-effort: if it fails (read-only target dir,
+        // disk full, AV-quarantined source), proceed with the write
+        // anyway — refusing to write because the backup couldn't be
+        // taken would itself be a bigger UX failure. But log the
+        // failure so a user diagnosing "where did my backup go?" can
+        // trace it instead of finding a missing .bak silently.
+        if let Err(e) = std::fs::copy(path, backup_path_for(path)) {
+            warn!(
+                "atomic_write: backup of {} failed (continuing without backup): {}",
+                path.display(),
+                e
+            );
+        }
     }
 
     let parent = path.parent().unwrap_or(Path::new("."));
