@@ -227,6 +227,18 @@ impl Application {
             {
                 self.active_avatar_index = self.avatars.len() - 1;
             }
+            self.evict_render_caches();
+        }
+    }
+
+    /// Tell the render thread to drop its texture and mesh caches.
+    /// Call after replacing or removing an avatar so the previous
+    /// avatar's GPU resources don't stay pinned in VRAM until process
+    /// exit. The next render re-uploads the active avatar's data on
+    /// demand — single-frame hitch in exchange for bounded VRAM use.
+    pub fn evict_render_caches(&self) {
+        if let Some(rt) = self.render_thread.as_ref() {
+            rt.submit(crate::app::render_thread::RenderCommand::EvictCaches);
         }
     }
 
@@ -380,6 +392,7 @@ impl Application {
         if self.active_avatar_index < self.avatars.len() {
             self.avatars[self.active_avatar_index] = new_instance;
         }
+        self.evict_render_caches();
     }
 
     // ---------------------------------------------------------------------

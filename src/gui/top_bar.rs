@@ -39,6 +39,16 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
 /// UI-thread post-load work: build an `AvatarInstance`, attach it to physics,
 /// register it in the library, and update recent-avatar history.
 pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAsset>) {
+    // If we're replacing an avatar that's already loaded at the same
+    // library slot, the previous asset's GPU textures + meshes are
+    // about to become unreferenced. The renderer caches them by URI
+    // / MeshId and never evicts on its own, so without this nudge
+    // they stay pinned in VRAM until process exit. `add_avatar`
+    // below grows the avatar list rather than replacing in place,
+    // but the active-avatar pointer moves — visual effect is the
+    // same: the prior caches are stale.
+    let had_existing_avatar = state.app.active_avatar().is_some();
+
     let instance_id = crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
     state.app.next_avatar_instance_id += 1;
     state.app.physics.attach_avatar(&asset);
@@ -65,6 +75,9 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
 
     let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
     state.app.add_avatar(instance);
+    if had_existing_avatar {
+        state.app.evict_render_caches();
+    }
     state.add_recent_avatar(path.to_path_buf());
     info!("avatar loaded: {}", path.display());
     state.push_notification(t!("top_bar.loaded_avatar", path = path.display().to_string()));
