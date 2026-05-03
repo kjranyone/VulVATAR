@@ -366,11 +366,6 @@ pub struct RenderingGuiState {
     pub main_light_dir: [f32; 3],
     pub main_light_intensity: f32,
     pub ambient_intensity: [f32; 3],
-    pub toon_ramp_threshold: f32,
-    pub shadow_softness: f32,
-    pub outline_enabled: bool,
-    pub outline_width: f32,
-    pub outline_color: [f32; 3],
     pub alpha_preview: bool,
     pub toggle_spring: bool,
     pub toggle_cloth: bool,
@@ -683,11 +678,6 @@ impl GuiApp {
                 main_light_dir: [0.5, -1.0, 0.3],
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
-                toon_ramp_threshold: 0.5,
-                shadow_softness: 0.1,
-                outline_enabled: true,
-                outline_width: 0.01,
-                outline_color: [0.0, 0.0, 0.0],
                 alpha_preview: false,
                 toggle_spring: true,
                 toggle_cloth: false,
@@ -942,11 +932,6 @@ impl GuiApp {
                 main_light_dir: [0.5, -1.0, 0.3],
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
-                toon_ramp_threshold: 0.5,
-                shadow_softness: 0.1,
-                outline_enabled: true,
-                outline_width: 0.01,
-                outline_color: [0.0, 0.0, 0.0],
                 alpha_preview: false,
                 toggle_spring: true,
                 toggle_cloth: false,
@@ -1162,11 +1147,6 @@ impl GuiApp {
             pose_calibration: None,
 
             material_mode_index: self.rendering.material_mode_index,
-            toon_ramp_threshold: self.rendering.toon_ramp_threshold,
-            shadow_softness: self.rendering.shadow_softness,
-            outline_enabled: self.rendering.outline_enabled,
-            outline_width: self.rendering.outline_width,
-            outline_color: self.rendering.outline_color,
             light_direction: self.rendering.main_light_dir,
             light_intensity: self.rendering.main_light_intensity,
             ambient: self.rendering.ambient_intensity,
@@ -1233,9 +1213,6 @@ impl GuiApp {
         self.rendering.main_light_intensity = profile.light_intensity;
         self.rendering.ambient_intensity = profile.ambient;
         self.rendering.camera_fov = profile.camera_fov;
-        self.rendering.outline_enabled = profile.outline_enabled;
-        self.rendering.outline_width = profile.outline_width;
-        self.rendering.outline_color = profile.outline_color;
         self.output.output_resolution_index = profile.output_resolution_index;
         self.output.output_framerate_index = profile.output_framerate_index;
         // Pose calibration follows the profile — switching to "Office
@@ -1412,11 +1389,6 @@ impl GuiApp {
             .set_calibration(active_calibration);
 
         self.rendering.material_mode_index = state.material_mode_index;
-        self.rendering.toon_ramp_threshold = state.toon_ramp_threshold;
-        self.rendering.shadow_softness = state.shadow_softness;
-        self.rendering.outline_enabled = state.outline_enabled;
-        self.rendering.outline_width = state.outline_width;
-        self.rendering.outline_color = state.outline_color;
         self.rendering.main_light_dir = state.light_direction;
         self.rendering.main_light_intensity = state.light_intensity;
         self.rendering.ambient_intensity = state.ambient;

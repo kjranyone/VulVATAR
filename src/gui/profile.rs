@@ -11,9 +11,6 @@ pub struct StreamProfile {
     pub light_intensity: f32,
     pub ambient: [f32; 3],
     pub camera_fov: f32,
-    pub outline_enabled: bool,
-    pub outline_width: f32,
-    pub outline_color: [f32; 3],
     pub output_sink_index: usize,
     pub output_resolution_index: usize,
     pub output_framerate_index: usize,
@@ -37,9 +34,6 @@ impl StreamProfile {
             light_intensity: 1.0,
             ambient: [0.2, 0.2, 0.2],
             camera_fov: 45.0,
-            outline_enabled: true,
-            outline_width: 0.5,
-            outline_color: [0.0, 0.0, 0.0],
             output_sink_index: 0,
             output_resolution_index: 0,
             output_framerate_index: 0,
@@ -57,9 +51,6 @@ impl StreamProfile {
             light_intensity: 1.2,
             ambient: [0.3, 0.3, 0.3],
             camera_fov: 40.0,
-            outline_enabled: false,
-            outline_width: 0.0,
-            outline_color: [0.0, 0.0, 0.0],
             output_sink_index: 3,
             output_resolution_index: 1,
             output_framerate_index: 1,
@@ -77,9 +68,6 @@ impl StreamProfile {
             light_intensity: 0.8,
             ambient: [0.4, 0.4, 0.4],
             camera_fov: 50.0,
-            outline_enabled: false,
-            outline_width: 0.0,
-            outline_color: [0.0, 0.0, 0.0],
             output_sink_index: 0,
             output_resolution_index: 0,
             output_framerate_index: 0,
@@ -215,9 +203,6 @@ mod profile_roundtrip_tests {
             light_intensity: 1.5,
             ambient: [0.0625, 0.125, 0.1875],
             camera_fov: 47.5,
-            outline_enabled: true,
-            outline_width: 0.0625,
-            outline_color: [0.75, 0.25, 0.5],
             output_sink_index: 2,
             output_resolution_index: 4,
             output_framerate_index: 5,
@@ -284,9 +269,6 @@ mod profile_roundtrip_tests {
         approx_eq(r.light_intensity, o.light_intensity, "light_intensity");
         approx_eq_arr3(r.ambient, o.ambient, "ambient");
         approx_eq(r.camera_fov, o.camera_fov, "camera_fov");
-        assert_eq!(r.outline_enabled, o.outline_enabled);
-        approx_eq(r.outline_width, o.outline_width, "outline_width");
-        approx_eq_arr3(r.outline_color, o.outline_color, "outline_color");
         assert_eq!(r.output_sink_index, o.output_sink_index);
         assert_eq!(r.output_resolution_index, o.output_resolution_index);
         assert_eq!(r.output_framerate_index, o.output_framerate_index);

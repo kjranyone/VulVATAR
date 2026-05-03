@@ -49,11 +49,6 @@ pub struct ProjectState {
 
     // Rendering config
     pub material_mode_index: usize,
-    pub toon_ramp_threshold: f32,
-    pub shadow_softness: f32,
-    pub outline_enabled: bool,
-    pub outline_width: f32,
-    pub outline_color: [f32; 3],
     pub light_direction: [f32; 3],
     pub light_intensity: f32,
     pub ambient: [f32; 3],
@@ -313,16 +308,6 @@ pub struct RenderingConfig {
     #[serde(default)]
     pub material_mode_index: usize,
     #[serde(default)]
-    pub toon_ramp_threshold: f32,
-    #[serde(default)]
-    pub shadow_softness: f32,
-    #[serde(default)]
-    pub outline_enabled: bool,
-    #[serde(default)]
-    pub outline_width: f32,
-    #[serde(default)]
-    pub outline_color: [f32; 3],
-    #[serde(default)]
     pub light_direction: [f32; 3],
     #[serde(default)]
     pub light_intensity: f32,
@@ -569,11 +554,6 @@ impl ProjectFile {
             },
             rendering: RenderingConfig {
                 material_mode_index: state.material_mode_index,
-                toon_ramp_threshold: state.toon_ramp_threshold,
-                shadow_softness: state.shadow_softness,
-                outline_enabled: state.outline_enabled,
-                outline_width: state.outline_width,
-                outline_color: state.outline_color,
                 light_direction: state.light_direction,
                 light_intensity: state.light_intensity,
                 ambient: state.ambient,
@@ -641,11 +621,6 @@ impl ProjectFile {
             pose_calibration: self.tracking.pose_calibration.as_ref().and_then(dto_to_pose_calibration),
 
             material_mode_index: self.rendering.material_mode_index,
-            toon_ramp_threshold: self.rendering.toon_ramp_threshold,
-            shadow_softness: self.rendering.shadow_softness,
-            outline_enabled: self.rendering.outline_enabled,
-            outline_width: self.rendering.outline_width,
-            outline_color: self.rendering.outline_color,
             light_direction: self.rendering.light_direction,
             light_intensity: self.rendering.light_intensity,
             ambient: self.rendering.ambient,
@@ -1362,11 +1337,6 @@ pub struct ScenePresetCamera {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ScenePresetRendering {
     pub material_mode_index: usize,
-    pub toon_ramp_threshold: f32,
-    pub shadow_softness: f32,
-    pub outline_enabled: bool,
-    pub outline_width: f32,
-    pub outline_color: [f32; 3],
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

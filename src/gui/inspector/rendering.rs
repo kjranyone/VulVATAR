@@ -31,57 +31,6 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
 
-    egui::CollapsingHeader::new(t!("inspector.toon_controls"))
-        .default_open(true)
-        .show(ui, |ui| {
-            if ui
-                .add_enabled(
-                    state.rendering.material_mode_index == 2,
-                    egui::Slider::new(&mut state.rendering.toon_ramp_threshold, 0.0..=1.0)
-                        .text(t!("inspector.ramp_threshold")),
-                )
-                .changed()
-            {
-                state.project_dirty = true;
-            }
-            if ui
-                .add_enabled(
-                    state.rendering.material_mode_index == 2,
-                    egui::Slider::new(&mut state.rendering.shadow_softness, 0.0..=1.0)
-                        .text(t!("inspector.shadow_softness")),
-                )
-                .changed()
-            {
-                state.project_dirty = true;
-            }
-        });
-
-    egui::CollapsingHeader::new(t!("inspector.outline_controls"))
-        .default_open(false)
-        .show(ui, |ui| {
-            if ui
-                .checkbox(&mut state.rendering.outline_enabled, t!("inspector.enable_outline"))
-                .changed()
-            {
-                state.project_dirty = true;
-            }
-            if ui
-                .add_enabled(
-                    state.rendering.outline_enabled,
-                    egui::Slider::new(&mut state.rendering.outline_width, 0.0..=0.1).text(t!("inspector.width")),
-                )
-                .changed()
-            {
-                state.project_dirty = true;
-            }
-            ui.add_enabled_ui(state.rendering.outline_enabled, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(t!("inspector.color"));
-                    ui.color_edit_button_rgb(&mut state.rendering.outline_color);
-                });
-            });
-        });
-
     egui::CollapsingHeader::new(t!("inspector.lighting"))
         .default_open(true)
         .show(ui, |ui| {
@@ -190,11 +139,6 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                         },
                         rendering: crate::persistence::ScenePresetRendering {
                             material_mode_index: state.rendering.material_mode_index,
-                            toon_ramp_threshold: state.rendering.toon_ramp_threshold,
-                            shadow_softness: state.rendering.shadow_softness,
-                            outline_enabled: state.rendering.outline_enabled,
-                            outline_width: state.rendering.outline_width,
-                            outline_color: state.rendering.outline_color,
                         },
                     };
                     let name = if state.scene_preset_name.is_empty() {
@@ -264,11 +208,6 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.rendering.ambient_intensity = preset.lighting.ambient_intensity;
                     state.rendering.camera_fov = preset.camera.fov;
                     state.rendering.material_mode_index = preset.rendering.material_mode_index;
-                    state.rendering.toon_ramp_threshold = preset.rendering.toon_ramp_threshold;
-                    state.rendering.shadow_softness = preset.rendering.shadow_softness;
-                    state.rendering.outline_enabled = preset.rendering.outline_enabled;
-                    state.rendering.outline_width = preset.rendering.outline_width;
-                    state.rendering.outline_color = preset.rendering.outline_color;
                     state.push_notification(t!("inspector.loaded_preset", name = preset.name));
                     state.project_dirty = true;
                 }
