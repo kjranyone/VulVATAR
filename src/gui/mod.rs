@@ -2263,7 +2263,25 @@ impl eframe::App for GuiApp {
                 });
         }
 
-        ctx.request_repaint();
+        // Repaint gating. The previous unconditional `request_repaint()`
+        // pinned egui to monitor refresh (60–144 Hz) even when nothing
+        // visible was changing — burning CPU + battery when the user
+        // had the app open but idle. Now we only ask for a continuous
+        // repaint when something is actually animating: tracking
+        // (live webcam → avatar pose), lipsync (volume meter), an
+        // avatar load in progress (progress bar), an animation
+        // playing, or a notification toast still in its visible
+        // window. With none of those active, egui falls back to its
+        // event-driven repaint — input still produces a frame, idle
+        // costs nothing.
+        let needs_animation_frame = self.tracking.toggle_tracking
+            || self.app.is_lipsync_enabled()
+            || self.avatar_load_job.is_some()
+            || !self.notifications.is_empty()
+            || !self.paused;
+        if needs_animation_frame {
+            ctx.request_repaint();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
