@@ -1276,12 +1276,15 @@ impl GuiApp {
         }
         if self
             .hotkeys
-            .check(hotkey::HotkeyAction::ToggleTracking, ctx)
+            .check(hotkey::HotkeyAction::ToggleTrackingEnabled, ctx)
         {
             self.tracking.toggle_tracking = !self.tracking.toggle_tracking;
             self.project_dirty = true;
         }
-        if self.hotkeys.check(hotkey::HotkeyAction::ToggleCloth, ctx) {
+        if self
+            .hotkeys
+            .check(hotkey::HotkeyAction::ToggleClothSimulation, ctx)
+        {
             self.rendering.toggle_cloth = !self.rendering.toggle_cloth;
             self.project_dirty = true;
         }
@@ -1301,17 +1304,28 @@ impl GuiApp {
             };
             self.project_dirty = true;
         }
-        if self
-            .hotkeys
-            .check(hotkey::HotkeyAction::SwitchModePreview, ctx)
-        {
-            self.mode = AppMode::Preview;
-        }
-        if self
-            .hotkeys
-            .check(hotkey::HotkeyAction::SwitchModeAuthoring, ctx)
-        {
-            self.mode = AppMode::ClothAuthoring;
+        // Per-mode F-key nav. Listed in the same order as
+        // `AppMode::ALL` so the binding-to-mode mapping reads
+        // straight off the enum without surprises.
+        for (action, mode) in [
+            (hotkey::HotkeyAction::SwitchModeAvatar, AppMode::Avatar),
+            (hotkey::HotkeyAction::SwitchModePreview, AppMode::Preview),
+            (
+                hotkey::HotkeyAction::SwitchModeTracking,
+                AppMode::TrackingSetup,
+            ),
+            (hotkey::HotkeyAction::SwitchModeRendering, AppMode::Rendering),
+            (hotkey::HotkeyAction::SwitchModeOutput, AppMode::Output),
+            (
+                hotkey::HotkeyAction::SwitchModeAuthoring,
+                AppMode::ClothAuthoring,
+            ),
+            (hotkey::HotkeyAction::SwitchModeSettings, AppMode::Settings),
+        ] {
+            if self.hotkeys.check(action, ctx) {
+                self.mode = mode;
+                self.inspector_open = true;
+            }
         }
         if self.hotkeys.check(hotkey::HotkeyAction::SaveProject, ctx) {
             let ps = self.to_project_state();
