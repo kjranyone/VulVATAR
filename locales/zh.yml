@@ -93,8 +93,6 @@ tracking:
   lower_body_tooltip: "When on, the model picker prefers a wholebody CIGPose ONNX so leg keypoints are emitted. Trade-off: wholebody variants are usually smaller-resolution and detect hands less crisply than the same-tier ubody model. Restart tracking to apply."
   root_translation: "Follow Subject Position"
   root_translation_tooltip: "When on, the avatar's hip translates to follow the subject's side-step / lean / crouch. When off, the avatar pivots in place — useful when the rendered framing should stay locked regardless of how the subject drifts in front of the camera."
-  recalibrate: "重新校准"
-  recalibrate_tooltip: "丢弃每根骨骼的透视缩短校准值（观测到的 2D 长度的累积最大值），让求解器重新学习被试者的骨长。点击后请保持 T-pose（手臂水平、掌心朝前）数秒以重新播种 running max，之后帧的 Z 还原（前后方向运动）将基于该校准。"
   confidence: "Confidence"
   confidence_overall: "Overall"
   confidence_face: "Face"

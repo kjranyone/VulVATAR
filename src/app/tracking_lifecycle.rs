@@ -1,5 +1,4 @@
-//! Tracking worker lifecycle: start / stop / status / pose-solver
-//! recalibration.
+//! Tracking worker lifecycle: start / stop / status.
 
 use log::{info, warn};
 
@@ -11,19 +10,6 @@ impl Application {
     #[allow(dead_code)]
     pub fn start_tracking(&mut self, backend: CameraBackend) {
         self.start_tracking_with_params(backend, 640, 480, 30);
-    }
-
-    /// Discard every avatar's per-bone calibration (running max of
-    /// observed 2D length used by the pose solver to recover Z from
-    /// foreshortening). Call when the tracked subject changes — a
-    /// previous large subject's max would otherwise pin Z too high for
-    /// a smaller new subject. After reset, the user should hold a
-    /// T-pose for a moment so the solver can re-learn the bone lengths.
-    pub fn recalibrate_pose_solver(&mut self) {
-        for avatar in self.avatars.iter_mut() {
-            avatar.pose_solver_state.reset();
-        }
-        info!("app: pose-solver calibration reset across {} avatar(s)", self.avatars.len());
     }
 
     /// Like [`Self::start_tracking`] but allows specifying the webcam resolution and fps.
@@ -57,10 +43,13 @@ impl Application {
             }
         }
         // Tracking restart most likely means a different camera /
-        // session / subject — discard the per-bone foreshortening
-        // calibration so the new subject's actual proportions are
-        // learned from scratch.
-        self.recalibrate_pose_solver();
+        // session / subject. Clear every avatar's motion-smoothing
+        // state (1€ filter, hysteresis, root_offset EMA) so the
+        // first frame after restart isn't blended against stale
+        // history from the previous session.
+        for avatar in self.avatars.iter_mut() {
+            avatar.pose_solver_state.reset();
+        }
         let shared_mailbox = self.tracking.shared_mailbox();
         let mut worker = TrackingWorker::new(shared_mailbox);
         worker.start_with_params_full(backend, width, height, fps, prefer_lower_body);

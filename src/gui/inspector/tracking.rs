@@ -266,18 +266,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                if outlined_button(
-                    ui,
-                    Some(ic::REFRESH),
-                    &t!("tracking.recalibrate"),
-                    color::PRIMARY,
-                    true,
-                )
-                .on_hover_text(t!("tracking.recalibrate_tooltip"))
-                .clicked()
-                {
-                    state.app.recalibrate_pose_solver();
-                }
                 // Pose calibration entry — opens the fullscreen modal
                 // directly. Mode selection (Full Body / Upper Body)
                 // happens *inside* the modal via a Segmented Buttons

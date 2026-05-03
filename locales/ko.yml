@@ -93,8 +93,6 @@ tracking:
   lower_body_tooltip: "When on, the model picker prefers a wholebody CIGPose ONNX so leg keypoints are emitted. Trade-off: wholebody variants are usually smaller-resolution and detect hands less crisply than the same-tier ubody model. Restart tracking to apply."
   root_translation: "Follow Subject Position"
   root_translation_tooltip: "When on, the avatar's hip translates to follow the subject's side-step / lean / crouch. When off, the avatar pivots in place — useful when the rendered framing should stay locked regardless of how the subject drifts in front of the camera."
-  recalibrate: "재보정"
-  recalibrate_tooltip: "본별 단축 보정값(관측된 2D 길이의 누적 최대값)을 폐기하여 솔버가 피사체의 본 길이를 다시 학습하도록 합니다. 클릭 후 T-포즈(팔 수평, 손바닥은 정면)를 잠시 유지하면 running max가 재시드되어 이후 프레임의 Z 복원(전후 방향 움직임)에 사용됩니다."
   confidence: "Confidence"
   confidence_overall: "Overall"
   confidence_face: "Face"
