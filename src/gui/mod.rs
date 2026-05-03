@@ -467,7 +467,6 @@ pub struct GuiApp {
     // Hotkeys & profiles
     pub hotkeys: hotkey::HotkeyMap,
     pub profiles: profile::ProfileLibrary,
-    pub wind_presets: profile::WindPresetLibrary,
     /// Set whenever the in-memory `profiles` library diverges from
     /// what's currently on disk (`%APPDATA%\VulVATAR\profiles.json`).
     /// Triggered by `Calibrate Pose ▼` writing into the active
@@ -650,7 +649,6 @@ impl GuiApp {
             // (load_profiles already logs and returns None then).
             profiles: crate::persistence::load_profiles()
                 .unwrap_or_else(profile::ProfileLibrary::new),
-            wind_presets: profile::WindPresetLibrary::new(),
             profiles_dirty: false,
 
             notifications: Vec::new(),
@@ -910,7 +908,6 @@ impl GuiApp {
 
             hotkeys: hotkey::HotkeyMap::new(),
             profiles: profile::ProfileLibrary::new(),
-            wind_presets: profile::WindPresetLibrary::new(),
             profiles_dirty: false,
 
             notifications: Vec::new(),
