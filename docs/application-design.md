@@ -451,6 +451,26 @@ Cloth authoring should not block first-run success.
 
 These should appear in visible diagnostics, not only in logs.
 
+## Hotkeys
+
+Default bindings live in `src/gui/hotkey.rs::HotkeyMap::set_defaults`
+— that's the source of truth. Tooltips on the relevant buttons surface
+the chord (`mode_nav.rs`, `top_bar.rs`, `inspector/library.rs`).
+
+| Chord       | Action                        |
+|-------------|-------------------------------|
+| `Space`     | Toggle pause                  |
+| `Ctrl+T`    | Toggle tracking enabled       |
+| `Ctrl+C`    | Toggle cloth simulation       |
+| `Ctrl+Shift+R` | Reset pose                 |
+| `Home`      | Reset camera                  |
+| `Ctrl+S`    | Save project                  |
+| `Ctrl+O`    | Load avatar                   |
+| `F1`–`F7`   | Switch to mode 1..7 in `AppMode::ALL` order (Avatar / Tracking / Rendering / Output / Preview / Authoring / Settings) |
+
+Hotkeys are suppressed while a text input owns keyboard focus —
+typing "Save the day" in a rename field doesn't trigger save.
+
 ## Future Extensions
 
 Later versions can add:
@@ -458,6 +478,6 @@ Later versions can add:
 - multiple avatars
 - scene presets
 - expression control panels
-- hotkey support
+- user-rebindable hotkeys (defaults exist; rebinding UI does not)
 - preset export and import
 - profile switching for different streaming setups
