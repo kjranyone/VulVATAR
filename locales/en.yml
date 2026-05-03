@@ -64,7 +64,9 @@ top_bar:
   switched_profile: "Switched to profile: %{name}"
 
 calibration:
-  button: "Calibrate Pose ▼"
+  button: "Calibrate Pose"
+  retry: "Retry"
+  mode_label: "Pose mode:"
   title: "Pose Calibration"
   mode_full_body: "Full Body"
   mode_upper_body: "Upper Body Only"

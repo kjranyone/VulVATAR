@@ -64,7 +64,9 @@ top_bar:
   switched_profile: "プロファイルを切り替えました: %{name}"
 
 calibration:
-  button: "ポーズキャリブ ▼"
+  button: "ポーズキャリブレーション"
+  retry: "やり直し"
+  mode_label: "ポーズモード:"
   title: "ポーズキャリブレーション"
   mode_full_body: "全身"
   mode_upper_body: "上半身のみ"

@@ -341,6 +341,19 @@ impl TrackingMailbox {
         inner.torso_template_seq += 1;
     }
 
+    /// GUI-side peek: read the current torso-template publish seq
+    /// without consuming the template. Used by the modal's `retry`
+    /// path to fast-forward its `last_seen_seq` past any in-flight
+    /// publish from the *previous* capture window — without this
+    /// fast-forward, a publish that lands during the new HoldStill
+    /// (1–2 frames after the user clicked Retry) would be picked up
+    /// as if it belonged to the new capture and silently overwrite
+    /// the wrong calibration.
+    pub fn torso_template_seq(&self) -> u64 {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.torso_template_seq
+    }
+
     /// GUI-side consume: take the most recently published torso
     /// template if the worker published a new one since
     /// `last_seen_seq`. Returns `Some((template, seq))` exactly once

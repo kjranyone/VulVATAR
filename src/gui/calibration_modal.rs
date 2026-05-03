@@ -207,6 +207,39 @@ impl CalibrationModalState {
         };
     }
 
+    /// Update the calibration mode while the modal is in `HoldStill`
+    /// (= before any sample window has started). No-op in any other
+    /// state — the segmented buttons UI disables the click target
+    /// from `Collecting` onward, but this guard makes the contract
+    /// explicit and protects against a future caller that doesn't
+    /// know about the disabled-UI convention.
+    ///
+    /// Side effects on a successful switch:
+    /// - Resets `started_at` so the hold-still countdown restarts —
+    ///   gives the user a beat to reset their pose to match the new
+    ///   mode (e.g. dropping arms from T-pose down to "hands at sides"
+    ///   when switching FullBody → UpperBody).
+    /// - Clears `last_anchor_seen` / `last_confidence`. These are
+    ///   anchor-specific (hip pair vs shoulder pair) and would
+    ///   otherwise display stale "anchor visible ✓" reflecting the
+    ///   *previous* mode's anchor for one frame. Resetting forces the
+    ///   indicator to ✗ until the next mailbox snapshot confirms the
+    ///   new anchor type is in frame — that flicker is the visual
+    ///   "your mode switch was registered" feedback.
+    pub fn set_mode(&mut self, new_mode: CalibrationMode) {
+        if let CalibrationModalState::HoldStill {
+            mode,
+            started_at,
+            last_anchor_seen,
+            last_confidence,
+        } = self
+        {
+            *mode = new_mode;
+            *started_at = Instant::now();
+            *last_anchor_seen = false;
+            *last_confidence = 0.0;
+        }
+    }
 
     pub fn close(&mut self) {
         *self = CalibrationModalState::Closed;
@@ -265,21 +298,19 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
         });
 }
 
+/// Modal window title. Stable across mode switches — the active mode
+/// is conveyed by the Segmented Buttons control inside the status pane,
+/// so duplicating it in the window header would just produce the
+/// "every label says the same thing" Material Design anti-pattern.
+///
+/// Stable also keeps egui happy: the `Window::new(title)` value is
+/// hashed into the window's id-source, so a title that mutates between
+/// frames (e.g. on a mid-modal mode swap) would reset window state.
 fn modal_title(state: &CalibrationModalState) -> String {
-    let mode = match state {
-        CalibrationModalState::HoldStill { mode, .. }
-        | CalibrationModalState::Collecting { mode, .. }
-        | CalibrationModalState::AnchorDone { mode, .. }
-        | CalibrationModalState::RangeHoldStill { mode, .. }
-        | CalibrationModalState::RangeCollecting { mode, .. }
-        | CalibrationModalState::Done { mode, .. } => *mode,
-        CalibrationModalState::Closed => return String::new(),
-    };
-    let mode_label = match mode {
-        CalibrationMode::FullBody => t!("calibration.mode_full_body"),
-        CalibrationMode::UpperBody => t!("calibration.mode_upper_body"),
-    };
-    format!("{} — {}", t!("calibration.title"), mode_label)
+    if matches!(state, CalibrationModalState::Closed) {
+        return String::new();
+    }
+    t!("calibration.title").to_string()
 }
 
 /// Webcam preview pane (left side of the modal). Reuses the same
@@ -407,11 +438,55 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     refresh_anchor_telemetry(state, &snap);
 }
 
-/// Status pane (right side of the modal): instructions, countdown bar,
-/// confidence indicator, frame counter, action buttons.
+/// Status pane (right side of the modal): mode segmented buttons,
+/// instructions, countdown bar, confidence indicator, frame counter,
+/// action buttons.
 fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.vertical(|ui| {
         ui.set_min_width(220.0);
+
+        // Mode segmented buttons. Editable while still in HoldStill
+        // (= before any sample window has started); becomes a static
+        // display from Collecting onward so a mid-capture mode swap
+        // can't invalidate already-collected samples. Material's
+        // M3 spec uses Segmented Buttons for "mutually exclusive
+        // option pick" of small (2–5) sets — exactly this case.
+        if let Some(current_mode) = relevant_mode(&state.calibration_modal) {
+            let editable = matches!(
+                state.calibration_modal,
+                CalibrationModalState::HoldStill { .. }
+            );
+            ui.label(
+                egui::RichText::new(t!("calibration.mode_label"))
+                    .size(12.0),
+            );
+            ui.add_space(4.0);
+            ui.add_enabled_ui(editable, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            current_mode == CalibrationMode::FullBody,
+                            t!("calibration.mode_full_body"),
+                        )
+                        .clicked()
+                        && editable
+                    {
+                        state.calibration_modal.set_mode(CalibrationMode::FullBody);
+                    }
+                    if ui
+                        .selectable_label(
+                            current_mode == CalibrationMode::UpperBody,
+                            t!("calibration.mode_upper_body"),
+                        )
+                        .clicked()
+                        && editable
+                    {
+                        state.calibration_modal.set_mode(CalibrationMode::UpperBody);
+                    }
+                });
+            });
+            ui.add_space(12.0);
+        }
 
         // Step indicator + instructions.
         let (step_label, instructions) = step_text(&state.calibration_modal);
@@ -484,6 +559,9 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             match state.calibration_modal {
                 CalibrationModalState::AnchorDone { .. } => {
+                    if ui.button(t!("calibration.retry")).clicked() {
+                        retry_capture(state);
+                    }
                     if ui.button(t!("calibration.skip_and_finish")).clicked() {
                         skip_range(state);
                     }
@@ -503,6 +581,39 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
     });
+}
+
+/// User chose `Retry` from the AnchorDone prompt: discard the
+/// in-flight modal state and re-enter HoldStill at the same mode so
+/// they can capture again without leaving the modal and re-clicking
+/// the inspector button.
+///
+/// The previously persisted anchor calibration on
+/// `Application::tracking_calibration.pose` (and the active profile)
+/// is *not* reverted — completing the retry will overwrite it via the
+/// next `persist_calibration` call. If the user instead Cancels after
+/// hitting Retry, the previous record remains in place. This matches
+/// "I want to redo this" intent: clicking Retry doesn't itself destroy
+/// data; only landing a fresh capture does.
+///
+/// Also flips the worker's torso-capture toggle off and bumps the
+/// already-consumed template seq, so any template the worker was
+/// about to publish from the previous capture window doesn't leak
+/// into the new attempt's `poll_torso_template`.
+fn retry_capture(state: &mut GuiApp) {
+    let mode = match &state.calibration_modal {
+        CalibrationModalState::AnchorDone { mode, .. } => Some(*mode),
+        _ => None,
+    };
+    if let Some(mode) = mode {
+        state.app.tracking.mailbox().set_torso_capture(false);
+        state.calibration_torso_template_seq = state
+            .app
+            .tracking
+            .mailbox()
+            .torso_template_seq();
+        state.calibration_modal.open(mode);
+    }
 }
 
 /// User chose `Skip & Finish` from the AnchorDone prompt: jump

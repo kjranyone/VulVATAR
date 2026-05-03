@@ -278,25 +278,37 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 {
                     state.app.recalibrate_pose_solver();
                 }
-                // Pose calibration menu (Phase B). Opens a fullscreen
-                // modal in either Full Body or Upper Body mode; the
-                // depth pipeline / solver consume the captured anchor
-                // values from `Application::tracking_calibration.pose`
-                // once Phase D lands.
-                ui.menu_button(t!("calibration.button"), |ui| {
-                    if ui.button(t!("calibration.mode_full_body")).clicked() {
-                        state
-                            .calibration_modal
-                            .open(crate::tracking::CalibrationMode::FullBody);
-                        ui.close_menu();
-                    }
-                    if ui.button(t!("calibration.mode_upper_body")).clicked() {
-                        state
-                            .calibration_modal
-                            .open(crate::tracking::CalibrationMode::UpperBody);
-                        ui.close_menu();
-                    }
-                });
+                // Pose calibration entry — opens the fullscreen modal
+                // directly. Mode selection (Full Body / Upper Body)
+                // happens *inside* the modal via a Segmented Buttons
+                // control, which fits Material Design better than a
+                // menu_button → modal-launch chain (M3 considers the
+                // latter an anti-pattern: too much depth, indirect
+                // entry point, mode-without-context-of-modal).
+                //
+                // Default-open in FullBody mode; the user flips the
+                // segment if they only have an upper-body crop. The
+                // segment is editable up until Capture begins
+                // (`Collecting` state); the modal disables the
+                // toggle once a sample window has started.
+                if filled_button(ui, None, &t!("calibration.button"), true).clicked() {
+                    // Reopen at the mode the active profile was last
+                    // calibrated with, falling back to FullBody for a
+                    // first-time capture (or after a profile that
+                    // never completed calibration). The Segmented
+                    // Buttons inside the modal still let the user
+                    // override before HoldStill expires — this just
+                    // saves the round-trip for the common case where
+                    // they're recalibrating in the same configuration.
+                    let default_mode = state
+                        .app
+                        .tracking_calibration
+                        .pose
+                        .as_ref()
+                        .map(|c| c.mode)
+                        .unwrap_or(crate::tracking::CalibrationMode::FullBody);
+                    state.calibration_modal.open(default_mode);
+                }
             });
             draw_calibration_status(ui, state);
             if let Some(tracking) = &state.app.last_tracking_pose {
