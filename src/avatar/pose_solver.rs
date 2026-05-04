@@ -1018,6 +1018,7 @@ pub fn solve_avatar_pose(
 
         let new_local_rot = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
+
         let prev_local_rot = local_transforms[node_idx].rotation;
         local_transforms[node_idx].rotation = quat_slerp_short(
             &prev_local_rot,
@@ -2028,12 +2029,42 @@ fn solve_wrist_orientation(
     let blend = dt_aware_blend(params.rotation_blend, dt);
 
     let lower_arm_idx = skeleton.nodes[wrist_idx].parent.map(|NodeId(p)| p as usize);
+    // Forearm twist axis in WORLD space, derived from the LowerArm's
+    // *current* world rotation rather than `current_world.position`.
+    // The latter never gets re-FK'd after the per-bone direction-match
+    // pass updates rotations — it still holds rest-pose positions, so
+    // for any pose where the forearm rotated significantly off T-pose
+    // (hands-on-hips, hands-behind-head, "I dunno" shrug) the wrist
+    // position reads the REST world location and the resulting axis
+    // points along the rest-pose forearm (≈ ±X) instead of the
+    // current bone axis. Pre-multiplying `delta_world` by a "twist"
+    // that's actually a swing around world X then knocks the
+    // LowerArm out of its just-set direction, dragging the hand
+    // toward the body midline. Compute the axis from
+    // `current_world[la_idx].rotation` (which IS kept up-to-date) and
+    // the bone's rest forearm direction instead.
     let twist_axis = lower_arm_idx.and_then(|la_idx| {
-        let lower_arm_pos = current_world[la_idx].position;
-        let wrist_pos = current_world[wrist_idx].position;
-        let raw = vec3_sub(&wrist_pos, &lower_arm_pos);
-        let normalized = vec3_normalize(&raw);
-        if normalized == [0.0; 3] { None } else { Some(normalized) }
+        let rest_la_pos = rest_world[la_idx].position;
+        // Forearm rest direction in LowerArm's parent-relative space.
+        // Use the wrist child's rest_world position as the tip — same
+        // reference frame the per-bone direction-match used.
+        let rest_wrist_pos = rest_world[wrist_idx].position;
+        let rest_dir_local = vec3_normalize(&vec3_sub(&rest_wrist_pos, &rest_la_pos));
+        if rest_dir_local == [0.0; 3] {
+            return None;
+        }
+        // Apply the LowerArm's current world rotation to the rest
+        // direction to get the *current* world-space forearm axis.
+        // This stays the same when only twist is added, and rotates
+        // with any direction change the LowerArm has undergone.
+        let current_world_dir =
+            quat_rotate_vec3(&current_world[la_idx].rotation, &rest_dir_local);
+        let normalized = vec3_normalize(&current_world_dir);
+        if normalized == [0.0; 3] {
+            None
+        } else {
+            Some(normalized)
+        }
     });
 
     if let (Some(la_idx), Some(axis)) = (lower_arm_idx, twist_axis) {
