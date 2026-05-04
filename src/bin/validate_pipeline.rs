@@ -64,12 +64,20 @@ const OUT_DIR: &str = "diagnostics/validation_pipeline";
 
 /// Bones whose direction vector is meaningful for pose comparison.
 /// Tuples of (bone, base, tip) where the bone's *direction* is the
-/// vector from `base` joint to `tip` joint in source space. Skip
-/// fingers (too noisy), Hips/Chest/Spine (synthesized at origin so
-/// direction is degenerate).
+/// vector from `base` joint to `tip` joint in source space.
+///
+/// Anatomical-alignment caveat: in VRM rigs the `LeftShoulder` bone's
+/// world position is the **inner** clavicle pivot (sternum end), not
+/// the outer shoulder joint. The COCO source skeleton's `LeftShoulder`
+/// keypoint, by contrast, is at the **outer** shoulder joint (where
+/// the deltoid sits). Comparing the two directly compares different
+/// anatomical points and bakes a constant offset into every metric.
+/// To get apples-to-apples positions we use `LeftUpperArm`/
+/// `LeftUpperLeg` whose world position *is* the actual shoulder/hip
+/// joint in both skeletons.
 const BONE_DIRS: &[(&str, HumanoidBone, HumanoidBone)] = &[
-    ("L_upper_arm", HumanoidBone::LeftShoulder, HumanoidBone::LeftLowerArm),
-    ("R_upper_arm", HumanoidBone::RightShoulder, HumanoidBone::RightLowerArm),
+    ("L_upper_arm", HumanoidBone::LeftUpperArm,  HumanoidBone::LeftLowerArm),
+    ("R_upper_arm", HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm),
     ("L_forearm",   HumanoidBone::LeftLowerArm,  HumanoidBone::LeftHand),
     ("R_forearm",   HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
     ("L_thigh",     HumanoidBone::LeftUpperLeg,  HumanoidBone::LeftLowerLeg),
@@ -77,7 +85,7 @@ const BONE_DIRS: &[(&str, HumanoidBone, HumanoidBone)] = &[
     ("L_shin",      HumanoidBone::LeftLowerLeg,  HumanoidBone::LeftFoot),
     ("R_shin",      HumanoidBone::RightLowerLeg, HumanoidBone::RightFoot),
     ("neck",        HumanoidBone::UpperChest,    HumanoidBone::Head),
-    ("shoulder_line", HumanoidBone::RightShoulder, HumanoidBone::LeftShoulder),
+    ("shoulder_line", HumanoidBone::RightUpperArm, HumanoidBone::LeftUpperArm),
     ("hip_line",    HumanoidBone::RightUpperLeg, HumanoidBone::LeftUpperLeg),
 ];
 
