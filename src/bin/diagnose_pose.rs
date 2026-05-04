@@ -185,6 +185,7 @@ fn main() -> Result<(), String> {
 
     eprintln!("rendering posed (solver applied)…");
     let posed_avatar = make_avatar(&asset, Some(&estimate.skeleton), &mut solver_state);
+    dump_arm_world_positions(&posed_avatar, &out_dir.join("arm_world_positions.txt"))?;
     save_avatar_render(
         &mut renderer,
         &posed_avatar,
@@ -521,6 +522,69 @@ fn draw_disk(img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, cx: i32, cy: i32, radius:
 // ---------------------------------------------------------------------------
 // Source-skeleton text dump
 // ---------------------------------------------------------------------------
+
+/// FK-derived world positions of the upper-body chain. Pulls global
+/// transforms (already computed by `make_avatar`) and writes their
+/// translation column for each humanoid bone of interest. Lets us
+/// compare "where the solver/IK said the elbow should be in source
+/// space" against "where the avatar's bone actually ends up after
+/// FK", separating bone-rotation correctness from skinning effects.
+fn dump_arm_world_positions(
+    avatar: &AvatarInstance,
+    out_path: &Path,
+) -> Result<(), String> {
+    use std::fmt::Write;
+    use vulvatar_lib::asset::HumanoidBone;
+    let humanoid = avatar
+        .asset
+        .humanoid
+        .as_ref()
+        .ok_or_else(|| "asset has no HumanoidMap".to_string())?;
+    let bones: &[HumanoidBone] = &[
+        HumanoidBone::Hips,
+        HumanoidBone::Spine,
+        HumanoidBone::Chest,
+        HumanoidBone::UpperChest,
+        HumanoidBone::Neck,
+        HumanoidBone::Head,
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::LeftUpperArm,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftHand,
+        HumanoidBone::RightShoulder,
+        HumanoidBone::RightUpperArm,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightHand,
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::RightUpperLeg,
+    ];
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "World positions (avatar-units; +X = avatar's left, +Y = up, +Z = forward toward camera)",
+    );
+    for bone in bones {
+        let Some(node) = humanoid.bone_map.get(bone).copied() else {
+            let _ = writeln!(s, "  {bone:?}  <missing>");
+            continue;
+        };
+        let idx = node.0 as usize;
+        if idx >= avatar.pose.global_transforms.len() {
+            let _ = writeln!(s, "  {bone:?}  <out of range>");
+            continue;
+        }
+        let g = &avatar.pose.global_transforms[idx];
+        // Translation column of the global matrix.
+        let pos = [g[3][0], g[3][1], g[3][2]];
+        let _ = writeln!(
+            s,
+            "  {bone:?}  pos=({:+.3},{:+.3},{:+.3})",
+            pos[0], pos[1], pos[2]
+        );
+    }
+    std::fs::write(out_path, s)
+        .map_err(|e| format!("write '{}': {e}", out_path.display()))
+}
 
 fn dump_source_skeleton(skeleton: &SourceSkeleton, out_path: &Path) -> Result<(), String> {
     use std::fmt::Write;
