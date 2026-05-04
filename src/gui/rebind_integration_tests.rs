@@ -18,6 +18,7 @@
 //!   (`save_rebound_overlay` writing `last_rebound_with`) is
 //!   covered by a focused IO test below; once tier-2/3 resolution
 //!   lands, replace that with a true E2E Partial test.
+use super::project::save_rebound_overlay;
 use super::*;
 use crate::asset::{
     Aabb, AssetSourceHash, AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, ClothPin,

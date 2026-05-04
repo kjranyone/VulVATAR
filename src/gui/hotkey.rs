@@ -2,6 +2,10 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
+use crate::t;
+
+use super::{AppMode, CameraOrbitState, GuiApp};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HotkeyAction {
     TogglePause,
@@ -211,5 +215,93 @@ fn key_name(key: egui::Key) -> &'static str {
         egui::Key::R => "R",
         egui::Key::O => "O",
         _ => "?",
+    }
+}
+
+impl GuiApp {
+    /// Per-frame hotkey dispatcher: read the egui input, fire the
+    /// matching `HotkeyAction`, and apply its GUI-side effect (toggle a
+    /// flag, switch mode, save project, open the avatar picker, etc.).
+    /// Called once near the top of `update()` before any UI is drawn.
+    pub(super) fn process_hotkeys(&mut self, ctx: &egui::Context) {
+        if self.hotkeys.check(HotkeyAction::TogglePause, ctx) {
+            self.paused = !self.paused;
+            self.push_notification(if self.paused {
+                t!("toast.paused")
+            } else {
+                t!("toast.resumed")
+            });
+        }
+        if self
+            .hotkeys
+            .check(HotkeyAction::ToggleTrackingEnabled, ctx)
+        {
+            self.tracking.toggle_tracking = !self.tracking.toggle_tracking;
+            self.project_dirty = true;
+        }
+        if self
+            .hotkeys
+            .check(HotkeyAction::ToggleClothSimulation, ctx)
+        {
+            self.rendering.toggle_cloth = !self.rendering.toggle_cloth;
+            self.project_dirty = true;
+        }
+        if self.hotkeys.check(HotkeyAction::ResetPose, ctx) {
+            self.transform.position = [0.0, 0.0, 0.0];
+            self.transform.rotation = [0.0, 0.0, 0.0];
+            self.transform.scale = 1.0;
+            self.project_dirty = true;
+        }
+        if self.hotkeys.check(HotkeyAction::ResetCamera, ctx) {
+            self.camera_orbit = CameraOrbitState {
+                yaw_deg: 0.0,
+                pitch_deg: 0.0,
+                pan: [0.0, 0.0],
+                distance: 5.0,
+                target_distance: 5.0,
+            };
+            self.project_dirty = true;
+        }
+        // Per-mode F-key nav. Listed in the same order as
+        // `AppMode::ALL` so the binding-to-mode mapping reads
+        // straight off the enum without surprises.
+        for (action, mode) in [
+            (HotkeyAction::SwitchModeAvatar, AppMode::Avatar),
+            (HotkeyAction::SwitchModePreview, AppMode::Preview),
+            (HotkeyAction::SwitchModeTracking, AppMode::TrackingSetup),
+            (HotkeyAction::SwitchModeRendering, AppMode::Rendering),
+            (HotkeyAction::SwitchModeOutput, AppMode::Output),
+            (HotkeyAction::SwitchModeAuthoring, AppMode::ClothAuthoring),
+            (HotkeyAction::SwitchModeSettings, AppMode::Settings),
+        ] {
+            if self.hotkeys.check(action, ctx) {
+                self.mode = mode;
+                self.inspector_open = true;
+            }
+        }
+        if self.hotkeys.check(HotkeyAction::SaveProject, ctx) {
+            let ps = self.to_project_state();
+            if let Some(ref path) = self.project_path.clone() {
+                match crate::persistence::save_project(&ps, path) {
+                    Ok(()) => {
+                        self.project_dirty = false;
+                        self.push_notification(t!("toast.project_saved"));
+                    }
+                    Err(e) => {
+                        self.push_notification(t!("toast.save_failed", error = e.to_string()));
+                    }
+                }
+            } else {
+                self.push_notification(t!("toast.no_project_path"));
+            }
+        }
+        if self.hotkeys.check(HotkeyAction::LoadAvatar, ctx) {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("VRM 1.0", &["vrm"])
+                .pick_file()
+            {
+                super::top_bar::load_avatar_from_path(self, &path);
+            }
+        }
     }
 }

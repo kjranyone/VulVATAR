@@ -17,6 +17,9 @@ use crate::asset::{
     AvatarAsset,
 };
 use crate::persistence::{ProjectLoadWarnings, ProjectState};
+use crate::t;
+
+use super::{top_bar, GuiApp};
 
 /// Optional follow-up work to perform on the UI thread once the avatar
 /// finishes loading. `Open Project` uses this to apply the project state
@@ -98,6 +101,50 @@ impl AvatarLoadJob {
                     // Worker died without sending a terminal message.
                     return Some(LoadOutcome::Error("loader worker disconnected".to_string()));
                 }
+            }
+        }
+    }
+}
+
+impl GuiApp {
+    /// Drain the active background load job (if any). On terminal
+    /// outcome, finalise the avatar onto the scene; if the job was
+    /// chained behind an `Open Project` action, also apply the
+    /// pending `ProjectState` and emit any deferred load warnings.
+    /// Called once per frame from `update()`.
+    pub(super) fn poll_avatar_load_job(&mut self) {
+        // Drain progress messages; bail if no terminal outcome arrived yet.
+        let outcome = match self.avatar_load_job.as_mut().and_then(|j| j.poll()) {
+            Some(o) => o,
+            None => return,
+        };
+
+        // Worker finished — take ownership so we can mutate other GuiApp fields.
+        let job = self.avatar_load_job.take().expect("job still present");
+        if let Some(handle) = job.worker {
+            let _ = handle.join();
+        }
+
+        match outcome {
+            LoadOutcome::Done(asset) => {
+                top_bar::finalize_avatar_load(self, &job.path, asset);
+                if let AfterLoad::ApplyProject {
+                    project_state,
+                    project_path,
+                    warnings,
+                } = job.after_load
+                {
+                    self.apply_project_state(&project_state);
+                    self.project_path = Some(project_path.clone());
+                    self.project_dirty = false;
+                    for w in &warnings.warnings {
+                        self.push_notification(t!("toast.warning", msg = w.to_string()));
+                    }
+                    self.push_notification(t!("toast.opened_project", path = project_path.display().to_string()));
+                }
+            }
+            LoadOutcome::Error(e) => {
+                self.push_notification(t!("toast.failed_load_avatar", path = job.path.display().to_string(), error = e.to_string()));
             }
         }
     }
