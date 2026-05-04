@@ -556,7 +556,11 @@ fn dump_arm_world_positions(
         HumanoidBone::RightLowerArm,
         HumanoidBone::RightHand,
         HumanoidBone::LeftUpperLeg,
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::LeftFoot,
         HumanoidBone::RightUpperLeg,
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::RightFoot,
     ];
     let mut s = String::new();
     let _ = writeln!(
