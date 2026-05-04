@@ -5,9 +5,10 @@ use crate::asset::{
     Vec3,
 };
 use crate::avatar::animation::{self, AnimationState};
-use crate::avatar::pose::AvatarPose;
+use crate::avatar::pose::{
+    self as pose_helpers, AvatarPose,
+};
 use crate::avatar::pose_solver::{PoseSolverState, ResolvedExpressionWeight};
-use crate::math_utils::mat4_mul;
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -295,60 +296,30 @@ impl AvatarInstance {
     }
 
     pub fn compute_global_pose(&mut self) {
-        let skeleton = &self.asset.skeleton;
-
-        // Process root nodes first, then recurse into children.
-        // We use an explicit stack to avoid borrowing issues with recursion.
-        let mut stack: Vec<(usize, Option<usize>)> = Vec::new();
-
-        // Push root nodes (no parent).
-        for root_id in skeleton.root_nodes.iter().rev() {
-            stack.push((root_id.0 as usize, None));
-        }
-
-        while let Some((node_idx, parent_idx)) = stack.pop() {
-            let local_mat = self.pose.local_transforms[node_idx].to_matrix();
-
-            let global_mat = match parent_idx {
-                Some(pi) => mat4_mul(&self.pose.global_transforms[pi], &local_mat),
-                None => local_mat,
-            };
-
-            self.pose.global_transforms[node_idx] = global_mat;
-
-            // Push children in reverse order so they are processed in forward order.
-            for child_id in skeleton.nodes[node_idx].children.iter().rev() {
-                stack.push((child_id.0 as usize, Some(node_idx)));
-            }
-        }
+        pose_helpers::compute_global_transforms(
+            &self.asset.skeleton,
+            &self.pose.local_transforms,
+            &mut self.pose.global_transforms,
+        );
     }
 
     pub fn build_skinning_matrices(&mut self) {
         let skeleton = &self.asset.skeleton;
         let node_count = skeleton.nodes.len();
 
-        // Vertex joint indices are rewritten to be glTF node indices at load
-        // time (see VrmAssetLoader::assign_skins_to_meshes). A single node-
-        // indexed skinning array then serves every skin in the avatar,
-        // regardless of whether the model ships one unified skin or separate
-        // face/body/accessory skins.
+        // Vertex joint indices are rewritten to be glTF node indices at
+        // load time (see VrmAssetLoader::assign_skins_to_meshes). A
+        // single node-indexed skinning array then serves every skin in
+        // the avatar, regardless of whether the model ships one unified
+        // skin or separate face / body / accessory skins.
         if self.pose.skinning_matrices.len() != node_count {
             self.pose.skinning_matrices = vec![crate::asset::identity_matrix(); node_count];
         }
-
-        for i in 0..node_count {
-            let ibm = if i < skeleton.inverse_bind_matrices.len() {
-                &skeleton.inverse_bind_matrices[i]
-            } else {
-                continue;
-            };
-            let global = if i < self.pose.global_transforms.len() {
-                &self.pose.global_transforms[i]
-            } else {
-                continue;
-            };
-            self.pose.skinning_matrices[i] = mat4_mul(global, ibm);
-        }
+        pose_helpers::build_skinning_matrices(
+            skeleton,
+            &self.pose.global_transforms,
+            &mut self.pose.skinning_matrices,
+        );
     }
 }
 

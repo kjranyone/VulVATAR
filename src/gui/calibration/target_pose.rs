@@ -22,11 +22,10 @@
 //! parent shoulder isn't axis-aligned to world; aim-at-target
 //! sidesteps that entirely.
 
-use crate::asset::{
-    identity_matrix, AvatarAsset, HumanoidBone, Mat4, Quat, SkeletonAsset, Transform,
-};
+use crate::asset::{identity_matrix, AvatarAsset, HumanoidBone, Mat4, SkeletonAsset, Transform};
+use crate::avatar::pose as pose_helpers;
 use crate::math_utils::{
-    mat4_mul, mat4_translation, quat_conjugate, quat_from_vectors, quat_mul, quat_normalize,
+    mat4_rotation_to_quat, mat4_translation, quat_conjugate, quat_from_vectors, quat_mul,
     vec3_length_sq, vec3_normalize, vec3_sub, Vec3,
 };
 use crate::tracking::CalibrationMode;
@@ -122,7 +121,7 @@ fn apply_arm_down_rotation(
 
     let parent_idx = skeleton.nodes[upper_idx].parent.map(|p| p.0 as usize);
     let parent_rot = match parent_idx {
-        Some(pi) if pi < rest_globals.len() => mat3_to_quat(&rest_globals[pi]),
+        Some(pi) if pi < rest_globals.len() => mat4_rotation_to_quat(&rest_globals[pi]),
         _ => [0.0, 0.0, 0.0, 1.0],
     };
     let parent_rot_inv = quat_conjugate(&parent_rot);
@@ -131,105 +130,20 @@ fn apply_arm_down_rotation(
     locals[upper_idx].rotation = quat_mul(&q_pre, &locals[upper_idx].rotation);
 }
 
-/// Extract the rotation component from a column-major affine 4×4 as
-/// a unit quaternion. Normalises each basis column to strip uniform
-/// scale; non-uniform scale will produce a slightly off-axis result
-/// but VRM rigs don't use non-uniform scale on humanoid bones.
-fn mat3_to_quat(m: &Mat4) -> Quat {
-    let col0 = vec3_normalize(&[m[0][0], m[0][1], m[0][2]]);
-    let col1 = vec3_normalize(&[m[1][0], m[1][1], m[1][2]]);
-    let col2 = vec3_normalize(&[m[2][0], m[2][1], m[2][2]]);
-    let m00 = col0[0];
-    let m10 = col0[1];
-    let m20 = col0[2];
-    let m01 = col1[0];
-    let m11 = col1[1];
-    let m21 = col1[2];
-    let m02 = col2[0];
-    let m12 = col2[1];
-    let m22 = col2[2];
-
-    let trace = m00 + m11 + m22;
-    if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        let inv = 1.0 / s;
-        quat_normalize(&[
-            (m21 - m12) * inv,
-            (m02 - m20) * inv,
-            (m10 - m01) * inv,
-            0.25 * s,
-        ])
-    } else if m00 > m11 && m00 > m22 {
-        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
-        let inv = 1.0 / s;
-        quat_normalize(&[
-            0.25 * s,
-            (m01 + m10) * inv,
-            (m02 + m20) * inv,
-            (m21 - m12) * inv,
-        ])
-    } else if m11 > m22 {
-        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
-        let inv = 1.0 / s;
-        quat_normalize(&[
-            (m01 + m10) * inv,
-            0.25 * s,
-            (m12 + m21) * inv,
-            (m02 - m20) * inv,
-        ])
-    } else {
-        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
-        let inv = 1.0 / s;
-        quat_normalize(&[
-            (m02 + m20) * inv,
-            (m12 + m21) * inv,
-            0.25 * s,
-            (m10 - m01) * inv,
-        ])
-    }
-}
-
 /// Hierarchy traversal that produces global transforms from per-node
-/// locals. Stack-based so it doesn't blow the call stack on deep
-/// rigs. Identical algorithm to
-/// `AvatarInstance::compute_global_pose`; duplicated here so the
-/// snapshot path doesn't need a `&mut AvatarInstance`.
+/// locals. Owns its output `Vec<Mat4>` so the snapshot path doesn't
+/// need a `&mut AvatarInstance` — wraps the in-place pure helper in
+/// [`crate::avatar::pose::compute_global_transforms`].
 fn compute_globals(skeleton: &SkeletonAsset, locals: &[Transform]) -> Vec<Mat4> {
-    let n = skeleton.nodes.len();
-    let mut globals = vec![identity_matrix(); n];
-    let mut stack: Vec<(usize, Option<usize>)> = Vec::new();
-    for root in skeleton.root_nodes.iter().rev() {
-        stack.push((root.0 as usize, None));
-    }
-    while let Some((idx, parent_idx)) = stack.pop() {
-        let local_mat = locals[idx].to_matrix();
-        let global_mat = match parent_idx {
-            Some(pi) => mat4_mul(&globals[pi], &local_mat),
-            None => local_mat,
-        };
-        globals[idx] = global_mat;
-        for child in skeleton.nodes[idx].children.iter().rev() {
-            stack.push((child.0 as usize, Some(idx)));
-        }
-    }
+    let mut globals = vec![identity_matrix(); skeleton.nodes.len()];
+    pose_helpers::compute_global_transforms(skeleton, locals, &mut globals);
     globals
 }
 
-/// `skinning[i] = globals[i] * inverse_bind[i]`. Identical to
-/// `AvatarInstance::build_skinning_matrices`; same duplication
-/// rationale (see [`compute_globals`]).
+/// Owning wrapper around [`crate::avatar::pose::build_skinning_matrices`]
+/// — same rationale as [`compute_globals`].
 fn build_skinning_from_globals(skeleton: &SkeletonAsset, globals: &[Mat4]) -> Vec<Mat4> {
-    let n = skeleton.nodes.len();
-    let mut out = vec![identity_matrix(); n];
-    for i in 0..n {
-        let ibm = if i < skeleton.inverse_bind_matrices.len() {
-            &skeleton.inverse_bind_matrices[i]
-        } else {
-            continue;
-        };
-        if i < globals.len() {
-            out[i] = mat4_mul(&globals[i], ibm);
-        }
-    }
+    let mut out = vec![identity_matrix(); skeleton.nodes.len()];
+    pose_helpers::build_skinning_matrices(skeleton, globals, &mut out);
     out
 }

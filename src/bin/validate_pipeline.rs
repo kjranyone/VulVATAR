@@ -433,54 +433,12 @@ fn dump_bone_positions(
         let cosy = 1.0 - 2.0 * (y * y + z * z);
         siny.atan2(cosy).to_degrees()
     };
-    // Quaternion of an avatar bone's WORLD rotation (extracted from
-    // its Mat4 via the upper 3x3 block). Returns identity if missing
-    // or if the matrix isn't a clean rotation (fallback for safety).
+    // Quaternion of an avatar bone's WORLD rotation, extracted from
+    // its Mat4 via the upper 3x3 block.
     let world_quat = |av: &AvatarInstance, b: HumanoidBone| -> Option<[f32; 4]> {
         let idx = humanoid.bone_map.get(&b).copied().map(|n| n.0 as usize)?;
         let m = av.pose.global_transforms.get(idx)?;
-        // m is column-major; rotation is the upper 3x3 in cols 0,1,2.
-        let r = [
-            [m[0][0], m[1][0], m[2][0]],
-            [m[0][1], m[1][1], m[2][1]],
-            [m[0][2], m[1][2], m[2][2]],
-        ];
-        // Convert 3x3 rotation matrix → quaternion (Shoemake).
-        let trace = r[0][0] + r[1][1] + r[2][2];
-        let q = if trace > 0.0 {
-            let s = (trace + 1.0).sqrt() * 2.0;
-            [
-                (r[2][1] - r[1][2]) / s,
-                (r[0][2] - r[2][0]) / s,
-                (r[1][0] - r[0][1]) / s,
-                0.25 * s,
-            ]
-        } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
-            let s = (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt() * 2.0;
-            [
-                0.25 * s,
-                (r[0][1] + r[1][0]) / s,
-                (r[0][2] + r[2][0]) / s,
-                (r[2][1] - r[1][2]) / s,
-            ]
-        } else if r[1][1] > r[2][2] {
-            let s = (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt() * 2.0;
-            [
-                (r[0][1] + r[1][0]) / s,
-                0.25 * s,
-                (r[1][2] + r[2][1]) / s,
-                (r[0][2] - r[2][0]) / s,
-            ]
-        } else {
-            let s = (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt() * 2.0;
-            [
-                (r[0][2] + r[2][0]) / s,
-                (r[1][2] + r[2][1]) / s,
-                0.25 * s,
-                (r[1][0] - r[0][1]) / s,
-            ]
-        };
-        Some(q)
+        Some(vulvatar_lib::math_utils::mat4_rotation_to_quat(m))
     };
 
     let mut s = String::new();
