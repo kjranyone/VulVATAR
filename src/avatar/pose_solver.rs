@@ -1637,34 +1637,99 @@ fn apply_2bone_ik_chain(
         .clamp(-1.0, 1.0);
     let sin_alpha = (1.0 - cos_alpha * cos_alpha).max(0.0).sqrt();
 
-    // Project the static pole hint onto the plane perpendicular to
-    // the chord — that gives the actual bend direction in source
-    // space. We deliberately don't adapt the hint to the original
-    // middle's offset: when the keypoint is correctly detected and
-    // sits near the chord (e.g. arm hanging straight at side, chord
-    // ≈ -Y, original elbow with tiny perpendicular component), the
-    // adaptive hint is dominated by detection noise and produces a
-    // wrong-direction bend that visibly distorts the avatar's pose.
-    // The static hint stays consistent and degrades gracefully:
-    // for chords parallel to the hint (arm straight down with hint
-    // = -Y) the perpendicular collapses and IK aborts, leaving the
-    // already-correct keypoint untouched.
-    let dot = vec3_dot(&pole_hint_source, &chord_unit);
-    let pole_perp = [
-        pole_hint_source[0] - chord_unit[0] * dot,
-        pole_hint_source[1] - chord_unit[1] * dot,
-        pole_hint_source[2] - chord_unit[2] * dot,
-    ];
-    let pole_len = vec3_length(&pole_perp);
-    if pole_len < 1e-4 {
-        // Pole parallel to chord; bend direction undetermined.
-        return;
-    }
-    let pole_unit = [
-        pole_perp[0] / pole_len,
-        pole_perp[1] / pole_len,
-        pole_perp[2] / pole_len,
-    ];
+    // Bend-direction selection. Strategy: prefer the **detected**
+    // elbow's displacement off the chord, falling back to the static
+    // pole hint only when the detected elbow sits too close to the
+    // chord for its direction to be reliable.
+    //
+    // The previous implementation used the static hint unconditionally
+    // — that worked for arms hanging at the sides (chord ≈ -Y, hint
+    // = -Y, perp collapses, IK aborts and the correct keypoint
+    // survives) and for arms-forward (elbow naturally bends down). It
+    // failed for poses where the elbow flares laterally (hands on
+    // hips, "I dunno" shrug, arms-akimbo): the static -Y pole forced
+    // the elbow downward into the hand position, collapsing the
+    // forearm.
+    //
+    // Threshold (`5% of chord length`) is the empirical "above
+    // detection noise" floor. Below it the original elbow's perp is
+    // dominated by RTMW3D jitter and we fall back to the static hint;
+    // above it we trust the detected direction entirely. The
+    // intermediate band (5%-15%) blends so a mid-confidence detection
+    // doesn't snap discontinuously between modes.
+    let static_pole_perp_unit = {
+        let dot = vec3_dot(&pole_hint_source, &chord_unit);
+        let perp = [
+            pole_hint_source[0] - chord_unit[0] * dot,
+            pole_hint_source[1] - chord_unit[1] * dot,
+            pole_hint_source[2] - chord_unit[2] * dot,
+        ];
+        let len = vec3_length(&perp);
+        if len < 1e-4 {
+            None
+        } else {
+            Some([perp[0] / len, perp[1] / len, perp[2] / len])
+        }
+    };
+
+    let detected_pole_perp_unit = original_middle.and_then(|orig| {
+        let orig_off = vec3_sub(&orig, &base_pos);
+        let orig_dot = vec3_dot(&orig_off, &chord_unit);
+        let orig_perp = [
+            orig_off[0] - chord_unit[0] * orig_dot,
+            orig_off[1] - chord_unit[1] * orig_dot,
+            orig_off[2] - chord_unit[2] * orig_dot,
+        ];
+        let orig_perp_len = vec3_length(&orig_perp);
+        // 5% floor = detection-noise margin. Tuned against the
+        // calibration_effect_validation/fixed_camera dataset: at
+        // 5% the hands-on-hips and shrug poses pick up the lateral
+        // bend, while arms-at-sides (perp ≈ 0.5% of chord) still
+        // falls through to the static hint.
+        if orig_perp_len < chord_len * 0.05 {
+            return None;
+        }
+        Some((
+            [
+                orig_perp[0] / orig_perp_len,
+                orig_perp[1] / orig_perp_len,
+                orig_perp[2] / orig_perp_len,
+            ],
+            orig_perp_len,
+        ))
+    });
+
+    let pole_unit = match (detected_pole_perp_unit, static_pole_perp_unit) {
+        (Some((det, det_perp_len)), Some(stat)) => {
+            // Blend zone: 5%–15% of chord length. Below 5% we never
+            // get here (detected returns None); above 15% trust the
+            // detection fully. In between, slerp from static toward
+            // detected so the transition is continuous.
+            let t = ((det_perp_len / chord_len - 0.05) / 0.10).clamp(0.0, 1.0);
+            // Linear blend then renormalise — the two unit vectors
+            // are usually within ~30° of each other in this band, so
+            // the chord length of the lerp is far enough from zero.
+            let mixed = [
+                stat[0] * (1.0 - t) + det[0] * t,
+                stat[1] * (1.0 - t) + det[1] * t,
+                stat[2] * (1.0 - t) + det[2] * t,
+            ];
+            let len = vec3_length(&mixed);
+            if len < 1e-4 {
+                det
+            } else {
+                [mixed[0] / len, mixed[1] / len, mixed[2] / len]
+            }
+        }
+        (Some((det, _)), None) => det,
+        (None, Some(stat)) => stat,
+        (None, None) => {
+            // Both pole sources collapsed (chord parallel to static
+            // hint AND detected elbow on the chord). Bend direction
+            // genuinely undetermined; leave the keypoint alone.
+            return;
+        }
+    };
 
     let middle_pos = [
         base_pos[0] + l_upper * (cos_alpha * chord_unit[0] + sin_alpha * pole_unit[0]),
