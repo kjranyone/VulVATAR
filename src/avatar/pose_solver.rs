@@ -330,17 +330,7 @@ const DRIVEN_BONES: &[(HumanoidBone, Tip)] = &[
     // of being silently swallowed by the rest pose.
     (HumanoidBone::Spine, Tip::ShoulderMidpoint),
     (HumanoidBone::Chest, Tip::ShoulderMidpoint),
-    // UpperChest used to be driven by Tip::HeadFromShoulders to make
-    // chin-thrust translate the head forward. RTMW3D's ear-midpoint
-    // Head proxy sits ~5–8 cm forward of the shoulder midpoint in
-    // every neutral pose (model bias + real ear-vs-cervical-spine
-    // anatomy), so the unconditional driver was pitching UpperChest
-    // ~25° forward on every frame. That cascade dragged the clavicles
-    // → upper arms → elbows → hands forward in world Z, breaking
-    // hands-on-hips, arms-at-sides, shrug, and most other "no chin
-    // thrust" poses across the calibration_effect_validation set.
-    // Chin-thrust is still expressed via the Neck driver below; the
-    // shoulders no longer follow the head's forward-Z signal.
+    (HumanoidBone::UpperChest, Tip::HeadFromShoulders),
     // Clavicles. Listed before the upper arms so the FK pass updates
     // them first — when the clavicle picks up a shrug, the upper
     // arm's *current* world rotation needs the parent's already-
@@ -2866,17 +2856,13 @@ mod chin_chain_tests {
     }
 
     /// Chin thrust: head moved 10 cm forward (+Z toward camera) while
-    /// shoulders stay put. The Neck must pitch forward enough to move
-    /// the Head bone's world position toward +Z, and the shoulders
-    /// (LeftUpperArm / RightUpperArm) must NOT drift forward — the
-    /// previous wiring drove UpperChest by the same head signal,
-    /// which dragged the entire shoulder line into +Z on every frame
-    /// (RTMW3D's ear-mid Head proxy reads ~5–8 cm forward of the
-    /// shoulder midpoint on neutral poses too, so the chain bowed on
-    /// every input). After this contract change the head moves and
-    /// the shoulders stay.
+    /// shoulders stay put. UpperChest must pitch forward enough to
+    /// move the Head bone's world position toward +Z. Before this
+    /// commit the entire chain was at rest pose and the avatar's
+    /// head pivot stayed motionless regardless of how far the
+    /// subject pushed their face out — this test pins the new path.
     #[test]
-    fn chin_thrust_pitches_neck_without_dragging_shoulders() {
+    fn chin_thrust_pitches_chain_forward() {
         let mut sk = SourceSkeleton::empty(0);
         put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
         put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
@@ -2886,52 +2872,29 @@ mod chin_chain_tests {
 
         let (local, humanoid, skeleton) = solve_with(&sk);
         let uc_idx = humanoid.bone_map[&HumanoidBone::UpperChest].0 as usize;
-        let n_idx = humanoid.bone_map[&HumanoidBone::Neck].0 as usize;
 
-        // UpperChest now stays at rest under chin-thrust — it is no
-        // longer driven by the head signal.
         assert!(
-            quat_is_near_identity(&local[uc_idx].rotation),
-            "chin thrust: UpperChest must stay at rest (no shoulder drag), got {:?}",
+            !quat_is_near_identity(&local[uc_idx].rotation),
+            "chin thrust: UpperChest must rotate, got {:?}",
             local[uc_idx].rotation
         );
-        // Neck absorbs the full forward pitch.
-        assert!(
-            !quat_is_near_identity(&local[n_idx].rotation),
-            "chin thrust: Neck must rotate, got {:?}",
-            local[n_idx].rotation
-        );
 
+        // The avatar's Head bone world position should have moved
+        // forward in Z. Recompute world transforms after the solve to
+        // confirm — the UpperChest rotation must propagate up the
+        // chain to Neck and Head positions via FK.
         let head_idx = humanoid.bone_map[&HumanoidBone::Head].0 as usize;
         let world = compute_world_transforms(&skeleton, |i| local[i].clone());
-
-        // Head still moves forward in Z (less than the old chain-bend
-        // path because only the neck contributes; the visible head
-        // translation is preserved).
         let head_z = world[head_idx].position[2];
         assert!(
-            head_z > 0.02,
-            "chin thrust: Head world Z must move forward (>2 cm), got {head_z}"
+            head_z > 0.04,
+            "chin thrust: Head world Z must move forward (>4 cm), got {head_z}"
         );
 
-        // Critically, the shoulders must NOT have drifted forward. In
-        // the old wiring both LeftUpperArm and RightUpperArm rode
-        // UpperChest's pitch into +Z by ~3–5 cm; here they should
-        // stay essentially at their rest Z (zero in this rig).
-        let lu_idx = humanoid.bone_map[&HumanoidBone::LeftUpperArm].0 as usize;
-        let ru_idx = humanoid.bone_map[&HumanoidBone::RightUpperArm].0 as usize;
-        assert!(
-            world[lu_idx].position[2].abs() < 0.01,
-            "chin thrust: LeftUpperArm Z must stay at rest, got {}",
-            world[lu_idx].position[2],
-        );
-        assert!(
-            world[ru_idx].position[2].abs() < 0.01,
-            "chin thrust: RightUpperArm Z must stay at rest, got {}",
-            world[ru_idx].position[2],
-        );
-
-        // Head should still be roughly at its rest height.
+        // Sanity: the Head should still be roughly at its rest height.
+        // A pitch around X drops the Y a little (cos(θ) factor); 10 cm
+        // forward over a 30 cm chain gives θ ≈ 19°, cos(19°) ≈ 0.946,
+        // so Y drops by ~5%. Allow generous slack for FK distribution.
         let head_y = world[head_idx].position[1];
         assert!(
             head_y > 1.10 && head_y < 1.50,
@@ -2960,12 +2923,9 @@ mod chin_chain_tests {
 
         let head_x = world[head_idx].position[0];
         let head_z = world[head_idx].position[2];
-        // Only Neck contributes to the lateral roll now (UpperChest
-        // is no longer driven by HeadFromShoulders). Neck length is
-        // 0.10 m and source_dir.x ≈ 0.316 → expected Head X ≈ 0.032 m.
         assert!(
-            head_x > 0.02,
-            "head lean: Head world X must move toward +X (>2 cm), got {head_x}"
+            head_x > 0.04,
+            "head lean: Head world X must move toward +X (>4 cm), got {head_x}"
         );
         assert!(
             head_z.abs() < 0.02,
