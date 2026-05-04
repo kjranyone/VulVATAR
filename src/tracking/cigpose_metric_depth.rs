@@ -332,14 +332,13 @@ impl CigposeMetricDepthProvider {
             opts,
             self.pose_calibration.as_ref(),
         ) {
-            Some((origin, anchor_was_hip, anchor_score)) => {
+            Some(anchor) => {
+                let origin = anchor.origin;
                 let sk = build_skeleton(
                     frame_index,
                     &joints_2d,
                     &depth_frame,
-                    origin,
-                    anchor_was_hip,
-                    anchor_score,
+                    anchor,
                     opts,
                     self.pose_calibration.as_ref(),
                 );

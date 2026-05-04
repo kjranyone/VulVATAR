@@ -555,17 +555,19 @@ const TEMPLATE_BIAS_BAND_M: f32 = 0.5;
 ///
 /// **Algorithm**:
 /// 1. Build current-frame torso bbox from shoulders + hips.
-/// 2. For each template cell:
-///    a. Skip if `template_depth` is NaN (the cell never got a
-///       valid sample during calibration).
-///    b. Compute the cell's centre position in image coords by
-///       projecting `(rel_x, rel_y)` through the *current* bbox.
-///    c. Sample the current frame's depth at that pixel.
-///    d. Skip if the sample is non-finite or out of frame.
-///    e. Skip if `|current − template| > TEMPLATE_BIAS_BAND_M`
-///       (occluder / background reject).
-///    f. Otherwise, append `current − template` to the bias pool.
-/// 3. Return median(pool) if pool is non-empty, else `None`.
+/// 2. For each template cell, project `(rel_x, rel_y)` through the
+///    *current* bbox to get an image-coord centre, sample the current
+///    frame's depth at that pixel, and append `current − template` to
+///    the bias pool unless the cell is skipped.
+/// 3. Return `median(pool)` if non-empty, else `None`.
+///
+/// A cell is skipped when:
+/// - `template_depth` is NaN (the cell never got a valid sample
+///   during calibration);
+/// - the projected image coord falls out of frame, or the current
+///   sample at that pixel is non-finite;
+/// - `|current − template| > TEMPLATE_BIAS_BAND_M` (occluder in
+///   front of the torso, or background showing through).
 ///
 /// **Why median over mean**: occluder pixels that *just barely*
 /// fall inside the band (e.g. a hand whose depth is 40 cm closer
@@ -740,7 +742,7 @@ pub(super) fn resolve_origin_metric(
     depth: &MoGeFrame,
     opts: BuildOptions,
     calibration: Option<&crate::tracking::PoseCalibration>,
-) -> Option<([f32; 3], /*anchor_was_hip*/ bool, /*anchor_score*/ f32)> {
+) -> Option<ResolvedAnchor> {
     if joints.len() < NUM_JOINTS {
         return None;
     }
@@ -799,8 +801,12 @@ pub(super) fn resolve_origin_metric(
         let rh = &joints[12];
         let hip_score = lh.score.min(rh.score);
         if hip_score >= KEYPOINT_VISIBILITY_FLOOR {
-            if let Some(o) = try_pair(lh, rh) {
-                return Some((o, true, hip_score));
+            if let Some(origin) = try_pair(lh, rh) {
+                return Some(ResolvedAnchor {
+                    origin,
+                    was_hip: true,
+                    score: hip_score,
+                });
             }
         }
     }
@@ -809,11 +815,35 @@ pub(super) fn resolve_origin_metric(
     let rs = &joints[6];
     let shoulder_score = ls.score.min(rs.score);
     if shoulder_score >= KEYPOINT_VISIBILITY_FLOOR {
-        if let Some(o) = try_pair(ls, rs) {
-            return Some((o, false, shoulder_score));
+        if let Some(origin) = try_pair(ls, rs) {
+            return Some(ResolvedAnchor {
+                origin,
+                was_hip: false,
+                score: shoulder_score,
+            });
         }
     }
     None
+}
+
+/// Resolved hip- or shoulder-pair midpoint that anchors the source
+/// skeleton, plus the per-keypoint confidence floor used to admit it.
+/// Bundling these three values lets [`build_skeleton`] take a single
+/// anchor reference instead of three positional arguments — the
+/// "anchor" is conceptually one decision and the values flow as a
+/// unit through the call graph.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResolvedAnchor {
+    /// Camera-space `(x, y, z)` in metres for the anchor pair midpoint.
+    pub origin: [f32; 3],
+    /// `true` when the anchor came from the hip pair (COCO 11/12);
+    /// `false` for the shoulder fallback (COCO 5/6) used in upper-body
+    /// crops.
+    pub was_hip: bool,
+    /// Min of the two anchor keypoints' confidences. Surfaced as the
+    /// skeleton's `overall_confidence` upper bound — body bones we
+    /// derive from this anchor can't exceed its own reliability.
+    pub score: f32,
 }
 
 /// Build a [`SourceSkeleton`] from 2D keypoints + sampled metric
@@ -832,12 +862,16 @@ pub(super) fn build_skeleton(
     frame_index: u64,
     joints: &[DecodedJoint2d],
     depth: &MoGeFrame,
-    origin: [f32; 3],
-    anchor_was_hip: bool,
-    anchor_score: f32,
+    anchor: ResolvedAnchor,
     opts: BuildOptions,
     calibration: Option<&crate::tracking::PoseCalibration>,
 ) -> SourceSkeleton {
+    let ResolvedAnchor {
+        origin,
+        was_hip: anchor_was_hip,
+        score: anchor_score,
+    } = anchor;
+
     let mut sk = SourceSkeleton::empty(frame_index);
     if joints.len() < NUM_JOINTS {
         return sk;

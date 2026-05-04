@@ -483,7 +483,7 @@ impl Rtmw3dWithDepthProvider {
         // always being computed for the most recent submission.
         let outbox_empty = self.depth_outbox.slot.lock().unwrap().is_none();
         let submit_depth_this_frame =
-            outbox_empty || frame_index % DEPTH_REFRESH_PERIOD == 0;
+            outbox_empty || frame_index.is_multiple_of(DEPTH_REFRESH_PERIOD);
         if submit_depth_this_frame {
             if let Some(tx) = self.depth_tx.as_ref() {
                 let req = DepthRequest {
@@ -681,13 +681,11 @@ impl Rtmw3dWithDepthProvider {
             opts,
             self.pose_calibration.as_ref(),
         ) {
-            Some((origin, was_hip, score)) => build_skeleton(
+            Some(anchor) => build_skeleton(
                 frame_index,
                 &joints_2d,
                 &metric_frame,
-                origin,
-                was_hip,
-                score,
+                anchor,
                 opts,
                 self.pose_calibration.as_ref(),
             ),

@@ -344,7 +344,7 @@ impl Rtmw3dInference {
             // within the 25% downstream pad.
             let bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
                 let cold_start = !worker.has_result();
-                if cold_start || frame_index % YOLOX_REFRESH_PERIOD == 0 {
+                if cold_start || frame_index.is_multiple_of(YOLOX_REFRESH_PERIOD) {
                     worker.submit(rgb_data, width, height);
                 }
                 worker.wait_latest().bbox

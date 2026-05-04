@@ -20,6 +20,8 @@
 //! auto-EMA / hardcoded clamp behaviour as long as
 //! [`PoseCalibration::is_active`] returns false.
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 /// Which pose the subject took during the calibration capture window.
@@ -50,12 +52,24 @@ impl CalibrationMode {
             CalibrationMode::UpperBody => "upper_body",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Returned by [`CalibrationMode`]'s [`FromStr`] when the string
+/// doesn't match any known variant. Callers (currently
+/// [`crate::persistence`]) treat this as "drop the calibration and
+/// log a warning" rather than fail-loud, so the existing project
+/// file isn't lost on a future schema change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownCalibrationMode;
+
+impl FromStr for CalibrationMode {
+    type Err = UnknownCalibrationMode;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "full_body" => Some(CalibrationMode::FullBody),
-            "upper_body" => Some(CalibrationMode::UpperBody),
-            _ => None,
+            "full_body" => Ok(CalibrationMode::FullBody),
+            "upper_body" => Ok(CalibrationMode::UpperBody),
+            _ => Err(UnknownCalibrationMode),
         }
     }
 }

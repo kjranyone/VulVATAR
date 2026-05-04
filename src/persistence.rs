@@ -167,9 +167,9 @@ fn pose_calibration_to_dto(
 fn dto_to_pose_calibration(
     dto: &PoseCalibrationDto,
 ) -> Option<crate::tracking::PoseCalibration> {
-    let mode = match crate::tracking::CalibrationMode::from_str(&dto.mode) {
-        Some(m) => m,
-        None => {
+    let mode = match dto.mode.parse::<crate::tracking::CalibrationMode>() {
+        Ok(m) => m,
+        Err(_) => {
             warn!(
                 "pose_calibration: unknown mode '{}' in project file, ignoring",
                 dto.mode

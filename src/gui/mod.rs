@@ -659,8 +659,7 @@ impl GuiApp {
             // presets is fine but a parse failure of an existing
             // file should not silently wipe out the user's data
             // (load_profiles already logs and returns None then).
-            profiles: crate::persistence::load_profiles()
-                .unwrap_or_else(profile::ProfileLibrary::new),
+            profiles: crate::persistence::load_profiles().unwrap_or_default(),
             profiles_dirty: false,
 
             notifications: Vec::new(),
