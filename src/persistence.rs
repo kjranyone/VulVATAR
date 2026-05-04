@@ -184,7 +184,15 @@ fn dto_to_pose_calibration(
         frame_count: dto.frame_count,
         anchor_x: dto.anchor_x,
         anchor_y: dto.anchor_y,
-        anchor_depth_m: dto.anchor_depth_m,
+        // Migration: pre-fix profiles stored `anchor_depth_m` as the
+        // *source-space* z (negative for forward subjects). The field
+        // is documented as camera-space metric depth (positive), and
+        // the live consumers (calibrate_scale plausibility band,
+        // pose_solver root-reference seed) require that. Coerce on
+        // load so stale profiles from before the bug fix don't break
+        // tracking; new captures already store the positive value via
+        // `aggregate()` so this is a no-op for them.
+        anchor_depth_m: dto.anchor_depth_m.map(|d| d.abs()),
         confidence: dto.confidence,
         anchor_depth_jitter_m: dto.anchor_depth_jitter_m,
         shoulder_span_m: dto.shoulder_span_m,

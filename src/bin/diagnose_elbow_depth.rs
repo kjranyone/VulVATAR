@@ -156,9 +156,9 @@ fn main() -> Result<(), String> {
         // we want to see the raw, EMA-uncorrected calibration each
         // image would produce on a cold provider.
         let calib = match calibrate_scale(&joints_2d, &depth, w, h, None) {
-            Some(c) => c,
-            None => {
-                eprintln!("[{idx:>3}] calibration failed — skipping");
+            Ok(c) => c,
+            Err(failure) => {
+                eprintln!("[{idx:>3}] calibration failed — skipping ({})", failure);
                 continue;
             }
         };

@@ -69,6 +69,8 @@ use std::path::{Path, PathBuf};
 
 use super::provider::PoseProvider;
 use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
+#[cfg(feature = "inference")]
+use crate::asset::HumanoidBone;
 
 #[cfg(feature = "inference")]
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -131,6 +133,14 @@ const ASSUMED_VERTICAL_FOV_DEG: f32 = 60.0;
 /// 3 to third it. 2 is the sweet spot for streaming.
 #[cfg(feature = "inference")]
 const DEPTH_REFRESH_PERIOD: u64 = 2;
+
+/// Rate-limit window for the "DAv2 scale calibration failed" WARN.
+/// At pose rate (~30 fps) a sustained failure dumps 30 lines/sec —
+/// the user can't read that and it crowds out other diagnostics. One
+/// line every 5 seconds preserves the "something is wrong" signal
+/// without burying the log.
+#[cfg(feature = "inference")]
+const CALIB_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// EMA blend factor for the calibration scalar `c`. The subject↔camera
 /// distance is a slow physical quantity (changes on the order of
@@ -234,6 +244,21 @@ pub struct Rtmw3dWithDepthProvider {
     /// skipped (no overhead in normal streaming).
     #[cfg(feature = "inference")]
     torso_capture: Option<super::skeleton_from_depth::TorsoCaptureBuffer>,
+    /// Rate-limit the per-frame "DAv2 scale calibration failed" WARN.
+    /// `calibrate_scale` runs at pose rate (~30 fps); a sustained
+    /// failure (e.g. plausibility band rejecting every frame because
+    /// the user is at a different distance than when they calibrated)
+    /// would otherwise dump 30 lines/sec to stderr. Holds the
+    /// `Instant` of the last emitted warning; the next emission waits
+    /// at least `CALIB_WARN_INTERVAL` past that.
+    #[cfg(feature = "inference")]
+    last_calib_warn_at: Option<std::time::Instant>,
+    /// Tracks whether the previous frame's `calibrate_scale` failed.
+    /// Used to emit a one-shot INFO when calibration recovers, so the
+    /// user sees "ok, working again" rather than just silently stopping
+    /// the WARN spam.
+    #[cfg(feature = "inference")]
+    calib_was_failing: bool,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -293,6 +318,8 @@ impl Rtmw3dWithDepthProvider {
             pose_calibration: None,
             scale_c_ema: None,
             torso_capture: None,
+            last_calib_warn_at: None,
+            calib_was_failing: false,
         })
     }
 
@@ -539,26 +566,62 @@ impl Rtmw3dWithDepthProvider {
         // ~5–10cm elbow-Z signal we depend on at hands-near-body
         // framings.
         let t_calib = std::time::Instant::now();
-        let mut calib = match calibrate_scale(
+        let calib_result = calibrate_scale(
             &joints_2d,
             dav2_frame,
             width,
             height,
             self.pose_calibration.as_ref(),
-        ) {
-            Some(c) => c,
-            None => {
-                // Calibration failed this frame (anchor occluded,
-                // degenerate side-profile, etc). Fall back to the EMA
-                // value if we have one — keeps tracking alive instead
-                // of dropping all metric Z to RTMW3D synthetic. Cold
-                // start (no EMA yet) still falls through to the
-                // RTMW3D-only estimate.
-                if let Some(prev) = self.scale_c_ema {
-                    warn!(
-                        "RTMW3D+DAv2: calibration unavailable this frame — reusing EMA scale_c={:.4}",
-                        prev
+        );
+        let mut calib = match calib_result {
+            Ok(c) => {
+                // Recovery path: if the previous frame failed, surface
+                // a one-shot INFO so the user can correlate the WARN
+                // burst with "tracking started working again".
+                if self.calib_was_failing {
+                    info!(
+                        "RTMW3D+DAv2: per-frame DAv2 scale calibration recovered (anchor={}, c={:.3})",
+                        c.anchor_label, c.scale_c
                     );
+                    self.calib_was_failing = false;
+                }
+                c
+            }
+            Err(failure) => {
+                // Per-frame DAv2 scale calibration failed this frame
+                // (anchor occluded, degenerate side-profile, plausibility
+                // band rejected, etc — see `failure` for the per-anchor
+                // breakdown). This is *separate* from the user's saved
+                // `PoseCalibration` profile, which the GUI surfaces as
+                // "calibrated"; the saved profile only narrows the
+                // plausibility band inside `calibrate_scale`, it does
+                // not itself produce a per-frame scale.
+                //
+                // Fall back to the EMA value if we have one — keeps
+                // tracking alive instead of dropping all metric Z to
+                // RTMW3D synthetic. Cold start (no EMA yet) still
+                // falls through to the RTMW3D-only estimate.
+                self.calib_was_failing = true;
+                let now = std::time::Instant::now();
+                let should_warn = self
+                    .last_calib_warn_at
+                    .map(|t| now.duration_since(t) >= CALIB_WARN_INTERVAL)
+                    .unwrap_or(true);
+                if should_warn {
+                    self.last_calib_warn_at = Some(now);
+                    if let Some(prev) = self.scale_c_ema {
+                        warn!(
+                            "RTMW3D+DAv2: per-frame DAv2 scale calibration failed — reusing EMA scale_c={:.4} ({})",
+                            prev, failure
+                        );
+                    } else {
+                        warn!(
+                            "RTMW3D+DAv2: per-frame DAv2 scale calibration failed (no EMA seed yet) — falling back to RTMW3D synthetic z ({})",
+                            failure
+                        );
+                    }
+                }
+                if let Some(prev) = self.scale_c_ema {
                     Calibration {
                         scale_c: prev,
                         h_half: (ASSUMED_VERTICAL_FOV_DEG.to_radians() * 0.5).tan()
@@ -569,7 +632,6 @@ impl Rtmw3dWithDepthProvider {
                         d_raw_b: f32::NAN,
                     }
                 } else {
-                    warn!("RTMW3D+DAv2: calibration anchor unavailable (cold) — falling back to RTMW3D synthetic z");
                     return rtmw_est;
                 }
             }
@@ -688,6 +750,25 @@ impl Rtmw3dWithDepthProvider {
         // different fallback when one of the source paths failed)
         // keep their dav2-derived position so we don't regress on
         // partial-coverage cases.
+        // Capture the shoulders' DAv2-metric X *before* Phase 7 so we
+        // can recover the per-frame metres-per-source-unit conversion
+        // factor used by the elbow-Z injection below. After the
+        // overwrite loop the metric XY is gone — only `metric_depth_m`
+        // (the Z scalar) survives on the joint. We only read X here
+        // because the conversion factor is derived from the X-axis
+        // shoulder span; Y/Z are not needed.
+        let shoulder_metric_x_pre_overwrite = {
+            let l = skeleton
+                .joints
+                .get(&HumanoidBone::LeftUpperArm)
+                .map(|j| j.position[0]);
+            let r = skeleton
+                .joints
+                .get(&HumanoidBone::RightUpperArm)
+                .map(|j| j.position[0]);
+            l.zip(r)
+        };
+
         for (bone, joint) in skeleton.joints.iter_mut() {
             if let Some(rtmw_joint) = rtmw_est.skeleton.joints.get(bone) {
                 joint.position = rtmw_joint.position;
@@ -697,6 +778,27 @@ impl Rtmw3dWithDepthProvider {
             if let Some(rtmw_joint) = rtmw_est.skeleton.fingertips.get(bone) {
                 joint.position = rtmw_joint.position;
             }
+        }
+
+        // Phase 7.5: re-inject the elbow Z component from DAv2 metric
+        // depth. Phase 7 above replaced every joint's `position` with
+        // RTMW3D's own (nx, ny, nz) to dodge the lateral-bias-into-XY
+        // problem in the dav2 back-projection — but RTMW3D's nz is a
+        // single softmax over 576 depth bins and does a poor job of
+        // resolving the 5-15 cm forward elbow displacement that
+        // distinguishes "elbow at side" from "elbow pushed toward
+        // camera" (e.g. fist-on-hip with elbow flared forward).
+        //
+        // DAv2's metric depth at the elbow pixel captures that signal
+        // accurately. We use it as a *relative* delta vs the shoulder
+        // — `Δz = shoulder_depth_m − elbow_depth_m` — which cancels
+        // DAv2's near-uniform lateral bias (the bias is roughly
+        // constant across nearby pixels in the same body region).
+        // The delta is then converted to source-Z units via the
+        // shoulder span (metres-per-source-unit), keeping the result
+        // dimensionally compatible with the IK that consumes it.
+        if let Some((sl_metric_x, sr_metric_x)) = shoulder_metric_x_pre_overwrite {
+            inject_elbow_z_from_dav2(&mut skeleton, sl_metric_x, sr_metric_x);
         }
         // Hand orientation is also re-derived from RTMW3D's own
         // (unbiased) hand-keypoint xyz — same rationale as the body
@@ -743,6 +845,96 @@ fn empty_estimate(frame_index: u64) -> PoseEstimate {
     }
 }
 
+/// Replace the elbow joints' source-space Z with one derived from
+/// DAv2 metric depth, taken relative to the shoulder. See the call
+/// site for why we do this only for the elbow (and not e.g. the
+/// wrist or shoulder itself).
+///
+/// `shoulder_l_metric_x` and `shoulder_r_metric_x` are the shoulders'
+/// metric-space X coordinates in metres, captured before Phase 7
+/// overwrote them with RTMW3D's source-space coords.
+///
+/// Bails on:
+/// - shoulder span too short to anchor a stable scale (< 1 mm metric
+///   or < 1e-3 source units — both indicate a degenerate detection
+///   where the conversion factor would be unstable);
+/// - either shoulder or elbow with confidence below
+///   `MIN_INJECT_CONFIDENCE` — RTMW3D is uncertain about the 2D
+///   pixel, so the DAv2 sample is centred on a possibly-wrong
+///   location and propagating it would amplify the error;
+/// - elbow or shoulder lacking a `metric_depth_m` sample (DAv2
+///   returned no finite pixels in the depth window);
+/// - implied Z displacement exceeding the same anatomical band that
+///   `apply_anatomical_z_clamps` enforces during the metric-space
+///   build (see [`super::skeleton_from_depth::MAX_UPPER_ARM_DZ_M`]).
+///   Without this guard we'd let DAv2 mis-samples (e.g. a hand from
+///   the other arm crossing in front of the target elbow's pixel)
+///   produce an elbow Z larger than what Phase 5 would have clamped,
+///   contradicting the anatomical floor we already enforce upstream.
+#[cfg(feature = "inference")]
+fn inject_elbow_z_from_dav2(
+    skeleton: &mut SourceSkeleton,
+    shoulder_l_metric_x: f32,
+    shoulder_r_metric_x: f32,
+) {
+    /// Confidence floor below which we don't trust the joint's 2D
+    /// localisation enough to inject a depth sample for it. Above the
+    /// codebase-wide `KEYPOINT_VISIBILITY_FLOOR` of 0.05 (which is the
+    /// "model produced any output here" floor) but below the typical
+    /// solver slider value, since the DAv2-derived Z is more
+    /// fragile than direct 2D-only consumers — a few jittered pixels
+    /// in the depth window can pull the median to a background depth.
+    const MIN_INJECT_CONFIDENCE: f32 = 0.4;
+
+    let metric_x_span = (shoulder_l_metric_x - shoulder_r_metric_x).abs();
+    if metric_x_span < 1e-3 {
+        return;
+    }
+    let source_x_span = match (
+        skeleton.joints.get(&HumanoidBone::LeftUpperArm),
+        skeleton.joints.get(&HumanoidBone::RightUpperArm),
+    ) {
+        (Some(l), Some(r)) => (l.position[0] - r.position[0]).abs(),
+        _ => return,
+    };
+    if source_x_span < 1e-3 {
+        return;
+    }
+    let metres_per_source_unit = metric_x_span / source_x_span;
+
+    for (shoulder_bone, elbow_bone) in [
+        (HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm),
+        (HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm),
+    ] {
+        let (shoulder_z_m, shoulder_z_src) = match skeleton.joints.get(&shoulder_bone) {
+            Some(s) if s.confidence >= MIN_INJECT_CONFIDENCE => match s.metric_depth_m {
+                Some(z_m) => (z_m, s.position[2]),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Some(elbow_joint_mut) = skeleton.joints.get_mut(&elbow_bone) else {
+            continue;
+        };
+        if elbow_joint_mut.confidence < MIN_INJECT_CONFIDENCE {
+            continue;
+        }
+        let Some(elbow_z_m) = elbow_joint_mut.metric_depth_m else {
+            continue;
+        };
+        // Δ in metric: positive when the elbow is forward (closer to
+        // the camera) than the shoulder. Source-z convention matches
+        // `rtmw3d::skeleton::to_source` — +z is toward the camera —
+        // so the metric Δ maps directly without a sign flip.
+        let delta_metric = shoulder_z_m - elbow_z_m;
+        if delta_metric.abs() > super::skeleton_from_depth::MAX_UPPER_ARM_DZ_M {
+            continue;
+        }
+        let delta_source = delta_metric / metres_per_source_unit;
+        elbow_joint_mut.position[2] = shoulder_z_src + delta_source;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Calibration
 // ---------------------------------------------------------------------------
@@ -766,6 +958,95 @@ pub struct Calibration {
     pub d_raw_b: f32,
 }
 
+/// Per-anchor reason `calibrate_scale` rejected a candidate, surfaced
+/// through [`CalibrationFailure`]. The function tries shoulders first,
+/// then hips; if shoulders succeed, the hip slot stays `NotChecked`.
+/// When both fail, the caller logs both reasons so the user can see
+/// which gate is biting (low keypoint score vs depth-sample failure
+/// vs plausibility rejection vs …) without enabling debug logs.
+#[cfg(feature = "inference")]
+#[derive(Debug, Clone, Copy)]
+pub enum AnchorOutcome {
+    /// Candidate not examined (the previous candidate already
+    /// succeeded, or the joints buffer didn't include this index).
+    NotChecked,
+    /// One or both keypoints sat below `KEYPOINT_VISIBILITY_FLOOR`.
+    LowKeypointScore { score_a: f32, score_b: f32 },
+    /// 2D separation in normalised image coords below
+    /// `MIN_ANCHOR_2D_SEPARATION` — too close together for the
+    /// `c = D / √geom` solve to be numerically stable.
+    PairTooClose2D { separation: f32 },
+    /// DAv2 returned no usable inverse-depth at one of the keypoints
+    /// (off-frame, or value at/below 1e-3 = "background asymptote").
+    DepthSampleFailed { which: char },
+    /// `geom` collapsed to ~0, usually because both samples landed on
+    /// the same depth surface (desk in foreground covering the anchor).
+    DegenerateGeometry { geom: f32 },
+    /// Computed scale_c non-finite, ≤ 0, or outside `[MIN_C, MAX_C]`.
+    ScaleOutOfRange { scale_c: f32 },
+    /// Plausibility band derived from the user's saved
+    /// `PoseCalibration` rejected this frame's predicted anchor depth.
+    /// Most likely cause: subject is at a different distance than when
+    /// they calibrated. Fix is to re-calibrate at the current seat /
+    /// stance.
+    PlausibilityRejected {
+        predicted_depth: f32,
+        cal_depth: f32,
+        max_deviation: f32,
+    },
+}
+
+#[cfg(feature = "inference")]
+impl std::fmt::Display for AnchorOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnchorOutcome::NotChecked => write!(f, "not-checked"),
+            AnchorOutcome::LowKeypointScore { score_a, score_b } => {
+                write!(f, "low-score(a={:.2}, b={:.2})", score_a, score_b)
+            }
+            AnchorOutcome::PairTooClose2D { separation } => {
+                write!(f, "pair-too-close-2d(sep={:.3})", separation)
+            }
+            AnchorOutcome::DepthSampleFailed { which } => {
+                write!(f, "depth-sample-failed({})", which)
+            }
+            AnchorOutcome::DegenerateGeometry { geom } => {
+                write!(f, "degenerate-geometry(geom={:.2e})", geom)
+            }
+            AnchorOutcome::ScaleOutOfRange { scale_c } => {
+                write!(f, "scale-out-of-range(c={:.3})", scale_c)
+            }
+            AnchorOutcome::PlausibilityRejected {
+                predicted_depth,
+                cal_depth,
+                max_deviation,
+            } => write!(
+                f,
+                "plausibility-rejected(predicted={:.2}m vs cal={:.2}m, max-dev={:.2}m)",
+                predicted_depth, cal_depth, max_deviation
+            ),
+        }
+    }
+}
+
+/// All-anchor failure breakdown returned by [`calibrate_scale`] when
+/// no candidate yielded a usable scale this frame. Constructed by the
+/// loop body itself; outer callers should `Display` it directly into
+/// their warning text.
+#[cfg(feature = "inference")]
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationFailure {
+    pub shoulder: AnchorOutcome,
+    pub hip: AnchorOutcome,
+}
+
+#[cfg(feature = "inference")]
+impl std::fmt::Display for CalibrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shoulder={}, hip={}", self.shoulder, self.hip)
+    }
+}
+
 #[cfg(feature = "inference")]
 pub fn calibrate_scale(
     joints: &[DecodedJoint2d],
@@ -773,7 +1054,7 @@ pub fn calibrate_scale(
     src_w: u32,
     src_h: u32,
     pose_calibration: Option<&crate::tracking::PoseCalibration>,
-) -> Option<Calibration> {
+) -> Result<Calibration, CalibrationFailure> {
     let v_half = (ASSUMED_VERTICAL_FOV_DEG.to_radians() * 0.5).tan();
     let h_half = v_half * (src_w as f32 / src_h.max(1) as f32);
 
@@ -812,12 +1093,41 @@ pub fn calibrate_scale(
     const MIN_C: f32 = 0.3;
     const MAX_C: f32 = 15.0;
 
+    // Outcome slots — one per candidate. We keep these so the caller
+    // can see *which* gate killed each anchor instead of just "no
+    // calibration this frame". The two indices are hardcoded against
+    // `candidates` above for readability — adding a third candidate
+    // would need another slot.
+    let mut shoulder_outcome = AnchorOutcome::NotChecked;
+    let mut hip_outcome = AnchorOutcome::NotChecked;
+
     for &(idx_a, idx_b, label, distance_m) in candidates {
-        let a = joints.get(idx_a)?;
-        let b = joints.get(idx_b)?;
+        // Borrow the right slot for this candidate. The shoulder
+        // candidate is `(5, 6, ...)`, hip is `(11, 12, ...)`; this
+        // discriminator stays valid as long as the table above keeps
+        // those COCO indices. A future "e.g. ear-pair fallback" anchor
+        // would need a third slot.
+        let outcome_slot = if idx_a == 5 {
+            &mut shoulder_outcome
+        } else {
+            &mut hip_outcome
+        };
+
+        // Joints buffer is gated to `NUM_JOINTS` upstream so missing
+        // is a logic bug, not a recoverable failure — but we keep a
+        // belt-and-braces guard rather than panicking so a corrupted
+        // upstream just shows up as `NotChecked` in the warning.
+        let (a, b) = match (joints.get(idx_a), joints.get(idx_b)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue,
+        };
         if a.score < super::skeleton_from_depth::KEYPOINT_VISIBILITY_FLOOR
             || b.score < super::skeleton_from_depth::KEYPOINT_VISIBILITY_FLOOR
         {
+            *outcome_slot = AnchorOutcome::LowKeypointScore {
+                score_a: a.score,
+                score_b: b.score,
+            };
             continue;
         }
 
@@ -827,16 +1137,25 @@ pub fn calibrate_scale(
         let dny = a.ny - b.ny;
         let pair_dist_2d = (dnx * dnx + dny * dny).sqrt();
         if pair_dist_2d < MIN_ANCHOR_2D_SEPARATION {
+            *outcome_slot = AnchorOutcome::PairTooClose2D {
+                separation: pair_dist_2d,
+            };
             continue;
         }
 
         let d_a = match dav2.sample_inverse_depth(a.nx, a.ny, SAMPLE_RADIUS_PX) {
             Some(v) if v > 1e-3 => v,
-            _ => continue,
+            _ => {
+                *outcome_slot = AnchorOutcome::DepthSampleFailed { which: 'a' };
+                continue;
+            }
         };
         let d_b = match dav2.sample_inverse_depth(b.nx, b.ny, SAMPLE_RADIUS_PX) {
             Some(v) if v > 1e-3 => v,
-            _ => continue,
+            _ => {
+                *outcome_slot = AnchorOutcome::DepthSampleFailed { which: 'b' };
+                continue;
+            }
         };
 
         let inv_a = 1.0 / d_a;
@@ -846,13 +1165,12 @@ pub fn calibrate_scale(
         let bz = inv_a - inv_b;
         let geom = (2.0 * h_half * ax).powi(2) + (2.0 * v_half * ay).powi(2) + bz.powi(2);
         if !geom.is_finite() || geom < 1e-9 {
+            *outcome_slot = AnchorOutcome::DegenerateGeometry { geom };
             continue;
         }
         let scale_c = distance_m / geom.sqrt();
-        if !scale_c.is_finite() || scale_c <= 0.0 {
-            continue;
-        }
-        if !(MIN_C..=MAX_C).contains(&scale_c) {
+        if !scale_c.is_finite() || scale_c <= 0.0 || !(MIN_C..=MAX_C).contains(&scale_c) {
+            *outcome_slot = AnchorOutcome::ScaleOutOfRange { scale_c };
             continue;
         }
 
@@ -879,12 +1197,17 @@ pub fn calibrate_scale(
                 let jitter = cal.anchor_depth_jitter_m.unwrap_or(0.05).max(0.05);
                 let max_deviation = (jitter * 3.0).max(cal_depth * 0.30);
                 if (predicted_depth - cal_depth).abs() > max_deviation {
+                    *outcome_slot = AnchorOutcome::PlausibilityRejected {
+                        predicted_depth,
+                        cal_depth,
+                        max_deviation,
+                    };
                     continue;
                 }
             }
         }
 
-        return Some(Calibration {
+        return Ok(Calibration {
             scale_c,
             h_half,
             v_half,
@@ -893,7 +1216,10 @@ pub fn calibrate_scale(
             d_raw_b: d_b,
         });
     }
-    None
+    Err(CalibrationFailure {
+        shoulder: shoulder_outcome,
+        hip: hip_outcome,
+    })
 }
 
 /// Back-project every DAv2 pixel into a metric `(x, y, z)` triple in
@@ -937,5 +1263,154 @@ pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibrati
         width: w,
         height: h,
         points_m,
+    }
+}
+
+#[cfg(all(test, feature = "inference"))]
+mod elbow_z_injection_tests {
+    use super::*;
+    use crate::tracking::source_skeleton::SourceJoint;
+
+    /// Build a minimal skeleton with both shoulders + the requested
+    /// elbows populated. Source-X span between shoulders = 0.50 units;
+    /// metric-X span = 0.40 m; conversion factor = 0.80 m/unit.
+    fn skeleton_with_elbows(
+        elbow_z_m_l: Option<f32>,
+        elbow_z_m_r: Option<f32>,
+        elbow_initial_src_z: f32,
+    ) -> (SourceSkeleton, f32, f32) {
+        skeleton_with_elbows_and_confidence(elbow_z_m_l, elbow_z_m_r, elbow_initial_src_z, 1.0)
+    }
+
+    fn skeleton_with_elbows_and_confidence(
+        elbow_z_m_l: Option<f32>,
+        elbow_z_m_r: Option<f32>,
+        elbow_initial_src_z: f32,
+        elbow_confidence: f32,
+    ) -> (SourceSkeleton, f32, f32) {
+        let sl_metric_x = 0.20;
+        let sr_metric_x = -0.20;
+        let mk_shoulder = |src_x: f32| SourceJoint {
+            position: [src_x, 0.0, 0.0],
+            confidence: 1.0,
+            metric_depth_m: Some(1.00),
+        };
+        let mk_elbow = |z_m: f32| SourceJoint {
+            position: [0.0, 0.0, elbow_initial_src_z],
+            confidence: elbow_confidence,
+            metric_depth_m: Some(z_m),
+        };
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftUpperArm, mk_shoulder(0.25));
+        sk.joints
+            .insert(HumanoidBone::RightUpperArm, mk_shoulder(-0.25));
+        if let Some(z) = elbow_z_m_l {
+            sk.joints.insert(HumanoidBone::LeftLowerArm, mk_elbow(z));
+        }
+        if let Some(z) = elbow_z_m_r {
+            sk.joints.insert(HumanoidBone::RightLowerArm, mk_elbow(z));
+        }
+        (sk, sl_metric_x, sr_metric_x)
+    }
+
+    #[test]
+    fn forward_elbow_gets_positive_source_z_delta_vs_shoulder() {
+        // Left elbow 0.16 m forward of shoulder → expected source delta
+        // 0.16 / 0.80 = 0.20.
+        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.84), None, 0.0);
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - 0.20).abs() < 1e-4, "got {z}");
+    }
+
+    #[test]
+    fn backward_elbow_gets_negative_source_z_delta() {
+        // Right elbow 0.10 m behind shoulder → expected delta -0.125.
+        let (mut sk, sl, sr) = skeleton_with_elbows(None, Some(1.10), 0.0);
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::RightLowerArm].position[2];
+        assert!((z + 0.125).abs() < 1e-4, "got {z}");
+    }
+
+    #[test]
+    fn implausible_forward_displacement_is_rejected_and_keeps_source_z() {
+        // Elbow 0.50 m forward of shoulder — past anatomical
+        // MAX_UPPER_ARM_DZ_M of 0.45.
+        let initial = 0.42;
+        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.50), None, initial);
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - initial).abs() < 1e-6, "got {z}");
+    }
+
+    #[test]
+    fn missing_elbow_metric_depth_skips_silently() {
+        let initial = 0.07;
+        let (mut sk, sl, sr) = skeleton_with_elbows(None, None, initial);
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.0, 0.0, initial],
+                confidence: 1.0,
+                metric_depth_m: None,
+            },
+        );
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - initial).abs() < 1e-6);
+    }
+
+    #[test]
+    fn degenerate_metric_shoulder_span_skips_silently() {
+        let initial = 0.07;
+        let (mut sk, _, _) = skeleton_with_elbows(Some(0.84), None, initial);
+        inject_elbow_z_from_dav2(&mut sk, 0.0001, -0.0001);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - initial).abs() < 1e-6, "got {z}");
+    }
+
+    #[test]
+    fn degenerate_source_shoulder_span_skips_silently() {
+        // Source-X span < 1mm — both shoulders coincide post-Phase-7.
+        // Function must skip even though the metric span we pass in
+        // looks fine.
+        let initial = 0.07;
+        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.84), None, initial);
+        // Collapse the source-X span by overwriting both shoulders to
+        // the same X.
+        for bone in [HumanoidBone::LeftUpperArm, HumanoidBone::RightUpperArm] {
+            if let Some(j) = sk.joints.get_mut(&bone) {
+                j.position[0] = 0.10;
+            }
+        }
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - initial).abs() < 1e-6, "got {z}");
+    }
+
+    #[test]
+    fn low_elbow_confidence_skips_injection() {
+        // Elbow has plausible metric depth but RTMW3D was uncertain
+        // about its 2D pixel — DAv2 sample is centred on a maybe-wrong
+        // location, so we should fall back to the RTMW3D nz value
+        // instead of trusting the depth sample.
+        let initial = 0.07;
+        let (mut sk, sl, sr) =
+            skeleton_with_elbows_and_confidence(Some(0.84), None, initial, 0.30);
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - initial).abs() < 1e-6, "got {z}");
+    }
+
+    #[test]
+    fn high_confidence_at_threshold_does_inject() {
+        // Sanity boundary: confidence exactly at MIN_INJECT_CONFIDENCE
+        // should pass (>=, not >). Otherwise small floor changes break
+        // poses near the threshold.
+        let (mut sk, sl, sr) =
+            skeleton_with_elbows_and_confidence(Some(0.84), None, 0.0, 0.40);
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((z - 0.20).abs() < 1e-4, "got {z}");
     }
 }

@@ -1267,7 +1267,12 @@ fn inject_spine_chain_proxies<F>(
 /// still moves the right direction) and only caps the *magnitude* to
 /// the anatomical bound. Less information loss than snap-to-parent.
 const MAX_TORSO_DZ_M: f32 = 0.50; // hip mid → shoulder
-const MAX_UPPER_ARM_DZ_M: f32 = 0.45; // shoulder → elbow
+/// Anatomical Z-distance ceiling between shoulder and elbow. Exposed
+/// to sibling tracking modules so the post-Phase-7 elbow Z re-injection
+/// in `rtmw3d_with_depth` can apply the same plausibility band that
+/// `apply_anatomical_z_clamps` enforces during the initial build —
+/// the alternative was a duplicate constant that drifts out of sync.
+pub(super) const MAX_UPPER_ARM_DZ_M: f32 = 0.45; // shoulder → elbow
 const MAX_LOWER_ARM_DZ_M: f32 = 0.40; // elbow → hand-wrist
 const MAX_UPPER_LEG_DZ_M: f32 = 0.55; // hip → knee
 const MAX_LOWER_LEG_DZ_M: f32 = 0.50; // knee → ankle

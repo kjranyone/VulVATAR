@@ -1,27 +1,14 @@
 use std::sync::Arc;
 
 use crate::asset::{
-    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, Mat4, MeshPrimitiveAsset, NodeId,
-    Transform, Vec3,
+    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, MeshPrimitiveAsset, NodeId, Transform,
+    Vec3,
 };
 use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::AvatarPose;
 use crate::avatar::pose_solver::{PoseSolverState, ResolvedExpressionWeight};
+use crate::math_utils::mat4_mul;
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
-
-/// Multiply two column-major 4x4 matrices: result = a * b.
-fn mul_mat4(a: &Mat4, b: &Mat4) -> Mat4 {
-    let mut out = [[0.0f32; 4]; 4];
-    for col in 0..4 {
-        for row in 0..4 {
-            out[col][row] = a[0][row] * b[col][0]
-                + a[1][row] * b[col][1]
-                + a[2][row] * b[col][2]
-                + a[3][row] * b[col][3];
-        }
-    }
-    out
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AvatarInstanceId(pub u64);
@@ -323,7 +310,7 @@ impl AvatarInstance {
             let local_mat = self.pose.local_transforms[node_idx].to_matrix();
 
             let global_mat = match parent_idx {
-                Some(pi) => mul_mat4(&self.pose.global_transforms[pi], &local_mat),
+                Some(pi) => mat4_mul(&self.pose.global_transforms[pi], &local_mat),
                 None => local_mat,
             };
 
@@ -360,7 +347,7 @@ impl AvatarInstance {
             } else {
                 continue;
             };
-            self.pose.skinning_matrices[i] = mul_mat4(global, ibm);
+            self.pose.skinning_matrices[i] = mat4_mul(global, ibm);
         }
     }
 }

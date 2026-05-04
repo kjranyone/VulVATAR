@@ -206,6 +206,38 @@ pub fn quat_from_euler_ypr(pitch: f32, yaw: f32, roll: f32) -> Quat {
 }
 
 // ---------------------------------------------------------------------------
+// Mat4 helpers (column-major)
+// ---------------------------------------------------------------------------
+
+/// Column-major 4×4 layout matching `crate::asset::Mat4`. Defined here
+/// rather than imported from `asset` to keep `math_utils` free of
+/// upstream dependencies — the type is just `[[f32; 4]; 4]`, which the
+/// compiler treats as identical to the `asset` alias.
+pub type Mat4 = [[f32; 4]; 4];
+
+/// Multiply two column-major 4×4 matrices: `result = a * b`.
+#[inline]
+pub fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
+    let mut out = [[0.0f32; 4]; 4];
+    for col in 0..4 {
+        for row in 0..4 {
+            out[col][row] = a[0][row] * b[col][0]
+                + a[1][row] * b[col][1]
+                + a[2][row] * b[col][2]
+                + a[3][row] * b[col][3];
+        }
+    }
+    out
+}
+
+/// Extract the translation column (column 3) of a column-major 4×4
+/// affine matrix.
+#[inline]
+pub fn mat4_translation(m: &Mat4) -> Vec3 {
+    [m[3][0], m[3][1], m[3][2]]
+}
+
+// ---------------------------------------------------------------------------
 // Geometry helpers
 // ---------------------------------------------------------------------------
 

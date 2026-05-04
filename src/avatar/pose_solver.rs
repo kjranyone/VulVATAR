@@ -640,10 +640,19 @@ pub fn solve_avatar_pose(
                         }
                     };
                     if anchor_type_matches {
+                        // `anchor_x` / `anchor_y` are stored in
+                        // source-space (matches `raw_offset` directly),
+                        // but `anchor_depth_m` is documented as
+                        // camera-space metric depth (positive forward
+                        // distance). `raw_offset[2]` is source-space
+                        // (= negative for forward subjects), so we
+                        // negate here to get the EMA seed onto the
+                        // same convention as the per-frame samples
+                        // it'll blend against.
                         state.root_reference = Some([
                             cal.anchor_x,
                             cal.anchor_y,
-                            cal.anchor_depth_m.unwrap_or(0.0),
+                            -cal.anchor_depth_m.unwrap_or(0.0),
                         ]);
                     }
                 }

@@ -1,8 +1,8 @@
 use crate::asset::ColliderShape;
 use crate::avatar::AvatarInstance;
 use crate::math_utils::{
-    closest_point_on_segment, quat_mul, quat_normalize, vec3_add, vec3_cross, vec3_dot,
-    vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
+    closest_point_on_segment, mat4_translation, quat_mul, quat_normalize, vec3_add, vec3_cross,
+    vec3_dot, vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
 };
 use crate::simulation::cloth::ResolvedCollider;
 
@@ -360,12 +360,6 @@ pub fn step_spring_bones(
 // ---------------------------------------------------------------------------
 // Mat4 helpers (column-major) -- specific to spring bone solver
 // ---------------------------------------------------------------------------
-
-/// Extract the translation (column 3) from a column-major 4x4 matrix.
-#[inline]
-fn mat4_translation(m: &[[f32; 4]; 4]) -> Vec3 {
-    [m[3][0], m[3][1], m[3][2]]
-}
 
 /// Transform a direction vector (no translation) by the upper-left 3x3 of a
 /// column-major 4x4 matrix.
