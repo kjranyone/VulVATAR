@@ -1631,6 +1631,38 @@ fn apply_2bone_ik_chain(
         chord[2] / chord_len,
     ];
 
+    // Heavily-bent guard: when the source-detected elbow's foot on
+    // chord lies OUTSIDE the [base, tip] segment (base→elbow→tip
+    // wraps back on itself: think elbows-forward with the wrist
+    // lifted near the face, or hands-behind-the-head), the standard
+    // 2-bone IK with avatar bone-length ratios mathematically cannot
+    // represent that configuration — the law-of-cosines triangle is
+    // forced to put the elbow at +cos_alpha along chord, while the
+    // detected elbow projects to -orig_dot along chord. Forcing the
+    // IK fit produces a 180°-flipped arm in source space (visible on
+    // calibration_effect_validation as elbows-forward and
+    // hands-behind-head poses with the entire forearm wrapping the
+    // wrong way around the avatar's body).
+    //
+    // In these cases the source detection is the more reliable
+    // signal: a deeply bent arm means base + tip + middle are all
+    // mutually close, the keypoints are all on the same side of the
+    // body and so the detector's noise is bounded; the IK adds no
+    // information the detector did not already have. Skip and
+    // preserve the source elbow.
+    if let Some(orig) = original_middle {
+        let orig_off = vec3_sub(&orig, &base_pos);
+        let orig_along_chord = vec3_dot(&orig_off, &chord_unit);
+        // Allow a tiny over-shoot tolerance so a clean fully-extended
+        // arm (foot lands exactly at base or tip) does not flicker in
+        // and out of IK between frames.
+        let lo = -chord_len * 0.05;
+        let hi = chord_len * 1.05;
+        if orig_along_chord < lo || orig_along_chord > hi {
+            return;
+        }
+    }
+
     // Law of cosines: angle α at base between chord and base→middle.
     let cos_alpha = ((l_upper * l_upper + chord_eff * chord_eff
         - l_lower * l_lower)
