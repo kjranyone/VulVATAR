@@ -328,7 +328,6 @@ impl RapierWorld {
     }
 
     /// Step the Rapier pipeline by one tick.
-    #[allow(dead_code)]
     pub fn step(&mut self, dt: f32) {
         self.integration_parameters.dt = dt;
         self.physics_pipeline.step(

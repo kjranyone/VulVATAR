@@ -32,7 +32,7 @@
 //! 5. **Head pose** derived from face landmarks 0..=4 + MoGe samples.
 //! 6. **FaceMesh + BlendshapeV2** cascade (optional) → expressions.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::provider::PoseProvider;
 use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
@@ -62,10 +62,6 @@ pub struct CigposeMetricDepthProvider {
     person_detector: Option<YoloxPersonDetector>,
     #[cfg(feature = "inference")]
     face_mesh: Option<FaceMeshInference>,
-    #[allow(dead_code)]
-    cigpose_model_path: PathBuf,
-    #[allow(dead_code)]
-    moge_model_path: PathBuf,
     load_warnings: Vec<String>,
     /// See `Rtmw3dWithDepthProvider::pose_calibration` — same role:
     /// drives `BuildOptions::force_shoulder_anchor` for Upper Body
@@ -85,11 +81,8 @@ impl CigposeMetricDepthProvider {
     #[cfg(feature = "inference")]
     pub(super) fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = models_dir.as_ref();
-        let cigpose_model_path = dir.join("cigpose.onnx");
-        let moge_model_path = dir.join("moge_v2.onnx");
-
-        let cigpose = CigposeInference::from_model_path(&cigpose_model_path)?;
-        let moge = MoGe2Inference::from_model_path(&moge_model_path)?;
+        let cigpose = CigposeInference::from_model_path(dir.join("cigpose.onnx"))?;
+        let moge = MoGe2Inference::from_model_path(dir.join("moge_v2.onnx"))?;
 
         let mut load_warnings = Vec::new();
         let person_detector = match YoloxPersonDetector::try_from_models_dir(dir) {
@@ -144,8 +137,6 @@ impl CigposeMetricDepthProvider {
             moge,
             person_detector,
             face_mesh,
-            cigpose_model_path,
-            moge_model_path,
             load_warnings,
             pose_calibration: None,
             torso_capture: None,

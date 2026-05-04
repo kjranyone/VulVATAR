@@ -65,7 +65,7 @@
 //! is the squared bracketed term computed from the two anchor
 //! pixels. One closed-form solve, no iteration.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::provider::PoseProvider;
 use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
@@ -215,8 +215,6 @@ pub struct Rtmw3dWithDepthProvider {
     /// instance on the main thread, so cache the string at startup.
     #[cfg(feature = "inference")]
     depth_backend_label: String,
-    #[allow(dead_code)]
-    dav2_model_path: PathBuf,
     load_warnings: Vec<String>,
     /// Latest pose calibration pushed from the GUI via the tracking
     /// mailbox. `None` means no calibration is active — the depth
@@ -274,7 +272,6 @@ impl Rtmw3dWithDepthProvider {
     #[cfg(feature = "inference")]
     pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = models_dir.as_ref();
-        let dav2_model_path = dir.join("dav2_small.onnx");
 
         // Force FaceMesh on CPU EP: with DAv2 on DirectML running
         // concurrently in the worker thread, sharing the GPU command
@@ -286,7 +283,7 @@ impl Rtmw3dWithDepthProvider {
             super::face_mediapipe::FaceMeshEp::ForceCpu,
         )?;
         let warnings = rtmw3d.take_load_warnings();
-        let dav2 = DepthAnythingV2Inference::from_model_path(&dav2_model_path)?;
+        let dav2 = DepthAnythingV2Inference::from_model_path(dir.join("dav2_small.onnx"))?;
         let depth_backend_label = dav2.backend().label().to_string();
 
         let (depth_tx, depth_rx) = channel::<DepthRequest>();
@@ -313,7 +310,6 @@ impl Rtmw3dWithDepthProvider {
             depth_thread: Some(depth_thread),
             depth_thread_dead_logged: false,
             depth_backend_label,
-            dav2_model_path,
             load_warnings: warnings,
             pose_calibration: None,
             scale_c_ema: None,

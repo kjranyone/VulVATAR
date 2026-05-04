@@ -292,7 +292,6 @@ impl VirtualCameraNative {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn frame_index(&self) -> u64 {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
