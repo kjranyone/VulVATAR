@@ -8,7 +8,7 @@
 //! delete the placeholder and the library would flash empty
 //! squares — that is the regression these tests prevent.
 
-use super::handle_thumbnail_response;
+use super::snapshot::handle_thumbnail_response;
 use crate::renderer::ThumbnailRenderResult;
 
 fn make_tempdir(suffix: &str) -> std::path::PathBuf {
