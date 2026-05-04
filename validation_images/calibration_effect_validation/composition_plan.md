@@ -52,6 +52,7 @@ validation_images/calibration_effect_validation/
     torso_hips/
     lower_body/
     arm_reach/
+    elbow_motion/
     depth_occlusion/
     balance_motion/
     hand_shoulder_occlusion/
@@ -161,6 +162,10 @@ enough to stress calibration behavior.
 | arm_reach | 008 | hands_behind_head | evaluation | Both hands behind head, elbows wide | Wrist/ear/shoulder ambiguity |
 | arm_reach | 009 | hands_on_hips | evaluation | Both hands on hips, elbows out | Wrist near pelvis landmarks |
 | arm_reach | 010 | elbows_forward | evaluation | Elbows lifted forward, fists near collarbone | Elbow/shoulder overlap |
+| elbow_motion | 001 | l_elbow_forward_r_back | evaluation | Left elbow projects forward, right elbow sits back | Elbow depth ordering |
+| elbow_motion | 002 | r_elbow_forward_l_back | evaluation | Right elbow projects forward, left elbow sits back | Elbow depth ordering |
+| elbow_motion | 003 | both_elbows_forward | evaluation | Both elbows project forward toward camera | Elbow and shoulder overlap |
+| elbow_motion | 004 | both_elbows_back | evaluation | Both elbows sit behind torso line | Rear elbow visibility |
 | depth_occlusion | 001 | l_hand_near_camera | evaluation | Left hand reaches toward camera, palm large, shoulder visible behind | Near-hand scale distraction |
 | depth_occlusion | 002 | r_hand_near_camera | evaluation | Right hand reaches toward camera, palm large, shoulder visible behind | Near-hand scale distraction |
 | depth_occlusion | 003 | both_hands_near_camera | evaluation | Both hands extended toward camera, palms visible | Bilateral near-hand scale distraction |
