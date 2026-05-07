@@ -178,6 +178,16 @@ struct TrackingMailboxInner {
     /// poll uses the same `seq` pattern to consume each template
     /// exactly once and avoid double-stitching.
     torso_template_seq: u64,
+    /// GUI-driven hint: the calibration mode the user is *currently
+    /// collecting* (modal open, samples about to flow), independent of
+    /// any confirmed `PoseCalibration`. The worker forwards this to the
+    /// provider via [`PoseProvider::set_calibration_mode_hint`]; without
+    /// it the very first `UpperBody` capture sees `force_shoulder_anchor=
+    /// false` and the GUI rejects every collected sample.
+    pending_calibration_mode_hint: Option<CalibrationMode>,
+    /// Bumped each time `set_calibration_mode_hint` writes; same edge-
+    /// detect rationale as `calibration_seq`.
+    pending_calibration_mode_hint_seq: u64,
 }
 
 fn now_nanos() -> u64 {
@@ -213,6 +223,8 @@ impl TrackingMailbox {
                 torso_capture_seq: 0,
                 torso_template_collected: None,
                 torso_template_seq: 0,
+                pending_calibration_mode_hint: None,
+                pending_calibration_mode_hint_seq: 0,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -310,6 +322,35 @@ impl TrackingMailbox {
         let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         if inner.torso_capture_seq != last_seen_seq {
             Some((inner.torso_capture_enabled, inner.torso_capture_seq))
+        } else {
+            None
+        }
+    }
+
+    /// GUI-side push: the calibration mode the user has selected in the
+    /// open modal, or `None` when the modal is closed. Forwarded to the
+    /// provider as a transient anchor hint so the very first `UpperBody`
+    /// capture isn't dropped by the model's hallucinated-hip output —
+    /// see [`PoseProvider::set_calibration_mode_hint`] for the contract.
+    pub fn set_calibration_mode_hint(&self, hint: Option<CalibrationMode>) {
+        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        inner.pending_calibration_mode_hint = hint;
+        inner.pending_calibration_mode_hint_seq += 1;
+    }
+
+    /// Worker-side poll for the calibration-mode hint. Same edge-detect
+    /// pattern as `poll_calibration`. Returns `Some((hint, seq))` only
+    /// when the GUI changed the hint since `last_seen_seq`.
+    pub fn poll_calibration_mode_hint(
+        &self,
+        last_seen_seq: u64,
+    ) -> Option<(Option<CalibrationMode>, u64)> {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.pending_calibration_mode_hint_seq != last_seen_seq {
+            Some((
+                inner.pending_calibration_mode_hint,
+                inner.pending_calibration_mode_hint_seq,
+            ))
         } else {
             None
         }
@@ -601,32 +642,16 @@ impl TrackingWorker {
         &self.backend
     }
 
-    /// Spawn the tracking worker thread with the given backend.
-    ///
-    /// The thread loops at approximately `fps` frames per second, capturing
-    /// frames from the selected backend and publishing poses to the shared
-    /// mailbox. If the thread is already running this is a no-op.
-    #[allow(dead_code)]
-    pub fn start(&mut self, backend: CameraBackend) {
-        self.start_with_params(backend, 640, 480, 30);
-    }
-
-    /// Like [`Self::start`] but allows specifying the webcam resolution and fps.
-    pub fn start_with_params(&mut self, backend: CameraBackend, width: u32, height: u32, fps: u32) {
-        self.start_with_params_full(backend, width, height, fps, false);
-    }
-
-    /// Same as [`Self::start_with_params`] but allows opting into a
-    /// wholebody pose model (legs/feet keypoints) at the cost of upper-
-    /// body fidelity. Only consulted at start time — toggling the flag
-    /// while the worker is running is a no-op.
-    pub fn start_with_params_full(
+    /// Spawn the tracking worker thread with the given backend / capture
+    /// parameters. The thread loops at approximately `fps` frames per second,
+    /// capturing frames and publishing poses to the shared mailbox. If a
+    /// worker is already running this is a no-op.
+    pub fn start_with_params(
         &mut self,
         backend: CameraBackend,
         width: u32,
         height: u32,
         fps: u32,
-        prefer_lower_body: bool,
     ) {
         if self.handle.is_some() {
             return;
@@ -653,7 +678,6 @@ impl TrackingWorker {
                     width,
                     height,
                     fps,
-                    prefer_lower_body,
                 );
             })
             .expect("failed to spawn tracking-worker thread");
@@ -700,11 +724,10 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
-        prefer_lower_body: bool,
     ) {
         match backend {
             CameraBackend::Synthetic => {
-                let _ = (width, height, fps, prefer_lower_body);
+                let _ = (width, height, fps);
                 ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(&mailbox, &running, frame_interval);
             }
@@ -719,7 +742,6 @@ impl TrackingWorker {
                     width,
                     height,
                     fps,
-                    prefer_lower_body,
                 );
             }
         }
@@ -764,7 +786,6 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
-        prefer_lower_body: bool,
     ) {
         info!(
             "tracking-worker: opening webcam {} ({}x{} @ {} fps)",
@@ -793,11 +814,7 @@ impl TrackingWorker {
             }
         };
 
-        // Initialize the pose provider. The legacy
-        // `prefer_lower_body` flag has been a no-op since the move
-        // to whole-body 3D models — kept in the function signature
-        // to avoid touching every caller, but the value is ignored.
-        let _ = prefer_lower_body;
+        // Initialize the pose provider.
         #[cfg(feature = "inference")]
         let mut pose_provider = match provider::create_pose_provider_from_env("models") {
             Ok(mut provider) => {
@@ -840,6 +857,11 @@ impl TrackingWorker {
         // `estimate_pose` (one Option-is-some branch per frame), so
         // this loop only needs to forward on/off transitions.
         let mut last_torso_capture_seq: u64 = 0;
+        // Same edge-detect for the calibration-mode hint pushed by the
+        // GUI while the calibration modal is open. Lets the provider
+        // suppress phantom hip keypoints during the very first
+        // `UpperBody` capture, before any persisted calibration exists.
+        let mut last_calibration_mode_hint_seq: u64 = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
         while running.load(Ordering::SeqCst) {
@@ -877,6 +899,16 @@ impl TrackingWorker {
                         provider.set_torso_capture(false);
                     }
                     last_torso_capture_seq = seq;
+                }
+                // Calibration-mode hint forwarding. Active for the
+                // lifetime of the open modal; cleared on close so the
+                // provider falls back to whatever the persisted
+                // calibration says.
+                if let Some((hint, seq)) =
+                    mailbox.poll_calibration_mode_hint(last_calibration_mode_hint_seq)
+                {
+                    provider.set_calibration_mode_hint(hint);
+                    last_calibration_mode_hint_seq = seq;
                 }
             }
 

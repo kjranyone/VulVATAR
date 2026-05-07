@@ -33,6 +33,7 @@ pub(super) fn begin_capture(state: &mut GuiApp) {
                 last_anchor_seen: false,
                 last_confidence: 0.0,
                 no_anchor_since: None,
+                no_lower_arms_since: None,
             })
         }
         _ => None,

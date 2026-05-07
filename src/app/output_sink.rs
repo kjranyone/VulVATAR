@@ -41,7 +41,9 @@ impl Application {
                         self.mf_virtual_camera = Some(cam);
                     }
                 }
-                FrameSink::SharedTexture | FrameSink::SharedMemory | FrameSink::ImageSequence => {
+                FrameSink::SharedTextureFileStub
+                | FrameSink::SharedMemory
+                | FrameSink::ImageSequence => {
                     if self.mf_virtual_camera.take().is_some() {
                         info!("output: MediaFoundation virtual camera unregistered");
                     }

@@ -85,6 +85,19 @@ pub enum CalibrationModalState {
         last_anchor_seen: bool,
         last_confidence: f32,
         no_anchor_since: Option<Instant>,
+        /// First frame on which `LeftLowerArm` + `RightLowerArm` went
+        /// missing while the mode-relevant anchor stayed visible.
+        /// Drives the "step back so your elbows are visible" framing
+        /// hint in the status pane (see `panes::framing_hint`).
+        ///
+        /// Separate from `no_anchor_since` because the failure modes
+        /// are distinct: anchor-missing means "we don't even see your
+        /// torso, you might be in the wrong calibration mode";
+        /// elbows-missing means "we see your torso fine, but the
+        /// camera is too close — both T-pose and A-pose require the
+        /// elbow keypoint, which is the first thing to crop out at
+        /// desk distances".
+        no_lower_arms_since: Option<Instant>,
     },
     /// Active anchor sample collection. Per-frame `AnchorSample` rows
     /// are appended each time the mailbox sequence advances *and* the
@@ -222,6 +235,16 @@ impl CalibrationModalState {
 
     pub fn close(&mut self) {
         *self = CalibrationModalState::Closed;
+    }
+
+    /// The mode currently driving the modal, in any non-`Closed` state.
+    /// Returns `None` when the modal is closed. Used by the GUI's
+    /// per-frame loop to push a calibration-mode hint to the tracking
+    /// worker so the provider's `force_shoulder_anchor` flips on the
+    /// instant the user opens an `UpperBody` capture, instead of waiting
+    /// for `persist_calibration` to fire after a successful capture.
+    pub fn active_mode(&self) -> Option<CalibrationMode> {
+        relevant_mode(self)
     }
 }
 

@@ -10,6 +10,7 @@ use crate::app::render_thread::RenderCommand;
 use crate::avatar::pose_solver::{self, SolverParams};
 use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
+use crate::simulation::SimulationStepOptions;
 use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
     CameraState, ClothDeformSnapshot, OutlineSnapshot, OutputTargetRequest, RenderAlphaMode,
@@ -74,6 +75,13 @@ impl Application {
             ..SolverParams::default()
         };
 
+        // Advance the simulation clock once per frame so every avatar in the
+        // scene observes the same `(fixed_dt, substeps)`. Previously this was
+        // called inside the avatar loop and the first avatar would consume the
+        // accumulator, leaving later avatars with zero substeps.
+        let substeps = self.sim_clock.advance(frame_dt);
+        let fixed_dt = self.sim_clock.fixed_dt();
+
         for avatar in self.avatars.iter_mut() {
             avatar.build_base_pose();
 
@@ -104,19 +112,23 @@ impl Application {
 
             avatar.compute_global_pose();
 
+            let step_options = SimulationStepOptions {
+                spring_enabled: toggles.spring_enabled,
+                cloth_enabled: toggles.cloth_enabled && avatar.cloth_enabled,
+            };
+
             if self.physics.rapier_initialized() {
-                self.physics.step_all(frame_dt, avatar);
+                self.physics
+                    .step_all(fixed_dt, substeps, avatar, step_options);
                 avatar.compute_global_pose();
             } else {
-                let substeps = self.sim_clock.advance(frame_dt);
-                if toggles.spring_enabled {
-                    self.physics
-                        .step_springs(self.sim_clock.fixed_dt(), substeps, avatar);
+                if step_options.spring_enabled {
+                    self.physics.step_springs(fixed_dt, substeps, avatar);
                     avatar.compute_global_pose();
                 }
-                if toggles.cloth_enabled && avatar.cloth_enabled {
+                if step_options.cloth_enabled {
                     for _ in 0..substeps {
-                        self.physics.step_cloth(self.sim_clock.fixed_dt(), avatar);
+                        self.physics.step_cloth(fixed_dt, avatar);
                     }
                     avatar.compute_global_pose();
                 }
@@ -146,18 +158,34 @@ impl Application {
             );
 
             if let Some(ref rt) = self.render_thread {
-                rt.submit(RenderCommand::RenderFrame(frame_input));
+                if rt.submit(RenderCommand::RenderFrame(frame_input)) {
+                    self.render_results_pending = self.render_results_pending.saturating_add(1);
+                }
             }
+        }
 
-            let pending_results: Vec<_> = if let Some(ref rt) = self.render_thread {
-                std::iter::from_fn(|| rt.try_recv_result()).collect()
-            } else {
-                vec![]
-            };
+        // Drain results unconditionally — outside the `!avatars.is_empty()`
+        // gate above and meant to be called even when the GUI is paused
+        // (`drain_render_results` below is wired into `GuiApp::update`).
+        // Without this the in-flight counter would pin to >0 the moment
+        // the user pauses or removes the last avatar with a frame still
+        // in flight, and the GUI repaint gate would loop forever.
+        self.drain_render_results();
+    }
 
-            for result in pending_results {
-                self.process_render_result(result);
-            }
+    /// Drain every result currently sitting in the render thread's
+    /// result channel and decrement the in-flight counter accordingly.
+    /// Safe to call whether or not `run_frame` ran this tick — the
+    /// counter is the boundary, not the avatar list.
+    pub fn drain_render_results(&mut self) {
+        let pending_results: Vec<_> = if let Some(ref rt) = self.render_thread {
+            std::iter::from_fn(|| rt.try_recv_result()).collect()
+        } else {
+            vec![]
+        };
+        for result in pending_results {
+            self.render_results_pending = self.render_results_pending.saturating_sub(1);
+            self.process_render_result(result);
         }
     }
 

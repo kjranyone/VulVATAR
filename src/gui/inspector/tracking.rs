@@ -90,13 +90,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     };
                     #[cfg(not(feature = "webcam"))]
                     let backend = crate::tracking::CameraBackend::Synthetic;
-                    state.app.start_tracking_with_params_full(
-                        backend,
-                        w,
-                        h,
-                        fps,
-                        state.tracking.lower_body_tracking_enabled,
-                    );
+                    state.app.start_tracking_with_params(backend, w, h, fps);
                 }
             });
             if ui
@@ -160,13 +154,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 };
                 #[cfg(not(feature = "webcam"))]
                 let backend = crate::tracking::CameraBackend::Synthetic;
-                state.app.start_tracking_with_params_full(
-                    backend,
-                    w,
-                    h,
-                    fps,
-                    state.tracking.lower_body_tracking_enabled,
-                );
+                state.app.start_tracking_with_params(backend, w, h, fps);
                 state.push_notification(t!("tracking.camera_restarted", w = w, h = h, fps = fps));
             }
         });

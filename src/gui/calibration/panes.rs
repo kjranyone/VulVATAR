@@ -265,25 +265,42 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         return;
     };
 
+    // Letterbox/pillarbox the camera frame into the fixed preview rect
+    // so 4:3 sources (the default 640×480) don't get stretched into
+    // the 16:9 outer rect. Mirrors the fit-inside logic in
+    // `viewport::draw` for the main viewport image.
+    let tex_size = tex.size_vec2();
+    let tex_aspect = tex_size.x / tex_size.y.max(1.0);
+    let rect_aspect = rect.width() / rect.height().max(1.0);
+    let (draw_w, draw_h) = if tex_aspect > rect_aspect {
+        (rect.width(), rect.width() / tex_aspect)
+    } else {
+        (rect.height() * tex_aspect, rect.height())
+    };
+    let image_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(draw_w, draw_h));
+
     let uv = if state.tracking.tracking_mirror {
         egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
     } else {
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
     };
-    painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
+    painter.image(tex.id(), image_rect, uv, egui::Color32::WHITE);
 
     // Skeleton + keypoint overlay. Same style the camera-wipe paints —
     // the calibration UX is most useful when the user can see exactly
-    // which keypoints the tracker is locking onto.
+    // which keypoints the tracker is locking onto. Coordinates map
+    // into the letterboxed image rect (not the outer pane rect) so
+    // overlay points sit on top of the actual camera pixels even
+    // when the image is pillarboxed.
     if let Some(ref ann) = snap.annotation {
         let kpt_color = egui::Color32::from_rgba_unmultiplied(0, 255, 128, 220);
         let line_color = egui::Color32::from_rgba_unmultiplied(0, 200, 255, 180);
         let mirror = state.tracking.tracking_mirror;
         let map_x = |nx: f32| {
             let x = if mirror { 1.0 - nx } else { nx };
-            rect.left() + x * rect.width()
+            image_rect.left() + x * image_rect.width()
         };
-        let map_y = |ny: f32| rect.top() + ny * rect.height();
+        let map_y = |ny: f32| image_rect.top() + ny * image_rect.height();
 
         for &(kx, ky, conf) in &ann.keypoints {
             if conf < 0.1 {
@@ -444,6 +461,17 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 last_confidence: 0.0,
             };
         }
+    } else if framing_hint(&state.calibration_modal) {
+        // Anchor is fine but the elbows have been cropped for a
+        // while. T-pose / A-pose scoring both need both elbow
+        // keypoints (see `pose_match::arm_direction`), so without
+        // them the user is stuck at 0% match with no visible cause.
+        // Inline-only — no auxiliary button, the action is physical.
+        ui.add_space(8.0);
+        ui.colored_label(
+            egui::Color32::from_rgb(240, 180, 90),
+            egui::RichText::new(t!("calibration.lower_arms_out_of_frame")).size(12.0),
+        );
     }
 
     ui.add_space(16.0);
@@ -495,6 +523,25 @@ fn mode_mismatch_hint(
         ),
     };
     Some((message, switch_to))
+}
+
+/// True when the user has been in `WaitingForPose` long enough with
+/// the elbows cropped for the framing hint to fire. Reuses
+/// `NO_ANCHOR_HINT_SECONDS` so a transient occlusion of one elbow
+/// (a hand passing over the lap, etc.) doesn't immediately ping;
+/// the threshold is the same load-bearing "ignore short blips,
+/// react to sustained problems" delay the anchor hint uses.
+fn framing_hint(state: &CalibrationModalState) -> bool {
+    let CalibrationModalState::WaitingForPose {
+        no_lower_arms_since,
+        ..
+    } = state
+    else {
+        return false;
+    };
+    no_lower_arms_since
+        .map(|t| t.elapsed().as_secs_f32() >= NO_ANCHOR_HINT_SECONDS)
+        .unwrap_or(false)
 }
 
 /// AnchorDone pane: result summary + the three branching choices

@@ -191,6 +191,13 @@ pub struct Application {
     pub ground_grid_visible: bool,
     stale_warn_cooldown: std::time::Instant,
     logged_first_render_result: bool,
+    /// Number of `RenderCommand::RenderFrame` submissions that have not
+    /// yet produced a `RenderResult`. Bumped on a successful submit in
+    /// `run_frame`, decremented for each result drained. The GUI repaint
+    /// gate reads this so a viewport mutation on an otherwise-idle
+    /// avatar still gets at least one follow-up frame to upload the
+    /// re-rendered texture instead of stalling on the previous image.
+    render_results_pending: u32,
 }
 
 impl Default for Application {
@@ -298,7 +305,17 @@ impl Application {
             viewport_background: None,
             ground_grid_visible: false,
             logged_first_render_result: false,
+            render_results_pending: 0,
         }
+    }
+
+    /// True iff the renderer has been handed a frame that hasn't come
+    /// back as a `RenderResult` yet. Drives the GUI repaint gate so a
+    /// one-shot mutation (slider drag, sink swap) still produces a
+    /// follow-up frame to drain the result, even when no animation,
+    /// tracking, or lipsync is active.
+    pub fn has_pending_render_result(&self) -> bool {
+        self.render_results_pending > 0
     }
 
     /// Set the desired viewport resolution (called by the GUI when the viewport panel resizes).

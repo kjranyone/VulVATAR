@@ -68,6 +68,13 @@ pub struct CigposeMetricDepthProvider {
     /// calibration so a phantom hip detection can't override the
     /// user's framing declaration.
     pose_calibration: Option<crate::tracking::PoseCalibration>,
+    /// Transient mode hint pushed by the GUI while the calibration
+    /// modal is open. Same contract as
+    /// `Rtmw3dWithDepthProvider::calibration_mode_hint` — overrides
+    /// the persisted calibration's mode for the
+    /// `force_shoulder_anchor` decision so re-calibration in either
+    /// direction works.
+    calibration_mode_hint: Option<crate::tracking::CalibrationMode>,
     /// Active torso-template capture buffer. See
     /// `Rtmw3dWithDepthProvider::torso_capture` — same role:
     /// accumulates per-frame torso-bbox depth samples while the GUI
@@ -139,6 +146,7 @@ impl CigposeMetricDepthProvider {
             face_mesh,
             load_warnings,
             pose_calibration: None,
+            calibration_mode_hint: None,
             torso_capture: None,
         })
     }
@@ -167,6 +175,13 @@ impl PoseProvider for CigposeMetricDepthProvider {
 
     fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
         self.pose_calibration = calibration;
+    }
+
+    fn set_calibration_mode_hint(&mut self, hint: Option<crate::tracking::CalibrationMode>) {
+        // Override the persisted calibration's mode for the
+        // `force_shoulder_anchor` decision while the modal is open —
+        // see `build_options_from_calibration` for the contract.
+        self.calibration_mode_hint = hint;
     }
 
     fn set_torso_capture(&mut self, enabled: bool) {
@@ -313,10 +328,16 @@ impl CigposeMetricDepthProvider {
         }
 
         let t_skel = std::time::Instant::now();
-        // BuildOptions derived from the active pose calibration
-        // (Upper Body mode forces shoulder anchor — see
-        // `Rtmw3dWithDepthProvider` for the rationale).
-        let opts = build_options_from_calibration(self.pose_calibration.as_ref());
+        // BuildOptions derived from the active pose calibration AND
+        // the GUI's transient mode hint — see
+        // `build_options_from_calibration` for why both are needed
+        // (the hint is what makes the very first `UpperBody` capture
+        // possible, and what allows re-calibrating in either
+        // direction).
+        let opts = build_options_from_calibration(
+            self.pose_calibration.as_ref(),
+            self.calibration_mode_hint,
+        );
         let (mut skeleton, origin_opt) = match resolve_origin_metric(
             &joints_2d,
             &depth_frame,

@@ -8,7 +8,13 @@ use super::{AlphaMode, OutputColorSpace, OutputFrame};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameSink {
     VirtualCamera,
-    SharedTexture,
+    /// File-backed CPU stub for the future GPU shared-texture path. The
+    /// implementation today writes a CPU pixel buffer to disk using the
+    /// VSTX framing — there is **no** GPU resource handoff. The variant is
+    /// named so callers, diagnostics, and persisted project data make that
+    /// clear; the real GPU path will get a separate variant when it lands
+    /// (see Phase 6 in `plan/architecture-pipeline-gui-critical-review.md`).
+    SharedTextureFileStub,
     SharedMemory,
     ImageSequence,
 }
@@ -20,7 +26,7 @@ impl FrameSink {
     pub fn to_gui_index(&self) -> usize {
         match self {
             FrameSink::VirtualCamera => 0,
-            FrameSink::SharedTexture => 1,
+            FrameSink::SharedTextureFileStub => 1,
             FrameSink::SharedMemory => 2,
             FrameSink::ImageSequence => 3,
         }
@@ -31,7 +37,7 @@ impl FrameSink {
     pub fn from_gui_index(index: usize) -> Self {
         match index {
             0 => FrameSink::VirtualCamera,
-            1 => FrameSink::SharedTexture,
+            1 => FrameSink::SharedTextureFileStub,
             2 => FrameSink::SharedMemory,
             _ => FrameSink::ImageSequence,
         }
@@ -187,48 +193,6 @@ impl OutputSinkWriter for SharedMemorySink {
 
     fn name(&self) -> &str {
         &self.mapping_name
-    }
-}
-
-pub struct SharedTextureSink {
-    inner: SharedMemorySink,
-    ready_path: PathBuf,
-}
-
-impl SharedTextureSink {
-    pub fn new() -> Self {
-        let path = std::env::temp_dir().join("vulvatar_shared_texture.raw");
-        let ready_path = std::env::temp_dir().join("vulvatar_shared_texture.ready");
-        Self {
-            inner: SharedMemorySink {
-                path,
-                sequence: 0,
-                mapping_name: "SharedTexture".to_string(),
-            },
-            ready_path,
-        }
-    }
-}
-
-impl Default for SharedTextureSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OutputSinkWriter for SharedTextureSink {
-    fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
-        let _ = fs::remove_file(&self.ready_path);
-        let seq = self.inner.sequence;
-        self.inner.write_frame(frame)?;
-        let seq_bytes = seq.to_le_bytes();
-        fs::write(&self.ready_path, seq_bytes)
-            .map_err(|e| format!("SharedTextureSink: failed to write ready signal: {}", e))?;
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        "SharedTexture"
     }
 }
 
@@ -545,7 +509,13 @@ impl OutputSinkWriter for VirtualCameraFileSink {
 }
 
 // ---------------------------------------------------------------------------
-// SharedMemoryFileSink — GPU shared texture file protocol (VSTX)
+// SharedMemoryFileSink — VSTX file protocol stub
+//
+// Despite the historical name, this writer is a CPU-only file dump using the
+// VSTX framing. It is the implementation behind `FrameSink::SharedTextureFileStub`
+// and exists as a placeholder until a real cross-process GPU shared-texture
+// handoff lands. `write_frame` requires `frame.pixel_data`; there is no GPU
+// resource handle exchanged.
 // ---------------------------------------------------------------------------
 
 const VSTX_MAGIC: [u8; 4] = [b'V', b'S', b'T', b'X'];
@@ -1011,6 +981,6 @@ pub fn create_sink_writer(sink: &FrameSink) -> Box<dyn OutputSinkWriter> {
                 Box::new(VirtualCameraFileSink::new())
             }
         }
-        FrameSink::SharedTexture => Box::new(SharedMemoryFileSink::new()),
+        FrameSink::SharedTextureFileStub => Box::new(SharedMemoryFileSink::new()),
     }
 }

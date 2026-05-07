@@ -158,6 +158,34 @@ pub struct Rtmw3dInference {
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
     backend: InferenceBackend,
+    /// When true, hip pair (COCO 11/12) is unconditionally treated as
+    /// not-visible inside [`skeleton::build_source_skeleton`]. Set by
+    /// the `PoseProvider::set_calibration` override when the user
+    /// picks `CalibrationMode::UpperBody`: webcam framing in that
+    /// mode crops the hips, but the keypoint head still hallucinates
+    /// a confident-looking hip position which would otherwise
+    /// pollute the source skeleton with phantom legs.
+    #[cfg(feature = "inference")]
+    pub(crate) force_shoulder_anchor: bool,
+    /// Transient hint pushed by the GUI while the calibration modal is
+    /// open. Carries the modal's currently selected mode so the provider
+    /// can **override** the persisted [`Self::force_shoulder_anchor`]
+    /// during sample collection — both directions:
+    ///
+    /// * `Some(UpperBody)` → force shoulder anchor (suppress phantom
+    ///   hip), even if the persisted calibration is `FullBody`.
+    /// * `Some(FullBody)`  → do **not** force shoulder anchor, even if
+    ///   the persisted calibration is `UpperBody`. Without this branch,
+    ///   re-calibrating from `UpperBody` to `FullBody` is impossible:
+    ///   the persisted flag stays true, hip never appears as the
+    ///   anchor, and every collected sample is rejected by the GUI's
+    ///   `pose.root_anchor_is_hip` gate.
+    /// * `None`            → modal closed, fall back to the persisted
+    ///   flag.
+    ///
+    /// Applied at the call site in `process_pose`.
+    #[cfg(feature = "inference")]
+    pub(crate) force_shoulder_anchor_hint: Option<crate::tracking::CalibrationMode>,
 }
 
 impl Rtmw3dInference {
@@ -269,6 +297,8 @@ impl Rtmw3dInference {
             right_wrist: wrist::WristTracker::default(),
             load_warnings,
             backend,
+            force_shoulder_anchor: false,
+            force_shoulder_anchor_hint: None,
         })
     }
 
@@ -476,7 +506,26 @@ impl Rtmw3dInference {
                 j.ny = (oy + j.ny * ch) * inv_h;
             }
         }
-        let mut skeleton = skeleton::build_source_skeleton(frame_index, &joints, width, height);
+        // Hint **overrides** persisted when present, in either direction:
+        // the transient GUI hint reflects the mode the user just opened
+        // the calibration modal in, which must take precedence over any
+        // previously-persisted calibration (otherwise re-calibrating from
+        // `UpperBody` to `FullBody` is impossible — the persisted flag
+        // would stay true and the GUI would reject every hip-anchored
+        // sample). When the modal is closed (`None`) the persisted flag
+        // takes over.
+        let force_shoulder = match self.force_shoulder_anchor_hint {
+            Some(crate::tracking::CalibrationMode::UpperBody) => true,
+            Some(crate::tracking::CalibrationMode::FullBody) => false,
+            None => self.force_shoulder_anchor,
+        };
+        let mut skeleton = skeleton::build_source_skeleton(
+            frame_index,
+            &joints,
+            width,
+            height,
+            force_shoulder,
+        );
 
         // Per-side wrist sanity check + temporal hold. Run before
         // the face cascade so the wrist is settled when the solver

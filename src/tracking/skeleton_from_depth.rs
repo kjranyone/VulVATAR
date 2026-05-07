@@ -703,16 +703,40 @@ pub struct BuildOptions {
 }
 
 /// Build [`BuildOptions`] from the depth-providers' cached
-/// `pose_calibration`. Single-sourced so both depth providers
+/// `pose_calibration` and the GUI's transient calibration-modal mode
+/// hint. Single-sourced so both depth providers
 /// (rtmw3d-with-depth, cigpose-metric-depth) compute the same opts
 /// and any future calibration-derived knob (c-clamp from jitter,
 /// anchor-bias rejection) lands in one place.
+///
+/// `mode_hint` carries the mode the user has selected in the
+/// **currently open** calibration modal. When `Some`, it **overrides**
+/// the persisted calibration's mode for the `force_shoulder_anchor`
+/// decision in either direction:
+///
+/// * `Some(UpperBody)` → force shoulder anchor (suppress phantom hip),
+///   even if the persisted calibration is `FullBody` or absent. This
+///   is what makes the *first* `UpperBody` capture possible — until
+///   `persist_calibration` runs there is no persisted flag to flip.
+/// * `Some(FullBody)`  → do **not** force shoulder anchor, even if
+///   the persisted calibration is `UpperBody`. Without this branch,
+///   re-calibrating from `UpperBody` to `FullBody` is impossible: the
+///   persisted flag stays true, hip never appears as the anchor, and
+///   every collected sample is rejected by the GUI's
+///   `pose.root_anchor_is_hip` gate.
+/// * `None`            → modal closed, fall back to the persisted
+///   calibration's mode.
 pub(super) fn build_options_from_calibration(
     calibration: Option<&super::PoseCalibration>,
+    mode_hint: Option<super::CalibrationMode>,
 ) -> BuildOptions {
-    let force_shoulder_anchor = calibration
-        .map(|c| matches!(c.mode, super::CalibrationMode::UpperBody))
-        .unwrap_or(false);
+    let force_shoulder_anchor = match mode_hint {
+        Some(super::CalibrationMode::UpperBody) => true,
+        Some(super::CalibrationMode::FullBody) => false,
+        None => calibration
+            .map(|c| matches!(c.mode, super::CalibrationMode::UpperBody))
+            .unwrap_or(false),
+    };
     // Adult anatomy ratios pinned to shoulder span: upper arm = 0.75 ×,
     // forearm = 0.625 ×. These are population averages; per-subject
     // variance is ~±10% which is well within reconstruction's

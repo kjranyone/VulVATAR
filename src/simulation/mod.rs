@@ -46,10 +46,19 @@ impl SimulationClock {
     }
 }
 
+/// Per-frame gates for the secondary-motion solvers driven from the GUI's
+/// `RuntimeToggles`. Kept separate from `RuntimeToggles` so the simulation
+/// crate doesn't depend on `app::*`, and so the Rapier/non-Rapier code paths
+/// can both honour the same set of switches uniformly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SimulationStepOptions {
+    pub spring_enabled: bool,
+    pub cloth_enabled: bool,
+}
+
 pub struct PhysicsWorld {
     collider_count: usize,
     spring_chain_count: usize,
-    sim_clock: SimulationClock,
     scene_colliders: Vec<crate::asset::SceneColliderAsset>,
     cloth_lod_presets: Vec<ClothLoDConfig>,
     #[cfg(feature = "rapier")]
@@ -61,7 +70,6 @@ impl PhysicsWorld {
         Self {
             collider_count: 0,
             spring_chain_count: 0,
-            sim_clock: SimulationClock::new(1.0 / 120.0, 8),
             scene_colliders: Vec::new(),
             cloth_lod_presets: ClothLoDConfig::presets(),
             #[cfg(feature = "rapier")]
@@ -118,23 +126,38 @@ impl PhysicsWorld {
         cloth_solver::step_cloth(dt, avatar, &world_colliders);
     }
 
-    pub fn step_all(&mut self, dt: f32, avatar: &mut AvatarInstance) {
-        let substeps = self.sim_clock.advance(dt);
-        let fixed_dt = self.sim_clock.fixed_dt();
+    /// Step all enabled secondary-motion solvers for `substeps` ticks of
+    /// `fixed_dt` seconds each. The frame-level [`SimulationClock`] lives in
+    /// `Application` so its accumulator advances once per frame and the
+    /// resulting `(fixed_dt, substeps)` are reused for every avatar; passing
+    /// them in here avoids the per-avatar consumption bug where the first
+    /// avatar drains the accumulator and later avatars get zero substeps.
+    ///
+    /// `options` gates the individual solvers so the GUI's spring/cloth
+    /// toggles work the same way whether or not the Rapier branch is taken.
+    pub fn step_all(
+        &mut self,
+        fixed_dt: f32,
+        substeps: u32,
+        avatar: &mut AvatarInstance,
+        options: SimulationStepOptions,
+    ) {
+        if substeps == 0 {
+            return;
+        }
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
         for _ in 0..substeps {
-            spring::step_spring_bones(fixed_dt, avatar, &world_colliders);
-            cloth_solver::step_cloth(fixed_dt, avatar, &world_colliders);
+            if options.spring_enabled {
+                spring::step_spring_bones(fixed_dt, avatar, &world_colliders);
+            }
+            if options.cloth_enabled {
+                cloth_solver::step_cloth(fixed_dt, avatar, &world_colliders);
+            }
             #[cfg(feature = "rapier")]
             if let Some(ref mut rapier) = self.rapier {
                 rapier.step(fixed_dt);
             }
         }
-        self.sim_clock.reset();
-    }
-
-    pub fn simulation_clock(&self) -> &SimulationClock {
-        &self.sim_clock
     }
 
     pub fn add_scene_collider(&mut self, collider: crate::asset::SceneColliderAsset) {
@@ -477,5 +500,185 @@ impl RapierWorld {
 impl Default for RapierWorld {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asset::{
+        identity_matrix, AssetSourceHash, AvatarAssetId, ExpressionAssetSet, NodeId,
+        SkeletonAsset, SkeletonNode, SpringBoneAsset, Transform,
+    };
+    use crate::avatar::{AvatarInstance, AvatarInstanceId};
+    use std::sync::Arc;
+
+    /// Regression test for Finding #6: a single frame must yield the same
+    /// `(fixed_dt, substeps)` for every avatar. After the first per-frame
+    /// `advance` call the accumulator is drained, so repeating the call with
+    /// `dt=0` must produce zero substeps. The previous code path called
+    /// `advance(frame_dt)` once per avatar, so the second avatar onwards saw
+    /// `substeps=0`.
+    #[test]
+    fn sim_clock_advance_does_not_regenerate_substeps_within_a_frame() {
+        let mut clock = SimulationClock::new(1.0 / 60.0, 8);
+        assert_eq!(clock.advance(1.0 / 60.0), 1);
+        assert_eq!(clock.advance(0.0), 0);
+        assert_eq!(clock.advance(0.0), 0);
+    }
+
+    fn make_two_joint_spring_avatar() -> AvatarInstance {
+        let nodes = vec![
+            SkeletonNode {
+                id: NodeId(0),
+                name: "root".into(),
+                parent: None,
+                children: vec![NodeId(1)],
+                rest_local: Transform::default(),
+                humanoid_bone: None,
+            },
+            SkeletonNode {
+                id: NodeId(1),
+                name: "j_a".into(),
+                parent: Some(NodeId(0)),
+                children: vec![NodeId(2)],
+                rest_local: Transform {
+                    translation: [0.0, 1.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: None,
+            },
+            SkeletonNode {
+                id: NodeId(2),
+                name: "j_b".into(),
+                parent: Some(NodeId(1)),
+                children: vec![],
+                rest_local: Transform {
+                    translation: [0.0, 1.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: None,
+            },
+        ];
+        let skeleton = SkeletonAsset {
+            nodes,
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: vec![identity_matrix(); 3],
+        };
+        let spring = SpringBoneAsset {
+            chain_root: NodeId(0),
+            joints: vec![NodeId(1), NodeId(2)],
+            stiffness: 1.0,
+            drag_force: 0.4,
+            gravity_dir: [0.0, -1.0, 0.0],
+            gravity_power: 1.0,
+            radius: 0.0,
+            collider_refs: vec![],
+            joint_stiffness: vec![],
+            joint_drag: vec![],
+            joint_gravity_power: vec![],
+        };
+
+        let asset = Arc::new(AvatarAsset {
+            id: AvatarAssetId(0),
+            source_path: std::path::PathBuf::from("test.vrm"),
+            source_hash: AssetSourceHash([0u8; 32]),
+            skeleton,
+            meshes: vec![],
+            materials: vec![],
+            humanoid: None,
+            spring_bones: vec![spring],
+            colliders: vec![],
+            default_expressions: ExpressionAssetSet {
+                expressions: vec![],
+            },
+            animation_clips: vec![],
+            node_to_mesh: Default::default(),
+            vrm_meta: Default::default(),
+            root_aabb: crate::asset::Aabb::empty(),
+            loaded_from_cache: false,
+        });
+
+        let mut inst = AvatarInstance::new(AvatarInstanceId(1), asset);
+        inst.build_base_pose();
+        inst.compute_global_pose();
+        inst
+    }
+
+    /// Regression test for Finding #5: when `spring_enabled` is false the
+    /// Rapier-bearing `step_all` must not advance spring state. Before the
+    /// fix the Rapier branch ignored runtime toggles entirely.
+    #[test]
+    fn step_all_with_spring_disabled_does_not_mutate_spring_state() {
+        let mut world = PhysicsWorld::new();
+        let mut avatar = make_two_joint_spring_avatar();
+        let sentinel = [9.0_f32, 9.0, 9.0];
+        for state in &mut avatar.secondary_motion.spring_states {
+            for p in &mut state.positions {
+                *p = sentinel;
+            }
+            for p in &mut state.previous_positions {
+                *p = sentinel;
+            }
+        }
+        let before: Vec<Vec<[f32; 3]>> = avatar
+            .secondary_motion
+            .spring_states
+            .iter()
+            .map(|s| s.positions.clone())
+            .collect();
+
+        world.step_all(
+            1.0 / 120.0,
+            4,
+            &mut avatar,
+            SimulationStepOptions {
+                spring_enabled: false,
+                cloth_enabled: false,
+            },
+        );
+
+        let after: Vec<Vec<[f32; 3]>> = avatar
+            .secondary_motion
+            .spring_states
+            .iter()
+            .map(|s| s.positions.clone())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// Counterpart to the disabled-toggle test: makes sure the disabled case
+    /// is non-trivially gated, i.e. the same setup *does* mutate spring
+    /// positions when the toggle is on.
+    #[test]
+    fn step_all_with_spring_enabled_does_mutate_spring_state() {
+        let mut world = PhysicsWorld::new();
+        let mut avatar = make_two_joint_spring_avatar();
+        let before: Vec<Vec<[f32; 3]>> = avatar
+            .secondary_motion
+            .spring_states
+            .iter()
+            .map(|s| s.positions.clone())
+            .collect();
+
+        world.step_all(
+            1.0 / 120.0,
+            4,
+            &mut avatar,
+            SimulationStepOptions {
+                spring_enabled: true,
+                cloth_enabled: false,
+            },
+        );
+
+        let after: Vec<Vec<[f32; 3]>> = avatar
+            .secondary_motion
+            .spring_states
+            .iter()
+            .map(|s| s.positions.clone())
+            .collect();
+        assert_ne!(before, after);
     }
 }

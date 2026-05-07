@@ -46,6 +46,21 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
             }
         })
         .unwrap_or(false);
+    // Lower-arm visibility: both elbows must clear the keypoint floor
+    // for `pose_match_score` to return non-zero (see
+    // `pose_match::arm_direction`). When the user can't get past 0%
+    // match because the camera is too close, this is almost always
+    // the cause — surface a dedicated framing hint in `WaitingForPose`
+    // rather than letting the user wonder why they're stuck at zero.
+    let lower_arms_seen = snap
+        .pose
+        .as_ref()
+        .map(|p| {
+            use crate::asset::HumanoidBone;
+            p.joints.contains_key(&HumanoidBone::LeftLowerArm)
+                && p.joints.contains_key(&HumanoidBone::RightLowerArm)
+        })
+        .unwrap_or(false);
 
     let now = Instant::now();
     match &mut state.calibration_modal {
@@ -69,6 +84,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
             last_anchor_seen,
             last_confidence,
             no_anchor_since,
+            no_lower_arms_since,
         } => {
             *last_anchor_seen = anchor_seen;
             *last_confidence = confidence;
@@ -79,6 +95,15 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
                 *no_anchor_since = None;
             } else if no_anchor_since.is_none() {
                 *no_anchor_since = Some(now);
+            }
+            // Same edge-trigger pattern for elbow visibility, but
+            // only meaningful while the anchor is in frame. If the
+            // anchor dropped too, the anchor hint takes priority and
+            // the framing hint would just add noise.
+            if !anchor_seen || lower_arms_seen {
+                *no_lower_arms_since = None;
+            } else if no_lower_arms_since.is_none() {
+                *no_lower_arms_since = Some(now);
             }
             // Pose-match scoring. Drives the progress bar fill *and*
             // the auto-transition to Collecting. If no live pose this

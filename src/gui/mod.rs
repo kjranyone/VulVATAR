@@ -410,6 +410,17 @@ pub struct GuiApp {
     /// see `calibration::poll_torso_template`. Initialised to
     /// 0 so the first publish (seq starts at 1) is always picked up.
     pub calibration_torso_template_seq: u64,
+    /// Last calibration-mode hint pushed to the tracking mailbox via
+    /// [`crate::tracking::TrackingMailbox::set_calibration_mode_hint`].
+    /// Tracked here so the GUI side only forwards on edges instead of
+    /// re-locking the mailbox every frame. Bridges the gap between
+    /// "modal is open with `UpperBody` selected" and the provider's
+    /// `force_shoulder_anchor` flag — without it the very first
+    /// `UpperBody` capture sees `force_shoulder_anchor=false` and the
+    /// `pose.root_anchor_is_hip` gate in `refresh.rs` rejects every
+    /// sample because the model hallucinates a confident hip.
+    pub last_pushed_calibration_mode_hint:
+        Option<crate::tracking::CalibrationMode>,
     /// One-shot offscreen render of the active avatar in the
     /// calibration target pose (T-pose for FullBody, hands-at-sides
     /// for UpperBody). Shown beside the webcam preview in the modal
@@ -637,6 +648,7 @@ impl GuiApp {
             calibration_preview_seq: 0,
             calibration_preview_rgba_buf: Vec::new(),
             calibration_torso_template_seq: 0,
+            last_pushed_calibration_mode_hint: None,
             calibration_target_pose_texture: None,
             calibration_target_pose_mode: None,
             calibration_target_pose_pending: None,
@@ -893,6 +905,7 @@ impl GuiApp {
             calibration_preview_seq: 0,
             calibration_preview_rgba_buf: Vec::new(),
             calibration_torso_template_seq: 0,
+            last_pushed_calibration_mode_hint: None,
             calibration_target_pose_texture: None,
             calibration_target_pose_mode: None,
             calibration_target_pose_pending: None,
@@ -1001,6 +1014,23 @@ impl GuiApp {
         }
     }
 
+    /// Push the current calibration-modal mode to the tracking mailbox
+    /// when it differs from the last value pushed. Idempotent — safe to
+    /// call multiple times per frame. The repaint loop calls this both
+    /// before `run_frame` (catches mode-button switches in `Idle`) and
+    /// after `draw_modal` (catches Cancel / Esc / Done auto-close
+    /// transitions whose state change happens inside `draw_modal`,
+    /// after the pre-`run_frame` push has already run).
+    fn sync_calibration_mode_hint(&mut self) {
+        let current = self.calibration_modal.active_mode();
+        if current != self.last_pushed_calibration_mode_hint {
+            self.app
+                .tracking
+                .mailbox()
+                .set_calibration_mode_hint(current);
+            self.last_pushed_calibration_mode_hint = current;
+        }
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -1044,6 +1074,15 @@ impl eframe::App for GuiApp {
         self.poll_folder_watcher();
         self.poll_thumbnail_jobs(ctx);
         self.poll_avatar_load_job();
+
+        // Forward the calibration-mode hint on edges. Called twice per
+        // update — once here (covers "user switched mode via the
+        // segmented buttons in Idle"), once after `draw_modal` (covers
+        // Cancel / Esc / auto-close transitions that happen *inside*
+        // `draw_modal`, which would otherwise leave a stale
+        // `Some(UpperBody|FullBody)` on the worker until the next
+        // unrelated repaint reason fires).
+        self.sync_calibration_mode_hint();
 
         // Sync GUI-driven state into the application before running the frame.
         if let Some(avatar) = self.app.active_avatar_mut() {
@@ -1147,6 +1186,12 @@ impl eframe::App for GuiApp {
             };
             self.app.run_frame(&frame_config);
             self.frame_count += 1;
+        } else {
+            // Paused: drain any in-flight render result anyway so
+            // `render_results_pending` doesn't pin the repaint gate
+            // to full rate while we're idle. `run_frame` would have
+            // drained as a side effect, but we skipped it.
+            self.app.drain_render_results();
         }
 
         self.autosave_tick();
@@ -1193,6 +1238,15 @@ impl eframe::App for GuiApp {
         // inspector panel. No-op when the modal is closed.
         calibration::draw_modal(ctx, self);
 
+        // Re-sync the calibration-mode hint *after* the modal has had a
+        // chance to transition (Cancel / Esc / Done auto-close all
+        // mutate `calibration_modal` from inside `draw_modal`). Without
+        // this second pass the worker keeps the last-pushed
+        // `Some(UpperBody|FullBody)` until some unrelated repaint fires,
+        // which on a static avatar with no autosave can be never — the
+        // provider would override the persisted calibration forever.
+        self.sync_calibration_mode_hint();
+
         // Loading-spinner overlay while a background avatar load is in flight.
         if let Some(job) = self.avatar_load_job.as_ref() {
             let stage_label = job.current_stage.label();
@@ -1226,20 +1280,62 @@ impl eframe::App for GuiApp {
         // Repaint gating. The previous unconditional `request_repaint()`
         // pinned egui to monitor refresh (60–144 Hz) even when nothing
         // visible was changing — burning CPU + battery when the user
-        // had the app open but idle. Now we only ask for a continuous
-        // repaint when something is actually animating: tracking
-        // (live webcam → avatar pose), lipsync (volume meter), an
-        // avatar load in progress (progress bar), an animation
-        // playing, or a notification toast still in its visible
-        // window. With none of those active, egui falls back to its
-        // event-driven repaint — input still produces a frame, idle
-        // costs nothing.
+        // had the app open but idle. Continuous repaint is only needed
+        // when frame *content* is actually changing tick to tick or the
+        // frame loop has work it can't make progress on without another
+        // tick. Egui's own event-driven repaint covers ordinary input
+        // (clicks, key presses, mouse moves), so we don't have to.
+        //
+        // Conditions that require a follow-up tick:
+        // - tracking active (live webcam → avatar pose)
+        // - lipsync active (volume meter, viseme stream)
+        // - avatar load in progress (progress bar)
+        // - notification toast still visible (fade animation)
+        // - clip animation playing (`active_clip` set on any avatar)
+        // - calibration modal open (consumes tracking samples per-frame)
+        // - a render result is in flight: `run_frame` submitted a frame
+        //   to the render thread but hasn't drained the result yet, so
+        //   `process_render_result` won't fire until we tick again. A
+        //   slider drag on a static avatar produces input-driven repaint
+        //   for the click but the *result* needs at least one more
+        //   frame to land — without this the viewport texture stays on
+        //   the old image until the user moves the mouse again.
+        //
+        // Note: `!self.paused` was previously included here, which
+        // defeated the gate entirely because `paused` is false by
+        // default and the gate then ran continuously from app start.
+        let animation_playing = self
+            .app
+            .avatars
+            .iter()
+            .any(|a| a.animation_state.active_clip.is_some());
+        let render_in_flight = self.app.has_pending_render_result();
+        let calibration_modal_open = self.calibration_modal.is_open();
         let needs_animation_frame = self.tracking.toggle_tracking
             || self.app.is_lipsync_enabled()
             || self.avatar_load_job.is_some()
             || !self.notifications.is_empty()
-            || !self.paused;
-        if needs_animation_frame {
+            || animation_playing
+            || render_in_flight
+            || calibration_modal_open;
+        if needs_animation_frame || self.project_dirty || self.profiles_dirty {
+            // Dirty flags imply an unsaved (and almost always also
+            // un-rendered) GUI mutation. Repaint immediately so the new
+            // state reaches the screen on the next render-thread cycle
+            // instead of waiting for the autosave throttle deadline —
+            // `request_repaint_after(throttle_remaining)` would defer
+            // the next render up to ~250 ms behind the user's click,
+            // which is the bug the original gate fix introduced.
+            //
+            // The autosave throttle still lives in `autosave_tick` and
+            // governs disk writes (≤ ~4/s); the worst case here is the
+            // ~15 frames between a click and `project_dirty` clearing
+            // when the save lands, which is well under any perceptual
+            // threshold and well above any battery threshold worth
+            // optimising. The narrow pathological case — autosave
+            // permanently failing — leaves the gate burning frames at
+            // the display rate, but that requires a read-only disk
+            // condition the user will already be aware of.
             ctx.request_repaint();
         }
     }

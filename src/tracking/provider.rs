@@ -84,6 +84,33 @@ pub trait PoseProvider {
     fn take_torso_template(&mut self) -> Option<crate::tracking::TorsoDepthTemplate> {
         None
     }
+
+    /// Hint from the GUI about the calibration mode the user is *currently
+    /// collecting* (modal open, samples about to flow), independent of any
+    /// confirmed `PoseCalibration`. Used to bridge the gap where
+    /// [`Self::set_calibration`] only fires *after* `persist_calibration`:
+    /// during the very first `UpperBody` capture there is no confirmed
+    /// calibration yet, so without this hint the provider would still
+    /// hallucinate hip keypoints with high confidence and the GUI would
+    /// reject every collected sample (`pose.root_anchor_is_hip == true`).
+    ///
+    /// Contract: implementations MUST treat the hint as an **override**
+    /// of the persisted calibration's mode, in either direction:
+    ///
+    /// * `Some(UpperBody)` → force shoulder-anchor framing, even if the
+    ///   persisted calibration is `FullBody` or absent.
+    /// * `Some(FullBody)` → do **not** force shoulder anchor, even if
+    ///   the persisted calibration is `UpperBody`. (OR semantics break
+    ///   here: re-calibrating from `UpperBody` to `FullBody` would be
+    ///   impossible because the persisted flag would keep suppressing
+    ///   hip and the GUI's `pose.root_anchor_is_hip` gate would reject
+    ///   every collected sample.)
+    /// * `None` → modal closed, fall back to the persisted calibration's
+    ///   mode.
+    ///
+    /// Default no-op covers providers that don't differentiate anchor
+    /// modes.
+    fn set_calibration_mode_hint(&mut self, _hint: Option<crate::tracking::CalibrationMode>) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +215,29 @@ impl PoseProvider for Rtmw3dPoseProvider {
     ) -> PoseEstimate {
         self.inner
             .estimate_pose(rgb_data, width, height, frame_index)
+    }
+
+    /// Match the depth-aware providers' policy: in `UpperBody` mode the
+    /// hip pair is treated as not-visible upstream so phantom legs
+    /// don't enter the source skeleton. The depth-aware path uses
+    /// [`super::skeleton_from_depth::build_options_from_calibration`]
+    /// to derive the same flag from the calibration; this is the
+    /// non-depth equivalent.
+    fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
+        self.inner.force_shoulder_anchor = calibration
+            .map(|c| matches!(c.mode, crate::tracking::CalibrationMode::UpperBody))
+            .unwrap_or(false);
+    }
+
+    /// Forward the GUI's calibration-modal mode straight through —
+    /// `Rtmw3dInference::process_pose` interprets it as an
+    /// **override** of the persisted `force_shoulder_anchor` flag (so
+    /// `Some(FullBody)` clears the flag the persisted UpperBody
+    /// calibration set, allowing re-calibration; `Some(UpperBody)`
+    /// sets it even when no calibration has been persisted yet;
+    /// `None` falls back to the persisted value).
+    fn set_calibration_mode_hint(&mut self, hint: Option<crate::tracking::CalibrationMode>) {
+        self.inner.force_shoulder_anchor_hint = hint;
     }
 }
 

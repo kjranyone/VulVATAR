@@ -23,6 +23,7 @@ pub(super) fn build_source_skeleton(
     joints: &[DecodedJoint],
     width: u32,
     height: u32,
+    force_shoulder_anchor: bool,
 ) -> SourceSkeleton {
     let mut sk = SourceSkeleton::empty(frame_index);
     if joints.len() < NUM_JOINTS {
@@ -41,10 +42,19 @@ pub(super) fn build_source_skeleton(
     // If neither pair is visible the subject is either out of frame
     // or so poorly detected that any rotation we infer would be
     // garbage; only then do we bail.
+    //
+    // `force_shoulder_anchor = true` (UpperBody calibration mode)
+    // overrides the confidence-based gate: the hip keypoint detector
+    // hallucinates a plausible-looking hip position even when the
+    // subject's hips are entirely below the frame, so confidence
+    // alone isn't enough to reject it. With this flag set, lower-
+    // body keypoints (Hips + UpperLeg/LowerLeg/Foot/Toes) are
+    // dropped entirely via the existing `!hip_visible` gates below
+    // and the origin always comes from the shoulder pair.
     let lh = &joints[11];
     let rh = &joints[12];
     let hip_score = lh.score.min(rh.score);
-    let hip_visible = hip_score >= KEYPOINT_VISIBILITY_FLOOR;
+    let hip_visible = !force_shoulder_anchor && hip_score >= KEYPOINT_VISIBILITY_FLOOR;
 
     let (origin_nx, origin_ny, origin_nz) = if hip_visible {
         (
@@ -514,5 +524,68 @@ fn inject_spine_chain_proxies<F>(
 
     if let Some(h) = head {
         sk.joints.insert(HumanoidBone::Head, h);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::decode::{DecodedJoint, NUM_JOINTS};
+
+    /// 133 evenly-confident COCO-Wholebody joints arranged so the hip
+    /// pair (idx 11/12) is plausible — the regression we're guarding
+    /// against is the *upstream* keypoint head emitting confident
+    /// hips even when the user's pelvis is below the camera frame.
+    fn fake_joints_with_visible_hips() -> Vec<DecodedJoint> {
+        let mut joints = vec![DecodedJoint::default(); NUM_JOINTS];
+        // Shoulders (5/6) — used as the fallback anchor.
+        joints[5] = DecodedJoint { nx: 0.40, ny: 0.30, nz: 0.5, score: 0.9 };
+        joints[6] = DecodedJoint { nx: 0.60, ny: 0.30, nz: 0.5, score: 0.9 };
+        // Hips (11/12) — the hallucinated pair we want to suppress.
+        joints[11] = DecodedJoint { nx: 0.42, ny: 0.70, nz: 0.5, score: 0.8 };
+        joints[12] = DecodedJoint { nx: 0.58, ny: 0.70, nz: 0.5, score: 0.8 };
+        // Knees (13/14) and ankles (15/16) — same hallucination
+        // pattern; downstream consumers must not see any of these.
+        joints[13] = DecodedJoint { nx: 0.42, ny: 0.85, nz: 0.5, score: 0.7 };
+        joints[14] = DecodedJoint { nx: 0.58, ny: 0.85, nz: 0.5, score: 0.7 };
+        joints[15] = DecodedJoint { nx: 0.42, ny: 0.95, nz: 0.5, score: 0.7 };
+        joints[16] = DecodedJoint { nx: 0.58, ny: 0.95, nz: 0.5, score: 0.7 };
+        joints
+    }
+
+    #[test]
+    fn upper_body_mode_drops_lower_body_even_when_hips_are_high_confidence() {
+        let joints = fake_joints_with_visible_hips();
+        let sk = build_source_skeleton(0, &joints, 640, 480, true);
+        for bone in [
+            HumanoidBone::Hips,
+            HumanoidBone::LeftUpperLeg,
+            HumanoidBone::RightUpperLeg,
+            HumanoidBone::LeftLowerLeg,
+            HumanoidBone::RightLowerLeg,
+            HumanoidBone::LeftFoot,
+            HumanoidBone::RightFoot,
+        ] {
+            assert!(
+                !sk.joints.contains_key(&bone),
+                "UpperBody mode must suppress {:?} regardless of keypoint confidence",
+                bone
+            );
+        }
+        assert!(
+            !sk.root_anchor_is_hip,
+            "root anchor must come from shoulders, not the suppressed hip pair"
+        );
+    }
+
+    #[test]
+    fn full_body_mode_emits_hips_when_visible() {
+        // Sanity counterpart: with the suppression flag off, the
+        // existing hip-driven path still works — confirms the guard
+        // is mode-gated, not a regression of the FullBody contract.
+        let joints = fake_joints_with_visible_hips();
+        let sk = build_source_skeleton(0, &joints, 640, 480, false);
+        assert!(sk.joints.contains_key(&HumanoidBone::Hips));
+        assert!(sk.root_anchor_is_hip);
     }
 }

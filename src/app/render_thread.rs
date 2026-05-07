@@ -77,9 +77,19 @@ impl RenderThread {
         }
     }
 
-    pub fn submit(&self, cmd: RenderCommand) {
-        if let Err(e) = self.cmd_tx.try_send(cmd) {
-            warn!("render_thread: failed to send command: {}", e);
+    /// Try to enqueue a command for the render thread. Returns `true`
+    /// when the command was accepted, `false` when the bounded command
+    /// channel was already full (in which case the command is dropped
+    /// and the caller should *not* count it as in-flight). Callers
+    /// driving the GUI repaint gate use the return value to decide
+    /// whether to expect a result back next frame.
+    pub fn submit(&self, cmd: RenderCommand) -> bool {
+        match self.cmd_tx.try_send(cmd) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("render_thread: failed to send command: {}", e);
+                false
+            }
         }
     }
 
@@ -144,11 +154,24 @@ impl RenderThreadInner {
 
             match cmd {
                 RenderCommand::RenderFrame(input) => {
+                    // On render error we still post an empty result back to
+                    // the app — `Application::render_results_pending` was
+                    // bumped on submit and would otherwise leak forever,
+                    // pinning the GUI's repaint gate at full rate. The
+                    // empty `exported_frame` makes `process_render_result`
+                    // a no-op (clears `rendered_pixels`) without surfacing
+                    // a fake successful frame to the output worker.
                     let result = match self.renderer.render(&input) {
                         Ok(r) => r,
                         Err(e) => {
                             error!("render_thread: render error: {}", e);
-                            continue;
+                            crate::renderer::RenderResult {
+                                extent: [0, 0],
+                                timestamp_nanos: 0,
+                                has_alpha: false,
+                                stats: crate::renderer::RenderStats::default(),
+                                exported_frame: None,
+                            }
                         }
                     };
                     if let Err(e) = self.result_tx.send(result) {

@@ -225,6 +225,13 @@ pub struct Rtmw3dWithDepthProvider {
     /// the user-acknowledged "I'm only showing my upper body"
     /// declaration.
     pose_calibration: Option<crate::tracking::PoseCalibration>,
+    /// Transient mode hint pushed by the GUI while the calibration
+    /// modal is open. **Overrides** `pose_calibration.mode` for the
+    /// `force_shoulder_anchor` decision so re-calibration in either
+    /// direction works (see
+    /// [`super::skeleton_from_depth::build_options_from_calibration`]
+    /// for the full contract). `None` whenever the modal is closed.
+    calibration_mode_hint: Option<crate::tracking::CalibrationMode>,
     /// EMA-smoothed calibration scalar from the previous frame. Used
     /// to dampen per-frame `c` jitter that otherwise breathes the
     /// entire metric skeleton in/out (see [`SCALE_C_EMA_ALPHA`]).
@@ -312,6 +319,7 @@ impl Rtmw3dWithDepthProvider {
             depth_backend_label,
             load_warnings: warnings,
             pose_calibration: None,
+            calibration_mode_hint: None,
             scale_c_ema: None,
             torso_capture: None,
             last_calib_warn_at: None,
@@ -398,7 +406,43 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
     }
 
     fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
+        // Mirror the persisted `force_shoulder_anchor` onto the inner
+        // `Rtmw3dInference` so the fallback paths in
+        // `estimate_pose_internal` (RTMW3D keypoint shortage at the
+        // top, DAv2 cold-start scale-calibration failure later) see
+        // the same anchor contract as the depth-built skeleton. Both
+        // fallbacks return `rtmw_est` straight through from the inner
+        // RTMW3D, which builds its source skeleton via the override
+        // logic in `Rtmw3dInference::process_pose`
+        // (`hint Some(UpperBody) → true`,
+        // `hint Some(FullBody) → false`,
+        // `hint None → persisted force_shoulder_anchor`). Without this
+        // mirror the persisted side of that match would always read
+        // `false`, so a fallback frame outside the modal would build
+        // a hip-anchored skeleton even when the user calibrated
+        // `UpperBody`.
+        #[cfg(feature = "inference")]
+        {
+            self.rtmw3d.force_shoulder_anchor = calibration
+                .as_ref()
+                .map(|c| matches!(c.mode, crate::tracking::CalibrationMode::UpperBody))
+                .unwrap_or(false);
+        }
         self.pose_calibration = calibration;
+    }
+
+    fn set_calibration_mode_hint(&mut self, hint: Option<crate::tracking::CalibrationMode>) {
+        // Override the persisted calibration's mode for the
+        // `force_shoulder_anchor` decision while the modal is open —
+        // see `build_options_from_calibration` for the contract.
+        self.calibration_mode_hint = hint;
+        // Also mirror onto the inner Rtmw3dInference so fallback frames
+        // (see `set_calibration` above for the rationale) honour the
+        // same override the depth-built path does.
+        #[cfg(feature = "inference")]
+        {
+            self.rtmw3d.force_shoulder_anchor_hint = hint;
+        }
     }
 
     fn set_torso_capture(&mut self, enabled: bool) {
@@ -562,12 +606,32 @@ impl Rtmw3dWithDepthProvider {
         // ~5–10cm elbow-Z signal we depend on at hands-near-body
         // framings.
         let t_calib = std::time::Instant::now();
+        // While the calibration modal is open the user is most likely
+        // re-capturing from a different distance than the persisted
+        // calibration was taken at. Suppressing the persisted value
+        // here disables the depth-plausibility gate inside
+        // `calibrate_scale` (`anchor_depth_m ± max_deviation`), which
+        // would otherwise `PlausibilityRejected` every recapture frame
+        // and starve the EMA — leaving the recapture session running
+        // on the RTMW3D synthetic-z fallback so the user can never
+        // produce a fresh depth-aware calibration. Once the modal
+        // closes and `persist_calibration` writes the new value into
+        // `self.pose_calibration`, the gate snaps back on with the
+        // updated band. (`resolve_origin_metric` / `build_skeleton`
+        // below still receive the persisted calibration because they
+        // use orthogonal channels — torso depth template, shoulder
+        // span — that are not affected by the recapture distance.)
+        let plausibility_calibration = if self.calibration_mode_hint.is_some() {
+            None
+        } else {
+            self.pose_calibration.as_ref()
+        };
         let calib_result = calibrate_scale(
             &joints_2d,
             dav2_frame,
             width,
             height,
-            self.pose_calibration.as_ref(),
+            plausibility_calibration,
         );
         let mut calib = match calib_result {
             Ok(c) => {
@@ -665,12 +729,21 @@ impl Rtmw3dWithDepthProvider {
 
         // Phase 5: skeleton from depth.
         let t_skel = std::time::Instant::now();
-        // BuildOptions derived from the active pose calibration. Upper
-        // Body calibration sets `force_shoulder_anchor` so a phantom
-        // hip detection (e.g. desk surface in the depth window) can't
-        // override the user-acknowledged "I'm only showing my upper
-        // body" declaration.
-        let opts = build_options_from_calibration(self.pose_calibration.as_ref());
+        // BuildOptions derived from the active pose calibration plus
+        // the GUI's transient mode hint. The hint **overrides** the
+        // persisted calibration's mode for the `force_shoulder_anchor`
+        // decision (in either direction): `Some(UpperBody)` forces
+        // shoulder anchor even before any calibration is persisted —
+        // makes the first `UpperBody` capture possible — and
+        // `Some(FullBody)` clears the flag even when the persisted
+        // calibration is `UpperBody`, which is what makes
+        // re-calibrating from `UpperBody` back to `FullBody`
+        // possible at all. See
+        // `build_options_from_calibration` for the full contract.
+        let opts = build_options_from_calibration(
+            self.pose_calibration.as_ref(),
+            self.calibration_mode_hint,
+        );
         let mut skeleton = match resolve_origin_metric(
             &joints_2d,
             &metric_frame,

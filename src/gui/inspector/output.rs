@@ -110,19 +110,61 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         state.project_dirty = true;
     }
 
+    let diagnostics = state.app.output.diagnostics();
+
     egui::CollapsingHeader::new(t!("inspector.synchronization"))
         .default_open(false)
         .show(ui, |ui| {
-            ui.label(t!("inspector.handoff_gpu"));
-            ui.label(t!("inspector.fallback_cpu"));
-            ui.label(egui::RichText::new(t!("inspector.gpu_active")).color(egui::Color32::GREEN));
+            use crate::output::HandoffPath;
+            // Reflect the most recently published frame's handoff_path
+            // rather than guessing from the sink variant. Until any frame
+            // has crossed the boundary, show "pending" instead of a green
+            // "GPU active" badge — the previous static labels claimed GPU
+            // interop even when every frame was a CPU readback.
+            let (label_key, color) = match &diagnostics.active_handoff_path {
+                Some(HandoffPath::GpuSharedFrame) => {
+                    ("inspector.handoff_active_gpu", egui::Color32::GREEN)
+                }
+                Some(HandoffPath::CpuReadback) => (
+                    "inspector.handoff_active_cpu_readback",
+                    egui::Color32::from_rgb(220, 160, 80),
+                ),
+                Some(HandoffPath::SharedMemory) => (
+                    "inspector.handoff_active_shared_memory",
+                    egui::Color32::from_rgb(220, 160, 80),
+                ),
+                None => (
+                    "inspector.handoff_pending",
+                    egui::Color32::from_rgb(180, 180, 180),
+                ),
+            };
+            ui.label(egui::RichText::new(t!(label_key)).color(color));
+            if diagnostics.fallback_active {
+                ui.label(
+                    egui::RichText::new(t!("inspector.handoff_fallback_warning"))
+                        .color(egui::Color32::from_rgb(220, 160, 80)),
+                );
+            }
         });
 
     egui::CollapsingHeader::new(t!("inspector.diagnostics"))
         .default_open(true)
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(t!("inspector.connected")).color(egui::Color32::GREEN));
-            ui.label(t!("inspector.queue_depth", depth = state.app.output.queue_depth()));
-            ui.label(t!("inspector.dropped_frames", count = state.app.output.dropped_count()));
+            // "Connected" was unconditional green before — only consider the
+            // pipeline connected once a frame has actually been published.
+            let (label_key, color) = if diagnostics.last_publish_timestamp == 0 {
+                (
+                    "inspector.connection_pending",
+                    egui::Color32::from_rgb(180, 180, 180),
+                )
+            } else {
+                ("inspector.connected", egui::Color32::GREEN)
+            };
+            ui.label(egui::RichText::new(t!(label_key)).color(color));
+            ui.label(t!("inspector.queue_depth", depth = diagnostics.queue_depth));
+            ui.label(t!(
+                "inspector.dropped_frames",
+                count = diagnostics.dropped_frame_count
+            ));
         });
 }

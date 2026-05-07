@@ -144,6 +144,12 @@ pub struct OutputRouter {
     /// Join handle for the background worker thread.
     worker_handle: Option<thread::JoinHandle<()>>,
     logged_first_publish: bool,
+
+    /// Most recent published `OutputFrame.handoff_path`. Used by
+    /// [`Self::diagnostics`] so the GUI shows the path actually carried by
+    /// frames instead of guessing from the sink variant. `None` until the
+    /// first publish.
+    last_handoff_path: Option<HandoffPath>,
 }
 
 impl OutputRouter {
@@ -165,6 +171,7 @@ impl OutputRouter {
             worker_tx: Some(tx),
             worker_handle: Some(handle),
             logged_first_publish: false,
+            last_handoff_path: None,
         }
     }
 
@@ -264,7 +271,15 @@ impl OutputRouter {
             self.logged_first_publish = true;
         }
 
-        self.last_publish_timestamp = frame.timestamp;
+        // Capture frame metadata for diagnostics now (the frame itself is
+        // about to be moved into the local queue / sent to the worker).
+        // The router only commits the metadata to `last_*` after a frame
+        // is successfully handed off to the worker — see the try_send
+        // arm below. Updating earlier would let the GUI report
+        // "connected / active handoff" even when every frame was being
+        // dropped at the local-queue or worker-channel boundary.
+        let attempted_timestamp = frame.timestamp;
+        let attempted_handoff_path = frame.handoff_path.clone();
 
         match self.policy {
             FrameSinkQueuePolicy::ReplaceLatest => {
@@ -310,9 +325,20 @@ impl OutputRouter {
         // a profiler asking "are we dropping frames?" would be told no.
         if let Some(queued) = self.queue.pop_front() {
             if let Some(ref tx) = self.worker_tx {
-                if let Err(e) = tx.try_send(WorkerMessage::Frame(queued)) {
-                    self.dropped_count += 1;
-                    debug!("output: worker channel full, dropping frame: {}", e);
+                match tx.try_send(WorkerMessage::Frame(queued)) {
+                    Ok(()) => {
+                        // Commit diagnostics only on a successful handoff.
+                        // `last_*` are what the GUI reads to decide whether
+                        // anything is flowing; if the worker channel is
+                        // saturated we want the panel to show "pending" /
+                        // "stalled", not "connected / GPU active".
+                        self.last_publish_timestamp = attempted_timestamp;
+                        self.last_handoff_path = Some(attempted_handoff_path);
+                    }
+                    Err(e) => {
+                        self.dropped_count += 1;
+                        debug!("output: worker channel full, dropping frame: {}", e);
+                    }
                 }
             }
         }
@@ -371,18 +397,20 @@ impl OutputRouter {
     }
 
     pub fn diagnostics(&self) -> OutputDiagnostics {
-        let gpu_interop_enabled = matches!(self.sink, FrameSink::SharedTexture);
+        // Derive everything from the actual published frame's handoff_path
+        // rather than guessing from the sink variant. Until the first frame
+        // is published the path is unknown — surface that explicitly so the
+        // GUI doesn't paint a green "GPU active" badge before any frame has
+        // crossed the boundary.
+        let active_handoff_path = self.last_handoff_path.clone();
+        let gpu_interop_enabled = matches!(active_handoff_path, Some(HandoffPath::GpuSharedFrame));
         let fallback_active = matches!(
-            self.sink,
-            FrameSink::SharedMemory | FrameSink::ImageSequence
+            active_handoff_path,
+            Some(HandoffPath::CpuReadback | HandoffPath::SharedMemory)
         );
         OutputDiagnostics {
             active_sink: self.sink.clone(),
-            active_handoff_path: if gpu_interop_enabled {
-                HandoffPath::GpuSharedFrame
-            } else {
-                HandoffPath::CpuReadback
-            },
+            active_handoff_path,
             gpu_interop_enabled,
             fallback_active,
             queue_depth: self.queue.len(),
@@ -402,7 +430,10 @@ impl Drop for OutputRouter {
 #[derive(Clone, Debug)]
 pub struct OutputDiagnostics {
     pub active_sink: FrameSink,
-    pub active_handoff_path: HandoffPath,
+    /// Handoff path of the most recently published frame, or `None` when
+    /// nothing has been published yet. Reflects what crossed the boundary,
+    /// not what the sink's name advertises.
+    pub active_handoff_path: Option<HandoffPath>,
     pub gpu_interop_enabled: bool,
     pub fallback_active: bool,
     pub queue_depth: usize,
@@ -416,4 +447,65 @@ pub enum HandoffPath {
     GpuSharedFrame,
     CpuReadback,
     SharedMemory,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_frame(id: u64, path: HandoffPath) -> OutputFrame {
+        let mut frame = OutputFrame::new(id, [16, 16], 1_000 + id);
+        frame.handoff_path = path;
+        frame
+    }
+
+    /// Publish frames carrying `handoff_path` until the router's
+    /// diagnostics report that path as `active`, or panic after a
+    /// generous timeout. The worker channel is `sync_channel(1)`, so a
+    /// single `try_send` can fail simply because the worker thread
+    /// hasn't drained the previous message yet — retrying lets the
+    /// test verify "delivery eventually completes" without leaning on
+    /// fragile fixed sleeps.
+    fn publish_until_active(router: &mut OutputRouter, base_id: u64, handoff_path: HandoffPath) {
+        for attempt in 0..200 {
+            router.publish(make_frame(base_id + attempt, handoff_path.clone()));
+            if router.diagnostics().active_handoff_path.as_ref() == Some(&handoff_path) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "publish never reached the worker for handoff_path={:?} after 200 attempts",
+            handoff_path
+        );
+    }
+
+    /// Regression test for Finding #2 (initial pass) plus Fix #2 review:
+    /// diagnostics must reflect the actual handoff path of the most
+    /// recently *delivered* frame — not the sink variant, and not a
+    /// frame that failed `try_send` to the worker channel.
+    #[test]
+    fn diagnostics_handoff_path_follows_published_frames() {
+        let mut router = OutputRouter::new(FrameSink::ImageSequence);
+
+        let initial = router.diagnostics();
+        assert!(
+            initial.active_handoff_path.is_none(),
+            "no frames published yet — handoff path must be unknown"
+        );
+        assert!(!initial.gpu_interop_enabled);
+        assert!(!initial.fallback_active);
+
+        publish_until_active(&mut router, 0, HandoffPath::CpuReadback);
+        let after_cpu = router.diagnostics();
+        assert!(!after_cpu.gpu_interop_enabled);
+        assert!(after_cpu.fallback_active);
+
+        publish_until_active(&mut router, 1_000, HandoffPath::GpuSharedFrame);
+        let after_gpu = router.diagnostics();
+        assert!(after_gpu.gpu_interop_enabled);
+        assert!(!after_gpu.fallback_active);
+
+        router.shutdown();
+    }
 }
