@@ -250,6 +250,7 @@ struct JointRow {
     y: f32,
     z: f32,
     confidence: f32,
+    metric_depth_m: Option<f32>,
 }
 
 struct OrientRow {
@@ -292,6 +293,7 @@ fn build_row(image_path: &Path, width: u32, height: u32, sk: &SourceSkeleton) ->
             y: j.position[1],
             z: j.position[2],
             confidence: j.confidence,
+            metric_depth_m: j.metric_depth_m,
         })
     };
     let orient = |o: Option<&HandOrientation>| -> Option<OrientRow> {
@@ -434,10 +436,16 @@ fn push_joint(s: &mut String, name: &str, j: Option<&JointRow>) {
     s.push_str(name);
     s.push_str("\":");
     match j {
-        Some(j) => s.push_str(&format!(
-            "{{\"x\":{:.4},\"y\":{:.4},\"z\":{:.4},\"confidence\":{:.3}}}",
-            j.x, j.y, j.z, j.confidence
-        )),
+        Some(j) => {
+            let md = match j.metric_depth_m {
+                Some(v) if v.is_finite() => format!("{:.4}", v),
+                _ => "null".to_string(),
+            };
+            s.push_str(&format!(
+                "{{\"x\":{:.4},\"y\":{:.4},\"z\":{:.4},\"confidence\":{:.3},\"metric_depth_m\":{}}}",
+                j.x, j.y, j.z, j.confidence, md
+            ));
+        }
         None => s.push_str("null"),
     }
 }

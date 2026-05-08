@@ -535,6 +535,46 @@ pub fn solve_avatar_pose(
         skeleton.nodes[node_idx].rest_local.clone()
     });
 
+    // Seed `running_shoulder_x_span_max` from the calibrated shoulder
+    // span when the user has captured a `PoseCalibration`. Without this
+    // seed the running max accumulates from zero across the first few
+    // frames of the session — if those frames happen to be at a
+    // non-frontal yaw, the captured max is an under-estimate of the
+    // user's true frontal X-span, and `compute_body_yaw_3d`'s
+    // foreshortening recovery under-shoots until a frontal pose lands.
+    //
+    // Robustness against unusual clothing: 2D shoulder keypoint
+    // detection latches onto whatever silhouette boundary the model
+    // picks up. Wide collars, padded jackets, costume armour all push
+    // the keypoint outward from the anatomical shoulder, so the
+    // session's running max can creep beyond the user's true span as
+    // pose variation surfaces ever-wider detections. A calibrated
+    // shoulder span captured under the *same* outfit anchors the
+    // expected magnitude — `compute_body_yaw_3d` then divides bx by a
+    // floor that matches the user's actual frontal extent rather than
+    // an outlier from a single bad frame.
+    //
+    // Caveat: `shoulder_span_m` is in whatever source-space units the
+    // provider that captured the calibration emits (RTMW3D-normalised
+    // for the rtmw3d / rtmw3d-with-depth paths, metres for
+    // cigpose-metric-depth). Switching providers mid-session would put
+    // the seed in the wrong unit; the user is expected to re-calibrate
+    // after such a switch (the inspector flags low-sample / stale
+    // calibrations independently). Only seeded when `running_*` is
+    // still zero (cold start) so a session that's already learned a
+    // larger max keeps it.
+    if state.running_shoulder_x_span_max == 0.0 {
+        if let Some(span) = params
+            .pose_calibration
+            .as_ref()
+            .and_then(|c| c.shoulder_span_m)
+        {
+            if span.is_finite() && span > 0.0 {
+                state.running_shoulder_x_span_max = span;
+            }
+        }
+    }
+
     // Source body yaw, computed early so the IK pole hints (which
     // describe limb-bend direction in body-local terms — knee bends
     // forward, elbow bends down) can be rotated into the source frame
@@ -2455,6 +2495,129 @@ mod body_yaw_tests {
         assert!(
             (yaw - (-0.27)).abs() < 0.02,
             "hip-only yaw mismatch: {yaw}"
+        );
+    }
+
+    /// `solve_avatar_pose` seeds `running_shoulder_x_span_max` from the
+    /// active `PoseCalibration::shoulder_span_m` on the cold-start
+    /// frame. Without this seed, an initial frame caught at a non-
+    /// frontal yaw would lock the running max to the foreshortened bx
+    /// for the rest of the session.
+    #[test]
+    fn calibration_seeds_running_shoulder_max_on_cold_start() {
+        use crate::asset::{HumanoidMap, NodeId, SkeletonNode, Transform};
+        use std::collections::HashMap;
+
+        // Minimal skeleton: a single Hips node so `solve_avatar_pose`
+        // doesn't bail early on a missing humanoid map. The seed runs
+        // before any geometry, so the rig topology is irrelevant.
+        let skeleton = SkeletonAsset {
+            nodes: vec![SkeletonNode {
+                id: NodeId(0),
+                name: "Hips".to_string(),
+                parent: None,
+                children: Vec::new(),
+                rest_local: Transform::default(),
+                humanoid_bone: Some(HumanoidBone::Hips),
+            }],
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: Vec::new(),
+        };
+        let mut bone_map = HashMap::new();
+        bone_map.insert(HumanoidBone::Hips, NodeId(0));
+        let humanoid = HumanoidMap { bone_map };
+        let mut local = vec![Transform::default()];
+
+        let cal = crate::tracking::PoseCalibration {
+            mode: crate::tracking::CalibrationMode::FullBody,
+            captured_at: String::new(),
+            captured_at_unix: 0,
+            frame_count: 12,
+            anchor_x: 0.0,
+            anchor_y: 0.0,
+            anchor_depth_m: Some(1.8),
+            confidence: 1.0,
+            anchor_depth_jitter_m: None,
+            shoulder_span_m: Some(0.412),
+            x_range_observed: None,
+            z_range_observed: None,
+            torso_depth_template: None,
+        };
+        let params = SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.5,
+            pose_calibration: Some(cal),
+            ..Default::default()
+        };
+        let mut state = PoseSolverState::new();
+        let source = SourceSkeleton::empty(0);
+
+        assert_eq!(state.running_shoulder_x_span_max, 0.0);
+        solve_avatar_pose(&source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
+        assert!(
+            (state.running_shoulder_x_span_max - 0.412).abs() < 1e-6,
+            "expected seed=0.412, got {}",
+            state.running_shoulder_x_span_max
+        );
+    }
+
+    /// Already-warm session: a session that has accumulated a max
+    /// larger than the calibrated value (e.g. user shifted closer to
+    /// camera mid-session, or the detector caught a transient wider
+    /// silhouette) keeps the larger value. The seed is a *floor*, not
+    /// an override.
+    #[test]
+    fn warm_running_max_is_not_overwritten_by_calibration_seed() {
+        use crate::asset::{HumanoidMap, NodeId, SkeletonNode, Transform};
+        use std::collections::HashMap;
+
+        let skeleton = SkeletonAsset {
+            nodes: vec![SkeletonNode {
+                id: NodeId(0),
+                name: "Hips".to_string(),
+                parent: None,
+                children: Vec::new(),
+                rest_local: Transform::default(),
+                humanoid_bone: Some(HumanoidBone::Hips),
+            }],
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: Vec::new(),
+        };
+        let mut bone_map = HashMap::new();
+        bone_map.insert(HumanoidBone::Hips, NodeId(0));
+        let humanoid = HumanoidMap { bone_map };
+        let mut local = vec![Transform::default()];
+
+        let cal = crate::tracking::PoseCalibration {
+            mode: crate::tracking::CalibrationMode::FullBody,
+            captured_at: String::new(),
+            captured_at_unix: 0,
+            frame_count: 12,
+            anchor_x: 0.0,
+            anchor_y: 0.0,
+            anchor_depth_m: Some(1.8),
+            confidence: 1.0,
+            anchor_depth_jitter_m: None,
+            shoulder_span_m: Some(0.412),
+            x_range_observed: None,
+            z_range_observed: None,
+            torso_depth_template: None,
+        };
+        let params = SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.5,
+            pose_calibration: Some(cal),
+            ..Default::default()
+        };
+        let mut state = PoseSolverState::new();
+        state.running_shoulder_x_span_max = 0.55;
+        let source = SourceSkeleton::empty(0);
+
+        solve_avatar_pose(&source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
+        assert!(
+            (state.running_shoulder_x_span_max - 0.55).abs() < 1e-6,
+            "warm value 0.55 must survive seed=0.412, got {}",
+            state.running_shoulder_x_span_max
         );
     }
 }

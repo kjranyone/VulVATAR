@@ -847,24 +847,43 @@ impl Rtmw3dWithDepthProvider {
             }
         }
 
-        // Phase 7.5: re-inject the elbow Z component from DAv2 metric
-        // depth. Phase 7 above replaced every joint's `position` with
-        // RTMW3D's own (nx, ny, nz) to dodge the lateral-bias-into-XY
-        // problem in the dav2 back-projection — but RTMW3D's nz is a
-        // single softmax over 576 depth bins and does a poor job of
-        // resolving the 5-15 cm forward elbow displacement that
-        // distinguishes "elbow at side" from "elbow pushed toward
-        // camera" (e.g. fist-on-hip with elbow flared forward).
+        // Phase 7.5: re-inject Z components from DAv2 metric depth.
+        // Phase 7 above replaced every joint's `position` with RTMW3D's
+        // own (nx, ny, nz) to dodge the lateral-bias-into-XY problem in
+        // the dav2 back-projection — but RTMW3D's nz is a single
+        // softmax over 576 depth bins and does a poor job of resolving
+        // small forward/backward displacements at the elbow / inter-
+        // shoulder Δz at 30°–60° body yaw.
         //
-        // DAv2's metric depth at the elbow pixel captures that signal
-        // accurately. We use it as a *relative* delta vs the shoulder
-        // — `Δz = shoulder_depth_m − elbow_depth_m` — which cancels
-        // DAv2's near-uniform lateral bias (the bias is roughly
-        // constant across nearby pixels in the same body region).
-        // The delta is then converted to source-Z units via the
-        // shoulder span (metres-per-source-unit), keeping the result
-        // dimensionally compatible with the IK that consumes it.
+        // For each joint we re-inject DAv2's signal as a *relative*
+        // delta against the next-anchored joint up the chain (shoulder
+        // Δ vs the shoulder midpoint; elbow Δ vs the shoulder), which
+        // cancels DAv2's near-uniform lateral bias (the bias is roughly
+        // constant across nearby pixels in the same body region). The
+        // delta is converted to source-Z units via the shoulder span
+        // (metres-per-source-unit), keeping the result dimensionally
+        // compatible with the IK and `compute_body_yaw_3d` that consume
+        // the source skeleton.
+        //
+        // Order matters: shoulders first so the elbow delta is taken
+        // against the corrected shoulder Z, not the RTMW3D-nz one.
+        // `pose_calibration` flows into `metric_depth_band` so the
+        // outlier-rejection range tightens around the user's habitual
+        // seat distance — the validation set has 9/16 mocap rotation
+        // frames where DAv2 samples background depth on the occluded
+        // shoulder, and a wider band would let those bogus samples
+        // through.
+        //
+        // Wrist Z is *not* re-injected: the MCP-centroid that drives
+        // the wrist's pixel sample lands on the back of the hand, which
+        // routinely (arms-forward / arms-back poses on the
+        // calibration_effect_validation/arm_reach set) reads as either
+        // background depth (3–5 m) or a body region behind the actual
+        // wrist. RTMW3D's nz captures wrist forward/backward extension
+        // more reliably than DAv2 at the MCP centroid does.
         if let Some((sl_metric_x, sr_metric_x)) = shoulder_metric_x_pre_overwrite {
+            let cal = self.pose_calibration.as_ref();
+            inject_shoulder_bz_from_dav2(&mut skeleton, sl_metric_x, sr_metric_x, cal);
             inject_elbow_z_from_dav2(&mut skeleton, sl_metric_x, sr_metric_x);
         }
         // Hand orientation is also re-derived from RTMW3D's own
@@ -999,6 +1018,154 @@ fn inject_elbow_z_from_dav2(
         }
         let delta_source = delta_metric / metres_per_source_unit;
         elbow_joint_mut.position[2] = shoulder_z_src + delta_source;
+    }
+}
+
+/// Plausibility band for an individual joint's metric depth, in
+/// metres. When `pose_calibration.anchor_depth_m` is set the band is
+/// narrower (subject's habitual distance ± `CALIBRATED_DEPTH_TOL_M`);
+/// otherwise the static webcam-friendly range covers anywhere from
+/// "right against the camera" to "across a small room".
+///
+/// Why the gate exists: at intermediate body yaws (~30°–60°) the rear
+/// shoulder is partially occluded by the torso, and DAv2 frequently
+/// samples background depth (3–10 m) at that pixel instead of the
+/// shoulder surface. Without this guard `inject_shoulder_bz_from_dav2`
+/// happily writes the resulting bogus `bz` into the source skeleton
+/// and `compute_body_yaw_3d` reads it as a wild rotation. Bulk
+/// validation across `mocap_suit_rotation` (16 frames, 22.5° steps)
+/// shows 9/16 frames have one shoulder DAv2 sample landing on
+/// background — the gate catches those without affecting the clean
+/// frontal / cardinal poses where DAv2 succeeds.
+#[cfg(feature = "inference")]
+fn metric_depth_band(pose_calibration: Option<&crate::tracking::PoseCalibration>) -> (f32, f32) {
+    /// Half-width of the plausibility band when the user has captured a
+    /// `PoseCalibration` profile with `anchor_depth_m`. Allows the
+    /// subject to lean ±60 cm toward / away from the calibrated seat
+    /// without rejecting frames; beyond that we'd rather drop the
+    /// metric Z than propagate a sample taken from the wall behind
+    /// them.
+    const CALIBRATED_DEPTH_TOL_M: f32 = 0.6;
+    /// Static fallback when no calibration is active. 0.3 m is close
+    /// enough to the camera that a webcam subject's body would already
+    /// be partially out of frame; 5.0 m is past where DAv2 + a typical
+    /// indoor scene retain useful depth contrast against the
+    /// background. Anything outside this is by construction not the
+    /// subject.
+    const STATIC_MIN_M: f32 = 0.3;
+    const STATIC_MAX_M: f32 = 5.0;
+
+    if let Some(d) = pose_calibration.and_then(|c| c.anchor_depth_m) {
+        if d.is_finite() && d > 0.0 {
+            let lo = (d - CALIBRATED_DEPTH_TOL_M).max(STATIC_MIN_M);
+            let hi = (d + CALIBRATED_DEPTH_TOL_M).min(STATIC_MAX_M);
+            return (lo, hi);
+        }
+    }
+    (STATIC_MIN_M, STATIC_MAX_M)
+}
+
+/// Replace the shoulder pair's source-space Z with one derived from
+/// DAv2's inter-shoulder Δz. Phase 7's overwrite replaced both
+/// shoulders' Z with RTMW3D's nz, which suffers from the same
+/// coarse-softmax limitation as the elbow nz: at intermediate body
+/// yaws (~30°–60°) the inter-shoulder Δz is small in nz units, and
+/// `compute_body_yaw_3d`'s X-foreshortening recovery under-estimates
+/// the rotation (validation set: 45° label → 26° recovered).
+///
+/// Mirror of `inject_elbow_z_from_dav2`: we use DAv2's bz signal as a
+/// *relative* delta `Δ = R_metric − L_metric`, which cancels DAv2's
+/// near-uniform lateral bias. Only the L↔R asymmetry is corrected;
+/// the average source Z (= shoulder midpoint) is preserved so the
+/// downstream elbow injection still anchors against the same midpoint
+/// the spine-chain proxy logic uses.
+///
+/// Bails on the same conditions as the elbow injection, plus:
+/// - either shoulder's `metric_depth_m` outside [`metric_depth_band`]
+///   (DAv2 sampled background instead of the shoulder pixel);
+/// - `|Δ| > MAX_BZ_METRIC_M` (anatomical L↔R Z spread bound).
+#[cfg(feature = "inference")]
+fn inject_shoulder_bz_from_dav2(
+    skeleton: &mut SourceSkeleton,
+    shoulder_l_metric_x: f32,
+    shoulder_r_metric_x: f32,
+    pose_calibration: Option<&crate::tracking::PoseCalibration>,
+) {
+    /// See `inject_elbow_z_from_dav2`. Same threshold, same rationale —
+    /// DAv2 windows on a low-confidence keypoint pixel are dominated by
+    /// surrounding-region depth rather than the body part.
+    const MIN_INJECT_CONFIDENCE: f32 = 0.4;
+
+    /// Anatomical bound on `|R_z_m − L_z_m|`. At 90° body yaw the
+    /// shoulder pair is fully separated along the camera Z axis so the
+    /// max anatomical spread ≈ `ASSUMED_SHOULDER_SPAN_M` (0.40 m).
+    /// Allow 25% margin for DAv2 sample noise / non-square anatomy
+    /// before rejecting — beyond that the Δ is almost certainly a
+    /// DAv2 outlier sampling something other than the shoulder
+    /// (background, hair, the other shoulder occluding).
+    const MAX_BZ_METRIC_M: f32 = 0.50;
+
+    let metric_x_span = (shoulder_l_metric_x - shoulder_r_metric_x).abs();
+    if metric_x_span < 1e-3 {
+        return;
+    }
+    let source_x_span = match (
+        skeleton.joints.get(&HumanoidBone::LeftUpperArm),
+        skeleton.joints.get(&HumanoidBone::RightUpperArm),
+    ) {
+        (Some(l), Some(r)) => (l.position[0] - r.position[0]).abs(),
+        _ => return,
+    };
+    if source_x_span < 1e-3 {
+        return;
+    }
+    let metres_per_source_unit = metric_x_span / source_x_span;
+
+    let l = skeleton.joints.get(&HumanoidBone::LeftUpperArm);
+    let r = skeleton.joints.get(&HumanoidBone::RightUpperArm);
+    let (Some(l), Some(r)) = (l, r) else {
+        return;
+    };
+    if l.confidence < MIN_INJECT_CONFIDENCE || r.confidence < MIN_INJECT_CONFIDENCE {
+        return;
+    }
+    let (Some(l_z_m), Some(r_z_m)) = (l.metric_depth_m, r.metric_depth_m) else {
+        return;
+    };
+    let (lo, hi) = metric_depth_band(pose_calibration);
+    if !(lo..=hi).contains(&l_z_m) || !(lo..=hi).contains(&r_z_m) {
+        return;
+    }
+    let mid_z_src = (l.position[2] + r.position[2]) * 0.5;
+
+    // Sign convention: source-z is `+z` toward the camera, DAv2
+    // metric_depth_m is distance-from-camera. So "L closer to camera"
+    // means `L_metric < R_metric` (smaller distance) and `L_src >
+    // R_src` (larger source-z). The bz signal `compute_body_yaw_3d`
+    // reads is `bz = L_src − R_src`, which has the same sign as
+    // `(R_metric − L_metric)` — both positive when L is forward.
+    let bz_metric = r_z_m - l_z_m;
+    if bz_metric.abs() > MAX_BZ_METRIC_M {
+        return;
+    }
+    let bz_source_target = bz_metric / metres_per_source_unit;
+    let half = bz_source_target * 0.5;
+    let l_new = mid_z_src + half;
+    let r_new = mid_z_src - half;
+
+    // RTMW3D shares the same source-space sample for `LeftShoulder` /
+    // `LeftUpperArm` (both come from COCO index 5, likewise 6 for the
+    // right side). Update both so consumers reading either bone see
+    // the corrected Z.
+    for bone in [HumanoidBone::LeftShoulder, HumanoidBone::LeftUpperArm] {
+        if let Some(j) = skeleton.joints.get_mut(&bone) {
+            j.position[2] = l_new;
+        }
+    }
+    for bone in [HumanoidBone::RightShoulder, HumanoidBone::RightUpperArm] {
+        if let Some(j) = skeleton.joints.get_mut(&bone) {
+            j.position[2] = r_new;
+        }
     }
 }
 
@@ -1479,5 +1646,200 @@ mod elbow_z_injection_tests {
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         assert!((z - 0.20).abs() < 1e-4, "got {z}");
+    }
+}
+
+#[cfg(all(test, feature = "inference"))]
+mod shoulder_bz_injection_tests {
+    use super::*;
+    use crate::tracking::source_skeleton::SourceJoint;
+
+    /// Source-X span = 0.50 units, metric-X span = 0.40 m,
+    /// metres_per_source_unit = 0.80. Average shoulder source-Z = 0.04
+    /// (a small RTMW3D-nz baseline) so tests can assert the mid is
+    /// preserved while the L-R asymmetry shifts.
+    fn skeleton_with_shoulders(
+        l_metric_z: Option<f32>,
+        r_metric_z: Option<f32>,
+        confidence: f32,
+    ) -> (SourceSkeleton, f32, f32) {
+        let sl_metric_x = 0.20;
+        let sr_metric_x = -0.20;
+        let mk = |src_x: f32, z_m: Option<f32>| SourceJoint {
+            position: [src_x, 0.0, 0.04],
+            confidence,
+            metric_depth_m: z_m,
+        };
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints
+            .insert(HumanoidBone::LeftShoulder, mk(0.25, l_metric_z));
+        sk.joints
+            .insert(HumanoidBone::LeftUpperArm, mk(0.25, l_metric_z));
+        sk.joints
+            .insert(HumanoidBone::RightShoulder, mk(-0.25, r_metric_z));
+        sk.joints
+            .insert(HumanoidBone::RightUpperArm, mk(-0.25, r_metric_z));
+        (sk, sl_metric_x, sr_metric_x)
+    }
+
+    #[test]
+    fn left_forward_yields_positive_l_minus_r_bz() {
+        // L closer to camera by 0.16 m → bz_metric = R - L = +0.16 m,
+        // bz_source_target = +0.20 source units, half = 0.10. Mid
+        // (= 0.04) preserved, so L = 0.14, R = -0.06.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - 0.14).abs() < 1e-4, "L got {l_z}");
+        assert!((r_z + 0.06).abs() < 1e-4, "R got {r_z}");
+        // bz must be positive (subject turned to her left).
+        assert!(l_z - r_z > 0.0);
+    }
+
+    #[test]
+    fn right_forward_yields_negative_l_minus_r_bz() {
+        // R closer (= subject turned to her right) by 0.10 m → bz_src
+        // = -0.125, half = -0.0625, L = -0.0225, R = 0.1025.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(1.05), Some(0.95), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - (-0.0225)).abs() < 1e-4, "L got {l_z}");
+        assert!((r_z - 0.1025).abs() < 1e-4, "R got {r_z}");
+        assert!(l_z - r_z < 0.0);
+    }
+
+    #[test]
+    fn upper_arm_alias_receives_same_z_as_shoulder() {
+        // RTMW3D shares COCO 5/6 between LeftShoulder/LeftUpperArm —
+        // both must end up with identical source-Z post-injection.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_sh = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let l_ua = sk.joints[&HumanoidBone::LeftUpperArm].position[2];
+        let r_sh = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        let r_ua = sk.joints[&HumanoidBone::RightUpperArm].position[2];
+        assert!((l_sh - l_ua).abs() < 1e-9);
+        assert!((r_sh - r_ua).abs() < 1e-9);
+    }
+
+    #[test]
+    fn average_shoulder_z_is_preserved() {
+        // The pre-existing mid (0.04) should survive — the elbow
+        // injection that runs immediately after relies on it.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!(((l_z + r_z) * 0.5 - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn implausible_spread_is_rejected_and_keeps_source_z() {
+        // 0.60 m spread > MAX_BZ_METRIC_M (0.50) — almost certainly a
+        // DAv2 sample landing on the wrong surface. Bail and let the
+        // RTMW3D nz value through.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.70), Some(1.30), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6);
+        assert!((r_z - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_metric_depth_skips_silently() {
+        let (mut sk, sl, sr) = skeleton_with_shoulders(None, Some(1.00), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn low_confidence_skips_injection() {
+        // RTMW3D uncertain about the shoulder 2D pixel → DAv2 sample is
+        // centred on the wrong location and propagating the bz would
+        // amplify the error.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 0.30);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn confidence_at_threshold_does_inject() {
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 0.40);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        assert!((l_z - 0.14).abs() < 1e-4);
+    }
+
+    #[test]
+    fn elbow_injection_anchors_against_corrected_shoulder() {
+        // End-to-end ordering check: shoulder injection runs first, so
+        // the elbow injection's `shoulder_z_src + delta_source` line
+        // sees the corrected Z. With L_shoulder advanced by +0.10 and
+        // L_elbow's metric depth identical to L_shoulder's metric
+        // depth (= 0.92), the elbow Δ vs shoulder is 0, so the elbow's
+        // final source-Z should equal the new shoulder Z (0.14), not
+        // the original 0.04.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        sk.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            SourceJoint {
+                position: [0.0, 0.0, 0.0],
+                confidence: 1.0,
+                metric_depth_m: Some(0.92),
+            },
+        );
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        inject_elbow_z_from_dav2(&mut sk, sl, sr);
+        let elbow_z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
+        assert!((elbow_z - 0.14).abs() < 1e-4, "elbow got {elbow_z}");
+    }
+
+    #[test]
+    fn out_of_band_metric_depth_skips_silently() {
+        // 8.0 m on the left shoulder is exactly the failure mode
+        // observed on `mocap_suit_rotation` 22.5° / 67.5° frames where
+        // DAv2 sampled the wall behind the subject instead of the
+        // shoulder pixel. Without the band guard the bz delta still
+        // looks small (both shoulders on the same wall) and the
+        // injection writes a garbage offset onto the source-Z. With
+        // the guard we bail and let the RTMW3D nz fallback through.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(8.0), Some(1.08), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6);
+        assert!((r_z - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calibrated_band_rejects_off_distance_subject() {
+        // Calibrated to 1.8 m ± 0.6 m (band [1.2, 2.4]). Both
+        // shoulders at 1.0 m — subject is much closer than calibrated
+        // and the DAv2 sample probably hit the user's hand/face crossing
+        // the shoulder ROI. Inject must bail.
+        let cal = crate::tracking::PoseCalibration {
+            mode: crate::tracking::CalibrationMode::FullBody,
+            captured_at: String::new(),
+            captured_at_unix: 0,
+            frame_count: 1,
+            anchor_x: 0.0,
+            anchor_y: 0.0,
+            anchor_depth_m: Some(1.8),
+            confidence: 1.0,
+            anchor_depth_jitter_m: None,
+            shoulder_span_m: None,
+            x_range_observed: None,
+            z_range_observed: None,
+            torso_depth_template: None,
+        };
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(1.0), Some(1.0), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, Some(&cal));
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6);
     }
 }
