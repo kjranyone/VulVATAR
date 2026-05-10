@@ -1083,7 +1083,9 @@ fn metric_depth_band(pose_calibration: Option<&crate::tracking::PoseCalibration>
 /// Bails on the same conditions as the elbow injection, plus:
 /// - either shoulder's `metric_depth_m` outside [`metric_depth_band`]
 ///   (DAv2 sampled background instead of the shoulder pixel);
-/// - `|Δ| > MAX_BZ_METRIC_M` (anatomical L↔R Z spread bound).
+/// - `|Δ| > MAX_BZ_METRIC_M` (anatomical L↔R Z spread bound);
+/// - `|Δ| < MIN_BZ_METRIC_M` (dead-zone for DAv2's residual lateral-
+///   bias DC offset — see the constant's docstring).
 #[cfg(feature = "inference")]
 fn inject_shoulder_bz_from_dav2(
     skeleton: &mut SourceSkeleton,
@@ -1104,6 +1106,29 @@ fn inject_shoulder_bz_from_dav2(
     /// DAv2 outlier sampling something other than the shoulder
     /// (background, hair, the other shoulder occluding).
     const MAX_BZ_METRIC_M: f32 = 0.50;
+
+    /// Lower bound below which DAv2's `bz_metric` is treated as
+    /// indistinguishable from its residual lateral-bias DC offset.
+    /// The bias-into-Δz is small (the elbow comment notes the bias is
+    /// "roughly constant across nearby pixels") but not zero — bulk
+    /// `mocap_suit_rotation` data shows ~0.10–0.16 m of phantom L↔R
+    /// asymmetry on visually frontal poses. Without this dead-zone
+    /// the injection writes that bias into the source bz, which
+    /// inflates `span_xz` in `compute_body_yaw_3d`'s
+    /// `target_span = running_max.max(span_xz)` formula, dragging
+    /// `cos_yaw` below 1 and producing a phantom 15-25° rotation
+    /// when the subject is square-on.
+    ///
+    /// 0.20 m chosen so a genuine ~12° rotation
+    /// (`bz_metric ≈ sin(12°)·shoulder_span ≈ 0.083 m`) doesn't fire,
+    /// but a ~22° rotation (`≈ 0.15 m`) — still under-shooting since
+    /// the synthetic validation set's 22.5° label measured at 0.24 m —
+    /// does. Below 12° the foreshortening recovery from `bx` alone
+    /// already gives correct magnitude (the running max captures
+    /// frontal width), and the small-magnitude sign jitter from the
+    /// fall-back RTMW3D nz path is dominated by `rotation_blend` /
+    /// 1€ smoothing downstream.
+    const MIN_BZ_METRIC_M: f32 = 0.20;
 
     let metric_x_span = (shoulder_l_metric_x - shoulder_r_metric_x).abs();
     if metric_x_span < 1e-3 {
@@ -1145,7 +1170,8 @@ fn inject_shoulder_bz_from_dav2(
     // reads is `bz = L_src − R_src`, which has the same sign as
     // `(R_metric − L_metric)` — both positive when L is forward.
     let bz_metric = r_z_m - l_z_m;
-    if bz_metric.abs() > MAX_BZ_METRIC_M {
+    let abs_bz = bz_metric.abs();
+    if !(MIN_BZ_METRIC_M..=MAX_BZ_METRIC_M).contains(&abs_bz) {
         return;
     }
     let bz_source_target = bz_metric / metres_per_source_unit;
@@ -1686,27 +1712,27 @@ mod shoulder_bz_injection_tests {
     fn left_forward_yields_positive_l_minus_r_bz() {
         // L closer to camera by 0.16 m → bz_metric = R - L = +0.16 m,
         // bz_source_target = +0.20 source units, half = 0.10. Mid
-        // (= 0.04) preserved, so L = 0.14, R = -0.06.
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        // (= 0.04) preserved, so L = 0.29, R = -0.21.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 1.0);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
-        assert!((l_z - 0.14).abs() < 1e-4, "L got {l_z}");
-        assert!((r_z + 0.06).abs() < 1e-4, "R got {r_z}");
+        assert!((l_z - 0.29).abs() < 1e-4, "L got {l_z}");
+        assert!((r_z + 0.21).abs() < 1e-4, "R got {r_z}");
         // bz must be positive (subject turned to her left).
         assert!(l_z - r_z > 0.0);
     }
 
     #[test]
     fn right_forward_yields_negative_l_minus_r_bz() {
-        // R closer (= subject turned to her right) by 0.10 m → bz_src
-        // = -0.125, half = -0.0625, L = -0.0225, R = 0.1025.
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(1.05), Some(0.95), 1.0);
+        // R closer (= subject turned to her right) by 0.40 m → bz_src
+        // = -0.50, half = -0.25, L = -0.21, R = 0.29.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(1.20), Some(0.80), 1.0);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
-        assert!((l_z - (-0.0225)).abs() < 1e-4, "L got {l_z}");
-        assert!((r_z - 0.1025).abs() < 1e-4, "R got {r_z}");
+        assert!((l_z - (-0.21)).abs() < 1e-4, "L got {l_z}");
+        assert!((r_z - 0.29).abs() < 1e-4, "R got {r_z}");
         assert!(l_z - r_z < 0.0);
     }
 
@@ -1714,7 +1740,7 @@ mod shoulder_bz_injection_tests {
     fn upper_arm_alias_receives_same_z_as_shoulder() {
         // RTMW3D shares COCO 5/6 between LeftShoulder/LeftUpperArm —
         // both must end up with identical source-Z post-injection.
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 1.0);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_sh = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let l_ua = sk.joints[&HumanoidBone::LeftUpperArm].position[2];
@@ -1728,11 +1754,28 @@ mod shoulder_bz_injection_tests {
     fn average_shoulder_z_is_preserved() {
         // The pre-existing mid (0.04) should survive — the elbow
         // injection that runs immediately after relies on it.
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 1.0);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
         assert!(((l_z + r_z) * 0.5 - 0.04).abs() < 1e-6);
+    }
+
+    #[test]
+    fn small_bz_metric_below_deadzone_is_not_injected() {
+        // 0.16 m of inter-shoulder Δ is in the residual lateral-bias
+        // band — DAv2 routinely emits this much "phantom asymmetry"
+        // even on visually frontal poses. Without the dead-zone the
+        // injection writes 0.16 m of source-Z bias, which inflates
+        // `span_xz` in `compute_body_yaw_3d` and produces a phantom
+        // ~20° rotation. With the dead-zone we keep the RTMW3D nz
+        // value (= the pre-existing 0.04 source-Z) unchanged.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6, "L got {l_z}");
+        assert!((r_z - 0.04).abs() < 1e-6, "R got {r_z}");
     }
 
     #[test]
@@ -1769,34 +1812,34 @@ mod shoulder_bz_injection_tests {
 
     #[test]
     fn confidence_at_threshold_does_inject() {
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 0.40);
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 0.40);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
-        assert!((l_z - 0.14).abs() < 1e-4);
+        assert!((l_z - 0.29).abs() < 1e-4, "L got {l_z}");
     }
 
     #[test]
     fn elbow_injection_anchors_against_corrected_shoulder() {
         // End-to-end ordering check: shoulder injection runs first, so
         // the elbow injection's `shoulder_z_src + delta_source` line
-        // sees the corrected Z. With L_shoulder advanced by +0.10 and
-        // L_elbow's metric depth identical to L_shoulder's metric
-        // depth (= 0.92), the elbow Δ vs shoulder is 0, so the elbow's
-        // final source-Z should equal the new shoulder Z (0.14), not
-        // the original 0.04.
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        // sees the corrected Z. With L_shoulder advanced from 0.04 →
+        // 0.29 and L_elbow's metric depth identical to L_shoulder's
+        // metric depth (= 0.80), the elbow Δ vs shoulder is 0, so the
+        // elbow's final source-Z should equal the new shoulder Z
+        // (0.29), not the original 0.04.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 1.0);
         sk.joints.insert(
             HumanoidBone::LeftLowerArm,
             SourceJoint {
                 position: [0.0, 0.0, 0.0],
                 confidence: 1.0,
-                metric_depth_m: Some(0.92),
+                metric_depth_m: Some(0.80),
             },
         );
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let elbow_z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        assert!((elbow_z - 0.14).abs() < 1e-4, "elbow got {elbow_z}");
+        assert!((elbow_z - 0.29).abs() < 1e-4, "elbow got {elbow_z}");
     }
 
     #[test]
