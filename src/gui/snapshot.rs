@@ -192,7 +192,7 @@ impl GuiApp {
                 world_transform: avatar.world_transform.clone(),
                 mesh_instances,
                 skinning_matrices: avatar.pose.skinning_matrices.clone(),
-                cloth_deform: None,
+                cloth_deforms: Vec::new(),
                 debug_flags: RenderDebugFlags::default(),
             }],
             output_request: OutputTargetRequest {
@@ -318,7 +318,7 @@ impl GuiApp {
                 world_transform: avatar.world_transform.clone(),
                 mesh_instances,
                 skinning_matrices,
-                cloth_deform: None,
+                cloth_deforms: Vec::new(),
                 debug_flags: RenderDebugFlags::default(),
             }],
             output_request: OutputTargetRequest {

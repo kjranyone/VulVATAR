@@ -8,6 +8,7 @@ pub mod render_thread;
 mod tracking_lifecycle;
 
 use log::{error, info, warn};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::app::render_thread::RenderThread;
@@ -198,6 +199,11 @@ pub struct Application {
     /// avatar still gets at least one follow-up frame to upload the
     /// re-rendered texture instead of stalling on the previous image.
     render_results_pending: u32,
+    /// Lease completions waiting to be forwarded back to the render thread.
+    /// The render command channel is bounded, so failed `try_send` attempts
+    /// are retried next tick instead of dropping the release and pinning a
+    /// pool slot forever.
+    pending_export_lease_releases: VecDeque<u64>,
 }
 
 impl Default for Application {
@@ -306,6 +312,7 @@ impl Application {
             ground_grid_visible: false,
             logged_first_render_result: false,
             render_results_pending: 0,
+            pending_export_lease_releases: VecDeque::new(),
         }
     }
 
@@ -486,8 +493,11 @@ impl Application {
         // 1. Stop the tracking worker so no new tracking data arrives.
         if let Some(ref mut worker) = self.tracking_worker {
             info!("app: stopping tracking worker...");
-            worker.stop();
-            info!("app: tracking worker stopped");
+            if worker.stop() {
+                info!("app: tracking worker stopped");
+            } else {
+                warn!("app: tracking worker stop timed out during shutdown");
+            }
         }
 
         // 2. Mark application as no longer running (prevents run_frame from

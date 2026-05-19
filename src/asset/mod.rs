@@ -620,6 +620,15 @@ pub struct ClothRenderRegionBinding {
     pub primitive: PrimitiveRef,
     pub vertex_subset: VertexSubsetRef,
     pub mapping_region: ClothRegionTag,
+    /// Mesh that owns `primitive`. Populated by `cloth_rebind` once the
+    /// overlay has been resolved against an `AvatarAsset`. Older
+    /// serialised overlays predate this field and default to `None`;
+    /// loaders should treat a `None` here as "look up the mesh from the
+    /// primitive id at the next rebind" — `PrimitiveId` is globally
+    /// unique within an avatar so the renderer can still match by
+    /// primitive id alone.
+    #[serde(default)]
+    pub mesh: Option<MeshRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

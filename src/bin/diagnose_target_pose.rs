@@ -191,7 +191,7 @@ fn build_frame_input(
             world_transform: avatar.world_transform.clone(),
             mesh_instances,
             skinning_matrices: skinning_matrices.to_vec(),
-            cloth_deform: None,
+            cloth_deforms: Vec::new(),
             debug_flags: RenderDebugFlags::default(),
         }],
         output_request: OutputTargetRequest {

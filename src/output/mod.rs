@@ -9,60 +9,17 @@ pub mod virtual_camera_native;
 pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter};
 
 use crate::avatar::pose::FrameTimestamp;
+pub use crate::frame_handoff::{
+    AlphaMode, ExportedResourceId, ExternalHandleType, FallbackReason, FrameLease,
+    FrameLifetimeContract, GpuFrameToken, HandoffPath, OutputColorSpace, OutputFrameId,
+    OutputSyncToken,
+};
 use log::{debug, error, info};
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Unique identifier for a GPU-exported resource (shared texture handle, etc.).
-pub type ExportedResourceId = u64;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct OutputFrameId(pub u64);
-
-#[derive(Clone, Debug)]
-pub enum OutputColorSpace {
-    Srgb,
-    LinearSrgb,
-}
-
-#[derive(Clone, Debug)]
-pub enum AlphaMode {
-    Opaque,
-    Premultiplied,
-    Straight,
-}
-
-#[derive(Clone, Debug)]
-pub enum ExternalHandleType {
-    Win32Kmt,
-    D3D12Fence,
-    VkSemaphore,
-    SharedMemoryHandle,
-}
-
-#[derive(Clone, Debug)]
-pub enum GpuSyncToken {
-    None,
-    FenceValue(u64),
-    SemaphoreHandle(u64),
-}
-
-#[derive(Clone, Debug)]
-pub enum FrameLifetimeContract {
-    SingleConsumerImmediate,
-    SingleConsumerRetained,
-}
-
-#[derive(Clone, Debug)]
-pub struct GpuFrameToken {
-    pub resource_id: ExportedResourceId,
-    pub handle_type: ExternalHandleType,
-    pub sync: GpuSyncToken,
-    pub lifetime: FrameLifetimeContract,
-}
 
 #[derive(Clone, Debug)]
 pub struct OutputFrame {
@@ -71,10 +28,10 @@ pub struct OutputFrame {
     pub extent: [u32; 2],
     pub color_space: OutputColorSpace,
     pub alpha_mode: AlphaMode,
-    pub gpu_token: GpuFrameToken,
+    pub gpu_token: Option<GpuFrameToken>,
     pub handoff_path: HandoffPath,
+    pub fallback_reason: Option<FallbackReason>,
     pub pixel_data: Option<Arc<Vec<u8>>>,
-    pub gpu_image: Option<Arc<vulkano::image::Image>>,
 }
 
 impl OutputFrame {
@@ -85,15 +42,10 @@ impl OutputFrame {
             extent,
             color_space: OutputColorSpace::Srgb,
             alpha_mode: AlphaMode::Premultiplied,
-            gpu_token: GpuFrameToken {
-                resource_id: id,
-                handle_type: ExternalHandleType::SharedMemoryHandle,
-                sync: GpuSyncToken::None,
-                lifetime: FrameLifetimeContract::SingleConsumerImmediate,
-            },
+            gpu_token: None,
             handoff_path: HandoffPath::CpuReadback,
+            fallback_reason: Some(FallbackReason::RequestedCpuReadback),
             pixel_data: None,
-            gpu_image: None,
         }
     }
 
@@ -102,10 +54,10 @@ impl OutputFrame {
         self
     }
 
-    pub fn with_gpu_image(mut self, image: Arc<vulkano::image::Image>) -> Self {
-        self.gpu_image = Some(image);
+    pub fn with_gpu_token(mut self, token: GpuFrameToken) -> Self {
+        self.gpu_token = Some(token);
         self.handoff_path = HandoffPath::GpuSharedFrame;
-        self.gpu_token.handle_type = ExternalHandleType::VkSemaphore;
+        self.fallback_reason = None;
         self
     }
 }
@@ -141,6 +93,11 @@ pub struct OutputRouter {
 
     /// Channel sender to the background output worker.
     worker_tx: Option<mpsc::SyncSender<WorkerMessage>>,
+    /// Completion channel for GPU leases that are no longer retained by the
+    /// output pipeline. The worker sends after sink consumption; the router
+    /// itself sends when a frame is dropped before it reaches the worker.
+    lease_completion_tx: mpsc::Sender<u64>,
+    lease_completion_rx: mpsc::Receiver<u64>,
     /// Join handle for the background worker thread.
     worker_handle: Option<thread::JoinHandle<()>>,
     logged_first_publish: bool,
@@ -150,13 +107,20 @@ pub struct OutputRouter {
     /// frames instead of guessing from the sink variant. `None` until the
     /// first publish.
     last_handoff_path: Option<HandoffPath>,
+    /// Whether the most recently delivered GPU frame actually carried an
+    /// external handle the sink could consume. A GPU-looking path without a
+    /// valid handle is still architectural scaffolding, not interop.
+    last_gpu_token_valid: Option<bool>,
+    last_fallback_reason: Option<FallbackReason>,
+    last_export_pool_stats: Option<crate::renderer::output_export::ExportImagePoolStats>,
 }
 
 impl OutputRouter {
     pub fn new(sink: FrameSink) -> Self {
         let writer = create_sink_writer(&sink);
         let (tx, rx) = mpsc::sync_channel::<WorkerMessage>(1);
-        let handle = Self::spawn_worker(rx, writer);
+        let (lease_completion_tx, lease_completion_rx) = mpsc::channel::<u64>();
+        let handle = Self::spawn_worker(rx, writer, lease_completion_tx.clone());
 
         Self {
             sink,
@@ -169,9 +133,14 @@ impl OutputRouter {
             forward_min_interval: Duration::ZERO,
             last_forward_at: None,
             worker_tx: Some(tx),
+            lease_completion_tx,
+            lease_completion_rx,
             worker_handle: Some(handle),
             logged_first_publish: false,
             last_handoff_path: None,
+            last_gpu_token_valid: None,
+            last_fallback_reason: None,
+            last_export_pool_stats: None,
         }
     }
 
@@ -192,6 +161,7 @@ impl OutputRouter {
     fn spawn_worker(
         rx: mpsc::Receiver<WorkerMessage>,
         mut writer: Box<dyn OutputSinkWriter>,
+        lease_completion_tx: mpsc::Sender<u64>,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("output-worker".into())
@@ -203,6 +173,7 @@ impl OutputRouter {
                             if let Err(e) = writer.write_frame(&frame) {
                                 error!("output-worker: write error: {}", e);
                             }
+                            Self::complete_gpu_lease(&lease_completion_tx, &frame);
                         }
                         Ok(WorkerMessage::Shutdown) => {
                             info!("output-worker: shutdown requested, draining queue");
@@ -212,6 +183,7 @@ impl OutputRouter {
                                     if let Err(e) = writer.write_frame(&frame) {
                                         error!("output-worker: drain write error: {}", e);
                                     }
+                                    Self::complete_gpu_lease(&lease_completion_tx, &frame);
                                 }
                             }
                             info!("output-worker: stopped");
@@ -228,6 +200,12 @@ impl OutputRouter {
             .expect("failed to spawn output-worker thread")
     }
 
+    fn complete_gpu_lease(completion_tx: &mpsc::Sender<u64>, frame: &OutputFrame) {
+        if let Some(token) = frame.gpu_token.as_ref() {
+            let _ = completion_tx.send(token.lease.lease_id);
+        }
+    }
+
     /// Publish a frame to the output pipeline.
     ///
     /// The frame is queued locally (applying the queue policy) and then
@@ -242,6 +220,7 @@ impl OutputRouter {
             if let Some(last) = self.last_forward_at {
                 if now.duration_since(last) < self.forward_min_interval {
                     self.dropped_count += 1;
+                    Self::complete_gpu_lease(&self.lease_completion_tx, &frame);
                     return;
                 }
             }
@@ -280,18 +259,31 @@ impl OutputRouter {
         // dropped at the local-queue or worker-channel boundary.
         let attempted_timestamp = frame.timestamp;
         let attempted_handoff_path = frame.handoff_path.clone();
+        let attempted_gpu_token_valid = frame
+            .gpu_token
+            .as_ref()
+            .is_some_and(GpuFrameToken::has_external_handle);
+        let attempted_fallback_reason = frame.fallback_reason.clone().or_else(|| {
+            (matches!(frame.handoff_path, HandoffPath::GpuSharedFrame)
+                && !attempted_gpu_token_valid)
+                .then_some(FallbackReason::MissingExternalHandle)
+        });
 
         match self.policy {
             FrameSinkQueuePolicy::ReplaceLatest => {
                 // Keep only the latest frame: clear the queue first.
                 let dropped = self.queue.len();
-                self.queue.clear();
+                for dropped_frame in self.queue.drain(..) {
+                    Self::complete_gpu_lease(&self.lease_completion_tx, &dropped_frame);
+                }
                 self.dropped_count += dropped as u64;
                 self.queue.push_back(frame);
             }
             FrameSinkQueuePolicy::DropOldest => {
                 if self.queue.len() >= self.max_queue_depth {
-                    self.queue.pop_front();
+                    if let Some(dropped_frame) = self.queue.pop_front() {
+                        Self::complete_gpu_lease(&self.lease_completion_tx, &dropped_frame);
+                    }
                     self.dropped_count += 1;
                 }
                 self.queue.push_back(frame);
@@ -301,6 +293,7 @@ impl OutputRouter {
                     self.queue.push_back(frame);
                 } else {
                     self.dropped_count += 1;
+                    Self::complete_gpu_lease(&self.lease_completion_tx, &frame);
                     return; // frame dropped, do not send to worker
                 }
             }
@@ -309,6 +302,7 @@ impl OutputRouter {
                     self.queue.push_back(frame);
                 } else {
                     self.dropped_count += 1;
+                    Self::complete_gpu_lease(&self.lease_completion_tx, &frame);
                     return;
                 }
             }
@@ -334,10 +328,20 @@ impl OutputRouter {
                         // "stalled", not "connected / GPU active".
                         self.last_publish_timestamp = attempted_timestamp;
                         self.last_handoff_path = Some(attempted_handoff_path);
+                        self.last_gpu_token_valid = Some(attempted_gpu_token_valid);
+                        self.last_fallback_reason = attempted_fallback_reason;
                     }
                     Err(e) => {
                         self.dropped_count += 1;
-                        debug!("output: worker channel full, dropping frame: {}", e);
+                        let error_text = e.to_string();
+                        let dropped_message = match e {
+                            mpsc::TrySendError::Full(message)
+                            | mpsc::TrySendError::Disconnected(message) => message,
+                        };
+                        if let WorkerMessage::Frame(dropped_frame) = dropped_message {
+                            Self::complete_gpu_lease(&self.lease_completion_tx, &dropped_frame);
+                        }
+                        debug!("output: worker channel full, dropping frame: {}", error_text);
                     }
                 }
             }
@@ -358,20 +362,32 @@ impl OutputRouter {
             extent: [width, height],
             color_space: OutputColorSpace::Srgb,
             alpha_mode: AlphaMode::Premultiplied,
-            gpu_token: GpuFrameToken {
-                resource_id: id,
-                handle_type: ExternalHandleType::SharedMemoryHandle,
-                sync: GpuSyncToken::None,
-                lifetime: FrameLifetimeContract::SingleConsumerImmediate,
-            },
+            gpu_token: None,
             handoff_path: HandoffPath::CpuReadback,
+            fallback_reason: Some(FallbackReason::RequestedCpuReadback),
             pixel_data: None,
-            gpu_image: None,
         }
+    }
+
+    /// Drain leases that the output worker has finished with, plus frames the
+    /// router dropped before they reached the worker. The app forwards these
+    /// acknowledgements back to the render thread so GPU slots can be reused.
+    pub fn drain_completed_gpu_leases(&mut self) -> Vec<u64> {
+        std::iter::from_fn(|| self.lease_completion_rx.try_recv().ok()).collect()
+    }
+
+    pub fn update_export_pool_stats(
+        &mut self,
+        stats: crate::renderer::output_export::ExportImagePoolStats,
+    ) {
+        self.last_export_pool_stats = Some(stats);
     }
 
     /// Drain the output queue and stop the background worker thread.
     pub fn shutdown(&mut self) {
+        for dropped_frame in self.queue.drain(..) {
+            Self::complete_gpu_lease(&self.lease_completion_tx, &dropped_frame);
+        }
         if let Some(tx) = self.worker_tx.take() {
             let _ = tx.send(WorkerMessage::Shutdown);
         }
@@ -403,14 +419,20 @@ impl OutputRouter {
         // GUI doesn't paint a green "GPU active" badge before any frame has
         // crossed the boundary.
         let active_handoff_path = self.last_handoff_path.clone();
-        let gpu_interop_enabled = matches!(active_handoff_path, Some(HandoffPath::GpuSharedFrame));
+        let active_gpu_token_valid = self.last_gpu_token_valid;
+        let gpu_interop_enabled = matches!(active_handoff_path, Some(HandoffPath::GpuSharedFrame))
+            && active_gpu_token_valid == Some(true);
         let fallback_active = matches!(
             active_handoff_path,
             Some(HandoffPath::CpuReadback | HandoffPath::SharedMemory)
-        );
+        ) || matches!(active_handoff_path, Some(HandoffPath::GpuSharedFrame))
+            && active_gpu_token_valid == Some(false);
         OutputDiagnostics {
             active_sink: self.sink.clone(),
             active_handoff_path,
+            active_gpu_token_valid,
+            fallback_reason: self.last_fallback_reason.clone(),
+            export_pool: self.last_export_pool_stats,
             gpu_interop_enabled,
             fallback_active,
             queue_depth: self.queue.len(),
@@ -434,19 +456,17 @@ pub struct OutputDiagnostics {
     /// nothing has been published yet. Reflects what crossed the boundary,
     /// not what the sink's name advertises.
     pub active_handoff_path: Option<HandoffPath>,
+    /// Whether the last delivered GPU token carried a real external handle.
+    /// `None` until the first frame crosses the worker boundary.
+    pub active_gpu_token_valid: Option<bool>,
+    pub fallback_reason: Option<FallbackReason>,
+    pub export_pool: Option<crate::renderer::output_export::ExportImagePoolStats>,
     pub gpu_interop_enabled: bool,
     pub fallback_active: bool,
     pub queue_depth: usize,
     pub max_queue_depth: usize,
     pub dropped_frame_count: u64,
     pub last_publish_timestamp: FrameTimestamp,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum HandoffPath {
-    GpuSharedFrame,
-    CpuReadback,
-    SharedMemory,
 }
 
 #[cfg(test)]
@@ -457,6 +477,19 @@ mod tests {
         let mut frame = OutputFrame::new(id, [16, 16], 1_000 + id);
         frame.handoff_path = path;
         frame
+    }
+
+    fn make_valid_gpu_frame(id: u64) -> OutputFrame {
+        OutputFrame::new(id, [16, 16], 1_000 + id).with_gpu_token(GpuFrameToken {
+            resource_id: id,
+            handle_type: ExternalHandleType::Win32Kmt,
+            external_handle: Some(id + 100),
+            sync: OutputSyncToken::ProducerWaitComplete,
+            lease: FrameLease {
+                lease_id: id,
+                lifetime: FrameLifetimeContract::SingleConsumerImmediate,
+            },
+        })
     }
 
     /// Publish frames carrying `handoff_path` until the router's
@@ -478,6 +511,20 @@ mod tests {
             "publish never reached the worker for handoff_path={:?} after 200 attempts",
             handoff_path
         );
+    }
+
+    fn wait_for_completed_lease(router: &mut OutputRouter, lease_id: u64) {
+        for _ in 0..200 {
+            if router
+                .drain_completed_gpu_leases()
+                .into_iter()
+                .any(|completed| completed == lease_id)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("lease {lease_id} was never completed");
     }
 
     /// Regression test for Finding #2 (initial pass) plus Fix #2 review:
@@ -503,9 +550,42 @@ mod tests {
 
         publish_until_active(&mut router, 1_000, HandoffPath::GpuSharedFrame);
         let after_gpu = router.diagnostics();
-        assert!(after_gpu.gpu_interop_enabled);
-        assert!(!after_gpu.fallback_active);
+        assert!(
+            !after_gpu.gpu_interop_enabled,
+            "a GPU-looking path without an external handle is still fallback"
+        );
+        assert!(after_gpu.fallback_active);
 
+        for attempt in 0..200 {
+            router.publish(make_valid_gpu_frame(2_000 + attempt));
+            let diagnostics = router.diagnostics();
+            if diagnostics.gpu_interop_enabled {
+                assert_eq!(diagnostics.active_gpu_token_valid, Some(true));
+                assert_eq!(diagnostics.fallback_reason, None);
+                assert!(!diagnostics.fallback_active);
+                router.shutdown();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("valid GPU token never reached the worker after 200 attempts");
+    }
+
+    #[test]
+    fn gpu_leases_complete_after_worker_consumption() {
+        let mut router = OutputRouter::new(FrameSink::ImageSequence);
+        router.publish(make_valid_gpu_frame(3_000));
+        wait_for_completed_lease(&mut router, 3_000);
+        router.shutdown();
+    }
+
+    #[test]
+    fn gpu_leases_complete_when_frames_are_dropped_before_worker() {
+        let mut router = OutputRouter::new(FrameSink::ImageSequence);
+        router.set_target_fps(1);
+        router.publish(make_valid_gpu_frame(4_000));
+        router.publish(make_valid_gpu_frame(4_001));
+        wait_for_completed_lease(&mut router, 4_001);
         router.shutdown();
     }
 }

@@ -559,7 +559,9 @@ impl Rtmw3dWithDepthProvider {
         // `rtmw_est.skeleton` gets thrown away and rebuilt with
         // metric depth below.
         let t_rtmw = std::time::Instant::now();
-        let mut rtmw_est = self.rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
+        let mut rtmw_est = self
+            .rtmw3d
+            .estimate_pose(rgb_data, width, height, frame_index);
         let dt_rtmw = t_rtmw.elapsed();
 
         let joints_2d: Vec<DecodedJoint2d> = rtmw_est
@@ -1561,7 +1563,8 @@ mod elbow_z_injection_tests {
             metric_depth_m: Some(z_m),
         };
         let mut sk = SourceSkeleton::empty(0);
-        sk.joints.insert(HumanoidBone::LeftUpperArm, mk_shoulder(0.25));
+        sk.joints
+            .insert(HumanoidBone::LeftUpperArm, mk_shoulder(0.25));
         sk.joints
             .insert(HumanoidBone::RightUpperArm, mk_shoulder(-0.25));
         if let Some(z) = elbow_z_m_l {
@@ -1655,8 +1658,7 @@ mod elbow_z_injection_tests {
         // location, so we should fall back to the RTMW3D nz value
         // instead of trusting the depth sample.
         let initial = 0.07;
-        let (mut sk, sl, sr) =
-            skeleton_with_elbows_and_confidence(Some(0.84), None, initial, 0.30);
+        let (mut sk, sl, sr) = skeleton_with_elbows_and_confidence(Some(0.84), None, initial, 0.30);
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         assert!((z - initial).abs() < 1e-6, "got {z}");
@@ -1667,8 +1669,7 @@ mod elbow_z_injection_tests {
         // Sanity boundary: confidence exactly at MIN_INJECT_CONFIDENCE
         // should pass (>=, not >). Otherwise small floor changes break
         // poses near the threshold.
-        let (mut sk, sl, sr) =
-            skeleton_with_elbows_and_confidence(Some(0.84), None, 0.0, 0.40);
+        let (mut sk, sl, sr) = skeleton_with_elbows_and_confidence(Some(0.84), None, 0.0, 0.40);
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         assert!((z - 0.20).abs() < 1e-4, "got {z}");

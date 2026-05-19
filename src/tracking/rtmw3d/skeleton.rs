@@ -498,8 +498,7 @@ fn inject_spine_chain_proxies<F>(
 
     let head = match (joints.get(LEFT_EAR_IDX), joints.get(RIGHT_EAR_IDX)) {
         (Some(l), Some(r))
-            if l.score >= KEYPOINT_VISIBILITY_FLOOR
-                && r.score >= KEYPOINT_VISIBILITY_FLOOR =>
+            if l.score >= KEYPOINT_VISIBILITY_FLOOR && r.score >= KEYPOINT_VISIBILITY_FLOOR =>
         {
             let lp = to_source(l);
             let rp = to_source(r);
@@ -529,8 +528,8 @@ fn inject_spine_chain_proxies<F>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::decode::{DecodedJoint, NUM_JOINTS};
+    use super::*;
 
     /// 133 evenly-confident COCO-Wholebody joints arranged so the hip
     /// pair (idx 11/12) is plausible — the regression we're guarding
@@ -539,17 +538,57 @@ mod tests {
     fn fake_joints_with_visible_hips() -> Vec<DecodedJoint> {
         let mut joints = vec![DecodedJoint::default(); NUM_JOINTS];
         // Shoulders (5/6) — used as the fallback anchor.
-        joints[5] = DecodedJoint { nx: 0.40, ny: 0.30, nz: 0.5, score: 0.9 };
-        joints[6] = DecodedJoint { nx: 0.60, ny: 0.30, nz: 0.5, score: 0.9 };
+        joints[5] = DecodedJoint {
+            nx: 0.40,
+            ny: 0.30,
+            nz: 0.5,
+            score: 0.9,
+        };
+        joints[6] = DecodedJoint {
+            nx: 0.60,
+            ny: 0.30,
+            nz: 0.5,
+            score: 0.9,
+        };
         // Hips (11/12) — the hallucinated pair we want to suppress.
-        joints[11] = DecodedJoint { nx: 0.42, ny: 0.70, nz: 0.5, score: 0.8 };
-        joints[12] = DecodedJoint { nx: 0.58, ny: 0.70, nz: 0.5, score: 0.8 };
+        joints[11] = DecodedJoint {
+            nx: 0.42,
+            ny: 0.70,
+            nz: 0.5,
+            score: 0.8,
+        };
+        joints[12] = DecodedJoint {
+            nx: 0.58,
+            ny: 0.70,
+            nz: 0.5,
+            score: 0.8,
+        };
         // Knees (13/14) and ankles (15/16) — same hallucination
         // pattern; downstream consumers must not see any of these.
-        joints[13] = DecodedJoint { nx: 0.42, ny: 0.85, nz: 0.5, score: 0.7 };
-        joints[14] = DecodedJoint { nx: 0.58, ny: 0.85, nz: 0.5, score: 0.7 };
-        joints[15] = DecodedJoint { nx: 0.42, ny: 0.95, nz: 0.5, score: 0.7 };
-        joints[16] = DecodedJoint { nx: 0.58, ny: 0.95, nz: 0.5, score: 0.7 };
+        joints[13] = DecodedJoint {
+            nx: 0.42,
+            ny: 0.85,
+            nz: 0.5,
+            score: 0.7,
+        };
+        joints[14] = DecodedJoint {
+            nx: 0.58,
+            ny: 0.85,
+            nz: 0.5,
+            score: 0.7,
+        };
+        joints[15] = DecodedJoint {
+            nx: 0.42,
+            ny: 0.95,
+            nz: 0.5,
+            score: 0.7,
+        };
+        joints[16] = DecodedJoint {
+            nx: 0.58,
+            ny: 0.95,
+            nz: 0.5,
+            score: 0.7,
+        };
         joints
     }
 

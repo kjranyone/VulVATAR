@@ -24,7 +24,12 @@ pub struct RenderAvatarInstance {
     pub world_transform: crate::asset::Transform,
     pub mesh_instances: Vec<RenderMeshInstance>,
     pub skinning_matrices: Vec<Mat4>,
-    pub cloth_deform: Option<ClothDeformSnapshot>,
+    /// Per-frame cloth snapshots, scoped per (target primitive, vertex
+    /// subset). Each entry applies its `deformed_positions` to the
+    /// `[vertex_offset .. vertex_offset + vertex_count)` range of the
+    /// primitive identified by `target_primitive_id`. Empty when the
+    /// avatar has no cloth or the cloth has no render binding yet.
+    pub cloth_deforms: Vec<ClothDeformSnapshot>,
     pub debug_flags: RenderDebugFlags,
 }
 
@@ -56,6 +61,23 @@ pub struct RenderMeshInstance {
 
 #[derive(Clone, Debug)]
 pub struct ClothDeformSnapshot {
+    /// Primitive the cloth applies to. Globally unique within an avatar,
+    /// so this is enough on its own for the renderer to match snapshots
+    /// against `RenderMeshInstance::primitive_id`.
+    pub target_primitive_id: crate::asset::PrimitiveId,
+    /// Mesh that owns the target primitive. Cosmetic/diagnostic — the
+    /// renderer never reads it. `None` for legacy snapshots whose
+    /// `ClothRenderRegionBinding` was authored before the mesh field
+    /// landed.
+    pub target_mesh_id: Option<crate::asset::MeshId>,
+    /// Vertex range inside the target primitive that this snapshot
+    /// covers, copied from `ClothRenderRegionBinding::vertex_subset`.
+    /// The renderer writes `deformed_positions[i]` into the primitive's
+    /// cloth SSBO at index `vertex_offset + i` and leaves vertices
+    /// outside `[vertex_offset .. vertex_offset + vertex_count)` at
+    /// their rest pose.
+    pub vertex_offset: u32,
+    pub vertex_count: u32,
     pub deformed_positions: Vec<crate::asset::Vec3>,
     pub deformed_normals: Option<Vec<crate::asset::Vec3>>,
     pub version: u64,

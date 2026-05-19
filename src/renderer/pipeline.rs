@@ -2,6 +2,7 @@ use crate::renderer::frame_input::{RenderAlphaMode, RenderCullMode};
 use crate::renderer::material::MaterialShaderMode;
 use std::sync::Arc;
 use vulkano::device::Device;
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
 };
@@ -15,26 +16,123 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{
+    ComputePipeline, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+};
 use vulkano::render_pass::{RenderPass, Subpass};
 
 // ---------------------------------------------------------------------------
-// Vertex type used by the GPU pipeline
+// Vertex / compute resource types
 // ---------------------------------------------------------------------------
+//
+// The renderer runs a single compute prepass per frame that fuses skinning,
+// morph-target blending, and CPU-computed cloth deformation. The output is
+// `GpuVertex` — already world-space and ready for graphics consumption. The
+// forward / outline vertex shaders just transform that by view / projection.
 
+/// Compute-stage *input* vertex layout, std430-friendly. Used inside the
+/// per-primitive `BaseVertices` storage buffer that the transform compute
+/// shader reads. `vec3` fields are padded to `vec4` because std430's array
+/// layout treats them as 16-byte aligned. Joint indices / weights stay
+/// because skinning happens inside the compute prepass, not in the
+/// graphics vertex shader.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct GpuVertexBase {
+    pub position: [f32; 4],
+    pub normal: [f32; 4],
+    pub uv: [f32; 2],
+    pub _pad0: [u32; 2],
+    pub joint_indices: [u32; 4],
+    pub joint_weights: [f32; 4],
+}
+
+/// Graphics vertex layout. The compute prepass writes world-space
+/// `(position.xyz, normal.xyz, uv)` per vertex into this buffer; the
+/// vertex shaders only apply the camera view + projection. The trailing
+/// `uvec2 _pad` keeps the layout 48 B and 16-byte aligned so std430 and
+/// the vertex-input definition agree byte-for-byte with the compute
+/// shader's `OutVertex` struct.
 #[derive(Clone, Copy, Debug, Default, Vertex, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GpuVertex {
-    #[format(R32G32B32_SFLOAT)]
-    pub position: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    pub normal: [f32; 3],
+    #[format(R32G32B32A32_SFLOAT)]
+    pub position: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    pub normal: [f32; 4],
     #[format(R32G32_SFLOAT)]
     pub uv: [f32; 2],
-    #[format(R32G32B32A32_UINT)]
-    pub joint_indices: [u32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    pub joint_weights: [f32; 4],
+    #[format(R32G32_UINT)]
+    pub _pad: [u32; 2],
+}
+
+/// Per-primitive control UBO consumed by the transform compute shader.
+/// `weights` is packed as `vec4[64]` (up to 256 morph targets); excess
+/// targets are clamped at upload time with a warning. The `has_cloth` /
+/// `has_cloth_normals` flags select between the per-primitive cloth SSBO
+/// (filled in-place by the CPU solver each frame) and the morph + base
+/// fallback path.
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct TransformControl {
+    pub vertex_count: u32,
+    pub target_count: u32,
+    pub has_cloth: u32,
+    pub has_cloth_normals: u32,
+    pub weights: [[f32; 4]; 64],
+}
+
+impl TransformControl {
+    pub fn zeroed() -> Self {
+        Self {
+            vertex_count: 0,
+            target_count: 0,
+            has_cloth: 0,
+            has_cloth_normals: 0,
+            weights: [[0.0; 4]; 64],
+        }
+    }
+}
+
+/// Pack `VertexData` into the std430-aligned `GpuVertexBase` form the
+/// transform compute shader consumes. `vec3` lanes are padded to `vec4`
+/// so the shader-side struct matches the Rust struct byte-for-byte.
+pub fn vertex_data_to_base(vd: &crate::asset::VertexData) -> Vec<GpuVertexBase> {
+    let count = vd.positions.len();
+    (0..count)
+        .map(|i| {
+            let pos = vd.positions[i];
+            let norm = if i < vd.normals.len() {
+                vd.normals[i]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            let uv = if i < vd.uvs.len() {
+                vd.uvs[i]
+            } else {
+                [0.0, 0.0]
+            };
+            let ji = if i < vd.joint_indices.len() {
+                let j = vd.joint_indices[i];
+                [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]
+            } else {
+                [0, 0, 0, 0]
+            };
+            let jw = if i < vd.joint_weights.len() {
+                vd.joint_weights[i]
+            } else {
+                [1.0, 0.0, 0.0, 0.0]
+            };
+            GpuVertexBase {
+                position: [pos[0], pos[1], pos[2], 1.0],
+                normal: [norm[0], norm[1], norm[2], 0.0],
+                uv,
+                _pad0: [0, 0],
+                joint_indices: ji,
+                joint_weights: jw,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -60,15 +158,14 @@ pub struct GpuVertex {
 
 pub mod vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "vertex",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "vertex",
+        src: r"
 #version 450
 
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec4 normal;
 layout(location = 2) in vec2 uv;
-layout(location = 3) in uvec4 joint_indices;
-layout(location = 4) in vec4 joint_weights;
+layout(location = 3) in uvec2 _pad;
 
 layout(set = 0, binding = 0) uniform CameraData {
     mat4 view;
@@ -83,36 +180,18 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad2;
 } camera;
 
-layout(set = 1, binding = 0) readonly buffer SkinningData {
-    mat4 matrices[];
-} skinning;
-
 layout(location = 0) out vec3 frag_normal;
 layout(location = 1) out vec2 frag_uv;
 layout(location = 2) out vec3 frag_world_pos;
 
 void main() {
-    // Apply skinning
-    mat4 skin_mat = mat4(0.0);
-    for (int i = 0; i < 4; i++) {
-        skin_mat += joint_weights[i] * skinning.matrices[joint_indices[i]];
-    }
-
-    // If all weights are zero, use identity
-    float total_weight = joint_weights.x + joint_weights.y + joint_weights.z + joint_weights.w;
-    if (total_weight < 0.001) {
-        skin_mat = mat4(1.0);
-    }
-
-    vec4 world_pos = skin_mat * vec4(position, 1.0);
-    frag_world_pos = world_pos.xyz;
-    frag_normal = mat3(skin_mat) * normal;
+    frag_world_pos = position.xyz;
+    frag_normal = normal.xyz;
     frag_uv = uv;
-
-    gl_Position = camera.proj * camera.view * world_pos;
+    gl_Position = camera.proj * camera.view * vec4(position.xyz, 1.0);
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
 pub mod fs {
@@ -138,7 +217,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad2;
 } camera;
 
-layout(set = 2, binding = 0) uniform MaterialData {
+layout(set = 1, binding = 0) uniform MaterialData {
     vec4 base_color;
     float alpha_cutoff;
     int alpha_mode;
@@ -159,9 +238,9 @@ layout(set = 2, binding = 0) uniform MaterialData {
     float matcap_blend;
 } material;
 
-layout(set = 2, binding = 1) uniform sampler2D base_texture;
-layout(set = 2, binding = 2) uniform sampler2D matcap_texture;
-layout(set = 2, binding = 3) uniform sampler2D shade_texture;
+layout(set = 1, binding = 1) uniform sampler2D base_texture;
+layout(set = 1, binding = 2) uniform sampler2D matcap_texture;
+layout(set = 1, binding = 3) uniform sampler2D shade_texture;
 
 layout(location = 0) out vec4 out_color;
 
@@ -266,15 +345,14 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "vertex",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "vertex",
+        src: r"
 #version 450
 
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec4 normal;
 layout(location = 2) in vec2 uv;
-layout(location = 3) in uvec4 joint_indices;
-layout(location = 4) in vec4 joint_weights;
+layout(location = 3) in uvec2 _pad;
 
 layout(set = 0, binding = 0) uniform CameraData {
     mat4 view;
@@ -289,10 +367,6 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad2;
 } camera;
 
-layout(set = 1, binding = 0) readonly buffer SkinningData {
-    mat4 matrices[];
-} skinning;
-
 layout(push_constant) uniform OutlinePush {
     float outline_width;
     float r;
@@ -302,39 +376,23 @@ layout(push_constant) uniform OutlinePush {
 } outline;
 
 void main() {
-    // Apply skinning
-    mat4 skin_mat = mat4(0.0);
-    for (int i = 0; i < 4; i++) {
-        skin_mat += joint_weights[i] * skinning.matrices[joint_indices[i]];
-    }
-
-    float total_weight = joint_weights.x + joint_weights.y + joint_weights.z + joint_weights.w;
-    if (total_weight < 0.001) {
-        skin_mat = mat4(1.0);
-    }
-
-    vec4 world_pos = skin_mat * vec4(position, 1.0);
-    vec3 world_normal = normalize(mat3(skin_mat) * normal);
-
-    vec4 clip_pos = camera.proj * camera.view * world_pos;
-
-    // Offset along normal in clip space for screen-space-like outline width
+    vec3 world_normal = normalize(normal.xyz);
+    vec4 clip_pos = camera.proj * camera.view * vec4(position.xyz, 1.0);
     vec4 clip_normal = camera.proj * camera.view * vec4(world_normal, 0.0);
     vec2 clip_normal_xy = clip_normal.xy;
     float clip_normal_len = length(clip_normal_xy);
     vec2 screen_normal = clip_normal_len > 0.001 ? clip_normal_xy / clip_normal_len : vec2(0.0, 1.0);
     clip_pos.xy += screen_normal * outline.outline_width * clip_pos.w * 0.01;
-
     gl_Position = clip_pos;
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "fragment",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "fragment",
+        src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -351,64 +409,134 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
-pub mod depth_only_vs {
+// ---------------------------------------------------------------------------
+// Transform compute shader (skinning + morph + cloth fuse)
+//
+// Dispatched once per (instance, primitive) per frame from the renderer's
+// `render()` / `render_to_thumbnail()` paths. Reads per-vertex base data +
+// per-frame morph weights + per-frame cloth snapshots and writes
+// world-space `GpuVertex` records that the graphics pipelines consume as
+// their vertex buffer. The graphics `vs` / `outline_vs` above only apply
+// the camera view + projection on top.
+// ---------------------------------------------------------------------------
+
+pub mod transform_cs {
+    // One workgroup invocation per output vertex. Reads the immutable
+    // base SSBO, the per-frame morph weights / cloth deformed positions,
+    // and the per-instance skinning matrices; writes the world-space
+    // `GpuVertex` array that the graphics pipelines consume as their
+    // vertex buffer.
+    //
+    // Layout invariants (must match the Rust `GpuVertexBase` / `GpuVertex`
+    // / `TransformControl` types in this file). std430 places `vec3` on
+    // 16-byte alignment, so we pad to `vec4` on both ends — see the Rust
+    // struct comments for byte-for-byte breakdown.
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "vertex",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "compute",
+        src: r"
 #version 450
 
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
-layout(location = 2) in vec2 uv;
-layout(location = 3) in uvec4 joint_indices;
-layout(location = 4) in vec4 joint_weights;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) uniform CameraData {
-    mat4 view;
-    mat4 proj;
-    vec3 camera_pos;
-    float _pad0;
-    vec3 light_dir;
-    float light_intensity;
-    vec3 light_color;
-    float _pad1;
-    vec3 ambient_term;
-    float _pad2;
-} camera;
+struct VertexBase {
+    vec4 position;
+    vec4 normal;
+    vec2 uv;
+    uvec2 _pad0;
+    uvec4 joint_indices;
+    vec4 joint_weights;
+};
+
+struct OutVertex {
+    vec4 position;
+    vec4 normal;
+    vec2 uv;
+    uvec2 _pad;
+};
+
+layout(set = 0, binding = 0) readonly buffer BaseVertices {
+    VertexBase v[];
+} base;
+
+layout(set = 0, binding = 1) readonly buffer MorphDeltas {
+    vec4 data[];
+} morph_deltas;
+
+layout(set = 0, binding = 2) readonly buffer ClothPositions {
+    vec4 p[];
+} cloth_pos;
+
+layout(set = 0, binding = 3) readonly buffer ClothNormals {
+    vec4 n[];
+} cloth_norm;
+
+layout(set = 0, binding = 4) uniform TransformControl {
+    uint vertex_count;
+    uint target_count;
+    uint has_cloth;
+    uint has_cloth_normals;
+    vec4 weights[64];
+} ctrl;
+
+layout(set = 0, binding = 5) writeonly buffer OutVertices {
+    OutVertex v[];
+} out_v;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
     mat4 matrices[];
 } skinning;
 
 void main() {
-    mat4 skin_mat = mat4(0.0);
-    for (int i = 0; i < 4; i++) {
-        skin_mat += joint_weights[i] * skinning.matrices[joint_indices[i]];
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= ctrl.vertex_count) return;
+
+    VertexBase b = base.v[vid];
+    vec3 pos = b.position.xyz;
+    vec3 nrm = b.normal.xyz;
+
+    // Morph target blend (vertex pulling).
+    for (uint t = 0u; t < ctrl.target_count; t++) {
+        float w = ctrl.weights[t / 4u][t % 4u];
+        if (abs(w) < 1e-6) continue;
+        uint i = (t * ctrl.vertex_count + vid) * 2u;
+        pos += w * morph_deltas.data[i + 0u].xyz;
+        nrm += w * morph_deltas.data[i + 1u].xyz;
     }
-    float total_weight = joint_weights.x + joint_weights.y + joint_weights.z + joint_weights.w;
-    if (total_weight < 0.001) {
-        skin_mat = mat4(1.0);
+
+    // Cloth override: the CPU physics solver wrote per-frame world-relative
+    // positions into `cloth_pos` and (optionally) normals into `cloth_norm`.
+    // Skinning still applies on top so cloth-bearing primitives can ride
+    // along with the avatar's root transform.
+    if (ctrl.has_cloth > 0u) {
+        pos = cloth_pos.p[vid].xyz;
+        if (ctrl.has_cloth_normals > 0u) {
+            nrm = cloth_norm.n[vid].xyz;
+        }
     }
-    vec4 world_pos = skin_mat * vec4(position, 1.0);
-    gl_Position = camera.proj * camera.view * world_pos;
+
+    // Linear blend skinning. All-zero joint weights → identity (used for
+    // primitives without skeletal binding, e.g. accessories).
+    mat4 skin = mat4(0.0);
+    for (uint i = 0u; i < 4u; i++) {
+        skin += b.joint_weights[i] * skinning.matrices[b.joint_indices[i]];
+    }
+    float total_w = b.joint_weights.x + b.joint_weights.y +
+                    b.joint_weights.z + b.joint_weights.w;
+    if (total_w < 0.001) skin = mat4(1.0);
+
+    vec4 world_pos = skin * vec4(pos, 1.0);
+    vec3 world_nrm = mat3(skin) * nrm;
+
+    out_v.v[vid].position = vec4(world_pos.xyz, 0.0);
+    out_v.v[vid].normal   = vec4(world_nrm, 0.0);
+    out_v.v[vid].uv       = b.uv;
+    out_v.v[vid]._pad     = uvec2(0u, 0u);
 }
 "
-                                                                                                                                                                                                                                                                    }
-}
-
-pub mod depth_only_fs {
-    vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "fragment",
-                                                                                                                                                                                                                                                                        src: r"
-#version 450
-
-void main() {
-}
-"
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +549,6 @@ pub enum RenderPipeline {
     SkinningSimpleLit,
     SkinningToon,
     Outline,
-    DepthOnly,
 }
 
 pub struct PipelineState {
@@ -699,78 +826,33 @@ pub fn create_outline_pipeline(
     .map_err(|e| format!("failed to create outline graphics pipeline: {e}"))
 }
 
-pub fn create_depth_only_pipeline(
+/// Build the compute pipeline that fuses skinning, morph-target blend, and
+/// CPU-fed cloth deformation into a single dispatch per (instance, primitive).
+/// Output lands in the per-primitive `GpuVertex` SSBO that the graphics
+/// pipelines bind as their vertex buffer. See `transform_cs` for the
+/// shader-side contract.
+pub fn create_transform_compute_pipeline(
     device: Arc<Device>,
-    render_pass: Arc<RenderPass>,
-    viewport: Viewport,
-) -> Result<Arc<GraphicsPipeline>, String> {
-    let vs_module = depth_only_vs::load(device.clone())
-        .map_err(|e| format!("failed to load depth-only vertex shader: {e}"))?;
-    let fs_module = depth_only_fs::load(device.clone())
-        .map_err(|e| format!("failed to load depth-only fragment shader: {e}"))?;
-
-    let vs_entry = vs_module
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = transform_cs::load(device.clone())
+        .map_err(|e| format!("failed to load transform compute shader: {e}"))?;
+    let cs_entry = cs_module
         .entry_point("main")
-        .ok_or_else(|| "depth-only vertex shader entry point 'main' not found".to_string())?;
-    let fs_entry = fs_module
-        .entry_point("main")
-        .ok_or_else(|| "depth-only fragment shader entry point 'main' not found".to_string())?;
-
-    let vertex_input_state = GpuVertex::per_vertex()
-        .definition(&vs_entry)
-        .map_err(|e| format!("failed to get depth-only vertex input state: {e}"))?;
-
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs_entry),
-        PipelineShaderStageCreateInfo::new(fs_entry),
-    ];
-
+        .ok_or_else(|| "transform compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
     let layout = PipelineLayout::new(
         device.clone(),
         PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
             .into_pipeline_layout_create_info(device.clone())
-            .map_err(|e| format!("failed to create depth-only pipeline layout info: {e}"))?,
+            .map_err(|e| format!("failed to build transform pipeline layout info: {e}"))?,
     )
-    .map_err(|e| format!("failed to create depth-only pipeline layout: {e}"))?;
-
-    let subpass = Subpass::from(render_pass.clone(), 0).ok_or_else(|| {
-        "failed to get subpass from render pass for depth-only pipeline".to_string()
-    })?;
-
-    GraphicsPipeline::new(
-        device.clone(),
+    .map_err(|e| format!("failed to create transform pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
         None,
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState {
-                viewports: [viewport].into_iter().collect(),
-                ..Default::default()
-            }),
-            rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::Back,
-                front_face: FrontFace::CounterClockwise,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: true,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState {
-                attachments: vec![ColorBlendAttachmentState {
-                    blend: None,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
-    .map_err(|e| format!("failed to create depth-only pipeline: {e}"))
+    .map_err(|e| format!("failed to create transform compute pipeline: {e}"))
 }
+

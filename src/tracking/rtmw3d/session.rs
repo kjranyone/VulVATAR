@@ -83,6 +83,16 @@ fn try_build_directml_session(model_path: &str, intra_threads: usize) -> Result<
     let builder = builder
         .with_execution_providers([ort::ep::DirectML::default().build()])
         .map_err(|e| format!("with_execution_providers: {}", e))?;
+    // DirectML EP requires sequential execution and memory-pattern
+    // optimisation disabled. ORT's default execution mode is already
+    // sequential, but keep both options explicit here so the DirectML
+    // contract remains obvious at the point where the EP is selected.
+    let builder = builder
+        .with_parallel_execution(false)
+        .map_err(|e| format!("with_parallel_execution: {}", e))?;
+    let builder = builder
+        .with_memory_pattern(false)
+        .map_err(|e| format!("with_memory_pattern: {}", e))?;
     let mut builder = builder
         .with_intra_threads(intra_threads)
         .map_err(|e| format!("with_intra_threads: {}", e))?;

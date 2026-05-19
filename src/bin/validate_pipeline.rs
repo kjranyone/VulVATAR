@@ -748,7 +748,7 @@ fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameIn
             world_transform: avatar.world_transform.clone(),
             mesh_instances,
             skinning_matrices: avatar.pose.skinning_matrices.clone(),
-            cloth_deform: None,
+            cloth_deforms: Vec::new(),
             debug_flags: RenderDebugFlags::default(),
         }],
         output_request: OutputTargetRequest {

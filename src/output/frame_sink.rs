@@ -3,17 +3,18 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use super::{AlphaMode, OutputColorSpace, OutputFrame};
+use super::{
+    AlphaMode, ExternalHandleType, GpuFrameToken, OutputColorSpace, OutputFrame, OutputSyncToken,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameSink {
     VirtualCamera,
-    /// File-backed CPU stub for the future GPU shared-texture path. The
-    /// implementation today writes a CPU pixel buffer to disk using the
-    /// VSTX framing — there is **no** GPU resource handoff. The variant is
-    /// named so callers, diagnostics, and persisted project data make that
-    /// clear; the real GPU path will get a separate variant when it lands
-    /// (see Phase 6 in `plan/architecture-pipeline-gui-critical-review.md`).
+    /// File-backed bridge for the future GPU shared-texture path. Valid GPU
+    /// tokens are serialized as metadata-only `VGTK` records; CPU fallback
+    /// frames still use the legacy `VSTX` bytes-on-disk shape. The external
+    /// consumer is still a stub, so the variant name remains intentionally
+    /// conservative.
     SharedTextureFileStub,
     SharedMemory,
     ImageSequence,
@@ -55,6 +56,10 @@ pub enum FrameSinkQueuePolicy {
 pub trait OutputSinkWriter: Send {
     fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String>;
     fn name(&self) -> &str;
+
+    fn supports_gpu_tokens(&self) -> bool {
+        false
+    }
 }
 
 pub struct ImageSequenceSink {
@@ -509,17 +514,25 @@ impl OutputSinkWriter for VirtualCameraFileSink {
 }
 
 // ---------------------------------------------------------------------------
-// SharedMemoryFileSink — VSTX file protocol stub
+// SharedMemoryFileSink ? shared-texture bridge stub
 //
-// Despite the historical name, this writer is a CPU-only file dump using the
-// VSTX framing. It is the implementation behind `FrameSink::SharedTextureFileStub`
-// and exists as a placeholder until a real cross-process GPU shared-texture
-// handoff lands. `write_frame` requires `frame.pixel_data`; there is no GPU
-// resource handle exchanged.
+// This sink is intentionally still file-backed, but it now models the real
+// handoff boundary:
+//
+// - `VGTK` records carry a valid exported GPU token and require no CPU pixels
+// - `VSTX` records preserve the legacy CPU-readback fallback shape
+//
+// The consumer side is still a future piece of work, hence the public sink
+// variant remains `SharedTextureFileStub`; the important change is that the
+// output layer can now preserve whether a live GPU token or a CPU fallback
+// reached the last hop.
 // ---------------------------------------------------------------------------
 
 const VSTX_MAGIC: [u8; 4] = [b'V', b'S', b'T', b'X'];
 const VSTX_HEADER_SIZE: usize = 28;
+const VGTK_MAGIC: [u8; 4] = [b'V', b'G', b'T', b'K'];
+const VGTK_VERSION: u32 = 1;
+const VGTK_HEADER_SIZE: usize = 72;
 
 pub struct SharedMemoryFileSink {
     path: PathBuf,
@@ -534,6 +547,86 @@ impl SharedMemoryFileSink {
             frame_index: 0,
         }
     }
+
+    #[cfg(test)]
+    fn with_path(path: PathBuf) -> Self {
+        Self {
+            path,
+            frame_index: 0,
+        }
+    }
+
+    fn write_atomically(&self, bytes: &[u8]) -> Result<(), String> {
+        let tmp_path = self.path.with_extension("bin.tmp");
+        {
+            let mut file = fs::File::create(&tmp_path)
+                .map_err(|e| format!("SharedMemoryFileSink: create tmp: {}", e))?;
+            file.write_all(bytes)
+                .map_err(|e| format!("SharedMemoryFileSink: write: {}", e))?;
+            file.flush()
+                .map_err(|e| format!("SharedMemoryFileSink: flush: {}", e))?;
+        }
+        fs::copy(&tmp_path, &self.path)
+            .map_err(|e| format!("SharedMemoryFileSink: copy: {}", e))?;
+        let _ = fs::remove_file(&tmp_path);
+        Ok(())
+    }
+
+    fn gpu_token_is_publishable(token: &GpuFrameToken) -> bool {
+        token.has_external_handle()
+            && !matches!(token.handle_type, ExternalHandleType::Unavailable)
+    }
+
+    fn handle_type_code(handle_type: &ExternalHandleType) -> u32 {
+        match handle_type {
+            ExternalHandleType::Unavailable => 0,
+            ExternalHandleType::Win32Kmt => 1,
+            ExternalHandleType::D3D12Fence => 2,
+            ExternalHandleType::VkSemaphore => 3,
+            ExternalHandleType::SharedMemoryHandle => 4,
+        }
+    }
+
+    fn sync_parts(sync: &OutputSyncToken) -> (u32, u64) {
+        match sync {
+            OutputSyncToken::None => (0, 0),
+            OutputSyncToken::ProducerWaitComplete => (1, 0),
+            OutputSyncToken::FenceValue(value) => (2, *value),
+            OutputSyncToken::SemaphoreHandle(handle) => (3, *handle),
+        }
+    }
+
+    fn encode_gpu_token_frame(&self, frame: &OutputFrame, token: &GpuFrameToken) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(VGTK_HEADER_SIZE);
+        let (sync_type, sync_value) = Self::sync_parts(&token.sync);
+
+        buf.extend_from_slice(&VGTK_MAGIC);
+        buf.extend_from_slice(&VGTK_VERSION.to_le_bytes());
+        buf.extend_from_slice(&frame.extent[0].to_le_bytes());
+        buf.extend_from_slice(&frame.extent[1].to_le_bytes());
+        buf.extend_from_slice(&frame.frame_id.0.to_le_bytes());
+        buf.extend_from_slice(&frame.timestamp.to_le_bytes());
+        buf.extend_from_slice(&token.resource_id.to_le_bytes());
+        buf.extend_from_slice(&token.lease.lease_id.to_le_bytes());
+        buf.extend_from_slice(&Self::handle_type_code(&token.handle_type).to_le_bytes());
+        buf.extend_from_slice(&sync_type.to_le_bytes());
+        buf.extend_from_slice(&token.external_handle.unwrap_or_default().to_le_bytes());
+        buf.extend_from_slice(&sync_value.to_le_bytes());
+
+        debug_assert_eq!(buf.len(), VGTK_HEADER_SIZE);
+        buf
+    }
+
+    fn encode_cpu_frame(&self, frame: &OutputFrame, pixel_data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(VSTX_HEADER_SIZE + pixel_data.len());
+        buf.extend_from_slice(&VSTX_MAGIC);
+        buf.extend_from_slice(&frame.extent[0].to_le_bytes());
+        buf.extend_from_slice(&frame.extent[1].to_le_bytes());
+        buf.extend_from_slice(&self.frame_index.to_le_bytes());
+        buf.extend_from_slice(&frame.timestamp.to_le_bytes());
+        buf.extend_from_slice(pixel_data);
+        buf
+    }
 }
 
 impl Default for SharedMemoryFileSink {
@@ -544,43 +637,33 @@ impl Default for SharedMemoryFileSink {
 
 impl OutputSinkWriter for SharedMemoryFileSink {
     fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
-        let pixel_data = match &frame.pixel_data {
-            Some(data) => data,
-            None => return Err("SharedMemoryFileSink: frame has no pixel data".into()),
-        };
-
-        let width = frame.extent[0];
-        let height = frame.extent[1];
-        let timestamp_nanos = frame.timestamp;
-        let total_len = VSTX_HEADER_SIZE + pixel_data.len();
-
-        let mut buf: Vec<u8> = Vec::with_capacity(total_len);
-        buf.extend_from_slice(&VSTX_MAGIC);
-        buf.extend_from_slice(&width.to_le_bytes());
-        buf.extend_from_slice(&height.to_le_bytes());
-        buf.extend_from_slice(&self.frame_index.to_le_bytes());
-        buf.extend_from_slice(&timestamp_nanos.to_le_bytes());
-        buf.extend_from_slice(pixel_data);
-
-        let tmp_path = self.path.with_extension("bin.tmp");
+        if let Some(token) = frame
+            .gpu_token
+            .as_ref()
+            .filter(|token| Self::gpu_token_is_publishable(token))
         {
-            let mut file = fs::File::create(&tmp_path)
-                .map_err(|e| format!("SharedMemoryFileSink: create tmp: {}", e))?;
-            file.write_all(&buf)
-                .map_err(|e| format!("SharedMemoryFileSink: write: {}", e))?;
-            file.flush()
-                .map_err(|e| format!("SharedMemoryFileSink: flush: {}", e))?;
+            let buf = self.encode_gpu_token_frame(frame, token);
+            self.write_atomically(&buf)?;
+            self.frame_index += 1;
+            return Ok(());
         }
-        fs::copy(&tmp_path, &self.path)
-            .map_err(|e| format!("SharedMemoryFileSink: copy: {}", e))?;
-        let _ = fs::remove_file(&tmp_path);
+
+        let pixel_data = frame.pixel_data.as_deref().ok_or_else(|| {
+            "SharedMemoryFileSink: frame has neither a valid GPU token nor pixel data".to_string()
+        })?;
+        let buf = self.encode_cpu_frame(frame, pixel_data);
+        self.write_atomically(&buf)?;
 
         self.frame_index += 1;
         Ok(())
     }
 
     fn name(&self) -> &str {
-        "shared-memory-file-vstx"
+        "shared-texture-file-bridge"
+    }
+
+    fn supports_gpu_tokens(&self) -> bool {
+        true
     }
 }
 
@@ -982,5 +1065,76 @@ pub fn create_sink_writer(sink: &FrameSink) -> Box<dyn OutputSinkWriter> {
             }
         }
         FrameSink::SharedTextureFileStub => Box::new(SharedMemoryFileSink::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_handoff::{
+        FrameLease, FrameLifetimeContract, HandoffPath, OutputFrameId,
+    };
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("vulvatar-{label}-{nanos}.bin"))
+    }
+
+    fn gpu_frame() -> OutputFrame {
+        OutputFrame {
+            frame_id: OutputFrameId(7),
+            timestamp: 123_456,
+            extent: [1920, 1080],
+            color_space: OutputColorSpace::Srgb,
+            alpha_mode: AlphaMode::Premultiplied,
+            gpu_token: Some(GpuFrameToken {
+                resource_id: 11,
+                handle_type: ExternalHandleType::Win32Kmt,
+                external_handle: Some(22),
+                sync: OutputSyncToken::ProducerWaitComplete,
+                lease: FrameLease {
+                    lease_id: 33,
+                    lifetime: FrameLifetimeContract::SingleConsumerImmediate,
+                },
+            }),
+            handoff_path: HandoffPath::GpuSharedFrame,
+            fallback_reason: None,
+            pixel_data: None,
+        }
+    }
+
+    #[test]
+    fn shared_texture_bridge_writes_gpu_token_without_cpu_pixels() {
+        let path = unique_temp_path("gpu-token");
+        let mut sink = SharedMemoryFileSink::with_path(path.clone());
+
+        sink.write_frame(&gpu_frame()).expect("write gpu token");
+
+        let bytes = fs::read(&path).expect("read gpu token file");
+        assert_eq!(&bytes[0..4], &VGTK_MAGIC);
+        assert_eq!(bytes.len(), VGTK_HEADER_SIZE);
+        assert!(sink.supports_gpu_tokens());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_texture_bridge_falls_back_to_cpu_bytes_when_token_is_not_publishable() {
+        let path = unique_temp_path("cpu-fallback");
+        let mut sink = SharedMemoryFileSink::with_path(path.clone());
+        let mut frame = gpu_frame();
+        frame.gpu_token.as_mut().expect("gpu token").external_handle = None;
+        frame.pixel_data = Some(Arc::new(vec![1, 2, 3, 4]));
+
+        sink.write_frame(&frame).expect("write cpu fallback");
+
+        let bytes = fs::read(&path).expect("read cpu fallback file");
+        assert_eq!(&bytes[0..4], &VSTX_MAGIC);
+        assert_eq!(bytes.len(), VSTX_HEADER_SIZE + 4);
+        let _ = fs::remove_file(path);
     }
 }

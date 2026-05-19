@@ -54,10 +54,8 @@ pub(super) const COCO_BODY: &[(usize, HumanoidBone)] = &[
     (16, HumanoidBone::LeftFoot),
 ];
 
-pub(super) const COCO_FOOT_TIPS: &[(usize, HumanoidBone)] = &[
-    (17, HumanoidBone::RightFoot),
-    (20, HumanoidBone::LeftFoot),
-];
+pub(super) const COCO_FOOT_TIPS: &[(usize, HumanoidBone)] =
+    &[(17, HumanoidBone::RightFoot), (20, HumanoidBone::LeftFoot)];
 
 pub(super) const HAND_PHALANGES_RIGHT: &[(usize, HumanoidBone)] = &[
     (1, HumanoidBone::RightThumbProximal),
@@ -346,8 +344,7 @@ impl TorsoCaptureBuffer {
     /// Grid resolution. Mirrors `TorsoDepthTemplate::GRID_SIZE` so
     /// callers can pre-size their loops without coupling to the
     /// calibration module's constant.
-    pub const GRID: usize =
-        crate::tracking::TorsoDepthTemplate::GRID_SIZE as usize;
+    pub const GRID: usize = crate::tracking::TorsoDepthTemplate::GRID_SIZE as usize;
 
     pub fn new() -> Self {
         let cell_count = Self::GRID * Self::GRID;
@@ -371,11 +368,7 @@ impl TorsoCaptureBuffer {
     /// variant could fall back to "shoulder line + a fixed offset"
     /// or to MediaPipe's torso segmentation, but that's outside the
     /// minimum-version scope.
-    pub fn add_frame(
-        &mut self,
-        joints: &[DecodedJoint2d],
-        frame: &MoGeFrame,
-    ) -> bool {
+    pub fn add_frame(&mut self, joints: &[DecodedJoint2d], frame: &MoGeFrame) -> bool {
         if joints.len() < NUM_JOINTS {
             return false;
         }
@@ -794,9 +787,7 @@ pub(super) fn resolve_origin_metric(
     //       visible torso pixels matched the band).
     let sample = |kpt: &DecodedJoint2d| -> Option<[f32; 3]> {
         if let Some((template, bbox, bias)) = template_bias.as_ref() {
-            if let Some(template_z) =
-                template_depth_at_keypoint(template, bbox, kpt.nx, kpt.ny)
-            {
+            if let Some(template_z) = template_depth_at_keypoint(template, bbox, kpt.nx, kpt.ny) {
                 // Keep x / y from the back-percentile sample (image-
                 // plane location is what we trust the keypoint
                 // detector for), but replace z with the calibrated
@@ -942,9 +933,7 @@ pub(super) fn build_skeleton(
         let pos_cam = if matches!(idx, 5 | 6 | 11 | 12) {
             // Torso anchor path.
             if let Some((template, bbox, bias)) = template_bias.as_ref() {
-                if let Some(template_z) =
-                    template_depth_at_keypoint(template, bbox, j.nx, j.ny)
-                {
+                if let Some(template_z) = template_depth_at_keypoint(template, bbox, j.nx, j.ny) {
                     let xy = sample_metric_point_back_percentile(depth, j.nx, j.ny)?;
                     [xy[0], xy[1], template_z + bias]
                 } else {
@@ -1025,7 +1014,14 @@ pub(super) fn build_skeleton(
     // RTMW3D-normalised, but the geometry the solver consumes is the
     // *direction* between joints, so the units cancel and the same
     // injection scheme works unchanged.
-    inject_spine_chain_proxies(&mut sk, joints, depth, &to_source, anchor_was_hip, anchor_score);
+    inject_spine_chain_proxies(
+        &mut sk,
+        joints,
+        depth,
+        &to_source,
+        anchor_was_hip,
+        anchor_score,
+    );
 
     attach_hand(
         &mut sk,
@@ -1386,10 +1382,30 @@ fn apply_anatomical_z_clamps(sk: &mut SourceSkeleton) {
     // Torso: shoulders against hips. RightShoulder + RightUpperArm
     // alias to the same depth sample (idx 5), and likewise for left
     // (idx 6) — clamp both for consistency.
-    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::LeftShoulder, MAX_TORSO_DZ_M);
-    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::RightShoulder, MAX_TORSO_DZ_M);
-    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::LeftUpperArm, MAX_TORSO_DZ_M);
-    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::RightUpperArm, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::Hips,
+        HumanoidBone::LeftShoulder,
+        MAX_TORSO_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::Hips,
+        HumanoidBone::RightShoulder,
+        MAX_TORSO_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::Hips,
+        HumanoidBone::LeftUpperArm,
+        MAX_TORSO_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::Hips,
+        HumanoidBone::RightUpperArm,
+        MAX_TORSO_DZ_M,
+    );
 
     // Arms: elbow vs shoulder, hand vs elbow.
     clamp_z_to_parent(
@@ -1418,8 +1434,18 @@ fn apply_anatomical_z_clamps(sk: &mut SourceSkeleton) {
     );
 
     // Legs: knee vs hip, ankle vs knee.
-    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::LeftUpperLeg, MAX_TORSO_DZ_M);
-    clamp_z_to_parent(sk, HumanoidBone::Hips, HumanoidBone::RightUpperLeg, MAX_TORSO_DZ_M);
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::Hips,
+        HumanoidBone::LeftUpperLeg,
+        MAX_TORSO_DZ_M,
+    );
+    clamp_z_to_parent(
+        sk,
+        HumanoidBone::Hips,
+        HumanoidBone::RightUpperLeg,
+        MAX_TORSO_DZ_M,
+    );
     clamp_z_to_parent(
         sk,
         HumanoidBone::LeftUpperLeg,

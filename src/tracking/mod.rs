@@ -689,9 +689,14 @@ impl TrackingWorker {
     ///
     /// Waits up to 3 seconds for the worker thread to exit. If it hasn't
     /// exited by then (e.g. `grab_frame()` is blocking indefinitely), the
-    /// thread is detached so the caller is not blocked. Safe to call
-    /// multiple times.
-    pub fn stop(&mut self) {
+    /// join handle is kept so a later call can reap it once the blocked
+    /// operation unwinds. This prevents a restart from orphaning a still-live
+    /// inference worker and creating overlapping GPU sessions.
+    ///
+    /// Returns `true` when the worker fully stopped and was joined, or when
+    /// there was no worker to stop. Returns `false` when the stop request was
+    /// issued but the worker is still alive after the timeout.
+    pub fn stop(&mut self) -> bool {
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -700,16 +705,19 @@ impl TrackingWorker {
                     if let Err(e) = handle.join() {
                         error!("tracking-worker: thread panicked: {:?}", e);
                     }
-                    return;
+                    return true;
                 }
                 if std::time::Instant::now() >= deadline {
-                    warn!("tracking-worker: thread did not exit within timeout, detaching");
-                    std::mem::drop(handle);
-                    return;
+                    warn!(
+                        "tracking-worker: thread did not exit within timeout; keeping handle and refusing overlapping restart"
+                    );
+                    self.handle = Some(handle);
+                    return false;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        true
     }
 
     // -- internal -----------------------------------------------------------
@@ -960,7 +968,12 @@ impl TrackingWorker {
 
 impl Drop for TrackingWorker {
     fn drop(&mut self) {
-        self.stop();
+        // During normal lifecycle management `stop()` should already have
+        // joined the thread. If destruction happens while a camera backend is
+        // still wedged inside a blocking call, there is no non-blocking way to
+        // recover in `Drop`; requesting stop one last time is still the least
+        // surprising behaviour.
+        let _ = self.stop();
     }
 }
 

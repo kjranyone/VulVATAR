@@ -190,7 +190,9 @@ impl MaterialUploader {
     }
 
     /// Upload material data to a GPU uniform buffer and return a descriptor set
-    /// bound at set 2 of the given pipeline layout.
+    /// bound at set 1 of the given pipeline layout. The compute prepass owns
+    /// set 0 (transform resources), so the graphics shaders only need
+    /// camera (set 0) + material (set 1).
     ///
     /// The descriptor set contains:
     /// - binding 0: material uniform buffer
@@ -256,9 +258,9 @@ impl MaterialUploader {
         let layout = pipeline
             .layout()
             .set_layouts()
-            .get(2)
+            .get(1)
             .ok_or_else(|| {
-                "material: pipeline has no descriptor set at index 2 (material set)".to_string()
+                "material: pipeline has no descriptor set at index 1 (material set)".to_string()
             })?
             .clone();
         let matcap_view = matcap_texture_view.unwrap_or_else(|| texture_view.clone());

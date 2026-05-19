@@ -24,6 +24,12 @@ The preferred output path is GPU-resident handoff with explicit synchronization.
 
 CPU readback is a fallback path, not the architectural center.
 
+Current bridge note: `SharedTextureFileStub` now preserves that distinction at
+the last hop. It writes metadata-only `VGTK` records when a valid
+`GpuFrameToken` arrives and legacy `VSTX` records when the frame is on the CPU
+fallback path. The downstream consumer is still a stub; this is the first
+token-capable sink boundary, not yet the finished live interop path.
+
 ## Sink Abstraction
 
 Recommended sink families:
@@ -78,6 +84,13 @@ Examples:
 - keyed mutex style synchronization if a target API requires it
 
 Do not assume "submission finished" implies safe external consumption without explicit sync.
+
+Current implementation note: the first token path uses
+`OutputSyncToken::ProducerWaitComplete`, meaning the producer waits for render
+completion before publishing the token. That is an honest readiness contract
+for the present code, but it is not yet an exported cross-process wait object.
+True zero-copy GPU interop still needs an exported fence or semaphore handle
+before a live sink can consume frames asynchronously without CPU-side waiting.
 
 ## Queue Policy
 

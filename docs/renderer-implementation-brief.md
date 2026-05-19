@@ -38,6 +38,7 @@ The implementation agent should treat these as the main sources of truth:
 6. [docs/rendering-materials.md](/C:/lib/github/kjranyone/VulVATAR/docs/rendering-materials.md)
 7. [docs/mtoon-compatibility.md](/C:/lib/github/kjranyone/VulVATAR/docs/mtoon-compatibility.md)
 8. [docs/output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
+9. [docs/gpu-runtime-roadmap.md](/C:/lib/github/kjranyone/VulVATAR/docs/gpu-runtime-roadmap.md)
 
 For shader-facing detail:
 

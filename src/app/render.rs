@@ -10,7 +10,6 @@ use crate::app::render_thread::RenderCommand;
 use crate::avatar::pose_solver::{self, SolverParams};
 use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
-use crate::simulation::SimulationStepOptions;
 use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
     CameraState, ClothDeformSnapshot, OutlineSnapshot, OutputTargetRequest, RenderAlphaMode,
@@ -19,6 +18,7 @@ use crate::renderer::frame_input::{
 };
 use crate::renderer::material::MaterialShaderMode;
 use crate::renderer::material::MaterialUploadRequest;
+use crate::simulation::SimulationStepOptions;
 
 impl Application {
     pub fn run_frame(&mut self, config: &FrameConfig) {
@@ -187,9 +187,29 @@ impl Application {
             self.render_results_pending = self.render_results_pending.saturating_sub(1);
             self.process_render_result(result);
         }
+        self.forward_completed_output_leases();
+    }
+
+    fn forward_completed_output_leases(&mut self) {
+        self.pending_export_lease_releases
+            .extend(self.output.drain_completed_gpu_leases());
+
+        let Some(ref rt) = self.render_thread else {
+            return;
+        };
+
+        while let Some(&lease_id) = self.pending_export_lease_releases.front() {
+            if rt.submit(RenderCommand::ReleaseExportLease(lease_id)) {
+                self.pending_export_lease_releases.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     fn process_render_result(&mut self, render_result: crate::renderer::RenderResult) {
+        self.output
+            .update_export_pool_stats(render_result.stats.export_pool);
         let Some(exported) = render_result.exported_frame else {
             self.rendered_pixels = None;
             return;
@@ -202,6 +222,7 @@ impl Application {
         );
 
         output_frame.handoff_path = exported.handoff_path.clone();
+        output_frame.fallback_reason = exported.fallback_reason.clone();
         // Phase B-4: tag the frame with the user's alpha preference so the
         // downstream sink (Win32FileBackedSharedMemorySink → DLL) knows
         // whether to preserve or clobber the alpha channel.
@@ -240,7 +261,7 @@ impl Application {
                 self.rendered_frame_counter += 1;
                 output_frame.pixel_data = Some(Arc::clone(pixel_data));
             }
-            crate::renderer::output_export::ExportedPixelData::GpuOwned => {
+            crate::renderer::output_export::ExportedPixelData::GpuFrameToken(ref gpu_token) => {
                 if !self.logged_first_render_result {
                     info!(
                         "render: first result is GPU-owned {}x{}",
@@ -250,7 +271,7 @@ impl Application {
                 }
                 self.rendered_extent = render_result.extent;
                 self.rendered_frame_counter += 1;
-                output_frame.gpu_image = exported.gpu_image.clone();
+                output_frame.gpu_token = Some(gpu_token.clone());
             }
             _ => {
                 self.rendered_pixels = None;
@@ -463,28 +484,45 @@ impl Application {
                     })
                     .collect();
 
-                let cloth_deform = avatar
+                // Collect one snapshot per cloth source that has been
+                // pinned to a render target. The current pre-compute-prepass
+                // policy was "at most one cloth per instance" (cloth_state
+                // first, else the first enabled overlay); preserve that
+                // upper bound for now via `.take(1)`. The Vec shape is
+                // future-ready for multi-cloth instances once the CPU
+                // solver budget allows it.
+                let cloth_deforms: Vec<ClothDeformSnapshot> = avatar
                     .cloth_state
                     .as_ref()
-                    .or_else(|| {
+                    .into_iter()
+                    .chain(
                         avatar
                             .cloth_overlays
                             .iter()
-                            .find(|s| s.enabled)
-                            .map(|s| &s.state)
+                            .filter(|s| s.enabled)
+                            .map(|s| &s.state),
+                    )
+                    .filter_map(|cs| {
+                        let target_primitive_id = cs.target_primitive_id?;
+                        Some(ClothDeformSnapshot {
+                            target_primitive_id,
+                            target_mesh_id: cs.target_mesh_id,
+                            vertex_offset: cs.target_vertex_offset,
+                            vertex_count: cs.target_vertex_count,
+                            deformed_positions: cs.deform_output.deformed_positions.clone(),
+                            deformed_normals: cs.deform_output.deformed_normals.clone(),
+                            version: cs.deform_output.version,
+                        })
                     })
-                    .map(|cs| ClothDeformSnapshot {
-                        deformed_positions: cs.deform_output.deformed_positions.clone(),
-                        deformed_normals: cs.deform_output.deformed_normals.clone(),
-                        version: cs.deform_output.version,
-                    });
+                    .take(1)
+                    .collect();
 
                 RenderAvatarInstance {
                     instance_id: avatar.id,
                     world_transform: avatar.world_transform.clone(),
                     mesh_instances,
                     skinning_matrices: avatar.pose.skinning_matrices.clone(),
-                    cloth_deform,
+                    cloth_deforms,
                     debug_flags: RenderDebugFlags {
                         show_skeleton: toggles.skeleton_debug,
                         show_colliders: toggles.collision_debug,

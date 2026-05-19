@@ -72,8 +72,6 @@ pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
 use super::yolox::YoloxPersonDetector;
-#[cfg(feature = "inference")]
-use yolox_worker::YoloxWorker;
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{DetectionAnnotation, SourceSkeleton};
@@ -87,6 +85,8 @@ use ort::session::Session;
 use ort::value::TensorRef;
 #[cfg(feature = "inference")]
 use std::path::Path;
+#[cfg(feature = "inference")]
+use yolox_worker::YoloxWorker;
 
 #[cfg(feature = "inference")]
 use decode::{NUM_JOINTS, SIMCC_X_BINS, SIMCC_Y_BINS, SIMCC_Z_BINS};
@@ -198,10 +198,7 @@ impl Rtmw3dInference {
     /// avoid GPU contention.
     #[cfg(feature = "inference")]
     pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
-        Self::from_models_dir_with_face_ep(
-            models_dir,
-            super::face_mediapipe::FaceMeshEp::Auto,
-        )
+        Self::from_models_dir_with_face_ep(models_dir, super::face_mediapipe::FaceMeshEp::Auto)
     }
 
     /// Same as [`Self::from_models_dir`] but with explicit FaceMesh
@@ -519,13 +516,8 @@ impl Rtmw3dInference {
             Some(crate::tracking::CalibrationMode::FullBody) => false,
             None => self.force_shoulder_anchor,
         };
-        let mut skeleton = skeleton::build_source_skeleton(
-            frame_index,
-            &joints,
-            width,
-            height,
-            force_shoulder,
-        );
+        let mut skeleton =
+            skeleton::build_source_skeleton(frame_index, &joints, width, height, force_shoulder);
 
         // Per-side wrist sanity check + temporal hold. Run before
         // the face cascade so the wrist is settled when the solver

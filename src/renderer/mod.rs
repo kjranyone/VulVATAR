@@ -10,13 +10,12 @@ pub mod pipeline;
 mod pipeline_lint_tests;
 pub mod targets;
 pub mod thumbnail;
-pub mod upload;
 
-use crate::asset::{MeshId, MeshPrimitiveAsset, PrimitiveId, VertexData};
-use frame_input::{ClothDeformSnapshot, RenderFrameInput};
+use crate::asset::{MeshId, MeshPrimitiveAsset, PrimitiveId};
+use frame_input::RenderFrameInput;
 use log::{info, warn};
 use output_export::OutputExporter;
-use pipeline::GpuVertex;
+use pipeline::{GpuVertex, GpuVertexBase, TransformControl};
 use std::collections::HashMap;
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -38,7 +37,7 @@ use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::viewport::Viewport;
-use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint};
+use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::sync::GpuFuture;
 use vulkano::VulkanLibrary;
@@ -69,6 +68,17 @@ pub struct RenderStats {
     pub mesh_count: u32,
     pub material_count: u32,
     pub cloth_instances: u32,
+    pub export_pool: output_export::ExportImagePoolStats,
+}
+
+/// Cumulative counters that prove the renderer has reached a steady state
+/// after avatar warm-up rather than quietly recreating dynamic resources.
+#[derive(Clone, Debug, Default)]
+struct GpuRuntimeCounters {
+    morph_gpu_resource_creations: u64,
+    morph_ubo_writes: u64,
+    cloth_cache_creations: u64,
+    cloth_vbo_writes: u64,
 }
 
 /// Push constant layout for the outline pipeline (matches shader).
@@ -80,6 +90,51 @@ struct OutlinePushConstants {
     g: f32,
     b: f32,
     a: f32,
+}
+
+/// Hard cap on morph targets per primitive the compute prepass supports.
+/// VRoid Studio's default VRM ships ≲ 100 targets on the face primitive
+/// (mouth / eye / brow shapes), so 256 leaves comfortable headroom.
+/// Exceeding it logs a warning and clamps; this would only happen on
+/// hand-authored avatars with unusually dense expression rigs. Mirrors
+/// `pipeline::TransformControl::weights` length × 4.
+const MORPH_MAX_TARGETS: usize = 256;
+
+/// Workgroup size of `pipeline::transform_cs` (`local_size_x = 64`).
+/// Used to compute the dispatch count `ceil(vertex_count / 64)`.
+const TRANSFORM_LOCAL_SIZE: u32 = 64;
+
+/// Persistent GPU resources backing the per-primitive compute prepass.
+/// Allocated once on first encounter of a primitive and reused for the
+/// lifetime of the avatar. The compute dispatch reads `base_ssbo` +
+/// `morph_deltas` + `cloth_pos_ssbo` + `cloth_norm_ssbo` + `control_ubo`
+/// and writes `transformed_vbo`, which the graphics pipelines bind as
+/// their vertex buffer.
+///
+/// Stub-or-real selection at allocation time keeps the descriptor set
+/// pinned for the slot's lifetime: a primitive without morph targets
+/// points `morph_deltas` at the shared stub SSBO, and a primitive
+/// without cloth points the cloth buffers at the same stub. The
+/// `has_cloth` / `has_cloth_normals` flags in `control_ubo` make the
+/// shader skip reads from stubbed bindings so it never observes
+/// uninitialised data.
+struct TransformGpuData {
+    #[allow(dead_code)] // Held to keep the SSBO alive for the descriptor set's lifetime.
+    base_ssbo: Subbuffer<[GpuVertexBase]>,
+    index_buffer: Subbuffer<[u32]>,
+    transformed_vbo: Subbuffer<[GpuVertex]>,
+    control_ubo: Subbuffer<TransformControl>,
+    #[allow(dead_code)]
+    morph_deltas: Subbuffer<[[f32; 4]]>,
+    cloth_pos_ssbo: Subbuffer<[[f32; 4]]>,
+    cloth_norm_ssbo: Subbuffer<[[f32; 4]]>,
+    transform_set: Arc<DescriptorSet>,
+    index_count: u32,
+    vertex_count: u32,
+    target_count: u32,
+    has_cloth_alloc: bool,
+    has_cloth_normals_alloc: bool,
+    last_cloth_version: Option<u64>,
 }
 
 /// State for an in-flight readback whose GPU fence has not yet been waited on.
@@ -112,7 +167,24 @@ pub struct VulkanRenderer {
     /// `initial_poc()` for diagnostics; no read-side yet.
     #[allow(dead_code)]
     mtoon_status: mtoon::MtoonCompatibilityStatus,
-    mesh_cache: HashMap<(MeshId, PrimitiveId), (Subbuffer<[GpuVertex]>, Subbuffer<[u32]>, u32)>,
+    /// Per-primitive compute prepass resources. Built lazily on first
+    /// encounter of a primitive and reused for the lifetime of the
+    /// avatar; cleared by [`Self::clear_caches`] on avatar swap.
+    transform_cache: HashMap<(MeshId, PrimitiveId), TransformGpuData>,
+    /// Shared single-`vec4` SSBO bound at the morph / cloth slots of a
+    /// primitive that has neither. The compute shader never reads past
+    /// index 0 because the corresponding `has_cloth` / `target_count`
+    /// flag in the control UBO is 0.
+    stub_storage_ssbo: Option<Subbuffer<[[f32; 4]]>>,
+    /// Compute pipeline that fuses skinning, morph-target blending, and
+    /// cloth deformation into a single dispatch per (instance, primitive).
+    /// Output lands in [`TransformGpuData::transformed_vbo`] which the
+    /// graphics pipelines bind as their vertex buffer. Populated in
+    /// [`Self::initialize`]; render paths unwrap with an error if
+    /// initialization was skipped. See `pipeline::transform_cs` for
+    /// the shader-side contract.
+    transform_compute_pipeline: Option<Arc<ComputePipeline>>,
+    gpu_runtime_counters: GpuRuntimeCounters,
     texture_cache: HashMap<String, Arc<ImageView>>,
     device: Option<Arc<Device>>,
     queue: Option<Arc<Queue>>,
@@ -183,7 +255,10 @@ impl VulkanRenderer {
             active_pipeline: None,
             frame_counter: 0,
             mtoon_status: mtoon::MtoonCompatibilityStatus::initial_poc(),
-            mesh_cache: HashMap::new(),
+            transform_cache: HashMap::new(),
+            stub_storage_ssbo: None,
+            transform_compute_pipeline: None,
+            gpu_runtime_counters: GpuRuntimeCounters::default(),
             texture_cache: HashMap::new(),
             device: None,
             queue: None,
@@ -242,7 +317,6 @@ impl VulkanRenderer {
 
         let exported_frame = output_export::ExportedFrame {
             pixel_data: output_export::ExportedPixelData::CpuReadback(Arc::new(pixel_data)),
-            gpu_image: None,
             extent: pending.extent,
             timestamp_nanos: pending.timestamp_nanos,
             gpu_token_id: self.frame_counter.saturating_sub(1),
@@ -253,7 +327,8 @@ impl VulkanRenderer {
                 color_space: pending.color_space.clone(),
                 timestamp_nanos: pending.timestamp_nanos,
             },
-            handoff_path: crate::output::HandoffPath::CpuReadback,
+            handoff_path: crate::frame_handoff::HandoffPath::CpuReadback,
+            fallback_reason: Some(crate::frame_handoff::FallbackReason::RequestedCpuReadback),
         };
 
         Ok(Some(RenderResult {
@@ -562,6 +637,15 @@ impl VulkanRenderer {
         self.pipeline_front_cull = Some(front_cull_pipeline);
         self.pipeline_front_cull_blend = Some(front_cull_pipeline_blend);
         self.outline_pipeline = Some(outline_pipeline.clone());
+        // Build the transform compute pipeline alongside the graphics
+        // pipelines. The render loop dispatches it every frame to fuse
+        // skinning + morph + cloth into world-space vertices, so failure
+        // here means we cannot render at all — fail hard.
+        let transform_compute_pipeline = pipeline::create_transform_compute_pipeline(
+            self.device.as_ref().expect("device set above").clone(),
+        )
+        .expect("failed to create transform compute pipeline");
+        self.transform_compute_pipeline = Some(transform_compute_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
         self.offscreen_color = Some(color_img);
@@ -732,6 +816,20 @@ impl VulkanRenderer {
         // pass without a "incompatible render pass" panic.
         self.thumb_cache = None;
 
+        // Material descriptor sets were allocated against the *previous*
+        // `gfx_pipeline.layout().set_layouts()[1]`. The new graphics
+        // pipelines built above carry brand-new `PipelineLayout` /
+        // `DescriptorSetLayout` Arcs. Even though they are structurally
+        // identical to the old layouts (same shaders), vulkano's bind
+        // validation hashes by Arc identity in places, so persisting old
+        // descriptor sets across a rebuild risks an `incompatible set
+        // layout` error the moment they are bound under the new pipelines.
+        // Drop the cache; first frame after a resize / colour-space change
+        // rebuilds them lazily. `transform_cache` is unaffected because
+        // its descriptor sets are pinned to the (untouched) compute
+        // pipeline's layout.
+        self.material_uploader.clear_cache();
+
         Ok(())
     }
 
@@ -771,9 +869,16 @@ impl VulkanRenderer {
 
     pub fn clear_caches(&mut self) {
         self.texture_cache.clear();
-        self.mesh_cache.clear();
+        self.transform_cache.clear();
+        // `stub_storage_ssbo` is intentionally retained — it is a tiny
+        // 1-element zero buffer with no per-avatar state, and reallocating
+        // would burn one needless VRAM round-trip on every avatar swap.
         self.material_uploader.clear_cache();
         self.skinning_cache.clear();
+    }
+
+    pub(crate) fn release_export_lease(&mut self, lease_id: u64) {
+        self.output_exporter.release_token(lease_id);
     }
 
     pub fn render(&mut self, input: &RenderFrameInput) -> Result<RenderResult, String> {
@@ -835,6 +940,11 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no outline pipeline")?
             .clone();
+        let transform_pipeline = self
+            .transform_compute_pipeline
+            .as_ref()
+            .ok_or("renderer: no transform compute pipeline")?
+            .clone();
         let framebuffer = self
             .offscreen_framebuffer
             .as_ref()
@@ -865,7 +975,7 @@ impl VulkanRenderer {
         let cloth_instances: u32 = input
             .instances
             .iter()
-            .filter(|i| i.cloth_deform.is_some())
+            .filter(|i| !i.cloth_deforms.is_empty())
             .count() as u32;
 
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -875,12 +985,324 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("render: failed to create command buffer: {e}"))?;
 
-        // Use the user's Scene Background settings: transparent_background
-        // clears to (0,0,0,0) so OBS chroma keys / RGBA-aware consumers can
-        // composite the avatar over their own background. When false the
-        // pass clears to the user's solid colour with full alpha so MF
-        // virtual camera consumers (Meet, Zoom, NV12 conversion) get a
-        // visible background instead of all-black.
+        // ── Camera UBO update (ring slot for this frame) ────────────────
+        let ld = input.lighting.main_light_dir_ws;
+        let ld_len = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2])
+            .sqrt()
+            .max(1e-6);
+        let light_dir = [ld[0] / ld_len, ld[1] / ld_len, ld[2] / ld_len];
+
+        let camera_data = CameraUniform {
+            view: mat4_to_cols(input.camera.view),
+            proj: mat4_to_cols(input.camera.projection),
+            camera_pos: input.camera.position_ws,
+            _pad0: 0.0,
+            light_dir,
+            light_intensity: input.lighting.main_light_intensity,
+            light_color: input.lighting.main_light_color,
+            _pad1: 0.0,
+            ambient_term: input.lighting.ambient_term,
+            _pad2: 0.0,
+        };
+        let ring_slot = (self.frame_counter % FRAME_LAG as u64) as usize;
+        let (camera_set, outline_camera_set) = {
+            let ring = self.camera_ring.as_ref().ok_or("render: no camera ring")?;
+            {
+                let mut guard = ring.buffers[ring_slot]
+                    .write()
+                    .map_err(|e| format!("render: camera buffer write failed: {e}"))?;
+                *guard = camera_data;
+            }
+            (
+                ring.main_sets[ring_slot].clone(),
+                ring.outline_sets[ring_slot].clone(),
+            )
+        };
+
+        // Per-primitive draw record built during the compute prepass and
+        // consumed by the graphics passes that follow. `vertex_buffer` is
+        // the compute shader's output, so the graphics passes never see
+        // base / morph / cloth data — only the world-space vertices.
+        struct DrawInfo {
+            pipeline: Arc<GraphicsPipeline>,
+            alpha_mode: frame_input::RenderAlphaMode,
+            vertex_buffer: Subbuffer<[GpuVertex]>,
+            index_buffer: Subbuffer<[u32]>,
+            index_count: u32,
+            material_set: Arc<DescriptorSet>,
+            outline: Option<(f32, [f32; 3])>,
+        }
+        let mut draws: Vec<DrawInfo> = Vec::new();
+
+        // ── Compute prepass: fuse skinning + morph + cloth per primitive
+        builder
+            .bind_pipeline_compute(transform_pipeline.clone())
+            .map_err(|e| format!("render: bind_pipeline_compute failed: {e}"))?;
+
+        for (inst_idx, instance) in input.instances.iter().enumerate() {
+            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
+                vec![mat4_cols_identity()]
+            } else {
+                instance.skinning_matrices.to_vec()
+            };
+            let mat_count = skinning_mats.len();
+
+            let skinning_set = self.get_or_update_skinning(
+                inst_idx,
+                &skinning_mats,
+                mat_count,
+                memory_allocator.clone(),
+                ds_allocator.clone(),
+                &transform_pipeline,
+            )?;
+
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    transform_pipeline.layout().clone(),
+                    1,
+                    skinning_set,
+                )
+                .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
+
+            for mesh_inst in &instance.mesh_instances {
+                let prim_asset = match mesh_inst.primitive_data.as_ref() {
+                    Some(p) => p.as_ref(),
+                    None => continue,
+                };
+                let vd = match prim_asset.vertices.as_ref() {
+                    Some(vd) if !vd.positions.is_empty() => vd,
+                    _ => continue,
+                };
+                let key = (mesh_inst.mesh_id, mesh_inst.primitive_id);
+
+                // Per-primitive cloth scope: find the first snapshot that
+                // targets *this* primitive. Other primitives in the same
+                // instance get `has_cloth = false` and reuse the shared
+                // stub SSBO — no more "body collapses to origin because
+                // the cloth solver shipped a shorter vector" footgun.
+                let cloth_snap_opt = instance
+                    .cloth_deforms
+                    .iter()
+                    .find(|c| c.target_primitive_id == mesh_inst.primitive_id);
+                let has_cloth_prim = cloth_snap_opt.is_some();
+                let has_cloth_normals_prim = cloth_snap_opt
+                    .map(|c| c.deformed_normals.is_some())
+                    .unwrap_or(false);
+
+                self.ensure_transform_data(
+                    mesh_inst.mesh_id,
+                    mesh_inst.primitive_id,
+                    prim_asset,
+                    has_cloth_prim,
+                    has_cloth_normals_prim,
+                    &memory_allocator,
+                    &ds_allocator,
+                    &transform_pipeline,
+                )?;
+
+                // Write the control UBO with this frame's morph weights and
+                // cloth flags. Live-write is safe because the previous
+                // frame's fence has already been waited on at the top of
+                // `render` (via `harvest_pending_readback`).
+                {
+                    let slot = self
+                        .transform_cache
+                        .get(&key)
+                        .expect("ensure_transform_data populated the slot");
+                    let mut guard = slot
+                        .control_ubo
+                        .write()
+                        .map_err(|e| format!("render: control UBO write failed: {e}"))?;
+                    guard.vertex_count = slot.vertex_count;
+                    guard.target_count = slot.target_count;
+                    guard.has_cloth = if has_cloth_prim { 1 } else { 0 };
+                    guard.has_cloth_normals = if has_cloth_normals_prim { 1 } else { 0 };
+                    let copy_n = (slot.target_count as usize).min(MORPH_MAX_TARGETS);
+                    for i in 0..copy_n {
+                        let w = mesh_inst.morph_weights.get(i).copied().unwrap_or(0.0);
+                        guard.weights[i / 4][i % 4] = w;
+                    }
+                    for i in copy_n..MORPH_MAX_TARGETS {
+                        guard.weights[i / 4][i % 4] = 0.0;
+                    }
+                }
+                self.gpu_runtime_counters.morph_ubo_writes += 1;
+
+                // Cloth write: fill the SSBO with rest pose, then overlay
+                // the snapshot's `[offset..offset+count)` slice. Vertices
+                // outside the snapshot's vertex subset stay at rest pose
+                // — they belong to the same primitive but are not part
+                // of the cloth region.
+                let cloth_changed = if let Some(cloth) = cloth_snap_opt {
+                    let slot = self
+                        .transform_cache
+                        .get_mut(&key)
+                        .expect("slot present");
+                    if slot.last_cloth_version != Some(cloth.version) {
+                        let off = cloth.vertex_offset as usize;
+                        let cnt = cloth.vertex_count as usize;
+                        {
+                            let mut pos_guard = slot
+                                .cloth_pos_ssbo
+                                .write()
+                                .map_err(|e| format!("render: cloth pos write failed: {e}"))?;
+                            for (i, dst) in pos_guard.iter_mut().enumerate() {
+                                let p = if i >= off && i < off + cnt {
+                                    cloth
+                                        .deformed_positions
+                                        .get(i - off)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            vd.positions
+                                                .get(i)
+                                                .copied()
+                                                .unwrap_or([0.0, 0.0, 0.0])
+                                        })
+                                } else {
+                                    vd.positions.get(i).copied().unwrap_or([0.0, 0.0, 0.0])
+                                };
+                                *dst = [p[0], p[1], p[2], 1.0];
+                            }
+                        }
+                        if let Some(ref normals) = cloth.deformed_normals {
+                            let mut norm_guard = slot
+                                .cloth_norm_ssbo
+                                .write()
+                                .map_err(|e| format!("render: cloth norm write failed: {e}"))?;
+                            for (i, dst) in norm_guard.iter_mut().enumerate() {
+                                let n = if i >= off && i < off + cnt {
+                                    normals.get(i - off).copied().unwrap_or_else(|| {
+                                        vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])
+                                    })
+                                } else {
+                                    vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])
+                                };
+                                *dst = [n[0], n[1], n[2], 0.0];
+                            }
+                        }
+                        slot.last_cloth_version = Some(cloth.version);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if cloth_changed {
+                    self.gpu_runtime_counters.cloth_vbo_writes += 1;
+                }
+
+                // Bind set 0 + dispatch.
+                let (transform_set, vertex_count, vbo, ibo, idx_count) = {
+                    let slot = self.transform_cache.get(&key).expect("slot present");
+                    (
+                        slot.transform_set.clone(),
+                        slot.vertex_count,
+                        slot.transformed_vbo.clone(),
+                        slot.index_buffer.clone(),
+                        slot.index_count,
+                    )
+                };
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        transform_pipeline.layout().clone(),
+                        0,
+                        transform_set,
+                    )
+                    .map_err(|e| format!("render: bind transform set 0 failed: {e}"))?;
+                let groups = vertex_count.div_ceil(TRANSFORM_LOCAL_SIZE);
+                unsafe {
+                    builder
+                        .dispatch([groups, 1, 1])
+                        .map_err(|e| format!("render: dispatch failed: {e}"))?;
+                }
+
+                // Pick the graphics variant for the eventual draw.
+                let is_blend = matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
+                let active_pipeline = match (mesh_inst.cull_mode.clone(), is_blend) {
+                    (frame_input::RenderCullMode::DoubleSided, true) => self
+                        .pipeline_no_cull_blend
+                        .as_ref()
+                        .or(self.pipeline_no_cull.as_ref())
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    (frame_input::RenderCullMode::FrontFace, true) => self
+                        .pipeline_front_cull_blend
+                        .as_ref()
+                        .or(self.pipeline_front_cull.as_ref())
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    (frame_input::RenderCullMode::BackFace, true) => self
+                        .graphics_pipeline_blend
+                        .as_ref()
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    (frame_input::RenderCullMode::DoubleSided, false) => self
+                        .pipeline_no_cull
+                        .as_ref()
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    (frame_input::RenderCullMode::FrontFace, false) => self
+                        .pipeline_front_cull
+                        .as_ref()
+                        .unwrap_or(&gfx_pipeline)
+                        .clone(),
+                    (frame_input::RenderCullMode::BackFace, false) => gfx_pipeline.clone(),
+                };
+
+                // Material descriptor. Allocated against the canonical
+                // `gfx_pipeline`; every variant has a structurally
+                // identical set 1 layout (same shaders) so the binding
+                // is valid under Vulkan descriptor set compatibility.
+                let texture_view =
+                    self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
+                let shade_texture_view = self
+                    .resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
+                let matcap_view = self
+                    .resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
+
+                let material_set = self.material_uploader.upload_to_gpu(
+                    Some((mesh_inst.mesh_id, mesh_inst.primitive_id)),
+                    &mesh_inst.material_binding,
+                    memory_allocator.clone(),
+                    ds_allocator.clone(),
+                    &gfx_pipeline,
+                    texture_view,
+                    shade_texture_view,
+                    sampler.clone(),
+                    matcap_view,
+                )?;
+
+                let is_cutout =
+                    matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
+                let outline_info = if !is_blend
+                    && !is_cutout
+                    && mesh_inst.outline.enabled
+                    && mesh_inst.outline.width > 0.0
+                {
+                    Some((mesh_inst.outline.width, mesh_inst.outline.color))
+                } else {
+                    None
+                };
+
+                draws.push(DrawInfo {
+                    pipeline: active_pipeline,
+                    alpha_mode: mesh_inst.alpha_mode.clone(),
+                    vertex_buffer: vbo,
+                    index_buffer: ibo,
+                    index_count: idx_count,
+                    material_set,
+                    outline: outline_info,
+                });
+            }
+        }
+
+        // ── Graphics pass: forward draws then outlines ──────────────────
+        // Vulkano inserts the compute-write → vertex-input-read barrier on
+        // each `transformed_vbo` automatically because the dispatch and the
+        // draw share this single command buffer.
         let bg_clear = if input.transparent_background {
             [0.0_f32, 0.0, 0.0, 0.0]
         } else {
@@ -903,281 +1325,76 @@ impl VulkanRenderer {
             )
             .map_err(|e| format!("render: begin_render_pass failed: {e}"))?
             .bind_pipeline_graphics(gfx_pipeline.clone())
-            .map_err(|e| format!("render: bind_pipeline_graphics failed: {e}"))?;
-
-        // Camera uniform (set 0)
-        let ld = input.lighting.main_light_dir_ws;
-        let ld_len = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2])
-            .sqrt()
-            .max(1e-6);
-        let light_dir = [ld[0] / ld_len, ld[1] / ld_len, ld[2] / ld_len];
-
-        let camera_data = CameraUniform {
-            view: mat4_to_cols(input.camera.view),
-            proj: mat4_to_cols(input.camera.projection),
-            camera_pos: input.camera.position_ws,
-            _pad0: 0.0,
-            light_dir,
-            light_intensity: input.lighting.main_light_intensity,
-            light_color: input.lighting.main_light_color,
-            _pad1: 0.0,
-            ambient_term: input.lighting.ambient_term,
-            _pad2: 0.0,
-        };
-        let slot = (self.frame_counter % FRAME_LAG as u64) as usize;
-        let (camera_set, outline_camera_set) = {
-            let ring = self.camera_ring.as_ref().ok_or("render: no camera ring")?;
-            {
-                let mut guard = ring.buffers[slot]
-                    .write()
-                    .map_err(|e| format!("render: camera buffer write failed: {e}"))?;
-                *guard = camera_data;
-            }
-            (
-                ring.main_sets[slot].clone(),
-                ring.outline_sets[slot].clone(),
-            )
-        };
-
-        builder
+            .map_err(|e| format!("render: bind_pipeline_graphics failed: {e}"))?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 gfx_pipeline.layout().clone(),
                 0,
                 camera_set,
             )
-            .map_err(|e| format!("render: bind camera descriptor sets failed: {e}"))?;
+            .map_err(|e| format!("render: bind camera descriptor set failed: {e}"))?;
 
-        // Collect outline draws for second pass
-        struct OutlineDrawInfo {
-            vertex_buffer: Subbuffer<[GpuVertex]>,
-            index_buffer: Subbuffer<[u32]>,
-            index_count: u32,
-            skinning_set: Arc<DescriptorSet>,
-            outline_width: f32,
-            outline_color: [f32; 3],
-        }
-        let mut outline_draws: Vec<OutlineDrawInfo> = Vec::new();
-
-        // Draw each avatar instance
-        for (inst_idx, instance) in input.instances.iter().enumerate() {
-            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
-                vec![mat4_cols_identity()]
-            } else {
-                instance.skinning_matrices.to_vec()
-            };
-
-            let mat_count = skinning_mats.len();
-            let skinning_set = self.get_or_update_skinning(
-                inst_idx,
-                &skinning_mats,
-                mat_count,
-                memory_allocator.clone(),
-                ds_allocator.clone(),
-                &gfx_pipeline,
-            )?;
-
-            builder
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    gfx_pipeline.layout().clone(),
-                    1,
-                    skinning_set.clone(),
-                )
-                .map_err(|e| format!("render: bind skinning descriptor sets failed: {e}"))?;
-
-            for blend_pass in [false, true] {
-                for mesh_inst in &instance.mesh_instances {
-                    let is_blend =
-                        matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
-                    if is_blend != blend_pass {
-                        continue;
-                    }
-
-                    let active_pipeline = match (mesh_inst.cull_mode.clone(), is_blend) {
-                        (frame_input::RenderCullMode::DoubleSided, true) => self
-                            .pipeline_no_cull_blend
-                            .as_ref()
-                            .or(self.pipeline_no_cull.as_ref())
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::FrontFace, true) => self
-                            .pipeline_front_cull_blend
-                            .as_ref()
-                            .or(self.pipeline_front_cull.as_ref())
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::BackFace, true) => self
-                            .graphics_pipeline_blend
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::DoubleSided, false) => self
-                            .pipeline_no_cull
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::FrontFace, false) => self
-                            .pipeline_front_cull
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::BackFace, false) => gfx_pipeline.clone(),
-                    };
+        // Opaque pass then blend pass. The camera set 0 layout matches
+        // across all graphics variants, so it stays bound when we swap
+        // variant pipelines (Vulkan layout compatibility for set 0).
+        for blend_pass in [false, true] {
+            for draw in &draws {
+                let is_blend = matches!(draw.alpha_mode, frame_input::RenderAlphaMode::Blend);
+                if is_blend != blend_pass {
+                    continue;
+                }
+                builder
+                    .bind_pipeline_graphics(draw.pipeline.clone())
+                    .map_err(|e| {
+                        format!("render: bind_pipeline_graphics for variant failed: {e}")
+                    })?
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        draw.pipeline.layout().clone(),
+                        1,
+                        draw.material_set.clone(),
+                    )
+                    .map_err(|e| format!("render: bind material descriptor set failed: {e}"))?
+                    .bind_vertex_buffers(0, draw.vertex_buffer.clone())
+                    .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
+                    .bind_index_buffer(draw.index_buffer.clone())
+                    .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?;
+                unsafe {
                     builder
-                        .bind_pipeline_graphics(active_pipeline.clone())
-                        .map_err(|e| {
-                            format!(
-                                "render: bind_pipeline_graphics for cull/alpha mode failed: {e}"
-                            )
-                        })?;
-
-                    let texture_view =
-                        self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
-                    let shade_texture_view = self
-                        .resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
-                    let matcap_view = self
-                        .resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
-
-                    let material_set = self.material_uploader.upload_to_gpu(
-                        Some((mesh_inst.mesh_id, mesh_inst.primitive_id)),
-                        &mesh_inst.material_binding,
-                        memory_allocator.clone(),
-                        ds_allocator.clone(),
-                        &active_pipeline,
-                        texture_view,
-                        shade_texture_view,
-                        sampler.clone(),
-                        matcap_view,
-                    )?;
-
-                    builder
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            active_pipeline.layout().clone(),
-                            2,
-                            material_set,
-                        )
-                        .map_err(|e| {
-                            format!("render: bind material descriptor sets failed: {e}")
-                        })?;
-
-                    let has_morph = !mesh_inst.morph_weights.is_empty()
-                        && mesh_inst.morph_weights.iter().any(|w| w.abs() > 1e-6);
-
-                    let (vertex_buffer, index_buffer, index_count) = if let Some(ref prim_asset) =
-                        mesh_inst.primitive_data
-                    {
-                        if let Some(ref cloth) = instance.cloth_deform {
-                            if let Some(ref vd) = prim_asset.vertices {
-                                let verts = Self::build_cloth_vertices(vd, cloth);
-                                let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
-                                let idx_count = indices.len() as u32;
-                                let vb =
-                                    Self::create_vertex_buffer(memory_allocator.clone(), &verts);
-                                let ib =
-                                    Self::create_index_buffer(memory_allocator.clone(), indices);
-                                (vb, ib, idx_count)
-                            } else {
-                                Self::create_placeholder_mesh(memory_allocator.clone())
-                            }
-                        } else if has_morph {
-                            if let Some(ref vd) = prim_asset.vertices {
-                                let verts = Self::build_morphed_vertices(
-                                    vd,
-                                    &prim_asset.morph_targets,
-                                    &mesh_inst.morph_weights,
-                                );
-                                let indices = prim_asset.indices.as_deref().unwrap_or(&[]);
-                                let idx_count = indices.len() as u32;
-                                let vb =
-                                    Self::create_vertex_buffer(memory_allocator.clone(), &verts);
-                                let ib =
-                                    Self::create_index_buffer(memory_allocator.clone(), indices);
-                                (vb, ib, idx_count)
-                            } else {
-                                Self::create_placeholder_mesh(memory_allocator.clone())
-                            }
-                        } else {
-                            self.upload_mesh(
-                                mesh_inst.mesh_id,
-                                mesh_inst.primitive_id,
-                                prim_asset,
-                                memory_allocator.clone(),
-                            )
-                        }
-                    } else {
-                        Self::create_placeholder_mesh(memory_allocator.clone())
-                    };
-
-                    builder
-                        .bind_vertex_buffers(0, vertex_buffer.clone())
-                        .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
-                        .bind_index_buffer(index_buffer.clone())
-                        .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?;
-                    unsafe {
-                        builder
-                            .draw_indexed(index_count, 1, 0, 0, 0)
-                            .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
-                    }
-
-                    // Skip outlines for alpha-masked (Cutout) materials: the outline
-                    // shader cannot do alpha testing, so it would draw in regions
-                    // that the main pass discarded, creating dark jagged artifacts.
-                    let is_cutout = matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
-                    if !is_blend && !is_cutout && mesh_inst.outline.enabled && mesh_inst.outline.width > 0.0 {
-                        outline_draws.push(OutlineDrawInfo {
-                            vertex_buffer,
-                            index_buffer,
-                            index_count,
-                            skinning_set: skinning_set.clone(),
-                            outline_width: mesh_inst.outline.width,
-                            outline_color: mesh_inst.outline.color,
-                        });
-                    }
+                        .draw_indexed(draw.index_count, 1, 0, 0, 0)
+                        .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
                 }
             }
         }
 
-        // --- Outline pass ---
-        if !outline_draws.is_empty() {
+        // ── Outline pass ────────────────────────────────────────────────
+        let outline_count = draws.iter().filter(|d| d.outline.is_some()).count();
+        if outline_count > 0 {
             builder
                 .bind_pipeline_graphics(outline_pipeline.clone())
-                .map_err(|e| format!("render: bind outline pipeline failed: {e}"))?;
-
-            builder
+                .map_err(|e| format!("render: bind outline pipeline failed: {e}"))?
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     outline_pipeline.layout().clone(),
                     0,
                     outline_camera_set,
                 )
-                .map_err(|e| format!("render: bind outline camera descriptor sets failed: {e}"))?;
+                .map_err(|e| format!("render: bind outline camera set failed: {e}"))?;
 
-            for draw in &outline_draws {
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        outline_pipeline.layout().clone(),
-                        1,
-                        draw.skinning_set.clone(),
-                    )
-                    .map_err(|e| {
-                        format!("render: bind outline skinning descriptor sets failed: {e}")
-                    })?;
-
+            for draw in &draws {
+                let Some((width, color)) = draw.outline else {
+                    continue;
+                };
                 let push = OutlinePushConstants {
-                    outline_width: draw.outline_width,
-                    r: draw.outline_color[0],
-                    g: draw.outline_color[1],
-                    b: draw.outline_color[2],
+                    outline_width: width,
+                    r: color[0],
+                    g: color[1],
+                    b: color[2],
                     a: 1.0,
                 };
                 builder
                     .push_constants(outline_pipeline.layout().clone(), 0, push)
-                    .map_err(|e| format!("render: push_constants failed: {e}"))?;
-
-                builder
+                    .map_err(|e| format!("render: push_constants failed: {e}"))?
                     .bind_vertex_buffers(0, draw.vertex_buffer.clone())
                     .map_err(|e| format!("render: outline bind_vertex_buffers failed: {e}"))?
                     .bind_index_buffer(draw.index_buffer.clone())
@@ -1194,10 +1411,7 @@ impl VulkanRenderer {
             .end_render_pass(SubpassEndInfo::default())
             .map_err(|e| format!("render: end_render_pass failed: {e}"))?;
 
-        // ── Readback: two-stage copy to avoid slow Intel DMA path ────
-        // Stage 1 (GPU): image → device-local staging buffer (fast on-chip copy)
-        // Stage 2 (GPU): staging → host-cached readback buffer (GPU memcpy)
-        // The CPU then reads from the host-cached buffer without penalty.
+        // ── Readback: two-stage copy to avoid slow Intel DMA path ───────
         let (staging_buffer, readback_buffer) =
             self.ensure_readback_buffers(self.current_extent)?;
 
@@ -1219,7 +1433,6 @@ impl VulkanRenderer {
             .build()
             .map_err(|e| format!("render: failed to build command buffer: {e}"))?;
 
-        // ── Submit without waiting ──────────────────────────────────────
         let fence_future = vulkano::sync::now(device.clone())
             .then_execute(queue.clone(), command_buffer)
             .map_err(|e| format!("render: then_execute failed: {e}"))?
@@ -1230,14 +1443,29 @@ impl VulkanRenderer {
         let timestamp_nanos = self.frame_counter * 16_666_667u64;
         let extent = self.current_extent;
 
+        if self.frame_counter.is_multiple_of(60) {
+            let counters = &self.gpu_runtime_counters;
+            info!(
+                "GPU_RUNTIME frame={} transform_resources={} ubo_writes={} \
+                 cloth_writes={} cloth_creations={} cache_slots={} readback_bytes={}",
+                self.frame_counter,
+                counters.morph_gpu_resource_creations,
+                counters.morph_ubo_writes,
+                counters.cloth_vbo_writes,
+                counters.cloth_cache_creations,
+                self.transform_cache.len(),
+                (extent[0] as u64) * (extent[1] as u64) * 4,
+            );
+        }
+
         let stats = RenderStats {
             instance_count: input.instances.len() as u32,
             mesh_count: total_meshes,
             material_count: total_materials,
             cloth_instances,
+            export_pool: self.output_exporter.export_image_pool().stats(),
         };
 
-        // Store the fence and readback buffer for harvest on the next frame.
         self.pending_readback = Some(PendingReadbackState {
             wait_fn: Box::new(move || {
                 fence_future
@@ -1251,7 +1479,6 @@ impl VulkanRenderer {
             color_space: input.output_request.color_space.clone(),
         });
 
-        // ── Return the *previous* frame's result ────────────────────────
         Ok(harvested.unwrap_or(RenderResult {
             extent,
             timestamp_nanos: 0,
@@ -1308,8 +1535,11 @@ impl VulkanRenderer {
         })
     }
 
-    /// Get or create a reusable skinning buffer + descriptor set for the given
-    /// avatar instance slot, writing the current frame's matrices into it.
+    /// Get or create a reusable skinning buffer + descriptor set for the
+    /// given avatar instance slot, writing the current frame's matrices
+    /// into it. The descriptor set is allocated against the compute
+    /// prepass pipeline's set 1 layout because the live consumer is now
+    /// `pipeline::transform_cs`, not the graphics vertex shaders.
     fn get_or_update_skinning(
         &mut self,
         inst_idx: usize,
@@ -1317,11 +1547,10 @@ impl VulkanRenderer {
         mat_count: usize,
         memory_allocator: Arc<StandardMemoryAllocator>,
         ds_allocator: Arc<StandardDescriptorSetAllocator>,
-        gfx_pipeline: &Arc<GraphicsPipeline>,
+        transform_pipeline: &Arc<ComputePipeline>,
     ) -> Result<Arc<DescriptorSet>, String> {
         // Grow the cache vector if needed.
         while self.skinning_cache.len() <= inst_idx {
-            // Placeholder; will be (re)created below.
             let buf = Buffer::from_iter(
                 memory_allocator.clone(),
                 BufferCreateInfo {
@@ -1337,11 +1566,11 @@ impl VulkanRenderer {
             )
             .map_err(|e| format!("render: skinning buffer init failed: {e}"))?;
 
-            let layout = gfx_pipeline
+            let layout = transform_pipeline
                 .layout()
                 .set_layouts()
                 .get(1)
-                .ok_or("render: no skinning set layout")?
+                .ok_or("render: transform pipeline missing skinning set layout")?
                 .clone();
             let ds = DescriptorSet::new(
                 ds_allocator.clone(),
@@ -1377,11 +1606,11 @@ impl VulkanRenderer {
             )
             .map_err(|e| format!("render: skinning buffer realloc failed: {e}"))?;
 
-            let layout = gfx_pipeline
+            let layout = transform_pipeline
                 .layout()
                 .set_layouts()
                 .get(1)
-                .ok_or("render: no skinning set layout")?
+                .ok_or("render: transform pipeline missing skinning set layout")?
                 .clone();
             let ds = DescriptorSet::new(
                 ds_allocator.clone(),
@@ -1408,6 +1637,281 @@ impl VulkanRenderer {
         }
 
         Ok(entry.descriptor_set.clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Transform compute helpers
+    // -----------------------------------------------------------------------
+
+    /// Lazily allocate (and cache) the shared 1-element zero SSBO used as
+    /// the fallback for primitives that have no morph deltas and / or no
+    /// cloth buffers. Vulkano refuses zero-element storage buffers, so the
+    /// stub holds exactly one `vec4`. The compute shader never reads past
+    /// index 0 because the corresponding `has_cloth` / `target_count` flag
+    /// in the control UBO is 0.
+    fn ensure_stub_ssbo(
+        &mut self,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+    ) -> Result<Subbuffer<[[f32; 4]]>, String> {
+        if let Some(ref stub) = self.stub_storage_ssbo {
+            return Ok(stub.clone());
+        }
+        let stub = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            [[0.0_f32; 4]].into_iter(),
+        )
+        .map_err(|e| format!("renderer: stub SSBO alloc failed: {e}"))?;
+        self.stub_storage_ssbo = Some(stub.clone());
+        Ok(stub)
+    }
+
+    /// Ensure a [`TransformGpuData`] slot exists for `(mesh_id, prim_id)`
+    /// with cloth allocation matching this frame's requirements. If the
+    /// existing slot's cloth allocation shape disagrees with `has_cloth` /
+    /// `has_cloth_normals` (rare — user toggled a cloth-bearing accessory
+    /// on / off at runtime), the slot is evicted and rebuilt so the
+    /// descriptor set's pinned bindings stay consistent.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_transform_data(
+        &mut self,
+        mesh_id: MeshId,
+        prim_id: PrimitiveId,
+        prim: &MeshPrimitiveAsset,
+        has_cloth: bool,
+        has_cloth_normals: bool,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+        transform_pipeline: &Arc<ComputePipeline>,
+    ) -> Result<(), String> {
+        let key = (mesh_id, prim_id);
+
+        if let Some(existing) = self.transform_cache.get(&key) {
+            if existing.has_cloth_alloc == has_cloth
+                && existing.has_cloth_normals_alloc == has_cloth_normals
+            {
+                return Ok(());
+            }
+            // Cloth allocation shape changed under us; drop the slot so
+            // the fresh allocation lands below with the right SSBOs.
+            self.transform_cache.remove(&key);
+        }
+
+        let vd = prim
+            .vertices
+            .as_ref()
+            .ok_or("renderer: ensure_transform_data requires primitive vertex data")?;
+        let vertex_count = vd.positions.len();
+        if vertex_count == 0 {
+            return Err("renderer: ensure_transform_data with empty vertex data".to_string());
+        }
+        let indices: &[u32] = prim.indices.as_deref().unwrap_or(&[]);
+        let owned_indices;
+        let idx_slice: &[u32] = if indices.is_empty() {
+            owned_indices = (0..vertex_count as u32).collect::<Vec<_>>();
+            &owned_indices
+        } else {
+            indices
+        };
+        let index_count = idx_slice.len() as u32;
+
+        let base_data = pipeline::vertex_data_to_base(vd);
+        let base_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            base_data,
+        )
+        .map_err(|e| format!("renderer: base SSBO alloc failed: {e}"))?;
+
+        let index_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::INDEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            idx_slice.iter().copied(),
+        )
+        .map_err(|e| format!("renderer: index buffer alloc failed: {e}"))?;
+
+        // Compute output: device-local storage + vertex buffer.
+        let transformed_vbo: Subbuffer<[GpuVertex]> = Buffer::new_slice::<GpuVertex>(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER | BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            vertex_count as u64,
+        )
+        .map_err(|e| format!("renderer: transformed VBO alloc failed: {e}"))?;
+
+        // Morph deltas, or the shared stub when this primitive has none.
+        let raw_target_count = prim.morph_targets.len();
+        let target_count = raw_target_count.min(MORPH_MAX_TARGETS);
+        if raw_target_count > MORPH_MAX_TARGETS {
+            warn!(
+                "renderer: primitive {:?} has {} morph targets, clamping to {}",
+                key, raw_target_count, MORPH_MAX_TARGETS
+            );
+        }
+        let morph_deltas = if target_count == 0 {
+            self.ensure_stub_ssbo(memory_allocator)?
+        } else {
+            let mut deltas: Vec<[f32; 4]> =
+                Vec::with_capacity(target_count * vertex_count * 2);
+            for t in 0..target_count {
+                let target = &prim.morph_targets[t];
+                for v in 0..vertex_count {
+                    let pd = target.position_deltas.get(v).copied().unwrap_or([0.0; 3]);
+                    let nd = target.normal_deltas.get(v).copied().unwrap_or([0.0; 3]);
+                    deltas.push([pd[0], pd[1], pd[2], 0.0]);
+                    deltas.push([nd[0], nd[1], nd[2], 0.0]);
+                }
+            }
+            Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                deltas,
+            )
+            .map_err(|e| format!("renderer: morph deltas alloc failed: {e}"))?
+        };
+
+        // Cloth SSBOs, sized to `vertex_count` when the primitive is
+        // cloth-bearing this frame; otherwise the shared stub. The render
+        // loop rewrites `cloth_pos_ssbo` / `cloth_norm_ssbo` in place
+        // whenever the cloth solver bumps its `version`.
+        let cloth_pos_ssbo = if has_cloth {
+            Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                (0..vertex_count).map(|_| [0.0_f32; 4]),
+            )
+            .map_err(|e| format!("renderer: cloth pos SSBO alloc failed: {e}"))?
+        } else {
+            self.ensure_stub_ssbo(memory_allocator)?
+        };
+        let cloth_norm_ssbo = if has_cloth_normals {
+            Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                (0..vertex_count).map(|_| [0.0_f32; 4]),
+            )
+            .map_err(|e| format!("renderer: cloth norm SSBO alloc failed: {e}"))?
+        } else {
+            self.ensure_stub_ssbo(memory_allocator)?
+        };
+
+        let mut ctrl = TransformControl::zeroed();
+        ctrl.vertex_count = vertex_count as u32;
+        ctrl.target_count = target_count as u32;
+        let control_ubo = Buffer::from_data(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            ctrl,
+        )
+        .map_err(|e| format!("renderer: control UBO alloc failed: {e}"))?;
+
+        let set0_layout = transform_pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .ok_or("renderer: transform pipeline missing set 0 layout")?
+            .clone();
+        let transform_set = DescriptorSet::new(
+            ds_allocator.clone(),
+            set0_layout,
+            [
+                WriteDescriptorSet::buffer(0, base_ssbo.clone()),
+                WriteDescriptorSet::buffer(1, morph_deltas.clone()),
+                WriteDescriptorSet::buffer(2, cloth_pos_ssbo.clone()),
+                WriteDescriptorSet::buffer(3, cloth_norm_ssbo.clone()),
+                WriteDescriptorSet::buffer(4, control_ubo.clone()),
+                WriteDescriptorSet::buffer(5, transformed_vbo.clone()),
+            ],
+            [],
+        )
+        .map_err(|e| format!("renderer: transform descriptor set: {e}"))?;
+
+        self.transform_cache.insert(
+            key,
+            TransformGpuData {
+                base_ssbo,
+                index_buffer,
+                transformed_vbo,
+                control_ubo,
+                morph_deltas,
+                cloth_pos_ssbo,
+                cloth_norm_ssbo,
+                transform_set,
+                index_count,
+                vertex_count: vertex_count as u32,
+                target_count: target_count as u32,
+                has_cloth_alloc: has_cloth,
+                has_cloth_normals_alloc: has_cloth_normals,
+                last_cloth_version: None,
+            },
+        );
+        self.gpu_runtime_counters.morph_gpu_resource_creations += 1;
+        if has_cloth {
+            self.gpu_runtime_counters.cloth_cache_creations += 1;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1622,222 +2126,6 @@ impl VulkanRenderer {
         let pixels: [u8; 4] = [255, 255, 255, 255];
         Self::upload_rgba_texture(device, memory_allocator, cb_allocator, queue, 1, 1, &pixels)
             .expect("failed to create default white texture")
-    }
-
-    // -----------------------------------------------------------------------
-    // Mesh upload helpers
-    // -----------------------------------------------------------------------
-
-    fn vertex_data_to_gpu(vd: &VertexData) -> Vec<GpuVertex> {
-        let count = vd.positions.len();
-        (0..count)
-            .map(|i| {
-                let pos = vd.positions[i];
-                let norm = if i < vd.normals.len() {
-                    vd.normals[i]
-                } else {
-                    [0.0, 1.0, 0.0]
-                };
-                let uv = if i < vd.uvs.len() {
-                    vd.uvs[i]
-                } else {
-                    [0.0, 0.0]
-                };
-                let ji = if i < vd.joint_indices.len() {
-                    let j = vd.joint_indices[i];
-                    [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]
-                } else {
-                    [0, 0, 0, 0]
-                };
-                let jw = if i < vd.joint_weights.len() {
-                    vd.joint_weights[i]
-                } else {
-                    [1.0, 0.0, 0.0, 0.0]
-                };
-                GpuVertex {
-                    position: pos,
-                    normal: norm,
-                    uv,
-                    joint_indices: ji,
-                    joint_weights: jw,
-                }
-            })
-            .collect()
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn upload_mesh(
-        &mut self,
-        mesh_id: MeshId,
-        prim_id: PrimitiveId,
-        prim: &MeshPrimitiveAsset,
-        memory_allocator: Arc<StandardMemoryAllocator>,
-    ) -> (Subbuffer<[GpuVertex]>, Subbuffer<[u32]>, u32) {
-        let key = (mesh_id, prim_id);
-        if let Some(cached) = self.mesh_cache.get(&key) {
-            return cached.clone();
-        }
-        let vd = match prim.vertices.as_ref() {
-            Some(vd) if !vd.positions.is_empty() => vd,
-            _ => {
-                let result = Self::create_placeholder_mesh(memory_allocator);
-                self.mesh_cache.insert(key, result.clone());
-                return result;
-            }
-        };
-        let gpu_verts = Self::vertex_data_to_gpu(vd);
-        let indices: &[u32] = prim.indices.as_deref().unwrap_or(&[]);
-        let owned_indices;
-        let idx_slice = if indices.is_empty() {
-            owned_indices = (0..gpu_verts.len() as u32).collect::<Vec<_>>();
-            &owned_indices
-        } else {
-            indices
-        };
-        let index_count = idx_slice.len() as u32;
-        let vb = Self::create_vertex_buffer(memory_allocator.clone(), &gpu_verts);
-        let ib = Self::create_index_buffer(memory_allocator, idx_slice);
-        let result = (vb, ib, index_count);
-        self.mesh_cache.insert(key, result.clone());
-        result
-    }
-
-    /// Apply morph target (blend shape) deltas to base vertex data on the CPU.
-    fn build_morphed_vertices(
-        vd: &VertexData,
-        morph_targets: &[crate::asset::MorphTargetDelta],
-        morph_weights: &[f32],
-    ) -> Vec<GpuVertex> {
-        let count = vd.positions.len();
-        (0..count)
-            .map(|i| {
-                let mut pos = vd.positions[i];
-                let mut norm = vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
-
-                for (ti, target) in morph_targets.iter().enumerate() {
-                    let w = morph_weights.get(ti).copied().unwrap_or(0.0);
-                    if w.abs() < 1e-6 {
-                        continue;
-                    }
-                    if let Some(d) = target.position_deltas.get(i) {
-                        pos[0] += w * d[0];
-                        pos[1] += w * d[1];
-                        pos[2] += w * d[2];
-                    }
-                    if let Some(d) = target.normal_deltas.get(i) {
-                        norm[0] += w * d[0];
-                        norm[1] += w * d[1];
-                        norm[2] += w * d[2];
-                    }
-                }
-
-                let uv = vd.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-                let ji = if i < vd.joint_indices.len() {
-                    let j = vd.joint_indices[i];
-                    [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]
-                } else {
-                    [0, 0, 0, 0]
-                };
-                let jw = vd.joint_weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
-
-                GpuVertex {
-                    position: pos,
-                    normal: norm,
-                    uv,
-                    joint_indices: ji,
-                    joint_weights: jw,
-                }
-            })
-            .collect()
-    }
-
-    fn build_cloth_vertices(vd: &VertexData, cloth: &ClothDeformSnapshot) -> Vec<GpuVertex> {
-        let count = vd.positions.len();
-        (0..count)
-            .map(|i| {
-                let pos = if i < cloth.deformed_positions.len() {
-                    cloth.deformed_positions[i]
-                } else {
-                    vd.positions[i]
-                };
-                let norm = if let Some(ref dn) = cloth.deformed_normals {
-                    if i < dn.len() {
-                        dn[i]
-                    } else if i < vd.normals.len() {
-                        vd.normals[i]
-                    } else {
-                        [0.0, 1.0, 0.0]
-                    }
-                } else if i < vd.normals.len() {
-                    vd.normals[i]
-                } else {
-                    [0.0, 1.0, 0.0]
-                };
-                let uv = if i < vd.uvs.len() {
-                    vd.uvs[i]
-                } else {
-                    [0.0, 0.0]
-                };
-                let ji = if i < vd.joint_indices.len() {
-                    let j = vd.joint_indices[i];
-                    [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]
-                } else {
-                    [0, 0, 0, 0]
-                };
-                let jw = if i < vd.joint_weights.len() {
-                    vd.joint_weights[i]
-                } else {
-                    [1.0, 0.0, 0.0, 0.0]
-                };
-                GpuVertex {
-                    position: pos,
-                    normal: norm,
-                    uv,
-                    joint_indices: ji,
-                    joint_weights: jw,
-                }
-            })
-            .collect()
-    }
-
-    fn create_vertex_buffer(
-        memory_allocator: Arc<StandardMemoryAllocator>,
-        vertices: &[GpuVertex],
-    ) -> Subbuffer<[GpuVertex]> {
-        Buffer::from_iter(
-            memory_allocator,
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            vertices.iter().copied(),
-        )
-        .expect("failed to create vertex buffer")
-    }
-
-    fn create_index_buffer(
-        memory_allocator: Arc<StandardMemoryAllocator>,
-        indices: &[u32],
-    ) -> Subbuffer<[u32]> {
-        Buffer::from_iter(
-            memory_allocator,
-            BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            indices.iter().copied(),
-        )
-        .expect("failed to create index buffer")
     }
 
     /// Vulkan colour-attachment format that backs a given output colour
@@ -2060,6 +2348,16 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no render pass")?
             .clone();
+        let transform_pipeline = self
+            .transform_compute_pipeline
+            .as_ref()
+            .ok_or("renderer: no transform compute pipeline")?
+            .clone();
+        let outline_pipeline = self
+            .outline_pipeline
+            .as_ref()
+            .ok_or("renderer: no outline pipeline")?
+            .clone();
         let sampler = self.sampler.as_ref().ok_or("renderer: no sampler")?.clone();
         let default_tex = self
             .default_texture_view
@@ -2183,6 +2481,227 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("thumbnail: cmd buffer failed: {e}"))?;
 
+        struct ThumbDraw {
+            vertex_buffer: Subbuffer<[GpuVertex]>,
+            index_buffer: Subbuffer<[u32]>,
+            index_count: u32,
+            material_set: Arc<DescriptorSet>,
+            outline: Option<(f32, [f32; 3])>,
+        }
+        let mut draws: Vec<ThumbDraw> = Vec::new();
+
+        // ── Compute prepass per (instance, primitive) ──────────────────
+        builder
+            .bind_pipeline_compute(transform_pipeline.clone())
+            .map_err(|e| format!("thumbnail: bind compute pipeline failed: {e}"))?;
+
+        for (inst_idx, instance) in input.instances.iter().enumerate() {
+            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
+                vec![mat4_cols_identity()]
+            } else {
+                instance.skinning_matrices.to_vec()
+            };
+            let mat_count = skinning_mats.len();
+            let skinning_set = self.get_or_update_skinning(
+                inst_idx,
+                &skinning_mats,
+                mat_count,
+                memory_allocator.clone(),
+                ds_allocator.clone(),
+                &transform_pipeline,
+            )?;
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    transform_pipeline.layout().clone(),
+                    1,
+                    skinning_set,
+                )
+                .map_err(|e| format!("thumbnail: bind compute skinning failed: {e}"))?;
+
+            for mesh_inst in &instance.mesh_instances {
+                let prim_asset = match mesh_inst.primitive_data.as_ref() {
+                    Some(p) => p.as_ref(),
+                    None => continue,
+                };
+                let vd = match prim_asset.vertices.as_ref() {
+                    Some(vd) if !vd.positions.is_empty() => vd,
+                    _ => continue,
+                };
+                let key = (mesh_inst.mesh_id, mesh_inst.primitive_id);
+
+                let cloth_snap_opt = instance
+                    .cloth_deforms
+                    .iter()
+                    .find(|c| c.target_primitive_id == mesh_inst.primitive_id);
+                let has_cloth_prim = cloth_snap_opt.is_some();
+                let has_cloth_normals_prim = cloth_snap_opt
+                    .map(|c| c.deformed_normals.is_some())
+                    .unwrap_or(false);
+
+                self.ensure_transform_data(
+                    mesh_inst.mesh_id,
+                    mesh_inst.primitive_id,
+                    prim_asset,
+                    has_cloth_prim,
+                    has_cloth_normals_prim,
+                    &memory_allocator,
+                    &ds_allocator,
+                    &transform_pipeline,
+                )?;
+
+                {
+                    let slot = self
+                        .transform_cache
+                        .get(&key)
+                        .expect("slot present");
+                    let mut guard = slot
+                        .control_ubo
+                        .write()
+                        .map_err(|e| format!("thumbnail: control UBO write failed: {e}"))?;
+                    guard.vertex_count = slot.vertex_count;
+                    guard.target_count = slot.target_count;
+                    guard.has_cloth = if has_cloth_prim { 1 } else { 0 };
+                    guard.has_cloth_normals = if has_cloth_normals_prim { 1 } else { 0 };
+                    let copy_n = (slot.target_count as usize).min(MORPH_MAX_TARGETS);
+                    for i in 0..copy_n {
+                        let w = mesh_inst.morph_weights.get(i).copied().unwrap_or(0.0);
+                        guard.weights[i / 4][i % 4] = w;
+                    }
+                    for i in copy_n..MORPH_MAX_TARGETS {
+                        guard.weights[i / 4][i % 4] = 0.0;
+                    }
+                }
+
+                // Cloth subset write — see the matching block in `render()`
+                // for the rationale; vertices outside
+                // `[vertex_offset .. vertex_offset + vertex_count)` keep
+                // rest pose.
+                if let Some(cloth) = cloth_snap_opt {
+                    let slot = self
+                        .transform_cache
+                        .get_mut(&key)
+                        .expect("slot present");
+                    if slot.last_cloth_version != Some(cloth.version) {
+                        let off = cloth.vertex_offset as usize;
+                        let cnt = cloth.vertex_count as usize;
+                        {
+                            let mut pos_guard = slot
+                                .cloth_pos_ssbo
+                                .write()
+                                .map_err(|e| format!("thumbnail: cloth pos write failed: {e}"))?;
+                            for (i, dst) in pos_guard.iter_mut().enumerate() {
+                                let p = if i >= off && i < off + cnt {
+                                    cloth
+                                        .deformed_positions
+                                        .get(i - off)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            vd.positions
+                                                .get(i)
+                                                .copied()
+                                                .unwrap_or([0.0, 0.0, 0.0])
+                                        })
+                                } else {
+                                    vd.positions.get(i).copied().unwrap_or([0.0, 0.0, 0.0])
+                                };
+                                *dst = [p[0], p[1], p[2], 1.0];
+                            }
+                        }
+                        if let Some(ref normals) = cloth.deformed_normals {
+                            let mut norm_guard = slot
+                                .cloth_norm_ssbo
+                                .write()
+                                .map_err(|e| {
+                                    format!("thumbnail: cloth norm write failed: {e}")
+                                })?;
+                            for (i, dst) in norm_guard.iter_mut().enumerate() {
+                                let n = if i >= off && i < off + cnt {
+                                    normals.get(i - off).copied().unwrap_or_else(|| {
+                                        vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])
+                                    })
+                                } else {
+                                    vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])
+                                };
+                                *dst = [n[0], n[1], n[2], 0.0];
+                            }
+                        }
+                        slot.last_cloth_version = Some(cloth.version);
+                    }
+                }
+
+                let (transform_set, vertex_count, vbo, ibo, idx_count) = {
+                    let slot = self.transform_cache.get(&key).expect("slot present");
+                    (
+                        slot.transform_set.clone(),
+                        slot.vertex_count,
+                        slot.transformed_vbo.clone(),
+                        slot.index_buffer.clone(),
+                        slot.index_count,
+                    )
+                };
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        transform_pipeline.layout().clone(),
+                        0,
+                        transform_set,
+                    )
+                    .map_err(|e| format!("thumbnail: bind transform set 0 failed: {e}"))?;
+                let groups = vertex_count.div_ceil(TRANSFORM_LOCAL_SIZE);
+                unsafe {
+                    builder
+                        .dispatch([groups, 1, 1])
+                        .map_err(|e| format!("thumbnail: dispatch failed: {e}"))?;
+                }
+
+                let texture_view =
+                    self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
+                let shade_texture_view = self
+                    .resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
+                let matcap_view = self
+                    .resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
+
+                let material_set = self
+                    .material_uploader
+                    .upload_to_gpu(
+                        None,
+                        &mesh_inst.material_binding,
+                        memory_allocator.clone(),
+                        ds_allocator.clone(),
+                        &thumb_pipeline,
+                        texture_view,
+                        shade_texture_view,
+                        sampler.clone(),
+                        matcap_view,
+                    )
+                    .map_err(|e| format!("thumbnail: material upload failed: {e}"))?;
+
+                let is_cutout =
+                    matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
+                let is_blend =
+                    matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
+                let outline_info = if !is_blend
+                    && !is_cutout
+                    && mesh_inst.outline.enabled
+                    && mesh_inst.outline.width > 0.0
+                {
+                    Some((mesh_inst.outline.width, mesh_inst.outline.color))
+                } else {
+                    None
+                };
+
+                draws.push(ThumbDraw {
+                    vertex_buffer: vbo,
+                    index_buffer: ibo,
+                    index_count: idx_count,
+                    material_set,
+                    outline: outline_info,
+                });
+            }
+        }
+
+        // ── Graphics pass ──────────────────────────────────────────────
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -2208,17 +2727,36 @@ impl VulkanRenderer {
             )
             .map_err(|e| format!("thumbnail: bind camera set failed: {e}"))?;
 
-        for instance in &input.instances {
-            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
-                vec![mat4_cols_identity()]
-            } else {
-                instance.skinning_matrices.to_vec()
-            };
+        for draw in &draws {
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    thumb_pipeline.layout().clone(),
+                    1,
+                    draw.material_set.clone(),
+                )
+                .map_err(|e| format!("thumbnail: bind material set failed: {e}"))?
+                .bind_vertex_buffers(0, draw.vertex_buffer.clone())
+                .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
+                .bind_index_buffer(draw.index_buffer.clone())
+                .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?;
+            unsafe {
+                builder
+                    .draw_indexed(draw.index_count, 1, 0, 0, 0)
+                    .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+            }
+        }
 
-            let skinning_buffer = Buffer::from_iter(
+        // Outline pass for thumbnail. Builds a one-shot camera descriptor
+        // against the outline pipeline's set 0 layout (the thumbnail's
+        // camera_set was allocated against the forward `thumb_pipeline`,
+        // a different layout object).
+        let outline_count = draws.iter().filter(|d| d.outline.is_some()).count();
+        if outline_count > 0 {
+            let outline_cam_buffer = Buffer::from_data(
                 memory_allocator.clone(),
                 BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER,
+                    usage: BufferUsage::UNIFORM_BUFFER,
                     ..Default::default()
                 },
                 AllocationCreateInfo {
@@ -2226,136 +2764,58 @@ impl VulkanRenderer {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                skinning_mats,
+                camera_data,
             )
-            .map_err(|e| format!("thumbnail: skinning buffer failed: {e}"))?;
-
-            let skinning_set_layout = thumb_pipeline
+            .map_err(|e| format!("thumbnail: outline camera buffer failed: {e}"))?;
+            let outline_cam_layout = outline_pipeline
                 .layout()
                 .set_layouts()
-                .get(1)
-                .ok_or("thumbnail: no set 1")?
+                .first()
+                .ok_or("thumbnail: outline pipeline missing set 0")?
                 .clone();
-            let skinning_set = DescriptorSet::new(
+            let outline_cam_set = DescriptorSet::new(
                 ds_allocator.clone(),
-                skinning_set_layout,
-                [WriteDescriptorSet::buffer(0, skinning_buffer)],
+                outline_cam_layout,
+                [WriteDescriptorSet::buffer(0, outline_cam_buffer)],
                 [],
             )
-            .map_err(|e| format!("thumbnail: skinning desc set failed: {e}"))?;
+            .map_err(|e| format!("thumbnail: outline camera desc set failed: {e}"))?;
 
             builder
+                .bind_pipeline_graphics(outline_pipeline.clone())
+                .map_err(|e| format!("thumbnail: bind outline pipeline failed: {e}"))?
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
-                    thumb_pipeline.layout().clone(),
-                    1,
-                    skinning_set,
+                    outline_pipeline.layout().clone(),
+                    0,
+                    outline_cam_set,
                 )
-                .map_err(|e| format!("thumbnail: bind skinning set failed: {e}"))?;
+                .map_err(|e| format!("thumbnail: bind outline camera set failed: {e}"))?;
 
-            for mesh_inst in &instance.mesh_instances {
-                let texture_view =
-                    self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
-
-                let shade_texture_view =
-                    self.resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
-
-                let matcap_view =
-                    self.resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
-
-                let material_set = self
-                    .material_uploader
-                    .upload_to_gpu(
-                        None,
-                        &mesh_inst.material_binding,
-                        memory_allocator.clone(),
-                        ds_allocator.clone(),
-                        &thumb_pipeline,
-                        texture_view,
-                        shade_texture_view,
-                        sampler.clone(),
-                        matcap_view,
-                    )
-                    .map_err(|e| format!("thumbnail: material upload failed: {e}"))?;
-
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        thumb_pipeline.layout().clone(),
-                        2,
-                        material_set,
-                    )
-                    .map_err(|e| format!("thumbnail: bind material set failed: {e}"))?;
-
-                let prim_asset = match mesh_inst.primitive_data.as_ref() {
-                    Some(p) => p.as_ref(),
-                    None => {
-                        let (vb, ib, idx_count) =
-                            Self::create_placeholder_mesh(memory_allocator.clone());
-                        builder
-                            .bind_vertex_buffers(0, vb)
-                            .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
-                            .bind_index_buffer(ib)
-                            .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?;
-                        unsafe {
-                            builder
-                                .draw_indexed(idx_count, 1, 0, 0, 0)
-                                .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
-                        }
-                        continue;
-                    }
+            for draw in &draws {
+                let Some((width, color)) = draw.outline else {
+                    continue;
                 };
-
-                let (vb, ib, idx_count) = if let Some(ref cloth_snap) = instance.cloth_deform {
-                    if let Some(ref vd) = prim_asset.vertices {
-                        let cloth_verts = Self::build_cloth_vertices(vd, cloth_snap);
-                        let cloth_vb = Buffer::from_iter(
-                            memory_allocator.clone(),
-                            BufferCreateInfo {
-                                usage: BufferUsage::VERTEX_BUFFER,
-                                ..Default::default()
-                            },
-                            AllocationCreateInfo {
-                                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                                ..Default::default()
-                            },
-                            cloth_verts,
-                        )
-                        .map_err(|e| format!("thumbnail: cloth vb failed: {e}"))?;
-                        let (_, cached_ib, cached_idx) = self.upload_mesh(
-                            mesh_inst.mesh_id,
-                            mesh_inst.primitive_id,
-                            prim_asset,
-                            memory_allocator.clone(),
-                        );
-                        (cloth_vb, cached_ib, cached_idx)
-                    } else {
-                        self.upload_mesh(
-                            mesh_inst.mesh_id,
-                            mesh_inst.primitive_id,
-                            prim_asset,
-                            memory_allocator.clone(),
-                        )
-                    }
-                } else {
-                    self.upload_mesh(
-                        mesh_inst.mesh_id,
-                        mesh_inst.primitive_id,
-                        prim_asset,
-                        memory_allocator.clone(),
-                    )
+                let push = OutlinePushConstants {
+                    outline_width: width,
+                    r: color[0],
+                    g: color[1],
+                    b: color[2],
+                    a: 1.0,
                 };
-
                 builder
-                    .bind_vertex_buffers(0, vb)
-                    .map_err(|e| format!("thumbnail: bind vb failed: {e}"))?
-                    .bind_index_buffer(ib)
-                    .map_err(|e| format!("thumbnail: bind ib failed: {e}"))?;
+                    .push_constants(outline_pipeline.layout().clone(), 0, push)
+                    .map_err(|e| format!("thumbnail: outline push_constants failed: {e}"))?
+                    .bind_vertex_buffers(0, draw.vertex_buffer.clone())
+                    .map_err(|e| {
+                        format!("thumbnail: outline bind_vertex_buffers failed: {e}")
+                    })?
+                    .bind_index_buffer(draw.index_buffer.clone())
+                    .map_err(|e| format!("thumbnail: outline bind_index_buffer failed: {e}"))?;
                 unsafe {
                     builder
-                        .draw_indexed(idx_count, 1, 0, 0, 0)
-                        .map_err(|e| format!("thumbnail: draw failed: {e}"))?;
+                        .draw_indexed(draw.index_count, 1, 0, 0, 0)
+                        .map_err(|e| format!("thumbnail: outline draw failed: {e}"))?;
                 }
             }
         }
@@ -2393,67 +2853,6 @@ impl VulkanRenderer {
         Ok(pixels)
     }
 
-    #[allow(clippy::type_complexity)]
-    fn create_placeholder_mesh(
-        memory_allocator: Arc<StandardMemoryAllocator>,
-    ) -> (Subbuffer<[GpuVertex]>, Subbuffer<[u32]>, u32) {
-        let vertices = vec![
-            GpuVertex {
-                position: [0.0, -0.5, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                uv: [0.5, 0.0],
-                joint_indices: [0, 0, 0, 0],
-                joint_weights: [1.0, 0.0, 0.0, 0.0],
-            },
-            GpuVertex {
-                position: [-0.5, 0.5, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                uv: [0.0, 1.0],
-                joint_indices: [0, 0, 0, 0],
-                joint_weights: [1.0, 0.0, 0.0, 0.0],
-            },
-            GpuVertex {
-                position: [0.5, 0.5, 0.0],
-                normal: [0.0, 0.0, 1.0],
-                uv: [1.0, 1.0],
-                joint_indices: [0, 0, 0, 0],
-                joint_weights: [1.0, 0.0, 0.0, 0.0],
-            },
-        ];
-        let indices: Vec<u32> = vec![0, 1, 2];
-
-        let vertex_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            vertices,
-        )
-        .expect("failed to create vertex buffer");
-
-        let index_buffer = Buffer::from_iter(
-            memory_allocator,
-            BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            indices,
-        )
-        .expect("failed to create index buffer");
-
-        (vertex_buffer, index_buffer, 3)
-    }
 }
 
 // ---------------------------------------------------------------------------

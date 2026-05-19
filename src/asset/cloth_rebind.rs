@@ -327,6 +327,23 @@ pub fn rebind_overlay(overlay: &mut ClothAsset, new_avatar: &AvatarAsset) -> Reb
                     ));
                     report.downgrade(RebindStatus::Failed);
                 }
+
+                // Populate the parent-mesh reference if we can recover it
+                // from the primitive name. Cosmetic for the renderer
+                // (which matches by globally-unique PrimitiveId) but lets
+                // overlay tooling reason about the binding without
+                // re-walking the asset graph.
+                if let Some((mesh_name, _idx)) = parse_primitive_name(&rb.primitive.name) {
+                    if let Some(mesh) = resolver.resolve_mesh(&MeshRef {
+                        id: MeshId(0),
+                        name: mesh_name.to_string(),
+                    }) {
+                        rb.mesh = Some(MeshRef {
+                            id: mesh.id,
+                            name: mesh.name.clone(),
+                        });
+                    }
+                }
             }
             None => {
                 report.unresolved.push(UnresolvedRef {
@@ -575,6 +592,7 @@ mod tests {
                 count: 4,
             },
             mapping_region: ClothRegionTag(0),
+            mesh: None,
         });
 
         let body_mesh = MeshAsset {
@@ -625,6 +643,7 @@ mod tests {
                 count: 100,
             },
             mapping_region: ClothRegionTag(0),
+            mesh: None,
         });
 
         let body_mesh = MeshAsset {

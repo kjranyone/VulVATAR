@@ -144,6 +144,27 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                     egui::RichText::new(t!("inspector.handoff_fallback_warning"))
                         .color(egui::Color32::from_rgb(220, 160, 80)),
                 );
+                if let Some(reason) = diagnostics.fallback_reason.as_ref() {
+                    use crate::output::FallbackReason;
+                    let reason_key = match reason {
+                        FallbackReason::RequestedCpuReadback => {
+                            "inspector.handoff_fallback_reason_requested_cpu"
+                        }
+                        FallbackReason::ExternalHandleUnavailable => {
+                            "inspector.handoff_fallback_reason_external_handle"
+                        }
+                        FallbackReason::ExportPoolSaturated => {
+                            "inspector.handoff_fallback_reason_pool_saturated"
+                        }
+                        FallbackReason::MissingExternalHandle => {
+                            "inspector.handoff_fallback_reason_missing_handle"
+                        }
+                    };
+                    ui.label(
+                        egui::RichText::new(t!(reason_key))
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
             }
         });
 
@@ -162,6 +183,15 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
             };
             ui.label(egui::RichText::new(t!(label_key)).color(color));
             ui.label(t!("inspector.queue_depth", depth = diagnostics.queue_depth));
+            if let Some(pool) = diagnostics.export_pool {
+                ui.label(t!(
+                    "inspector.export_pool",
+                    total = pool.total_slots,
+                    capacity = pool.capacity,
+                    available = pool.available_slots,
+                    leased = pool.leased_slots,
+                ));
+            }
             ui.label(t!(
                 "inspector.dropped_frames",
                 count = diagnostics.dropped_frame_count

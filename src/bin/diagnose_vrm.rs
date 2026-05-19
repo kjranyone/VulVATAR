@@ -301,7 +301,7 @@ fn build_frame_input(
             } else {
                 avatar.pose.skinning_matrices.clone()
             },
-            cloth_deform: None,
+            cloth_deforms: Vec::new(),
             debug_flags: RenderDebugFlags {
                 material_mode_override: Some(material_mode),
                 ..Default::default()

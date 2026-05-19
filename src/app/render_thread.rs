@@ -26,6 +26,10 @@ pub enum RenderCommand {
     /// re-paid upload cost (~10–30 ms hitch on a fresh swap) is
     /// strictly cheaper than monotonic VRAM growth across a session.
     EvictCaches,
+    /// The output worker has finished consuming a GPU-exported frame.
+    /// Return its lease to the renderer-owned export pool so the slot may be
+    /// reused by a future frame.
+    ReleaseExportLease(u64),
     #[allow(dead_code)]
     Resize(u32, u32),
     Shutdown,
@@ -199,6 +203,9 @@ impl RenderThreadInner {
                     self.renderer.flush_pending();
                     self.renderer.clear_caches();
                     info!("render_thread: caches evicted (avatar swap)");
+                }
+                RenderCommand::ReleaseExportLease(lease_id) => {
+                    self.renderer.release_export_lease(lease_id);
                 }
                 RenderCommand::Shutdown => {
                     info!("render_thread: shutdown received");

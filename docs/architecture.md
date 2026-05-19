@@ -777,6 +777,7 @@ Detailed contracts for data shapes, persistence, threading, tracking, and output
 - [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
 - [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
 - [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md)
+- [gpu-runtime-roadmap.md](/C:/lib/github/kjranyone/VulVATAR/docs/gpu-runtime-roadmap.md)
 - [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
 - [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
 - [rendering-materials.md](/C:/lib/github/kjranyone/VulVATAR/docs/rendering-materials.md)

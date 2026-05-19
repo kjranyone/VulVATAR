@@ -511,6 +511,10 @@ fn write_back_copies_positions_and_normals() {
             deformed_normals: None,
             version: 0,
         },
+        target_primitive_id: None,
+        target_mesh_id: None,
+        target_vertex_offset: 0,
+        target_vertex_count: 0,
     };
 
     write_back(&sim, &mut cloth_state);
@@ -543,6 +547,10 @@ fn write_back_increments_version() {
             deformed_normals: None,
             version: 42,
         },
+        target_primitive_id: None,
+        target_mesh_id: None,
+        target_vertex_offset: 0,
+        target_vertex_count: 0,
     };
 
     write_back(&sim, &mut cloth_state);

@@ -84,6 +84,15 @@ pub struct ClothState {
     pub constraint_cache: ClothConstraintRuntimeCache,
     pub collision_cache: ClothCollisionRuntimeCache,
     pub deform_output: ClothDeformOutput,
+    /// Render target resolved from the attached `ClothAsset`'s first
+    /// `ClothRenderRegionBinding`. Populated by `init_cloth_sim` /
+    /// `init_cloth_overlay`; `None` until then or when the asset has
+    /// no render bindings. The renderer skips contributing this cloth
+    /// to any primitive while `target_primitive_id` is `None`.
+    pub target_primitive_id: Option<crate::asset::PrimitiveId>,
+    pub target_mesh_id: Option<crate::asset::MeshId>,
+    pub target_vertex_offset: u32,
+    pub target_vertex_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -176,11 +185,18 @@ impl AvatarInstance {
                 deformed_normals: None,
                 version: 0,
             },
+            target_primitive_id: None,
+            target_mesh_id: None,
+            target_vertex_offset: 0,
+            target_vertex_count: 0,
         });
     }
 
     /// Initialise the cloth simulation from a `ClothAsset`.
     /// Call this after `attach_cloth` to populate the PBD solver state.
+    /// Also resolves the render target from `cloth_asset.render_bindings[0]`
+    /// so the renderer can scope the deform output to a single primitive
+    /// instead of broadcasting it across every primitive in the instance.
     pub fn init_cloth_sim(&mut self, cloth_asset: &ClothAsset) {
         let sim = ClothSimState::from_asset(cloth_asset);
         let n = sim.particle_count();
@@ -190,6 +206,7 @@ impl AvatarInstance {
             cs.sim_positions = sim.particles.iter().map(|p| p.position).collect();
             cs.prev_sim_positions = cs.sim_positions.clone();
             cs.deform_output.deformed_positions = cs.sim_positions.clone();
+            apply_render_target(cs, cloth_asset);
         }
 
         self.cloth_sim_buffers = Some(ClothSimTempBuffers::new(n));
@@ -223,6 +240,10 @@ impl AvatarInstance {
                 deformed_normals: None,
                 version: 0,
             },
+            target_primitive_id: None,
+            target_mesh_id: None,
+            target_vertex_offset: 0,
+            target_vertex_count: 0,
         };
         let sim = ClothSimState::default();
         let n = sim.particle_count();
@@ -251,6 +272,7 @@ impl AvatarInstance {
             slot.state.prev_sim_positions = slot.state.sim_positions.clone();
             slot.state.deform_output.deformed_positions = slot.state.sim_positions.clone();
             slot.buffers = ClothSimTempBuffers::new(n);
+            apply_render_target(&mut slot.state, cloth_asset);
         }
     }
 
@@ -330,4 +352,21 @@ impl Default for SecondaryMotionState {
             collision_cache: SecondaryMotionCollisionCache { contact_count: 0 },
         }
     }
+}
+
+/// Resolve the render target (`target_primitive_id`, mesh id, vertex
+/// subset) from a `ClothAsset`'s first `ClothRenderRegionBinding` and
+/// store it on `state`. Leaves the fields at their pre-existing values
+/// when the asset has no render bindings — that case represents a cloth
+/// that simulates but hasn't been pinned to a render target yet, and
+/// the renderer's per-primitive `has_cloth` gate will skip applying
+/// the deform to any draw.
+fn apply_render_target(state: &mut ClothState, cloth_asset: &ClothAsset) {
+    let Some(binding) = cloth_asset.render_bindings.first() else {
+        return;
+    };
+    state.target_primitive_id = Some(binding.primitive.id);
+    state.target_mesh_id = binding.mesh.as_ref().map(|m| m.id);
+    state.target_vertex_offset = binding.vertex_subset.offset;
+    state.target_vertex_count = binding.vertex_subset.count;
 }

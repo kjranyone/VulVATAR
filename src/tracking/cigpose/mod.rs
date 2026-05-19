@@ -130,12 +130,7 @@ impl CigposeInference {
     /// Run inference on a whole-frame RGB buffer and return one
     /// decoded 2D joint per COCO-Wholebody index. Keypoint coordinates
     /// are normalised image-relative (`nx, ny ∈ [0, 1]`).
-    pub fn estimate(
-        &mut self,
-        rgb: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Vec<DecodedJoint2d> {
+    pub fn estimate(&mut self, rgb: &[u8], width: u32, height: u32) -> Vec<DecodedJoint2d> {
         let expected = (width as usize)
             .saturating_mul(height as usize)
             .saturating_mul(3);
@@ -219,7 +214,9 @@ fn read_split_ratio_from_metadata(session: &Session) -> Option<f32> {
     let colon = after.find(':')?;
     let tail = after[colon + 1..].trim_start();
     let end = tail
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'))
+        .find(|c: char| {
+            !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
+        })
         .unwrap_or(tail.len());
     let num = tail[..end].trim();
     let parsed: f32 = num.parse().ok()?;

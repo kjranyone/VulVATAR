@@ -2,6 +2,7 @@ pub mod app;
 pub mod asset;
 pub mod avatar;
 pub mod editor;
+pub mod frame_handoff;
 pub mod gui;
 pub mod i18n;
 pub mod lipsync;

@@ -23,6 +23,29 @@ Related documents:
    ```
 4. Grep for the `PROFILE` or `HARVEST` tags in the log.
 
+For GPU-runtime regression checks, also grep for `GPU_RUNTIME`. The renderer
+logs cumulative steady-state counters every 60 frames; the field names
+reflect the compute-prepass migration (single `TransformGpuData` slot per
+primitive, fused skinning + morph + cloth dispatch):
+
+```text
+GPU_RUNTIME frame=600 transform_resources=42 ubo_writes=25140 \
+cloth_writes=180 cloth_creations=2 cache_slots=42 readback_bytes=8294400
+```
+
+After avatar warm-up:
+
+- `transform_resources` and `cloth_creations` should plateau (the former
+  at total visible primitive count, the latter at the count of
+  cloth-bearing primitives) — any continued growth means a slot is being
+  evicted and recreated every frame.
+- `cache_slots` mirrors `transform_resources` minus any user-driven
+  cache clears.
+- `ubo_writes` and `cloth_writes` keep growing because they represent
+  cheap in-place updates: one `control_ubo` write per visible primitive
+  per frame, and one `cloth_pos_ssbo` rewrite per cloth-bearing
+  primitive each time the solver's `version` advances.
+
 ## Instrumentation Pattern
 
 The profiling code is **not checked in** — it is added on-demand and removed
@@ -199,3 +222,52 @@ PROFILE total=16.6ms
 ```
 
 60 FPS, vsync-limited.  All budget items well under 5 ms.
+
+## GPU Runtime Soak
+
+Use this after changes to morphs, cloth, output handoff, or GPU scheduling.
+
+### Scenario
+
+1. Start with:
+   - face tracking on
+   - cloth on
+   - 1920x1080 output
+   - virtual camera or another live output sink active
+2. Run for at least 30 minutes with logs enabled:
+   ```powershell
+   $stamp = Get-Date -Format yyyyMMdd_HHmmss
+   $env:RUST_LOG = "vulvatar=info"
+   cargo run 2> "profile\\gpu_soak_$stamp.log"
+   ```
+3. Keep normal user motion in frame so morph weights and cloth keep updating.
+
+### Inspect
+
+- `GPU_RUNTIME`
+  - `transform_resources`
+  - `cloth_creations`
+  - `cache_slots`
+- render cadence / frame-time summaries
+- output queue depth and dropped frames
+- active handoff path / fallback warnings
+
+### Healthy signature
+
+- `transform_resources` stops growing after warm-up (the compute prepass
+  reuses each per-primitive slot)
+- `cloth_creations` stops after the first cloth-on frame (and only ticks
+  again if the user toggles a cloth overlay on a primitive that wasn't
+  previously cloth-bearing — that case evicts the slot and rebuilds)
+- only `ubo_writes` and `cloth_writes` continue growing
+- no device loss
+- no tracking-worker restart refusal unless intentionally provoked
+- no unexpected output fallback activation
+
+### Failure signatures worth saving
+
+- `VIDEO_TDR_FAILURE`, device loss, or sudden process termination
+- `tracking: refusing restart` without a deliberate stop/start test
+- `GPU_RUNTIME` creation counters that keep rising during steady-state motion
+- output queue depth or dropped-frame count that trends upward without recovery
+- handoff falling back from GPU to CPU/shared memory unexpectedly
