@@ -113,6 +113,14 @@ pub struct OutputRouter {
     last_gpu_token_valid: Option<bool>,
     last_fallback_reason: Option<FallbackReason>,
     last_export_pool_stats: Option<crate::renderer::output_export::ExportImagePoolStats>,
+    /// Option A lease policy: a GPU token carrying
+    /// `FrameLifetimeContract::SingleConsumerRetained` is held alive on the
+    /// producer side until the *next* successfully-handed-off frame replaces
+    /// it. This is the lease id currently in flight to the consumer; it is
+    /// cleared the moment the router hands the next frame to the worker (or
+    /// at shutdown). Frames dropped before reaching the worker do NOT clear
+    /// this — the consumer is still bound to the previous frame's texture.
+    pending_retained_lease: Option<u64>,
 }
 
 impl OutputRouter {
@@ -141,6 +149,7 @@ impl OutputRouter {
             last_gpu_token_valid: None,
             last_fallback_reason: None,
             last_export_pool_stats: None,
+            pending_retained_lease: None,
         }
     }
 
@@ -173,7 +182,7 @@ impl OutputRouter {
                             if let Err(e) = writer.write_frame(&frame) {
                                 error!("output-worker: write error: {}", e);
                             }
-                            Self::complete_gpu_lease(&lease_completion_tx, &frame);
+                            Self::complete_gpu_lease_after_write(&lease_completion_tx, &frame);
                         }
                         Ok(WorkerMessage::Shutdown) => {
                             info!("output-worker: shutdown requested, draining queue");
@@ -183,7 +192,10 @@ impl OutputRouter {
                                     if let Err(e) = writer.write_frame(&frame) {
                                         error!("output-worker: drain write error: {}", e);
                                     }
-                                    Self::complete_gpu_lease(&lease_completion_tx, &frame);
+                                    Self::complete_gpu_lease_after_write(
+                                        &lease_completion_tx,
+                                        &frame,
+                                    );
                                 }
                             }
                             info!("output-worker: stopped");
@@ -200,9 +212,29 @@ impl OutputRouter {
             .expect("failed to spawn output-worker thread")
     }
 
+    /// Eagerly send the lease completion regardless of lifetime. Used on the
+    /// drop paths (throttling, queue policy eviction, worker channel full)
+    /// where the frame never reaches the consumer, so the texture is safe to
+    /// recycle immediately even for retained-lifetime tokens.
     fn complete_gpu_lease(completion_tx: &mpsc::Sender<u64>, frame: &OutputFrame) {
         if let Some(token) = frame.gpu_token.as_ref() {
             let _ = completion_tx.send(token.lease.lease_id);
+        }
+    }
+
+    /// Worker-side completion. Honours `FrameLifetimeContract`: an `Immediate`
+    /// frame is done with the texture the moment `write_frame` returns, but a
+    /// `Retained` frame stays alive on the consumer (the consumer reads the
+    /// shared texture out-of-band) until the *next* publish replaces it —
+    /// `OutputRouter::publish` owns that transition.
+    fn complete_gpu_lease_after_write(completion_tx: &mpsc::Sender<u64>, frame: &OutputFrame) {
+        if let Some(token) = frame.gpu_token.as_ref() {
+            if matches!(
+                token.lease.lifetime,
+                FrameLifetimeContract::SingleConsumerImmediate
+            ) {
+                let _ = completion_tx.send(token.lease.lease_id);
+            }
         }
     }
 
@@ -318,6 +350,22 @@ impl OutputRouter {
         // frames here while the local-queue counter stayed at zero, and
         // a profiler asking "are we dropping frames?" would be told no.
         if let Some(queued) = self.queue.pop_front() {
+            // Option A retained-lease policy: the lease the consumer is
+            // currently bound to is released only when a successor reaches the
+            // worker. Snapshot the new frame's retained-lease id (if any)
+            // before we move `queued` into the worker channel, so we can swap
+            // `pending_retained_lease` only on a successful handoff.
+            let attempted_retained_lease = queued
+                .gpu_token
+                .as_ref()
+                .filter(|token| {
+                    matches!(
+                        token.lease.lifetime,
+                        FrameLifetimeContract::SingleConsumerRetained
+                    )
+                })
+                .map(|token| token.lease.lease_id);
+
             if let Some(ref tx) = self.worker_tx {
                 match tx.try_send(WorkerMessage::Frame(queued)) {
                     Ok(()) => {
@@ -330,6 +378,15 @@ impl OutputRouter {
                         self.last_handoff_path = Some(attempted_handoff_path);
                         self.last_gpu_token_valid = Some(attempted_gpu_token_valid);
                         self.last_fallback_reason = attempted_fallback_reason;
+
+                        // Release the previously-retained lease — the
+                        // consumer has moved on to this frame. Then record
+                        // the new frame's retained-lease (if any) so the
+                        // *next* successful publish releases it in turn.
+                        if let Some(prev) = self.pending_retained_lease.take() {
+                            let _ = self.lease_completion_tx.send(prev);
+                        }
+                        self.pending_retained_lease = attempted_retained_lease;
                     }
                     Err(e) => {
                         self.dropped_count += 1;
@@ -387,6 +444,12 @@ impl OutputRouter {
     pub fn shutdown(&mut self) {
         for dropped_frame in self.queue.drain(..) {
             Self::complete_gpu_lease(&self.lease_completion_tx, &dropped_frame);
+        }
+        // No successor will ever arrive — release the currently-bound
+        // retained lease so the renderer's export pool slot is recycled
+        // rather than leaked across the shutdown boundary.
+        if let Some(prev) = self.pending_retained_lease.take() {
+            let _ = self.lease_completion_tx.send(prev);
         }
         if let Some(tx) = self.worker_tx.take() {
             let _ = tx.send(WorkerMessage::Shutdown);
@@ -492,6 +555,19 @@ mod tests {
         })
     }
 
+    fn make_retained_gpu_frame(id: u64) -> OutputFrame {
+        OutputFrame::new(id, [16, 16], 1_000 + id).with_gpu_token(GpuFrameToken {
+            resource_id: id,
+            handle_type: ExternalHandleType::Win32Kmt,
+            external_handle: Some(id + 100),
+            sync: OutputSyncToken::ProducerWaitComplete,
+            lease: FrameLease {
+                lease_id: id,
+                lifetime: FrameLifetimeContract::SingleConsumerRetained,
+            },
+        })
+    }
+
     /// Publish frames carrying `handoff_path` until the router's
     /// diagnostics report that path as `active`, or panic after a
     /// generous timeout. The worker channel is `sync_channel(1)`, so a
@@ -587,5 +663,68 @@ mod tests {
         router.publish(make_valid_gpu_frame(4_001));
         wait_for_completed_lease(&mut router, 4_001);
         router.shutdown();
+    }
+
+    /// Option A retained-lease policy: a `SingleConsumerRetained` lease must
+    /// stay alive on the producer until the *next* successfully-handed-off
+    /// frame replaces it. The texture the consumer is currently bound to
+    /// cannot be recycled mid-frame. At shutdown the last pending lease must
+    /// be flushed so the renderer's export pool slot is reclaimed instead of
+    /// leaking across teardown.
+    #[test]
+    fn retained_gpu_leases_complete_on_next_publish_and_at_shutdown() {
+        let mut router = OutputRouter::new(FrameSink::ImageSequence);
+
+        router.publish(make_retained_gpu_frame(9_000));
+        // Give the worker a moment to consume from sync_channel(1) so a
+        // subsequent publish does not race against a full channel.
+        std::thread::sleep(Duration::from_millis(50));
+        let drained = router.drain_completed_gpu_leases();
+        assert!(
+            drained.is_empty(),
+            "retained lease must not complete before its successor is published, got: {:?}",
+            drained,
+        );
+
+        router.publish(make_retained_gpu_frame(9_001));
+        wait_for_completed_lease(&mut router, 9_000);
+        std::thread::sleep(Duration::from_millis(50));
+
+        router.publish(make_retained_gpu_frame(9_002));
+        wait_for_completed_lease(&mut router, 9_001);
+
+        router.shutdown();
+        wait_for_completed_lease(&mut router, 9_002);
+    }
+
+    /// Frames dropped at the throttling boundary never reach the consumer,
+    /// so their leases complete immediately regardless of lifetime — and
+    /// they must not disturb the currently-bound `pending_retained_lease`.
+    #[test]
+    fn retained_pending_survives_dropped_successor() {
+        let mut router = OutputRouter::new(FrameSink::ImageSequence);
+
+        // Arm the throttle BEFORE the first publish so `last_forward_at`
+        // gets set by 8_000 reaching the worker. Without this the
+        // throttling gate's `last_forward_at` is still `None` when 8_001
+        // arrives and the second publish would slip through the gate.
+        router.set_target_fps(1);
+        router.publish(make_retained_gpu_frame(8_000));
+        std::thread::sleep(Duration::from_millis(50));
+
+        router.publish(make_retained_gpu_frame(8_001));
+        // The dropped successor must complete immediately (it never bound a
+        // consumer). The retained pending (8_000) must NOT have been
+        // released by this drop.
+        wait_for_completed_lease(&mut router, 8_001);
+        let drained = router.drain_completed_gpu_leases();
+        assert!(
+            !drained.contains(&8_000),
+            "throttle-dropped successor must not release the bound retained lease, got: {:?}",
+            drained,
+        );
+
+        router.shutdown();
+        wait_for_completed_lease(&mut router, 8_000);
     }
 }

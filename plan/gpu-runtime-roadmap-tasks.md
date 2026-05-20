@@ -267,8 +267,14 @@ This is where architecture becomes runtime truth.
 - [ ] Keep thumbnails / image-sequence export on CPU readback.
 - [x] Add the first GPU-token-capable bridge sink (`SharedTextureFileStub`)
       while preserving CPU fallback bytes.
-- [ ] Move the first live sink to GPU token consumption.
-- [ ] Preserve fallback parity.
+- [x] Move the first live sink to GPU token consumption (producer
+      side: `Win32FileBackedSharedMemorySink` now emits a VGTK sidecar
+      and `FrameSink::{VirtualCamera, SharedMemory}` advertise GPU
+      capability on Windows; consumer-side DLL is W8 in
+      [`win32-sink-gpu-token-consumption.md`](./win32-sink-gpu-token-consumption.md)).
+- [x] Preserve fallback parity (CPU bytes path unchanged; sidecar
+      untouched on fallback; covered by
+      `cpu_fallback_leaves_sidecar_untouched_and_writes_bytes`).
 - [ ] Repeat for the next live sink only after the first one is stable.
 
 **Done when**

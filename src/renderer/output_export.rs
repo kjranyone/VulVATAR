@@ -432,7 +432,15 @@ impl OutputExporter {
                             sync: OutputSyncToken::ProducerWaitComplete,
                             lease: FrameLease {
                                 lease_id: lease.lease_id,
-                                lifetime: FrameLifetimeContract::SingleConsumerImmediate,
+                                // Retained: the consumer reads the shared texture
+                                // out-of-band after the producer published the
+                                // sidecar. Releasing the lease before the next
+                                // frame is published would let the renderer
+                                // recycle the texture while the consumer is
+                                // still bound to it. `OutputRouter` holds the
+                                // lease until the *next* publish supersedes it
+                                // (Option A: next-publish-release).
+                                lifetime: FrameLifetimeContract::SingleConsumerRetained,
                             },
                         }),
                         extent: [width, height],
@@ -507,7 +515,13 @@ impl OutputExporter {
                             sync: OutputSyncToken::ProducerWaitComplete,
                             lease: FrameLease {
                                 lease_id: lease.lease_id,
-                                lifetime: FrameLifetimeContract::SingleConsumerImmediate,
+                                // Same Retained semantics as the Win32Kmt
+                                // branch: even though the handle is missing,
+                                // the slot is still reserved on the renderer
+                                // side and must outlive any sink-side use of
+                                // the (CPU-fallback) frame data this lease
+                                // represents.
+                                lifetime: FrameLifetimeContract::SingleConsumerRetained,
                             },
                         }),
                         extent: [width, height],

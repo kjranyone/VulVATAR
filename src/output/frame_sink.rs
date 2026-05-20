@@ -50,8 +50,23 @@ impl FrameSink {
     /// `CpuReadback` without having to construct a writer just to ask. Must
     /// agree with the writer trait's `supports_gpu_tokens()` for the same
     /// variant — covered by `frame_sink_capability_matches_writer` below.
+    ///
+    /// On Windows the live `VirtualCamera` and `SharedMemory` sinks are
+    /// backed by `Win32FileBackedSharedMemorySink`, which publishes a VGTK
+    /// sidecar for GPU-token frames and falls back to RGBA bytes for CPU
+    /// frames — so they advertise GPU-token support there. On non-Windows
+    /// those variants fall back to other writers (RingBuffer /
+    /// VirtualCameraFile) that only accept CPU pixels; the cfg-gated arms
+    /// keep enum/writer agreement on every target.
     pub fn supports_gpu_tokens(&self) -> bool {
-        matches!(self, FrameSink::SharedTextureFileStub)
+        match self {
+            FrameSink::SharedTextureFileStub => true,
+            #[cfg(target_os = "windows")]
+            FrameSink::VirtualCamera => true,
+            #[cfg(target_os = "windows")]
+            FrameSink::SharedMemory => true,
+            _ => false,
+        }
     }
 }
 
@@ -544,6 +559,91 @@ const VGTK_MAGIC: [u8; 4] = [b'V', b'G', b'T', b'K'];
 const VGTK_VERSION: u32 = 1;
 const VGTK_HEADER_SIZE: usize = 72;
 
+/// Bit 0 of the VGTK `flags` field tells the consumer to preserve the
+/// renderer's RGBA alpha rather than forcing the output to opaque.
+const VGTK_FLAG_PRESERVE_ALPHA: u32 = 1 << 0;
+/// Bit 1 tells the consumer the renderer produced linear-RGB pixels rather
+/// than sRGB-encoded ones. Identical semantics to the byte-buffer header's
+/// `SHMEM_FLAG_LINEAR_COLOR_SPACE` so both sinks describe colour the same
+/// way regardless of whether the consumer reads bytes or a shared texture.
+const VGTK_FLAG_LINEAR_COLOR_SPACE: u32 = 1 << 1;
+
+fn gpu_token_is_publishable(token: &GpuFrameToken) -> bool {
+    token.has_external_handle() && !matches!(token.handle_type, ExternalHandleType::Unavailable)
+}
+
+fn vgtk_handle_type_code(handle_type: &ExternalHandleType) -> u32 {
+    match handle_type {
+        ExternalHandleType::Unavailable => 0,
+        ExternalHandleType::Win32Kmt => 1,
+        ExternalHandleType::D3D12Fence => 2,
+        ExternalHandleType::VkSemaphore => 3,
+        ExternalHandleType::SharedMemoryHandle => 4,
+    }
+}
+
+fn vgtk_sync_parts(sync: &OutputSyncToken) -> (u32, u64) {
+    match sync {
+        OutputSyncToken::None => (0, 0),
+        OutputSyncToken::ProducerWaitComplete => (1, 0),
+        OutputSyncToken::FenceValue(value) => (2, *value),
+        OutputSyncToken::SemaphoreHandle(handle) => (3, *handle),
+    }
+}
+
+fn vgtk_color_space_code(c: &OutputColorSpace) -> u32 {
+    match c {
+        OutputColorSpace::Srgb => 0,
+        OutputColorSpace::LinearSrgb => 1,
+    }
+}
+
+fn vgtk_alpha_mode_code(a: &AlphaMode) -> u32 {
+    match a {
+        AlphaMode::Opaque => 0,
+        AlphaMode::Premultiplied => 1,
+        AlphaMode::Straight => 2,
+    }
+}
+
+fn vgtk_flags_for_frame(frame: &OutputFrame) -> u32 {
+    let mut flags = 0u32;
+    if !matches!(frame.alpha_mode, AlphaMode::Opaque) {
+        flags |= VGTK_FLAG_PRESERVE_ALPHA;
+    }
+    if matches!(frame.color_space, OutputColorSpace::LinearSrgb) {
+        flags |= VGTK_FLAG_LINEAR_COLOR_SPACE;
+    }
+    flags
+}
+
+/// Encode a 72-byte VGTK record describing a published GPU texture token.
+/// Shape is identical between `SharedMemoryFileSink` and the Win32
+/// file-backed sinks so a future consumer can read one format regardless of
+/// which producer wrote it. See `docs/output-interop.md` for the field map.
+fn encode_vgtk_record(frame: &OutputFrame, token: &GpuFrameToken) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(VGTK_HEADER_SIZE);
+    let (sync_type, sync_value) = vgtk_sync_parts(&token.sync);
+
+    buf.extend_from_slice(&VGTK_MAGIC); // 0..4
+    buf.extend_from_slice(&VGTK_VERSION.to_le_bytes()); // 4..8
+    buf.extend_from_slice(&frame.extent[0].to_le_bytes()); // 8..12
+    buf.extend_from_slice(&frame.extent[1].to_le_bytes()); // 12..16
+    buf.extend_from_slice(&vgtk_handle_type_code(&token.handle_type).to_le_bytes()); // 16..20
+    buf.extend_from_slice(&sync_type.to_le_bytes()); // 20..24
+    buf.extend_from_slice(&token.external_handle.unwrap_or_default().to_le_bytes()); // 24..32
+    buf.extend_from_slice(&sync_value.to_le_bytes()); // 32..40
+    buf.extend_from_slice(&frame.frame_id.0.to_le_bytes()); // 40..48
+    buf.extend_from_slice(&frame.timestamp.to_le_bytes()); // 48..56
+    buf.extend_from_slice(&vgtk_color_space_code(&frame.color_space).to_le_bytes()); // 56..60
+    buf.extend_from_slice(&vgtk_alpha_mode_code(&frame.alpha_mode).to_le_bytes()); // 60..64
+    buf.extend_from_slice(&vgtk_flags_for_frame(frame).to_le_bytes()); // 64..68
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 68..72 reserved
+
+    debug_assert_eq!(buf.len(), VGTK_HEADER_SIZE);
+    buf
+}
+
 pub struct SharedMemoryFileSink {
     path: PathBuf,
     frame_index: u64,
@@ -582,51 +682,6 @@ impl SharedMemoryFileSink {
         Ok(())
     }
 
-    fn gpu_token_is_publishable(token: &GpuFrameToken) -> bool {
-        token.has_external_handle()
-            && !matches!(token.handle_type, ExternalHandleType::Unavailable)
-    }
-
-    fn handle_type_code(handle_type: &ExternalHandleType) -> u32 {
-        match handle_type {
-            ExternalHandleType::Unavailable => 0,
-            ExternalHandleType::Win32Kmt => 1,
-            ExternalHandleType::D3D12Fence => 2,
-            ExternalHandleType::VkSemaphore => 3,
-            ExternalHandleType::SharedMemoryHandle => 4,
-        }
-    }
-
-    fn sync_parts(sync: &OutputSyncToken) -> (u32, u64) {
-        match sync {
-            OutputSyncToken::None => (0, 0),
-            OutputSyncToken::ProducerWaitComplete => (1, 0),
-            OutputSyncToken::FenceValue(value) => (2, *value),
-            OutputSyncToken::SemaphoreHandle(handle) => (3, *handle),
-        }
-    }
-
-    fn encode_gpu_token_frame(&self, frame: &OutputFrame, token: &GpuFrameToken) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(VGTK_HEADER_SIZE);
-        let (sync_type, sync_value) = Self::sync_parts(&token.sync);
-
-        buf.extend_from_slice(&VGTK_MAGIC);
-        buf.extend_from_slice(&VGTK_VERSION.to_le_bytes());
-        buf.extend_from_slice(&frame.extent[0].to_le_bytes());
-        buf.extend_from_slice(&frame.extent[1].to_le_bytes());
-        buf.extend_from_slice(&frame.frame_id.0.to_le_bytes());
-        buf.extend_from_slice(&frame.timestamp.to_le_bytes());
-        buf.extend_from_slice(&token.resource_id.to_le_bytes());
-        buf.extend_from_slice(&token.lease.lease_id.to_le_bytes());
-        buf.extend_from_slice(&Self::handle_type_code(&token.handle_type).to_le_bytes());
-        buf.extend_from_slice(&sync_type.to_le_bytes());
-        buf.extend_from_slice(&token.external_handle.unwrap_or_default().to_le_bytes());
-        buf.extend_from_slice(&sync_value.to_le_bytes());
-
-        debug_assert_eq!(buf.len(), VGTK_HEADER_SIZE);
-        buf
-    }
-
     fn encode_cpu_frame(&self, frame: &OutputFrame, pixel_data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(VSTX_HEADER_SIZE + pixel_data.len());
         buf.extend_from_slice(&VSTX_MAGIC);
@@ -650,9 +705,9 @@ impl OutputSinkWriter for SharedMemoryFileSink {
         if let Some(token) = frame
             .gpu_token
             .as_ref()
-            .filter(|token| Self::gpu_token_is_publishable(token))
+            .filter(|token| gpu_token_is_publishable(token))
         {
-            let buf = self.encode_gpu_token_frame(frame, token);
+            let buf = encode_vgtk_record(frame, token);
             self.write_atomically(&buf)?;
             self.frame_index += 1;
             return Ok(());
@@ -708,10 +763,14 @@ impl OutputSinkWriter for NullSink {
 
 #[cfg(target_os = "windows")]
 mod win32_shmem {
-    use super::{AlphaMode, OutputColorSpace, OutputFrame, OutputSinkWriter};
+    use super::{
+        encode_vgtk_record, gpu_token_is_publishable, AlphaMode, GpuFrameToken, OutputColorSpace,
+        OutputFrame, OutputSinkWriter,
+    };
     use log::{debug, info};
     use std::ffi::c_void;
     use std::fs::File;
+    use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
@@ -830,24 +889,113 @@ mod win32_shmem {
         mapping_handle: isize,
         view: *mut c_void,
         file_path: PathBuf,
+        /// Sidecar file carrying VGTK records for GPU-token frames. Lives
+        /// next to `file_path` with a `.vgtk` extension swap so the consumer
+        /// can locate it without an out-of-band agreement. Atomic
+        /// tmp-rename keeps the sidecar internally consistent: a torn read
+        /// is impossible because the consumer always opens a file that was
+        /// fully written before its inode was published into the directory.
+        sidecar_path: PathBuf,
         mapped_size: usize,
         sequence: u64,
         logged_first_write: bool,
+        logged_first_sidecar_write: bool,
     }
 
     unsafe impl Send for Win32FileBackedSharedMemorySink {}
 
     impl Win32FileBackedSharedMemorySink {
         pub fn new(file_path: PathBuf) -> Self {
+            let sidecar_path = file_path.with_extension("vgtk");
             Self {
                 file: None,
                 mapping_handle: 0,
                 view: ptr::null_mut(),
                 file_path,
+                sidecar_path,
                 mapped_size: 0,
                 sequence: 0,
                 logged_first_write: false,
+                logged_first_sidecar_write: false,
             }
+        }
+
+        #[cfg(test)]
+        pub fn sidecar_path(&self) -> &Path {
+            &self.sidecar_path
+        }
+
+        fn write_sidecar_atomically(&self, bytes: &[u8]) -> Result<(), String> {
+            if let Some(parent) = self.sidecar_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Win32FileBackedSink: create_dir_all('{}') for sidecar failed: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+            let tmp_path = self.sidecar_path.with_extension("vgtk.tmp");
+            {
+                let mut f = File::create(&tmp_path).map_err(|e| {
+                    format!(
+                        "Win32FileBackedSink: create sidecar tmp '{}' failed: {}",
+                        tmp_path.display(),
+                        e
+                    )
+                })?;
+                f.write_all(bytes).map_err(|e| {
+                    format!(
+                        "Win32FileBackedSink: write sidecar tmp '{}' failed: {}",
+                        tmp_path.display(),
+                        e
+                    )
+                })?;
+                f.flush().map_err(|e| {
+                    format!(
+                        "Win32FileBackedSink: flush sidecar tmp '{}' failed: {}",
+                        tmp_path.display(),
+                        e
+                    )
+                })?;
+            }
+            std::fs::rename(&tmp_path, &self.sidecar_path).map_err(|e| {
+                format!(
+                    "Win32FileBackedSink: rename sidecar '{}' -> '{}' failed: {}",
+                    tmp_path.display(),
+                    self.sidecar_path.display(),
+                    e
+                )
+            })?;
+            Ok(())
+        }
+
+        fn write_gpu_token_sidecar(
+            &mut self,
+            frame: &OutputFrame,
+            token: &GpuFrameToken,
+        ) -> Result<(), String> {
+            let buf = encode_vgtk_record(frame, token);
+            self.write_sidecar_atomically(&buf)?;
+            debug!(
+                "Win32FileBackedSink: wrote VGTK sidecar to '{}' (seq={}, {}x{}, handle={:?})",
+                self.sidecar_path.display(),
+                self.sequence,
+                frame.extent[0],
+                frame.extent[1],
+                token.external_handle,
+            );
+            if !self.logged_first_sidecar_write {
+                info!(
+                    "Win32FileBackedSink: first VGTK sidecar to '{}' (seq={}, {}x{})",
+                    self.sidecar_path.display(),
+                    self.sequence,
+                    frame.extent[0],
+                    frame.extent[1],
+                );
+                self.logged_first_sidecar_write = true;
+            }
+            Ok(())
         }
 
         fn open_file(path: &Path) -> std::io::Result<File> {
@@ -950,6 +1098,25 @@ mod win32_shmem {
 
     impl OutputSinkWriter for Win32FileBackedSharedMemorySink {
         fn write_frame(&mut self, frame: &OutputFrame) -> Result<(), String> {
+            // GPU shared-handle fast path. When the upstream renderer
+            // produced a publishable GPU token, emit the VGTK sidecar and
+            // skip the entire memory-mapped byte-buffer copy. The main
+            // mapping is intentionally left at its previous (stale)
+            // contents — a partial deploy (new producer, old DLL) sees the
+            // old seq counter and reads stale bytes for one or two frames
+            // until the DLL is restarted, rather than failing outright.
+            // The sidecar's atomic tmp-rename + Option A lease policy
+            // guarantee the shared texture is alive while the DLL holds it.
+            if let Some(token) = frame
+                .gpu_token
+                .as_ref()
+                .filter(|token| gpu_token_is_publishable(token))
+            {
+                self.write_gpu_token_sidecar(frame, token)?;
+                self.sequence += 1;
+                return Ok(());
+            }
+
             let pixel_data = match &frame.pixel_data {
                 Some(data) => data,
                 None => return Err("Win32FileBackedSink: frame has no pixel data".into()),
@@ -1021,6 +1188,10 @@ mod win32_shmem {
 
         fn name(&self) -> &str {
             "win32-file-backed-shared-memory"
+        }
+
+        fn supports_gpu_tokens(&self) -> bool {
+            true
         }
     }
 
@@ -1171,5 +1342,94 @@ mod tests {
         assert_eq!(&bytes[0..4], &VSTX_MAGIC);
         assert_eq!(bytes.len(), VSTX_HEADER_SIZE + 4);
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "windows")]
+    mod win32_sink {
+        use super::*;
+        use crate::output::FallbackReason;
+
+        fn small_cpu_frame() -> OutputFrame {
+            OutputFrame {
+                frame_id: OutputFrameId(1),
+                timestamp: 0,
+                extent: [2, 2],
+                color_space: OutputColorSpace::Srgb,
+                alpha_mode: AlphaMode::Premultiplied,
+                gpu_token: None,
+                handoff_path: HandoffPath::CpuReadback,
+                fallback_reason: Some(FallbackReason::RequestedCpuReadback),
+                pixel_data: Some(Arc::new(vec![0u8; 2 * 2 * 4])),
+            }
+        }
+
+        /// A publishable GPU token must produce a `.vgtk` sidecar (atomic
+        /// rename) and leave the main memory-mapped byte buffer untouched.
+        /// Verifies W2 + W4 of the P2-05 phase 2 plan: capability flip plus
+        /// real sidecar write.
+        #[test]
+        fn writes_vgtk_sidecar_for_publishable_gpu_token() {
+            let path = unique_temp_path("win32-sink-gpu");
+            let mut sink = Win32FileBackedSharedMemorySink::new(path.clone());
+
+            assert!(sink.supports_gpu_tokens());
+
+            // Make sure the main file does not exist before the test so the
+            // "untouched" assertion below is meaningful.
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(sink.sidecar_path());
+
+            sink.write_frame(&gpu_frame()).expect("write gpu token");
+
+            let sidecar_bytes = fs::read(sink.sidecar_path()).expect("sidecar exists");
+            assert_eq!(&sidecar_bytes[0..4], &VGTK_MAGIC);
+            assert_eq!(sidecar_bytes.len(), VGTK_HEADER_SIZE);
+
+            // The main mmap-backed file MUST NOT have been created — the
+            // contract is "do not write pixel bytes on the GPU path".
+            assert!(
+                !path.exists(),
+                "Win32 sink wrote main buffer despite publishable GPU token: '{}'",
+                path.display()
+            );
+
+            let _ = fs::remove_file(sink.sidecar_path());
+            let _ = fs::remove_file(&path);
+        }
+
+        /// A CPU-bytes frame must update the main mmap-backed file and
+        /// leave any pre-existing sidecar in place (no stale clobbering,
+        /// no spurious sidecar emit). Verifies W3 parity.
+        #[test]
+        fn cpu_fallback_leaves_sidecar_untouched_and_writes_bytes() {
+            let path = unique_temp_path("win32-sink-cpu");
+            let mut sink = Win32FileBackedSharedMemorySink::new(path.clone());
+
+            // Seed a recognisable sidecar payload to prove the CPU path
+            // does not touch it.
+            let sentinel = b"SIDECAR-SENTINEL".to_vec();
+            if let Some(parent) = sink.sidecar_path().parent() {
+                std::fs::create_dir_all(parent).expect("mkdir sidecar parent");
+            }
+            std::fs::write(sink.sidecar_path(), &sentinel).expect("seed sidecar");
+
+            sink.write_frame(&small_cpu_frame()).expect("write cpu");
+
+            let sidecar_after = fs::read(sink.sidecar_path()).expect("sidecar still present");
+            assert_eq!(
+                sidecar_after, sentinel,
+                "CPU-fallback path must not rewrite the sidecar"
+            );
+
+            // Main mmap file should now exist and carry the expected
+            // header magic at offset 0.
+            let main_bytes = fs::read(&path).expect("main buffer exists");
+            assert!(main_bytes.len() >= 4, "main buffer must have a header");
+            let magic = u32::from_le_bytes(main_bytes[0..4].try_into().unwrap());
+            assert_eq!(magic, 0x5643_4D46, "main buffer header magic mismatch");
+
+            let _ = fs::remove_file(sink.sidecar_path());
+            let _ = fs::remove_file(&path);
+        }
     }
 }

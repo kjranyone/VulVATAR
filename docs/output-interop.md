@@ -30,6 +30,102 @@ the last hop. It writes metadata-only `VGTK` records when a valid
 fallback path. The downstream consumer is still a stub; this is the first
 token-capable sink boundary, not yet the finished live interop path.
 
+P2-05 phase 2 extends this contract to the live `VirtualCamera` and
+`SharedMemory` sinks on Windows. Both sinks are backed by
+`Win32FileBackedSharedMemorySink`, which now emits the same `VGTK` record
+into a sidecar file alongside the existing byte buffer when the renderer
+publishes a valid GPU token, and leaves the byte buffer to the existing
+CPU-fallback path. See [`Win32 GPU-handle sidecar`](#win32-gpu-handle-sidecar).
+
+## Win32 GPU-handle sidecar
+
+`Win32FileBackedSharedMemorySink` (used by `FrameSink::VirtualCamera` and
+`FrameSink::SharedMemory` on Windows) now supports two on-disk shapes that
+the consumer (MF virtual camera DLL) must distinguish:
+
+| Path | File | Contents | When |
+|---|---|---|---|
+| GPU shared handle | `<main>.vgtk` (sidecar) | 72-byte `VGTK` record | renderer published a publishable `GpuFrameToken` |
+| CPU readback | `<main>.bin` (memory-mapped) | existing 32-byte header + RGBA bytes | no token / handle unavailable |
+
+The sidecar path is the main file's path with the extension swapped to
+`.vgtk`. For the two production deployments:
+
+- `%ProgramData%\VulVATAR\camera_frame_buffer.bin` →
+  `%ProgramData%\VulVATAR\camera_frame_buffer.vgtk`
+- `%ProgramData%\VulVATAR\shared_memory_buffer.bin` →
+  `%ProgramData%\VulVATAR\shared_memory_buffer.vgtk`
+
+### VGTK record layout (v1)
+
+```
+offset  size  field
+  0       4   magic "VGTK"
+  4       4   version (u32, currently 1)
+  8       4   width
+ 12       4   height
+ 16       4   handle_type (0 Unavailable, 1 Win32Kmt, 2 D3D12Fence,
+                          3 VkSemaphore, 4 SharedMemoryHandle)
+ 20       4   sync_type   (0 None, 1 ProducerWaitComplete,
+                          2 FenceValue, 3 SemaphoreHandle)
+ 24       8   external_handle (u64)
+ 32       8   sync_value      (u64)
+ 40       8   frame_id
+ 48       8   timestamp_nanos
+ 56       4   color_space (0 srgb, 1 linear)
+ 60       4   alpha_mode  (0 opaque, 1 premultiplied, 2 straight)
+ 64       4   flags       (bit 0: preserve alpha; bit 1: linear colour)
+ 68       4   reserved
+ 72             — end of header
+```
+
+The shape is shared with `SharedMemoryFileSink` so a future consumer
+factoring can read one format regardless of which producer wrote it.
+
+### Atomic publish
+
+Each VGTK sidecar write goes through a `<sidecar>.tmp` file then a
+`std::fs::rename` to publish the new inode atomically. A consumer that
+`OpenSharedResource1`s the handle from a fully-written sidecar will never
+observe a torn record.
+
+### Lease policy (Option A — short-lived)
+
+The renderer's export-image pool reserves a slot for each published GPU
+frame. That slot must not be recycled while the consumer is bound to the
+shared texture; otherwise the renderer would write into the texture the
+consumer is sampling.
+
+`Win32FileBackedSharedMemorySink` cooperates with `OutputRouter` to enforce
+the following lifetime:
+
+1. renderer publishes frame N with `FrameLifetimeContract::SingleConsumerRetained`
+2. router writes the VGTK sidecar via the worker; does NOT release the
+   lease yet
+3. router records frame N's lease id as the "currently bound" lease
+4. on the next successful publish (frame N+1), router sends frame N's
+   lease completion before recording frame N+1 as the new bound lease
+5. on shutdown, router flushes the bound lease so the slot is reclaimed
+
+This Option A protocol assumes the consumer reads the latest published
+sidecar within one producer frame interval. A consumer that is slower than
+the producer sees the second-latest GPU frame for one tick — the same
+behaviour as the existing byte-buffer's `seq_in_progress` /
+`seq_committed` window provides on the CPU path. Adopting the
+back-channelled "Option B / C" protocol becomes possible once the DLL
+gains a producer-readable acknowledgement field.
+
+### Partial-deploy safety
+
+A new producer paired with an old DLL keeps working: the DLL keeps reading
+the byte buffer's stale contents, which the producer no longer overwrites
+during GPU frames. The DLL sees the same RGBA pixels indefinitely until
+the producer falls back to the CPU path (handle export failure / GPU
+contention) or the user restarts the DLL.
+
+An old producer paired with a new DLL also works: the sidecar simply does
+not exist, and the DLL reads the byte buffer as before.
+
 ## Sink Abstraction
 
 Recommended sink families:

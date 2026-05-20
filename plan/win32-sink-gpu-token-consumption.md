@@ -35,10 +35,16 @@ for the dual-sink case (preview + virtual camera).
 
 - [x] Capability-based routing (P2-05 phase 1)
 - [x] `SharedTextureFileStub` consumes GPU tokens via VGTK records
-- [ ] Win32 sink GPU-token sidecar format
+- [x] Win32 sink GPU-token sidecar format (`<main>.vgtk` next to
+      `<main>.bin`, atomic tmp+rename publish)
+- [x] CPU-fallback parity test (token unpublishable → bytes path,
+      sidecar untouched)
+- [x] Lease lifetime upgraded to `SingleConsumerRetained`; Option A
+      next-publish-release wired into `OutputRouter::publish`
 - [ ] MF DLL update to open shared D3D textures by exported handle
+      (out-of-tree, blocked on W8)
 - [ ] Negotiation: producer-side fence vs DLL-side fence wait
-- [ ] CPU-fallback parity test (token unpublishable → bytes path)
+      (deferred; landing back-channelled sync is part of a later slice)
 
 Hardware verification (NVIDIA / AMD / Intel Arc) is **out of scope for
 this plan** — that lands in a separate vendor-diff verification pass.
@@ -129,25 +135,41 @@ Out:
 
 ## Tasks
 
-- [ ] **W1** define the sidecar format (locked in this doc; finalise after
-      one round of review)
-- [ ] **W2** implement `encode_gpu_token_sidecar` in
+- [x] **W1** define the sidecar format (locked in this doc; documented
+      in `docs/output-interop.md` "Win32 GPU-handle sidecar" section)
+- [x] **W2** implement `encode_gpu_token_sidecar` in
       `Win32FileBackedSharedMemorySink`; write atomically to the sidecar
       path on a publishable token
-- [ ] **W3** when the token is not publishable, leave the sidecar
+- [x] **W3** when the token is not publishable, leave the sidecar
       untouched and write the existing RGBA bytes (parity)
-- [ ] **W4** flip `FrameSink::supports_gpu_tokens()` for `VirtualCamera`
-      and `SharedMemory` to `true` (and update
-      `frame_sink_capability_matches_writer`)
-- [ ] **W5** unit test: token frame → sidecar exists, main buffer is
+- [x] **W4** flip `FrameSink::supports_gpu_tokens()` for `VirtualCamera`
+      and `SharedMemory` to `true` (Windows-gated;
+      `frame_sink_capability_matches_writer` covers the agreement)
+- [x] **W5** unit test: token frame → sidecar exists, main buffer is
       stale-but-untouched
-- [ ] **W6** unit test: CPU-fallback frame → sidecar is *not* updated
-      (or carries a sentinel "no GPU frame this tick"), main buffer
-      receives bytes
-- [ ] **W7** document the sidecar protocol in `docs/output-interop.md`
+- [x] **W6** unit test: CPU-fallback frame → sidecar is *not* updated,
+      main buffer receives bytes
+- [x] **W7** document the sidecar protocol in `docs/output-interop.md`
 - [ ] **W8** MF DLL changes (out-of-tree) — open sidecar, parse VGTK,
       `OpenSharedResource1`, keyed-mutex acquire/release, fall back to
       main buffer if sidecar is absent
+
+## Resolved IPC decision (lease ack)
+
+Option A (short-lived, next-publish-release) selected. `OutputRouter`
+holds the most recent `SingleConsumerRetained` lease as
+`pending_retained_lease` and releases it the moment the next frame
+crosses the `try_send` boundary. No back-channel from the DLL is
+required for the first slice; the protocol assumes the consumer reads
+the latest published sidecar within one producer frame interval.
+
+Implications:
+- export pool capacity stays at 2 (current + previous = 2 leased slots
+  worst case, matching `DEFAULT_EXPORT_IMAGE_POOL_CAPACITY`)
+- a stalled consumer sees the second-latest GPU frame for one extra
+  tick (same window as the byte-buffer's seq tearing-protection)
+- shutdown flushes the bound lease so the slot is reclaimed before the
+  router drops
 
 ## Risks
 
