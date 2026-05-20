@@ -386,6 +386,22 @@ architecture.
 - broad renderer module cleanup unrelated to output handoff
 - more tuning of the default CPU readback path beyond correctness/fallback
 
+## Per-task plans
+
+Each open workstream below has its own plan document:
+
+- P2-05 phase 2 (live Win32 sink GPU token consumption) →
+  [`win32-sink-gpu-token-consumption.md`](./win32-sink-gpu-token-consumption.md)
+- Composed output sink coverage →
+  [`output-sink-integration-tests.md`](./output-sink-integration-tests.md)
+- P3-02 (cloth solver to compute) →
+  [`gpu-cloth-solver-compute-migration.md`](./gpu-cloth-solver-compute-migration.md)
+- P3-03 (runtime GPU budget) →
+  [`runtime-gpu-budget.md`](./runtime-gpu-budget.md)
+
+Per-task plans are the source of truth for scope, tasks, and done-when.
+This roadmap stays the high-level critical path.
+
 ## Related files
 
 - `docs/gpu-runtime-roadmap.md`
