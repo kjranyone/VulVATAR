@@ -2,12 +2,13 @@
 //! Windows) the MediaFoundation virtual camera in line with the
 //! requested sink.
 
+#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 use log::info;
 #[cfg(all(target_os = "windows", feature = "virtual-camera"))]
 use log::warn;
 
 use super::Application;
-use crate::output::{FrameSink, OutputRouter};
+use crate::output::FrameSink;
 
 impl Application {
     /// Bring the OutputRouter and (on Windows) the MF virtual camera in line
@@ -51,15 +52,7 @@ impl Application {
             }
         }
 
-        if self.output.active_sink() != &sink {
-            info!(
-                "output: swapping sink {:?} -> {:?}",
-                self.output.active_sink(),
-                sink
-            );
-            self.output.shutdown();
-            self.output = OutputRouter::new(sink.clone());
-        }
+        self.output.set_sink(sink);
 
         Ok(())
     }

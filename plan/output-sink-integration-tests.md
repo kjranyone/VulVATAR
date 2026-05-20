@@ -40,15 +40,15 @@ test catching them.
 - [x] `frame_sink_capability_matches_writer` (enum/writer agreement)
 - [x] `diagnostics_handoff_path_follows_published_frames` (router-level)
 - [x] `shared_texture_bridge_writes_gpu_token_without_cpu_pixels` (sink-level)
-- [ ] composed test: `RenderExportMode::GpuExport` →
+- [x] composed test: `RenderExportMode::GpuExport` →
       `ExportedFrame::GpuFrameToken` → `OutputRouter::publish` → file is
       `VGTK` shape (no `pixel_data` written)
-- [ ] composed test: `RenderExportMode::CpuReadback` →
+- [x] composed test: `RenderExportMode::CpuReadback` →
       `ExportedFrame::CpuReadback` → `OutputRouter::publish` → file is
-      `VSTX` or Win32 file-backed shape (no GPU token written)
-- [ ] regression test: changing `Application.requested_sink` between the
-      two cases without restarting the router routes subsequent frames to
-      the new path within N frames
+      `frame_000000.png` (ImageSequence path)
+- [x] regression test: changing the active sink at runtime via
+      `OutputRouter::set_writer` routes subsequent frames to the new
+      sink's artefact (and *not* the old one)
 
 ## Architecture target
 
@@ -84,20 +84,26 @@ Out:
 
 ## Tasks
 
-- [ ] **T1** wire a unique temp dir per test (the `Win32FileBackedSharedMemorySink`
-      defaults to `%ProgramData%\VulVATAR\` which is shared — needs a path
-      injection seam to be testable in CI)
-- [ ] **T2** `e2e_gpu_token_round_trip`: construct an `ExportedFrame` with
-      a `GpuFrameToken`, build an `OutputRouter::new(FrameSink::SharedTextureFileStub)`,
-      publish, wait for worker, read file, assert `VGTK` magic and header size
-- [ ] **T3** `e2e_cpu_readback_round_trip`: same setup with
-      `FrameSink::ImageSequence` and a `CpuReadback` frame; assert
-      `frame_000000.png` exists with expected dimensions
-- [ ] **T4** `e2e_sink_swap_routes_within_n_frames`: start with one sink,
-      publish, hot-swap via `OutputRouter::set_sink` (add the method if it
-      does not exist yet), publish again, assert the new sink's artefact
-- [ ] **T5** add the helper `OutputRouter::wait_until_worker_drains` (or
-      similar) gated on `#[cfg(test)]` to avoid sleeping with arbitrary
+- [x] **T1** path injection seam: `OutputRouter::with_writer(sink, writer)`
+      lets tests construct a writer (`ImageSequenceSink::new(temp_dir)`,
+      `SharedMemoryFileSink::with_path(temp_path)`) with a unique temp
+      path per test; `SharedMemoryFileSink::with_path` made pub
+- [x] **T2** `e2e_gpu_token_round_trip` — publish a publishable
+      `GpuFrameToken` via `OutputRouter::with_writer(SharedTextureFileStub,
+      SharedMemoryFileSink::with_path(...))`; verify VGTK magic and
+      72-byte header land on disk
+- [x] **T3** `e2e_cpu_readback_round_trip` — publish an `OutputFrame`
+      with `pixel_data` via `ImageSequence`; verify `frame_000000.png`
+      lands at the configured path with the PNG signature
+- [x] **T4** `e2e_sink_swap_routes_to_new_writer_within_one_frame` —
+      start with `ImageSequence`, publish, hot-swap via
+      `OutputRouter::set_writer`, publish, assert the second sink's
+      artefact appears AND a subsequent file is NOT written under the
+      first sink's directory
+- [x] **T5** `OutputRouter::wait_until_worker_drains(timeout)` (cfg test)
+      — sends a `WorkerMessage::Sync(ack)` sentinel through the
+      sync_channel(1); when the ack arrives, every prior `Frame` has
+      already been written, so the test never sleeps on arbitrary
       timeouts
 
 ## Done when

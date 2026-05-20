@@ -658,8 +658,11 @@ impl SharedMemoryFileSink {
         }
     }
 
-    #[cfg(test)]
-    fn with_path(path: PathBuf) -> Self {
+    /// Construct a sink writing to an explicit path instead of the
+    /// platform's default `std::env::temp_dir()` location. Exposed for
+    /// tests (per-test temp paths avoid collisions on concurrent runs)
+    /// and any future caller wanting deterministic sidecar placement.
+    pub fn with_path(path: PathBuf) -> Self {
         Self {
             path,
             frame_index: 0,
