@@ -37,12 +37,21 @@ policy in place *before* that contention lands.
 
 ## Status
 
-- [ ] `RuntimeGpuBudget` struct + module
-- [ ] Live-measurement intake (render dt, provider dt, output pressure,
-      pool occupancy)
-- [ ] Degraded-mode definitions
-- [ ] First production consumer (one of: render FPS clamp, YOLOX skip,
-      FaceMesh EP downgrade)
+- [x] `RuntimeGpuBudget` struct + module (`src/app/runtime_gpu_budget.rs`)
+- [x] Live-measurement intake (render dt EMA, output drops/sec window,
+      export pool leased/capacity). Provider dt + GPU export failure
+      window are stubs in `RuntimeMeasurements` — the budget reads
+      them, the producer needs more plumbing (deferred)
+- [x] Degraded-mode definitions (4 levels) with hysteresis (5 s dwell
+      Light→Heavy, 30 s recovery dwell per step)
+- [x] First production consumer: render FPS clamp via
+      `Application::set_user_render_fps` → `budget.render_fps_target()`
+      → `OutputRouter::set_target_fps`
+- [ ] YOLOX skip period consumer (B4): the budget value is computed
+      and surfaced in the inspector, but `Rtmw3dInference` still reads
+      `YOLOX_REFRESH_PERIOD` const. Cross-thread plumbing needed
+      (Application → TrackingSource → PoseProvider → Rtmw3dInference)
+      and is deferred to a follow-up slice
 
 ## Architecture target
 
@@ -128,20 +137,25 @@ Out:
 
 ## Tasks
 
-- [ ] **B1** define `RuntimeGpuBudget` + `DegradedMode` in the new module
-- [ ] **B2** add a per-frame measurement intake on `Application`
-      (`update_runtime_gpu_budget(...)`) called from `run_frame`
-- [ ] **B3** migrate `OutputRouter::set_target_fps` to read the budget
-      (still settable from GUI, but the budget clamps it)
-- [ ] **B4** migrate YOLOX skip period (`tracking/yolox.rs`) to read the
-      budget
-- [ ] **B5** surface budget state in the output diagnostics panel
-      (`src/gui/inspector/output.rs`) so the user can see why cadence
-      changed without a debugger
-- [ ] **B6** unit test the degraded-mode transitions on a synthetic
-      measurement stream
-- [ ] **B7** document the inputs / thresholds in
-      `docs/gpu-runtime-roadmap.md` once they stabilize
+- [x] **B1** define `RuntimeGpuBudget` + `DegradedMode` in
+      `src/app/runtime_gpu_budget.rs`
+- [x] **B2** per-frame measurement intake on `Application`
+      (`update_runtime_gpu_budget(now)`) called from `run_frame`
+- [x] **B3** GUI calls `Application::set_user_render_fps`; the budget
+      stores user intent and `OutputRouter::set_target_fps` reads the
+      (possibly-clamped) `budget.render_fps_target()` each frame
+- [ ] **B4** migrate YOLOX skip period (`tracking/yolox.rs`) — value
+      is computed and shown in inspector; consumer wiring deferred
+      (needs `Arc<AtomicU64>` plumbed Application → TrackingSource →
+      PoseProvider → Rtmw3dInference)
+- [x] **B5** budget state surfaced in
+      `src/gui/inspector/output.rs::draw_output` under "Runtime GPU
+      Budget" collapsing header: degraded mode, render target
+      (user→clamped), YOLOX skip period, last transition reason
+- [x] **B6** unit tests cover all four transitions and recovery
+      (9 tests in `runtime_gpu_budget::tests`)
+- [ ] **B7** docs update — deferred until thresholds tune against
+      live data
 
 ## Risks
 

@@ -197,4 +197,37 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 count = diagnostics.dropped_frame_count
             ));
         });
+
+    egui::CollapsingHeader::new(t!("inspector.runtime_budget"))
+        .default_open(false)
+        .show(ui, |ui| {
+            let budget = &state.app.runtime_gpu_budget;
+            use crate::app::runtime_gpu_budget::DegradedMode;
+            let mode_color = match budget.degraded_mode() {
+                DegradedMode::Healthy => egui::Color32::GREEN,
+                DegradedMode::PressureLight => egui::Color32::from_rgb(220, 200, 80),
+                DegradedMode::PressureHeavy => egui::Color32::from_rgb(220, 130, 60),
+                DegradedMode::EmergencyCpu => egui::Color32::from_rgb(220, 80, 80),
+            };
+            ui.label(
+                egui::RichText::new(t!(
+                    "inspector.runtime_budget_mode",
+                    mode = budget.degraded_mode().label().to_string()
+                ))
+                .color(mode_color),
+            );
+            ui.label(t!(
+                "inspector.runtime_budget_render_fps",
+                target = budget.render_fps_target(),
+                user = budget.user_render_fps(),
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_yolox_skip",
+                period = budget.yolox_skip_period()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_reason",
+                reason = budget.last_transition_reason().label().to_string()
+            ));
+        });
 }

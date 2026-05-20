@@ -1140,10 +1140,12 @@ impl eframe::App for GuiApp {
         ));
 
         // Phase B-3: throttle the output cadence to the user's selection.
-        // Idempotent (just sets a Duration), so no need for change-detect.
+        // P3-03: routes through `RuntimeGpuBudget` so the user's intent is
+        // stored as `user_render_fps` and the *effective* target may be
+        // clamped below it under pressure. Idempotent so calling each
+        // GUI update is cheap.
         self.app
-            .output
-            .set_target_fps(output_fps_for_index(self.output.output_framerate_index));
+            .set_user_render_fps(output_fps_for_index(self.output.output_framerate_index));
 
         // Phase B-4: forward the alpha preference. Read each frame in
         // process_render_result to tag OutputFrame.alpha_mode.

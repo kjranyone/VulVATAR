@@ -35,6 +35,9 @@ impl Application {
         let frame_dt = config.frame_dt;
         let material_mode_index = config.material_mode_index;
 
+        self.update_render_dt_ema(frame_dt);
+        self.update_runtime_gpu_budget(std::time::Instant::now());
+
         // 1. input update
         self.input_update(frame_dt);
 
@@ -177,6 +180,69 @@ impl Application {
         // the user pauses or removes the last avatar with a frame still
         // in flight, and the GUI repaint gate would loop forever.
         self.drain_render_results();
+    }
+
+    fn update_render_dt_ema(&mut self, frame_dt: f32) {
+        if frame_dt <= 0.0 || !frame_dt.is_finite() {
+            return;
+        }
+        // 5-frame EMA: enough smoothing to ignore one-off hitches without
+        // letting a permanent regression hide for too long.
+        let alpha = 1.0 / 5.0;
+        let new_dt = std::time::Duration::from_secs_f32(frame_dt);
+        let old_secs = self.render_dt_ema.as_secs_f32();
+        let blended = old_secs * (1.0 - alpha) + new_dt.as_secs_f32() * alpha;
+        self.render_dt_ema = std::time::Duration::from_secs_f32(blended.max(1e-6));
+    }
+
+    /// Per-frame runtime measurement intake. Reads the latest render dt,
+    /// output drops/sec, and export pool occupancy; pushes them through
+    /// the budget; then propagates the (possibly-clamped) render target
+    /// back to `OutputRouter::set_target_fps` so the throttling gate
+    /// honours the budget without any other party knowing about it.
+    pub fn update_runtime_gpu_budget(&mut self, now: std::time::Instant) {
+        let user_fps = self.runtime_gpu_budget.user_render_fps().max(1) as f32;
+        let render_target = std::time::Duration::from_secs_f32(1.0 / user_fps);
+
+        let elapsed = now
+            .saturating_duration_since(self.last_output_drop_sample)
+            .as_secs_f32();
+        let current_drops = self.output.dropped_count();
+        let drops_per_sec = if elapsed >= 0.5 {
+            let delta = current_drops.saturating_sub(self.last_output_drop_count) as f32;
+            self.last_output_drop_count = current_drops;
+            self.last_output_drop_sample = now;
+            (delta / elapsed).max(0.0)
+        } else {
+            0.0
+        };
+
+        let diagnostics = self.output.diagnostics();
+        let (export_pool_leased, export_pool_capacity) = diagnostics
+            .export_pool
+            .map(|p| (p.leased_slots, p.capacity))
+            .unwrap_or((0, 0));
+
+        let measurements = crate::app::runtime_gpu_budget::RuntimeMeasurements {
+            render_dt: self.render_dt_ema,
+            render_target,
+            output_drops_per_sec: drops_per_sec,
+            export_pool_leased,
+            export_pool_capacity,
+            // GPU export failure tracking is plumbed but not yet wired —
+            // `OutputDiagnostics` reports `fallback_active` after a token
+            // export miss, but the budget needs a *recent* count, not a
+            // single-bit flag. Left at 0 until a small failure-window
+            // counter lands; the budget then only escalates to
+            // `EmergencyCpu` once that counter is populated.
+            gpu_export_failures_recent: 0,
+        };
+        self.runtime_gpu_budget.update(&measurements, now);
+
+        // Forward the clamped target. `OutputRouter::set_target_fps` is
+        // idempotent so calling it every frame is cheap.
+        self.output
+            .set_target_fps(self.runtime_gpu_budget.render_fps_target());
     }
 
     /// Drain every result currently sitting in the render thread's
