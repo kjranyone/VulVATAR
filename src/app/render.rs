@@ -139,6 +139,11 @@ impl Application {
 
         if !self.avatars.is_empty() {
             let output_extent = self.output_extent.unwrap_or(self.viewport_extent);
+            let export_mode = if self.output.active_sink().supports_gpu_tokens() {
+                RenderExportMode::GpuExport
+            } else {
+                RenderExportMode::CpuReadback
+            };
             let fi_config = FrameInputConfig {
                 camera: self.viewport_camera.clone(),
                 lighting: self.viewport_lighting.clone(),
@@ -147,6 +152,7 @@ impl Application {
                 background_color: self.background_color,
                 transparent_background: self.transparent_background,
                 output_color_space: self.output_color_space.clone(),
+                export_mode,
             };
             let frame_input = Self::build_frame_input_multi(
                 &self.avatars,
@@ -484,38 +490,19 @@ impl Application {
                     })
                     .collect();
 
-                // Collect one snapshot per cloth source that has been
-                // pinned to a render target. The current pre-compute-prepass
-                // policy was "at most one cloth per instance" (cloth_state
-                // first, else the first enabled overlay); preserve that
-                // upper bound for now via `.take(1)`. The Vec shape is
-                // future-ready for multi-cloth instances once the CPU
-                // solver budget allows it.
-                let cloth_deforms: Vec<ClothDeformSnapshot> = avatar
-                    .cloth_state
-                    .as_ref()
-                    .into_iter()
-                    .chain(
-                        avatar
-                            .cloth_overlays
-                            .iter()
-                            .filter(|s| s.enabled)
-                            .map(|s| &s.state),
-                    )
-                    .filter_map(|cs| {
-                        let target_primitive_id = cs.target_primitive_id?;
-                        Some(ClothDeformSnapshot {
-                            target_primitive_id,
-                            target_mesh_id: cs.target_mesh_id,
-                            vertex_offset: cs.target_vertex_offset,
-                            vertex_count: cs.target_vertex_count,
-                            deformed_positions: cs.deform_output.deformed_positions.clone(),
-                            deformed_normals: cs.deform_output.deformed_normals.clone(),
-                            version: cs.deform_output.version,
-                        })
-                    })
-                    .take(1)
-                    .collect();
+                let cloth_deforms = collect_cloth_deforms(
+                    avatar
+                        .cloth_state
+                        .as_ref()
+                        .into_iter()
+                        .chain(
+                            avatar
+                                .cloth_overlays
+                                .iter()
+                                .filter(|s| s.enabled)
+                                .map(|s| &s.state),
+                        ),
+                );
 
                 RenderAvatarInstance {
                     instance_id: avatar.id,
@@ -557,7 +544,7 @@ impl Application {
                 extent: output_extent,
                 color_space: fi_config.output_color_space.clone(),
                 alpha_mode: RenderOutputAlpha::Premultiplied,
-                export_mode: RenderExportMode::CpuReadback,
+                export_mode: fi_config.export_mode.clone(),
             },
             background_image_path: background_image_path.map(|p| p.to_path_buf()),
             show_ground_grid,
@@ -600,5 +587,115 @@ impl Application {
             // frame and spammed info logs at 60 fps.)
             None
         }
+    }
+}
+
+/// Collect per-primitive cloth snapshots from an iterator of `ClothState`s.
+///
+/// Cloth is scoped per primitive (`target_primitive_id`), so multiple cloths
+/// can coexist on one avatar as long as they target distinct primitives. When
+/// two sources target the same primitive, the first wins — the call site
+/// iterates `avatar.cloth_state` before `cloth_overlays`, so the authoritative
+/// cloth takes precedence over any overlay variant of the same garment.
+fn collect_cloth_deforms<'a>(
+    sources: impl IntoIterator<Item = &'a crate::avatar::instance::ClothState>,
+) -> Vec<ClothDeformSnapshot> {
+    let mut seen_targets: std::collections::HashSet<crate::asset::PrimitiveId> =
+        std::collections::HashSet::new();
+    sources
+        .into_iter()
+        .filter_map(|cs| {
+            let target_primitive_id = cs.target_primitive_id?;
+            if !seen_targets.insert(target_primitive_id) {
+                return None;
+            }
+            Some(ClothDeformSnapshot {
+                target_primitive_id,
+                target_mesh_id: cs.target_mesh_id,
+                vertex_offset: cs.target_vertex_offset,
+                vertex_count: cs.target_vertex_count,
+                deformed_positions: cs.deform_output.deformed_positions.clone(),
+                deformed_normals: cs.deform_output.deformed_normals.clone(),
+                version: cs.deform_output.version,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cloth_collection_tests {
+    use super::*;
+    use crate::asset::{ClothOverlayId, MeshId, PrimitiveId};
+    use crate::avatar::instance::{
+        ClothCollisionRuntimeCache, ClothConstraintRuntimeCache, ClothDeformOutput, ClothState,
+    };
+
+    fn make_cloth_state(
+        overlay_id: u64,
+        target_primitive_id: Option<PrimitiveId>,
+        vertex_count: u32,
+        version: u64,
+    ) -> ClothState {
+        ClothState {
+            overlay_id: ClothOverlayId(overlay_id),
+            enabled: true,
+            sim_positions: vec![],
+            prev_sim_positions: vec![],
+            sim_normals: vec![],
+            constraint_cache: ClothConstraintRuntimeCache {
+                active_constraint_count: 0,
+            },
+            collision_cache: ClothCollisionRuntimeCache {
+                active_collision_count: 0,
+            },
+            deform_output: ClothDeformOutput {
+                deformed_positions: vec![[0.0, 0.0, 0.0]; vertex_count as usize],
+                deformed_normals: None,
+                version,
+            },
+            target_primitive_id,
+            target_mesh_id: target_primitive_id.map(|p| MeshId(p.0)),
+            target_vertex_offset: 0,
+            target_vertex_count: vertex_count,
+        }
+    }
+
+    #[test]
+    fn multi_cloth_targeting_distinct_primitives_all_survive() {
+        let body = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
+        let skirt = make_cloth_state(2, Some(PrimitiveId(20)), 64, 1);
+        let scarf = make_cloth_state(3, Some(PrimitiveId(30)), 16, 1);
+
+        let result = collect_cloth_deforms([&body, &skirt, &scarf]);
+
+        assert_eq!(result.len(), 3, "all three distinct-target cloths must be kept");
+        let target_ids: Vec<u64> =
+            result.iter().map(|c| c.target_primitive_id.0).collect();
+        assert_eq!(target_ids, vec![10, 20, 30]);
+        let vertex_counts: Vec<u32> = result.iter().map(|c| c.vertex_count).collect();
+        assert_eq!(vertex_counts, vec![32, 64, 16]);
+    }
+
+    #[test]
+    fn duplicate_target_dedups_with_first_wins() {
+        let authoritative = make_cloth_state(1, Some(PrimitiveId(10)), 32, 5);
+        let overlay_duplicate = make_cloth_state(2, Some(PrimitiveId(10)), 64, 99);
+
+        let result = collect_cloth_deforms([&authoritative, &overlay_duplicate]);
+
+        assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
+        assert_eq!(result[0].version, 5, "first (authoritative) cloth wins");
+        assert_eq!(result[0].vertex_count, 32);
+    }
+
+    #[test]
+    fn unbound_cloth_without_target_primitive_is_skipped() {
+        let bound = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
+        let unbound = make_cloth_state(2, None, 64, 1);
+
+        let result = collect_cloth_deforms([&bound, &unbound]);
+
+        assert_eq!(result.len(), 1, "cloth with no render target is dropped");
+        assert_eq!(result[0].target_primitive_id.0, 10);
     }
 }

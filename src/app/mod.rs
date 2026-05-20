@@ -52,6 +52,13 @@ pub struct FrameInputConfig {
     /// to `OutputTargetRequest.color_space` and metadata; render target
     /// format / shader gamma changes land in later stages.
     pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
+    /// P2-05: how the renderer should export the frame for the active sink.
+    /// Populated each tick from `OutputRouter::active_sink().supports_gpu_tokens()`
+    /// — sinks that consume `GpuFrameToken` get `GpuExport`, the file-backed
+    /// Win32 sinks stay on `CpuReadback` so the existing MF DLL consumer
+    /// keeps receiving raw RGBA bytes. Decoupled from any GUI setting so a
+    /// sink swap is the single source of truth for the export path.
+    pub export_mode: crate::renderer::frame_input::RenderExportMode,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.

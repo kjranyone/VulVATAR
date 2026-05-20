@@ -43,6 +43,16 @@ impl FrameSink {
             _ => FrameSink::ImageSequence,
         }
     }
+
+    /// Whether the concrete writer produced by [`create_sink_writer`] for
+    /// this variant accepts `OutputFrame::gpu_token` directly. The caller
+    /// (`Application`) uses this to pick `RenderExportMode::GpuExport` vs
+    /// `CpuReadback` without having to construct a writer just to ask. Must
+    /// agree with the writer trait's `supports_gpu_tokens()` for the same
+    /// variant — covered by `frame_sink_capability_matches_writer` below.
+    pub fn supports_gpu_tokens(&self) -> bool {
+        matches!(self, FrameSink::SharedTextureFileStub)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1120,6 +1130,31 @@ mod tests {
         assert_eq!(bytes.len(), VGTK_HEADER_SIZE);
         assert!(sink.supports_gpu_tokens());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn frame_sink_capability_matches_writer() {
+        // `Application` relies on `FrameSink::supports_gpu_tokens` to avoid
+        // building a writer just to query GPU-token support. Drift between
+        // the enum-level answer and the actual writer would silently route
+        // GPU-token frames to a CPU-only sink and leave it returning
+        // "frame has no pixel data" every tick.
+        for sink in [
+            FrameSink::VirtualCamera,
+            FrameSink::SharedTextureFileStub,
+            FrameSink::SharedMemory,
+            FrameSink::ImageSequence,
+        ] {
+            let writer = create_sink_writer(&sink);
+            assert_eq!(
+                sink.supports_gpu_tokens(),
+                writer.supports_gpu_tokens(),
+                "{:?}: enum says {} but writer says {}",
+                sink,
+                sink.supports_gpu_tokens(),
+                writer.supports_gpu_tokens(),
+            );
+        }
     }
 
     #[test]
