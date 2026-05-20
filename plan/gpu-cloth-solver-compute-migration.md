@@ -37,11 +37,21 @@ self-collision become viable when the cost is GPU-side.
 - [x] Render-consumable boundary type
       ([`ClothRenderConsumableDeform`](../src/simulation/cloth_gpu_boundary.rs))
       and placeholder [`ClothGpuSimulationState`] — landed in P3-01
-- [ ] Compute pipelines for the three solver stages
-- [ ] CPU → compact-control SSBO upload path
-- [ ] CPU PBD path retained behind `ClothSolverBackend::Cpu` for fallback /
-      diagnostics
-- [ ] Runtime switch consulting `RuntimeGpuBudget` (see [`runtime-gpu-budget.md`])
+- [x] **S0 — particle state representation locked: Verlet (pos +
+      prev_pos)**. Documented in `cloth_gpu_boundary.rs` alongside the
+      lifecycle and SSBO slot layout the compute landing will use
+- [x] `ClothGpuSimulationState` fleshed out with counts +
+      `iterations` + `version`; `from_authoring` constructor in place
+- [x] `ClothSolverBackend::{Cpu, Gpu}` with `Default = Cpu`; intent
+      switch available at attach time even though the renderer still
+      runs the CPU snapshot path for both variants
+- [ ] Compute pipelines for the three solver stages (S1.2, S2.1, S3.1)
+- [ ] CPU → compact-control SSBO upload path (S1.1 Vulkan side)
+- [ ] Direct-draw consumption suppressing the per-primitive
+      `cloth_pos_ssbo.write` calls (S4)
+- [ ] Runtime switch consulting `RuntimeGpuBudget`
+      (see [`runtime-gpu-budget.md`]; depends on B4 cross-thread
+      plumbing landing first)
 
 ## Architecture target
 
@@ -133,26 +143,52 @@ Out:
 
 ## Tasks
 
-- [ ] **S0** decide particle state representation: Verlet (pos + prev_pos)
-      vs explicit velocity. Document the choice in a comment in
-      `cloth_gpu_boundary.rs`
-- [ ] **S1.1** add `ClothGpuSimulationState` SSBO fields (particles,
-      constraints, colliders, normals, control UBO)
-- [ ] **S1.2** implement particle-integration compute shader; CPU writes
-      control UBO each frame
-- [ ] **S1.3** unit test on a 4-particle synthetic cloth: gravity over N
-      frames matches CPU reference within tolerance
-- [ ] **S2.1** implement constraint-projection compute; upload constraint
-      table once at attach time
-- [ ] **S2.2** integration test: hang a 32-particle sheet, compare
-      steady-state height vs CPU reference
-- [ ] **S3.1** implement normal recomputation compute
-- [ ] **S3.2** snapshot test: rendered cloth visually matches CPU path
-      (within tolerance) under no wind
-- [ ] **S4** suppress the CPU snapshot write for `ClothSolverBackend::Gpu`
-      cloths in `renderer::mod.rs`; flip `has_cloth` based on GPU version
-- [ ] **S5** wire `ClothSolverBackend` selection into the cloth attach
-      path (default `Cpu` until `RuntimeGpuBudget` decides otherwise)
+- [x] **S0** Verlet (pos + prev_pos) chosen; rationale in
+      `cloth_gpu_boundary.rs` (mirrors CPU PBD so its reference tests
+      double as compute-side smoke values, halves per-particle SSBO
+      writes during constraint iteration)
+- [x] **S1.1 (CPU side)** `ClothGpuSimulationState` fleshed out with
+      `particle_count`, `constraint_count`, `iterations`, `version`,
+      `from_authoring` constructor, `bump_version` helper. SSBO slot
+      shape documented in module rustdoc
+- [ ] **S1.1 (Vulkan side)** allocate per-primitive SSBOs sized by
+      `ClothGpuSimulationState.particle_count` /
+      `constraint_count` at cloth-attach time
+- [ ] **S1.2** GLSL compute shader for Verlet integration; Vulkano
+      pipeline; CPU writes control UBO each frame
+- [ ] **S1.3** unit test: 4-particle synthetic cloth under gravity
+      matches CPU reference (`verlet_gravity_pulls_down`) within
+      `1e-3` over 60 frames
+- [ ] **S2.1** GLSL compute shader for PBD constraint projection;
+      constraint table uploaded once at attach time
+- [ ] **S2.2** integration test: 32-particle sheet drape matches CPU
+      reference within tolerance
+- [ ] **S3.1** GLSL compute shader for vertex normal recomputation
+      (face-normal accumulate + per-vertex normalise)
+- [ ] **S3.2** rendered-cloth snapshot diff vs CPU path
+- [ ] **S4** suppress the CPU snapshot write for
+      `ClothSolverBackend::Gpu` cloths in `renderer::mod.rs`; flip
+      `has_cloth = 1` based on `ClothGpuSimulationState.version`
+- [x] **S5 (scaffolding)** `ClothSolverBackend::{Cpu, Gpu}` available
+      at the avatar attach boundary with `Default = Cpu`. Production
+      attach paths still default to `Cpu` (no `Gpu` consumer until
+      `RuntimeGpuBudget` B4 ships and the compute pipelines land)
+
+## What this slice ships
+
+A structural scaffold for the migration: the boundary types are
+production-shaped, the backend enum is selectable, the particle state
+representation is decided, and the SSBO slot layout is documented. The
+actual compute shaders, Vulkano pipelines, and round-trip parity tests
+are deferred to follow-up slices.
+
+The deferred work splits cleanly along Vulkano boundaries: each
+compute stage is its own pipeline + dispatch site, and each stage's
+test compares against the existing CPU PBD solver's outputs (no
+external reference data needed). Picking up where this slice left off
+means filling in the SSBO handles on `ClothGpuSimulationState`,
+landing the integration compute shader (S1.2), and adding the
+4-particle test (S1.3).
 
 ## Verification
 
