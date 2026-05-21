@@ -560,14 +560,16 @@ impl Application {
                     avatar
                         .cloth_state
                         .as_ref()
+                        .map(|cs| (cs, avatar.cloth_sim.as_ref()))
                         .into_iter()
                         .chain(
                             avatar
                                 .cloth_overlays
                                 .iter()
                                 .filter(|s| s.enabled)
-                                .map(|s| &s.state),
+                                .map(|s| (&s.state, Some(&s.sim))),
                         ),
+                    1.0 / 60.0,
                 );
 
                 RenderAvatarInstance {
@@ -656,25 +658,55 @@ impl Application {
     }
 }
 
-/// Collect per-primitive cloth snapshots from an iterator of `ClothState`s.
+/// Collect per-primitive cloth snapshots from `(ClothState, Option<ClothSimState>)` pairs.
 ///
 /// Cloth is scoped per primitive (`target_primitive_id`), so multiple cloths
 /// can coexist on one avatar as long as they target distinct primitives. When
 /// two sources target the same primitive, the first wins — the call site
 /// iterates `avatar.cloth_state` before `cloth_overlays`, so the authoritative
 /// cloth takes precedence over any overlay variant of the same garment.
+///
+/// `frame_dt` is the per-frame timestep used to populate `gpu_control.dt`
+/// when the cloth's `solver_backend` is `Gpu`. The renderer uses it as the
+/// `dt` input to the Verlet integration shader; for CPU-backed cloths it
+/// is ignored.
 fn collect_cloth_deforms<'a>(
-    sources: impl IntoIterator<Item = &'a crate::avatar::instance::ClothState>,
+    sources: impl IntoIterator<
+        Item = (
+            &'a crate::avatar::instance::ClothState,
+            Option<&'a crate::simulation::cloth::ClothSimState>,
+        ),
+    >,
+    frame_dt: f32,
 ) -> Vec<ClothDeformSnapshot> {
+    use crate::renderer::frame_input::ClothGpuDispatchControl;
+    use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
+    use crate::math_utils::vec3_scale;
+
     let mut seen_targets: std::collections::HashSet<crate::asset::PrimitiveId> =
         std::collections::HashSet::new();
     sources
         .into_iter()
-        .filter_map(|cs| {
+        .filter_map(|(cs, sim_opt)| {
             let target_primitive_id = cs.target_primitive_id?;
             if !seen_targets.insert(target_primitive_id) {
                 return None;
             }
+            let gpu_control =
+                if cs.solver_backend == ClothSolverBackend::Gpu {
+                    sim_opt.map(|sim| {
+                        let wind_force =
+                            vec3_scale(&sim.wind_direction, sim.wind_response);
+                        ClothGpuDispatchControl {
+                            dt: frame_dt,
+                            damping: sim.damping,
+                            gravity: sim.gravity,
+                            wind_force,
+                        }
+                    })
+                } else {
+                    None
+                };
             Some(ClothDeformSnapshot {
                 target_primitive_id,
                 target_mesh_id: cs.target_mesh_id,
@@ -684,13 +716,7 @@ fn collect_cloth_deforms<'a>(
                 deformed_normals: cs.deform_output.deformed_normals.clone(),
                 version: cs.deform_output.version,
                 solver_backend: cs.solver_backend,
-                // GPU dispatch control plumbing arrives with the next
-                // slice that wires the actual compute dispatch — the
-                // ClothSimState fields (gravity/damping/wind) need
-                // pairing with each ClothState here, and threading
-                // ClothSimState through this collector requires a
-                // signature change at the call site.
-                gpu_control: None,
+                gpu_control,
             })
         })
         .collect()
@@ -742,7 +768,8 @@ mod cloth_collection_tests {
         let skirt = make_cloth_state(2, Some(PrimitiveId(20)), 64, 1);
         let scarf = make_cloth_state(3, Some(PrimitiveId(30)), 16, 1);
 
-        let result = collect_cloth_deforms([&body, &skirt, &scarf]);
+        let result =
+            collect_cloth_deforms([(&body, None), (&skirt, None), (&scarf, None)], 1.0 / 60.0);
 
         assert_eq!(result.len(), 3, "all three distinct-target cloths must be kept");
         let target_ids: Vec<u64> =
@@ -757,7 +784,8 @@ mod cloth_collection_tests {
         let authoritative = make_cloth_state(1, Some(PrimitiveId(10)), 32, 5);
         let overlay_duplicate = make_cloth_state(2, Some(PrimitiveId(10)), 64, 99);
 
-        let result = collect_cloth_deforms([&authoritative, &overlay_duplicate]);
+        let result =
+            collect_cloth_deforms([(&authoritative, None), (&overlay_duplicate, None)], 1.0 / 60.0);
 
         assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
         assert_eq!(result[0].version, 5, "first (authoritative) cloth wins");
@@ -769,7 +797,8 @@ mod cloth_collection_tests {
         let bound = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
         let unbound = make_cloth_state(2, None, 64, 1);
 
-        let result = collect_cloth_deforms([&bound, &unbound]);
+        let result =
+            collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0);
 
         assert_eq!(result.len(), 1, "cloth with no render target is dropped");
         assert_eq!(result[0].target_primitive_id.0, 10);

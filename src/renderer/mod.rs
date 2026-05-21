@@ -152,10 +152,6 @@ struct TransformGpuData {
 /// [`TransformGpuData`] because `transform_cs` also reads it. The
 /// Verlet dispatch's descriptor set, however, binds the parent's
 /// `cloth_pos_ssbo` as read-write alongside this slot's `prev_pos_ssbo`.
-// Fields are populated this slice (S1.1.b) but the dispatch wiring
-// that reads them lives in the follow-up slice (S1.2). The
-// `#[allow(dead_code)]` is removed when the dispatch lands.
-#[allow(dead_code)]
 struct ClothGpuSlot {
     /// Counts + version mirror. `version` bumps each frame the GPU
     /// dispatch writes the position SSBO.
@@ -163,7 +159,10 @@ struct ClothGpuSlot {
     /// `vec4` per particle, xyz = previous position, w = pinned flag
     /// (>= 0.5 means pinned). Initialised on the first frame from the
     /// snapshot's `deformed_positions`; the integration shader rewrites
-    /// it every dispatch.
+    /// it every dispatch. Held here to keep the buffer alive for the
+    /// descriptor set's lifetime — Rust sees no direct read because
+    /// only the GPU touches it after construction.
+    #[allow(dead_code)]
     prev_pos_ssbo: Subbuffer<[[f32; 4]]>,
     /// Per-frame control block consumed by `cloth_verlet_cs`. CPU
     /// rewrites this each frame with `(dt, damping, particle_count,
@@ -1157,27 +1156,27 @@ impl VulkanRenderer {
                 )?;
 
                 // If the cloth snapshot reports GPU backend, lazily build
-                // the per-primitive GPU cloth solver slot. Dispatch wiring
-                // (writing the control UBO and recording the compute pass)
-                // lands in a follow-up slice; for now we simply hold the
-                // SSBOs so the next slice has the descriptor set ready.
-                if let Some(cloth_snap) = cloth_snap_opt {
-                    use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
-                    if cloth_snap.solver_backend == ClothSolverBackend::Gpu {
-                        let particle_count = cloth_snap
-                            .vertex_count
-                            .max(cloth_snap.deformed_positions.len() as u32);
-                        if let Some(cloth_verlet_pipeline) =
-                            self.cloth_verlet_pipeline.clone()
-                        {
-                            self.ensure_cloth_gpu_slot(
-                                (mesh_inst.mesh_id, mesh_inst.primitive_id),
-                                particle_count,
-                                &memory_allocator,
-                                &ds_allocator,
-                                &cloth_verlet_pipeline,
-                            )?;
-                        }
+                // the per-primitive GPU cloth solver slot (seeding both
+                // pos and prev_pos SSBOs from the rest pose). Dispatch
+                // happens after the per-frame control UBO is rewritten
+                // below.
+                let cloth_is_gpu = cloth_snap_opt
+                    .map(|c| {
+                        c.solver_backend
+                            == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+                    })
+                    .unwrap_or(false);
+                if let (true, Some(cloth_snap)) = (cloth_is_gpu, cloth_snap_opt) {
+                    if let Some(cloth_verlet_pipeline) =
+                        self.cloth_verlet_pipeline.clone()
+                    {
+                        self.ensure_cloth_gpu_slot(
+                            (mesh_inst.mesh_id, mesh_inst.primitive_id),
+                            &cloth_snap.deformed_positions,
+                            &memory_allocator,
+                            &ds_allocator,
+                            &cloth_verlet_pipeline,
+                        )?;
                     }
                 }
 
@@ -1214,7 +1213,12 @@ impl VulkanRenderer {
                 // outside the snapshot's vertex subset stay at rest pose
                 // — they belong to the same primitive but are not part
                 // of the cloth region.
-                let cloth_changed = if let Some(cloth) = cloth_snap_opt {
+                //
+                // For `ClothSolverBackend::Gpu` cloths the GPU compute
+                // dispatch (below) writes `cloth_pos_ssbo` in place; the
+                // CPU snapshot copy is skipped so we don't clobber the
+                // simulation state.
+                let cloth_changed = if let (false, Some(cloth)) = (cloth_is_gpu, cloth_snap_opt) {
                     let slot = self
                         .transform_cache
                         .get_mut(&key)
@@ -1271,6 +1275,93 @@ impl VulkanRenderer {
                 };
                 if cloth_changed {
                     self.gpu_runtime_counters.cloth_vbo_writes += 1;
+                }
+
+                // GPU cloth Verlet integration dispatch. Runs before
+                // `transform_cs` reads `cloth_pos_ssbo`; Vulkano's
+                // automatic command-buffer synchronisation inserts the
+                // SSBO write→read barrier so the transform pass sees
+                // the integrated positions.
+                if let (true, Some(cloth)) = (cloth_is_gpu, cloth_snap_opt) {
+                    if let (Some(ctrl), Some(cloth_verlet_pipeline)) = (
+                        cloth.gpu_control.as_ref(),
+                        self.cloth_verlet_pipeline.clone(),
+                    ) {
+                        let (verlet_set, particle_count) = {
+                            let slot = self
+                                .transform_cache
+                                .get(&key)
+                                .expect("transform slot present");
+                            match slot.cloth_gpu.as_ref() {
+                                Some(gpu) => {
+                                    (gpu.verlet_set.clone(), gpu.state.particle_count)
+                                }
+                                None => continue,
+                            }
+                        };
+                        {
+                            let slot = self
+                                .transform_cache
+                                .get_mut(&key)
+                                .expect("transform slot present");
+                            let gpu = slot
+                                .cloth_gpu
+                                .as_mut()
+                                .expect("cloth_gpu present (just checked)");
+                            let mut ctrl_guard = gpu
+                                .verlet_control_ubo
+                                .write()
+                                .map_err(|e| format!("render: cloth verlet UBO write: {e}"))?;
+                            *ctrl_guard = pipeline::ClothVerletControl {
+                                dt: ctrl.dt,
+                                damping: ctrl.damping,
+                                particle_count,
+                                _pad0: 0,
+                                gravity: [
+                                    ctrl.gravity[0],
+                                    ctrl.gravity[1],
+                                    ctrl.gravity[2],
+                                    0.0,
+                                ],
+                                wind: [
+                                    ctrl.wind_force[0],
+                                    ctrl.wind_force[1],
+                                    ctrl.wind_force[2],
+                                    0.0,
+                                ],
+                            };
+                            gpu.state.bump_version();
+                        }
+                        builder
+                            .bind_pipeline_compute(cloth_verlet_pipeline.clone())
+                            .map_err(|e| {
+                                format!("render: bind cloth verlet pipeline: {e}")
+                            })?;
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Compute,
+                                cloth_verlet_pipeline.layout().clone(),
+                                0,
+                                verlet_set,
+                            )
+                            .map_err(|e| format!("render: bind cloth verlet set: {e}"))?;
+                        let groups = particle_count.div_ceil(TRANSFORM_LOCAL_SIZE);
+                        unsafe {
+                            builder
+                                .dispatch([groups, 1, 1])
+                                .map_err(|e| format!("render: cloth verlet dispatch: {e}"))?;
+                        }
+                        // Switch the bound compute pipeline back to the
+                        // transform pipeline so the dispatch below uses
+                        // the right shader. (The descriptor set bound
+                        // afterwards targets a different layout, so an
+                        // explicit re-bind here is required.)
+                        builder
+                            .bind_pipeline_compute(transform_pipeline.clone())
+                            .map_err(|e| {
+                                format!("render: rebind transform pipeline: {e}")
+                            })?;
+                    }
                 }
 
                 // Bind set 0 + dispatch.
@@ -1997,17 +2088,23 @@ impl VulkanRenderer {
 
     /// Allocate the GPU cloth solver resources for a primitive whose
     /// snapshot reported `ClothSolverBackend::Gpu`. No-op if the slot
-    /// already exists or if the primitive is not in the transform
-    /// cache. Caller must guarantee the primitive's transform slot
-    /// has `cloth_pos_ssbo` sized to `particle_count` (i.e. the slot
-    /// was allocated with `has_cloth = true`).
+    /// already exists or if `initial_positions` is empty. Caller must
+    /// guarantee the primitive's transform slot has `cloth_pos_ssbo`
+    /// sized to `initial_positions.len()` (i.e. the slot was allocated
+    /// with `has_cloth = true`).
     ///
-    /// Buffer sizing is fixed at allocation time; `particle_count`
+    /// On creation, both `cloth_pos_ssbo` (on the parent slot) and the
+    /// new `prev_pos_ssbo` are seeded with `initial_positions`, which
+    /// gives a zero-velocity start at the rest pose. Subsequent frames
+    /// only rewrite the control UBO; the GPU advances positions in
+    /// place.
+    ///
+    /// Buffer sizing is fixed at allocation time; the particle count
     /// cannot change after this without rebuilding the slot.
     fn ensure_cloth_gpu_slot(
         &mut self,
         key: (MeshId, PrimitiveId),
-        particle_count: u32,
+        initial_positions: &[crate::asset::Vec3],
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         cloth_verlet_pipeline: &Arc<ComputePipeline>,
@@ -2017,9 +2114,11 @@ impl VulkanRenderer {
             .get(&key)
             .map(|s| s.cloth_gpu.is_some())
             .unwrap_or(true);
-        if already_alloc || particle_count == 0 {
+        if already_alloc || initial_positions.is_empty() {
             return Ok(());
         }
+
+        let particle_count = initial_positions.len() as u32;
 
         let prev_pos_ssbo = Buffer::from_iter(
             memory_allocator.clone(),
@@ -2032,7 +2131,12 @@ impl VulkanRenderer {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            (0..particle_count as usize).map(|_| [0.0_f32; 4]),
+            // Seed prev_pos to same as initial positions ⇒ zero velocity
+            // at start. Pinned flag = 0 (free); future S2 work resolves
+            // pin targets and writes 1.0 here per pinned particle.
+            initial_positions
+                .iter()
+                .map(|p| [p[0], p[1], p[2], 0.0]),
         )
         .map_err(|e| format!("renderer: cloth prev_pos SSBO alloc failed: {e}"))?;
 
@@ -2073,6 +2177,19 @@ impl VulkanRenderer {
             .ok_or("renderer: ensure_cloth_gpu_slot before transform slot exists")?
             .cloth_pos_ssbo
             .clone();
+
+        // Seed cloth_pos_ssbo with the rest pose so the very first GPU
+        // dispatch reads valid positions. `w = 1.0` matches the
+        // inv_mass-of-1 convention (free particle); pinned mass goes
+        // here when S2 lands pin handling.
+        {
+            let mut guard = cloth_pos_ssbo
+                .write()
+                .map_err(|e| format!("renderer: cloth pos initial seed failed: {e}"))?;
+            for (dst, p) in guard.iter_mut().zip(initial_positions.iter()) {
+                *dst = [p[0], p[1], p[2], 1.0];
+            }
+        }
 
         let verlet_set = DescriptorSet::new(
             ds_allocator.clone(),
