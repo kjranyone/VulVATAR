@@ -172,6 +172,59 @@ pub struct VertexTriangleAdjacency {
     pub triangles: Vec<u32>,
 }
 
+/// Build a CSR particle→constraint adjacency for a cloth's distance
+/// constraint table.
+///
+/// `constraints` is a slice of `(particle_a, particle_b)` index pairs.
+/// For particle `p`, the incident constraint indices live in
+/// `output.triangles[output.offsets[p] .. output.offsets[p + 1]]`
+/// (reusing the `VertexTriangleAdjacency` field names — same CSR
+/// shape, different semantics). Indices `>= particle_count` are
+/// silently skipped.
+pub fn build_particle_constraint_adjacency(
+    constraints: &[(u32, u32)],
+    particle_count: u32,
+) -> VertexTriangleAdjacency {
+    let pc = particle_count as usize;
+
+    let mut counts = vec![0u32; pc];
+    for (a, b) in constraints {
+        if (*a as usize) < pc {
+            counts[*a as usize] += 1;
+        }
+        if (*b as usize) < pc {
+            counts[*b as usize] += 1;
+        }
+    }
+
+    let mut offsets = vec![0u32; pc + 1];
+    let mut acc: u32 = 0;
+    for p in 0..pc {
+        offsets[p] = acc;
+        acc = acc.saturating_add(counts[p]);
+    }
+    offsets[pc] = acc;
+
+    let mut triangles = vec![0u32; acc as usize];
+    let mut cursor = vec![0u32; pc];
+    for (cidx, (a, b)) in constraints.iter().enumerate() {
+        if (*a as usize) < pc {
+            let ai = *a as usize;
+            let slot = (offsets[ai] + cursor[ai]) as usize;
+            triangles[slot] = cidx as u32;
+            cursor[ai] += 1;
+        }
+        if (*b as usize) < pc {
+            let bi = *b as usize;
+            let slot = (offsets[bi] + cursor[bi]) as usize;
+            triangles[slot] = cidx as u32;
+            cursor[bi] += 1;
+        }
+    }
+
+    VertexTriangleAdjacency { offsets, triangles }
+}
+
 /// Build a CSR vertex→triangle adjacency for a cloth mesh.
 ///
 /// `triangle_indices` is the flat index buffer (3 entries per triangle).
@@ -437,6 +490,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn particle_constraint_adjacency_single_constraint() {
+        let adj = build_particle_constraint_adjacency(&[(0, 1)], 2);
+        assert_eq!(adj.offsets, vec![0, 1, 2]);
+        assert_eq!(collect_triangles_for(&adj, 0), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 1), vec![0]);
+    }
+
+    #[test]
+    fn particle_constraint_adjacency_shared_particle() {
+        // 3 constraints, particle 1 in all three.
+        let adj = build_particle_constraint_adjacency(&[(0, 1), (1, 2), (1, 3)], 4);
+        assert_eq!(adj.offsets, vec![0, 1, 4, 5, 6]);
+        assert_eq!(collect_triangles_for(&adj, 0), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 1), vec![0, 1, 2]);
+        assert_eq!(collect_triangles_for(&adj, 2), vec![1]);
+        assert_eq!(collect_triangles_for(&adj, 3), vec![2]);
+    }
+
+    #[test]
+    fn particle_constraint_adjacency_skips_out_of_range() {
+        let adj = build_particle_constraint_adjacency(&[(0, 1), (1, 9)], 2);
+        // (1, 9) → 1 still recorded, 9 dropped.
+        assert_eq!(adj.offsets, vec![0, 1, 3]);
+        assert_eq!(collect_triangles_for(&adj, 0), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 1), vec![0, 1]);
     }
 
     /// Pinned particles must hold their starting position under the

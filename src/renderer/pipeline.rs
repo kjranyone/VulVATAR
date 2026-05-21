@@ -506,6 +506,154 @@ void main() {
 }
 
 // ---------------------------------------------------------------------------
+// Cloth PBD distance constraint projection — accumulate pass (P3-02 S2.1)
+// ---------------------------------------------------------------------------
+//
+// Jacobi-style 2-pass constraint projection: this first shader runs one
+// invocation per particle, walks the constraints touching that particle
+// via a precomputed CSR adjacency (`build_particle_constraint_adjacency`),
+// and writes per-particle position corrections into `delta_ssbo`. The
+// apply pass below adds the deltas to `pos_ssbo` and zeroes
+// `delta_ssbo` for the next iteration.
+//
+// Choosing Jacobi (2 passes per iteration) over Gauss-Seidel-on-GPU
+// (atomics or partition coloring) keeps the shader simple — no
+// atomicAdd, no `VK_EXT_shader_atomic_float`, no per-constraint colour
+// dispatch. Convergence per iteration is slower than Gauss-Seidel, so
+// real workloads typically run more iterations to compensate.
+pub mod cloth_constraint_accumulate_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// xyz = position, w = inv_mass (0.0 = effectively pinned / immobile).
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+// Per-particle position correction accumulated this iteration. The
+// apply pass adds these to `positions.p[i].xyz` and zeroes the entry.
+layout(set = 0, binding = 1) writeonly buffer Deltas {
+    vec4 d[];
+} deltas;
+
+// Constraint table, matches Rust `ClothConstraintGpu`.
+struct Constraint {
+    uint  particle_a;
+    uint  particle_b;
+    float rest_length;
+    float stiffness;
+};
+layout(set = 0, binding = 2) readonly buffer Constraints {
+    Constraint c[];
+} constraints;
+
+// CSR adjacency: constraints touching vertex v live at
+// `adj_constraints.c[adj_offsets.o[v] .. adj_offsets.o[v + 1]]`.
+layout(set = 0, binding = 3) readonly buffer AdjacencyOffsets {
+    uint o[];
+} adj_offsets;
+layout(set = 0, binding = 4) readonly buffer AdjacencyConstraints {
+    uint c[];
+} adj_constraints;
+
+// Rust mirror: `ClothConstraintControl`.
+layout(set = 0, binding = 5) uniform Control {
+    uint particle_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} ctrl;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 self_p = positions.p[pid];
+    float w_self = self_p.w;
+
+    // Pinned (inv_mass == 0) particles take no correction.
+    if (w_self <= 0.0) {
+        deltas.d[pid] = vec4(0.0);
+        return;
+    }
+
+    vec3 self_pos = self_p.xyz;
+    vec3 delta = vec3(0.0);
+
+    uint start = adj_offsets.o[pid];
+    uint end   = adj_offsets.o[pid + 1u];
+    for (uint k = start; k < end; ++k) {
+        uint cidx = adj_constraints.c[k];
+        Constraint cn = constraints.c[cidx];
+        uint other = (cn.particle_a == pid) ? cn.particle_b : cn.particle_a;
+        vec4 other_p = positions.p[other];
+        vec3 dir = other_p.xyz - self_pos;
+        float len = length(dir);
+        if (len > 1e-6) {
+            float err = len - cn.rest_length;
+            float w_other = other_p.w;
+            float w_sum = w_self + w_other;
+            if (w_sum > 0.0) {
+                // Jacobi PBD: pull self toward other proportional to mass
+                // ratio, weighted by constraint stiffness. The other
+                // particle's invocation does the mirrored correction.
+                float scale = cn.stiffness * err / len * (w_self / w_sum);
+                delta += dir * scale;
+            }
+        }
+    }
+    deltas.d[pid] = vec4(delta, 0.0);
+}
+"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloth PBD distance constraint projection — apply pass (P3-02 S2.1)
+// ---------------------------------------------------------------------------
+pub mod cloth_constraint_apply_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+
+layout(set = 0, binding = 1) buffer Deltas {
+    vec4 d[];
+} deltas;
+
+layout(set = 0, binding = 2) uniform Control {
+    uint particle_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} ctrl;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 pos = positions.p[pid];
+    vec4 d = deltas.d[pid];
+    pos.xyz += d.xyz;
+    positions.p[pid] = pos;
+    // Reset for the next constraint iteration's accumulate pass.
+    deltas.d[pid] = vec4(0.0);
+}
+"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cloth vertex normal recomputation compute shader (P3-02 S3.1 — pipeline only)
 // ---------------------------------------------------------------------------
 //
@@ -1045,6 +1193,87 @@ pub fn create_cloth_verlet_compute_pipeline(
     .map_err(|e| format!("failed to create cloth verlet compute pipeline: {e}"))
 }
 
+/// Per-constraint SSBO entry consumed by `cloth_constraint_accumulate_cs`
+/// (P3-02 S2.1). std430 layout — 16 bytes per constraint, packed tight.
+/// `stiffness` is the [0,1] PBD relaxation factor copied from
+/// `ClothDistanceConstraint::stiffness`.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothConstraintGpu {
+    pub particle_a: u32,
+    pub particle_b: u32,
+    pub rest_length: f32,
+    pub stiffness: f32,
+}
+
+/// Per-frame control block consumed by both constraint shaders.
+/// std140 layout — `particle_count` carries the data; three trailing
+/// `uint` pad to a 16-byte boundary.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothConstraintControl {
+    pub particle_count: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Build the cloth PBD constraint accumulate compute pipeline
+/// (P3-02 S2.1, first pass of the Jacobi-style iteration).
+pub fn create_cloth_constraint_accumulate_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_constraint_accumulate_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth constraint accumulate shader: {e}"))?;
+    let cs_entry = cs_module.entry_point("main").ok_or_else(|| {
+        "cloth constraint accumulate shader entry point 'main' not found".to_string()
+    })?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| {
+                format!("failed to build cloth constraint accumulate layout info: {e}")
+            })?,
+    )
+    .map_err(|e| format!("failed to create cloth constraint accumulate layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth constraint accumulate pipeline: {e}"))
+}
+
+/// Build the cloth PBD constraint apply compute pipeline
+/// (P3-02 S2.1, second pass of the Jacobi-style iteration).
+pub fn create_cloth_constraint_apply_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_constraint_apply_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth constraint apply shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth constraint apply shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth constraint apply layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth constraint apply layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth constraint apply pipeline: {e}"))
+}
+
 /// Per-frame control block consumed by `cloth_normal_cs` (P3-02 S3.1).
 ///
 /// std140 layout — only `vertex_count` carries data; three trailing `uint`
@@ -1157,6 +1386,39 @@ mod tests {
         assert_eq!(offset_of!(ClothNormalControl, _pad0), 4);
         assert_eq!(offset_of!(ClothNormalControl, _pad1), 8);
         assert_eq!(offset_of!(ClothNormalControl, _pad2), 12);
+    }
+
+    // GLSL std430 layout for the `Constraint` struct in
+    // `cloth_constraint_accumulate_cs`:
+    //   uint  particle_a;  // offset 0, size 4
+    //   uint  particle_b;  // offset 4, size 4
+    //   float rest_length; // offset 8, size 4
+    //   float stiffness;   // offset 12, size 4
+    //   total              // 16 bytes
+    #[test]
+    fn cloth_constraint_gpu_matches_std430_layout() {
+        use super::ClothConstraintGpu;
+        assert_eq!(size_of::<ClothConstraintGpu>(), 16);
+        assert_eq!(offset_of!(ClothConstraintGpu, particle_a), 0);
+        assert_eq!(offset_of!(ClothConstraintGpu, particle_b), 4);
+        assert_eq!(offset_of!(ClothConstraintGpu, rest_length), 8);
+        assert_eq!(offset_of!(ClothConstraintGpu, stiffness), 12);
+    }
+
+    // GLSL std140 layout for the `Control` UBO in both constraint shaders.
+    //   uint particle_count;  // offset 0, size 4
+    //   uint _pad0;           // offset 4, size 4
+    //   uint _pad1;           // offset 8, size 4
+    //   uint _pad2;           // offset 12, size 4
+    //   total                 // 16 bytes
+    #[test]
+    fn cloth_constraint_control_matches_std140_layout() {
+        use super::ClothConstraintControl;
+        assert_eq!(size_of::<ClothConstraintControl>(), 16);
+        assert_eq!(offset_of!(ClothConstraintControl, particle_count), 0);
+        assert_eq!(offset_of!(ClothConstraintControl, _pad0), 4);
+        assert_eq!(offset_of!(ClothConstraintControl, _pad1), 8);
+        assert_eq!(offset_of!(ClothConstraintControl, _pad2), 12);
     }
 }
 
