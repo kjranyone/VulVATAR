@@ -9,7 +9,7 @@ candidates are catalogued below for future-me / future maintainers.
 
 ## Landed
 
-### Cloth constraint solver — PBD → XPBD (CPU)
+### Cloth constraint solver — PBD → XPBD (CPU + GPU)
 
 **Reference**: Macklin, Müller, Chentanez. "XPBD: Position-Based
 Simulation of Compliant Constrained Dynamics", MIG 2016.
@@ -42,11 +42,33 @@ existing assets visually identical to the prior PBD output.
 `stiffness = 0` short-circuits to "constraint disabled" so the
 legacy "soft-hinge-or-disable" assets keep working.
 
-**Files**:
+**Files (CPU side, commit `fa82bbc`)**:
 - `src/simulation/cloth_solver/constraints.rs` — XPBD update rule
 - `src/simulation/cloth_solver/mod.rs` — `reset_lambda` per substep
 - `src/simulation/cloth.rs` — `ClothSimTempBuffers::lambda_distance` +
   `reset_lambda(count)` helper
+
+**Files (GPU side, commit `3911428`)**:
+- `src/renderer/pipeline.rs` —
+  `cloth_constraint_lambda_update_cs` (new GLSL),
+  `cloth_constraint_accumulate_cs` (rewritten to read `dlambda`),
+  `cloth_constraint_apply_cs` (UBO layout update only),
+  `ClothConstraintControl` gains `constraint_count` + `dt` fields
+- `src/renderer/cloth_cache.rs` — `lambda_ssbo` + `dlambda_ssbo`
+  allocation, `lambda_update_set` descriptor set
+- `src/renderer/mod.rs` —
+  `cloth_constraint_lambda_update_pipeline` field on `VulkanRenderer`,
+  3-pass dispatch loop (lambda update → accumulate → apply),
+  per-substep `cmd.fill_buffer(lambda_ssbo, 0)` reset
+
+The GPU side uses the same lambda → dlambda buffer split that the
+CPU side does (lambda is persistent across iterations within a
+substep, dlambda is per-iteration scratch). The split makes the
+per-particle Δx accumulate **race-free without atomics**: lambda is
+mutated exactly once per constraint per iteration (the lambda-update
+dispatch); the accumulate pass reads dlambda but never writes
+lambda, so the two endpoint invocations of a constraint consume the
+same `Δλ_j` and produce consistent Δx contributions.
 
 **Tests**:
 - `xpbd_rigid_stiffness_satisfies_constraint_in_one_pass`
@@ -54,32 +76,15 @@ legacy "soft-hinge-or-disable" assets keep working.
 - `xpbd_disabled_constraint_leaves_lambda_zero`
 - existing `cloth_constraint_jacobi_satisfies_rest_lengths_like_cpu_pbd`
   parity test stays correct because XPBD@α=0 reduces to PBD@stiffness=1
-  algebraically
+  algebraically — covers the CPU XPBD ↔ GPU XPBD parity at stiffness=1
+
+**Follow-up validation** (not yet landed): extend the parity test to
+cover stiffness ∈ {1.0, 0.7, 0.3} so that CPU XPBD ↔ GPU XPBD parity
+is exercised at non-trivial compliance values too. Requires upgrading
+`cpu_mirror_of_cloth_constraint_iter` (the GPU formula mirror) to do
+the lambda accumulation; the GPU side is now ready.
 
 ## Open SOTA slices
-
-### Cloth constraint solver — XPBD on GPU
-
-**Scope**: migrate `pipeline::cloth_constraint_accumulate_cs` and
-`cloth_constraint_apply_cs` to XPBD too. The shader needs:
-
-- A new lambda SSBO sized to the constraint count, bound at set 0
-- The `dt` and per-constraint `α` (or shared α from material) added
-  to `ClothConstraintControl` UBO
-- `ensure_cloth_gpu_slot` (in `renderer/cloth_cache.rs`) allocating
-  and resetting the lambda SSBO at slot construction + each frame
-- The shader applying the XPBD update rule per-constraint via the
-  existing Jacobi adjacency
-
-**Why deferred**: the CPU↔GPU parity test passes at the current
-stiffness (1.0) because XPBD@α=0 ≡ PBD@stiffness=1, so the GPU side
-can stay on PBD until cloth authoring exposes compliance < 1.0. The
-migration is mechanically similar to the CPU side but lives in GLSL
-and adds a buffer.
-
-**Done when**: the GPU constraint dispatch produces the same Δx as
-the CPU XPBD reference at all stiffness values, and the parity test
-covers stiffness ∈ {1.0, 0.7, 0.3} not just 1.0.
 
 ### Cloth normal recomputation — area-weighted vs angle-weighted
 
