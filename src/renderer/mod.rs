@@ -173,6 +173,44 @@ struct ClothGpuSlot {
     ///   1 = `prev_pos_ssbo` (read-write)
     ///   2 = `verlet_control_ubo` (uniform)
     verlet_set: Arc<DescriptorSet>,
+    /// PBD constraint projection resources. `None` when the cloth has
+    /// no distance constraints (e.g. authoring only set up a triangulated
+    /// mesh for normal recomputation).
+    constraints: Option<ClothGpuConstraintResources>,
+    /// Vertex normal recomputation resources. `None` when the cloth has
+    /// no triangle index data.
+    normals: Option<ClothGpuNormalResources>,
+}
+
+/// Per-primitive constraint-projection resources for the Jacobi 2-pass
+/// PBD compute. All buffers but the control UBO are written once at
+/// attach time and read-only thereafter.
+struct ClothGpuConstraintResources {
+    #[allow(dead_code)]
+    constraint_ssbo: Subbuffer<[pipeline::ClothConstraintGpu]>,
+    #[allow(dead_code)]
+    delta_ssbo: Subbuffer<[[f32; 4]]>,
+    #[allow(dead_code)]
+    adj_offsets_ssbo: Subbuffer<[u32]>,
+    #[allow(dead_code)]
+    adj_constraints_ssbo: Subbuffer<[u32]>,
+    control_ubo: Subbuffer<pipeline::ClothConstraintControl>,
+    accumulate_set: Arc<DescriptorSet>,
+    apply_set: Arc<DescriptorSet>,
+}
+
+/// Per-primitive normal-recomputation resources. The output normal SSBO
+/// is the parent slot's `cloth_norm_ssbo` — reused so `transform_cs`
+/// sees the GPU-written normals without an extra binding.
+struct ClothGpuNormalResources {
+    #[allow(dead_code)]
+    triangle_idx_ssbo: Subbuffer<[u32]>,
+    #[allow(dead_code)]
+    adj_offsets_ssbo: Subbuffer<[u32]>,
+    #[allow(dead_code)]
+    adj_triangles_ssbo: Subbuffer<[u32]>,
+    control_ubo: Subbuffer<pipeline::ClothNormalControl>,
+    normal_set: Arc<DescriptorSet>,
 }
 
 /// State for an in-flight readback whose GPU fence has not yet been waited on.
@@ -228,6 +266,13 @@ pub struct VulkanRenderer {
     /// [`Self::initialize`]. See `pipeline::cloth_verlet_cs` for the
     /// shader-side contract.
     cloth_verlet_pipeline: Option<Arc<ComputePipeline>>,
+    /// Cloth PBD distance-constraint accumulate compute pipeline (S2.1
+    /// pass 1 of 2 Jacobi).
+    cloth_constraint_accumulate_pipeline: Option<Arc<ComputePipeline>>,
+    /// Cloth PBD distance-constraint apply compute pipeline (S2.1 pass 2).
+    cloth_constraint_apply_pipeline: Option<Arc<ComputePipeline>>,
+    /// Cloth vertex normal recomputation compute pipeline (S3.1).
+    cloth_normal_pipeline: Option<Arc<ComputePipeline>>,
     gpu_runtime_counters: GpuRuntimeCounters,
     texture_cache: HashMap<String, Arc<ImageView>>,
     device: Option<Arc<Device>>,
@@ -303,6 +348,9 @@ impl VulkanRenderer {
             stub_storage_ssbo: None,
             transform_compute_pipeline: None,
             cloth_verlet_pipeline: None,
+            cloth_constraint_accumulate_pipeline: None,
+            cloth_constraint_apply_pipeline: None,
+            cloth_normal_pipeline: None,
             gpu_runtime_counters: GpuRuntimeCounters::default(),
             texture_cache: HashMap::new(),
             device: None,
@@ -700,6 +748,23 @@ impl VulkanRenderer {
         )
         .expect("failed to create cloth Verlet compute pipeline");
         self.cloth_verlet_pipeline = Some(cloth_verlet_pipeline);
+        let cloth_constraint_accumulate_pipeline =
+            pipeline::create_cloth_constraint_accumulate_compute_pipeline(
+                self.device.as_ref().expect("device set above").clone(),
+            )
+            .expect("failed to create cloth constraint accumulate pipeline");
+        self.cloth_constraint_accumulate_pipeline = Some(cloth_constraint_accumulate_pipeline);
+        let cloth_constraint_apply_pipeline =
+            pipeline::create_cloth_constraint_apply_compute_pipeline(
+                self.device.as_ref().expect("device set above").clone(),
+            )
+            .expect("failed to create cloth constraint apply pipeline");
+        self.cloth_constraint_apply_pipeline = Some(cloth_constraint_apply_pipeline);
+        let cloth_normal_pipeline = pipeline::create_cloth_normal_compute_pipeline(
+            self.device.as_ref().expect("device set above").clone(),
+        )
+        .expect("failed to create cloth normal compute pipeline");
+        self.cloth_normal_pipeline = Some(cloth_normal_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
         self.offscreen_color = Some(color_img);
@@ -1140,8 +1205,21 @@ impl VulkanRenderer {
                     .iter()
                     .find(|c| c.target_primitive_id == mesh_inst.primitive_id);
                 let has_cloth_prim = cloth_snap_opt.is_some();
+                // For Gpu-backed cloth with a triangulated mesh, the
+                // normal compute dispatch (S3.1) writes `cloth_norm_ssbo`
+                // even though the CPU snapshot's `deformed_normals` is
+                // `None` — flip the flag so `transform_cs` reads the
+                // GPU-written normals.
                 let has_cloth_normals_prim = cloth_snap_opt
-                    .map(|c| c.deformed_normals.is_some())
+                    .map(|c| {
+                        c.deformed_normals.is_some()
+                            || (c.solver_backend
+                                == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+                                && c.gpu_attach
+                                    .as_ref()
+                                    .map(|a| !a.triangle_indices.is_empty())
+                                    .unwrap_or(false))
+                    })
                     .unwrap_or(false);
 
                 self.ensure_transform_data(
@@ -1167,15 +1245,29 @@ impl VulkanRenderer {
                     })
                     .unwrap_or(false);
                 if let (true, Some(cloth_snap)) = (cloth_is_gpu, cloth_snap_opt) {
-                    if let Some(cloth_verlet_pipeline) =
-                        self.cloth_verlet_pipeline.clone()
-                    {
+                    if let (
+                        Some(attach),
+                        Some(cloth_verlet_pipeline),
+                        Some(cloth_constraint_accumulate_pipeline),
+                        Some(cloth_constraint_apply_pipeline),
+                        Some(cloth_normal_pipeline),
+                    ) = (
+                        cloth_snap.gpu_attach.as_ref(),
+                        self.cloth_verlet_pipeline.clone(),
+                        self.cloth_constraint_accumulate_pipeline.clone(),
+                        self.cloth_constraint_apply_pipeline.clone(),
+                        self.cloth_normal_pipeline.clone(),
+                    ) {
                         self.ensure_cloth_gpu_slot(
                             (mesh_inst.mesh_id, mesh_inst.primitive_id),
                             &cloth_snap.deformed_positions,
+                            attach,
                             &memory_allocator,
                             &ds_allocator,
                             &cloth_verlet_pipeline,
+                            &cloth_constraint_accumulate_pipeline,
+                            &cloth_constraint_apply_pipeline,
+                            &cloth_normal_pipeline,
                         )?;
                     }
                 }
@@ -1351,6 +1443,133 @@ impl VulkanRenderer {
                                 .dispatch([groups, 1, 1])
                                 .map_err(|e| format!("render: cloth verlet dispatch: {e}"))?;
                         }
+
+                        // S2.1 — PBD constraint projection iterations.
+                        let constraint_iters = ctrl.solver_iterations.max(1);
+                        let constraint_resources = self
+                            .transform_cache
+                            .get(&key)
+                            .and_then(|s| s.cloth_gpu.as_ref())
+                            .and_then(|g| g.constraints.as_ref())
+                            .map(|c| {
+                                (
+                                    c.accumulate_set.clone(),
+                                    c.apply_set.clone(),
+                                    c.control_ubo.clone(),
+                                )
+                            });
+                        if let (
+                            Some((accumulate_set, apply_set, constraint_ctrl_ubo)),
+                            Some(accumulate_pipeline),
+                            Some(apply_pipeline),
+                        ) = (
+                            constraint_resources,
+                            self.cloth_constraint_accumulate_pipeline.clone(),
+                            self.cloth_constraint_apply_pipeline.clone(),
+                        ) {
+                            // Refresh the control UBO once (particle_count
+                            // is static; only the value changes when the
+                            // backend swaps cloths, which always rebuilds
+                            // the slot).
+                            {
+                                let mut g = constraint_ctrl_ubo.write().map_err(|e| {
+                                    format!("render: constraint UBO write: {e}")
+                                })?;
+                                *g = pipeline::ClothConstraintControl {
+                                    particle_count,
+                                    _pad0: 0,
+                                    _pad1: 0,
+                                    _pad2: 0,
+                                };
+                            }
+                            for _ in 0..constraint_iters {
+                                builder
+                                    .bind_pipeline_compute(accumulate_pipeline.clone())
+                                    .map_err(|e| {
+                                        format!("render: bind constraint accumulate: {e}")
+                                    })?;
+                                builder
+                                    .bind_descriptor_sets(
+                                        PipelineBindPoint::Compute,
+                                        accumulate_pipeline.layout().clone(),
+                                        0,
+                                        accumulate_set.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint accumulate set: {e}")
+                                    })?;
+                                unsafe {
+                                    builder.dispatch([groups, 1, 1]).map_err(|e| {
+                                        format!("render: constraint accumulate dispatch: {e}")
+                                    })?;
+                                }
+                                builder
+                                    .bind_pipeline_compute(apply_pipeline.clone())
+                                    .map_err(|e| {
+                                        format!("render: bind constraint apply: {e}")
+                                    })?;
+                                builder
+                                    .bind_descriptor_sets(
+                                        PipelineBindPoint::Compute,
+                                        apply_pipeline.layout().clone(),
+                                        0,
+                                        apply_set.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint apply set: {e}")
+                                    })?;
+                                unsafe {
+                                    builder.dispatch([groups, 1, 1]).map_err(|e| {
+                                        format!("render: constraint apply dispatch: {e}")
+                                    })?;
+                                }
+                            }
+                        }
+
+                        // S3.1 — vertex normal recomputation.
+                        let normal_resources = self
+                            .transform_cache
+                            .get(&key)
+                            .and_then(|s| s.cloth_gpu.as_ref())
+                            .and_then(|g| g.normals.as_ref())
+                            .map(|n| (n.normal_set.clone(), n.control_ubo.clone()));
+                        if let (Some((normal_set, normal_ctrl_ubo)), Some(normal_pipeline)) = (
+                            normal_resources,
+                            self.cloth_normal_pipeline.clone(),
+                        ) {
+                            {
+                                let mut g = normal_ctrl_ubo.write().map_err(|e| {
+                                    format!("render: normal UBO write: {e}")
+                                })?;
+                                *g = pipeline::ClothNormalControl {
+                                    vertex_count: particle_count,
+                                    _pad0: 0,
+                                    _pad1: 0,
+                                    _pad2: 0,
+                                };
+                            }
+                            builder
+                                .bind_pipeline_compute(normal_pipeline.clone())
+                                .map_err(|e| {
+                                    format!("render: bind cloth normal pipeline: {e}")
+                                })?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    normal_pipeline.layout().clone(),
+                                    0,
+                                    normal_set,
+                                )
+                                .map_err(|e| {
+                                    format!("render: bind cloth normal set: {e}")
+                                })?;
+                            unsafe {
+                                builder.dispatch([groups, 1, 1]).map_err(|e| {
+                                    format!("render: cloth normal dispatch: {e}")
+                                })?;
+                            }
+                        }
+
                         // Switch the bound compute pipeline back to the
                         // transform pipeline so the dispatch below uses
                         // the right shader. (The descriptor set bound
@@ -2088,26 +2307,31 @@ impl VulkanRenderer {
 
     /// Allocate the GPU cloth solver resources for a primitive whose
     /// snapshot reported `ClothSolverBackend::Gpu`. No-op if the slot
-    /// already exists or if `initial_positions` is empty. Caller must
-    /// guarantee the primitive's transform slot has `cloth_pos_ssbo`
-    /// sized to `initial_positions.len()` (i.e. the slot was allocated
-    /// with `has_cloth = true`).
+    /// already exists or if `initial_positions` is empty.
     ///
-    /// On creation, both `cloth_pos_ssbo` (on the parent slot) and the
-    /// new `prev_pos_ssbo` are seeded with `initial_positions`, which
-    /// gives a zero-velocity start at the rest pose. Subsequent frames
-    /// only rewrite the control UBO; the GPU advances positions in
-    /// place.
+    /// Lifecycle:
+    /// - Verlet resources (`prev_pos_ssbo`, `verlet_control_ubo`,
+    ///   `verlet_set`) are always allocated.
+    /// - Constraint resources are allocated only when
+    ///   `attach.constraints` is non-empty (built once, read-only).
+    /// - Normal-recomputation resources are allocated only when
+    ///   `attach.triangle_indices` is non-empty (built once, read-only).
     ///
-    /// Buffer sizing is fixed at allocation time; the particle count
-    /// cannot change after this without rebuilding the slot.
+    /// On creation, `cloth_pos_ssbo` and `prev_pos_ssbo` are seeded
+    /// from `initial_positions` × `attach.inv_masses` / `attach.pinned`
+    /// so the very first dispatch reads valid data and pinned particles
+    /// stay put.
     fn ensure_cloth_gpu_slot(
         &mut self,
         key: (MeshId, PrimitiveId),
         initial_positions: &[crate::asset::Vec3],
+        attach: &crate::renderer::frame_input::ClothGpuAttachData,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         cloth_verlet_pipeline: &Arc<ComputePipeline>,
+        cloth_constraint_accumulate_pipeline: &Arc<ComputePipeline>,
+        cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
+        cloth_normal_pipeline: &Arc<ComputePipeline>,
     ) -> Result<(), String> {
         let already_alloc = self
             .transform_cache
@@ -2119,6 +2343,14 @@ impl VulkanRenderer {
         }
 
         let particle_count = initial_positions.len() as u32;
+        let inv_mass_at = |i: usize| attach.inv_masses.get(i).copied().unwrap_or(1.0);
+        let pinned_at = |i: usize| {
+            if attach.pinned.get(i).copied().unwrap_or(false) {
+                1.0_f32
+            } else {
+                0.0
+            }
+        };
 
         let prev_pos_ssbo = Buffer::from_iter(
             memory_allocator.clone(),
@@ -2131,12 +2363,12 @@ impl VulkanRenderer {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            // Seed prev_pos to same as initial positions ⇒ zero velocity
-            // at start. Pinned flag = 0 (free); future S2 work resolves
-            // pin targets and writes 1.0 here per pinned particle.
+            // Seed prev_pos to same as initial positions ⇒ zero
+            // velocity at start. `w` = pinned flag (1.0 = locked).
             initial_positions
                 .iter()
-                .map(|p| [p[0], p[1], p[2], 0.0]),
+                .enumerate()
+                .map(|(i, p)| [p[0], p[1], p[2], pinned_at(i)]),
         )
         .map_err(|e| format!("renderer: cloth prev_pos SSBO alloc failed: {e}"))?;
 
@@ -2179,15 +2411,16 @@ impl VulkanRenderer {
             .clone();
 
         // Seed cloth_pos_ssbo with the rest pose so the very first GPU
-        // dispatch reads valid positions. `w = 1.0` matches the
-        // inv_mass-of-1 convention (free particle); pinned mass goes
-        // here when S2 lands pin handling.
+        // dispatch reads valid positions. `w` carries the inverse mass
+        // (0.0 = effectively pinned / immobile per the shader).
         {
             let mut guard = cloth_pos_ssbo
                 .write()
                 .map_err(|e| format!("renderer: cloth pos initial seed failed: {e}"))?;
-            for (dst, p) in guard.iter_mut().zip(initial_positions.iter()) {
-                *dst = [p[0], p[1], p[2], 1.0];
+            for (i, (dst, p)) in
+                guard.iter_mut().zip(initial_positions.iter()).enumerate()
+            {
+                *dst = [p[0], p[1], p[2], inv_mass_at(i)];
             }
         }
 
@@ -2195,7 +2428,7 @@ impl VulkanRenderer {
             ds_allocator.clone(),
             set0_layout,
             [
-                WriteDescriptorSet::buffer(0, cloth_pos_ssbo),
+                WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
                 WriteDescriptorSet::buffer(1, prev_pos_ssbo.clone()),
                 WriteDescriptorSet::buffer(2, verlet_control_ubo.clone()),
             ],
@@ -2203,19 +2436,327 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("renderer: cloth verlet descriptor set: {e}"))?;
 
+        // ---------- S2.1 — constraint resources (optional) ----------
+        let constraints = if !attach.constraints.is_empty() {
+            Some(Self::allocate_cloth_constraint_resources(
+                &attach.constraints,
+                particle_count,
+                &cloth_pos_ssbo,
+                memory_allocator,
+                ds_allocator,
+                cloth_constraint_accumulate_pipeline,
+                cloth_constraint_apply_pipeline,
+            )?)
+        } else {
+            None
+        };
+
+        // ---------- S3.1 — normal recomputation resources (optional) ----------
+        let cloth_norm_ssbo = self
+            .transform_cache
+            .get(&key)
+            .expect("transform slot exists")
+            .cloth_norm_ssbo
+            .clone();
+        let normals = if !attach.triangle_indices.is_empty() {
+            Some(Self::allocate_cloth_normal_resources(
+                &attach.triangle_indices,
+                particle_count,
+                &cloth_pos_ssbo,
+                &cloth_norm_ssbo,
+                memory_allocator,
+                ds_allocator,
+                cloth_normal_pipeline,
+            )?)
+        } else {
+            None
+        };
+
         if let Some(slot) = self.transform_cache.get_mut(&key) {
             slot.cloth_gpu = Some(ClothGpuSlot {
                 state: crate::simulation::cloth_gpu_boundary::ClothGpuSimulationState::from_authoring(
                     particle_count,
-                    0,
+                    attach.constraints.len() as u32,
                     8,
                 ),
                 prev_pos_ssbo,
                 verlet_control_ubo,
                 verlet_set,
+                constraints,
+                normals,
             });
         }
         Ok(())
+    }
+
+    fn allocate_cloth_constraint_resources(
+        constraints: &[(u32, u32, f32, f32)],
+        particle_count: u32,
+        cloth_pos_ssbo: &Subbuffer<[[f32; 4]]>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+        accumulate_pipeline: &Arc<ComputePipeline>,
+        apply_pipeline: &Arc<ComputePipeline>,
+    ) -> Result<ClothGpuConstraintResources, String> {
+        let constraint_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            constraints.iter().map(|(a, b, r, s)| pipeline::ClothConstraintGpu {
+                particle_a: *a,
+                particle_b: *b,
+                rest_length: *r,
+                stiffness: *s,
+            }),
+        )
+        .map_err(|e| format!("renderer: cloth constraint SSBO alloc: {e}"))?;
+
+        let delta_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            (0..particle_count as usize).map(|_| [0.0_f32; 4]),
+        )
+        .map_err(|e| format!("renderer: cloth delta SSBO alloc: {e}"))?;
+
+        let constraint_pairs: Vec<(u32, u32)> =
+            constraints.iter().map(|(a, b, _, _)| (*a, *b)).collect();
+        let adj = crate::simulation::cloth_gpu_boundary::build_particle_constraint_adjacency(
+            &constraint_pairs,
+            particle_count,
+        );
+        let adj_offsets_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            adj.offsets.iter().copied(),
+        )
+        .map_err(|e| format!("renderer: constraint adj offsets SSBO alloc: {e}"))?;
+        // Vulkano refuses zero-sized buffers; supply a single u32 stub
+        // when the CSR scatter array is empty (no particle touches any
+        // constraint). The shader's adjacency loop won't iterate
+        // because every `offsets[v+1] == offsets[v]` in that case.
+        let adj_constraints_data: Vec<u32> = if adj.triangles.is_empty() {
+            vec![0_u32]
+        } else {
+            adj.triangles.clone()
+        };
+        let adj_constraints_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            adj_constraints_data,
+        )
+        .map_err(|e| format!("renderer: constraint adj scatter SSBO alloc: {e}"))?;
+
+        let control_ubo = Buffer::from_data(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            pipeline::ClothConstraintControl {
+                particle_count,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        )
+        .map_err(|e| format!("renderer: constraint control UBO alloc: {e}"))?;
+
+        let accumulate_layout = accumulate_pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .ok_or("renderer: constraint accumulate pipeline missing set 0")?
+            .clone();
+        let accumulate_set = DescriptorSet::new(
+            ds_allocator.clone(),
+            accumulate_layout,
+            [
+                WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+                WriteDescriptorSet::buffer(1, delta_ssbo.clone()),
+                WriteDescriptorSet::buffer(2, constraint_ssbo.clone()),
+                WriteDescriptorSet::buffer(3, adj_offsets_ssbo.clone()),
+                WriteDescriptorSet::buffer(4, adj_constraints_ssbo.clone()),
+                WriteDescriptorSet::buffer(5, control_ubo.clone()),
+            ],
+            [],
+        )
+        .map_err(|e| format!("renderer: constraint accumulate descriptor set: {e}"))?;
+
+        let apply_layout = apply_pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .ok_or("renderer: constraint apply pipeline missing set 0")?
+            .clone();
+        let apply_set = DescriptorSet::new(
+            ds_allocator.clone(),
+            apply_layout,
+            [
+                WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+                WriteDescriptorSet::buffer(1, delta_ssbo.clone()),
+                WriteDescriptorSet::buffer(2, control_ubo.clone()),
+            ],
+            [],
+        )
+        .map_err(|e| format!("renderer: constraint apply descriptor set: {e}"))?;
+
+        Ok(ClothGpuConstraintResources {
+            constraint_ssbo,
+            delta_ssbo,
+            adj_offsets_ssbo,
+            adj_constraints_ssbo,
+            control_ubo,
+            accumulate_set,
+            apply_set,
+        })
+    }
+
+    fn allocate_cloth_normal_resources(
+        triangle_indices: &[u32],
+        particle_count: u32,
+        cloth_pos_ssbo: &Subbuffer<[[f32; 4]]>,
+        cloth_norm_ssbo: &Subbuffer<[[f32; 4]]>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+        normal_pipeline: &Arc<ComputePipeline>,
+    ) -> Result<ClothGpuNormalResources, String> {
+        let triangle_idx_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            triangle_indices.iter().copied(),
+        )
+        .map_err(|e| format!("renderer: triangle index SSBO alloc: {e}"))?;
+
+        let adj = crate::simulation::cloth_gpu_boundary::build_vertex_triangle_adjacency(
+            triangle_indices,
+            particle_count,
+        );
+        let adj_offsets_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            adj.offsets.iter().copied(),
+        )
+        .map_err(|e| format!("renderer: normal adj offsets SSBO alloc: {e}"))?;
+        let adj_triangles_data: Vec<u32> = if adj.triangles.is_empty() {
+            vec![0_u32]
+        } else {
+            adj.triangles.clone()
+        };
+        let adj_triangles_ssbo = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            adj_triangles_data,
+        )
+        .map_err(|e| format!("renderer: normal adj scatter SSBO alloc: {e}"))?;
+
+        let control_ubo = Buffer::from_data(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            pipeline::ClothNormalControl {
+                vertex_count: particle_count,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        )
+        .map_err(|e| format!("renderer: normal control UBO alloc: {e}"))?;
+
+        let normal_layout = normal_pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .ok_or("renderer: normal pipeline missing set 0")?
+            .clone();
+        let normal_set = DescriptorSet::new(
+            ds_allocator.clone(),
+            normal_layout,
+            [
+                WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+                WriteDescriptorSet::buffer(1, triangle_idx_ssbo.clone()),
+                WriteDescriptorSet::buffer(2, adj_offsets_ssbo.clone()),
+                WriteDescriptorSet::buffer(3, adj_triangles_ssbo.clone()),
+                WriteDescriptorSet::buffer(4, cloth_norm_ssbo.clone()),
+                WriteDescriptorSet::buffer(5, control_ubo.clone()),
+            ],
+            [],
+        )
+        .map_err(|e| format!("renderer: normal descriptor set: {e}"))?;
+
+        Ok(ClothGpuNormalResources {
+            triangle_idx_ssbo,
+            adj_offsets_ssbo,
+            adj_triangles_ssbo,
+            control_ubo,
+            normal_set,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2839,8 +3380,21 @@ impl VulkanRenderer {
                     .iter()
                     .find(|c| c.target_primitive_id == mesh_inst.primitive_id);
                 let has_cloth_prim = cloth_snap_opt.is_some();
+                // For Gpu-backed cloth with a triangulated mesh, the
+                // normal compute dispatch (S3.1) writes `cloth_norm_ssbo`
+                // even though the CPU snapshot's `deformed_normals` is
+                // `None` — flip the flag so `transform_cs` reads the
+                // GPU-written normals.
                 let has_cloth_normals_prim = cloth_snap_opt
-                    .map(|c| c.deformed_normals.is_some())
+                    .map(|c| {
+                        c.deformed_normals.is_some()
+                            || (c.solver_backend
+                                == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+                                && c.gpu_attach
+                                    .as_ref()
+                                    .map(|a| !a.triangle_indices.is_empty())
+                                    .unwrap_or(false))
+                    })
                     .unwrap_or(false);
 
                 self.ensure_transform_data(

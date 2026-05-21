@@ -93,6 +93,12 @@ pub struct ClothDeformSnapshot {
     /// initialiser for `cloth_pos_ssbo` / `prev_pos_ssbo`, so this
     /// struct only carries the simulation parameters.
     pub gpu_control: Option<ClothGpuDispatchControl>,
+    /// One-shot attach data for the GPU cloth solver — constraints,
+    /// triangle indices, masses, pinned flags. Carried on every frame
+    /// `solver_backend == Gpu` (cloning is cheap relative to the
+    /// dispatch cost); the renderer only reads it when lazily
+    /// allocating `ClothGpuSlot` on the first frame.
+    pub gpu_attach: Option<ClothGpuAttachData>,
 }
 
 /// Per-frame control data uploaded to `cloth_verlet_cs`'s `Control`
@@ -105,6 +111,35 @@ pub struct ClothGpuDispatchControl {
     pub gravity: [f32; 3],
     /// `wind_direction * wind_response` baked into a single vector.
     pub wind_force: [f32; 3],
+    /// PBD constraint iteration count for this frame. Mirror of
+    /// `ClothSimState::solver_iterations`; the renderer runs the
+    /// accumulate+apply compute passes this many times before the
+    /// normal recomputation pass.
+    pub solver_iterations: u32,
+}
+
+/// One-shot data uploaded to the GPU at cloth-attach time: constraint
+/// table, triangle indices, per-particle inverse mass and pinned flag.
+/// Carried on `ClothDeformSnapshot.gpu_attach` so the renderer's lazy
+/// slot allocation can seed the static SSBOs.
+#[derive(Clone, Debug)]
+pub struct ClothGpuAttachData {
+    /// `(particle_a, particle_b, rest_length, stiffness)` tuples. Built
+    /// from `ClothSimState::distance_constraints`; uploaded once into
+    /// the constraint SSBO.
+    pub constraints: Vec<(u32, u32, f32, f32)>,
+    /// Flat triangle index buffer (3 per triangle). Built from
+    /// `ClothSimState::triangle_indices` (cast u32). Uploaded once
+    /// into the triangle-index SSBO.
+    pub triangle_indices: Vec<u32>,
+    /// Per-particle inverse mass. `0.0` marks a pinned / immobile
+    /// particle. Written into the `w` component of `cloth_pos_ssbo`
+    /// at allocation time.
+    pub inv_masses: Vec<f32>,
+    /// Per-particle pinned flag (`true` ⇒ shader's `pinned > 0.5`
+    /// branch wins, particle holds its previous position). Written
+    /// into the `w` component of `prev_pos_ssbo`.
+    pub pinned: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

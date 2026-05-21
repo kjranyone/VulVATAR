@@ -679,7 +679,7 @@ fn collect_cloth_deforms<'a>(
     >,
     frame_dt: f32,
 ) -> Vec<ClothDeformSnapshot> {
-    use crate::renderer::frame_input::ClothGpuDispatchControl;
+    use crate::renderer::frame_input::{ClothGpuAttachData, ClothGpuDispatchControl};
     use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
     use crate::math_utils::vec3_scale;
 
@@ -692,20 +692,46 @@ fn collect_cloth_deforms<'a>(
             if !seen_targets.insert(target_primitive_id) {
                 return None;
             }
-            let gpu_control =
+            let (gpu_control, gpu_attach) =
                 if cs.solver_backend == ClothSolverBackend::Gpu {
-                    sim_opt.map(|sim| {
-                        let wind_force =
-                            vec3_scale(&sim.wind_direction, sim.wind_response);
-                        ClothGpuDispatchControl {
-                            dt: frame_dt,
-                            damping: sim.damping,
-                            gravity: sim.gravity,
-                            wind_force,
+                    match sim_opt {
+                        Some(sim) => {
+                            let wind_force =
+                                vec3_scale(&sim.wind_direction, sim.wind_response);
+                            let ctrl = ClothGpuDispatchControl {
+                                dt: frame_dt,
+                                damping: sim.damping,
+                                gravity: sim.gravity,
+                                wind_force,
+                                solver_iterations: sim.solver_iterations as u32,
+                            };
+                            let attach = ClothGpuAttachData {
+                                constraints: sim
+                                    .distance_constraints
+                                    .iter()
+                                    .map(|c| {
+                                        (
+                                            c.a as u32,
+                                            c.b as u32,
+                                            c.rest_length,
+                                            c.stiffness,
+                                        )
+                                    })
+                                    .collect(),
+                                triangle_indices: sim.triangle_indices.clone(),
+                                inv_masses: sim
+                                    .particles
+                                    .iter()
+                                    .map(|p| p.inv_mass)
+                                    .collect(),
+                                pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                            };
+                            (Some(ctrl), Some(attach))
                         }
-                    })
+                        None => (None, None),
+                    }
                 } else {
-                    None
+                    (None, None)
                 };
             Some(ClothDeformSnapshot {
                 target_primitive_id,
@@ -717,6 +743,7 @@ fn collect_cloth_deforms<'a>(
                 version: cs.deform_output.version,
                 solver_backend: cs.solver_backend,
                 gpu_control,
+                gpu_attach,
             })
         })
         .collect()
