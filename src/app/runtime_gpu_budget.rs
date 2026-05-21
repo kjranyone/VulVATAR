@@ -290,32 +290,26 @@ impl RuntimeGpuBudget {
                     self.last_transition_reason = reason;
                 }
             }
-            (DegradedMode::PressureHeavy, _) => {
+            (DegradedMode::PressureHeavy, p) => {
                 if self.failure_history.len() >= EMERGENCY_FAILURE_COUNT {
                     self.transition_to(
                         DegradedMode::EmergencyCpu,
                         now,
                         TransitionReason::GpuExportFailures,
                     );
+                } else if p.is_none() {
+                    self.maybe_recover_one_level(now);
                 }
             }
-            (DegradedMode::EmergencyCpu, _) => {
-                // Recovery only — no escalation past Emergency.
+            (DegradedMode::EmergencyCpu, p) => {
+                if p.is_none() {
+                    self.maybe_recover_one_level(now);
+                }
             }
             (_, None) => {
-                if let Some(streak) = self.clean_streak_started {
-                    if now.duration_since(streak) > RECOVERY_DWELL {
-                        let next = match self.degraded_mode {
-                            DegradedMode::EmergencyCpu => DegradedMode::PressureHeavy,
-                            DegradedMode::PressureHeavy => DegradedMode::PressureLight,
-                            DegradedMode::PressureLight => DegradedMode::Healthy,
-                            DegradedMode::Healthy => DegradedMode::Healthy,
-                        };
-                        if next != self.degraded_mode {
-                            self.transition_to(next, now, TransitionReason::Recovery);
-                        }
-                    }
-                }
+                // Healthy + None → step_down is a no-op; PressureLight
+                // + None → step down to Healthy after the dwell.
+                self.maybe_recover_one_level(now);
             }
         }
 
@@ -361,6 +355,33 @@ impl RuntimeGpuBudget {
         self.degraded_mode = mode;
         self.last_transition_at = now;
         self.last_transition_reason = reason;
+        // Force the recovery streak to restart after any transition so
+        // each step-down (Heavy → Light → Healthy) requires its own
+        // RECOVERY_DWELL of clean signals rather than cascading in two
+        // consecutive updates. The post-match streak-state block at
+        // the bottom of `update` re-arms it when pressure is clear.
+        self.clean_streak_started = None;
+    }
+
+    /// Recovery transition: drop one level toward Healthy when the
+    /// clean streak has run for at least `RECOVERY_DWELL`. Called
+    /// from the `update` match arms that handle `pressure.is_none()`;
+    /// a no-op when no streak is active, the dwell hasn't elapsed,
+    /// or we are already at Healthy.
+    fn maybe_recover_one_level(&mut self, now: Instant) {
+        let Some(streak) = self.clean_streak_started else {
+            return;
+        };
+        if now.duration_since(streak) <= RECOVERY_DWELL {
+            return;
+        }
+        let next = match self.degraded_mode {
+            DegradedMode::EmergencyCpu => DegradedMode::PressureHeavy,
+            DegradedMode::PressureHeavy => DegradedMode::PressureLight,
+            DegradedMode::PressureLight => DegradedMode::Healthy,
+            DegradedMode::Healthy => return,
+        };
+        self.transition_to(next, now, TransitionReason::Recovery);
     }
 
     fn recompute_targets(&mut self) {
@@ -538,6 +559,95 @@ mod tests {
             DegradedMode::EmergencyCpu,
             "second failure inside the window escalates"
         );
+    }
+
+    /// PressureHeavy steps down to PressureLight after a full
+    /// RECOVERY_DWELL of clean signals. Before the recovery fix the
+    /// match arm `(PressureHeavy, _)` swallowed the pressure-clear
+    /// case, leaving Heavy permanently stuck.
+    #[test]
+    fn pressure_heavy_recovers_to_light_after_clean_dwell() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        budget.update(&heavy_drop_measurements(), t0);
+        budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+
+        let streak_started = t0 + Duration::from_millis(100);
+        budget.update(&healthy_measurements(), streak_started);
+        budget.update(
+            &healthy_measurements(),
+            streak_started + RECOVERY_DWELL + Duration::from_millis(1),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
+    }
+
+    /// EmergencyCpu steps down to PressureHeavy after a full
+    /// RECOVERY_DWELL of clean signals. Symmetric to the Heavy → Light
+    /// case; without the recovery fix EmergencyCpu was a permanent
+    /// trap once entered.
+    #[test]
+    fn emergency_cpu_recovers_to_heavy_after_clean_dwell() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        // Force into EmergencyCpu the same way the unit-tested
+        // escalation path does.
+        budget.update(&heavy_drop_measurements(), t0);
+        budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
+        let mut m = heavy_drop_measurements();
+        m.gpu_export_failures_this_tick = EMERGENCY_FAILURE_COUNT as u32;
+        budget.update(&m, t0 + Duration::from_millis(32));
+        assert_eq!(budget.degraded_mode(), DegradedMode::EmergencyCpu);
+
+        let streak_started = t0 + Duration::from_millis(100);
+        budget.update(&healthy_measurements(), streak_started);
+        budget.update(
+            &healthy_measurements(),
+            streak_started + RECOVERY_DWELL + Duration::from_millis(1),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+    }
+
+    /// Recovery is one level per dwell, not a cascade. After Heavy
+    /// steps down to Light the streak must restart so a second
+    /// `RECOVERY_DWELL` is required before Light → Healthy. Without
+    /// this, two consecutive updates a few ms apart could carry the
+    /// budget from Heavy all the way to Healthy.
+    #[test]
+    fn recovery_cascades_one_level_per_dwell_not_instant() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        budget.update(&heavy_drop_measurements(), t0);
+        budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+
+        let streak_start = t0 + Duration::from_millis(100);
+        budget.update(&healthy_measurements(), streak_start);
+        // First recovery: Heavy → Light at streak + RECOVERY_DWELL + ε.
+        let first_recovery = streak_start + RECOVERY_DWELL + Duration::from_millis(1);
+        budget.update(&healthy_measurements(), first_recovery);
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
+
+        // Immediately afterwards, the streak must have been reset:
+        // a clean update a few ms later should not skip straight to
+        // Healthy.
+        budget.update(
+            &healthy_measurements(),
+            first_recovery + Duration::from_millis(50),
+        );
+        assert_eq!(
+            budget.degraded_mode(),
+            DegradedMode::PressureLight,
+            "second step-down must wait for its own dwell, not cascade"
+        );
+
+        // Wait a full RECOVERY_DWELL from the first recovery — second
+        // step Light → Healthy fires.
+        budget.update(
+            &healthy_measurements(),
+            first_recovery + RECOVERY_DWELL + Duration::from_millis(2),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::Healthy);
     }
 
     /// Failures separated by more than the window do not escalate —

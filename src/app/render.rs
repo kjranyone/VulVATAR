@@ -55,7 +55,7 @@ impl Application {
 
         // 2. read the latest completed tracking sample from the async
         //    tracking worker. Three age states:
-        //    - **Fresh** (`!is_stale()`): pull a new sample.
+        //    - **Fresh** (`age <= stale_timeout`): pull a new sample.
         //    - **Holding** (stale but age < `TRACKING_HOLD_WINDOW`):
         //      reuse `last_tracking_pose` with confidence decayed
         //      linearly to zero across the hold window. The avatar
@@ -67,22 +67,24 @@ impl Application {
         //      base / animation pose.
         let tracking_sample = if toggles.tracking_enabled {
             let mailbox = self.tracking.mailbox();
-            if !mailbox.is_stale() {
-                self.step_tracking()
-            } else if let Some(age) = mailbox.age() {
-                let stale_threshold = mailbox.stale_timeout();
-                if age < TRACKING_HOLD_WINDOW {
-                    self.last_tracking_pose.as_ref().map(|last| {
-                        let span =
-                            (TRACKING_HOLD_WINDOW - stale_threshold).as_secs_f32().max(1e-6);
-                        let into_hold = age.saturating_sub(stale_threshold).as_secs_f32();
-                        let progress = (into_hold / span).clamp(0.0, 1.0);
-                        let scale = (1.0 - progress).clamp(0.0, 1.0);
-                        let mut held = last.clone();
-                        held.scale_confidence(scale);
-                        held
-                    })
-                } else {
+            // Single mailbox lock per frame: age + stale_timeout
+            // together describe the freshness state cheaper than
+            // a separate `is_stale()` call.
+            let age = mailbox.age();
+            let stale_threshold = mailbox.stale_timeout();
+            match age {
+                Some(a) if a <= stale_threshold => self.step_tracking(),
+                Some(a) if a < TRACKING_HOLD_WINDOW => self.last_tracking_pose.as_ref().map(|last| {
+                    let span =
+                        (TRACKING_HOLD_WINDOW - stale_threshold).as_secs_f32().max(1e-6);
+                    let into_hold = a.saturating_sub(stale_threshold).as_secs_f32();
+                    let progress = (into_hold / span).clamp(0.0, 1.0);
+                    let scale = (1.0 - progress).clamp(0.0, 1.0);
+                    let mut held = last.clone();
+                    held.scale_confidence(scale);
+                    held
+                }),
+                Some(_) => {
                     if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
                         warn!(
                             "tracking: sample expired (age > {:?}), holding base pose",
@@ -92,8 +94,9 @@ impl Application {
                     }
                     None
                 }
-            } else {
-                None
+                // Mailbox never published a sample — same end state
+                // as Expired (no pose, no warn spam yet).
+                None => None,
             }
         } else {
             None
