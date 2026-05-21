@@ -670,8 +670,17 @@ mod tests {
             spatial_hash: SpatialHashGrid::new(0.04),
         };
         let mut buffers = ClothSimTempBuffers::new(n);
+        // XPBD lambda is meaningless across substeps — reset once
+        // before the 64-iter loop so this whole block models a single
+        // substep with 64 projection passes (which is what the GPU
+        // mirror does too).
+        buffers.reset_lambda(sim.distance_constraints.len());
+        // `dt` only matters when stiffness < 1 (compliance > 0). The
+        // grid uses stiffness = 1 so α = 0 and `dt` falls out of the
+        // formula; any positive value gives identical behaviour.
+        let test_dt = 1.0 / 60.0_f32;
         for _ in 0..64 {
-            project_distance_constraints(&mut sim, &mut buffers);
+            project_distance_constraints(&mut sim, &mut buffers, test_dt);
         }
 
         // ----- (b) GLSL Jacobi formula mirror -----

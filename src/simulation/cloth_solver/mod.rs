@@ -86,10 +86,15 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
     // ---- Verlet integration ---------------------------------------------------
     integrator::verlet_integrate(sim, dt);
 
+    // ---- reset XPBD Lagrange multipliers for this substep --------------------
+    // The lambda buffer accumulates across `solver_iterations` projection
+    // passes inside one substep; the next substep starts fresh.
+    buffers.reset_lambda(sim.distance_constraints.len());
+
     // ---- constraint projection (iterative) ------------------------------------
     let iterations = sim.solver_iterations;
     for _ in 0..iterations {
-        constraints::project_distance_constraints(sim, buffers);
+        constraints::project_distance_constraints(sim, buffers, dt);
         constraints::project_bend_constraints(sim);
     }
 
@@ -151,9 +156,14 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
         collision::apply_pin_targets(&mut slot.sim, &global_transforms);
         integrator::verlet_integrate(&mut slot.sim, dt);
 
+        // XPBD lambda reset per substep — see `step_cloth_single` for
+        // the lifecycle rationale.
+        slot.buffers
+            .reset_lambda(slot.sim.distance_constraints.len());
+
         let iterations = slot.sim.solver_iterations;
         for _ in 0..iterations {
-            constraints::project_distance_constraints(&mut slot.sim, &mut slot.buffers);
+            constraints::project_distance_constraints(&mut slot.sim, &mut slot.buffers, dt);
             constraints::project_bend_constraints(&mut slot.sim);
         }
 
