@@ -219,6 +219,13 @@ pub struct Application {
     /// avatar still gets at least one follow-up frame to upload the
     /// re-rendered texture instead of stalling on the previous image.
     render_results_pending: u32,
+    /// Lifetime tally of render results the render thread had to drop
+    /// because the app hadn't drained the mailbox yet. Each entry is a
+    /// frame that completed on the GPU but never reached
+    /// `process_render_result`. Increasing values indicate the app
+    /// thread is falling behind the renderer (modal stalls, long load
+    /// jobs, etc.); plumbed for diagnostics surfacing in the inspector.
+    render_results_dropped: u64,
     /// Lease completions waiting to be forwarded back to the render thread.
     /// The render command channel is bounded, so failed `try_send` attempts
     /// are retried next tick instead of dropping the release and pinning a
@@ -337,6 +344,7 @@ impl Application {
             ground_grid_visible: false,
             logged_first_render_result: false,
             render_results_pending: 0,
+            render_results_dropped: 0,
             pending_export_lease_releases: VecDeque::new(),
         }
     }
@@ -348,6 +356,14 @@ impl Application {
     /// tracking, or lipsync is active.
     pub fn has_pending_render_result(&self) -> bool {
         self.render_results_pending > 0
+    }
+
+    /// Cumulative render-result drops since process start. Increases
+    /// monotonically when the render thread had to replace an older
+    /// mailbox entry with a newer one because the app hadn't drained
+    /// the previous frame yet.
+    pub fn render_results_dropped_count(&self) -> u64 {
+        self.render_results_dropped
     }
 
     /// Set the desired viewport resolution (called by the GUI when the viewport panel resizes).

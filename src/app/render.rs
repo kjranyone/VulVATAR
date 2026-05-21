@@ -20,6 +20,18 @@ use crate::renderer::material::MaterialShaderMode;
 use crate::renderer::material::MaterialUploadRequest;
 use crate::simulation::SimulationStepOptions;
 
+/// Maximum age the tracking mailbox may reach before the hold/fade
+/// policy gives up and lets the avatar return to its base / animation
+/// pose. The mailbox starts reporting `is_stale() == true` at
+/// `TrackingMailbox::stale_timeout()` (200 ms by default); inside the
+/// window `[stale_timeout, TRACKING_HOLD_WINDOW]` the last good sample
+/// is reused with its confidence decayed linearly so the avatar
+/// freezes and then fades back instead of snapping. Tuned for typical
+/// webcam tracking hiccups (occluded face, brief out-of-frame); larger
+/// values risk visible "phantom pose" persistence after the user has
+/// genuinely walked away.
+const TRACKING_HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
 impl Application {
     pub fn run_frame(&mut self, config: &FrameConfig) {
         if !self.running {
@@ -41,16 +53,47 @@ impl Application {
         // 1. input update
         self.input_update(frame_dt);
 
-        // 2. read the latest completed tracking sample from the async tracking worker
+        // 2. read the latest completed tracking sample from the async
+        //    tracking worker. Three age states:
+        //    - **Fresh** (`!is_stale()`): pull a new sample.
+        //    - **Holding** (stale but age < `TRACKING_HOLD_WINDOW`):
+        //      reuse `last_tracking_pose` with confidence decayed
+        //      linearly to zero across the hold window. The avatar
+        //      freezes in place and joints drop below the solver's
+        //      confidence threshold gradually as the decay proceeds,
+        //      so the pose drifts back to base rather than snapping.
+        //    - **Expired** (age past the hold window, or never
+        //      published): drop the sample. Solver bypass restores
+        //      base / animation pose.
         let tracking_sample = if toggles.tracking_enabled {
-            if self.tracking.mailbox().is_stale() {
-                if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
-                    warn!("tracking: stale sample detected, skipping tracking this frame");
-                    self.stale_warn_cooldown = std::time::Instant::now();
-                }
-                None
-            } else {
+            let mailbox = self.tracking.mailbox();
+            if !mailbox.is_stale() {
                 self.step_tracking()
+            } else if let Some(age) = mailbox.age() {
+                let stale_threshold = mailbox.stale_timeout();
+                if age < TRACKING_HOLD_WINDOW {
+                    self.last_tracking_pose.as_ref().map(|last| {
+                        let span =
+                            (TRACKING_HOLD_WINDOW - stale_threshold).as_secs_f32().max(1e-6);
+                        let into_hold = age.saturating_sub(stale_threshold).as_secs_f32();
+                        let progress = (into_hold / span).clamp(0.0, 1.0);
+                        let scale = (1.0 - progress).clamp(0.0, 1.0);
+                        let mut held = last.clone();
+                        held.scale_confidence(scale);
+                        held
+                    })
+                } else {
+                    if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
+                        warn!(
+                            "tracking: sample expired (age > {:?}), holding base pose",
+                            TRACKING_HOLD_WINDOW
+                        );
+                        self.stale_warn_cooldown = std::time::Instant::now();
+                    }
+                    None
+                }
+            } else {
+                None
             }
         } else {
             None
@@ -230,20 +273,14 @@ impl Application {
             output_drops_per_sec: drops_per_sec,
             export_pool_leased,
             export_pool_capacity,
-            // GPU export failure tracking is plumbed but not yet wired —
-            // `OutputDiagnostics` reports `fallback_active` after a token
-            // export miss, but the budget needs a *recent* count, not a
-            // single-bit flag. Left at 0 until a small failure-window
-            // counter lands; the budget then only escalates to
-            // `EmergencyCpu` once that counter is populated.
-            // Pulled from the OutputRouter's recent-window counter,
-            // which increments whenever a frame attempted the GPU
-            // handoff but published with an invalid token (renderer
-            // wanted GPU, sink had to fall back). The take-and-reset
-            // semantic means the budget sees only failures that
-            // occurred in the current tick window — the right shape
-            // for `EmergencyCpu` (2 failures inside a window → escalate).
-            gpu_export_failures_recent: self.output.take_gpu_export_failure_count(),
+            // Per-tick delta from `OutputRouter`'s cumulative failure
+            // counter (increments whenever a frame attempted the GPU
+            // handoff but published with an invalid token — renderer
+            // wanted GPU, sink fell back). The budget integrates these
+            // deltas into a `FAILURE_WINDOW`-wide rolling history;
+            // one failure per frame still accumulates to the
+            // `EmergencyCpu` threshold within seconds.
+            gpu_export_failures_this_tick: self.output.take_gpu_export_failure_count(),
         };
         self.runtime_gpu_budget.update(&measurements, now);
 
@@ -276,19 +313,31 @@ impl Application {
         }
     }
 
-    /// Drain every result currently sitting in the render thread's
-    /// result channel and decrement the in-flight counter accordingly.
-    /// Safe to call whether or not `run_frame` ran this tick — the
+    /// Drain the latest result from the render thread's mailbox and
+    /// decrement the in-flight counter for both the drained frame and
+    /// any frames the render thread had to replace before this call.
+    /// Safe to invoke whether or not `run_frame` ran this tick — the
     /// counter is the boundary, not the avatar list.
     pub fn drain_render_results(&mut self) {
-        let pending_results: Vec<_> = if let Some(ref rt) = self.render_thread {
-            std::iter::from_fn(|| rt.try_recv_result()).collect()
-        } else {
-            vec![]
-        };
-        for result in pending_results {
-            self.render_results_pending = self.render_results_pending.saturating_sub(1);
-            self.process_render_result(result);
+        if let Some(ref rt) = self.render_thread {
+            // Compensate the in-flight counter for frames that completed
+            // on the renderer but were replaced before they reached us
+            // (latest-frame mailbox semantics). Without this the counter
+            // would inflate by one per dropped frame and the GUI repaint
+            // gate would pin to full rate forever after even one stall.
+            let dropped = rt.take_dropped_results();
+            if dropped > 0 {
+                self.render_results_dropped =
+                    self.render_results_dropped.saturating_add(dropped);
+                let dropped_u32 = u32::try_from(dropped).unwrap_or(u32::MAX);
+                self.render_results_pending =
+                    self.render_results_pending.saturating_sub(dropped_u32);
+            }
+
+            if let Some(result) = rt.try_recv_result() {
+                self.render_results_pending = self.render_results_pending.saturating_sub(1);
+                self.process_render_result(result);
+            }
         }
         self.forward_completed_output_leases();
     }

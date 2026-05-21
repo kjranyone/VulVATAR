@@ -450,6 +450,27 @@ impl TrackingMailbox {
         let elapsed = now_nanos().saturating_sub(inner.last_update_nanos);
         elapsed > self.stale_timeout_nanos
     }
+
+    /// Time elapsed since the last published sample. `None` when no
+    /// sample has ever been published. The hold/fade policy in
+    /// [`crate::app::Application::run_frame`] uses this to grade
+    /// stale samples by age (fresh / holding / expired) instead of
+    /// the binary stale flag.
+    pub fn age(&self) -> Option<std::time::Duration> {
+        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.last_update_nanos == 0 {
+            return None;
+        }
+        let elapsed_nanos = now_nanos().saturating_sub(inner.last_update_nanos);
+        Some(std::time::Duration::from_nanos(elapsed_nanos))
+    }
+
+    /// Stale-flip threshold the mailbox was constructed with. Surfaced
+    /// so the hold/fade policy can ladder its windows from the same
+    /// anchor instead of duplicating the constant.
+    pub fn stale_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.stale_timeout_nanos)
+    }
 }
 
 // ---------------------------------------------------------------------------

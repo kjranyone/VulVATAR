@@ -10,6 +10,7 @@
 //!
 //! See `plan/runtime-gpu-budget.md` for the design and threshold rationale.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Coarse GPU pressure level. Levels are intentionally few — fine-grained
@@ -75,9 +76,16 @@ pub struct RuntimeMeasurements {
     /// from `OutputDiagnostics::export_pool` so the budget never holds
     /// a stale copy).
     pub export_pool_capacity: usize,
-    /// Number of GPU export failures observed in the last 10 seconds.
-    /// Drives the `PressureHeavy → EmergencyCpu` step.
-    pub gpu_export_failures_recent: u32,
+    /// Number of GPU export failures observed since the previous
+    /// [`RuntimeGpuBudget::update`] call. Producer (`OutputRouter`)
+    /// counts handle-export / fence-wait misses cumulatively; the
+    /// caller drains via `take_gpu_export_failure_count` each tick and
+    /// passes the delta here. The budget accumulates these deltas
+    /// into its own time-windowed counter (see `FAILURE_WINDOW`) and
+    /// compares the window total against `EMERGENCY_FAILURE_COUNT` —
+    /// per-tick counts of 0 or 1 would otherwise never reach the
+    /// threshold in normal operation.
+    pub gpu_export_failures_this_tick: u32,
 }
 
 impl Default for RuntimeMeasurements {
@@ -88,13 +96,16 @@ impl Default for RuntimeMeasurements {
             output_drops_per_sec: 0.0,
             export_pool_leased: 0,
             export_pool_capacity: 2,
-            gpu_export_failures_recent: 0,
+            gpu_export_failures_this_tick: 0,
         }
     }
 }
 
 /// Knobs published by the budget. Consumers read these each tick.
-#[derive(Clone, Copy, Debug)]
+///
+/// Not `Copy` — the failure-history ring is a `VecDeque`. `Application`
+/// owns one instance by value; nothing in the codebase needs to copy it.
+#[derive(Clone, Debug)]
 pub struct RuntimeGpuBudget {
     /// User's intent for render cadence (combo box). The budget may
     /// clamp the *exposed* target below this under pressure.
@@ -111,6 +122,13 @@ pub struct RuntimeGpuBudget {
     clean_streak_started: Option<Instant>,
     last_transition_at: Instant,
     last_transition_reason: TransitionReason,
+
+    /// Timestamps of recent GPU export failures, pruned to the
+    /// `FAILURE_WINDOW` rolling window on every `update`. Counted in
+    /// the `PressureHeavy → EmergencyCpu` decision so a per-tick
+    /// count of 0 or 1 (the normal case — at most one publish per
+    /// frame) can still accumulate to the threshold.
+    failure_history: VecDeque<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -139,14 +157,22 @@ impl TransitionReason {
     }
 }
 
-/// Hysteresis windows. Mirror the values documented in
-/// `plan/runtime-gpu-budget.md`; tuned after live data lands.
+/// Hysteresis windows. Tuned after live data lands; values are the
+/// round-numbered first cut.
 const LIGHT_TO_HEAVY_DWELL: Duration = Duration::from_secs(5);
 const RECOVERY_DWELL: Duration = Duration::from_secs(30);
 const HEAVY_DROP_RATE_PER_SEC: f32 = 20.0;
 const LIGHT_DROP_RATE_PER_SEC: f32 = 5.0;
 const RENDER_OVERRUN_MULTIPLE: f32 = 1.2;
-const EMERGENCY_FAILURE_COUNT: u32 = 2;
+/// Failures within this rolling window count toward the
+/// `PressureHeavy → EmergencyCpu` escalation.
+const FAILURE_WINDOW: Duration = Duration::from_secs(10);
+const EMERGENCY_FAILURE_COUNT: usize = 2;
+/// Cap on history entries to bound memory; at 60 fps with one failure
+/// per frame, `FAILURE_WINDOW * 60 = 600` is the theoretical maximum.
+/// A higher cap protects against a runaway producer; pruning happens
+/// each tick regardless.
+const MAX_FAILURE_HISTORY: usize = 1024;
 
 impl RuntimeGpuBudget {
     pub fn new(now: Instant) -> Self {
@@ -162,7 +188,15 @@ impl RuntimeGpuBudget {
             clean_streak_started: Some(now),
             last_transition_at: now,
             last_transition_reason: TransitionReason::InitialState,
+            failure_history: VecDeque::new(),
         }
+    }
+
+    /// Currently-windowed GPU export failure count. Exposed for
+    /// inspector diagnostics; the escalation logic uses it directly
+    /// inside `update`.
+    pub fn gpu_export_failure_window_count(&self) -> usize {
+        self.failure_history.len()
     }
 
     pub fn set_user_render_fps(&mut self, fps: u32) {
@@ -214,6 +248,23 @@ impl RuntimeGpuBudget {
             }
         }
 
+        // Drop history entries that are either older than the window
+        // (normal pruning) or in the future relative to `now` (clock
+        // adjustment / test injection). Both cases would otherwise
+        // produce stale "recent failures" counts.
+        self.failure_history
+            .retain(|t| *t <= now && now.duration_since(*t) <= FAILURE_WINDOW);
+        // Record the failures this tick at `now`. Saturate the per-tick
+        // count so a pathological producer can't exhaust the bound in
+        // one call, then trim from the front to keep `MAX_FAILURE_HISTORY`.
+        let to_push = (m.gpu_export_failures_this_tick as usize).min(MAX_FAILURE_HISTORY);
+        for _ in 0..to_push {
+            self.failure_history.push_back(now);
+        }
+        while self.failure_history.len() > MAX_FAILURE_HISTORY {
+            self.failure_history.pop_front();
+        }
+
         let pressure = self.detect_pressure(m);
 
         match (self.degraded_mode, pressure) {
@@ -240,7 +291,7 @@ impl RuntimeGpuBudget {
                 }
             }
             (DegradedMode::PressureHeavy, _) => {
-                if m.gpu_export_failures_recent >= EMERGENCY_FAILURE_COUNT {
+                if self.failure_history.len() >= EMERGENCY_FAILURE_COUNT {
                     self.transition_to(
                         DegradedMode::EmergencyCpu,
                         now,
@@ -448,15 +499,67 @@ mod tests {
         // Heavy drop rate from PressureLight escalates immediately (no dwell).
         budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
-        // Two GPU export failures bumps to Emergency.
+        // Two GPU export failures in a single tick bumps to Emergency.
         let mut m = heavy_drop_measurements();
-        m.gpu_export_failures_recent = EMERGENCY_FAILURE_COUNT;
+        m.gpu_export_failures_this_tick = EMERGENCY_FAILURE_COUNT as u32;
         budget.update(&m, t0 + Duration::from_millis(32));
         assert_eq!(budget.degraded_mode(), DegradedMode::EmergencyCpu);
         assert_eq!(
             budget.facemesh_ep_preference(),
             FaceMeshEpPreference::Cpu
         );
+    }
+
+    /// Failures arriving one-per-tick still accumulate to the
+    /// threshold because the budget keeps a sliding `FAILURE_WINDOW`
+    /// history. This is the real-world path: `OutputRouter` increments
+    /// its counter by at most 1 per publish (one publish per frame),
+    /// so the previous per-tick threshold of 2 was effectively
+    /// unreachable.
+    #[test]
+    fn failures_one_per_tick_still_reach_emergency_within_window() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        budget.update(&heavy_drop_measurements(), t0);
+        budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+
+        let mut m = heavy_drop_measurements();
+        m.gpu_export_failures_this_tick = 1;
+        budget.update(&m, t0 + Duration::from_millis(100));
+        assert_eq!(
+            budget.degraded_mode(),
+            DegradedMode::PressureHeavy,
+            "one failure within the window is below threshold"
+        );
+        budget.update(&m, t0 + Duration::from_millis(200));
+        assert_eq!(
+            budget.degraded_mode(),
+            DegradedMode::EmergencyCpu,
+            "second failure inside the window escalates"
+        );
+    }
+
+    /// Failures separated by more than the window do not escalate —
+    /// the older entry is pruned before the newer one lands.
+    #[test]
+    fn failures_outside_window_do_not_accumulate() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        budget.update(&heavy_drop_measurements(), t0);
+        budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+
+        let mut m = heavy_drop_measurements();
+        m.gpu_export_failures_this_tick = 1;
+        budget.update(&m, t0 + Duration::from_secs(1));
+        assert_eq!(budget.gpu_export_failure_window_count(), 1);
+        // 11 seconds after the first failure — the first entry is now
+        // outside FAILURE_WINDOW and gets pruned before the second is
+        // pushed. The window count never reaches 2.
+        budget.update(&m, t0 + Duration::from_secs(12));
+        assert_eq!(budget.gpu_export_failure_window_count(), 1);
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
     }
 
     #[test]

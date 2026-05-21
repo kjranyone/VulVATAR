@@ -598,7 +598,7 @@ impl OutputRouter {
 
     /// Return and reset the GPU export failure counter. Application
     /// calls this each `update_runtime_gpu_budget` tick and feeds the
-    /// value into `RuntimeMeasurements::gpu_export_failures_recent`.
+    /// value into `RuntimeMeasurements::gpu_export_failures_this_tick`.
     pub fn take_gpu_export_failure_count(&mut self) -> u32 {
         std::mem::take(&mut self.gpu_export_failure_count)
     }
