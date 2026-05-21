@@ -6,7 +6,51 @@
 
 use std::time::Instant;
 
+use eframe::egui;
+
 use crate::tracking::{CalibrationMode, PoseCalibration};
+
+/// Calibration-related fields lifted out of `GuiApp`. Aggregates the
+/// modal state, the live webcam preview texture used by the modal,
+/// the worker→GUI `torso_template_seq` shadow, the last
+/// calibration-mode hint we pushed (so the GUI only forwards on
+/// edges), and the asynchronous target-pose snapshot render. Part of
+/// the architecture-finding #10 GUI state split.
+#[derive(Default)]
+pub struct CalibrationUiState {
+    /// Modal state-machine variant (Closed / Idle / WaitingForPose /
+    /// Collecting / AnchorDone / Done / ...).
+    pub modal: CalibrationModalState,
+    /// Independent texture + buffer for the calibration preview so
+    /// toggling the camera-wipe PIP while calibrating doesn't tear
+    /// either preview.
+    pub preview_texture: Option<egui::TextureHandle>,
+    pub preview_seq: u64,
+    pub preview_rgba_buf: Vec<u8>,
+    /// Last `torso_template_seq` we consumed from the tracking
+    /// mailbox. Drives one-shot stitching of the worker-published
+    /// `TorsoDepthTemplate` onto the in-flight `PoseCalibration`.
+    /// Initialised to 0 so the first publish (seq starts at 1) is
+    /// always picked up.
+    pub torso_template_seq: u64,
+    /// Last calibration-mode hint pushed to the tracking mailbox via
+    /// `TrackingMailbox::set_calibration_mode_hint`. Tracked here so
+    /// the GUI side only forwards on edges instead of re-locking the
+    /// mailbox every frame.
+    pub last_pushed_mode_hint: Option<CalibrationMode>,
+    /// One-shot offscreen render of the active avatar in the
+    /// calibration target pose (T-pose for FullBody, hands-at-sides
+    /// for UpperBody). Shown beside the webcam preview in the modal
+    /// as a "this is what you should look like" reference.
+    pub target_pose_texture: Option<egui::TextureHandle>,
+    /// The mode the current `target_pose_texture` was rendered for.
+    /// Used to invalidate the snapshot when the user toggles modes.
+    pub target_pose_mode: Option<CalibrationMode>,
+    /// In-flight target-pose render request. The poll path drains
+    /// this and uploads pixels to `target_pose_texture`.
+    pub target_pose_pending:
+        Option<std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>>,
+}
 
 /// One per-frame anchor reading collected during the capture window.
 /// Stored as `Vec<AnchorSample>` on the `Collecting` variant; the

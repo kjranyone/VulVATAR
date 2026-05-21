@@ -397,48 +397,10 @@ pub struct GuiApp {
     pub camera_wipe_seq: u64,
     pub camera_wipe_rgba_buf: Vec<u8>,
 
-    // Pose-calibration modal (Phase B). Independent texture + buffer so
-    // toggling the camera-wipe PIP while calibrating doesn't tear
-    // either preview.
-    pub calibration_modal: calibration::CalibrationModalState,
-    pub calibration_preview_texture: Option<egui::TextureHandle>,
-    pub calibration_preview_seq: u64,
-    pub calibration_preview_rgba_buf: Vec<u8>,
-    /// Last `torso_template_seq` we consumed from the tracking
-    /// mailbox. Drives one-shot stitching of the worker-published
-    /// `TorsoDepthTemplate` onto the in-flight `PoseCalibration` —
-    /// see `calibration::poll_torso_template`. Initialised to
-    /// 0 so the first publish (seq starts at 1) is always picked up.
-    pub calibration_torso_template_seq: u64,
-    /// Last calibration-mode hint pushed to the tracking mailbox via
-    /// [`crate::tracking::TrackingMailbox::set_calibration_mode_hint`].
-    /// Tracked here so the GUI side only forwards on edges instead of
-    /// re-locking the mailbox every frame. Bridges the gap between
-    /// "modal is open with `UpperBody` selected" and the provider's
-    /// `force_shoulder_anchor` flag — without it the very first
-    /// `UpperBody` capture sees `force_shoulder_anchor=false` and the
-    /// `pose.root_anchor_is_hip` gate in `refresh.rs` rejects every
-    /// sample because the model hallucinates a confident hip.
-    pub last_pushed_calibration_mode_hint:
-        Option<crate::tracking::CalibrationMode>,
-    /// One-shot offscreen render of the active avatar in the
-    /// calibration target pose (T-pose for FullBody, hands-at-sides
-    /// for UpperBody). Shown beside the webcam preview in the modal
-    /// as a "this is what you should look like" reference. `None`
-    /// until the first request resolves; rebuilt whenever the modal
-    /// opens or the user switches modes via the segmented buttons.
-    pub calibration_target_pose_texture: Option<egui::TextureHandle>,
-    /// The mode the current `calibration_target_pose_texture` was
-    /// rendered for. Used to invalidate (= re-request) the snapshot
-    /// when the user toggles the segmented buttons.
-    pub calibration_target_pose_mode:
-        Option<crate::tracking::CalibrationMode>,
-    /// In-flight render request for the target-pose snapshot. The
-    /// poll path (called from the modal's per-frame entry) drains
-    /// this and uploads pixels to `calibration_target_pose_texture`.
-    /// `None` when no request is outstanding.
-    pub calibration_target_pose_pending:
-        Option<std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>>,
+    // Pose-calibration modal (Phase B). Aggregated into
+    // `calibration::CalibrationUiState` as part of the GuiApp state
+    // split — see plan/architecture-pipeline-gui-critical-review.md #10.
+    pub calibration: calibration::CalibrationUiState,
 
     // Lip sync
     pub lipsync: LipSyncGuiState,
@@ -643,15 +605,7 @@ impl GuiApp {
             camera_wipe_seq: 0,
             camera_wipe_rgba_buf: Vec::new(),
 
-            calibration_modal: calibration::CalibrationModalState::default(),
-            calibration_preview_texture: None,
-            calibration_preview_seq: 0,
-            calibration_preview_rgba_buf: Vec::new(),
-            calibration_torso_template_seq: 0,
-            last_pushed_calibration_mode_hint: None,
-            calibration_target_pose_texture: None,
-            calibration_target_pose_mode: None,
-            calibration_target_pose_pending: None,
+            calibration: calibration::CalibrationUiState::default(),
 
             lipsync: LipSyncGuiState {
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
@@ -900,15 +854,7 @@ impl GuiApp {
             camera_wipe_seq: 0,
             camera_wipe_rgba_buf: Vec::new(),
 
-            calibration_modal: calibration::CalibrationModalState::default(),
-            calibration_preview_texture: None,
-            calibration_preview_seq: 0,
-            calibration_preview_rgba_buf: Vec::new(),
-            calibration_torso_template_seq: 0,
-            last_pushed_calibration_mode_hint: None,
-            calibration_target_pose_texture: None,
-            calibration_target_pose_mode: None,
-            calibration_target_pose_pending: None,
+            calibration: calibration::CalibrationUiState::default(),
 
             lipsync: LipSyncGuiState {
                 available_mics: Vec::new(),
@@ -1022,13 +968,13 @@ impl GuiApp {
     /// transitions whose state change happens inside `draw_modal`,
     /// after the pre-`run_frame` push has already run).
     fn sync_calibration_mode_hint(&mut self) {
-        let current = self.calibration_modal.active_mode();
-        if current != self.last_pushed_calibration_mode_hint {
+        let current = self.calibration.modal.active_mode();
+        if current != self.calibration.last_pushed_mode_hint {
             self.app
                 .tracking
                 .mailbox()
                 .set_calibration_mode_hint(current);
-            self.last_pushed_calibration_mode_hint = current;
+            self.calibration.last_pushed_mode_hint = current;
         }
     }
 }
@@ -1312,7 +1258,7 @@ impl eframe::App for GuiApp {
             .iter()
             .any(|a| a.animation_state.active_clip.is_some());
         let render_in_flight = self.app.has_pending_render_result();
-        let calibration_modal_open = self.calibration_modal.is_open();
+        let calibration_modal_open = self.calibration.modal.is_open();
         let needs_animation_frame = self.tracking.toggle_tracking
             || self.app.is_lipsync_enabled()
             || self.avatar_load_job.is_some()

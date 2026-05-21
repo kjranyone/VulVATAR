@@ -45,7 +45,7 @@ mod target_pose;
 mod transitions;
 
 pub use panes::draw_modal;
-pub use state::CalibrationModalState;
+pub use state::{CalibrationModalState, CalibrationUiState};
 pub use target_pose::target_pose_skinning_matrices;
 
 /// Anchor-capture window duration after the pose is recognised. At

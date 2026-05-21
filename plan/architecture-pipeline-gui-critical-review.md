@@ -1,35 +1,33 @@
 # VulVATAR architecture / pipeline / GUI — open findings
 
 Original review date: 2026-05-06  
-Last stocktake: 2026-05-21
+Last stocktake: 2026-05-22
 
 This file used to be the full 1095-line review with the work history of every
 fix. The history is in `git log`; this file now only lists the **open**
 findings and the recommended order for picking them up. For the closed ones
-see commits between `2026-05-06` and `2026-05-21` (architecture review pass +
+see commits between `2026-05-06` and `2026-05-22` (architecture review pass +
 output refactor + simulation step correctness + GUI repaint gate fix +
-P3-03 runtime budget + #4 render-thread mailbox + #7 tracking hold/fade +
-#8 mailbox split + #13 primitive Arc lift).
+P3-03 runtime budget + #1 producer-side capability routing + #4 render-thread
+mailbox + #7 tracking hold/fade + #8 mailbox split + #13 primitive Arc lift).
 
 ## Open findings at a glance
 
 | # | Finding | Severity |
 |---|---------|----------|
-| #1  | Live output is CPU-readback-centred (producer-side capability routing landed; second live sink still on CPU) | High |
 | #10 | `GuiApp` has been partially split into sub-states but is still a broad mutable coordinator | High |
 | #12 | `src/renderer/mod.rs` is ~3900 lines and has too many reasons to change | Medium |
 
-## #1 — Second live sink not yet on GPU handoff
-
-Status: **PARTIAL.** Capability-based routing landed (P2-05 phase 1); the
-first live sink (`Win32FileBackedSharedMemorySink` for `VirtualCamera` /
-`SharedMemory`) now publishes VGTK sidecars when the consumer can read
-them. The second live sink is still on CPU readback until the MF DLL slice
-lands and a follow-up sink is chosen.
-
-Recommendation: wait for the out-of-tree DLL ship, then pick the next sink
-in [`gpu-runtime-roadmap-tasks.md`](./gpu-runtime-roadmap-tasks.md) §"What
-is actually still open".
+#1 (live output GPU handoff) is closed on the producer side: every
+non-`ImageSequence` sink on Windows
+(`VirtualCamera` / `SharedMemory` / `SharedTextureFileStub`) advertises
+GPU-token support via `Win32FileBackedSharedMemorySink`, and the export
+path picks `RenderExportMode::GpuExport` whenever the active sink agrees.
+The remaining unfinished work is the MF Virtual Camera **DLL consumer**
+(tracked out-of-tree in the `vulvatar-mf-camera` repository) and the
+additional cross-process sync primitives — both items live in
+[`gpu-runtime-roadmap-tasks.md`](./gpu-runtime-roadmap-tasks.md) §"What
+is actually still open" rather than here.
 
 ## #10 — GUI state split is partial
 
@@ -79,13 +77,11 @@ Keep `VulkanRenderer` as the facade.
 
 ## Suggested order
 
-1. **#10** — large mechanical refactor; biggest open item, pick up
+1. **#10** — biggest open item, large mechanical refactor; pick up
    when behaviour churn has settled enough that the sub-state split
    doesn't immediately need to be revisited.
 2. **#12** — the renderer split is comparably large; defer until the
    compute prepass and GPU cloth paths stop churning.
-3. **#1** — second live sink GPU-token migration is blocked on the
-   out-of-tree MF DLL ship; pick up when that lands.
 
 ## What this file is NOT
 

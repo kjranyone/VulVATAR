@@ -32,7 +32,7 @@ use super::{
 /// advances the state machine, paints the dim overlay + centred
 /// `Window`, and handles the Cancel / Capture Now buttons.
 pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
-    if !state.calibration_modal.is_open() {
+    if !state.calibration.modal.is_open() {
         return;
     }
 
@@ -44,14 +44,14 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     // The Done state auto-closes after `DONE_LINGER_SECONDS` so we
     // don't intercept Esc there (let the lingering "Captured!"
     // message read).
-    if !matches!(state.calibration_modal, CalibrationModalState::Done { .. })
+    if !matches!(state.calibration.modal, CalibrationModalState::Done { .. })
         && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     {
         // Same teardown as the Cancel button: discard any in-flight
         // torso capture buffer so a partial window doesn't leak into
         // the next attempt.
         state.app.tracking.mailbox().set_torso_capture(false);
-        state.calibration_modal.close();
+        state.calibration.modal.close();
         return;
     }
 
@@ -71,12 +71,12 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     // Kick a fresh target-pose snapshot whenever the modal-relevant
     // mode changes (or the first time the modal opens). The kick is
     // idempotent (same-mode no-op) so it's safe to call every frame.
-    if let Some(mode) = relevant_mode(&state.calibration_modal) {
+    if let Some(mode) = relevant_mode(&state.calibration.modal) {
         state.kick_calibration_target_pose_snapshot(mode);
     }
-    if let CalibrationModalState::Done { shown_at, .. } = &state.calibration_modal {
+    if let CalibrationModalState::Done { shown_at, .. } = &state.calibration.modal {
         if shown_at.elapsed().as_secs_f32() > DONE_LINGER_SECONDS {
-            state.calibration_modal.close();
+            state.calibration.modal.close();
             return;
         }
     }
@@ -105,7 +105,7 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     // window state. The `modal_title` helper happens to return a
     // constant today — pin the id so a future title rewrite can't
     // silently regress that.
-    egui::Window::new(modal_title(&state.calibration_modal))
+    egui::Window::new(modal_title(&state.calibration.modal))
         .id(egui::Id::new("calibration_modal_window"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .collapsible(false)
@@ -148,7 +148,7 @@ fn draw_target_pose_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         egui::Stroke::new(2.0, color::VIEWPORT_OVERLAY_OUTLINE),
     );
 
-    if let Some(ref tex) = state.calibration_target_pose_texture {
+    if let Some(ref tex) = state.calibration.target_pose_texture {
         painter.image(
             tex.id(),
             rect,
@@ -231,15 +231,15 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     // Sharing the buffer / handle would couple the two previews;
     // keep them separate so toggling camera-wipe while calibrating
     // doesn't tear either preview.
-    if snap.preview_sequence != state.calibration_preview_seq {
+    if snap.preview_sequence != state.calibration.preview_seq {
         let w = frame.width as usize;
         let h = frame.height as usize;
         if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
             let needed = w * h * 4;
-            if state.calibration_preview_rgba_buf.len() != needed {
-                state.calibration_preview_rgba_buf.resize(needed, 255);
+            if state.calibration.preview_rgba_buf.len() != needed {
+                state.calibration.preview_rgba_buf.resize(needed, 255);
             }
-            let rgba = &mut state.calibration_preview_rgba_buf;
+            let rgba = &mut state.calibration.preview_rgba_buf;
             for i in 0..w * h {
                 rgba[i * 4] = frame.rgb_data[i * 3];
                 rgba[i * 4 + 1] = frame.rgb_data[i * 3 + 1];
@@ -252,19 +252,19 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 minification: egui::TextureFilter::Linear,
                 ..Default::default()
             };
-            if let Some(ref mut handle) = state.calibration_preview_texture {
+            if let Some(ref mut handle) = state.calibration.preview_texture {
                 handle.set(color_image, options);
             } else {
                 let handle =
                     ui.ctx()
                         .load_texture("calibration_preview", color_image, options);
-                state.calibration_preview_texture = Some(handle);
+                state.calibration.preview_texture = Some(handle);
             }
         }
-        state.calibration_preview_seq = snap.preview_sequence;
+        state.calibration.preview_seq = snap.preview_sequence;
     }
 
-    let Some(ref tex) = state.calibration_preview_texture else {
+    let Some(ref tex) = state.calibration.preview_texture else {
         return;
     };
 
@@ -342,7 +342,7 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.vertical(|ui| {
         ui.set_min_width(220.0);
-        match &state.calibration_modal {
+        match &state.calibration.modal {
             CalibrationModalState::Idle { .. } => draw_idle_pane(ui, state),
             CalibrationModalState::WaitingForPose { .. }
             | CalibrationModalState::Collecting { .. }
@@ -361,7 +361,7 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// Cancel/Start. No progress bar, no sample counter — capture has
 /// not started yet.
 fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
-    if let Some(current_mode) = relevant_mode(&state.calibration_modal) {
+    if let Some(current_mode) = relevant_mode(&state.calibration.modal) {
         ui.label(egui::RichText::new(t!("calibration.mode_label")).size(12.0));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -372,7 +372,7 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .clicked()
             {
-                state.calibration_modal.set_mode(CalibrationMode::FullBody);
+                state.calibration.modal.set_mode(CalibrationMode::FullBody);
             }
             if ui
                 .selectable_label(
@@ -381,13 +381,13 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .clicked()
             {
-                state.calibration_modal.set_mode(CalibrationMode::UpperBody);
+                state.calibration.modal.set_mode(CalibrationMode::UpperBody);
             }
         });
         ui.add_space(12.0);
     }
 
-    let (step_label, instructions) = step_text(&state.calibration_modal);
+    let (step_label, instructions) = step_text(&state.calibration.modal);
     ui.label(egui::RichText::new(step_label).size(13.0).strong());
     ui.add_space(4.0);
     ui.label(egui::RichText::new(instructions).size(12.0));
@@ -395,14 +395,14 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     // Live framing check: lets the user verify the camera is seeing
     // the right anchor before they commit to the countdown.
-    draw_live_telemetry(ui, &state.calibration_modal, false);
+    draw_live_telemetry(ui, &state.calibration.modal, false);
 
     ui.add_space(16.0);
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
             state.app.tracking.mailbox().set_torso_capture(false);
-            state.calibration_modal.close();
+            state.calibration.modal.close();
         }
         if ui.button(t!("calibration.start")).clicked() {
             begin_capture(state);
@@ -419,13 +419,13 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// surfacing a "switch mode" button so a wrong-mode user can recover
 /// without cancelling.
 fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
-    let (step_label, instructions) = step_text(&state.calibration_modal);
+    let (step_label, instructions) = step_text(&state.calibration.modal);
     ui.label(egui::RichText::new(step_label).size(13.0).strong());
     ui.add_space(4.0);
     ui.label(egui::RichText::new(instructions).size(12.0));
     ui.add_space(12.0);
 
-    let (progress, time_left) = progress_for(&state.calibration_modal);
+    let (progress, time_left) = progress_for(&state.calibration.modal);
     ui.add(
         egui::ProgressBar::new(progress)
             .desired_width(220.0)
@@ -433,14 +433,14 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     );
     ui.add_space(12.0);
 
-    draw_live_telemetry(ui, &state.calibration_modal, true);
+    draw_live_telemetry(ui, &state.calibration.modal, true);
 
     // Mode-mismatch hint. Only fires in WaitingForPose (= the user
     // is trying to take the pose but the required anchor isn't in
     // frame). Surfaces after NO_ANCHOR_HINT_SECONDS so a transient
     // dropout doesn't ping the user, but a sustained "wrong mode"
     // misconfiguration shows up and the user gets a one-click escape.
-    let hint = mode_mismatch_hint(&state.calibration_modal);
+    let hint = mode_mismatch_hint(&state.calibration.modal);
     if let Some((message_key, switch_to)) = hint {
         ui.add_space(8.0);
         ui.colored_label(
@@ -458,13 +458,13 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             // WaitingForPose directly) gives the user a chance to
             // re-read the new mode's instructions before the gate
             // starts watching for a match.
-            state.calibration_modal = CalibrationModalState::Idle {
+            state.calibration.modal = CalibrationModalState::Idle {
                 mode: switch_to,
                 last_anchor_seen: false,
                 last_confidence: 0.0,
             };
         }
-    } else if framing_hint(&state.calibration_modal) {
+    } else if framing_hint(&state.calibration.modal) {
         // Anchor is fine but the elbows have been cropped for a
         // while. T-pose / A-pose scoring both need both elbow
         // keypoints (see `pose_match::arm_direction`), so without
@@ -487,7 +487,7 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             // (whose seq edge-detect would surface stale
             // half-window data as a fresh template).
             state.app.tracking.mailbox().set_torso_capture(false);
-            state.calibration_modal.close();
+            state.calibration.modal.close();
         }
         if ui.button(t!("calibration.capture_now")).clicked() {
             finish_capture(state);
@@ -552,7 +552,7 @@ fn framing_hint(state: &CalibrationModalState) -> bool {
 /// capture is finished, the values shown via `step_text` come from
 /// the aggregated calibration on the variant.
 fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
-    let (step_label, instructions) = step_text(&state.calibration_modal);
+    let (step_label, instructions) = step_text(&state.calibration.modal);
     ui.label(egui::RichText::new(step_label).size(13.0).strong());
     ui.add_space(4.0);
     ui.label(egui::RichText::new(instructions).size(12.0));
@@ -561,7 +561,7 @@ fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
             state.app.tracking.mailbox().set_torso_capture(false);
-            state.calibration_modal.close();
+            state.calibration.modal.close();
         }
         if ui.button(t!("calibration.retry")).clicked() {
             retry_capture(state);
@@ -579,7 +579,7 @@ fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// `DONE_LINGER_SECONDS`. Cancel is still available so the user
 /// can dismiss the linger immediately.
 fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
-    let (step_label, instructions) = step_text(&state.calibration_modal);
+    let (step_label, instructions) = step_text(&state.calibration.modal);
     ui.label(egui::RichText::new(step_label).size(13.0).strong());
     ui.add_space(4.0);
     ui.label(egui::RichText::new(instructions).size(12.0));
@@ -588,7 +588,7 @@ fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
             state.app.tracking.mailbox().set_torso_capture(false);
-            state.calibration_modal.close();
+            state.calibration.modal.close();
         }
     });
 }

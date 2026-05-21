@@ -293,7 +293,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .as_ref()
                         .map(|c| c.mode)
                         .unwrap_or(crate::tracking::CalibrationMode::FullBody);
-                    state.calibration_modal.open(default_mode);
+                    state.calibration.modal.open(default_mode);
                 }
             });
             draw_calibration_status(ui, state);

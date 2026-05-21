@@ -28,7 +28,7 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
     // behind a UI they can't reach. Surfacing a notification gives
     // the user something to act on instead of silently swallowing
     // the click.
-    if state.calibration_modal.is_open() {
+    if state.calibration.modal.is_open() {
         state.push_notification(t!("top_bar.avatar_load_blocked_by_calibration"));
         return;
     }
