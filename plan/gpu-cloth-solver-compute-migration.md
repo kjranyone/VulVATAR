@@ -154,8 +154,15 @@ Out:
 - [ ] **S1.1 (Vulkan side)** allocate per-primitive SSBOs sized by
       `ClothGpuSimulationState.particle_count` /
       `constraint_count` at cloth-attach time
-- [ ] **S1.2** GLSL compute shader for Verlet integration; Vulkano
+- [~] **S1.2** GLSL compute shader for Verlet integration; Vulkano
       pipeline; CPU writes control UBO each frame
+  - [x] `cloth_verlet_cs` module landed in `src/renderer/pipeline.rs`
+        with the Verlet formula mirroring `cloth_solver::integrator`
+        bit-for-bit (pos / prev_pos SSBOs + `Control` UBO)
+  - [x] `create_cloth_verlet_compute_pipeline` factory + Rust mirror
+        `ClothVerletControl` (std140 layout, 48 B, asserted by test)
+  - [ ] Per-frame CPU UBO upload + dispatch (waits on S1.1 Vulkan side
+        SSBO handles)
 - [ ] **S1.3** unit test: 4-particle synthetic cloth under gravity
       matches CPU reference (`verlet_gravity_pulls_down`) within
       `1e-3` over 60 frames
@@ -187,8 +194,12 @@ compute stage is its own pipeline + dispatch site, and each stage's
 test compares against the existing CPU PBD solver's outputs (no
 external reference data needed). Picking up where this slice left off
 means filling in the SSBO handles on `ClothGpuSimulationState`,
-landing the integration compute shader (S1.2), and adding the
-4-particle test (S1.3).
+wiring the (already-landed) `cloth_verlet_cs` pipeline into the
+renderer dispatch path, and adding the 4-particle test (S1.3).
+
+The Verlet integration compute shader and Vulkano pipeline factory
+themselves have already landed alongside this plan as additive prep
+(see `pipeline.rs::cloth_verlet_cs` + `create_cloth_verlet_compute_pipeline`).
 
 ## Verification
 

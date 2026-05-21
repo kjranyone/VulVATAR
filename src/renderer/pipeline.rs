@@ -423,6 +423,88 @@ void main() {
 // the camera view + projection on top.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Cloth Verlet integration compute shader (P3-02 S1.2 — pipeline only)
+// ---------------------------------------------------------------------------
+//
+// First stage of the GPU cloth solver migration: integrates particle
+// positions under gravity / wind / damping using Verlet (pos + prev_pos).
+// Mirrors `simulation::cloth_solver::integrator::verlet_integrate` formula
+// bit-for-bit so the CPU PBD tests double as parity oracles for the eventual
+// GPU side-by-side test (P3-02 S1.3).
+//
+// **Status**: shader + pipeline factory only. Not yet wired into the render
+// loop; that lands when `ClothGpuSimulationState` grows actual Vulkano
+// buffer handles (P3-02 S1.1 Vulkan side).
+//
+// SSBO + UBO layout matches the slot table documented in
+// `simulation::cloth_gpu_boundary::ClothGpuSimulationState`.
+pub mod cloth_verlet_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// xyz = position, w = inv_mass (0.0 marks an effectively immobile particle).
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+
+// xyz = previous position, w = pinned flag (>= 0.5 means pinned).
+layout(set = 0, binding = 1) buffer PreviousPositions {
+    vec4 p[];
+} prev_positions;
+
+// std140-friendly control block. Rust mirror: `ClothVerletControl`.
+layout(set = 0, binding = 2) uniform Control {
+    float dt;
+    float damping;
+    uint  particle_count;
+    uint  _pad0;
+    vec4  gravity;  // xyz = gravity vector
+    vec4  wind;     // xyz = wind_direction * wind_response
+} ctrl;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= ctrl.particle_count) return;
+
+    vec4 cur = positions.p[idx];
+    vec4 prv = prev_positions.p[idx];
+
+    float inv_mass = cur.w;
+    float pinned   = prv.w;
+
+    // Pinned / immobile particles skip integration. Matches CPU
+    // `if p.pinned { continue }` in `verlet_integrate`.
+    if (pinned > 0.5 || inv_mass <= 0.0) {
+        return;
+    }
+
+    vec3 pos      = cur.xyz;
+    vec3 prev_pos = prv.xyz;
+
+    // CPU reference (cloth_solver/integrator.rs verlet_integrate):
+    //   vel        = pos - prev_pos
+    //   damped_vel = vel * (1.0 - damping)
+    //   accel      = (gravity + wind_force) * dt * dt
+    //   new_pos    = pos + damped_vel + accel
+    //   prev = pos; pos = new_pos
+    vec3 vel        = pos - prev_pos;
+    vec3 damped_vel = vel * (1.0 - ctrl.damping);
+    float dt2       = ctrl.dt * ctrl.dt;
+    vec3 accel      = (ctrl.gravity.xyz + ctrl.wind.xyz) * dt2;
+    vec3 new_pos    = pos + damped_vel + accel;
+
+    positions.p[idx]      = vec4(new_pos, inv_mass);
+    prev_positions.p[idx] = vec4(pos, pinned);
+}
+"
+    }
+}
+
 pub mod transform_cs {
     // One workgroup invocation per output vertex. Reads the immutable
     // base SSBO, the per-frame morph weights / cloth deformed positions,
@@ -826,6 +908,54 @@ pub fn create_outline_pipeline(
     .map_err(|e| format!("failed to create outline graphics pipeline: {e}"))
 }
 
+/// Per-frame control block consumed by `cloth_verlet_cs` (P3-02 S1.2).
+///
+/// std140 layout — field offsets must match the `Control` UBO in
+/// `cloth_verlet_cs`. `_pad0` exists so the following `vec4` lands on a
+/// 16-byte boundary as std140 requires. `gravity` / `wind` are `[f32; 4]`
+/// (xyz used, w unused) rather than `[f32; 3]` because std140 aligns
+/// `vec3` to 16 anyway.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothVerletControl {
+    pub dt: f32,
+    pub damping: f32,
+    pub particle_count: u32,
+    pub _pad0: u32,
+    pub gravity: [f32; 4],
+    pub wind: [f32; 4],
+}
+
+/// Build the cloth Verlet integration compute pipeline (P3-02 S1.2).
+///
+/// Not yet called at runtime: the per-primitive cloth particle SSBOs
+/// (`pos_ssbo`, `prev_pos_ssbo`) land in P3-02 S1.1 Vulkan side. The
+/// factory exists so that landing is a wiring change, not a new design.
+pub fn create_cloth_verlet_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_verlet_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth verlet compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth verlet compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth verlet pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth verlet pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth verlet compute pipeline: {e}"))
+}
+
 /// Build the compute pipeline that fuses skinning, morph-target blend, and
 /// CPU-fed cloth deformation into a single dispatch per (instance, primitive).
 /// Output lands in the per-primitive `GpuVertex` SSBO that the graphics
@@ -854,5 +984,30 @@ pub fn create_transform_compute_pipeline(
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .map_err(|e| format!("failed to create transform compute pipeline: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClothVerletControl;
+    use std::mem::{offset_of, size_of};
+
+    // GLSL std140 layout for `Control` UBO in cloth_verlet_cs:
+    //   float dt;             // offset 0,  size 4
+    //   float damping;        // offset 4,  size 4
+    //   uint  particle_count; // offset 8,  size 4
+    //   uint  _pad0;          // offset 12, size 4
+    //   vec4  gravity;        // offset 16, size 16
+    //   vec4  wind;           // offset 32, size 16
+    //   total                 // 48 bytes
+    #[test]
+    fn cloth_verlet_control_matches_std140_layout() {
+        assert_eq!(size_of::<ClothVerletControl>(), 48);
+        assert_eq!(offset_of!(ClothVerletControl, dt), 0);
+        assert_eq!(offset_of!(ClothVerletControl, damping), 4);
+        assert_eq!(offset_of!(ClothVerletControl, particle_count), 8);
+        assert_eq!(offset_of!(ClothVerletControl, _pad0), 12);
+        assert_eq!(offset_of!(ClothVerletControl, gravity), 16);
+        assert_eq!(offset_of!(ClothVerletControl, wind), 32);
+    }
 }
 
