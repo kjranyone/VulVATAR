@@ -176,6 +176,15 @@ struct PoseMailboxInner {
 struct PreviewMailboxInner {
     latest_frame: Option<WebcamFrame>,
     latest_annotation: Option<DetectionAnnotation>,
+    /// Bumped on every preview write so GUI consumers can dedup
+    /// texture uploads on a counter that strictly corresponds to
+    /// frame freshness. The pose-mailbox `sequence` and this one
+    /// advance together inside `publish_estimate` (under separate
+    /// locks); a snapshot that races the writer can observe pose-
+    /// `sequence == N` with preview `sequence == N-1`, in which case
+    /// the GUI sees "old frame, new pose" — the right dedup key for
+    /// preview consumers is *this* counter, not pose `sequence`.
+    sequence: u64,
 }
 
 struct DiagnosticsMailboxInner {
@@ -239,13 +248,20 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
-/// Atomically captured snapshot of the tracking mailbox state.
+/// Captured snapshot of the tracking mailbox state. Not strictly
+/// cross-lock-atomic — see `TrackingMailbox::snapshot` for the
+/// torn-read trade-off. `sequence` is the pose-side counter (use for
+/// pose-driven dedup like solver consumption); `preview_sequence` is
+/// the preview-side counter (use for frame / annotation upload dedup
+/// — using `sequence` for frame uploads can permanently skip a frame
+/// whenever the snapshot races a writer mid-publish).
 #[derive(Clone, Debug, Default)]
 pub struct MailboxSnapshot {
     pub pose: Option<SourceSkeleton>,
     pub frame: Option<WebcamFrame>,
     pub annotation: Option<DetectionAnnotation>,
     pub sequence: u64,
+    pub preview_sequence: u64,
 }
 
 impl TrackingMailbox {
@@ -259,6 +275,7 @@ impl TrackingMailbox {
             preview: Arc::new(Mutex::new(PreviewMailboxInner {
                 latest_frame: None,
                 latest_annotation: None,
+                sequence: 0,
             })),
             diagnostics: Arc::new(Mutex::new(DiagnosticsMailboxInner {
                 pending_error: None,
@@ -309,6 +326,7 @@ impl TrackingMailbox {
         let mut v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
         v.latest_annotation = Some(estimate.annotation);
         v.latest_frame = frame;
+        v.sequence += 1;
     }
 
     /// Snapshot the pose + preview slices. NOT cross-lock-atomic: a
@@ -329,6 +347,7 @@ impl TrackingMailbox {
             frame: v.latest_frame.clone(),
             annotation: v.latest_annotation.clone(),
             sequence,
+            preview_sequence: v.sequence,
         }
     }
 

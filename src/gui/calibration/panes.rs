@@ -224,11 +224,14 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         return;
     };
 
-    // Refresh texture on new sequence — same path the camera-wipe
-    // uses. Sharing the buffer / handle would couple the two; keep
-    // them separate so toggling camera-wipe while calibrating doesn't
-    // tear either preview.
-    if snap.sequence != state.calibration_preview_seq {
+    // Refresh texture on new preview sequence — same path the
+    // camera-wipe uses (and same reason: pose `sequence` can advance
+    // mid-snapshot while the frame is still the previous publish,
+    // which would permanently strand a frame if we deduped on it).
+    // Sharing the buffer / handle would couple the two previews;
+    // keep them separate so toggling camera-wipe while calibrating
+    // doesn't tear either preview.
+    if snap.preview_sequence != state.calibration_preview_seq {
         let w = frame.width as usize;
         let h = frame.height as usize;
         if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
@@ -258,7 +261,7 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.calibration_preview_texture = Some(handle);
             }
         }
-        state.calibration_preview_seq = snap.sequence;
+        state.calibration_preview_seq = snap.preview_sequence;
     }
 
     let Some(ref tex) = state.calibration_preview_texture else {

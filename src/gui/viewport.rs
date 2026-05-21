@@ -487,7 +487,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             if state.show_camera_wipe {
                 let snap = state.app.tracking.mailbox().snapshot();
                 if let Some(ref frame) = snap.frame {
-                    if snap.sequence != state.camera_wipe_seq {
+                    // Dedup on `preview_sequence` (the preview-mailbox
+                    // counter) not `sequence` (pose). Using pose here
+                    // would cause "torn snapshot" races to advance
+                    // `camera_wipe_seq` while still uploading the old
+                    // frame, leaving the newer frame permanently un-
+                    // uploaded until the next publish.
+                    if snap.preview_sequence != state.camera_wipe_seq {
                         let w = frame.width as usize;
                         let h = frame.height as usize;
                         if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
@@ -517,7 +523,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 state.camera_wipe_texture = Some(handle);
                             }
                         }
-                        state.camera_wipe_seq = snap.sequence;
+                        state.camera_wipe_seq = snap.preview_sequence;
                     }
 
                     if let Some(ref tex) = state.camera_wipe_texture {
