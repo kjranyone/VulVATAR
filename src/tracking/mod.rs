@@ -556,6 +556,84 @@ impl TrackingMailbox {
     }
 }
 
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+
+    fn empty_estimate() -> PoseEstimate {
+        PoseEstimate {
+            skeleton: SourceSkeleton::empty(0),
+            annotation: DetectionAnnotation::default(),
+        }
+    }
+
+    #[test]
+    fn empty_mailbox_is_stale_and_has_no_age() {
+        let mb = TrackingMailbox::new();
+        assert!(mb.is_stale());
+        assert_eq!(mb.age(), None);
+        assert_eq!(mb.sequence(), 0);
+        assert!(mb.latest_pose().is_none());
+        assert!(mb.latest_frame().is_none());
+    }
+
+    #[test]
+    fn publish_bumps_pose_sequence_only() {
+        let mb = TrackingMailbox::new();
+        let snap_before = mb.snapshot();
+        mb.publish(SourceSkeleton::empty(0));
+        let snap_after = mb.snapshot();
+        assert_eq!(snap_after.sequence, snap_before.sequence + 1);
+        assert_eq!(
+            snap_after.preview_sequence, snap_before.preview_sequence,
+            "publish (pose-only) must not touch preview_sequence"
+        );
+    }
+
+    #[test]
+    fn publish_estimate_bumps_both_sequences() {
+        let mb = TrackingMailbox::new();
+        mb.publish_estimate(empty_estimate(), None);
+        let snap = mb.snapshot();
+        assert_eq!(snap.sequence, 1);
+        assert_eq!(snap.preview_sequence, 1);
+    }
+
+    #[test]
+    fn calibration_command_and_template_use_independent_seqs() {
+        let mb = TrackingMailbox::new();
+        // Calibration command seq is independent of pose / preview seq.
+        mb.set_calibration(None);
+        let snap = mb.snapshot();
+        assert_eq!(snap.sequence, 0, "calibration write must not bump pose seq");
+        assert_eq!(
+            snap.preview_sequence, 0,
+            "calibration write must not bump preview seq"
+        );
+
+        // Calibration mailbox uses its own seqs for edge detection.
+        assert!(mb.poll_calibration(0).is_some(), "first poll sees the write");
+        let observed_seq = mb.poll_calibration(0).map(|(_, s)| s).unwrap();
+        assert!(mb.poll_calibration(observed_seq).is_none(), "no advance, no work");
+    }
+
+    #[test]
+    fn error_drain_and_backend_label_round_trip() {
+        let mb = TrackingMailbox::new();
+        mb.report_error("test failure", TrackingErrorLevel::Warning);
+        let drained = mb.drain_error();
+        assert!(drained.is_some());
+        assert!(
+            mb.drain_error().is_none(),
+            "errors drain exactly once"
+        );
+        mb.set_inference_backend_label(Some("CPU".to_string()));
+        assert_eq!(mb.inference_backend_label(), Some("CPU".to_string()));
+        mb.set_inference_backend_label(None);
+        assert_eq!(mb.inference_backend_label(), None);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Webcam frame & detection annotation (for GUI PIP wipe display)
 // ---------------------------------------------------------------------------
