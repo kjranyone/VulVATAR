@@ -95,8 +95,8 @@ impl GuiApp {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             camera_index: self.camera_index,
-            show_camera_wipe: self.show_camera_wipe,
-            show_detection_annotations: self.show_detection_annotations,
+            show_camera_wipe: self.viewport.show_camera_wipe,
+            show_detection_annotations: self.viewport.show_detection_annotations,
             // Calibration now lives on `StreamProfile.pose_calibration`
             // (per-room/setup storage), not the project file. New saves
             // never emit this field — the on-disk DTO has
@@ -222,8 +222,8 @@ impl GuiApp {
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
         self.camera_index = state.camera_index;
-        self.show_camera_wipe = state.show_camera_wipe;
-        self.show_detection_annotations = state.show_detection_annotations;
+        self.viewport.show_camera_wipe = state.show_camera_wipe;
+        self.viewport.show_detection_annotations = state.show_detection_annotations;
         // Pose calibration migration: per-profile storage replaced
         // per-project storage in this version. When the loaded
         // project file carries a legacy `pose_calibration` value

@@ -150,6 +150,46 @@ pub enum LibrarySortMode {
     Favorites,
 }
 
+/// Viewport-pane UI state lifted out of `GuiApp` (architecture
+/// finding #10). Holds the texture egui binds the rendered scene to,
+/// the cursor-grab state during orbit/pan drags, and the camera-wipe
+/// PIP overlay (toggle + texture + dedup seq + rgba scratch).
+#[derive(Default)]
+pub struct ViewportUiState {
+    /// egui texture handle the renderer's CPU readback uploads pixels
+    /// into. The viewport draws this handle each frame; `None` until
+    /// the first render result arrives.
+    pub texture: Option<egui::TextureHandle>,
+    /// Frame counter of the last render result we uploaded, used to
+    /// avoid re-uploading the same pixels.
+    pub last_frame: u64,
+    /// Blender-style infinite-drag during orbit/pan: cursor is hidden
+    /// + warped back to the drag origin every frame so the user can
+    /// drag past screen edges. `true` while a drag is active.
+    pub cursor_grabbed: bool,
+    /// Cursor position at drag start; restored when the drag ends.
+    /// `None` when no drag is in progress.
+    pub drag_origin: Option<egui::Pos2>,
+    /// Whether the camera-wipe PIP (live webcam preview) is shown.
+    pub show_camera_wipe: bool,
+    /// Whether the 2D detection annotation overlay is drawn over the
+    /// camera-wipe PIP.
+    pub show_detection_annotations: bool,
+    /// egui texture for the camera-wipe PIP (separate from the
+    /// calibration preview's texture so toggling either doesn't tear
+    /// the other).
+    pub camera_wipe_texture: Option<egui::TextureHandle>,
+    /// Preview-mailbox sequence of the last frame we uploaded into
+    /// `camera_wipe_texture`. Driven off `preview_sequence`, not
+    /// pose `sequence` — the latter can advance mid-snapshot with
+    /// the previous frame still in the mailbox and would permanently
+    /// strand a frame.
+    pub camera_wipe_seq: u64,
+    /// RGBA scratch buffer reused across uploads so the wipe doesn't
+    /// reallocate per frame.
+    pub camera_wipe_rgba_buf: Vec<u8>,
+}
+
 /// Library-panel UI state lifted out of `GuiApp` (architecture
 /// finding #10). Aggregates the search/selection/rename widget
 /// buffers, the folder watcher + watched-dirs list, the thumbnail
@@ -422,11 +462,11 @@ pub struct GuiApp {
 
     pub camera_index: usize,
     pub available_cameras: Vec<crate::tracking::CameraInfo>,
-    pub show_camera_wipe: bool,
-    pub show_detection_annotations: bool,
-    pub camera_wipe_texture: Option<egui::TextureHandle>,
-    pub camera_wipe_seq: u64,
-    pub camera_wipe_rgba_buf: Vec<u8>,
+
+    // Viewport-pane state: rendered-scene texture handle, the
+    // Blender-style drag-grab state, and the camera-wipe PIP toggle +
+    // its companion texture / scratch buffer. See `ViewportUiState`.
+    pub viewport: ViewportUiState,
 
     // Pose-calibration modal (Phase B). Aggregated into
     // `calibration::CalibrationUiState` as part of the GuiApp state
@@ -462,14 +502,6 @@ pub struct GuiApp {
     pub scene_presets: Vec<crate::persistence::ScenePreset>,
     pub scene_preset_index: Option<usize>,
     pub scene_preset_name: String,
-
-    // Viewport texture integration
-    pub viewport_texture: Option<egui::TextureHandle>,
-    pub viewport_last_frame: u64,
-
-    // Infinite-drag state (Blender-style cursor grab during orbit/pan)
-    pub viewport_cursor_grabbed: bool,
-    pub viewport_drag_origin: Option<egui::Pos2>,
 
     // Avatar library GUI state
     // Avatar library panel state (search, selection, sort, thumbnail
@@ -608,11 +640,10 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
-            show_camera_wipe: false,
-            show_detection_annotations: true,
-            camera_wipe_texture: None,
-            camera_wipe_seq: 0,
-            camera_wipe_rgba_buf: Vec::new(),
+            viewport: ViewportUiState {
+                show_detection_annotations: true,
+                ..ViewportUiState::default()
+            },
 
             calibration: calibration::CalibrationUiState::default(),
 
@@ -643,11 +674,6 @@ impl GuiApp {
             scene_presets: crate::persistence::load_scene_presets(),
             scene_preset_index: None,
             scene_preset_name: String::new(),
-
-            viewport_texture: None,
-            viewport_last_frame: 0,
-            viewport_cursor_grabbed: false,
-            viewport_drag_origin: None,
 
             library: LibraryUiState {
                 thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
@@ -848,11 +874,10 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: Vec::new(),
-            show_camera_wipe: false,
-            show_detection_annotations: true,
-            camera_wipe_texture: None,
-            camera_wipe_seq: 0,
-            camera_wipe_rgba_buf: Vec::new(),
+            viewport: ViewportUiState {
+                show_detection_annotations: true,
+                ..ViewportUiState::default()
+            },
 
             calibration: calibration::CalibrationUiState::default(),
 
@@ -883,11 +908,6 @@ impl GuiApp {
             scene_presets: Vec::new(),
             scene_preset_index: None,
             scene_preset_name: String::new(),
-
-            viewport_texture: None,
-            viewport_last_frame: 0,
-            viewport_cursor_grabbed: false,
-            viewport_drag_origin: None,
 
             library: LibraryUiState {
                 thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(

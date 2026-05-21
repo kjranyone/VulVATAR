@@ -94,14 +94,14 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             });
             if ui
-                .checkbox(&mut state.show_camera_wipe, t!("tracking.camera_wipe"))
+                .checkbox(&mut state.viewport.show_camera_wipe, t!("tracking.camera_wipe"))
                 .changed()
             {
                 state.project_dirty = true;
             }
-            if state.show_camera_wipe
+            if state.viewport.show_camera_wipe
                 && ui
-                    .checkbox(&mut state.show_detection_annotations, t!("tracking.show_annotations"))
+                    .checkbox(&mut state.viewport.show_detection_annotations, t!("tracking.show_annotations"))
                     .changed()
             {
                 state.project_dirty = true;

@@ -153,17 +153,17 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         ..Default::default()
                     };
 
-                    if frame_counter != state.viewport_last_frame {
+                    if frame_counter != state.viewport.last_frame {
                         // Update existing texture handle or create a new one.
-                        if let Some(ref mut handle) = state.viewport_texture {
+                        if let Some(ref mut handle) = state.viewport.texture {
                             handle.set(color_image, options);
                         } else {
                             let handle =
                                 ui.ctx()
                                     .load_texture("viewport_render", color_image, options);
-                            state.viewport_texture = Some(handle);
+                            state.viewport.texture = Some(handle);
                         }
-                        state.viewport_last_frame = frame_counter;
+                        state.viewport.last_frame = frame_counter;
                     }
                     true
                 } else {
@@ -174,7 +174,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             };
 
             if has_rendered_image {
-                if let Some(ref tex) = state.viewport_texture {
+                if let Some(ref tex) = state.viewport.texture {
                     // Scale the rendered image to fit the viewport while
                     // preserving aspect ratio.
                     let tex_size = tex.size_vec2();
@@ -337,30 +337,30 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 || response.dragged_by(egui::PointerButton::Middle);
             let any_drag = drag_orbit || drag_pan;
 
-            if any_drag && !state.viewport_cursor_grabbed {
+            if any_drag && !state.viewport.cursor_grabbed {
                 // First frame of a drag — lock the cursor.
-                state.viewport_drag_origin = ctx.input(|i| i.pointer.interact_pos());
+                state.viewport.drag_origin = ctx.input(|i| i.pointer.interact_pos());
                 ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
                     egui::viewport::CursorGrab::Locked,
                 ));
-                state.viewport_cursor_grabbed = true;
-            } else if !any_drag && state.viewport_cursor_grabbed {
+                state.viewport.cursor_grabbed = true;
+            } else if !any_drag && state.viewport.cursor_grabbed {
                 // Drag ended — unlock the cursor and warp back to the origin.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
                     egui::viewport::CursorGrab::None,
                 ));
                 ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
-                if let Some(origin) = state.viewport_drag_origin.take() {
+                if let Some(origin) = state.viewport.drag_origin.take() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(origin));
                 }
-                state.viewport_cursor_grabbed = false;
+                state.viewport.cursor_grabbed = false;
             }
 
             // Use raw device motion when the cursor is locked; fall back to
             // the normal drag delta otherwise (first frame of drag, or if the
             // platform doesn't support CursorGrab::Locked).
-            let delta = if state.viewport_cursor_grabbed {
+            let delta = if state.viewport.cursor_grabbed {
                 ctx.input(|i| i.pointer.motion())
                     .unwrap_or_else(|| response.drag_delta())
             } else {
@@ -484,7 +484,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             }
 
             // ── Camera PIP wipe ───────────────────────────────────────
-            if state.show_camera_wipe {
+            if state.viewport.show_camera_wipe {
                 let snap = state.app.tracking.mailbox().snapshot();
                 if let Some(ref frame) = snap.frame {
                     // Dedup on `preview_sequence` (the preview-mailbox
@@ -493,15 +493,15 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     // `camera_wipe_seq` while still uploading the old
                     // frame, leaving the newer frame permanently un-
                     // uploaded until the next publish.
-                    if snap.preview_sequence != state.camera_wipe_seq {
+                    if snap.preview_sequence != state.viewport.camera_wipe_seq {
                         let w = frame.width as usize;
                         let h = frame.height as usize;
                         if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
                             let needed = w * h * 4;
-                            if state.camera_wipe_rgba_buf.len() != needed {
-                                state.camera_wipe_rgba_buf.resize(needed, 255);
+                            if state.viewport.camera_wipe_rgba_buf.len() != needed {
+                                state.viewport.camera_wipe_rgba_buf.resize(needed, 255);
                             }
-                            let rgba = &mut state.camera_wipe_rgba_buf;
+                            let rgba = &mut state.viewport.camera_wipe_rgba_buf;
                             for i in 0..w * h {
                                 rgba[i * 4] = frame.rgb_data[i * 3];
                                 rgba[i * 4 + 1] = frame.rgb_data[i * 3 + 1];
@@ -515,18 +515,18 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 minification: egui::TextureFilter::Linear,
                                 ..Default::default()
                             };
-                            if let Some(ref mut handle) = state.camera_wipe_texture {
+                            if let Some(ref mut handle) = state.viewport.camera_wipe_texture {
                                 handle.set(color_image, options);
                             } else {
                                 let handle =
                                     ui.ctx().load_texture("camera_wipe", color_image, options);
-                                state.camera_wipe_texture = Some(handle);
+                                state.viewport.camera_wipe_texture = Some(handle);
                             }
                         }
-                        state.camera_wipe_seq = snap.preview_sequence;
+                        state.viewport.camera_wipe_seq = snap.preview_sequence;
                     }
 
-                    if let Some(ref tex) = state.camera_wipe_texture {
+                    if let Some(ref tex) = state.viewport.camera_wipe_texture {
                         let pip_max_w = 240.0;
                         let tex_size = tex.size_vec2();
                         let scale = pip_max_w / tex_size.x.max(1.0);
@@ -551,7 +551,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         painter.image(tex.id(), pip_rect, uv, egui::Color32::WHITE);
 
                         // ── Detection annotations ──────────────────────
-                        if state.show_detection_annotations {
+                        if state.viewport.show_detection_annotations {
                             if let Some(ref ann) = snap.annotation {
                                 let kpt_color =
                                     egui::Color32::from_rgba_unmultiplied(0, 255, 128, 220);
