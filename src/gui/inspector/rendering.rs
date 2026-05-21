@@ -122,13 +122,13 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new(t!("inspector.scene_presets"))
+    egui::CollapsingHeader::new(t!("inspector.scene_preset.presets"))
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if filled_button(ui, Some(ic::SAVE), &t!("inspector.save_preset"), true).clicked() {
                     let preset = crate::persistence::ScenePreset {
-                        name: state.scene_preset_name.clone(),
+                        name: state.scene_preset.name.clone(),
                         lighting: crate::persistence::ScenePresetLighting {
                             main_light_dir: state.rendering.main_light_dir,
                             main_light_intensity: state.rendering.main_light_intensity,
@@ -141,16 +141,16 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                             material_mode_index: state.rendering.material_mode_index,
                         },
                     };
-                    let name = if state.scene_preset_name.is_empty() {
-                        format!("Preset {}", state.scene_presets.len() + 1)
+                    let name = if state.scene_preset.name.is_empty() {
+                        format!("Preset {}", state.scene_preset.presets.len() + 1)
                     } else {
-                        state.scene_preset_name.clone()
+                        state.scene_preset.name.clone()
                     };
-                    state.scene_presets.push(crate::persistence::ScenePreset {
+                    state.scene_preset.presets.push(crate::persistence::ScenePreset {
                         name: name.clone(),
                         ..preset
                     });
-                    let _ = crate::persistence::save_scene_presets(&state.scene_presets);
+                    let _ = crate::persistence::save_scene_presets(&state.scene_preset.presets);
                     state.push_notification(t!("inspector.saved_preset", name = name));
                 }
                 if outlined_button(
@@ -162,12 +162,12 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .clicked()
                 {
-                    if let Some(idx) = state.scene_preset_index {
-                        if idx < state.scene_presets.len() {
-                            let name = state.scene_presets[idx].name.clone();
-                            state.scene_presets.remove(idx);
-                            state.scene_preset_index = None;
-                            let _ = crate::persistence::save_scene_presets(&state.scene_presets);
+                    if let Some(idx) = state.scene_preset.selected_index {
+                        if idx < state.scene_preset.presets.len() {
+                            let name = state.scene_preset.presets[idx].name.clone();
+                            state.scene_preset.presets.remove(idx);
+                            state.scene_preset.selected_index = None;
+                            let _ = crate::persistence::save_scene_presets(&state.scene_preset.presets);
                             state.push_notification(t!("inspector.deleted_preset", name = name));
                         }
                     }
@@ -176,16 +176,16 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             ui.horizontal(|ui| {
                 ui.label(t!("inspector.name"));
-                ui.text_edit_singleline(&mut state.scene_preset_name);
+                ui.text_edit_singleline(&mut state.scene_preset.name);
             });
 
             ui.separator();
 
             let mut load_idx: Option<usize> = None;
             let preset_names: Vec<String> =
-                state.scene_presets.iter().map(|p| p.name.clone()).collect();
+                state.scene_preset.presets.iter().map(|p| p.name.clone()).collect();
             let selected_text = state
-                .scene_preset_index
+                .scene_preset.selected_index
                 .and_then(|i| preset_names.get(i))
                 .map(|s| s.as_str())
                 .unwrap_or("None");
@@ -193,7 +193,7 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for (i, name) in preset_names.iter().enumerate() {
-                        let is_selected = state.scene_preset_index == Some(i);
+                        let is_selected = state.scene_preset.selected_index == Some(i);
                         if ui.selectable_label(is_selected, name.as_str()).clicked() {
                             load_idx = Some(i);
                         }
@@ -201,8 +201,8 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
 
             if let Some(idx) = load_idx {
-                state.scene_preset_index = Some(idx);
-                if let Some(preset) = state.scene_presets.get(idx).cloned() {
+                state.scene_preset.selected_index = Some(idx);
+                if let Some(preset) = state.scene_preset.presets.get(idx).cloned() {
                     state.rendering.main_light_dir = preset.lighting.main_light_dir;
                     state.rendering.main_light_intensity = preset.lighting.main_light_intensity;
                     state.rendering.ambient_intensity = preset.lighting.ambient_intensity;
@@ -213,6 +213,6 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             }
 
-            ui.label(t!("inspector.presets_count", count = state.scene_presets.len()));
+            ui.label(t!("inspector.presets_count", count = state.scene_preset.presets.len()));
         });
 }

@@ -150,6 +150,26 @@ pub enum LibrarySortMode {
     Favorites,
 }
 
+/// Scene-preset UI state lifted out of `GuiApp` (architecture
+/// finding #10). The preset library is loaded eagerly from disk;
+/// the selected-index / name widget buffers track the rendering
+/// inspector's preset combo and rename field.
+pub struct ScenePresetUiState {
+    pub presets: Vec<crate::persistence::ScenePreset>,
+    pub selected_index: Option<usize>,
+    pub name: String,
+}
+
+impl Default for ScenePresetUiState {
+    fn default() -> Self {
+        Self {
+            presets: Vec::new(),
+            selected_index: None,
+            name: String::new(),
+        }
+    }
+}
+
 /// Cloth-authoring panel UI state lifted out of `GuiApp` (architecture
 /// finding #10). Bundles the cloth-sim playback toggle, the
 /// rename / save-status widget buffers, the per-vertex region
@@ -527,10 +547,8 @@ pub struct GuiApp {
 
     pub expression_weights: Vec<f32>,
 
-    // Scene presets
-    pub scene_presets: Vec<crate::persistence::ScenePreset>,
-    pub scene_preset_index: Option<usize>,
-    pub scene_preset_name: String,
+    // Scene preset library + inspector combo + rename buffer.
+    pub scene_preset: ScenePresetUiState,
 
     // Avatar library GUI state
     // Avatar library panel state (search, selection, sort, thumbnail
@@ -689,9 +707,10 @@ impl GuiApp {
             inspector_open: true,
             expression_weights: Vec::new(),
 
-            scene_presets: crate::persistence::load_scene_presets(),
-            scene_preset_index: None,
-            scene_preset_name: String::new(),
+            scene_preset: ScenePresetUiState {
+                presets: crate::persistence::load_scene_presets(),
+                ..ScenePresetUiState::default()
+            },
 
             library: LibraryUiState {
                 thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
@@ -912,9 +931,7 @@ impl GuiApp {
             inspector_open: true,
             expression_weights: Vec::new(),
 
-            scene_presets: Vec::new(),
-            scene_preset_index: None,
-            scene_preset_name: String::new(),
+            scene_preset: ScenePresetUiState::default(),
 
             library: LibraryUiState {
                 thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
