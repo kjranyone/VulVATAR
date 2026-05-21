@@ -126,26 +126,68 @@ pub enum TrackingErrorLevel {
 
 // ---------------------------------------------------------------------------
 // TrackingMailbox
+//
+// The mailbox is split into four independent mutexes so the hot path
+// (worker → app pose handoff) doesn't contend with GUI-only state. Each
+// sub-mutex guards a self-contained slice of state and **no call site
+// acquires more than one of them at a time**, so deadlock by lock-order
+// inversion is impossible by construction.
+//
+// Atomicity trade-off: `snapshot` (pose + frame + annotation in one
+// struct) and `publish_estimate` (pose + frame + annotation in one
+// write) used to be one-lock atomic. They now span two locks (pose
+// and preview), so a reader that races a writer can observe the new
+// pose-side sequence with the previous frame for at most one
+// publish_estimate. The GUI consumers (`viewport.rs` camera wipe,
+// `calibration/refresh.rs` telemetry) dedup on `sequence`, so a
+// torn read shows up as one extra "no-update" frame at worst — no
+// rendering corruption.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct TrackingMailbox {
-    shared: Arc<Mutex<TrackingMailboxInner>>,
+    /// Hot path: worker writes per inference cycle, app reads every
+    /// frame from `run_frame`. Keeping this isolated from the heavier
+    /// `WebcamFrame` clone in the preview mailbox is the main reason
+    /// for the split.
+    pose: Arc<Mutex<PoseMailboxInner>>,
+    /// GUI display: webcam frame + detection annotation. Cloned per
+    /// GUI tick. Larger payloads (RGB pixel buffers) so the lock is
+    /// occasionally held a little longer, but never while the pose
+    /// mutex is also held.
+    preview: Arc<Mutex<PreviewMailboxInner>>,
+    /// Low-frequency worker → GUI diagnostics: error toasts +
+    /// inference backend label.
+    diagnostics: Arc<Mutex<DiagnosticsMailboxInner>>,
+    /// Bidirectional calibration channel: GUI → worker commands
+    /// (calibration, torso-capture toggle, mode hint) plus worker → GUI
+    /// results (captured torso template). All edge-detected via
+    /// matching `_seq` counters.
+    calibration: Arc<Mutex<CalibrationChannelInner>>,
     stale_timeout_nanos: u64,
 }
 
-struct TrackingMailboxInner {
+struct PoseMailboxInner {
     latest_pose: Option<SourceSkeleton>,
-    latest_frame: Option<WebcamFrame>,
-    latest_annotation: Option<DetectionAnnotation>,
     sequence: u64,
     last_update_nanos: u64,
+}
+
+struct PreviewMailboxInner {
+    latest_frame: Option<WebcamFrame>,
+    latest_annotation: Option<DetectionAnnotation>,
+}
+
+struct DiagnosticsMailboxInner {
     pending_error: Option<(String, TrackingErrorLevel)>,
     /// One-line label of the inference backend in use (e.g. "DirectML",
     /// "CPU", "CPU (DirectML unavailable: ...)"). `None` when no
     /// inference engine is loaded — e.g. synthetic mode, or before the
     /// worker has finished init.
     inference_backend_label: Option<String>,
+}
+
+struct CalibrationChannelInner {
     /// Latest pose-calibration capture pushed from the GUI. The
     /// tracking worker reads this each iteration and forwards it to
     /// the provider via `PoseProvider::set_calibration`. Replaces
@@ -209,14 +251,20 @@ pub struct MailboxSnapshot {
 impl TrackingMailbox {
     pub fn new() -> Self {
         Self {
-            shared: Arc::new(Mutex::new(TrackingMailboxInner {
+            pose: Arc::new(Mutex::new(PoseMailboxInner {
                 latest_pose: None,
-                latest_frame: None,
-                latest_annotation: None,
                 sequence: 0,
                 last_update_nanos: 0,
+            })),
+            preview: Arc::new(Mutex::new(PreviewMailboxInner {
+                latest_frame: None,
+                latest_annotation: None,
+            })),
+            diagnostics: Arc::new(Mutex::new(DiagnosticsMailboxInner {
                 pending_error: None,
                 inference_backend_label: None,
+            })),
+            calibration: Arc::new(Mutex::new(CalibrationChannelInner {
                 calibration: None,
                 calibration_seq: 0,
                 torso_capture_enabled: false,
@@ -238,45 +286,62 @@ impl Default for TrackingMailbox {
 }
 
 impl TrackingMailbox {
-    /// Thread-safe publish: takes &self, locks the mutex internally.
+    /// Thread-safe publish (pose-only path used by synthetic / test
+    /// drivers that don't attach a webcam frame).
     pub fn publish(&self, pose: SourceSkeleton) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.latest_pose = Some(pose);
-        inner.sequence += 1;
-        inner.last_update_nanos = now_nanos();
+        let mut p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+        p.latest_pose = Some(pose);
+        p.sequence += 1;
+        p.last_update_nanos = now_nanos();
     }
 
     /// Publish a full estimation result including frame and annotations.
+    /// Writes to two mutexes sequentially (pose, then preview) — see the
+    /// module-level comment above `TrackingMailbox` for the cross-lock
+    /// atomicity trade-off.
     pub fn publish_estimate(&self, estimate: PoseEstimate, frame: Option<WebcamFrame>) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.latest_pose = Some(estimate.skeleton);
-        inner.latest_annotation = Some(estimate.annotation);
-        inner.latest_frame = frame;
-        inner.sequence += 1;
-        inner.last_update_nanos = now_nanos();
+        {
+            let mut p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+            p.latest_pose = Some(estimate.skeleton);
+            p.sequence += 1;
+            p.last_update_nanos = now_nanos();
+        }
+        let mut v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
+        v.latest_annotation = Some(estimate.annotation);
+        v.latest_frame = frame;
     }
 
-    /// Atomically snapshot the entire mailbox state under a single lock.
+    /// Snapshot the pose + preview slices. NOT cross-lock-atomic: a
+    /// concurrent `publish_estimate` between the two lock acquisitions
+    /// can produce a snapshot where `sequence` matches the new pose
+    /// but `frame` / `annotation` are still from the previous publish.
+    /// Both GUI consumers dedup on `sequence` and treat a momentary
+    /// pose-newer-than-frame as "no update", so the worst-case is one
+    /// skipped redraw rather than visible corruption.
     pub fn snapshot(&self) -> MailboxSnapshot {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (pose, sequence) = {
+            let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+            (p.latest_pose.clone(), p.sequence)
+        };
+        let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
         MailboxSnapshot {
-            pose: inner.latest_pose.clone(),
-            frame: inner.latest_frame.clone(),
-            annotation: inner.latest_annotation.clone(),
-            sequence: inner.sequence,
+            pose,
+            frame: v.latest_frame.clone(),
+            annotation: v.latest_annotation.clone(),
+            sequence,
         }
     }
 
     /// Report a non-fatal error from the worker thread (shown as GUI toast).
     pub fn report_error(&self, msg: impl Into<String>, level: TrackingErrorLevel) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.pending_error = Some((msg.into(), level));
+        let mut d = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        d.pending_error = Some((msg.into(), level));
     }
 
     /// Drain the latest pending error (returns it only once).
     pub fn drain_error(&self) -> Option<(String, TrackingErrorLevel)> {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.pending_error.take()
+        let mut d = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        d.pending_error.take()
     }
 
     /// GUI-side push: stash the latest pose calibration so the worker
@@ -285,9 +350,9 @@ impl TrackingMailbox {
     /// sequence lets the worker skip the per-frame
     /// `set_calibration` call when nothing changed.
     pub fn set_calibration(&self, calibration: Option<PoseCalibration>) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.calibration = calibration;
-        inner.calibration_seq += 1;
+        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        c.calibration = calibration;
+        c.calibration_seq += 1;
     }
 
     /// Worker-side poll: returns `Some((calibration, seq))` only when
@@ -297,9 +362,9 @@ impl TrackingMailbox {
         &self,
         last_seen_seq: u64,
     ) -> Option<(Option<PoseCalibration>, u64)> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.calibration_seq != last_seen_seq {
-            Some((inner.calibration.clone(), inner.calibration_seq))
+        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        if c.calibration_seq != last_seen_seq {
+            Some((c.calibration.clone(), c.calibration_seq))
         } else {
             None
         }
@@ -310,18 +375,18 @@ impl TrackingMailbox {
     /// rapid toggles (e.g. modal open → cancel → re-open) collapse
     /// to whichever transition the worker observes first.
     pub fn set_torso_capture(&self, enabled: bool) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.torso_capture_enabled = enabled;
-        inner.torso_capture_seq += 1;
+        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        c.torso_capture_enabled = enabled;
+        c.torso_capture_seq += 1;
     }
 
     /// Worker-side poll for the torso-capture toggle. Same edge-detect
     /// pattern as `poll_calibration`. Returns `Some((enabled, seq))`
     /// only when the GUI flipped the flag since `last_seen_seq`.
     pub fn poll_torso_capture(&self, last_seen_seq: u64) -> Option<(bool, u64)> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.torso_capture_seq != last_seen_seq {
-            Some((inner.torso_capture_enabled, inner.torso_capture_seq))
+        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        if c.torso_capture_seq != last_seen_seq {
+            Some((c.torso_capture_enabled, c.torso_capture_seq))
         } else {
             None
         }
@@ -333,9 +398,9 @@ impl TrackingMailbox {
     /// capture isn't dropped by the model's hallucinated-hip output —
     /// see [`PoseProvider::set_calibration_mode_hint`] for the contract.
     pub fn set_calibration_mode_hint(&self, hint: Option<CalibrationMode>) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.pending_calibration_mode_hint = hint;
-        inner.pending_calibration_mode_hint_seq += 1;
+        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        c.pending_calibration_mode_hint = hint;
+        c.pending_calibration_mode_hint_seq += 1;
     }
 
     /// Worker-side poll for the calibration-mode hint. Same edge-detect
@@ -345,11 +410,11 @@ impl TrackingMailbox {
         &self,
         last_seen_seq: u64,
     ) -> Option<(Option<CalibrationMode>, u64)> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.pending_calibration_mode_hint_seq != last_seen_seq {
+        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        if c.pending_calibration_mode_hint_seq != last_seen_seq {
             Some((
-                inner.pending_calibration_mode_hint,
-                inner.pending_calibration_mode_hint_seq,
+                c.pending_calibration_mode_hint,
+                c.pending_calibration_mode_hint_seq,
             ))
         } else {
             None
@@ -362,9 +427,9 @@ impl TrackingMailbox {
     /// recent capture matters; if a user runs two captures in rapid
     /// succession the second one wins.
     pub fn publish_torso_template(&self, template: TorsoDepthTemplate) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.torso_template_collected = Some(template);
-        inner.torso_template_seq += 1;
+        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        c.torso_template_collected = Some(template);
+        c.torso_template_seq += 1;
     }
 
     /// GUI-side peek: read the current torso-template publish seq
@@ -376,8 +441,8 @@ impl TrackingMailbox {
     /// as if it belonged to the new capture and silently overwrite
     /// the wrong calibration.
     pub fn torso_template_seq(&self) -> u64 {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.torso_template_seq
+        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        c.torso_template_seq
     }
 
     /// GUI-side consume: take the most recently published torso
@@ -391,12 +456,11 @@ impl TrackingMailbox {
         &self,
         last_seen_seq: u64,
     ) -> Option<(TorsoDepthTemplate, u64)> {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.torso_template_seq != last_seen_seq {
-            inner
-                .torso_template_collected
+        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        if c.torso_template_seq != last_seen_seq {
+            c.torso_template_collected
                 .take()
-                .map(|t| (t, inner.torso_template_seq))
+                .map(|t| (t, c.torso_template_seq))
         } else {
             None
         }
@@ -406,48 +470,48 @@ impl TrackingMailbox {
     /// `Rtmw3dInference` finishes loading its model. `None` resets it
     /// (e.g. when tracking stops or the engine is destroyed).
     pub fn set_inference_backend_label(&self, label: Option<String>) {
-        let mut inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.inference_backend_label = label;
+        let mut d = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        d.inference_backend_label = label;
     }
 
     /// Read the inference-backend label. Cheap clone so the GUI thread
     /// can render without holding the lock.
     pub fn inference_backend_label(&self) -> Option<String> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.inference_backend_label.clone()
+        let d = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        d.inference_backend_label.clone()
     }
 
-    /// Thread-safe read: takes &self, locks the mutex, clones the pose.
+    /// Thread-safe read: takes &self, locks the pose mutex, clones the pose.
     pub fn latest_pose(&self) -> Option<SourceSkeleton> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.latest_pose.clone()
+        let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+        p.latest_pose.clone()
     }
 
     /// Read the latest webcam frame (downscaled for GUI display).
     pub fn latest_frame(&self) -> Option<WebcamFrame> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.latest_frame.clone()
+        let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
+        v.latest_frame.clone()
     }
 
     /// Read the latest 2D detection annotation.
     pub fn latest_annotation(&self) -> Option<DetectionAnnotation> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.latest_annotation.clone()
+        let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
+        v.latest_annotation.clone()
     }
 
     pub fn sequence(&self) -> u64 {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        inner.sequence
+        let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+        p.sequence
     }
 
     /// Returns true if the latest sample is older than `stale_timeout_nanos`,
     /// or if no sample has ever been published.
     pub fn is_stale(&self) -> bool {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.last_update_nanos == 0 {
+        let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+        if p.last_update_nanos == 0 {
             return true;
         }
-        let elapsed = now_nanos().saturating_sub(inner.last_update_nanos);
+        let elapsed = now_nanos().saturating_sub(p.last_update_nanos);
         elapsed > self.stale_timeout_nanos
     }
 
@@ -457,11 +521,11 @@ impl TrackingMailbox {
     /// stale samples by age (fresh / holding / expired) instead of
     /// the binary stale flag.
     pub fn age(&self) -> Option<std::time::Duration> {
-        let inner = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.last_update_nanos == 0 {
+        let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
+        if p.last_update_nanos == 0 {
             return None;
         }
-        let elapsed_nanos = now_nanos().saturating_sub(inner.last_update_nanos);
+        let elapsed_nanos = now_nanos().saturating_sub(p.last_update_nanos);
         Some(std::time::Duration::from_nanos(elapsed_nanos))
     }
 
