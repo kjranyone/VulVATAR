@@ -150,9 +150,20 @@ Out:
 - [x] **W6** unit test: CPU-fallback frame → sidecar is *not* updated,
       main buffer receives bytes
 - [x] **W7** document the sidecar protocol in `docs/output-interop.md`
-- [ ] **W8** MF DLL changes (out-of-tree) — open sidecar, parse VGTK,
-      `OpenSharedResource1`, keyed-mutex acquire/release, fall back to
-      main buffer if sidecar is absent
+- [→] **W8** MF DLL changes — **tracked out-of-tree** in the MF
+      Virtual Camera DLL repository (separate project). Producer side
+      of this plan (W1–W7) is complete and the protocol is documented
+      in `docs/output-interop.md`; the DLL repo owns:
+      - opening the sidecar file (path discovery via the documented
+        convention next to the main shared-memory region)
+      - parsing the `VGTK` v1 header
+      - `OpenSharedResource1` on `gpu_handle`
+      - keyed-mutex acquire/release with the documented key
+      - fallback to the main RGBA buffer if the sidecar is absent or
+        stale (the producer guarantees one of the two paths is always
+        publishing valid pixels)
+      Tracking handoff: see commit `951ee19` (W1–W7 landing) and
+      `docs/output-interop.md` § "Win32 GPU-handle sidecar"
 
 ## Resolved IPC decision (lease ack)
 
@@ -205,8 +216,10 @@ Implications:
 
 ## Sequence
 
-1. Resolve the lease-ack IPC question first (architecture decision)
-2. Land sidecar producer (W1–W7) with the DLL still on CPU path
-3. Verify producer doesn't regress CPU-fallback parity
-4. Land DLL changes (W8)
+1. Resolve the lease-ack IPC question first (architecture decision) ✓
+2. Land sidecar producer (W1–W7) with the DLL still on CPU path ✓
+3. Verify producer doesn't regress CPU-fallback parity ✓
+4. Land DLL changes (W8) — **out-of-tree**; producer-side guarantees
+   the CPU fallback path stays valid in the absence of W8 so this
+   slice ships standalone
 5. Hand off to hardware verification pass (separate plan)
