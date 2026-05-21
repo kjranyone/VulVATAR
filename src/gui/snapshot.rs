@@ -440,7 +440,7 @@ impl GuiApp {
             return;
         };
         let rx = rt.request_thumbnail(input);
-        self.pending_thumbnail_jobs.push((output_path, rx));
+        self.library.pending_thumbnail_jobs.push((output_path, rx));
     }
 
     /// Drain any thumbnail jobs whose render thread response has
@@ -452,8 +452,8 @@ impl GuiApp {
     /// avatar import — is left untouched. See
     /// [`handle_thumbnail_response`] for the exact contract.
     pub(super) fn poll_thumbnail_jobs(&mut self, ctx: &egui::Context) {
-        let mut still_pending = Vec::with_capacity(self.pending_thumbnail_jobs.len());
-        for (path, rx) in std::mem::take(&mut self.pending_thumbnail_jobs) {
+        let mut still_pending = Vec::with_capacity(self.library.pending_thumbnail_jobs.len());
+        for (path, rx) in std::mem::take(&mut self.library.pending_thumbnail_jobs) {
             match rx.try_recv() {
                 Ok(response) => {
                     if handle_thumbnail_response(&path, response).is_ok() {
@@ -475,6 +475,6 @@ impl GuiApp {
                 }
             }
         }
-        self.pending_thumbnail_jobs = still_pending;
+        self.library.pending_thumbnail_jobs = still_pending;
     }
 }

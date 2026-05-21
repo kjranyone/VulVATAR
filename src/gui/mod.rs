@@ -150,6 +150,37 @@ pub enum LibrarySortMode {
     Favorites,
 }
 
+/// Library-panel UI state lifted out of `GuiApp` (architecture
+/// finding #10). Aggregates the search/selection/rename widget
+/// buffers, the folder watcher + watched-dirs list, the thumbnail
+/// generator, the pending real-render thumbnail-job queue, and the
+/// background avatar-load job slot.
+#[derive(Default)]
+pub struct LibraryUiState {
+    pub search_query: String,
+    pub selected_index: Option<usize>,
+    pub rename_buf: String,
+    pub tag_buf: String,
+    pub show_missing: bool,
+    /// Which sort mode the user last selected via the chip row. Used
+    /// purely for the chip's "selected" rendering — the actual entry
+    /// order is mutated in place by `AvatarLibrary::sort_*`.
+    pub sort_mode: LibrarySortMode,
+    pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
+    pub watched_avatar_dirs: Vec<std::path::PathBuf>,
+    pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
+    /// Pending real-render thumbnail jobs, keyed by the destination PNG
+    /// path. Each entry's receiver completes when the render thread has
+    /// finished its synchronous thumbnail render. `update` drains them
+    /// once per frame, writes the PNG, and tells egui to forget the
+    /// cached texture for that file:// URI so the new pixels show up.
+    pub pending_thumbnail_jobs:
+        Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>)>,
+    /// Background avatar load in progress, if any. Set by `top_bar::load_*`
+    /// helpers, polled and cleared by `update`.
+    pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
+}
+
 pub struct TransformState {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
@@ -441,32 +472,10 @@ pub struct GuiApp {
     pub viewport_drag_origin: Option<egui::Pos2>,
 
     // Avatar library GUI state
-    pub library_search_query: String,
-    pub library_selected_index: Option<usize>,
-    pub library_rename_buf: String,
-    pub library_tag_buf: String,
-    pub library_show_missing: bool,
-    /// Which sort mode the user last selected via the chip row. Used
-    /// purely for the chip's "selected" rendering — the actual entry
-    /// order is mutated in place by `AvatarLibrary::sort_*`, so this
-    /// field doesn't drive sorting; it just remembers what the user
-    /// clicked so the chip stays highlighted.
-    pub library_sort_mode: LibrarySortMode,
-
-    pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
-    pub watched_avatar_dirs: Vec<std::path::PathBuf>,
-    pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
-
-    /// Pending real-render thumbnail jobs, keyed by the destination PNG
-    /// path. Each entry's receiver completes when the render thread has
-    /// finished its synchronous thumbnail render. `update` drains them
-    /// once per frame, writes the PNG, and tells egui to forget the
-    /// cached texture for that file:// URI so the new pixels show up.
-    pub pending_thumbnail_jobs: Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>)>,
-
-    /// Background avatar load in progress, if any. Set by `top_bar::load_*`
-    /// helpers, polled and cleared by `update`.
-    pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
+    // Avatar library panel state (search, selection, sort, thumbnail
+    // pipeline, folder watching, background avatar-load job). See
+    // `LibraryUiState` for the breakdown.
+    pub library: LibraryUiState,
 
     /// When true, `save_avatar_library` and other persistence writes are
     /// suppressed so unit tests never clobber the user's real data.
@@ -640,21 +649,12 @@ impl GuiApp {
             viewport_cursor_grabbed: false,
             viewport_drag_origin: None,
 
-            library_search_query: String::new(),
-            library_selected_index: None,
-            library_rename_buf: String::new(),
-            library_tag_buf: String::new(),
-            library_show_missing: false,
-            library_sort_mode: LibrarySortMode::None,
-
-            folder_watcher: None,
-            watched_avatar_dirs: Vec::new(),
-            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
-                crate::persistence::thumbnails_dir(),
-            ),
-            pending_thumbnail_jobs: Vec::new(),
-
-            avatar_load_job: None,
+            library: LibraryUiState {
+                thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
+                    crate::persistence::thumbnails_dir(),
+                ),
+                ..LibraryUiState::default()
+            },
             test_no_persist: false,
         };
 
@@ -708,7 +708,7 @@ impl GuiApp {
                 .is_none_or(|p| !p.exists());
             if needs {
                 if let Some(path) = state
-                    .thumbnail_gen
+                    .library.thumbnail_gen
                     .generate_and_save_placeholder(&entry.name)
                 {
                     entry.thumbnail_path = Some(path);
@@ -734,7 +734,7 @@ impl GuiApp {
                 state.push_notification(t!("toast.failed_restore_watch", path = path.display().to_string(), error = e.to_string()));
             }
         }
-        let _ = crate::persistence::save_watched_folders(&state.watched_avatar_dirs);
+        let _ = crate::persistence::save_watched_folders(&state.library.watched_avatar_dirs);
 
         // Seed the active profile's pose calibration into Application
         // + tracking mailbox at startup. Without this, a user who
@@ -889,21 +889,12 @@ impl GuiApp {
             viewport_cursor_grabbed: false,
             viewport_drag_origin: None,
 
-            library_search_query: String::new(),
-            library_selected_index: None,
-            library_rename_buf: String::new(),
-            library_tag_buf: String::new(),
-            library_show_missing: false,
-            library_sort_mode: LibrarySortMode::None,
-
-            folder_watcher: None,
-            watched_avatar_dirs: Vec::new(),
-            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
-                std::env::temp_dir().join("vulvatar_test_thumbs"),
-            ),
-            pending_thumbnail_jobs: Vec::new(),
-
-            avatar_load_job: None,
+            library: LibraryUiState {
+                thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
+                    std::env::temp_dir().join("vulvatar_test_thumbs"),
+                ),
+                ..LibraryUiState::default()
+            },
             test_no_persist: true,
         }
     }
@@ -1196,7 +1187,7 @@ impl eframe::App for GuiApp {
         self.sync_calibration_mode_hint();
 
         // Loading-spinner overlay while a background avatar load is in flight.
-        if let Some(job) = self.avatar_load_job.as_ref() {
+        if let Some(job) = self.library.avatar_load_job.as_ref() {
             let stage_label = job.current_stage.label();
             let file_label = job
                 .path
@@ -1261,7 +1252,7 @@ impl eframe::App for GuiApp {
         let calibration_modal_open = self.calibration.modal.is_open();
         let needs_animation_frame = self.tracking.toggle_tracking
             || self.app.is_lipsync_enabled()
-            || self.avatar_load_job.is_some()
+            || self.library.avatar_load_job.is_some()
             || !self.notifications.is_empty()
             || animation_playing
             || render_in_flight

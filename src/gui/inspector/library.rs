@@ -12,7 +12,7 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("watched_folders.heading"))
         .default_open(false)
         .show(ui, |ui| {
-            let watched: Vec<std::path::PathBuf> = state.watched_avatar_dirs.clone();
+            let watched: Vec<std::path::PathBuf> = state.library.watched_avatar_dirs.clone();
 
             if watched.is_empty() {
                 ui.label(
@@ -169,7 +169,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
         ui.horizontal(|ui| {
             ui.label(icon_text(ic::SEARCH, 16.0));
             ui.add(
-                egui::TextEdit::singleline(&mut state.library_search_query)
+                egui::TextEdit::singleline(&mut state.library.search_query)
                     .hint_text(t!("inspector.search"))
                     .desired_width(f32::INFINITY),
             );
@@ -182,38 +182,38 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             if chip(
                 ui,
                 &t!("inspector.sort_name"),
-                state.library_sort_mode == LibrarySortMode::Name,
+                state.library.sort_mode == LibrarySortMode::Name,
             )
             .clicked()
             {
                 state.app.avatar_library.sort_by_name();
-                state.library_sort_mode = LibrarySortMode::Name;
+                state.library.sort_mode = LibrarySortMode::Name;
             }
             if chip(
                 ui,
                 &t!("inspector.sort_recent"),
-                state.library_sort_mode == LibrarySortMode::Recent,
+                state.library.sort_mode == LibrarySortMode::Recent,
             )
             .clicked()
             {
                 state.app.avatar_library.sort_by_last_loaded();
-                state.library_sort_mode = LibrarySortMode::Recent;
+                state.library.sort_mode = LibrarySortMode::Recent;
             }
             if chip(
                 ui,
                 &t!("inspector.favorites_first"),
-                state.library_sort_mode == LibrarySortMode::Favorites,
+                state.library.sort_mode == LibrarySortMode::Favorites,
             )
             .clicked()
             {
                 state.app.avatar_library.sort_favorites_first();
-                state.library_sort_mode = LibrarySortMode::Favorites;
+                state.library.sort_mode = LibrarySortMode::Favorites;
             }
         });
         ui.add_space(space::XS);
 
         // ── Show missing toggle ──────────────────────────────────
-        ui.checkbox(&mut state.library_show_missing, t!("inspector.show_missing"));
+        ui.checkbox(&mut state.library.show_missing, t!("inspector.show_missing"));
         ui.add_space(space::SM);
 
         // ── Sub-accordions ───────────────────────────────────────
@@ -254,17 +254,17 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                     thumbnail_path: e.thumbnail_path.clone(),
                 }
             };
-            if state.library_search_query.is_empty() {
+            if state.library.search_query.is_empty() {
                 lib.entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| state.library_show_missing || e.exists())
+                    .filter(|(_, e)| state.library.show_missing || e.exists())
                     .map(|(i, e)| to_row(i, e))
                     .collect()
             } else {
-                lib.search(&state.library_search_query)
+                lib.search(&state.library.search_query)
                     .into_iter()
-                    .filter(|e| state.library_show_missing || e.exists())
+                    .filter(|e| state.library.show_missing || e.exists())
                     .filter_map(|e| {
                         let idx = lib.entries.iter().position(|x| x.path == e.path)?;
                         Some(to_row(idx, e))
@@ -476,7 +476,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                     });
 
                     if response.response.clicked() {
-                        state.library_selected_index = Some(row.idx);
+                        state.library.selected_index = Some(row.idx);
                     }
                 }
             });
@@ -508,7 +508,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
         let mut tag_to_add: Option<String> = None;
         let mut tag_to_remove: Option<usize> = None;
 
-        if let Some(idx) = state.library_selected_index {
+        if let Some(idx) = state.library.selected_index {
             if idx < state.app.avatar_library.entries.len() {
                 ui.add_space(space::SM);
                 ui.separator();
@@ -534,11 +534,11 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                             .font(typography::body())
                             .color(color::ON_SURFACE_VARIANT),
                     );
-                    ui.text_edit_singleline(&mut state.library_tag_buf);
+                    ui.text_edit_singleline(&mut state.library.tag_buf);
                     if icon_button(ui, ic::ADD, &t!("inspector.add_tag")).clicked()
-                        && !state.library_tag_buf.is_empty()
+                        && !state.library.tag_buf.is_empty()
                     {
-                        tag_to_add = Some(state.library_tag_buf.clone());
+                        tag_to_add = Some(state.library.tag_buf.clone());
                     }
                 });
 
@@ -579,16 +579,16 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
         }
 
         if let Some(tag) = tag_to_add {
-            if let Some(idx) = state.library_selected_index {
+            if let Some(idx) = state.library.selected_index {
                 if let Some(entry) = state.app.avatar_library.entries.get_mut(idx) {
                     entry.tags.push(tag.clone());
-                    state.library_tag_buf.clear();
+                    state.library.tag_buf.clear();
                     details_save_requested = true;
                 }
             }
         }
         if let Some(tag_i) = tag_to_remove {
-            if let Some(idx) = state.library_selected_index {
+            if let Some(idx) = state.library.selected_index {
                 if let Some(entry) = state.app.avatar_library.entries.get_mut(idx) {
                     entry.tags.remove(tag_i);
                     details_save_requested = true;
@@ -647,7 +647,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         crate::app::avatar_library::AvatarLibraryEntry::from_path(&path);
                     if entry.thumbnail_path.as_ref().is_none_or(|p| !p.exists()) {
                         entry.thumbnail_path = state
-                            .thumbnail_gen
+                            .library.thumbnail_gen
                             .generate_and_save_placeholder(&entry.name);
                     }
                     state.app.avatar_library.add(entry);

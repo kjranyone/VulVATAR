@@ -18,7 +18,7 @@ const TOPBAR_HEIGHT: f32 = 56.0;
 /// happens on the UI thread once the asset arrives via
 /// [`finalize_avatar_load`].
 pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
-    if state.avatar_load_job.is_some() {
+    if state.library.avatar_load_job.is_some() {
         state.push_notification(t!("top_bar.avatar_load_in_progress"));
         return;
     }
@@ -39,12 +39,12 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
     // but wastes the multi-hundred-MB working set the worker built up.
     // The user almost certainly didn't mean to abandon the first load,
     // so a notification is more honest than a silent kick-off.
-    if state.avatar_load_job.is_some() {
+    if state.library.avatar_load_job.is_some() {
         state.push_notification(t!("top_bar.avatar_load_in_progress"));
         return;
     }
     state.push_notification(t!("top_bar.loading_avatar", path = path.display().to_string()));
-    state.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
+    state.library.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
 
 /// UI-thread post-load work: build an `AvatarInstance`, attach it to physics,
@@ -65,13 +65,13 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     state.app.physics.attach_avatar(&asset);
 
     let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
-    entry.update_from_asset_with_thumbnail_dir(&asset, state.thumbnail_gen.output_dir());
+    entry.update_from_asset_with_thumbnail_dir(&asset, state.library.thumbnail_gen.output_dir());
     if entry
         .thumbnail_path
         .as_ref()
         .is_none_or(|p| !p.exists())
     {
-        entry.thumbnail_path = state.thumbnail_gen.generate_and_save_placeholder(&entry.name);
+        entry.thumbnail_path = state.library.thumbnail_gen.generate_and_save_placeholder(&entry.name);
     }
     state.app.avatar_library.add(entry);
     state.save_avatar_library_with_toast();
@@ -97,7 +97,7 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "avatar".to_string());
-    let thumb_path = state.thumbnail_gen.thumbnail_path_for(&avatar_name);
+    let thumb_path = state.library.thumbnail_gen.thumbnail_path_for(&avatar_name);
     state.kick_thumbnail_job(thumb_path);
 }
 
@@ -281,14 +281,14 @@ fn open_project(state: &mut GuiApp) {
             }
 
             if let Some(avatar_path) = avatar_to_load {
-                if state.avatar_load_job.is_some() {
+                if state.library.avatar_load_job.is_some() {
                     state.push_notification(t!("top_bar.avatar_load_in_progress"));
                 } else {
                     state.push_notification(t!(
                         "top_bar.loading_project",
                         path = path.display().to_string()
                     ));
-                    state.avatar_load_job = Some(AvatarLoadJob::spawn(
+                    state.library.avatar_load_job = Some(AvatarLoadJob::spawn(
                         avatar_path,
                         AfterLoad::ApplyProject {
                             project_state: Box::new(project_state),

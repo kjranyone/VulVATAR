@@ -274,7 +274,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 // click target reachable through the (paint-only)
                 // scrim. Same gate enforced on the open() side just
                 // below, in case the button somehow fires anyway.
-                let calib_enabled = state.avatar_load_job.is_none();
+                let calib_enabled = state.library.avatar_load_job.is_none();
                 if filled_button(ui, None, &t!("calibration.button"), calib_enabled).clicked()
                     && calib_enabled
                 {
