@@ -8,17 +8,16 @@ fix. The history is in `git log`; this file now only lists the **open**
 findings and the recommended order for picking them up. For the closed ones
 see commits between `2026-05-06` and `2026-05-21` (architecture review pass +
 output refactor + simulation step correctness + GUI repaint gate fix +
-P3-03 runtime budget + #4 render-thread mailbox + #7 tracking hold/fade).
+P3-03 runtime budget + #4 render-thread mailbox + #7 tracking hold/fade +
+#8 mailbox split + #13 primitive Arc lift).
 
 ## Open findings at a glance
 
 | # | Finding | Severity |
 |---|---------|----------|
 | #1  | Live output is CPU-readback-centred (producer-side capability routing landed; second live sink still on CPU) | High |
-| #8  | Tracking mailbox clones relatively heavy GUI data (pose + webcam preview + diagnostics) under one mutex | Medium |
 | #10 | `GuiApp` has been partially split into sub-states but is still a broad mutable coordinator | High |
 | #12 | `src/renderer/mod.rs` is ~3900 lines and has too many reasons to change | Medium |
-| #13 | `AvatarInstance` stores `primitive_arcs`, blurring asset / runtime / render boundaries | Medium |
 
 ## #1 — Second live sink not yet on GPU handoff
 
@@ -31,20 +30,6 @@ lands and a follow-up sink is chosen.
 Recommendation: wait for the out-of-tree DLL ship, then pick the next sink
 in [`gpu-runtime-roadmap-tasks.md`](./gpu-runtime-roadmap-tasks.md) §"What
 is actually still open".
-
-## #8 — Tracking mailbox does too much under one mutex
-
-Current state: `src/tracking/mod.rs` `TrackingMailboxInner` holds pose,
-webcam preview frame, annotation, calibration, and torso template under
-one `Arc<Mutex<…>>`. The webcam preview clone happens on every inference
-frame.
-
-Recommendation: split into separate mailboxes (pose / camera preview /
-diagnostics / calibration command). Use `Arc<Vec<u8>>` for preview frame
-payloads if snapshots continue to clone them.
-
-Files: `src/tracking/mod.rs` (and call sites in
-`src/app/tracking_lifecycle.rs`, `src/gui/inspector/tracking.rs`).
 
 ## #10 — GUI state split is partial
 
@@ -92,32 +77,15 @@ Recommendation: split by execution path:
 
 Keep `VulkanRenderer` as the facade.
 
-## #13 — Avatar instance carries render-facing primitives
-
-Current state: `src/avatar/instance.rs` stores `primitive_arcs:
-Vec<Vec<Arc<MeshPrimitiveAsset>>>` so that the render snapshot does not
-clone vertex data every frame. It works, but avatar runtime now carries
-renderer-snapshot optimisation data — not a GPU type leak, but it blurs
-the asset / runtime / render boundary.
-
-Recommendation:
-
-- Move primitive arc / cache ownership into immutable asset construction.
-- Or build a `RenderAssetView` once per loaded `AvatarAsset` and share it
-  through render snapshot construction.
-
-Files: `src/avatar/instance.rs`, `src/app/render.rs` (snapshot build sites).
-
 ## Suggested order
 
-1. **#8** — independent of the others; smaller blast radius. Now the
-   highest-impact OPEN item left.
-2. **#10** — large mechanical refactor; pick up after the runtime issues
-   so the split lands on a stable contract.
-3. **#13** — incremental cleanup; pair with whichever asset path is being
-   touched next.
-4. **#12** — the renderer split is the biggest chunk; defer until the
+1. **#10** — large mechanical refactor; biggest open item, pick up
+   when behaviour churn has settled enough that the sub-state split
+   doesn't immediately need to be revisited.
+2. **#12** — the renderer split is comparably large; defer until the
    compute prepass and GPU cloth paths stop churning.
+3. **#1** — second live sink GPU-token migration is blocked on the
+   out-of-tree MF DLL ship; pick up when that lands.
 
 ## What this file is NOT
 
