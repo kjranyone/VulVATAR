@@ -302,7 +302,18 @@ impl RuntimeGpuBudget {
                 }
             }
             (DegradedMode::EmergencyCpu, p) => {
-                if p.is_none() {
+                // Emergency recovery also requires the failure window
+                // to drop below the trigger threshold. Without this,
+                // pressure-clear + persistent GPU export failures would
+                // oscillate Emergency → Heavy → Emergency: recovery
+                // fires on `p.is_none()`, then the next update sees
+                // `failure_history.len() >= EMERGENCY_FAILURE_COUNT`
+                // and re-escalates. The 30 s dwell already exceeds the
+                // 10 s `FAILURE_WINDOW`, so by the time recovery is
+                // legitimately due, expired failures have been pruned;
+                // anything still in the window is "new failures since
+                // recovery started" and is the right reason to stay.
+                if p.is_none() && self.failure_history.len() < EMERGENCY_FAILURE_COUNT {
                     self.maybe_recover_one_level(now);
                 }
             }
@@ -559,6 +570,49 @@ mod tests {
             DegradedMode::EmergencyCpu,
             "second failure inside the window escalates"
         );
+    }
+
+    /// EmergencyCpu does not recover while the failure window is
+    /// still above the trigger threshold, even after the dwell
+    /// elapses. Prevents Emergency → Heavy → Emergency oscillation
+    /// when GPU export keeps failing under otherwise-clean pressure.
+    #[test]
+    fn emergency_cpu_does_not_recover_while_failures_persist() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        budget.update(&heavy_drop_measurements(), t0);
+        budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
+        let mut m = heavy_drop_measurements();
+        m.gpu_export_failures_this_tick = EMERGENCY_FAILURE_COUNT as u32;
+        budget.update(&m, t0 + Duration::from_millis(32));
+        assert_eq!(budget.degraded_mode(), DegradedMode::EmergencyCpu);
+
+        // Pressure clears. Most of the dwell is clean, but right at
+        // the recovery boundary a fresh burst of failures arrives —
+        // enough to keep `failure_history` at or above the trigger
+        // threshold. Recovery must hold off until that burst expires.
+        let streak_start = t0 + Duration::from_millis(100);
+        budget.update(&healthy_measurements(), streak_start);
+        let mut fresh_burst = healthy_measurements();
+        fresh_burst.gpu_export_failures_this_tick = EMERGENCY_FAILURE_COUNT as u32;
+        budget.update(
+            &fresh_burst,
+            streak_start + RECOVERY_DWELL + Duration::from_millis(1),
+        );
+        assert_eq!(
+            budget.degraded_mode(),
+            DegradedMode::EmergencyCpu,
+            "Emergency must not recover while failure_history >= threshold"
+        );
+
+        // Once the burst ages out of the window, recovery proceeds —
+        // proves the gate is conditional on the failure window, not
+        // a permanent block.
+        budget.update(
+            &healthy_measurements(),
+            streak_start + RECOVERY_DWELL + FAILURE_WINDOW + Duration::from_millis(2),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
     }
 
     /// PressureHeavy steps down to PressureLight after a full

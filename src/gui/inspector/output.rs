@@ -229,5 +229,13 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 "inspector.runtime_budget_reason",
                 reason = budget.last_transition_reason().label().to_string()
             ));
+            ui.label(t!(
+                "inspector.runtime_budget_failures",
+                count = budget.gpu_export_failure_window_count()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_dropped_results",
+                count = state.app.render_results_dropped_count()
+            ));
         });
 }

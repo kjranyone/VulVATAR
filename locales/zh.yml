@@ -306,6 +306,8 @@ inspector:
   runtime_budget_render_fps: "Render target: %{target} fps (user %{user})"
   runtime_budget_yolox_skip: "YOLOX skip period: %{period}"
   runtime_budget_reason: "Last transition: %{reason}"
+  runtime_budget_failures: "GPU export failures (last 10s): %{count}"
+  runtime_budget_dropped_results: "Render results dropped: %{count}"
   cloth_overlay: "Cloth Overlay"
   unsaved_changes: "Unsaved changes"
   no_unsaved: "No unsaved changes"
