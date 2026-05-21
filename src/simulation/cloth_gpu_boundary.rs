@@ -585,11 +585,22 @@ mod tests {
     }
 
     /// 32-particle sheet (4×8) with horizontal + vertical distance
-    /// constraints between adjacent grid neighbours. Run 64 PBD
-    /// iterations on both:
-    ///   (a) the CPU PBD `project_distance_constraints` reference
+    /// constraints between adjacent grid neighbours. Run 64 constraint
+    /// projection iterations on both:
+    ///   (a) the CPU `project_distance_constraints` reference
+    ///       (now XPBD — eXtended PBD, Macklin et al. 2016)
     ///   (b) the GLSL Jacobi formula mirror (`cpu_mirror_of_cloth_constraint_iter`)
+    ///       which is still classic PBD
     /// and assert convergence to within a tolerance.
+    ///
+    /// **Stiffness-1 equivalence**: at `stiffness = 1.0` the XPBD
+    /// compliance `α = 0`, which collapses the XPBD update to exactly
+    /// the PBD form for this iteration (`Δλ = −C / w_sum`, `Δx = w·d·Δλ`
+    /// — identical magnitude to PBD's `correction = err`). The test
+    /// therefore stays correct as a CPU↔GPU parity check while the
+    /// GPU side is still on PBD; a follow-up slice will migrate the
+    /// GLSL constraint shader to XPBD too (adding a lambda SSBO and a
+    /// `dt`/`α` field on the constraint control UBO).
     ///
     /// Jacobi is only an *approximation* of Gauss-Seidel; the two
     /// converge to the same equilibrium but along different paths.
