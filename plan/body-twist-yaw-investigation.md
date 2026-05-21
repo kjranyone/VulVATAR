@@ -150,7 +150,7 @@ B/D はその後の選択肢。
 
 ## 一次資料
 
-- `pose_solver.rs` `compute_body_yaw_3d` (現在は肩+腰ペア合成版)
+- `pose_solver.rs` `compute_body_yaw_3d` (現在は肩優先 + 腰ペアフォールバックの順次選択版。Option A の平均化は撤回済)
 - `pose_solver.rs` Hips 適用パス (`solve_avatar_pose` 内)
 - `tracking/rtmw3d/skeleton.rs` ソース座標変換 (`build_source_skeleton`)
 - `tracking/rtmw3d/consts.rs` `COCO_BODY` (selfie mirror マッピング)

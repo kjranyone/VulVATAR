@@ -40,8 +40,9 @@ Avoid giant feature-flag shaders as the default architecture.
 
 ## Vertex Shader Responsibilities
 
-After the [compute prepass migration](../plan/compute-prepass-migration.md),
-the main avatar vertex shader is intentionally tiny:
+After the compute prepass migration (landed on
+`feature/compute-prepass-migration`, 2026-05-19), the main avatar
+vertex shader is intentionally tiny:
 
 - clip-space projection (`view * proj` applied to the world-space input)
 - passing normalized material inputs (UV, world position, world normal) to

@@ -324,8 +324,8 @@ upward; everything else needs the 5 s dwell.
   global — one Application + one Rtmw3dInference per session.
 - **Pose Hz / Depth skip / FaceMesh EP**: budget fields are populated
   and surfaced in the inspector; the consumer wiring lands when each
-  subsystem starts honouring the budget (these are tracked under
-  `plan/runtime-gpu-budget.md`).
+  subsystem starts honouring the budget. The YOLOX skip period is the
+  reference pattern (`pub static AtomicU64` read in the submit guard).
 
 ### Inputs the budget reads
 

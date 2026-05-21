@@ -118,8 +118,10 @@ Responsibilities:
 
 The graphics vertex shaders are reduced to view × projection; they
 never see the source `GpuVertexBase` or the morph / cloth buffers. See
-`pipeline::transform_cs` for the shader contract and
-`plan/compute-prepass-migration.md` for the migration rationale.
+`pipeline::transform_cs` for the shader contract; the migration that
+introduced this layout landed on `feature/compute-prepass-migration`
+(commit history of `src/renderer/{mod,pipeline,material}.rs` from
+2026-05-19).
 
 ### Main Forward Avatar Pass
 
