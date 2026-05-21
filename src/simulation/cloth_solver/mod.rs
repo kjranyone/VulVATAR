@@ -6,12 +6,12 @@ use crate::avatar::AvatarInstance;
 use crate::simulation::cloth::{ClothSimTempBuffers, ResolvedCollider};
 
 mod collision;
-mod constraints;
 // `pub(crate)` so the GPU cloth boundary's formula-parity tests can
-// call `verlet_integrate` directly to compare the GLSL shader's
-// integration formula against the CPU PBD reference.
+// call them directly to compare the GLSL shaders' formulas against
+// the CPU PBD references.
+pub(crate) mod constraints;
 pub(crate) mod integrator;
-mod output;
+pub(crate) mod output;
 
 #[cfg(test)]
 mod tests;

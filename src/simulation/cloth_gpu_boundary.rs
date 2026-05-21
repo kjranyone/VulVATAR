@@ -520,6 +520,320 @@ mod tests {
         assert_eq!(collect_triangles_for(&adj, 1), vec![0, 1]);
     }
 
+    // =====================================================================
+    // S2.2 — CPU mirror of cloth_constraint_{accumulate,apply}_cs formula
+    // =====================================================================
+
+    /// Direct port of the two GLSL constraint shaders, applied as a single
+    /// Jacobi iteration: accumulate deltas per particle, then apply them.
+    /// Used in the parity test below as the GLSL-side reference.
+    fn cpu_mirror_of_cloth_constraint_iter(
+        positions: &mut [[f32; 4]], // xyz = pos, w = inv_mass
+        constraints: &[(u32, u32, f32, f32)], // (a, b, rest_length, stiffness)
+        adj: &VertexTriangleAdjacency,
+    ) {
+        let n = positions.len();
+        let mut deltas = vec![[0.0_f32; 3]; n];
+
+        // Accumulate pass — mirrors `cloth_constraint_accumulate_cs`.
+        for pid in 0..n {
+            let w_self = positions[pid][3];
+            if w_self <= 0.0 {
+                continue;
+            }
+            let self_pos = [positions[pid][0], positions[pid][1], positions[pid][2]];
+            let start = adj.offsets[pid] as usize;
+            let end = adj.offsets[pid + 1] as usize;
+            let mut delta = [0.0_f32; 3];
+            for k in start..end {
+                let cidx = adj.triangles[k] as usize;
+                let (a, b, rest_length, stiffness) = constraints[cidx];
+                let other = if a as usize == pid { b } else { a } as usize;
+                let other_p = positions[other];
+                let dir = [
+                    other_p[0] - self_pos[0],
+                    other_p[1] - self_pos[1],
+                    other_p[2] - self_pos[2],
+                ];
+                let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+                if len > 1e-6 {
+                    let err = len - rest_length;
+                    let w_other = other_p[3];
+                    let w_sum = w_self + w_other;
+                    if w_sum > 0.0 {
+                        let scale = stiffness * err / len * (w_self / w_sum);
+                        delta[0] += dir[0] * scale;
+                        delta[1] += dir[1] * scale;
+                        delta[2] += dir[2] * scale;
+                    }
+                }
+            }
+            deltas[pid] = delta;
+        }
+
+        // Apply pass — mirrors `cloth_constraint_apply_cs`.
+        for pid in 0..n {
+            positions[pid][0] += deltas[pid][0];
+            positions[pid][1] += deltas[pid][1];
+            positions[pid][2] += deltas[pid][2];
+        }
+    }
+
+    /// 32-particle sheet (4×8) with horizontal + vertical distance
+    /// constraints between adjacent grid neighbours. Run 64 PBD
+    /// iterations on both:
+    ///   (a) the CPU PBD `project_distance_constraints` reference
+    ///   (b) the GLSL Jacobi formula mirror (`cpu_mirror_of_cloth_constraint_iter`)
+    /// and assert convergence to within a tolerance.
+    ///
+    /// Jacobi is only an *approximation* of Gauss-Seidel; the two
+    /// converge to the same equilibrium but along different paths.
+    /// We compare per-constraint length error, not per-particle position,
+    /// because position drift between methods can be larger than length
+    /// drift while both still satisfy the rest-length constraint.
+    #[test]
+    fn cloth_constraint_jacobi_satisfies_rest_lengths_like_cpu_pbd() {
+        use crate::simulation::cloth::{
+            ClothDistanceConstraint, ClothParticle, ClothSimState, ClothSimTempBuffers,
+            SpatialHashGrid,
+        };
+        use crate::simulation::cloth_solver::constraints::project_distance_constraints;
+        use std::collections::HashSet;
+
+        const W: u32 = 4;
+        const H: u32 = 8;
+        let n = (W * H) as usize;
+
+        // Build the grid: vertex i is at ((i % W) - W/2, (i / W) - H/2, 0)
+        // with rest length 1.0 between immediate horizontal / vertical
+        // neighbours.
+        let mut positions: Vec<[f32; 3]> = (0..n)
+            .map(|i| {
+                let x = (i as u32 % W) as f32 - (W as f32 - 1.0) * 0.5;
+                let y = (i as u32 / W) as f32 - (H as f32 - 1.0) * 0.5;
+                [x, y, 0.0]
+            })
+            .collect();
+        // Perturb a couple of particles so the constraints actually need
+        // to do work (otherwise the rest-pose already satisfies them).
+        positions[0] = [-3.0, -3.0, 0.5];
+        positions[(n - 1) as usize] = [3.0, 3.0, -0.5];
+
+        let mut constraints: Vec<(u32, u32, f32, f32)> = Vec::new();
+        let stiffness = 1.0_f32;
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * W + x;
+                if x + 1 < W {
+                    constraints.push((i, i + 1, 1.0, stiffness));
+                }
+                if y + 1 < H {
+                    constraints.push((i, i + W, 1.0, stiffness));
+                }
+            }
+        }
+
+        // ----- (a) CPU PBD reference: project_distance_constraints -----
+        let mut sim = ClothSimState {
+            particles: positions
+                .iter()
+                .map(|p| ClothParticle::new(*p, false))
+                .collect(),
+            distance_constraints: constraints
+                .iter()
+                .map(|(a, b, r, s)| ClothDistanceConstraint {
+                    a: *a as usize,
+                    b: *b as usize,
+                    rest_length: *r,
+                    stiffness: *s,
+                })
+                .collect(),
+            bend_constraints: Vec::new(),
+            pin_targets: Vec::new(),
+            solver_iterations: 0,
+            gravity: [0.0; 3],
+            damping: 0.0,
+            collision_margin: 0.0,
+            wind_response: 0.0,
+            wind_direction: [0.0; 3],
+            triangle_indices: Vec::new(),
+            computed_normals: vec![[0.0; 3]; n],
+            initialized: true,
+            self_collision: false,
+            self_collision_radius: 0.0,
+            connected_pairs: HashSet::new(),
+            spatial_hash: SpatialHashGrid::new(0.04),
+        };
+        let mut buffers = ClothSimTempBuffers::new(n);
+        for _ in 0..64 {
+            project_distance_constraints(&mut sim, &mut buffers);
+        }
+
+        // ----- (b) GLSL Jacobi formula mirror -----
+        let mut gpu_positions: Vec<[f32; 4]> = positions
+            .iter()
+            .map(|p| [p[0], p[1], p[2], 1.0])
+            .collect();
+        let adj = build_particle_constraint_adjacency(
+            &constraints.iter().map(|(a, b, _, _)| (*a, *b)).collect::<Vec<_>>(),
+            n as u32,
+        );
+        for _ in 0..64 {
+            cpu_mirror_of_cloth_constraint_iter(&mut gpu_positions, &constraints, &adj);
+        }
+
+        // ----- Assert: every constraint's length is within tolerance of rest_length -----
+        let tol = 0.05; // 5cm of slack for 64 Jacobi iterations on the rough perturbation
+        for (a, b, rest_length, _) in &constraints {
+            let pa_cpu = sim.particles[*a as usize].position;
+            let pb_cpu = sim.particles[*b as usize].position;
+            let dx = pb_cpu[0] - pa_cpu[0];
+            let dy = pb_cpu[1] - pa_cpu[1];
+            let dz = pb_cpu[2] - pa_cpu[2];
+            let len_cpu = (dx * dx + dy * dy + dz * dz).sqrt();
+            assert!(
+                (len_cpu - rest_length).abs() < tol,
+                "CPU PBD constraint ({},{}) length drift: {}",
+                a, b, len_cpu
+            );
+
+            let pa_gpu = gpu_positions[*a as usize];
+            let pb_gpu = gpu_positions[*b as usize];
+            let dx = pb_gpu[0] - pa_gpu[0];
+            let dy = pb_gpu[1] - pa_gpu[1];
+            let dz = pb_gpu[2] - pa_gpu[2];
+            let len_gpu = (dx * dx + dy * dy + dz * dz).sqrt();
+            assert!(
+                (len_gpu - rest_length).abs() < tol,
+                "GLSL Jacobi constraint ({},{}) length drift: {}",
+                a, b, len_gpu
+            );
+        }
+    }
+
+    // =====================================================================
+    // S3.2 — CPU mirror of cloth_normal_cs formula
+    // =====================================================================
+
+    /// Direct port of the `cloth_normal_cs::main` body. Used in the
+    /// parity test below to verify the GLSL normal recomputation matches
+    /// the CPU PBD reference (`cloth_solver::output::compute_normals`).
+    fn cpu_mirror_of_cloth_normal_cs(
+        positions: &[[f32; 3]],
+        triangle_indices: &[u32],
+        adj: &VertexTriangleAdjacency,
+    ) -> Vec<[f32; 3]> {
+        let n = positions.len();
+        let mut normals = vec![[0.0_f32, 1.0, 0.0]; n];
+        for vid in 0..n {
+            let start = adj.offsets[vid] as usize;
+            let end = adj.offsets[vid + 1] as usize;
+            let mut accum = [0.0_f32; 3];
+            for k in start..end {
+                let tri = adj.triangles[k] as usize;
+                let i0 = triangle_indices[tri * 3] as usize;
+                let i1 = triangle_indices[tri * 3 + 1] as usize;
+                let i2 = triangle_indices[tri * 3 + 2] as usize;
+                let p0 = positions[i0];
+                let p1 = positions[i1];
+                let p2 = positions[i2];
+                let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                let cross = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                accum[0] += cross[0];
+                accum[1] += cross[1];
+                accum[2] += cross[2];
+            }
+            let len = (accum[0] * accum[0] + accum[1] * accum[1] + accum[2] * accum[2]).sqrt();
+            if len > 1e-12 {
+                normals[vid] = [accum[0] / len, accum[1] / len, accum[2] / len];
+            }
+        }
+        normals
+    }
+
+    /// 32-particle (4×8) flat sheet of triangles in XY plane: the GLSL
+    /// normal formula must agree with the CPU PBD `compute_normals`
+    /// reference to within `1e-4` per component per vertex. (The CPU
+    /// reference uses the same area-weighted accumulation, so they
+    /// should match bit-for-bit modulo floating-point summation order.)
+    #[test]
+    fn cloth_normal_cs_formula_matches_cpu_pbd() {
+        use crate::simulation::cloth::{
+            ClothParticle, ClothSimState, SpatialHashGrid,
+        };
+        use crate::simulation::cloth_solver::output::compute_normals;
+        use std::collections::HashSet;
+
+        const W: u32 = 4;
+        const H: u32 = 8;
+        let n = (W * H) as usize;
+
+        let positions: Vec<[f32; 3]> = (0..n)
+            .map(|i| {
+                let x = (i as u32 % W) as f32;
+                let y = (i as u32 / W) as f32;
+                [x, y, 0.0]
+            })
+            .collect();
+        // Two triangles per quad cell: (i, i+1, i+W) and (i+1, i+W+1, i+W).
+        let mut triangle_indices: Vec<u32> = Vec::new();
+        for y in 0..(H - 1) {
+            for x in 0..(W - 1) {
+                let i = y * W + x;
+                triangle_indices.extend_from_slice(&[i, i + 1, i + W]);
+                triangle_indices.extend_from_slice(&[i + 1, i + W + 1, i + W]);
+            }
+        }
+
+        // ----- CPU PBD reference -----
+        let mut sim = ClothSimState {
+            particles: positions
+                .iter()
+                .map(|p| ClothParticle::new(*p, false))
+                .collect(),
+            distance_constraints: Vec::new(),
+            bend_constraints: Vec::new(),
+            pin_targets: Vec::new(),
+            solver_iterations: 0,
+            gravity: [0.0; 3],
+            damping: 0.0,
+            collision_margin: 0.0,
+            wind_response: 0.0,
+            wind_direction: [0.0; 3],
+            triangle_indices: triangle_indices.clone(),
+            computed_normals: vec![[0.0; 3]; n],
+            initialized: true,
+            self_collision: false,
+            self_collision_radius: 0.0,
+            connected_pairs: HashSet::new(),
+            spatial_hash: SpatialHashGrid::new(0.04),
+        };
+        compute_normals(&mut sim);
+        let cpu_normals = sim.computed_normals.clone();
+
+        // ----- GLSL formula mirror -----
+        let adj = build_vertex_triangle_adjacency(&triangle_indices, n as u32);
+        let gpu_normals = cpu_mirror_of_cloth_normal_cs(&positions, &triangle_indices, &adj);
+
+        // ----- Parity check -----
+        for i in 0..n {
+            for k in 0..3 {
+                // Vertex with no triangles (corners of degenerate grid) — skip if both methods agree on default
+                let diff = (cpu_normals[i][k] - gpu_normals[i][k]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "normal {} axis {} mismatch: CPU = {:?}, GLSL = {:?}",
+                    i, k, cpu_normals[i], gpu_normals[i]
+                );
+            }
+        }
+    }
+
     /// Pinned particles must hold their starting position under the
     /// shader formula, mirroring CPU PBD `verlet_integrate`.
     #[test]

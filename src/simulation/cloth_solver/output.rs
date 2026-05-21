@@ -7,7 +7,7 @@ use crate::simulation::cloth::ClothSimState;
 // Per-vertex normal computation (M2)
 // =========================================================================
 
-pub(super) fn compute_normals(sim: &mut ClothSimState) {
+pub(crate) fn compute_normals(sim: &mut ClothSimState) {
     let n = sim.particles.len();
     // Resize normals buffer inside sim (we store temporarily in a local vec
     // and then copy back, since ClothSimState doesn't have a normals field

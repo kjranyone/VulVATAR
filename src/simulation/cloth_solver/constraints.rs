@@ -9,7 +9,7 @@ use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 // Distance constraint projection (Jakobsen-style)
 // =========================================================================
 
-pub(super) fn project_distance_constraints(
+pub(crate) fn project_distance_constraints(
     sim: &mut ClothSimState,
     buffers: &mut ClothSimTempBuffers,
 ) {
