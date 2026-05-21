@@ -243,6 +243,19 @@ impl Application {
         // idempotent so calling it every frame is cheap.
         self.output
             .set_target_fps(self.runtime_gpu_budget.render_fps_target());
+
+        // P3-03 B4 — publish the YOLOX submit period to the tracking
+        // pipeline via the shared atomic. `Rtmw3dInference` reads this
+        // each frame; the cadence flip takes effect on the next
+        // `frame_index.is_multiple_of(period)` check (typically next
+        // submit cycle).
+        #[cfg(feature = "inference")]
+        {
+            crate::tracking::rtmw3d::YOLOX_REFRESH_PERIOD.store(
+                self.runtime_gpu_budget.yolox_skip_period() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     /// Drain every result currently sitting in the render thread's

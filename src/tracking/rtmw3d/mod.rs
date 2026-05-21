@@ -113,17 +113,30 @@ impl InferenceBackend {
     }
 }
 
-/// Submit a frame to the YOLOX worker on every Nth call. Detection
-/// itself runs asynchronously in a background thread, so the main
-/// pipeline never waits for it past the cold-start frame — we just
-/// read the worker's sticky outbox each call and use whatever bbox
-/// it last produced (typically 1–2 frames stale).
+/// Default submit period for the YOLOX worker (every Nth call).
+/// Detection itself runs asynchronously in a background thread, so the
+/// main pipeline never waits for it past the cold-start frame — we just
+/// read the worker's sticky outbox each call and use whatever bbox it
+/// last produced (typically 1–2 frames stale).
 ///
 /// At 30 fps and N=4, YOLOX submits at 7.5 fps. The 25% downstream
 /// pad on the bbox absorbs the few-pixel subject motion that
 /// accumulates between submits.
 #[cfg(feature = "inference")]
-const YOLOX_REFRESH_PERIOD: u64 = 4;
+pub const YOLOX_REFRESH_PERIOD_DEFAULT: u64 = 4;
+
+/// Active YOLOX submit period, settable cross-thread from the
+/// application's `RuntimeGpuBudget` consumer (P3-03 B4).
+///
+/// Single shared atomic because (a) only one `Rtmw3dInference` runs at a
+/// time in any session, (b) only one `Application` writes it, and (c)
+/// the value is conceptually a global cadence knob, not per-instance
+/// state. An `Arc<AtomicU64>` plumbing path (Application → TrackingSource
+/// → PoseProvider → Rtmw3dInference) was rejected as needless ceremony
+/// for state that is already globally singular.
+#[cfg(feature = "inference")]
+pub static YOLOX_REFRESH_PERIOD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(YOLOX_REFRESH_PERIOD_DEFAULT);
 
 pub struct Rtmw3dInference {
     #[cfg(feature = "inference")]
@@ -371,7 +384,9 @@ impl Rtmw3dInference {
             // within the 25% downstream pad.
             let bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
                 let cold_start = !worker.has_result();
-                if cold_start || frame_index.is_multiple_of(YOLOX_REFRESH_PERIOD) {
+                let period =
+                    YOLOX_REFRESH_PERIOD.load(std::sync::atomic::Ordering::Relaxed).max(1);
+                if cold_start || frame_index.is_multiple_of(period) {
                     worker.submit(rgb_data, width, height);
                 }
                 worker.wait_latest().bbox
