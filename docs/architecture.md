@@ -24,6 +24,12 @@ Keep these systems separate:
 - `editor / authoring layer`: create optional cloth overlays and save project-local authoring data
 - `avatar layer`: own runtime skeleton, pose, animation, and simulation state
 - `simulation layer`: update spring bones, colliders, and cloth
+  - cloth simulation is currently CPU PBD (`simulation/cloth_solver`);
+    a GPU compute path (`renderer/pipeline::cloth_verlet_cs`,
+    `cloth_constraint_*_cs`, `cloth_normal_cs`) is wired and selected
+    per-cloth via `ClothState::solver_backend`. Production attach
+    paths default to `Cpu`; the GPU path is exercised when a future
+    consumer (e.g. `RuntimeGpuBudget`) flips the backend.
 - `renderer layer`: own Vulkan resources and shading
 - `tracking layer`: estimate performer motion from camera input
 - `capture/output layer`: export rendered frames to external video consumers

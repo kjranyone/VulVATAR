@@ -47,11 +47,21 @@ policy in place *before* that contention lands.
 - [x] First production consumer: render FPS clamp via
       `Application::set_user_render_fps` → `budget.render_fps_target()`
       → `OutputRouter::set_target_fps`
-- [ ] YOLOX skip period consumer (B4): the budget value is computed
-      and surfaced in the inspector, but `Rtmw3dInference` still reads
-      `YOLOX_REFRESH_PERIOD` const. Cross-thread plumbing needed
-      (Application → TrackingSource → PoseProvider → Rtmw3dInference)
-      and is deferred to a follow-up slice
+- [x] **B4** YOLOX skip period consumer: `YOLOX_REFRESH_PERIOD` is
+      now a `pub static AtomicU64` in `tracking::rtmw3d`. The
+      `Application::update_runtime_gpu_budget` tick stores the budget's
+      `yolox_skip_period` into this atomic each frame;
+      `Rtmw3dInference::process_pose` loads it (Relaxed) inside the
+      submit guard. Single shared atomic over an Arc plumbing path
+      because the value is conceptually global. New test
+      `all_modes_emit_nonzero_yolox_skip_period` asserts every mode
+      arm produces a non-zero period (review pass 2). `.max(1)` on the
+      read site is defence-in-depth.
+- [x] **B7** docs/gpu-runtime-roadmap.md "RuntimeGpuBudget — Landed
+      State Machine" section: full state-machine table with
+      thresholds, per-mode targets, consumer plumbing matrix, and
+      rationale notes. EmergencyCpu unreachability documented as
+      pending the recent-window GPU-export-failure counter.
 
 ## Architecture target
 

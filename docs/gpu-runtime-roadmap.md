@@ -334,9 +334,12 @@ upward; everything else needs the 5 s dwell.
 - `render_dt_ema` — 5-frame EMA of render-thread frame dt
 - `OutputRouter::dropped_count()` → drops/sec across the sampling window
 - `OutputDiagnostics::export_pool` → leased / capacity counts
-- recent GPU export failures (currently 0; a small failure-window
-  counter is the remaining work — `EmergencyCpu` will only fire once
-  that counter is populated)
+- recent GPU export failures via
+  `OutputRouter::take_gpu_export_failure_count` — a take-and-reset
+  counter incremented each time a frame attempted the GPU shared-frame
+  handoff but published with an invalid token. Drives `EmergencyCpu`
+  when ≥ `EMERGENCY_FAILURE_COUNT` (2) failures occur inside a single
+  budget tick window.
 
 ### Why centralise
 
@@ -454,15 +457,18 @@ provider encode permanent timing assumptions in isolation.
 
 ## Immediate Next Implementation Task
 
-The Phase 2 GPU export pool, Phase 3 cloth compute migration, and
-Phase 3 runtime budget have all landed. The remaining immediate work is:
+The Phase 2 GPU export pool, Phase 3 cloth compute migration, Phase 3
+runtime budget, and the GPU-export-failure → `EmergencyCpu` counter
+(review pass 4) have all landed. The remaining immediate work is:
 
-> Add a recent-window GPU-export-failure counter to `OutputDiagnostics`
-> so `RuntimeGpuBudget::EmergencyCpu` can actually fire (today the
-> input is hardcoded to 0). Then plumb `pose_hz_target`, `depth_skip_period`,
-> and `facemesh_ep_preference` to their respective consumers, the same
-> way YOLOX skip is wired through `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`.
+> Plumb `pose_hz_target`, `depth_skip_period`, and
+> `facemesh_ep_preference` to their respective consumers, the same way
+> YOLOX skip is wired through `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`.
+> Each landing is a small slice: a `pub static AtomicU64`/`AtomicU32`
+> alongside the consumer's existing const, plus a one-line write in
+> `Application::update_runtime_gpu_budget`.
 
 These complete the runtime budget loop: today the budget is fully
-expressive on its outputs but only one consumer (YOLOX) actually
-honours its decisions cross-thread.
+expressive on its outputs, and YOLOX + render FPS + the EmergencyCpu
+escalation path honour it. The remaining three (pose Hz, depth skip,
+facemesh EP) are inspector-visible but not yet acted on.

@@ -113,6 +113,13 @@ pub struct OutputRouter {
     /// [`Self::diagnostics`] so the GUI shows the path actually carried by
     /// frames instead of guessing from the sink variant. `None` until the
     /// first publish.
+    /// Count of frames that *attempted* the GPU shared-frame handoff
+    /// but published with an invalid token (i.e. the renderer wanted
+    /// GPU but the sink had to fall back to bytes). Reset each time
+    /// `take_gpu_export_failure_count` is called. Drives
+    /// `RuntimeGpuBudget::EmergencyCpu` when it crosses
+    /// `EMERGENCY_FAILURE_COUNT` within the budget's tick window.
+    gpu_export_failure_count: u32,
     last_handoff_path: Option<HandoffPath>,
     /// Whether the most recently delivered GPU frame actually carried an
     /// external handle the sink could consume. A GPU-looking path without a
@@ -161,6 +168,7 @@ impl OutputRouter {
             lease_completion_rx,
             worker_handle: Some(handle),
             logged_first_publish: false,
+            gpu_export_failure_count: 0,
             last_handoff_path: None,
             last_gpu_token_valid: None,
             last_fallback_reason: None,
@@ -473,6 +481,20 @@ impl OutputRouter {
                         // anything is flowing; if the worker channel is
                         // saturated we want the panel to show "pending" /
                         // "stalled", not "connected / GPU active".
+                        // Recent-window failure counter feeding
+                        // `RuntimeGpuBudget`'s EmergencyCpu trigger. A
+                        // failure here is a frame whose handoff path is
+                        // GpuSharedFrame but whose token isn't valid —
+                        // the renderer wanted GPU but the sink had to
+                        // fall back. Cleared each time the budget reads
+                        // via `take_gpu_export_failure_count`.
+                        if matches!(attempted_handoff_path, HandoffPath::GpuSharedFrame)
+                            && !attempted_gpu_token_valid
+                        {
+                            self.gpu_export_failure_count = self
+                                .gpu_export_failure_count
+                                .saturating_add(1);
+                        }
                         self.last_publish_timestamp = attempted_timestamp;
                         self.last_handoff_path = Some(attempted_handoff_path);
                         self.last_gpu_token_valid = Some(attempted_gpu_token_valid);
@@ -572,6 +594,13 @@ impl OutputRouter {
     /// requested variant matches what is already running.
     pub fn active_sink(&self) -> &FrameSink {
         &self.sink
+    }
+
+    /// Return and reset the GPU export failure counter. Application
+    /// calls this each `update_runtime_gpu_budget` tick and feeds the
+    /// value into `RuntimeMeasurements::gpu_export_failures_recent`.
+    pub fn take_gpu_export_failure_count(&mut self) -> u32 {
+        std::mem::take(&mut self.gpu_export_failure_count)
     }
 
     pub fn diagnostics(&self) -> OutputDiagnostics {

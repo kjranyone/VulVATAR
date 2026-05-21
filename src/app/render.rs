@@ -236,15 +236,14 @@ impl Application {
             // single-bit flag. Left at 0 until a small failure-window
             // counter lands; the budget then only escalates to
             // `EmergencyCpu` once that counter is populated.
-            // **NOTE — EmergencyCpu is unreachable today**. The budget's
-            // `EmergencyCpu` transition fires when this counter reaches
-            // `EMERGENCY_FAILURE_COUNT` (2). Until the
-            // recent-window failure counter on `OutputDiagnostics` lands
-            // (tracked in `docs/gpu-runtime-roadmap.md` § "Immediate
-            // Next Implementation Task") this stays at 0. If you are
-            // hunting a "why does EmergencyCpu never fire" bug, the
-            // answer is right here — not a state-machine issue.
-            gpu_export_failures_recent: 0,
+            // Pulled from the OutputRouter's recent-window counter,
+            // which increments whenever a frame attempted the GPU
+            // handoff but published with an invalid token (renderer
+            // wanted GPU, sink had to fall back). The take-and-reset
+            // semantic means the budget sees only failures that
+            // occurred in the current tick window — the right shape
+            // for `EmergencyCpu` (2 failures inside a window → escalate).
+            gpu_export_failures_recent: self.output.take_gpu_export_failure_count(),
         };
         self.runtime_gpu_budget.update(&measurements, now);
 

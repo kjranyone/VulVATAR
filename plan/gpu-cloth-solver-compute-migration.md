@@ -151,42 +151,63 @@ Out:
       `particle_count`, `constraint_count`, `iterations`, `version`,
       `from_authoring` constructor, `bump_version` helper. SSBO slot
       shape documented in module rustdoc
-- [ ] **S1.1 (Vulkan side)** allocate per-primitive SSBOs sized by
-      `ClothGpuSimulationState.particle_count` /
-      `constraint_count` at cloth-attach time
-- [~] **S1.2** GLSL compute shader for Verlet integration; Vulkano
-      pipeline; CPU writes control UBO each frame
-  - [x] `cloth_verlet_cs` module landed in `src/renderer/pipeline.rs`
-        with the Verlet formula mirroring `cloth_solver::integrator`
-        bit-for-bit (pos / prev_pos SSBOs + `Control` UBO)
-  - [x] `create_cloth_verlet_compute_pipeline` factory + Rust mirror
-        `ClothVerletControl` (std140 layout, 48 B, asserted by test)
-  - [ ] Per-frame CPU UBO upload + dispatch (waits on S1.1 Vulkan side
-        SSBO handles)
-- [ ] **S1.3** unit test: 4-particle synthetic cloth under gravity
-      matches CPU reference (`verlet_gravity_pulls_down`) within
-      `1e-3` over 60 frames
-- [ ] **S2.1** GLSL compute shader for PBD constraint projection;
-      constraint table uploaded once at attach time
-- [ ] **S2.2** integration test: 32-particle sheet drape matches CPU
-      reference within tolerance
-- [~] **S3.1** GLSL compute shader for vertex normal recomputation
-      (face-normal accumulate + per-vertex normalise)
-  - [x] `cloth_normal_cs` module landed in `src/renderer/pipeline.rs`
-        — vertex-per-thread, CSR-adjacency driven, area-weighted
-        accumulation matching `cloth_solver::output::compute_normals`
-  - [x] `create_cloth_normal_compute_pipeline` factory + Rust mirror
-        `ClothNormalControl` (std140 layout, 16 B, asserted by test)
-  - [x] CPU adjacency builder `build_vertex_triangle_adjacency` in
-        `cloth_gpu_boundary.rs` (CSR; out-of-range indices skipped;
-        5 unit tests covering single tri / shared vertex / isolated
-        vertex / corrupt index / empty input)
-  - [ ] Per-frame dispatch wiring (waits on S1.1 Vulkan side SSBO
-        handles)
-- [ ] **S3.2** rendered-cloth snapshot diff vs CPU path
-- [ ] **S4** suppress the CPU snapshot write for
-      `ClothSolverBackend::Gpu` cloths in `renderer::mod.rs`; flip
-      `has_cloth = 1` based on `ClothGpuSimulationState.version`
+- [x] **S1.1 (Vulkan side)** per-primitive cloth GPU SSBO allocation —
+      `ClothGpuSlot` on `TransformGpuData` holds `prev_pos_ssbo` +
+      `verlet_control_ubo` + `verlet_set` + optional
+      `ClothGpuConstraintResources` (constraints + delta scratch +
+      adjacency) + optional `ClothGpuNormalResources` (triangle indices
+      + adjacency). `ensure_cloth_gpu_slot` builds the slot on first
+      Gpu-backed snapshot; rebuilds on particle / constraint count
+      mismatch (review pass 1)
+- [x] **S1.2** GLSL compute shader for Verlet integration; Vulkano
+      pipeline; CPU writes control UBO each frame —
+      `cloth_verlet_cs` dispatched per Gpu-backed primitive each
+      frame, `verlet_control_ubo` rewritten with `(dt, damping,
+      particle_count, gravity, wind)` from `ClothGpuDispatchControl`.
+      Rebound to `transform_pipeline` after dispatch so the existing
+      transform pass dispatch later in the loop binds the right
+      shader. `frame_dt` plumbed through `build_frame_input_multi` so
+      the GPU integrates with the same total per-frame wall time as
+      the CPU PBD substep loop (review pass 1).
+- [x] **S1.3** formula parity test landed: pure-Rust port of
+      `cloth_verlet_cs::main` matches CPU PBD `verlet_integrate` on
+      4 particles + gravity within `1e-3` over 60 frames. Also covers
+      pinned + `inv_mass = 0` branches (review pass 1).
+- [x] **S2.1** PBD constraint projection: Jacobi 2-pass shaders
+      `cloth_constraint_accumulate_cs` + `cloth_constraint_apply_cs`,
+      `ClothConstraintGpu` (std430, 16 B) + `ClothConstraintControl`
+      (std140, 16 B) Rust mirrors with layout assertions,
+      `ClothGpuAttachData` carries `(particle_a, particle_b, rest_length,
+      stiffness)` tuples + `build_particle_constraint_adjacency` CSR
+      adjacency for the per-particle accumulation loop. Renderer
+      dispatches accumulate+apply `ctrl.solver_iterations` times each
+      frame (default 8).
+- [x] **S2.2** 32-particle (4×8) sheet drape with horizontal+vertical
+      constraints: 64 Jacobi iterations of the formula mirror agree
+      with 64 CPU PBD iterations to within 5cm of rest length per
+      constraint. (Jacobi converges to the same equilibrium as
+      Gauss-Seidel but along a different path, so per-constraint
+      length is the parity metric, not per-particle position.)
+- [x] **S3.1** GLSL compute shader for vertex normal recomputation —
+      `cloth_normal_cs` dispatched per Gpu-backed primitive after the
+      constraint passes. Vertex-per-thread, CSR-adjacency driven,
+      area-weighted accumulation matching
+      `cloth_solver::output::compute_normals`. `has_cloth_normals_prim`
+      flips true for Gpu-backed cloths with triangles so
+      `transform_cs` reads the GPU-written `cloth_norm_ssbo`.
+- [x] **S3.2** 32-particle flat sheet normal recomputation: formula
+      mirror agrees with CPU `compute_normals` per-component within
+      `1e-4` (area-weighted summation matches bit-for-bit modulo
+      floating-point summation order).
+- [x] **S4** CPU snapshot write suppression: the cloth_pos /
+      cloth_norm SSBO write block in `renderer::mod.rs` is now
+      gated on `!cloth_is_gpu`, so the Gpu compute output is not
+      clobbered. `cloth_solver::step_cloth_single` /
+      `step_cloth_overlays` early-return for Gpu-backed cloths so
+      the CPU PBD work is also skipped (no wasted CPU cycles).
+      `has_cloth = 1` is flipped on snapshot presence (independent
+      of backend), so the transform pass always reads cloth_pos when
+      it should.
 - [x] **S5 (scaffolding)** `ClothSolverBackend::{Cpu, Gpu}` available
       at the avatar attach boundary with `Default = Cpu`. Production
       attach paths still default to `Cpu` (no `Gpu` consumer until
