@@ -9,14 +9,15 @@ findings and the recommended order for picking them up. For the closed ones
 see commits between `2026-05-06` and `2026-05-22` (architecture review pass +
 output refactor + simulation step correctness + GUI repaint gate fix +
 P3-03 runtime budget + #1 producer-side capability routing + #4 render-thread
-mailbox + #7 tracking hold/fade + #8 mailbox split + #13 primitive Arc lift).
+mailbox + #7 tracking hold/fade + #8 mailbox split + #10 partial GuiApp
+state split + #12 partial renderer module split + #13 primitive Arc lift).
 
 ## Open findings at a glance
 
 | # | Finding | Severity |
 |---|---------|----------|
-| #10 | `GuiApp` has been partially split into sub-states but is still a broad mutable coordinator | High |
-| #12 | `src/renderer/mod.rs` is ~3900 lines and has too many reasons to change | Medium |
+| #10 | `GuiApp` state split is mostly landed; one panel cluster + the runtime/project status group are still top-level fields | Medium |
+| #12 | `src/renderer/mod.rs` is down ≈810 lines from the baseline; the `render()` body and pipeline-targets builders still dominate the file | Medium |
 
 #1 (live output GPU handoff) is closed on the producer side: every
 non-`ImageSequence` sink on Windows
@@ -29,59 +30,86 @@ additional cross-process sync primitives — both items live in
 [`gpu-runtime-roadmap-tasks.md`](./gpu-runtime-roadmap-tasks.md) §"What
 is actually still open" rather than here.
 
-## #10 — GUI state split is partial
+## #10 — GUI state split (mostly landed)
 
-Current state: `GuiApp` has had a few sub-states extracted (`TrackingGuiState`,
-`RenderingGuiState`, `OutputGuiState` per the verification pass), but the
-broader pattern — most panels mutating `GuiApp` directly and `GuiApp::update`
-reconciling fields into `Application` every frame — is unchanged.
+Status: **mostly landed**. The 2026-05-22 series extracted five new
+sub-states on top of the four pre-existing ones:
 
-Recommendation: continue the slice, prioritising panels with
-requested-vs-active mismatches:
+Pre-existing:
+- `TransformState`, `CameraOrbitState`, `TrackingGuiState`,
+  `RenderingGuiState`, `OutputGuiState`, `SettingsGuiState`,
+  `LipSyncGuiState`
 
-1. Output panel state and reconciliation (partly done already)
-2. Tracking panel state next
-3. Keep `GuiApp` as a coordinator and owner of top-level sub-states only
+Added in this series:
+- `CalibrationUiState` — modal state + preview texture + torso/template
+  + target-pose snapshot pipeline
+- `LibraryUiState` — search/selection/rename buffers, folder watcher,
+  thumbnail generator, pending-thumbnail-jobs queue, avatar-load job
+- `ViewportUiState` — rendered-scene texture handle, Blender-style drag
+  state, camera-wipe PIP (toggle + texture + dedup seq + RGBA scratch)
+- `ClothAuthoringUiState` — sim playback, rename/save buffers, region
+  selection, sim-parameter widget values
+- `ScenePresetUiState` — preset library + inspector combo + rename buffer
 
-Target shape (kept here as the reference contract):
+Total: 12 sub-states. The plan's original 7-state target is comfortably
+exceeded.
 
-- `ProjectUiModel`
-- `RuntimeStatus`
-- `TrackingPanelState`
-- `RenderingPanelState`
-- `OutputPanelState`
-- `CalibrationUiState`
-- `LibraryUiState`
+Still top-level on `GuiApp`:
 
-Files: `src/gui/mod.rs` and panel modules under `src/gui/`.
+- single-field roles (`mode`, `paused`, `app`, `inspector_open`,
+  `animation_playing`, `test_no_persist`, `expression_weights`,
+  `camera_index`, `available_cameras`, `hotkeys`, `profiles`,
+  `notifications`)
+- "RuntimeStatus" cluster: `frame_count`, `last_frame_instant`,
+  `frame_time_ms`, `fps`
+- "ProjectStatus" cluster: `project_path`, `project_dirty`,
+  `last_autosave`, `recovery_manager`, `overlay_dirty`,
+  `recent_avatars`, `profiles_dirty`
+
+The remaining clusters are smaller and live closer to the coordinator
+role of `GuiApp::update`. Extracting them is incremental cleanup
+rather than a structural change; the brittleness pattern the plan
+flagged (panels mutating widget state through `GuiApp` directly) is
+already broken up.
+
+Files: `src/gui/mod.rs` and the per-panel modules under `src/gui/`.
 
 ## #12 — Renderer module size
 
-Current state: `src/renderer/mod.rs` is approximately 3900 lines. It owns
-initialisation, pipeline selection, render pass, resource caches, readback,
-thumbnails, debug-ish paths, texture resolution, transform compute prepass,
-cloth GPU dispatch wiring, and placeholder geometry. Touching colour space,
-thumbnail rendering, output export, or mesh upload all share one file.
+Status: **partial split landed**. Three sibling submodules now host
+distinct concerns of `VulkanRenderer`:
 
-Recommendation: split by execution path:
+- `renderer::texture_cache` — texture upload + cache (`resolve_*`,
+  `upload_*`, `create_default_white_texture`)
+- `renderer::readback` — async CPU readback ring
+  (`harvest_pending*`, `ensure_readback_buffers`,
+  `PendingReadbackState`, `READBACK_RING_SIZE`)
+- `renderer::cloth_cache` — GPU cloth solver slot allocator
+  (`ensure_cloth_gpu_slot`, `allocate_cloth_constraint_resources`,
+  `allocate_cloth_normal_resources`)
 
-- `device.rs` / `context.rs`
-- `frame.rs`
-- `readback.rs`
-- `draw.rs`
-- `thumbnail.rs` (already exists but still shares substantial code in `mod.rs`)
-- `mesh_cache.rs`
-- `texture_cache.rs`
+Each submodule reuses the same `impl VulkanRenderer` pattern, so
+call sites in `mod.rs` are unchanged. `renderer/mod.rs` shrank from
+3883 to roughly 3074 lines (≈ 810 lines extracted; numbers will
+keep moving as the remaining slices land).
+
+Recommendation for follow-up slices:
+
+- `transform_cache` — `ensure_transform_data` + `ensure_stub_ssbo`
+  + the `TransformGpuData` struct definitions
+- `pipeline_targets` — `rebuild_pipelines_and_targets` /
+  `build_render_pass` / `create_offscreen_targets`
+- `draw` — the ~900-line `render()` body. Most tightly coupled to
+  command-buffer state; needs its own analysis pass before
+  extraction.
 
 Keep `VulkanRenderer` as the facade.
 
 ## Suggested order
 
-1. **#10** — biggest open item, large mechanical refactor; pick up
-   when behaviour churn has settled enough that the sub-state split
-   doesn't immediately need to be revisited.
-2. **#12** — the renderer split is comparably large; defer until the
-   compute prepass and GPU cloth paths stop churning.
+Both remaining items are now medium-severity incremental work
+rather than structural blockers. Pick them up when nearby code is
+already being touched.
 
 ## What this file is NOT
 
