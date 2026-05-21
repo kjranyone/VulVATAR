@@ -164,6 +164,7 @@ impl Application {
                 material_mode_index,
                 self.viewport_background.as_deref(),
                 self.ground_grid_visible,
+                frame_dt,
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -457,6 +458,7 @@ impl Application {
         material_mode_index: usize,
         background_image_path: Option<&std::path::Path>,
         show_ground_grid: bool,
+        frame_dt: f32,
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -569,6 +571,12 @@ impl Application {
                     })
                     .collect();
 
+                // GPU cloth integrates once per frame, so the dt
+                // forwarded to its control UBO must cover the *entire*
+                // frame interval (CPU PBD integrates `substeps` times
+                // each at `fixed_dt`, so its total per-frame coverage
+                // equals `substeps * fixed_dt ≈ frame_dt`).
+                let gpu_cloth_dt = frame_dt.max(1.0 / 1000.0);
                 let cloth_deforms = collect_cloth_deforms(
                     avatar
                         .cloth_state
@@ -582,7 +590,7 @@ impl Application {
                                 .filter(|s| s.enabled)
                                 .map(|s| (&s.state, Some(&s.sim))),
                         ),
-                    1.0 / 60.0,
+                    gpu_cloth_dt,
                 );
 
                 RenderAvatarInstance {

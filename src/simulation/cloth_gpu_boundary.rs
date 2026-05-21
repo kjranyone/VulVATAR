@@ -378,6 +378,7 @@ mod tests {
         positions: &mut [[f32; 3]],
         prev_positions: &mut [[f32; 3]],
         pinned: &[bool],
+        inv_masses: &[f32],
         gravity: [f32; 3],
         wind_force: [f32; 3],
         damping: f32,
@@ -385,7 +386,9 @@ mod tests {
     ) {
         let dt2 = dt * dt;
         for i in 0..positions.len() {
-            if pinned[i] {
+            // Mirror the shader's `if (pinned > 0.5 || inv_mass <= 0.0)`
+            // branch — both conditions skip integration.
+            if pinned[i] || inv_masses[i] <= 0.0 {
                 continue;
             }
             let pos = positions[i];
@@ -463,11 +466,13 @@ mod tests {
             wind[1] * wind_response,
             wind[2] * wind_response,
         ];
+        let inv_masses = vec![1.0_f32; 4];
         for _ in 0..60 {
             cpu_mirror_of_cloth_verlet_cs(
                 &mut positions,
                 &mut prev_positions,
                 &pinned,
+                &inv_masses,
                 gravity,
                 wind_force,
                 damping,
@@ -841,10 +846,12 @@ mod tests {
         let mut positions = vec![[2.0_f32, 3.0, 4.0]];
         let mut prev = vec![[2.0_f32, 3.0, 4.0]];
         let pinned = vec![true];
+        let inv_masses = vec![1.0_f32];
         cpu_mirror_of_cloth_verlet_cs(
             &mut positions,
             &mut prev,
             &pinned,
+            &inv_masses,
             [0.0, -100.0, 0.0],
             [0.0; 3],
             0.0,
@@ -852,5 +859,28 @@ mod tests {
         );
         assert_eq!(positions[0], [2.0, 3.0, 4.0]);
         assert_eq!(prev[0], [2.0, 3.0, 4.0]);
+    }
+
+    /// Particles with `inv_mass = 0` are equivalent to pinned — the
+    /// shader's `if (pinned > 0.5 || inv_mass <= 0.0)` branch handles
+    /// both. This test asserts the mirror behaves identically.
+    #[test]
+    fn cloth_verlet_cs_formula_zero_inv_mass_pins_like_explicit_pin() {
+        let mut positions = vec![[1.0_f32, 0.0, 0.0]];
+        let mut prev = vec![[1.0_f32, 0.0, 0.0]];
+        let pinned = vec![false]; // not explicitly pinned …
+        let inv_masses = vec![0.0_f32]; // … but inv_mass == 0 should pin it
+        cpu_mirror_of_cloth_verlet_cs(
+            &mut positions,
+            &mut prev,
+            &pinned,
+            &inv_masses,
+            [0.0, -100.0, 0.0],
+            [0.0; 3],
+            0.0,
+            0.1,
+        );
+        assert_eq!(positions[0], [1.0, 0.0, 0.0]);
+        assert_eq!(prev[0], [1.0, 0.0, 0.0]);
     }
 }

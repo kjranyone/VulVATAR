@@ -1370,11 +1370,34 @@ impl VulkanRenderer {
                 }
 
                 // GPU cloth Verlet integration dispatch. Runs before
-                // `transform_cs` reads `cloth_pos_ssbo`; Vulkano's
-                // automatic command-buffer synchronisation inserts the
-                // SSBO write→read barrier so the transform pass sees
-                // the integrated positions.
+                // `transform_cs` reads `cloth_pos_ssbo`. Inter-dispatch
+                // synchronisation here relies on Vulkano 0.35's
+                // `AutoCommandBufferBuilder` resource-access tracking:
+                // when two dispatches in the same command buffer share
+                // a buffer with conflicting access (write→read or
+                // write→write), the builder inserts the appropriate
+                // `VkMemoryBarrier` at the bind-point boundary. This
+                // covers verlet → constraint accumulate → constraint
+                // apply → normal → transform_cs because each pair
+                // shares `cloth_pos_ssbo` and/or `delta_ssbo` /
+                // `cloth_norm_ssbo`. If the Vulkano version is bumped
+                // and auto-sync semantics change, this code needs to
+                // gain explicit `synchronization_pipeline_barrier`
+                // calls.
                 if let (true, Some(cloth)) = (cloth_is_gpu, cloth_snap_opt) {
+                    if cloth.gpu_control.is_none() {
+                        // Silent skip → renderer reads stale positions.
+                        // Warn loudly so the misconfiguration is visible
+                        // (typically: snapshot was collected without
+                        // `ClothSimState`, so the collector returned
+                        // `gpu_control: None` despite backend == Gpu).
+                        warn!(
+                            "render: cloth backend == Gpu but gpu_control \
+                             missing for primitive {:?}; cloth_pos_ssbo will \
+                             not advance this frame",
+                            mesh_inst.primitive_id
+                        );
+                    }
                     if let (Some(ctrl), Some(cloth_verlet_pipeline)) = (
                         cloth.gpu_control.as_ref(),
                         self.cloth_verlet_pipeline.clone(),
@@ -2333,6 +2356,30 @@ impl VulkanRenderer {
         cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
         cloth_normal_pipeline: &Arc<ComputePipeline>,
     ) -> Result<(), String> {
+        let particle_count = initial_positions.len() as u32;
+        let constraint_count = attach.constraints.len() as u32;
+
+        // Compare against the cached slot's recorded counts. If either
+        // the particle count or constraint count changed (e.g. the user
+        // swapped to a different cloth asset on the same primitive
+        // without toggling `has_cloth`), drop the stale slot so it
+        // gets rebuilt at the new sizes; SSBOs allocated for the old
+        // counts would silently mis-size or overflow.
+        let needs_rebuild = self
+            .transform_cache
+            .get(&key)
+            .and_then(|s| s.cloth_gpu.as_ref())
+            .map(|gpu| {
+                gpu.state.particle_count != particle_count
+                    || gpu.state.constraint_count != constraint_count
+            })
+            .unwrap_or(false);
+        if needs_rebuild {
+            if let Some(slot) = self.transform_cache.get_mut(&key) {
+                slot.cloth_gpu = None;
+            }
+        }
+
         let already_alloc = self
             .transform_cache
             .get(&key)
@@ -2341,8 +2388,6 @@ impl VulkanRenderer {
         if already_alloc || initial_positions.is_empty() {
             return Ok(());
         }
-
-        let particle_count = initial_positions.len() as u32;
         let inv_mass_at = |i: usize| attach.inv_masses.get(i).copied().unwrap_or(1.0);
         let pinned_at = |i: usize| {
             if attach.pinned.get(i).copied().unwrap_or(false) {

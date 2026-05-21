@@ -99,6 +99,16 @@ pub struct ClothState {
     /// integration / constraint loop and lets the renderer dispatch
     /// the cloth compute pipelines, which write the SSBO in place.
     /// Set at attach time (e.g. by a future `RuntimeGpuBudget` consumer).
+    ///
+    /// **Known limitation — mid-session flips**: Switching from `Gpu`
+    /// back to `Cpu` after the GPU solver has run for any frames will
+    /// resume the CPU solver from `deform_output.deformed_positions`,
+    /// which is the *initial rest pose* (the GPU writes only into the
+    /// renderer-owned `cloth_pos_ssbo` and never copies positions back
+    /// to the CPU-readable buffer). The cloth will jump to its rest
+    /// pose at the moment of the flip. Until a GPU→CPU readback path
+    /// is wired, treat `solver_backend` as a one-shot decision at
+    /// attach time, not a runtime toggle.
     pub solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend,
 }
 
