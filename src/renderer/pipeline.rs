@@ -505,6 +505,95 @@ void main() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cloth vertex normal recomputation compute shader (P3-02 S3.1 — pipeline only)
+// ---------------------------------------------------------------------------
+//
+// Third stage of the GPU cloth solver migration. After integration (S1.2)
+// and constraint projection (S2.1) produce updated positions, this shader
+// recomputes per-vertex normals so the transform compute pass and the
+// graphics pipelines see consistent shading.
+//
+// Strategy: one workgroup invocation per cloth vertex; each invocation
+// walks its incident triangles via a precomputed CSR adjacency built once
+// at attach time (`cloth_gpu_boundary::build_vertex_triangle_adjacency`).
+// Face normals are accumulated **without** pre-normalising so the sum is
+// area-weighted (same convention as `cloth_solver::output::compute_normals`),
+// then the per-vertex result is normalised. Embarrassingly parallel — no
+// atomics, no extensions, no cross-invocation synchronisation.
+//
+// **Status**: shader + pipeline factory only. Not yet wired; lands with
+// the rest of the GPU cloth dispatch path in P3-02 stage 3.
+pub mod cloth_normal_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// xyz = position, w = inv_mass (matches cloth_verlet_cs layout).
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+// Flat triangle index buffer: 3 uints per triangle.
+layout(set = 0, binding = 1) readonly buffer TriangleIndices {
+    uint t[];
+} indices;
+
+// CSR adjacency: for vertex v, the incident triangle indices are
+// `adj_triangles.t[adj_offsets.o[v] .. adj_offsets.o[v + 1]]`.
+// Built once at attach time; never changes at runtime.
+layout(set = 0, binding = 2) readonly buffer AdjacencyOffsets {
+    uint o[];
+} adj_offsets;
+
+layout(set = 0, binding = 3) readonly buffer AdjacencyTriangles {
+    uint t[];
+} adj_triangles;
+
+// Output: per-vertex normal, xyz used (matches cloth_solver::output convention).
+layout(set = 0, binding = 4) writeonly buffer Normals {
+    vec4 n[];
+} normals;
+
+// std140 control block. Rust mirror: `ClothNormalControl`.
+layout(set = 0, binding = 5) uniform Control {
+    uint vertex_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} ctrl;
+
+void main() {
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= ctrl.vertex_count) return;
+
+    uint start = adj_offsets.o[vid];
+    uint end   = adj_offsets.o[vid + 1u];
+
+    vec3 accum = vec3(0.0);
+    for (uint k = start; k < end; ++k) {
+        uint tri = adj_triangles.t[k];
+        uint i0 = indices.t[tri * 3u + 0u];
+        uint i1 = indices.t[tri * 3u + 1u];
+        uint i2 = indices.t[tri * 3u + 2u];
+        vec3 p0 = positions.p[i0].xyz;
+        vec3 p1 = positions.p[i1].xyz;
+        vec3 p2 = positions.p[i2].xyz;
+        // Unnormalised cross product → area-weighted face normal.
+        accum += cross(p1 - p0, p2 - p0);
+    }
+
+    float len = length(accum);
+    vec3 nrm = (len > 1e-12) ? (accum / len) : vec3(0.0, 1.0, 0.0);
+    normals.n[vid] = vec4(nrm, 0.0);
+}
+"
+    }
+}
+
 pub mod transform_cs {
     // One workgroup invocation per output vertex. Reads the immutable
     // base SSBO, the per-frame morph weights / cloth deformed positions,
@@ -956,6 +1045,50 @@ pub fn create_cloth_verlet_compute_pipeline(
     .map_err(|e| format!("failed to create cloth verlet compute pipeline: {e}"))
 }
 
+/// Per-frame control block consumed by `cloth_normal_cs` (P3-02 S3.1).
+///
+/// std140 layout — only `vertex_count` carries data; three trailing `uint`
+/// pad to a 16-byte boundary so the UBO meets std140's minimum size /
+/// alignment expectations across drivers.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothNormalControl {
+    pub vertex_count: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Build the cloth vertex normal recomputation compute pipeline (P3-02 S3.1).
+///
+/// Not yet called at runtime. Lands with the rest of the GPU cloth dispatch
+/// path once `ClothGpuSimulationState` carries actual Vulkano buffer
+/// handles.
+pub fn create_cloth_normal_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_normal_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth normal compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth normal compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth normal pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth normal pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth normal compute pipeline: {e}"))
+}
+
 /// Build the compute pipeline that fuses skinning, morph-target blend, and
 /// CPU-fed cloth deformation into a single dispatch per (instance, primitive).
 /// Output lands in the per-primitive `GpuVertex` SSBO that the graphics
@@ -1008,6 +1141,22 @@ mod tests {
         assert_eq!(offset_of!(ClothVerletControl, _pad0), 12);
         assert_eq!(offset_of!(ClothVerletControl, gravity), 16);
         assert_eq!(offset_of!(ClothVerletControl, wind), 32);
+    }
+
+    // GLSL std140 layout for `Control` UBO in cloth_normal_cs:
+    //   uint vertex_count; // offset 0,  size 4
+    //   uint _pad0;        // offset 4,  size 4
+    //   uint _pad1;        // offset 8,  size 4
+    //   uint _pad2;        // offset 12, size 4
+    //   total              // 16 bytes
+    #[test]
+    fn cloth_normal_control_matches_std140_layout() {
+        use super::ClothNormalControl;
+        assert_eq!(size_of::<ClothNormalControl>(), 16);
+        assert_eq!(offset_of!(ClothNormalControl, vertex_count), 0);
+        assert_eq!(offset_of!(ClothNormalControl, _pad0), 4);
+        assert_eq!(offset_of!(ClothNormalControl, _pad1), 8);
+        assert_eq!(offset_of!(ClothNormalControl, _pad2), 12);
     }
 }
 

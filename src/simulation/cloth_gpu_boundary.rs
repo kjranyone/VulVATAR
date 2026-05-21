@@ -159,6 +159,70 @@ impl ClothSolverBackend {
     }
 }
 
+/// CSR (compressed sparse row) adjacency listing the triangles incident to
+/// each vertex. Built once at cloth-attach time; consumed by the
+/// `cloth_normal_cs` compute shader's per-vertex normal-accumulation loop
+/// without needing atomics.
+///
+/// `offsets.len() == vertex_count + 1`. For vertex `v`, the incident
+/// triangle indices live in `triangles[offsets[v] .. offsets[v + 1]]`.
+#[derive(Clone, Debug, Default)]
+pub struct VertexTriangleAdjacency {
+    pub offsets: Vec<u32>,
+    pub triangles: Vec<u32>,
+}
+
+/// Build a CSR vertex→triangle adjacency for a cloth mesh.
+///
+/// `triangle_indices` is the flat index buffer (3 entries per triangle).
+/// Indices `>= vertex_count` are silently skipped — corrupt indices
+/// would otherwise read past the position SSBO at runtime, and a panic
+/// here would be unhelpful far from the asset-loading site.
+pub fn build_vertex_triangle_adjacency(
+    triangle_indices: &[u32],
+    vertex_count: u32,
+) -> VertexTriangleAdjacency {
+    let vc = vertex_count as usize;
+    let tri_count = triangle_indices.len() / 3;
+
+    // First pass: count incident triangles per vertex.
+    let mut counts = vec![0u32; vc];
+    for t in 0..tri_count {
+        for k in 0..3 {
+            let v = triangle_indices[t * 3 + k];
+            if (v as usize) < vc {
+                counts[v as usize] += 1;
+            }
+        }
+    }
+
+    // Prefix sum → offsets[v + 1].
+    let mut offsets = vec![0u32; vc + 1];
+    let mut acc: u32 = 0;
+    for v in 0..vc {
+        offsets[v] = acc;
+        acc = acc.saturating_add(counts[v]);
+    }
+    offsets[vc] = acc;
+
+    // Second pass: scatter triangle indices into the right slot per vertex.
+    let mut triangles = vec![0u32; acc as usize];
+    let mut cursor = vec![0u32; vc];
+    for t in 0..tri_count {
+        for k in 0..3 {
+            let v = triangle_indices[t * 3 + k];
+            let vi = v as usize;
+            if vi < vc {
+                let slot = (offsets[vi] + cursor[vi]) as usize;
+                triangles[slot] = t as u32;
+                cursor[vi] += 1;
+            }
+        }
+    }
+
+    VertexTriangleAdjacency { offsets, triangles }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +247,61 @@ mod tests {
         s.version = u32::MAX;
         s.bump_version();
         assert_eq!(s.version, 0);
+    }
+
+    fn collect_triangles_for(adj: &VertexTriangleAdjacency, vertex: u32) -> Vec<u32> {
+        let v = vertex as usize;
+        let start = adj.offsets[v] as usize;
+        let end = adj.offsets[v + 1] as usize;
+        let mut tris: Vec<u32> = adj.triangles[start..end].to_vec();
+        tris.sort_unstable();
+        tris
+    }
+
+    #[test]
+    fn adjacency_single_triangle_lists_each_vertex_once() {
+        let adj = build_vertex_triangle_adjacency(&[0, 1, 2], 3);
+        assert_eq!(adj.offsets, vec![0, 1, 2, 3]);
+        assert_eq!(collect_triangles_for(&adj, 0), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 1), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 2), vec![0]);
+    }
+
+    #[test]
+    fn adjacency_shared_vertex_appears_in_both_triangles() {
+        // Two triangles sharing vertex 1: (0,1,2) and (1,3,4).
+        let adj = build_vertex_triangle_adjacency(&[0, 1, 2, 1, 3, 4], 5);
+        assert_eq!(adj.offsets, vec![0, 1, 3, 4, 5, 6]);
+        assert_eq!(collect_triangles_for(&adj, 0), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 1), vec![0, 1]);
+        assert_eq!(collect_triangles_for(&adj, 2), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 3), vec![1]);
+        assert_eq!(collect_triangles_for(&adj, 4), vec![1]);
+    }
+
+    #[test]
+    fn adjacency_isolated_vertex_has_empty_range() {
+        // Vertex 3 is not referenced by any triangle.
+        let adj = build_vertex_triangle_adjacency(&[0, 1, 2], 4);
+        assert_eq!(adj.offsets, vec![0, 1, 2, 3, 3]);
+        assert_eq!(collect_triangles_for(&adj, 3), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn adjacency_skips_out_of_range_indices() {
+        // Vertex index 9 is out of range; should be ignored, not panic,
+        // not read past the vertex count.
+        let adj = build_vertex_triangle_adjacency(&[0, 1, 9], 3);
+        assert_eq!(adj.offsets, vec![0, 1, 2, 2]);
+        assert_eq!(collect_triangles_for(&adj, 0), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 1), vec![0]);
+        assert_eq!(collect_triangles_for(&adj, 2), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn adjacency_empty_input_yields_only_terminator() {
+        let adj = build_vertex_triangle_adjacency(&[], 4);
+        assert_eq!(adj.offsets, vec![0, 0, 0, 0, 0]);
+        assert!(adj.triangles.is_empty());
     }
 }

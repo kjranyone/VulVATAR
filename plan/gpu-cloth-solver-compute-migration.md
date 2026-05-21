@@ -170,8 +170,19 @@ Out:
       constraint table uploaded once at attach time
 - [ ] **S2.2** integration test: 32-particle sheet drape matches CPU
       reference within tolerance
-- [ ] **S3.1** GLSL compute shader for vertex normal recomputation
+- [~] **S3.1** GLSL compute shader for vertex normal recomputation
       (face-normal accumulate + per-vertex normalise)
+  - [x] `cloth_normal_cs` module landed in `src/renderer/pipeline.rs`
+        — vertex-per-thread, CSR-adjacency driven, area-weighted
+        accumulation matching `cloth_solver::output::compute_normals`
+  - [x] `create_cloth_normal_compute_pipeline` factory + Rust mirror
+        `ClothNormalControl` (std140 layout, 16 B, asserted by test)
+  - [x] CPU adjacency builder `build_vertex_triangle_adjacency` in
+        `cloth_gpu_boundary.rs` (CSR; out-of-range indices skipped;
+        5 unit tests covering single tri / shared vertex / isolated
+        vertex / corrupt index / empty input)
+  - [ ] Per-frame dispatch wiring (waits on S1.1 Vulkan side SSBO
+        handles)
 - [ ] **S3.2** rendered-cloth snapshot diff vs CPU path
 - [ ] **S4** suppress the CPU snapshot write for
       `ClothSolverBackend::Gpu` cloths in `renderer::mod.rs`; flip
