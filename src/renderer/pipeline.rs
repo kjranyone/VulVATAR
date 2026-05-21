@@ -521,6 +521,125 @@ void main() {
 // atomicAdd, no `VK_EXT_shader_atomic_float`, no per-constraint colour
 // dispatch. Convergence per iteration is slower than Gauss-Seidel, so
 // real workloads typically run more iterations to compensate.
+// =========================================================================
+// Cloth XPBD distance constraint — lambda update pass (per-constraint)
+// =========================================================================
+//
+// First of three passes per iteration of the GPU XPBD distance-constraint
+// solver (Macklin, Müller, Chentanez 2016). One invocation per constraint:
+// reads the two endpoint positions, computes Δλ_j via the XPBD formula,
+// updates the persistent λ_j buffer, and writes Δλ_j to a transient
+// per-constraint scratch buffer so the per-particle accumulate pass can
+// translate Δλ_j into Δx without re-doing the math (and without racing
+// the lambda update across endpoints).
+//
+// The math:
+// ```
+//   α̃   = α(stiffness) / dt²
+//   Δλ_j = -(C_j + α̃ · λ_j) / (w_a + w_b + α̃)
+//   λ_j ← λ_j + Δλ_j
+//   dlambda_j ← Δλ_j
+// ```
+// `α(stiffness)` mirrors `compliance_from_pbd_stiffness` on the CPU
+// (slack² × 1e-7); `stiffness <= 1e-6` short-circuits to "constraint
+// disabled" exactly like the CPU path.
+pub mod cloth_constraint_lambda_update_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+struct Constraint {
+    uint  particle_a;
+    uint  particle_b;
+    float rest_length;
+    float stiffness;
+};
+layout(set = 0, binding = 1) readonly buffer Constraints {
+    Constraint c[];
+} constraints;
+
+layout(set = 0, binding = 2) uniform Control {
+    uint  particle_count;
+    uint  constraint_count;
+    float dt;
+    uint  _pad;
+} ctrl;
+
+// Persistent Lagrange multiplier per constraint. Reset to 0 by the
+// host at the start of each substep; the lambda update pass mutates
+// it in place, and the next iteration of the same substep reads the
+// accumulated value.
+layout(set = 0, binding = 3) buffer Lambda {
+    float l[];
+} lambda;
+
+// Δλ_j for THIS iteration only. Written here, read by the accumulate
+// pass to translate Δλ_j into Δx without re-running the formula and
+// without racing the lambda update across constraint endpoints.
+layout(set = 0, binding = 4) writeonly buffer DeltaLambda {
+    float l[];
+} dlambda;
+
+float xpbd_compliance(float stiffness) {
+    float s = clamp(stiffness, 0.0, 1.0);
+    float slack = max(1.0 - s, 0.0);
+    return slack * slack * 1.0e-7;
+}
+
+void main() {
+    uint cidx = gl_GlobalInvocationID.x;
+    if (cidx >= ctrl.constraint_count) return;
+
+    Constraint cn = constraints.c[cidx];
+    if (cn.stiffness <= 1.0e-6) {
+        // Disabled constraint — mirror the CPU short-circuit so this
+        // edge contributes nothing this iteration. Clear dlambda so a
+        // previous iteration's value can't leak into the accumulate
+        // pass's read.
+        dlambda.l[cidx] = 0.0;
+        return;
+    }
+
+    vec4 pa = positions.p[cn.particle_a];
+    vec4 pb = positions.p[cn.particle_b];
+    vec3 diff = pa.xyz - pb.xyz;
+    float dist = length(diff);
+    if (dist < 1.0e-6) {
+        dlambda.l[cidx] = 0.0;
+        return;
+    }
+
+    float w_a = pa.w;
+    float w_b = pb.w;
+    float w_sum = w_a + w_b;
+    if (w_sum < 1.0e-12) {
+        dlambda.l[cidx] = 0.0;
+        return;
+    }
+
+    float compliance = xpbd_compliance(cn.stiffness);
+    float dt_sq = max(ctrl.dt * ctrl.dt, 1.0e-12);
+    float alpha_tilde = compliance / dt_sq;
+
+    float c = dist - cn.rest_length;
+    float lambda_old = lambda.l[cidx];
+    float denom = w_sum + alpha_tilde;
+    float delta_lambda = (-c - alpha_tilde * lambda_old) / denom;
+
+    lambda.l[cidx] = lambda_old + delta_lambda;
+    dlambda.l[cidx] = delta_lambda;
+}
+"
+    }
+}
+
 pub mod cloth_constraint_accumulate_cs {
     vulkano_shaders::shader! {
         ty: "compute",
@@ -562,11 +681,18 @@ layout(set = 0, binding = 4) readonly buffer AdjacencyConstraints {
 
 // Rust mirror: `ClothConstraintControl`.
 layout(set = 0, binding = 5) uniform Control {
-    uint particle_count;
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
+    uint  particle_count;
+    uint  constraint_count;
+    float dt;
+    uint  _pad;
 } ctrl;
+
+// Δλ_j computed by `cloth_constraint_lambda_update_cs` this iteration.
+// Read-only here: each constraint's Δλ is consumed by both endpoint
+// invocations, no inter-invocation write race.
+layout(set = 0, binding = 6) readonly buffer DeltaLambda {
+    float l[];
+} dlambda;
 
 void main() {
     uint pid = gl_GlobalInvocationID.x;
@@ -591,19 +717,16 @@ void main() {
         Constraint cn = constraints.c[cidx];
         uint other = (cn.particle_a == pid) ? cn.particle_b : cn.particle_a;
         vec4 other_p = positions.p[other];
-        vec3 dir = other_p.xyz - self_pos;
+        vec3 dir = other_p.xyz - self_pos;  // points self → other
         float len = length(dir);
         if (len > 1e-6) {
-            float err = len - cn.rest_length;
-            float w_other = other_p.w;
-            float w_sum = w_self + w_other;
-            if (w_sum > 0.0) {
-                // Jacobi PBD: pull self toward other proportional to mass
-                // ratio, weighted by constraint stiffness. The other
-                // particle's invocation does the mirrored correction.
-                float scale = cn.stiffness * err / len * (w_self / w_sum);
-                delta += dir * scale;
-            }
+            // XPBD: Δx_self = -d_unit · w_self · Δλ_j
+            //   where d_unit = (other - self) / len = +d_unit_GPU
+            //   = w_self · ((self - other) / len) · Δλ_j on the CPU
+            //     convention (d_CPU = (a - b) / |a - b|, so d_unit_GPU
+            //     = -d_CPU and the sign flip cancels).
+            float dl = dlambda.l[cidx];
+            delta += -(dir / len) * w_self * dl;
         }
     }
     deltas.d[pid] = vec4(delta, 0.0);
@@ -631,11 +754,15 @@ layout(set = 0, binding = 1) buffer Deltas {
     vec4 d[];
 } deltas;
 
+// Layout matches the Rust `ClothConstraintControl` struct after the
+// XPBD migration — apply_cs only reads `particle_count` so the other
+// fields are inert here, but the binding must still match the layout
+// shared with the lambda update / accumulate passes.
 layout(set = 0, binding = 2) uniform Control {
-    uint particle_count;
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
+    uint  particle_count;
+    uint  constraint_count;
+    float dt;
+    uint  _pad;
 } ctrl;
 
 void main() {
@@ -1206,20 +1333,58 @@ pub struct ClothConstraintGpu {
     pub stiffness: f32,
 }
 
-/// Per-frame control block consumed by both constraint shaders.
-/// std140 layout — `particle_count` carries the data; three trailing
-/// `uint` pad to a 16-byte boundary.
+/// Per-frame control block consumed by the constraint shaders.
+/// std140 layout — 16 bytes packed.
+///
+/// `constraint_count` and `dt` are the two new fields added during the
+/// GPU XPBD migration. `dt` is the substep duration; the lambda update
+/// shader uses it to scale compliance into `α̃ = α / dt²`. At
+/// `stiffness = 1` (the rigid limit), `α = 0` and `dt` falls out, so
+/// the field is harmless for the legacy PBD-style usage.
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct ClothConstraintControl {
     pub particle_count: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub constraint_count: u32,
+    pub dt: f32,
+    pub _pad: u32,
 }
 
-/// Build the cloth PBD constraint accumulate compute pipeline
-/// (P3-02 S2.1, first pass of the Jacobi-style iteration).
+/// Build the cloth XPBD lambda-update compute pipeline. One
+/// invocation per constraint per iteration. Runs **before**
+/// [`create_cloth_constraint_accumulate_compute_pipeline`] each
+/// iteration so the accumulate pass has Δλ_j available without
+/// reaching for the lambda buffer (and racing across endpoints).
+pub fn create_cloth_constraint_lambda_update_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_constraint_lambda_update_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth constraint lambda update shader: {e}"))?;
+    let cs_entry = cs_module.entry_point("main").ok_or_else(|| {
+        "cloth constraint lambda update shader entry point 'main' not found".to_string()
+    })?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| {
+                format!("failed to build cloth constraint lambda update layout info: {e}")
+            })?,
+    )
+    .map_err(|e| format!("failed to create cloth constraint lambda update layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth constraint lambda update pipeline: {e}"))
+}
+
+/// Build the cloth XPBD constraint accumulate compute pipeline
+/// (per-particle Δx accumulation; reads Δλ_j from the dlambda SSBO
+/// written by the lambda-update pass).
 pub fn create_cloth_constraint_accumulate_compute_pipeline(
     device: Arc<Device>,
 ) -> Result<Arc<ComputePipeline>, String> {
@@ -1407,18 +1572,18 @@ mod tests {
 
     // GLSL std140 layout for the `Control` UBO in both constraint shaders.
     //   uint particle_count;  // offset 0, size 4
-    //   uint _pad0;           // offset 4, size 4
-    //   uint _pad1;           // offset 8, size 4
-    //   uint _pad2;           // offset 12, size 4
-    //   total                 // 16 bytes
+    //   uint  constraint_count; // offset 4, size 4
+    //   float dt;               // offset 8, size 4
+    //   uint  _pad;             // offset 12, size 4
+    //   total                   // 16 bytes
     #[test]
     fn cloth_constraint_control_matches_std140_layout() {
         use super::ClothConstraintControl;
         assert_eq!(size_of::<ClothConstraintControl>(), 16);
         assert_eq!(offset_of!(ClothConstraintControl, particle_count), 0);
-        assert_eq!(offset_of!(ClothConstraintControl, _pad0), 4);
-        assert_eq!(offset_of!(ClothConstraintControl, _pad1), 8);
-        assert_eq!(offset_of!(ClothConstraintControl, _pad2), 12);
+        assert_eq!(offset_of!(ClothConstraintControl, constraint_count), 4);
+        assert_eq!(offset_of!(ClothConstraintControl, dt), 8);
+        assert_eq!(offset_of!(ClothConstraintControl, _pad), 12);
     }
 }
 

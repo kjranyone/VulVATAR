@@ -48,6 +48,7 @@ impl VulkanRenderer {
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         cloth_verlet_pipeline: &Arc<ComputePipeline>,
+        cloth_constraint_lambda_update_pipeline: &Arc<ComputePipeline>,
         cloth_constraint_accumulate_pipeline: &Arc<ComputePipeline>,
         cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
         cloth_normal_pipeline: &Arc<ComputePipeline>,
@@ -185,6 +186,7 @@ impl VulkanRenderer {
                 &cloth_pos_ssbo,
                 memory_allocator,
                 ds_allocator,
+                cloth_constraint_lambda_update_pipeline,
                 cloth_constraint_accumulate_pipeline,
                 cloth_constraint_apply_pipeline,
             )?)
@@ -232,12 +234,14 @@ impl VulkanRenderer {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn allocate_cloth_constraint_resources(
     constraints: &[(u32, u32, f32, f32)],
     particle_count: u32,
     cloth_pos_ssbo: &Subbuffer<[[f32; 4]]>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+    lambda_update_pipeline: &Arc<ComputePipeline>,
     accumulate_pipeline: &Arc<ComputePipeline>,
     apply_pipeline: &Arc<ComputePipeline>,
 ) -> Result<ClothGpuConstraintResources, String> {
@@ -333,12 +337,85 @@ fn allocate_cloth_constraint_resources(
         },
         pipeline::ClothConstraintControl {
             particle_count,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            // `constraint_count` and `dt` are populated by the render-
+            // loop's per-frame UBO rewrite (constraint_count is stable
+            // per slot; dt comes from the substep duration). Seed with
+            // zero — the very first frame's lambda-update dispatch
+            // sees an `α̃ = 0 / 0` early-return because dt² is guarded.
+            constraint_count: constraints.len() as u32,
+            dt: 0.0,
+            _pad: 0,
         },
     )
     .map_err(|e| format!("renderer: constraint control UBO alloc: {e}"))?;
+
+    // XPBD per-constraint Lagrange multiplier (accumulates across the
+    // projection iterations within one substep; reset to zero at
+    // substep start by the renderer's `fill_buffer`).
+    let lambda_ssbo: Subbuffer<[f32]> = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        // Vulkano refuses zero-sized buffers — supply a single 0.0
+        // stub when there are no constraints. Won't be read because
+        // `constraint_count = 0` short-circuits the lambda-update
+        // dispatch's per-invocation work.
+        if constraints.is_empty() {
+            vec![0.0_f32]
+        } else {
+            vec![0.0_f32; constraints.len()]
+        },
+    )
+    .map_err(|e| format!("renderer: cloth lambda SSBO alloc: {e}"))?;
+
+    // Per-iteration Δλ_j scratch buffer. Written by the
+    // lambda-update pass each iteration, read by the accumulate pass;
+    // contents are overwritten so no initial state matters.
+    let dlambda_ssbo: Subbuffer<[f32]> = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        if constraints.is_empty() {
+            vec![0.0_f32]
+        } else {
+            vec![0.0_f32; constraints.len()]
+        },
+    )
+    .map_err(|e| format!("renderer: cloth dlambda SSBO alloc: {e}"))?;
+
+    let lambda_update_layout = lambda_update_pipeline
+        .layout()
+        .set_layouts()
+        .first()
+        .ok_or("renderer: constraint lambda-update pipeline missing set 0")?
+        .clone();
+    let lambda_update_set = DescriptorSet::new(
+        ds_allocator.clone(),
+        lambda_update_layout,
+        [
+            WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+            WriteDescriptorSet::buffer(1, constraint_ssbo.clone()),
+            WriteDescriptorSet::buffer(2, control_ubo.clone()),
+            WriteDescriptorSet::buffer(3, lambda_ssbo.clone()),
+            WriteDescriptorSet::buffer(4, dlambda_ssbo.clone()),
+        ],
+        [],
+    )
+    .map_err(|e| format!("renderer: constraint lambda-update descriptor set: {e}"))?;
 
     let accumulate_layout = accumulate_pipeline
         .layout()
@@ -356,6 +433,7 @@ fn allocate_cloth_constraint_resources(
             WriteDescriptorSet::buffer(3, adj_offsets_ssbo.clone()),
             WriteDescriptorSet::buffer(4, adj_constraints_ssbo.clone()),
             WriteDescriptorSet::buffer(5, control_ubo.clone()),
+            WriteDescriptorSet::buffer(6, dlambda_ssbo.clone()),
         ],
         [],
     )
@@ -385,6 +463,10 @@ fn allocate_cloth_constraint_resources(
         adj_offsets_ssbo,
         adj_constraints_ssbo,
         control_ubo,
+        lambda_ssbo,
+        dlambda_ssbo,
+        constraint_count: constraints.len() as u32,
+        lambda_update_set,
         accumulate_set,
         apply_set,
     })

@@ -185,9 +185,11 @@ struct ClothGpuSlot {
     normals: Option<ClothGpuNormalResources>,
 }
 
-/// Per-primitive constraint-projection resources for the Jacobi 2-pass
-/// PBD compute. All buffers but the control UBO are written once at
-/// attach time and read-only thereafter.
+/// Per-primitive constraint-projection resources for the Jacobi
+/// XPBD pipeline (3 passes per iteration: lambda update, Δx
+/// accumulate, apply). All read-only buffers are written once at
+/// attach time; `control_ubo`, `lambda_ssbo`, and `dlambda_ssbo`
+/// mutate each frame.
 struct ClothGpuConstraintResources {
     #[allow(dead_code)]
     constraint_ssbo: Subbuffer<[pipeline::ClothConstraintGpu]>,
@@ -198,6 +200,28 @@ struct ClothGpuConstraintResources {
     #[allow(dead_code)]
     adj_constraints_ssbo: Subbuffer<[u32]>,
     control_ubo: Subbuffer<pipeline::ClothConstraintControl>,
+    /// Persistent λ_j across the constraint projection iterations
+    /// inside one substep. Reset to zero by the renderer (`fill_buffer`)
+    /// at the start of every substep — XPBD's stiffness-independent
+    /// behaviour depends on λ growing through the iterations of the
+    /// CURRENT substep and being discarded at the next.
+    lambda_ssbo: Subbuffer<[f32]>,
+    /// Per-iteration Δλ_j written by the lambda-update pass and read
+    /// by the accumulate pass. The two-buffer split (`lambda_ssbo`
+    /// vs `dlambda_ssbo`) is what makes the accumulate pass safe
+    /// without atomics: each constraint's Δλ is computed exactly
+    /// once per iteration (by the per-constraint lambda-update
+    /// dispatch) and then read by both endpoint invocations of the
+    /// accumulate pass.
+    #[allow(dead_code)]
+    dlambda_ssbo: Subbuffer<[f32]>,
+    /// Number of distance constraints — cached on the slot so the
+    /// renderer can populate `ClothConstraintControl::constraint_count`
+    /// each frame without re-reading the SSBO length.
+    constraint_count: u32,
+    /// Set 0 binding layout matches `cloth_constraint_lambda_update_cs`:
+    /// `(0 positions, 1 constraints, 2 control, 3 lambda, 4 dlambda)`.
+    lambda_update_set: Arc<DescriptorSet>,
     accumulate_set: Arc<DescriptorSet>,
     apply_set: Arc<DescriptorSet>,
 }
@@ -258,10 +282,14 @@ pub struct VulkanRenderer {
     /// [`Self::initialize`]. See `pipeline::cloth_verlet_cs` for the
     /// shader-side contract.
     cloth_verlet_pipeline: Option<Arc<ComputePipeline>>,
-    /// Cloth PBD distance-constraint accumulate compute pipeline (S2.1
-    /// pass 1 of 2 Jacobi).
+    /// Cloth XPBD lambda-update compute pipeline (pass 1 of 3 per
+    /// iteration — one invocation per constraint, computes Δλ_j).
+    cloth_constraint_lambda_update_pipeline: Option<Arc<ComputePipeline>>,
+    /// Cloth XPBD distance-constraint Δx accumulate compute pipeline
+    /// (pass 2 of 3 — per-particle, reads Δλ_j from the dlambda SSBO).
     cloth_constraint_accumulate_pipeline: Option<Arc<ComputePipeline>>,
-    /// Cloth PBD distance-constraint apply compute pipeline (S2.1 pass 2).
+    /// Cloth XPBD constraint apply compute pipeline (pass 3 of 3 —
+    /// adds the accumulated Δx into positions, zeroes deltas).
     cloth_constraint_apply_pipeline: Option<Arc<ComputePipeline>>,
     /// Cloth vertex normal recomputation compute pipeline (S3.1).
     cloth_normal_pipeline: Option<Arc<ComputePipeline>>,
@@ -340,6 +368,7 @@ impl VulkanRenderer {
             stub_storage_ssbo: None,
             transform_compute_pipeline: None,
             cloth_verlet_pipeline: None,
+            cloth_constraint_lambda_update_pipeline: None,
             cloth_constraint_accumulate_pipeline: None,
             cloth_constraint_apply_pipeline: None,
             cloth_normal_pipeline: None,
@@ -610,6 +639,13 @@ impl VulkanRenderer {
         )
         .expect("failed to create cloth Verlet compute pipeline");
         self.cloth_verlet_pipeline = Some(cloth_verlet_pipeline);
+        let cloth_constraint_lambda_update_pipeline =
+            pipeline::create_cloth_constraint_lambda_update_compute_pipeline(
+                self.device.as_ref().expect("device set above").clone(),
+            )
+            .expect("failed to create cloth constraint lambda update pipeline");
+        self.cloth_constraint_lambda_update_pipeline =
+            Some(cloth_constraint_lambda_update_pipeline);
         let cloth_constraint_accumulate_pipeline =
             pipeline::create_cloth_constraint_accumulate_compute_pipeline(
                 self.device.as_ref().expect("device set above").clone(),
@@ -1110,12 +1146,14 @@ impl VulkanRenderer {
                     if let (
                         Some(attach),
                         Some(cloth_verlet_pipeline),
+                        Some(cloth_constraint_lambda_update_pipeline),
                         Some(cloth_constraint_accumulate_pipeline),
                         Some(cloth_constraint_apply_pipeline),
                         Some(cloth_normal_pipeline),
                     ) = (
                         cloth_snap.gpu_attach.as_ref(),
                         self.cloth_verlet_pipeline.clone(),
+                        self.cloth_constraint_lambda_update_pipeline.clone(),
                         self.cloth_constraint_accumulate_pipeline.clone(),
                         self.cloth_constraint_apply_pipeline.clone(),
                         self.cloth_normal_pipeline.clone(),
@@ -1127,6 +1165,7 @@ impl VulkanRenderer {
                             &memory_allocator,
                             &ds_allocator,
                             &cloth_verlet_pipeline,
+                            &cloth_constraint_lambda_update_pipeline,
                             &cloth_constraint_accumulate_pipeline,
                             &cloth_constraint_apply_pipeline,
                             &cloth_normal_pipeline,
@@ -1338,36 +1377,92 @@ impl VulkanRenderer {
                             .and_then(|g| g.constraints.as_ref())
                             .map(|c| {
                                 (
+                                    c.lambda_update_set.clone(),
                                     c.accumulate_set.clone(),
                                     c.apply_set.clone(),
                                     c.control_ubo.clone(),
+                                    c.lambda_ssbo.clone(),
+                                    c.constraint_count,
                                 )
                             });
                         if let (
-                            Some((accumulate_set, apply_set, constraint_ctrl_ubo)),
+                            Some((
+                                lambda_update_set,
+                                accumulate_set,
+                                apply_set,
+                                constraint_ctrl_ubo,
+                                lambda_ssbo,
+                                constraint_count,
+                            )),
+                            Some(lambda_update_pipeline),
                             Some(accumulate_pipeline),
                             Some(apply_pipeline),
                         ) = (
                             constraint_resources,
+                            self.cloth_constraint_lambda_update_pipeline.clone(),
                             self.cloth_constraint_accumulate_pipeline.clone(),
                             self.cloth_constraint_apply_pipeline.clone(),
                         ) {
-                            // Refresh the control UBO once (particle_count
-                            // is static; only the value changes when the
-                            // backend swaps cloths, which always rebuilds
-                            // the slot).
+                            // Refresh the control UBO once per substep.
+                            // particle_count + constraint_count are
+                            // static for the slot; `dt` follows the
+                            // substep duration so the XPBD lambda
+                            // update can build `α̃ = α / dt²`.
                             {
                                 let mut g = constraint_ctrl_ubo.write().map_err(|e| {
                                     format!("render: constraint UBO write: {e}")
                                 })?;
                                 *g = pipeline::ClothConstraintControl {
                                     particle_count,
-                                    _pad0: 0,
-                                    _pad1: 0,
-                                    _pad2: 0,
+                                    constraint_count,
+                                    dt: ctrl.dt,
+                                    _pad: 0,
                                 };
                             }
+                            // Reset lambda for this substep. XPBD's λ
+                            // accumulates across the projection
+                            // iterations *within* one substep, then
+                            // starts fresh at the next substep — same
+                            // lifecycle as `ClothSimTempBuffers::
+                            // reset_lambda` on the CPU side.
+                            builder
+                                .fill_buffer(
+                                    lambda_ssbo.clone().reinterpret::<[u32]>(),
+                                    0u32,
+                                )
+                                .map_err(|e| {
+                                    format!("render: lambda fill_buffer: {e}")
+                                })?;
+                            let constraint_groups =
+                                constraint_count.div_ceil(64).max(1);
                             for _ in 0..constraint_iters {
+                                // Pass 1: per-constraint XPBD lambda
+                                // update writes Δλ_j to dlambda_ssbo
+                                // and accumulates into lambda_ssbo.
+                                builder
+                                    .bind_pipeline_compute(lambda_update_pipeline.clone())
+                                    .map_err(|e| {
+                                        format!("render: bind constraint lambda update: {e}")
+                                    })?;
+                                builder
+                                    .bind_descriptor_sets(
+                                        PipelineBindPoint::Compute,
+                                        lambda_update_pipeline.layout().clone(),
+                                        0,
+                                        lambda_update_set.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint lambda update set: {e}")
+                                    })?;
+                                unsafe {
+                                    builder.dispatch([constraint_groups, 1, 1]).map_err(
+                                        |e| {
+                                            format!("render: constraint lambda update dispatch: {e}")
+                                        },
+                                    )?;
+                                }
+                                // Pass 2: per-particle Δx accumulate
+                                // reads Δλ_j (immutable in this pass).
                                 builder
                                     .bind_pipeline_compute(accumulate_pipeline.clone())
                                     .map_err(|e| {
@@ -1388,6 +1483,8 @@ impl VulkanRenderer {
                                         format!("render: constraint accumulate dispatch: {e}")
                                     })?;
                                 }
+                                // Pass 3: apply Δx to positions, zero
+                                // deltas for next iteration.
                                 builder
                                     .bind_pipeline_compute(apply_pipeline.clone())
                                     .map_err(|e| {
