@@ -81,6 +81,12 @@ pub struct ClothDeformSnapshot {
     pub deformed_positions: Vec<crate::asset::Vec3>,
     pub deformed_normals: Option<Vec<crate::asset::Vec3>>,
     pub version: u64,
+    /// Which solver produced this snapshot. For `Cpu`, the renderer
+    /// copies `deformed_positions` / `deformed_normals` into the
+    /// per-primitive cloth SSBO. For `Gpu`, the renderer skips the
+    /// CPU snapshot copy and instead dispatches the cloth compute
+    /// pipelines, which write the SSBOs in place.
+    pub solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

@@ -93,6 +93,13 @@ pub struct ClothState {
     pub target_mesh_id: Option<crate::asset::MeshId>,
     pub target_vertex_offset: u32,
     pub target_vertex_count: u32,
+    /// Selected solver path for this cloth. `Cpu` (default) runs the
+    /// existing PBD solver on the avatar instance and copies snapshots
+    /// into the renderer's cloth SSBO each frame. `Gpu` skips the CPU
+    /// integration / constraint loop and lets the renderer dispatch
+    /// the cloth compute pipelines, which write the SSBO in place.
+    /// Set at attach time (e.g. by a future `RuntimeGpuBudget` consumer).
+    pub solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +196,8 @@ impl AvatarInstance {
             target_mesh_id: None,
             target_vertex_offset: 0,
             target_vertex_count: 0,
+            solver_backend:
+                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
         });
     }
 
@@ -244,6 +253,8 @@ impl AvatarInstance {
             target_mesh_id: None,
             target_vertex_offset: 0,
             target_vertex_count: 0,
+            solver_backend:
+                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
         };
         let sim = ClothSimState::default();
         let n = sim.particle_count();

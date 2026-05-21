@@ -683,6 +683,7 @@ fn collect_cloth_deforms<'a>(
                 deformed_positions: cs.deform_output.deformed_positions.clone(),
                 deformed_normals: cs.deform_output.deformed_normals.clone(),
                 version: cs.deform_output.version,
+                solver_backend: cs.solver_backend,
             })
         })
         .collect()
@@ -723,6 +724,8 @@ mod cloth_collection_tests {
             target_mesh_id: target_primitive_id.map(|p| MeshId(p.0)),
             target_vertex_offset: 0,
             target_vertex_count: vertex_count,
+            solver_backend:
+                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
         }
     }
 

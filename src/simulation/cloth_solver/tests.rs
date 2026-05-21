@@ -515,6 +515,8 @@ fn write_back_copies_positions_and_normals() {
         target_mesh_id: None,
         target_vertex_offset: 0,
         target_vertex_count: 0,
+        solver_backend:
+            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
     };
 
     write_back(&sim, &mut cloth_state);
@@ -551,6 +553,8 @@ fn write_back_increments_version() {
         target_mesh_id: None,
         target_vertex_offset: 0,
         target_vertex_count: 0,
+        solver_backend:
+            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
     };
 
     write_back(&sim, &mut cloth_state);
