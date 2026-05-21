@@ -38,12 +38,12 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             });
 
-            let mut autosave_enabled = state.cloth_autosave_consent.unwrap_or(false);
+            let mut autosave_enabled = state.cloth_authoring.autosave_consent.unwrap_or(false);
             if ui
                 .checkbox(&mut autosave_enabled, t!("inspector.autosave_cloth"))
                 .changed()
             {
-                state.cloth_autosave_consent = Some(autosave_enabled);
+                state.cloth_authoring.autosave_consent = Some(autosave_enabled);
             }
         });
 
@@ -61,14 +61,14 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .map(|m| format!("{} (id {})", m.name, m.id.0))
                         .collect();
                     let selected_text = mat_names
-                        .get(state.cloth_material_pick_index)
+                        .get(state.cloth_authoring.material_pick_index)
                         .cloned()
                         .unwrap_or_else(|| "None".to_string());
                     egui::ComboBox::from_id_salt("cloth_material_pick")
                         .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
                             for (i, name) in mat_names.iter().enumerate() {
-                                ui.selectable_value(&mut state.cloth_material_pick_index, i, name);
+                                ui.selectable_value(&mut state.cloth_authoring.material_pick_index, i, name);
                             }
                         });
                     if outlined_button(
@@ -81,9 +81,9 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .clicked()
                     {
                         if let Some(mat) =
-                            avatar.asset.materials.get(state.cloth_material_pick_index)
+                            avatar.asset.materials.get(state.cloth_authoring.material_pick_index)
                         {
-                            state.region_selection =
+                            state.cloth_authoring.region_selection =
                                 crate::editor::cloth_authoring::RegionSelection::select_by_material(
                                     &avatar.asset,
                                     mat.id,
@@ -104,7 +104,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .clicked()
                     {
-                        if let Some(ref mut sel) = state.region_selection {
+                        if let Some(ref mut sel) = state.cloth_authoring.region_selection {
                             sel.grow_selection(&avatar.asset);
                         }
                     }
@@ -117,7 +117,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .clicked()
                     {
-                        if let Some(ref mut sel) = state.region_selection {
+                        if let Some(ref mut sel) = state.cloth_authoring.region_selection {
                             sel.shrink_selection(&avatar.asset);
                         }
                     }
@@ -130,13 +130,13 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .clicked()
                     {
-                        state.region_selection = None;
+                        state.cloth_authoring.region_selection = None;
                     }
                 });
 
                 ui.add_space(4.0);
 
-                if let Some(ref sel) = state.region_selection {
+                if let Some(ref sel) = state.cloth_authoring.region_selection {
                     ui.label(
                         egui::RichText::new(t!("inspector.selected_vertices", count = sel.selected_vertices.len()))
                         .color(egui::Color32::from_rgb(255, 220, 80)),
@@ -149,7 +149,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(4.0);
 
                 if filled_button(ui, None, &t!("inspector.generate_sim_mesh"), true).clicked() {
-                    if let Some(ref sel) = state.region_selection {
+                    if let Some(ref sel) = state.cloth_authoring.region_selection {
                         let verts: Vec<usize> = sel.selected_vertices.iter().copied().collect();
                         if let Some(sim_mesh) = crate::editor::cloth_authoring::generate_sim_mesh(
                             &avatar.asset,
@@ -177,35 +177,35 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 if nodes.is_empty() {
                     ui.label(t!("inspector.no_skeleton_nodes"));
                 } else {
-                    if state.cloth_pin_node_index >= nodes.len() {
-                        state.cloth_pin_node_index = 0;
+                    if state.cloth_authoring.pin_node_index >= nodes.len() {
+                        state.cloth_authoring.pin_node_index = 0;
                     }
                     let node_names: Vec<String> = nodes
                         .iter()
                         .map(|n| format!("{} (id {})", n.name, n.id.0))
                         .collect();
                     let selected_text = node_names
-                        .get(state.cloth_pin_node_index)
+                        .get(state.cloth_authoring.pin_node_index)
                         .cloned()
                         .unwrap_or_else(|| "None".to_string());
                     egui::ComboBox::from_id_salt("cloth_pin_node")
                         .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
                             for (i, name) in node_names.iter().enumerate() {
-                                ui.selectable_value(&mut state.cloth_pin_node_index, i, name);
+                                ui.selectable_value(&mut state.cloth_authoring.pin_node_index, i, name);
                             }
                         });
 
                     ui.add_space(4.0);
 
-                    let pin_node_id = nodes[state.cloth_pin_node_index].id;
-                    let pin_node_name = nodes[state.cloth_pin_node_index].name.clone();
+                    let pin_node_id = nodes[state.cloth_authoring.pin_node_index].id;
+                    let pin_node_name = nodes[state.cloth_authoring.pin_node_index].name.clone();
 
                     ui.horizontal(|ui| {
                         if filled_button(ui, Some(ic::ADD), &t!("inspector.create_pin_set"), true)
                             .clicked()
                         {
-                            if state.region_selection.is_some() {
+                            if state.cloth_authoring.region_selection.is_some() {
                                 if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                                     let sim_mesh = &overlay.simulation_mesh;
                                     if !sim_mesh.vertices.is_empty() {
@@ -277,13 +277,13 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             ui.add(
-                egui::Slider::new(&mut state.cloth_distance_stiffness, 0.0..=1.0)
+                egui::Slider::new(&mut state.cloth_authoring.distance_stiffness, 0.0..=1.0)
                     .text(t!("inspector.distance_stiffness")),
             );
-            ui.checkbox(&mut state.cloth_bend_enabled, t!("inspector.bend_constraints"));
-            if state.cloth_bend_enabled {
+            ui.checkbox(&mut state.cloth_authoring.bend_enabled, t!("inspector.bend_constraints"));
+            if state.cloth_authoring.bend_enabled {
                 ui.add(
-                    egui::Slider::new(&mut state.cloth_bend_stiffness, 0.0..=1.0)
+                    egui::Slider::new(&mut state.cloth_authoring.bend_stiffness, 0.0..=1.0)
                         .text(t!("inspector.bend_stiffness")),
                 );
             }
@@ -294,12 +294,12 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.label(t!("inspector.bend_constraints_count", count = overlay.constraints.bend_constraints.len()));
                 if filled_button(ui, None, &t!("inspector.apply_constraints"), true).clicked() {
                     for dc in &mut overlay.constraints.distance_constraints {
-                        dc.stiffness = state.cloth_distance_stiffness;
+                        dc.stiffness = state.cloth_authoring.distance_stiffness;
                     }
                     for bc in &mut overlay.constraints.bend_constraints {
-                        bc.stiffness = state.cloth_bend_stiffness;
+                        bc.stiffness = state.cloth_authoring.bend_stiffness;
                     }
-                    if !state.cloth_bend_enabled {
+                    if !state.cloth_authoring.bend_enabled {
                         overlay.constraints.bend_constraints.clear();
                     }
                     state.app.editor.set_dirty();
@@ -315,8 +315,8 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         .show(ui, |ui| {
             if let Some(avatar) = state.app.active_avatar() {
                 let collider_count = avatar.asset.colliders.len();
-                if state.cloth_collider_toggles.len() != collider_count {
-                    state.cloth_collider_toggles = vec![true; collider_count];
+                if state.cloth_authoring.collider_toggles.len() != collider_count {
+                    state.cloth_authoring.collider_toggles = vec![true; collider_count];
                 }
                 if collider_count == 0 {
                     ui.label(t!("inspector.no_colliders"));
@@ -339,7 +339,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                             }
                         };
                         ui.checkbox(
-                            &mut state.cloth_collider_toggles[i],
+                            &mut state.cloth_authoring.collider_toggles[i],
                             format!("{}: {} ({})", collider.id.0, node_name, shape_label),
                         );
                     }
@@ -436,7 +436,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.cloth_simulation"));
 
                 ui.horizontal(|ui| {
-                    if state.cloth_sim_playing {
+                    if state.cloth_authoring.sim_playing {
                         if outlined_button(
                             ui,
                             Some(ic::PAUSE),
@@ -446,12 +446,12 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         )
                         .clicked()
                         {
-                            state.cloth_sim_playing = false;
+                            state.cloth_authoring.sim_playing = false;
                         }
                     } else if filled_button(ui, Some(ic::PLAY), &t!("inspector.play"), true)
                         .clicked()
                     {
-                        state.cloth_sim_playing = true;
+                        state.cloth_authoring.sim_playing = true;
                     }
                     if outlined_button(ui, None, &t!("inspector.step"), color::PRIMARY, true)
                         .clicked()

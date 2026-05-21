@@ -139,7 +139,7 @@ impl GuiApp {
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,
             settings_orbit_sensitivity: self.settings.orbit_sensitivity,
             settings_pan_sensitivity: self.settings.pan_sensitivity,
-            cloth_autosave_consent: self.cloth_autosave_consent,
+            cloth_autosave_consent: self.cloth_authoring.autosave_consent,
         }
     }
 
@@ -285,7 +285,7 @@ impl GuiApp {
         self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;
         self.settings.orbit_sensitivity = state.settings_orbit_sensitivity;
         self.settings.pan_sensitivity = state.settings_pan_sensitivity;
-        self.cloth_autosave_consent = state.cloth_autosave_consent;
+        self.cloth_authoring.autosave_consent = state.cloth_autosave_consent;
         crate::i18n::set_locale(&self.settings.locale);
 
         self.apply_pipeline_bound_settings(
@@ -490,7 +490,7 @@ impl GuiApp {
         };
 
         let has_overlay = self.app.editor.overlay_asset.is_some();
-        let overlay_for_snapshot = if has_overlay && self.cloth_autosave_consent == Some(true) {
+        let overlay_for_snapshot = if has_overlay && self.cloth_authoring.autosave_consent == Some(true) {
             let overlay_name = self
                 .app
                 .editor

@@ -628,7 +628,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             // T04: Draw cloth region selection overlay in ClothAuthoring mode.
             if state.mode == crate::gui::AppMode::ClothAuthoring {
                 if let Some(avatar) = state.app.active_avatar() {
-                    let sel_ref = state.region_selection.as_ref();
+                    let sel_ref = state.cloth_authoring.region_selection.as_ref();
                     match sel_ref {
                         Some(sel) => {
                             let prim_label = avatar

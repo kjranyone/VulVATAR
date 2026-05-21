@@ -150,6 +150,45 @@ pub enum LibrarySortMode {
     Favorites,
 }
 
+/// Cloth-authoring panel UI state lifted out of `GuiApp` (architecture
+/// finding #10). Bundles the cloth-sim playback toggle, the
+/// rename / save-status widget buffers, the per-vertex region
+/// selection driven by mesh picking, and the sim-parameter widgets
+/// (distance stiffness, bend stiffness, collider toggles, pin node).
+pub struct ClothAuthoringUiState {
+    pub sim_playing: bool,
+    pub rename_buf: String,
+    pub save_status: Option<String>,
+    pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
+    pub material_pick_index: usize,
+    pub distance_stiffness: f32,
+    pub bend_enabled: bool,
+    pub bend_stiffness: f32,
+    pub collider_toggles: Vec<bool>,
+    pub pin_node_index: usize,
+    pub autosave_consent: Option<bool>,
+}
+
+impl Default for ClothAuthoringUiState {
+    fn default() -> Self {
+        Self {
+            sim_playing: false,
+            rename_buf: String::new(),
+            save_status: None,
+            region_selection: None,
+            material_pick_index: 0,
+            // Cloth-sim defaults match the values the inspector
+            // previously hard-coded into `GuiApp::new`.
+            distance_stiffness: 1.0,
+            bend_enabled: true,
+            bend_stiffness: 0.5,
+            collider_toggles: Vec::new(),
+            pin_node_index: 0,
+            autosave_consent: None,
+        }
+    }
+}
+
 /// Viewport-pane UI state lifted out of `GuiApp` (architecture
 /// finding #10). Holds the texture egui binds the rendered scene to,
 /// the cursor-grab state during orbit/pan drags, and the camera-wipe
@@ -479,20 +518,10 @@ pub struct GuiApp {
     // Animation inspector state
     pub animation_playing: bool,
 
-    // Cloth authoring inspector state
-    pub cloth_sim_playing: bool,
-    pub cloth_rename_buf: String,
-    pub cloth_save_status: Option<String>,
-
-    // T04: Region selection state
-    pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
-    pub cloth_material_pick_index: usize,
-    pub cloth_distance_stiffness: f32,
-    pub cloth_bend_enabled: bool,
-    pub cloth_bend_stiffness: f32,
-    pub cloth_collider_toggles: Vec<bool>,
-    pub cloth_pin_node_index: usize,
-    pub cloth_autosave_consent: Option<bool>,
+    // Cloth-authoring panel state (sim playback, rename / save
+    // buffers, region selection, sim-parameter widgets). See
+    // `ClothAuthoringUiState`.
+    pub cloth_authoring: ClothAuthoringUiState,
 
     pub inspector_open: bool,
 
@@ -656,18 +685,7 @@ impl GuiApp {
 
             animation_playing: false,
 
-            cloth_sim_playing: false,
-            cloth_rename_buf: String::new(),
-            cloth_save_status: None,
-
-            region_selection: None,
-            cloth_material_pick_index: 0,
-            cloth_distance_stiffness: 1.0,
-            cloth_bend_enabled: true,
-            cloth_bend_stiffness: 0.5,
-            cloth_collider_toggles: Vec::new(),
-            cloth_pin_node_index: 0,
-            cloth_autosave_consent: None,
+            cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
             expression_weights: Vec::new(),
 
@@ -890,18 +908,7 @@ impl GuiApp {
 
             animation_playing: false,
 
-            cloth_sim_playing: false,
-            cloth_rename_buf: String::new(),
-            cloth_save_status: None,
-
-            region_selection: None,
-            cloth_material_pick_index: 0,
-            cloth_distance_stiffness: 1.0,
-            cloth_bend_enabled: true,
-            cloth_bend_stiffness: 0.5,
-            cloth_collider_toggles: Vec::new(),
-            cloth_pin_node_index: 0,
-            cloth_autosave_consent: None,
+            cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
             expression_weights: Vec::new(),
 
@@ -965,7 +972,7 @@ impl GuiApp {
         RuntimeToggles {
             tracking_enabled: self.tracking.toggle_tracking,
             spring_enabled: self.rendering.toggle_spring,
-            cloth_enabled: self.rendering.toggle_cloth && self.cloth_sim_playing,
+            cloth_enabled: self.rendering.toggle_cloth && self.cloth_authoring.sim_playing,
             collision_debug: self.rendering.toggle_collision_debug,
             skeleton_debug: self.rendering.toggle_skeleton_debug,
         }
@@ -1157,7 +1164,7 @@ impl eframe::App for GuiApp {
         self.write_recovery_snapshot_if_due();
 
         // Cloth overlay autosave consent dialog
-        if self.app.editor.overlay_asset.is_some() && self.cloth_autosave_consent.is_none() {
+        if self.app.editor.overlay_asset.is_some() && self.cloth_authoring.autosave_consent.is_none() {
         egui::Window::new(t!("dialog.cloth_autosave_title"))
             .collapsible(false)
             .resizable(false)
@@ -1169,7 +1176,7 @@ impl eframe::App for GuiApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if components::filled_button(ui, None, &t!("dialog.yes"), true).clicked() {
-                        self.cloth_autosave_consent = Some(true);
+                        self.cloth_authoring.autosave_consent = Some(true);
                     }
                     if components::outlined_button(
                         ui,
@@ -1180,7 +1187,7 @@ impl eframe::App for GuiApp {
                     )
                     .clicked()
                     {
-                        self.cloth_autosave_consent = Some(false);
+                        self.cloth_authoring.autosave_consent = Some(false);
                     }
                 });
             });
