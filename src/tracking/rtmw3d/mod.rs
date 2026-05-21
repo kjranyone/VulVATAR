@@ -384,6 +384,11 @@ impl Rtmw3dInference {
             // within the 25% downstream pad.
             let bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
                 let cold_start = !worker.has_result();
+                // `.max(1)` is defence-in-depth: `RuntimeGpuBudget`'s
+                // mode arms only emit {4, 6, 8, 12}, asserted by the
+                // `all_modes_emit_nonzero_yolox_skip_period` unit
+                // test, but `is_multiple_of(0)` would panic so we
+                // guard against an accidental future regression.
                 let period =
                     YOLOX_REFRESH_PERIOD.load(std::sync::atomic::Ordering::Relaxed).max(1);
                 if cold_start || frame_index.is_multiple_of(period) {

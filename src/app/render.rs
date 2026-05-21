@@ -236,6 +236,14 @@ impl Application {
             // single-bit flag. Left at 0 until a small failure-window
             // counter lands; the budget then only escalates to
             // `EmergencyCpu` once that counter is populated.
+            // **NOTE — EmergencyCpu is unreachable today**. The budget's
+            // `EmergencyCpu` transition fires when this counter reaches
+            // `EMERGENCY_FAILURE_COUNT` (2). Until the
+            // recent-window failure counter on `OutputDiagnostics` lands
+            // (tracked in `docs/gpu-runtime-roadmap.md` § "Immediate
+            // Next Implementation Task") this stays at 0. If you are
+            // hunting a "why does EmergencyCpu never fire" bug, the
+            // answer is right here — not a state-machine issue.
             gpu_export_failures_recent: 0,
         };
         self.runtime_gpu_budget.update(&measurements, now);
@@ -250,6 +258,16 @@ impl Application {
         // each frame; the cadence flip takes effect on the next
         // `frame_index.is_multiple_of(period)` check (typically next
         // submit cycle).
+        //
+        // Ordering::Relaxed is intentional: the value is an advisory
+        // cadence knob, no other state depends on this load's freshness,
+        // and a one-frame stale read on the tracking thread is
+        // semantically equivalent to the budget recomputing one frame
+        // later (which can happen anyway). Worst-case lag: at Healthy
+        // (period=4) the tracker only checks `frame_index.is_multiple_of(period)`
+        // every 4 frames, so a transition to Emergency (period=12)
+        // can take up to 3 frames before the new period takes effect.
+        // Acceptable given the budget's own 5s/30s dwell times.
         #[cfg(feature = "inference")]
         {
             crate::tracking::rtmw3d::YOLOX_REFRESH_PERIOD.store(

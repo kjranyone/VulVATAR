@@ -196,6 +196,24 @@ impl RuntimeGpuBudget {
     }
 
     pub fn update(&mut self, m: &RuntimeMeasurements, now: Instant) {
+        // Clock-backward defence: `Instant` is monotonic on most
+        // platforms but some embed Instant in a wrapper that can be
+        // adjusted (or `now` might be supplied from a test). If either
+        // dwell-tracking timestamp lies in the future relative to `now`,
+        // reset it — `duration_since` saturates to zero in that case,
+        // which would otherwise freeze the state machine indefinitely
+        // because no dwell ever appears to elapse.
+        if let Some(s) = self.pressure_since {
+            if s > now {
+                self.pressure_since = Some(now);
+            }
+        }
+        if let Some(s) = self.clean_streak_started {
+            if s > now {
+                self.clean_streak_started = Some(now);
+            }
+        }
+
         let pressure = self.detect_pressure(m);
 
         match (self.degraded_mode, pressure) {
@@ -508,5 +526,55 @@ mod tests {
             45,
             "user intent above PressureLight ceiling is clamped"
         );
+    }
+
+    /// Contract: no mode emits `yolox_skip_period = 0`. The tracking
+    /// thread reads the period inside `frame_index.is_multiple_of(period)`
+    /// which would panic on zero. Defence-in-depth `.max(1)` on the
+    /// read site backs this, but the invariant should hold at the
+    /// source too.
+    #[test]
+    fn all_modes_emit_nonzero_yolox_skip_period() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        for mode in [
+            DegradedMode::Healthy,
+            DegradedMode::PressureLight,
+            DegradedMode::PressureHeavy,
+            DegradedMode::EmergencyCpu,
+        ] {
+            // Force the mode + recompute targets through the public surface.
+            budget.degraded_mode = mode;
+            budget.recompute_targets();
+            assert!(
+                budget.yolox_skip_period() >= 1,
+                "mode {:?} emitted yolox_skip_period = 0",
+                mode
+            );
+        }
+    }
+
+    /// Defence: if the dwell timer's anchor is in the future relative
+    /// to `now` (clock adjustment / test injection), it must be clamped
+    /// down to `now` so subsequent `duration_since(s)` doesn't saturate
+    /// to zero forever.
+    #[test]
+    fn clock_going_backward_does_not_freeze_state_machine() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        // Move into PressureLight and arm pressure_since at t0+5s.
+        budget.update(&render_overrun_measurements(), t0);
+        budget.update(&render_overrun_measurements(), t0 + LIGHT_TO_HEAVY_DWELL / 2);
+        // Now travel "backward" by calling update with `now = t0` again
+        // (simulates a clock adjustment). pressure_since was in the
+        // future; the guard must reset it to `now` so dwell can advance.
+        budget.update(&render_overrun_measurements(), t0);
+        // From this point, advancing forward by the dwell time must
+        // reach PressureHeavy as if the backward jump never happened.
+        budget.update(
+            &render_overrun_measurements(),
+            t0 + LIGHT_TO_HEAVY_DWELL + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
     }
 }
