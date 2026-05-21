@@ -154,20 +154,11 @@ pub enum LibrarySortMode {
 /// finding #10). The preset library is loaded eagerly from disk;
 /// the selected-index / name widget buffers track the rendering
 /// inspector's preset combo and rename field.
+#[derive(Default)]
 pub struct ScenePresetUiState {
     pub presets: Vec<crate::persistence::ScenePreset>,
     pub selected_index: Option<usize>,
     pub name: String,
-}
-
-impl Default for ScenePresetUiState {
-    fn default() -> Self {
-        Self {
-            presets: Vec::new(),
-            selected_index: None,
-            name: String::new(),
-        }
-    }
 }
 
 /// Cloth-authoring panel UI state lifted out of `GuiApp` (architecture
@@ -222,8 +213,8 @@ pub struct ViewportUiState {
     /// Frame counter of the last render result we uploaded, used to
     /// avoid re-uploading the same pixels.
     pub last_frame: u64,
-    /// Blender-style infinite-drag during orbit/pan: cursor is hidden
-    /// + warped back to the drag origin every frame so the user can
+    /// Blender-style infinite-drag during orbit/pan: cursor is hidden +
+    /// warped back to the drag origin every frame so the user can
     /// drag past screen edges. `true` while a drag is active.
     pub cursor_grabbed: bool,
     /// Cursor position at drag start; restored when the drag ends.
