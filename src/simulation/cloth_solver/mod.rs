@@ -45,6 +45,16 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
         _ => return,
     };
 
+    // For Gpu-backed cloth the renderer dispatches the integration /
+    // constraint projection / normal recomputation compute pipelines;
+    // running the CPU PBD path on top would waste CPU cycles and the
+    // resulting deform_output would just be ignored by the renderer.
+    if cloth_state.solver_backend
+        == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+    {
+        return;
+    }
+
     // ---- lazy init of sim state -----------------------------------------------
     let sim = match avatar.cloth_sim.as_mut() {
         Some(s) if s.initialized => s,
@@ -120,6 +130,12 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
 
     for slot in &mut avatar.cloth_overlays {
         if !slot.enabled {
+            continue;
+        }
+        // Skip CPU PBD for Gpu-backed overlays — renderer drives them.
+        if slot.state.solver_backend
+            == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+        {
             continue;
         }
 
