@@ -962,14 +962,27 @@ mod win32_shmem {
                     )
                 })?;
             }
-            std::fs::rename(&tmp_path, &self.sidecar_path).map_err(|e| {
-                format!(
+            // `std::fs::rename` on Windows uses `MoveFileExW` with
+            // `MOVEFILE_REPLACE_EXISTING`, so this overwrites any stale
+            // sidecar from a slow consumer atomically. Failure modes that
+            // remain: ERROR_SHARING_VIOLATION (consumer holds the file
+            // without FILE_SHARE_DELETE), disk full, permission denied.
+            // In any of those, the temp file is left behind without
+            // cleanup, which a subsequent successful write would
+            // overwrite via the same `File::create(&tmp_path)`. Best-
+            // effort `remove_file` on rename failure keeps the disk
+            // tidy across consumer hiccups; ignore the result because
+            // even the cleanup may fail (locked file, etc.) and the
+            // upstream error is the one the caller cares about.
+            if let Err(e) = std::fs::rename(&tmp_path, &self.sidecar_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!(
                     "Win32FileBackedSink: rename sidecar '{}' -> '{}' failed: {}",
                     tmp_path.display(),
                     self.sidecar_path.display(),
                     e
-                )
-            })?;
+                ));
+            }
             Ok(())
         }
 

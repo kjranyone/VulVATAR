@@ -827,6 +827,29 @@ mod tests {
         wait_for_completed_lease(&mut router, 8_000);
     }
 
+    /// Sink swap with a pending retained lease: the old sink's last
+    /// retained lease must be released when the sink is swapped, not
+    /// leaked across the boundary. This caught a regression where
+    /// `set_sink` flushed the worker channel but forgot to drain
+    /// `pending_retained_lease`.
+    #[test]
+    fn sink_swap_releases_pending_retained_lease() {
+        let mut router = OutputRouter::new(FrameSink::ImageSequence);
+        router.publish(make_retained_gpu_frame(9_000));
+        std::thread::sleep(Duration::from_millis(50));
+        // `9_000` is bound as pending; the worker has consumed and
+        // ack'd it, but the next-publish-release contract leaves it
+        // armed.
+
+        router.set_sink(FrameSink::SharedTextureFileStub);
+        // After sink swap, the old pending lease must complete (the
+        // new sink can't honour it) — otherwise the renderer's export
+        // pool slot stays leased indefinitely.
+        wait_for_completed_lease(&mut router, 9_000);
+
+        router.shutdown();
+    }
+
     // -----------------------------------------------------------------
     // End-to-end composed coverage (plan: output-sink-integration-tests)
     // -----------------------------------------------------------------
