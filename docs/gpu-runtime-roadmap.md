@@ -231,15 +231,24 @@ shared GPU budget rather than letting subsystems fight invisibly.
 
 Move cloth simulation toward compute in stages:
 
-1. persistent GPU particle/state buffers
-2. compute kernels for integration + constraints
-3. compute-produced deform buffers consumed directly by draw passes
-   — partially landed: the renderer already consumes cloth via the
-   `cloth_pos_ssbo` / `cloth_norm_ssbo` bindings of the transform
-   compute prepass. Step 3 completes when the CPU solver is replaced
-   by a compute kernel that writes those SSBOs directly, removing the
-   per-frame host write
-4. CPU readback only for diagnostics/editor inspection
+1. persistent GPU particle/state buffers — landed (`ClothGpuSlot`)
+2. compute kernels for integration + constraints + normals — landed
+   (`cloth_verlet_cs` / `cloth_constraint_accumulate_cs` +
+   `cloth_constraint_apply_cs` / `cloth_normal_cs`)
+3. compute-produced deform buffers consumed directly by draw passes —
+   landed: when `ClothDeformSnapshot::solver_backend == Gpu`, the
+   renderer dispatches the cloth compute pipelines and `transform_cs`
+   reads `cloth_pos_ssbo` / `cloth_norm_ssbo` filled by the GPU. The
+   per-frame host write into those SSBOs is suppressed.
+4. CPU readback only for diagnostics/editor inspection — pending
+   (current CPU solver remains the default backend, runs in parallel
+   when `Cpu` is selected; `Gpu` backend skips it)
+
+Formula parity locked by `cloth_gpu_boundary::tests`: each shader has a
+pure-Rust mirror of its GLSL body and is asserted equal (within
+`1e-3`) to the CPU PBD reference over 60 frames / 64 iterations / etc.
+Bit-for-bit SPIR-V vs CPU parity needs a hardware integration test
+outside the lib boundary.
 
 `ClothDeformSnapshot` is now primitive-scoped (`target_primitive_id`,
 `target_mesh_id`, `vertex_offset`, `vertex_count`) and
@@ -278,6 +287,66 @@ that cannot see each other.
   main path
 - GPU contention is visible in one place
 - degraded modes are intentional, not accidental
+
+## RuntimeGpuBudget — Landed State Machine
+
+Phase 3's GPU scheduling exit criterion landed as
+`src/app/runtime_gpu_budget.rs`. The budget is the single place that
+decides system-level cadence; consumers read its outputs and never
+hard-code their own thresholds.
+
+### State machine
+
+| Mode | Trigger to enter | Trigger to leave | Render FPS clamp | Pose Hz | YOLOX skip | Depth skip | FaceMesh EP |
+|---|---|---|---|---|---|---|---|
+| `Healthy` | initial / recovered | render dt > 1.2× target dt **or** drops/sec ≥ 5 (5 s sustained) | user choice | 30 | every 4 | every 4 | Auto |
+| `PressureLight` | sustained light pressure for 5 s | clean 30 s **or** light→heavy escalation | min(user, 45) | 25 | every 6 | every 6 | Auto |
+| `PressureHeavy` | sustained light pressure another 5 s **or** drops/sec ≥ 20 (bypass) | clean 30 s | min(user, 30) | 20 | every 8 | every 8 | Cpu |
+| `EmergencyCpu` | 2 GPU export failures in the recent window | clean 30 s | min(user, 30) | 15 | every 12 | every 12 | Cpu |
+
+Hysteresis is the point. Recovery requires a 30-second clean streak per
+step — a one-frame stutter does not immediately bounce you up a level,
+and a one-frame all-clean does not race you back to `Healthy` from
+`EmergencyCpu`. The 20-drops/sec bypass is the only short-circuit
+upward; everything else needs the 5 s dwell.
+
+### Consumer plumbing
+
+- **Render FPS**: forwarded each frame from
+  `Application::update_runtime_gpu_budget` to
+  `OutputRouter::set_target_fps`. The output throttle gate enforces the
+  clamp without any other party knowing about it.
+- **YOLOX skip period**: published to
+  `tracking::rtmw3d::YOLOX_REFRESH_PERIOD` (a `pub static AtomicU64`).
+  `Rtmw3dInference::process_pose` loads it on every frame inside the
+  submit guard. A single shared atomic is used in preference to an
+  `Arc<AtomicU64>` plumbing path because the value is conceptually
+  global — one Application + one Rtmw3dInference per session.
+- **Pose Hz / Depth skip / FaceMesh EP**: budget fields are populated
+  and surfaced in the inspector; the consumer wiring lands when each
+  subsystem starts honouring the budget (these are tracked under
+  `plan/runtime-gpu-budget.md`).
+
+### Inputs the budget reads
+
+`RuntimeMeasurements`, populated each frame from:
+
+- `render_dt_ema` — 5-frame EMA of render-thread frame dt
+- `OutputRouter::dropped_count()` → drops/sec across the sampling window
+- `OutputDiagnostics::export_pool` → leased / capacity counts
+- recent GPU export failures (currently 0; a small failure-window
+  counter is the remaining work — `EmergencyCpu` will only fire once
+  that counter is populated)
+
+### Why centralise
+
+Before this landed, render cadence lived on `OutputRouter`, YOLOX skip
+period was a `const` in `tracking::rtmw3d`, depth refresh was a
+separate const, and facemesh EP was chosen at startup with no runtime
+adjustment. None of them could see the others. Under sustained load
+the system would either (a) drop frames in one subsystem while another
+remained at full cost, or (b) require manual re-tuning. The budget
+makes degraded modes intentional and visible in one place.
 
 ## Recommended Concrete Types
 
@@ -385,11 +454,15 @@ provider encode permanent timing assumptions in isolation.
 
 ## Immediate Next Implementation Task
 
-The next implementation task should be:
+The Phase 2 GPU export pool, Phase 3 cloth compute migration, and
+Phase 3 runtime budget have all landed. The remaining immediate work is:
 
-> Introduce the `GpuFrameToken` / export-image-pool boundary in
-> `renderer::output_export`, keep the current CPU readback path as a visible
-> fallback, and add diagnostics that say which handoff path is active.
+> Add a recent-window GPU-export-failure counter to `OutputDiagnostics`
+> so `RuntimeGpuBudget::EmergencyCpu` can actually fire (today the
+> input is hardcoded to 0). Then plumb `pose_hz_target`, `depth_skip_period`,
+> and `facemesh_ep_preference` to their respective consumers, the same
+> way YOLOX skip is wired through `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`.
 
-That task advances the architecture more than further tuning of the current
-readback path would.
+These complete the runtime budget loop: today the budget is fully
+expressive on its outputs but only one consumer (YOLOX) actually
+honours its decisions cross-thread.
