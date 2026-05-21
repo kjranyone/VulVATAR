@@ -7,15 +7,14 @@ This file used to be the full 1095-line review with the work history of every
 fix. The history is in `git log`; this file now only lists the **open**
 findings and the recommended order for picking them up. For the closed ones
 see commits between `2026-05-06` and `2026-05-21` (architecture review pass +
-output refactor + simulation step correctness + GUI repaint gate fix).
+output refactor + simulation step correctness + GUI repaint gate fix +
+P3-03 runtime budget + #4 render-thread mailbox + #7 tracking hold/fade).
 
 ## Open findings at a glance
 
 | # | Finding | Severity |
 |---|---------|----------|
 | #1  | Live output is CPU-readback-centred (producer-side capability routing landed; second live sink still on CPU) | High |
-| #4  | Render thread result delivery still uses blocking `result_tx.send`; result side has no latest-frame semantics | High |
-| #7  | Stale tracking samples cause a hard pose reset rather than hold/fade | High |
 | #8  | Tracking mailbox clones relatively heavy GUI data (pose + webcam preview + diagnostics) under one mutex | Medium |
 | #10 | `GuiApp` has been partially split into sub-states but is still a broad mutable coordinator | High |
 | #12 | `src/renderer/mod.rs` is ~3900 lines and has too many reasons to change | Medium |
@@ -32,40 +31,6 @@ lands and a follow-up sink is chosen.
 Recommendation: wait for the out-of-tree DLL ship, then pick the next sink
 in [`gpu-runtime-roadmap-tasks.md`](./gpu-runtime-roadmap-tasks.md) §"What
 is actually still open".
-
-## #4 — Result-side render thread backpressure
-
-Current state: `src/app/render_thread.rs` uses `sync_channel(2)` + `try_send`
-on the command side (good), but result delivery still uses blocking
-`result_tx.send(result)`. A modal loop, long UI work, or an asset-load
-hiccup that delays draining results can stall the render thread.
-
-Recommendation:
-
-- Make result delivery use `sync_channel(1)` + `try_send` with
-  replace-latest semantics, OR a mailbox (`Arc<Mutex<Option<RenderResult>>>`).
-- Track dropped render results in diagnostics so the regression is visible.
-
-Files: `src/app/render_thread.rs`, `src/app/render.rs`.
-
-## #7 — Stale tracking causes hard pose reset
-
-Current state: `src/app/render.rs` treats `tracking.is_stale()` as `None`
-and rebuilds base/rest pose every frame. `Application::last_tracking_pose`
-exists (set when a fresh sample arrives) but is never *consumed* on a
-stale frame.
-
-Recommendation: add a latched tracking sample with age metadata and a
-three-state policy:
-
-- fresh: solve normally
-- stale but within hold window: reuse `last_tracking_pose` with decaying
-  confidence
-- expired: fade from last solved pose toward animation / rest
-
-One stale frame must not invalidate all pose channels at once.
-
-Files: `src/app/render.rs`, possibly a small new policy module.
 
 ## #8 — Tracking mailbox does too much under one mutex
 
@@ -145,16 +110,13 @@ Files: `src/avatar/instance.rs`, `src/app/render.rs` (snapshot build sites).
 
 ## Suggested order
 
-1. **#7** — most user-visible runtime issue still open; isolated to
-   `app::run_frame` + a small bit of state.
-2. **#4** — small change with high robustness payoff; unblocks longer UI
-   work without render thread stalls.
-3. **#8** — independent of the others; smaller blast radius.
-4. **#10** — large mechanical refactor; pick up after the runtime issues
+1. **#8** — independent of the others; smaller blast radius. Now the
+   highest-impact OPEN item left.
+2. **#10** — large mechanical refactor; pick up after the runtime issues
    so the split lands on a stable contract.
-5. **#13** — incremental cleanup; pair with whichever asset path is being
+3. **#13** — incremental cleanup; pair with whichever asset path is being
    touched next.
-6. **#12** — the renderer split is the biggest chunk; defer until the
+4. **#12** — the renderer split is the biggest chunk; defer until the
    compute prepass and GPU cloth paths stop churning.
 
 ## What this file is NOT

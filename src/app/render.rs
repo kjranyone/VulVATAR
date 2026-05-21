@@ -65,7 +65,7 @@ impl Application {
         //    - **Expired** (age past the hold window, or never
         //      published): drop the sample. Solver bypass restores
         //      base / animation pose.
-        let tracking_sample = if toggles.tracking_enabled {
+        let (tracking_sample, sample_is_fresh) = if toggles.tracking_enabled {
             let mailbox = self.tracking.mailbox();
             // Single mailbox lock per frame: age + stale_timeout
             // together describe the freshness state cheaper than
@@ -73,17 +73,21 @@ impl Application {
             let age = mailbox.age();
             let stale_threshold = mailbox.stale_timeout();
             match age {
-                Some(a) if a <= stale_threshold => self.step_tracking(),
-                Some(a) if a < TRACKING_HOLD_WINDOW => self.last_tracking_pose.as_ref().map(|last| {
-                    let span =
-                        (TRACKING_HOLD_WINDOW - stale_threshold).as_secs_f32().max(1e-6);
-                    let into_hold = a.saturating_sub(stale_threshold).as_secs_f32();
-                    let progress = (into_hold / span).clamp(0.0, 1.0);
-                    let scale = (1.0 - progress).clamp(0.0, 1.0);
-                    let mut held = last.clone();
-                    held.scale_confidence(scale);
-                    held
-                }),
+                Some(a) if a <= stale_threshold => (self.step_tracking(), true),
+                Some(a) if a < TRACKING_HOLD_WINDOW => {
+                    let held = self.last_tracking_pose.as_ref().map(|last| {
+                        let span = (TRACKING_HOLD_WINDOW - stale_threshold)
+                            .as_secs_f32()
+                            .max(1e-6);
+                        let into_hold = a.saturating_sub(stale_threshold).as_secs_f32();
+                        let progress = (into_hold / span).clamp(0.0, 1.0);
+                        let scale = (1.0 - progress).clamp(0.0, 1.0);
+                        let mut held = last.clone();
+                        held.scale_confidence(scale);
+                        held
+                    });
+                    (held, false)
+                }
                 Some(_) => {
                     if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
                         warn!(
@@ -92,19 +96,25 @@ impl Application {
                         );
                         self.stale_warn_cooldown = std::time::Instant::now();
                     }
-                    None
+                    (None, false)
                 }
                 // Mailbox never published a sample — same end state
                 // as Expired (no pose, no warn spam yet).
-                None => None,
+                None => (None, false),
             }
         } else {
-            None
+            (None, false)
         };
 
-        // Run simulation on all avatars
-        if let Some(ref tp) = tracking_sample {
-            self.last_tracking_pose = Some(tp.clone());
+        // Persist only fresh samples. A held sample is derived from
+        // the previous `last_tracking_pose` with its confidences
+        // decayed; persisting it would compound the decay multiplier
+        // every frame and collapse the effective hold window to a
+        // small fraction of TRACKING_HOLD_WINDOW.
+        if sample_is_fresh {
+            if let Some(ref tp) = tracking_sample {
+                self.last_tracking_pose = Some(tp.clone());
+            }
         }
 
         let solver_params = SolverParams {

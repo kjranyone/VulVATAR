@@ -41,10 +41,6 @@ into an executable sequence of work. One architectural rule:
    `Win32Kmt`, D3D12 fence, and external semaphore variants are stubbed in
    `OutputSyncToken` but the producer does not emit them yet. Each variant
    needs (a) a renderer-side export path and (b) the matching DLL contract.
-3. **GPU export failure window observability** — `RuntimeMeasurements`
-   accepts `gpu_export_failures_recent`, but no producer currently increments
-   it (would-be sources: handle export error, fence wait timeout). Add the
-   counter increment so `DegradedMode::EmergencyCpu` can actually trigger.
 
 ### Out-of-tree
 
