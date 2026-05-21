@@ -684,6 +684,13 @@ fn collect_cloth_deforms<'a>(
                 deformed_normals: cs.deform_output.deformed_normals.clone(),
                 version: cs.deform_output.version,
                 solver_backend: cs.solver_backend,
+                // GPU dispatch control plumbing arrives with the next
+                // slice that wires the actual compute dispatch — the
+                // ClothSimState fields (gravity/damping/wind) need
+                // pairing with each ClothState here, and threading
+                // ClothSimState through this collector requires a
+                // signature change at the call site.
+                gpu_control: None,
             })
         })
         .collect()

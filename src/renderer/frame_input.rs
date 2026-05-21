@@ -87,6 +87,24 @@ pub struct ClothDeformSnapshot {
     /// CPU snapshot copy and instead dispatches the cloth compute
     /// pipelines, which write the SSBOs in place.
     pub solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend,
+    /// Per-frame control data consumed by the GPU cloth compute
+    /// pipelines. `Some` when `solver_backend == Gpu`; `None`
+    /// otherwise. `deformed_positions` doubles as the first-frame
+    /// initialiser for `cloth_pos_ssbo` / `prev_pos_ssbo`, so this
+    /// struct only carries the simulation parameters.
+    pub gpu_control: Option<ClothGpuDispatchControl>,
+}
+
+/// Per-frame control data uploaded to `cloth_verlet_cs`'s `Control`
+/// UBO. Populated by `collect_cloth_deforms` for GPU-backed cloths
+/// from the avatar's `ClothSimState`.
+#[derive(Clone, Copy, Debug)]
+pub struct ClothGpuDispatchControl {
+    pub dt: f32,
+    pub damping: f32,
+    pub gravity: [f32; 3],
+    /// `wind_direction * wind_response` baked into a single vector.
+    pub wind_force: [f32; 3],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
