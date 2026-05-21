@@ -327,7 +327,15 @@ pub struct SkeletonNode {
 pub struct MeshAsset {
     pub id: MeshId,
     pub name: String,
-    pub primitives: Vec<MeshPrimitiveAsset>,
+    /// Primitives wrapped in `Arc` so the renderer can hand out
+    /// per-frame snapshot references without cloning the per-primitive
+    /// vertex / index / morph payload. Wrapping at the asset level
+    /// (rather than via a separate `primitive_arcs` field on
+    /// `AvatarInstance`) means multiple instances of the same loaded
+    /// asset share storage and no per-frame deep copy ever happens —
+    /// the previous design built a fresh `Arc::new(prim.clone())` per
+    /// instance and re-copied vertex data into the heap on each spawn.
+    pub primitives: Vec<std::sync::Arc<MeshPrimitiveAsset>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -164,7 +164,7 @@ impl<'a> AvatarResolver<'a> {
         let mut primitives_by_position = HashMap::new();
         for mesh in &avatar.meshes {
             for (idx, prim) in mesh.primitives.iter().enumerate() {
-                primitives_by_position.insert((mesh.name.clone(), idx), prim);
+                primitives_by_position.insert((mesh.name.clone(), idx), prim.as_ref());
             }
         }
 
@@ -599,7 +599,7 @@ mod tests {
             id: MeshId(2),
             name: "Body".to_string(),
             primitives: vec![
-                MeshPrimitiveAsset {
+                std::sync::Arc::new(MeshPrimitiveAsset {
                     id: PrimitiveId(20),
                     vertex_count: 16,
                     index_count: 24,
@@ -609,8 +609,8 @@ mod tests {
                     vertices: None,
                     indices: None,
                     morph_targets: vec![],
-                },
-                MeshPrimitiveAsset {
+                }),
+                std::sync::Arc::new(MeshPrimitiveAsset {
                     id: PrimitiveId(21),
                     vertex_count: 16,
                     index_count: 24,
@@ -620,7 +620,7 @@ mod tests {
                     vertices: None,
                     indices: None,
                     morph_targets: vec![],
-                },
+                }),
             ],
         };
         let avatar = make_avatar(vec![], vec![body_mesh]);
@@ -649,7 +649,7 @@ mod tests {
         let body_mesh = MeshAsset {
             id: MeshId(2),
             name: "Body".to_string(),
-            primitives: vec![MeshPrimitiveAsset {
+            primitives: vec![std::sync::Arc::new(MeshPrimitiveAsset {
                 id: PrimitiveId(20),
                 vertex_count: 50, // shrunk: was needs 100
                 index_count: 0,
@@ -659,7 +659,7 @@ mod tests {
                 vertices: None,
                 indices: None,
                 morph_targets: vec![],
-            }],
+            })],
         };
         let avatar = make_avatar(vec![], vec![body_mesh]);
         let report = rebind_overlay(&mut overlay, &avatar);

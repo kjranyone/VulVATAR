@@ -147,7 +147,7 @@ impl GuiApp {
                         alpha_mode,
                         cull_mode,
                         outline,
-                        primitive_data: Some(Arc::new(prim.clone())),
+                        primitive_data: Some(Arc::clone(prim)),
                         morph_weights: Vec::new(),
                     }
                 })
@@ -269,7 +269,7 @@ impl GuiApp {
                         alpha_mode,
                         cull_mode,
                         outline,
-                        primitive_data: Some(Arc::new(prim.clone())),
+                        primitive_data: Some(Arc::clone(prim)),
                         morph_weights: Vec::new(),
                     }
                 })

@@ -726,7 +726,7 @@ fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameIn
                 alpha_mode,
                 cull_mode,
                 outline: Default::default(),
-                primitive_data: Some(Arc::new(prim.clone())),
+                primitive_data: Some(Arc::clone(prim)),
                 morph_weights: Vec::new(),
             }
         })).collect();

@@ -757,7 +757,7 @@ mod tests {
         let mesh = MeshAsset {
             id: MeshId(0),
             name: "test_mesh".into(),
-            primitives: vec![prim],
+            primitives: vec![Arc::new(prim)],
         };
 
         let asset = Arc::new(AvatarAsset {

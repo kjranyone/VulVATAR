@@ -628,12 +628,14 @@ impl Application {
                                 weights
                             };
 
-                            let prim_arc = avatar
-                                .primitive_arcs
-                                .get(mi)
-                                .and_then(|v| v.get(pi))
-                                .cloned()
-                                .unwrap_or_else(|| std::sync::Arc::new(prim.clone()));
+                            // `prim` is `&Arc<MeshPrimitiveAsset>` from
+                            // the asset; the per-frame snapshot keeps a
+                            // refcount bump rather than deep-cloning the
+                            // vertex / index / morph payload. `mi` and
+                            // `pi` are kept in scope for clarity but no
+                            // longer index a separate arc table.
+                            let _ = (mi, pi);
+                            let prim_arc = std::sync::Arc::clone(prim);
 
                             RenderMeshInstance {
                                 mesh_id: mesh.id,

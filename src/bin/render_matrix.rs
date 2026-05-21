@@ -169,7 +169,7 @@ fn build_frame_input(
                     alpha_mode,
                     cull_mode,
                     outline: Default::default(),
-                    primitive_data: Some(Arc::new(prim.clone())),
+                    primitive_data: Some(Arc::clone(prim)),
                     morph_weights: Vec::new(),
                 }
             })

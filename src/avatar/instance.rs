@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use crate::asset::{
-    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, MeshPrimitiveAsset, NodeId, Transform,
-    Vec3,
+    AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, NodeId, Transform, Vec3,
 };
 use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::{
@@ -34,9 +33,6 @@ pub struct AvatarInstance {
     /// foreshortening can be inverted into Z. See
     /// [`PoseSolverState`] for details.
     pub pose_solver_state: PoseSolverState,
-    /// Pre-built `Arc<MeshPrimitiveAsset>` per (mesh, primitive) to avoid
-    /// cloning vertex data every frame. Built once in `AvatarInstance::new`.
-    pub primitive_arcs: Vec<Vec<Arc<MeshPrimitiveAsset>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,17 +144,6 @@ impl AvatarInstance {
             })
             .collect();
 
-        let primitive_arcs = asset
-            .meshes
-            .iter()
-            .map(|mesh| {
-                mesh.primitives
-                    .iter()
-                    .map(|prim| Arc::new(prim.clone()))
-                    .collect()
-            })
-            .collect();
-
         Self {
             id,
             asset_id,
@@ -178,7 +163,6 @@ impl AvatarInstance {
             cloth_overlays: Vec::new(),
             expression_weights: Vec::new(),
             pose_solver_state: PoseSolverState::default(),
-            primitive_arcs,
         }
     }
 
