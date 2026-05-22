@@ -458,17 +458,17 @@ provider encode permanent timing assumptions in isolation.
 ## Immediate Next Implementation Task
 
 The Phase 2 GPU export pool, Phase 3 cloth compute migration, Phase 3
-runtime budget, and the GPU-export-failure → `EmergencyCpu` counter
-(review pass 4) have all landed. The remaining immediate work is:
+runtime budget, the GPU-export-failure → `EmergencyCpu` counter, and the
+`EmergencyCpu → RenderExportMode::CpuReadback` wiring that closes the
+failure-recovery loop have all landed. Future slices that would extend
+the budget's reach (each a small wiring change with a real consumer in
+the same commit, so the budget doesn't accumulate dead policy outputs):
 
-> Plumb `pose_hz_target`, `depth_skip_period`, and
-> `facemesh_ep_preference` to their respective consumers, the same way
-> YOLOX skip is wired through `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`.
-> Each landing is a small slice: a `pub static AtomicU64`/`AtomicU32`
-> alongside the consumer's existing const, plus a one-line write in
-> `Application::update_runtime_gpu_budget`.
-
-These complete the runtime budget loop: today the budget is fully
-expressive on its outputs, and YOLOX + render FPS + the EmergencyCpu
-escalation path honour it. The remaining three (pose Hz, depth skip,
-facemesh EP) are inspector-visible but not yet acted on.
+- pose worker Hz throttle — `pub static AtomicU32` next to the pose
+  worker's loop tick, written from `Application::update_runtime_gpu_budget`.
+- depth refresh period — same pattern beside the depth provider's
+  per-frame guard.
+- FaceMesh ONNX EP preference — currently hard-coded per provider
+  (`Auto` for standalone rtmw3d, `ForceCpu` for the depth-colocated
+  paths). Plumbing the preference means re-init on change OR an
+  `AtomicU8` consulted at next session build.

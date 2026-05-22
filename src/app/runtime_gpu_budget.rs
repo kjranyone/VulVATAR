@@ -1,12 +1,28 @@
 //! Runtime GPU budget policy (P3-03).
 //!
 //! Centralises the render / output / tracking cadence decisions that were
-//! previously scattered as constants across `OutputRouter::set_target_fps`,
-//! `tracking/rtmw3d/mod.rs::YOLOX_REFRESH_PERIOD`, depth refresh periods
-//! and FaceMesh EP selection. Consumers read the latest target from the
-//! budget; the budget reads live measurements (render dt, output queue
-//! depth, export pool occupancy, recent GPU export failures) and decides
-//! one global [`DegradedMode`] level that drives all targets together.
+//! previously scattered as constants across `OutputRouter::set_target_fps`
+//! and `tracking/rtmw3d/mod.rs::YOLOX_REFRESH_PERIOD`. Consumers read the
+//! latest target from the budget; the budget reads live measurements
+//! (render dt, output queue depth, export pool occupancy, recent GPU
+//! export failures) and decides one global [`DegradedMode`] level that
+//! drives the wired targets together.
+//!
+//! Currently wired:
+//! - `render_fps_target` → `OutputRouter::set_target_fps` via
+//!   `Application::set_user_render_fps`
+//! - `yolox_skip_period` → `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`
+//!   (`pub static AtomicU64`)
+//! - `degraded_mode == EmergencyCpu` → forces `RenderExportMode::CpuReadback`
+//!   in `app/render.rs`, breaking the GPU-export → failure loop
+//!
+//! Not yet wired (would be follow-up work, with a real consumer in the
+//! same commit so the budget doesn't accumulate dead policy outputs):
+//! - pose worker Hz throttle
+//! - depth refresh period
+//! - FaceMesh ONNX EP preference (today the EP is hard-coded per
+//!   provider: `Auto` for standalone rtmw3d, `ForceCpu` for the depth-
+//!   colocated paths)
 //!
 //! See `plan/runtime-gpu-budget.md` for the design and threshold rationale.
 
@@ -37,22 +53,6 @@ impl DegradedMode {
             DegradedMode::EmergencyCpu => "Emergency CPU",
         }
     }
-}
-
-/// FaceMesh ONNX Runtime execution-provider preference. The actual EP
-/// negotiation happens in `tracking::face_mediapipe`; the budget just
-/// publishes the *intent* so the tracking worker can act on it next time
-/// it negotiates a session.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FaceMeshEpPreference {
-    /// Let the EP factory decide (current behaviour).
-    #[default]
-    Auto,
-    /// Prefer the GPU EP (DirectML on Windows).
-    Gpu,
-    /// Force the CPU EP. Used under heavy pressure to free up the
-    /// DirectML command queue for other workloads.
-    Cpu,
 }
 
 /// Snapshot of the inputs the budget uses for its decision. Constructed
@@ -112,10 +112,7 @@ pub struct RuntimeGpuBudget {
     user_render_fps: u32,
 
     render_fps_target: u32,
-    pose_hz_target: u32,
     yolox_skip_period: u32,
-    depth_skip_period: u32,
-    facemesh_ep_preference: FaceMeshEpPreference,
     degraded_mode: DegradedMode,
 
     pressure_since: Option<Instant>,
@@ -179,10 +176,7 @@ impl RuntimeGpuBudget {
         Self {
             user_render_fps: 60,
             render_fps_target: 60,
-            pose_hz_target: 30,
             yolox_skip_period: 4,
-            depth_skip_period: 4,
-            facemesh_ep_preference: FaceMeshEpPreference::Auto,
             degraded_mode: DegradedMode::Healthy,
             pressure_since: None,
             clean_streak_started: Some(now),
@@ -207,17 +201,8 @@ impl RuntimeGpuBudget {
     pub fn render_fps_target(&self) -> u32 {
         self.render_fps_target
     }
-    pub fn pose_hz_target(&self) -> u32 {
-        self.pose_hz_target
-    }
     pub fn yolox_skip_period(&self) -> u32 {
         self.yolox_skip_period
-    }
-    pub fn depth_skip_period(&self) -> u32 {
-        self.depth_skip_period
-    }
-    pub fn facemesh_ep_preference(&self) -> FaceMeshEpPreference {
-        self.facemesh_ep_preference
     }
     pub fn degraded_mode(&self) -> DegradedMode {
         self.degraded_mode
@@ -399,31 +384,19 @@ impl RuntimeGpuBudget {
         match self.degraded_mode {
             DegradedMode::Healthy => {
                 self.render_fps_target = self.user_render_fps;
-                self.pose_hz_target = 30;
                 self.yolox_skip_period = 4;
-                self.depth_skip_period = 4;
-                self.facemesh_ep_preference = FaceMeshEpPreference::Auto;
             }
             DegradedMode::PressureLight => {
                 self.render_fps_target = self.user_render_fps.min(45);
-                self.pose_hz_target = 25;
                 self.yolox_skip_period = 6;
-                self.depth_skip_period = 6;
-                self.facemesh_ep_preference = FaceMeshEpPreference::Auto;
             }
             DegradedMode::PressureHeavy => {
                 self.render_fps_target = self.user_render_fps.min(30);
-                self.pose_hz_target = 20;
                 self.yolox_skip_period = 8;
-                self.depth_skip_period = 8;
-                self.facemesh_ep_preference = FaceMeshEpPreference::Cpu;
             }
             DegradedMode::EmergencyCpu => {
                 self.render_fps_target = self.user_render_fps.min(30);
-                self.pose_hz_target = 15;
                 self.yolox_skip_period = 12;
-                self.depth_skip_period = 12;
-                self.facemesh_ep_preference = FaceMeshEpPreference::Cpu;
             }
         }
     }
@@ -536,10 +509,7 @@ mod tests {
         m.gpu_export_failures_this_tick = EMERGENCY_FAILURE_COUNT as u32;
         budget.update(&m, t0 + Duration::from_millis(32));
         assert_eq!(budget.degraded_mode(), DegradedMode::EmergencyCpu);
-        assert_eq!(
-            budget.facemesh_ep_preference(),
-            FaceMeshEpPreference::Cpu
-        );
+        assert_eq!(budget.yolox_skip_period(), 12);
     }
 
     /// Failures arriving one-per-tick still accumulate to the

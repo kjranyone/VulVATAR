@@ -198,7 +198,18 @@ impl Application {
 
         if !self.avatars.is_empty() {
             let output_extent = self.output_extent.unwrap_or(self.viewport_extent);
-            let export_mode = if self.output.active_sink().supports_gpu_tokens() {
+            // `EmergencyCpu` is the budget's "GPU export is failing —
+            // stop trying" mode, escalated when the export pool reports
+            // repeated GpuExport failures within FAILURE_WINDOW. Once
+            // there, force CpuReadback regardless of sink capability so
+            // we stop generating the same failures the budget escalated
+            // on. The next ProducerWaitComplete that lands resets the
+            // mode back to Healthy and GpuExport resumes naturally.
+            let force_cpu_export = self.runtime_gpu_budget.degraded_mode()
+                == crate::app::runtime_gpu_budget::DegradedMode::EmergencyCpu;
+            let export_mode = if !force_cpu_export
+                && self.output.active_sink().supports_gpu_tokens()
+            {
                 RenderExportMode::GpuExport
             } else {
                 RenderExportMode::CpuReadback
