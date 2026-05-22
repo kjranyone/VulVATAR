@@ -1,36 +1,59 @@
 //! Per-vertex normal computation and write-back to the renderable ClothState.
+//!
+//! Normals use **angle-weighted** face-normal accumulation (Max 1999,
+//! "Weights for Computing Vertex Normals from Facet Normals"). Each
+//! triangle's contribution to a vertex is its unit face-normal scaled
+//! by the incident angle at that vertex, summed across all incident
+//! triangles, then normalised once per vertex.
+//!
+//! Compared with the prior area-weighted accumulation (face-normal scaled
+//! by 2 × triangle area):
+//!
+//! - On regular meshes the two converge to the same answer.
+//! - On **irregular** triangulations — long thin triangles next to short
+//!   compact ones, T-junctions, fans where one triangle dominates the
+//!   1-ring area — angle weighting gives noticeably smoother shading
+//!   because each triangle's contribution is bounded by `[0, π]` rather
+//!   than by its (potentially unbounded) area. The area-weighted scheme
+//!   skews the normal toward whichever triangle happens to be largest.
+//!
+//! Cost per triangle is one extra `acos` for each of the three vertices
+//! plus three edge normalisations — negligible against the constraint
+//! solver and well within the cloth path's per-frame budget.
 
-use crate::math_utils::{vec3_add, vec3_cross, vec3_normalize, vec3_sub};
+use crate::math_utils::{vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_normalize, vec3_scale, vec3_sub};
 use crate::simulation::cloth::ClothSimState;
 
 // =========================================================================
-// Per-vertex normal computation (M2)
+// Per-vertex normal computation (Max 1999, angle-weighted)
 // =========================================================================
+
+/// Angle between two unit-or-zero vectors `u`, `v`. Returns 0 if either
+/// side is degenerate (effectively dropping the triangle's contribution
+/// to this vertex, which is correct — a degenerate edge can't define
+/// an angle).
+fn safe_angle_between(u: [f32; 3], v: [f32; 3]) -> f32 {
+    let lu = vec3_length(&u);
+    let lv = vec3_length(&v);
+    if lu < 1e-9 || lv < 1e-9 {
+        return 0.0;
+    }
+    let dot = vec3_dot(&u, &v) / (lu * lv);
+    // Clamp to `[-1, 1]` so a tiny float drift past the unit-circle
+    // doesn't make `acos` return NaN.
+    dot.clamp(-1.0, 1.0).acos()
+}
 
 pub(crate) fn compute_normals(sim: &mut ClothSimState) {
     let n = sim.particles.len();
-    // Resize normals buffer inside sim (we store temporarily in a local vec
-    // and then copy back, since ClothSimState doesn't have a normals field
-    // -- we'll write directly to the output in write_back instead).
-    // Actually, we compute here and store in a side buffer attached to sim.
-    // We'll use the temp_positions-style approach: store in the sim state.
-    // For simplicity, we compute here and pass via a static-lifetime trick.
-    // Better: we store the computed normals in a Vec on the stack and pass
-    // them to write_back.  But since step_cloth calls compute_normals then
-    // write_back separately, we need storage.  Let's add a normals vec to
-    // ClothSimState.  It's already there as an implicit need.
-
-    // Lazy-init normals buffer on ClothSimState
+    // Lazy-init normals buffer.
     if sim.computed_normals.len() != n {
         sim.computed_normals.resize(n, [0.0; 3]);
     }
-
-    // Zero out
     for normal in sim.computed_normals.iter_mut() {
         *normal = [0.0, 0.0, 0.0];
     }
 
-    // Accumulate face normals from triangles
     let idx = &sim.triangle_indices;
     let tri_count = idx.len() / 3;
     for t in 0..tri_count {
@@ -45,16 +68,39 @@ pub(crate) fn compute_normals(sim: &mut ClothSimState) {
         let p1 = sim.particles[i1].position;
         let p2 = sim.particles[i2].position;
 
-        let e1 = vec3_sub(&p1, &p0);
-        let e2 = vec3_sub(&p2, &p0);
-        let face_normal = vec3_cross(&e1, &e2); // not normalized; magnitude = 2*area (area-weighted)
+        // Face normal — normalised so the angle weights are the sole
+        // contribution magnitude. Skip degenerate triangles whose
+        // cross product is below the noise floor (collinear points,
+        // duplicate vertices, etc.).
+        let e01 = vec3_sub(&p1, &p0);
+        let e02 = vec3_sub(&p2, &p0);
+        let raw_normal = vec3_cross(&e01, &e02);
+        let face_area2 = vec3_length(&raw_normal);
+        if face_area2 < 1e-12 {
+            continue;
+        }
+        let face_normal = vec3_scale(&raw_normal, 1.0 / face_area2);
 
-        sim.computed_normals[i0] = vec3_add(&sim.computed_normals[i0], &face_normal);
-        sim.computed_normals[i1] = vec3_add(&sim.computed_normals[i1], &face_normal);
-        sim.computed_normals[i2] = vec3_add(&sim.computed_normals[i2], &face_normal);
+        // Three incident angles. By construction
+        // `α0 + α1 + α2 = π`, but rounding sometimes drifts; the
+        // sum-to-π identity is not load-bearing for shading.
+        let e10 = vec3_sub(&p0, &p1);
+        let e12 = vec3_sub(&p2, &p1);
+        let e20 = vec3_sub(&p0, &p2);
+        let e21 = vec3_sub(&p1, &p2);
+        let a0 = safe_angle_between(e01, e02);
+        let a1 = safe_angle_between(e10, e12);
+        let a2 = safe_angle_between(e20, e21);
+
+        sim.computed_normals[i0] =
+            vec3_add(&sim.computed_normals[i0], &vec3_scale(&face_normal, a0));
+        sim.computed_normals[i1] =
+            vec3_add(&sim.computed_normals[i1], &vec3_scale(&face_normal, a1));
+        sim.computed_normals[i2] =
+            vec3_add(&sim.computed_normals[i2], &vec3_scale(&face_normal, a2));
     }
 
-    // Normalize
+    // Normalise.
     for normal in sim.computed_normals.iter_mut() {
         *normal = vec3_normalize(normal);
     }

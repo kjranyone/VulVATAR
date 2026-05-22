@@ -841,6 +841,17 @@ layout(set = 0, binding = 5) uniform Control {
     uint _pad2;
 } ctrl;
 
+// Angle between two vectors, robust against degenerate inputs.
+// Returns 0 when either side has near-zero length so a collinear /
+// zero-length edge doesn't contribute a NaN to the accumulator.
+float safe_angle(vec3 u, vec3 v) {
+    float lu = length(u);
+    float lv = length(v);
+    if (lu < 1e-9 || lv < 1e-9) return 0.0;
+    float d = dot(u, v) / (lu * lv);
+    return acos(clamp(d, -1.0, 1.0));
+}
+
 void main() {
     uint vid = gl_GlobalInvocationID.x;
     if (vid >= ctrl.vertex_count) return;
@@ -848,6 +859,11 @@ void main() {
     uint start = adj_offsets.o[vid];
     uint end   = adj_offsets.o[vid + 1u];
 
+    // Angle-weighted (Max 1999) face-normal accumulation. Each
+    // incident triangle contributes its **unit** face normal scaled
+    // by the incident angle at THIS vertex, so the result depends
+    // only on the local geometry around the 1-ring rather than on
+    // which incident triangle happens to be largest.
     vec3 accum = vec3(0.0);
     for (uint k = start; k < end; ++k) {
         uint tri = adj_triangles.t[k];
@@ -857,8 +873,21 @@ void main() {
         vec3 p0 = positions.p[i0].xyz;
         vec3 p1 = positions.p[i1].xyz;
         vec3 p2 = positions.p[i2].xyz;
-        // Unnormalised cross product → area-weighted face normal.
-        accum += cross(p1 - p0, p2 - p0);
+        vec3 raw_normal = cross(p1 - p0, p2 - p0);
+        float face_area2 = length(raw_normal);
+        if (face_area2 < 1e-12) continue;  // degenerate triangle
+        vec3 face_normal = raw_normal / face_area2;
+        // Pick the two edges that meet at the current vertex `vid`
+        // and weight by the angle between them.
+        float angle;
+        if (vid == i0) {
+            angle = safe_angle(p1 - p0, p2 - p0);
+        } else if (vid == i1) {
+            angle = safe_angle(p0 - p1, p2 - p1);
+        } else {
+            angle = safe_angle(p0 - p2, p1 - p2);
+        }
+        accum += face_normal * angle;
     }
 
     float len = length(accum);

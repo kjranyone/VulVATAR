@@ -742,12 +742,27 @@ mod tests {
 
     /// Direct port of the `cloth_normal_cs::main` body. Used in the
     /// parity test below to verify the GLSL normal recomputation matches
-    /// the CPU PBD reference (`cloth_solver::output::compute_normals`).
+    /// the CPU reference (`cloth_solver::output::compute_normals`).
+    ///
+    /// Implements the same **angle-weighted** (Max 1999) accumulation
+    /// as both the CPU reference and the GLSL shader: each incident
+    /// triangle contributes its unit face normal scaled by the angle
+    /// at the vertex.
     fn cpu_mirror_of_cloth_normal_cs(
         positions: &[[f32; 3]],
         triangle_indices: &[u32],
         adj: &VertexTriangleAdjacency,
     ) -> Vec<[f32; 3]> {
+        fn safe_angle(u: [f32; 3], v: [f32; 3]) -> f32 {
+            let lu = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+            let lv = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if lu < 1e-9 || lv < 1e-9 {
+                return 0.0;
+            }
+            let dot = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (lu * lv);
+            dot.clamp(-1.0, 1.0).acos()
+        }
+
         let n = positions.len();
         let mut normals = vec![[0.0_f32, 1.0, 0.0]; n];
         for vid in 0..n {
@@ -769,9 +784,29 @@ mod tests {
                     e1[2] * e2[0] - e1[0] * e2[2],
                     e1[0] * e2[1] - e1[1] * e2[0],
                 ];
-                accum[0] += cross[0];
-                accum[1] += cross[1];
-                accum[2] += cross[2];
+                let face_area2 = (cross[0] * cross[0]
+                    + cross[1] * cross[1]
+                    + cross[2] * cross[2])
+                    .sqrt();
+                if face_area2 < 1e-12 {
+                    continue;
+                }
+                let inv = 1.0 / face_area2;
+                let face_normal = [cross[0] * inv, cross[1] * inv, cross[2] * inv];
+                let angle = if vid == i0 {
+                    safe_angle(e1, e2)
+                } else if vid == i1 {
+                    let e10 = [-e1[0], -e1[1], -e1[2]];
+                    let e12 = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+                    safe_angle(e10, e12)
+                } else {
+                    let e20 = [-e2[0], -e2[1], -e2[2]];
+                    let e21 = [p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]];
+                    safe_angle(e20, e21)
+                };
+                accum[0] += face_normal[0] * angle;
+                accum[1] += face_normal[1] * angle;
+                accum[2] += face_normal[2] * angle;
             }
             let len = (accum[0] * accum[0] + accum[1] * accum[1] + accum[2] * accum[2]).sqrt();
             if len > 1e-12 {
