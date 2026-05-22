@@ -96,11 +96,16 @@ to roughly 2599 lines (≈ 1280 lines extracted, 33% reduction).
 
 What's left in `mod.rs` at this point:
 
-- The `render()` body itself (~900 lines) — tightly coupled to
-  command-buffer state, would need its own analysis pass before
-  extraction.
-- `render_thumbnail` / `render_to_thumbnail` — share infrastructure
-  with `render()`; split alongside it.
+- The `render()` body itself (~900 lines). Inside that body, the
+  GPU cloth dispatch sub-routine (~280 lines: bind verlet, lambda
+  update / accumulate / apply iterations, normal recompute) is a
+  cohesive sub-system that could move to `cloth_cache.rs` as
+  `dispatch_cloth_gpu(builder, …)` — the descriptor sets it consumes
+  already live there. The rest of `render()` is genuinely
+  coordination-shaped (command-buffer setup, per-primitive draw,
+  readback bookkeeping).
+- `render_thumbnail` — small wrapper that calls `render()` with a
+  thumbnail-sized request.
 - The `VulkanRenderer` struct definition.
 - Small helpers: `color_attachment_format`, `apply_color_space`,
   `resize`, `clear_caches`, `release_export_lease`,

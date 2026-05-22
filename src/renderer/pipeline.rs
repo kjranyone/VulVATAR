@@ -416,7 +416,7 @@ void main() {
 // Transform compute shader (skinning + morph + cloth fuse)
 //
 // Dispatched once per (instance, primitive) per frame from the renderer's
-// `render()` / `render_to_thumbnail()` paths. Reads per-vertex base data +
+// `render()` path. Reads per-vertex base data +
 // per-frame morph weights + per-frame cloth snapshots and writes
 // world-space `GpuVertex` records that the graphics pipelines consume as
 // their vertex buffer. The graphics `vs` / `outline_vs` above only apply

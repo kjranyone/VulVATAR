@@ -305,11 +305,6 @@ impl VulkanRenderer {
             ps.graphics_pipeline = Some(gfx_pipeline);
         }
 
-        // The thumbnail pipeline is bound to the previous render pass; drop
-        // the cache so the next thumbnail render rebuilds against the new
-        // pass without an "incompatible render pass" panic.
-        self.thumb_cache = None;
-
         // Material descriptor sets were allocated against the *previous*
         // `gfx_pipeline.layout().set_layouts()[1]`. The new graphics
         // pipelines built above carry brand-new `PipelineLayout` /
