@@ -111,10 +111,10 @@ pub struct ClothGpuDispatchControl {
     pub gravity: [f32; 3],
     /// `wind_direction * wind_response` baked into a single vector.
     pub wind_force: [f32; 3],
-    /// PBD constraint iteration count for this frame. Mirror of
+    /// XPBD constraint iteration count for this frame. Mirror of
     /// `ClothSimState::solver_iterations`; the renderer runs the
-    /// accumulate+apply compute passes this many times before the
-    /// normal recomputation pass.
+    /// lambda-update + accumulate + apply compute passes this many
+    /// times per substep before the normal recomputation pass.
     pub solver_iterations: u32,
 }
 

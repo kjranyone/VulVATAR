@@ -505,24 +505,20 @@ void main() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cloth PBD distance constraint projection — accumulate pass (P3-02 S2.1)
-// ---------------------------------------------------------------------------
-//
-// Jacobi-style 2-pass constraint projection: this first shader runs one
-// invocation per particle, walks the constraints touching that particle
-// via a precomputed CSR adjacency (`build_particle_constraint_adjacency`),
-// and writes per-particle position corrections into `delta_ssbo`. The
-// apply pass below adds the deltas to `pos_ssbo` and zeroes
-// `delta_ssbo` for the next iteration.
-//
-// Choosing Jacobi (2 passes per iteration) over Gauss-Seidel-on-GPU
-// (atomics or partition coloring) keeps the shader simple — no
-// atomicAdd, no `VK_EXT_shader_atomic_float`, no per-constraint colour
-// dispatch. Convergence per iteration is slower than Gauss-Seidel, so
-// real workloads typically run more iterations to compensate.
 // =========================================================================
 // Cloth XPBD distance constraint — lambda update pass (per-constraint)
+// =========================================================================
+//
+// Three-pass XPBD constraint projection (Macklin/Müller/Chentanez 2016):
+//   1. lambda update (per constraint): compute Δλ_j, update persistent λ
+//   2. accumulate (per particle): walk adjacency CSR, sum w·d·Δλ into Δx
+//   3. apply (per particle): add Δx to position, zero Δx for next iter
+//
+// Choosing Jacobi (2 passes per iteration after the lambda update) over
+// Gauss-Seidel-on-GPU (atomics or partition coloring) keeps the shaders
+// simple — no atomicAdd, no `VK_EXT_shader_atomic_float`, no
+// per-constraint colour dispatch. Convergence per iteration is slower
+// than Gauss-Seidel, so real workloads run more iterations to compensate.
 // =========================================================================
 //
 // First of three passes per iteration of the GPU XPBD distance-constraint
@@ -736,7 +732,7 @@ void main() {
 }
 
 // ---------------------------------------------------------------------------
-// Cloth PBD distance constraint projection — apply pass (P3-02 S2.1)
+// Cloth XPBD distance constraint projection — apply pass (P3-02 S2.1)
 // ---------------------------------------------------------------------------
 pub mod cloth_constraint_apply_cs {
     vulkano_shaders::shader! {
@@ -1460,8 +1456,11 @@ pub fn create_cloth_verlet_compute_pipeline(
 
 /// Per-constraint SSBO entry consumed by `cloth_constraint_accumulate_cs`
 /// (P3-02 S2.1). std430 layout — 16 bytes per constraint, packed tight.
-/// `stiffness` is the [0,1] PBD relaxation factor copied from
-/// `ClothDistanceConstraint::stiffness`.
+/// `stiffness` is the [0,1] knob the author sets; the lambda-update
+/// shader maps it to XPBD compliance via
+/// `xpbd_compliance(stiffness) = (1 - stiffness)² * 1e-7` so
+/// `stiffness = 1` yields the rigid (α = 0) limit and `stiffness = 0`
+/// short-circuits to "constraint disabled".
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct ClothConstraintGpu {
@@ -1550,7 +1549,7 @@ pub fn create_cloth_constraint_accumulate_compute_pipeline(
     .map_err(|e| format!("failed to create cloth constraint accumulate pipeline: {e}"))
 }
 
-/// Build the cloth PBD constraint apply compute pipeline
+/// Build the cloth XPBD constraint apply compute pipeline
 /// (P3-02 S2.1, second pass of the Jacobi-style iteration).
 pub fn create_cloth_constraint_apply_compute_pipeline(
     device: Arc<Device>,

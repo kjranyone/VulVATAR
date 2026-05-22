@@ -1,7 +1,7 @@
 //! Cloth GPU solver resource allocation — extracted from
 //! `VulkanRenderer` as the third slice of the #12 renderer split.
 //! Owns the per-primitive cloth slot construction (Verlet integrator
-//! state, optional PBD constraint resources, optional normal-
+//! state, optional XPBD constraint resources, optional normal-
 //! recomputation resources) used by the cloth compute dispatch
 //! pipeline. The render-loop dispatch wiring still lives in `mod.rs`
 //! next to the rest of the per-frame command-buffer construction;

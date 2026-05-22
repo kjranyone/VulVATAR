@@ -427,7 +427,7 @@ mod tests {
         let wind_response = 0.0_f32; // wind_force = wind * response = 0
         let damping = 0.02_f32;
 
-        // ----- CPU PBD path -----
+        // ----- CPU XPBD path -----
         let mut sim = ClothSimState {
             particles: (0..4)
                 .map(|i| ClothParticle::new([i as f32, 1.0, 0.0], false))
@@ -914,7 +914,7 @@ mod tests {
             }
         }
 
-        // ----- CPU PBD reference -----
+        // ----- CPU XPBD reference -----
         let mut sim = ClothSimState {
             particles: positions
                 .iter()

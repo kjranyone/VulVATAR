@@ -81,25 +81,36 @@ It should not:
 ## Skinning Notes
 
 Skinning lives in the transform compute prepass, not in the graphics
-vertex shader. The shape is unchanged:
+vertex shader. The shape is unchanged on the input side:
 
 - up to four weights per vertex
 - skinning matrices uploaded per instance (one SSBO per `AvatarInstance`,
   bound at compute set 1)
-- linear blend in the compute kernel:
 
-```text
-skinned_position =
-    weight0 * (joint_matrix0 * source_position) +
-    weight1 * (joint_matrix1 * source_position) +
-    weight2 * (joint_matrix2 * source_position) +
-    weight3 * (joint_matrix3 * source_position)
-```
+The blend itself is Dual Quaternion Skinning (DQS, Kavan et al. I3D
+2007), not linear blend:
+
+1. extract a rotation quaternion from each joint's skinning matrix
+   (Mike Day's mat3→quat case-split — see `pipeline::transform_cs`)
+2. pick the first non-zero-weight joint as the antipodal reference;
+   flip subsequent contributing quaternions when `dot(qi, ref) < 0`
+3. weighted-blend the (flipped) quaternions and renormalise
+4. recover translation as the weighted average of each joint matrix's
+   `m[3].xyz` (kept separate from the quaternion blend because the
+   source matrices are `global · inverse_bind` products with
+   already-world-space translations)
+5. apply: `pos' = quat_rotate(q, pos) + t`,
+   `nrm' = quat_rotate(q, nrm)`
 
 `source_position` is the morph- and (optionally) cloth-resolved position
 described below; the prepass applies skinning on top so cloth-bearing
-primitives still ride the avatar's root transform. Normals use
-`mat3(skin) * source_normal` rather than reusing the position transform.
+primitives still ride the avatar's root transform. DQS eliminates the
+candy-wrapper twist artefact at joints with non-trivial rotational
+delta (forearm pronation, hip yaw, neck twist) that classic LBS shows.
+
+Assumption: skinning matrices are rigid (rotation + translation only).
+Non-uniform scale in inverse-bind matrices is silently lost by the
+mat3→quat extraction.
 
 ## Cloth Deformation Notes
 

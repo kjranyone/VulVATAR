@@ -177,7 +177,7 @@ struct ClothGpuSlot {
     ///   1 = `prev_pos_ssbo` (read-write)
     ///   2 = `verlet_control_ubo` (uniform)
     verlet_set: Arc<DescriptorSet>,
-    /// PBD constraint projection resources. `None` when the cloth has
+    /// XPBD constraint projection resources. `None` when the cloth has
     /// no distance constraints (e.g. authoring only set up a triangulated
     /// mesh for normal recomputation).
     constraints: Option<ClothGpuConstraintResources>,
@@ -1226,7 +1226,7 @@ impl VulkanRenderer {
                                 .map_err(|e| format!("render: cloth verlet dispatch: {e}"))?;
                         }
 
-                        // S2.1 — PBD constraint projection iterations.
+                        // S2.1 — XPBD constraint projection iterations.
                         let constraint_iters = ctrl.solver_iterations.max(1);
                         let constraint_resources = self
                             .transform_cache

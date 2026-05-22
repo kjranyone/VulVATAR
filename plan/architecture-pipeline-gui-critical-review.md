@@ -24,8 +24,9 @@ non-`ImageSequence` sink on Windows
 GPU-token support via `Win32FileBackedSharedMemorySink`, and the export
 path picks `RenderExportMode::GpuExport` whenever the active sink agrees.
 The remaining unfinished work is the MF Virtual Camera **DLL consumer**
-(tracked out-of-tree in the `vulvatar-mf-camera` repository) and the
-additional cross-process sync primitives — both items live in
+(in-tree at `vulvatar-mf-camera/` — workspace member with its own
+`cargo build -p vulvatar-mf-camera` build + DLL install lifecycle) and
+the additional cross-process sync primitives — both items live in
 [`gpu-runtime-roadmap-tasks.md`](./gpu-runtime-roadmap-tasks.md) §"What
 is actually still open" rather than here.
 

@@ -8,7 +8,7 @@ use crate::simulation::cloth::{ClothSimTempBuffers, ResolvedCollider};
 mod collision;
 // `pub(crate)` so the GPU cloth boundary's formula-parity tests can
 // call them directly to compare the GLSL shaders' formulas against
-// the CPU PBD references.
+// the CPU XPBD references.
 pub(crate) mod constraints;
 pub(crate) mod integrator;
 pub(crate) mod output;
@@ -47,7 +47,7 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
 
     // For Gpu-backed cloth the renderer dispatches the integration /
     // constraint projection / normal recomputation compute pipelines;
-    // running the CPU PBD path on top would waste CPU cycles and the
+    // running the CPU XPBD path on top would waste CPU cycles and the
     // resulting deform_output would just be ignored by the renderer.
     if cloth_state.solver_backend
         == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu

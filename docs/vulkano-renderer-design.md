@@ -111,8 +111,8 @@ Runs once per (instance, primitive) before the graphics passes start.
 
 Responsibilities:
 
-- fuse linear blend skinning, morph-target blending, and cloth override
-  into a single dispatch
+- fuse dual quaternion skinning, morph-target blending, and cloth
+  override into a single dispatch
 - write world-space `GpuVertex` records to a persistent SSBO that the
   graphics passes bind as their vertex buffer
 
@@ -213,8 +213,8 @@ constant for outline width / colour.
 
 ## Skinning Strategy
 
-Linear blend skinning runs inside the transform compute prepass, not
-the graphics vertex shader. Inputs are unchanged:
+Dual quaternion skinning (DQS) runs inside the transform compute
+prepass, not the graphics vertex shader. Inputs are unchanged:
 
 - four weights and four joint indices per vertex in `GpuVertexBase`
 - one skinning matrix SSBO per `AvatarInstance`, bound to compute set 1

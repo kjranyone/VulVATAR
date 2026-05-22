@@ -22,7 +22,7 @@ into an executable sequence of work. One architectural rule:
 | 2 | P2-02 export image pool (`ExportImagePool`) | DONE |
 | 2 | P2-03 explicit sync on token path (`OutputSyncToken`, sink ack) | DONE — `ProducerWaitComplete` is the first supported primitive; fence / keyed-mutex variants land alongside the out-of-tree DLL work |
 | 2 | P2-04 diagnostics tell the truth (handoff path, pool occupancy) | DONE |
-| 2 | P2-05 first live sink (`Win32FileBackedSharedMemorySink`) emits VGTK | DONE on the producer side. MF Virtual Camera DLL consumer is tracked **out-of-tree** in the separate `vulvatar-mf-camera` repository |
+| 2 | P2-05 first live sink (`Win32FileBackedSharedMemorySink`) emits VGTK | DONE on the producer side. MF Virtual Camera DLL consumer lives in the in-tree `vulvatar-mf-camera/` workspace member (separate build/install lifecycle) |
 | 2 | P2-05 second live sink migration | OPEN — waiting for the DLL slice to ship before touching another sink |
 | 3 | P3-01 cloth GPU-state boundary | DONE |
 | 3 | P3-02 cloth solver to compute (Verlet + XPBD + normals; PBD → XPBD migration landed on both CPU and GPU paths — see [`sota-algorithm-upgrades.md`](./sota-algorithm-upgrades.md)) | DONE |
@@ -42,11 +42,13 @@ into an executable sequence of work. One architectural rule:
    `OutputSyncToken` but the producer does not emit them yet. Each variant
    needs (a) a renderer-side export path and (b) the matching DLL contract.
 
-### Out-of-tree
+### MF Virtual Camera DLL (separate build lifecycle)
 
 - **MF DLL update to open shared D3D textures by exported handle** —
-  tracked in the `vulvatar-mf-camera` repository. Producer-side is complete
-  and the wire protocol is documented in
+  the `vulvatar-mf-camera/` workspace member. Built and installed
+  independently of the main binary
+  (`cargo build -p vulvatar-mf-camera --release`). Producer-side is
+  complete and the wire protocol is documented in
   [`docs/output-interop.md`](../docs/output-interop.md) §"Win32 GPU-handle sidecar".
 
 ## Hardware verification (separate plan)
