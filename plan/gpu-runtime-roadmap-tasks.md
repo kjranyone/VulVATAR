@@ -1,7 +1,7 @@
 # GPU runtime roadmap tasks
 
 Date: 2026-05-18  
-Last stocktake: 2026-05-21
+Last stocktake: 2026-05-22
 
 ## Goal
 
@@ -11,7 +11,7 @@ into an executable sequence of work. One architectural rule:
 > Large frame-shaped data stays on the GPU; the CPU moves compact control data
 > and lifetime tokens.
 
-## Status snapshot (2026-05-21)
+## Status snapshot (2026-05-22)
 
 | Phase | Workstream | State |
 |---|---|---|
@@ -25,7 +25,7 @@ into an executable sequence of work. One architectural rule:
 | 2 | P2-05 first live sink (`Win32FileBackedSharedMemorySink`) emits VGTK | DONE on the producer side. MF Virtual Camera DLL consumer is tracked **out-of-tree** in the separate `vulvatar-mf-camera` repository |
 | 2 | P2-05 second live sink migration | OPEN — waiting for the DLL slice to ship before touching another sink |
 | 3 | P3-01 cloth GPU-state boundary | DONE |
-| 3 | P3-02 cloth solver to compute (Verlet + PBD + normals) | DONE |
+| 3 | P3-02 cloth solver to compute (Verlet + XPBD + normals; PBD → XPBD migration landed on both CPU and GPU paths — see [`sota-algorithm-upgrades.md`](./sota-algorithm-upgrades.md)) | DONE |
 | 3 | P3-03 `RuntimeGpuBudget` policy + consumers | DONE |
 | — | compute prepass migration (skinning + morph + cloth fused) | DONE — see [`docs/vulkano-renderer-design.md`](../docs/vulkano-renderer-design.md) §"Compute prepass" |
 
