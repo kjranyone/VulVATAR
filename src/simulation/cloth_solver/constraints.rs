@@ -146,28 +146,28 @@ pub(crate) fn project_distance_constraints(
 
         buffers.correction_accumulator[a] =
             vec3_add(&buffers.correction_accumulator[a], &corr_a);
-        buffers.correction_counts[a] += 1;
-
         buffers.correction_accumulator[b] =
             vec3_add(&buffers.correction_accumulator[b], &corr_b);
-        buffers.correction_counts[b] += 1;
     }
 
-    // Jacobi-averaged Δx application: every constraint that touches
-    // particle `i` contributes one entry into the accumulator; we
-    // apply the mean. Matches the PBD code path this XPBD pass
-    // replaced so the existing collision / pin / self-collision
-    // phases see corrections of comparable magnitude.
+    // Sum-of-corrections Δx application: every constraint that
+    // touches particle `i` adds its full XPBD Δx_i contribution into
+    // the accumulator and we apply the sum. The previous Jacobi-
+    // averaged form (`accumulator / count`) was inconsistent with the
+    // per-constraint λ update — λ accumulates the un-averaged C/w_sum,
+    // so dividing the position by `count` biased the next iteration's
+    // C towards an inflated residual and let effective stiffness drift
+    // with mesh connectivity. Direct sum matches the GLSL accumulate
+    // pass byte-for-byte and is the formulation the XPBD paper assumes.
     for i in 0..sim.particles.len() {
         if sim.particles[i].pinned {
             continue;
         }
-        let count = buffers.correction_counts[i];
-        if count == 0 {
+        let corr = buffers.correction_accumulator[i];
+        if corr[0] == 0.0 && corr[1] == 0.0 && corr[2] == 0.0 {
             continue;
         }
-        let avg = vec3_scale(&buffers.correction_accumulator[i], 1.0 / count as f32);
-        sim.particles[i].position = vec3_add(&sim.particles[i].position, &avg);
+        sim.particles[i].position = vec3_add(&sim.particles[i].position, &corr);
     }
 }
 

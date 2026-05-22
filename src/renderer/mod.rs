@@ -1206,28 +1206,10 @@ impl VulkanRenderer {
                             };
                             gpu.state.bump_version();
                         }
-                        builder
-                            .bind_pipeline_compute(cloth_verlet_pipeline.clone())
-                            .map_err(|e| {
-                                format!("render: bind cloth verlet pipeline: {e}")
-                            })?;
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Compute,
-                                cloth_verlet_pipeline.layout().clone(),
-                                0,
-                                verlet_set,
-                            )
-                            .map_err(|e| format!("render: bind cloth verlet set: {e}"))?;
                         let groups = particle_count.div_ceil(TRANSFORM_LOCAL_SIZE);
-                        unsafe {
-                            builder
-                                .dispatch([groups, 1, 1])
-                                .map_err(|e| format!("render: cloth verlet dispatch: {e}"))?;
-                        }
-
-                        // S2.1 — XPBD constraint projection iterations.
+                        // S2.1 — XPBD constraint projection resources.
                         let constraint_iters = ctrl.solver_iterations.max(1);
+                        let substeps = ctrl.substeps.max(1);
                         let constraint_resources = self
                             .transform_cache
                             .get(&key)
@@ -1243,7 +1225,12 @@ impl VulkanRenderer {
                                     c.constraint_count,
                                 )
                             });
-                        if let (
+                        // Write the constraint UBO once per frame —
+                        // particle_count + constraint_count are slot-
+                        // static, dt is the per-substep duration, and
+                        // we run every substep with the same value.
+                        // λ is reset per-substep via fill_buffer below.
+                        let constraint_pack = if let (
                             Some((
                                 lambda_update_set,
                                 accumulate_set,
@@ -1261,11 +1248,6 @@ impl VulkanRenderer {
                             self.cloth_constraint_accumulate_pipeline.clone(),
                             self.cloth_constraint_apply_pipeline.clone(),
                         ) {
-                            // Refresh the control UBO once per substep.
-                            // particle_count + constraint_count are
-                            // static for the slot; `dt` follows the
-                            // substep duration so the XPBD lambda
-                            // update can build `α̃ = α / dt²`.
                             {
                                 let mut g = constraint_ctrl_ubo.write().map_err(|e| {
                                     format!("render: constraint UBO write: {e}")
@@ -1277,91 +1259,157 @@ impl VulkanRenderer {
                                     _pad: 0,
                                 };
                             }
-                            // Reset lambda for this substep. XPBD's λ
-                            // accumulates across the projection
-                            // iterations *within* one substep, then
-                            // starts fresh at the next substep — same
-                            // lifecycle as `ClothSimTempBuffers::
-                            // reset_lambda` on the CPU side.
+                            Some((
+                                lambda_update_set,
+                                accumulate_set,
+                                apply_set,
+                                lambda_ssbo,
+                                constraint_count,
+                                lambda_update_pipeline,
+                                accumulate_pipeline,
+                                apply_pipeline,
+                            ))
+                        } else {
+                            None
+                        };
+
+                        // Substep loop: each substep advances Verlet
+                        // integration by `ctrl.dt` (fixed_dt), then
+                        // runs `constraint_iters` XPBD constraint
+                        // iterations. Matches the CPU path's
+                        // `for _ in 0..substeps { step_cloth(fixed_dt) }`
+                        // loop in `simulation::step_cloth_overlays`.
+                        // Before this loop the GPU dispatched the
+                        // whole thing once at frame_dt, integrating
+                        // gravity·dt² with `substeps²` more energy and
+                        // making α̃ = α/dt² `substeps²` smaller — CPU
+                        // and GPU produced qualitatively different
+                        // cloth physics.
+                        for _ in 0..substeps {
                             builder
-                                .fill_buffer(
-                                    lambda_ssbo.clone().reinterpret::<[u32]>(),
-                                    0u32,
+                                .bind_pipeline_compute(cloth_verlet_pipeline.clone())
+                                .map_err(|e| {
+                                    format!("render: bind cloth verlet pipeline: {e}")
+                                })?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_verlet_pipeline.layout().clone(),
+                                    0,
+                                    verlet_set.clone(),
                                 )
                                 .map_err(|e| {
-                                    format!("render: lambda fill_buffer: {e}")
+                                    format!("render: bind cloth verlet set: {e}")
                                 })?;
-                            let constraint_groups =
-                                constraint_count.div_ceil(64).max(1);
-                            for _ in 0..constraint_iters {
-                                // Pass 1: per-constraint XPBD lambda
-                                // update writes Δλ_j to dlambda_ssbo
-                                // and accumulates into lambda_ssbo.
+                            unsafe {
+                                builder.dispatch([groups, 1, 1]).map_err(|e| {
+                                    format!("render: cloth verlet dispatch: {e}")
+                                })?;
+                            }
+
+                            if let Some((
+                                lambda_update_set,
+                                accumulate_set,
+                                apply_set,
+                                lambda_ssbo,
+                                constraint_count,
+                                lambda_update_pipeline,
+                                accumulate_pipeline,
+                                apply_pipeline,
+                            )) = constraint_pack.as_ref()
+                            {
+                                // Reset λ for this substep. XPBD's λ
+                                // accumulates across the projection
+                                // iterations *within* one substep,
+                                // then starts fresh at the next
+                                // substep — same lifecycle as
+                                // `ClothSimTempBuffers::reset_lambda`
+                                // on the CPU side.
                                 builder
-                                    .bind_pipeline_compute(lambda_update_pipeline.clone())
-                                    .map_err(|e| {
-                                        format!("render: bind constraint lambda update: {e}")
-                                    })?;
-                                builder
-                                    .bind_descriptor_sets(
-                                        PipelineBindPoint::Compute,
-                                        lambda_update_pipeline.layout().clone(),
-                                        0,
-                                        lambda_update_set.clone(),
+                                    .fill_buffer(
+                                        lambda_ssbo.clone().reinterpret::<[u32]>(),
+                                        0u32,
                                     )
                                     .map_err(|e| {
-                                        format!("render: bind constraint lambda update set: {e}")
+                                        format!("render: lambda fill_buffer: {e}")
                                     })?;
-                                unsafe {
-                                    builder.dispatch([constraint_groups, 1, 1]).map_err(
-                                        |e| {
-                                            format!("render: constraint lambda update dispatch: {e}")
-                                        },
-                                    )?;
-                                }
-                                // Pass 2: per-particle Δx accumulate
-                                // reads Δλ_j (immutable in this pass).
-                                builder
-                                    .bind_pipeline_compute(accumulate_pipeline.clone())
-                                    .map_err(|e| {
-                                        format!("render: bind constraint accumulate: {e}")
-                                    })?;
-                                builder
-                                    .bind_descriptor_sets(
-                                        PipelineBindPoint::Compute,
-                                        accumulate_pipeline.layout().clone(),
-                                        0,
-                                        accumulate_set.clone(),
-                                    )
-                                    .map_err(|e| {
-                                        format!("render: bind constraint accumulate set: {e}")
-                                    })?;
-                                unsafe {
-                                    builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                        format!("render: constraint accumulate dispatch: {e}")
-                                    })?;
-                                }
-                                // Pass 3: apply Δx to positions, zero
-                                // deltas for next iteration.
-                                builder
-                                    .bind_pipeline_compute(apply_pipeline.clone())
-                                    .map_err(|e| {
-                                        format!("render: bind constraint apply: {e}")
-                                    })?;
-                                builder
-                                    .bind_descriptor_sets(
-                                        PipelineBindPoint::Compute,
-                                        apply_pipeline.layout().clone(),
-                                        0,
-                                        apply_set.clone(),
-                                    )
-                                    .map_err(|e| {
-                                        format!("render: bind constraint apply set: {e}")
-                                    })?;
-                                unsafe {
-                                    builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                        format!("render: constraint apply dispatch: {e}")
-                                    })?;
+                                let constraint_groups =
+                                    constraint_count.div_ceil(64).max(1);
+                                for _ in 0..constraint_iters {
+                                    // Pass 1: per-constraint XPBD λ
+                                    // update writes Δλ_j to
+                                    // dlambda_ssbo and accumulates
+                                    // into lambda_ssbo.
+                                    builder
+                                        .bind_pipeline_compute(
+                                            lambda_update_pipeline.clone(),
+                                        )
+                                        .map_err(|e| {
+                                            format!("render: bind constraint lambda update: {e}")
+                                        })?;
+                                    builder
+                                        .bind_descriptor_sets(
+                                            PipelineBindPoint::Compute,
+                                            lambda_update_pipeline.layout().clone(),
+                                            0,
+                                            lambda_update_set.clone(),
+                                        )
+                                        .map_err(|e| {
+                                            format!("render: bind constraint lambda update set: {e}")
+                                        })?;
+                                    unsafe {
+                                        builder.dispatch([constraint_groups, 1, 1]).map_err(
+                                            |e| {
+                                                format!("render: constraint lambda update dispatch: {e}")
+                                            },
+                                        )?;
+                                    }
+                                    // Pass 2: per-particle Δx
+                                    // accumulate reads Δλ_j.
+                                    builder
+                                        .bind_pipeline_compute(
+                                            accumulate_pipeline.clone(),
+                                        )
+                                        .map_err(|e| {
+                                            format!("render: bind constraint accumulate: {e}")
+                                        })?;
+                                    builder
+                                        .bind_descriptor_sets(
+                                            PipelineBindPoint::Compute,
+                                            accumulate_pipeline.layout().clone(),
+                                            0,
+                                            accumulate_set.clone(),
+                                        )
+                                        .map_err(|e| {
+                                            format!("render: bind constraint accumulate set: {e}")
+                                        })?;
+                                    unsafe {
+                                        builder.dispatch([groups, 1, 1]).map_err(|e| {
+                                            format!("render: constraint accumulate dispatch: {e}")
+                                        })?;
+                                    }
+                                    // Pass 3: apply Δx to positions,
+                                    // zero deltas for next iter.
+                                    builder
+                                        .bind_pipeline_compute(apply_pipeline.clone())
+                                        .map_err(|e| {
+                                            format!("render: bind constraint apply: {e}")
+                                        })?;
+                                    builder
+                                        .bind_descriptor_sets(
+                                            PipelineBindPoint::Compute,
+                                            apply_pipeline.layout().clone(),
+                                            0,
+                                            apply_set.clone(),
+                                        )
+                                        .map_err(|e| {
+                                            format!("render: bind constraint apply set: {e}")
+                                        })?;
+                                    unsafe {
+                                        builder.dispatch([groups, 1, 1]).map_err(|e| {
+                                            format!("render: constraint apply dispatch: {e}")
+                                        })?;
+                                    }
                                 }
                             }
                         }

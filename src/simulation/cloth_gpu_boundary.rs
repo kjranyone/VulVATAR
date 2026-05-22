@@ -766,6 +766,29 @@ mod tests {
                 );
             }
 
+            // ----- Assert CPU XPBD and GPU mirror agree per-particle -----
+            // After review pass 10 dropped the CPU's Jacobi averaging,
+            // both paths run identical XPBD updates and should match
+            // within float-rounding noise. The constraint-length
+            // assertion below is the convergence sanity check; the
+            // per-particle assertion is the actual parity guarantee.
+            let pos_tol = 1.0e-4_f32; // ~0.1 mm — float-summation noise.
+            for i in 0..n as usize {
+                let pc = sim.particles[i].position;
+                let pg = gpu_positions[i];
+                let dx = pg[0] - pc[0];
+                let dy = pg[1] - pc[1];
+                let dz = pg[2] - pc[2];
+                let drift = (dx * dx + dy * dy + dz * dz).sqrt();
+                assert!(
+                    drift < pos_tol,
+                    "CPU XPBD vs GLSL XPBD parity broke @ particle {} stiffness={}: drift={}",
+                    i,
+                    stiffness,
+                    drift
+                );
+            }
+
             // ----- Assert every constraint's length lands inside tol -----
             let tol = 0.05; // 5 cm slack across stiffness range, 64 iters.
             for (a, b, rest_length, _) in &constraints {

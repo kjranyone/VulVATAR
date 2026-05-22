@@ -391,7 +391,6 @@ impl Default for ClothSimState {
 pub struct ClothSimTempBuffers {
     pub temp_positions: Vec<Vec3>,
     pub correction_accumulator: Vec<Vec3>,
-    pub correction_counts: Vec<u32>,
     /// XPBD per-distance-constraint Lagrange multiplier (λ_j),
     /// accumulated across the `solver_iterations` projection passes
     /// inside a single substep. Reset to zero at the top of every
@@ -411,7 +410,6 @@ impl ClothSimTempBuffers {
         Self {
             temp_positions: vec![[0.0; 3]; particle_count],
             correction_accumulator: vec![[0.0; 3]; particle_count],
-            correction_counts: vec![0; particle_count],
             lambda_distance: Vec::new(),
         }
     }
@@ -419,15 +417,11 @@ impl ClothSimTempBuffers {
     pub fn resize(&mut self, particle_count: usize) {
         self.temp_positions.resize(particle_count, [0.0; 3]);
         self.correction_accumulator.resize(particle_count, [0.0; 3]);
-        self.correction_counts.resize(particle_count, 0);
     }
 
     pub fn clear(&mut self) {
         for v in self.correction_accumulator.iter_mut() {
             *v = [0.0; 3];
-        }
-        for c in self.correction_counts.iter_mut() {
-            *c = 0;
         }
     }
 

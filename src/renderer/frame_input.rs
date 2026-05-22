@@ -106,15 +106,26 @@ pub struct ClothDeformSnapshot {
 /// from the avatar's `ClothSimState`.
 #[derive(Clone, Copy, Debug)]
 pub struct ClothGpuDispatchControl {
+    /// Substep dt. The renderer dispatches the verlet + constraint
+    /// pipeline `substeps` times per frame with this dt, matching the
+    /// CPU path's `for _ in 0..substeps { step_cloth(fixed_dt) }`
+    /// loop. Was previously frame_dt (multiple substeps' worth of
+    /// time integrated in one shot) which made gravity·dt² roughly
+    /// `substeps²` too large and `α̃ = α/dt²` roughly `substeps²`
+    /// too small — CPU and GPU ran qualitatively different physics.
     pub dt: f32,
+    /// Number of verlet + constraint dispatch substeps to run this
+    /// frame. Comes from `SimClock::advance(frame_dt)`.
+    pub substeps: u32,
     pub damping: f32,
     pub gravity: [f32; 3],
     /// `wind_direction * wind_response` baked into a single vector.
     pub wind_force: [f32; 3],
-    /// XPBD constraint iteration count for this frame. Mirror of
+    /// XPBD constraint iteration count per substep. Mirror of
     /// `ClothSimState::solver_iterations`; the renderer runs the
     /// lambda-update + accumulate + apply compute passes this many
-    /// times per substep before the normal recomputation pass.
+    /// times *within each substep*. Normal recomputation runs once
+    /// per frame, after all substeps complete.
     pub solver_iterations: u32,
 }
 

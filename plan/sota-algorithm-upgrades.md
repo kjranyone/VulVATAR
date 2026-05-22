@@ -86,6 +86,35 @@ sweeps `stiffness ∈ {1.0, 0.7, 0.3}`. CPU XPBD ↔ GPU XPBD parity
 is therefore exercised at non-trivial compliance values, not just
 the `α = 0` rigid limit.
 
+**Per-particle position parity** (landed in review pass 10):
+Post-merge review found three CPU↔GPU divergences that the rest-
+length tolerance test couldn't catch:
+
+1. GPU received `frame_dt`, CPU stepped `substeps × fixed_dt`. So
+   `α̃ = α/dt²` was `substeps²` smaller on the GPU and
+   `gravity·dt²` was `substeps²` larger — qualitatively different
+   physics. Fix: `ClothGpuDispatchControl` now carries `substeps`,
+   the renderer wraps verlet + constraint iters in a substep loop,
+   and the per-substep λ reset moved inside that loop. `dt` is now
+   `fixed_dt` (one substep duration).
+2. GPU accumulate summed Δx without averaging; CPU XPBD ran a
+   Jacobi `corr_accum / count` averaging step at the end. Per
+   interior particle on a 4-incident-constraint mesh the GPU pushed
+   ~4× as hard per iteration. Fix: CPU drops the averaging (and
+   the `correction_counts` buffer) and applies the un-averaged sum
+   directly, matching the GLSL accumulate pass byte-for-byte.
+3. Even within the CPU itself, λ accumulated the un-averaged C/w_sum
+   while Δx applied the averaged sum, so `α̃·λ` biased the residual
+   computation by ~E[valence] over multiple iterations — effective
+   stiffness drifted with mesh connectivity. Fix #2 resolves this
+   automatically because λ and Δx now use the same full correction.
+
+After these fixes the parity test asserts CPU↔GPU agreement at
+**0.1 mm per particle** (1e-4 m drift after 64 iterations across
+stiffness ∈ {1.0, 0.7, 0.3}) — the assertion that previously could
+only check rest-length convergence inside 5 cm now pins the per-
+iteration trajectory down to float-summation noise.
+
 ### Cloth normal recomputation — angle-weighted (Max 1999)
 
 **Reference**: Max, "Weights for Computing Vertex Normals from

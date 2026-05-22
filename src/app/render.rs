@@ -232,6 +232,8 @@ impl Application {
                 self.viewport_background.as_deref(),
                 self.ground_grid_visible,
                 frame_dt,
+                fixed_dt,
+                substeps as u32,
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -548,7 +550,9 @@ impl Application {
         material_mode_index: usize,
         background_image_path: Option<&std::path::Path>,
         show_ground_grid: bool,
-        frame_dt: f32,
+        _frame_dt: f32,
+        fixed_dt: f32,
+        substeps: u32,
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -663,12 +667,11 @@ impl Application {
                     })
                     .collect();
 
-                // GPU cloth integrates once per frame, so the dt
-                // forwarded to its control UBO must cover the *entire*
-                // frame interval (CPU PBD integrates `substeps` times
-                // each at `fixed_dt`, so its total per-frame coverage
-                // equals `substeps * fixed_dt ≈ frame_dt`).
-                let gpu_cloth_dt = frame_dt.max(1.0 / 1000.0);
+                // GPU cloth substeps each at `fixed_dt`, matching the
+                // CPU path's `for _ in 0..substeps { step_cloth(fixed_dt) }`
+                // loop. The renderer's substep loop runs verlet +
+                // constraint iters that many times per frame.
+                let cloth_substep_dt = fixed_dt.max(1.0 / 1000.0);
                 let cloth_deforms = collect_cloth_deforms(
                     avatar
                         .cloth_state
@@ -682,7 +685,8 @@ impl Application {
                                 .filter(|s| s.enabled)
                                 .map(|s| (&s.state, Some(&s.sim))),
                         ),
-                    gpu_cloth_dt,
+                    cloth_substep_dt,
+                    substeps,
                 );
 
                 RenderAvatarInstance {
@@ -790,7 +794,8 @@ fn collect_cloth_deforms<'a>(
             Option<&'a crate::simulation::cloth::ClothSimState>,
         ),
     >,
-    frame_dt: f32,
+    fixed_dt: f32,
+    substeps: u32,
 ) -> Vec<ClothDeformSnapshot> {
     use crate::renderer::frame_input::{ClothGpuAttachData, ClothGpuDispatchControl};
     use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
@@ -812,7 +817,8 @@ fn collect_cloth_deforms<'a>(
                             let wind_force =
                                 vec3_scale(&sim.wind_direction, sim.wind_response);
                             let ctrl = ClothGpuDispatchControl {
-                                dt: frame_dt,
+                                dt: fixed_dt,
+                                substeps,
                                 damping: sim.damping,
                                 gravity: sim.gravity,
                                 wind_force,
@@ -909,7 +915,7 @@ mod cloth_collection_tests {
         let scarf = make_cloth_state(3, Some(PrimitiveId(30)), 16, 1);
 
         let result =
-            collect_cloth_deforms([(&body, None), (&skirt, None), (&scarf, None)], 1.0 / 60.0);
+            collect_cloth_deforms([(&body, None), (&skirt, None), (&scarf, None)], 1.0 / 60.0, 1);
 
         assert_eq!(result.len(), 3, "all three distinct-target cloths must be kept");
         let target_ids: Vec<u64> =
@@ -925,7 +931,7 @@ mod cloth_collection_tests {
         let overlay_duplicate = make_cloth_state(2, Some(PrimitiveId(10)), 64, 99);
 
         let result =
-            collect_cloth_deforms([(&authoritative, None), (&overlay_duplicate, None)], 1.0 / 60.0);
+            collect_cloth_deforms([(&authoritative, None), (&overlay_duplicate, None)], 1.0 / 60.0, 1);
 
         assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
         assert_eq!(result[0].version, 5, "first (authoritative) cloth wins");
@@ -938,7 +944,7 @@ mod cloth_collection_tests {
         let unbound = make_cloth_state(2, None, 64, 1);
 
         let result =
-            collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0);
+            collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1);
 
         assert_eq!(result.len(), 1, "cloth with no render target is dropped");
         assert_eq!(result[0].target_primitive_id.0, 10);
