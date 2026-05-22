@@ -15,19 +15,19 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .radio_value(&mut state.rendering.material_mode_index, 0, t!("inspector.unlit"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .radio_value(&mut state.rendering.material_mode_index, 1, t!("inspector.simple_lit"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .radio_value(&mut state.rendering.material_mode_index, 2, t!("inspector.toon_like"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
 
@@ -44,7 +44,7 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if ui
                     .add(
@@ -54,7 +54,7 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if ui
                     .add(
@@ -64,7 +64,7 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
             });
             if ui
@@ -74,7 +74,7 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             ui.horizontal(|ui| {
                 ui.label(t!("inspector.ambient"));
@@ -92,13 +92,13 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .checkbox(&mut state.rendering.alpha_preview, t!("inspector.alpha_preview"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
 
@@ -209,7 +209,7 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.rendering.camera_fov = preset.camera.fov;
                     state.rendering.material_mode_index = preset.rendering.material_mode_index;
                     state.push_notification(t!("inspector.loaded_preset", name = preset.name));
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
             }
 

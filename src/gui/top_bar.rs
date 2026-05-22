@@ -129,7 +129,7 @@ fn draw_left(ui: &mut Ui, state: &mut GuiApp) {
         state.inspector_open = !state.inspector_open;
     }
     ui.add_space(space::SM);
-    let title_text = if state.project_dirty {
+    let title_text = if state.project_status.project_dirty {
         format!("{} \u{2022}", state.mode.label())
     } else {
         state.mode.label()
@@ -158,14 +158,14 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
         save_overlay(state);
     }
     ui.add_space(space::SM);
-    let pause_glyph = if state.paused { ic::PLAY } else { ic::PAUSE };
-    let pause_label = if state.paused {
+    let pause_glyph = if state.runtime_status.paused { ic::PLAY } else { ic::PAUSE };
+    let pause_label = if state.runtime_status.paused {
         t!("top_bar.resume")
     } else {
         t!("top_bar.pause")
     };
     if topbar_action(ui, pause_glyph, &pause_label).clicked() {
-        state.paused = !state.paused;
+        state.runtime_status.paused = !state.runtime_status.paused;
     }
 }
 
@@ -299,8 +299,8 @@ fn open_project(state: &mut GuiApp) {
                 }
             } else {
                 state.apply_project_state(&project_state);
-                state.project_path = Some(path.clone());
-                state.project_dirty = false;
+                state.project_status.project_path = Some(path.clone());
+                state.project_status.project_dirty = false;
                 for w in &load_warnings.warnings {
                     state.push_notification(t!("toast.warning", msg = w.to_string()));
                 }
@@ -318,10 +318,10 @@ fn open_project(state: &mut GuiApp) {
 
 fn save_project(state: &mut GuiApp) {
     let ps = state.to_project_state();
-    if let Some(ref path) = state.project_path.clone() {
+    if let Some(ref path) = state.project_status.project_path.clone() {
         match persistence::save_project(&ps, path) {
             Ok(()) => {
-                state.project_dirty = false;
+                state.project_status.project_dirty = false;
                 state.push_notification(t!("top_bar.project_saved"));
             }
             Err(e) => {
@@ -335,8 +335,8 @@ fn save_project(state: &mut GuiApp) {
     {
         match persistence::save_project(&ps, &path) {
             Ok(()) => {
-                state.project_path = Some(path);
-                state.project_dirty = false;
+                state.project_status.project_path = Some(path);
+                state.project_status.project_dirty = false;
                 state.push_notification(t!("top_bar.project_saved"));
             }
             Err(e) => {

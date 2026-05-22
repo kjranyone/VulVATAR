@@ -85,7 +85,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if ui
                     .add(
@@ -95,7 +95,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if ui
                     .add(
@@ -105,7 +105,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
             });
             ui.label(t!("inspector.rotation"));
@@ -118,7 +118,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if ui
                     .add(
@@ -128,7 +128,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if ui
                     .add(
@@ -138,7 +138,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
             });
             ui.horizontal(|ui| {
@@ -151,7 +151,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed()
                 {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
             });
             if outlined_button(
@@ -166,7 +166,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.transform.position = [0.0, 0.0, 0.0];
                 state.transform.rotation = [0.0, 0.0, 0.0];
                 state.transform.scale = 1.0;
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
 
@@ -329,7 +329,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if !state.rendering.transparent_background {
                 ui.horizontal(|ui| {
@@ -338,7 +338,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .color_edit_button_rgb(&mut state.rendering.background_color)
                         .changed()
                     {
-                        state.project_dirty = true;
+                        state.project_status.project_dirty = true;
                     }
                 });
             }
@@ -351,13 +351,13 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .checkbox(&mut state.rendering.toggle_spring, t!("inspector.spring_enabled"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .checkbox(&mut state.rendering.toggle_cloth, t!("inspector.cloth_enabled"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .checkbox(
@@ -366,7 +366,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .checkbox(
@@ -375,7 +375,7 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
 

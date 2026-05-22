@@ -135,8 +135,8 @@ impl GuiApp {
                 } = job.after_load
                 {
                     self.apply_project_state(&project_state);
-                    self.project_path = Some(project_path.clone());
-                    self.project_dirty = false;
+                    self.project_status.project_path = Some(project_path.clone());
+                    self.project_status.project_dirty = false;
                     for w in &warnings.warnings {
                         self.push_notification(t!("toast.warning", msg = w.to_string()));
                     }

@@ -244,7 +244,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .add(
@@ -254,7 +254,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .add(
@@ -266,7 +266,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .changed()
             {
                 state.camera_orbit.target_distance = state.camera_orbit.distance;
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
         ui.horizontal(|ui| {
@@ -278,7 +278,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .add(
@@ -288,7 +288,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
         ui.add_space(space::SM);
@@ -306,7 +306,7 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
             state.camera_orbit.distance = 5.0;
             state.camera_orbit.target_distance = 5.0;
             state.camera_orbit.pan = [0.0, 0.0];
-            state.project_dirty = true;
+            state.project_status.project_dirty = true;
         }
     });
 }

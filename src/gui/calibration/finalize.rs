@@ -106,7 +106,7 @@ fn persist_calibration(state: &mut GuiApp, calibration: PoseCalibration) {
     if let Some(idx) = state.profiles.active_index {
         if let Some(profile) = state.profiles.profiles.get_mut(idx) {
             profile.pose_calibration = Some(calibration);
-            state.profiles_dirty = true;
+            state.project_status.profiles_dirty = true;
         }
     }
 }
@@ -149,7 +149,7 @@ pub(super) fn poll_torso_template(state: &mut GuiApp) {
         if let Some(profile) = state.profiles.profiles.get_mut(idx) {
             if let Some(cal) = profile.pose_calibration.as_mut() {
                 cal.torso_depth_template = Some(template.clone());
-                state.profiles_dirty = true;
+                state.project_status.profiles_dirty = true;
                 updated = Some(cal.clone());
             }
         }

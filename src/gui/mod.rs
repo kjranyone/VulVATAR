@@ -426,6 +426,96 @@ pub struct SettingsGuiState {
     pub pan_sensitivity: f32,
 }
 
+/// Per-frame timing + pause state lifted out of `GuiApp`
+/// (architecture finding #10). Updated each frame's `update` entry by
+/// the EMA smoothing block; consumed by the status bar's "frame N |
+/// fps | frame_time_ms" readout and by the simulation step that uses
+/// `frame_time_ms` as its `frame_dt` source.
+pub struct RuntimeStatusUi {
+    pub paused: bool,
+    pub frame_count: u64,
+    /// Wall-clock instant at the previous `update` entry. Subtracted
+    /// from `now` each frame to derive the dt that drives the EMA
+    /// smoothing of `frame_time_ms` and `fps`.
+    pub last_frame_instant: Instant,
+    /// Exponential-moving-average frame interval in milliseconds.
+    /// Also doubles as the simulation step `frame_dt` source so the
+    /// avatar's animation playback ticks at wall-clock pace rather
+    /// than at the renderer's variable cadence.
+    pub frame_time_ms: f64,
+    /// Exponential-moving-average frame rate in Hz. Display-only —
+    /// every consumer that needs a step duration reads
+    /// `frame_time_ms` instead.
+    pub fps: f64,
+}
+
+impl RuntimeStatusUi {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            paused: false,
+            frame_count: 0,
+            last_frame_instant: now,
+            frame_time_ms: 16.0,
+            fps: 60.0,
+        }
+    }
+}
+
+/// Project lifecycle + persistence status lifted out of `GuiApp`
+/// (architecture finding #10). Owns the loaded project path, the
+/// recent-avatar MRU list, the dirty flags that drive autosave, the
+/// crash-recovery manager, and the throttle clock that decides when
+/// a dirty mutation actually hits disk.
+pub struct ProjectStatusUi {
+    /// Filesystem path of the project file currently open, if any.
+    /// `None` for the "untitled new project" mode.
+    pub project_path: Option<PathBuf>,
+    /// MRU list of recently loaded avatars; surfaced as the
+    /// "Open Recent" submenu and persisted via
+    /// `crate::persistence::save_recent_avatars`.
+    pub recent_avatars: Vec<PathBuf>,
+    /// Set whenever the in-memory project state diverges from disk.
+    /// The per-frame autosave block compares
+    /// `last_autosave.elapsed()` against `AUTOSAVE_THROTTLE`; once
+    /// the throttle clears, a `save_project` call flips this back
+    /// to `false`.
+    pub project_dirty: bool,
+    /// Immediate-save throttle clock. Updated each time the project
+    /// is saved.
+    pub last_autosave: Instant,
+    /// Crash-recovery manager: writes a sidecar snapshot on every
+    /// dirty mutation so an abnormal exit can be recovered from
+    /// next session.
+    pub recovery_manager: crate::persistence::RecoveryManager,
+    /// Set whenever the active cloth overlay is in a dirty state
+    /// (region edit, parameter change, rebind) and the user hasn't
+    /// hit save yet. Drives the "Save Overlay" button's enabled
+    /// state and the unload confirmation prompt.
+    pub overlay_dirty: bool,
+    /// Set whenever the in-memory `profiles` library diverges from
+    /// disk (`%APPDATA%\VulVATAR\profiles.json`). Mirrors
+    /// `project_dirty` but flushes via `save_profiles`.
+    pub profiles_dirty: bool,
+}
+
+impl ProjectStatusUi {
+    pub fn new(
+        recent_avatars: Vec<PathBuf>,
+        recovery_manager: crate::persistence::RecoveryManager,
+        now: Instant,
+    ) -> Self {
+        Self {
+            project_path: None,
+            recent_avatars,
+            project_dirty: false,
+            last_autosave: now,
+            recovery_manager,
+            overlay_dirty: false,
+            profiles_dirty: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMode {
     Avatar,
@@ -464,41 +554,16 @@ impl AppMode {
 pub struct GuiApp {
     pub mode: AppMode,
     pub app: Box<Application>,
-    pub paused: bool,
-    pub frame_count: u64,
-    pub project_path: Option<PathBuf>,
 
-    // E10: Frame timing
-    pub last_frame_instant: Instant,
-    pub frame_time_ms: f64,
-    pub fps: f64,
+    /// Per-frame timing + pause flag, see `RuntimeStatusUi`.
+    pub runtime_status: RuntimeStatusUi,
 
-    // E11: Recent avatars
-    pub recent_avatars: Vec<PathBuf>,
-
-    // E12: Project dirty state
-    pub project_dirty: bool,
-
-    // Immediate-save throttle clock. Updated each time the project is
-    // saved; the per-frame block compares `last_autosave.elapsed()`
-    // against `AUTOSAVE_THROTTLE` to decide whether the next dirty
-    // mutation should hit disk yet.
-    pub last_autosave: Instant,
-
-    // Crash recovery
-    pub recovery_manager: crate::persistence::RecoveryManager,
-    pub overlay_dirty: bool,
+    /// Project lifecycle / persistence status, see `ProjectStatusUi`.
+    pub project_status: ProjectStatusUi,
 
     // Hotkeys & profiles
     pub hotkeys: hotkey::HotkeyMap,
     pub profiles: profile::ProfileLibrary,
-    /// Set whenever the in-memory `profiles` library diverges from
-    /// what's currently on disk (`%APPDATA%\VulVATAR\profiles.json`).
-    /// Triggered by `Calibrate Pose ▼` writing into the active
-    /// profile, by future profile-edit UI, etc. The per-frame
-    /// autosave block (mirroring `project_dirty`) flushes via
-    /// `crate::persistence::save_profiles` and clears this flag.
-    pub profiles_dirty: bool,
 
     // M10: Notification/toast system
     pub notifications: Vec<Notification>,
@@ -597,22 +662,14 @@ impl GuiApp {
         let mut state = Self {
             mode: AppMode::Preview,
             app,
-            paused: false,
-            frame_count: 0,
-            project_path: None,
 
-            last_frame_instant: Instant::now(),
-            frame_time_ms: 0.0,
-            fps: 0.0,
+            runtime_status: RuntimeStatusUi::new(Instant::now()),
 
-            recent_avatars: crate::persistence::load_recent_avatars(),
-
-            project_dirty: false,
-
-            last_autosave: Instant::now(),
-
-            recovery_manager: crate::persistence::RecoveryManager::new(120),
-            overlay_dirty: false,
+            project_status: ProjectStatusUi::new(
+                crate::persistence::load_recent_avatars(),
+                crate::persistence::RecoveryManager::new(120),
+                Instant::now(),
+            ),
 
             hotkeys: hotkey::HotkeyMap::new(),
             // Profiles persist across project loads — calibration
@@ -622,7 +679,6 @@ impl GuiApp {
             // file should not silently wipe out the user's data
             // (load_profiles already logs and returns None then).
             profiles: crate::persistence::load_profiles().unwrap_or_default(),
-            profiles_dirty: false,
 
             notifications: Vec::new(),
 
@@ -730,11 +786,11 @@ impl GuiApp {
         // user doesn't see a phantom file in the title bar — they
         // never opened one.
         let last_session = crate::persistence::last_session_path();
-        if state.project_path.is_none() && last_session.exists() {
+        if state.project_status.project_path.is_none() && last_session.exists() {
             match crate::persistence::load_project(&last_session) {
                 Ok((project_state, _warnings)) => {
                     state.apply_project_state(&project_state);
-                    state.project_dirty = false;
+                    state.project_status.project_dirty = false;
                     info!(
                         "persistence: restored last session from {}",
                         last_session.display()
@@ -827,26 +883,17 @@ impl GuiApp {
         Self {
             mode: AppMode::Preview,
             app,
-            paused: false,
-            frame_count: 0,
-            project_path: None,
 
-            last_frame_instant: Instant::now(),
-            frame_time_ms: 0.0,
-            fps: 0.0,
+            runtime_status: RuntimeStatusUi::new(Instant::now()),
 
-            recent_avatars: Vec::new(),
-
-            project_dirty: false,
-
-            last_autosave: Instant::now(),
-
-            recovery_manager: crate::persistence::RecoveryManager::new(120),
-            overlay_dirty: false,
+            project_status: ProjectStatusUi::new(
+                Vec::new(),
+                crate::persistence::RecoveryManager::new(120),
+                Instant::now(),
+            ),
 
             hotkeys: hotkey::HotkeyMap::new(),
             profiles: profile::ProfileLibrary::new(),
-            profiles_dirty: false,
 
             notifications: Vec::new(),
 
@@ -969,10 +1016,10 @@ impl GuiApp {
 
     /// Add a path to the recent avatars list (max 10, dedup, most recent first).
     pub fn add_recent_avatar(&mut self, path: PathBuf) {
-        self.recent_avatars.retain(|p| p != &path);
-        self.recent_avatars.insert(0, path);
-        self.recent_avatars.truncate(10);
-        let _ = crate::persistence::save_recent_avatars(&self.recent_avatars);
+        self.project_status.recent_avatars.retain(|p| p != &path);
+        self.project_status.recent_avatars.insert(0, path);
+        self.project_status.recent_avatars.truncate(10);
+        let _ = crate::persistence::save_recent_avatars(&self.project_status.recent_avatars);
     }
 
     /// Build a `RuntimeToggles` from the current GUI state.
@@ -1025,13 +1072,13 @@ impl eframe::App for GuiApp {
 
         // E10: Measure frame timing.
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_frame_instant);
-        self.last_frame_instant = now;
+        let elapsed = now.duration_since(self.runtime_status.last_frame_instant);
+        self.runtime_status.last_frame_instant = now;
         let dt_secs = elapsed.as_secs_f64();
         // Exponential moving average for smoothing.
-        self.frame_time_ms = self.frame_time_ms * 0.9 + (dt_secs * 1000.0) * 0.1;
+        self.runtime_status.frame_time_ms = self.runtime_status.frame_time_ms * 0.9 + (dt_secs * 1000.0) * 0.1;
         if dt_secs > 0.0 {
-            self.fps = self.fps * 0.9 + (1.0 / dt_secs) * 0.1;
+            self.runtime_status.fps = self.runtime_status.fps * 0.9 + (1.0 / dt_secs) * 0.1;
         }
 
         self.process_hotkeys(ctx);
@@ -1080,7 +1127,7 @@ impl eframe::App for GuiApp {
         }
 
         // Smooth zoom: lerp distance toward target_distance each frame.
-        let t = (1.0 - (-5.0 * self.frame_time_ms / 1000.0).exp()) as f32;
+        let t = (1.0 - (-5.0 * self.runtime_status.frame_time_ms / 1000.0).exp()) as f32;
         self.camera_orbit.distance +=
             (self.camera_orbit.target_distance - self.camera_orbit.distance) * t;
 
@@ -1132,8 +1179,8 @@ impl eframe::App for GuiApp {
             _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
         };
 
-        if !self.paused {
-            let real_dt = (self.frame_time_ms / 1000.0) as f32;
+        if !self.runtime_status.paused {
+            let real_dt = (self.runtime_status.frame_time_ms / 1000.0) as f32;
             // Clamp dt to avoid huge steps on first frame or after pauses.
             let frame_dt = real_dt.clamp(0.001, 0.1);
 
@@ -1159,7 +1206,7 @@ impl eframe::App for GuiApp {
                 frame_dt,
             };
             self.app.run_frame(&frame_config);
-            self.frame_count += 1;
+            self.runtime_status.frame_count += 1;
         } else {
             // Paused: drain any in-flight render result anyway so
             // `render_results_pending` doesn't pin the repaint gate
@@ -1275,7 +1322,7 @@ impl eframe::App for GuiApp {
         //   frame to land — without this the viewport texture stays on
         //   the old image until the user moves the mouse again.
         //
-        // Note: `!self.paused` was previously included here, which
+        // Note: `!self.runtime_status.paused` was previously included here, which
         // defeated the gate entirely because `paused` is false by
         // default and the gate then ran continuously from app start.
         let animation_playing = self
@@ -1292,7 +1339,7 @@ impl eframe::App for GuiApp {
             || animation_playing
             || render_in_flight
             || calibration_modal_open;
-        if needs_animation_frame || self.project_dirty || self.profiles_dirty {
+        if needs_animation_frame || self.project_status.project_dirty || self.project_status.profiles_dirty {
             // Dirty flags imply an unsaved (and almost always also
             // un-rendered) GUI mutation. Repaint immediately so the new
             // state reaches the screen on the next render-thread cycle
@@ -1320,8 +1367,9 @@ impl eframe::App for GuiApp {
         // checkbox and immediately Alt+F4s would otherwise lose the
         // change. Falls back to `last_session.vvtproj` when the user
         // never opened a project file.
-        if self.project_dirty {
+        if self.project_status.project_dirty {
             let path = self
+                .project_status
                 .project_path
                 .clone()
                 .unwrap_or_else(crate::persistence::last_session_path);

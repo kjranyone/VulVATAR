@@ -45,11 +45,11 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         match state.app.set_requested_sink(want_sink) {
             Ok(()) => {
                 state.push_notification(t!("inspector.output_sink_changed", name = sink_names[new_idx].to_string()));
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             Err(e) => {
                 state.push_notification(t!("inspector.output_sink_failed", error = e.to_string()));
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         }
     }
@@ -107,7 +107,7 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         || state.output.output_has_alpha != prev_alpha
         || state.output.output_color_space_index != prev_cs
     {
-        state.project_dirty = true;
+        state.project_status.project_dirty = true;
     }
 
     let diagnostics = state.app.output.diagnostics();

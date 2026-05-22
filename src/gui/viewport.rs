@@ -370,13 +370,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             if drag_orbit {
                 state.camera_orbit.yaw_deg += delta.x * state.settings.orbit_sensitivity;
                 state.camera_orbit.pitch_deg += delta.y * state.settings.orbit_sensitivity;
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if drag_pan {
                 let scale = 0.002 * state.camera_orbit.distance * 0.2 * state.settings.pan_sensitivity;
                 state.camera_orbit.pan[0] += delta.x * scale;
                 state.camera_orbit.pan[1] -= delta.y * scale;
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -384,7 +384,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     state.camera_orbit.target_distance = (state.camera_orbit.target_distance
                         - scroll * state.camera_orbit.target_distance * state.settings.zoom_sensitivity)
                         .max(0.1);
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
             }
 
