@@ -529,18 +529,65 @@ mod tests {
     // S2.2 — CPU mirror of cloth_constraint_{accumulate,apply}_cs formula
     // =====================================================================
 
-    /// Direct port of the two GLSL constraint shaders, applied as a single
-    /// Jacobi iteration: accumulate deltas per particle, then apply them.
-    /// Used in the parity test below as the GLSL-side reference.
+    /// Direct port of the three GLSL XPBD constraint shaders, applied
+    /// as a single iteration: per-constraint lambda update + Δλ_j write,
+    /// per-particle Δx accumulate (reading Δλ), then apply.
+    ///
+    /// `lambda` accumulates across calls within one substep — caller
+    /// is responsible for zeroing it at the start of each substep,
+    /// matching the renderer's `cmd.fill_buffer(lambda_ssbo, 0)` reset
+    /// in `mod.rs`.
     fn cpu_mirror_of_cloth_constraint_iter(
         positions: &mut [[f32; 4]], // xyz = pos, w = inv_mass
         constraints: &[(u32, u32, f32, f32)], // (a, b, rest_length, stiffness)
         adj: &VertexTriangleAdjacency,
+        lambda: &mut [f32],
+        dt: f32,
     ) {
-        let n = positions.len();
-        let mut deltas = vec![[0.0_f32; 3]; n];
+        fn compliance(stiffness: f32) -> f32 {
+            let s = stiffness.clamp(0.0, 1.0);
+            let slack = (1.0 - s).max(0.0);
+            slack * slack * 1.0e-7
+        }
 
-        // Accumulate pass — mirrors `cloth_constraint_accumulate_cs`.
+        let n = positions.len();
+        let dt_sq = (dt * dt).max(1.0e-12);
+        let mut dlambda = vec![0.0_f32; constraints.len()];
+
+        // Pass 1 — per-constraint Δλ_j (mirror of
+        // `cloth_constraint_lambda_update_cs`).
+        for (j, &(a, b, rest_length, stiffness)) in constraints.iter().enumerate() {
+            if stiffness <= 1.0e-6 {
+                dlambda[j] = 0.0;
+                continue;
+            }
+            let pa = positions[a as usize];
+            let pb = positions[b as usize];
+            let diff = [pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]];
+            let dist = (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt();
+            if dist < 1.0e-6 {
+                dlambda[j] = 0.0;
+                continue;
+            }
+            let w_a = pa[3];
+            let w_b = pb[3];
+            let w_sum = w_a + w_b;
+            if w_sum < 1.0e-12 {
+                dlambda[j] = 0.0;
+                continue;
+            }
+            let alpha_tilde = compliance(stiffness) / dt_sq;
+            let c = dist - rest_length;
+            let lambda_old = lambda[j];
+            let denom = w_sum + alpha_tilde;
+            let dl = (-c - alpha_tilde * lambda_old) / denom;
+            lambda[j] = lambda_old + dl;
+            dlambda[j] = dl;
+        }
+
+        // Pass 2 — per-particle Δx accumulate (mirror of
+        // `cloth_constraint_accumulate_cs`).
+        let mut deltas = vec![[0.0_f32; 3]; n];
         for pid in 0..n {
             let w_self = positions[pid][3];
             if w_self <= 0.0 {
@@ -552,7 +599,7 @@ mod tests {
             let mut delta = [0.0_f32; 3];
             for k in start..end {
                 let cidx = adj.triangles[k] as usize;
-                let (a, b, rest_length, stiffness) = constraints[cidx];
+                let (a, b, _, _) = constraints[cidx];
                 let other = if a as usize == pid { b } else { a } as usize;
                 let other_p = positions[other];
                 let dir = [
@@ -561,22 +608,20 @@ mod tests {
                     other_p[2] - self_pos[2],
                 ];
                 let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-                if len > 1e-6 {
-                    let err = len - rest_length;
-                    let w_other = other_p[3];
-                    let w_sum = w_self + w_other;
-                    if w_sum > 0.0 {
-                        let scale = stiffness * err / len * (w_self / w_sum);
-                        delta[0] += dir[0] * scale;
-                        delta[1] += dir[1] * scale;
-                        delta[2] += dir[2] * scale;
-                    }
+                if len > 1.0e-6 {
+                    // Δx_self = -d_unit · w_self · Δλ_j
+                    //   where d_unit = (other - self) / len
+                    let dl = dlambda[cidx];
+                    let scale = -w_self * dl / len;
+                    delta[0] += dir[0] * scale;
+                    delta[1] += dir[1] * scale;
+                    delta[2] += dir[2] * scale;
                 }
             }
             deltas[pid] = delta;
         }
 
-        // Apply pass — mirrors `cloth_constraint_apply_cs`.
+        // Pass 3 — apply Δx (mirror of `cloth_constraint_apply_cs`).
         for pid in 0..n {
             positions[pid][0] += deltas[pid][0];
             positions[pid][1] += deltas[pid][1];
@@ -588,25 +633,28 @@ mod tests {
     /// constraints between adjacent grid neighbours. Run 64 constraint
     /// projection iterations on both:
     ///   (a) the CPU `project_distance_constraints` reference
-    ///       (now XPBD — eXtended PBD, Macklin et al. 2016)
-    ///   (b) the GLSL Jacobi formula mirror (`cpu_mirror_of_cloth_constraint_iter`)
-    ///       which is still classic PBD
-    /// and assert convergence to within a tolerance.
+    ///       (XPBD — eXtended PBD, Macklin et al. 2016)
+    ///   (b) the GLSL XPBD formula mirror (`cpu_mirror_of_cloth_constraint_iter`)
+    ///       which mirrors the three-pass lambda-update / accumulate /
+    ///       apply dispatch in the GLSL shaders.
     ///
-    /// **Stiffness-1 equivalence**: at `stiffness = 1.0` the XPBD
-    /// compliance `α = 0`, which collapses the XPBD update to exactly
-    /// the PBD form for this iteration (`Δλ = −C / w_sum`, `Δx = w·d·Δλ`
-    /// — identical magnitude to PBD's `correction = err`). The test
-    /// therefore stays correct as a CPU↔GPU parity check while the
-    /// GPU side is still on PBD; a follow-up slice will migrate the
-    /// GLSL constraint shader to XPBD too (adding a lambda SSBO and a
-    /// `dt`/`α` field on the constraint control UBO).
+    /// Sweeps `stiffness ∈ {1.0, 0.7, 0.3}` to cover the rigid limit
+    /// (`α = 0`, XPBD ≡ PBD) and two compliance regimes where the
+    /// XPBD-specific `λ` accumulation matters.
+    ///
+    /// Without external load, every stiffness setting wants to drive
+    /// the constraints to their rest length — the compliance shifts
+    /// only the per-iteration step size and the iteration count to
+    /// reach a given tolerance, not the asymptote. 64 iterations is
+    /// enough that all three stiffness values land inside the 5cm
+    /// tolerance.
     ///
     /// Jacobi is only an *approximation* of Gauss-Seidel; the two
     /// converge to the same equilibrium but along different paths.
-    /// We compare per-constraint length error, not per-particle position,
-    /// because position drift between methods can be larger than length
-    /// drift while both still satisfy the rest-length constraint.
+    /// We compare per-constraint length error, not per-particle
+    /// position, because position drift between methods can be
+    /// larger than length drift while both still satisfy the
+    /// rest-length constraint.
     #[test]
     fn cloth_constraint_jacobi_satisfies_rest_lengths_like_cpu_pbd() {
         use crate::simulation::cloth::{
@@ -622,117 +670,133 @@ mod tests {
 
         // Build the grid: vertex i is at ((i % W) - W/2, (i / W) - H/2, 0)
         // with rest length 1.0 between immediate horizontal / vertical
-        // neighbours.
-        let mut positions: Vec<[f32; 3]> = (0..n)
+        // neighbours. The perturbation moves two corners off the rest
+        // pose so the constraints actually need to do work.
+        let mut base_positions: Vec<[f32; 3]> = (0..n)
             .map(|i| {
                 let x = (i as u32 % W) as f32 - (W as f32 - 1.0) * 0.5;
                 let y = (i as u32 / W) as f32 - (H as f32 - 1.0) * 0.5;
                 [x, y, 0.0]
             })
             .collect();
-        // Perturb a couple of particles so the constraints actually need
-        // to do work (otherwise the rest-pose already satisfies them).
-        positions[0] = [-3.0, -3.0, 0.5];
-        positions[(n - 1) as usize] = [3.0, 3.0, -0.5];
+        base_positions[0] = [-3.0, -3.0, 0.5];
+        base_positions[(n - 1) as usize] = [3.0, 3.0, -0.5];
 
-        let mut constraints: Vec<(u32, u32, f32, f32)> = Vec::new();
-        let stiffness = 1.0_f32;
+        // Build the constraint list once; the stiffness sweep below
+        // mutates the per-edge `stiffness` per iteration.
+        let mut constraint_pairs: Vec<(u32, u32, f32)> = Vec::new();
         for y in 0..H {
             for x in 0..W {
                 let i = y * W + x;
                 if x + 1 < W {
-                    constraints.push((i, i + 1, 1.0, stiffness));
+                    constraint_pairs.push((i, i + 1, 1.0));
                 }
                 if y + 1 < H {
-                    constraints.push((i, i + W, 1.0, stiffness));
+                    constraint_pairs.push((i, i + W, 1.0));
                 }
             }
         }
-
-        // ----- (a) CPU PBD reference: project_distance_constraints -----
-        let mut sim = ClothSimState {
-            particles: positions
-                .iter()
-                .map(|p| ClothParticle::new(*p, false))
-                .collect(),
-            distance_constraints: constraints
-                .iter()
-                .map(|(a, b, r, s)| ClothDistanceConstraint {
-                    a: *a as usize,
-                    b: *b as usize,
-                    rest_length: *r,
-                    stiffness: *s,
-                })
-                .collect(),
-            bend_constraints: Vec::new(),
-            pin_targets: Vec::new(),
-            solver_iterations: 0,
-            gravity: [0.0; 3],
-            damping: 0.0,
-            collision_margin: 0.0,
-            wind_response: 0.0,
-            wind_direction: [0.0; 3],
-            triangle_indices: Vec::new(),
-            computed_normals: vec![[0.0; 3]; n],
-            initialized: true,
-            self_collision: false,
-            self_collision_radius: 0.0,
-            connected_pairs: HashSet::new(),
-            spatial_hash: SpatialHashGrid::new(0.04),
-        };
-        let mut buffers = ClothSimTempBuffers::new(n);
-        // XPBD lambda is meaningless across substeps — reset once
-        // before the 64-iter loop so this whole block models a single
-        // substep with 64 projection passes (which is what the GPU
-        // mirror does too).
-        buffers.reset_lambda(sim.distance_constraints.len());
-        // `dt` only matters when stiffness < 1 (compliance > 0). The
-        // grid uses stiffness = 1 so α = 0 and `dt` falls out of the
-        // formula; any positive value gives identical behaviour.
-        let test_dt = 1.0 / 60.0_f32;
-        for _ in 0..64 {
-            project_distance_constraints(&mut sim, &mut buffers, test_dt);
-        }
-
-        // ----- (b) GLSL Jacobi formula mirror -----
-        let mut gpu_positions: Vec<[f32; 4]> = positions
-            .iter()
-            .map(|p| [p[0], p[1], p[2], 1.0])
-            .collect();
         let adj = build_particle_constraint_adjacency(
-            &constraints.iter().map(|(a, b, _, _)| (*a, *b)).collect::<Vec<_>>(),
+            &constraint_pairs
+                .iter()
+                .map(|(a, b, _)| (*a, *b))
+                .collect::<Vec<_>>(),
             n as u32,
         );
-        for _ in 0..64 {
-            cpu_mirror_of_cloth_constraint_iter(&mut gpu_positions, &constraints, &adj);
-        }
 
-        // ----- Assert: every constraint's length is within tolerance of rest_length -----
-        let tol = 0.05; // 5cm of slack for 64 Jacobi iterations on the rough perturbation
-        for (a, b, rest_length, _) in &constraints {
-            let pa_cpu = sim.particles[*a as usize].position;
-            let pb_cpu = sim.particles[*b as usize].position;
-            let dx = pb_cpu[0] - pa_cpu[0];
-            let dy = pb_cpu[1] - pa_cpu[1];
-            let dz = pb_cpu[2] - pa_cpu[2];
-            let len_cpu = (dx * dx + dy * dy + dz * dz).sqrt();
-            assert!(
-                (len_cpu - rest_length).abs() < tol,
-                "CPU PBD constraint ({},{}) length drift: {}",
-                a, b, len_cpu
-            );
+        for &stiffness in &[1.0_f32, 0.7, 0.3] {
+            let constraints: Vec<(u32, u32, f32, f32)> = constraint_pairs
+                .iter()
+                .map(|(a, b, r)| (*a, *b, *r, stiffness))
+                .collect();
+            let test_dt = 1.0 / 60.0_f32;
 
-            let pa_gpu = gpu_positions[*a as usize];
-            let pb_gpu = gpu_positions[*b as usize];
-            let dx = pb_gpu[0] - pa_gpu[0];
-            let dy = pb_gpu[1] - pa_gpu[1];
-            let dz = pb_gpu[2] - pa_gpu[2];
-            let len_gpu = (dx * dx + dy * dy + dz * dz).sqrt();
-            assert!(
-                (len_gpu - rest_length).abs() < tol,
-                "GLSL Jacobi constraint ({},{}) length drift: {}",
-                a, b, len_gpu
-            );
+            // ----- (a) CPU XPBD reference -----
+            let mut sim = ClothSimState {
+                particles: base_positions
+                    .iter()
+                    .map(|p| ClothParticle::new(*p, false))
+                    .collect(),
+                distance_constraints: constraints
+                    .iter()
+                    .map(|(a, b, r, s)| ClothDistanceConstraint {
+                        a: *a as usize,
+                        b: *b as usize,
+                        rest_length: *r,
+                        stiffness: *s,
+                    })
+                    .collect(),
+                bend_constraints: Vec::new(),
+                pin_targets: Vec::new(),
+                solver_iterations: 0,
+                gravity: [0.0; 3],
+                damping: 0.0,
+                collision_margin: 0.0,
+                wind_response: 0.0,
+                wind_direction: [0.0; 3],
+                triangle_indices: Vec::new(),
+                computed_normals: vec![[0.0; 3]; n],
+                initialized: true,
+                self_collision: false,
+                self_collision_radius: 0.0,
+                connected_pairs: HashSet::new(),
+                spatial_hash: SpatialHashGrid::new(0.04),
+            };
+            let mut buffers = ClothSimTempBuffers::new(n);
+            buffers.reset_lambda(sim.distance_constraints.len());
+            for _ in 0..64 {
+                project_distance_constraints(&mut sim, &mut buffers, test_dt);
+            }
+
+            // ----- (b) GLSL XPBD formula mirror -----
+            let mut gpu_positions: Vec<[f32; 4]> = base_positions
+                .iter()
+                .map(|p| [p[0], p[1], p[2], 1.0])
+                .collect();
+            let mut gpu_lambda = vec![0.0_f32; constraints.len()];
+            for _ in 0..64 {
+                cpu_mirror_of_cloth_constraint_iter(
+                    &mut gpu_positions,
+                    &constraints,
+                    &adj,
+                    &mut gpu_lambda,
+                    test_dt,
+                );
+            }
+
+            // ----- Assert every constraint's length lands inside tol -----
+            let tol = 0.05; // 5 cm slack across stiffness range, 64 iters.
+            for (a, b, rest_length, _) in &constraints {
+                let pa_cpu = sim.particles[*a as usize].position;
+                let pb_cpu = sim.particles[*b as usize].position;
+                let dx = pb_cpu[0] - pa_cpu[0];
+                let dy = pb_cpu[1] - pa_cpu[1];
+                let dz = pb_cpu[2] - pa_cpu[2];
+                let len_cpu = (dx * dx + dy * dy + dz * dz).sqrt();
+                assert!(
+                    (len_cpu - rest_length).abs() < tol,
+                    "CPU XPBD constraint ({},{}) length drift @ stiffness={}: {}",
+                    a,
+                    b,
+                    stiffness,
+                    len_cpu
+                );
+
+                let pa_gpu = gpu_positions[*a as usize];
+                let pb_gpu = gpu_positions[*b as usize];
+                let dx = pb_gpu[0] - pa_gpu[0];
+                let dy = pb_gpu[1] - pa_gpu[1];
+                let dz = pb_gpu[2] - pa_gpu[2];
+                let len_gpu = (dx * dx + dy * dy + dz * dz).sqrt();
+                assert!(
+                    (len_gpu - rest_length).abs() < tol,
+                    "GLSL XPBD constraint ({},{}) length drift @ stiffness={}: {}",
+                    a,
+                    b,
+                    stiffness,
+                    len_gpu
+                );
+            }
         }
     }
 
