@@ -383,18 +383,17 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
 }
 
 pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
-    let avatar_expressions = state
-        .app
-        .active_avatar()
-        .map(|a| a.asset.default_expressions.expressions.clone());
-
-    let expressions = match avatar_expressions {
-        Some(e) if !e.is_empty() => e,
-        _ => return,
+    // Bind sliders directly to `avatar.expression_weights[i].weight` so
+    // the slider widget IS the avatar's value — no GUI shadow buffer,
+    // no per-frame reconcile. Face tracking writes a fresh weights Vec
+    // to the avatar each frame (`app/render.rs`); the slider sees that
+    // new value on the next paint without any explicit copy. When
+    // tracking is off, the slider directly drives the avatar.
+    let Some(avatar) = state.app.active_avatar_mut() else {
+        return;
     };
-
-    if state.expression_weights.len() != expressions.len() {
-        state.expression_weights = expressions.iter().map(|e| e.weight).collect();
+    if avatar.expression_weights.is_empty() {
+        return;
     }
 
     egui::CollapsingHeader::new(t!("inspector.expression_control"))
@@ -410,7 +409,9 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .clicked()
                 {
-                    state.expression_weights.fill(0.0);
+                    for ew in avatar.expression_weights.iter_mut() {
+                        ew.weight = 0.0;
+                    }
                 }
                 if outlined_button(
                     ui,
@@ -421,26 +422,19 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                 )
                 .clicked()
                 {
-                    state.expression_weights.fill(0.5);
+                    for ew in avatar.expression_weights.iter_mut() {
+                        ew.weight = 0.5;
+                    }
                 }
             });
 
             ui.separator();
 
-            let mut changed = false;
-            // Iterate via zip so a length drift between `expressions`
-            // and `expression_weights` (e.g. avatar reload between the
-            // sync check above and this loop) silently truncates
-            // instead of panicking. The sync guard makes the lengths
-            // match on the happy path; this is just defensive.
-            for (expr, weight) in expressions
-                .iter()
-                .zip(state.expression_weights.iter_mut())
-            {
+            for ew in avatar.expression_weights.iter_mut() {
                 ui.horizontal(|ui| {
-                    ui.label(&expr.name);
-                    let response = ui.add(
-                        egui::Slider::new(weight, 0.0..=1.0)
+                    ui.label(&ew.name);
+                    ui.add(
+                        egui::Slider::new(&mut ew.weight, 0.0..=1.0)
                             .text("")
                             .custom_formatter(|n, _| format!("{:.0}%", n * 100.0))
                             .custom_parser(|s| {
@@ -450,38 +444,13 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                                     .map(|v| v / 100.0)
                             }),
                     );
-                    if response.changed() {
-                        changed = true;
-                    }
                 });
             }
 
-            if changed {
-                if let Some(avatar) = state.app.active_avatar_mut() {
-                    avatar.expression_weights = expressions
-                        .iter()
-                        .zip(state.expression_weights.iter())
-                        .map(
-                            |(expr, &w)| crate::avatar::pose_solver::ResolvedExpressionWeight {
-                                name: expr.name.clone(),
-                                weight: w,
-                            },
-                        )
-                        .collect();
-                }
-            }
-
-            if !changed {
-                if let Some(avatar) = state.app.active_avatar() {
-                    let avatar_weights: Vec<f32> =
-                        avatar.expression_weights.iter().map(|w| w.weight).collect();
-                    if avatar_weights.len() == state.expression_weights.len() {
-                        state.expression_weights = avatar_weights;
-                    }
-                }
-            }
-
             ui.separator();
-            ui.label(t!("inspector.expressions_loaded", count = expressions.len()));
+            ui.label(t!(
+                "inspector.expressions_loaded",
+                count = avatar.expression_weights.len()
+            ));
         });
 }

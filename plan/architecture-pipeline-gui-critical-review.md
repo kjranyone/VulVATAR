@@ -63,14 +63,29 @@ Added in this split:
 
 Still top-level on `GuiApp` (intentional — these are single-field roles
 or "coordinator owns" data that doesn't fit a panel cluster):
-`mode`, `app`, `inspector_open`, `animation_playing`,
-`test_no_persist`, `expression_weights`, `camera_index`,
+`mode`, `app`, `inspector_open`, `test_no_persist`, `camera_index`,
 `available_cameras`, `hotkeys`, `profiles`, `notifications`.
 
 The brittleness pattern the original review flagged (panels mutating
 widget state through `GuiApp` directly, `GuiApp::update` reconciling
 fields into `Application` every frame) is now contained — each panel
 mutates only its own sub-state struct.
+
+### Phase C single-source-of-truth — scope clarification
+
+The "no GUI shadow" rule applied to `expression_weights` (review pass 9
+removed the per-frame double-reconcile and binds the slider directly to
+`avatar.expression_weights[i].weight`) and to the sink + lipsync
+binding paths (`project.rs:153-168`). For other pipeline-bound widget
+settings (`camera_orbit`, `rendering.main_light_*`, `rendering.
+background_color`, `output.output_resolution_index`,
+`output.output_framerate_index`, `output.output_has_alpha`,
+`output.output_color_space_index`) the current design is **one-way
+push every frame** in `GuiApp::update` (`gui/mod.rs:1135-1180`) —
+not bidirectional shadow, but also not Phase C single-source-of-truth.
+Eliminating those per-frame pushes is a structural refactor (widgets
+bind directly to `Application` fields) that is deferred; the per-frame
+push is harmless beyond the bookkeeping it represents.
 
 ## #12 — Renderer module size (residual)
 

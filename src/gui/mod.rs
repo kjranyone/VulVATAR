@@ -591,17 +591,12 @@ pub struct GuiApp {
     // Lip sync
     pub lipsync: LipSyncGuiState,
 
-    // Animation inspector state
-    pub animation_playing: bool,
-
     // Cloth-authoring panel state (sim playback, rename / save
     // buffers, region selection, sim-parameter widgets). See
     // `ClothAuthoringUiState`.
     pub cloth_authoring: ClothAuthoringUiState,
 
     pub inspector_open: bool,
-
-    pub expression_weights: Vec<f32>,
 
     // Scene preset library + inspector combo + rename buffer.
     pub scene_preset: ScenePresetUiState,
@@ -748,11 +743,8 @@ impl GuiApp {
                 current_volume: 0.0,
             },
 
-            animation_playing: false,
-
             cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
-            expression_weights: Vec::new(),
 
             scene_preset: ScenePresetUiState {
                 presets: crate::persistence::load_scene_presets(),
@@ -963,11 +955,8 @@ impl GuiApp {
                 current_volume: 0.0,
             },
 
-            animation_playing: false,
-
             cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
-            expression_weights: Vec::new(),
 
             scene_preset: ScenePresetUiState::default(),
 
