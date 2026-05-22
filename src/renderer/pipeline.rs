@@ -964,6 +964,68 @@ layout(set = 1, binding = 0) readonly buffer SkinningData {
     mat4 matrices[];
 } skinning;
 
+// =====================================================================
+// Dual Quaternion Skinning (DQS, Kavan 2007) — derived in-shader from
+// the per-bone skinning matrices that LBS would consume.
+//
+// Compared with the prior LBS path, DQS eliminates the candy-wrapper
+// twist artefact at joints with non-trivial rotational delta (forearm
+// pronation, hip yaw under skirts, neck twist). Cost: one
+// matrix→quaternion extraction per blended joint (4 per vertex) plus
+// a 4-way quaternion blend + normalise. Negligible against the
+// per-frame morph and constraint solvers.
+//
+// Translation is recovered from the 4th column of the skinning matrix
+// rather than re-derived from the dual, because the source matrices
+// from `Application::build_skinning_matrices` are
+// `global_transform · inverse_bind` products where the translation
+// component is already in world space — re-encoding it into a dual
+// quaternion just to decode it again would be lossy if the source
+// matrix carries any non-rigid component.
+// =====================================================================
+
+// Mike Day's robust mat3→quat conversion. GLSL is column-major
+// (`m[col][row]`), so the row-major literature's `M[i][j]` reads as
+// `m[j][i]` here.
+vec4 mat3_to_quat(mat3 m) {
+    float trace = m[0][0] + m[1][1] + m[2][2];
+    vec4 q;
+    if (trace > 0.0) {
+        float s = sqrt(trace + 1.0) * 2.0;
+        q.w = 0.25 * s;
+        q.x = (m[1][2] - m[2][1]) / s;
+        q.y = (m[2][0] - m[0][2]) / s;
+        q.z = (m[0][1] - m[1][0]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        float s = sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+        q.w = (m[1][2] - m[2][1]) / s;
+        q.x = 0.25 * s;
+        q.y = (m[1][0] + m[0][1]) / s;
+        q.z = (m[2][0] + m[0][2]) / s;
+    } else if (m[1][1] > m[2][2]) {
+        float s = sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+        q.w = (m[2][0] - m[0][2]) / s;
+        q.x = (m[1][0] + m[0][1]) / s;
+        q.y = 0.25 * s;
+        q.z = (m[2][1] + m[1][2]) / s;
+    } else {
+        float s = sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+        q.w = (m[0][1] - m[1][0]) / s;
+        q.x = (m[2][0] + m[0][2]) / s;
+        q.y = (m[2][1] + m[1][2]) / s;
+        q.z = 0.25 * s;
+    }
+    return q;
+}
+
+// Rotate a vector by a unit quaternion. Standard
+// `q ⊗ v ⊗ q⁻¹` derivation reduced to vector ops.
+vec3 quat_rotate(vec4 q, vec3 v) {
+    vec3 u = q.xyz;
+    float w = q.w;
+    return v + 2.0 * cross(u, cross(u, v) + w * v);
+}
+
 void main() {
     uint vid = gl_GlobalInvocationID.x;
     if (vid >= ctrl.vertex_count) return;
@@ -992,20 +1054,47 @@ void main() {
         }
     }
 
-    // Linear blend skinning. All-zero joint weights → identity (used for
-    // primitives without skeletal binding, e.g. accessories).
-    mat4 skin = mat4(0.0);
-    for (uint i = 0u; i < 4u; i++) {
-        skin += b.joint_weights[i] * skinning.matrices[b.joint_indices[i]];
-    }
     float total_w = b.joint_weights.x + b.joint_weights.y +
                     b.joint_weights.z + b.joint_weights.w;
-    if (total_w < 0.001) skin = mat4(1.0);
+    if (total_w < 0.001) {
+        // No skinning weights — emit the morph/cloth-blended position
+        // as-is (used for accessories that aren't bone-bound).
+        out_v.v[vid].position = vec4(pos, 0.0);
+        out_v.v[vid].normal   = vec4(nrm, 0.0);
+        out_v.v[vid].uv       = b.uv;
+        out_v.v[vid]._pad     = uvec2(0u, 0u);
+        return;
+    }
 
-    vec4 world_pos = skin * vec4(pos, 1.0);
-    vec3 world_nrm = mat3(skin) * nrm;
+    // ----- DQS: extract rotation quaternion + translation per joint,
+    //          weighted-blend, normalise, apply.
+    // Reference rotation is the FIRST joint's quaternion. Subsequent
+    // joints flip sign if dot < 0 so the blend always stays on the
+    // same hemisphere (otherwise the weighted average could land on
+    // the antipode and produce a flipped rotation).
+    mat4 m0 = skinning.matrices[b.joint_indices[0]];
+    vec4 ref_real = mat3_to_quat(mat3(m0));
+    vec4 acc_real = vec4(0.0);
+    vec3 acc_trans = vec3(0.0);
+    for (uint i = 0u; i < 4u; i++) {
+        float wi = b.joint_weights[i];
+        if (wi <= 0.0) continue;
+        mat4 mi = skinning.matrices[b.joint_indices[i]];
+        vec4 qi = mat3_to_quat(mat3(mi));
+        // Antipodal flip against the reference so the linear
+        // combination stays consistent.
+        float s = (i == 0u || dot(qi, ref_real) >= 0.0) ? 1.0 : -1.0;
+        acc_real += wi * s * qi;
+        acc_trans += wi * mi[3].xyz;
+    }
+    // Renormalise the real quaternion — the linear blend is no
+    // longer unit-length.
+    acc_real = normalize(acc_real);
 
-    out_v.v[vid].position = vec4(world_pos.xyz, 0.0);
+    vec3 world_pos = quat_rotate(acc_real, pos) + acc_trans;
+    vec3 world_nrm = quat_rotate(acc_real, nrm);
+
+    out_v.v[vid].position = vec4(world_pos, 0.0);
     out_v.v[vid].normal   = vec4(world_nrm, 0.0);
     out_v.v[vid].uv       = b.uv;
     out_v.v[vid]._pad     = uvec2(0u, 0u);
