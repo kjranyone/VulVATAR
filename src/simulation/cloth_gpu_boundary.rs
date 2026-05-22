@@ -565,7 +565,9 @@ mod tests {
             let pb = positions[b as usize];
             let diff = [pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]];
             let dist = (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt();
-            if dist < 1.0e-6 {
+            // 1e-9 m = 1 nm. Below this both endpoints are numerically
+            // coincident; matches the GLSL + CPU XPBD threshold.
+            if dist < 1.0e-9 {
                 dlambda[j] = 0.0;
                 continue;
             }
@@ -608,7 +610,7 @@ mod tests {
                     other_p[2] - self_pos[2],
                 ];
                 let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-                if len > 1.0e-6 {
+                if len > 1.0e-9 {
                     // Δx_self = -d_unit · w_self · Δλ_j
                     //   where d_unit = (other - self) / len
                     let dl = dlambda[cidx];
@@ -881,10 +883,11 @@ mod tests {
     }
 
     /// 32-particle (4×8) flat sheet of triangles in XY plane: the GLSL
-    /// normal formula must agree with the CPU PBD `compute_normals`
-    /// reference to within `1e-4` per component per vertex. (The CPU
-    /// reference uses the same area-weighted accumulation, so they
-    /// should match bit-for-bit modulo floating-point summation order.)
+    /// normal formula must agree with the CPU `compute_normals`
+    /// reference to within `1e-4` per component per vertex. Both paths
+    /// use angle-weighted accumulation (Max 1999), so they should match
+    /// bit-for-bit modulo floating-point summation order. Isolated /
+    /// degenerate vertices fall back to `(0, 1, 0)` on both sides.
     #[test]
     fn cloth_normal_cs_formula_matches_cpu_pbd() {
         use crate::simulation::cloth::{

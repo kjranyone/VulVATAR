@@ -114,7 +114,11 @@ pub(crate) fn project_distance_constraints(
         // w.r.t. x_b is −d.
         let diff = vec3_sub(&pa, &pb);
         let dist = vec3_length(&diff);
-        if dist < 1e-12 {
+        // 1e-9 m = 1 nm. Below this both endpoints are numerically
+        // coincident and the constraint direction is undefined. Same
+        // threshold used by the GPU mirror at the lambda-update +
+        // accumulate passes.
+        if dist < 1e-9 {
             continue;
         }
         let d = vec3_scale(&diff, 1.0 / dist);

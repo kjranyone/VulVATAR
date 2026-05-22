@@ -21,7 +21,7 @@
 //! plus three edge normalisations — negligible against the constraint
 //! solver and well within the cloth path's per-frame budget.
 
-use crate::math_utils::{vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_normalize, vec3_scale, vec3_sub};
+use crate::math_utils::{vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_scale, vec3_sub};
 use crate::simulation::cloth::ClothSimState;
 
 // =========================================================================
@@ -100,9 +100,17 @@ pub(crate) fn compute_normals(sim: &mut ClothSimState) {
             vec3_add(&sim.computed_normals[i2], &vec3_scale(&face_normal, a2));
     }
 
-    // Normalise.
+    // Normalise. Degenerate / isolated vertices fall back to (0, 1, 0)
+    // so downstream shading sees a renderable normal — and the GPU
+    // mirror (`cloth_normal_cs`) uses the same fallback, keeping CPU↔GPU
+    // parity for isolated vertices.
     for normal in sim.computed_normals.iter_mut() {
-        *normal = vec3_normalize(normal);
+        let len = vec3_length(normal);
+        if len < 1e-12 {
+            *normal = [0.0, 1.0, 0.0];
+        } else {
+            *normal = vec3_scale(normal, 1.0 / len);
+        }
     }
 }
 

@@ -607,7 +607,9 @@ void main() {
     vec4 pb = positions.p[cn.particle_b];
     vec3 diff = pa.xyz - pb.xyz;
     float dist = length(diff);
-    if (dist < 1.0e-6) {
+    // 1e-9 m = 1 nm. Below this both endpoints are numerically
+    // coincident; matches the CPU XPBD path's zero-length guard.
+    if (dist < 1.0e-9) {
         dlambda.l[cidx] = 0.0;
         return;
     }
@@ -715,7 +717,8 @@ void main() {
         vec4 other_p = positions.p[other];
         vec3 dir = other_p.xyz - self_pos;  // points self → other
         float len = length(dir);
-        if (len > 1e-6) {
+        // Matches the lambda-update + CPU XPBD zero-length guard (1 nm).
+        if (len > 1.0e-9) {
             // XPBD: Δx_self = -d_unit · w_self · Δλ_j
             //   where d_unit = (other - self) / len = +d_unit_GPU
             //   = w_self · ((self - other) / len) · Δλ_j on the CPU
@@ -777,7 +780,7 @@ void main() {
 }
 
 // ---------------------------------------------------------------------------
-// Cloth vertex normal recomputation compute shader (P3-02 S3.1 — pipeline only)
+// Cloth vertex normal recomputation compute shader (P3-02 S3.1)
 // ---------------------------------------------------------------------------
 //
 // Third stage of the GPU cloth solver migration. After integration (S1.2)
@@ -788,13 +791,14 @@ void main() {
 // Strategy: one workgroup invocation per cloth vertex; each invocation
 // walks its incident triangles via a precomputed CSR adjacency built once
 // at attach time (`cloth_gpu_boundary::build_vertex_triangle_adjacency`).
-// Face normals are accumulated **without** pre-normalising so the sum is
-// area-weighted (same convention as `cloth_solver::output::compute_normals`),
-// then the per-vertex result is normalised. Embarrassingly parallel — no
-// atomics, no extensions, no cross-invocation synchronisation.
-//
-// **Status**: shader + pipeline factory only. Not yet wired; lands with
-// the rest of the GPU cloth dispatch path in P3-02 stage 3.
+// Each incident triangle contributes its **unit** face normal scaled by
+// the incident angle at this vertex (angle-weighted accumulation, Max
+// 1999 — matches `cloth_solver::output::compute_normals`). Bounded by
+// [0, π] per triangle so the result follows the local 1-ring shape
+// instead of the area of the largest incident triangle. Embarrassingly
+// parallel — no atomics, no extensions, no cross-invocation
+// synchronisation. Degenerate / isolated vertices fall back to
+// `(0, 1, 0)`; CPU path uses the same fallback.
 pub mod cloth_normal_cs {
     vulkano_shaders::shader! {
         ty: "compute",
@@ -1050,9 +1054,17 @@ void main() {
         }
     }
 
+    // Unified weight threshold. Weights below this are treated as
+    // not-contributing across every check (total-weight gate, antipodal
+    // reference pick, accumulator skip). Asymmetric thresholds caused a
+    // pathology where total_w squeaked past 0.001 but the per-element
+    // `> 0.0` gate stayed strict, mixing contributing-joint selection
+    // with float-noise weights.
+    const float WEIGHT_EPS = 1.0e-4;
+
     float total_w = b.joint_weights.x + b.joint_weights.y +
                     b.joint_weights.z + b.joint_weights.w;
-    if (total_w < 0.001) {
+    if (total_w < WEIGHT_EPS) {
         // No skinning weights — emit the morph/cloth-blended position
         // as-is (used for accessories that aren't bone-bound).
         out_v.v[vid].position = vec4(pos, 0.0);
@@ -1064,48 +1076,50 @@ void main() {
 
     // ----- DQS: extract rotation quaternion + translation per joint,
     //          weighted-blend, normalise, apply.
-    // The antipodal-reference quaternion is the FIRST non-zero-weight
-    // joint's rotation, not unconditionally `joint_indices[0]` — a
+    // The antipodal-reference quaternion is the FIRST contributing
+    // joint's rotation (not unconditionally `joint_indices[0]`) — a
     // vertex with `joint_weights = [0, 0.5, 0.5, 0]` and a stray
     // `joint_indices[0]` would otherwise let an unused bone's
-    // hemisphere drive the flip decisions for the contributing
-    // bones. Subsequent contributing joints flip sign when
-    // `dot(qi, ref_real) < 0` so the linear combination always
-    // stays on the same hemisphere (otherwise the weighted average
-    // can land on the antipode and produce a flipped rotation).
+    // hemisphere drive the flip decisions for the contributing bones.
+    // Subsequent contributing joints flip sign when
+    // `dot(qi, ref_real) < 0` so the linear combination stays on one
+    // hemisphere. A weighted average of strictly-antipodal quaternions
+    // can still cancel to near-zero magnitude after the flip (e.g. two
+    // contributors whose xyz parts oppose); guard against that below
+    // before `normalize()`.
     vec4 ref_real = vec4(0.0, 0.0, 0.0, 1.0);
-    bool ref_set = false;
     for (uint i = 0u; i < 4u; i++) {
-        if (b.joint_weights[i] > 0.0) {
+        if (b.joint_weights[i] > WEIGHT_EPS) {
             ref_real = mat3_to_quat(mat3(skinning.matrices[b.joint_indices[i]]));
-            ref_set = true;
             break;
         }
-    }
-    // `ref_set == false` is unreachable because `total_w < 0.001`
-    // already early-returned above; the variable is here only to
-    // make the invariant inspectable from a debugger.
-    if (!ref_set) {
-        out_v.v[vid].position = vec4(pos, 0.0);
-        out_v.v[vid].normal   = vec4(nrm, 0.0);
-        out_v.v[vid].uv       = b.uv;
-        out_v.v[vid]._pad     = uvec2(0u, 0u);
-        return;
     }
     vec4 acc_real = vec4(0.0);
     vec3 acc_trans = vec3(0.0);
     for (uint i = 0u; i < 4u; i++) {
         float wi = b.joint_weights[i];
-        if (wi <= 0.0) continue;
+        if (wi <= WEIGHT_EPS) continue;
         mat4 mi = skinning.matrices[b.joint_indices[i]];
         vec4 qi = mat3_to_quat(mat3(mi));
         float s = (dot(qi, ref_real) >= 0.0) ? 1.0 : -1.0;
         acc_real += wi * s * qi;
         acc_trans += wi * mi[3].xyz;
     }
-    // Renormalise the real quaternion — the linear blend is no
-    // longer unit-length.
-    acc_real = normalize(acc_real);
+    // Renormalise — the linear blend is no longer unit-length. Guard
+    // against the degenerate case where the antipodal-flipped sum has
+    // near-zero magnitude (rare: two contributors whose xyz parts
+    // cancel and whose w parts also cancel). Fall back to pass-through
+    // so the vertex stays in the morph/cloth-blended frame instead of
+    // emitting NaN through the SSBO.
+    float acc_len = length(acc_real);
+    if (acc_len < 1.0e-6) {
+        out_v.v[vid].position = vec4(pos, 0.0);
+        out_v.v[vid].normal   = vec4(nrm, 0.0);
+        out_v.v[vid].uv       = b.uv;
+        out_v.v[vid]._pad     = uvec2(0u, 0u);
+        return;
+    }
+    acc_real /= acc_len;
 
     vec3 world_pos = quat_rotate(acc_real, pos) + acc_trans;
     vec3 world_nrm = quat_rotate(acc_real, nrm);
