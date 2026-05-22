@@ -234,7 +234,6 @@ impl VulkanRenderer {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn allocate_cloth_constraint_resources(
     constraints: &[(u32, u32, f32, f32)],
     particle_count: u32,
