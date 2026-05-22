@@ -78,25 +78,77 @@ same `Δλ_j` and produce consistent Δx contributions.
   parity test stays correct because XPBD@α=0 reduces to PBD@stiffness=1
   algebraically — covers the CPU XPBD ↔ GPU XPBD parity at stiffness=1
 
-**Follow-up validation** (not yet landed): extend the parity test to
-cover stiffness ∈ {1.0, 0.7, 0.3} so that CPU XPBD ↔ GPU XPBD parity
-is exercised at non-trivial compliance values too. Requires upgrading
-`cpu_mirror_of_cloth_constraint_iter` (the GPU formula mirror) to do
-the lambda accumulation; the GPU side is now ready.
+**Stiffness sweep parity** (landed in `aa6532c`):
+`cpu_mirror_of_cloth_constraint_iter` was rewritten to mirror the
+three-pass GLSL XPBD dispatch with `lambda` + `dt` parameters, and
+`cloth_constraint_jacobi_satisfies_rest_lengths_like_cpu_pbd` now
+sweeps `stiffness ∈ {1.0, 0.7, 0.3}`. CPU XPBD ↔ GPU XPBD parity
+is therefore exercised at non-trivial compliance values, not just
+the `α = 0` rigid limit.
+
+### Cloth normal recomputation — angle-weighted (Max 1999)
+
+**Reference**: Max, "Weights for Computing Vertex Normals from
+Facet Normals", JGT 1999.
+
+Replaced area-weighted face-normal accumulation (raw cross product
+summed per vertex) with angle-weighted (each incident triangle
+contributes its *unit* face normal scaled by the incident angle at
+the vertex). On regular meshes the two converge to the same result;
+on irregular triangulations the angle-weighted version is bounded
+by `[0, π]` per triangle rather than by triangle area, so the
+normal at each vertex follows the local 1-ring shape instead of
+the area of the largest incident triangle.
+
+**Files (commit `70bcfdc`)**:
+- `src/simulation/cloth_solver/output.rs::compute_normals` — CPU
+  reference. Adds `safe_angle(u, v)` helper for degenerate
+  protection.
+- `src/renderer/pipeline.rs::cloth_normal_cs` — GLSL mirror.
+- `src/simulation/cloth_gpu_boundary.rs::cpu_mirror_of_cloth_normal_cs`
+  — formula-parity reference for the GLSL shader.
+
+### Skinning — LBS → DQS (Kavan 2007)
+
+**Reference**: Kavan, Collins, Žára, O'Sullivan. "Skinning with
+Dual Quaternions", I3D 2007.
+
+Replaced Linear Blend Skinning with Dual Quaternion Skinning in
+`transform_cs`. DQS eliminates the candy-wrapper twist artefact at
+joints with non-trivial rotational delta (forearm pronation, hip
+yaw under skirts, neck twist).
+
+**Algorithm** (in-shader, per vertex):
+
+1. Extract rotation quaternion from each joint's skinning matrix
+   via Mike Day's robust mat3→quat conversion.
+2. Pick the first non-zero-weight joint as the antipodal reference;
+   flip subsequent contributing quaternions when `dot(qi, ref) < 0`
+   so the linear blend stays on one hemisphere.
+3. Weighted-blend the (flipped) quaternions and renormalise.
+4. Recover translation as the weighted average of each joint's
+   `m[3].xyz` (kept separate from the quaternion blend because the
+   source matrices are `global · inverse_bind` products with
+   already-world-space translations).
+5. Apply: `pos' = quat_rotate(q, pos) + t`,
+   `nrm' = quat_rotate(q, nrm)`.
+
+**Files (commit `198d876`, hardened in `2daf611`)**:
+- `src/renderer/pipeline.rs::transform_cs` — GLSL DQS dispatch.
+  The `SkinningData.matrices` SSBO layout is **unchanged**; the
+  matrix → quaternion conversion happens entirely in-shader so no
+  CPU code needed to be touched.
+
+Cost: 4× mat3→quat extractions per vertex plus a 4-way quaternion
+blend + normalise + two `quat_rotate` calls. On VRM avatars
+(~10k–50k skinned vertices) the cost lands well below the morph /
+cloth solver and graphics pipeline budget.
+
+The `total_w < 0.001` early-return preserves the prior LBS path's
+"no skinning → pass through" behaviour for non-bone-bound
+accessories.
 
 ## Open SOTA slices
-
-### Cloth normal recomputation — area-weighted vs angle-weighted
-
-Current implementation: area-weighted face-normal accumulation
-(triangle area × face normal summed per vertex, then normalised).
-
-SOTA alternative: angle-weighted (Max 1999) — each face contributes
-its normal scaled by the incident angle at the vertex. Less prone to
-biased normals on irregular triangulations. Cost: cosine per triangle
-edge.
-
-Defer until a measurable visual issue motivates it.
 
 ### Body twist / yaw — torso 4-point plane fit OR elbow Δz with arm-pose gate
 
@@ -109,21 +161,6 @@ floor — the root cause is the RTMW3D depth model's degenerate Z output
 on close-together points, which only a backend swap (Option D: Sapiens
 / BlazePose GHUM 3D) cleanly fixes. Backend swap is multi-day work and
 out of scope for this slice.
-
-### Skinning — Linear blend → Dual quaternion
-
-Current: linear blend skinning (LBS) on the compute prepass output.
-SOTA: dual quaternion skinning (Kavan 2007) eliminates the
-"candy-wrapper" twist artefact at elbows / knees. The change is
-local to `transform_cs`:
-
-- Add dual-quaternion derivation from each bone's matrix
-- Blend dual-quats per vertex (weighted, then normalised), apply
-
-Cost: ~30% more arithmetic per vertex. Visual win is most
-noticeable on extreme bone twist (forearm pronation, hip rotation).
-
-Deferred. Comparable scope to GPU XPBD.
 
 ### Tracking — RTMW3D → Sapiens or BlazePose GHUM 3D
 
