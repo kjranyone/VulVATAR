@@ -1068,12 +1068,34 @@ void main() {
 
     // ----- DQS: extract rotation quaternion + translation per joint,
     //          weighted-blend, normalise, apply.
-    // Reference rotation is the FIRST joint's quaternion. Subsequent
-    // joints flip sign if dot < 0 so the blend always stays on the
-    // same hemisphere (otherwise the weighted average could land on
-    // the antipode and produce a flipped rotation).
-    mat4 m0 = skinning.matrices[b.joint_indices[0]];
-    vec4 ref_real = mat3_to_quat(mat3(m0));
+    // The antipodal-reference quaternion is the FIRST non-zero-weight
+    // joint's rotation, not unconditionally `joint_indices[0]` — a
+    // vertex with `joint_weights = [0, 0.5, 0.5, 0]` and a stray
+    // `joint_indices[0]` would otherwise let an unused bone's
+    // hemisphere drive the flip decisions for the contributing
+    // bones. Subsequent contributing joints flip sign when
+    // `dot(qi, ref_real) < 0` so the linear combination always
+    // stays on the same hemisphere (otherwise the weighted average
+    // can land on the antipode and produce a flipped rotation).
+    vec4 ref_real = vec4(0.0, 0.0, 0.0, 1.0);
+    bool ref_set = false;
+    for (uint i = 0u; i < 4u; i++) {
+        if (b.joint_weights[i] > 0.0) {
+            ref_real = mat3_to_quat(mat3(skinning.matrices[b.joint_indices[i]]));
+            ref_set = true;
+            break;
+        }
+    }
+    // `ref_set == false` is unreachable because `total_w < 0.001`
+    // already early-returned above; the variable is here only to
+    // make the invariant inspectable from a debugger.
+    if (!ref_set) {
+        out_v.v[vid].position = vec4(pos, 0.0);
+        out_v.v[vid].normal   = vec4(nrm, 0.0);
+        out_v.v[vid].uv       = b.uv;
+        out_v.v[vid]._pad     = uvec2(0u, 0u);
+        return;
+    }
     vec4 acc_real = vec4(0.0);
     vec3 acc_trans = vec3(0.0);
     for (uint i = 0u; i < 4u; i++) {
@@ -1081,9 +1103,7 @@ void main() {
         if (wi <= 0.0) continue;
         mat4 mi = skinning.matrices[b.joint_indices[i]];
         vec4 qi = mat3_to_quat(mat3(mi));
-        // Antipodal flip against the reference so the linear
-        // combination stays consistent.
-        float s = (i == 0u || dot(qi, ref_real) >= 0.0) ? 1.0 : -1.0;
+        float s = (dot(qi, ref_real) >= 0.0) ? 1.0 : -1.0;
         acc_real += wi * s * qi;
         acc_trans += wi * mi[3].xyz;
     }
