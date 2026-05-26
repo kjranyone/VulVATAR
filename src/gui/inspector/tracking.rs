@@ -17,8 +17,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("tracking.input_device"))
         .default_open(true)
         .show(ui, |ui| {
+            // Captured before the device combo so a mid-session device switch
+            // triggers the same auto-restart as a resolution / FPS change.
+            let prev_camera = state.camera_index;
             ui.horizontal(|ui| {
-                let prev_camera = state.camera_index;
                 let selected_text = state
                     .available_cameras
                     .iter()
@@ -55,6 +57,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             });
+            let camera_changed = state.camera_index != prev_camera;
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let active = state.is_tracking_active();
@@ -143,8 +146,11 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             // Phase B-1: if the webcam is currently running, restart it with
             // the new params so the change takes effect immediately rather
-            // than only at the next Stop / Start Camera cycle.
-            if (res_changed || fps_changed) && state.app.is_tracking_running() {
+            // than only at the next Stop / Start Camera cycle. The device
+            // dropdown (`camera_changed`) restarts the same way — previously
+            // it only flagged the project dirty and the running camera kept
+            // the old device until a manual Stop / Start.
+            if (res_changed || fps_changed || camera_changed) && state.app.is_tracking_running() {
                 let (w, h) =
                     crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
                 let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
@@ -166,6 +172,79 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .checkbox(&mut state.tracking.tracking_mirror, t!("tracking.mirror_preview"))
                 .changed()
             {
+                state.project_status.project_dirty = true;
+            }
+        });
+
+    // Pose-solver smoothing / confidence thresholds. These used to be
+    // hardcoded to `TrackingSmoothingParams::default()` at the FrameConfig
+    // build site, so the values existed but no control could reach them.
+    // They now live on `state.tracking.smoothing` and flow through
+    // `FrameConfig::smoothing` each frame. Collapsed by default — most
+    // users should never need to touch them.
+    egui::CollapsingHeader::new(t!("tracking.advanced_smoothing"))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(t!("tracking.advanced_smoothing_hint"))
+                    .color(color::ON_SURFACE_VARIANT),
+            );
+            ui.add_space(4.0);
+            let mut changed = false;
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut state.tracking.smoothing.rotation_blend, 0.0..=1.0)
+                        .text(t!("tracking.rotation_blend")),
+                )
+                .on_hover_text(t!("tracking.rotation_blend_tooltip"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut state.tracking.smoothing.expression_blend, 0.0..=1.0)
+                        .text(t!("tracking.expression_blend")),
+                )
+                .on_hover_text(t!("tracking.expression_blend_tooltip"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut state.tracking.smoothing.joint_confidence_threshold,
+                        0.0..=1.0,
+                    )
+                    .text(t!("tracking.joint_confidence")),
+                )
+                .on_hover_text(t!("tracking.joint_confidence_tooltip"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut state.tracking.smoothing.face_confidence_threshold,
+                        0.0..=1.0,
+                    )
+                    .text(t!("tracking.face_confidence")),
+                )
+                .on_hover_text(t!("tracking.face_confidence_tooltip"))
+                .changed();
+            ui.add_space(4.0);
+            if outlined_button(
+                ui,
+                Some(ic::HISTORY),
+                &t!("tracking.smoothing_reset"),
+                color::PRIMARY,
+                true,
+            )
+            .clicked()
+            {
+                let defaults = crate::tracking::TrackingSmoothingParams::default();
+                state.tracking.smoothing.rotation_blend = defaults.rotation_blend;
+                state.tracking.smoothing.expression_blend = defaults.expression_blend;
+                state.tracking.smoothing.joint_confidence_threshold =
+                    defaults.joint_confidence_threshold;
+                state.tracking.smoothing.face_confidence_threshold =
+                    defaults.face_confidence_threshold;
+                changed = true;
+            }
+            if changed {
                 state.project_status.project_dirty = true;
             }
         });

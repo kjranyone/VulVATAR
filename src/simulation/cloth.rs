@@ -445,9 +445,16 @@ impl ClothSimTempBuffers {
 pub fn resolve_colliders(
     colliders: &[crate::asset::ColliderAsset],
     global_transforms: &[Mat4],
+    enabled: &[bool],
 ) -> Vec<ResolvedCollider> {
     let mut out = Vec::with_capacity(colliders.len());
-    for collider in colliders {
+    for (i, collider) in colliders.iter().enumerate() {
+        // Per-collider enable mask (cloth-authoring "Collision Proxies"
+        // toggles). A missing entry defaults to enabled so callers that
+        // pass an empty/short slice keep the all-colliders behaviour.
+        if !enabled.get(i).copied().unwrap_or(true) {
+            continue;
+        }
         let node_idx = collider.node.0 as usize;
         if node_idx >= global_transforms.len() {
             continue;

@@ -40,7 +40,11 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(true)
         .show(ui, |ui| {
             ui.add(
-                egui::Slider::new(&mut state.settings.zoom_sensitivity, 0.01..=0.5)
+                // Feeds `exp(-scroll * sens)` in the viewport: ~2.5%/notch at
+                // the low end to ~40%/notch at the high end. Logarithmic so the
+                // gentle end (where most users want to be) gets slider travel.
+                egui::Slider::new(&mut state.settings.zoom_sensitivity, 0.0005..=0.01)
+                    .logarithmic(true)
                     .text(t!("settings.zoom_sensitivity")),
             );
             ui.add(

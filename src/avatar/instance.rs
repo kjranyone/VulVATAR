@@ -28,6 +28,12 @@ pub struct AvatarInstance {
     pub cloth_sim: Option<ClothSimState>,
     pub cloth_sim_buffers: Option<ClothSimTempBuffers>,
     pub cloth_overlays: Vec<ClothOverlaySlot>,
+    /// Per-collider enable mask for cloth collision, indexed parallel to
+    /// `asset.colliders`. The cloth-authoring inspector's "Collision
+    /// Proxies" checkboxes bind here directly (single source of truth — no
+    /// GUI shadow). `resolve_colliders` skips entries set to `false`.
+    /// Runtime-only (not persisted); resets to all-enabled on (re)load.
+    pub collider_enabled: Vec<bool>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
     /// Per-bone calibration carried between solver frames so 2D
     /// foreshortening can be inverted into Z. See
@@ -128,6 +134,7 @@ pub struct ClothDeformOutput {
 impl AvatarInstance {
     pub fn new(id: AvatarInstanceId, asset: Arc<AvatarAsset>) -> Self {
         let node_count = asset.skeleton.nodes.len();
+        let collider_count = asset.colliders.len();
         let asset_id = asset.id;
 
         let spring_states = asset
@@ -161,6 +168,7 @@ impl AvatarInstance {
             cloth_sim: None,
             cloth_sim_buffers: None,
             cloth_overlays: Vec::new(),
+            collider_enabled: vec![true; collider_count],
             expression_weights: Vec::new(),
             pose_solver_state: PoseSolverState::default(),
         }

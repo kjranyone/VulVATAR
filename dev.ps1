@@ -179,6 +179,26 @@ function Install-DepthAnythingSmall {
     )
 }
 
+function Install-VitposeWholebody {
+    # ViTPose-s Wholebody (Vision Transformer pose estimator, 97 MB
+    # fp32). MIT-licensed checkpoint from JunkyByte/easy_ViTPose. 2D
+    # only — outputs 133 COCO-Wholebody keypoint heatmaps from a
+    # 256×192 person crop. Adopted as the SOTA-tier 2D backend to
+    # work around RTMW3D-x's asymmetric T-pose wrist detection bias
+    # observed in `validate_pipeline` benchmarking. Pair with DAv2 /
+    # RTMW3D's z lift for full 3D, or fall back to rest-pose z for
+    # purely planar matching.
+    Write-Host "Setting up ViTPose-s Wholebody ONNX..." -ForegroundColor Cyan
+    if (!(Test-Path "models")) {
+        New-Item -ItemType Directory -Force -Path "models" | Out-Null
+    }
+
+    Install-DirectFiles -Name "ViTPose-s Wholebody (2D, 133 keypoints)" -Files @(
+        @{ Url = "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-s-wholebody.onnx";
+           OutName = "vitpose-s-wholebody.onnx" }
+    )
+}
+
 function Select-PoseProvider {
     $current = $env:VULVATAR_POSE_PROVIDER
     if ([string]::IsNullOrWhiteSpace($current)) {
@@ -190,6 +210,9 @@ function Select-PoseProvider {
     Write-Host "   1. rtmw3d              (~48 fps, prior-based z, default)" -ForegroundColor Green
     Write-Host "   2. rtmw3d-with-depth   (~40 fps, calibrated metric z via DAv2-Small async)" -ForegroundColor Green
     Write-Host "   3. cigpose-metric-depth (~5 fps, true metric z via MoGe-2 ViT-S)" -ForegroundColor Yellow
+    Write-Host "   4. vitpose-wholebody   (ViTPose-L 2D, best in-plane accuracy, 2D-only)" -ForegroundColor Green
+    Write-Host "   5. hybrid              (ViTPose-L + RTMW3D z hybrid, torso-only z gate)" -ForegroundColor Green
+    Write-Host "   6. hmr2                (HMR2 SMPL body + MediaPipe Palm+Hand CPU, 3D w/ fingers)" -ForegroundColor Cyan
     Write-Host "   0. keep current" -ForegroundColor DarkGray
     $choice = Read-Host "Provider"
 
@@ -208,6 +231,36 @@ function Select-PoseProvider {
             Write-Host "Using pose provider: cigpose-metric-depth" -ForegroundColor Yellow
             Install-Models
             Install-ExperimentalPoseModels
+        }
+        "4" {
+            $env:VULVATAR_POSE_PROVIDER = "vitpose-wholebody"
+            Write-Host "Using pose provider: vitpose-wholebody" -ForegroundColor Green
+            Install-Models
+        }
+        "5" {
+            $env:VULVATAR_POSE_PROVIDER = "hybrid"
+            Write-Host "Using pose provider: hybrid (ViTPose + RTMW3D z)" -ForegroundColor Green
+            Install-Models
+        }
+        "6" {
+            $env:VULVATAR_POSE_PROVIDER = "hmr2"
+            Write-Host "Using pose provider: hmr2 (SMPL body + MediaPipe Hands)" -ForegroundColor Cyan
+            Install-Models
+            # HMR2 ONNX + MediaPipe hand/palm checks. The HMR2 model is
+            # exported separately (hmr2_export/) — we just verify it's
+            # present here instead of downloading it (2.7 GB).
+            $hmr2 = Test-Path "models/hmr2_fp16.onnx"
+            $palm = Test-Path "models/mediapipe_palm_detection.onnx"
+            $hand = Test-Path "models/mediapipe_hand_landmark.onnx"
+            if (-not $hmr2) {
+                Write-Host "  WARNING: models/hmr2_fp16.onnx missing. Run hmr2_export/export_onnx.py + fp16.py first." -ForegroundColor Red
+            }
+            if (-not $palm) {
+                Write-Host "  WARNING: models/mediapipe_palm_detection.onnx missing." -ForegroundColor Yellow
+            }
+            if (-not $hand) {
+                Write-Host "  WARNING: models/mediapipe_hand_landmark.onnx missing." -ForegroundColor Yellow
+            }
         }
         default {
             $env:VULVATAR_POSE_PROVIDER = "rtmw3d"

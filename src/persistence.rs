@@ -41,6 +41,14 @@ pub struct ProjectState {
     pub camera_index: usize,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
+    // Pose-solver smoothing (Advanced smoothing inspector section). The
+    // remaining `TrackingSmoothingParams` field (`stale_timeout_nanos`) is
+    // not user-editable, so it is not persisted — it always reloads at its
+    // default.
+    pub smoothing_rotation_blend: f32,
+    pub smoothing_expression_blend: f32,
+    pub smoothing_joint_confidence: f32,
+    pub smoothing_face_confidence: f32,
     /// Captured pose-calibration reference. Wired through `Application`'s
     /// `tracking_calibration.pose` on load; the GUI reads it back through
     /// the same field so the inspector status line ("Calibrated 2 min
@@ -248,6 +256,17 @@ pub struct TrackingConfig {
     pub show_camera_wipe: bool,
     #[serde(default)]
     pub show_detection_annotations: bool,
+    /// Pose-solver smoothing. Defaults mirror `TrackingSmoothingParams::
+    /// default()` so projects predating the Advanced smoothing section load
+    /// with the same behaviour the solver had when the values were hardcoded.
+    #[serde(default = "default_rotation_blend")]
+    pub smoothing_rotation_blend: f32,
+    #[serde(default = "default_expression_blend")]
+    pub smoothing_expression_blend: f32,
+    #[serde(default)]
+    pub smoothing_joint_confidence: f32,
+    #[serde(default)]
+    pub smoothing_face_confidence: f32,
     /// **Legacy field — read-only for migration.** Pose calibration
     /// has moved to per-profile storage (`StreamProfile.pose_calibration`
     /// in `gui::profile`) so a user with multiple "home desk" /
@@ -358,6 +377,14 @@ fn default_lipsync_smoothing() -> f32 {
     0.5
 }
 
+fn default_rotation_blend() -> f32 {
+    1.0
+}
+
+fn default_expression_blend() -> f32 {
+    0.8
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct OutputConfig {
     #[serde(default)]
@@ -373,7 +400,9 @@ pub struct OutputConfig {
 }
 
 fn default_zoom_sensitivity() -> f32 {
-    0.1
+    // Exponential-zoom scale (see viewport.rs): ~10%/notch. Projects saved
+    // under the old linear scale (~0.1) are clamped to 0.01 at use-time.
+    0.002
 }
 
 fn default_orbit_sensitivity() -> f32 {
@@ -555,6 +584,10 @@ impl ProjectFile {
                 camera_index: state.camera_index,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
+                smoothing_rotation_blend: state.smoothing_rotation_blend,
+                smoothing_expression_blend: state.smoothing_expression_blend,
+                smoothing_joint_confidence: state.smoothing_joint_confidence,
+                smoothing_face_confidence: state.smoothing_face_confidence,
                 pose_calibration: state.pose_calibration.as_ref().map(pose_calibration_to_dto),
             },
             rendering: RenderingConfig {
@@ -622,6 +655,10 @@ impl ProjectFile {
             camera_index: self.tracking.camera_index,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,
+            smoothing_rotation_blend: self.tracking.smoothing_rotation_blend,
+            smoothing_expression_blend: self.tracking.smoothing_expression_blend,
+            smoothing_joint_confidence: self.tracking.smoothing_joint_confidence,
+            smoothing_face_confidence: self.tracking.smoothing_face_confidence,
             pose_calibration: self.tracking.pose_calibration.as_ref().and_then(dto_to_pose_calibration),
 
             material_mode_index: self.rendering.material_mode_index,

@@ -9,13 +9,16 @@
 //! ## Why DAv2 (Small) and not MoGe-2
 //!
 //! MoGe-2 emits true metric points but its ViT-S backbone with full
-//! self-attention runs at ~200 ms on DirectML — incompatible with
+//! self-attention is in the hundreds-of-ms range — incompatible with
 //! 30 fps. DAv2-Small is also DPT-architected, but the DINOv2-S
 //! backbone (~21 M params) plus a much smaller token count (1036 vs
-//! 1564 here) brings inference to ~30 ms range. The trade-off is
-//! the output is *relative* (inverse-depth-proportional) rather than
-//! metric, which the calibration step in `rtmw3d_with_depth` solves
-//! for using the body-anchor 1-DoF fit:
+//! 1564 here) brings it within a 30 fps async-worker budget when
+//! throttled by `DEPTH_REFRESH_PERIOD`. We run it on the CPU EP only
+//! — see [`super::rtmw3d::build_session_cpu_only`] for why sharing
+//! DirectML with RTMW3D-x and Vulkan trips a 0x116 TDR on Intel iGPU.
+//! The trade-off is the output is *relative* (inverse-depth-
+//! proportional) rather than metric, which the calibration step in
+//! `rtmw3d_with_depth` solves for using the body-anchor 1-DoF fit:
 //!
 //! ```text
 //!   z_metric = c / d_raw,   c = body_distance / sqrt(geom_term)
@@ -51,7 +54,7 @@ use ort::value::TensorRef;
 use std::path::Path;
 
 #[cfg(feature = "inference")]
-use super::rtmw3d::{build_session, InferenceBackend};
+use super::rtmw3d::{build_session_cpu_only, InferenceBackend};
 
 /// Per-frame DAv2 output. `relative` is row-major
 /// `width × height` floats — DAv2 emits inverse-depth-style values
@@ -125,7 +128,15 @@ impl DepthAnythingV2Inference {
         info!("Loading Depth Anything V2 from {}", path.display());
 
         let path_str = path.to_string_lossy().into_owned();
-        let (session, backend) = build_session(&path_str, 4, "DAv2-Small")?;
+        // CPU EP only: when DAv2 shared the DirectML command queue with
+        // RTMW3D-x in the rtmw3d-with-depth provider, the Intel iGPU
+        // driver hit a 0x116 VIDEO_TDR_FAILURE under the combined load
+        // (RTMW3D + DAv2 + Vulkan avatar render on one device). DAv2
+        // already runs in an async worker throttled by
+        // DEPTH_REFRESH_PERIOD, so the ~200–400 ms CPU latency is
+        // absorbed by the staleness budget and does not block the
+        // 30 fps tracker loop. See docs/pose-provider-benchmark.md.
+        let (session, backend) = build_session_cpu_only(&path_str, 4, "DAv2-Small")?;
 
         let input_name = session
             .inputs()

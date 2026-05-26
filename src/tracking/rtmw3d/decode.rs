@@ -5,25 +5,31 @@
 
 use super::consts::INPUT_H;
 
-pub(super) const NUM_JOINTS: usize = 133;
+pub(in crate::tracking) const NUM_JOINTS: usize = 133;
 pub(super) const SIMCC_X_BINS: usize = 576;
 pub(super) const SIMCC_Y_BINS: usize = 768;
 pub(super) const SIMCC_Z_BINS: usize = 576;
 
 pub(super) const RTMW3D_Z_RANGE: f32 = 2.1744869;
-pub(super) const RTMW3D_SOURCE_Z_SCALE: f32 =
+pub(in crate::tracking) const RTMW3D_SOURCE_Z_SCALE: f32 =
     (SIMCC_Z_BINS as f32 / INPUT_H as f32) * RTMW3D_Z_RANGE;
 
 /// One decoded keypoint in normalised model space:
 /// `nx, ny ∈ [0, 1]` (image-relative, NY top-to-bottom),
 /// `nz ∈ [0, 1]` (model depth axis), `score` is the per-joint
 /// confidence after sigmoid.
+///
+/// Re-exported as `pub(in crate::tracking)` so sibling pose
+/// providers (e.g. ViTPose, which is 2D-only) can synthesise a
+/// `nz = 0.5` planar fallback and feed the shared
+/// [`super::skeleton::build_source_skeleton`] builder without
+/// duplicating the COCO-Wholebody mapping table.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct DecodedJoint {
-    pub(super) nx: f32,
-    pub(super) ny: f32,
-    pub(super) nz: f32,
-    pub(super) score: f32,
+pub(in crate::tracking) struct DecodedJoint {
+    pub(in crate::tracking) nx: f32,
+    pub(in crate::tracking) ny: f32,
+    pub(in crate::tracking) nz: f32,
+    pub(in crate::tracking) score: f32,
 }
 
 /// SimCC argmax with subpixel score. Returns `(bin, max_value)`.

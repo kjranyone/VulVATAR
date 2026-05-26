@@ -815,7 +815,7 @@ fn resolve_colliders_sphere_transform() {
         [0.0, 1.0, 0.0, 1.0], // translation [0, 1, 0]
     ];
 
-    let resolved = crate::simulation::cloth::resolve_colliders(&[collider], &[identity]);
+    let resolved = crate::simulation::cloth::resolve_colliders(&[collider], &[identity], &[true]);
     assert_eq!(resolved.len(), 1);
     match &resolved[0] {
         ResolvedCollider::Sphere { center, radius } => {
@@ -824,6 +824,40 @@ fn resolve_colliders_sphere_transform() {
         }
         _ => panic!("expected sphere"),
     }
+}
+
+#[test]
+fn resolve_colliders_skips_disabled_entries() {
+    // The cloth-authoring "Collision Proxies" toggles drive `enabled`; a
+    // collider whose entry is false must be dropped from the resolved set
+    // so it no longer participates in cloth collision.
+    let mk = |id: u64| crate::asset::ColliderAsset {
+        id: crate::asset::ColliderId(id),
+        node: crate::asset::NodeId(0),
+        offset: [0.0, 0.0, 0.0],
+        shape: crate::asset::ColliderShape::Sphere { radius: 0.5 },
+    };
+    let identity: crate::asset::Mat4 = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let colliders = [mk(0), mk(1), mk(2)];
+    let transforms = [identity];
+
+    // Middle collider disabled → only two survive.
+    let resolved = crate::simulation::cloth::resolve_colliders(
+        &colliders,
+        &transforms,
+        &[true, false, true],
+    );
+    assert_eq!(resolved.len(), 2);
+
+    // A short/empty mask defaults every collider to enabled (back-compat).
+    let resolved_default =
+        crate::simulation::cloth::resolve_colliders(&colliders, &transforms, &[]);
+    assert_eq!(resolved_default.len(), 3);
 }
 
 // =========================================================================

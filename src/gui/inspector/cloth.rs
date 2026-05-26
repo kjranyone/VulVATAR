@@ -276,6 +276,24 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("inspector.constraints"))
         .default_open(false)
         .show(ui, |ui| {
+            // Seed the sliders from the active overlay's actual constraint
+            // stiffness whenever the overlay changes, so the displayed value
+            // matches the asset instead of the GUI default. Without this, a
+            // stray "Apply Constraints" on a freshly-loaded overlay would
+            // silently overwrite its stiffness with the default 1.0 / 0.5.
+            if let Some(ref overlay) = state.app.editor.overlay_asset {
+                if state.cloth_authoring.constraints_seeded_for != Some(overlay.id) {
+                    if let Some(dc) = overlay.constraints.distance_constraints.first() {
+                        state.cloth_authoring.distance_stiffness = dc.stiffness;
+                    }
+                    state.cloth_authoring.bend_enabled =
+                        !overlay.constraints.bend_constraints.is_empty();
+                    if let Some(bc) = overlay.constraints.bend_constraints.first() {
+                        state.cloth_authoring.bend_stiffness = bc.stiffness;
+                    }
+                    state.cloth_authoring.constraints_seeded_for = Some(overlay.id);
+                }
+            }
             ui.add(
                 egui::Slider::new(&mut state.cloth_authoring.distance_stiffness, 0.0..=1.0)
                     .text(t!("inspector.distance_stiffness")),
@@ -313,35 +331,46 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("inspector.collision_proxies"))
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(avatar) = state.app.active_avatar() {
+            if let Some(avatar) = state.app.active_avatar_mut() {
                 let collider_count = avatar.asset.colliders.len();
-                if state.cloth_authoring.collider_toggles.len() != collider_count {
-                    state.cloth_authoring.collider_toggles = vec![true; collider_count];
+                // Keep the runtime enable mask sized to the collider list.
+                // This is the single source of truth — `resolve_colliders`
+                // skips entries set to false, so unchecking a proxy removes
+                // it from cloth collision.
+                if avatar.collider_enabled.len() != collider_count {
+                    avatar.collider_enabled = vec![true; collider_count];
                 }
                 if collider_count == 0 {
                     ui.label(t!("inspector.no_colliders"));
                 } else {
-                    for (i, collider) in avatar.asset.colliders.iter().enumerate() {
-                        let node_name = avatar
-                            .asset
-                            .skeleton
-                            .nodes
-                            .iter()
-                            .find(|n| n.id == collider.node)
-                            .map(|n| n.name.as_str())
-                            .unwrap_or("unknown");
-                        let shape_label = match &collider.shape {
-                            crate::asset::ColliderShape::Sphere { radius } => {
-                                format!("Sphere(r={:.3})", radius)
-                            }
-                            crate::asset::ColliderShape::Capsule { radius, height } => {
-                                format!("Capsule(r={:.3}, h={:.3})", radius, height)
-                            }
-                        };
-                        ui.checkbox(
-                            &mut state.cloth_authoring.collider_toggles[i],
-                            format!("{}: {} ({})", collider.id.0, node_name, shape_label),
-                        );
+                    // Precompute labels so the immutable `asset` borrow is
+                    // released before we mutably bind `collider_enabled[i]`.
+                    let labels: Vec<String> = avatar
+                        .asset
+                        .colliders
+                        .iter()
+                        .map(|collider| {
+                            let node_name = avatar
+                                .asset
+                                .skeleton
+                                .nodes
+                                .iter()
+                                .find(|n| n.id == collider.node)
+                                .map(|n| n.name.as_str())
+                                .unwrap_or("unknown");
+                            let shape_label = match &collider.shape {
+                                crate::asset::ColliderShape::Sphere { radius } => {
+                                    format!("Sphere(r={:.3})", radius)
+                                }
+                                crate::asset::ColliderShape::Capsule { radius, height } => {
+                                    format!("Capsule(r={:.3}, h={:.3})", radius, height)
+                                }
+                            };
+                            format!("{}: {} ({})", collider.id.0, node_name, shape_label)
+                        })
+                        .collect();
+                    for (i, label) in labels.into_iter().enumerate() {
+                        ui.checkbox(&mut avatar.collider_enabled[i], label);
                     }
                 }
             } else {

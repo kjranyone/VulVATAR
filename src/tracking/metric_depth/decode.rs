@@ -14,6 +14,23 @@
 
 use super::consts::MASK_THRESHOLD;
 
+/// Describes the region of the full camera frame that a depth map
+/// covers when the depth model was fed a cropped (person-only) input
+/// rather than the full frame. All values are in normalised
+/// full-frame coordinates `[0, 1]`. `None` on `MoGeFrame::crop`
+/// means the depth map covers the entire frame.
+#[derive(Clone, Debug)]
+pub struct FrameCrop {
+    /// Left edge of the crop in normalised full-frame X.
+    pub x1_frac: f32,
+    /// Top edge of the crop in normalised full-frame Y.
+    pub y1_frac: f32,
+    /// Width of the crop as a fraction of full-frame width.
+    pub w_frac: f32,
+    /// Height of the crop as a fraction of full-frame height.
+    pub h_frac: f32,
+}
+
 /// Decoded MoGe frame: per-pixel metric point cloud, in metres, in
 /// MoGe's input pixel grid (`width × height`). Invalid pixels (mask
 /// below the threshold or non-finite output) are stored as `NaN` in
@@ -25,6 +42,10 @@ pub struct MoGeFrame {
     pub width: u32,
     pub height: u32,
     pub points_m: Vec<[f32; 3]>,
+    /// If this frame was produced from a cropped input (e.g. DAv2 fed
+    /// a YOLOX person crop), the crop region in full-frame normalised
+    /// coordinates. `None` means the depth map covers the entire frame.
+    pub crop: Option<FrameCrop>,
 }
 
 /// Post-process the four MoGe outputs into a [`MoGeFrame`].
@@ -72,6 +93,7 @@ pub fn build_frame(
         width,
         height,
         points_m,
+        crop: None,
     })
 }
 

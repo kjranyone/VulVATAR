@@ -330,6 +330,7 @@ mod tests {
                 },
                 handoff_path: HandoffPath::CpuReadback,
                 fallback_reason: Some(FallbackReason::RequestedCpuReadback),
+                preview_pixels: None,
             }),
         }
     }
@@ -364,6 +365,7 @@ mod tests {
                 },
                 handoff_path: HandoffPath::GpuSharedFrame,
                 fallback_reason: None,
+                preview_pixels: None,
             }),
         }
     }

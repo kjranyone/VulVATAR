@@ -1074,19 +1074,27 @@ void main() {
         return;
     }
 
-    // ----- DQS: extract rotation quaternion + translation per joint,
-    //          weighted-blend, normalise, apply.
-    // The antipodal-reference quaternion is the FIRST contributing
-    // joint's rotation (not unconditionally `joint_indices[0]`) — a
-    // vertex with `joint_weights = [0, 0.5, 0.5, 0]` and a stray
-    // `joint_indices[0]` would otherwise let an unused bone's
-    // hemisphere drive the flip decisions for the contributing bones.
-    // Subsequent contributing joints flip sign when
-    // `dot(qi, ref_real) < 0` so the linear combination stays on one
-    // hemisphere. A weighted average of strictly-antipodal quaternions
-    // can still cancel to near-zero magnitude after the flip (e.g. two
-    // contributors whose xyz parts oppose); guard against that below
-    // before `normalize()`.
+    // ----- Dual Quaternion Skinning (Kavan 2007) -----
+    // The previous implementation blended the rotation in quaternion
+    // space (QLERP) but accumulated the translation linearly from
+    // each joint's `mi[3]`. That hybrid is consistent only when the
+    // joint rotations are similar; for wildly-differing rotations
+    // (e.g. solver-driven 180°-class finger bones whose `mi[3]`
+    // grows to 2–3 m) the QLERP rotation and the LBS-style
+    // translation describe geometrically inconsistent frames, and
+    // skinned vertices end up at rotated-rest + averaged-translation
+    // positions that don't correspond to any per-bone skinning
+    // result. `validate_gui_render` makes the failure reproducible
+    // across `validation_images/`.
+    //
+    // Full DQS packs each joint's transform into a unit dual
+    // quaternion (q_real, q_dual) where q_real is the rotation and
+    // q_dual encodes the translation via
+    //   q_dual = 0.5 * (0, t) * q_real
+    // The blend stays a valid rigid transform — both the rotation
+    // *and* translation are interpolated together in the same dual-
+    // quaternion space, preserving the rigidity that LBS-style
+    // translation accumulation breaks.
     vec4 ref_real = vec4(0.0, 0.0, 0.0, 1.0);
     for (uint i = 0u; i < 4u; i++) {
         if (b.joint_weights[i] > WEIGHT_EPS) {
@@ -1095,22 +1103,27 @@ void main() {
         }
     }
     vec4 acc_real = vec4(0.0);
-    vec3 acc_trans = vec3(0.0);
+    vec4 acc_dual = vec4(0.0);
     for (uint i = 0u; i < 4u; i++) {
         float wi = b.joint_weights[i];
         if (wi <= WEIGHT_EPS) continue;
         mat4 mi = skinning.matrices[b.joint_indices[i]];
-        vec4 qi = mat3_to_quat(mat3(mi));
-        float s = (dot(qi, ref_real) >= 0.0) ? 1.0 : -1.0;
-        acc_real += wi * s * qi;
-        acc_trans += wi * mi[3].xyz;
+        vec4 qr = mat3_to_quat(mat3(mi));
+        float s = (dot(qr, ref_real) >= 0.0) ? 1.0 : -1.0;
+        qr = s * qr;
+        vec3 ti = mi[3].xyz;
+        // q_dual = 0.5 * (0, t) ⊗ q_real, quaternion product (xyz, w).
+        // (0, t) ⊗ (qx, qy, qz, qw) =
+        //   xyz = qw * t + cross(t, q_real.xyz)
+        //   w   = -dot(t, q_real.xyz)
+        vec3 qrxyz = qr.xyz;
+        float qrw = qr.w;
+        vec3 dxyz = 0.5 * (qrw * ti + cross(ti, qrxyz));
+        float dw = -0.5 * dot(ti, qrxyz);
+        vec4 qd = vec4(dxyz, dw);
+        acc_real += wi * qr;
+        acc_dual += wi * qd;
     }
-    // Renormalise — the linear blend is no longer unit-length. Guard
-    // against the degenerate case where the antipodal-flipped sum has
-    // near-zero magnitude (rare: two contributors whose xyz parts
-    // cancel and whose w parts also cancel). Fall back to pass-through
-    // so the vertex stays in the morph/cloth-blended frame instead of
-    // emitting NaN through the SSBO.
     float acc_len = length(acc_real);
     if (acc_len < 1.0e-6) {
         out_v.v[vid].position = vec4(pos, 0.0);
@@ -1119,10 +1132,21 @@ void main() {
         out_v.v[vid]._pad     = uvec2(0u, 0u);
         return;
     }
-    acc_real /= acc_len;
-
-    vec3 world_pos = quat_rotate(acc_real, pos) + acc_trans;
-    vec3 world_nrm = quat_rotate(acc_real, nrm);
+    float inv_len = 1.0 / acc_len;
+    vec4 q_real = acc_real * inv_len;
+    vec4 q_dual = acc_dual * inv_len;
+    // Translation recovered from the dual quaternion:
+    //   t = 2 * q_dual * conj(q_real)  (taking only the vector part).
+    // With q_real unit and the relation above, this reduces to:
+    //   t = 2 * (q_dual.w * (-q_real.xyz) + q_real.w * q_dual.xyz
+    //           + cross(q_dual.xyz, -q_real.xyz))
+    vec3 rqxyz = -q_real.xyz;
+    float rqw = q_real.w;
+    vec3 t_recovered = 2.0 * (q_dual.w * rqxyz
+                              + rqw * q_dual.xyz
+                              + cross(q_dual.xyz, rqxyz));
+    vec3 world_pos = quat_rotate(q_real, pos) + t_recovered;
+    vec3 world_nrm = quat_rotate(q_real, nrm);
 
     out_v.v[vid].position = vec4(world_pos, 0.0);
     out_v.v[vid].normal   = vec4(world_nrm, 0.0);
