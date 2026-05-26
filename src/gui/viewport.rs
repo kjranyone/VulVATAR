@@ -626,15 +626,25 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 }
             }
 
-            // Show camera info overlay.
+            // Show camera info overlay. Drawn on a dark semi-transparent badge
+            // with a bright foreground so it stays legible over both light and
+            // dark rendered content — the old flat dim-grey text was nearly
+            // invisible against the viewport background.
             let info = t!("viewport.camera_info", x = format!("{:.2}", cam_pos[0]), y = format!("{:.2}", cam_pos[1]), z = format!("{:.2}", cam_pos[2]), yaw = format!("{:.1}", state.camera_orbit.yaw_deg), pitch = format!("{:.1}", state.camera_orbit.pitch_deg), dist = format!("{:.2}", state.camera_orbit.distance));
-            painter.text(
-                egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
-                egui::Align2::LEFT_BOTTOM,
-                info,
-                egui::FontId::monospace(11.0),
-                egui::Color32::from_rgb(90, 90, 100),
+            let info_color = egui::Color32::from_rgb(205, 212, 230);
+            let galley =
+                painter.layout_no_wrap(info, egui::FontId::monospace(11.0), info_color);
+            let pad = egui::vec2(6.0, 4.0);
+            let text_tl = egui::pos2(
+                rect.left() + 10.0,
+                rect.bottom() - 10.0 - galley.size().y,
             );
+            painter.rect_filled(
+                egui::Rect::from_min_size(text_tl - pad, galley.size() + pad * 2.0),
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(18, 20, 26, 190),
+            );
+            painter.galley(text_tl, galley, info_color);
 
             // T04: Draw cloth region selection overlay in ClothAuthoring mode.
             if state.mode == crate::gui::AppMode::ClothAuthoring {

@@ -192,6 +192,7 @@ tracking:
 
 inspector:
   camera_transform: "Camera Transform"
+  camera_world_pos: "Eye Position (looks at origin)"
   yaw: "Yaw:"
   pitch: "Pitch:"
   distance: "Distance:"

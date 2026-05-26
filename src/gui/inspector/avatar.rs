@@ -292,6 +292,44 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
         ui.add_space(space::SM);
+        // World-space eye position. The camera is an orbit rig, so X/Y/Z is a
+        // derived quantity (eye = orbit of yaw/pitch/distance around the pan
+        // target). Editing it repositions the eye about the world origin —
+        // pan is cleared and yaw/pitch/distance re-derived, which is the only
+        // *exact* inverse this rig supports. When not being edited the fields
+        // track the live eye, matching the viewport overlay.
+        let (sy, cy) = state.camera_orbit.yaw_deg.to_radians().sin_cos();
+        let (sp, cp) = state.camera_orbit.pitch_deg.to_radians().sin_cos();
+        let right = [cy, 0.0, -sy];
+        let up = [-sy * sp, cp, -cy * sp];
+        let pan = state.camera_orbit.pan;
+        let dist = state.camera_orbit.distance;
+        let mut eye = [
+            dist * cp * sy + pan[0] * right[0] + pan[1] * up[0],
+            dist * sp + pan[0] * right[1] + pan[1] * up[1],
+            dist * cp * cy + pan[0] * right[2] + pan[1] * up[2],
+        ];
+        ui.label(t!("inspector.camera_world_pos"));
+        ui.horizontal(|ui| {
+            let mut changed = false;
+            for (axis, prefix) in [(0usize, "X: "), (1, "Y: "), (2, "Z: ")] {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut eye[axis]).speed(0.05).prefix(prefix))
+                    .changed();
+            }
+            if changed {
+                let d = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2])
+                    .sqrt()
+                    .max(0.1);
+                state.camera_orbit.distance = d;
+                state.camera_orbit.target_distance = d;
+                state.camera_orbit.pitch_deg = (eye[1] / d).clamp(-1.0, 1.0).asin().to_degrees();
+                state.camera_orbit.yaw_deg = eye[0].atan2(eye[2]).to_degrees();
+                state.camera_orbit.pan = [0.0, 0.0];
+                state.project_status.project_dirty = true;
+            }
+        });
+        ui.add_space(space::SM);
         if outlined_button(
             ui,
             Some(ic::HISTORY),

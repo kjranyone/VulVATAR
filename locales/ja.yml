@@ -192,6 +192,7 @@ tracking:
 
 inspector:
   camera_transform: "カメラトランスフォーム"
+  camera_world_pos: "視点位置 (原点を注視)"
   yaw: "ヨー:"
   pitch: "ピッチ:"
   distance: "距離:"
