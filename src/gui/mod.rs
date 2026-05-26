@@ -175,7 +175,12 @@ pub struct ClothAuthoringUiState {
     pub distance_stiffness: f32,
     pub bend_enabled: bool,
     pub bend_stiffness: f32,
-    pub collider_toggles: Vec<bool>,
+    /// Identity of the overlay the Constraints sliders were last seeded
+    /// from. When the active overlay changes, the constraint sliders are
+    /// re-initialised from its actual stiffness so the displayed value
+    /// matches the asset instead of the GUI default (otherwise an
+    /// unwitting "Apply Constraints" would clobber the loaded value).
+    pub constraints_seeded_for: Option<crate::asset::ClothOverlayId>,
     pub pin_node_index: usize,
     pub autosave_consent: Option<bool>,
 }
@@ -193,7 +198,7 @@ impl Default for ClothAuthoringUiState {
             distance_stiffness: 1.0,
             bend_enabled: true,
             bend_stiffness: 0.5,
-            collider_toggles: Vec::new(),
+            constraints_seeded_for: None,
             pin_node_index: 0,
             autosave_consent: None,
         }

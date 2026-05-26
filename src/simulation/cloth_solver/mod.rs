@@ -78,6 +78,7 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
     let colliders = crate::simulation::cloth::resolve_colliders(
         &avatar.asset.colliders,
         &avatar.pose.global_transforms,
+        &avatar.collider_enabled,
     );
 
     // ---- resolve pin targets --------------------------------------------------
@@ -127,6 +128,7 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
     let colliders = crate::simulation::cloth::resolve_colliders(
         &avatar.asset.colliders,
         &avatar.pose.global_transforms,
+        &avatar.collider_enabled,
     );
     let mut all_colliders = colliders;
     all_colliders.extend_from_slice(world_colliders);
