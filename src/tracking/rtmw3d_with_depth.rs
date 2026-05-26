@@ -84,7 +84,7 @@ use super::cigpose::{DecodedJoint2d, NUM_JOINTS};
 #[cfg(feature = "inference")]
 use super::depth_anything::{DepthAnythingFrame, DepthAnythingV2Inference};
 #[cfg(feature = "inference")]
-use super::metric_depth::MoGeFrame;
+use super::metric_depth::{FrameCrop, MoGeFrame};
 #[cfg(feature = "inference")]
 use super::rtmw3d::Rtmw3dInference;
 #[cfg(feature = "inference")]
@@ -171,6 +171,7 @@ struct DepthRequest {
     width: u32,
     height: u32,
     frame_index: u64,
+    crop_origin: Option<(f32, f32, f32, f32)>,
 }
 
 #[cfg(feature = "inference")]
@@ -178,6 +179,7 @@ struct DepthResult {
     frame_index: u64,
     depth: DepthAnythingFrame,
     inference_ms: f32,
+    crop_origin: Option<(f32, f32, f32, f32)>,
 }
 
 /// Sticky outbox: the latest completed depth result. `Arc<DepthResult>`
@@ -376,6 +378,7 @@ fn depth_worker_loop(
             frame_index: req.frame_index,
             depth,
             inference_ms,
+            crop_origin: req.crop_origin,
         });
         {
             let mut slot = outbox.slot.lock().unwrap();
@@ -514,43 +517,6 @@ impl Rtmw3dWithDepthProvider {
 
         let t_total = std::time::Instant::now();
 
-        // Phase 0: dispatch DAv2 work for this frame to the worker
-        // thread. We submit only on every `DEPTH_REFRESH_PERIOD`-th
-        // frame to halve GPU contention between RTMW3D + DAv2 — but
-        // we ALWAYS submit on cold start (outbox empty) so the very
-        // first call doesn't deadlock waiting for a never-submitted
-        // depth. The worker drains older queued requests so depth is
-        // always being computed for the most recent submission.
-        let outbox_empty = self.depth_outbox.slot.lock().unwrap().is_none();
-        let submit_depth_this_frame =
-            outbox_empty || frame_index.is_multiple_of(DEPTH_REFRESH_PERIOD);
-        if submit_depth_this_frame {
-            if let Some(tx) = self.depth_tx.as_ref() {
-                let req = DepthRequest {
-                    rgb: rgb_data.to_vec(),
-                    width,
-                    height,
-                    frame_index,
-                };
-                // SendError only happens if the worker thread died —
-                // at which point we'll fall back to whatever's left
-                // in the outbox (sticky last result). Log loudly the
-                // first time so a power user diagnosing "tracking
-                // feels stale" sees the cause in the log; gate further
-                // sends behind the same flag so the log isn't
-                // hammered at 30 fps.
-                if let Err(e) = tx.send(req) {
-                    if !self.depth_thread_dead_logged {
-                        error!(
-                            "DAv2 depth worker died (frame {}); falling back to sticky outbox forever: {}",
-                            frame_index, e
-                        );
-                        self.depth_thread_dead_logged = true;
-                    }
-                }
-            }
-        }
-
         // Phase 1: RTMW3D — full pipeline (YOLOX + RTMW3D + FaceMesh).
         // Runs in parallel with the depth worker. We keep its
         // `annotation.keypoints` (whole-frame normalised 2D + score)
@@ -574,6 +540,78 @@ impl Rtmw3dWithDepthProvider {
             // RTMW3D failed to emit a full keypoint set — pass its
             // empty estimate through unchanged.
             return rtmw_est;
+        }
+
+        // Phase 0: dispatch DAv2 work for this frame to the worker
+        // thread. We submit only on every `DEPTH_REFRESH_PERIOD`-th
+        // frame to halve GPU contention between RTMW3D + DAv2 — but
+        // we ALWAYS submit on cold start (outbox empty) so the very
+        // first call doesn't deadlock waiting for a never-submitted
+        // depth. The worker drains older queued requests so depth is
+        // always being computed for the most recent submission.
+        let crop_info = if let Some((bx1, by1, bx2, by2)) = rtmw_est.annotation.bounding_box {
+            let bbox = crate::tracking::yolox::PersonBbox {
+                x1: bx1 * width as f32,
+                y1: by1 * height as f32,
+                x2: bx2 * width as f32,
+                y2: by2 * height as f32,
+                score: 1.0,
+            };
+            let (cx1, cy1, cx2, cy2) = crate::tracking::rtmw3d::pad_and_clamp_bbox(&bbox, width, height, 0.25);
+            let cw = cx2 - cx1;
+            let ch = cy2 - cy1;
+            if cw >= 32 && ch >= 32 {
+                Some((cx1, cy1, cw, ch))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (dav2_rgb, dav2_w, dav2_h, crop_origin) = match crop_info {
+            Some((cx1, cy1, cw, ch)) => {
+                let crop = crate::tracking::rtmw3d::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
+                let crop_origin = Some((
+                    cx1 as f32 / width as f32,
+                    cy1 as f32 / height as f32,
+                    cw as f32 / width as f32,
+                    ch as f32 / height as f32,
+                ));
+                (crop, cw, ch, crop_origin)
+            }
+            None => (rgb_data.to_vec(), width, height, None),
+        };
+
+        let outbox_empty = self.depth_outbox.slot.lock().unwrap().is_none();
+        let submit_depth_this_frame =
+            outbox_empty || frame_index.is_multiple_of(DEPTH_REFRESH_PERIOD);
+        if submit_depth_this_frame {
+            if let Some(tx) = self.depth_tx.as_ref() {
+                let req = DepthRequest {
+                    rgb: dav2_rgb,
+                    width: dav2_w,
+                    height: dav2_h,
+                    frame_index,
+                    crop_origin,
+                };
+                // SendError only happens if the worker thread died —
+                // at which point we'll fall back to whatever's left
+                // in the outbox (sticky last result). Log loudly the
+                // first time so a power user diagnosing "tracking
+                // feels stale" sees the cause in the log; gate further
+                // sends behind the same flag so the log isn't
+                // hammered at 30 fps.
+                if let Err(e) = tx.send(req) {
+                    if !self.depth_thread_dead_logged {
+                        error!(
+                            "DAv2 depth worker died (frame {}); falling back to sticky outbox forever: {}",
+                            frame_index, e
+                        );
+                        self.depth_thread_dead_logged = true;
+                    }
+                }
+            }
         }
 
         // Phase 2: read latest depth from outbox. Block on first
@@ -631,6 +669,7 @@ impl Rtmw3dWithDepthProvider {
         let calib_result = calibrate_scale(
             &joints_2d,
             dav2_frame,
+            depth_result.crop_origin,
             width,
             height,
             plausibility_calibration,
@@ -692,6 +731,7 @@ impl Rtmw3dWithDepthProvider {
                         anchor_label: "ema-fallback",
                         d_raw_a: f32::NAN,
                         d_raw_b: f32::NAN,
+                        crop_origin: depth_result.crop_origin,
                     }
                 } else {
                     return rtmw_est;
@@ -1086,8 +1126,10 @@ fn metric_depth_band(pose_calibration: Option<&crate::tracking::PoseCalibration>
 /// - either shoulder's `metric_depth_m` outside [`metric_depth_band`]
 ///   (DAv2 sampled background instead of the shoulder pixel);
 /// - `|Δ| > MAX_BZ_METRIC_M` (anatomical L↔R Z spread bound);
-/// - `|Δ| < MIN_BZ_METRIC_M` (dead-zone for DAv2's residual lateral-
-///   bias DC offset — see the constant's docstring).
+/// - `|Δ| ≤ BZ_BLEND_START_M` (soft-blend floor — DAv2's residual
+///   lateral-bias DC offset is fully suppressed below this, then ramps
+///   linearly to full strength at `BZ_BLEND_END_M`; see the constants'
+///   docstrings).
 #[cfg(feature = "inference")]
 fn inject_shoulder_bz_from_dav2(
     skeleton: &mut SourceSkeleton,
@@ -1109,28 +1151,32 @@ fn inject_shoulder_bz_from_dav2(
     /// (background, hair, the other shoulder occluding).
     const MAX_BZ_METRIC_M: f32 = 0.50;
 
-    /// Lower bound below which DAv2's `bz_metric` is treated as
-    /// indistinguishable from its residual lateral-bias DC offset.
-    /// The bias-into-Δz is small (the elbow comment notes the bias is
-    /// "roughly constant across nearby pixels") but not zero — bulk
-    /// `mocap_suit_rotation` data shows ~0.10–0.16 m of phantom L↔R
-    /// asymmetry on visually frontal poses. Without this dead-zone
-    /// the injection writes that bias into the source bz, which
-    /// inflates `span_xz` in `compute_body_yaw_3d`'s
-    /// `target_span = running_max.max(span_xz)` formula, dragging
-    /// `cos_yaw` below 1 and producing a phantom 15-25° rotation
-    /// when the subject is square-on.
+    /// The DAv2 lateral-bias DC offset is small (the elbow comment
+    /// notes the bias is "roughly constant across nearby pixels") but
+    /// not zero — bulk `mocap_suit_rotation` data shows ~0.10–0.16 m
+    /// of phantom L↔R asymmetry on visually frontal poses. A hard
+    /// dead-zone at 0.20 m eliminated the bias but also made genuine
+    /// body twists in the 10°–30° range completely invisible, causing
+    /// an abrupt snap-in past 30°.
     ///
-    /// 0.20 m chosen so a genuine ~12° rotation
-    /// (`bz_metric ≈ sin(12°)·shoulder_span ≈ 0.083 m`) doesn't fire,
-    /// but a ~22° rotation (`≈ 0.15 m`) — still under-shooting since
-    /// the synthetic validation set's 22.5° label measured at 0.24 m —
-    /// does. Below 12° the foreshortening recovery from `bx` alone
-    /// already gives correct magnitude (the running max captures
-    /// frontal width), and the small-magnitude sign jitter from the
-    /// fall-back RTMW3D nz path is dominated by `rotation_blend` /
-    /// 1€ smoothing downstream.
-    const MIN_BZ_METRIC_M: f32 = 0.20;
+    /// Instead we use a soft linear blend between `BZ_BLEND_START_M`
+    /// and `BZ_BLEND_END_M`. Below `START` the signal is fully
+    /// suppressed (residual noise / DC offset territory). Between
+    /// `START` and `END` the strength ramps linearly from 0→1. At and
+    /// above `END` the DAv2 signal is adopted at full strength, so
+    /// large-angle behaviour is unchanged from the old hard cutoff.
+
+    /// Lower end of the soft-blend zone. Below this value the DAv2
+    /// bz signal is fully suppressed (residual lateral-bias noise).
+    /// 0.05 m ≈ sin(7°)·0.40 m — genuine sub-7° rotations are below
+    /// DAv2's per-pixel noise floor at typical webcam distances.
+    const BZ_BLEND_START_M: f32 = 0.05;
+
+    /// Upper end of the soft-blend zone. At and above this value the
+    /// DAv2 bz signal is adopted at full strength. 0.20 m ≈
+    /// sin(30°)·0.40 m — matches the old hard cutoff, so behaviour
+    /// at large angles is unchanged.
+    const BZ_BLEND_END_M: f32 = 0.20;
 
     let metric_x_span = (shoulder_l_metric_x - shoulder_r_metric_x).abs();
     if metric_x_span < 1e-3 {
@@ -1173,10 +1219,24 @@ fn inject_shoulder_bz_from_dav2(
     // `(R_metric − L_metric)` — both positive when L is forward.
     let bz_metric = r_z_m - l_z_m;
     let abs_bz = bz_metric.abs();
-    if !(MIN_BZ_METRIC_M..=MAX_BZ_METRIC_M).contains(&abs_bz) {
+    if abs_bz > MAX_BZ_METRIC_M {
         return;
     }
-    let bz_source_target = bz_metric / metres_per_source_unit;
+    // Soft blend: linearly ramp from 0 at BZ_BLEND_START to 1 at
+    // BZ_BLEND_END. Avoids the hard jump at the old MIN_BZ cutoff
+    // that made small-angle body twists (10°–30°) invisible to the
+    // avatar, then snap-in abruptly past 30°.
+    let bz_blend = if abs_bz <= BZ_BLEND_START_M {
+        0.0_f32
+    } else if abs_bz >= BZ_BLEND_END_M {
+        1.0
+    } else {
+        (abs_bz - BZ_BLEND_START_M) / (BZ_BLEND_END_M - BZ_BLEND_START_M)
+    };
+    if bz_blend == 0.0 {
+        return;
+    }
+    let bz_source_target = bz_metric / metres_per_source_unit * bz_blend;
     let half = bz_source_target * 0.5;
     let l_new = mid_z_src + half;
     let r_new = mid_z_src - half;
@@ -1218,6 +1278,7 @@ pub struct Calibration {
     pub anchor_label: &'static str,
     pub d_raw_a: f32,
     pub d_raw_b: f32,
+    pub crop_origin: Option<(f32, f32, f32, f32)>,
 }
 
 /// Per-anchor reason `calibrate_scale` rejected a candidate, surfaced
@@ -1313,6 +1374,7 @@ impl std::fmt::Display for CalibrationFailure {
 pub fn calibrate_scale(
     joints: &[DecodedJoint2d],
     dav2: &DepthAnythingFrame,
+    crop_origin: Option<(f32, f32, f32, f32)>,
     src_w: u32,
     src_h: u32,
     pose_calibration: Option<&crate::tracking::PoseCalibration>,
@@ -1405,14 +1467,32 @@ pub fn calibrate_scale(
             continue;
         }
 
-        let d_a = match dav2.sample_inverse_depth(a.nx, a.ny, SAMPLE_RADIUS_PX) {
+        let (a_nx, a_ny) = match crop_origin {
+            Some((cx, cy, cw, ch)) => ((a.nx - cx) / cw, (a.ny - cy) / ch),
+            None => (a.nx, a.ny),
+        };
+        let (b_nx, b_ny) = match crop_origin {
+            Some((cx, cy, cw, ch)) => ((b.nx - cx) / cw, (b.ny - cy) / ch),
+            None => (b.nx, b.ny),
+        };
+
+        if a_nx < 0.0 || a_nx > 1.0 || a_ny < 0.0 || a_ny > 1.0 {
+            *outcome_slot = AnchorOutcome::DepthSampleFailed { which: 'a' };
+            continue;
+        }
+        if b_nx < 0.0 || b_nx > 1.0 || b_ny < 0.0 || b_ny > 1.0 {
+            *outcome_slot = AnchorOutcome::DepthSampleFailed { which: 'b' };
+            continue;
+        }
+
+        let d_a = match dav2.sample_inverse_depth(a_nx, a_ny, SAMPLE_RADIUS_PX) {
             Some(v) if v > 1e-3 => v,
             _ => {
                 *outcome_slot = AnchorOutcome::DepthSampleFailed { which: 'a' };
                 continue;
             }
         };
-        let d_b = match dav2.sample_inverse_depth(b.nx, b.ny, SAMPLE_RADIUS_PX) {
+        let d_b = match dav2.sample_inverse_depth(b_nx, b_ny, SAMPLE_RADIUS_PX) {
             Some(v) if v > 1e-3 => v,
             _ => {
                 *outcome_slot = AnchorOutcome::DepthSampleFailed { which: 'b' };
@@ -1420,12 +1500,17 @@ pub fn calibrate_scale(
             }
         };
 
+        let (crop_h_half, crop_v_half) = match crop_origin {
+            Some((_, _, crop_w_frac, crop_h_frac)) => (h_half * crop_w_frac, v_half * crop_h_frac),
+            None => (h_half, v_half),
+        };
+
         let inv_a = 1.0 / d_a;
         let inv_b = 1.0 / d_b;
-        let ax = (a.nx - 0.5) * inv_a - (b.nx - 0.5) * inv_b;
-        let ay = (a.ny - 0.5) * inv_a - (b.ny - 0.5) * inv_b;
+        let ax = (a_nx - 0.5) * inv_a - (b_nx - 0.5) * inv_b;
+        let ay = (a_ny - 0.5) * inv_a - (b_ny - 0.5) * inv_b;
         let bz = inv_a - inv_b;
-        let geom = (2.0 * h_half * ax).powi(2) + (2.0 * v_half * ay).powi(2) + bz.powi(2);
+        let geom = (2.0 * crop_h_half * ax).powi(2) + (2.0 * crop_v_half * ay).powi(2) + bz.powi(2);
         if !geom.is_finite() || geom < 1e-9 {
             *outcome_slot = AnchorOutcome::DegenerateGeometry { geom };
             continue;
@@ -1476,6 +1561,7 @@ pub fn calibrate_scale(
             anchor_label: label,
             d_raw_a: d_a,
             d_raw_b: d_b,
+            crop_origin,
         });
     }
     Err(CalibrationFailure {
@@ -1515,16 +1601,30 @@ pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibrati
             // pixel whose centre is at `(px + 0.5, py + 0.5)`.
             let nx = (px as f32 + 0.5) * inv_w;
             let ny = (py as f32 + 0.5) * inv_h;
-            let x = (nx - 0.5) * two_h * z;
-            let y = (ny - 0.5) * two_v * z;
+            let (frame_nx, frame_ny) = match calib.crop_origin {
+                Some((crop_x1, crop_y1, crop_w, crop_h)) => {
+                    (crop_x1 + nx * crop_w, crop_y1 + ny * crop_h)
+                }
+                None => (nx, ny),
+            };
+            let x = (frame_nx - 0.5) * two_h * z;
+            let y = (frame_ny - 0.5) * two_v * z;
             points_m.push([x, y, z]);
         }
     }
+
+    let crop = calib.crop_origin.map(|(x1, y1, w, h)| FrameCrop {
+        x1_frac: x1,
+        y1_frac: y1,
+        w_frac: w,
+        h_frac: h,
+    });
 
     MoGeFrame {
         width: w,
         height: h,
         points_m,
+        crop,
     }
 }
 
@@ -1763,20 +1863,41 @@ mod shoulder_bz_injection_tests {
     }
 
     #[test]
-    fn small_bz_metric_below_deadzone_is_not_injected() {
-        // 0.16 m of inter-shoulder Δ is in the residual lateral-bias
-        // band — DAv2 routinely emits this much "phantom asymmetry"
-        // even on visually frontal poses. Without the dead-zone the
-        // injection writes 0.16 m of source-Z bias, which inflates
-        // `span_xz` in `compute_body_yaw_3d` and produces a phantom
-        // ~20° rotation. With the dead-zone we keep the RTMW3D nz
-        // value (= the pre-existing 0.04 source-Z) unchanged.
-        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+    fn tiny_bz_metric_below_blend_start_is_fully_suppressed() {
+        // 0.04 m of inter-shoulder Δ is below `BZ_BLEND_START_M` (0.05 m
+        // ≈ sin(7°)·0.40 m) — DAv2's per-pixel noise floor / residual
+        // lateral-bias DC offset territory. The soft blend fully
+        // suppresses it (`bz_blend == 0.0`), so the RTMW3D nz value
+        // (= the pre-existing 0.04 source-Z) survives unchanged. Without
+        // this floor the noise would inflate `span_xz` in
+        // `compute_body_yaw_3d` and produce a phantom rotation.
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.98), Some(1.02), 1.0);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
         assert!((l_z - 0.04).abs() < 1e-6, "L got {l_z}");
         assert!((r_z - 0.04).abs() < 1e-6, "R got {r_z}");
+    }
+
+    #[test]
+    fn mid_band_bz_metric_is_partially_injected() {
+        // 0.16 m of Δ sits inside the soft-blend zone (BZ_BLEND_START
+        // 0.05 → BZ_BLEND_END 0.20). The old hard dead-zone suppressed
+        // this entirely, which made genuine 10°–30° body twists invisible
+        // until an abrupt snap-in past 30°. The blend instead applies the
+        // signal at partial strength:
+        //   bz_blend = (0.16 - 0.05) / (0.20 - 0.05) = 0.7333
+        //   metres_per_source_unit = 0.40 / 0.50 = 0.80
+        //   bz_source_target = (0.16 / 0.80) * 0.7333 = 0.1467
+        //   half = 0.0733  → L = 0.04 + 0.0733 = 0.1133, R = -0.0333
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 1.0);
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - 0.1133).abs() < 1e-3, "L got {l_z}");
+        assert!((r_z - (-0.0333)).abs() < 1e-3, "R got {r_z}");
+        // Midpoint must still be preserved (elbow injection depends on it).
+        assert!(((l_z + r_z) * 0.5 - 0.04).abs() < 1e-6, "mid drifted");
     }
 
     #[test]

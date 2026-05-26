@@ -377,6 +377,13 @@ pub struct TrackingGuiState {
     /// lean / crouch (translation, on top of body-yaw rotation). When
     /// false the avatar pivots in place, keeping the framing stable.
     pub root_translation_enabled: bool,
+    /// Pose-solver smoothing / confidence thresholds, surfaced in the
+    /// Tracking inspector's *Advanced smoothing* section and passed
+    /// straight through `FrameConfig::smoothing` each frame. Defaults are
+    /// tuned for the common case; see [`TrackingSmoothingParams`]. Only the
+    /// blend / confidence fields are user-editable — `stale_timeout_nanos`
+    /// keeps its default.
+    pub smoothing: TrackingSmoothingParams,
 }
 
 pub struct LipSyncGuiState {
@@ -404,14 +411,22 @@ pub struct RenderingGuiState {
     pub toggle_skeleton_debug: bool,
 }
 
-/// Output settings the inspector binds to. The pipeline-bound fields
-/// (sink) live exclusively on `Application` after Phase C — the inspector
-/// reads them via getters (`app.output.active_sink()`) and writes via
-/// mutators (`app.ensure_output_sink_runtime()`).
+/// Output settings the inspector binds to. The pipeline-bound *sink* lives
+/// exclusively on `Application` after Phase C — the inspector reads it via
+/// getters (`app.output.active_sink()`) and writes via mutators
+/// (`app.ensure_output_sink_runtime()`).
 ///
-/// The other fields below are not yet wired to any pipeline consumer
-/// (Phase B). They remain GUI-only state for now and are persisted via
-/// `to_project_state` so the user's selection survives across sessions.
+/// The index fields below are now fully wired (each is reconciled into
+/// `Application` once per frame in `GuiApp::update`) and persisted via
+/// `to_project_state`:
+/// - `output_resolution_index` → `app.output_extent` → render target extent
+///   (`OutputTargetRequest.extent`).
+/// - `output_framerate_index` → `app.set_user_render_fps` → the output
+///   router's forward-throttle interval.
+/// - `output_has_alpha` → `app.output_preserve_alpha` → `OutputFrame.alpha_mode`
+///   → VGTK / shared-memory alpha flag.
+/// - `output_color_space_index` → `app.output_color_space` → Vulkan colour
+///   attachment format (sRGB vs UNORM) + frame metadata.
 pub struct OutputGuiState {
     pub output_resolution_index: usize,
     pub output_framerate_index: usize,
@@ -698,6 +713,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
+                smoothing: TrackingSmoothingParams::default(),
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
@@ -910,6 +926,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
+                smoothing: TrackingSmoothingParams::default(),
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
@@ -1186,7 +1203,7 @@ impl eframe::App for GuiApp {
 
             let frame_config = crate::app::FrameConfig {
                 toggles: self.runtime_toggles(),
-                smoothing: TrackingSmoothingParams::default(),
+                smoothing: self.tracking.smoothing.clone(),
                 material_mode_index: self.rendering.material_mode_index,
                 hand_tracking_enabled: self.tracking.hand_tracking_enabled,
                 face_tracking_enabled: self.tracking.face_tracking_enabled,

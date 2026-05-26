@@ -58,6 +58,16 @@ All images are 16:9 PNG files normalized to 1600x900. Filenames include the scen
   - Split into the same `face_head/`, `shoulders/`, `wrists_hands/`, `torso_hips/`, and `orientation/` categories.
   - Prefer this set when comparing pose changes without camera framing changes.
 
+- `streamer_display_webcam_capture/photorealistic/`
+  - 64 photorealistic upper-body webcam frames of a fictional adult woman streamer
+    in a seated desk crop from a head-height display-mounted webcam.
+  - Uses `displaycam_headlevel_deskcrop` filename and CSV annotations to keep the
+    desk crop and near-horizontal monitor-top camera geometry explicit.
+  - Split into calibration reference, head/face, shoulders, torso posture, arm
+    reach, elbow depth, wrists/hands, self-occlusion, and depth gesture cases.
+  - Useful for testing pose stability when the pelvis is hidden by the desk and
+    realistic streamer hand motion dominates the visible frame.
+
 - `reiwa_idol_chest_silhouette_variation/photorealistic_fixed_camera/`
   - 9 photorealistic fixed-camera webcam-style frames for checking whether chest silhouette changes affect pose inference.
   - Split into `small_chest/`, `medium_chest/`, and `large_chest/`, with the same 3 pose labels in each group:

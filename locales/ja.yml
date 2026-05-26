@@ -178,6 +178,17 @@ tracking:
   error_model_warning: "ポーズトラッキング品質警告: %{warnings}。./dev.ps1 setup を実行してフルモデルバンドルをインストールしてください。"
   error_model_unavailable: "ポーズモデルが見つかりません: %{error} 低品質のHSVトラッキングにフォールバックします。"
   error_camera_stopped: "%{count} 回連続で読み取りエラーが発生し、カメラを停止しました。他のアプリがカメラを使用しているか、デバイスが切断された可能性があります。"
+  advanced_smoothing: "詳細スムージング"
+  advanced_smoothing_hint: "既定値で大半のセットアップに適合します。ノイズの多いカメラや表情のチラつきがある場合のみ調整してください。"
+  rotation_blend: "回転ブレンド"
+  rotation_blend_tooltip: "新しく追跡された回転へのフレーム毎ブレンド係数。1.0 は毎フレーム即座に追従（追加遅延なし）、低い値は上流の 1€ フィルタに加えてスムージングします。"
+  expression_blend: "表情ブレンド"
+  expression_blend_tooltip: "新しいブレンドシェイプ重みへのフレーム毎ブレンド係数。低いほど滑らかですが表情の遅延が増えます。"
+  joint_confidence: "関節信頼度フロア"
+  joint_confidence_tooltip: "関節がボーンを駆動するための最小キーポイント信頼度。0 はゲーティングを上流の構造的フロアに委ねます。"
+  face_confidence: "顔信頼度フロア"
+  face_confidence_tooltip: "頭部が反応するための最小の顔ポーズ信頼度。"
+  smoothing_reset: "スムージングをリセット"
 
 inspector:
   camera_transform: "カメラトランスフォーム"

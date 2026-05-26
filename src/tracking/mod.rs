@@ -21,6 +21,17 @@ pub mod provider;
 pub mod rtmw3d_with_depth;
 #[cfg(feature = "inference")]
 pub mod skeleton_from_depth;
+#[cfg(feature = "inference")]
+pub mod vitpose;
+#[cfg(feature = "inference")]
+pub mod hand_mediapipe;
+pub mod hmr2;
+pub mod hmr2_provider;
+#[cfg(feature = "inference")]
+pub mod palm_detector;
+pub mod vitpose_provider;
+pub mod vitpose_rtmw3d_hybrid;
+pub mod vitpose_with_depth;
 
 pub mod calibration;
 pub mod face_mediapipe;
@@ -36,14 +47,15 @@ pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleto
 /// [`crate::avatar::pose_solver::solve_avatar_pose`] via
 /// [`SolverParams`](crate::avatar::pose_solver::SolverParams).
 ///
-/// **Not user-tunable.** The GUI always constructs a `Default::default()`
-/// — the upstream 1€ filter and structural keypoint floors already cover
-/// the cases sliders here would address, so adding controls would invite
-/// users to "tune" away tracking that's already correctly behaved. The
-/// doc-comment used to claim the GUI exposed sliders for these; that was
-/// aspirational and never landed. If a future workflow genuinely needs
-/// per-user tuning (per-camera setups vary in confidence noise floors,
-/// for example), wire it through `tracking_smoothing` on `Application`.
+/// The [`Default`] values below are tuned to lean on the upstream 1€ filter
+/// and structural keypoint floors (see the `Default` impl), so most users
+/// never need to touch these. They are now surfaced in the Tracking
+/// inspector's *Advanced smoothing* section for the per-camera cases the
+/// defaults don't cover (noisy confidence floors, jittery expression
+/// rigs): the GUI holds the live values on `TrackingGuiState::smoothing`
+/// and passes them through `FrameConfig::smoothing` each frame. The GUI
+/// does not expose `stale_timeout_nanos` — it is a hold-policy timing knob,
+/// not a smoothing control — so it always keeps its default.
 #[derive(Clone, Debug)]
 pub struct TrackingSmoothingParams {
     /// Per-frame blend factor toward the new rotation. Maps directly to

@@ -67,6 +67,14 @@ pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
 // originally written. Promotion-only re-export, no logic change.
 #[cfg(feature = "inference")]
 pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
+// Shared with sibling 2D-only pose providers (ViTPose-Wholebody):
+// the COCO-Wholebody → HumanoidBone mapping in `skeleton` is identical
+// across any 133-keypoint backbone, so 2D-only consumers feed a
+// synthesised `nz = 0.5` DecodedJoint and reuse the same builder.
+#[cfg(feature = "inference")]
+pub(in crate::tracking) use decode::DecodedJoint;
+#[cfg(feature = "inference")]
+pub(in crate::tracking) use skeleton::build_source_skeleton as build_source_skeleton_from_coco;
 
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;

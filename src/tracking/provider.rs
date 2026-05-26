@@ -9,6 +9,10 @@ use std::path::Path;
 
 use super::cigpose_metric_depth::CigposeMetricDepthProvider;
 use super::rtmw3d_with_depth::Rtmw3dWithDepthProvider;
+use super::vitpose_provider::VitposeWholebodyProvider;
+use super::hmr2_provider::Hmr2Provider;
+use super::vitpose_rtmw3d_hybrid::VitposeRtmw3dHybridProvider;
+use super::vitpose_with_depth::VitposeWithDepthProvider;
 use super::PoseEstimate;
 
 /// Selects which tracking pipeline runs. Set to one of:
@@ -118,6 +122,10 @@ pub enum PoseProviderKind {
     Rtmw3d,
     Rtmw3dWithDepth,
     CigposeMetricDepth,
+    VitposeWholebody,
+    VitposeWithDepth,
+    VitposeRtmw3dHybrid,
+    Hmr2,
 }
 
 impl PoseProviderKind {
@@ -125,7 +133,7 @@ impl PoseProviderKind {
         let raw = std::env::var(POSE_PROVIDER_ENV).unwrap_or_else(|_| "rtmw3d".to_string());
         Self::parse(&raw).ok_or_else(|| {
             format!(
-                "unknown pose provider '{}'. Set {} to one of: rtmw3d, rtmw3d-with-depth, cigpose-metric-depth",
+                "unknown pose provider '{}'. Set {} to one of: rtmw3d, rtmw3d-with-depth, cigpose-metric-depth, vitpose-wholebody",
                 raw, POSE_PROVIDER_ENV
             )
         })
@@ -144,6 +152,20 @@ impl PoseProviderKind {
             | "cigpose-metric-depth"
             | "cigpose-metric"
             | "cigpose-3d" => Some(Self::CigposeMetricDepth),
+            "vitpose" | "vitpose-wholebody" | "vit-pose" | "vitpose-s" | "vitpose-s-wholebody" => {
+                Some(Self::VitposeWholebody)
+            }
+            "vitpose-with-depth"
+            | "vitpose-depth"
+            | "vitpose-da"
+            | "vitpose-dav2"
+            | "vitpose+dav2" => Some(Self::VitposeWithDepth),
+            "vitpose-rtmw3d"
+            | "vitpose+rtmw3d"
+            | "vitpose-rtmw3d-hybrid"
+            | "vitpose-rtmw3d-z"
+            | "hybrid" => Some(Self::VitposeRtmw3dHybrid),
+            "hmr2" | "4d-humans" | "smpl" => Some(Self::Hmr2),
             _ => None,
         }
     }
@@ -167,6 +189,16 @@ pub fn create_pose_provider(
             CigposeMetricDepthProvider::from_models_dir(models_dir)
                 .map(|p| Box::new(p) as Box<dyn PoseProvider>)
         }
+        PoseProviderKind::VitposeWholebody => VitposeWholebodyProvider::from_models_dir(models_dir)
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
+        PoseProviderKind::VitposeWithDepth => VitposeWithDepthProvider::from_models_dir(models_dir)
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
+        PoseProviderKind::VitposeRtmw3dHybrid => {
+            VitposeRtmw3dHybridProvider::from_models_dir(models_dir)
+                .map(|p| Box::new(p) as Box<dyn PoseProvider>)
+        }
+        PoseProviderKind::Hmr2 => Hmr2Provider::from_models_dir(models_dir)
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
     }
 }
 
@@ -272,6 +304,18 @@ mod tests {
         assert_eq!(
             PoseProviderKind::parse("rtmw3d-da"),
             Some(PoseProviderKind::Rtmw3dWithDepth)
+        );
+        assert_eq!(
+            PoseProviderKind::parse("vitpose"),
+            Some(PoseProviderKind::VitposeWholebody)
+        );
+        assert_eq!(
+            PoseProviderKind::parse("vitpose-wholebody"),
+            Some(PoseProviderKind::VitposeWholebody)
+        );
+        assert_eq!(
+            PoseProviderKind::parse("vitpose_s_wholebody"),
+            Some(PoseProviderKind::VitposeWholebody)
         );
     }
 

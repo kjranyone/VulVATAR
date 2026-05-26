@@ -155,7 +155,7 @@ fn main() -> Result<(), String> {
         // Diagnostic always runs without an explicit pose calibration —
         // we want to see the raw, EMA-uncorrected calibration each
         // image would produce on a cold provider.
-        let calib = match calibrate_scale(&joints_2d, &depth, w, h, None) {
+        let calib = match calibrate_scale(&joints_2d, &depth, None, w, h, None) {
             Ok(c) => c,
             Err(failure) => {
                 eprintln!("[{idx:>3}] calibration failed — skipping ({})", failure);

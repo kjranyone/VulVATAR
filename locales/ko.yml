@@ -178,6 +178,17 @@ tracking:
   error_model_warning: "Pose tracking quality warning: %{warnings}. Run ./dev.ps1 setup to install the full model bundle."
   error_model_unavailable: "Pose model unavailable: %{error} Falling back to low-quality HSV tracking."
   error_camera_stopped: "Camera stopped after %{count} consecutive read errors. Another app may be using the camera, or the device was disconnected."
+  advanced_smoothing: "Advanced Smoothing"
+  advanced_smoothing_hint: "Defaults suit most setups — adjust only for noisy cameras or jittery expression rigs."
+  rotation_blend: "Rotation Blend"
+  rotation_blend_tooltip: "Per-frame blend toward the newly tracked rotation. 1.0 snaps each frame (no extra lag); lower values add smoothing on top of the upstream 1€ filter."
+  expression_blend: "Expression Blend"
+  expression_blend_tooltip: "Per-frame blend toward new blendshape weights. Lower = smoother but laggier facial expressions."
+  joint_confidence: "Joint Confidence Floor"
+  joint_confidence_tooltip: "Minimum keypoint confidence for a joint to drive its bone. 0 delegates gating to the structural floors upstream."
+  face_confidence: "Face Confidence Floor"
+  face_confidence_tooltip: "Minimum face-pose confidence before the head reacts."
+  smoothing_reset: "Reset smoothing"
 
 inspector:
   camera_transform: "Camera Transform"

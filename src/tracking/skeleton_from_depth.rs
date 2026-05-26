@@ -15,7 +15,7 @@ use crate::asset::HumanoidBone;
 
 use super::cigpose::DecodedJoint2d;
 use super::face_mediapipe::{derive_face_bbox, FaceBbox};
-use super::metric_depth::MoGeFrame;
+use super::metric_depth::{FrameCrop, MoGeFrame};
 use super::source_skeleton::HandOrientation;
 use super::{FacePose, SourceJoint, SourceSkeleton};
 
@@ -29,6 +29,31 @@ pub const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 /// dragging in neighbouring depth, large enough that single-pixel
 /// model artefacts get out-voted by the median.
 pub const SAMPLE_RADIUS_PX: i32 = 3;
+
+/// Remap full-frame normalised `(nx, ny)` to crop-local normalised
+/// coordinates when the depth frame covers only a sub-region of the
+/// camera frame. Returns `None` if the point falls outside the crop.
+#[inline]
+fn remap_to_crop(crop: &FrameCrop, nx: f32, ny: f32) -> Option<(f32, f32)> {
+    let cnx = (nx - crop.x1_frac) / crop.w_frac;
+    let cny = (ny - crop.y1_frac) / crop.h_frac;
+    if cnx < 0.0 || cnx > 1.0 || cny < 0.0 || cny > 1.0 {
+        return None;
+    }
+    Some((cnx, cny))
+}
+
+/// デプスフレームの解像度上で、肩幅ピクセル数に応じた安全なサンプリング半径を計算。
+/// 肩幅の 1/4 を超えないよう制限し、最小 0 (単一ピクセル)、最大 SAMPLE_RADIUS_PX。
+pub fn adaptive_sample_radius(depth_frame: &MoGeFrame, shoulder_px_span: Option<f32>) -> i32 {
+    match shoulder_px_span {
+        Some(span) if span > 0.0 => {
+            let max_safe = (span * 0.25).floor() as i32;
+            max_safe.clamp(0, SAMPLE_RADIUS_PX)
+        }
+        _ => SAMPLE_RADIUS_PX, // フォールバック: 固定値
+    }
+}
 
 const NUM_JOINTS: usize = 133;
 
@@ -133,6 +158,13 @@ pub fn sample_metric_point_with_radius(
     if !nx.is_finite() || !ny.is_finite() {
         return None;
     }
+    let (nx, ny) = match &frame.crop {
+        Some(c) => match remap_to_crop(c, nx, ny) {
+            Some(remapped) => remapped,
+            None => return None,
+        },
+        None => (nx, ny),
+    };
     let w = frame.width as i32;
     let h = frame.height as i32;
     let cx = (nx * frame.width as f32).round() as i32;
@@ -234,6 +266,13 @@ pub fn sample_metric_point_back_percentile_with_radius(
     if !nx.is_finite() || !ny.is_finite() {
         return None;
     }
+    let (nx, ny) = match &frame.crop {
+        Some(c) => match remap_to_crop(c, nx, ny) {
+            Some(remapped) => remapped,
+            None => return None,
+        },
+        None => (nx, ny),
+    };
     let w = frame.width as i32;
     let h = frame.height as i32;
     let cx = (nx * frame.width as f32).round() as i32;
@@ -785,6 +824,27 @@ pub(super) fn resolve_origin_metric(
     //       no calibration exists, or when the template cell at the
     //       keypoint is NaN, or the bias couldn't be computed (no
     //       visible torso pixels matched the band).
+    let adaptive_radius = {
+        let shoulder_px_span = if joints.len() >= NUM_JOINTS {
+            let left_shoulder = &joints[5];
+            let right_shoulder = &joints[6];
+            if left_shoulder.score >= KEYPOINT_VISIBILITY_FLOOR && right_shoulder.score >= KEYPOINT_VISIBILITY_FLOOR {
+                let dx = (left_shoulder.nx - right_shoulder.nx) * depth.width as f32;
+                let dy = (left_shoulder.ny - right_shoulder.ny) * depth.height as f32;
+                Some((dx*dx + dy*dy).sqrt())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        adaptive_sample_radius(depth, shoulder_px_span)
+    };
+
+    let sample_metric_point_back_percentile = |frame: &MoGeFrame, nx: f32, ny: f32| {
+        sample_metric_point_back_percentile_with_radius(frame, nx, ny, adaptive_radius)
+    };
+
     let sample = |kpt: &DecodedJoint2d| -> Option<[f32; 3]> {
         if let Some((template, bbox, bias)) = template_bias.as_ref() {
             if let Some(template_z) = template_depth_at_keypoint(template, bbox, kpt.nx, kpt.ny) {
@@ -922,6 +982,31 @@ pub(super) fn build_skeleton(
     //     back-percentile or template-bias correction to a wrist
     //     held in front of the body would push it backward onto the
     //     torso depth — a regression in the no-occlusion case.
+    let adaptive_radius = {
+        let shoulder_px_span = if joints.len() >= NUM_JOINTS {
+            let left_shoulder = &joints[5];
+            let right_shoulder = &joints[6];
+            if left_shoulder.score >= KEYPOINT_VISIBILITY_FLOOR && right_shoulder.score >= KEYPOINT_VISIBILITY_FLOOR {
+                let dx = (left_shoulder.nx - right_shoulder.nx) * depth.width as f32;
+                let dy = (left_shoulder.ny - right_shoulder.ny) * depth.height as f32;
+                Some((dx*dx + dy*dy).sqrt())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        adaptive_sample_radius(depth, shoulder_px_span)
+    };
+
+    let sample_metric_point = |frame: &MoGeFrame, nx: f32, ny: f32| {
+        sample_metric_point_with_radius(frame, nx, ny, adaptive_radius)
+    };
+
+    let sample_metric_point_back_percentile = |frame: &MoGeFrame, nx: f32, ny: f32| {
+        sample_metric_point_back_percentile_with_radius(frame, nx, ny, adaptive_radius)
+    };
+
     let resolve = |idx: usize| -> Option<SourceJoint> {
         if idx >= joints.len() {
             return None;
@@ -1762,6 +1847,7 @@ mod tests {
             width,
             height,
             points_m: vec![point; pixels],
+            crop: None,
         }
     }
 

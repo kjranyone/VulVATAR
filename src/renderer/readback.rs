@@ -64,6 +64,8 @@ impl VulkanRenderer {
             },
             handoff_path: crate::frame_handoff::HandoffPath::CpuReadback,
             fallback_reason: Some(crate::frame_handoff::FallbackReason::RequestedCpuReadback),
+            // CpuReadback `pixel_data` already feeds the preview directly.
+            preview_pixels: None,
         };
 
         Ok(Some(RenderResult {

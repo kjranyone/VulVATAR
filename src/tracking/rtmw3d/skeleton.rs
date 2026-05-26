@@ -18,7 +18,7 @@ use super::consts::{
 use super::decode::{DecodedJoint, NUM_JOINTS, RTMW3D_SOURCE_Z_SCALE};
 use super::math::{length3, sub3};
 
-pub(super) fn build_source_skeleton(
+pub(in crate::tracking) fn build_source_skeleton(
     frame_index: u64,
     joints: &[DecodedJoint],
     width: u32,
@@ -252,12 +252,818 @@ pub(super) fn build_source_skeleton(
     }
     sk.overall_confidence = if n > 0 { sum / n as f32 } else { 0.0 };
 
-    // Face pose / blendshapes are intentionally left at None / empty
-    // for v1 — the head bone falls back to spine direction. Blendshape
-    // expressions need the dedicated face model (Phase C: SMIRK).
-    sk.face = None;
+    // Anatomical sanity check for leg chain (knee → ankle). ViTPose
+    // occasionally misdetects the ankle as a point well off the
+    // anatomical "downward" axis from the knee — observed on
+    // shoulders_003 where the LeftFoot landed at x=+0.775 vs y=-0.632
+    // from the knee, giving a 51° shin angle from vertical that the
+    // avatar's solver can't follow without rig damage. Cap the shin
+    // x/y ratio so a wildly tilted source ankle gets pulled back to
+    // a straight-down position from the knee; this preserves the
+    // knee position (which is the primary leg joint signal) and
+    // gives the foot a plausible default.
+    sanity_check_shin(&mut sk, HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot);
+    sanity_check_shin(&mut sk, HumanoidBone::RightLowerLeg, HumanoidBone::RightFoot);
+
+    // 2D-only foreshortening → spine forward-pitch inference. Fires
+    // only when the upper-body source-z is essentially flat (= caller
+    // is a 2D-only provider like ViTPose with `nz = 0.5`). RTMW3D's
+    // own 3D output produces non-trivial source z so the gate inside
+    // skips the inference. See the function docstring for the
+    // anatomy reasoning. `pitch_sign` is derived from head /
+    // face landmarks (chin-down vs chin-up) so backward-leaning
+    // poses get -z injection instead of the default forward bias.
+    // Spine pitch: gated and scaled by the 2D head-pose signal
+    // (nose-vs-ear-midpoint y ratio). Face-pose-derived pitch was
+    // attempted (v3p) but produced near-zero pitch on deep bow
+    // cases where the face landmarks are noisy, undershooting
+    // depth_006. The nose-vs-ear heuristic in detect_pitch_scale
+    // is more robust because it uses only the COCO 0/3/4 body
+    // keypoints which stay reliable when the face cascade does
+    // not.
+    if let Some(pitch_scale) = detect_pitch_scale(joints) {
+        // Estimate head pitch angle in radians from the nose-vs-
+        // ear-midpoint signal. Use it as a cap on the inferred
+        // body pitch angle: head can pitch *further* than body
+        // (independent neck tilt) but not *less* in normal poses
+        // (rigid neck-spine coupling). For balance_001 this caps
+        // the foreshortening-derived 45° down to ~20°, matching
+        // the photo's mild lean; for depth_006 the head pitch
+        // is large so cap doesn't bind and full pitch fires.
+        let head_pitch_cap = estimate_head_pitch_angle(joints);
+        infer_spine_pitch_from_foreshortening(&mut sk, pitch_scale, head_pitch_cap);
+    }
+    // Same idea, orthogonal axis: shoulder / hip pair X-span
+    // compression → body yaw around vertical (twist poses). Sign
+    // disambiguation uses the raw COCO nose + ear-pair keypoints:
+    // when the body yaws, the face yaws with it, and the nose's
+    // image-x shifts relative to the ear-midpoint in the direction
+    // that side of the face is exposed.
+    let yaw_sign = detect_yaw_sign(joints);
+    infer_body_yaw_from_foreshortening(&mut sk, yaw_sign);
+
+    // Face pose: derive yaw / pitch / roll from the 5 body-face
+    // keypoints (nose + eyes + ears, COCO 0..=4) when they clear
+    // confidence. Drives the Head bone independently of the body
+    // direction and gives the solver a face-yaw signal that's
+    // orthogonal to my spine-yaw inference. (v3x probe confirmed
+    // face pose does NOT contribute to the 5.4° neck residual —
+    // that's a pose_solver-level rest-pose offset artefact.)
+    sk.face = super::face::derive_face_pose_from_body(&sk, joints);
     sk.expressions = Vec::new();
     sk
+}
+
+/// Recover a spine forward-pitch (around X axis) signal from 2D
+/// foreshortening of the shoulder-hip y span. ViTPose and any other
+/// 2D-only provider emits `position[2] = 0` for every joint, so the
+/// solver's direction-matching path sees the spine direction as
+/// pure `+y` regardless of whether the subject is upright or
+/// deeply bowed. This routine bridges the gap by injecting a
+/// per-frame `+z` offset into the spine-chain tip joints derived
+/// from the anatomical relation
+///
+/// ```text
+/// shoulder-hip y distance ≈ 1.15 × shoulder x span (upright frontal adult)
+/// ```
+///
+/// When the observed y span is shorter than that prediction, the
+/// subject is foreshortened — either leaning forward (toward
+/// camera) or backward (away). Without a depth signal we cannot
+/// distinguish the two, so we **default to forward**: subjects
+/// performing for a camera are vastly more likely to lean toward
+/// it than away, and the rest-pose neutral covers the rare
+/// backward-lean case with a 5° error budget.
+///
+/// Gating:
+/// - Skips when `UpperChest.z` already carries a real depth signal
+///   (> `MAX_EXISTING_Z_FOR_INFERENCE` in source units), so depth-
+///   aware providers and RTMW3D's native 3D output don't get this
+///   bias added on top.
+/// - Skips when the subject is side-profile (`shoulder_span_x` too
+///   small) — direction is ambiguous and the anatomy ratio doesn't
+///   hold.
+/// - Skips when compression is < 5 % (subject is upright; jitter
+///   should not push the avatar around).
+/// Constrain the shin direction (knee → ankle) to a plausibly
+/// downward orientation. ViTPose's ankle detection misfires on
+/// some images, placing the foot at a wildly off-axis position
+/// (51°+ from vertical) that the avatar's leg chain can't follow.
+/// We cap the horizontal offset to half the vertical offset
+/// (≈ 27° from vertical max). Outside that, snap the ankle x to
+/// be inline with the knee while preserving the y/z components —
+/// the shin then points roughly downward like the actual anatomy.
+fn sanity_check_shin(sk: &mut SourceSkeleton, knee: HumanoidBone, ankle: HumanoidBone) {
+    /// Max |dx| / |dy| ratio for shin direction. ≈ 27° from
+    /// vertical. Beyond this is a detection error, not a real
+    /// anatomical pose (legs splaying outward extremely is rare
+    /// in standing / standard poses; a kick or sit-cross pose
+    /// would also bend the knee, which we don't model here).
+    const MAX_SHIN_LATERAL_RATIO: f32 = 0.5;
+
+    let Some(knee_j) = sk.joints.get(&knee).copied() else {
+        return;
+    };
+    let Some(ankle_j) = sk.joints.get(&ankle).copied() else {
+        return;
+    };
+    let dx = ankle_j.position[0] - knee_j.position[0];
+    let dy = ankle_j.position[1] - knee_j.position[1];
+    // shin must point downward: dy < 0
+    if dy >= 0.0 {
+        // Ankle above knee — anatomically impossible; pull it
+        // directly below the knee at expected shin length.
+        if let Some(j) = sk.joints.get_mut(&ankle) {
+            j.position[0] = knee_j.position[0];
+            j.position[1] = knee_j.position[1] - 0.30;
+        }
+        return;
+    }
+    if dx.abs() > MAX_SHIN_LATERAL_RATIO * dy.abs() {
+        // Lateral offset too large; snap x directly to knee
+        // (= vertical shin). Earlier "clamp to max ratio"
+        // approach left a 20° residual error because the source
+        // detection was unreliable in this regime — better to
+        // default to the anatomically common vertical posture
+        // than partially honour a bad detection.
+        if let Some(j) = sk.joints.get_mut(&ankle) {
+            j.position[0] = knee_j.position[0];
+        }
+    }
+}
+
+fn infer_spine_pitch_from_foreshortening(
+    sk: &mut SourceSkeleton,
+    pitch_sign: f32,
+    head_pitch_cap: Option<f32>,
+) {
+    /// Anatomical ratio for an upright frontal adult: shoulder-to-
+    /// hip y distance divided by shoulder x span. Drives the
+    /// expected y span the per-frame measurement is compared
+    /// against.
+    const EXPECTED_SHOULDER_HIP_RATIO: f32 = 1.15;
+    /// Above this absolute source-z value on the UpperChest, the
+    /// caller has already produced a depth signal — assume it's the
+    /// truth and don't overwrite.
+    const MAX_EXISTING_Z_FOR_INFERENCE: f32 = 0.05;
+    /// Below this shoulder x span, the subject is in side-profile
+    /// and the foreshortening signal is ambiguous (the shoulders
+    /// themselves are now z-separated, not x-separated).
+    const MIN_SHOULDER_SPAN_FOR_INFERENCE: f32 = 0.10;
+    /// Trigger threshold. compression ≥ this is "essentially
+    /// upright"; below is treated as forward lean.
+    const COMPRESSION_THRESHOLD: f32 = 0.95;
+
+    // Require an explicit Hips entry. Without it the subject is in
+    // upper-body framing (`force_shoulder_anchor` mode) and origin is
+    // shoulder-mid — `chest.y` collapses to ~0 and the foreshortening
+    // ratio is meaningless (we'd divide by ~0 and inject a giant z).
+    let Some(hips) = sk.joints.get(&HumanoidBone::Hips).copied() else {
+        return;
+    };
+    let Some(chest) = sk.joints.get(&HumanoidBone::UpperChest).copied() else {
+        return;
+    };
+    if chest.position[2].abs() > MAX_EXISTING_Z_FOR_INFERENCE {
+        return;
+    }
+    let (lsh, rsh) = match (
+        sk.joints.get(&HumanoidBone::LeftShoulder),
+        sk.joints.get(&HumanoidBone::RightShoulder),
+    ) {
+        (Some(l), Some(r)) => (*l, *r),
+        _ => return,
+    };
+    let shoulder_span = (lsh.position[0] - rsh.position[0]).abs();
+    if shoulder_span < MIN_SHOULDER_SPAN_FOR_INFERENCE {
+        return;
+    }
+    // Skip the forward-pitch interpretation when the shoulder line
+    // is significantly tilted in y: that's a roll (side lean), not
+    // a pitch (forward lean). Treating roll-induced y compression
+    // as forward pitch produces visible contortion artefacts —
+    // tested on the `three_quarter_left_side_lunge` validation
+    // image, where pitch inference fired at ~50° and bent the
+    // avatar forward when the subject was actually leaning side-
+    // ways. 0.20 source units of y tilt across the shoulder pair
+    // corresponds to ~30° roll, well outside the noise floor.
+    const MAX_SHOULDER_LINE_Y_TILT: f32 = 0.20;
+    let shoulder_line_y_tilt = (lsh.position[1] - rsh.position[1]).abs();
+    if shoulder_line_y_tilt > MAX_SHOULDER_LINE_Y_TILT {
+        return;
+    }
+
+    let hip_y = hips.position[1];
+    let actual_y = chest.position[1] - hip_y;
+    // Minimum sane shoulder-hip y distance to attempt the ratio
+    // inference. Below this the geometry is degenerate (shoulder
+    // overlaps hip in image y, e.g. extreme rear-view torso) and the
+    // division below would amplify floating-point noise into a
+    // catastrophic z injection. Tuned against the validation set:
+    // legitimate forward-lean cases sit at ≥ 0.08 source units.
+    const MIN_ACTUAL_Y: f32 = 0.05;
+    if actual_y < MIN_ACTUAL_Y {
+        return;
+    }
+
+    let expected_y = shoulder_span * EXPECTED_SHOULDER_HIP_RATIO;
+    let compression = (actual_y / expected_y).clamp(-1.0, 1.0);
+    if compression >= COMPRESSION_THRESHOLD {
+        return;
+    }
+
+    // Reconstruct the missing z component so the 3-D shoulder-hip
+    // vector still has length `expected_y` but is rotated by
+    // `acos(compression)` toward the camera. cos_pitch = compression,
+    // sin_pitch = √(1 − cos²). Sign comes from the caller's face-
+    // pitch signal (chin-down = +, chin-up = −); default + on no-
+    // signal still picks the more common performer direction.
+    let cos_pitch = compression;
+    let pitch_angle = cos_pitch.acos();
+    // Cap the body pitch by the head pitch estimate when
+    // available — body normally pitches ≤ head, so a small
+    // head pitch on a "compressed-looking" image means the
+    // compression is per-subject anatomy, not pose.
+    let effective_pitch = match head_pitch_cap {
+        Some(head_pitch) => pitch_angle.min(head_pitch),
+        None => pitch_angle,
+    };
+    let sin_pitch = effective_pitch.sin();
+    let z_offset = sin_pitch * expected_y * pitch_sign;
+
+    // Propagate the z into the spine-chain tip joints. UpperChest
+    // and Neck share a position (shoulder mid); Head's source
+    // entry (ear / nose midpoint) follows the spine so we scale
+    // its offset by the head/chest height ratio. Clamp the ratio
+    // to anatomical plausibility (1.0–2.0) so a head/chest with an
+    // unexpected y compression can't blow up the z offset.
+    let head_scale = sk
+        .joints
+        .get(&HumanoidBone::Head)
+        .map(|h| ((h.position[1] - hip_y) / actual_y).clamp(1.0, 2.0))
+        .unwrap_or(1.5);
+    for (bone, scale) in [
+        (HumanoidBone::UpperChest, 1.0),
+        (HumanoidBone::Neck, 1.0),
+        (HumanoidBone::Head, head_scale),
+    ] {
+        if let Some(j) = sk.joints.get_mut(&bone) {
+            j.position[2] = z_offset * scale;
+        }
+    }
+}
+
+/// Recover a body yaw (rotation around vertical) signal from 2D
+/// foreshortening of the shoulder / hip X-span. Counterpart to
+/// [`infer_spine_pitch_from_foreshortening`]: same anatomy-ratio
+/// approach, orthogonal axis. Independent inference for upper body
+/// (shoulder pair drives shoulder + spine + arm chain) and lower
+/// body (hip pair drives leg chain) lets a torso-twist pose come
+/// through without forcing both halves to rotate together.
+///
+/// Implementation: detect yaw magnitude from x-span compression,
+/// then **rotate the entire body half** by `yaw` around the
+/// vertical axis through hip mid. This is structurally correct —
+/// in a real twist, the elbow / wrist / knee / foot all rotate
+/// with their parent (shoulder / hip). Per-pair single-joint z
+/// injection (the obvious first attempt) leaves the chain children
+/// in the 2D plane and produces an "arm pointing forward into the
+/// torso" artefact when the body actually twisted.
+///
+/// Without a depth signal we cannot tell which way the subject is
+/// turned (+yaw vs −yaw produce identical x-span compression).
+/// Default to subject-right-toward-camera (= positive yaw per
+/// [`super::super::super::avatar::pose_solver::compute_body_yaw_3d`]'s
+/// convention) — performers facing the camera most often demo this
+/// direction, and a wrong-direction case is angularly identical so
+/// the rest-pose neutral keeps the bound tight.
+fn infer_body_yaw_from_foreshortening(sk: &mut SourceSkeleton, yaw_sign: f32) {
+    /// Anatomical ratio: shoulder vertical span (shoulder-to-hip y)
+    /// divided by frontal shoulder x-span. 1.50 covers most adult
+    /// subjects (true 1.15-1.20) without over-estimating yaw on
+    /// slim / stylised builds where the shoulder/y ratio runs
+    /// closer to 2.5. Earlier 1.15 produced 55°+ inferred yaw on
+    /// gothic_twist where the actual yaw was ~35°.
+    const SHOULDER_RATIO: f32 = 1.50;
+    /// Hip x-span expected = `HIP_FROM_SHOULDER_RATIO × observed
+    /// shoulder span`. Tying hip anchor to the same frame's
+    /// observed shoulder span (rather than an independent anatomy
+    /// ratio against torso_y) cancels per-subject build variance —
+    /// a slim subject's narrow shoulders also have narrow hips, so
+    /// the ratio between the two is more stable than either's
+    /// ratio to torso_y. 0.80 is the population mean for adult hip/
+    /// shoulder.
+    const HIP_FROM_SHOULDER_RATIO: f32 = 0.80;
+    /// Skip when any joint already carries a real depth signal.
+    const MAX_EXISTING_Z_FOR_INFERENCE: f32 = 0.05;
+    /// `compression ≥ this` is treated as upright; below is yawed.
+    const COMPRESSION_THRESHOLD: f32 = 0.95;
+    const MIN_TORSO_Y: f32 = 0.05;
+
+    let Some(hips) = sk.joints.get(&HumanoidBone::Hips).copied() else {
+        return;
+    };
+    let Some(chest) = sk.joints.get(&HumanoidBone::UpperChest).copied() else {
+        return;
+    };
+    let torso_y = chest.position[1] - hips.position[1];
+    if torso_y < MIN_TORSO_Y {
+        return;
+    }
+    let pivot = hips.position;
+
+    // Observed shoulder span: feeds both the shoulder-yaw expected
+    // (anatomical fallback) and the hip-yaw expected (derived
+    // ratio). Compute before rotating so the rotation doesn't
+    // shrink it further.
+    let observed_shoulder_x_span = match (
+        sk.joints.get(&HumanoidBone::LeftShoulder),
+        sk.joints.get(&HumanoidBone::RightShoulder),
+    ) {
+        (Some(l), Some(r)) => (l.position[0] - r.position[0]).abs(),
+        _ => 0.0,
+    };
+
+    // Step 1: shoulder yaw. Gate the entire inference on the
+    // shoulder pair clearing the compression threshold — shoulders
+    // are the most reliable anatomical anchor, and hip-only yaw
+    // signals are dominated by per-subject build variance (narrow-
+    // hipped anime / idol photoshoots produced 41° false-positive
+    // hip yaw on forward-lean poses where the shoulder pair clearly
+    // showed no rotation). If shoulders say "frontal", hips do too.
+    let shoulder_expected = torso_y / SHOULDER_RATIO;
+
+    // 180° back-view bias: when L/R shoulder x positions are
+    // swapped (L < R in source space, opposite of the frontal
+    // anatomy), the body is yawed ~180°. The `quat_from_vectors`
+    // shortest-arc rotation in `compute_hip_align_rotation` /
+    // `compute_body_yaw_3d` becomes degenerate at exactly 180° —
+    // any axis perpendicular to both vectors is equally valid, so
+    // numerical noise picks an arbitrary one (typically Z), which
+    // rotates the avatar around an unintended axis. Inject a tiny
+    // +z bias into the L side and -z into R so the cross-product
+    // rotation axis tilts toward Y (body yaw). Apply this BEFORE
+    // the yaw-magnitude gate so 180° back-view cases (where shoulder
+    // x-span is full so no yaw is detected) still get the bias.
+    let back_view_for_bias = match (
+        sk.joints.get(&HumanoidBone::LeftShoulder),
+        sk.joints.get(&HumanoidBone::RightShoulder),
+    ) {
+        (Some(l), Some(r)) => l.position[0] < r.position[0],
+        _ => false,
+    };
+    if back_view_for_bias && observed_shoulder_x_span > 0.05 {
+        let bias = observed_shoulder_x_span * 0.03;
+        let left_bones = [
+            HumanoidBone::LeftShoulder,
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::LeftLowerArm,
+            HumanoidBone::LeftHand,
+            HumanoidBone::LeftUpperLeg,
+            HumanoidBone::LeftLowerLeg,
+            HumanoidBone::LeftFoot,
+        ];
+        let right_bones = [
+            HumanoidBone::RightShoulder,
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::RightLowerArm,
+            HumanoidBone::RightHand,
+            HumanoidBone::RightUpperLeg,
+            HumanoidBone::RightLowerLeg,
+            HumanoidBone::RightFoot,
+        ];
+        for bone in &left_bones {
+            if let Some(j) = sk.joints.get_mut(bone) {
+                j.position[2] += bias;
+            }
+        }
+        for bone in &right_bones {
+            if let Some(j) = sk.joints.get_mut(bone) {
+                j.position[2] -= bias;
+            }
+        }
+    }
+
+    let shoulder_yaw = detect_yaw_magnitude(
+        sk,
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::RightShoulder,
+        shoulder_expected,
+        MAX_EXISTING_Z_FOR_INFERENCE,
+        COMPRESSION_THRESHOLD,
+    );
+    let Some(shoulder_yaw) = shoulder_yaw else {
+        return;
+    };
+
+    // Anatomical recovery for the 90°-profile collapse case. When
+    // the shoulder pair projects to (nearly) the same image x —
+    // i.e. the subject is in deep side profile and the L/R
+    // shoulders overlap in 2D — the bone-label distinguishes
+    // anatomical L from R while the pixel coordinate doesn't.
+    // Separate the L/R chain joints by ±half_span in the source x
+    // axis *before* applying the rotation: rotation around vertical
+    // then projects them to opposite z, which is the correct 3D
+    // configuration for the 90° profile. Without this recovery,
+    // both shoulders stay at x = 0 and rotation produces no
+    // separation in z (cos·0 + sin·0 = 0), so the avatar fails to
+    // turn even though yaw was correctly inferred as 90°.
+    const COLLAPSE_X_SPAN: f32 = 0.05;
+    /// Subject-adaptive collapse threshold via shoulder/torso_y
+    /// ratio. For an upright frontal adult, shoulder_span_x ≈
+    /// 0.7-1.3 × torso_y. When the observed ratio drops below
+    /// 0.50, the subject is in deep profile (~60°+ yaw) — apply
+    /// the anatomical-separation recovery so the chain rotation
+    /// produces a proper z separation. orient_001 walking case
+    /// had ratio 0.45 (shoulder_span 0.135, torso 0.30) and was
+    /// missing the recovery despite being near-90°. The absolute
+    /// COLLAPSE_X_SPAN gate above stays for the literal 0-span
+    /// case (90° + zero detection noise).
+    const COLLAPSE_RATIO_THRESHOLD: f32 = 0.30;
+    let upper_left_chain: &[HumanoidBone] = &[
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::LeftUpperArm,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftHand,
+    ];
+    let upper_right_chain: &[HumanoidBone] = &[
+        HumanoidBone::RightShoulder,
+        HumanoidBone::RightUpperArm,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::RightHand,
+    ];
+    // Soft collapse recovery: instead of binary on/off, scale the
+    // anatomical separation by how close the observed shoulder span
+    // is to the expected. compression < 0.5 → progressive recovery;
+    // ≥ 0.5 → no recovery (frontal-enough that 2D detection alone
+    // suffices). Tested against orient_001 walking 90° profile
+    // (compression 0.32) where binary firing helped but the
+    // resulting rotation overshoots; soft scaling produces an
+    // intermediate amount that matches the actual yaw better.
+    let upper_compression = observed_shoulder_x_span / shoulder_expected.max(1e-3);
+    if upper_compression < 1.0 || observed_shoulder_x_span < COLLAPSE_X_SPAN {
+        let recovery_strength = if observed_shoulder_x_span < COLLAPSE_X_SPAN {
+            1.0  // total collapse — full anatomical recovery
+        } else {
+            // Quadratic ramp: 1.0 at compression 0 → 0.0 at 1.0,
+            // emphasising the recovery for deep-profile cases
+            // while leaving near-frontal cases lightly touched.
+            let r = (1.0 - upper_compression).clamp(0.0, 1.0);
+            r * r
+        };
+        anatomically_separate(
+            sk,
+            upper_left_chain,
+            upper_right_chain,
+            shoulder_expected * 0.5 * recovery_strength,
+        );
+    }
+
+    // Upper body chain (shoulders → arms → spine chain tips).
+    let upper_chain: &[HumanoidBone] = &[
+        HumanoidBone::UpperChest,
+        HumanoidBone::Neck,
+        HumanoidBone::Head,
+        HumanoidBone::LeftShoulder,
+        HumanoidBone::RightShoulder,
+        HumanoidBone::LeftUpperArm,
+        HumanoidBone::RightUpperArm,
+        HumanoidBone::LeftLowerArm,
+        HumanoidBone::RightLowerArm,
+        HumanoidBone::LeftHand,
+        HumanoidBone::RightHand,
+    ];
+    rotate_chain_by_yaw_magnitude(sk, upper_chain, shoulder_yaw * yaw_sign, pivot);
+
+    // Step 2: hip yaw, gated on shoulder yaw firing. Use observed
+    // shoulder x-span (× anatomical ratio 0.80) as the hip anchor
+    // — ties hip yaw to the same frame's body width and cancels
+    // per-subject build variance. Additionally require the inferred
+    // hip yaw magnitude to be within a 2× band of the shoulder yaw:
+    // a real body yaw rotates both pairs by similar amounts (full
+    // rotation) or hip-yaw slightly less (torso twist), but hip-only
+    // rotations beyond shoulder yaw are anatomically implausible
+    // and almost always anatomy / detection artefacts.
+    let hip_yaw = detect_yaw_magnitude(
+        sk,
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::RightUpperLeg,
+        observed_shoulder_x_span * HIP_FROM_SHOULDER_RATIO,
+        MAX_EXISTING_Z_FOR_INFERENCE,
+        COMPRESSION_THRESHOLD,
+    );
+    let lower_chain: &[HumanoidBone] = &[
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::RightUpperLeg,
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::LeftFoot,
+        HumanoidBone::RightFoot,
+    ];
+    // Same anatomical recovery for the leg chain when the hip pair
+    // has collapsed in 2D.
+    let observed_hip_x_span = match (
+        sk.joints.get(&HumanoidBone::LeftUpperLeg),
+        sk.joints.get(&HumanoidBone::RightUpperLeg),
+    ) {
+        (Some(l), Some(r)) => (l.position[0] - r.position[0]).abs(),
+        _ => 0.0,
+    };
+    let lower_left_chain: &[HumanoidBone] = &[
+        HumanoidBone::LeftUpperLeg,
+        HumanoidBone::LeftLowerLeg,
+        HumanoidBone::LeftFoot,
+    ];
+    let lower_right_chain: &[HumanoidBone] = &[
+        HumanoidBone::RightUpperLeg,
+        HumanoidBone::RightLowerLeg,
+        HumanoidBone::RightFoot,
+    ];
+    // Hip expected: observed shoulder span × 0.80 (subject-anchor).
+    // When the shoulder pair has fully collapsed in 2D (observed
+    // shoulder x-span < COLLAPSE_X_SPAN, i.e. 90° profile) the
+    // subject-anchor is useless (= 0) so we fall back to an
+    // anatomical estimate from torso_y. Outside the collapse case
+    // we stick with the subject-anchor to avoid perturbing
+    // shoulders_003-style non-rotated poses where the anatomical
+    // fallback would over-estimate hip_expected and fire hip_yaw
+    // when it shouldn't.
+    let hip_expected_span = if observed_shoulder_x_span < COLLAPSE_X_SPAN {
+        torso_y * 0.40
+    } else {
+        observed_shoulder_x_span * HIP_FROM_SHOULDER_RATIO
+    };
+    let lower_compression = observed_hip_x_span / hip_expected_span.max(1e-3);
+    if lower_compression < 1.0 || observed_hip_x_span < COLLAPSE_X_SPAN {
+        let recovery_strength = if observed_hip_x_span < COLLAPSE_X_SPAN {
+            1.0
+        } else {
+            let r = (1.0 - lower_compression).clamp(0.0, 1.0);
+            r * r
+        };
+        let half_span = hip_expected_span * 0.5 * recovery_strength;
+        anatomically_separate(
+            sk,
+            lower_left_chain,
+            lower_right_chain,
+            half_span,
+        );
+    }
+    if let Some(hip_yaw_raw) = hip_yaw {
+        // Clamp hip yaw to at most the shoulder yaw — torso twist
+        // never has hips yawed *more* than shoulders.
+        let hip_yaw_clamped = hip_yaw_raw.min(shoulder_yaw.abs());
+        rotate_chain_by_yaw_magnitude(sk, lower_chain, hip_yaw_clamped * yaw_sign, pivot);
+    } else {
+        // Hip span suggested frontal — but shoulders are yawed. Most
+        // likely this is a full body yaw (not torso twist) and the
+        // hip detection noise is hiding it. Apply the shoulder yaw
+        // to the legs too so the full body rotates coherently.
+        rotate_chain_by_yaw_magnitude(sk, lower_chain, shoulder_yaw * yaw_sign, pivot);
+    }
+}
+
+/// Disambiguate the yaw direction (+ or -) from the raw COCO
+/// keypoints. When the body yaws, the face yaws with it, and the
+/// nose's image-x shifts relative to the ear-midpoint in the
+/// direction whose side of the face becomes exposed to the camera.
+///
+/// Convention: positive yaw = subject's right side toward camera
+/// (per `compute_body_yaw_3d`). After selfie mirror and `to_source`,
+/// subject's right is image-LEFT (small nx). For +yaw, the face
+/// has rotated such that the nose moves toward subject's right →
+/// nose.nx is SMALLER than ear_mid.nx.
+///
+/// Returns +1 (default) or -1. When nose/ear keypoints fail
+/// visibility, returns +1 — preserving the "performer turning
+/// toward camera" default.
+/// Combined sign + magnitude scalar for spine pitch inference,
+/// derived from the head pose. Returns a signed value in `[-1, 1]`:
+/// 0 = head essentially neutral (skip pitch), ±0.x = mild chin-
+/// down / chin-up (scale pitch down), ±1 = strong chin angle
+/// (full pitch). Without a confirmed head pitch direction, raw
+/// shoulder-hip foreshortening is ambiguous between real body
+/// pitch and per-subject anatomy variance — letting the head
+/// magnitude scale the inferred z_offset cancels both the over-
+/// estimate on slim-torsoed subjects and the under-estimate on
+/// wide-shouldered ones.
+/// Estimate the head pitch angle in radians from the COCO 0/3/4
+/// keypoints (nose, left/right ear). Returns `None` when the
+/// face triangle is unavailable. Used as a cap on the spine
+/// pitch inference.
+fn estimate_head_pitch_angle(joints: &[DecodedJoint]) -> Option<f32> {
+    const NOSE_IDX: usize = 0;
+    const LEFT_EAR_IDX: usize = 3;
+    const RIGHT_EAR_IDX: usize = 4;
+    if joints.len() <= RIGHT_EAR_IDX {
+        return None;
+    }
+    let nose = &joints[NOSE_IDX];
+    let l_ear = &joints[LEFT_EAR_IDX];
+    let r_ear = &joints[RIGHT_EAR_IDX];
+    let visibility = super::consts::KEYPOINT_VISIBILITY_FLOOR;
+    if nose.score < visibility
+        || l_ear.score < visibility
+        || r_ear.score < visibility
+    {
+        return None;
+    }
+    let ear_span = (l_ear.nx - r_ear.nx)
+        .hypot(l_ear.ny - r_ear.ny)
+        .max(1.0e-4);
+    let ear_mid_ny = (l_ear.ny + r_ear.ny) * 0.5;
+    let nose_dy = nose.ny - ear_mid_ny;
+    // Normalised dy / ear_span ≈ tan(pitch_angle). Atan recovers
+    // a face-pitch-equivalent angle in radians.
+    Some((nose_dy.abs() / ear_span).atan())
+}
+
+fn detect_pitch_scale(joints: &[DecodedJoint]) -> Option<f32> {
+    const NOSE_IDX: usize = 0;
+    const LEFT_EAR_IDX: usize = 3;
+    const RIGHT_EAR_IDX: usize = 4;
+    /// Below this nose-vs-ear-midpoint offset (as a fraction of
+    /// face width) the head is treated as neutral. Roughly
+    /// corresponds to ±10° head pitch.
+    const MIN_HEAD_PITCH_RATIO: f32 = 0.10;
+    /// At and beyond this ratio, the chin is clearly down /
+    /// up — corresponds to ±30° head pitch. Saturates the scale
+    /// at 1 so a deep bow still injects the full inferred pitch.
+    /// Lower threshold (vs 0.50) keeps deep bows at full strength
+    /// while mild head tilts get a proportional reduction —
+    /// tested against balance_001 (mild) vs depth_006 (deep).
+    const MAX_HEAD_PITCH_RATIO: f32 = 0.30;
+
+    if joints.len() <= RIGHT_EAR_IDX {
+        return None;
+    }
+    let nose = &joints[NOSE_IDX];
+    let l_ear = &joints[LEFT_EAR_IDX];
+    let r_ear = &joints[RIGHT_EAR_IDX];
+    let visibility = super::consts::KEYPOINT_VISIBILITY_FLOOR;
+    if nose.score < visibility
+        || l_ear.score < visibility
+        || r_ear.score < visibility
+    {
+        return None;
+    }
+    // Normalise the nose-vs-ear dy by the ear span — gives a
+    // resolution- and subject-size-independent head pitch ratio.
+    let ear_span = (l_ear.nx - r_ear.nx)
+        .hypot(l_ear.ny - r_ear.ny)
+        .max(1.0e-4);
+    let ear_mid_ny = (l_ear.ny + r_ear.ny) * 0.5;
+    let nose_dy_ratio = (nose.ny - ear_mid_ny) / ear_span;
+    if nose_dy_ratio.abs() < MIN_HEAD_PITCH_RATIO {
+        return None;
+    }
+    // Linear scale between MIN..MAX, clamped at ±1.
+    let signed = nose_dy_ratio.clamp(-MAX_HEAD_PITCH_RATIO, MAX_HEAD_PITCH_RATIO)
+        / MAX_HEAD_PITCH_RATIO;
+    Some(signed)
+}
+
+fn detect_yaw_sign(joints: &[DecodedJoint]) -> f32 {
+    const NOSE_IDX: usize = 0;
+    const LEFT_EAR_IDX: usize = 3;
+    const RIGHT_EAR_IDX: usize = 4;
+    const LEFT_SHOULDER_IDX: usize = 5;
+    const RIGHT_SHOULDER_IDX: usize = 6;
+    /// Below this normalised-image-x offset the nose-vs-ears signal
+    /// is dominated by detection noise. Drop to shoulder-asymmetry
+    /// fallback below this threshold.
+    const MIN_NX_OFFSET_FOR_SIGN: f32 = 0.01;
+    /// Shoulder confidence asymmetry threshold for the fallback —
+    /// the front shoulder (toward camera) detects with high score
+    /// in deep profile, the back one drops well below. 0.2 was
+    /// chosen empirically: frontal poses sit at ~0.85 / ~0.85, deep
+    /// profile sits at ~0.85 / ~0.45.
+    const MIN_SHOULDER_CONF_ASYM: f32 = 0.20;
+
+    if joints.len() <= RIGHT_SHOULDER_IDX {
+        return 1.0;
+    }
+    let nose = &joints[NOSE_IDX];
+    let l_ear = &joints[LEFT_EAR_IDX];
+    let r_ear = &joints[RIGHT_EAR_IDX];
+    let visibility = super::consts::KEYPOINT_VISIBILITY_FLOOR;
+
+    // Primary signal: nose x position relative to ear midpoint.
+    // Most reliable for 3/4 / mild profile poses where both ears
+    // are still visible.
+    if nose.score >= visibility && l_ear.score >= visibility && r_ear.score >= visibility {
+        let ear_mid_nx = (l_ear.nx + r_ear.nx) * 0.5;
+        let nose_offset = nose.nx - ear_mid_nx;
+        if nose_offset.abs() >= MIN_NX_OFFSET_FOR_SIGN {
+            // Nose shifted toward image-LEFT (smaller nx) =
+            // subject's right side exposed = +yaw.
+            return if nose_offset < 0.0 { 1.0 } else { -1.0 };
+        }
+    }
+
+    // Fallback signal: shoulder pair confidence asymmetry. At
+    // deep profile (~90°) the back shoulder is occluded and its
+    // detection confidence drops sharply; the front shoulder
+    // stays high. COCO 5 = subject's left shoulder, COCO 6 =
+    // subject's right shoulder.
+    let l_sh = &joints[LEFT_SHOULDER_IDX];
+    let r_sh = &joints[RIGHT_SHOULDER_IDX];
+    if l_sh.score >= visibility && r_sh.score >= visibility {
+        let asym = r_sh.score - l_sh.score;
+        if asym.abs() >= MIN_SHOULDER_CONF_ASYM {
+            // R shoulder more visible (asym > 0) = subject's right
+            // side toward camera = +yaw.
+            return if asym > 0.0 { 1.0 } else { -1.0 };
+        }
+    }
+
+    // No reliable signal — default to + (subject's right toward
+    // camera, statistically the more common performer-facing
+    // direction).
+    1.0
+}
+
+/// Shift the L/R sides of a collapsed anatomical pair apart by
+/// `half_span` along source x. Recovers the body-frame L/R
+/// distinction lost in 90°-profile 2D projection where both
+/// shoulders (or both hips) project to the same pixel — the bone
+/// label still says "this is the left", so we move it back to the
+/// L side of the body. Downstream rotation then maps that body-
+/// frame x to its proper image-frame (x, z).
+fn anatomically_separate(
+    sk: &mut SourceSkeleton,
+    left_chain: &[HumanoidBone],
+    right_chain: &[HumanoidBone],
+    half_span: f32,
+) {
+    if half_span < 0.025 {
+        return;
+    }
+    for bone in left_chain {
+        if let Some(j) = sk.joints.get_mut(bone) {
+            j.position[0] += half_span;
+        }
+    }
+    for bone in right_chain {
+        if let Some(j) = sk.joints.get_mut(bone) {
+            j.position[0] -= half_span;
+        }
+    }
+}
+
+/// Detect yaw magnitude (always positive) from x-span compression.
+/// Returns `None` when the pair is degenerate, depth-occupied, or
+/// not foreshortened.
+fn detect_yaw_magnitude(
+    sk: &SourceSkeleton,
+    left_bone: HumanoidBone,
+    right_bone: HumanoidBone,
+    expected_x_span: f32,
+    max_existing_z: f32,
+    compression_threshold: f32,
+) -> Option<f32> {
+    let lj = sk.joints.get(&left_bone)?;
+    let rj = sk.joints.get(&right_bone)?;
+    if lj.position[2].abs() > max_existing_z || rj.position[2].abs() > max_existing_z {
+        return None;
+    }
+    if expected_x_span < 0.05 {
+        return None;
+    }
+    let x_span = (lj.position[0] - rj.position[0]).abs();
+    let compression = (x_span / expected_x_span).clamp(0.0, 1.0);
+    if compression >= compression_threshold {
+        return None;
+    }
+    Some(compression.acos())
+}
+
+/// Rotate every joint in `chain` by `yaw_magnitude` radians around
+/// the vertical axis through `pivot`. Sign convention: positive yaw
+/// rotates the avatar's `x > 0` side (= subject's right via selfie-
+/// mirror) toward +z (camera). See [`infer_body_yaw_from_foreshortening`]
+/// for why this is the default.
+fn rotate_chain_by_yaw_magnitude(
+    sk: &mut SourceSkeleton,
+    chain: &[HumanoidBone],
+    yaw_magnitude: f32,
+    pivot: [f32; 3],
+) {
+    if yaw_magnitude.abs() < 1e-3 {
+        return;
+    }
+    let cos_yaw = yaw_magnitude.cos();
+    let sin_yaw = yaw_magnitude.sin();
+    for bone in chain {
+        if let Some(j) = sk.joints.get_mut(bone) {
+            let lx = j.position[0] - pivot[0];
+            let lz = j.position[2] - pivot[2];
+            let nx = lx * cos_yaw + lz * sin_yaw;
+            let nz = -lx * sin_yaw + lz * cos_yaw;
+            j.position[0] = pivot[0] + nx;
+            j.position[2] = pivot[2] + nz;
+        }
+    }
 }
 
 fn attach_hand<F>(

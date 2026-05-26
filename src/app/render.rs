@@ -450,6 +450,17 @@ impl Application {
                 self.rendered_extent = render_result.extent;
                 self.rendered_frame_counter += 1;
                 output_frame.gpu_token = Some(gpu_token.clone());
+                // Feed the in-app egui preview from the side-channel CPU
+                // readback the export path attached. The output consumer
+                // uses `gpu_token`; the viewport pane can only display host
+                // RGBA. Without this the preview texture freezes on its last
+                // CPU frame whenever output runs on the GPU-token path (which
+                // is the default — `FrameSink::SharedMemory` reports
+                // `supports_gpu_tokens()`), so camera / pose edits appear to
+                // have no effect even though the *output* is updating.
+                if let Some(ref preview) = exported.preview_pixels {
+                    self.rendered_pixels = Some(Arc::clone(preview));
+                }
             }
             _ => {
                 self.rendered_pixels = None;

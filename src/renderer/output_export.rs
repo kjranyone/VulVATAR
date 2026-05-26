@@ -47,6 +47,14 @@ pub struct ExportedFrame {
     pub export_metadata: ExportMetadata,
     pub handoff_path: HandoffPath,
     pub fallback_reason: Option<FallbackReason>,
+    /// CPU pixels for the in-app egui preview, populated **independently**
+    /// of `pixel_data`. The viewport preview (`src/gui/viewport.rs`) can
+    /// only display CPU RGBA — it has no Vulkan→glow interop path — so the
+    /// GPU-export branches must side-channel a host readback here, or the
+    /// preview freezes on its last CPU frame while the *output* (virtual
+    /// camera / shared memory) keeps advancing. `None` on the CpuReadback
+    /// branches because `pixel_data` already carries usable pixels there.
+    pub preview_pixels: Option<Arc<Vec<u8>>>,
 }
 
 impl ExportedFrame {
@@ -455,6 +463,18 @@ impl OutputExporter {
                         },
                         handoff_path: HandoffPath::GpuSharedFrame,
                         fallback_reason: None,
+                        // Side-channel CPU readback so the in-app egui preview
+                        // keeps advancing. The output consumer reads the shared
+                        // texture via the GPU token above; the preview pane has
+                        // no Vulkan→glow interop path and needs host RGBA.
+                        preview_pixels: Some(Arc::new(Self::readback_image_pixels(
+                            color_image,
+                            memory_allocator,
+                            command_buffer_allocator,
+                            queue,
+                            width,
+                            height,
+                        ))),
                     }),
                     export_succeeded: true,
                 }
@@ -494,6 +514,9 @@ impl OutputExporter {
                         },
                         handoff_path: HandoffPath::SharedMemory,
                         fallback_reason: Some(FallbackReason::ExternalHandleUnavailable),
+                        // `pixel_data` is CpuReadback here, so the preview is
+                        // fed from it in `process_render_result` directly.
+                        preview_pixels: None,
                     }),
                     export_succeeded: true,
                 }
@@ -536,6 +559,17 @@ impl OutputExporter {
                         },
                         handoff_path: HandoffPath::GpuSharedFrame,
                         fallback_reason: Some(FallbackReason::ExternalHandleUnavailable),
+                        // No external handle was produced, but the slot is
+                        // still GPU-leased. Feed the preview from a host
+                        // readback the same way the Win32Kmt branch does.
+                        preview_pixels: Some(Arc::new(Self::readback_image_pixels(
+                            color_image,
+                            memory_allocator,
+                            command_buffer_allocator,
+                            queue,
+                            width,
+                            height,
+                        ))),
                     }),
                     export_succeeded: true,
                 }
@@ -780,6 +814,8 @@ impl OutputExporter {
                 handoff_path: HandoffPath::CpuReadback,
                 fallback_reason: fallback_reason
                     .or(Some(FallbackReason::RequestedCpuReadback)),
+                // CpuReadback `pixel_data` already feeds the preview.
+                preview_pixels: None,
             }),
             export_succeeded: true,
         }

@@ -34,7 +34,7 @@ mod preprocess;
 #[cfg(feature = "inference")]
 pub use consts::{INPUT_H, INPUT_W};
 #[cfg(feature = "inference")]
-pub use decode::MoGeFrame;
+pub use decode::{FrameCrop, MoGeFrame};
 
 #[cfg(feature = "inference")]
 use log::{error, info, warn};

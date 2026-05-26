@@ -196,10 +196,30 @@ fn build_v1_meta(ext: &v1::VrmExtension) -> (VrmMeta, ThumbnailHint) {
 fn build_v1_humanoid(humanoid: &v1::Humanoid) -> Result<HumanoidMap, VrmLoadError> {
     let mut bone_map = HashMap::new();
     for (bone_name, bone_def) in &humanoid.human_bones {
-        // Unknown bones (fingers, toes, jaw, eyes, ...) are accepted by the
-        // VRM 1.0 spec but ignored by this retargeting pipeline. Skipping them
-        // is friendlier than hard-erroring the entire load.
-        if let Some(humanoid_bone) = parse_humanoid_bone(bone_name) {
+        // VRM 1.0 renamed the thumb chain to use anatomical terms — the
+        // FIRST thumb bone (carpometacarpal, at the wrist side) is now
+        // called "leftThumbMetacarpal" / "rightThumbMetacarpal", and
+        // what VRM 0.x called "leftThumbProximal" (first bone) became
+        // "leftThumbProximal" referring to the SECOND bone (MCP).
+        // Naming map between specs for the LEFT thumb:
+        //   VRM 0.x: Proximal (CMC) → Intermediate (MCP) → Distal (IP)
+        //   VRM 1.0: Metacarpal (CMC) → Proximal (MCP) → Distal (IP)
+        //
+        // Our `HumanoidBone` enum follows VRM 0.x naming, so for VRM
+        // 1.0 we need to shift Proximal → Intermediate and
+        // Metacarpal → Proximal. Without this, the same physical
+        // bone gets mapped to a different enum variant depending on
+        // VRM version, and the solver's BONE_DIRS chain runs
+        // backwards (proximal driven toward CMC instead of toward
+        // the fingertip), inverting the rendered thumb.
+        let humanoid_bone = match bone_name.as_str() {
+            "leftThumbMetacarpal" => Some(HumanoidBone::LeftThumbProximal),
+            "leftThumbProximal" => Some(HumanoidBone::LeftThumbIntermediate),
+            "rightThumbMetacarpal" => Some(HumanoidBone::RightThumbProximal),
+            "rightThumbProximal" => Some(HumanoidBone::RightThumbIntermediate),
+            other => parse_humanoid_bone(other),
+        };
+        if let Some(humanoid_bone) = humanoid_bone {
             bone_map.insert(humanoid_bone, NodeId(bone_def.node as u64));
         }
     }

@@ -97,6 +97,10 @@ impl GuiApp {
             camera_index: self.camera_index,
             show_camera_wipe: self.viewport.show_camera_wipe,
             show_detection_annotations: self.viewport.show_detection_annotations,
+            smoothing_rotation_blend: self.tracking.smoothing.rotation_blend,
+            smoothing_expression_blend: self.tracking.smoothing.expression_blend,
+            smoothing_joint_confidence: self.tracking.smoothing.joint_confidence_threshold,
+            smoothing_face_confidence: self.tracking.smoothing.face_confidence_threshold,
             // Calibration now lives on `StreamProfile.pose_calibration`
             // (per-room/setup storage), not the project file. New saves
             // never emit this field — the on-disk DTO has
@@ -224,6 +228,10 @@ impl GuiApp {
         self.camera_index = state.camera_index;
         self.viewport.show_camera_wipe = state.show_camera_wipe;
         self.viewport.show_detection_annotations = state.show_detection_annotations;
+        self.tracking.smoothing.rotation_blend = state.smoothing_rotation_blend;
+        self.tracking.smoothing.expression_blend = state.smoothing_expression_blend;
+        self.tracking.smoothing.joint_confidence_threshold = state.smoothing_joint_confidence;
+        self.tracking.smoothing.face_confidence_threshold = state.smoothing_face_confidence;
         // Pose calibration migration: per-profile storage replaced
         // per-project storage in this version. When the loaded
         // project file carries a legacy `pose_calibration` value
