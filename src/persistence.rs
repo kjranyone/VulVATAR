@@ -400,7 +400,9 @@ pub struct OutputConfig {
 }
 
 fn default_zoom_sensitivity() -> f32 {
-    0.1
+    // Exponential-zoom scale (see viewport.rs): ~10%/notch. Projects saved
+    // under the old linear scale (~0.1) are clamped to 0.01 at use-time.
+    0.002
 }
 
 fn default_orbit_sensitivity() -> f32 {

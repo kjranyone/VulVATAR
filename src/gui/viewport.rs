@@ -381,9 +381,20 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll.abs() > 0.0 {
-                    state.camera_orbit.target_distance = (state.camera_orbit.target_distance
-                        - scroll * state.camera_orbit.target_distance * state.settings.zoom_sensitivity)
-                        .max(0.1);
+                    // Exponential (ratio) zoom: a constant percentage change per
+                    // scroll unit, independent of the current distance. The old
+                    // formula `target -= scroll * target * sens` was linear in
+                    // `scroll`, so one wheel notch (smooth_scroll_delta ≈ 50)
+                    // with the default sens=0.1 gave `scroll*sens = 5` → the
+                    // multiplier `(1 - 5)` went negative and slammed straight to
+                    // the near clamp. `exp(-scroll*sens)` is always positive and
+                    // never overshoots, so it stays smooth at any sensitivity.
+                    // Clamp `sens` defensively so projects saved under the old
+                    // (much larger) scale don't reintroduce the abrupt jump.
+                    let sens = state.settings.zoom_sensitivity.clamp(0.0005, 0.01);
+                    let factor = (-scroll * sens).exp();
+                    state.camera_orbit.target_distance =
+                        (state.camera_orbit.target_distance * factor).clamp(0.1, 1000.0);
                     state.project_status.project_dirty = true;
                 }
             }

@@ -743,7 +743,7 @@ impl GuiApp {
 
             settings: SettingsGuiState {
                 locale: crate::i18n::locale(),
-                zoom_sensitivity: 0.1,
+                zoom_sensitivity: 0.002,
                 orbit_sensitivity: 0.3,
                 pan_sensitivity: 1.0,
             },
@@ -956,7 +956,7 @@ impl GuiApp {
 
             settings: SettingsGuiState {
                 locale: "en".to_string(),
-                zoom_sensitivity: 0.1,
+                zoom_sensitivity: 0.002,
                 orbit_sensitivity: 0.3,
                 pan_sensitivity: 1.0,
             },
