@@ -530,12 +530,39 @@ impl Hmr2Provider {
             dt_infer.as_secs_f32() * 1000.0,
             dt_hands.as_secs_f32() * 1000.0,
         );
-        let _ = crop_origin; // crop_origin reserved for future face crop logic
+        // Project the SMPL body joints to normalised full-image coords so the
+        // webcam-preview wipe can draw HMR2's detected pose (keypoints +
+        // skeleton), matching the RTMW3D / ViTPose providers. HMR2 is a
+        // parametric model with no native 2D keypoints, so reuse the same
+        // weak-perspective `pred_cam` projection the hand-wrist disambiguation
+        // uses. The crop is stretched to IMAGE_SIZE for inference, so invert
+        // that (`* crop_w / IMAGE_SIZE`) then offset by the crop origin. Joint
+        // placement inherits pred_cam's known deskcrop bias, but the wipe is a
+        // debug overlay — an approximate skeleton is more useful than none.
+        // Confidence is 1.0: the model always emits a complete pose.
+        let inv_w = 1.0 / width as f32;
+        let inv_h = 1.0 / height as f32;
+        let crop_sx = crop_w as f32 / IMAGE_SIZE as f32;
+        let crop_sy = crop_h as f32 / IMAGE_SIZE as f32;
+        let ann_keypoints: Vec<(f32, f32, f32)> = camera_joints
+            .iter()
+            .map(|j| {
+                let (u_px, v_px) = project_to_crop_px(j, &pose.pred_cam, IMAGE_SIZE as i32);
+                let full_x = crop_origin.0 as f32 + u_px * crop_sx;
+                let full_y = crop_origin.1 as f32 + v_px * crop_sy;
+                (full_x * inv_w, full_y * inv_h, 1.0)
+            })
+            .collect();
+        let ann_skeleton: Vec<(usize, usize)> = smpl::PARENTS
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &p)| (p >= 0).then_some((i, p as usize)))
+            .collect();
 
         PoseEstimate {
             annotation: DetectionAnnotation {
-                keypoints: Vec::new(),
-                skeleton: Vec::new(),
+                keypoints: ann_keypoints,
+                skeleton: ann_skeleton,
                 bounding_box: annotation_bbox,
             },
             skeleton,
