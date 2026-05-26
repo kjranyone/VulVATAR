@@ -32,7 +32,6 @@
 //! significant. BlendshapeV2 maps directly into ARKit, the path is
 //! load-tested, and the model is Apache-2.
 
-
 // FaceBbox and SourceExpression are referenced by both the real
 // (inference) and stub (no-inference) `estimate` impls, so they must
 // be visible regardless of feature flag — otherwise the
@@ -232,7 +231,11 @@ impl FaceMeshInference {
             FaceMeshEp::Auto => "Auto",
             FaceMeshEp::ForceCpu => "CPU EP",
         };
-        info!("Loading FaceMeshV2 from {} ({})", face_path.display(), ep_label);
+        info!(
+            "Loading FaceMeshV2 from {} ({})",
+            face_path.display(),
+            ep_label
+        );
         let (face_session, backend) = match face_ep {
             FaceMeshEp::Auto => {
                 super::rtmw3d::build_session(&face_path.to_string_lossy(), 2, "FaceMeshV2")?
@@ -396,7 +399,11 @@ impl FaceMeshInference {
         // collapses to noise). `face_conf` already gates this — the
         // caller folds it into the FacePose's confidence.
         let face_pose = derive_face_pose_from_landmarks(&landmarks);
-        Some((map_blendshapes_to_expressions(&weights), face_conf, face_pose))
+        Some((
+            map_blendshapes_to_expressions(&weights),
+            face_conf,
+            face_pose,
+        ))
     }
 
     #[cfg(not(feature = "inference"))]

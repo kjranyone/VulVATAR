@@ -157,7 +157,7 @@ pub(super) fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<Mes
             let mesh_id = MeshId(next_mesh_id);
             next_mesh_id += 1;
 
-            let primitives: Vec<MeshPrimitiveAsset> = gmesh
+            let primitives: Vec<std::sync::Arc<MeshPrimitiveAsset>> = gmesh
                 .primitives()
                 .map(|prim| {
                     let prim_id = PrimitiveId(next_prim_id);
@@ -288,7 +288,7 @@ pub(super) fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<Mes
                         );
                     }
 
-                    MeshPrimitiveAsset {
+                    std::sync::Arc::new(MeshPrimitiveAsset {
                         id: prim_id,
                         vertex_count,
                         index_count,
@@ -298,7 +298,7 @@ pub(super) fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<Mes
                         vertices,
                         indices: idx_data,
                         morph_targets,
-                    }
+                    })
                 })
                 .collect();
 
@@ -610,6 +610,14 @@ pub(super) fn assign_skins_to_meshes(
 
             if let Some(skin) = effective_skin {
                 for prim in &mut mesh.primitives {
+                    // `Arc::make_mut` gives a `&mut MeshPrimitiveAsset`
+                    // without cloning here because the Arc has just been
+                    // built and no other refs exist yet — this whole loop
+                    // runs before the meshes leave decoding. If a future
+                    // refactor shares these Arcs earlier, `make_mut` will
+                    // clone-on-write rather than aliasing, preserving
+                    // correctness at the cost of one allocation.
+                    let prim = std::sync::Arc::make_mut(prim);
                     // Remap vertex joint indices from "skin-relative"
                     // (index into this skin's joint_nodes list) to
                     // "node-relative" (glTF node index). This lets the

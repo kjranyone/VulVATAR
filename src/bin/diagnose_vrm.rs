@@ -255,7 +255,7 @@ fn build_frame_input(
                     alpha_mode,
                     cull_mode,
                     outline,
-                    primitive_data: Some(Arc::new(prim.clone())),
+                    primitive_data: Some(Arc::clone(prim)),
                     morph_weights: Vec::new(),
                 })
             })
@@ -301,7 +301,7 @@ fn build_frame_input(
             } else {
                 avatar.pose.skinning_matrices.clone()
             },
-            cloth_deform: None,
+            cloth_deforms: Vec::new(),
             debug_flags: RenderDebugFlags {
                 material_mode_override: Some(material_mode),
                 ..Default::default()

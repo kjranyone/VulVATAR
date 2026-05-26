@@ -225,8 +225,8 @@ impl GuiApp {
     /// Called once near the top of `update()` before any UI is drawn.
     pub(super) fn process_hotkeys(&mut self, ctx: &egui::Context) {
         if self.hotkeys.check(HotkeyAction::TogglePause, ctx) {
-            self.paused = !self.paused;
-            self.push_notification(if self.paused {
+            self.runtime_status.paused = !self.runtime_status.paused;
+            self.push_notification(if self.runtime_status.paused {
                 t!("toast.paused")
             } else {
                 t!("toast.resumed")
@@ -237,20 +237,20 @@ impl GuiApp {
             .check(HotkeyAction::ToggleTrackingEnabled, ctx)
         {
             self.tracking.toggle_tracking = !self.tracking.toggle_tracking;
-            self.project_dirty = true;
+            self.project_status.project_dirty = true;
         }
         if self
             .hotkeys
             .check(HotkeyAction::ToggleClothSimulation, ctx)
         {
             self.rendering.toggle_cloth = !self.rendering.toggle_cloth;
-            self.project_dirty = true;
+            self.project_status.project_dirty = true;
         }
         if self.hotkeys.check(HotkeyAction::ResetPose, ctx) {
             self.transform.position = [0.0, 0.0, 0.0];
             self.transform.rotation = [0.0, 0.0, 0.0];
             self.transform.scale = 1.0;
-            self.project_dirty = true;
+            self.project_status.project_dirty = true;
         }
         if self.hotkeys.check(HotkeyAction::ResetCamera, ctx) {
             self.camera_orbit = CameraOrbitState {
@@ -260,7 +260,7 @@ impl GuiApp {
                 distance: 5.0,
                 target_distance: 5.0,
             };
-            self.project_dirty = true;
+            self.project_status.project_dirty = true;
         }
         // Per-mode F-key nav. Listed in the same order as
         // `AppMode::ALL` so the binding-to-mode mapping reads
@@ -281,10 +281,10 @@ impl GuiApp {
         }
         if self.hotkeys.check(HotkeyAction::SaveProject, ctx) {
             let ps = self.to_project_state();
-            if let Some(ref path) = self.project_path.clone() {
+            if let Some(ref path) = self.project_status.project_path.clone() {
                 match crate::persistence::save_project(&ps, path) {
                     Ok(()) => {
-                        self.project_dirty = false;
+                        self.project_status.project_dirty = false;
                         self.push_notification(t!("toast.project_saved"));
                     }
                     Err(e) => {

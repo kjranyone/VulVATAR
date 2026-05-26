@@ -105,13 +105,31 @@ Recommended early pass structure:
 3. outline pass
 4. output resolve or export step
 
+### Transform Compute Prepass
+
+Runs once per (instance, primitive) before the graphics passes start.
+
+Responsibilities:
+
+- fuse dual quaternion skinning, morph-target blending, and cloth
+  override into a single dispatch
+- write world-space `GpuVertex` records to a persistent SSBO that the
+  graphics passes bind as their vertex buffer
+
+The graphics vertex shaders are reduced to view × projection; they
+never see the source `GpuVertexBase` or the morph / cloth buffers. See
+`pipeline::transform_cs` for the shader contract; the migration that
+introduced this layout landed on `feature/compute-prepass-migration`
+(commit history of `src/renderer/{mod,pipeline,material}.rs` from
+2026-05-19).
+
 ### Main Forward Avatar Pass
 
 Responsibilities:
 
-- draw opaque and alpha-tested avatar surfaces
+- draw opaque and alpha-tested avatar surfaces using the compute
+  prepass output
 - evaluate selected material mode
-- apply skinning and cloth deformation
 
 ### Outline Pass
 
@@ -159,64 +177,86 @@ Recommended categories:
 
 ## Descriptor Layout Strategy
 
-Keep descriptor organization predictable.
+Two pipeline-bind-points, two independent layouts:
 
-Recommended split:
+### Compute (`pipeline::transform_cs`)
 
-- set 0: frame or scene data
-- set 1: instance data
-- set 2: material data
+- set 0 — per-primitive transform resources, allocated by
+  `ensure_transform_data` and pinned for the slot's lifetime:
+  - binding 0: `BaseVertices` (`GpuVertexBase[]` SSBO)
+  - binding 1: `MorphDeltas` (`vec4[]` SSBO; shared stub when the
+    primitive has no morph targets)
+  - binding 2: `ClothPositions` (`vec4[]` SSBO; shared stub when the
+    primitive isn't cloth-bearing)
+  - binding 3: `ClothNormals` (`vec4[]` SSBO; shared stub when no cloth
+    normals)
+  - binding 4: `TransformControl` UBO (`vertex_count`, `target_count`,
+    `has_cloth`, `has_cloth_normals`, packed morph `weights[64]`)
+  - binding 5: `OutVertices` (`GpuVertex[]` SSBO — the prepass write
+    target, also bound as the graphics vertex buffer)
+- set 1 — per-instance skinning data, allocated by
+  `get_or_update_skinning`:
+  - binding 0: `SkinningData` (`mat4[]` SSBO)
 
-### Set 0: Frame or Scene Data
+### Graphics (forward + outline)
 
-Includes:
+- set 0 — frame / scene data
+  - binding 0: camera + lighting UBO
+- set 1 — material data
+  - binding 0: normalized material parameter UBO
+  - binding 1: base color texture + sampler
+  - binding 2: matcap texture + sampler
+  - binding 3: shade ramp texture + sampler
 
-- camera matrices
-- lighting state
-- frame-wide renderer parameters
-
-### Set 1: Instance Data
-
-Includes:
-
-- skinning matrix buffer
-- optional cloth deformation buffer
-- instance-local transform data
-
-### Set 2: Material Data
-
-Includes:
-
-- normalized material parameters
-- bound textures
-- sampler bindings
+The outline pipeline omits set 1; it uses only set 0 and a push
+constant for outline width / colour.
 
 ## Skinning Strategy
 
-The first renderer should favor a straightforward GPU skinning path.
+Dual quaternion skinning (DQS) runs inside the transform compute
+prepass, not the graphics vertex shader. Inputs are unchanged:
 
-Recommended approach:
+- four weights and four joint indices per vertex in `GpuVertexBase`
+- one skinning matrix SSBO per `AvatarInstance`, bound to compute set 1
 
-- upload skinning matrices per rendered avatar instance
-- perform vertex skinning in the vertex shader
+Reasons for skinning compute-side:
 
-Reasons:
-
-- simpler than CPU skinning for live tracking and cloth updates
-- compatible with skinned VRM rendering expectations
-- keeps renderer in control of GPU-side animation inputs
+- a single compute dispatch produces world-space vertices that every
+  graphics pass shares (forward + outline + future thumbnail / debug),
+  avoiding redundant skinning math per pass
+- the graphics shaders shrink to view × projection, reducing per-draw
+  vertex work and making them trivial to extend with new passes
+- skinning, morph blend, and cloth override fuse into a single
+  dispatch instead of three independent shader paths
 
 ## Cloth Deformation Strategy
 
-The renderer should treat cloth deformation as renderer input, not as simulation logic.
+The renderer treats cloth deformation as an input buffer it consumes,
+not as simulation logic it owns.
 
-Recommended first approach:
+- app thread resolves cloth deformation output and publishes a
+  `Vec<ClothDeformSnapshot>` per `RenderAvatarInstance`. Each snapshot
+  carries `target_primitive_id` + `target_mesh_id` (the primitive it
+  applies to), `vertex_offset` / `vertex_count` (the subset of that
+  primitive it covers), and monotonic `version`.
+- renderer matches each snapshot against the primitive it targets and
+  rewrites the primitive's `cloth_pos_ssbo` / `cloth_norm_ssbo` in
+  place whenever `version` advances since the last frame. Vertices
+  outside the subset range stay at the primitive's rest pose; vertices
+  of primitives that are not the snapshot's target keep `has_cloth = 0`
+  and bind the shared stub SSBO.
+- the transform compute prepass picks the cloth values via the
+  per-primitive `has_cloth` / `has_cloth_normals` flags in
+  `TransformControl`, applying skinning on top so cloth-bearing
+  primitives still ride the avatar's root transform.
 
-- app thread resolves cloth deformation output
-- renderer uploads deformation data as a per-instance buffer
-- vertex stage applies deformation according to the selected cloth mapping contract
-
-This keeps simulation and rendering boundaries clean.
+Cloth targets are resolved at `init_cloth_sim` /
+`init_cloth_overlay` time from `ClothAsset::render_bindings[0]` —
+which carries `primitive: PrimitiveRef`, `mesh: Option<MeshRef>`, and
+`vertex_subset` — and cached on `ClothState`. `app/render.rs` reads
+those cached fields when building the snapshot list, so the simulation
+boundary stays clean: the renderer never walks back into the asset
+graph.
 
 ## Material Normalization Boundary
 

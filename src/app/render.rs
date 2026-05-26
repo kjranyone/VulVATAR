@@ -10,7 +10,6 @@ use crate::app::render_thread::RenderCommand;
 use crate::avatar::pose_solver::{self, SolverParams};
 use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
-use crate::simulation::SimulationStepOptions;
 use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
     CameraState, ClothDeformSnapshot, OutlineSnapshot, OutputTargetRequest, RenderAlphaMode,
@@ -19,6 +18,19 @@ use crate::renderer::frame_input::{
 };
 use crate::renderer::material::MaterialShaderMode;
 use crate::renderer::material::MaterialUploadRequest;
+use crate::simulation::SimulationStepOptions;
+
+/// Maximum age the tracking mailbox may reach before the hold/fade
+/// policy gives up and lets the avatar return to its base / animation
+/// pose. The mailbox starts reporting `is_stale() == true` at
+/// `TrackingMailbox::stale_timeout()` (200 ms by default); inside the
+/// window `[stale_timeout, TRACKING_HOLD_WINDOW]` the last good sample
+/// is reused with its confidence decayed linearly so the avatar
+/// freezes and then fades back instead of snapping. Tuned for typical
+/// webcam tracking hiccups (occluded face, brief out-of-frame); larger
+/// values risk visible "phantom pose" persistence after the user has
+/// genuinely walked away.
+const TRACKING_HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
 
 impl Application {
     pub fn run_frame(&mut self, config: &FrameConfig) {
@@ -35,27 +47,74 @@ impl Application {
         let frame_dt = config.frame_dt;
         let material_mode_index = config.material_mode_index;
 
+        self.update_render_dt_ema(frame_dt);
+        self.update_runtime_gpu_budget(std::time::Instant::now());
+
         // 1. input update
         self.input_update(frame_dt);
 
-        // 2. read the latest completed tracking sample from the async tracking worker
-        let tracking_sample = if toggles.tracking_enabled {
-            if self.tracking.mailbox().is_stale() {
-                if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
-                    warn!("tracking: stale sample detected, skipping tracking this frame");
-                    self.stale_warn_cooldown = std::time::Instant::now();
+        // 2. read the latest completed tracking sample from the async
+        //    tracking worker. Three age states:
+        //    - **Fresh** (`age <= stale_timeout`): pull a new sample.
+        //    - **Holding** (stale but age < `TRACKING_HOLD_WINDOW`):
+        //      reuse `last_tracking_pose` with confidence decayed
+        //      linearly to zero across the hold window. The avatar
+        //      freezes in place and joints drop below the solver's
+        //      confidence threshold gradually as the decay proceeds,
+        //      so the pose drifts back to base rather than snapping.
+        //    - **Expired** (age past the hold window, or never
+        //      published): drop the sample. Solver bypass restores
+        //      base / animation pose.
+        let (tracking_sample, sample_is_fresh) = if toggles.tracking_enabled {
+            let mailbox = self.tracking.mailbox();
+            // Single mailbox lock per frame: age + stale_timeout
+            // together describe the freshness state cheaper than
+            // a separate `is_stale()` call.
+            let age = mailbox.age();
+            let stale_threshold = mailbox.stale_timeout();
+            match age {
+                Some(a) if a <= stale_threshold => (self.step_tracking(), true),
+                Some(a) if a < TRACKING_HOLD_WINDOW => {
+                    let held = self.last_tracking_pose.as_ref().map(|last| {
+                        let span = (TRACKING_HOLD_WINDOW - stale_threshold)
+                            .as_secs_f32()
+                            .max(1e-6);
+                        let into_hold = a.saturating_sub(stale_threshold).as_secs_f32();
+                        let progress = (into_hold / span).clamp(0.0, 1.0);
+                        let scale = (1.0 - progress).clamp(0.0, 1.0);
+                        let mut held = last.clone();
+                        held.scale_confidence(scale);
+                        held
+                    });
+                    (held, false)
                 }
-                None
-            } else {
-                self.step_tracking()
+                Some(_) => {
+                    if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
+                        warn!(
+                            "tracking: sample expired (age > {:?}), holding base pose",
+                            TRACKING_HOLD_WINDOW
+                        );
+                        self.stale_warn_cooldown = std::time::Instant::now();
+                    }
+                    (None, false)
+                }
+                // Mailbox never published a sample — same end state
+                // as Expired (no pose, no warn spam yet).
+                None => (None, false),
             }
         } else {
-            None
+            (None, false)
         };
 
-        // Run simulation on all avatars
-        if let Some(ref tp) = tracking_sample {
-            self.last_tracking_pose = Some(tp.clone());
+        // Persist only fresh samples. A held sample is derived from
+        // the previous `last_tracking_pose` with its confidences
+        // decayed; persisting it would compound the decay multiplier
+        // every frame and collapse the effective hold window to a
+        // small fraction of TRACKING_HOLD_WINDOW.
+        if sample_is_fresh {
+            if let Some(ref tp) = tracking_sample {
+                self.last_tracking_pose = Some(tp.clone());
+            }
         }
 
         let solver_params = SolverParams {
@@ -139,6 +198,22 @@ impl Application {
 
         if !self.avatars.is_empty() {
             let output_extent = self.output_extent.unwrap_or(self.viewport_extent);
+            // `EmergencyCpu` is the budget's "GPU export is failing —
+            // stop trying" mode, escalated when the export pool reports
+            // repeated GpuExport failures within FAILURE_WINDOW. Once
+            // there, force CpuReadback regardless of sink capability so
+            // we stop generating the same failures the budget escalated
+            // on. The next ProducerWaitComplete that lands resets the
+            // mode back to Healthy and GpuExport resumes naturally.
+            let force_cpu_export = self.runtime_gpu_budget.degraded_mode()
+                == crate::app::runtime_gpu_budget::DegradedMode::EmergencyCpu;
+            let export_mode = if !force_cpu_export
+                && self.output.active_sink().supports_gpu_tokens()
+            {
+                RenderExportMode::GpuExport
+            } else {
+                RenderExportMode::CpuReadback
+            };
             let fi_config = FrameInputConfig {
                 camera: self.viewport_camera.clone(),
                 lighting: self.viewport_lighting.clone(),
@@ -147,6 +222,7 @@ impl Application {
                 background_color: self.background_color,
                 transparent_background: self.transparent_background,
                 output_color_space: self.output_color_space.clone(),
+                export_mode,
             };
             let frame_input = Self::build_frame_input_multi(
                 &self.avatars,
@@ -155,6 +231,9 @@ impl Application {
                 material_mode_index,
                 self.viewport_background.as_deref(),
                 self.ground_grid_visible,
+                frame_dt,
+                fixed_dt,
+                substeps as u32,
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -173,23 +252,142 @@ impl Application {
         self.drain_render_results();
     }
 
-    /// Drain every result currently sitting in the render thread's
-    /// result channel and decrement the in-flight counter accordingly.
-    /// Safe to call whether or not `run_frame` ran this tick — the
+    fn update_render_dt_ema(&mut self, frame_dt: f32) {
+        if frame_dt <= 0.0 || !frame_dt.is_finite() {
+            return;
+        }
+        // 5-frame EMA: enough smoothing to ignore one-off hitches without
+        // letting a permanent regression hide for too long.
+        let alpha = 1.0 / 5.0;
+        let new_dt = std::time::Duration::from_secs_f32(frame_dt);
+        let old_secs = self.render_dt_ema.as_secs_f32();
+        let blended = old_secs * (1.0 - alpha) + new_dt.as_secs_f32() * alpha;
+        self.render_dt_ema = std::time::Duration::from_secs_f32(blended.max(1e-6));
+    }
+
+    /// Per-frame runtime measurement intake. Reads the latest render dt,
+    /// output drops/sec, and export pool occupancy; pushes them through
+    /// the budget; then propagates the (possibly-clamped) render target
+    /// back to `OutputRouter::set_target_fps` so the throttling gate
+    /// honours the budget without any other party knowing about it.
+    pub fn update_runtime_gpu_budget(&mut self, now: std::time::Instant) {
+        let user_fps = self.runtime_gpu_budget.user_render_fps().max(1) as f32;
+        let render_target = std::time::Duration::from_secs_f32(1.0 / user_fps);
+
+        let elapsed = now
+            .saturating_duration_since(self.last_output_drop_sample)
+            .as_secs_f32();
+        let current_drops = self.output.dropped_count();
+        let drops_per_sec = if elapsed >= 0.5 {
+            let delta = current_drops.saturating_sub(self.last_output_drop_count) as f32;
+            self.last_output_drop_count = current_drops;
+            self.last_output_drop_sample = now;
+            (delta / elapsed).max(0.0)
+        } else {
+            0.0
+        };
+
+        let diagnostics = self.output.diagnostics();
+        let (export_pool_leased, export_pool_capacity) = diagnostics
+            .export_pool
+            .map(|p| (p.leased_slots, p.capacity))
+            .unwrap_or((0, 0));
+
+        let measurements = crate::app::runtime_gpu_budget::RuntimeMeasurements {
+            render_dt: self.render_dt_ema,
+            render_target,
+            output_drops_per_sec: drops_per_sec,
+            export_pool_leased,
+            export_pool_capacity,
+            // Per-tick delta from `OutputRouter`'s cumulative failure
+            // counter (increments whenever a frame attempted the GPU
+            // handoff but published with an invalid token — renderer
+            // wanted GPU, sink fell back). The budget integrates these
+            // deltas into a `FAILURE_WINDOW`-wide rolling history;
+            // one failure per frame still accumulates to the
+            // `EmergencyCpu` threshold within seconds.
+            gpu_export_failures_this_tick: self.output.take_gpu_export_failure_count(),
+        };
+        self.runtime_gpu_budget.update(&measurements, now);
+
+        // Forward the clamped target. `OutputRouter::set_target_fps` is
+        // idempotent so calling it every frame is cheap.
+        self.output
+            .set_target_fps(self.runtime_gpu_budget.render_fps_target());
+
+        // P3-03 B4 — publish the YOLOX submit period to the tracking
+        // pipeline via the shared atomic. `Rtmw3dInference` reads this
+        // each frame; the cadence flip takes effect on the next
+        // `frame_index.is_multiple_of(period)` check (typically next
+        // submit cycle).
+        //
+        // Ordering::Relaxed is intentional: the value is an advisory
+        // cadence knob, no other state depends on this load's freshness,
+        // and a one-frame stale read on the tracking thread is
+        // semantically equivalent to the budget recomputing one frame
+        // later (which can happen anyway). Worst-case lag: at Healthy
+        // (period=4) the tracker only checks `frame_index.is_multiple_of(period)`
+        // every 4 frames, so a transition to Emergency (period=12)
+        // can take up to 3 frames before the new period takes effect.
+        // Acceptable given the budget's own 5s/30s dwell times.
+        #[cfg(feature = "inference")]
+        {
+            crate::tracking::rtmw3d::YOLOX_REFRESH_PERIOD.store(
+                self.runtime_gpu_budget.yolox_skip_period() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Drain the latest result from the render thread's mailbox and
+    /// decrement the in-flight counter for both the drained frame and
+    /// any frames the render thread had to replace before this call.
+    /// Safe to invoke whether or not `run_frame` ran this tick — the
     /// counter is the boundary, not the avatar list.
     pub fn drain_render_results(&mut self) {
-        let pending_results: Vec<_> = if let Some(ref rt) = self.render_thread {
-            std::iter::from_fn(|| rt.try_recv_result()).collect()
-        } else {
-            vec![]
+        if let Some(ref rt) = self.render_thread {
+            // Compensate the in-flight counter for frames that completed
+            // on the renderer but were replaced before they reached us
+            // (latest-frame mailbox semantics). Without this the counter
+            // would inflate by one per dropped frame and the GUI repaint
+            // gate would pin to full rate forever after even one stall.
+            let dropped = rt.take_dropped_results();
+            if dropped > 0 {
+                self.render_results_dropped =
+                    self.render_results_dropped.saturating_add(dropped);
+                let dropped_u32 = u32::try_from(dropped).unwrap_or(u32::MAX);
+                self.render_results_pending =
+                    self.render_results_pending.saturating_sub(dropped_u32);
+            }
+
+            if let Some(result) = rt.try_recv_result() {
+                self.render_results_pending = self.render_results_pending.saturating_sub(1);
+                self.process_render_result(result);
+            }
+        }
+        self.forward_completed_output_leases();
+    }
+
+    fn forward_completed_output_leases(&mut self) {
+        self.pending_export_lease_releases
+            .extend(self.output.drain_completed_gpu_leases());
+
+        let Some(ref rt) = self.render_thread else {
+            return;
         };
-        for result in pending_results {
-            self.render_results_pending = self.render_results_pending.saturating_sub(1);
-            self.process_render_result(result);
+
+        while let Some(&lease_id) = self.pending_export_lease_releases.front() {
+            if rt.submit(RenderCommand::ReleaseExportLease(lease_id)) {
+                self.pending_export_lease_releases.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
     fn process_render_result(&mut self, render_result: crate::renderer::RenderResult) {
+        self.output
+            .update_export_pool_stats(render_result.stats.export_pool);
         let Some(exported) = render_result.exported_frame else {
             self.rendered_pixels = None;
             return;
@@ -202,6 +400,7 @@ impl Application {
         );
 
         output_frame.handoff_path = exported.handoff_path.clone();
+        output_frame.fallback_reason = exported.fallback_reason.clone();
         // Phase B-4: tag the frame with the user's alpha preference so the
         // downstream sink (Win32FileBackedSharedMemorySink → DLL) knows
         // whether to preserve or clobber the alpha channel.
@@ -240,7 +439,7 @@ impl Application {
                 self.rendered_frame_counter += 1;
                 output_frame.pixel_data = Some(Arc::clone(pixel_data));
             }
-            crate::renderer::output_export::ExportedPixelData::GpuOwned => {
+            crate::renderer::output_export::ExportedPixelData::GpuFrameToken(ref gpu_token) => {
                 if !self.logged_first_render_result {
                     info!(
                         "render: first result is GPU-owned {}x{}",
@@ -250,7 +449,7 @@ impl Application {
                 }
                 self.rendered_extent = render_result.extent;
                 self.rendered_frame_counter += 1;
-                output_frame.gpu_image = exported.gpu_image.clone();
+                output_frame.gpu_token = Some(gpu_token.clone());
             }
             _ => {
                 self.rendered_pixels = None;
@@ -351,6 +550,9 @@ impl Application {
         material_mode_index: usize,
         background_image_path: Option<&std::path::Path>,
         show_ground_grid: bool,
+        _frame_dt: f32,
+        fixed_dt: f32,
+        substeps: u32,
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -441,12 +643,14 @@ impl Application {
                                 weights
                             };
 
-                            let prim_arc = avatar
-                                .primitive_arcs
-                                .get(mi)
-                                .and_then(|v| v.get(pi))
-                                .cloned()
-                                .unwrap_or_else(|| std::sync::Arc::new(prim.clone()));
+                            // `prim` is `&Arc<MeshPrimitiveAsset>` from
+                            // the asset; the per-frame snapshot keeps a
+                            // refcount bump rather than deep-cloning the
+                            // vertex / index / morph payload. `mi` and
+                            // `pi` are kept in scope for clarity but no
+                            // longer index a separate arc table.
+                            let _ = (mi, pi);
+                            let prim_arc = std::sync::Arc::clone(prim);
 
                             RenderMeshInstance {
                                 mesh_id: mesh.id,
@@ -463,28 +667,34 @@ impl Application {
                     })
                     .collect();
 
-                let cloth_deform = avatar
-                    .cloth_state
-                    .as_ref()
-                    .or_else(|| {
-                        avatar
-                            .cloth_overlays
-                            .iter()
-                            .find(|s| s.enabled)
-                            .map(|s| &s.state)
-                    })
-                    .map(|cs| ClothDeformSnapshot {
-                        deformed_positions: cs.deform_output.deformed_positions.clone(),
-                        deformed_normals: cs.deform_output.deformed_normals.clone(),
-                        version: cs.deform_output.version,
-                    });
+                // GPU cloth substeps each at `fixed_dt`, matching the
+                // CPU path's `for _ in 0..substeps { step_cloth(fixed_dt) }`
+                // loop. The renderer's substep loop runs verlet +
+                // constraint iters that many times per frame.
+                let cloth_substep_dt = fixed_dt.max(1.0 / 1000.0);
+                let cloth_deforms = collect_cloth_deforms(
+                    avatar
+                        .cloth_state
+                        .as_ref()
+                        .map(|cs| (cs, avatar.cloth_sim.as_ref()))
+                        .into_iter()
+                        .chain(
+                            avatar
+                                .cloth_overlays
+                                .iter()
+                                .filter(|s| s.enabled)
+                                .map(|s| (&s.state, Some(&s.sim))),
+                        ),
+                    cloth_substep_dt,
+                    substeps,
+                );
 
                 RenderAvatarInstance {
                     instance_id: avatar.id,
                     world_transform: avatar.world_transform.clone(),
                     mesh_instances,
                     skinning_matrices: avatar.pose.skinning_matrices.clone(),
-                    cloth_deform,
+                    cloth_deforms,
                     debug_flags: RenderDebugFlags {
                         show_skeleton: toggles.skeleton_debug,
                         show_colliders: toggles.collision_debug,
@@ -519,7 +729,7 @@ impl Application {
                 extent: output_extent,
                 color_space: fi_config.output_color_space.clone(),
                 alpha_mode: RenderOutputAlpha::Premultiplied,
-                export_mode: RenderExportMode::CpuReadback,
+                export_mode: fi_config.export_mode.clone(),
             },
             background_image_path: background_image_path.map(|p| p.to_path_buf()),
             show_ground_grid,
@@ -562,5 +772,181 @@ impl Application {
             // frame and spammed info logs at 60 fps.)
             None
         }
+    }
+}
+
+/// Collect per-primitive cloth snapshots from `(ClothState, Option<ClothSimState>)` pairs.
+///
+/// Cloth is scoped per primitive (`target_primitive_id`), so multiple cloths
+/// can coexist on one avatar as long as they target distinct primitives. When
+/// two sources target the same primitive, the first wins — the call site
+/// iterates `avatar.cloth_state` before `cloth_overlays`, so the authoritative
+/// cloth takes precedence over any overlay variant of the same garment.
+///
+/// `frame_dt` is the per-frame timestep used to populate `gpu_control.dt`
+/// when the cloth's `solver_backend` is `Gpu`. The renderer uses it as the
+/// `dt` input to the Verlet integration shader; for CPU-backed cloths it
+/// is ignored.
+fn collect_cloth_deforms<'a>(
+    sources: impl IntoIterator<
+        Item = (
+            &'a crate::avatar::instance::ClothState,
+            Option<&'a crate::simulation::cloth::ClothSimState>,
+        ),
+    >,
+    fixed_dt: f32,
+    substeps: u32,
+) -> Vec<ClothDeformSnapshot> {
+    use crate::renderer::frame_input::{ClothGpuAttachData, ClothGpuDispatchControl};
+    use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
+    use crate::math_utils::vec3_scale;
+
+    let mut seen_targets: std::collections::HashSet<crate::asset::PrimitiveId> =
+        std::collections::HashSet::new();
+    sources
+        .into_iter()
+        .filter_map(|(cs, sim_opt)| {
+            let target_primitive_id = cs.target_primitive_id?;
+            if !seen_targets.insert(target_primitive_id) {
+                return None;
+            }
+            let (gpu_control, gpu_attach) =
+                if cs.solver_backend == ClothSolverBackend::Gpu {
+                    match sim_opt {
+                        Some(sim) => {
+                            let wind_force =
+                                vec3_scale(&sim.wind_direction, sim.wind_response);
+                            let ctrl = ClothGpuDispatchControl {
+                                dt: fixed_dt,
+                                substeps,
+                                damping: sim.damping,
+                                gravity: sim.gravity,
+                                wind_force,
+                                solver_iterations: sim.solver_iterations as u32,
+                            };
+                            let attach = ClothGpuAttachData {
+                                constraints: sim
+                                    .distance_constraints
+                                    .iter()
+                                    .map(|c| {
+                                        (
+                                            c.a as u32,
+                                            c.b as u32,
+                                            c.rest_length,
+                                            c.stiffness,
+                                        )
+                                    })
+                                    .collect(),
+                                triangle_indices: sim.triangle_indices.clone(),
+                                inv_masses: sim
+                                    .particles
+                                    .iter()
+                                    .map(|p| p.inv_mass)
+                                    .collect(),
+                                pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                            };
+                            (Some(ctrl), Some(attach))
+                        }
+                        None => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+            Some(ClothDeformSnapshot {
+                target_primitive_id,
+                target_mesh_id: cs.target_mesh_id,
+                vertex_offset: cs.target_vertex_offset,
+                vertex_count: cs.target_vertex_count,
+                deformed_positions: cs.deform_output.deformed_positions.clone(),
+                deformed_normals: cs.deform_output.deformed_normals.clone(),
+                version: cs.deform_output.version,
+                solver_backend: cs.solver_backend,
+                gpu_control,
+                gpu_attach,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cloth_collection_tests {
+    use super::*;
+    use crate::asset::{ClothOverlayId, MeshId, PrimitiveId};
+    use crate::avatar::instance::{
+        ClothCollisionRuntimeCache, ClothConstraintRuntimeCache, ClothDeformOutput, ClothState,
+    };
+
+    fn make_cloth_state(
+        overlay_id: u64,
+        target_primitive_id: Option<PrimitiveId>,
+        vertex_count: u32,
+        version: u64,
+    ) -> ClothState {
+        ClothState {
+            overlay_id: ClothOverlayId(overlay_id),
+            enabled: true,
+            sim_positions: vec![],
+            prev_sim_positions: vec![],
+            sim_normals: vec![],
+            constraint_cache: ClothConstraintRuntimeCache {
+                active_constraint_count: 0,
+            },
+            collision_cache: ClothCollisionRuntimeCache {
+                active_collision_count: 0,
+            },
+            deform_output: ClothDeformOutput {
+                deformed_positions: vec![[0.0, 0.0, 0.0]; vertex_count as usize],
+                deformed_normals: None,
+                version,
+            },
+            target_primitive_id,
+            target_mesh_id: target_primitive_id.map(|p| MeshId(p.0)),
+            target_vertex_offset: 0,
+            target_vertex_count: vertex_count,
+            solver_backend:
+                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+        }
+    }
+
+    #[test]
+    fn multi_cloth_targeting_distinct_primitives_all_survive() {
+        let body = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
+        let skirt = make_cloth_state(2, Some(PrimitiveId(20)), 64, 1);
+        let scarf = make_cloth_state(3, Some(PrimitiveId(30)), 16, 1);
+
+        let result =
+            collect_cloth_deforms([(&body, None), (&skirt, None), (&scarf, None)], 1.0 / 60.0, 1);
+
+        assert_eq!(result.len(), 3, "all three distinct-target cloths must be kept");
+        let target_ids: Vec<u64> =
+            result.iter().map(|c| c.target_primitive_id.0).collect();
+        assert_eq!(target_ids, vec![10, 20, 30]);
+        let vertex_counts: Vec<u32> = result.iter().map(|c| c.vertex_count).collect();
+        assert_eq!(vertex_counts, vec![32, 64, 16]);
+    }
+
+    #[test]
+    fn duplicate_target_dedups_with_first_wins() {
+        let authoritative = make_cloth_state(1, Some(PrimitiveId(10)), 32, 5);
+        let overlay_duplicate = make_cloth_state(2, Some(PrimitiveId(10)), 64, 99);
+
+        let result =
+            collect_cloth_deforms([(&authoritative, None), (&overlay_duplicate, None)], 1.0 / 60.0, 1);
+
+        assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
+        assert_eq!(result[0].version, 5, "first (authoritative) cloth wins");
+        assert_eq!(result[0].vertex_count, 32);
+    }
+
+    #[test]
+    fn unbound_cloth_without_target_primitive_is_skipped() {
+        let bound = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
+        let unbound = make_cloth_state(2, None, 64, 1);
+
+        let result =
+            collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1);
+
+        assert_eq!(result.len(), 1, "cloth with no render target is dropped");
+        assert_eq!(result[0].target_primitive_id.0, 10);
     }
 }

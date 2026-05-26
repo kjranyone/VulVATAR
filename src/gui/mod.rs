@@ -150,6 +150,127 @@ pub enum LibrarySortMode {
     Favorites,
 }
 
+/// Scene-preset UI state lifted out of `GuiApp` (architecture
+/// finding #10). The preset library is loaded eagerly from disk;
+/// the selected-index / name widget buffers track the rendering
+/// inspector's preset combo and rename field.
+#[derive(Default)]
+pub struct ScenePresetUiState {
+    pub presets: Vec<crate::persistence::ScenePreset>,
+    pub selected_index: Option<usize>,
+    pub name: String,
+}
+
+/// Cloth-authoring panel UI state lifted out of `GuiApp` (architecture
+/// finding #10). Bundles the cloth-sim playback toggle, the
+/// rename / save-status widget buffers, the per-vertex region
+/// selection driven by mesh picking, and the sim-parameter widgets
+/// (distance stiffness, bend stiffness, collider toggles, pin node).
+pub struct ClothAuthoringUiState {
+    pub sim_playing: bool,
+    pub rename_buf: String,
+    pub save_status: Option<String>,
+    pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
+    pub material_pick_index: usize,
+    pub distance_stiffness: f32,
+    pub bend_enabled: bool,
+    pub bend_stiffness: f32,
+    pub collider_toggles: Vec<bool>,
+    pub pin_node_index: usize,
+    pub autosave_consent: Option<bool>,
+}
+
+impl Default for ClothAuthoringUiState {
+    fn default() -> Self {
+        Self {
+            sim_playing: false,
+            rename_buf: String::new(),
+            save_status: None,
+            region_selection: None,
+            material_pick_index: 0,
+            // Cloth-sim defaults match the values the inspector
+            // previously hard-coded into `GuiApp::new`.
+            distance_stiffness: 1.0,
+            bend_enabled: true,
+            bend_stiffness: 0.5,
+            collider_toggles: Vec::new(),
+            pin_node_index: 0,
+            autosave_consent: None,
+        }
+    }
+}
+
+/// Viewport-pane UI state lifted out of `GuiApp` (architecture
+/// finding #10). Holds the texture egui binds the rendered scene to,
+/// the cursor-grab state during orbit/pan drags, and the camera-wipe
+/// PIP overlay (toggle + texture + dedup seq + rgba scratch).
+#[derive(Default)]
+pub struct ViewportUiState {
+    /// egui texture handle the renderer's CPU readback uploads pixels
+    /// into. The viewport draws this handle each frame; `None` until
+    /// the first render result arrives.
+    pub texture: Option<egui::TextureHandle>,
+    /// Frame counter of the last render result we uploaded, used to
+    /// avoid re-uploading the same pixels.
+    pub last_frame: u64,
+    /// Blender-style infinite-drag during orbit/pan: cursor is hidden +
+    /// warped back to the drag origin every frame so the user can
+    /// drag past screen edges. `true` while a drag is active.
+    pub cursor_grabbed: bool,
+    /// Cursor position at drag start; restored when the drag ends.
+    /// `None` when no drag is in progress.
+    pub drag_origin: Option<egui::Pos2>,
+    /// Whether the camera-wipe PIP (live webcam preview) is shown.
+    pub show_camera_wipe: bool,
+    /// Whether the 2D detection annotation overlay is drawn over the
+    /// camera-wipe PIP.
+    pub show_detection_annotations: bool,
+    /// egui texture for the camera-wipe PIP (separate from the
+    /// calibration preview's texture so toggling either doesn't tear
+    /// the other).
+    pub camera_wipe_texture: Option<egui::TextureHandle>,
+    /// Preview-mailbox sequence of the last frame we uploaded into
+    /// `camera_wipe_texture`. Driven off `preview_sequence`, not
+    /// pose `sequence` — the latter can advance mid-snapshot with
+    /// the previous frame still in the mailbox and would permanently
+    /// strand a frame.
+    pub camera_wipe_seq: u64,
+    /// RGBA scratch buffer reused across uploads so the wipe doesn't
+    /// reallocate per frame.
+    pub camera_wipe_rgba_buf: Vec<u8>,
+}
+
+/// Library-panel UI state lifted out of `GuiApp` (architecture
+/// finding #10). Aggregates the search/selection/rename widget
+/// buffers, the folder watcher + watched-dirs list, the thumbnail
+/// generator, the pending real-render thumbnail-job queue, and the
+/// background avatar-load job slot.
+#[derive(Default)]
+pub struct LibraryUiState {
+    pub search_query: String,
+    pub selected_index: Option<usize>,
+    pub rename_buf: String,
+    pub tag_buf: String,
+    pub show_missing: bool,
+    /// Which sort mode the user last selected via the chip row. Used
+    /// purely for the chip's "selected" rendering — the actual entry
+    /// order is mutated in place by `AvatarLibrary::sort_*`.
+    pub sort_mode: LibrarySortMode,
+    pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
+    pub watched_avatar_dirs: Vec<std::path::PathBuf>,
+    pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
+    /// Pending real-render thumbnail jobs, keyed by the destination PNG
+    /// path. Each entry's receiver completes when the render thread has
+    /// finished its synchronous thumbnail render. `update` drains them
+    /// once per frame, writes the PNG, and tells egui to forget the
+    /// cached texture for that file:// URI so the new pixels show up.
+    pub pending_thumbnail_jobs:
+        Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>)>,
+    /// Background avatar load in progress, if any. Set by `top_bar::load_*`
+    /// helpers, polled and cleared by `update`.
+    pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
+}
+
 pub struct TransformState {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
@@ -305,6 +426,96 @@ pub struct SettingsGuiState {
     pub pan_sensitivity: f32,
 }
 
+/// Per-frame timing + pause state lifted out of `GuiApp`
+/// (architecture finding #10). Updated each frame's `update` entry by
+/// the EMA smoothing block; consumed by the status bar's "frame N |
+/// fps | frame_time_ms" readout and by the simulation step that uses
+/// `frame_time_ms` as its `frame_dt` source.
+pub struct RuntimeStatusUi {
+    pub paused: bool,
+    pub frame_count: u64,
+    /// Wall-clock instant at the previous `update` entry. Subtracted
+    /// from `now` each frame to derive the dt that drives the EMA
+    /// smoothing of `frame_time_ms` and `fps`.
+    pub last_frame_instant: Instant,
+    /// Exponential-moving-average frame interval in milliseconds.
+    /// Also doubles as the simulation step `frame_dt` source so the
+    /// avatar's animation playback ticks at wall-clock pace rather
+    /// than at the renderer's variable cadence.
+    pub frame_time_ms: f64,
+    /// Exponential-moving-average frame rate in Hz. Display-only —
+    /// every consumer that needs a step duration reads
+    /// `frame_time_ms` instead.
+    pub fps: f64,
+}
+
+impl RuntimeStatusUi {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            paused: false,
+            frame_count: 0,
+            last_frame_instant: now,
+            frame_time_ms: 16.0,
+            fps: 60.0,
+        }
+    }
+}
+
+/// Project lifecycle + persistence status lifted out of `GuiApp`
+/// (architecture finding #10). Owns the loaded project path, the
+/// recent-avatar MRU list, the dirty flags that drive autosave, the
+/// crash-recovery manager, and the throttle clock that decides when
+/// a dirty mutation actually hits disk.
+pub struct ProjectStatusUi {
+    /// Filesystem path of the project file currently open, if any.
+    /// `None` for the "untitled new project" mode.
+    pub project_path: Option<PathBuf>,
+    /// MRU list of recently loaded avatars; surfaced as the
+    /// "Open Recent" submenu and persisted via
+    /// `crate::persistence::save_recent_avatars`.
+    pub recent_avatars: Vec<PathBuf>,
+    /// Set whenever the in-memory project state diverges from disk.
+    /// The per-frame autosave block compares
+    /// `last_autosave.elapsed()` against `AUTOSAVE_THROTTLE`; once
+    /// the throttle clears, a `save_project` call flips this back
+    /// to `false`.
+    pub project_dirty: bool,
+    /// Immediate-save throttle clock. Updated each time the project
+    /// is saved.
+    pub last_autosave: Instant,
+    /// Crash-recovery manager: writes a sidecar snapshot on every
+    /// dirty mutation so an abnormal exit can be recovered from
+    /// next session.
+    pub recovery_manager: crate::persistence::RecoveryManager,
+    /// Set whenever the active cloth overlay is in a dirty state
+    /// (region edit, parameter change, rebind) and the user hasn't
+    /// hit save yet. Drives the "Save Overlay" button's enabled
+    /// state and the unload confirmation prompt.
+    pub overlay_dirty: bool,
+    /// Set whenever the in-memory `profiles` library diverges from
+    /// disk (`%APPDATA%\VulVATAR\profiles.json`). Mirrors
+    /// `project_dirty` but flushes via `save_profiles`.
+    pub profiles_dirty: bool,
+}
+
+impl ProjectStatusUi {
+    pub fn new(
+        recent_avatars: Vec<PathBuf>,
+        recovery_manager: crate::persistence::RecoveryManager,
+        now: Instant,
+    ) -> Self {
+        Self {
+            project_path: None,
+            recent_avatars,
+            project_dirty: false,
+            last_autosave: now,
+            recovery_manager,
+            overlay_dirty: false,
+            profiles_dirty: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMode {
     Avatar,
@@ -343,41 +554,16 @@ impl AppMode {
 pub struct GuiApp {
     pub mode: AppMode,
     pub app: Box<Application>,
-    pub paused: bool,
-    pub frame_count: u64,
-    pub project_path: Option<PathBuf>,
 
-    // E10: Frame timing
-    pub last_frame_instant: Instant,
-    pub frame_time_ms: f64,
-    pub fps: f64,
+    /// Per-frame timing + pause flag, see `RuntimeStatusUi`.
+    pub runtime_status: RuntimeStatusUi,
 
-    // E11: Recent avatars
-    pub recent_avatars: Vec<PathBuf>,
-
-    // E12: Project dirty state
-    pub project_dirty: bool,
-
-    // Immediate-save throttle clock. Updated each time the project is
-    // saved; the per-frame block compares `last_autosave.elapsed()`
-    // against `AUTOSAVE_THROTTLE` to decide whether the next dirty
-    // mutation should hit disk yet.
-    pub last_autosave: Instant,
-
-    // Crash recovery
-    pub recovery_manager: crate::persistence::RecoveryManager,
-    pub overlay_dirty: bool,
+    /// Project lifecycle / persistence status, see `ProjectStatusUi`.
+    pub project_status: ProjectStatusUi,
 
     // Hotkeys & profiles
     pub hotkeys: hotkey::HotkeyMap,
     pub profiles: profile::ProfileLibrary,
-    /// Set whenever the in-memory `profiles` library diverges from
-    /// what's currently on disk (`%APPDATA%\VulVATAR\profiles.json`).
-    /// Triggered by `Calibrate Pose ▼` writing into the active
-    /// profile, by future profile-edit UI, etc. The per-frame
-    /// autosave block (mirroring `project_dirty`) flushes via
-    /// `crate::persistence::save_profiles` and clears this flag.
-    pub profiles_dirty: bool,
 
     // M10: Notification/toast system
     pub notifications: Vec<Notification>,
@@ -391,120 +577,35 @@ pub struct GuiApp {
 
     pub camera_index: usize,
     pub available_cameras: Vec<crate::tracking::CameraInfo>,
-    pub show_camera_wipe: bool,
-    pub show_detection_annotations: bool,
-    pub camera_wipe_texture: Option<egui::TextureHandle>,
-    pub camera_wipe_seq: u64,
-    pub camera_wipe_rgba_buf: Vec<u8>,
 
-    // Pose-calibration modal (Phase B). Independent texture + buffer so
-    // toggling the camera-wipe PIP while calibrating doesn't tear
-    // either preview.
-    pub calibration_modal: calibration::CalibrationModalState,
-    pub calibration_preview_texture: Option<egui::TextureHandle>,
-    pub calibration_preview_seq: u64,
-    pub calibration_preview_rgba_buf: Vec<u8>,
-    /// Last `torso_template_seq` we consumed from the tracking
-    /// mailbox. Drives one-shot stitching of the worker-published
-    /// `TorsoDepthTemplate` onto the in-flight `PoseCalibration` —
-    /// see `calibration::poll_torso_template`. Initialised to
-    /// 0 so the first publish (seq starts at 1) is always picked up.
-    pub calibration_torso_template_seq: u64,
-    /// Last calibration-mode hint pushed to the tracking mailbox via
-    /// [`crate::tracking::TrackingMailbox::set_calibration_mode_hint`].
-    /// Tracked here so the GUI side only forwards on edges instead of
-    /// re-locking the mailbox every frame. Bridges the gap between
-    /// "modal is open with `UpperBody` selected" and the provider's
-    /// `force_shoulder_anchor` flag — without it the very first
-    /// `UpperBody` capture sees `force_shoulder_anchor=false` and the
-    /// `pose.root_anchor_is_hip` gate in `refresh.rs` rejects every
-    /// sample because the model hallucinates a confident hip.
-    pub last_pushed_calibration_mode_hint:
-        Option<crate::tracking::CalibrationMode>,
-    /// One-shot offscreen render of the active avatar in the
-    /// calibration target pose (T-pose for FullBody, hands-at-sides
-    /// for UpperBody). Shown beside the webcam preview in the modal
-    /// as a "this is what you should look like" reference. `None`
-    /// until the first request resolves; rebuilt whenever the modal
-    /// opens or the user switches modes via the segmented buttons.
-    pub calibration_target_pose_texture: Option<egui::TextureHandle>,
-    /// The mode the current `calibration_target_pose_texture` was
-    /// rendered for. Used to invalidate (= re-request) the snapshot
-    /// when the user toggles the segmented buttons.
-    pub calibration_target_pose_mode:
-        Option<crate::tracking::CalibrationMode>,
-    /// In-flight render request for the target-pose snapshot. The
-    /// poll path (called from the modal's per-frame entry) drains
-    /// this and uploads pixels to `calibration_target_pose_texture`.
-    /// `None` when no request is outstanding.
-    pub calibration_target_pose_pending:
-        Option<std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>>,
+    // Viewport-pane state: rendered-scene texture handle, the
+    // Blender-style drag-grab state, and the camera-wipe PIP toggle +
+    // its companion texture / scratch buffer. See `ViewportUiState`.
+    pub viewport: ViewportUiState,
+
+    // Pose-calibration modal (Phase B). Aggregated into
+    // `calibration::CalibrationUiState` as part of the GuiApp state
+    // split — see plan/architecture-pipeline-gui-critical-review.md #10.
+    pub calibration: calibration::CalibrationUiState,
 
     // Lip sync
     pub lipsync: LipSyncGuiState,
 
-    // Animation inspector state
-    pub animation_playing: bool,
-
-    // Cloth authoring inspector state
-    pub cloth_sim_playing: bool,
-    pub cloth_rename_buf: String,
-    pub cloth_save_status: Option<String>,
-
-    // T04: Region selection state
-    pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
-    pub cloth_material_pick_index: usize,
-    pub cloth_distance_stiffness: f32,
-    pub cloth_bend_enabled: bool,
-    pub cloth_bend_stiffness: f32,
-    pub cloth_collider_toggles: Vec<bool>,
-    pub cloth_pin_node_index: usize,
-    pub cloth_autosave_consent: Option<bool>,
+    // Cloth-authoring panel state (sim playback, rename / save
+    // buffers, region selection, sim-parameter widgets). See
+    // `ClothAuthoringUiState`.
+    pub cloth_authoring: ClothAuthoringUiState,
 
     pub inspector_open: bool,
 
-    pub expression_weights: Vec<f32>,
-
-    // Scene presets
-    pub scene_presets: Vec<crate::persistence::ScenePreset>,
-    pub scene_preset_index: Option<usize>,
-    pub scene_preset_name: String,
-
-    // Viewport texture integration
-    pub viewport_texture: Option<egui::TextureHandle>,
-    pub viewport_last_frame: u64,
-
-    // Infinite-drag state (Blender-style cursor grab during orbit/pan)
-    pub viewport_cursor_grabbed: bool,
-    pub viewport_drag_origin: Option<egui::Pos2>,
+    // Scene preset library + inspector combo + rename buffer.
+    pub scene_preset: ScenePresetUiState,
 
     // Avatar library GUI state
-    pub library_search_query: String,
-    pub library_selected_index: Option<usize>,
-    pub library_rename_buf: String,
-    pub library_tag_buf: String,
-    pub library_show_missing: bool,
-    /// Which sort mode the user last selected via the chip row. Used
-    /// purely for the chip's "selected" rendering — the actual entry
-    /// order is mutated in place by `AvatarLibrary::sort_*`, so this
-    /// field doesn't drive sorting; it just remembers what the user
-    /// clicked so the chip stays highlighted.
-    pub library_sort_mode: LibrarySortMode,
-
-    pub folder_watcher: Option<crate::app::folder_watcher::FolderWatcher>,
-    pub watched_avatar_dirs: Vec<std::path::PathBuf>,
-    pub thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator,
-
-    /// Pending real-render thumbnail jobs, keyed by the destination PNG
-    /// path. Each entry's receiver completes when the render thread has
-    /// finished its synchronous thumbnail render. `update` drains them
-    /// once per frame, writes the PNG, and tells egui to forget the
-    /// cached texture for that file:// URI so the new pixels show up.
-    pub pending_thumbnail_jobs: Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>)>,
-
-    /// Background avatar load in progress, if any. Set by `top_bar::load_*`
-    /// helpers, polled and cleared by `update`.
-    pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
+    // Avatar library panel state (search, selection, sort, thumbnail
+    // pipeline, folder watching, background avatar-load job). See
+    // `LibraryUiState` for the breakdown.
+    pub library: LibraryUiState,
 
     /// When true, `save_avatar_library` and other persistence writes are
     /// suppressed so unit tests never clobber the user's real data.
@@ -556,22 +657,14 @@ impl GuiApp {
         let mut state = Self {
             mode: AppMode::Preview,
             app,
-            paused: false,
-            frame_count: 0,
-            project_path: None,
 
-            last_frame_instant: Instant::now(),
-            frame_time_ms: 0.0,
-            fps: 0.0,
+            runtime_status: RuntimeStatusUi::new(Instant::now()),
 
-            recent_avatars: crate::persistence::load_recent_avatars(),
-
-            project_dirty: false,
-
-            last_autosave: Instant::now(),
-
-            recovery_manager: crate::persistence::RecoveryManager::new(120),
-            overlay_dirty: false,
+            project_status: ProjectStatusUi::new(
+                crate::persistence::load_recent_avatars(),
+                crate::persistence::RecoveryManager::new(120),
+                Instant::now(),
+            ),
 
             hotkeys: hotkey::HotkeyMap::new(),
             // Profiles persist across project loads — calibration
@@ -581,7 +674,6 @@ impl GuiApp {
             // file should not silently wipe out the user's data
             // (load_profiles already logs and returns None then).
             profiles: crate::persistence::load_profiles().unwrap_or_default(),
-            profiles_dirty: false,
 
             notifications: Vec::new(),
 
@@ -637,21 +729,12 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
-            show_camera_wipe: false,
-            show_detection_annotations: true,
-            camera_wipe_texture: None,
-            camera_wipe_seq: 0,
-            camera_wipe_rgba_buf: Vec::new(),
+            viewport: ViewportUiState {
+                show_detection_annotations: true,
+                ..ViewportUiState::default()
+            },
 
-            calibration_modal: calibration::CalibrationModalState::default(),
-            calibration_preview_texture: None,
-            calibration_preview_seq: 0,
-            calibration_preview_rgba_buf: Vec::new(),
-            calibration_torso_template_seq: 0,
-            last_pushed_calibration_mode_hint: None,
-            calibration_target_pose_texture: None,
-            calibration_target_pose_mode: None,
-            calibration_target_pose_pending: None,
+            calibration: calibration::CalibrationUiState::default(),
 
             lipsync: LipSyncGuiState {
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
@@ -660,47 +743,20 @@ impl GuiApp {
                 current_volume: 0.0,
             },
 
-            animation_playing: false,
-
-            cloth_sim_playing: false,
-            cloth_rename_buf: String::new(),
-            cloth_save_status: None,
-
-            region_selection: None,
-            cloth_material_pick_index: 0,
-            cloth_distance_stiffness: 1.0,
-            cloth_bend_enabled: true,
-            cloth_bend_stiffness: 0.5,
-            cloth_collider_toggles: Vec::new(),
-            cloth_pin_node_index: 0,
-            cloth_autosave_consent: None,
+            cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
-            expression_weights: Vec::new(),
 
-            scene_presets: crate::persistence::load_scene_presets(),
-            scene_preset_index: None,
-            scene_preset_name: String::new(),
+            scene_preset: ScenePresetUiState {
+                presets: crate::persistence::load_scene_presets(),
+                ..ScenePresetUiState::default()
+            },
 
-            viewport_texture: None,
-            viewport_last_frame: 0,
-            viewport_cursor_grabbed: false,
-            viewport_drag_origin: None,
-
-            library_search_query: String::new(),
-            library_selected_index: None,
-            library_rename_buf: String::new(),
-            library_tag_buf: String::new(),
-            library_show_missing: false,
-            library_sort_mode: LibrarySortMode::None,
-
-            folder_watcher: None,
-            watched_avatar_dirs: Vec::new(),
-            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
-                crate::persistence::thumbnails_dir(),
-            ),
-            pending_thumbnail_jobs: Vec::new(),
-
-            avatar_load_job: None,
+            library: LibraryUiState {
+                thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
+                    crate::persistence::thumbnails_dir(),
+                ),
+                ..LibraryUiState::default()
+            },
             test_no_persist: false,
         };
 
@@ -722,11 +778,11 @@ impl GuiApp {
         // user doesn't see a phantom file in the title bar — they
         // never opened one.
         let last_session = crate::persistence::last_session_path();
-        if state.project_path.is_none() && last_session.exists() {
+        if state.project_status.project_path.is_none() && last_session.exists() {
             match crate::persistence::load_project(&last_session) {
                 Ok((project_state, _warnings)) => {
                     state.apply_project_state(&project_state);
-                    state.project_dirty = false;
+                    state.project_status.project_dirty = false;
                     info!(
                         "persistence: restored last session from {}",
                         last_session.display()
@@ -754,7 +810,7 @@ impl GuiApp {
                 .is_none_or(|p| !p.exists());
             if needs {
                 if let Some(path) = state
-                    .thumbnail_gen
+                    .library.thumbnail_gen
                     .generate_and_save_placeholder(&entry.name)
                 {
                     entry.thumbnail_path = Some(path);
@@ -780,7 +836,7 @@ impl GuiApp {
                 state.push_notification(t!("toast.failed_restore_watch", path = path.display().to_string(), error = e.to_string()));
             }
         }
-        let _ = crate::persistence::save_watched_folders(&state.watched_avatar_dirs);
+        let _ = crate::persistence::save_watched_folders(&state.library.watched_avatar_dirs);
 
         // Seed the active profile's pose calibration into Application
         // + tracking mailbox at startup. Without this, a user who
@@ -819,26 +875,17 @@ impl GuiApp {
         Self {
             mode: AppMode::Preview,
             app,
-            paused: false,
-            frame_count: 0,
-            project_path: None,
 
-            last_frame_instant: Instant::now(),
-            frame_time_ms: 0.0,
-            fps: 0.0,
+            runtime_status: RuntimeStatusUi::new(Instant::now()),
 
-            recent_avatars: Vec::new(),
-
-            project_dirty: false,
-
-            last_autosave: Instant::now(),
-
-            recovery_manager: crate::persistence::RecoveryManager::new(120),
-            overlay_dirty: false,
+            project_status: ProjectStatusUi::new(
+                Vec::new(),
+                crate::persistence::RecoveryManager::new(120),
+                Instant::now(),
+            ),
 
             hotkeys: hotkey::HotkeyMap::new(),
             profiles: profile::ProfileLibrary::new(),
-            profiles_dirty: false,
 
             notifications: Vec::new(),
 
@@ -894,21 +941,12 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: Vec::new(),
-            show_camera_wipe: false,
-            show_detection_annotations: true,
-            camera_wipe_texture: None,
-            camera_wipe_seq: 0,
-            camera_wipe_rgba_buf: Vec::new(),
+            viewport: ViewportUiState {
+                show_detection_annotations: true,
+                ..ViewportUiState::default()
+            },
 
-            calibration_modal: calibration::CalibrationModalState::default(),
-            calibration_preview_texture: None,
-            calibration_preview_seq: 0,
-            calibration_preview_rgba_buf: Vec::new(),
-            calibration_torso_template_seq: 0,
-            last_pushed_calibration_mode_hint: None,
-            calibration_target_pose_texture: None,
-            calibration_target_pose_mode: None,
-            calibration_target_pose_pending: None,
+            calibration: calibration::CalibrationUiState::default(),
 
             lipsync: LipSyncGuiState {
                 available_mics: Vec::new(),
@@ -917,47 +955,17 @@ impl GuiApp {
                 current_volume: 0.0,
             },
 
-            animation_playing: false,
-
-            cloth_sim_playing: false,
-            cloth_rename_buf: String::new(),
-            cloth_save_status: None,
-
-            region_selection: None,
-            cloth_material_pick_index: 0,
-            cloth_distance_stiffness: 1.0,
-            cloth_bend_enabled: true,
-            cloth_bend_stiffness: 0.5,
-            cloth_collider_toggles: Vec::new(),
-            cloth_pin_node_index: 0,
-            cloth_autosave_consent: None,
+            cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
-            expression_weights: Vec::new(),
 
-            scene_presets: Vec::new(),
-            scene_preset_index: None,
-            scene_preset_name: String::new(),
+            scene_preset: ScenePresetUiState::default(),
 
-            viewport_texture: None,
-            viewport_last_frame: 0,
-            viewport_cursor_grabbed: false,
-            viewport_drag_origin: None,
-
-            library_search_query: String::new(),
-            library_selected_index: None,
-            library_rename_buf: String::new(),
-            library_tag_buf: String::new(),
-            library_show_missing: false,
-            library_sort_mode: LibrarySortMode::None,
-
-            folder_watcher: None,
-            watched_avatar_dirs: Vec::new(),
-            thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
-                std::env::temp_dir().join("vulvatar_test_thumbs"),
-            ),
-            pending_thumbnail_jobs: Vec::new(),
-
-            avatar_load_job: None,
+            library: LibraryUiState {
+                thumbnail_gen: crate::renderer::thumbnail::ThumbnailGenerator::new(
+                    std::env::temp_dir().join("vulvatar_test_thumbs"),
+                ),
+                ..LibraryUiState::default()
+            },
             test_no_persist: true,
         }
     }
@@ -997,10 +1005,10 @@ impl GuiApp {
 
     /// Add a path to the recent avatars list (max 10, dedup, most recent first).
     pub fn add_recent_avatar(&mut self, path: PathBuf) {
-        self.recent_avatars.retain(|p| p != &path);
-        self.recent_avatars.insert(0, path);
-        self.recent_avatars.truncate(10);
-        let _ = crate::persistence::save_recent_avatars(&self.recent_avatars);
+        self.project_status.recent_avatars.retain(|p| p != &path);
+        self.project_status.recent_avatars.insert(0, path);
+        self.project_status.recent_avatars.truncate(10);
+        let _ = crate::persistence::save_recent_avatars(&self.project_status.recent_avatars);
     }
 
     /// Build a `RuntimeToggles` from the current GUI state.
@@ -1008,7 +1016,7 @@ impl GuiApp {
         RuntimeToggles {
             tracking_enabled: self.tracking.toggle_tracking,
             spring_enabled: self.rendering.toggle_spring,
-            cloth_enabled: self.rendering.toggle_cloth && self.cloth_sim_playing,
+            cloth_enabled: self.rendering.toggle_cloth && self.cloth_authoring.sim_playing,
             collision_debug: self.rendering.toggle_collision_debug,
             skeleton_debug: self.rendering.toggle_skeleton_debug,
         }
@@ -1022,13 +1030,13 @@ impl GuiApp {
     /// transitions whose state change happens inside `draw_modal`,
     /// after the pre-`run_frame` push has already run).
     fn sync_calibration_mode_hint(&mut self) {
-        let current = self.calibration_modal.active_mode();
-        if current != self.last_pushed_calibration_mode_hint {
+        let current = self.calibration.modal.active_mode();
+        if current != self.calibration.last_pushed_mode_hint {
             self.app
                 .tracking
                 .mailbox()
                 .set_calibration_mode_hint(current);
-            self.last_pushed_calibration_mode_hint = current;
+            self.calibration.last_pushed_mode_hint = current;
         }
     }
 }
@@ -1053,13 +1061,13 @@ impl eframe::App for GuiApp {
 
         // E10: Measure frame timing.
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_frame_instant);
-        self.last_frame_instant = now;
+        let elapsed = now.duration_since(self.runtime_status.last_frame_instant);
+        self.runtime_status.last_frame_instant = now;
         let dt_secs = elapsed.as_secs_f64();
         // Exponential moving average for smoothing.
-        self.frame_time_ms = self.frame_time_ms * 0.9 + (dt_secs * 1000.0) * 0.1;
+        self.runtime_status.frame_time_ms = self.runtime_status.frame_time_ms * 0.9 + (dt_secs * 1000.0) * 0.1;
         if dt_secs > 0.0 {
-            self.fps = self.fps * 0.9 + (1.0 / dt_secs) * 0.1;
+            self.runtime_status.fps = self.runtime_status.fps * 0.9 + (1.0 / dt_secs) * 0.1;
         }
 
         self.process_hotkeys(ctx);
@@ -1108,7 +1116,7 @@ impl eframe::App for GuiApp {
         }
 
         // Smooth zoom: lerp distance toward target_distance each frame.
-        let t = (1.0 - (-5.0 * self.frame_time_ms / 1000.0).exp()) as f32;
+        let t = (1.0 - (-5.0 * self.runtime_status.frame_time_ms / 1000.0).exp()) as f32;
         self.camera_orbit.distance +=
             (self.camera_orbit.target_distance - self.camera_orbit.distance) * t;
 
@@ -1140,10 +1148,12 @@ impl eframe::App for GuiApp {
         ));
 
         // Phase B-3: throttle the output cadence to the user's selection.
-        // Idempotent (just sets a Duration), so no need for change-detect.
+        // P3-03: routes through `RuntimeGpuBudget` so the user's intent is
+        // stored as `user_render_fps` and the *effective* target may be
+        // clamped below it under pressure. Idempotent so calling each
+        // GUI update is cheap.
         self.app
-            .output
-            .set_target_fps(output_fps_for_index(self.output.output_framerate_index));
+            .set_user_render_fps(output_fps_for_index(self.output.output_framerate_index));
 
         // Phase B-4: forward the alpha preference. Read each frame in
         // process_render_result to tag OutputFrame.alpha_mode.
@@ -1158,8 +1168,8 @@ impl eframe::App for GuiApp {
             _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
         };
 
-        if !self.paused {
-            let real_dt = (self.frame_time_ms / 1000.0) as f32;
+        if !self.runtime_status.paused {
+            let real_dt = (self.runtime_status.frame_time_ms / 1000.0) as f32;
             // Clamp dt to avoid huge steps on first frame or after pauses.
             let frame_dt = real_dt.clamp(0.001, 0.1);
 
@@ -1185,7 +1195,7 @@ impl eframe::App for GuiApp {
                 frame_dt,
             };
             self.app.run_frame(&frame_config);
-            self.frame_count += 1;
+            self.runtime_status.frame_count += 1;
         } else {
             // Paused: drain any in-flight render result anyway so
             // `render_results_pending` doesn't pin the repaint gate
@@ -1198,7 +1208,7 @@ impl eframe::App for GuiApp {
         self.write_recovery_snapshot_if_due();
 
         // Cloth overlay autosave consent dialog
-        if self.app.editor.overlay_asset.is_some() && self.cloth_autosave_consent.is_none() {
+        if self.app.editor.overlay_asset.is_some() && self.cloth_authoring.autosave_consent.is_none() {
         egui::Window::new(t!("dialog.cloth_autosave_title"))
             .collapsible(false)
             .resizable(false)
@@ -1210,7 +1220,7 @@ impl eframe::App for GuiApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if components::filled_button(ui, None, &t!("dialog.yes"), true).clicked() {
-                        self.cloth_autosave_consent = Some(true);
+                        self.cloth_authoring.autosave_consent = Some(true);
                     }
                     if components::outlined_button(
                         ui,
@@ -1221,7 +1231,7 @@ impl eframe::App for GuiApp {
                     )
                     .clicked()
                     {
-                        self.cloth_autosave_consent = Some(false);
+                        self.cloth_authoring.autosave_consent = Some(false);
                     }
                 });
             });
@@ -1248,7 +1258,7 @@ impl eframe::App for GuiApp {
         self.sync_calibration_mode_hint();
 
         // Loading-spinner overlay while a background avatar load is in flight.
-        if let Some(job) = self.avatar_load_job.as_ref() {
+        if let Some(job) = self.library.avatar_load_job.as_ref() {
             let stage_label = job.current_stage.label();
             let file_label = job
                 .path
@@ -1301,7 +1311,7 @@ impl eframe::App for GuiApp {
         //   frame to land — without this the viewport texture stays on
         //   the old image until the user moves the mouse again.
         //
-        // Note: `!self.paused` was previously included here, which
+        // Note: `!self.runtime_status.paused` was previously included here, which
         // defeated the gate entirely because `paused` is false by
         // default and the gate then ran continuously from app start.
         let animation_playing = self
@@ -1310,15 +1320,15 @@ impl eframe::App for GuiApp {
             .iter()
             .any(|a| a.animation_state.active_clip.is_some());
         let render_in_flight = self.app.has_pending_render_result();
-        let calibration_modal_open = self.calibration_modal.is_open();
+        let calibration_modal_open = self.calibration.modal.is_open();
         let needs_animation_frame = self.tracking.toggle_tracking
             || self.app.is_lipsync_enabled()
-            || self.avatar_load_job.is_some()
+            || self.library.avatar_load_job.is_some()
             || !self.notifications.is_empty()
             || animation_playing
             || render_in_flight
             || calibration_modal_open;
-        if needs_animation_frame || self.project_dirty || self.profiles_dirty {
+        if needs_animation_frame || self.project_status.project_dirty || self.project_status.profiles_dirty {
             // Dirty flags imply an unsaved (and almost always also
             // un-rendered) GUI mutation. Repaint immediately so the new
             // state reaches the screen on the next render-thread cycle
@@ -1346,8 +1356,9 @@ impl eframe::App for GuiApp {
         // checkbox and immediately Alt+F4s would otherwise lose the
         // change. Falls back to `last_session.vvtproj` when the user
         // never opened a project file.
-        if self.project_dirty {
+        if self.project_status.project_dirty {
             let path = self
+                .project_status
                 .project_path
                 .clone()
                 .unwrap_or_else(crate::persistence::last_session_path);

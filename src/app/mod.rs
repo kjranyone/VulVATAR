@@ -5,9 +5,11 @@ mod lipsync;
 mod output_sink;
 mod render;
 pub mod render_thread;
+pub mod runtime_gpu_budget;
 mod tracking_lifecycle;
 
 use log::{error, info, warn};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::app::render_thread::RenderThread;
@@ -51,6 +53,13 @@ pub struct FrameInputConfig {
     /// to `OutputTargetRequest.color_space` and metadata; render target
     /// format / shader gamma changes land in later stages.
     pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
+    /// P2-05: how the renderer should export the frame for the active sink.
+    /// Populated each tick from `OutputRouter::active_sink().supports_gpu_tokens()`
+    /// — sinks that consume `GpuFrameToken` get `GpuExport`, the file-backed
+    /// Win32 sinks stay on `CpuReadback` so the existing MF DLL consumer
+    /// keeps receiving raw RGBA bytes. Decoupled from any GUI setting so a
+    /// sink swap is the single source of truth for the export path.
+    pub export_mode: crate::renderer::frame_input::RenderExportMode,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -103,6 +112,18 @@ pub struct Application {
     pub tracking: TrackingSource,
     pub tracking_calibration: TrackingCalibration,
     pub output: OutputRouter,
+    /// P3-03: central GPU pressure / pacing policy. Driven per-frame by
+    /// [`Self::update_runtime_gpu_budget`]; read by render/output/tracking
+    /// consumers each tick so cadence decisions come from one place.
+    pub runtime_gpu_budget: runtime_gpu_budget::RuntimeGpuBudget,
+    /// Tracks frames dropped over the last second so the budget gets a
+    /// drops-per-sec measurement rather than a raw counter.
+    last_output_drop_count: u64,
+    last_output_drop_sample: std::time::Instant,
+    /// Smoothed render frame interval (EMA of `FrameConfig::frame_dt`).
+    /// Initialised to the 60 fps target; updated each call to
+    /// [`Self::run_frame`].
+    render_dt_ema: std::time::Duration,
     pub sim_clock: SimulationClock,
     pub editor: EditorSession,
     pub avatars: Vec<AvatarInstance>,
@@ -198,6 +219,18 @@ pub struct Application {
     /// avatar still gets at least one follow-up frame to upload the
     /// re-rendered texture instead of stalling on the previous image.
     render_results_pending: u32,
+    /// Lifetime tally of render results the render thread had to drop
+    /// because the app hadn't drained the mailbox yet. Each entry is a
+    /// frame that completed on the GPU but never reached
+    /// `process_render_result`. Increasing values indicate the app
+    /// thread is falling behind the renderer (modal stalls, long load
+    /// jobs, etc.); plumbed for diagnostics surfacing in the inspector.
+    render_results_dropped: u64,
+    /// Lease completions waiting to be forwarded back to the render thread.
+    /// The render command channel is bounded, so failed `try_send` attempts
+    /// are retried next tick instead of dropping the release and pinning a
+    /// pool slot forever.
+    pending_export_lease_releases: VecDeque<u64>,
 }
 
 impl Default for Application {
@@ -264,12 +297,17 @@ impl Application {
         // unbounded as the user iterates on different VRMs.
         crate::asset::cache::evict_to_count(crate::asset::cache::DEFAULT_MAX_CACHE_ENTRIES);
 
+        let now = std::time::Instant::now();
         Self {
             render_thread: None,
             physics: PhysicsWorld::new(),
             tracking: TrackingSource::new(),
             tracking_calibration: TrackingCalibration::default(),
             output: OutputRouter::new(FrameSink::SharedMemory),
+            runtime_gpu_budget: runtime_gpu_budget::RuntimeGpuBudget::new(now),
+            last_output_drop_count: 0,
+            last_output_drop_sample: now,
+            render_dt_ema: std::time::Duration::from_secs_f32(1.0 / 60.0),
             sim_clock: SimulationClock::new(1.0 / 60.0, 8),
             editor: EditorSession::new(),
             avatars: Vec::new(),
@@ -306,6 +344,8 @@ impl Application {
             ground_grid_visible: false,
             logged_first_render_result: false,
             render_results_pending: 0,
+            render_results_dropped: 0,
+            pending_export_lease_releases: VecDeque::new(),
         }
     }
 
@@ -316,6 +356,14 @@ impl Application {
     /// tracking, or lipsync is active.
     pub fn has_pending_render_result(&self) -> bool {
         self.render_results_pending > 0
+    }
+
+    /// Cumulative render-result drops since process start. Increases
+    /// monotonically when the render thread had to replace an older
+    /// mailbox entry with a newer one because the app hadn't drained
+    /// the previous frame yet.
+    pub fn render_results_dropped_count(&self) -> u64 {
+        self.render_results_dropped
     }
 
     /// Set the desired viewport resolution (called by the GUI when the viewport panel resizes).
@@ -430,6 +478,18 @@ impl Application {
         &self.requested_sink
     }
 
+    /// Store the user's render FPS intent in [`Self::runtime_gpu_budget`]
+    /// and immediately forward the budget's (possibly-clamped) target to
+    /// [`OutputRouter::set_target_fps`]. The per-frame
+    /// [`Self::update_runtime_gpu_budget`] then re-applies the latest
+    /// budget value each tick, so a transient pressure spike that
+    /// happens *after* the GUI change is still reflected.
+    pub fn set_user_render_fps(&mut self, fps: u32) {
+        self.runtime_gpu_budget.set_user_render_fps(fps);
+        self.output
+            .set_target_fps(self.runtime_gpu_budget.render_fps_target());
+    }
+
     /// Update the requested sink and try to make the runtime match. The
     /// requested value is updated unconditionally, even if the runtime
     /// transition fails — the user's intent persists for next time
@@ -486,8 +546,11 @@ impl Application {
         // 1. Stop the tracking worker so no new tracking data arrives.
         if let Some(ref mut worker) = self.tracking_worker {
             info!("app: stopping tracking worker...");
-            worker.stop();
-            info!("app: tracking worker stopped");
+            if worker.stop() {
+                info!("app: tracking worker stopped");
+            } else {
+                warn!("app: tracking worker stop timed out during shutdown");
+            }
         }
 
         // 2. Mark application as no longer running (prevents run_frame from
@@ -694,7 +757,7 @@ mod tests {
         let mesh = MeshAsset {
             id: MeshId(0),
             name: "test_mesh".into(),
-            primitives: vec![prim],
+            primitives: vec![Arc::new(prim)],
         };
 
         let asset = Arc::new(AvatarAsset {

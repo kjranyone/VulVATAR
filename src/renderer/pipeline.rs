@@ -2,6 +2,7 @@ use crate::renderer::frame_input::{RenderAlphaMode, RenderCullMode};
 use crate::renderer::material::MaterialShaderMode;
 use std::sync::Arc;
 use vulkano::device::Device;
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
 };
@@ -15,26 +16,123 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{
+    ComputePipeline, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+};
 use vulkano::render_pass::{RenderPass, Subpass};
 
 // ---------------------------------------------------------------------------
-// Vertex type used by the GPU pipeline
+// Vertex / compute resource types
 // ---------------------------------------------------------------------------
+//
+// The renderer runs a single compute prepass per frame that fuses skinning,
+// morph-target blending, and CPU-computed cloth deformation. The output is
+// `GpuVertex` — already world-space and ready for graphics consumption. The
+// forward / outline vertex shaders just transform that by view / projection.
 
+/// Compute-stage *input* vertex layout, std430-friendly. Used inside the
+/// per-primitive `BaseVertices` storage buffer that the transform compute
+/// shader reads. `vec3` fields are padded to `vec4` because std430's array
+/// layout treats them as 16-byte aligned. Joint indices / weights stay
+/// because skinning happens inside the compute prepass, not in the
+/// graphics vertex shader.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct GpuVertexBase {
+    pub position: [f32; 4],
+    pub normal: [f32; 4],
+    pub uv: [f32; 2],
+    pub _pad0: [u32; 2],
+    pub joint_indices: [u32; 4],
+    pub joint_weights: [f32; 4],
+}
+
+/// Graphics vertex layout. The compute prepass writes world-space
+/// `(position.xyz, normal.xyz, uv)` per vertex into this buffer; the
+/// vertex shaders only apply the camera view + projection. The trailing
+/// `uvec2 _pad` keeps the layout 48 B and 16-byte aligned so std430 and
+/// the vertex-input definition agree byte-for-byte with the compute
+/// shader's `OutVertex` struct.
 #[derive(Clone, Copy, Debug, Default, Vertex, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GpuVertex {
-    #[format(R32G32B32_SFLOAT)]
-    pub position: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    pub normal: [f32; 3],
+    #[format(R32G32B32A32_SFLOAT)]
+    pub position: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    pub normal: [f32; 4],
     #[format(R32G32_SFLOAT)]
     pub uv: [f32; 2],
-    #[format(R32G32B32A32_UINT)]
-    pub joint_indices: [u32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    pub joint_weights: [f32; 4],
+    #[format(R32G32_UINT)]
+    pub _pad: [u32; 2],
+}
+
+/// Per-primitive control UBO consumed by the transform compute shader.
+/// `weights` is packed as `vec4[64]` (up to 256 morph targets); excess
+/// targets are clamped at upload time with a warning. The `has_cloth` /
+/// `has_cloth_normals` flags select between the per-primitive cloth SSBO
+/// (filled in-place by the CPU solver each frame) and the morph + base
+/// fallback path.
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct TransformControl {
+    pub vertex_count: u32,
+    pub target_count: u32,
+    pub has_cloth: u32,
+    pub has_cloth_normals: u32,
+    pub weights: [[f32; 4]; 64],
+}
+
+impl TransformControl {
+    pub fn zeroed() -> Self {
+        Self {
+            vertex_count: 0,
+            target_count: 0,
+            has_cloth: 0,
+            has_cloth_normals: 0,
+            weights: [[0.0; 4]; 64],
+        }
+    }
+}
+
+/// Pack `VertexData` into the std430-aligned `GpuVertexBase` form the
+/// transform compute shader consumes. `vec3` lanes are padded to `vec4`
+/// so the shader-side struct matches the Rust struct byte-for-byte.
+pub fn vertex_data_to_base(vd: &crate::asset::VertexData) -> Vec<GpuVertexBase> {
+    let count = vd.positions.len();
+    (0..count)
+        .map(|i| {
+            let pos = vd.positions[i];
+            let norm = if i < vd.normals.len() {
+                vd.normals[i]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            let uv = if i < vd.uvs.len() {
+                vd.uvs[i]
+            } else {
+                [0.0, 0.0]
+            };
+            let ji = if i < vd.joint_indices.len() {
+                let j = vd.joint_indices[i];
+                [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32]
+            } else {
+                [0, 0, 0, 0]
+            };
+            let jw = if i < vd.joint_weights.len() {
+                vd.joint_weights[i]
+            } else {
+                [1.0, 0.0, 0.0, 0.0]
+            };
+            GpuVertexBase {
+                position: [pos[0], pos[1], pos[2], 1.0],
+                normal: [norm[0], norm[1], norm[2], 0.0],
+                uv,
+                _pad0: [0, 0],
+                joint_indices: ji,
+                joint_weights: jw,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -60,15 +158,14 @@ pub struct GpuVertex {
 
 pub mod vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "vertex",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "vertex",
+        src: r"
 #version 450
 
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec4 normal;
 layout(location = 2) in vec2 uv;
-layout(location = 3) in uvec4 joint_indices;
-layout(location = 4) in vec4 joint_weights;
+layout(location = 3) in uvec2 _pad;
 
 layout(set = 0, binding = 0) uniform CameraData {
     mat4 view;
@@ -83,36 +180,18 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad2;
 } camera;
 
-layout(set = 1, binding = 0) readonly buffer SkinningData {
-    mat4 matrices[];
-} skinning;
-
 layout(location = 0) out vec3 frag_normal;
 layout(location = 1) out vec2 frag_uv;
 layout(location = 2) out vec3 frag_world_pos;
 
 void main() {
-    // Apply skinning
-    mat4 skin_mat = mat4(0.0);
-    for (int i = 0; i < 4; i++) {
-        skin_mat += joint_weights[i] * skinning.matrices[joint_indices[i]];
-    }
-
-    // If all weights are zero, use identity
-    float total_weight = joint_weights.x + joint_weights.y + joint_weights.z + joint_weights.w;
-    if (total_weight < 0.001) {
-        skin_mat = mat4(1.0);
-    }
-
-    vec4 world_pos = skin_mat * vec4(position, 1.0);
-    frag_world_pos = world_pos.xyz;
-    frag_normal = mat3(skin_mat) * normal;
+    frag_world_pos = position.xyz;
+    frag_normal = normal.xyz;
     frag_uv = uv;
-
-    gl_Position = camera.proj * camera.view * world_pos;
+    gl_Position = camera.proj * camera.view * vec4(position.xyz, 1.0);
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
 pub mod fs {
@@ -138,7 +217,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad2;
 } camera;
 
-layout(set = 2, binding = 0) uniform MaterialData {
+layout(set = 1, binding = 0) uniform MaterialData {
     vec4 base_color;
     float alpha_cutoff;
     int alpha_mode;
@@ -159,9 +238,9 @@ layout(set = 2, binding = 0) uniform MaterialData {
     float matcap_blend;
 } material;
 
-layout(set = 2, binding = 1) uniform sampler2D base_texture;
-layout(set = 2, binding = 2) uniform sampler2D matcap_texture;
-layout(set = 2, binding = 3) uniform sampler2D shade_texture;
+layout(set = 1, binding = 1) uniform sampler2D base_texture;
+layout(set = 1, binding = 2) uniform sampler2D matcap_texture;
+layout(set = 1, binding = 3) uniform sampler2D shade_texture;
 
 layout(location = 0) out vec4 out_color;
 
@@ -266,15 +345,14 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "vertex",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "vertex",
+        src: r"
 #version 450
 
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec4 normal;
 layout(location = 2) in vec2 uv;
-layout(location = 3) in uvec4 joint_indices;
-layout(location = 4) in vec4 joint_weights;
+layout(location = 3) in uvec2 _pad;
 
 layout(set = 0, binding = 0) uniform CameraData {
     mat4 view;
@@ -289,10 +367,6 @@ layout(set = 0, binding = 0) uniform CameraData {
     float _pad2;
 } camera;
 
-layout(set = 1, binding = 0) readonly buffer SkinningData {
-    mat4 matrices[];
-} skinning;
-
 layout(push_constant) uniform OutlinePush {
     float outline_width;
     float r;
@@ -302,39 +376,23 @@ layout(push_constant) uniform OutlinePush {
 } outline;
 
 void main() {
-    // Apply skinning
-    mat4 skin_mat = mat4(0.0);
-    for (int i = 0; i < 4; i++) {
-        skin_mat += joint_weights[i] * skinning.matrices[joint_indices[i]];
-    }
-
-    float total_weight = joint_weights.x + joint_weights.y + joint_weights.z + joint_weights.w;
-    if (total_weight < 0.001) {
-        skin_mat = mat4(1.0);
-    }
-
-    vec4 world_pos = skin_mat * vec4(position, 1.0);
-    vec3 world_normal = normalize(mat3(skin_mat) * normal);
-
-    vec4 clip_pos = camera.proj * camera.view * world_pos;
-
-    // Offset along normal in clip space for screen-space-like outline width
+    vec3 world_normal = normalize(normal.xyz);
+    vec4 clip_pos = camera.proj * camera.view * vec4(position.xyz, 1.0);
     vec4 clip_normal = camera.proj * camera.view * vec4(world_normal, 0.0);
     vec2 clip_normal_xy = clip_normal.xy;
     float clip_normal_len = length(clip_normal_xy);
     vec2 screen_normal = clip_normal_len > 0.001 ? clip_normal_xy / clip_normal_len : vec2(0.0, 1.0);
     clip_pos.xy += screen_normal * outline.outline_width * clip_pos.w * 0.01;
-
     gl_Position = clip_pos;
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "fragment",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "fragment",
+        src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -351,64 +409,728 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
-pub mod depth_only_vs {
+// ---------------------------------------------------------------------------
+// Transform compute shader (skinning + morph + cloth fuse)
+//
+// Dispatched once per (instance, primitive) per frame from the renderer's
+// `render()` path. Reads per-vertex base data +
+// per-frame morph weights + per-frame cloth snapshots and writes
+// world-space `GpuVertex` records that the graphics pipelines consume as
+// their vertex buffer. The graphics `vs` / `outline_vs` above only apply
+// the camera view + projection on top.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Cloth Verlet integration compute shader (P3-02 S1.2 — pipeline only)
+// ---------------------------------------------------------------------------
+//
+// First stage of the GPU cloth solver migration: integrates particle
+// positions under gravity / wind / damping using Verlet (pos + prev_pos).
+// Mirrors `simulation::cloth_solver::integrator::verlet_integrate` formula
+// bit-for-bit so the CPU PBD tests double as parity oracles for the eventual
+// GPU side-by-side test (P3-02 S1.3).
+//
+// **Status**: shader + pipeline factory only. Not yet wired into the render
+// loop; that lands when `ClothGpuSimulationState` grows actual Vulkano
+// buffer handles (P3-02 S1.1 Vulkan side).
+//
+// SSBO + UBO layout matches the slot table documented in
+// `simulation::cloth_gpu_boundary::ClothGpuSimulationState`.
+pub mod cloth_verlet_cs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "vertex",
-                                                                                                                                                                                                                                                                        src: r"
+        ty: "compute",
+        src: r"
 #version 450
 
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
-layout(location = 2) in vec2 uv;
-layout(location = 3) in uvec4 joint_indices;
-layout(location = 4) in vec4 joint_weights;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) uniform CameraData {
-    mat4 view;
-    mat4 proj;
-    vec3 camera_pos;
-    float _pad0;
-    vec3 light_dir;
-    float light_intensity;
-    vec3 light_color;
-    float _pad1;
-    vec3 ambient_term;
-    float _pad2;
-} camera;
+// xyz = position, w = inv_mass (0.0 marks an effectively immobile particle).
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+
+// xyz = previous position, w = pinned flag (>= 0.5 means pinned).
+layout(set = 0, binding = 1) buffer PreviousPositions {
+    vec4 p[];
+} prev_positions;
+
+// std140-friendly control block. Rust mirror: `ClothVerletControl`.
+layout(set = 0, binding = 2) uniform Control {
+    float dt;
+    float damping;
+    uint  particle_count;
+    uint  _pad0;
+    vec4  gravity;  // xyz = gravity vector
+    vec4  wind;     // xyz = wind_direction * wind_response
+} ctrl;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= ctrl.particle_count) return;
+
+    vec4 cur = positions.p[idx];
+    vec4 prv = prev_positions.p[idx];
+
+    float inv_mass = cur.w;
+    float pinned   = prv.w;
+
+    // Pinned / immobile particles skip integration. Matches CPU
+    // `if p.pinned { continue }` in `verlet_integrate`.
+    if (pinned > 0.5 || inv_mass <= 0.0) {
+        return;
+    }
+
+    vec3 pos      = cur.xyz;
+    vec3 prev_pos = prv.xyz;
+
+    // CPU reference (cloth_solver/integrator.rs verlet_integrate):
+    //   vel        = pos - prev_pos
+    //   damped_vel = vel * (1.0 - damping)
+    //   accel      = (gravity + wind_force) * dt * dt
+    //   new_pos    = pos + damped_vel + accel
+    //   prev = pos; pos = new_pos
+    vec3 vel        = pos - prev_pos;
+    vec3 damped_vel = vel * (1.0 - ctrl.damping);
+    float dt2       = ctrl.dt * ctrl.dt;
+    vec3 accel      = (ctrl.gravity.xyz + ctrl.wind.xyz) * dt2;
+    vec3 new_pos    = pos + damped_vel + accel;
+
+    positions.p[idx]      = vec4(new_pos, inv_mass);
+    prev_positions.p[idx] = vec4(pos, pinned);
+}
+"
+    }
+}
+
+// =========================================================================
+// Cloth XPBD distance constraint — lambda update pass (per-constraint)
+// =========================================================================
+//
+// Three-pass XPBD constraint projection (Macklin/Müller/Chentanez 2016):
+//   1. lambda update (per constraint): compute Δλ_j, update persistent λ
+//   2. accumulate (per particle): walk adjacency CSR, sum w·d·Δλ into Δx
+//   3. apply (per particle): add Δx to position, zero Δx for next iter
+//
+// Choosing Jacobi (2 passes per iteration after the lambda update) over
+// Gauss-Seidel-on-GPU (atomics or partition coloring) keeps the shaders
+// simple — no atomicAdd, no `VK_EXT_shader_atomic_float`, no
+// per-constraint colour dispatch. Convergence per iteration is slower
+// than Gauss-Seidel, so real workloads run more iterations to compensate.
+// =========================================================================
+//
+// First of three passes per iteration of the GPU XPBD distance-constraint
+// solver (Macklin, Müller, Chentanez 2016). One invocation per constraint:
+// reads the two endpoint positions, computes Δλ_j via the XPBD formula,
+// updates the persistent λ_j buffer, and writes Δλ_j to a transient
+// per-constraint scratch buffer so the per-particle accumulate pass can
+// translate Δλ_j into Δx without re-doing the math (and without racing
+// the lambda update across endpoints).
+//
+// The math:
+// ```
+//   α̃   = α(stiffness) / dt²
+//   Δλ_j = -(C_j + α̃ · λ_j) / (w_a + w_b + α̃)
+//   λ_j ← λ_j + Δλ_j
+//   dlambda_j ← Δλ_j
+// ```
+// `α(stiffness)` mirrors `compliance_from_pbd_stiffness` on the CPU
+// (slack² × 1e-7); `stiffness <= 1e-6` short-circuits to "constraint
+// disabled" exactly like the CPU path.
+pub mod cloth_constraint_lambda_update_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+struct Constraint {
+    uint  particle_a;
+    uint  particle_b;
+    float rest_length;
+    float stiffness;
+};
+layout(set = 0, binding = 1) readonly buffer Constraints {
+    Constraint c[];
+} constraints;
+
+layout(set = 0, binding = 2) uniform Control {
+    uint  particle_count;
+    uint  constraint_count;
+    float dt;
+    uint  _pad;
+} ctrl;
+
+// Persistent Lagrange multiplier per constraint. Reset to 0 by the
+// host at the start of each substep; the lambda update pass mutates
+// it in place, and the next iteration of the same substep reads the
+// accumulated value.
+layout(set = 0, binding = 3) buffer Lambda {
+    float l[];
+} lambda;
+
+// Δλ_j for THIS iteration only. Written here, read by the accumulate
+// pass to translate Δλ_j into Δx without re-running the formula and
+// without racing the lambda update across constraint endpoints.
+layout(set = 0, binding = 4) writeonly buffer DeltaLambda {
+    float l[];
+} dlambda;
+
+float xpbd_compliance(float stiffness) {
+    float s = clamp(stiffness, 0.0, 1.0);
+    float slack = max(1.0 - s, 0.0);
+    return slack * slack * 1.0e-7;
+}
+
+void main() {
+    uint cidx = gl_GlobalInvocationID.x;
+    if (cidx >= ctrl.constraint_count) return;
+
+    Constraint cn = constraints.c[cidx];
+    if (cn.stiffness <= 1.0e-6) {
+        // Disabled constraint — mirror the CPU short-circuit so this
+        // edge contributes nothing this iteration. Clear dlambda so a
+        // previous iteration's value can't leak into the accumulate
+        // pass's read.
+        dlambda.l[cidx] = 0.0;
+        return;
+    }
+
+    vec4 pa = positions.p[cn.particle_a];
+    vec4 pb = positions.p[cn.particle_b];
+    vec3 diff = pa.xyz - pb.xyz;
+    float dist = length(diff);
+    // 1e-9 m = 1 nm. Below this both endpoints are numerically
+    // coincident; matches the CPU XPBD path's zero-length guard.
+    if (dist < 1.0e-9) {
+        dlambda.l[cidx] = 0.0;
+        return;
+    }
+
+    float w_a = pa.w;
+    float w_b = pb.w;
+    float w_sum = w_a + w_b;
+    if (w_sum < 1.0e-12) {
+        dlambda.l[cidx] = 0.0;
+        return;
+    }
+
+    float compliance = xpbd_compliance(cn.stiffness);
+    float dt_sq = max(ctrl.dt * ctrl.dt, 1.0e-12);
+    float alpha_tilde = compliance / dt_sq;
+
+    float c = dist - cn.rest_length;
+    float lambda_old = lambda.l[cidx];
+    float denom = w_sum + alpha_tilde;
+    float delta_lambda = (-c - alpha_tilde * lambda_old) / denom;
+
+    lambda.l[cidx] = lambda_old + delta_lambda;
+    dlambda.l[cidx] = delta_lambda;
+}
+"
+    }
+}
+
+pub mod cloth_constraint_accumulate_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// xyz = position, w = inv_mass (0.0 = effectively pinned / immobile).
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+// Per-particle position correction accumulated this iteration. The
+// apply pass adds these to `positions.p[i].xyz` and zeroes the entry.
+layout(set = 0, binding = 1) writeonly buffer Deltas {
+    vec4 d[];
+} deltas;
+
+// Constraint table, matches Rust `ClothConstraintGpu`.
+struct Constraint {
+    uint  particle_a;
+    uint  particle_b;
+    float rest_length;
+    float stiffness;
+};
+layout(set = 0, binding = 2) readonly buffer Constraints {
+    Constraint c[];
+} constraints;
+
+// CSR adjacency: constraints touching vertex v live at
+// `adj_constraints.c[adj_offsets.o[v] .. adj_offsets.o[v + 1]]`.
+layout(set = 0, binding = 3) readonly buffer AdjacencyOffsets {
+    uint o[];
+} adj_offsets;
+layout(set = 0, binding = 4) readonly buffer AdjacencyConstraints {
+    uint c[];
+} adj_constraints;
+
+// Rust mirror: `ClothConstraintControl`.
+layout(set = 0, binding = 5) uniform Control {
+    uint  particle_count;
+    uint  constraint_count;
+    float dt;
+    uint  _pad;
+} ctrl;
+
+// Δλ_j computed by `cloth_constraint_lambda_update_cs` this iteration.
+// Read-only here: each constraint's Δλ is consumed by both endpoint
+// invocations, no inter-invocation write race.
+layout(set = 0, binding = 6) readonly buffer DeltaLambda {
+    float l[];
+} dlambda;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 self_p = positions.p[pid];
+    float w_self = self_p.w;
+
+    // Pinned (inv_mass == 0) particles take no correction.
+    if (w_self <= 0.0) {
+        deltas.d[pid] = vec4(0.0);
+        return;
+    }
+
+    vec3 self_pos = self_p.xyz;
+    vec3 delta = vec3(0.0);
+
+    uint start = adj_offsets.o[pid];
+    uint end   = adj_offsets.o[pid + 1u];
+    for (uint k = start; k < end; ++k) {
+        uint cidx = adj_constraints.c[k];
+        Constraint cn = constraints.c[cidx];
+        uint other = (cn.particle_a == pid) ? cn.particle_b : cn.particle_a;
+        vec4 other_p = positions.p[other];
+        vec3 dir = other_p.xyz - self_pos;  // points self → other
+        float len = length(dir);
+        // Matches the lambda-update + CPU XPBD zero-length guard (1 nm).
+        if (len > 1.0e-9) {
+            // XPBD: Δx_self = -d_unit · w_self · Δλ_j
+            //   where d_unit = (other - self) / len = +d_unit_GPU
+            //   = w_self · ((self - other) / len) · Δλ_j on the CPU
+            //     convention (d_CPU = (a - b) / |a - b|, so d_unit_GPU
+            //     = -d_CPU and the sign flip cancels).
+            float dl = dlambda.l[cidx];
+            delta += -(dir / len) * w_self * dl;
+        }
+    }
+    deltas.d[pid] = vec4(delta, 0.0);
+}
+"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloth XPBD distance constraint projection — apply pass (P3-02 S2.1)
+// ---------------------------------------------------------------------------
+pub mod cloth_constraint_apply_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+
+layout(set = 0, binding = 1) buffer Deltas {
+    vec4 d[];
+} deltas;
+
+// Layout matches the Rust `ClothConstraintControl` struct after the
+// XPBD migration — apply_cs only reads `particle_count` so the other
+// fields are inert here, but the binding must still match the layout
+// shared with the lambda update / accumulate passes.
+layout(set = 0, binding = 2) uniform Control {
+    uint  particle_count;
+    uint  constraint_count;
+    float dt;
+    uint  _pad;
+} ctrl;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 pos = positions.p[pid];
+    vec4 d = deltas.d[pid];
+    pos.xyz += d.xyz;
+    positions.p[pid] = pos;
+    // Reset for the next constraint iteration's accumulate pass.
+    deltas.d[pid] = vec4(0.0);
+}
+"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloth vertex normal recomputation compute shader (P3-02 S3.1)
+// ---------------------------------------------------------------------------
+//
+// Third stage of the GPU cloth solver migration. After integration (S1.2)
+// and constraint projection (S2.1) produce updated positions, this shader
+// recomputes per-vertex normals so the transform compute pass and the
+// graphics pipelines see consistent shading.
+//
+// Strategy: one workgroup invocation per cloth vertex; each invocation
+// walks its incident triangles via a precomputed CSR adjacency built once
+// at attach time (`cloth_gpu_boundary::build_vertex_triangle_adjacency`).
+// Each incident triangle contributes its **unit** face normal scaled by
+// the incident angle at this vertex (angle-weighted accumulation, Max
+// 1999 — matches `cloth_solver::output::compute_normals`). Bounded by
+// [0, π] per triangle so the result follows the local 1-ring shape
+// instead of the area of the largest incident triangle. Embarrassingly
+// parallel — no atomics, no extensions, no cross-invocation
+// synchronisation. Degenerate / isolated vertices fall back to
+// `(0, 1, 0)`; CPU path uses the same fallback.
+pub mod cloth_normal_cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// xyz = position, w = inv_mass (matches cloth_verlet_cs layout).
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+// Flat triangle index buffer: 3 uints per triangle.
+layout(set = 0, binding = 1) readonly buffer TriangleIndices {
+    uint t[];
+} indices;
+
+// CSR adjacency: for vertex v, the incident triangle indices are
+// `adj_triangles.t[adj_offsets.o[v] .. adj_offsets.o[v + 1]]`.
+// Built once at attach time; never changes at runtime.
+layout(set = 0, binding = 2) readonly buffer AdjacencyOffsets {
+    uint o[];
+} adj_offsets;
+
+layout(set = 0, binding = 3) readonly buffer AdjacencyTriangles {
+    uint t[];
+} adj_triangles;
+
+// Output: per-vertex normal, xyz used (matches cloth_solver::output convention).
+layout(set = 0, binding = 4) writeonly buffer Normals {
+    vec4 n[];
+} normals;
+
+// std140 control block. Rust mirror: `ClothNormalControl`.
+layout(set = 0, binding = 5) uniform Control {
+    uint vertex_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} ctrl;
+
+// Angle between two vectors, robust against degenerate inputs.
+// Returns 0 when either side has near-zero length so a collinear /
+// zero-length edge doesn't contribute a NaN to the accumulator.
+float safe_angle(vec3 u, vec3 v) {
+    float lu = length(u);
+    float lv = length(v);
+    if (lu < 1e-9 || lv < 1e-9) return 0.0;
+    float d = dot(u, v) / (lu * lv);
+    return acos(clamp(d, -1.0, 1.0));
+}
+
+void main() {
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= ctrl.vertex_count) return;
+
+    uint start = adj_offsets.o[vid];
+    uint end   = adj_offsets.o[vid + 1u];
+
+    // Angle-weighted (Max 1999) face-normal accumulation. Each
+    // incident triangle contributes its **unit** face normal scaled
+    // by the incident angle at THIS vertex, so the result depends
+    // only on the local geometry around the 1-ring rather than on
+    // which incident triangle happens to be largest.
+    vec3 accum = vec3(0.0);
+    for (uint k = start; k < end; ++k) {
+        uint tri = adj_triangles.t[k];
+        uint i0 = indices.t[tri * 3u + 0u];
+        uint i1 = indices.t[tri * 3u + 1u];
+        uint i2 = indices.t[tri * 3u + 2u];
+        vec3 p0 = positions.p[i0].xyz;
+        vec3 p1 = positions.p[i1].xyz;
+        vec3 p2 = positions.p[i2].xyz;
+        vec3 raw_normal = cross(p1 - p0, p2 - p0);
+        float face_area2 = length(raw_normal);
+        if (face_area2 < 1e-12) continue;  // degenerate triangle
+        vec3 face_normal = raw_normal / face_area2;
+        // Pick the two edges that meet at the current vertex `vid`
+        // and weight by the angle between them.
+        float angle;
+        if (vid == i0) {
+            angle = safe_angle(p1 - p0, p2 - p0);
+        } else if (vid == i1) {
+            angle = safe_angle(p0 - p1, p2 - p1);
+        } else {
+            angle = safe_angle(p0 - p2, p1 - p2);
+        }
+        accum += face_normal * angle;
+    }
+
+    float len = length(accum);
+    vec3 nrm = (len > 1e-12) ? (accum / len) : vec3(0.0, 1.0, 0.0);
+    normals.n[vid] = vec4(nrm, 0.0);
+}
+"
+    }
+}
+
+pub mod transform_cs {
+    // One workgroup invocation per output vertex. Reads the immutable
+    // base SSBO, the per-frame morph weights / cloth deformed positions,
+    // and the per-instance skinning matrices; writes the world-space
+    // `GpuVertex` array that the graphics pipelines consume as their
+    // vertex buffer.
+    //
+    // Layout invariants (must match the Rust `GpuVertexBase` / `GpuVertex`
+    // / `TransformControl` types in this file). std430 places `vec3` on
+    // 16-byte alignment, so we pad to `vec4` on both ends — see the Rust
+    // struct comments for byte-for-byte breakdown.
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct VertexBase {
+    vec4 position;
+    vec4 normal;
+    vec2 uv;
+    uvec2 _pad0;
+    uvec4 joint_indices;
+    vec4 joint_weights;
+};
+
+struct OutVertex {
+    vec4 position;
+    vec4 normal;
+    vec2 uv;
+    uvec2 _pad;
+};
+
+layout(set = 0, binding = 0) readonly buffer BaseVertices {
+    VertexBase v[];
+} base;
+
+layout(set = 0, binding = 1) readonly buffer MorphDeltas {
+    vec4 data[];
+} morph_deltas;
+
+layout(set = 0, binding = 2) readonly buffer ClothPositions {
+    vec4 p[];
+} cloth_pos;
+
+layout(set = 0, binding = 3) readonly buffer ClothNormals {
+    vec4 n[];
+} cloth_norm;
+
+layout(set = 0, binding = 4) uniform TransformControl {
+    uint vertex_count;
+    uint target_count;
+    uint has_cloth;
+    uint has_cloth_normals;
+    vec4 weights[64];
+} ctrl;
+
+layout(set = 0, binding = 5) writeonly buffer OutVertices {
+    OutVertex v[];
+} out_v;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
     mat4 matrices[];
 } skinning;
 
-void main() {
-    mat4 skin_mat = mat4(0.0);
-    for (int i = 0; i < 4; i++) {
-        skin_mat += joint_weights[i] * skinning.matrices[joint_indices[i]];
+// =====================================================================
+// Dual Quaternion Skinning (DQS, Kavan 2007) — derived in-shader from
+// the per-bone skinning matrices that LBS would consume.
+//
+// Compared with the prior LBS path, DQS eliminates the candy-wrapper
+// twist artefact at joints with non-trivial rotational delta (forearm
+// pronation, hip yaw under skirts, neck twist). Cost: one
+// matrix→quaternion extraction per blended joint (4 per vertex) plus
+// a 4-way quaternion blend + normalise. Negligible against the
+// per-frame morph and constraint solvers.
+//
+// Translation is recovered from the 4th column of the skinning matrix
+// rather than re-derived from the dual, because the source matrices
+// from `Application::build_skinning_matrices` are
+// `global_transform · inverse_bind` products where the translation
+// component is already in world space — re-encoding it into a dual
+// quaternion just to decode it again would be lossy if the source
+// matrix carries any non-rigid component.
+// =====================================================================
+
+// Mike Day's robust mat3→quat conversion. GLSL is column-major
+// (`m[col][row]`), so the row-major literature's `M[i][j]` reads as
+// `m[j][i]` here.
+vec4 mat3_to_quat(mat3 m) {
+    float trace = m[0][0] + m[1][1] + m[2][2];
+    vec4 q;
+    if (trace > 0.0) {
+        float s = sqrt(trace + 1.0) * 2.0;
+        q.w = 0.25 * s;
+        q.x = (m[1][2] - m[2][1]) / s;
+        q.y = (m[2][0] - m[0][2]) / s;
+        q.z = (m[0][1] - m[1][0]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        float s = sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+        q.w = (m[1][2] - m[2][1]) / s;
+        q.x = 0.25 * s;
+        q.y = (m[1][0] + m[0][1]) / s;
+        q.z = (m[2][0] + m[0][2]) / s;
+    } else if (m[1][1] > m[2][2]) {
+        float s = sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+        q.w = (m[2][0] - m[0][2]) / s;
+        q.x = (m[1][0] + m[0][1]) / s;
+        q.y = 0.25 * s;
+        q.z = (m[2][1] + m[1][2]) / s;
+    } else {
+        float s = sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+        q.w = (m[0][1] - m[1][0]) / s;
+        q.x = (m[2][0] + m[0][2]) / s;
+        q.y = (m[2][1] + m[1][2]) / s;
+        q.z = 0.25 * s;
     }
-    float total_weight = joint_weights.x + joint_weights.y + joint_weights.z + joint_weights.w;
-    if (total_weight < 0.001) {
-        skin_mat = mat4(1.0);
-    }
-    vec4 world_pos = skin_mat * vec4(position, 1.0);
-    gl_Position = camera.proj * camera.view * world_pos;
-}
-"
-                                                                                                                                                                                                                                                                    }
+    return q;
 }
 
-pub mod depth_only_fs {
-    vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "fragment",
-                                                                                                                                                                                                                                                                        src: r"
-#version 450
+// Rotate a vector by a unit quaternion. Standard
+// `q ⊗ v ⊗ q⁻¹` derivation reduced to vector ops.
+vec3 quat_rotate(vec4 q, vec3 v) {
+    vec3 u = q.xyz;
+    float w = q.w;
+    return v + 2.0 * cross(u, cross(u, v) + w * v);
+}
 
 void main() {
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= ctrl.vertex_count) return;
+
+    VertexBase b = base.v[vid];
+    vec3 pos = b.position.xyz;
+    vec3 nrm = b.normal.xyz;
+
+    // Morph target blend (vertex pulling).
+    for (uint t = 0u; t < ctrl.target_count; t++) {
+        float w = ctrl.weights[t / 4u][t % 4u];
+        if (abs(w) < 1e-6) continue;
+        uint i = (t * ctrl.vertex_count + vid) * 2u;
+        pos += w * morph_deltas.data[i + 0u].xyz;
+        nrm += w * morph_deltas.data[i + 1u].xyz;
+    }
+
+    // Cloth override: the CPU physics solver wrote per-frame world-relative
+    // positions into `cloth_pos` and (optionally) normals into `cloth_norm`.
+    // Skinning still applies on top so cloth-bearing primitives can ride
+    // along with the avatar's root transform.
+    if (ctrl.has_cloth > 0u) {
+        pos = cloth_pos.p[vid].xyz;
+        if (ctrl.has_cloth_normals > 0u) {
+            nrm = cloth_norm.n[vid].xyz;
+        }
+    }
+
+    // Unified weight threshold. Weights below this are treated as
+    // not-contributing across every check (total-weight gate, antipodal
+    // reference pick, accumulator skip). Asymmetric thresholds caused a
+    // pathology where total_w squeaked past 0.001 but the per-element
+    // `> 0.0` gate stayed strict, mixing contributing-joint selection
+    // with float-noise weights.
+    const float WEIGHT_EPS = 1.0e-4;
+
+    float total_w = b.joint_weights.x + b.joint_weights.y +
+                    b.joint_weights.z + b.joint_weights.w;
+    if (total_w < WEIGHT_EPS) {
+        // No skinning weights — emit the morph/cloth-blended position
+        // as-is (used for accessories that aren't bone-bound).
+        out_v.v[vid].position = vec4(pos, 0.0);
+        out_v.v[vid].normal   = vec4(nrm, 0.0);
+        out_v.v[vid].uv       = b.uv;
+        out_v.v[vid]._pad     = uvec2(0u, 0u);
+        return;
+    }
+
+    // ----- DQS: extract rotation quaternion + translation per joint,
+    //          weighted-blend, normalise, apply.
+    // The antipodal-reference quaternion is the FIRST contributing
+    // joint's rotation (not unconditionally `joint_indices[0]`) — a
+    // vertex with `joint_weights = [0, 0.5, 0.5, 0]` and a stray
+    // `joint_indices[0]` would otherwise let an unused bone's
+    // hemisphere drive the flip decisions for the contributing bones.
+    // Subsequent contributing joints flip sign when
+    // `dot(qi, ref_real) < 0` so the linear combination stays on one
+    // hemisphere. A weighted average of strictly-antipodal quaternions
+    // can still cancel to near-zero magnitude after the flip (e.g. two
+    // contributors whose xyz parts oppose); guard against that below
+    // before `normalize()`.
+    vec4 ref_real = vec4(0.0, 0.0, 0.0, 1.0);
+    for (uint i = 0u; i < 4u; i++) {
+        if (b.joint_weights[i] > WEIGHT_EPS) {
+            ref_real = mat3_to_quat(mat3(skinning.matrices[b.joint_indices[i]]));
+            break;
+        }
+    }
+    vec4 acc_real = vec4(0.0);
+    vec3 acc_trans = vec3(0.0);
+    for (uint i = 0u; i < 4u; i++) {
+        float wi = b.joint_weights[i];
+        if (wi <= WEIGHT_EPS) continue;
+        mat4 mi = skinning.matrices[b.joint_indices[i]];
+        vec4 qi = mat3_to_quat(mat3(mi));
+        float s = (dot(qi, ref_real) >= 0.0) ? 1.0 : -1.0;
+        acc_real += wi * s * qi;
+        acc_trans += wi * mi[3].xyz;
+    }
+    // Renormalise — the linear blend is no longer unit-length. Guard
+    // against the degenerate case where the antipodal-flipped sum has
+    // near-zero magnitude (rare: two contributors whose xyz parts
+    // cancel and whose w parts also cancel). Fall back to pass-through
+    // so the vertex stays in the morph/cloth-blended frame instead of
+    // emitting NaN through the SSBO.
+    float acc_len = length(acc_real);
+    if (acc_len < 1.0e-6) {
+        out_v.v[vid].position = vec4(pos, 0.0);
+        out_v.v[vid].normal   = vec4(nrm, 0.0);
+        out_v.v[vid].uv       = b.uv;
+        out_v.v[vid]._pad     = uvec2(0u, 0u);
+        return;
+    }
+    acc_real /= acc_len;
+
+    vec3 world_pos = quat_rotate(acc_real, pos) + acc_trans;
+    vec3 world_nrm = quat_rotate(acc_real, nrm);
+
+    out_v.v[vid].position = vec4(world_pos, 0.0);
+    out_v.v[vid].normal   = vec4(world_nrm, 0.0);
+    out_v.v[vid].uv       = b.uv;
+    out_v.v[vid]._pad     = uvec2(0u, 0u);
 }
 "
-                                                                                                                                                                                                                                                                    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +1143,6 @@ pub enum RenderPipeline {
     SkinningSimpleLit,
     SkinningToon,
     Outline,
-    DepthOnly,
 }
 
 pub struct PipelineState {
@@ -699,78 +1420,321 @@ pub fn create_outline_pipeline(
     .map_err(|e| format!("failed to create outline graphics pipeline: {e}"))
 }
 
-pub fn create_depth_only_pipeline(
+/// Per-frame control block consumed by `cloth_verlet_cs` (P3-02 S1.2).
+///
+/// std140 layout — field offsets must match the `Control` UBO in
+/// `cloth_verlet_cs`. `_pad0` exists so the following `vec4` lands on a
+/// 16-byte boundary as std140 requires. `gravity` / `wind` are `[f32; 4]`
+/// (xyz used, w unused) rather than `[f32; 3]` because std140 aligns
+/// `vec3` to 16 anyway.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothVerletControl {
+    pub dt: f32,
+    pub damping: f32,
+    pub particle_count: u32,
+    pub _pad0: u32,
+    pub gravity: [f32; 4],
+    pub wind: [f32; 4],
+}
+
+/// Build the cloth Verlet integration compute pipeline (P3-02 S1.2).
+///
+/// Not yet called at runtime: the per-primitive cloth particle SSBOs
+/// (`pos_ssbo`, `prev_pos_ssbo`) land in P3-02 S1.1 Vulkan side. The
+/// factory exists so that landing is a wiring change, not a new design.
+pub fn create_cloth_verlet_compute_pipeline(
     device: Arc<Device>,
-    render_pass: Arc<RenderPass>,
-    viewport: Viewport,
-) -> Result<Arc<GraphicsPipeline>, String> {
-    let vs_module = depth_only_vs::load(device.clone())
-        .map_err(|e| format!("failed to load depth-only vertex shader: {e}"))?;
-    let fs_module = depth_only_fs::load(device.clone())
-        .map_err(|e| format!("failed to load depth-only fragment shader: {e}"))?;
-
-    let vs_entry = vs_module
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_verlet_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth verlet compute shader: {e}"))?;
+    let cs_entry = cs_module
         .entry_point("main")
-        .ok_or_else(|| "depth-only vertex shader entry point 'main' not found".to_string())?;
-    let fs_entry = fs_module
-        .entry_point("main")
-        .ok_or_else(|| "depth-only fragment shader entry point 'main' not found".to_string())?;
-
-    let vertex_input_state = GpuVertex::per_vertex()
-        .definition(&vs_entry)
-        .map_err(|e| format!("failed to get depth-only vertex input state: {e}"))?;
-
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs_entry),
-        PipelineShaderStageCreateInfo::new(fs_entry),
-    ];
-
+        .ok_or_else(|| "cloth verlet compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
     let layout = PipelineLayout::new(
         device.clone(),
         PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
             .into_pipeline_layout_create_info(device.clone())
-            .map_err(|e| format!("failed to create depth-only pipeline layout info: {e}"))?,
+            .map_err(|e| format!("failed to build cloth verlet pipeline layout info: {e}"))?,
     )
-    .map_err(|e| format!("failed to create depth-only pipeline layout: {e}"))?;
-
-    let subpass = Subpass::from(render_pass.clone(), 0).ok_or_else(|| {
-        "failed to get subpass from render pass for depth-only pipeline".to_string()
-    })?;
-
-    GraphicsPipeline::new(
-        device.clone(),
+    .map_err(|e| format!("failed to create cloth verlet pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
         None,
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState {
-                viewports: [viewport].into_iter().collect(),
-                ..Default::default()
-            }),
-            rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::Back,
-                front_face: FrontFace::CounterClockwise,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: true,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState {
-                attachments: vec![ColorBlendAttachmentState {
-                    blend: None,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
-    .map_err(|e| format!("failed to create depth-only pipeline: {e}"))
+    .map_err(|e| format!("failed to create cloth verlet compute pipeline: {e}"))
 }
+
+/// Per-constraint SSBO entry consumed by `cloth_constraint_accumulate_cs`
+/// (P3-02 S2.1). std430 layout — 16 bytes per constraint, packed tight.
+/// `stiffness` is the [0,1] knob the author sets; the lambda-update
+/// shader maps it to XPBD compliance via
+/// `xpbd_compliance(stiffness) = (1 - stiffness)² * 1e-7` so
+/// `stiffness = 1` yields the rigid (α = 0) limit and `stiffness = 0`
+/// short-circuits to "constraint disabled".
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothConstraintGpu {
+    pub particle_a: u32,
+    pub particle_b: u32,
+    pub rest_length: f32,
+    pub stiffness: f32,
+}
+
+/// Per-frame control block consumed by the constraint shaders.
+/// std140 layout — 16 bytes packed.
+///
+/// `constraint_count` and `dt` are the two new fields added during the
+/// GPU XPBD migration. `dt` is the substep duration; the lambda update
+/// shader uses it to scale compliance into `α̃ = α / dt²`. At
+/// `stiffness = 1` (the rigid limit), `α = 0` and `dt` falls out, so
+/// the field is harmless for the legacy PBD-style usage.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothConstraintControl {
+    pub particle_count: u32,
+    pub constraint_count: u32,
+    pub dt: f32,
+    pub _pad: u32,
+}
+
+/// Build the cloth XPBD lambda-update compute pipeline. One
+/// invocation per constraint per iteration. Runs **before**
+/// [`create_cloth_constraint_accumulate_compute_pipeline`] each
+/// iteration so the accumulate pass has Δλ_j available without
+/// reaching for the lambda buffer (and racing across endpoints).
+pub fn create_cloth_constraint_lambda_update_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_constraint_lambda_update_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth constraint lambda update shader: {e}"))?;
+    let cs_entry = cs_module.entry_point("main").ok_or_else(|| {
+        "cloth constraint lambda update shader entry point 'main' not found".to_string()
+    })?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| {
+                format!("failed to build cloth constraint lambda update layout info: {e}")
+            })?,
+    )
+    .map_err(|e| format!("failed to create cloth constraint lambda update layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth constraint lambda update pipeline: {e}"))
+}
+
+/// Build the cloth XPBD constraint accumulate compute pipeline
+/// (per-particle Δx accumulation; reads Δλ_j from the dlambda SSBO
+/// written by the lambda-update pass).
+pub fn create_cloth_constraint_accumulate_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_constraint_accumulate_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth constraint accumulate shader: {e}"))?;
+    let cs_entry = cs_module.entry_point("main").ok_or_else(|| {
+        "cloth constraint accumulate shader entry point 'main' not found".to_string()
+    })?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| {
+                format!("failed to build cloth constraint accumulate layout info: {e}")
+            })?,
+    )
+    .map_err(|e| format!("failed to create cloth constraint accumulate layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth constraint accumulate pipeline: {e}"))
+}
+
+/// Build the cloth XPBD constraint apply compute pipeline
+/// (P3-02 S2.1, second pass of the Jacobi-style iteration).
+pub fn create_cloth_constraint_apply_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_constraint_apply_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth constraint apply shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth constraint apply shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth constraint apply layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth constraint apply layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth constraint apply pipeline: {e}"))
+}
+
+/// Per-frame control block consumed by `cloth_normal_cs` (P3-02 S3.1).
+///
+/// std140 layout — only `vertex_count` carries data; three trailing `uint`
+/// pad to a 16-byte boundary so the UBO meets std140's minimum size /
+/// alignment expectations across drivers.
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct ClothNormalControl {
+    pub vertex_count: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Build the cloth vertex normal recomputation compute pipeline (P3-02 S3.1).
+///
+/// Not yet called at runtime. Lands with the rest of the GPU cloth dispatch
+/// path once `ClothGpuSimulationState` carries actual Vulkano buffer
+/// handles.
+pub fn create_cloth_normal_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_normal_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth normal compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth normal compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth normal pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth normal pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth normal compute pipeline: {e}"))
+}
+
+/// Build the compute pipeline that fuses skinning, morph-target blend, and
+/// CPU-fed cloth deformation into a single dispatch per (instance, primitive).
+/// Output lands in the per-primitive `GpuVertex` SSBO that the graphics
+/// pipelines bind as their vertex buffer. See `transform_cs` for the
+/// shader-side contract.
+pub fn create_transform_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = transform_cs::load(device.clone())
+        .map_err(|e| format!("failed to load transform compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "transform compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build transform pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create transform pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create transform compute pipeline: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClothVerletControl;
+    use std::mem::{offset_of, size_of};
+
+    // GLSL std140 layout for `Control` UBO in cloth_verlet_cs:
+    //   float dt;             // offset 0,  size 4
+    //   float damping;        // offset 4,  size 4
+    //   uint  particle_count; // offset 8,  size 4
+    //   uint  _pad0;          // offset 12, size 4
+    //   vec4  gravity;        // offset 16, size 16
+    //   vec4  wind;           // offset 32, size 16
+    //   total                 // 48 bytes
+    #[test]
+    fn cloth_verlet_control_matches_std140_layout() {
+        assert_eq!(size_of::<ClothVerletControl>(), 48);
+        assert_eq!(offset_of!(ClothVerletControl, dt), 0);
+        assert_eq!(offset_of!(ClothVerletControl, damping), 4);
+        assert_eq!(offset_of!(ClothVerletControl, particle_count), 8);
+        assert_eq!(offset_of!(ClothVerletControl, _pad0), 12);
+        assert_eq!(offset_of!(ClothVerletControl, gravity), 16);
+        assert_eq!(offset_of!(ClothVerletControl, wind), 32);
+    }
+
+    // GLSL std140 layout for `Control` UBO in cloth_normal_cs:
+    //   uint vertex_count; // offset 0,  size 4
+    //   uint _pad0;        // offset 4,  size 4
+    //   uint _pad1;        // offset 8,  size 4
+    //   uint _pad2;        // offset 12, size 4
+    //   total              // 16 bytes
+    #[test]
+    fn cloth_normal_control_matches_std140_layout() {
+        use super::ClothNormalControl;
+        assert_eq!(size_of::<ClothNormalControl>(), 16);
+        assert_eq!(offset_of!(ClothNormalControl, vertex_count), 0);
+        assert_eq!(offset_of!(ClothNormalControl, _pad0), 4);
+        assert_eq!(offset_of!(ClothNormalControl, _pad1), 8);
+        assert_eq!(offset_of!(ClothNormalControl, _pad2), 12);
+    }
+
+    // GLSL std430 layout for the `Constraint` struct in
+    // `cloth_constraint_accumulate_cs`:
+    //   uint  particle_a;  // offset 0, size 4
+    //   uint  particle_b;  // offset 4, size 4
+    //   float rest_length; // offset 8, size 4
+    //   float stiffness;   // offset 12, size 4
+    //   total              // 16 bytes
+    #[test]
+    fn cloth_constraint_gpu_matches_std430_layout() {
+        use super::ClothConstraintGpu;
+        assert_eq!(size_of::<ClothConstraintGpu>(), 16);
+        assert_eq!(offset_of!(ClothConstraintGpu, particle_a), 0);
+        assert_eq!(offset_of!(ClothConstraintGpu, particle_b), 4);
+        assert_eq!(offset_of!(ClothConstraintGpu, rest_length), 8);
+        assert_eq!(offset_of!(ClothConstraintGpu, stiffness), 12);
+    }
+
+    // GLSL std140 layout for the `Control` UBO in both constraint shaders.
+    //   uint particle_count;  // offset 0, size 4
+    //   uint  constraint_count; // offset 4, size 4
+    //   float dt;               // offset 8, size 4
+    //   uint  _pad;             // offset 12, size 4
+    //   total                   // 16 bytes
+    #[test]
+    fn cloth_constraint_control_matches_std140_layout() {
+        use super::ClothConstraintControl;
+        assert_eq!(size_of::<ClothConstraintControl>(), 16);
+        assert_eq!(offset_of!(ClothConstraintControl, particle_count), 0);
+        assert_eq!(offset_of!(ClothConstraintControl, constraint_count), 4);
+        assert_eq!(offset_of!(ClothConstraintControl, dt), 8);
+        assert_eq!(offset_of!(ClothConstraintControl, _pad), 12);
+    }
+}
+

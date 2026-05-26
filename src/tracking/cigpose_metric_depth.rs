@@ -135,7 +135,11 @@ impl CigposeMetricDepthProvider {
             "CIGPose+MoGe-2 provider ready (CIGPose: {}, MoGe-2: {}, YOLOX: {}, FaceMesh: {})",
             cigpose.backend().label(),
             moge.backend().label(),
-            if person_detector.is_some() { "on" } else { "off" },
+            if person_detector.is_some() {
+                "on"
+            } else {
+                "off"
+            },
             if face_mesh.is_some() { "on" } else { "off" },
         );
 
@@ -254,9 +258,8 @@ impl CigposeMetricDepthProvider {
                 .and_then(|d| d.detect_largest_person(rgb_data, width, height));
             match bbox_opt {
                 Some(bbox) => {
-                    let (cx1, cy1, cx2, cy2) = super::rtmw3d::pad_and_clamp_bbox(
-                        &bbox, width, height, 0.25,
-                    );
+                    let (cx1, cy1, cx2, cy2) =
+                        super::rtmw3d::pad_and_clamp_bbox(&bbox, width, height, 0.25);
                     let cw = cx2 - cx1;
                     let ch = cy2 - cy1;
                     debug!(
@@ -266,7 +269,8 @@ impl CigposeMetricDepthProvider {
                     if cw < 32 || ch < 32 {
                         (None, rgb_data, width, height, None, None)
                     } else {
-                        let crop = super::rtmw3d::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
+                        let crop =
+                            super::rtmw3d::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
                         let ann = Some((
                             bbox.x1 / width as f32,
                             bbox.y1 / height as f32,

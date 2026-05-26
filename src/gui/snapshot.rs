@@ -147,7 +147,7 @@ impl GuiApp {
                         alpha_mode,
                         cull_mode,
                         outline,
-                        primitive_data: Some(Arc::new(prim.clone())),
+                        primitive_data: Some(Arc::clone(prim)),
                         morph_weights: Vec::new(),
                     }
                 })
@@ -192,7 +192,7 @@ impl GuiApp {
                 world_transform: avatar.world_transform.clone(),
                 mesh_instances,
                 skinning_matrices: avatar.pose.skinning_matrices.clone(),
-                cloth_deform: None,
+                cloth_deforms: Vec::new(),
                 debug_flags: RenderDebugFlags::default(),
             }],
             output_request: OutputTargetRequest {
@@ -269,7 +269,7 @@ impl GuiApp {
                         alpha_mode,
                         cull_mode,
                         outline,
-                        primitive_data: Some(Arc::new(prim.clone())),
+                        primitive_data: Some(Arc::clone(prim)),
                         morph_weights: Vec::new(),
                     }
                 })
@@ -318,7 +318,7 @@ impl GuiApp {
                 world_transform: avatar.world_transform.clone(),
                 mesh_instances,
                 skinning_matrices,
-                cloth_deform: None,
+                cloth_deforms: Vec::new(),
                 debug_flags: RenderDebugFlags::default(),
             }],
             output_request: OutputTargetRequest {
@@ -348,16 +348,16 @@ impl GuiApp {
         // Already have an in-flight render for this mode — don't
         // double up. Pending for a different mode is also fine to
         // overwrite (the user changed their mind).
-        if self.calibration_target_pose_pending.is_some()
-            && self.calibration_target_pose_mode == Some(mode)
+        if self.calibration.target_pose_pending.is_some()
+            && self.calibration.target_pose_mode == Some(mode)
         {
             return;
         }
         // Already have the snapshot for this mode and no pending
         // request — nothing to do.
-        if self.calibration_target_pose_pending.is_none()
-            && self.calibration_target_pose_mode == Some(mode)
-            && self.calibration_target_pose_texture.is_some()
+        if self.calibration.target_pose_pending.is_none()
+            && self.calibration.target_pose_mode == Some(mode)
+            && self.calibration.target_pose_texture.is_some()
         {
             return;
         }
@@ -369,8 +369,8 @@ impl GuiApp {
             return;
         };
         let rx = rt.request_thumbnail(input);
-        self.calibration_target_pose_pending = Some(rx);
-        self.calibration_target_pose_mode = Some(mode);
+        self.calibration.target_pose_pending = Some(rx);
+        self.calibration.target_pose_mode = Some(mode);
     }
 
     /// Drain the pending target-pose snapshot, if any, and upload
@@ -378,7 +378,7 @@ impl GuiApp {
     /// `calibration_target_pose_texture`. Called every frame from
     /// the modal's `draw_modal` entry while the modal is open.
     pub fn poll_calibration_target_pose_snapshot(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.calibration_target_pose_pending.take() else {
+        let Some(rx) = self.calibration.target_pose_pending.take() else {
             return;
         };
         match rx.try_recv() {
@@ -395,7 +395,7 @@ impl GuiApp {
                         minification: egui::TextureFilter::Linear,
                         ..Default::default()
                     };
-                    if let Some(ref mut handle) = self.calibration_target_pose_texture {
+                    if let Some(ref mut handle) = self.calibration.target_pose_texture {
                         handle.set(color_image, options);
                     } else {
                         let handle = ctx.load_texture(
@@ -403,7 +403,7 @@ impl GuiApp {
                             color_image,
                             options,
                         );
-                        self.calibration_target_pose_texture = Some(handle);
+                        self.calibration.target_pose_texture = Some(handle);
                     }
                 }
             }
@@ -415,7 +415,7 @@ impl GuiApp {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 // Still rendering — put the receiver back.
-                self.calibration_target_pose_pending = Some(rx);
+                self.calibration.target_pose_pending = Some(rx);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 log::warn!(
@@ -440,7 +440,7 @@ impl GuiApp {
             return;
         };
         let rx = rt.request_thumbnail(input);
-        self.pending_thumbnail_jobs.push((output_path, rx));
+        self.library.pending_thumbnail_jobs.push((output_path, rx));
     }
 
     /// Drain any thumbnail jobs whose render thread response has
@@ -452,8 +452,8 @@ impl GuiApp {
     /// avatar import — is left untouched. See
     /// [`handle_thumbnail_response`] for the exact contract.
     pub(super) fn poll_thumbnail_jobs(&mut self, ctx: &egui::Context) {
-        let mut still_pending = Vec::with_capacity(self.pending_thumbnail_jobs.len());
-        for (path, rx) in std::mem::take(&mut self.pending_thumbnail_jobs) {
+        let mut still_pending = Vec::with_capacity(self.library.pending_thumbnail_jobs.len());
+        for (path, rx) in std::mem::take(&mut self.library.pending_thumbnail_jobs) {
             match rx.try_recv() {
                 Ok(response) => {
                     if handle_thumbnail_response(&path, response).is_ok() {
@@ -475,6 +475,6 @@ impl GuiApp {
                 }
             }
         }
-        self.pending_thumbnail_jobs = still_pending;
+        self.library.pending_thumbnail_jobs = still_pending;
     }
 }

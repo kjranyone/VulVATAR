@@ -1,4 +1,5 @@
 pub mod cloth;
+pub mod cloth_gpu_boundary;
 pub mod cloth_solver;
 pub mod spring;
 

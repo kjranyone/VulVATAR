@@ -135,11 +135,9 @@ impl PoseProviderKind {
         let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
         match normalized.as_str() {
             "" | "rtmw3d" | "rtmpose3d" => Some(Self::Rtmw3d),
-            "rtmw3d-with-depth"
-            | "rtmw3d-depth"
-            | "rtmw3d-da"
-            | "rtmw3d-dav2"
-            | "rtmw3d+dav2" => Some(Self::Rtmw3dWithDepth),
+            "rtmw3d-with-depth" | "rtmw3d-depth" | "rtmw3d-da" | "rtmw3d-dav2" | "rtmw3d+dav2" => {
+                Some(Self::Rtmw3dWithDepth)
+            }
             "cig-depth"
             | "cigpose-depth"
             | "cigpose-depth-anything"

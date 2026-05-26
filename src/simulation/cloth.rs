@@ -391,7 +391,18 @@ impl Default for ClothSimState {
 pub struct ClothSimTempBuffers {
     pub temp_positions: Vec<Vec3>,
     pub correction_accumulator: Vec<Vec3>,
-    pub correction_counts: Vec<u32>,
+    /// XPBD per-distance-constraint Lagrange multiplier (λ_j),
+    /// accumulated across the `solver_iterations` projection passes
+    /// inside a single substep. Reset to zero at the top of every
+    /// substep (after `verlet_integrate`, before the constraint
+    /// projection loop) — XPBD's stiffness-independent behaviour
+    /// depends on λ growing as the constraint projects through
+    /// successive iterations, then being discarded so the next
+    /// substep starts fresh.
+    ///
+    /// Sized to the number of distance constraints, NOT particles.
+    /// Resized lazily when the constraint count changes.
+    pub lambda_distance: Vec<f32>,
 }
 
 impl ClothSimTempBuffers {
@@ -399,22 +410,30 @@ impl ClothSimTempBuffers {
         Self {
             temp_positions: vec![[0.0; 3]; particle_count],
             correction_accumulator: vec![[0.0; 3]; particle_count],
-            correction_counts: vec![0; particle_count],
+            lambda_distance: Vec::new(),
         }
     }
 
     pub fn resize(&mut self, particle_count: usize) {
         self.temp_positions.resize(particle_count, [0.0; 3]);
         self.correction_accumulator.resize(particle_count, [0.0; 3]);
-        self.correction_counts.resize(particle_count, 0);
     }
 
     pub fn clear(&mut self) {
         for v in self.correction_accumulator.iter_mut() {
             *v = [0.0; 3];
         }
-        for c in self.correction_counts.iter_mut() {
-            *c = 0;
+    }
+
+    /// Ensure the XPBD Lagrange-multiplier buffer matches `count`
+    /// entries and reset every entry to zero. Call once per substep
+    /// before the constraint projection iteration loop.
+    pub fn reset_lambda(&mut self, count: usize) {
+        if self.lambda_distance.len() != count {
+            self.lambda_distance.resize(count, 0.0);
+        }
+        for v in self.lambda_distance.iter_mut() {
+            *v = 0.0;
         }
     }
 }

@@ -9,10 +9,7 @@ use super::super::DetectionAnnotation;
 use super::decode::DecodedJoint;
 
 pub(super) fn build_annotation(joints: &[DecodedJoint]) -> DetectionAnnotation {
-    let keypoints = joints
-        .iter()
-        .map(|j| (j.nx, j.ny, j.score))
-        .collect();
+    let keypoints = joints.iter().map(|j| (j.nx, j.ny, j.score)).collect();
     DetectionAnnotation {
         keypoints,
         skeleton: coco_body_edges(),

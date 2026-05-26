@@ -34,7 +34,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         .as_ref()
         .map(|p| {
             use crate::asset::HumanoidBone;
-            match relevant_mode(&state.calibration_modal) {
+            match relevant_mode(&state.calibration.modal) {
                 Some(CalibrationMode::FullBody) => {
                     p.joints.contains_key(&HumanoidBone::Hips)
                 }
@@ -63,7 +63,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         .unwrap_or(false);
 
     let now = Instant::now();
-    match &mut state.calibration_modal {
+    match &mut state.calibration.modal {
         CalibrationModalState::Idle {
             last_anchor_seen,
             last_confidence,
@@ -149,7 +149,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         ref mut samples,
         ref mut last_seq_consumed,
         ..
-    } = state.calibration_modal
+    } = state.calibration.modal
     {
         if snap.sequence > *last_seq_consumed {
             *last_seq_consumed = snap.sequence;
@@ -185,7 +185,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         ref mut samples_seen,
         ref mut last_seq_consumed,
         ..
-    } = state.calibration_modal
+    } = state.calibration.modal
     {
         if snap.sequence > *last_seq_consumed {
             *last_seq_consumed = snap.sequence;

@@ -7,7 +7,7 @@ use crate::simulation::cloth::ClothSimState;
 // Verlet integration (E7: wind_response applied here)
 // =========================================================================
 
-pub(super) fn verlet_integrate(sim: &mut ClothSimState, dt: f32) {
+pub(crate) fn verlet_integrate(sim: &mut ClothSimState, dt: f32) {
     let gravity = sim.gravity;
     let damping = sim.damping.clamp(0.0, 1.0);
     let wind_force = vec3_scale(&sim.wind_direction, sim.wind_response);

@@ -95,8 +95,8 @@ impl GuiApp {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             camera_index: self.camera_index,
-            show_camera_wipe: self.show_camera_wipe,
-            show_detection_annotations: self.show_detection_annotations,
+            show_camera_wipe: self.viewport.show_camera_wipe,
+            show_detection_annotations: self.viewport.show_detection_annotations,
             // Calibration now lives on `StreamProfile.pose_calibration`
             // (per-room/setup storage), not the project file. New saves
             // never emit this field — the on-disk DTO has
@@ -139,7 +139,7 @@ impl GuiApp {
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,
             settings_orbit_sensitivity: self.settings.orbit_sensitivity,
             settings_pan_sensitivity: self.settings.pan_sensitivity,
-            cloth_autosave_consent: self.cloth_autosave_consent,
+            cloth_autosave_consent: self.cloth_authoring.autosave_consent,
         }
     }
 
@@ -190,7 +190,7 @@ impl GuiApp {
             .tracking
             .mailbox()
             .set_calibration(profile.pose_calibration.clone());
-        self.project_dirty = true;
+        self.project_status.project_dirty = true;
         // Profiles don't carry lipsync settings; pass current App requested
         // state to keep them unchanged.
         self.apply_pipeline_bound_settings(
@@ -222,8 +222,8 @@ impl GuiApp {
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
         self.camera_index = state.camera_index;
-        self.show_camera_wipe = state.show_camera_wipe;
-        self.show_detection_annotations = state.show_detection_annotations;
+        self.viewport.show_camera_wipe = state.show_camera_wipe;
+        self.viewport.show_detection_annotations = state.show_detection_annotations;
         // Pose calibration migration: per-profile storage replaced
         // per-project storage in this version. When the loaded
         // project file carries a legacy `pose_calibration` value
@@ -245,7 +245,7 @@ impl GuiApp {
                 if let Some(active_profile) = self.profiles.profiles.get_mut(idx) {
                     if active_profile.pose_calibration.is_none() {
                         active_profile.pose_calibration = Some(legacy.clone());
-                        self.profiles_dirty = true;
+                        self.project_status.profiles_dirty = true;
                     }
                 }
             }
@@ -285,7 +285,7 @@ impl GuiApp {
         self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;
         self.settings.orbit_sensitivity = state.settings_orbit_sensitivity;
         self.settings.pan_sensitivity = state.settings_pan_sensitivity;
-        self.cloth_autosave_consent = state.cloth_autosave_consent;
+        self.cloth_authoring.autosave_consent = state.cloth_autosave_consent;
         crate::i18n::set_locale(&self.settings.locale);
 
         self.apply_pipeline_bound_settings(
@@ -422,22 +422,23 @@ impl GuiApp {
         // No toast: a "saved" notification firing 4× a second during a
         // slider drag would be UI spam.
         const AUTOSAVE_THROTTLE: Duration = Duration::from_millis(250);
-        if self.project_dirty && self.last_autosave.elapsed() >= AUTOSAVE_THROTTLE {
+        if self.project_status.project_dirty && self.project_status.last_autosave.elapsed() >= AUTOSAVE_THROTTLE {
             let path = self
+                .project_status
                 .project_path
                 .clone()
                 .unwrap_or_else(crate::persistence::last_session_path);
             let project_state = self.to_project_state();
             match crate::persistence::save_project(&project_state, &path) {
                 Ok(()) => {
-                    self.project_dirty = false;
-                    self.last_autosave = Instant::now();
+                    self.project_status.project_dirty = false;
+                    self.project_status.last_autosave = Instant::now();
                 }
                 Err(e) => {
                     // Bump the timestamp so a persistent failure (read-only
                     // disk, missing directory) doesn't pin the GUI in a
                     // tight save-fail loop. The next mutation will retry.
-                    self.last_autosave = Instant::now();
+                    self.project_status.last_autosave = Instant::now();
                     self.push_notification(t!("toast.autosave_failed", error = e.to_string()));
                 }
             }
@@ -450,10 +451,10 @@ impl GuiApp {
         // project save — the two writes target different files and
         // it's fine for them to interleave. Failure is non-fatal:
         // the next dirty mutation retries on the following frame.
-        if self.profiles_dirty {
+        if self.project_status.profiles_dirty {
             match crate::persistence::save_profiles(&self.profiles) {
                 Ok(()) => {
-                    self.profiles_dirty = false;
+                    self.project_status.profiles_dirty = false;
                 }
                 Err(e) => {
                     // Don't toast — calibration capture already
@@ -464,7 +465,7 @@ impl GuiApp {
                     // Clear the flag so a permanently-read-only
                     // config dir doesn't trigger a save attempt
                     // on every frame for the rest of the session.
-                    self.profiles_dirty = false;
+                    self.project_status.profiles_dirty = false;
                 }
             }
         }
@@ -479,18 +480,18 @@ impl GuiApp {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !self.recovery_manager.should_snapshot(now_secs) {
+        if !self.project_status.recovery_manager.should_snapshot(now_secs) {
             return;
         }
 
-        let project_state = if self.project_dirty {
+        let project_state = if self.project_status.project_dirty {
             Some(self.to_project_state())
         } else {
             None
         };
 
         let has_overlay = self.app.editor.overlay_asset.is_some();
-        let overlay_for_snapshot = if has_overlay && self.cloth_autosave_consent == Some(true) {
+        let overlay_for_snapshot = if has_overlay && self.cloth_authoring.autosave_consent == Some(true) {
             let overlay_name = self
                 .app
                 .editor
@@ -515,9 +516,9 @@ impl GuiApp {
             None
         };
 
-        let _ = self.recovery_manager.write_snapshot(
+        let _ = self.project_status.recovery_manager.write_snapshot(
             project_state.as_ref(),
-            self.overlay_dirty,
+            self.project_status.overlay_dirty,
             overlay_for_snapshot.as_ref(),
         );
     }

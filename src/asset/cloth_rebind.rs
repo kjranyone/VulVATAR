@@ -164,7 +164,7 @@ impl<'a> AvatarResolver<'a> {
         let mut primitives_by_position = HashMap::new();
         for mesh in &avatar.meshes {
             for (idx, prim) in mesh.primitives.iter().enumerate() {
-                primitives_by_position.insert((mesh.name.clone(), idx), prim);
+                primitives_by_position.insert((mesh.name.clone(), idx), prim.as_ref());
             }
         }
 
@@ -326,6 +326,23 @@ pub fn rebind_overlay(overlay: &mut ClothAsset, new_avatar: &AvatarAsset) -> Reb
                         rb.primitive.name, needed, prim.vertex_count
                     ));
                     report.downgrade(RebindStatus::Failed);
+                }
+
+                // Populate the parent-mesh reference if we can recover it
+                // from the primitive name. Cosmetic for the renderer
+                // (which matches by globally-unique PrimitiveId) but lets
+                // overlay tooling reason about the binding without
+                // re-walking the asset graph.
+                if let Some((mesh_name, _idx)) = parse_primitive_name(&rb.primitive.name) {
+                    if let Some(mesh) = resolver.resolve_mesh(&MeshRef {
+                        id: MeshId(0),
+                        name: mesh_name.to_string(),
+                    }) {
+                        rb.mesh = Some(MeshRef {
+                            id: mesh.id,
+                            name: mesh.name.clone(),
+                        });
+                    }
                 }
             }
             None => {
@@ -575,13 +592,14 @@ mod tests {
                 count: 4,
             },
             mapping_region: ClothRegionTag(0),
+            mesh: None,
         });
 
         let body_mesh = MeshAsset {
             id: MeshId(2),
             name: "Body".to_string(),
             primitives: vec![
-                MeshPrimitiveAsset {
+                std::sync::Arc::new(MeshPrimitiveAsset {
                     id: PrimitiveId(20),
                     vertex_count: 16,
                     index_count: 24,
@@ -591,8 +609,8 @@ mod tests {
                     vertices: None,
                     indices: None,
                     morph_targets: vec![],
-                },
-                MeshPrimitiveAsset {
+                }),
+                std::sync::Arc::new(MeshPrimitiveAsset {
                     id: PrimitiveId(21),
                     vertex_count: 16,
                     index_count: 24,
@@ -602,7 +620,7 @@ mod tests {
                     vertices: None,
                     indices: None,
                     morph_targets: vec![],
-                },
+                }),
             ],
         };
         let avatar = make_avatar(vec![], vec![body_mesh]);
@@ -625,12 +643,13 @@ mod tests {
                 count: 100,
             },
             mapping_region: ClothRegionTag(0),
+            mesh: None,
         });
 
         let body_mesh = MeshAsset {
             id: MeshId(2),
             name: "Body".to_string(),
-            primitives: vec![MeshPrimitiveAsset {
+            primitives: vec![std::sync::Arc::new(MeshPrimitiveAsset {
                 id: PrimitiveId(20),
                 vertex_count: 50, // shrunk: was needs 100
                 index_count: 0,
@@ -640,7 +659,7 @@ mod tests {
                 vertices: None,
                 indices: None,
                 morph_targets: vec![],
-            }],
+            })],
         };
         let avatar = make_avatar(vec![], vec![body_mesh]);
         let report = rebind_overlay(&mut overlay, &avatar);

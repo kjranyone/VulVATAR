@@ -132,7 +132,7 @@ fn distance_constraint_converges_to_rest_length() {
     let mut buffers = ClothSimTempBuffers::new(2);
 
     for _ in 0..50 {
-        project_distance_constraints(&mut sim, &mut buffers);
+        project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
     }
 
     let dist = vec3_length(&vec3_sub(
@@ -165,7 +165,7 @@ fn distance_constraint_preserves_center_of_mass() {
     );
 
     let mut buffers = ClothSimTempBuffers::new(2);
-    project_distance_constraints(&mut sim, &mut buffers);
+    project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
 
     let com_after: Vec3 = vec3_scale(
         &vec3_add(&sim.particles[0].position, &sim.particles[1].position),
@@ -195,10 +195,106 @@ fn distance_constraint_with_zero_stiffness_does_nothing() {
     });
 
     let mut buffers = ClothSimTempBuffers::new(2);
-    project_distance_constraints(&mut sim, &mut buffers);
+    project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
 
     assert_eq!(sim.particles[0].position, [0.0, 0.0, 0.0]);
     assert_eq!(sim.particles[1].position, [3.0, 0.0, 0.0]);
+}
+
+/// XPBD's `α = 0` (rigid) limit must drive the constraint to **exactly**
+/// the rest length in a single projection pass. PBD with `stiffness = 1`
+/// behaved this way too; verify the migration preserves the property so
+/// existing assets keep looking the same.
+#[test]
+fn xpbd_rigid_stiffness_satisfies_constraint_in_one_pass() {
+    let mut sim = make_simple_sim(2);
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    sim.particles[1].position = [3.0, 0.0, 0.0];
+    sim.distance_constraints.push(ClothDistanceConstraint {
+        a: 0,
+        b: 1,
+        rest_length: 1.0,
+        stiffness: 1.0,
+    });
+
+    let mut buffers = ClothSimTempBuffers::new(2);
+    buffers.reset_lambda(1);
+    project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
+
+    let dist = (sim.particles[1].position[0] - sim.particles[0].position[0]).abs();
+    assert!(
+        (dist - 1.0).abs() < 1e-4,
+        "after one XPBD pass at stiffness=1, distance should be ~rest_length=1.0, got {dist}",
+    );
+}
+
+/// Verify the XPBD Lagrange-multiplier buffer accumulates across
+/// successive `project_distance_constraints` calls within one substep,
+/// and that `reset_lambda` zeroes it for the next substep. This is the
+/// structural property that decouples convergence from iteration count
+/// vs. classic PBD's "stiffness × iters" coupling.
+#[test]
+fn xpbd_lambda_accumulates_within_substep_and_resets_across_substeps() {
+    let mut sim = make_simple_sim(2);
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    sim.particles[1].position = [3.0, 0.0, 0.0];
+    sim.distance_constraints.push(ClothDistanceConstraint {
+        a: 0,
+        b: 1,
+        rest_length: 1.0,
+        stiffness: 1.0,
+    });
+
+    let mut buffers = ClothSimTempBuffers::new(2);
+    buffers.reset_lambda(1);
+
+    project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
+    let lambda_after_iter_1 = buffers.lambda_distance[0];
+    assert!(
+        lambda_after_iter_1.abs() > 0.0,
+        "first XPBD pass must produce non-zero λ; got {lambda_after_iter_1}"
+    );
+
+    // Second iter inside the SAME substep: the constraint is already
+    // ~satisfied (rigid case), so |Δλ| should be tiny. λ stays close
+    // to its post-first-iter value.
+    project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
+    let lambda_after_iter_2 = buffers.lambda_distance[0];
+    let delta = (lambda_after_iter_2 - lambda_after_iter_1).abs();
+    assert!(
+        delta < 0.1 * lambda_after_iter_1.abs().max(1e-6),
+        "rigid constraint already satisfied; second-iter Δλ should be tiny, got {delta}",
+    );
+
+    // Reset simulates the start of the next substep.
+    buffers.reset_lambda(1);
+    assert_eq!(buffers.lambda_distance[0], 0.0);
+}
+
+/// Disabling the constraint (`stiffness == 0`) must also leave `λ`
+/// untouched — the short-circuit `continue` skips the entire formula
+/// so no spurious accumulation leaks across iterations.
+#[test]
+fn xpbd_disabled_constraint_leaves_lambda_zero() {
+    let mut sim = make_simple_sim(2);
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    sim.particles[1].position = [3.0, 0.0, 0.0];
+    sim.distance_constraints.push(ClothDistanceConstraint {
+        a: 0,
+        b: 1,
+        rest_length: 1.0,
+        stiffness: 0.0,
+    });
+
+    let mut buffers = ClothSimTempBuffers::new(2);
+    buffers.reset_lambda(1);
+    for _ in 0..16 {
+        project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
+    }
+    assert_eq!(
+        buffers.lambda_distance[0], 0.0,
+        "disabled constraints must not accumulate λ"
+    );
 }
 
 // =========================================================================
@@ -511,6 +607,12 @@ fn write_back_copies_positions_and_normals() {
             deformed_normals: None,
             version: 0,
         },
+        target_primitive_id: None,
+        target_mesh_id: None,
+        target_vertex_offset: 0,
+        target_vertex_count: 0,
+        solver_backend:
+            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
     };
 
     write_back(&sim, &mut cloth_state);
@@ -543,6 +645,12 @@ fn write_back_increments_version() {
             deformed_normals: None,
             version: 42,
         },
+        target_primitive_id: None,
+        target_mesh_id: None,
+        target_vertex_offset: 0,
+        target_vertex_count: 0,
+        solver_backend:
+            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
     };
 
     write_back(&sim, &mut cloth_state);
@@ -575,7 +683,7 @@ fn multi_step_does_not_spike() {
     for _ in 0..1000 {
         verlet_integrate(&mut sim, 1.0 / 60.0);
         for _ in 0..sim.solver_iterations {
-            project_distance_constraints(&mut sim, &mut buffers);
+            project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
         }
     }
 
@@ -765,7 +873,7 @@ fn cloth_step_performance_stub() {
     for _ in 0..600 {
         verlet_integrate(&mut sim, 1.0 / 60.0);
         for _ in 0..sim.solver_iterations {
-            project_distance_constraints(&mut sim, &mut buffers);
+            project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
         }
     }
     let elapsed = start.elapsed();
@@ -816,7 +924,7 @@ fn cloth_reenable_after_disable_resumes_from_state() {
 
     verlet_integrate(&mut sim, 1.0 / 60.0);
     for _ in 0..sim.solver_iterations {
-        project_distance_constraints(&mut sim, &mut buffers);
+        project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
     }
 
     let saved_positions: Vec<Vec3> = sim.particles.iter().map(|p| p.position).collect();
@@ -828,7 +936,7 @@ fn cloth_reenable_after_disable_resumes_from_state() {
 
     verlet_integrate(&mut sim, 1.0 / 60.0);
     for _ in 0..sim.solver_iterations {
-        project_distance_constraints(&mut sim, &mut buffers);
+        project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
     }
 
     let positions_after: Vec<Vec3> = sim.particles.iter().map(|p| p.position).collect();
@@ -864,7 +972,7 @@ fn cloth_timing_breakdown() {
     for _ in 0..iterations {
         verlet_integrate(&mut sim, 1.0 / 60.0);
         for _ in 0..sim.solver_iterations {
-            project_distance_constraints(&mut sim, &mut buffers);
+            project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
         }
         project_bend_constraints(&mut sim);
         compute_normals(&mut sim);
@@ -913,7 +1021,7 @@ fn step_cloth_respects_time_budget() {
         }
         verlet_integrate(&mut sim, 1.0 / 60.0);
         for _ in 0..sim.solver_iterations {
-            project_distance_constraints(&mut sim, &mut buffers);
+            project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
         }
         steps_completed += 1;
     }
@@ -962,7 +1070,7 @@ fn cloth_performance_overhead_is_bounded() {
     for _ in 0..iterations {
         verlet_integrate(&mut sim, 1.0 / 60.0);
         for _ in 0..sim.solver_iterations {
-            project_distance_constraints(&mut sim, &mut buffers);
+            project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
         }
         project_bend_constraints(&mut sim);
         compute_normals(&mut sim);

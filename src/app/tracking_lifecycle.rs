@@ -17,10 +17,13 @@ impl Application {
         fps: u32,
     ) {
         if let Some(ref mut worker) = self.tracking_worker {
-            if worker.is_running() {
-                worker.stop();
-                info!("app: stopped previous tracking worker for backend switch");
+            if !worker.stop() {
+                warn!(
+                    "app: previous tracking worker is still stopping; refusing overlapping restart"
+                );
+                return;
             }
+            info!("app: stopped previous tracking worker for backend switch");
         }
         // Tracking restart most likely means a different camera /
         // session / subject. Clear every avatar's motion-smoothing
@@ -44,8 +47,11 @@ impl Application {
     /// Stop the tracking worker thread. No-op if not running.
     pub fn stop_tracking(&mut self) {
         if let Some(ref mut worker) = self.tracking_worker {
-            worker.stop();
-            info!("app: tracking worker stopped");
+            if worker.stop() {
+                info!("app: tracking worker stopped");
+            } else {
+                warn!("app: tracking worker stop requested but thread is still alive");
+            }
         }
     }
 

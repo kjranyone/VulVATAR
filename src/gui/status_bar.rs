@@ -99,7 +99,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 ui.separator();
 
                 ui.label(
-                    egui::RichText::new(t!("status.frame", frame = state.frame_count))
+                    egui::RichText::new(t!("status.frame", frame = state.runtime_status.frame_count))
                         .font(typography::caption())
                         .color(color::ON_SURFACE_VARIANT),
                 );
@@ -109,13 +109,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     ui.label(
                         egui::RichText::new(t!(
                             "status.fps",
-                            fps = format!("{:.0}", state.fps),
-                            ms = format!("{:.1}", state.frame_time_ms)
+                            fps = format!("{:.0}", state.runtime_status.fps),
+                            ms = format!("{:.1}", state.runtime_status.frame_time_ms)
                         ))
                         .font(typography::caption())
                         .color(color::ON_SURFACE),
                     );
-                    if state.paused {
+                    if state.runtime_status.paused {
                         ui.label(
                             egui::RichText::new(t!("status.paused"))
                                 .font(typography::caption())
@@ -123,7 +123,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 .strong(),
                         );
                     }
-                    if state.project_dirty {
+                    if state.project_status.project_dirty {
                         ui.label(
                             egui::RichText::new(t!("status.modified"))
                                 .font(typography::caption())

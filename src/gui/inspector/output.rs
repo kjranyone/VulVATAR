@@ -45,11 +45,11 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         match state.app.set_requested_sink(want_sink) {
             Ok(()) => {
                 state.push_notification(t!("inspector.output_sink_changed", name = sink_names[new_idx].to_string()));
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             Err(e) => {
                 state.push_notification(t!("inspector.output_sink_failed", error = e.to_string()));
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         }
     }
@@ -107,7 +107,7 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         || state.output.output_has_alpha != prev_alpha
         || state.output.output_color_space_index != prev_cs
     {
-        state.project_dirty = true;
+        state.project_status.project_dirty = true;
     }
 
     let diagnostics = state.app.output.diagnostics();
@@ -144,6 +144,27 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                     egui::RichText::new(t!("inspector.handoff_fallback_warning"))
                         .color(egui::Color32::from_rgb(220, 160, 80)),
                 );
+                if let Some(reason) = diagnostics.fallback_reason.as_ref() {
+                    use crate::output::FallbackReason;
+                    let reason_key = match reason {
+                        FallbackReason::RequestedCpuReadback => {
+                            "inspector.handoff_fallback_reason_requested_cpu"
+                        }
+                        FallbackReason::ExternalHandleUnavailable => {
+                            "inspector.handoff_fallback_reason_external_handle"
+                        }
+                        FallbackReason::ExportPoolSaturated => {
+                            "inspector.handoff_fallback_reason_pool_saturated"
+                        }
+                        FallbackReason::MissingExternalHandle => {
+                            "inspector.handoff_fallback_reason_missing_handle"
+                        }
+                    };
+                    ui.label(
+                        egui::RichText::new(t!(reason_key))
+                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                    );
+                }
             }
         });
 
@@ -162,9 +183,59 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
             };
             ui.label(egui::RichText::new(t!(label_key)).color(color));
             ui.label(t!("inspector.queue_depth", depth = diagnostics.queue_depth));
+            if let Some(pool) = diagnostics.export_pool {
+                ui.label(t!(
+                    "inspector.export_pool",
+                    total = pool.total_slots,
+                    capacity = pool.capacity,
+                    available = pool.available_slots,
+                    leased = pool.leased_slots,
+                ));
+            }
             ui.label(t!(
                 "inspector.dropped_frames",
                 count = diagnostics.dropped_frame_count
+            ));
+        });
+
+    egui::CollapsingHeader::new(t!("inspector.runtime_budget"))
+        .default_open(false)
+        .show(ui, |ui| {
+            let budget = &state.app.runtime_gpu_budget;
+            use crate::app::runtime_gpu_budget::DegradedMode;
+            let mode_color = match budget.degraded_mode() {
+                DegradedMode::Healthy => egui::Color32::GREEN,
+                DegradedMode::PressureLight => egui::Color32::from_rgb(220, 200, 80),
+                DegradedMode::PressureHeavy => egui::Color32::from_rgb(220, 130, 60),
+                DegradedMode::EmergencyCpu => egui::Color32::from_rgb(220, 80, 80),
+            };
+            ui.label(
+                egui::RichText::new(t!(
+                    "inspector.runtime_budget_mode",
+                    mode = budget.degraded_mode().label().to_string()
+                ))
+                .color(mode_color),
+            );
+            ui.label(t!(
+                "inspector.runtime_budget_render_fps",
+                target = budget.render_fps_target(),
+                user = budget.user_render_fps(),
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_yolox_skip",
+                period = budget.yolox_skip_period()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_reason",
+                reason = budget.last_transition_reason().label().to_string()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_failures",
+                count = budget.gpu_export_failure_window_count()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_dropped_results",
+                count = state.app.render_results_dropped_count()
             ));
         });
 }

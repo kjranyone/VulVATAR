@@ -15,8 +15,8 @@
 
 use ndarray::Array4;
 
-use super::consts::{INPUT_H, INPUT_W, MEAN_RGB, STD_RGB};
 use super::super::yolox::PersonBbox;
+use super::consts::{INPUT_H, INPUT_W, MEAN_RGB, STD_RGB};
 
 // ---------------------------------------------------------------------------
 // YOLOX crop helpers

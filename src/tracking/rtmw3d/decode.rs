@@ -45,11 +45,7 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-pub(super) fn decode_simcc(
-    simcc_x: &[f32],
-    simcc_y: &[f32],
-    simcc_z: &[f32],
-) -> Vec<DecodedJoint> {
+pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) -> Vec<DecodedJoint> {
     let mut out = Vec::with_capacity(NUM_JOINTS);
     for j in 0..NUM_JOINTS {
         let x_slice = &simcc_x[j * SIMCC_X_BINS..(j + 1) * SIMCC_X_BINS];

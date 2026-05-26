@@ -35,7 +35,7 @@ pub(super) fn finalize_collection(
     // Pull the current samples out of the state; the WaitingForPose
     // escape-hatch path (Capture Now hit before any frames were
     // collected) yields an empty vec.
-    let samples: Vec<AnchorSample> = match &mut state.calibration_modal {
+    let samples: Vec<AnchorSample> = match &mut state.calibration.modal {
         CalibrationModalState::Collecting { samples, .. } => std::mem::take(samples),
         _ => Vec::new(),
     };
@@ -106,7 +106,7 @@ fn persist_calibration(state: &mut GuiApp, calibration: PoseCalibration) {
     if let Some(idx) = state.profiles.active_index {
         if let Some(profile) = state.profiles.profiles.get_mut(idx) {
             profile.pose_calibration = Some(calibration);
-            state.profiles_dirty = true;
+            state.project_status.profiles_dirty = true;
         }
     }
 }
@@ -136,11 +136,11 @@ pub(super) fn poll_torso_template(state: &mut GuiApp) {
         .app
         .tracking
         .mailbox()
-        .take_torso_template(state.calibration_torso_template_seq)
+        .take_torso_template(state.calibration.torso_template_seq)
     else {
         return;
     };
-    state.calibration_torso_template_seq = seq;
+    state.calibration.torso_template_seq = seq;
 
     // Stitch onto the active profile (and mark it dirty so the next
     // autosave persists the enriched calibration).
@@ -149,7 +149,7 @@ pub(super) fn poll_torso_template(state: &mut GuiApp) {
         if let Some(profile) = state.profiles.profiles.get_mut(idx) {
             if let Some(cal) = profile.pose_calibration.as_mut() {
                 cal.torso_depth_template = Some(template.clone());
-                state.profiles_dirty = true;
+                state.project_status.profiles_dirty = true;
                 updated = Some(cal.clone());
             }
         }
@@ -166,7 +166,7 @@ pub(super) fn poll_torso_template(state: &mut GuiApp) {
     }
     // Mirror onto the modal's own carried calibration so the
     // success-display reflects the template.
-    match &mut state.calibration_modal {
+    match &mut state.calibration.modal {
         CalibrationModalState::AnchorDone { calibration, .. }
         | CalibrationModalState::RangeHoldStill { calibration, .. }
         | CalibrationModalState::RangeCollecting { calibration, .. } => {
@@ -210,7 +210,7 @@ pub(super) fn finalize_range_collection(
     const MIN_RANGE_SAMPLES: usize = 10;
 
     let (mut calibration, x_range, z_range, samples_seen, z_was_metric) =
-        match &mut state.calibration_modal {
+        match &mut state.calibration.modal {
             CalibrationModalState::RangeCollecting {
                 calibration,
                 x_min,

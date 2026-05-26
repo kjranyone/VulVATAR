@@ -1,8 +1,11 @@
 use log::{error, info, warn};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::renderer::frame_input::RenderFrameInput;
+use crate::renderer::output_export::ExportedPixelData;
 use crate::renderer::{RenderResult, ThumbnailRenderResult, VulkanRenderer};
 
 pub enum RenderCommand {
@@ -26,27 +29,45 @@ pub enum RenderCommand {
     /// re-paid upload cost (~10–30 ms hitch on a fresh swap) is
     /// strictly cheaper than monotonic VRAM growth across a session.
     EvictCaches,
+    /// The output worker has finished consuming a GPU-exported frame.
+    /// Return its lease to the renderer-owned export pool so the slot may be
+    /// reused by a future frame.
+    ReleaseExportLease(u64),
     #[allow(dead_code)]
     Resize(u32, u32),
     Shutdown,
 }
 
+/// Latest-frame mailbox for `RenderResult` handoff (render thread →
+/// app). Replaces the original `sync_channel(2) + blocking send` model
+/// so that a momentarily slow app drain (modal, asset load, GUI
+/// hitch) cannot stall the render thread on `send`. When a previous
+/// result is still pending and a newer one is produced, the older
+/// result is dropped and accounted via `dropped` so the
+/// in-flight counter on the app side stays accurate; if the dropped
+/// result was carrying a GPU export lease, the lease is released back
+/// to the export pool so the slot doesn't leak.
+type ResultMailbox = Arc<Mutex<Option<RenderResult>>>;
+
 struct RenderThreadInner {
     renderer: VulkanRenderer,
     cmd_rx: Receiver<RenderCommand>,
-    result_tx: SyncSender<RenderResult>,
+    result_mailbox: ResultMailbox,
+    result_dropped: Arc<AtomicU64>,
 }
 
 pub struct RenderThread {
     cmd_tx: SyncSender<RenderCommand>,
-    result_rx: Receiver<RenderResult>,
+    result_mailbox: ResultMailbox,
+    result_dropped: Arc<AtomicU64>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl RenderThread {
     pub fn new(renderer: VulkanRenderer) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<RenderCommand>(2);
-        let (result_tx, result_rx) = mpsc::sync_channel::<RenderResult>(2);
+        let result_mailbox: ResultMailbox = Arc::new(Mutex::new(None));
+        let result_dropped = Arc::new(AtomicU64::new(0));
 
         let init_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let barrier_clone = init_barrier.clone();
@@ -54,7 +75,8 @@ impl RenderThread {
         let inner = RenderThreadInner {
             renderer,
             cmd_rx,
-            result_tx,
+            result_mailbox: Arc::clone(&result_mailbox),
+            result_dropped: Arc::clone(&result_dropped),
         };
 
         let handle = thread::Builder::new()
@@ -72,7 +94,8 @@ impl RenderThread {
 
         Self {
             cmd_tx,
-            result_rx,
+            result_mailbox,
+            result_dropped,
             handle: Some(handle),
         }
     }
@@ -114,15 +137,23 @@ impl RenderThread {
         rx
     }
 
+    /// Take the latest result if one has been published. Returns
+    /// `None` when the render thread hasn't produced anything new
+    /// since the last call.
     pub fn try_recv_result(&self) -> Option<RenderResult> {
-        match self.result_rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                warn!("render_thread: result channel disconnected");
-                None
-            }
-        }
+        self.result_mailbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Read-and-reset the count of results the render thread had to
+    /// drop because the app hadn't drained the mailbox yet. Each entry
+    /// corresponds to a render that completed on the GPU but never
+    /// reached `process_render_result`. The app uses this to keep its
+    /// `render_results_pending` counter accurate.
+    pub fn take_dropped_results(&self) -> u64 {
+        self.result_dropped.swap(0, Ordering::Relaxed)
     }
 
     pub fn shutdown(&mut self) {
@@ -141,6 +172,27 @@ impl Drop for RenderThread {
 }
 
 impl RenderThreadInner {
+    /// Publish a freshly produced result via the mailbox. If a previous
+    /// result was still pending, drop it and release its GPU lease (if
+    /// any) so the export pool slot doesn't leak — only the renderer
+    /// (i.e. this thread) is allowed to release, so the cleanup
+    /// happens here rather than across the boundary.
+    fn publish_result(&mut self, result: RenderResult) {
+        let prev = {
+            let mut mb = self
+                .result_mailbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            mb.replace(result)
+        };
+        if let Some(prev) = prev {
+            self.result_dropped.fetch_add(1, Ordering::Relaxed);
+            if let Some(lease_id) = lease_id_for_release(&prev) {
+                self.renderer.release_export_lease(lease_id);
+            }
+        }
+    }
+
     fn run(mut self) {
         info!("render_thread: started");
         loop {
@@ -154,13 +206,14 @@ impl RenderThreadInner {
 
             match cmd {
                 RenderCommand::RenderFrame(input) => {
-                    // On render error we still post an empty result back to
-                    // the app — `Application::render_results_pending` was
-                    // bumped on submit and would otherwise leak forever,
-                    // pinning the GUI's repaint gate at full rate. The
-                    // empty `exported_frame` makes `process_render_result`
-                    // a no-op (clears `rendered_pixels`) without surfacing
-                    // a fake successful frame to the output worker.
+                    // On render error we still publish an empty result back
+                    // to the app — `Application::render_results_pending`
+                    // was bumped on submit and would otherwise leak
+                    // forever, pinning the GUI's repaint gate at full
+                    // rate. The empty `exported_frame` makes
+                    // `process_render_result` a no-op (clears
+                    // `rendered_pixels`) without surfacing a fake
+                    // successful frame to the output worker.
                     let result = match self.renderer.render(&input) {
                         Ok(r) => r,
                         Err(e) => {
@@ -174,10 +227,7 @@ impl RenderThreadInner {
                             }
                         }
                     };
-                    if let Err(e) = self.result_tx.send(result) {
-                        error!("render_thread: failed to send result: {}", e);
-                        return;
-                    }
+                    self.publish_result(result);
                 }
                 RenderCommand::RenderThumbnail {
                     request,
@@ -187,7 +237,7 @@ impl RenderThreadInner {
                     // so the main viewport doesn't lose a frame's data
                     // to the upcoming synchronous thumbnail wait.
                     if let Ok(Some(prev)) = self.renderer.harvest_pending() {
-                        let _ = self.result_tx.try_send(prev);
+                        self.publish_result(prev);
                     }
                     let result = self.renderer.render_thumbnail(&request);
                     let _ = respond_to.send(result);
@@ -200,12 +250,136 @@ impl RenderThreadInner {
                     self.renderer.clear_caches();
                     info!("render_thread: caches evicted (avatar swap)");
                 }
+                RenderCommand::ReleaseExportLease(lease_id) => {
+                    self.renderer.release_export_lease(lease_id);
+                }
                 RenderCommand::Shutdown => {
                     info!("render_thread: shutdown received");
                     self.renderer.flush_pending();
+                    // On shutdown, any still-pending mailbox entry would
+                    // leak its lease. Drain explicitly so the export pool
+                    // doesn't keep a slot marked `Leased` past process
+                    // teardown.
+                    let leftover = self
+                        .result_mailbox
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    if let Some(prev) = leftover {
+                        if let Some(lease_id) = lease_id_for_release(&prev) {
+                            self.renderer.release_export_lease(lease_id);
+                        }
+                    }
                     return;
                 }
             }
         }
+    }
+}
+
+/// Extract the export pool lease id from a render result, if it
+/// carries a GPU-token frame. CPU-readback results have no leased
+/// slot and return `None`.
+fn lease_id_for_release(result: &RenderResult) -> Option<u64> {
+    let exported = result.exported_frame.as_ref()?;
+    match &exported.pixel_data {
+        ExportedPixelData::GpuFrameToken(_) => Some(exported.gpu_token_id),
+        ExportedPixelData::CpuReadback(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_handoff::{
+        ExternalHandleType, FrameLease, FrameLifetimeContract, GpuFrameToken, OutputSyncToken,
+    };
+    use crate::renderer::frame_input::RenderColorSpace;
+    use crate::renderer::output_export::{ExportMetadata, ExportedFrame};
+    use crate::renderer::RenderStats;
+    use crate::output::{FallbackReason, HandoffPath};
+    use std::sync::Arc;
+
+    fn empty_result() -> RenderResult {
+        RenderResult {
+            extent: [0, 0],
+            timestamp_nanos: 0,
+            has_alpha: false,
+            stats: RenderStats::default(),
+            exported_frame: None,
+        }
+    }
+
+    fn cpu_result() -> RenderResult {
+        RenderResult {
+            extent: [1, 1],
+            timestamp_nanos: 0,
+            has_alpha: false,
+            stats: RenderStats::default(),
+            exported_frame: Some(ExportedFrame {
+                pixel_data: ExportedPixelData::CpuReadback(Arc::new(vec![0, 0, 0, 255])),
+                extent: [1, 1],
+                timestamp_nanos: 0,
+                gpu_token_id: 0,
+                export_metadata: ExportMetadata {
+                    width: 1,
+                    height: 1,
+                    has_alpha: false,
+                    color_space: RenderColorSpace::Srgb,
+                    timestamp_nanos: 0,
+                },
+                handoff_path: HandoffPath::CpuReadback,
+                fallback_reason: Some(FallbackReason::RequestedCpuReadback),
+            }),
+        }
+    }
+
+    fn gpu_result(lease_id: u64) -> RenderResult {
+        let token = GpuFrameToken {
+            resource_id: 1,
+            handle_type: ExternalHandleType::Win32Kmt,
+            external_handle: None,
+            sync: OutputSyncToken::ProducerWaitComplete,
+            lease: FrameLease {
+                lease_id,
+                lifetime: FrameLifetimeContract::SingleConsumerImmediate,
+            },
+        };
+        RenderResult {
+            extent: [1, 1],
+            timestamp_nanos: 0,
+            has_alpha: false,
+            stats: RenderStats::default(),
+            exported_frame: Some(ExportedFrame {
+                pixel_data: ExportedPixelData::GpuFrameToken(token),
+                extent: [1, 1],
+                timestamp_nanos: 0,
+                gpu_token_id: lease_id,
+                export_metadata: ExportMetadata {
+                    width: 1,
+                    height: 1,
+                    has_alpha: false,
+                    color_space: RenderColorSpace::Srgb,
+                    timestamp_nanos: 0,
+                },
+                handoff_path: HandoffPath::GpuSharedFrame,
+                fallback_reason: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn lease_id_extraction_skips_results_without_a_lease() {
+        assert_eq!(lease_id_for_release(&empty_result()), None);
+        assert_eq!(
+            lease_id_for_release(&cpu_result()),
+            None,
+            "CPU readback frames carry no export pool slot"
+        );
+    }
+
+    #[test]
+    fn lease_id_extraction_returns_gpu_token_id_for_gpu_path() {
+        assert_eq!(lease_id_for_release(&gpu_result(42)), Some(42));
     }
 }

@@ -24,6 +24,14 @@ Keep these systems separate:
 - `editor / authoring layer`: create optional cloth overlays and save project-local authoring data
 - `avatar layer`: own runtime skeleton, pose, animation, and simulation state
 - `simulation layer`: update spring bones, colliders, and cloth
+  - cloth simulation is CPU XPBD (`simulation/cloth_solver`,
+    Macklin/Müller/Chentanez MIG 2016); a GPU compute path
+    (`renderer/pipeline::cloth_verlet_cs`, `cloth_constraint_*_cs`,
+    `cloth_normal_cs`) is wired and selected per-cloth via
+    `ClothState::solver_backend`. Production attach paths default to
+    `Cpu`; nothing in `RuntimeGpuBudget` currently flips the backend,
+    so the GPU path is exercised only by parity tests and manual
+    override today.
 - `renderer layer`: own Vulkan resources and shading
 - `tracking layer`: estimate performer motion from camera input
 - `capture/output layer`: export rendered frames to external video consumers
@@ -777,6 +785,7 @@ Detailed contracts for data shapes, persistence, threading, tracking, and output
 - [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
 - [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
 - [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md)
+- [gpu-runtime-roadmap.md](/C:/lib/github/kjranyone/VulVATAR/docs/gpu-runtime-roadmap.md)
 - [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
 - [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
 - [rendering-materials.md](/C:/lib/github/kjranyone/VulVATAR/docs/rendering-materials.md)

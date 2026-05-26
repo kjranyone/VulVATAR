@@ -114,13 +114,13 @@ impl GuiApp {
     /// Called once per frame from `update()`.
     pub(super) fn poll_avatar_load_job(&mut self) {
         // Drain progress messages; bail if no terminal outcome arrived yet.
-        let outcome = match self.avatar_load_job.as_mut().and_then(|j| j.poll()) {
+        let outcome = match self.library.avatar_load_job.as_mut().and_then(|j| j.poll()) {
             Some(o) => o,
             None => return,
         };
 
         // Worker finished — take ownership so we can mutate other GuiApp fields.
-        let job = self.avatar_load_job.take().expect("job still present");
+        let job = self.library.avatar_load_job.take().expect("job still present");
         if let Some(handle) = job.worker {
             let _ = handle.join();
         }
@@ -135,8 +135,8 @@ impl GuiApp {
                 } = job.after_load
                 {
                     self.apply_project_state(&project_state);
-                    self.project_path = Some(project_path.clone());
-                    self.project_dirty = false;
+                    self.project_status.project_path = Some(project_path.clone());
+                    self.project_status.project_dirty = false;
                     for w in &warnings.warnings {
                         self.push_notification(t!("toast.warning", msg = w.to_string()));
                     }

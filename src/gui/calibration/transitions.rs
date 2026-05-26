@@ -24,7 +24,7 @@ use super::{COLLECTION_SECONDS, RANGE_COLLECTION_SECONDS, RANGE_HOLD_STILL_SECON
 /// at" telemetry on the variant.
 pub(super) fn begin_capture(state: &mut GuiApp) {
     let _now = Instant::now();
-    let next = match &state.calibration_modal {
+    let next = match &state.calibration.modal {
         CalibrationModalState::Idle { mode, .. } => {
             Some(CalibrationModalState::WaitingForPose {
                 mode: *mode,
@@ -39,7 +39,7 @@ pub(super) fn begin_capture(state: &mut GuiApp) {
         _ => None,
     };
     if let Some(s) = next {
-        state.calibration_modal = s;
+        state.calibration.modal = s;
     }
 }
 
@@ -61,15 +61,15 @@ pub(super) fn begin_capture(state: &mut GuiApp) {
 /// about to publish from the previous capture window doesn't leak
 /// into the new attempt's `poll_torso_template`.
 pub(super) fn retry_capture(state: &mut GuiApp) {
-    let mode = match &state.calibration_modal {
+    let mode = match &state.calibration.modal {
         CalibrationModalState::AnchorDone { mode, .. } => Some(*mode),
         _ => None,
     };
     if let Some(mode) = mode {
         state.app.tracking.mailbox().set_torso_capture(false);
-        state.calibration_torso_template_seq =
+        state.calibration.torso_template_seq =
             state.app.tracking.mailbox().torso_template_seq();
-        state.calibration_modal.open(mode);
+        state.calibration.modal.open(mode);
     }
 }
 
@@ -79,14 +79,14 @@ pub(super) fn retry_capture(state: &mut GuiApp) {
 /// `finalize_collection`, so there's nothing else to write.
 pub(super) fn skip_range(state: &mut GuiApp) {
     let now = Instant::now();
-    let next = match &state.calibration_modal {
+    let next = match &state.calibration.modal {
         CalibrationModalState::AnchorDone {
             mode, calibration, ..
         } => Some(transition_to_done_success(*mode, calibration.clone(), now)),
         _ => None,
     };
     if let Some(s) = next {
-        state.calibration_modal = s;
+        state.calibration.modal = s;
     }
 }
 
@@ -96,7 +96,7 @@ pub(super) fn skip_range(state: &mut GuiApp) {
 /// so `finalize_range_collection` can update it in place.
 pub(super) fn begin_range_capture(state: &mut GuiApp) {
     let now = Instant::now();
-    let next = match &state.calibration_modal {
+    let next = match &state.calibration.modal {
         CalibrationModalState::AnchorDone {
             mode, calibration, ..
         } => Some(CalibrationModalState::RangeHoldStill {
@@ -108,7 +108,7 @@ pub(super) fn begin_range_capture(state: &mut GuiApp) {
         _ => None,
     };
     if let Some(s) = next {
-        state.calibration_modal = s;
+        state.calibration.modal = s;
     }
 }
 
@@ -125,7 +125,7 @@ pub(super) fn begin_range_capture(state: &mut GuiApp) {
 /// - `RangeCollecting`        → `Done` via [`finalize_range_collection`].
 pub(super) fn advance_state(state: &mut GuiApp) {
     let now = Instant::now();
-    let next = match &state.calibration_modal {
+    let next = match &state.calibration.modal {
         CalibrationModalState::WaitingForPose {
             mode,
             frames_at_match,
@@ -192,7 +192,7 @@ pub(super) fn advance_state(state: &mut GuiApp) {
         _ => None,
     };
     if let Some(s) = next {
-        state.calibration_modal = s;
+        state.calibration.modal = s;
     }
 }
 
@@ -216,7 +216,7 @@ pub(super) fn advance_state(state: &mut GuiApp) {
 ///   we accumulated.
 pub(super) fn finish_capture(state: &mut GuiApp) {
     let now = Instant::now();
-    let next = match &state.calibration_modal {
+    let next = match &state.calibration.modal {
         CalibrationModalState::WaitingForPose { mode, .. } => {
             // Bypass the gate: kick off Collecting straight away so
             // the 2-second sample window starts now. Same torso-capture
@@ -243,7 +243,7 @@ pub(super) fn finish_capture(state: &mut GuiApp) {
         _ => None,
     };
     if let Some(s) = next {
-        state.calibration_modal = s;
+        state.calibration.modal = s;
     }
 }
 

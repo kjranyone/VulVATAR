@@ -6,9 +6,12 @@ use crate::avatar::AvatarInstance;
 use crate::simulation::cloth::{ClothSimTempBuffers, ResolvedCollider};
 
 mod collision;
-mod constraints;
-mod integrator;
-mod output;
+// `pub(crate)` so the GPU cloth boundary's formula-parity tests can
+// call them directly to compare the GLSL shaders' formulas against
+// the CPU XPBD references.
+pub(crate) mod constraints;
+pub(crate) mod integrator;
+pub(crate) mod output;
 
 #[cfg(test)]
 mod tests;
@@ -42,6 +45,16 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
         _ => return,
     };
 
+    // For Gpu-backed cloth the renderer dispatches the integration /
+    // constraint projection / normal recomputation compute pipelines;
+    // running the CPU XPBD path on top would waste CPU cycles and the
+    // resulting deform_output would just be ignored by the renderer.
+    if cloth_state.solver_backend
+        == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+    {
+        return;
+    }
+
     // ---- lazy init of sim state -----------------------------------------------
     let sim = match avatar.cloth_sim.as_mut() {
         Some(s) if s.initialized => s,
@@ -73,10 +86,15 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
     // ---- Verlet integration ---------------------------------------------------
     integrator::verlet_integrate(sim, dt);
 
+    // ---- reset XPBD Lagrange multipliers for this substep --------------------
+    // The lambda buffer accumulates across `solver_iterations` projection
+    // passes inside one substep; the next substep starts fresh.
+    buffers.reset_lambda(sim.distance_constraints.len());
+
     // ---- constraint projection (iterative) ------------------------------------
     let iterations = sim.solver_iterations;
     for _ in 0..iterations {
-        constraints::project_distance_constraints(sim, buffers);
+        constraints::project_distance_constraints(sim, buffers, dt);
         constraints::project_bend_constraints(sim);
     }
 
@@ -119,6 +137,12 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
         if !slot.enabled {
             continue;
         }
+        // Skip CPU PBD for Gpu-backed overlays — renderer drives them.
+        if slot.state.solver_backend
+            == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+        {
+            continue;
+        }
 
         let particle_count = slot.sim.particle_count();
         if particle_count == 0 || !slot.sim.initialized {
@@ -132,9 +156,14 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
         collision::apply_pin_targets(&mut slot.sim, &global_transforms);
         integrator::verlet_integrate(&mut slot.sim, dt);
 
+        // XPBD lambda reset per substep — see `step_cloth_single` for
+        // the lifecycle rationale.
+        slot.buffers
+            .reset_lambda(slot.sim.distance_constraints.len());
+
         let iterations = slot.sim.solver_iterations;
         for _ in 0..iterations {
-            constraints::project_distance_constraints(&mut slot.sim, &mut slot.buffers);
+            constraints::project_distance_constraints(&mut slot.sim, &mut slot.buffers, dt);
             constraints::project_bend_constraints(&mut slot.sim);
         }
 

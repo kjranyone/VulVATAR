@@ -10,7 +10,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         .checkbox(&mut state.tracking.toggle_tracking, t!("tracking.enabled"))
         .changed()
     {
-        state.project_dirty = true;
+        state.project_status.project_dirty = true;
     }
     ui.add_space(4.0);
 
@@ -38,7 +38,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     });
                 if state.camera_index != prev_camera {
-                    state.project_dirty = true;
+                    state.project_status.project_dirty = true;
                 }
                 if icon_button(ui, ic::REFRESH, &t!("tracking.refresh")).clicked() {
                     state.available_cameras = crate::tracking::list_cameras();
@@ -94,17 +94,17 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             });
             if ui
-                .checkbox(&mut state.show_camera_wipe, t!("tracking.camera_wipe"))
+                .checkbox(&mut state.viewport.show_camera_wipe, t!("tracking.camera_wipe"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
-            if state.show_camera_wipe
+            if state.viewport.show_camera_wipe
                 && ui
-                    .checkbox(&mut state.show_detection_annotations, t!("tracking.show_annotations"))
+                    .checkbox(&mut state.viewport.show_detection_annotations, t!("tracking.show_annotations"))
                     .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             let prev_res = state.tracking.camera_resolution_index;
             egui::ComboBox::from_label(t!("tracking.resolution"))
@@ -124,7 +124,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
             let res_changed = state.tracking.camera_resolution_index != prev_res;
             if res_changed {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             let prev_fps = state.tracking.camera_framerate_index;
             egui::ComboBox::from_label(t!("tracking.frame_rate"))
@@ -139,7 +139,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
             let fps_changed = state.tracking.camera_framerate_index != prev_fps;
             if fps_changed {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             // Phase B-1: if the webcam is currently running, restart it with
             // the new params so the change takes effect immediately rather
@@ -166,7 +166,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .checkbox(&mut state.tracking.tracking_mirror, t!("tracking.mirror_preview"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
         });
 
@@ -223,13 +223,13 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .checkbox(&mut state.tracking.hand_tracking_enabled, t!("tracking.hand_tracking"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .checkbox(&mut state.tracking.face_tracking_enabled, t!("tracking.face_tracking"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             let lower_body_resp = ui
                 .checkbox(
@@ -240,7 +240,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     t!("tracking.lower_body_tooltip"),
                 );
             if lower_body_resp.changed() {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             if ui
                 .checkbox(
@@ -250,7 +250,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .on_hover_text(t!("tracking.root_translation_tooltip"))
                 .changed()
             {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -274,7 +274,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 // click target reachable through the (paint-only)
                 // scrim. Same gate enforced on the open() side just
                 // below, in case the button somehow fires anyway.
-                let calib_enabled = state.avatar_load_job.is_none();
+                let calib_enabled = state.library.avatar_load_job.is_none();
                 if filled_button(ui, None, &t!("calibration.button"), calib_enabled).clicked()
                     && calib_enabled
                 {
@@ -293,7 +293,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .as_ref()
                         .map(|c| c.mode)
                         .unwrap_or(crate::tracking::CalibrationMode::FullBody);
-                    state.calibration_modal.open(default_mode);
+                    state.calibration.modal.open(default_mode);
                 }
             });
             draw_calibration_status(ui, state);
@@ -376,7 +376,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     if new_mic != active_mic {
         match state.app.set_requested_lipsync(requested_enabled, new_mic) {
             Ok(()) => {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
             }
             Err(e) => {
                 // Mic device init failed — surface the error but
@@ -393,7 +393,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     if ui.checkbox(&mut new_enabled, t!("tracking.enable_lip_sync")).changed() {
         match state.app.set_requested_lipsync(new_enabled, active_mic) {
             Ok(()) => {
-                state.project_dirty = true;
+                state.project_status.project_dirty = true;
                 if new_enabled {
                     state.push_notification(t!("tracking.lip_sync_started").to_string());
                 } else {
@@ -463,13 +463,13 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         )
         .changed()
     {
-        state.project_dirty = true;
+        state.project_status.project_dirty = true;
     }
     if ui
         .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text(t!("tracking.smoothing")))
         .changed()
     {
-        state.project_dirty = true;
+        state.project_status.project_dirty = true;
     }
 }
 

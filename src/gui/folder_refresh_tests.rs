@@ -52,7 +52,7 @@ fn refresh_imports_new_vrm_files_in_watched_folder() {
     std::fs::write(&vrm_path, b"not a real vrm").expect("seed VRM");
 
     let mut harness = GuiApp::for_test();
-    harness.watched_avatar_dirs.push(dir.clone());
+    harness.library.watched_avatar_dirs.push(dir.clone());
     let before = harness.app.avatar_library.entries.len();
 
     harness.refresh_watched_folders();

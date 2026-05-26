@@ -15,37 +15,37 @@ use super::GuiApp;
 
 impl GuiApp {
     pub fn start_watching_folder(&mut self, path: std::path::PathBuf) -> Result<(), String> {
-        if self.watched_avatar_dirs.iter().any(|p| p == &path) {
+        if self.library.watched_avatar_dirs.iter().any(|p| p == &path) {
             return Ok(()); // idempotent
         }
-        if self.folder_watcher.is_none() {
-            self.folder_watcher = Some(crate::app::folder_watcher::FolderWatcher::new());
+        if self.library.folder_watcher.is_none() {
+            self.library.folder_watcher = Some(crate::app::folder_watcher::FolderWatcher::new());
         }
 
-        if let Some(ref mut fw) = self.folder_watcher {
+        if let Some(ref mut fw) = self.library.folder_watcher {
             fw.watch(&path, true)?;
-            self.watched_avatar_dirs.push(path.clone());
+            self.library.watched_avatar_dirs.push(path.clone());
             self.push_notification(t!("toast.watched_folder", path = path.display().to_string()));
-            let _ = crate::persistence::save_watched_folders(&self.watched_avatar_dirs);
+            let _ = crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs);
         }
         Ok(())
     }
 
     pub fn stop_watching_folder(&mut self, path: &std::path::Path) -> Result<(), String> {
-        if let Some(ref mut fw) = self.folder_watcher {
+        if let Some(ref mut fw) = self.library.folder_watcher {
             fw.unwatch(path)?;
-            self.watched_avatar_dirs.retain(|p| p != path);
+            self.library.watched_avatar_dirs.retain(|p| p != path);
             self.push_notification(t!("toast.stopped_watching", path = path.display().to_string()));
-            let _ = crate::persistence::save_watched_folders(&self.watched_avatar_dirs);
-            if self.watched_avatar_dirs.is_empty() {
-                self.folder_watcher = None;
+            let _ = crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs);
+            if self.library.watched_avatar_dirs.is_empty() {
+                self.library.folder_watcher = None;
             }
         }
         Ok(())
     }
 
     pub(super) fn poll_folder_watcher(&mut self) {
-        let Some(ref mut fw) = self.folder_watcher else {
+        let Some(ref mut fw) = self.library.folder_watcher else {
             return;
         };
         let events = fw.poll().to_vec();
@@ -75,7 +75,7 @@ impl GuiApp {
     /// `folder_watcher.rs` module docstring for which environments
     /// (UNC, OneDrive, symlinks) need this routinely.
     pub fn refresh_watched_folders(&mut self) {
-        let dirs: Vec<std::path::PathBuf> = self.watched_avatar_dirs.clone();
+        let dirs: Vec<std::path::PathBuf> = self.library.watched_avatar_dirs.clone();
         let mut imported = 0usize;
         for dir in &dirs {
             if !dir.exists() {
@@ -141,7 +141,7 @@ impl GuiApp {
             if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {
                 entry.update_from_asset_with_thumbnail_dir(
                     &asset,
-                    self.thumbnail_gen.output_dir(),
+                    self.library.thumbnail_gen.output_dir(),
                 );
             }
         }
@@ -151,7 +151,7 @@ impl GuiApp {
             .is_none_or(|p| !p.exists())
         {
             entry.thumbnail_path = self
-                .thumbnail_gen
+                .library.thumbnail_gen
                 .generate_and_save_placeholder(&entry.name);
         }
         self.app.avatar_library.add(entry);

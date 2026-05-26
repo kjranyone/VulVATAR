@@ -40,20 +40,27 @@ Avoid giant feature-flag shaders as the default architecture.
 
 ## Vertex Shader Responsibilities
 
-The main avatar vertex shader should handle:
+After the compute prepass migration (landed on
+`feature/compute-prepass-migration`, 2026-05-19), the main avatar
+vertex shader is intentionally tiny:
 
-- vertex skinning
-- optional cloth deformation application
-- normal transformation
-- tangent transformation if used
-- clip-space projection
-- passing normalized material inputs to the fragment stage
+- clip-space projection (`view * proj` applied to the world-space input)
+- passing normalized material inputs (UV, world position, world normal) to
+  the fragment stage
 
-It should not contain:
+Everything that used to live in the vertex stage — vertex skinning, morph
+blending, cloth deformation, normal/tangent transformation — has moved to
+the per-primitive **transform compute prepass** (`pipeline::transform_cs`)
+that runs ahead of the graphics passes each frame. The prepass writes
+world-space vertices into a persistent SSBO bound as the graphics vertex
+buffer.
+
+The vertex shader should not contain:
 
 - material-schema interpretation
 - output sink logic
 - tracking logic
+- skinning, morph, or cloth math (those belong to the compute prepass)
 
 ## Fragment Shader Responsibilities
 
@@ -73,34 +80,65 @@ It should not:
 
 ## Skinning Notes
 
-Recommended first path:
+Skinning lives in the transform compute prepass, not in the graphics
+vertex shader. The shape is unchanged on the input side:
 
 - up to four weights per vertex
-- skinning matrices uploaded per instance
-- matrix blend in the vertex shader
+- skinning matrices uploaded per instance (one SSBO per `AvatarInstance`,
+  bound at compute set 1)
 
-Pseudo flow:
+The blend itself is Dual Quaternion Skinning (DQS, Kavan et al. I3D
+2007), not linear blend:
 
-```text
-skinned_position =
-    weight0 * (joint_matrix0 * rest_position) +
-    weight1 * (joint_matrix1 * rest_position) +
-    weight2 * (joint_matrix2 * rest_position) +
-    weight3 * (joint_matrix3 * rest_position)
-```
+1. extract a rotation quaternion from each joint's skinning matrix
+   (Mike Day's mat3→quat case-split — see `pipeline::transform_cs`)
+2. pick the first non-zero-weight joint as the antipodal reference;
+   flip subsequent contributing quaternions when `dot(qi, ref) < 0`
+3. weighted-blend the (flipped) quaternions and renormalise
+4. recover translation as the weighted average of each joint matrix's
+   `m[3].xyz` (kept separate from the quaternion blend because the
+   source matrices are `global · inverse_bind` products with
+   already-world-space translations)
+5. apply: `pos' = quat_rotate(q, pos) + t`,
+   `nrm' = quat_rotate(q, nrm)`
 
-The same principle applies to normals, but with the appropriate normal-space transform rather than blindly reusing the position path.
+`source_position` is the morph- and (optionally) cloth-resolved position
+described below; the prepass applies skinning on top so cloth-bearing
+primitives still ride the avatar's root transform. DQS eliminates the
+candy-wrapper twist artefact at joints with non-trivial rotational
+delta (forearm pronation, hip yaw, neck twist) that classic LBS shows.
+
+Assumption: skinning matrices are rigid (rotation + translation only).
+Non-uniform scale in inverse-bind matrices is silently lost by the
+mat3→quat extraction.
 
 ## Cloth Deformation Notes
 
-The first renderer path should treat cloth as an additive deformation input or mapped replacement, depending on `ClothMeshMapping`.
+Cloth deformation runs inside the same transform compute prepass. The
+CPU solver writes per-frame `vec4` positions (and optionally normals)
+into the primitive's `cloth_pos_ssbo` / `cloth_norm_ssbo`, and the
+prepass switches its position / normal source from the morph-blended
+base to the cloth buffer when the per-primitive `has_cloth` /
+`has_cloth_normals` flags in `TransformControl` are non-zero. Skinning
+is applied after the cloth override so cloth-bearing primitives still
+ride the avatar's root transform — consistent with cloth reacting to
+already-driven body motion.
 
-Recommended first rule:
+Cloth is **scoped per primitive** (`ClothDeformSnapshot::target_primitive_id`)
+and per vertex subset (`vertex_offset` / `vertex_count`). The renderer
+matches each snapshot against the primitive it targets and writes the
+deform only into the subset range; vertices outside that range — and
+all vertices of primitives the snapshot does not target — stay at
+their morph-blended / skinning rest pose. Primitives with no matching
+snapshot bind the shared stub SSBO and pay no cloth cost.
 
-- skinning establishes base pose
-- cloth deformation is applied after skinning in the vertex stage
-
-This is consistent with cloth reacting to already-driven body motion.
+Target resolution: `ClothState::target_primitive_id` is populated from
+the attached `ClothAsset::render_bindings[0]` at `init_cloth_sim` /
+`init_cloth_overlay` time. A cloth that has been authored but not yet
+bound to a render target (no `render_bindings`) simulates but does
+not contribute to any draw — that's a deliberate "well-defined no
+cloth" state instead of the old "broadcasts to every primitive in
+the instance" footgun.
 
 ## Toon-Like Lighting Notes
 

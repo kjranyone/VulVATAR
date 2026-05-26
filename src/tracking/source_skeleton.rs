@@ -198,4 +198,124 @@ impl SourceSkeleton {
             self.joints.insert(bone, joint);
         }
     }
+
+    /// Multiply every confidence channel by `scale`, clamped to
+    /// `[0.0, 1.0]`. Used by the tracking hold/fade policy in
+    /// [`crate::app::Application::run_frame`]: when the mailbox is
+    /// stale but still inside the hold window, the last known sample
+    /// is reused with confidence decayed linearly so that joints fall
+    /// below the solver's threshold gradually rather than the avatar
+    /// snapping back to its base pose.
+    ///
+    /// Positions are left untouched — the avatar should *freeze* and
+    /// then fade, not blend toward an arbitrary intermediate position
+    /// while the tracker is briefly silent. Expression weights are
+    /// also left untouched: `solve_expressions` reads
+    /// `face_mesh_confidence` against the user threshold and skips
+    /// updates when the face is below confidence, so the smoothing
+    /// path takes care of the expression decay implicitly.
+    pub fn scale_confidence(&mut self, scale: f32) {
+        let scale = scale.clamp(0.0, 1.0);
+        for joint in self.joints.values_mut() {
+            joint.confidence *= scale;
+        }
+        for tip in self.fingertips.values_mut() {
+            tip.confidence *= scale;
+        }
+        if let Some(face) = self.face.as_mut() {
+            face.confidence *= scale;
+        }
+        if let Some(conf) = self.face_mesh_confidence.as_mut() {
+            *conf *= scale;
+        }
+        if let Some(hand) = self.left_hand_orientation.as_mut() {
+            hand.confidence *= scale;
+        }
+        if let Some(hand) = self.right_hand_orientation.as_mut() {
+            hand.confidence *= scale;
+        }
+        self.overall_confidence *= scale;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asset::HumanoidBone;
+
+    fn populated() -> SourceSkeleton {
+        let mut s = SourceSkeleton::empty(0);
+        s.overall_confidence = 0.8;
+        s.face_mesh_confidence = Some(0.9);
+        s.joints.insert(
+            HumanoidBone::Hips,
+            SourceJoint {
+                position: [0.0, 0.0, 0.0],
+                confidence: 0.6,
+                metric_depth_m: None,
+            },
+        );
+        s.fingertips.insert(
+            HumanoidBone::LeftIndexDistal,
+            SourceJoint {
+                position: [0.0, 0.0, 0.0],
+                confidence: 0.5,
+                metric_depth_m: None,
+            },
+        );
+        s.face = Some(FacePose {
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            confidence: 0.7,
+        });
+        s.left_hand_orientation = Some(HandOrientation {
+            forward: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            confidence: 0.4,
+        });
+        s
+    }
+
+    #[test]
+    fn scale_confidence_halves_every_channel() {
+        let mut s = populated();
+        let pos = s.joints[&HumanoidBone::Hips].position;
+        s.scale_confidence(0.5);
+        assert!((s.overall_confidence - 0.4).abs() < 1e-6);
+        assert!((s.face_mesh_confidence.unwrap() - 0.45).abs() < 1e-6);
+        assert!((s.joints[&HumanoidBone::Hips].confidence - 0.3).abs() < 1e-6);
+        assert!(
+            (s.fingertips[&HumanoidBone::LeftIndexDistal].confidence - 0.25).abs() < 1e-6,
+        );
+        assert!((s.face.unwrap().confidence - 0.35).abs() < 1e-6);
+        assert!((s.left_hand_orientation.unwrap().confidence - 0.2).abs() < 1e-6);
+        assert_eq!(
+            s.joints[&HumanoidBone::Hips].position,
+            pos,
+            "scaling confidence must not perturb joint positions",
+        );
+    }
+
+    #[test]
+    fn scale_confidence_zero_drives_all_signals_to_zero() {
+        let mut s = populated();
+        s.scale_confidence(0.0);
+        assert_eq!(s.overall_confidence, 0.0);
+        assert_eq!(s.face_mesh_confidence, Some(0.0));
+        assert_eq!(s.joints[&HumanoidBone::Hips].confidence, 0.0);
+        assert_eq!(s.face.unwrap().confidence, 0.0);
+    }
+
+    #[test]
+    fn scale_confidence_clamps_out_of_range_input() {
+        let mut s = populated();
+        s.scale_confidence(2.0);
+        // Clamped to 1.0 — original values preserved.
+        assert!((s.overall_confidence - 0.8).abs() < 1e-6);
+        let mut t = populated();
+        t.scale_confidence(-1.0);
+        // Clamped to 0.0.
+        assert_eq!(t.overall_confidence, 0.0);
+    }
 }

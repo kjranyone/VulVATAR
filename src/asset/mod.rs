@@ -327,7 +327,15 @@ pub struct SkeletonNode {
 pub struct MeshAsset {
     pub id: MeshId,
     pub name: String,
-    pub primitives: Vec<MeshPrimitiveAsset>,
+    /// Primitives wrapped in `Arc` so the renderer can hand out
+    /// per-frame snapshot references without cloning the per-primitive
+    /// vertex / index / morph payload. Wrapping at the asset level
+    /// (rather than via a separate `primitive_arcs` field on
+    /// `AvatarInstance`) means multiple instances of the same loaded
+    /// asset share storage and no per-frame deep copy ever happens —
+    /// the previous design built a fresh `Arc::new(prim.clone())` per
+    /// instance and re-copied vertex data into the heap on each spawn.
+    pub primitives: Vec<std::sync::Arc<MeshPrimitiveAsset>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -620,6 +628,15 @@ pub struct ClothRenderRegionBinding {
     pub primitive: PrimitiveRef,
     pub vertex_subset: VertexSubsetRef,
     pub mapping_region: ClothRegionTag,
+    /// Mesh that owns `primitive`. Populated by `cloth_rebind` once the
+    /// overlay has been resolved against an `AvatarAsset`. Older
+    /// serialised overlays predate this field and default to `None`;
+    /// loaders should treat a `None` here as "look up the mesh from the
+    /// primitive id at the next rebind" — `PrimitiveId` is globally
+    /// unique within an avatar so the renderer can still match by
+    /// primitive id alone.
+    #[serde(default)]
+    pub mesh: Option<MeshRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
