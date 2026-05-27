@@ -139,6 +139,9 @@ impl GuiApp {
             output_framerate_index: self.output.output_framerate_index,
             output_has_alpha: self.output.output_has_alpha,
             output_color_space_index: self.output.output_color_space_index,
+            // MSAA lives on the Rendering panel (RenderingGuiState) but is
+            // stored in the project's output.msaa_index slot.
+            output_msaa_index: self.rendering.msaa_index,
 
             settings_locale: self.settings.locale.clone(),
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,
@@ -290,6 +293,7 @@ impl GuiApp {
         self.output.output_framerate_index = state.output_framerate_index;
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
+        self.rendering.msaa_index = state.output_msaa_index;
 
         self.settings.locale = state.settings_locale.clone();
         self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;

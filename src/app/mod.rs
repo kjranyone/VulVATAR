@@ -66,6 +66,11 @@ pub struct FrameInputConfig {
     /// keeps receiving raw RGBA bytes. Decoupled from any GUI setting so a
     /// sink swap is the single source of truth for the export path.
     pub export_mode: crate::renderer::frame_input::RenderExportMode,
+    /// User-selected MSAA level. Forwarded to `OutputTargetRequest.msaa`;
+    /// the renderer clamps it to device support and applies it to the
+    /// offscreen render pass / pipelines (affects both the preview and the
+    /// exported frame, which share the offscreen target).
+    pub output_msaa: crate::renderer::frame_input::MsaaMode,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -167,6 +172,12 @@ pub struct Application {
     /// effects on render target format and MF media type land in later
     /// stages.
     pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
+    /// User-selected MSAA level. Synced from the GUI Rendering panel
+    /// (`rendering.msaa_index`) each frame and forwarded to the renderer
+    /// through `OutputTargetRequest.msaa`. The renderer clamps it to device
+    /// support (and caps integrated GPUs at 4x); the offscreen target is
+    /// shared by preview + export, so the chosen level antialiases both.
+    pub output_msaa: crate::renderer::frame_input::MsaaMode,
     /// Solid background colour the Vulkan renderer clears to when
     /// `transparent_background` is false. Synced from the Inspector's
     /// "Scene Background" panel each frame.
@@ -340,6 +351,7 @@ impl Application {
             output_extent: None,
             output_preserve_alpha: false,
             output_color_space: crate::renderer::frame_input::RenderColorSpace::Srgb,
+            output_msaa: crate::renderer::frame_input::MsaaMode::Off,
             background_color: [0.1, 0.1, 0.1],
             transparent_background: true,
             tracking_worker: None,

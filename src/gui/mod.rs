@@ -414,6 +414,12 @@ pub struct RenderingGuiState {
     pub main_light_intensity: f32,
     pub ambient_intensity: [f32; 3],
     pub alpha_preview: bool,
+    /// Anti-aliasing (MSAA) level: 0=Off, 1=2x, 2=4x, 3=8x. Reconciled into
+    /// `app.output_msaa` each frame and persisted (stored in the project's
+    /// `output.msaa_index` slot). The renderer clamps the level to the
+    /// device's framebuffer sample-count support (and caps iGPUs at 4x), so
+    /// an unsupported pick silently degrades.
+    pub msaa_index: usize,
     pub toggle_spring: bool,
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
@@ -734,6 +740,7 @@ impl GuiApp {
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
                 alpha_preview: false,
+                msaa_index: 0,
                 toggle_spring: true,
                 toggle_cloth: false,
                 toggle_collision_debug: false,
@@ -948,6 +955,7 @@ impl GuiApp {
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
                 alpha_preview: false,
+                msaa_index: 0,
                 toggle_spring: true,
                 toggle_cloth: false,
                 toggle_collision_debug: false,
@@ -1195,6 +1203,11 @@ impl eframe::App for GuiApp {
             1 => crate::renderer::frame_input::RenderColorSpace::LinearSrgb,
             _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
         };
+
+        // Forward the anti-aliasing pick. The renderer rebuilds its render
+        // pass + pipelines on change and clamps the level to device support.
+        self.app.output_msaa =
+            crate::renderer::frame_input::MsaaMode::from_index(self.rendering.msaa_index);
 
         if !self.runtime_status.paused {
             let real_dt = (self.runtime_status.frame_time_ms / 1000.0) as f32;

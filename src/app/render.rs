@@ -243,6 +243,7 @@ impl Application {
                 transparent_background: self.transparent_background,
                 avatar_opacity: self.tracking_fade_opacity,
                 output_color_space: self.output_color_space.clone(),
+                output_msaa: self.output_msaa,
                 export_mode,
             };
             let frame_input = Self::build_frame_input_multi(
@@ -762,6 +763,7 @@ impl Application {
                 color_space: fi_config.output_color_space.clone(),
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: fi_config.export_mode.clone(),
+                msaa: fi_config.output_msaa,
             },
             background_image_path: background_image_path.map(|p| p.to_path_buf()),
             show_ground_grid,

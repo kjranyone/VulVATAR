@@ -314,6 +314,7 @@ fn build_frame_input(
             color_space: vulvatar_lib::renderer::frame_input::RenderColorSpace::Srgb,
             alpha_mode: RenderOutputAlpha::Premultiplied,
             export_mode: vulvatar_lib::renderer::frame_input::RenderExportMode::CpuReadback,
+            msaa: vulvatar_lib::renderer::frame_input::MsaaMode::Off,
         },
         background_image_path: None,
         show_ground_grid: false,

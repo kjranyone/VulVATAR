@@ -235,6 +235,10 @@ pub struct OutputTargetRequest {
     pub color_space: RenderColorSpace,
     pub alpha_mode: RenderOutputAlpha,
     pub export_mode: RenderExportMode,
+    /// Requested multisample anti-aliasing level. The renderer clamps this
+    /// to what the physical device's framebuffer sample counts support and
+    /// rebuilds the render pass / pipelines / targets when it changes.
+    pub msaa: MsaaMode,
 }
 
 impl Default for OutputTargetRequest {
@@ -246,6 +250,50 @@ impl Default for OutputTargetRequest {
             color_space: RenderColorSpace::Srgb,
             alpha_mode: RenderOutputAlpha::Premultiplied,
             export_mode: RenderExportMode::None,
+            msaa: MsaaMode::Off,
+        }
+    }
+}
+
+/// Multisample anti-aliasing level for the offscreen render target.
+///
+/// `Off` keeps the historical single-sample path (no resolve attachment).
+/// The other levels add an N-sample colour + depth target that the render
+/// pass resolves into the single-sample readback / export image, so the
+/// downstream readback (`copy_image_to_buffer`) and the MF virtual-camera
+/// external-memory share both keep seeing a single-sample image regardless
+/// of the MSAA level. The renderer clamps the requested level down to the
+/// device's `framebuffer_color_sample_counts & framebuffer_depth_sample_counts`
+/// support before building anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum MsaaMode {
+    #[default]
+    Off,
+    X2,
+    X4,
+    X8,
+}
+
+impl MsaaMode {
+    /// Vulkan `rasterization_samples` / attachment sample count. `Off` maps
+    /// to 1 (the no-resolve, no-MSAA path).
+    pub fn sample_count(self) -> u32 {
+        match self {
+            MsaaMode::Off => 1,
+            MsaaMode::X2 => 2,
+            MsaaMode::X4 => 4,
+            MsaaMode::X8 => 8,
+        }
+    }
+
+    /// Map a GUI combo index (0=Off, 1=2x, 2=4x, 3=8x) to a mode.
+    /// Out-of-range indices fall back to `Off`.
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => MsaaMode::X2,
+            2 => MsaaMode::X4,
+            3 => MsaaMode::X8,
+            _ => MsaaMode::Off,
         }
     }
 }
@@ -281,4 +329,41 @@ pub enum RenderExportMode {
     None,
     GpuExport,
     CpuReadback,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MsaaMode;
+
+    #[test]
+    fn msaa_mode_sample_count_maps_to_vulkan_levels() {
+        assert_eq!(MsaaMode::Off.sample_count(), 1);
+        assert_eq!(MsaaMode::X2.sample_count(), 2);
+        assert_eq!(MsaaMode::X4.sample_count(), 4);
+        assert_eq!(MsaaMode::X8.sample_count(), 8);
+    }
+
+    #[test]
+    fn msaa_mode_from_index_matches_gui_combo_order() {
+        // The GUI combo order (0=Off, 1=2x, 2=4x, 3=8x) is the persisted
+        // contract; this guards against the mapping drifting from the
+        // inspector's `selectable_value` indices.
+        assert_eq!(MsaaMode::from_index(0), MsaaMode::Off);
+        assert_eq!(MsaaMode::from_index(1), MsaaMode::X2);
+        assert_eq!(MsaaMode::from_index(2), MsaaMode::X4);
+        assert_eq!(MsaaMode::from_index(3), MsaaMode::X8);
+    }
+
+    #[test]
+    fn msaa_mode_from_index_out_of_range_falls_back_to_off() {
+        assert_eq!(MsaaMode::from_index(4), MsaaMode::Off);
+        assert_eq!(MsaaMode::from_index(usize::MAX), MsaaMode::Off);
+    }
+
+    #[test]
+    fn msaa_mode_default_is_off() {
+        // Default must keep existing projects on the historical 1× path.
+        assert_eq!(MsaaMode::default(), MsaaMode::Off);
+        assert_eq!(MsaaMode::default().sample_count(), 1);
+    }
 }

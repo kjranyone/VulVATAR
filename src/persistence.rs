@@ -82,6 +82,8 @@ pub struct ProjectState {
     pub output_framerate_index: usize,
     pub output_has_alpha: bool,
     pub output_color_space_index: usize,
+    /// Anti-aliasing (MSAA) level index: 0=Off, 1=2x, 2=4x, 3=8x.
+    pub output_msaa_index: usize,
 
     // Settings
     pub settings_locale: String,
@@ -400,6 +402,10 @@ pub struct OutputConfig {
     pub has_alpha: bool,
     #[serde(default)]
     pub color_space_index: usize,
+    /// Anti-aliasing (MSAA) level index: 0=Off, 1=2x, 2=4x, 3=8x.
+    /// `#[serde(default)]` keeps older projects (which lacked this) loadable.
+    #[serde(default)]
+    pub msaa_index: usize,
 }
 
 fn default_zoom_sensitivity() -> f32 {
@@ -620,6 +626,7 @@ impl ProjectFile {
                 framerate_index: state.output_framerate_index,
                 has_alpha: state.output_has_alpha,
                 color_space_index: state.output_color_space_index,
+                msaa_index: state.output_msaa_index,
             },
             settings: SettingsConfig {
                 locale: state.settings_locale.clone(),
@@ -689,6 +696,7 @@ impl ProjectFile {
             output_framerate_index: self.output.framerate_index,
             output_has_alpha: self.output.has_alpha,
             output_color_space_index: self.output.color_space_index,
+            output_msaa_index: self.output.msaa_index,
 
             settings_locale: self.settings.locale.clone(),
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,

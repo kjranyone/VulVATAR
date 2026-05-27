@@ -100,6 +100,35 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_status.project_dirty = true;
             }
+            // Anti-aliasing (MSAA). Applies to both the viewport preview and
+            // the exported frame (they share the offscreen render target). The
+            // renderer clamps the pick to device sample-count support (and
+            // caps integrated GPUs at 4x), so an unsupported pick degrades.
+            ui.horizontal(|ui| {
+                ui.label(t!("inspector.antialiasing"));
+                let msaa_names: [String; 4] = [
+                    t!("inspector.msaa_off"),
+                    t!("inspector.msaa_2x"),
+                    t!("inspector.msaa_4x"),
+                    t!("inspector.msaa_8x"),
+                ];
+                let prev = state.rendering.msaa_index;
+                egui::ComboBox::from_id_salt("rendering_msaa")
+                    .selected_text(
+                        msaa_names
+                            .get(state.rendering.msaa_index)
+                            .map(|s: &String| s.as_str())
+                            .unwrap_or("Unknown"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, name) in msaa_names.iter().enumerate() {
+                            ui.selectable_value(&mut state.rendering.msaa_index, i, name);
+                        }
+                    });
+                if state.rendering.msaa_index != prev {
+                    state.project_status.project_dirty = true;
+                }
+            });
         });
 
     egui::CollapsingHeader::new(t!("inspector.physics"))
