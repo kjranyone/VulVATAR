@@ -331,6 +331,16 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_status.project_dirty = true;
             }
+            if ui
+                .checkbox(
+                    &mut state.tracking.fade_on_tracking_loss,
+                    t!("tracking.fade_on_loss"),
+                )
+                .on_hover_text(t!("tracking.fade_on_loss_tooltip"))
+                .changed()
+            {
+                state.project_status.project_dirty = true;
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 // Pose calibration entry — opens the fullscreen modal

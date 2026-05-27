@@ -10,6 +10,7 @@ use vulkano::pipeline::graphics::depth_stencil::{
     CompareOp, DepthState, DepthStencilState, StencilOp, StencilOpState, StencilState,
 };
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::image::SampleCount;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
@@ -177,7 +178,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     vec3 light_color;
     float _pad1;
     vec3 ambient_term;
-    float _pad2;
+    float fade_opacity;
 } camera;
 
 layout(location = 0) out vec3 frag_normal;
@@ -214,7 +215,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     vec3 light_color;
     float _pad1;
     vec3 ambient_term;
-    float _pad2;
+    float fade_opacity;
 } camera;
 
 layout(set = 1, binding = 0) uniform MaterialData {
@@ -333,7 +334,10 @@ void main() {
         color.a = 1.0;
     }
 
-    out_color = color;
+    // Global avatar fade (e.g. fade-out when no person is detected). 1.0 =
+    // fully opaque; applied after alpha_mode handling so it dims even opaque
+    // materials. Composited against the (possibly transparent) background.
+    out_color = vec4(color.rgb, color.a * camera.fade_opacity);
 }
 "
                                                                                                                                                                                                                                                                     }
@@ -364,7 +368,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     vec3 light_color;
     float _pad1;
     vec3 ambient_term;
-    float _pad2;
+    float fade_opacity;
 } camera;
 
 layout(push_constant) uniform OutlinePush {
@@ -1244,6 +1248,7 @@ pub fn create_graphics_pipeline(
     viewport: Viewport,
     cull_mode: CullMode,
     alpha_mode: RenderAlphaMode,
+    sample_count: u32,
 ) -> Result<Arc<GraphicsPipeline>, String> {
     let vs_module = vs::load(device.clone())
         .map_err(|e| format!("failed to load vertex shader module: {e}"))?;
@@ -1298,7 +1303,22 @@ pub fn create_graphics_pipeline(
                 front_face: FrontFace::CounterClockwise,
                 ..Default::default()
             }),
-            multisample_state: Some(MultisampleState::default()),
+            multisample_state: Some(MultisampleState {
+                // Must match the subpass' attachment sample count. MSAA off
+                // (sample_count == 1) keeps the Vulkano default (Sample1).
+                rasterization_samples: SampleCount::try_from(sample_count)
+                    .unwrap_or(SampleCount::Sample1),
+                // Alpha-to-coverage only on the Cutout variant, and only under
+                // MSAA. It converts the fragment's alpha into a sample coverage
+                // mask so alpha-tested edges (hair, foliage) antialias along
+                // with geometry. Deliberately NOT enabled for Opaque/Blend:
+                // opaque materials carry the global fade-out alpha
+                // (`out_color.a = fade_opacity`), and A2C there would dither
+                // the whole avatar into stipple while it fades.
+                alpha_to_coverage_enable: matches!(alpha_mode, RenderAlphaMode::Cutout)
+                    && sample_count > 1,
+                ..MultisampleState::default()
+            }),
             depth_stencil_state: Some(DepthStencilState {
                 depth: Some(DepthState {
                     write_enable: depth_write_enable,
@@ -1349,6 +1369,7 @@ pub fn create_outline_pipeline(
     device: Arc<Device>,
     render_pass: Arc<RenderPass>,
     viewport: Viewport,
+    sample_count: u32,
 ) -> Result<Arc<GraphicsPipeline>, String> {
     let vs_module = outline_vs::load(device.clone())
         .map_err(|e| format!("failed to load outline vertex shader module: {e}"))?;
@@ -1398,7 +1419,13 @@ pub fn create_outline_pipeline(
                 front_face: FrontFace::CounterClockwise,
                 ..Default::default()
             }),
-            multisample_state: Some(MultisampleState::default()),
+            multisample_state: Some(MultisampleState {
+                // Must match the subpass' attachment sample count. MSAA off
+                // (sample_count == 1) keeps the Vulkano default (Sample1).
+                rasterization_samples: SampleCount::try_from(sample_count)
+                    .unwrap_or(SampleCount::Sample1),
+                ..MultisampleState::default()
+            }),
             depth_stencil_state: Some(DepthStencilState {
                 depth: Some(DepthState {
                     write_enable: false,

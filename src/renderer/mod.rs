@@ -37,7 +37,7 @@ use vulkano::device::{
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::Image;
+use vulkano::image::{Image, SampleCounts};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::viewport::Viewport;
@@ -308,6 +308,12 @@ pub struct VulkanRenderer {
     pipeline_no_cull_blend: Option<Arc<GraphicsPipeline>>,
     pipeline_front_cull: Option<Arc<GraphicsPipeline>>,
     pipeline_front_cull_blend: Option<Arc<GraphicsPipeline>>,
+    // Cutout (alpha-tested) variants — same state as the opaque variants
+    // (depth-write on, no blend) but with alpha-to-coverage enabled under
+    // MSAA so alpha-tested edges (hair, foliage) antialias. One per cull mode.
+    graphics_pipeline_cutout: Option<Arc<GraphicsPipeline>>,
+    pipeline_no_cull_cutout: Option<Arc<GraphicsPipeline>>,
+    pipeline_front_cull_cutout: Option<Arc<GraphicsPipeline>>,
     outline_pipeline: Option<Arc<GraphicsPipeline>>,
     sampler: Option<Arc<Sampler>>,
     default_texture_view: Option<Arc<ImageView>>,
@@ -323,6 +329,18 @@ pub struct VulkanRenderer {
     /// offscreen targets if the user changed it. Default `Srgb` matches the
     /// historical hardcoded format and keeps existing projects unaffected.
     current_color_space: frame_input::RenderColorSpace,
+    /// MSAA sample count the render pass + pipelines + offscreen targets are
+    /// currently built for (1 = no MSAA). Compared against the requested
+    /// level at the top of `render()`; a change rebuilds the render pass
+    /// (the resolve attachment toggles on/off), the pipelines
+    /// (`rasterization_samples`), and the targets. Default 1 keeps existing
+    /// projects on the historical single-sample path.
+    current_sample_count: u32,
+    /// Multisampled colour target, present only when `current_sample_count > 1`.
+    /// The subpass renders into this and resolves into `offscreen_color` (the
+    /// single-sample readback / export image). `None` on the no-MSAA path.
+    msaa_color: Option<Arc<Image>>,
+    msaa_color_view: Option<Arc<ImageView>>,
     camera_ring: Option<CameraRing>,
 
     // Async readback ring: two-stage (staging + readback) buffers and pending fence.
@@ -378,6 +396,9 @@ impl VulkanRenderer {
             pipeline_no_cull_blend: None,
             pipeline_front_cull: None,
             pipeline_front_cull_blend: None,
+            graphics_pipeline_cutout: None,
+            pipeline_no_cull_cutout: None,
+            pipeline_front_cull_cutout: None,
             outline_pipeline: None,
             sampler: None,
             default_texture_view: None,
@@ -388,6 +409,9 @@ impl VulkanRenderer {
             offscreen_framebuffer: None,
             current_extent: [1920, 1080],
             current_color_space: frame_input::RenderColorSpace::Srgb,
+            current_sample_count: 1,
+            msaa_color: None,
+            msaa_color_view: None,
             camera_ring: None,
 
             staging_buffers: [None, None],
@@ -505,7 +529,12 @@ impl VulkanRenderer {
         // colour space. Defaults to sRGB; a user-driven switch to Linear
         // sRGB triggers a render-pass + pipeline rebuild later via
         // `apply_color_space`.
-        let render_pass = Self::build_render_pass(device.clone(), &self.current_color_space);
+        // Startup always builds the single-sample path; the first frame's
+        // `apply_output_format` upgrades to the user's requested MSAA level
+        // (clamped to device support) if it differs.
+        let sample_count = self.current_sample_count;
+        let render_pass =
+            Self::build_render_pass(device.clone(), &self.current_color_space, sample_count);
 
         let extent = self.current_extent;
         let viewport = Viewport {
@@ -521,6 +550,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Back,
             frame_input::RenderAlphaMode::Opaque,
+            sample_count,
         )
         .expect("failed to create graphics pipeline");
 
@@ -530,6 +560,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Back,
             frame_input::RenderAlphaMode::Blend,
+            sample_count,
         )
         .expect("failed to create blend graphics pipeline");
 
@@ -539,6 +570,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::None,
             frame_input::RenderAlphaMode::Opaque,
+            sample_count,
         )
         .expect("failed to create no-cull pipeline");
 
@@ -548,6 +580,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::None,
             frame_input::RenderAlphaMode::Blend,
+            sample_count,
         )
         .expect("failed to create blend no-cull pipeline");
 
@@ -557,6 +590,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Front,
             frame_input::RenderAlphaMode::Opaque,
+            sample_count,
         )
         .expect("failed to create front-cull pipeline");
 
@@ -566,20 +600,55 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Front,
             frame_input::RenderAlphaMode::Blend,
+            sample_count,
         )
         .expect("failed to create blend front-cull pipeline");
 
-        let outline_pipeline =
-            pipeline::create_outline_pipeline(device.clone(), render_pass.clone(), viewport)
-                .expect("failed to create outline pipeline");
+        let cutout_pipeline = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Back,
+            frame_input::RenderAlphaMode::Cutout,
+            sample_count,
+        )
+        .expect("failed to create cutout pipeline");
 
-        let (color_img, color_view, depth_img, depth_view, framebuffer) =
-            Self::create_offscreen_targets(
-                device.clone(),
-                memory_allocator.clone(),
-                render_pass.clone(),
-                extent,
-            );
+        let no_cull_pipeline_cutout = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::None,
+            frame_input::RenderAlphaMode::Cutout,
+            sample_count,
+        )
+        .expect("failed to create no-cull cutout pipeline");
+
+        let front_cull_pipeline_cutout = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Front,
+            frame_input::RenderAlphaMode::Cutout,
+            sample_count,
+        )
+        .expect("failed to create front-cull cutout pipeline");
+
+        let outline_pipeline = pipeline::create_outline_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport,
+            sample_count,
+        )
+        .expect("failed to create outline pipeline");
+
+        let targets = Self::create_offscreen_targets(
+            device.clone(),
+            memory_allocator.clone(),
+            render_pass.clone(),
+            extent,
+            sample_count,
+        );
 
         let sampler = Sampler::new(
             device.clone(),
@@ -611,6 +680,9 @@ impl VulkanRenderer {
         self.pipeline_no_cull_blend = Some(no_cull_pipeline_blend);
         self.pipeline_front_cull = Some(front_cull_pipeline);
         self.pipeline_front_cull_blend = Some(front_cull_pipeline_blend);
+        self.graphics_pipeline_cutout = Some(cutout_pipeline);
+        self.pipeline_no_cull_cutout = Some(no_cull_pipeline_cutout);
+        self.pipeline_front_cull_cutout = Some(front_cull_pipeline_cutout);
         self.outline_pipeline = Some(outline_pipeline.clone());
         // Build the transform compute pipeline alongside the graphics
         // pipelines. The render loop dispatches it every frame to fuse
@@ -656,11 +728,14 @@ impl VulkanRenderer {
         self.cloth_normal_pipeline = Some(cloth_normal_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
-        self.offscreen_color = Some(color_img);
-        self.offscreen_color_view = Some(color_view);
-        self.offscreen_depth = Some(depth_img);
-        self.offscreen_depth_view = Some(depth_view);
-        self.offscreen_framebuffer = Some(framebuffer);
+        self.offscreen_color = Some(targets.color);
+        self.offscreen_color_view = Some(targets.color_view);
+        self.offscreen_depth = Some(targets.depth);
+        self.offscreen_depth_view = Some(targets.depth_view);
+        self.offscreen_framebuffer = Some(targets.framebuffer);
+        self.msaa_color = targets.msaa_color;
+        self.msaa_color_view = targets.msaa_color_view;
+        self.current_sample_count = sample_count;
 
         self.active_pipeline = Some(pipeline::PipelineState {
             active_pipeline: pipeline::RenderPipeline::SkinningUnlit,
@@ -696,7 +771,7 @@ impl VulkanRenderer {
             .ok_or("renderer: no render pass")?
             .clone();
 
-        self.rebuild_pipelines_and_targets(render_pass, new_extent)
+        self.rebuild_pipelines_and_targets(render_pass, new_extent, self.current_sample_count)
             .map_err(|e| format!("resize: {e}"))?;
 
         // Invalidate pre-allocated readback buffers (extent changed).
@@ -708,35 +783,82 @@ impl VulkanRenderer {
     }
 
 
-    /// Switch the renderer's output colour space at runtime. Rebuilds the
-    /// render pass with the new colour-attachment format, then routes
-    /// through `rebuild_pipelines_and_targets` so all dependent state
+    /// Clamp a requested MSAA sample count down to what the physical device
+    /// can actually use as a framebuffer attachment. Intersects the colour
+    /// and depth framebuffer sample-count limits (both attachments are
+    /// multisampled together) and returns the highest supported power of two
+    /// that does not exceed `requested`. `requested <= 1` always returns 1.
+    ///
+    /// Integrated GPUs are additionally capped at 4×: they share system
+    /// memory and have far less bandwidth than discrete cards, so 8× MSAA at
+    /// output resolution risks GPU timeouts (TDR) / stutter on them. The GUI
+    /// still offers 8×; it just silently degrades to 4× on an iGPU.
+    fn clamp_sample_count(device: &Arc<Device>, requested: u32) -> u32 {
+        if requested <= 1 {
+            return 1;
+        }
+        let props = device.physical_device().properties();
+        let requested = if props.device_type == PhysicalDeviceType::IntegratedGpu {
+            requested.min(4)
+        } else {
+            requested
+        };
+        let supported =
+            props.framebuffer_color_sample_counts & props.framebuffer_depth_sample_counts;
+        let mut best = 1u32;
+        for (n, flag) in [
+            (2u32, SampleCounts::SAMPLE_2),
+            (4, SampleCounts::SAMPLE_4),
+            (8, SampleCounts::SAMPLE_8),
+        ] {
+            if n <= requested && supported.intersects(flag) {
+                best = n;
+            }
+        }
+        best
+    }
+
+    /// Reconcile the renderer's output colour space and MSAA level with the
+    /// user's request. Rebuilds the render pass (the colour-attachment format
+    /// and the resolve-attachment structure both depend on these), then
+    /// routes through `rebuild_pipelines_and_targets` so all dependent state
     /// (pipelines, offscreen targets, camera ring, thumb cache) ends up
-    /// compatible. No-op when the renderer is already on `target_cs`.
-    pub fn apply_color_space(
+    /// compatible. No-op when neither the colour space nor the (clamped)
+    /// sample count changed.
+    pub fn apply_output_format(
         &mut self,
         target_cs: frame_input::RenderColorSpace,
+        requested_samples: u32,
     ) -> Result<(), String> {
         if !self.initialized {
             return Ok(());
         }
-        if target_cs == self.current_color_space {
+
+        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
+        let target_samples = Self::clamp_sample_count(&device, requested_samples);
+        if target_cs == self.current_color_space && target_samples == self.current_sample_count {
             return Ok(());
         }
 
-        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
-        let new_render_pass = Self::build_render_pass(device, &target_cs);
+        let prev_cs = self.current_color_space.clone();
+        let prev_samples = self.current_sample_count;
+
+        let new_render_pass = Self::build_render_pass(device, &target_cs, target_samples);
         self.render_pass = Some(new_render_pass.clone());
 
         let extent = self.current_extent;
-        self.rebuild_pipelines_and_targets(new_render_pass, extent)
-            .map_err(|e| format!("apply_color_space: {e}"))?;
+        // `rebuild_pipelines_and_targets` sets `current_extent` and
+        // `current_sample_count`; the colour space is set below.
+        self.rebuild_pipelines_and_targets(new_render_pass, extent, target_samples)
+            .map_err(|e| format!("apply_output_format: {e}"))?;
 
         info!(
-            "renderer: switched output colour space {:?} -> {:?} (target {:?})",
-            self.current_color_space,
+            "renderer: output format colour {:?} -> {:?} (target {:?}), MSAA {}x -> {}x",
+            prev_cs,
             target_cs,
             Self::color_attachment_format(&target_cs),
+            prev_samples,
+            target_samples,
         );
         self.current_color_space = target_cs;
         Ok(())
@@ -768,11 +890,14 @@ impl VulkanRenderer {
             });
         }
 
-        // Adopt the user's selected output colour space before any per-frame
-        // GPU work. The path is a no-op when the renderer already matches,
-        // so the cost only applies on actual user toggles.
-        self.apply_color_space(input.output_request.color_space.clone())
-            .map_err(|e| format!("render: color space switch failed: {e}"))?;
+        // Adopt the user's selected output colour space + MSAA level before
+        // any per-frame GPU work. The path is a no-op when the renderer
+        // already matches, so the cost only applies on actual user toggles.
+        self.apply_output_format(
+            input.output_request.color_space.clone(),
+            input.output_request.msaa.sample_count(),
+        )
+        .map_err(|e| format!("render: output format switch failed: {e}"))?;
 
         let requested_extent = input.output_request.extent;
         if requested_extent != self.current_extent
@@ -877,7 +1002,7 @@ impl VulkanRenderer {
             light_color: input.lighting.main_light_color,
             _pad1: 0.0,
             ambient_term: input.lighting.ambient_term,
-            _pad2: 0.0,
+            fade_opacity: input.avatar_opacity,
         };
         let ring_slot = (self.frame_counter % FRAME_LAG as u64) as usize;
         let (camera_set, outline_camera_set) = {
@@ -1499,35 +1624,64 @@ impl VulkanRenderer {
 
                 // Pick the graphics variant for the eventual draw.
                 let is_blend = matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
-                let active_pipeline = match (mesh_inst.cull_mode.clone(), is_blend) {
-                    (frame_input::RenderCullMode::DoubleSided, true) => self
-                        .pipeline_no_cull_blend
-                        .as_ref()
-                        .or(self.pipeline_no_cull.as_ref())
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    (frame_input::RenderCullMode::FrontFace, true) => self
-                        .pipeline_front_cull_blend
-                        .as_ref()
-                        .or(self.pipeline_front_cull.as_ref())
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    (frame_input::RenderCullMode::BackFace, true) => self
-                        .graphics_pipeline_blend
-                        .as_ref()
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    (frame_input::RenderCullMode::DoubleSided, false) => self
-                        .pipeline_no_cull
-                        .as_ref()
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    (frame_input::RenderCullMode::FrontFace, false) => self
-                        .pipeline_front_cull
-                        .as_ref()
-                        .unwrap_or(&gfx_pipeline)
-                        .clone(),
-                    (frame_input::RenderCullMode::BackFace, false) => gfx_pipeline.clone(),
+                let is_cutout =
+                    matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
+                let active_pipeline = if is_cutout {
+                    // Cutout variants carry alpha-to-coverage (under MSAA) so
+                    // alpha-tested edges antialias. They share the opaque
+                    // variants' depth/blend state, so fall back to the opaque
+                    // variant of the same cull mode if a cutout pipeline is
+                    // somehow missing.
+                    match &mesh_inst.cull_mode {
+                        frame_input::RenderCullMode::DoubleSided => self
+                            .pipeline_no_cull_cutout
+                            .as_ref()
+                            .or(self.pipeline_no_cull.as_ref())
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        frame_input::RenderCullMode::FrontFace => self
+                            .pipeline_front_cull_cutout
+                            .as_ref()
+                            .or(self.pipeline_front_cull.as_ref())
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        frame_input::RenderCullMode::BackFace => self
+                            .graphics_pipeline_cutout
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                    }
+                } else {
+                    match (mesh_inst.cull_mode.clone(), is_blend) {
+                        (frame_input::RenderCullMode::DoubleSided, true) => self
+                            .pipeline_no_cull_blend
+                            .as_ref()
+                            .or(self.pipeline_no_cull.as_ref())
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::FrontFace, true) => self
+                            .pipeline_front_cull_blend
+                            .as_ref()
+                            .or(self.pipeline_front_cull.as_ref())
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::BackFace, true) => self
+                            .graphics_pipeline_blend
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::DoubleSided, false) => self
+                            .pipeline_no_cull
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::FrontFace, false) => self
+                            .pipeline_front_cull
+                            .as_ref()
+                            .unwrap_or(&gfx_pipeline)
+                            .clone(),
+                        (frame_input::RenderCullMode::BackFace, false) => gfx_pipeline.clone(),
+                    }
                 };
 
                 // Material descriptor. Allocated against the canonical
@@ -1553,8 +1707,6 @@ impl VulkanRenderer {
                     matcap_view,
                 )?;
 
-                let is_cutout =
-                    matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
                 let outline_info = if !is_blend
                     && !is_cutout
                     && mesh_inst.outline.enabled
@@ -1587,13 +1739,26 @@ impl VulkanRenderer {
             let [r, g, b] = input.background_color;
             [r, g, b, 1.0]
         };
+        // Clear values must line up with the render pass attachment order
+        // built in `build_render_pass`:
+        //   1×:   [color (Clear), depth (Clear)]
+        //   MSAA: [msaa_color (Clear), color/resolve (DontCare → None), depth (Clear)]
+        let clear_values = if self.current_sample_count > 1 {
+            vec![
+                Some(bg_clear.into()),
+                None,
+                Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
+            ]
+        } else {
+            vec![
+                Some(bg_clear.into()),
+                Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
+            ]
+        };
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![
-                        Some(bg_clear.into()),
-                        Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
-                    ],
+                    clear_values,
                     ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
                 },
                 SubpassBeginInfo {
@@ -1967,7 +2132,10 @@ struct CameraUniform {
     light_color: [f32; 3],
     _pad1: f32,
     ambient_term: [f32; 3],
-    _pad2: f32,
+    /// Global avatar opacity multiplier (1.0 = opaque). Drives the
+    /// fade-out-when-no-person-detected feature; reuses the former
+    /// `_pad2` slot so the std140 layout is unchanged.
+    fade_opacity: f32,
 }
 
 /// Convert row-major camera matrices into column-major for GLSL.
@@ -2023,7 +2191,7 @@ impl CameraRing {
             light_color: [0.0; 3],
             _pad1: 0.0,
             ambient_term: [0.0; 3],
-            _pad2: 0.0,
+            fade_opacity: 1.0,
         };
 
         let mut buffers = Vec::with_capacity(FRAME_LAG);

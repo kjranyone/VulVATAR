@@ -85,7 +85,7 @@ fn main() -> Result<(), String> {
 
     // Two cells per axis × two axes → four renders. Order is important:
     // we use the same renderer instance, so a switch on either axis
-    // exercises the apply_color_space rebuild path.
+    // exercises the apply_output_format rebuild path.
     let cells = [
         ("srgb_opaque", RenderColorSpace::Srgb, false),
         ("srgb_transparent", RenderColorSpace::Srgb, true),
@@ -218,11 +218,13 @@ fn build_frame_input(
             color_space,
             alpha_mode,
             export_mode: RenderExportMode::CpuReadback,
+            msaa: vulvatar_lib::renderer::frame_input::MsaaMode::Off,
         },
         background_image_path: None,
         show_ground_grid: false,
         background_color: [0.1, 0.1, 0.1],
         transparent_background,
+        avatar_opacity: 1.0,
     }
 }
 

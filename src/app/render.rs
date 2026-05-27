@@ -65,7 +65,7 @@ impl Application {
         //    - **Expired** (age past the hold window, or never
         //      published): drop the sample. Solver bypass restores
         //      base / animation pose.
-        let (tracking_sample, sample_is_fresh) = if toggles.tracking_enabled {
+        let (tracking_sample, sample_is_fresh, tracking_present) = if toggles.tracking_enabled {
             let mailbox = self.tracking.mailbox();
             // Single mailbox lock per frame: age + stale_timeout
             // together describe the freshness state cheaper than
@@ -73,7 +73,7 @@ impl Application {
             let age = mailbox.age();
             let stale_threshold = mailbox.stale_timeout();
             match age {
-                Some(a) if a <= stale_threshold => (self.step_tracking(), true),
+                Some(a) if a <= stale_threshold => (self.step_tracking(), true, true),
                 Some(a) if a < TRACKING_HOLD_WINDOW => {
                     let held = self.last_tracking_pose.as_ref().map(|last| {
                         let span = (TRACKING_HOLD_WINDOW - stale_threshold)
@@ -86,7 +86,7 @@ impl Application {
                         held.scale_confidence(scale);
                         held
                     });
-                    (held, false)
+                    (held, false, true)
                 }
                 Some(_) => {
                     if self.stale_warn_cooldown.elapsed() >= std::time::Duration::from_secs(5) {
@@ -96,14 +96,14 @@ impl Application {
                         );
                         self.stale_warn_cooldown = std::time::Instant::now();
                     }
-                    (None, false)
+                    (None, false, false)
                 }
                 // Mailbox never published a sample — same end state
                 // as Expired (no pose, no warn spam yet).
-                None => (None, false),
+                None => (None, false, false),
             }
         } else {
-            (None, false)
+            (None, false, false)
         };
 
         // Persist only fresh samples. A held sample is derived from
@@ -115,6 +115,26 @@ impl Application {
             if let Some(ref tp) = tracking_sample {
                 self.last_tracking_pose = Some(tp.clone());
             }
+        }
+
+        // Global avatar fade-out when person detection is lost. Target is full
+        // opacity while a person is present (fresh sample or within the hold
+        // window) and zero once detection has been lost past the hold window;
+        // the feature off or tracking off pins it opaque. Linear ramp over
+        // FADE_DURATION so a lost/recovered subject fades out/in smoothly.
+        {
+            const FADE_DURATION_S: f32 = 0.6;
+            let fade_target = if config.fade_on_tracking_loss
+                && toggles.tracking_enabled
+                && !tracking_present
+            {
+                0.0
+            } else {
+                1.0
+            };
+            let max_step = (frame_dt / FADE_DURATION_S).clamp(0.0, 1.0);
+            let delta = (fade_target - self.tracking_fade_opacity).clamp(-max_step, max_step);
+            self.tracking_fade_opacity = (self.tracking_fade_opacity + delta).clamp(0.0, 1.0);
         }
 
         let solver_params = SolverParams {
@@ -221,7 +241,9 @@ impl Application {
                 output_extent,
                 background_color: self.background_color,
                 transparent_background: self.transparent_background,
+                avatar_opacity: self.tracking_fade_opacity,
                 output_color_space: self.output_color_space.clone(),
+                output_msaa: self.output_msaa,
                 export_mode,
             };
             let frame_input = Self::build_frame_input_multi(
@@ -741,11 +763,13 @@ impl Application {
                 color_space: fi_config.output_color_space.clone(),
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: fi_config.export_mode.clone(),
+                msaa: fi_config.output_msaa,
             },
             background_image_path: background_image_path.map(|p| p.to_path_buf()),
             show_ground_grid,
             background_color: fi_config.background_color,
             transparent_background: fi_config.transparent_background,
+            avatar_opacity: fi_config.avatar_opacity,
         }
     }
 

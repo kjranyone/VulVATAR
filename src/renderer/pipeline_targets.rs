@@ -23,7 +23,7 @@ use log::{info, warn};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount};
 use vulkano::memory::allocator::{
     AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator,
 };
@@ -32,26 +32,64 @@ use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 
 use crate::renderer::{frame_input, pipeline, CameraRing, VulkanRenderer};
 
+/// Bundle of offscreen render-target resources produced by
+/// [`VulkanRenderer::create_offscreen_targets`]. `color` is always the
+/// single-sample image used as the readback / export source; on the MSAA
+/// path it doubles as the render pass' resolve target. `msaa_color` is the
+/// multisampled image the subpass actually renders into, present only when
+/// MSAA is active.
+pub(super) struct OffscreenTargets {
+    pub color: Arc<Image>,
+    pub color_view: Arc<ImageView>,
+    pub depth: Arc<Image>,
+    pub depth_view: Arc<ImageView>,
+    pub framebuffer: Arc<Framebuffer>,
+    pub msaa_color: Option<Arc<Image>>,
+    pub msaa_color_view: Option<Arc<ImageView>>,
+}
+
 impl VulkanRenderer {
     /// Build a render pass whose colour attachment matches the requested
-    /// output colour space. Two arms because `single_pass_renderpass!` is a
-    /// macro that doesn't accept a runtime `Format` value.
+    /// output colour space and MSAA level.
+    ///
+    /// `single_pass_renderpass!` takes the colour `format` and the attachment
+    /// `samples` as *expressions* (the macro calls
+    /// `SampleCount::try_from($samples)` internally), so both can be runtime
+    /// values here — only the resolve-vs-no-resolve attachment *structure*
+    /// has to branch:
+    ///
+    /// - `sample_count == 1`: the historical two-attachment pass — a
+    ///   single-sample colour target (stored, then read back) plus depth.
+    /// - `sample_count > 1`: a three-attachment pass — an N-sample colour
+    ///   target (`msaa_color`) that the subpass renders into and *resolves*
+    ///   into the single-sample `color` target, plus an N-sample depth
+    ///   target. The resolve target is the same external-memory / readback
+    ///   image used on the no-MSAA path, so the export + readback paths stay
+    ///   single-sample. The macro leaves the resolve target in
+    ///   `TransferDstOptimal`; vulkano inserts the transition to
+    ///   `TransferSrcOptimal` automatically before the readback copy.
+    ///
+    /// `sample_count` is expected to already be clamped to device support by
+    /// [`VulkanRenderer::clamp_sample_count`].
     pub(super) fn build_render_pass(
         device: Arc<Device>,
         color_space: &frame_input::RenderColorSpace,
+        sample_count: u32,
     ) -> Arc<RenderPass> {
-        match color_space {
-            frame_input::RenderColorSpace::Srgb => vulkano::single_pass_renderpass!(
+        let color_format = Self::color_attachment_format(color_space);
+        let depth_format = Format::D32_SFLOAT_S8_UINT;
+        if sample_count <= 1 {
+            vulkano::single_pass_renderpass!(
                 device,
                 attachments: {
                     color: {
-                        format: Format::R8G8B8A8_SRGB,
+                        format: color_format,
                         samples: 1,
                         load_op: Clear,
                         store_op: Store,
                     },
                     depth_stencil: {
-                        format: Format::D32_SFLOAT_S8_UINT,
+                        format: depth_format,
                         samples: 1,
                         load_op: Clear,
                         store_op: DontCare,
@@ -62,54 +100,59 @@ impl VulkanRenderer {
                     depth_stencil: {depth_stencil},
                 },
             )
-            .expect("failed to create sRGB render pass"),
-            frame_input::RenderColorSpace::LinearSrgb => vulkano::single_pass_renderpass!(
+            .expect("failed to create single-sample render pass")
+        } else {
+            vulkano::single_pass_renderpass!(
                 device,
                 attachments: {
-                    color: {
-                        format: Format::R8G8B8A8_UNORM,
-                        samples: 1,
+                    msaa_color: {
+                        format: color_format,
+                        samples: sample_count,
                         load_op: Clear,
+                        store_op: DontCare,
+                    },
+                    color: {
+                        format: color_format,
+                        samples: 1,
+                        load_op: DontCare,
                         store_op: Store,
                     },
                     depth_stencil: {
-                        format: Format::D32_SFLOAT_S8_UINT,
-                        samples: 1,
+                        format: depth_format,
+                        samples: sample_count,
                         load_op: Clear,
                         store_op: DontCare,
                     },
                 },
                 pass: {
-                    color: [color],
+                    color: [msaa_color],
+                    color_resolve: [color],
                     depth_stencil: {depth_stencil},
                 },
             )
-            .expect("failed to create linear render pass"),
+            .expect("failed to create MSAA render pass")
         }
     }
 
-    #[allow(clippy::type_complexity)]
     pub(super) fn create_offscreen_targets(
         device: Arc<Device>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         render_pass: Arc<RenderPass>,
         extent: [u32; 2],
-    ) -> (
-        Arc<Image>,
-        Arc<ImageView>,
-        Arc<Image>,
-        Arc<ImageView>,
-        Arc<Framebuffer>,
-    ) {
+        sample_count: u32,
+    ) -> OffscreenTargets {
         // The first colour attachment of the render pass dictates the
         // output target format. Reading it back here keeps the offscreen
         // image and the render pass guaranteed-compatible after a colour
-        // space switch.
+        // space switch. On the MSAA path the first attachment is `msaa_color`
+        // and the single-sample resolve target shares its format, so this is
+        // correct for both paths.
         let color_format = render_pass
             .attachments()
             .first()
             .map(|a| a.format)
             .unwrap_or(Format::R8G8B8A8_SRGB);
+        let samples = SampleCount::try_from(sample_count).unwrap_or(SampleCount::Sample1);
 
         let mut color_create_info = ImageCreateInfo {
             image_type: ImageType::Dim2d,
@@ -163,13 +206,16 @@ impl VulkanRenderer {
         )
         .expect("failed to create offscreen color image");
 
+        // Depth must carry the same sample count as the colour attachment it
+        // is paired with in the subpass.
         let depth_image = Image::new(
-            memory_allocator,
+            memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::D32_SFLOAT_S8_UINT,
                 extent: [extent[0], extent[1], 1],
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                samples,
                 ..Default::default()
             },
             AllocationCreateInfo {
@@ -182,16 +228,58 @@ impl VulkanRenderer {
         let color_view = ImageView::new_default(color_image.clone()).unwrap();
         let depth_view = ImageView::new_default(depth_image.clone()).unwrap();
 
+        // On the MSAA path the subpass renders into a dedicated multisampled
+        // colour image and resolves it into `color_image` (single-sample).
+        // GPU-internal only: no readback, sampling, or external sharing, so
+        // plain `COLOR_ATTACHMENT` usage is enough.
+        let (msaa_color, msaa_color_view) = if sample_count > 1 {
+            let msaa_image = Image::new(
+                memory_allocator,
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: color_format,
+                    extent: [extent[0], extent[1], 1],
+                    usage: ImageUsage::COLOR_ATTACHMENT,
+                    samples,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                    ..Default::default()
+                },
+            )
+            .expect("failed to create MSAA color image");
+            let view = ImageView::new_default(msaa_image.clone()).unwrap();
+            (Some(msaa_image), Some(view))
+        } else {
+            (None, None)
+        };
+
+        // Framebuffer attachment order must match the render pass declaration
+        // order built in `build_render_pass`: `[color, depth]` for 1×, and
+        // `[msaa_color, color (resolve), depth]` for MSAA.
+        let fb_attachments = match &msaa_color_view {
+            Some(mv) => vec![mv.clone(), color_view.clone(), depth_view.clone()],
+            None => vec![color_view.clone(), depth_view.clone()],
+        };
         let framebuffer = Framebuffer::new(
             render_pass,
             FramebufferCreateInfo {
-                attachments: vec![color_view.clone(), depth_view.clone()],
+                attachments: fb_attachments,
                 ..Default::default()
             },
         )
         .expect("failed to create offscreen framebuffer");
 
-        (color_image, color_view, depth_image, depth_view, framebuffer)
+        OffscreenTargets {
+            color: color_image,
+            color_view,
+            depth: depth_image,
+            depth_view,
+            framebuffer,
+            msaa_color,
+            msaa_color_view,
+        }
     }
 
     /// Rebuild every render-pass-dependent piece of state for the given
@@ -204,6 +292,7 @@ impl VulkanRenderer {
         &mut self,
         render_pass: Arc<RenderPass>,
         extent: [u32; 2],
+        sample_count: u32,
     ) -> Result<(), String> {
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
         let memory_allocator = self
@@ -212,13 +301,13 @@ impl VulkanRenderer {
             .ok_or("renderer: no memory allocator")?
             .clone();
 
-        let (color_img, color_view, depth_img, depth_view, framebuffer) =
-            Self::create_offscreen_targets(
-                device.clone(),
-                memory_allocator,
-                render_pass.clone(),
-                extent,
-            );
+        let targets = Self::create_offscreen_targets(
+            device.clone(),
+            memory_allocator,
+            render_pass.clone(),
+            extent,
+            sample_count,
+        );
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
@@ -232,6 +321,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Back,
             frame_input::RenderAlphaMode::Opaque,
+            sample_count,
         )
         .map_err(|e| format!("failed to create graphics pipeline: {e}"))?;
 
@@ -241,6 +331,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Back,
             frame_input::RenderAlphaMode::Blend,
+            sample_count,
         )
         .map_err(|e| format!("failed to create blend graphics pipeline: {e}"))?;
 
@@ -250,6 +341,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::None,
             frame_input::RenderAlphaMode::Opaque,
+            sample_count,
         )
         .map_err(|e| format!("failed to create no-cull pipeline: {e}"))?;
 
@@ -259,6 +351,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::None,
             frame_input::RenderAlphaMode::Blend,
+            sample_count,
         )
         .map_err(|e| format!("failed to create blend no-cull pipeline: {e}"))?;
 
@@ -268,6 +361,7 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Front,
             frame_input::RenderAlphaMode::Opaque,
+            sample_count,
         )
         .map_err(|e| format!("failed to create front-cull pipeline: {e}"))?;
 
@@ -277,25 +371,63 @@ impl VulkanRenderer {
             viewport.clone(),
             CullMode::Front,
             frame_input::RenderAlphaMode::Blend,
+            sample_count,
         )
         .map_err(|e| format!("failed to create blend front-cull pipeline: {e}"))?;
 
-        let outline_pipeline = pipeline::create_outline_pipeline(device, render_pass, viewport)
-            .map_err(|e| format!("failed to create outline pipeline: {e}"))?;
+        let cutout_pipeline = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Back,
+            frame_input::RenderAlphaMode::Cutout,
+            sample_count,
+        )
+        .map_err(|e| format!("failed to create cutout pipeline: {e}"))?;
 
-        self.offscreen_color = Some(color_img);
-        self.offscreen_color_view = Some(color_view);
-        self.offscreen_depth = Some(depth_img);
-        self.offscreen_depth_view = Some(depth_view);
-        self.offscreen_framebuffer = Some(framebuffer);
+        let no_cull_pipeline_cutout = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::None,
+            frame_input::RenderAlphaMode::Cutout,
+            sample_count,
+        )
+        .map_err(|e| format!("failed to create no-cull cutout pipeline: {e}"))?;
+
+        let front_cull_pipeline_cutout = pipeline::create_graphics_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            CullMode::Front,
+            frame_input::RenderAlphaMode::Cutout,
+            sample_count,
+        )
+        .map_err(|e| format!("failed to create front-cull cutout pipeline: {e}"))?;
+
+        let outline_pipeline =
+            pipeline::create_outline_pipeline(device, render_pass, viewport, sample_count)
+                .map_err(|e| format!("failed to create outline pipeline: {e}"))?;
+
+        self.offscreen_color = Some(targets.color);
+        self.offscreen_color_view = Some(targets.color_view);
+        self.offscreen_depth = Some(targets.depth);
+        self.offscreen_depth_view = Some(targets.depth_view);
+        self.offscreen_framebuffer = Some(targets.framebuffer);
+        self.msaa_color = targets.msaa_color;
+        self.msaa_color_view = targets.msaa_color_view;
         self.graphics_pipeline = Some(gfx_pipeline.clone());
         self.graphics_pipeline_blend = Some(gfx_pipeline_blend);
         self.pipeline_no_cull = Some(no_cull_pipeline);
         self.pipeline_no_cull_blend = Some(no_cull_pipeline_blend);
         self.pipeline_front_cull = Some(front_cull_pipeline);
         self.pipeline_front_cull_blend = Some(front_cull_pipeline_blend);
+        self.graphics_pipeline_cutout = Some(cutout_pipeline);
+        self.pipeline_no_cull_cutout = Some(no_cull_pipeline_cutout);
+        self.pipeline_front_cull_cutout = Some(front_cull_pipeline_cutout);
         self.outline_pipeline = Some(outline_pipeline.clone());
         self.current_extent = extent;
+        self.current_sample_count = sample_count;
 
         if let (Some(ma), Some(dsa)) = (&self.memory_allocator, &self.descriptor_set_allocator) {
             self.camera_ring = Some(CameraRing::new(ma, dsa, &gfx_pipeline, &outline_pipeline));

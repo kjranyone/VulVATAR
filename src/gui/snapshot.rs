@@ -202,11 +202,13 @@ impl GuiApp {
                 color_space: RenderColorSpace::Srgb,
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: RenderExportMode::CpuReadback,
+                msaa: crate::renderer::frame_input::MsaaMode::Off,
             },
             background_image_path: None,
             show_ground_grid: false,
             background_color: [0.0, 0.0, 0.0],
             transparent_background: true,
+            avatar_opacity: 1.0,
         }
     }
 
@@ -328,11 +330,13 @@ impl GuiApp {
                 color_space: RenderColorSpace::Srgb,
                 alpha_mode: RenderOutputAlpha::Premultiplied,
                 export_mode: RenderExportMode::CpuReadback,
+                msaa: crate::renderer::frame_input::MsaaMode::Off,
             },
             background_image_path: None,
             show_ground_grid: false,
             background_color: [0.0, 0.0, 0.0],
             transparent_background: true,
+            avatar_opacity: 1.0,
         }
     }
 

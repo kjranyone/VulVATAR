@@ -32,6 +32,9 @@ pub struct FrameConfig {
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
     pub root_translation_enabled: bool,
+    /// When true, the avatar fades to transparent after person detection is
+    /// lost past the tracking hold window, and fades back in on re-detection.
+    pub fade_on_tracking_loss: bool,
     pub frame_dt: f32,
 }
 
@@ -49,6 +52,9 @@ pub struct FrameInputConfig {
     /// avatar pixels are non-zero. When false, the render target is cleared
     /// to `(background_color, 1)` so the output is opaque.
     pub transparent_background: bool,
+    /// Global avatar opacity (1.0 = opaque). Drives the fade-out-when-no-
+    /// person-detected feature; folded into the per-frame camera uniform.
+    pub avatar_opacity: f32,
     /// User-selected output colour space. Stage 1 only routes this through
     /// to `OutputTargetRequest.color_space` and metadata; render target
     /// format / shader gamma changes land in later stages.
@@ -60,6 +66,11 @@ pub struct FrameInputConfig {
     /// keeps receiving raw RGBA bytes. Decoupled from any GUI setting so a
     /// sink swap is the single source of truth for the export path.
     pub export_mode: crate::renderer::frame_input::RenderExportMode,
+    /// User-selected MSAA level. Forwarded to `OutputTargetRequest.msaa`;
+    /// the renderer clamps it to device support and applies it to the
+    /// offscreen render pass / pipelines (affects both the preview and the
+    /// exported frame, which share the offscreen target).
+    pub output_msaa: crate::renderer::frame_input::MsaaMode,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -134,6 +145,13 @@ pub struct Application {
 
     pub last_tracking_pose: Option<crate::tracking::SourceSkeleton>,
 
+    /// Smoothed global avatar opacity for the fade-out-when-no-person feature.
+    /// Lerps toward 1.0 while a person is detected (or within the hold window)
+    /// and toward 0.0 once detection has been lost past the hold window. Fed
+    /// into `RenderFrameInput::avatar_opacity` each frame. Always 1.0 when the
+    /// feature is disabled or tracking is off.
+    tracking_fade_opacity: f32,
+
     rendered_pixels: Option<Arc<Vec<u8>>>,
     rendered_extent: [u32; 2],
     rendered_frame_counter: u64,
@@ -154,6 +172,12 @@ pub struct Application {
     /// effects on render target format and MF media type land in later
     /// stages.
     pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
+    /// User-selected MSAA level. Synced from the GUI Rendering panel
+    /// (`rendering.msaa_index`) each frame and forwarded to the renderer
+    /// through `OutputTargetRequest.msaa`. The renderer clamps it to device
+    /// support (and caps integrated GPUs at 4x); the offscreen target is
+    /// shared by preview + export, so the chosen level antialiases both.
+    pub output_msaa: crate::renderer::frame_input::MsaaMode,
     /// Solid background colour the Vulkan renderer clears to when
     /// `transparent_background` is false. Synced from the Inspector's
     /// "Scene Background" panel each frame.
@@ -316,6 +340,7 @@ impl Application {
             running: false,
             avatar_library: avatar_library::AvatarLibrary::new(),
             last_tracking_pose: None,
+            tracking_fade_opacity: 1.0,
             rendered_pixels: None,
             rendered_extent: [0, 0],
             rendered_frame_counter: 0,
@@ -326,6 +351,7 @@ impl Application {
             output_extent: None,
             output_preserve_alpha: false,
             output_color_space: crate::renderer::frame_input::RenderColorSpace::Srgb,
+            output_msaa: crate::renderer::frame_input::MsaaMode::Off,
             background_color: [0.1, 0.1, 0.1],
             transparent_background: true,
             tracking_worker: None,

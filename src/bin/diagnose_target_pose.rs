@@ -201,11 +201,13 @@ fn build_frame_input(
             color_space: RenderColorSpace::Srgb,
             alpha_mode: RenderOutputAlpha::Opaque,
             export_mode: RenderExportMode::CpuReadback,
+            msaa: vulvatar_lib::renderer::frame_input::MsaaMode::Off,
         },
         background_image_path: None,
         show_ground_grid: false,
         background_color: [0.15, 0.15, 0.18],
         transparent_background: false,
+        avatar_opacity: 1.0,
     }
 }
 

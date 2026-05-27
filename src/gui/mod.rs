@@ -382,6 +382,10 @@ pub struct TrackingGuiState {
     /// lean / crouch (translation, on top of body-yaw rotation). When
     /// false the avatar pivots in place, keeping the framing stable.
     pub root_translation_enabled: bool,
+    /// When true, the avatar fades to transparent after person detection is
+    /// lost (past the tracking hold window) and fades back in on re-detection.
+    /// Passed through `FrameConfig::fade_on_tracking_loss`.
+    pub fade_on_tracking_loss: bool,
     /// Pose-solver smoothing / confidence thresholds, surfaced in the
     /// Tracking inspector's *Advanced smoothing* section and passed
     /// straight through `FrameConfig::smoothing` each frame. Defaults are
@@ -410,6 +414,12 @@ pub struct RenderingGuiState {
     pub main_light_intensity: f32,
     pub ambient_intensity: [f32; 3],
     pub alpha_preview: bool,
+    /// Anti-aliasing (MSAA) level: 0=Off, 1=2x, 2=4x, 3=8x. Reconciled into
+    /// `app.output_msaa` each frame and persisted (stored in the project's
+    /// `output.msaa_index` slot). The renderer clamps the level to the
+    /// device's framebuffer sample-count support (and caps iGPUs at 4x), so
+    /// an unsupported pick silently degrades.
+    pub msaa_index: usize,
     pub toggle_spring: bool,
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
@@ -718,6 +728,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
+                fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
             },
             rendering: RenderingGuiState {
@@ -729,6 +740,7 @@ impl GuiApp {
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
                 alpha_preview: false,
+                msaa_index: 0,
                 toggle_spring: true,
                 toggle_cloth: false,
                 toggle_collision_debug: false,
@@ -931,6 +943,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
+                fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
             },
             rendering: RenderingGuiState {
@@ -942,6 +955,7 @@ impl GuiApp {
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
                 alpha_preview: false,
+                msaa_index: 0,
                 toggle_spring: true,
                 toggle_cloth: false,
                 toggle_collision_debug: false,
@@ -1190,6 +1204,11 @@ impl eframe::App for GuiApp {
             _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
         };
 
+        // Forward the anti-aliasing pick. The renderer rebuilds its render
+        // pass + pipelines on change and clamps the level to device support.
+        self.app.output_msaa =
+            crate::renderer::frame_input::MsaaMode::from_index(self.rendering.msaa_index);
+
         if !self.runtime_status.paused {
             let real_dt = (self.runtime_status.frame_time_ms / 1000.0) as f32;
             // Clamp dt to avoid huge steps on first frame or after pauses.
@@ -1214,6 +1233,7 @@ impl eframe::App for GuiApp {
                 face_tracking_enabled: self.tracking.face_tracking_enabled,
                 lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
                 root_translation_enabled: self.tracking.root_translation_enabled,
+                fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
                 frame_dt,
             };
             self.app.run_frame(&frame_config);

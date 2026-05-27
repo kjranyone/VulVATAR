@@ -27,6 +27,8 @@ use super::source_skeleton::SourceJoint;
 #[cfg(feature = "inference")]
 use super::yolox::YoloxPersonDetector;
 #[cfg(feature = "inference")]
+use super::face_mediapipe::{FaceBbox, FaceMeshEp, FaceMeshInference};
+#[cfg(feature = "inference")]
 use crate::asset::HumanoidBone;
 #[cfg(feature = "inference")]
 use log::{debug, info, warn};
@@ -38,6 +40,8 @@ pub struct Hmr2Provider {
     hand_landmarker: Option<HandLandmarker>,
     #[cfg(feature = "inference")]
     palm_detector: Option<PalmDetector>,
+    #[cfg(feature = "inference")]
+    face_mesh: Option<FaceMeshInference>,
     #[cfg(feature = "inference")]
     person_detector: Option<YoloxPersonDetector>,
     load_warnings: Vec<String>,
@@ -103,6 +107,26 @@ impl Hmr2Provider {
             None
         };
 
+        // MediaPipe FaceMesh for facial expressions (blendshapes). HMR2 is a
+        // body+hands model with no facial landmarks, so without this the
+        // avatar's face stays neutral even with Face Tracking enabled. CPU EP
+        // (ForceCpu) keeps DirectML clear for the HMR2 body model + Vulkan
+        // render — same rationale as the CPU-pinned hand stage.
+        let face_mesh = match FaceMeshInference::try_from_models_dir(dir, FaceMeshEp::ForceCpu) {
+            Ok(Some(f)) => Some(f),
+            Ok(None) => {
+                let msg = "MediaPipe FaceMesh not found (face_landmark.onnx / face_blendshapes.onnx); facial expressions will stay neutral".to_string();
+                warn!("{}", msg);
+                load_warnings.push(msg);
+                None
+            }
+            Err(e) => {
+                warn!("MediaPipe FaceMesh failed to load: {}", e);
+                load_warnings.push(format!("face mesh load: {}", e));
+                None
+            }
+        };
+
         let person_detector = match YoloxPersonDetector::try_from_models_dir(dir) {
             Ok(Some(d)) => {
                 info!("YOLOX person detector loaded ({})", d.backend().label());
@@ -126,17 +150,19 @@ impl Hmr2Provider {
         };
 
         info!(
-            "HMR2 provider ready (HMR2: {}, model: {}, YOLOX: {}, Hands: {})",
+            "HMR2 provider ready (HMR2: {}, model: {}, YOLOX: {}, Hands: {}, Face: {})",
             hmr2.backend().label(),
             model_path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
             if person_detector.is_some() { "on" } else { "off" },
-            if hand_landmarker.is_some() { "on" } else { "off" }
+            if hand_landmarker.is_some() { "on" } else { "off" },
+            if face_mesh.is_some() { "on" } else { "off" }
         );
 
         Ok(Self {
             hmr2,
             hand_landmarker,
             palm_detector,
+            face_mesh,
             person_detector,
             load_warnings,
         })
@@ -530,6 +556,46 @@ impl Hmr2Provider {
             dt_infer.as_secs_f32() * 1000.0,
             dt_hands.as_secs_f32() * 1000.0,
         );
+        // Face mesh pass: HMR2 has no facial landmarks, so derive a face bbox
+        // from the projected SMPL head / neck joints and run the MediaPipe
+        // FaceMesh cascade. Populates `skeleton.expressions` +
+        // `face_mesh_confidence`, which the solver's `solve_expressions`
+        // consumes when Face Tracking is enabled — without it the avatar's
+        // face stays neutral on the HMR2 provider. Head rotation remains
+        // HMR2/SMPL-driven; this only adds blendshape expressions. Placement
+        // inherits pred_cam's deskcrop bias, mitigated by a generous bbox.
+        if let Some(face_mesh) = self.face_mesh.as_mut() {
+            let crop_sx = crop_w as f32 / IMAGE_SIZE as f32;
+            let crop_sy = crop_h as f32 / IMAGE_SIZE as f32;
+            let project_full = |idx: usize| -> (f32, f32) {
+                let (u, v) =
+                    project_to_crop_px(&camera_joints[idx], &pose.pred_cam, IMAGE_SIZE as i32);
+                (
+                    crop_origin.0 as f32 + u * crop_sx,
+                    crop_origin.1 as f32 + v * crop_sy,
+                )
+            };
+            let (hx, hy) = project_full(15); // SMPL 15 = Head
+            let (nx, ny) = project_full(12); // SMPL 12 = Neck
+            let head_len = ((hx - nx).powi(2) + (hy - ny).powi(2)).sqrt().max(24.0);
+            // The face sits above the head joint (atlas), so nudge the centre
+            // up the neck→head direction and size the box generously.
+            let size = head_len * 2.4;
+            let cx = hx + (hx - nx) * 0.3;
+            let cy = hy + (hy - ny) * 0.3;
+            let bbox = FaceBbox {
+                x: cx - size * 0.5,
+                y: cy - size * 0.5,
+                size,
+            };
+            if let Some((exprs, mesh_conf, _face_pose)) =
+                face_mesh.estimate(rgb_data, width, height, &bbox)
+            {
+                skeleton.expressions = exprs;
+                skeleton.face_mesh_confidence = Some(mesh_conf);
+            }
+        }
+
         // Project the SMPL body joints to normalised full-image coords so the
         // webcam-preview wipe can draw HMR2's detected pose (keypoints +
         // skeleton), matching the RTMW3D / ViTPose providers. HMR2 is a

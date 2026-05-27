@@ -38,6 +38,7 @@ pub struct ProjectState {
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
     pub root_translation_enabled: bool,
+    pub fade_on_tracking_loss: bool,
     pub camera_index: usize,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
@@ -81,6 +82,8 @@ pub struct ProjectState {
     pub output_framerate_index: usize,
     pub output_has_alpha: bool,
     pub output_color_space_index: usize,
+    /// Anti-aliasing (MSAA) level index: 0=Off, 1=2x, 2=4x, 3=8x.
+    pub output_msaa_index: usize,
 
     // Settings
     pub settings_locale: String,
@@ -251,6 +254,8 @@ pub struct TrackingConfig {
     #[serde(default = "default_true")]
     pub root_translation_enabled: bool,
     #[serde(default)]
+    pub fade_on_tracking_loss: bool,
+    #[serde(default)]
     pub camera_index: usize,
     #[serde(default)]
     pub show_camera_wipe: bool,
@@ -397,6 +402,10 @@ pub struct OutputConfig {
     pub has_alpha: bool,
     #[serde(default)]
     pub color_space_index: usize,
+    /// Anti-aliasing (MSAA) level index: 0=Off, 1=2x, 2=4x, 3=8x.
+    /// `#[serde(default)]` keeps older projects (which lacked this) loadable.
+    #[serde(default)]
+    pub msaa_index: usize,
 }
 
 fn default_zoom_sensitivity() -> f32 {
@@ -581,6 +590,7 @@ impl ProjectFile {
                 face_tracking_enabled: state.face_tracking_enabled,
                 lower_body_tracking_enabled: state.lower_body_tracking_enabled,
                 root_translation_enabled: state.root_translation_enabled,
+                fade_on_tracking_loss: state.fade_on_tracking_loss,
                 camera_index: state.camera_index,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
@@ -616,6 +626,7 @@ impl ProjectFile {
                 framerate_index: state.output_framerate_index,
                 has_alpha: state.output_has_alpha,
                 color_space_index: state.output_color_space_index,
+                msaa_index: state.output_msaa_index,
             },
             settings: SettingsConfig {
                 locale: state.settings_locale.clone(),
@@ -652,6 +663,7 @@ impl ProjectFile {
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
+            fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             camera_index: self.tracking.camera_index,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,
@@ -684,6 +696,7 @@ impl ProjectFile {
             output_framerate_index: self.output.framerate_index,
             output_has_alpha: self.output.has_alpha,
             output_color_space_index: self.output.color_space_index,
+            output_msaa_index: self.output.msaa_index,
 
             settings_locale: self.settings.locale.clone(),
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,

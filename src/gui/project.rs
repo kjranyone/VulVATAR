@@ -94,6 +94,7 @@ impl GuiApp {
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
+            fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             camera_index: self.camera_index,
             show_camera_wipe: self.viewport.show_camera_wipe,
             show_detection_annotations: self.viewport.show_detection_annotations,
@@ -138,6 +139,9 @@ impl GuiApp {
             output_framerate_index: self.output.output_framerate_index,
             output_has_alpha: self.output.output_has_alpha,
             output_color_space_index: self.output.output_color_space_index,
+            // MSAA lives on the Rendering panel (RenderingGuiState) but is
+            // stored in the project's output.msaa_index slot.
+            output_msaa_index: self.rendering.msaa_index,
 
             settings_locale: self.settings.locale.clone(),
             settings_zoom_sensitivity: self.settings.zoom_sensitivity,
@@ -225,6 +229,7 @@ impl GuiApp {
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
+        self.tracking.fade_on_tracking_loss = state.fade_on_tracking_loss;
         self.camera_index = state.camera_index;
         self.viewport.show_camera_wipe = state.show_camera_wipe;
         self.viewport.show_detection_annotations = state.show_detection_annotations;
@@ -288,6 +293,7 @@ impl GuiApp {
         self.output.output_framerate_index = state.output_framerate_index;
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
+        self.rendering.msaa_index = state.output_msaa_index;
 
         self.settings.locale = state.settings_locale.clone();
         self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;
