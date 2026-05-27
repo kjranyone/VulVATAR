@@ -38,6 +38,7 @@ pub struct ProjectState {
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
     pub root_translation_enabled: bool,
+    pub fade_on_tracking_loss: bool,
     pub camera_index: usize,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
@@ -250,6 +251,8 @@ pub struct TrackingConfig {
     pub lower_body_tracking_enabled: bool,
     #[serde(default = "default_true")]
     pub root_translation_enabled: bool,
+    #[serde(default)]
+    pub fade_on_tracking_loss: bool,
     #[serde(default)]
     pub camera_index: usize,
     #[serde(default)]
@@ -581,6 +584,7 @@ impl ProjectFile {
                 face_tracking_enabled: state.face_tracking_enabled,
                 lower_body_tracking_enabled: state.lower_body_tracking_enabled,
                 root_translation_enabled: state.root_translation_enabled,
+                fade_on_tracking_loss: state.fade_on_tracking_loss,
                 camera_index: state.camera_index,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
@@ -652,6 +656,7 @@ impl ProjectFile {
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
+            fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             camera_index: self.tracking.camera_index,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,

@@ -206,6 +206,7 @@ fn build_frame_input(
         show_ground_grid: false,
         background_color: [0.15, 0.15, 0.18],
         transparent_background: false,
+        avatar_opacity: 1.0,
     }
 }
 

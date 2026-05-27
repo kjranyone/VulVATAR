@@ -207,6 +207,7 @@ impl GuiApp {
             show_ground_grid: false,
             background_color: [0.0, 0.0, 0.0],
             transparent_background: true,
+            avatar_opacity: 1.0,
         }
     }
 
@@ -333,6 +334,7 @@ impl GuiApp {
             show_ground_grid: false,
             background_color: [0.0, 0.0, 0.0],
             transparent_background: true,
+            avatar_opacity: 1.0,
         }
     }
 

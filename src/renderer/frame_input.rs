@@ -16,6 +16,11 @@ pub struct RenderFrameInput {
     /// target is cleared to `(0,0,0,0)` instead).
     pub background_color: [f32; 3],
     pub transparent_background: bool,
+    /// Global avatar opacity multiplier (1.0 = fully opaque). Drives the
+    /// fade-out-when-no-person-detected feature; the renderer folds it into
+    /// the per-frame camera uniform and multiplies it into every avatar
+    /// fragment's alpha.
+    pub avatar_opacity: f32,
 }
 
 #[derive(Clone, Debug)]

@@ -877,7 +877,7 @@ impl VulkanRenderer {
             light_color: input.lighting.main_light_color,
             _pad1: 0.0,
             ambient_term: input.lighting.ambient_term,
-            _pad2: 0.0,
+            fade_opacity: input.avatar_opacity,
         };
         let ring_slot = (self.frame_counter % FRAME_LAG as u64) as usize;
         let (camera_set, outline_camera_set) = {
@@ -1967,7 +1967,10 @@ struct CameraUniform {
     light_color: [f32; 3],
     _pad1: f32,
     ambient_term: [f32; 3],
-    _pad2: f32,
+    /// Global avatar opacity multiplier (1.0 = opaque). Drives the
+    /// fade-out-when-no-person-detected feature; reuses the former
+    /// `_pad2` slot so the std140 layout is unchanged.
+    fade_opacity: f32,
 }
 
 /// Convert row-major camera matrices into column-major for GLSL.
@@ -2023,7 +2026,7 @@ impl CameraRing {
             light_color: [0.0; 3],
             _pad1: 0.0,
             ambient_term: [0.0; 3],
-            _pad2: 0.0,
+            fade_opacity: 1.0,
         };
 
         let mut buffers = Vec::with_capacity(FRAME_LAG);

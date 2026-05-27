@@ -151,6 +151,8 @@ tracking:
   lower_body_tooltip: "When on, the solver writes leg / foot bone rotations from the tracked pose. When off, the avatar's lower body stays in its rest pose regardless of what the camera sees — useful when the legs are out of frame or you want a fixed sitting pose. Affects only the solver; the underlying pose model is unchanged."
   root_translation: "Follow Subject Position"
   root_translation_tooltip: "When on, the avatar's hip translates to follow the subject's side-step / lean / crouch. When off, the avatar pivots in place — useful when the rendered framing should stay locked regardless of how the subject drifts in front of the camera."
+  fade_on_loss: "Fade out when no person detected"
+  fade_on_loss_tooltip: "When tracking is on and no person has been detected past the ~1s hold window, fade the avatar to transparent. Fades back in on re-detection. Best with a transparent-background output."
   confidence: "Confidence"
   confidence_overall: "Overall"
   confidence_face: "Face"

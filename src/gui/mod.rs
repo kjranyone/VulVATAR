@@ -382,6 +382,10 @@ pub struct TrackingGuiState {
     /// lean / crouch (translation, on top of body-yaw rotation). When
     /// false the avatar pivots in place, keeping the framing stable.
     pub root_translation_enabled: bool,
+    /// When true, the avatar fades to transparent after person detection is
+    /// lost (past the tracking hold window) and fades back in on re-detection.
+    /// Passed through `FrameConfig::fade_on_tracking_loss`.
+    pub fade_on_tracking_loss: bool,
     /// Pose-solver smoothing / confidence thresholds, surfaced in the
     /// Tracking inspector's *Advanced smoothing* section and passed
     /// straight through `FrameConfig::smoothing` each frame. Defaults are
@@ -718,6 +722,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
+                fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
             },
             rendering: RenderingGuiState {
@@ -931,6 +936,7 @@ impl GuiApp {
                 face_tracking_enabled: true,
                 lower_body_tracking_enabled: false,
                 root_translation_enabled: true,
+                fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
             },
             rendering: RenderingGuiState {
@@ -1214,6 +1220,7 @@ impl eframe::App for GuiApp {
                 face_tracking_enabled: self.tracking.face_tracking_enabled,
                 lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
                 root_translation_enabled: self.tracking.root_translation_enabled,
+                fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
                 frame_dt,
             };
             self.app.run_frame(&frame_config);

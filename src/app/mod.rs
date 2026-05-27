@@ -32,6 +32,9 @@ pub struct FrameConfig {
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
     pub root_translation_enabled: bool,
+    /// When true, the avatar fades to transparent after person detection is
+    /// lost past the tracking hold window, and fades back in on re-detection.
+    pub fade_on_tracking_loss: bool,
     pub frame_dt: f32,
 }
 
@@ -49,6 +52,9 @@ pub struct FrameInputConfig {
     /// avatar pixels are non-zero. When false, the render target is cleared
     /// to `(background_color, 1)` so the output is opaque.
     pub transparent_background: bool,
+    /// Global avatar opacity (1.0 = opaque). Drives the fade-out-when-no-
+    /// person-detected feature; folded into the per-frame camera uniform.
+    pub avatar_opacity: f32,
     /// User-selected output colour space. Stage 1 only routes this through
     /// to `OutputTargetRequest.color_space` and metadata; render target
     /// format / shader gamma changes land in later stages.
@@ -133,6 +139,13 @@ pub struct Application {
     pub avatar_library: avatar_library::AvatarLibrary,
 
     pub last_tracking_pose: Option<crate::tracking::SourceSkeleton>,
+
+    /// Smoothed global avatar opacity for the fade-out-when-no-person feature.
+    /// Lerps toward 1.0 while a person is detected (or within the hold window)
+    /// and toward 0.0 once detection has been lost past the hold window. Fed
+    /// into `RenderFrameInput::avatar_opacity` each frame. Always 1.0 when the
+    /// feature is disabled or tracking is off.
+    tracking_fade_opacity: f32,
 
     rendered_pixels: Option<Arc<Vec<u8>>>,
     rendered_extent: [u32; 2],
@@ -316,6 +329,7 @@ impl Application {
             running: false,
             avatar_library: avatar_library::AvatarLibrary::new(),
             last_tracking_pose: None,
+            tracking_fade_opacity: 1.0,
             rendered_pixels: None,
             rendered_extent: [0, 0],
             rendered_frame_counter: 0,

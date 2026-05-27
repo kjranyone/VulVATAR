@@ -177,7 +177,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     vec3 light_color;
     float _pad1;
     vec3 ambient_term;
-    float _pad2;
+    float fade_opacity;
 } camera;
 
 layout(location = 0) out vec3 frag_normal;
@@ -214,7 +214,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     vec3 light_color;
     float _pad1;
     vec3 ambient_term;
-    float _pad2;
+    float fade_opacity;
 } camera;
 
 layout(set = 1, binding = 0) uniform MaterialData {
@@ -333,7 +333,10 @@ void main() {
         color.a = 1.0;
     }
 
-    out_color = color;
+    // Global avatar fade (e.g. fade-out when no person is detected). 1.0 =
+    // fully opaque; applied after alpha_mode handling so it dims even opaque
+    // materials. Composited against the (possibly transparent) background.
+    out_color = vec4(color.rgb, color.a * camera.fade_opacity);
 }
 "
                                                                                                                                                                                                                                                                     }
@@ -364,7 +367,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     vec3 light_color;
     float _pad1;
     vec3 ambient_term;
-    float _pad2;
+    float fade_opacity;
 } camera;
 
 layout(push_constant) uniform OutlinePush {

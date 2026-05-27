@@ -347,6 +347,7 @@ fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameIn
         show_ground_grid: false,
         background_color: [0.10, 0.10, 0.10],
         transparent_background: false,
+        avatar_opacity: 1.0,
     }
 }
 

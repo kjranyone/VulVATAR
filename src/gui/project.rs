@@ -94,6 +94,7 @@ impl GuiApp {
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
+            fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             camera_index: self.camera_index,
             show_camera_wipe: self.viewport.show_camera_wipe,
             show_detection_annotations: self.viewport.show_detection_annotations,
@@ -225,6 +226,7 @@ impl GuiApp {
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
+        self.tracking.fade_on_tracking_loss = state.fade_on_tracking_loss;
         self.camera_index = state.camera_index;
         self.viewport.show_camera_wipe = state.show_camera_wipe;
         self.viewport.show_detection_annotations = state.show_detection_annotations;
