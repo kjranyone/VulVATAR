@@ -160,6 +160,14 @@ pub struct PoseSolverState {
     /// Separate filter state map for fingertip auxiliary positions
     /// (keyed by the distal bone, same as `SourceSkeleton::fingertips`).
     fingertip_filters: HashMap<HumanoidBone, OneEuroFilterState>,
+    /// 1€ filter state for the hand-orientation forward/up vectors,
+    /// indexed `[left_forward, left_up, right_forward, right_up]`. The
+    /// wrist rotation reads `HandOrientation` directly and the palm-normal
+    /// cross product is very noisy, so held finger poses (thumbs-up,
+    /// pointing) jittered until this smoothing was added. Smoothed
+    /// per-component then re-normalised; at rest (≈zero velocity) the 1€
+    /// filter collapses to its min-cutoff and damps the jitter hard.
+    hand_orient_filters: [OneEuroFilterState; 4],
     /// Per-bone Schmitt hysteresis state for joint confidence.
     joint_active: HashMap<HumanoidBone, bool>,
     /// Wall-clock timestamp of the previous solve, used to derive `dt`
@@ -204,6 +212,7 @@ impl PoseSolverState {
     pub fn reset_motion_smoothing(&mut self) {
         self.joint_filters.clear();
         self.fingertip_filters.clear();
+        self.hand_orient_filters = Default::default();
         self.joint_active.clear();
         self.last_solve_instant = None;
         self.root_reference = None;
@@ -2152,7 +2161,149 @@ fn preprocess_source(
         // gate — so we only smooth the position here.
     }
 
+    // Smooth the hand orientation (forward/up) the same way the joints are
+    // smoothed. The wrist rotation consumes `HandOrientation` directly and
+    // the palm-normal cross product is noisy, so held finger poses jittered
+    // when it was used raw. Filter each vector per-component, then
+    // re-normalise (the 1€ filter doesn't preserve unit length).
+    let normalize3 = |v: [f32; 3]| -> [f32; 3] {
+        let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if m > 1e-6 {
+            [v[0] / m, v[1] / m, v[2] / m]
+        } else {
+            v
+        }
+    };
+    if let Some(o) = out.left_hand_orientation.as_mut() {
+        o.forward = normalize3(state.hand_orient_filters[0].apply(o.forward, dt));
+        o.up = normalize3(state.hand_orient_filters[1].apply(o.up, dt));
+    }
+    if let Some(o) = out.right_hand_orientation.as_mut() {
+        o.forward = normalize3(state.hand_orient_filters[2].apply(o.forward, dt));
+        o.up = normalize3(state.hand_orient_filters[3].apply(o.up, dt));
+    }
+
+    // Anatomical finger constraints (run on the smoothed keypoints): clamp
+    // each finger's curl to a single hinge plane with physiological angle
+    // limits, removing the impossible twist / lateral wobble that noisy
+    // landmarks otherwise feed into the unconstrained shortest-arc solve.
+    constrain_fingers(&mut out);
+
     out
+}
+
+/// Re-project each finger's PIP/DIP joints onto a single anatomical curl
+/// plane and clamp the bend magnitudes. The hinge axis is the knuckle
+/// (medio-lateral) axis = `palm_normal × proximal_phalanx`; fingers flex
+/// in the plane spanned by the phalanx and the palm normal. This removes
+/// the out-of-plane twist / lateral jitter that unconstrained shortest-arc
+/// direction matching produced from noisy MediaPipe keypoints — the
+/// dominant cause of thumbs-up / pointing-pose wobble. Runs on the already
+/// 1€-smoothed source, so bend angles are temporally stable before they're
+/// clamped. The proximal (MCP) joint is left as measured: it is a genuine
+/// 2-DoF joint carrying flexion *and* abduction/spread, which the curl
+/// plane must not flatten. Requires the hand orientation (palm normal);
+/// fingers on a hand with no orientation this frame are left untouched.
+fn constrain_fingers(out: &mut SourceSkeleton) {
+    use HumanoidBone::*;
+    // (proximal, intermediate, distal, is_left)
+    let fingers: [(HumanoidBone, HumanoidBone, HumanoidBone, bool); 10] = [
+        (LeftThumbProximal, LeftThumbIntermediate, LeftThumbDistal, true),
+        (LeftIndexProximal, LeftIndexIntermediate, LeftIndexDistal, true),
+        (LeftMiddleProximal, LeftMiddleIntermediate, LeftMiddleDistal, true),
+        (LeftRingProximal, LeftRingIntermediate, LeftRingDistal, true),
+        (LeftLittleProximal, LeftLittleIntermediate, LeftLittleDistal, true),
+        (RightThumbProximal, RightThumbIntermediate, RightThumbDistal, false),
+        (RightIndexProximal, RightIndexIntermediate, RightIndexDistal, false),
+        (RightMiddleProximal, RightMiddleIntermediate, RightMiddleDistal, false),
+        (RightRingProximal, RightRingIntermediate, RightRingDistal, false),
+        (RightLittleProximal, RightLittleIntermediate, RightLittleDistal, false),
+    ];
+    // Physiological flex cap (radians, magnitude only — the measured sign
+    // carries the curl direction, which flips with the hand's palm normal).
+    const MAX_FLEX: f32 = 2.0; // ~115°
+
+    for (prox, inter, dist, is_left) in fingers {
+        let palm_normal = match if is_left {
+            out.left_hand_orientation.as_ref()
+        } else {
+            out.right_hand_orientation.as_ref()
+        } {
+            Some(o) => o.up,
+            None => continue,
+        };
+        let (Some(p0), Some(p1), Some(p2)) = (
+            out.joints.get(&prox).map(|j| j.position),
+            out.joints.get(&inter).map(|j| j.position),
+            out.joints.get(&dist).map(|j| j.position),
+        ) else {
+            continue;
+        };
+        let Some(p3) = out.fingertips.get(&dist).map(|j| j.position) else {
+            continue;
+        };
+
+        let seg1 = vec3_sub(&p1, &p0);
+        let seg2 = vec3_sub(&p2, &p1);
+        let seg3 = vec3_sub(&p3, &p2);
+        let len2 = vec3_length(&seg2);
+        let len3 = vec3_length(&seg3);
+        if vec3_length(&seg1) < 1e-5 || len2 < 1e-5 || len3 < 1e-5 {
+            continue;
+        }
+        let dir1 = vec3_normalize(&seg1);
+        let hinge = vec3_cross(&palm_normal, &dir1);
+        if vec3_length(&hinge) < 1e-5 {
+            continue; // phalanx parallel to palm normal — axis undefined.
+        }
+        let hinge = vec3_normalize(&hinge);
+
+        // PIP: signed bend of seg2 vs seg1 about the hinge, clamped, then
+        // re-projected exactly into the hinge plane.
+        let pip = signed_angle(&dir1, &vec3_normalize(&seg2), &hinge).clamp(-MAX_FLEX, MAX_FLEX);
+        let dir2 = rotate_about_axis(&dir1, &hinge, pip);
+        // DIP: clamped and softly coupled — it cannot bend much past the
+        // PIP (tendon coupling) and stays in the same plane.
+        let dip_cap = (pip.abs() * 1.3).min(MAX_FLEX);
+        let dip = signed_angle(&vec3_normalize(&seg2), &vec3_normalize(&seg3), &hinge)
+            .clamp(-dip_cap, dip_cap);
+        let dir3 = rotate_about_axis(&dir2, &hinge, dip);
+
+        let p2_new = [
+            p1[0] + dir2[0] * len2,
+            p1[1] + dir2[1] * len2,
+            p1[2] + dir2[2] * len2,
+        ];
+        let p3_new = [
+            p2_new[0] + dir3[0] * len3,
+            p2_new[1] + dir3[1] * len3,
+            p2_new[2] + dir3[2] * len3,
+        ];
+        if let Some(j) = out.joints.get_mut(&dist) {
+            j.position = p2_new;
+        }
+        if let Some(j) = out.fingertips.get_mut(&dist) {
+            j.position = p3_new;
+        }
+    }
+}
+
+/// Rotate `v` about unit axis `k` by `theta` radians (Rodrigues).
+fn rotate_about_axis(v: &[f32; 3], k: &[f32; 3], theta: f32) -> [f32; 3] {
+    let (s, c) = theta.sin_cos();
+    let kxv = vec3_cross(k, v);
+    let kdv = vec3_dot(k, v) * (1.0 - c);
+    [
+        v[0] * c + kxv[0] * s + k[0] * kdv,
+        v[1] * c + kxv[1] * s + k[1] * kdv,
+        v[2] * c + kxv[2] * s + k[2] * kdv,
+    ]
+}
+
+/// Signed angle from unit vector `a` to unit vector `b` about unit `axis`.
+fn signed_angle(a: &[f32; 3], b: &[f32; 3], axis: &[f32; 3]) -> f32 {
+    let cross = vec3_cross(a, b);
+    vec3_dot(&cross, axis).atan2(vec3_dot(a, b))
 }
 
 /// True for the six lower-body bones the solver drives (per-side
