@@ -669,17 +669,6 @@ fn infer_body_yaw_from_foreshortening(sk: &mut SourceSkeleton, yaw_sign: f32) {
     // separation in z (cos·0 + sin·0 = 0), so the avatar fails to
     // turn even though yaw was correctly inferred as 90°.
     const COLLAPSE_X_SPAN: f32 = 0.05;
-    /// Subject-adaptive collapse threshold via shoulder/torso_y
-    /// ratio. For an upright frontal adult, shoulder_span_x ≈
-    /// 0.7-1.3 × torso_y. When the observed ratio drops below
-    /// 0.50, the subject is in deep profile (~60°+ yaw) — apply
-    /// the anatomical-separation recovery so the chain rotation
-    /// produces a proper z separation. orient_001 walking case
-    /// had ratio 0.45 (shoulder_span 0.135, torso 0.30) and was
-    /// missing the recovery despite being near-90°. The absolute
-    /// COLLAPSE_X_SPAN gate above stays for the literal 0-span
-    /// case (90° + zero detection noise).
-    const COLLAPSE_RATIO_THRESHOLD: f32 = 0.30;
     let upper_left_chain: &[HumanoidBone] = &[
         HumanoidBone::LeftShoulder,
         HumanoidBone::LeftUpperArm,

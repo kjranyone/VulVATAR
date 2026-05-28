@@ -15,7 +15,7 @@ use super::provider::PoseProvider;
 use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
 
 #[cfg(feature = "inference")]
-use super::hand_mediapipe::{HandKp, HandLandmarker, HandLandmarks};
+use super::hand_mediapipe::HandLandmarker;
 #[cfg(feature = "inference")]
 use super::hmr2::{smpl, Hmr2Inference, IMAGE_SIZE};
 #[cfg(feature = "inference")]
@@ -700,165 +700,6 @@ fn resize_rgb_to_224(rgb: &[u8], src_w: u32, src_h: u32) -> Vec<u8> {
     out
 }
 
-/// Write the 21 hand-landmark keypoints into the source skeleton's
-/// per-finger VRM bones. Coordinates are in MediaPipe's world frame
-/// (origin at wrist, meters); we offset by the SMPL wrist's source-
-/// frame position so the per-bone direction comes out aligned with
-/// the rest of the body.
-#[cfg(feature = "inference")]
-fn inject_hand_landmarks(
-    skeleton: &mut SourceSkeleton,
-    lm: &HandLandmarks,
-    avatar_left: bool,
-    wrist_anchor: [f32; 3],
-) {
-    // MediaPipe → VRM bone POSITION map. Each finger has 3 bones
-    // (Proximal/Intermediate/Distal) plus a tip that lands in
-    // `fingertips`. The tip is the kp index +3 from the proximal
-    // (MCP/CMC) base.
-    let (thumb_p, thumb_i, thumb_d, index_p, index_i, index_d,
-         middle_p, middle_i, middle_d, ring_p, ring_i, ring_d,
-         little_p, little_i, little_d): (HumanoidBone, _, _, _, _, _, _, _, _, _, _, _, _, _, _) =
-        if avatar_left {
-            (
-                HumanoidBone::LeftThumbProximal,
-                HumanoidBone::LeftThumbIntermediate,
-                HumanoidBone::LeftThumbDistal,
-                HumanoidBone::LeftIndexProximal,
-                HumanoidBone::LeftIndexIntermediate,
-                HumanoidBone::LeftIndexDistal,
-                HumanoidBone::LeftMiddleProximal,
-                HumanoidBone::LeftMiddleIntermediate,
-                HumanoidBone::LeftMiddleDistal,
-                HumanoidBone::LeftRingProximal,
-                HumanoidBone::LeftRingIntermediate,
-                HumanoidBone::LeftRingDistal,
-                HumanoidBone::LeftLittleProximal,
-                HumanoidBone::LeftLittleIntermediate,
-                HumanoidBone::LeftLittleDistal,
-            )
-        } else {
-            (
-                HumanoidBone::RightThumbProximal,
-                HumanoidBone::RightThumbIntermediate,
-                HumanoidBone::RightThumbDistal,
-                HumanoidBone::RightIndexProximal,
-                HumanoidBone::RightIndexIntermediate,
-                HumanoidBone::RightIndexDistal,
-                HumanoidBone::RightMiddleProximal,
-                HumanoidBone::RightMiddleIntermediate,
-                HumanoidBone::RightMiddleDistal,
-                HumanoidBone::RightRingProximal,
-                HumanoidBone::RightRingIntermediate,
-                HumanoidBone::RightRingDistal,
-                HumanoidBone::RightLittleProximal,
-                HumanoidBone::RightLittleIntermediate,
-                HumanoidBone::RightLittleDistal,
-            )
-        };
-
-    // MediaPipe world landmarks live in a HAND-CANONICAL frame: X is
-    // thumb-side, Y is wrist→fingertip, Z is palm-normal-out. To put
-    // them in our body's source frame we rotate by R = [right, forward,
-    // up] (columns), built from the same wrist forward/up we shipped
-    // to `HandOrientation`. Without this step the finger keypoints
-    // sit in hand-local coords and the solver curls fingers along
-    // unrelated axes.
-    let forward = vec3_normalize(&vec3_sub(
-        &[-lm.world[HandKp::MiddleMcp as usize][0],
-           lm.world[HandKp::MiddleMcp as usize][1],
-          -lm.world[HandKp::MiddleMcp as usize][2]],
-        &[-lm.world[HandKp::Wrist as usize][0],
-           lm.world[HandKp::Wrist as usize][1],
-          -lm.world[HandKp::Wrist as usize][2]],
-    ));
-    let v_idx = vec3_sub(
-        &[-lm.world[HandKp::IndexMcp as usize][0],
-           lm.world[HandKp::IndexMcp as usize][1],
-          -lm.world[HandKp::IndexMcp as usize][2]],
-        &[-lm.world[HandKp::Wrist as usize][0],
-           lm.world[HandKp::Wrist as usize][1],
-          -lm.world[HandKp::Wrist as usize][2]],
-    );
-    let v_pky = vec3_sub(
-        &[-lm.world[HandKp::PinkyMcp as usize][0],
-           lm.world[HandKp::PinkyMcp as usize][1],
-          -lm.world[HandKp::PinkyMcp as usize][2]],
-        &[-lm.world[HandKp::Wrist as usize][0],
-           lm.world[HandKp::Wrist as usize][1],
-          -lm.world[HandKp::Wrist as usize][2]],
-    );
-    let (a, b) = if avatar_left { (v_idx, v_pky) } else { (v_pky, v_idx) };
-    let up = vec3_normalize(&vec3_cross(&a, &b));
-    let right = vec3_normalize(&vec3_cross(&up, &forward));
-    // R columns: [right, forward, up] → R * canonical = source-frame
-    // direction. Each row of the matrix is computed inline below.
-    let rotate = |c: [f32; 3]| -> [f32; 3] {
-        [
-            right[0] * c[0] + forward[0] * c[1] + up[0] * c[2],
-            right[1] * c[0] + forward[1] * c[1] + up[1] * c[2],
-            right[2] * c[0] + forward[2] * c[1] + up[2] * c[2],
-        ]
-    };
-    let wrist_canon = lm.world[HandKp::Wrist as usize];
-    let pos = |kp: HandKp| -> [f32; 3] {
-        let w = lm.world[kp as usize];
-        // Canonical offset from wrist, then rotate into source frame,
-        // then anchor at the body's wrist position.
-        let canon = [w[0] - wrist_canon[0], w[1] - wrist_canon[1], w[2] - wrist_canon[2]];
-        let rotated = rotate(canon);
-        [
-            wrist_anchor[0] + rotated[0],
-            wrist_anchor[1] + rotated[1],
-            wrist_anchor[2] + rotated[2],
-        ]
-    };
-
-    // Thumb: MediaPipe has 4 joints (CMC/MCP/IP/Tip); VRM has 3
-    // bones (Proximal/Intermediate/Distal). Map MCP→Proximal,
-    // IP→Intermediate, Tip→Distal so the wrist→Proximal direction
-    // captures the thumb base orientation.
-    let p_thumb_p = pos(HandKp::ThumbMcp);
-    let p_thumb_i = pos(HandKp::ThumbIp);
-    let p_thumb_t = pos(HandKp::ThumbTip);
-    insert_joint(skeleton, thumb_p, p_thumb_p);
-    insert_joint(skeleton, thumb_i, p_thumb_i);
-    insert_joint(skeleton, thumb_d, p_thumb_t);
-    skeleton.fingertips.insert(thumb_d, joint(p_thumb_t));
-
-    // Index/Middle/Ring/Pinky: 4 keypoints each (MCP/PIP/DIP/Tip),
-    // 3 bones each (Proximal/Intermediate/Distal). MCP→Proximal,
-    // PIP→Intermediate, DIP→Distal, Tip→fingertips[Distal].
-    let fingers: [(_, _, _, _, _, _, _); 4] = [
-        (
-            HandKp::IndexMcp, HandKp::IndexPip, HandKp::IndexDip, HandKp::IndexTip,
-            index_p, index_i, index_d,
-        ),
-        (
-            HandKp::MiddleMcp, HandKp::MiddlePip, HandKp::MiddleDip, HandKp::MiddleTip,
-            middle_p, middle_i, middle_d,
-        ),
-        (
-            HandKp::RingMcp, HandKp::RingPip, HandKp::RingDip, HandKp::RingTip,
-            ring_p, ring_i, ring_d,
-        ),
-        (
-            HandKp::PinkyMcp, HandKp::PinkyPip, HandKp::PinkyDip, HandKp::PinkyTip,
-            little_p, little_i, little_d,
-        ),
-    ];
-    for (mcp, pip, dip, tip, b_p, b_i, b_d) in fingers {
-        let p_mcp = pos(mcp);
-        let p_pip = pos(pip);
-        let p_dip = pos(dip);
-        let p_tip = pos(tip);
-        insert_joint(skeleton, b_p, p_mcp);
-        insert_joint(skeleton, b_i, p_pip);
-        insert_joint(skeleton, b_d, p_dip);
-        skeleton.fingertips.insert(b_d, joint(p_tip));
-    }
-}
-
 #[cfg(feature = "inference")]
 fn insert_joint(skeleton: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3]) {
     skeleton.joints.insert(bone, joint(pos));
@@ -881,7 +722,7 @@ fn joint(pos: [f32; 3]) -> SourceJoint {
 /// works the same way it does for ViTPose fingers — finger curl in
 /// the image plane translates to finger curl on the avatar.
 ///
-/// Tradeoff vs `inject_hand_landmarks` (canonical-world path):
+/// Tradeoff (vs a canonical-world-frame mapping):
 /// finger Z is planar (no depth from MediaPipe screen output beyond
 /// a relative-depth field we currently discard). Palm depth still
 /// works via `HandOrientation`. For curl ("fingers open vs closed"),

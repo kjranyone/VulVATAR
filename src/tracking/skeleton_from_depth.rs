@@ -45,7 +45,7 @@ fn remap_to_crop(crop: &FrameCrop, nx: f32, ny: f32) -> Option<(f32, f32)> {
 
 /// デプスフレームの解像度上で、肩幅ピクセル数に応じた安全なサンプリング半径を計算。
 /// 肩幅の 1/4 を超えないよう制限し、最小 0 (単一ピクセル)、最大 SAMPLE_RADIUS_PX。
-pub fn adaptive_sample_radius(depth_frame: &MoGeFrame, shoulder_px_span: Option<f32>) -> i32 {
+pub fn adaptive_sample_radius(_depth_frame: &MoGeFrame, shoulder_px_span: Option<f32>) -> i32 {
     match shoulder_px_span {
         Some(span) if span > 0.0 => {
             let max_safe = (span * 0.25).floor() as i32;

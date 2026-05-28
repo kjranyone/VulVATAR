@@ -26,7 +26,7 @@
 use std::path::Path;
 
 use super::provider::PoseProvider;
-use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
+use super::PoseEstimate;
 
 #[cfg(feature = "inference")]
 use super::rtmw3d::Rtmw3dInference;
