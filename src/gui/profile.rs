@@ -233,6 +233,7 @@ mod profile_roundtrip_tests {
                     depths_m: vec![1.80, 1.85, 1.78, 1.83],
                     bbox_normalized: [0.30, 0.20, 0.70, 0.65],
                 }),
+                neutral_expressions: Vec::new(),
             }),
         }
     }

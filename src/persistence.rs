@@ -171,6 +171,7 @@ fn pose_calibration_to_dto(
                 bbox_normalized: t.bbox_normalized,
             }
         }),
+        neutral_expressions: cal.neutral_expressions.clone(),
     }
 }
 
@@ -219,6 +220,7 @@ fn dto_to_pose_calibration(
                 bbox_normalized: t.bbox_normalized,
             }
         }),
+        neutral_expressions: dto.neutral_expressions.clone(),
     })
 }
 
@@ -321,6 +323,12 @@ pub struct PoseCalibrationDto {
     /// struct (same pattern as `PoseCalibrationDto` itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torso_depth_template: Option<TorsoDepthTemplateDto>,
+    /// Per-person resting expression baseline — see
+    /// `crate::tracking::PoseCalibration::neutral_expressions`. Stored
+    /// as `(name, weight)` pairs; defaults to empty for older saves /
+    /// captures taken with face tracking off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutral_expressions: Vec<(String, f32)>,
 }
 
 /// On-disk DTO mirror of `crate::tracking::TorsoDepthTemplate`.

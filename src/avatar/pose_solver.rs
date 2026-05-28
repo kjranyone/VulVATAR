@@ -188,6 +188,14 @@ pub struct PoseSolverState {
     /// per-frame Δz signal at intermediate (~30°–60°) rotations.
     /// `0.0` until the first confident shoulder pair arrives.
     running_shoulder_x_span_max: f32,
+    /// EMA state for the camera-driven mouth visemes (aa/ih/ou/ee/oh),
+    /// keyed by expression name. The image lip-sync path takes the raw
+    /// FaceMesh blendshape, which is noisy frame-to-frame; the eye/brow
+    /// path is already smoothed by `expression_blend` inside
+    /// [`solve_expressions`], but the mouth viseme policy bypasses that
+    /// blend, so it is eased here instead. Empty until the first frame a
+    /// viseme is seen; reset with the rest of the motion smoothing.
+    mouth_viseme_ema: HashMap<String, f32>,
 }
 
 impl PoseSolverState {
@@ -213,6 +221,7 @@ impl PoseSolverState {
         self.joint_filters.clear();
         self.fingertip_filters.clear();
         self.hand_orient_filters = Default::default();
+        self.mouth_viseme_ema.clear();
         self.joint_active.clear();
         self.last_solve_instant = None;
         self.root_reference = None;
@@ -2169,6 +2178,7 @@ pub fn solve_expressions(
     expression_blend: f32,
     face_confidence_threshold: f32,
     mouth_source: crate::tracking::MouthSource,
+    state: &mut PoseSolverState,
 ) -> Vec<ResolvedExpressionWeight> {
     use crate::tracking::MouthSource;
     // VRM mouth visemes whose driver (audio lip-sync vs camera) is
@@ -2205,11 +2215,25 @@ pub fn solve_expressions(
                 // `prev_w` carries the audio lip-sync value: `step_lipsync`
                 // runs just before the face solve each frame and writes the
                 // mouth visemes into the weights `previous` points at. So the
-                // source policy mixes camera (`raw`) against audio (`prev_w`).
+                // source policy mixes camera against audio (`prev_w`).
+                //
+                // The camera viseme is eased here with its own EMA: the
+                // eye/brow path above is smoothed by `blended`, but the mouth
+                // policy bypasses that, so the raw FaceMesh blendshape would
+                // otherwise jitter the mouth frame-to-frame. The audio side is
+                // already smoothed upstream by the lip-sync `smoothing`.
+                let cam = {
+                    let ema = state
+                        .mouth_viseme_ema
+                        .entry(expr_def.name.clone())
+                        .or_insert(raw);
+                    *ema += expression_blend * (raw - *ema);
+                    *ema
+                };
                 match mouth_source {
                     MouthSource::Audio => prev_w,
-                    MouthSource::Image => raw,
-                    MouthSource::Both => raw.max(prev_w),
+                    MouthSource::Image => cam,
+                    MouthSource::Both => cam.max(prev_w),
                 }
             } else {
                 blended
@@ -2467,6 +2491,7 @@ mod body_yaw_tests {
             x_range_observed: None,
             z_range_observed: None,
             torso_depth_template: None,
+            neutral_expressions: Vec::new(),
         };
         let params = SolverParams {
             rotation_blend: 1.0,
@@ -2527,6 +2552,7 @@ mod body_yaw_tests {
             x_range_observed: None,
             z_range_observed: None,
             torso_depth_template: None,
+            neutral_expressions: Vec::new(),
         };
         let params = SolverParams {
             rotation_blend: 1.0,

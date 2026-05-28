@@ -156,6 +156,20 @@ pub struct PoseCalibration {
     /// rationale and `Step 1` minimal-version implementation notes.
     #[serde(default)]
     pub torso_depth_template: Option<TorsoDepthTemplate>,
+    /// Resting (neutral) expression weights sampled during the same
+    /// calibration window, keyed by VRM expression name (e.g. "aa",
+    /// "blink"). Captured only when face tracking is active while the
+    /// user holds the neutral calibration pose — empty otherwise.
+    ///
+    /// [`crate::tracking::TrackingCalibration::apply_calibration`]
+    /// subtracts this baseline from the live source expressions and
+    /// rescales the remaining headroom, so a face that rests with a
+    /// slightly open mouth or narrowed eyes maps to a neutral avatar
+    /// and still reaches full open/blink. Per-person eye/mouth aperture
+    /// differs, so a fixed `weight = raw` mapping is wrong without this.
+    /// Stored as an ordered `Vec` (not a map) for stable on-disk JSON.
+    #[serde(default)]
+    pub neutral_expressions: Vec<(String, f32)>,
 }
 
 /// Calibrated torso surface depth profile. Captured during the

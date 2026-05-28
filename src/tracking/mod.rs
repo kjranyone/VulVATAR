@@ -163,6 +163,28 @@ impl TrackingCalibration {
             face.pitch -= self.neutral_face_pose.pitch;
             face.roll -= self.neutral_face_pose.roll;
         }
+        // Per-person neutral expression baseline (captured during pose
+        // calibration when face tracking was on). Subtract the resting
+        // weight and rescale the remaining headroom so a face that rests
+        // with a slightly open mouth / narrowed eyes maps to neutral and
+        // still reaches a full open/blink at the top of its range:
+        //   w' = clamp((w − neutral) / (1 − neutral), 0, 1)
+        // The neutral is floored away from 1 so the divisor stays sane
+        // for an expression whose baseline is implausibly high.
+        if let Some(ref pose) = self.pose {
+            if !pose.neutral_expressions.is_empty() {
+                for expr in sample.expressions.iter_mut() {
+                    if let Some((_, neutral)) = pose
+                        .neutral_expressions
+                        .iter()
+                        .find(|(name, _)| *name == expr.name)
+                    {
+                        let n = neutral.clamp(0.0, 0.95);
+                        expr.weight = ((expr.weight - n) / (1.0 - n)).clamp(0.0, 1.0);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -170,6 +192,85 @@ impl TrackingCalibration {
 pub enum TrackingErrorLevel {
     Warning,
     Blocking,
+}
+
+#[cfg(test)]
+mod calibration_apply_tests {
+    use super::*;
+    use crate::tracking::source_skeleton::SourceExpression;
+
+    fn cal_with_neutral(neutral: Vec<(String, f32)>) -> TrackingCalibration {
+        TrackingCalibration {
+            neutral_face_pose: FacePose::default(),
+            pose: Some(PoseCalibration {
+                mode: crate::tracking::CalibrationMode::UpperBody,
+                captured_at: String::new(),
+                captured_at_unix: 0,
+                frame_count: 1,
+                anchor_x: 0.0,
+                anchor_y: 0.0,
+                anchor_depth_m: None,
+                confidence: 1.0,
+                anchor_depth_jitter_m: None,
+                shoulder_span_m: None,
+                x_range_observed: None,
+                z_range_observed: None,
+                torso_depth_template: None,
+                neutral_expressions: neutral,
+            }),
+        }
+    }
+
+    fn skeleton_with(name: &str, weight: f32) -> SourceSkeleton {
+        let mut sk = SourceSkeleton::default();
+        sk.expressions = vec![SourceExpression {
+            name: name.into(),
+            weight,
+        }];
+        sk
+    }
+
+    #[test]
+    fn neutral_baseline_subtracts_and_rescales() {
+        let cal = cal_with_neutral(vec![("aa".into(), 0.2)]);
+
+        // Resting mouth (raw == neutral) collapses to fully closed.
+        let mut sk = skeleton_with("aa", 0.2);
+        cal.apply_calibration(&mut sk);
+        assert!(sk.expressions[0].weight.abs() < 1e-6, "rest → 0");
+
+        // Full open survives the rescale unchanged.
+        let mut sk = skeleton_with("aa", 1.0);
+        cal.apply_calibration(&mut sk);
+        assert!((sk.expressions[0].weight - 1.0).abs() < 1e-6, "full → 1");
+
+        // Mid value rescales over the remaining headroom:
+        // (0.6 - 0.2) / (1 - 0.2) = 0.5.
+        let mut sk = skeleton_with("aa", 0.6);
+        cal.apply_calibration(&mut sk);
+        assert!((sk.expressions[0].weight - 0.5).abs() < 1e-6);
+
+        // Below baseline clamps at 0 rather than going negative.
+        let mut sk = skeleton_with("aa", 0.1);
+        cal.apply_calibration(&mut sk);
+        assert!(sk.expressions[0].weight.abs() < 1e-6, "below rest → 0");
+    }
+
+    #[test]
+    fn expression_without_baseline_passes_through() {
+        let cal = cal_with_neutral(vec![("aa".into(), 0.2)]);
+        let mut sk = skeleton_with("blink", 0.7);
+        cal.apply_calibration(&mut sk);
+        assert!((sk.expressions[0].weight - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_calibration_is_a_noop() {
+        let cal = TrackingCalibration::default();
+        let mut sk = skeleton_with("aa", 0.42);
+        cal.apply_calibration(&mut sk);
+        assert!((sk.expressions[0].weight - 0.42).abs() < 1e-6);
+    }
 }
 
 // ---------------------------------------------------------------------------

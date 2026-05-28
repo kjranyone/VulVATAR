@@ -147,6 +147,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
     if let CalibrationModalState::Collecting {
         mode,
         ref mut samples,
+        ref mut expr_accum,
         ref mut last_seq_consumed,
         ..
     } = state.calibration.modal
@@ -165,6 +166,16 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
                             confidence: pose.overall_confidence,
                             shoulder_span_m: measure_shoulder_span(pose),
                         });
+                    }
+                    // Fold the resting expression weights into the running
+                    // mean (independent of `root_offset` — a desk-distance
+                    // upper-body capture still has a face). When face
+                    // tracking is off, `pose.expressions` is empty and this
+                    // leaves `expr_accum` untouched → no neutral baseline.
+                    for expr in &pose.expressions {
+                        let acc = expr_accum.entry(expr.name.clone()).or_insert((0.0, 0));
+                        acc.0 += expr.weight;
+                        acc.1 += 1;
                     }
                 }
             }

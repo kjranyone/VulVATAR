@@ -185,6 +185,7 @@ impl Application {
                         smoothing_params.expression_blend,
                         smoothing_params.face_confidence_threshold,
                         config.mouth_source,
+                        &mut avatar.pose_solver_state,
                     );
                     avatar.expression_weights = new_weights;
                 }

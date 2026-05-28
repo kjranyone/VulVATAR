@@ -35,9 +35,13 @@ pub(super) fn finalize_collection(
     // Pull the current samples out of the state; the WaitingForPose
     // escape-hatch path (Capture Now hit before any frames were
     // collected) yields an empty vec.
-    let samples: Vec<AnchorSample> = match &mut state.calibration.modal {
-        CalibrationModalState::Collecting { samples, .. } => std::mem::take(samples),
-        _ => Vec::new(),
+    type ExprAccum = std::collections::HashMap<String, (f32, usize)>;
+    let (samples, expr_accum): (Vec<AnchorSample>, ExprAccum) = match &mut state.calibration.modal
+    {
+        CalibrationModalState::Collecting {
+            samples, expr_accum, ..
+        } => (std::mem::take(samples), std::mem::take(expr_accum)),
+        _ => (Vec::new(), ExprAccum::new()),
     };
 
     // Tell the worker to stop accumulating torso template samples
@@ -60,7 +64,19 @@ pub(super) fn finalize_collection(
         };
     }
 
-    let calibration = aggregate(&samples, mode);
+    let mut calibration = aggregate(&samples, mode);
+
+    // Average the resting expression weights into the per-person neutral
+    // face baseline (sorted by name so the on-disk JSON is deterministic).
+    // Empty when face tracking was off during the hold — `apply_calibration`
+    // then leaves expressions untouched.
+    let mut neutral: Vec<(String, f32)> = expr_accum
+        .into_iter()
+        .filter(|(_, (_, n))| *n > 0)
+        .map(|(name, (sum, n))| (name, sum / n as f32))
+        .collect();
+    neutral.sort_by(|a, b| a.0.cmp(&b.0));
+    calibration.neutral_expressions = neutral;
 
     // Write into Application so the solver / project file see the
     // new value next frame. Also push to the tracking mailbox so the
@@ -359,6 +375,10 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         // has no depth template), so we leave this `None` here and
         // let the depth-aware path overwrite it.
         torso_depth_template: None,
+        // Set by the caller (`finalize_collection`) from the averaged
+        // `expr_accum`; the aggregate over anchor samples has no view of
+        // the expression accumulator, so it leaves the baseline empty.
+        neutral_expressions: Vec::new(),
     }
 }
 

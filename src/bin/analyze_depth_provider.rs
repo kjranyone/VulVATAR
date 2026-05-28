@@ -120,6 +120,7 @@ fn main() -> Result<(), String> {
                     x_range_observed: None,
                     z_range_observed: None,
                     torso_depth_template: Some(t),
+                    neutral_expressions: Vec::new(),
                 };
                 provider.set_calibration(Some(cal));
             }

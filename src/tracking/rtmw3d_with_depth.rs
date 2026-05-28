@@ -2001,6 +2001,7 @@ mod shoulder_bz_injection_tests {
             x_range_observed: None,
             z_range_observed: None,
             torso_depth_template: None,
+            neutral_expressions: Vec::new(),
         };
         let (mut sk, sl, sr) = skeleton_with_shoulders(Some(1.0), Some(1.0), 1.0);
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, Some(&cal));
