@@ -560,6 +560,28 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     {
         state.project_status.project_dirty = true;
     }
+
+    // Mouth source: how the audio lip-sync and the camera (FaceMesh) mouth
+    // visemes combine. Both = whichever is stronger, so the mouth opens for
+    // speech or a visibly open mouth without one silently overriding the other.
+    use crate::tracking::MouthSource;
+    let mut ms = state.lipsync.mouth_source;
+    let label = |m: MouthSource| match m {
+        MouthSource::Audio => t!("tracking.mouth_source_audio"),
+        MouthSource::Image => t!("tracking.mouth_source_image"),
+        MouthSource::Both => t!("tracking.mouth_source_both"),
+    };
+    egui::ComboBox::from_label(t!("tracking.mouth_source"))
+        .selected_text(label(ms))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut ms, MouthSource::Both, label(MouthSource::Both));
+            ui.selectable_value(&mut ms, MouthSource::Image, label(MouthSource::Image));
+            ui.selectable_value(&mut ms, MouthSource::Audio, label(MouthSource::Audio));
+        });
+    if ms != state.lipsync.mouth_source {
+        state.lipsync.mouth_source = ms;
+        state.project_status.project_dirty = true;
+    }
 }
 
 /// Renders the pose-calibration status line(s) under the

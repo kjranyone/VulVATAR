@@ -35,6 +35,8 @@ pub struct FrameConfig {
     /// When true, the avatar fades to transparent after person detection is
     /// lost past the tracking hold window, and fades back in on re-detection.
     pub fade_on_tracking_loss: bool,
+    /// Which signal drives the mouth visemes (audio lip-sync / camera / both).
+    pub mouth_source: crate::tracking::MouthSource,
     pub frame_dt: f32,
 }
 

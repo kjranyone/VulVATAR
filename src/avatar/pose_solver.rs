@@ -2168,7 +2168,13 @@ pub fn solve_expressions(
     previous: Option<&[ResolvedExpressionWeight]>,
     expression_blend: f32,
     face_confidence_threshold: f32,
+    mouth_source: crate::tracking::MouthSource,
 ) -> Vec<ResolvedExpressionWeight> {
+    use crate::tracking::MouthSource;
+    // VRM mouth visemes whose driver (audio lip-sync vs camera) is
+    // selectable. Everything else (eyes / brows / emotions) always comes
+    // from the camera.
+    const MOUTH_VISEMES: [&str; 5] = ["aa", "ih", "ou", "ee", "oh"];
     // Gate on the face mesh's own confidence (the FaceMesh model
     // outputs an "is this a face" sigmoid). When the gate fails we
     // return the previous weights verbatim — leaves the avatar's
@@ -2195,9 +2201,22 @@ pub fn solve_expressions(
             let raw = tracking.weight.clamp(0.0, 1.0);
             let prev_w = prev_map.get(expr_def.name.as_str()).copied().unwrap_or(raw);
             let blended = prev_w + expression_blend * (raw - prev_w);
+            let weight = if MOUTH_VISEMES.contains(&expr_def.name.as_str()) {
+                // `prev_w` carries the audio lip-sync value: `step_lipsync`
+                // runs just before the face solve each frame and writes the
+                // mouth visemes into the weights `previous` points at. So the
+                // source policy mixes camera (`raw`) against audio (`prev_w`).
+                match mouth_source {
+                    MouthSource::Audio => prev_w,
+                    MouthSource::Image => raw,
+                    MouthSource::Both => raw.max(prev_w),
+                }
+            } else {
+                blended
+            };
             Some(ResolvedExpressionWeight {
                 name: expr_def.name.clone(),
-                weight: blended.clamp(0.0, 1.0),
+                weight: weight.clamp(0.0, 1.0),
             })
         })
         .collect()

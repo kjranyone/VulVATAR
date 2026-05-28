@@ -133,6 +133,7 @@ impl GuiApp {
             lipsync_mic_device_index: self.app.lipsync_mic_device_index(),
             lipsync_volume_threshold: self.lipsync.volume_threshold,
             lipsync_smoothing: self.lipsync.smoothing,
+            mouth_source_index: self.lipsync.mouth_source.to_index(),
 
             output_sink_index: self.app.requested_sink().to_gui_index(),
             output_resolution_index: self.output.output_resolution_index,
@@ -288,6 +289,8 @@ impl GuiApp {
 
         self.lipsync.volume_threshold = state.lipsync_volume_threshold;
         self.lipsync.smoothing = state.lipsync_smoothing;
+        self.lipsync.mouth_source =
+            crate::tracking::MouthSource::from_index(state.mouth_source_index);
 
         self.output.output_resolution_index = state.output_resolution_index;
         self.output.output_framerate_index = state.output_framerate_index;

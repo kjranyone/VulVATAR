@@ -578,11 +578,15 @@ impl Hmr2Provider {
             let (hx, hy) = project_full(15); // SMPL 15 = Head
             let (nx, ny) = project_full(12); // SMPL 12 = Neck
             let head_len = ((hx - nx).powi(2) + (hy - ny).powi(2)).sqrt().max(24.0);
-            // The face sits above the head joint (atlas), so nudge the centre
-            // up the neck→head direction and size the box generously.
-            let size = head_len * 2.4;
-            let cx = hx + (hx - nx) * 0.3;
-            let cy = hy + (hy - ny) * 0.3;
+            // The SMPL Head joint sits at the atlas (≈ ear level); the mouth /
+            // jaw is *below* it, toward the neck. Nudge the centre down the
+            // head→neck direction so the lower face is captured (an earlier
+            // up-nudge cropped the mouth out, leaving jawOpen ≈ 0 → no image
+            // lip-sync), and size the box generously to keep forehead→chin in
+            // frame.
+            let size = head_len * 2.8;
+            let cx = hx + (nx - hx) * 0.2;
+            let cy = hy + (ny - hy) * 0.3;
             let bbox = FaceBbox {
                 x: cx - size * 0.5,
                 y: cy - size * 0.5,

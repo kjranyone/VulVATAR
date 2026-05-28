@@ -75,6 +75,8 @@ pub struct ProjectState {
     pub lipsync_mic_device_index: usize,
     pub lipsync_volume_threshold: f32,
     pub lipsync_smoothing: f32,
+    /// Mouth viseme driver: 0=Audio, 1=Image, 2=Both. See `MouthSource`.
+    pub mouth_source_index: usize,
 
     // Output config
     pub output_sink_index: usize,
@@ -372,10 +374,18 @@ pub struct LipSyncConfig {
     pub volume_threshold: f32,
     #[serde(default = "default_lipsync_smoothing")]
     pub smoothing: f32,
+    /// 0=Audio, 1=Image, 2=Both. Defaults to Both so the camera mouth works
+    /// out of the box without silently overriding audio.
+    #[serde(default = "default_mouth_source_index")]
+    pub mouth_source_index: usize,
 }
 
 fn default_volume_threshold() -> f32 {
     0.01
+}
+
+fn default_mouth_source_index() -> usize {
+    2
 }
 
 fn default_lipsync_smoothing() -> f32 {
@@ -619,6 +629,7 @@ impl ProjectFile {
                 mic_device_index: state.lipsync_mic_device_index,
                 volume_threshold: state.lipsync_volume_threshold,
                 smoothing: state.lipsync_smoothing,
+                mouth_source_index: state.mouth_source_index,
             },
             output: OutputConfig {
                 sink_index: state.output_sink_index,
@@ -690,6 +701,7 @@ impl ProjectFile {
             lipsync_mic_device_index: self.lipsync.mic_device_index,
             lipsync_volume_threshold: self.lipsync.volume_threshold,
             lipsync_smoothing: self.lipsync.smoothing,
+            mouth_source_index: self.lipsync.mouth_source_index,
 
             output_sink_index: self.output.sink_index,
             output_resolution_index: self.output.resolution_index,

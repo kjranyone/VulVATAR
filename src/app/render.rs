@@ -184,6 +184,7 @@ impl Application {
                         Some(&avatar.expression_weights),
                         smoothing_params.expression_blend,
                         smoothing_params.face_confidence_threshold,
+                        config.mouth_source,
                     );
                     avatar.expression_weights = new_weights;
                 }

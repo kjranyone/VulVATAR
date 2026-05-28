@@ -403,6 +403,9 @@ pub struct LipSyncGuiState {
     pub smoothing: f32,
     /// Current RMS volume (for the live meter in the UI).
     pub current_volume: f32,
+    /// Which signal drives the mouth visemes (audio / camera / both).
+    /// Passed through `FrameConfig::mouth_source` to the expression solver.
+    pub mouth_source: crate::tracking::MouthSource,
 }
 
 pub struct RenderingGuiState {
@@ -774,6 +777,7 @@ impl GuiApp {
                 volume_threshold: 0.01,
                 smoothing: 0.5,
                 current_volume: 0.0,
+                mouth_source: crate::tracking::MouthSource::Both,
             },
 
             cloth_authoring: ClothAuthoringUiState::default(),
@@ -989,6 +993,7 @@ impl GuiApp {
                 volume_threshold: 0.01,
                 smoothing: 0.5,
                 current_volume: 0.0,
+                mouth_source: crate::tracking::MouthSource::Both,
             },
 
             cloth_authoring: ClothAuthoringUiState::default(),
@@ -1234,6 +1239,7 @@ impl eframe::App for GuiApp {
                 lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
                 root_translation_enabled: self.tracking.root_translation_enabled,
                 fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
+                mouth_source: self.lipsync.mouth_source,
                 frame_dt,
             };
             self.app.run_frame(&frame_config);

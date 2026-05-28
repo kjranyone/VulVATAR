@@ -93,6 +93,42 @@ impl Default for TrackingSmoothingParams {
     }
 }
 
+/// Which signal drives the avatar's mouth visemes (`aa`/`ih`/`ou`/`ee`/`oh`).
+/// Audio lip-sync and the camera (FaceMesh) both produce mouth shapes; this
+/// selects how they combine so the camera-based path doesn't silently
+/// override audio (or vice-versa). Only the mouth visemes are affected —
+/// eyes / brows / emotions always come from the camera. Consumed by
+/// [`crate::avatar::pose_solver::solve_expressions`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouthSource {
+    /// Audio lip-sync only — the camera's mouth visemes are ignored.
+    Audio,
+    /// Camera (FaceMesh / "image lip-sync") only — audio is ignored.
+    Image,
+    /// Whichever is stronger per viseme (`max`) — mouth opens for speech
+    /// *or* a visibly open mouth. The default.
+    #[default]
+    Both,
+}
+
+impl MouthSource {
+    /// Stable index for GUI combo boxes / persistence. 0=Audio, 1=Image, 2=Both.
+    pub fn to_index(self) -> usize {
+        match self {
+            MouthSource::Audio => 0,
+            MouthSource::Image => 1,
+            MouthSource::Both => 2,
+        }
+    }
+    pub fn from_index(i: usize) -> Self {
+        match i {
+            0 => MouthSource::Audio,
+            1 => MouthSource::Image,
+            _ => MouthSource::Both,
+        }
+    }
+}
+
 /// Per-session calibration.
 ///
 /// Two independent calibration channels live here:
