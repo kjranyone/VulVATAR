@@ -41,6 +41,8 @@
 #[cfg(feature = "inference")]
 mod annotation;
 #[cfg(feature = "inference")]
+mod arm_z;
+#[cfg(feature = "inference")]
 mod consts;
 #[cfg(feature = "inference")]
 mod decode;
@@ -61,21 +63,14 @@ mod yolox_worker;
 
 #[cfg(feature = "inference")]
 pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
-// Crop helpers shared with the CIGPose+MoGe-2 provider's optional
-// YOLOX person-crop pre-stage. The functions don't depend on RTMW3D
-// internals; they're here purely because that's where they were
-// originally written. Promotion-only re-export, no logic change.
+// Crop helpers shared with the rtmw3d_with_depth provider's DAv2
+// person-crop stage. The functions don't depend on RTMW3D internals;
+// they're here purely because that's where they were originally
+// written. Promotion-only re-export, no logic change.
 #[cfg(feature = "inference")]
 pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
-// Shared with sibling 2D-only pose providers (ViTPose-Wholebody):
-// the COCO-Wholebody → HumanoidBone mapping in `skeleton` is identical
-// across any 133-keypoint backbone, so 2D-only consumers feed a
-// synthesised `nz = 0.5` DecodedJoint and reuse the same builder.
 #[cfg(feature = "inference")]
-pub(in crate::tracking) use decode::DecodedJoint;
-#[cfg(feature = "inference")]
-pub(in crate::tracking) use skeleton::build_source_skeleton as build_source_skeleton_from_coco;
-
+pub(in crate::tracking) use arm_z::wrist_out_of_frame;
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
@@ -171,6 +166,20 @@ pub struct Rtmw3dInference {
     /// ~22 ms cost behind the rest of the pipeline.
     #[cfg(feature = "inference")]
     yolox_worker: Option<YoloxWorker>,
+    /// Self-tracking crop bbox in original-frame pixel coords,
+    /// derived from the previous frame's own high-confidence
+    /// keypoints. Preferred over the YOLOX bbox in steady state: it
+    /// refreshes at full frame rate (the CPU-EP YOLOX result is
+    /// ~300 ms stale) and by construction encloses every keypoint —
+    /// the person-class YOLOX bbox routinely cuts off a hand
+    /// extended toward the camera on deskcrop framings (validation:
+    /// up to 16.9 deg solver error from exactly that). `None` on
+    /// cold start or after a low-confidence frame; YOLOX then serves
+    /// as the (re)acquisition path.
+    #[cfg(feature = "inference")]
+    self_track_bbox: Option<crate::tracking::yolox::PersonBbox>,
+    #[cfg(feature = "inference")]
+    arm_len: arm_z::ArmLengthState,
     #[cfg(feature = "inference")]
     left_wrist: wrist::WristTracker,
     #[cfg(feature = "inference")]
@@ -209,27 +218,83 @@ pub struct Rtmw3dInference {
     pub(crate) force_shoulder_anchor_hint: Option<crate::tracking::CalibrationMode>,
 }
 
+/// Construction options for [`Rtmw3dInference`]. Lets the GUI's
+/// pipeline settings (and the safe-mode degraded configuration)
+/// control which execution providers and optional stages load.
+#[derive(Clone, Copy, Debug)]
+pub struct Rtmw3dOptions {
+    /// Execution provider for the FaceMesh + Blendshape cascade.
+    /// Overridden to CPU when `force_cpu` is set.
+    pub face_ep: super::face_mediapipe::FaceMeshEp,
+    /// Run RTMW3D and FaceMesh on the CPU EP, keeping DirectML — and
+    /// therefore the GPU driver's compute queue — completely out of
+    /// the tracking pipeline. (YOLOX is CPU-only unconditionally; see
+    /// `YoloxPersonDetector::try_from_models_dir`.)
+    pub force_cpu: bool,
+    /// Load the YOLOX person-crop stage. When false the pipeline runs
+    /// whole-frame RTMW3D (same as when `yolox.onnx` is absent).
+    pub yolox_enabled: bool,
+}
+
+impl Default for Rtmw3dOptions {
+    fn default() -> Self {
+        Self {
+            face_ep: super::face_mediapipe::FaceMeshEp::Auto,
+            force_cpu: false,
+            yolox_enabled: true,
+        }
+    }
+}
+
 impl Rtmw3dInference {
     /// Instantiate from `models_dir` (typically `models/`). Looks for
     /// `rtmw3d.onnx` and tries to register the DirectML EP, falling
     /// back to CPU on EP failure. FaceMesh + Blendshape go on
     /// DirectML (Auto) — best when no other heavy GPU model is
-    /// active. Depth-aware providers should use
-    /// [`Self::from_models_dir_with_face_ep`] with `ForceCpu` to
-    /// avoid GPU contention.
+    /// active.
     #[cfg(feature = "inference")]
     pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
-        Self::from_models_dir_with_face_ep(models_dir, super::face_mediapipe::FaceMeshEp::Auto)
+        Self::from_models_dir_with_options(models_dir, Rtmw3dOptions::default())
     }
 
     /// Same as [`Self::from_models_dir`] but with explicit FaceMesh
-    /// EP. Used by `rtmw3d-with-depth` to force FaceMesh onto CPU,
-    /// where it runs uncontended at ~7 ms instead of 13+ ms when
+    /// EP. Used by the depth-enabled pipeline to force FaceMesh onto
+    /// CPU, where it runs uncontended at ~7 ms instead of 13+ ms when
     /// fighting DAv2 for the DirectML command queue.
     #[cfg(feature = "inference")]
     pub fn from_models_dir_with_face_ep(
         models_dir: impl AsRef<Path>,
         face_ep: super::face_mediapipe::FaceMeshEp,
+    ) -> Result<Self, String> {
+        Self::from_models_dir_with_options(
+            models_dir,
+            Rtmw3dOptions {
+                face_ep,
+                ..Rtmw3dOptions::default()
+            },
+        )
+    }
+
+    /// Reset cross-frame temporal state (wrist temporal holds; the
+    /// self-tracking crop when present). See
+    /// `PoseProvider::reset_temporal_state`.
+    #[cfg(feature = "inference")]
+    pub fn reset_temporal_state(&mut self) {
+        self.left_wrist = wrist::WristTracker::default();
+        self.right_wrist = wrist::WristTracker::default();
+        self.self_track_bbox = None;
+        self.arm_len = arm_z::ArmLengthState::default();
+        if let Some(worker) = self.yolox_worker.as_mut() {
+            worker.clear_result();
+        }
+    }
+
+    /// Full-control constructor: EP selection and optional stages per
+    /// [`Rtmw3dOptions`].
+    #[cfg(feature = "inference")]
+    pub fn from_models_dir_with_options(
+        models_dir: impl AsRef<Path>,
+        opts: Rtmw3dOptions,
     ) -> Result<Self, String> {
         let models_dir = models_dir.as_ref();
         let model_path = models_dir.join("rtmw3d.onnx");
@@ -240,8 +305,18 @@ impl Rtmw3dInference {
             ));
         }
 
+        let face_ep = if opts.force_cpu {
+            super::face_mediapipe::FaceMeshEp::ForceCpu
+        } else {
+            opts.face_ep
+        };
+
         info!("Loading RTMW3D from {}", model_path.display());
-        let (session, backend) = build_session(&model_path.to_string_lossy(), 4, "RTMW3D")?;
+        let (session, backend) = if opts.force_cpu {
+            build_session_cpu_only(&model_path.to_string_lossy(), 4, "RTMW3D")?
+        } else {
+            build_session(&model_path.to_string_lossy(), 4, "RTMW3D")?
+        };
 
         let input_name = session
             .inputs()
@@ -278,26 +353,35 @@ impl Rtmw3dInference {
             }
         };
 
-        let person_detector = match YoloxPersonDetector::try_from_models_dir(models_dir) {
-            Ok(Some(d)) => {
-                info!(
-                    "YOLOX person detector loaded ({}) — running on background thread",
-                    d.backend().label()
-                );
-                Some(d)
-            }
-            Ok(None) => {
-                info!("YOLOX person detector not found — using whole-frame RTMW3D");
-                None
-            }
-            Err(e) => {
-                let msg = format!(
-                    "YOLOX person detector failed to load: {}. Falling back to whole-frame.",
-                    e
-                );
-                warn!("{}", msg);
-                load_warnings.push(msg);
-                None
+        let person_detector = if !opts.yolox_enabled {
+            info!("YOLOX person crop disabled by pipeline config — using whole-frame RTMW3D");
+            None
+        } else {
+            // YOLOX is CPU-only regardless of `opts.force_cpu` — see the
+            // rationale on `try_from_models_dir` (concurrent DirectML
+            // sessions from two threads are a recorded driver-hang
+            // pattern on Intel GPUs).
+            match YoloxPersonDetector::try_from_models_dir(models_dir) {
+                Ok(Some(d)) => {
+                    info!(
+                        "YOLOX person detector loaded ({}) — running on background thread",
+                        d.backend().label()
+                    );
+                    Some(d)
+                }
+                Ok(None) => {
+                    info!("YOLOX person detector not found — using whole-frame RTMW3D");
+                    None
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "YOLOX person detector failed to load: {}. Falling back to whole-frame.",
+                        e
+                    );
+                    warn!("{}", msg);
+                    load_warnings.push(msg);
+                    None
+                }
             }
         };
         let yolox_worker = match person_detector {
@@ -311,6 +395,8 @@ impl Rtmw3dInference {
             output_names,
             face_mesh,
             yolox_worker,
+            self_track_bbox: None,
+            arm_len: arm_z::ArmLengthState::default(),
             left_wrist: wrist::WristTracker::default(),
             right_wrist: wrist::WristTracker::default(),
             load_warnings,
@@ -381,6 +467,7 @@ impl Rtmw3dInference {
         // Falls through to whole-frame inference when no person is
         // detected or YOLOX is unavailable.
         let t_yolox = std::time::Instant::now();
+        crate::tracking::stagelog::mark(frame_index, "yolox_begin");
         let (infer_rgb_owned, infer_rgb_slice, infer_w, infer_h, crop_origin, annotation_bbox) = {
             // Submit a detect request to the YOLOX worker on every
             // `YOLOX_REFRESH_PERIOD`-th frame (or always on cold
@@ -390,7 +477,15 @@ impl Rtmw3dInference {
             // frame. Either way, we then read the latest sticky
             // result — typically from 1–2 frames ago, which is well
             // within the 25% downstream pad.
-            let bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
+            // Crop source priority: self-tracking bbox (fresh every
+            // frame, encloses all keypoints) > YOLOX (acquisition /
+            // re-acquisition only) > whole frame. While the
+            // self-track is live, YOLOX receives no submissions at
+            // all — no CPU spent on a detector whose result would be
+            // ignored.
+            let bbox_opt = if let Some(track) = self.self_track_bbox {
+                Some(track)
+            } else if let Some(worker) = self.yolox_worker.as_ref() {
                 let cold_start = !worker.has_result();
                 // `.max(1)` is defence-in-depth: `RuntimeGpuBudget`'s
                 // mode arms only emit {4, 6, 8, 12}, asserted by the
@@ -451,6 +546,7 @@ impl Rtmw3dInference {
             Some(buf) => buf.as_slice(),
             None => infer_rgb_slice,
         };
+        crate::tracking::stagelog::mark(frame_index, "yolox_end");
         let dt_yolox = t_yolox.elapsed();
 
         // Preprocess to 288×384 NCHW with ImageNet normalization.
@@ -472,6 +568,7 @@ impl Rtmw3dInference {
         let z_name = self.output_names.get(2).cloned();
 
         let t_run = std::time::Instant::now();
+        crate::tracking::stagelog::mark(frame_index, "rtmw_run_begin");
         let outputs = match self
             .session
             .run(ort::inputs![self.input_name.as_str() => input])
@@ -482,6 +579,7 @@ impl Rtmw3dInference {
                 return empty_estimate(frame_index);
             }
         };
+        crate::tracking::stagelog::mark(frame_index, "rtmw_run_end");
         let dt_run = t_run.elapsed();
 
         let extract = |name: &Option<String>, expected_len: usize| -> Option<Vec<f32>> {
@@ -531,6 +629,46 @@ impl Rtmw3dInference {
                 j.ny = (oy + j.ny * ch) * inv_h;
             }
         }
+        // Refresh the self-tracking crop from this frame's own
+        // keypoints (whole-frame coords post-remap), with hysteresis.
+        //
+        // Hysteresis matters: the crop influences where RTMW3D puts
+        // its keypoints, and the keypoints define the next crop — an
+        // undamped feedback loop. Reproduced as a period-2 limit
+        // cycle on the hands-at-chest validation transition (wrist y
+        // oscillating 0.38 ↔ 0.60 every frame, driving the solver
+        // 50°+ off). The cure is to keep the previous bbox until the
+        // subject actually threatens to leave it: a frozen crop
+        // means deterministic keypoints means a stable track.
+        let fresh = derive_self_track_bbox(&joints, width, height);
+        self.self_track_bbox = match (self.self_track_bbox, fresh) {
+            (_, None) => None,
+            (None, Some(new)) => Some(new),
+            (Some(cur), Some(new)) => {
+                // The crop site pads by 25%; demand the subject stays
+                // inside a 10% inner margin of the current bbox before
+                // we re-frame, and also re-frame when the subject has
+                // shrunk to well under the current box (crop much too
+                // loose degrades model resolution).
+                let cur_w = (cur.x2 - cur.x1).max(1.0);
+                let cur_h = (cur.y2 - cur.y1).max(1.0);
+                let margin_x = cur_w * 0.10;
+                let margin_y = cur_h * 0.10;
+                let escaping = new.x1 < cur.x1 - margin_x
+                    || new.y1 < cur.y1 - margin_y
+                    || new.x2 > cur.x2 + margin_x
+                    || new.y2 > cur.y2 + margin_y;
+                let new_w = (new.x2 - new.x1).max(1.0);
+                let new_h = (new.y2 - new.y1).max(1.0);
+                let shrunk = new_w < cur_w * 0.6 || new_h < cur_h * 0.6;
+                if escaping || shrunk {
+                    Some(new)
+                } else {
+                    Some(cur)
+                }
+            }
+        };
+
         // Hint **overrides** persisted when present, in either direction:
         // the transient GUI hint reflects the mode the user just opened
         // the calibration modal in, which must take precedence over any
@@ -546,6 +684,22 @@ impl Rtmw3dInference {
         };
         let mut skeleton =
             skeleton::build_source_skeleton(frame_index, &joints, width, height, force_shoulder);
+
+        // Edge-exit repair: keypoints clamped at the frame / crop
+        // boundary are observation clamps, not positions — restore
+        // the limb to bone length along the observed direction (the
+        // joint may legitimately live OUTSIDE the frame in source
+        // space). Must run before the wrist temporal hold (so the
+        // hold memorises the repaired wrist) and before
+        // `reconstruct_arm_z` (whose bone-length invariant would
+        // otherwise misread the clamp-shortened projection as
+        // forward depth).
+        arm_z::repair_edge_clamped_arms(
+            &mut skeleton,
+            &joints,
+            width as f32 / height as f32,
+            &mut self.arm_len,
+        );
 
         // Per-side wrist sanity check + temporal hold. Run before
         // the face cascade so the wrist is settled when the solver
@@ -565,6 +719,12 @@ impl Rtmw3dInference {
             &mut self.left_wrist,
         );
 
+        // Arm-depth reconstruction from the bone-length invariant —
+        // restores the forward z that the SimCC nz head cannot
+        // resolve for limbs pointing at the camera (the dominant
+        // desk-streaming arm pose). See `arm_z` for the geometry.
+        arm_z::reconstruct_arm_z(&mut skeleton, &mut self.arm_len);
+
         // Head pose (yaw/pitch/roll) from RTMW3D's body face keypoints
         // 0..=4. These are already in source-skeleton 3D coords, so
         // the angles fall straight into the solver's frame without
@@ -582,6 +742,7 @@ impl Rtmw3dInference {
         // The solver's `face_confidence_threshold` then gates head
         // rotation *and* expressions against this single number.
         let t_face = std::time::Instant::now();
+        crate::tracking::stagelog::mark(frame_index, "face_begin");
         if let Some(face_mesh) = self.face_mesh.as_mut() {
             if let Some(bbox) = face::build_face_bbox_from_joints(&joints, width, height) {
                 if let Some((exprs, mesh_conf, mesh_face_pose)) =
@@ -608,6 +769,7 @@ impl Rtmw3dInference {
                 }
             }
         }
+        crate::tracking::stagelog::mark(frame_index, "face_end");
         let dt_face = t_face.elapsed();
 
         let dt_total = t_total.elapsed();
@@ -628,6 +790,58 @@ impl Rtmw3dInference {
             skeleton,
         }
     }
+}
+
+/// Derive the next frame's self-tracking crop from this frame's
+/// decoded keypoints (whole-frame normalised coords). Returns `None`
+/// — releasing the track back to YOLOX re-acquisition — when fewer
+/// than [`SELF_TRACK_MIN_KEYPOINTS`] body keypoints clear the
+/// confidence floor or the bbox degenerates.
+///
+/// Confidence floor 0.3 (vs the global visibility floor of 0.05):
+/// a garbage crop produces sub-0.3 scores almost everywhere, so a
+/// bad track releases itself within one frame instead of locking on.
+#[cfg(feature = "inference")]
+fn derive_self_track_bbox(
+    joints: &[decode::DecodedJoint],
+    width: u32,
+    height: u32,
+) -> Option<crate::tracking::yolox::PersonBbox> {
+    const SELF_TRACK_CONF_FLOOR: f32 = 0.3;
+    /// COCO body keypoints (0..17) above the floor required to trust
+    /// the track. Hands/face alone must not sustain it — a track
+    /// locked onto a detached hand region would never recover.
+    const SELF_TRACK_MIN_KEYPOINTS: usize = 8;
+    const MIN_BBOX_PX: f32 = 48.0;
+
+    let body_confident = joints
+        .iter()
+        .take(17)
+        .filter(|j| j.score >= SELF_TRACK_CONF_FLOOR)
+        .count();
+    if body_confident < SELF_TRACK_MIN_KEYPOINTS {
+        return None;
+    }
+
+    let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for j in joints.iter().filter(|j| j.score >= SELF_TRACK_CONF_FLOOR) {
+        let px = j.nx * width as f32;
+        let py = j.ny * height as f32;
+        x1 = x1.min(px);
+        y1 = y1.min(py);
+        x2 = x2.max(px);
+        y2 = y2.max(py);
+    }
+    if x2 - x1 < MIN_BBOX_PX || y2 - y1 < MIN_BBOX_PX {
+        return None;
+    }
+    Some(crate::tracking::yolox::PersonBbox {
+        x1,
+        y1,
+        x2,
+        y2,
+        score: 1.0,
+    })
 }
 
 #[cfg(feature = "inference")]

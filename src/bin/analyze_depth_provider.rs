@@ -1,14 +1,13 @@
-//! Per-image dump of `rtmw3d-with-depth` (or any other provider)
-//! key signals — face pose, shoulder/wrist positions, hand
-//! orientations, calibration anchor — into JSON Lines for batch
-//! analysis of the depth pipeline output across a validation set.
+//! Per-image dump of the pose provider's key signals — face pose,
+//! shoulder/wrist positions, hand orientations, calibration anchor —
+//! into JSON Lines for batch analysis of the depth pipeline output
+//! across a validation set.
 //!
 //! Usage:
 //!   cargo run --bin analyze_depth_provider --features inference -- \
-//!       <provider> <image_or_dir> \
+//!       <image_or_dir> \
 //!       [--out <file.jsonl>] \
 //!       [--calibrate-with <prime.png>]
-//!     <provider> = rtmw3d | rtmw3d-with-depth | cigpose-metric-depth
 //!
 //! `--calibrate-with`: prime a torso-depth-template calibration from
 //! the given image (typically a clean front-neutral pose with no
@@ -16,25 +15,22 @@
 //! `set_torso_capture(true)`, harvesting the template, and feeding it
 //! back via `set_calibration`. Subsequent target-image inferences
 //! then use the template-based bias correction in
-//! `skeleton_from_depth`. No-op for non-depth providers.
+//! `skeleton_from_depth`. No-op when the depth stage is disabled.
 //!
-//! Defaults to rtmw3d-with-depth + the basic_pose_samples directory if
-//! no args are given. Output is line-delimited JSON for grep / jq.
+//! Defaults to the basic_pose_samples directory if no args are given.
+//! Output is line-delimited JSON for grep / jq.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use vulvatar_lib::asset::HumanoidBone;
-use vulvatar_lib::tracking::provider::{create_pose_provider, PoseProviderKind};
+use vulvatar_lib::tracking::provider::create_pose_provider;
 use vulvatar_lib::tracking::source_skeleton::{HandOrientation, SourceJoint, SourceSkeleton};
 
 fn main() -> Result<(), String> {
     env_logger::init();
 
     let mut args = std::env::args().skip(1);
-    let provider_arg = args
-        .next()
-        .unwrap_or_else(|| "rtmw3d-with-depth".to_string());
     let target = args
         .next()
         .unwrap_or_else(|| "validation_images/basic_pose_samples/photorealistic".to_string());
@@ -48,22 +44,11 @@ fn main() -> Result<(), String> {
         }
     }
 
-    let kind = match provider_arg.as_str() {
-        "rtmw3d" => PoseProviderKind::Rtmw3d,
-        "rtmw3d-with-depth" => PoseProviderKind::Rtmw3dWithDepth,
-        "cigpose-metric-depth" => PoseProviderKind::CigposeMetricDepth,
-        other => return Err(format!("unknown provider '{other}'")),
-    };
-
     let images = collect_images(Path::new(&target))?;
-    eprintln!(
-        "analyze_depth_provider: provider={:?}, images={}",
-        kind,
-        images.len()
-    );
+    eprintln!("analyze_depth_provider: images={}", images.len());
 
     let mut provider =
-        create_pose_provider(kind, "models").map_err(|e| format!("provider load: {e}"))?;
+        create_pose_provider("models", Default::default()).map_err(|e| format!("provider load: {e}"))?;
     eprintln!("provider label: {}", provider.label());
     for w in provider.take_load_warnings() {
         eprintln!("warning: {w}");

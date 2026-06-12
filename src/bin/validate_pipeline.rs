@@ -55,7 +55,7 @@ use vulvatar_lib::renderer::frame_input::{
 };
 use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
 use vulvatar_lib::renderer::VulkanRenderer;
-use vulvatar_lib::tracking::provider::{create_pose_provider, PoseProvider, PoseProviderKind};
+use vulvatar_lib::tracking::provider::{create_pose_provider, PoseProvider};
 use vulvatar_lib::tracking::source_skeleton::SourceSkeleton;
 
 const RENDER_EXTENT: [u32; 2] = [1536, 1536];
@@ -100,6 +100,15 @@ const BONE_DIRS: &[(&str, HumanoidBone, HumanoidBone)] = &[
 struct PerBoneDelta {
     name: &'static str,
     angle_deg: Option<f32>,    // None when bone unavailable in either frame
+    /// Foreshortening error: |xy_len(avatar)/span(avatar) −
+    /// xy_len(source)/span(source)|, span = UpperArm-pair xy
+    /// distance. The xy *direction* angle is blind to bones pointing
+    /// at the camera (the dominant deskcrop arm pose — both project
+    /// to near-identical directions whether the arm reaches forward
+    /// or hangs flat); the projected-length ratio is exactly what a
+    /// viewer perceives instead. 0 = same foreshortening; ~1 = arm
+    /// drawn at full length that the photo shows pointing at the lens.
+    fs_err: Option<f32>,
     conf_in: f32,
     conf_out: f32,
 }
@@ -111,6 +120,9 @@ struct ImageResult {
     inferred_input: bool,
     inferred_output: bool,
     score_deg: Option<f32>, // mean angular error, None if no comparable bones
+    /// Mean foreshortening error across scored bones (see
+    /// `PerBoneDelta::fs_err`).
+    fs_score: Option<f32>,
     bones: Vec<PerBoneDelta>,
     duration_ms: u128,
 }
@@ -123,9 +135,9 @@ fn main() -> Result<(), String> {
     let mut limit: Option<usize> = None;
     let mut debug_renders: Option<PathBuf> = None;
     let mut do_render = false;
-    let mut provider_kind = "rtmw3d";
     let mut out_dir_override: Option<PathBuf> = None;
     let mut filter: Option<String> = None;
+    let mut root_override: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -145,27 +157,14 @@ fn main() -> Result<(), String> {
                 do_render = true;
                 i += 1;
             }
-            "--provider" => {
-                let kind = args.get(i + 1)
-                    .ok_or_else(|| "--provider requires {rtmw3d|rtmw3d-with-depth|cigpose-metric-depth|vitpose-wholebody|vitpose-with-depth}".to_string())?;
-                provider_kind = match kind.as_str() {
-                    "rtmw3d" => "rtmw3d",
-                    "rtmw3d-with-depth" => "rtmw3d-with-depth",
-                    "cigpose-metric-depth" => "cigpose-metric-depth",
-                    "vitpose" | "vitpose-wholebody" => "vitpose-wholebody",
-                    "vitpose-with-depth" | "vitpose-dav2" => "vitpose-with-depth",
-                    "hybrid"
-                    | "vitpose-rtmw3d"
-                    | "vitpose+rtmw3d"
-                    | "vitpose-rtmw3d-hybrid" => "vitpose-rtmw3d-hybrid",
-                    "hmr2" | "4d-humans" | "smpl" => "hmr2",
-                    other => return Err(format!("unknown --provider value: {other}")),
-                };
-                i += 2;
-            }
             "--out-dir" => {
                 out_dir_override = Some(PathBuf::from(args.get(i + 1)
                     .ok_or_else(|| "--out-dir requires DIR".to_string())?));
+                i += 2;
+            }
+            "--root" => {
+                root_override = Some(PathBuf::from(args.get(i + 1)
+                    .ok_or_else(|| "--root requires DIR".to_string())?));
                 i += 2;
             }
             "--filter" => {
@@ -188,17 +187,8 @@ fn main() -> Result<(), String> {
         .store(1, std::sync::atomic::Ordering::Relaxed);
 
     // -------- load provider / renderer once --------
-    let kind = match provider_kind {
-        "rtmw3d-with-depth" => PoseProviderKind::Rtmw3dWithDepth,
-        "cigpose-metric-depth" => PoseProviderKind::CigposeMetricDepth,
-        "vitpose-wholebody" => PoseProviderKind::VitposeWholebody,
-        "vitpose-with-depth" => PoseProviderKind::VitposeWithDepth,
-        "vitpose-rtmw3d-hybrid" => PoseProviderKind::VitposeRtmw3dHybrid,
-        "hmr2" => PoseProviderKind::Hmr2,
-        _ => PoseProviderKind::Rtmw3d,
-    };
-    eprintln!("loading provider {provider_kind}…");
-    let mut infer = create_pose_provider(kind, "models")
+    eprintln!("loading pose provider…");
+    let mut infer = create_pose_provider("models", Default::default())
         .map_err(|e| format!("load provider: {e}"))?;
     for w in infer.take_load_warnings() {
         eprintln!("  warning: {w}");
@@ -220,7 +210,8 @@ fn main() -> Result<(), String> {
     };
 
     // -------- collect images --------
-    let mut images = collect_images(Path::new(VALIDATION_ROOT))?;
+    let root = root_override.unwrap_or_else(|| PathBuf::from(VALIDATION_ROOT));
+    let mut images = collect_images(&root)?;
     images.sort();
     if let Some(pattern) = filter.as_deref() {
         images.retain(|p| p.to_string_lossy().contains(pattern));
@@ -265,18 +256,19 @@ fn main() -> Result<(), String> {
         // bogus 50°+ yaw. Fix is to use a fresh state per image.
         let mut state = PoseSolverState::default();
 
+        // Per-image temporal isolation: without this, the provider's
+        // sticky depth outbox serves image N-1's depth map to image N
+        // (DEPTH_REFRESH_PERIOD = 4) and the wrist temporal hold
+        // carries across unrelated subjects — both contaminate the
+        // per-image score.
+        infer.reset_temporal_state();
+
         // Per-image upper-body framing hint. "deskcrop" in the path
         // marks streamer / above-desk shots where the hips and legs
-        // are entirely below the camera frame. Without this hint
-        // 2D-only providers (ViTPose) hallucinate confident leg
-        // keypoints from the desk surface; the hint routes them
-        // through `force_shoulder_anchor` so the lower body is
-        // dropped from the source skeleton. Without the hint
-        // RTMW3D's well-supervised SimCC heads quietly tolerate the
-        // hallucination (low confidence), but ViTPose's argmax
-        // doesn't — see [[pose-pipeline-iter]] for the A/B that
-        // motivated this gate. Apply to every provider so the
-        // comparison stays apples-to-apples.
+        // are entirely below the camera frame. The hint routes such
+        // images through `force_shoulder_anchor` so hallucinated leg
+        // keypoints (e.g. from the desk surface) are dropped from the
+        // source skeleton instead of driving the lower body.
         let path_lower = image_path.to_string_lossy().to_ascii_lowercase();
         let upper_body_hint = if path_lower.contains("deskcrop") {
             Some(vulvatar_lib::tracking::CalibrationMode::UpperBody)
@@ -323,7 +315,7 @@ fn process_image(
         Ok(i) => i,
         Err(e) => return ImageResult {
             image: image_str, category, inferred_input: false, inferred_output: false,
-            score_deg: None, bones: Vec::new(),
+            score_deg: None, fs_score: None, bones: Vec::new(),
             duration_ms: started.elapsed().as_millis(),
         }.with_error(format!("open: {e}")),
     };
@@ -332,7 +324,15 @@ fn process_image(
 
     // Step 1: inference on input image — the source skeleton the
     // solver works against and our ground-truth for comparison.
-    let est_input = infer.estimate_pose(rgb_in.as_raw(), iw, ih, frame_index);
+    //
+    // Two passes: the first acquires (YOLOX bbox or whole-frame),
+    // the second runs inside the self-tracking crop derived from the
+    // first pass's own keypoints — the same crop the live pipeline
+    // uses in steady state, which is what we want to score. The
+    // per-image `reset_temporal_state` above keeps pass 1 isolated
+    // from the previous image.
+    let _ = infer.estimate_pose(rgb_in.as_raw(), iw, ih, frame_index);
+    let est_input = infer.estimate_pose(rgb_in.as_raw(), iw, ih, frame_index + 1);
     let sk_input = est_input.skeleton;
 
     // Step 2: solve avatar pose. After this, the avatar's
@@ -396,12 +396,19 @@ fn process_image(
         }
     }
 
+    let fs_vals: Vec<f32> = bones.iter().filter_map(|b| b.fs_err).collect();
+    let fs_score = if fs_vals.is_empty() {
+        None
+    } else {
+        Some(fs_vals.iter().sum::<f32>() / fs_vals.len() as f32)
+    };
     ImageResult {
         image: image_str,
         category,
         inferred_input: true,
         inferred_output: bones.iter().any(|b| b.angle_deg.is_some()),
         score_deg: score,
+        fs_score,
         bones,
         duration_ms: started.elapsed().as_millis(),
     }
@@ -416,11 +423,31 @@ fn make_avatar(
     avatar.build_base_pose();
     if let Some(src) = source {
         let humanoid = asset.humanoid.as_ref();
-        let params = SolverParams {
-            rotation_blend: 1.0,
-            joint_confidence_threshold: 0.1,
-            face_confidence_threshold: 0.1,
-            ..Default::default()
+        // VULVATAR_GUI_PARAMS=1 mirrors the live GUI's solver
+        // configuration (captured from a real last_session.vvtproj:
+        // blend 1.0, confidence sliders 0.0, lower body off) so the
+        // benchmark scores the path the user actually runs instead
+        // of a benchmark-only configuration.
+        let gui_parity = std::env::var("VULVATAR_GUI_PARAMS").is_ok();
+        // Experiment hook: VULVATAR_NO_HANDS=1 disables the wrist /
+        // finger pass to isolate its contribution to bone scores.
+        let hands = std::env::var("VULVATAR_NO_HANDS").is_err();
+        let params = if gui_parity {
+            SolverParams {
+                rotation_blend: 1.0,
+                joint_confidence_threshold: 0.0,
+                face_confidence_threshold: 0.0,
+                lower_body_tracking_enabled: false,
+                hand_tracking_enabled: hands,
+                ..Default::default()
+            }
+        } else {
+            SolverParams {
+                rotation_blend: 1.0,
+                joint_confidence_threshold: 0.1,
+                face_confidence_threshold: 0.1,
+                ..Default::default()
+            }
         };
         solve_avatar_pose(
             src,
@@ -507,6 +534,14 @@ fn compare_bones_avatar_vs_source(
     };
 
     let mut out = Vec::with_capacity(BONE_DIRS.len());
+
+    // Projected-length helper for the foreshortening metric.
+    let xy_dist = |a: [f32; 3], b: [f32; 3]| -> f32 {
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        (dx * dx + dy * dy).sqrt()
+    };
+
     for (name, base, tip) in BONE_DIRS {
         // Override the "neck" base on both sides to match the solver's
         // Tip::HeadFromShoulders shoulder-midpoint anchor.
@@ -544,8 +579,7 @@ fn compare_bones_avatar_vs_source(
         // empirically: visible joints sit at 0.7+, fully occluded
         // joints at 0.05–0.15, partially occluded around 0.3–0.5.
         const SOURCE_CONF_FLOOR: f32 = 0.30;
-        // **2D image-plane projection metric**. Source positions come
-        // from a 2D inference pipeline (ViTPose-L), so what's actually
+        // **2D image-plane projection metric**. What's actually
         // observed in the photo is the xy projection. The previous
         // 3D-dot-product metric punished the avatar for having a
         // physically-correct z component (e.g. a body-yawed clavicle
@@ -577,7 +611,45 @@ fn compare_bones_avatar_vs_source(
             }
             _ => None,
         };
-        out.push(PerBoneDelta { name, angle_deg: angle, conf_in, conf_out });
+        // Foreshortening term: |sin θ_avatar − sin θ_source| where θ
+        // is the bone's angle off the camera axis — xy projected
+        // length over the bone's own 3D length per side. Normalising
+        // each side by ITS OWN bone length (not the shoulder span)
+        // keeps the comparison invariant to rig proportions: an anime
+        // avatar's forearm/span ratio differs from human anthropometry
+        // and a span-normalised ratio would penalise the rig, not the
+        // pose. The source side's 3D length is trustworthy because
+        // the provider's bone-length-invariant z reconstruction
+        // enforces it. Span lines are excluded (their foreshortening
+        // is body yaw, already covered by shoulder_line's angle).
+        let fs_err = if *name == "shoulder_line" || *name == "hip_line" {
+            None
+        } else {
+            let d3 = |a: [f32; 3], b: [f32; 3]| -> f32 {
+                let dx = b[0] - a[0];
+                let dy = b[1] - a[1];
+                let dz = b[2] - a[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            };
+            match (src_base, src_tip, av_base, av_tip) {
+                (Some(sb), Some(st), Some(ab), Some(at))
+                    if sb.confidence >= SOURCE_CONF_FLOOR
+                        && st.confidence >= SOURCE_CONF_FLOOR =>
+                {
+                    let src3 = d3(sb.position, st.position);
+                    let av3 = d3(ab, at);
+                    if src3 > 1e-3 && av3 > 1e-3 {
+                        let r_src = xy_dist(sb.position, st.position) / src3;
+                        let r_av = xy_dist(ab, at) / av3;
+                        Some((r_av - r_src).abs())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        out.push(PerBoneDelta { name, angle_deg: angle, fs_err, conf_in, conf_out });
     }
     out
 }
@@ -621,8 +693,8 @@ fn dump_bone_positions(
         if !bones.contains(b) { bones.push(*b); }
         if !bones.contains(t) { bones.push(*t); }
     }
-    // Include finger bones so HMR2+MediaPipe hand integration can be
-    // visually verified — `BONE_DIRS` only covers the body skeleton.
+    // Include finger bones so hand tracking can be visually
+    // verified — `BONE_DIRS` only covers the body skeleton.
     for b in [
         HumanoidBone::LeftHand, HumanoidBone::RightHand,
         HumanoidBone::LeftThumbProximal, HumanoidBone::LeftThumbIntermediate, HumanoidBone::LeftThumbDistal,
@@ -840,18 +912,22 @@ fn write_jsonl_row(w: &mut impl Write, r: &ImageResult) -> Result<(), String> {
         if i > 0 { bones_json.push(','); }
         let angle = b.angle_deg.map(|a| format!("{a:.2}"))
             .unwrap_or_else(|| "null".to_string());
+        let fs = b.fs_err.map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "null".to_string());
         bones_json.push_str(&format!(
-            "\"{}\":{{\"angle_deg\":{},\"conf_in\":{:.2},\"conf_out\":{:.2}}}",
-            b.name, angle, b.conf_in, b.conf_out
+            "\"{}\":{{\"angle_deg\":{},\"fs_err\":{},\"conf_in\":{:.2},\"conf_out\":{:.2}}}",
+            b.name, angle, fs, b.conf_in, b.conf_out
         ));
     }
     bones_json.push('}');
     let score = r.score_deg.map(|s| format!("{s:.2}"))
         .unwrap_or_else(|| "null".to_string());
+    let fs_score = r.fs_score.map(|s| format!("{s:.3}"))
+        .unwrap_or_else(|| "null".to_string());
     let line = format!(
-        "{{\"image\":\"{}\",\"category\":\"{}\",\"inferred_input\":{},\"inferred_output\":{},\"score_deg\":{},\"duration_ms\":{},\"bones\":{}}}\n",
+        "{{\"image\":\"{}\",\"category\":\"{}\",\"inferred_input\":{},\"inferred_output\":{},\"score_deg\":{},\"fs_score\":{},\"duration_ms\":{},\"bones\":{}}}\n",
         json_escape(&r.image), json_escape(&r.category),
-        r.inferred_input, r.inferred_output, score, r.duration_ms, bones_json,
+        r.inferred_input, r.inferred_output, score, fs_score, r.duration_ms, bones_json,
     );
     w.write_all(line.as_bytes()).map_err(|e| format!("write jsonl: {e}"))
 }
@@ -1031,6 +1107,10 @@ fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameIn
         background_color: [0.10, 0.10, 0.10],
         transparent_background: false,
         avatar_opacity: 1.0,
+        bloom: Default::default(),
+        generative_background: Default::default(),
+        background_tracking: Default::default(),
+        time_seconds: 0.0,
     }
 }
 

@@ -10,28 +10,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod webcam;
 
 #[cfg(feature = "inference")]
-pub mod cigpose;
-pub mod cigpose_metric_depth;
-#[cfg(feature = "inference")]
 pub mod depth_anything;
-#[cfg(feature = "inference")]
-pub mod metric_depth;
 mod pose_estimation;
 pub mod provider;
 pub mod rtmw3d_with_depth;
+pub mod stagelog;
 #[cfg(feature = "inference")]
 pub mod skeleton_from_depth;
-#[cfg(feature = "inference")]
-pub mod vitpose;
-#[cfg(feature = "inference")]
-pub mod hand_mediapipe;
-pub mod hmr2;
-pub mod hmr2_provider;
-#[cfg(feature = "inference")]
-pub mod palm_detector;
-pub mod vitpose_provider;
-pub mod vitpose_rtmw3d_hybrid;
-pub mod vitpose_with_depth;
 
 pub mod calibration;
 pub mod face_mediapipe;
@@ -983,6 +968,7 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
+        pipeline: provider::TrackingPipelineConfig,
     ) {
         if self.handle.is_some() {
             return;
@@ -1009,6 +995,7 @@ impl TrackingWorker {
                     width,
                     height,
                     fps,
+                    pipeline,
                 );
             })
             .expect("failed to spawn tracking-worker thread");
@@ -1063,10 +1050,11 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
+        pipeline: provider::TrackingPipelineConfig,
     ) {
         match backend {
             CameraBackend::Synthetic => {
-                let _ = (width, height, fps);
+                let _ = (width, height, fps, pipeline);
                 ready.store(true, Ordering::SeqCst);
                 Self::run_synthetic(&mailbox, &running, frame_interval);
             }
@@ -1081,6 +1069,7 @@ impl TrackingWorker {
                     width,
                     height,
                     fps,
+                    pipeline,
                 );
             }
         }
@@ -1125,11 +1114,22 @@ impl TrackingWorker {
         width: u32,
         height: u32,
         fps: u32,
+        pipeline: provider::TrackingPipelineConfig,
     ) {
         info!(
             "tracking-worker: opening webcam {} ({}x{} @ {} fps)",
             camera_index, width, height, fps
         );
+
+        // Crash-forensics session: stage markers flush to
+        // `logs/tracking_*.log` and the sentinel flags unclean exits
+        // (system freeze, process kill) for the safe-mode banner. The
+        // guard ends the session on every normal exit path including
+        // panic unwinds.
+        let _stage_session = stagelog::SessionGuard::begin(&format!(
+            "webcam{camera_index} {width}x{height}@{fps}"
+        ));
+        stagelog::mark(0, "camera_open_begin");
 
         let mut capture = match webcam::WebcamCapture::open(camera_index, width, height, fps) {
             Ok(c) => c,
@@ -1153,36 +1153,74 @@ impl TrackingWorker {
             }
         };
 
-        // Initialize the pose provider.
+        // Initialize the pose provider under cooperative GPU
+        // exclusivity. DirectML session creation (uploading the
+        // 370 MB RTMW3D-x graph + compiling its kernels) hung the
+        // Arc B570 driver when it raced the Vulkan render loop on
+        // one device — the 2026-06-12 stage log shows the system
+        // dying ~240 ms into `provider_load_begin` with
+        // `render_submit` still firing at 60 fps. While the guard is
+        // held the render thread skips frames (see
+        // `gpu_coordination`); we also run one warm-up inference
+        // inside the section so DirectML's lazy first-run kernel
+        // compilation happens here too, not on the first camera
+        // frame after the renderer resumes.
+        stagelog::mark(0, "provider_load_begin");
+        #[cfg(not(feature = "inference"))]
+        let _ = pipeline;
         #[cfg(feature = "inference")]
-        let mut pose_provider = match provider::create_pose_provider_from_env("models") {
-            Ok(mut provider) => {
-                let warnings = provider.take_load_warnings();
-                if !warnings.is_empty() {
-                    mailbox.report_error(
-                        t!(
-                            "tracking.error_model_warning",
-                            warnings = warnings.join("; ")
-                        ),
-                        TrackingErrorLevel::Warning,
-                    );
+        let mut pose_provider = {
+            let _gpu_exclusive =
+                crate::gpu_coordination::GpuExclusiveGuard::acquire("pose-provider-init");
+            match provider::create_pose_provider("models", pipeline) {
+                Ok(mut provider) => {
+                    let warnings = provider.take_load_warnings();
+                    if !warnings.is_empty() {
+                        mailbox.report_error(
+                            t!(
+                                "tracking.error_model_warning",
+                                warnings = warnings.join("; ")
+                            ),
+                            TrackingErrorLevel::Warning,
+                        );
+                    }
+                    mailbox.set_inference_backend_label(Some(provider.label()));
+
+                    // Warm-up on a black frame at the capture
+                    // resolution. The result is discarded; the point
+                    // is to force every lazy first-run compilation
+                    // (RTMW3D DirectML kernels, YOLOX/DAv2 cold-start
+                    // worker results) to complete while the render
+                    // thread is paused. FaceMesh stays cold (a black
+                    // frame produces no face bbox) — it is the
+                    // smallest session by two orders of magnitude.
+                    stagelog::mark(0, "provider_warmup_begin");
+                    let blank =
+                        vec![0u8; (capture.width() as usize) * (capture.height() as usize) * 3];
+                    let _ = provider.estimate_pose(&blank, capture.width(), capture.height(), 0);
+                    stagelog::mark(0, "provider_warmup_end");
+                    // The black frame exists only to force kernel
+                    // compilation — its garbage estimate must not
+                    // seed the session's temporal state (wrist
+                    // holds, sticky depth map, self-track bbox).
+                    provider.reset_temporal_state();
+                    Some(provider)
                 }
-                mailbox.set_inference_backend_label(Some(provider.label()));
-                Some(provider)
-            }
-            Err(e) => {
-                error!("tracking-worker: inference disabled: {}", e);
-                mailbox.report_error(
-                    t!("tracking.error_model_unavailable", error = e.to_string()),
-                    TrackingErrorLevel::Blocking,
-                );
-                None
+                Err(e) => {
+                    error!("tracking-worker: inference disabled: {}", e);
+                    mailbox.report_error(
+                        t!("tracking.error_model_unavailable", error = e.to_string()),
+                        TrackingErrorLevel::Blocking,
+                    );
+                    None
+                }
             }
         };
         #[cfg(not(feature = "inference"))]
         let mut pose_provider: Option<Box<dyn provider::PoseProvider>> = None;
 
         info!("tracking-worker: webcam opened successfully");
+        stagelog::mark(0, "provider_load_end");
         ready.store(true, Ordering::SeqCst);
         let mut frame_index: u64 = 0;
         let mut consecutive_errors: u32 = 0;
@@ -1251,12 +1289,14 @@ impl TrackingWorker {
                 }
             }
 
+            stagelog::mark(frame_index, "grab_begin");
             match capture.grab_frame() {
                 Ok(rgb_data) => {
                     consecutive_errors = 0;
                     let width = capture.width();
                     let height = capture.height();
 
+                    stagelog::mark(frame_index, "estimate_begin");
                     let estimate = if let Some(ref mut provider) = pose_provider {
                         provider.estimate_pose(&rgb_data, width, height, frame_index)
                     } else {
@@ -1265,6 +1305,7 @@ impl TrackingWorker {
 
                     let frame = Some(downscale_for_gui(&rgb_data, width, height, 320));
                     mailbox.publish_estimate(estimate, frame);
+                    stagelog::mark(frame_index, "publish");
                 }
                 Err(e) => {
                     consecutive_errors += 1;

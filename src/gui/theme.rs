@@ -63,6 +63,37 @@ pub mod color {
     /// 3D viewport stays dark even in light theme — avatars and
     /// streaming preview read better against a deep background.
     pub const VIEWPORT_BG: Color32 = Color32::from_rgb(20, 20, 26);
+
+    /// MD3 state layer: blend `on` over `base` at 8% — the hover
+    /// treatment for every tonal surface (buttons, chips, rows).
+    /// Interactive emphasis in this GUI is expressed through fills,
+    /// not hairline strokes: egui rasterises strokes as anti-aliased
+    /// meshes with no pixel snapping, so a 1 px outline renders with
+    /// visibly uneven thickness depending on sub-pixel phase and DPI
+    /// scale. Fills have no such failure mode.
+    pub fn state_layer(base: Color32, on: Color32) -> Color32 {
+        mix(base, on, 0.08)
+    }
+
+    /// Like [`state_layer`] but at the 12% pressed level.
+    pub fn pressed_layer(base: Color32, on: Color32) -> Color32 {
+        mix(base, on, 0.12)
+    }
+
+    /// `c` at opacity `a` — for translucent hover overlays on
+    /// surfaces whose base colour isn't known at the call site
+    /// (e.g. icon buttons floating on the top bar).
+    pub fn with_alpha(c: Color32, a: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+    }
+
+    /// Per-channel gamma-space blend of `b` over `a`.
+    pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+        let ch = |x: u8, y: u8| -> u8 {
+            (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8
+        };
+        Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+    }
     /// Cool-blue accent used to outline overlay panels inside the
     /// viewport (camera PIP, calibration preview pane). Distinct from
     /// the brand purple so the viewport's own affordances don't read
@@ -185,8 +216,10 @@ pub fn apply(ctx: &egui::Context) {
     visuals.selection.stroke = Stroke::new(1.0, color::ON_PRIMARY_CONTAINER);
 
     // ── Window decorations (popups / context menus) ──────────────
+    // Elevation is communicated by shadow alone — see the note on
+    // `color::state_layer` for why hairline strokes are avoided.
     visuals.window_rounding = Rounding::same(radius::MD);
-    visuals.window_stroke = Stroke::new(1.0, color::OUTLINE);
+    visuals.window_stroke = Stroke::NONE;
     visuals.window_shadow = Shadow {
         offset: Vec2::new(0.0, 4.0),
         blur: 16.0,
@@ -202,37 +235,49 @@ pub fn apply(ctx: &egui::Context) {
     visuals.menu_rounding = Rounding::same(radius::SM);
 
     // ── Widget states ────────────────────────────────────────────
+    // Interactive states are differentiated purely by fill (MD3 state
+    // layers): rest = SURFACE_VARIANT, hover = +8% primary, active /
+    // open = PRIMARY_CONTAINER. No bg_stroke hairlines — egui can't
+    // render them at uniform thickness (see `color::state_layer`).
+    // The only stroked state left is `noninteractive.bg_stroke`,
+    // which egui uses for separators — a structural divider, and
+    // axis-aligned lines don't suffer the rounded-corner artefacts.
+    //
+    // fg_stroke carries text/glyph colour plus checkmark / arrow
+    // line width; the width is kept identical across states so marks
+    // don't fatten on hover.
     let widgets = &mut visuals.widgets;
     let widget_round = Rounding::same(radius::SM);
+    const FG_STROKE_W: f32 = 1.5;
 
     widgets.noninteractive.bg_fill = color::SURFACE;
     widgets.noninteractive.weak_bg_fill = color::SURFACE;
     widgets.noninteractive.bg_stroke = Stroke::new(1.0, color::OUTLINE_VARIANT);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0, color::ON_SURFACE);
+    widgets.noninteractive.fg_stroke = Stroke::new(FG_STROKE_W, color::ON_SURFACE);
     widgets.noninteractive.rounding = widget_round;
 
     widgets.inactive.bg_fill = color::SURFACE_VARIANT;
     widgets.inactive.weak_bg_fill = color::SURFACE_VARIANT;
-    widgets.inactive.bg_stroke = Stroke::new(1.0, color::OUTLINE);
-    widgets.inactive.fg_stroke = Stroke::new(1.0, color::ON_SURFACE);
+    widgets.inactive.bg_stroke = Stroke::NONE;
+    widgets.inactive.fg_stroke = Stroke::new(FG_STROKE_W, color::ON_SURFACE);
     widgets.inactive.rounding = widget_round;
 
-    widgets.hovered.bg_fill = color::SURFACE;
-    widgets.hovered.weak_bg_fill = color::SURFACE;
-    widgets.hovered.bg_stroke = Stroke::new(1.0, color::PRIMARY);
-    widgets.hovered.fg_stroke = Stroke::new(1.5, color::PRIMARY);
+    widgets.hovered.bg_fill = color::state_layer(color::SURFACE_VARIANT, color::PRIMARY);
+    widgets.hovered.weak_bg_fill = color::state_layer(color::SURFACE_VARIANT, color::PRIMARY);
+    widgets.hovered.bg_stroke = Stroke::NONE;
+    widgets.hovered.fg_stroke = Stroke::new(FG_STROKE_W, color::PRIMARY);
     widgets.hovered.rounding = widget_round;
 
     widgets.active.bg_fill = color::PRIMARY_CONTAINER;
     widgets.active.weak_bg_fill = color::PRIMARY_CONTAINER;
-    widgets.active.bg_stroke = Stroke::new(1.0, color::PRIMARY);
-    widgets.active.fg_stroke = Stroke::new(1.5, color::ON_PRIMARY_CONTAINER);
+    widgets.active.bg_stroke = Stroke::NONE;
+    widgets.active.fg_stroke = Stroke::new(FG_STROKE_W, color::ON_PRIMARY_CONTAINER);
     widgets.active.rounding = widget_round;
 
     widgets.open.bg_fill = color::PRIMARY_CONTAINER;
     widgets.open.weak_bg_fill = color::PRIMARY_CONTAINER;
-    widgets.open.bg_stroke = Stroke::new(1.0, color::PRIMARY);
-    widgets.open.fg_stroke = Stroke::new(1.0, color::ON_PRIMARY_CONTAINER);
+    widgets.open.bg_stroke = Stroke::NONE;
+    widgets.open.fg_stroke = Stroke::new(FG_STROKE_W, color::ON_PRIMARY_CONTAINER);
     widgets.open.rounding = widget_round;
 
     ctx.set_visuals(visuals);

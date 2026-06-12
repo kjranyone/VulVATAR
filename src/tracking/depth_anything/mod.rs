@@ -70,8 +70,8 @@ pub struct DepthAnythingFrame {
 impl DepthAnythingFrame {
     /// Sample raw inverse-depth at a frame-relative position. Local
     /// median over a small window suppresses single-pixel artefacts
-    /// the same way [`super::cigpose_metric_depth::sample_metric_point`]
-    /// does for MoGe.
+    /// the same way [`super::skeleton_from_depth::sample_metric_point`]
+    /// does for the metric point cloud.
     pub fn sample_inverse_depth(&self, nx: f32, ny: f32, radius: i32) -> Option<f32> {
         if !nx.is_finite() || !ny.is_finite() {
             return None;
@@ -135,7 +135,7 @@ impl DepthAnythingV2Inference {
         // already runs in an async worker throttled by
         // DEPTH_REFRESH_PERIOD, so the ~200–400 ms CPU latency is
         // absorbed by the staleness budget and does not block the
-        // 30 fps tracker loop. See docs/pose-provider-benchmark.md.
+        // 30 fps tracker loop. See docs/onnx-tracking-pipeline.md.
         let (session, backend) = build_session_cpu_only(&path_str, 4, "DAv2-Small")?;
 
         let input_name = session

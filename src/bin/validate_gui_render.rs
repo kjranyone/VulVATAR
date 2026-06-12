@@ -393,6 +393,10 @@ fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameIn
         background_color: [0.10, 0.10, 0.10],
         transparent_background: false,
         avatar_opacity: 1.0,
+        bloom: Default::default(),
+        generative_background: Default::default(),
+        background_tracking: Default::default(),
+        time_seconds: 0.0,
     }
 }
 
@@ -510,6 +514,8 @@ struct VertexResult {
     dist_from_hips_m: f32,
     acc_len_pre_normalize: f32,
     mesh_idx: usize,
+    // Read only through the Debug impl when a breakage is reported.
+    #[allow(dead_code)]
     prim_idx: usize,
     vid: usize,
 }

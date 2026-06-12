@@ -1,7 +1,7 @@
 use eframe::egui;
 
-use crate::gui::components::outlined_button;
-use crate::gui::theme::{color, icon as ic};
+use crate::gui::components::{tonal_button, ButtonTone};
+use crate::gui::theme::icon as ic;
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -46,22 +46,22 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::REFRESH),
                     &t!("inspector.reload"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
                 {
                     state.app.reload_avatar();
                 }
-                if outlined_button(
+                if tonal_button(
                     ui,
                     None,
                     &t!("inspector.detach"),
-                    color::ERROR,
+                    ButtonTone::Error,
                     true,
                 )
                 .clicked()
@@ -154,11 +154,11 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                     state.project_status.project_dirty = true;
                 }
             });
-            if outlined_button(
+            if tonal_button(
                 ui,
                 None,
                 &t!("inspector.reset_transform"),
-                color::PRIMARY,
+                ButtonTone::Primary,
                 true,
             )
             .clicked()
@@ -174,11 +174,11 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if outlined_button(
+                if tonal_button(
                     ui,
                     None,
                     &t!("inspector.attach_primary"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -192,11 +192,11 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         avatar.attach_cloth(overlay_id);
                     }
                 }
-                if outlined_button(
+                if tonal_button(
                     ui,
                     None,
                     &t!("inspector.detach_primary"),
-                    color::ERROR,
+                    ButtonTone::Error,
                     true,
                 )
                 .clicked()
@@ -207,11 +207,11 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
             });
             ui.horizontal(|ui| {
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::ADD),
                     &t!("inspector.add_overlay_slot"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -237,11 +237,11 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::FOLDER_OPEN),
                     &t!("inspector.load_overlay_file"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -300,11 +300,11 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 slot.sim.particle_count()
                             ),
                         );
-                        if outlined_button(
+                        if tonal_button(
                             ui,
                             None,
                             &t!("inspector.remove"),
-                            color::ERROR,
+                            ButtonTone::Error,
                             true,
                         )
                         .clicked()
@@ -322,26 +322,110 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("inspector.scene_background"))
         .default_open(false)
         .show(ui, |ui| {
+            // An enabled generative background fills the frame with
+            // alpha = 1.0, overriding the transparent/solid clear — grey
+            // those controls out to make the relationship visible.
+            let generative_enabled = state.rendering.generative_background.enabled;
+            ui.add_enabled_ui(!generative_enabled, |ui| {
+                if ui
+                    .checkbox(
+                        &mut state.rendering.transparent_background,
+                        t!("inspector.transparent_background"),
+                    )
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+                if !state.rendering.transparent_background {
+                    ui.horizontal(|ui| {
+                        ui.label(t!("inspector.color"));
+                        if ui
+                            .color_edit_button_rgb(&mut state.rendering.background_color)
+                            .changed()
+                        {
+                            state.project_status.project_dirty = true;
+                        }
+                    });
+                }
+            });
+
+            ui.separator();
+
             if ui
                 .checkbox(
-                    &mut state.rendering.transparent_background,
-                    t!("inspector.transparent_background"),
+                    &mut state.rendering.generative_background.enabled,
+                    t!("inspector.generative_background"),
                 )
                 .changed()
             {
                 state.project_status.project_dirty = true;
             }
-            if !state.rendering.transparent_background {
+            ui.add_enabled_ui(state.rendering.generative_background.enabled, |ui| {
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.generative_background.intensity,
+                            0.0..=3.0,
+                        )
+                        .text(t!("inspector.bg_intensity")),
+                    )
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.generative_background.speed,
+                            0.0..=2.0,
+                        )
+                        .text(t!("inspector.bg_speed")),
+                    )
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.generative_background.scale,
+                            0.5..=8.0,
+                        )
+                        .text(t!("inspector.bg_scale")),
+                    )
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.generative_background.reactivity,
+                            0.0..=2.0,
+                        )
+                        .text(t!("inspector.bg_reactivity")),
+                    )
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
                 ui.horizontal(|ui| {
-                    ui.label(t!("inspector.color"));
+                    ui.label(t!("inspector.bg_color_a"));
                     if ui
-                        .color_edit_button_rgb(&mut state.rendering.background_color)
+                        .color_edit_button_rgb(&mut state.rendering.generative_background.color_a)
+                        .changed()
+                    {
+                        state.project_status.project_dirty = true;
+                    }
+                    ui.label(t!("inspector.bg_color_b"));
+                    if ui
+                        .color_edit_button_rgb(&mut state.rendering.generative_background.color_b)
                         .changed()
                     {
                         state.project_status.project_dirty = true;
                     }
                 });
-            }
+            });
         });
 
     egui::CollapsingHeader::new(t!("inspector.runtime_toggles"))
@@ -400,11 +484,11 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if outlined_button(
+                if tonal_button(
                     ui,
                     None,
                     &t!("inspector.reset_all"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -413,11 +497,11 @@ pub(super) fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                         ew.weight = 0.0;
                     }
                 }
-                if outlined_button(
+                if tonal_button(
                     ui,
                     None,
                     &t!("inspector.set_all_50"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()

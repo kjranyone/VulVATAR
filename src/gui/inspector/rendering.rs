@@ -1,7 +1,7 @@
 use eframe::egui;
 
-use crate::gui::components::{filled_button, outlined_button};
-use crate::gui::theme::{color, icon as ic};
+use crate::gui::components::{filled_button, tonal_button, ButtonTone};
+use crate::gui::theme::icon as ic;
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -100,32 +100,32 @@ pub(super) fn draw_rendering(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_status.project_dirty = true;
             }
-            // Anti-aliasing (MSAA). Applies to both the viewport preview and
-            // the exported frame (they share the offscreen render target). The
-            // renderer clamps the pick to device sample-count support (and
-            // caps integrated GPUs at 4x), so an unsupported pick degrades.
-            ui.horizontal(|ui| {
-                ui.label(t!("inspector.antialiasing"));
-                let msaa_names: [String; 4] = [
-                    t!("inspector.msaa_off"),
-                    t!("inspector.msaa_2x"),
-                    t!("inspector.msaa_4x"),
-                    t!("inspector.msaa_8x"),
-                ];
-                let prev = state.rendering.msaa_index;
-                egui::ComboBox::from_id_salt("rendering_msaa")
-                    .selected_text(
-                        msaa_names
-                            .get(state.rendering.msaa_index)
-                            .map(|s: &String| s.as_str())
-                            .unwrap_or("Unknown"),
+
+            ui.separator();
+
+            if ui
+                .checkbox(&mut state.rendering.bloom_enabled, t!("inspector.bloom"))
+                .changed()
+            {
+                state.project_status.project_dirty = true;
+            }
+            ui.add_enabled_ui(state.rendering.bloom_enabled, |ui| {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut state.rendering.bloom_intensity, 0.0..=2.0)
+                            .text(t!("inspector.bloom_intensity")),
                     )
-                    .show_ui(ui, |ui| {
-                        for (i, name) in msaa_names.iter().enumerate() {
-                            ui.selectable_value(&mut state.rendering.msaa_index, i, name);
-                        }
-                    });
-                if state.rendering.msaa_index != prev {
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(&mut state.rendering.bloom_threshold, 0.0..=4.0)
+                            .text(t!("inspector.bloom_threshold")),
+                    )
+                    .changed()
+                {
                     state.project_status.project_dirty = true;
                 }
             });
@@ -182,11 +182,11 @@ fn draw_scene_presets(ui: &mut egui::Ui, state: &mut GuiApp) {
                     let _ = crate::persistence::save_scene_presets(&state.scene_preset.presets);
                     state.push_notification(t!("inspector.saved_preset", name = name));
                 }
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::DELETE),
                     &t!("inspector.delete_selected"),
-                    color::ERROR,
+                    ButtonTone::Error,
                     true,
                 )
                 .clicked()

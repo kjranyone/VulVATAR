@@ -18,12 +18,6 @@ pub(in crate::tracking) const RTMW3D_SOURCE_Z_SCALE: f32 =
 /// `nx, ny ∈ [0, 1]` (image-relative, NY top-to-bottom),
 /// `nz ∈ [0, 1]` (model depth axis), `score` is the per-joint
 /// confidence after sigmoid.
-///
-/// Re-exported as `pub(in crate::tracking)` so sibling pose
-/// providers (e.g. ViTPose, which is 2D-only) can synthesise a
-/// `nz = 0.5` planar fallback and feed the shared
-/// [`super::skeleton::build_source_skeleton`] builder without
-/// duplicating the COCO-Wholebody mapping table.
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::tracking) struct DecodedJoint {
     pub(in crate::tracking) nx: f32,

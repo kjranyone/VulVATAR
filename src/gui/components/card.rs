@@ -1,7 +1,10 @@
-//! MD3-style card surface: rounded rectangle on `SURFACE` with a
-//! subtle outline, generous internal padding, and an optional title +
-//! trailing action row at the top. Cards stack inside the inspector
-//! and replace the previous `CollapsingHeader` chrome.
+//! MD3-style elevated card surface: rounded rectangle on `SURFACE`
+//! with a soft shadow, generous internal padding, and an optional
+//! title + trailing action row at the top. Cards stack inside the
+//! inspector and replace the previous `CollapsingHeader` chrome.
+//! Elevation comes from the shadow + fill contrast against
+//! `SURFACE_DIM` alone — no outline (egui can't render hairline
+//! strokes at uniform thickness; see `theme::color::state_layer`).
 //!
 //! Two entry points:
 //!   * [`card`] — title + content. Use for static panels.
@@ -44,7 +47,7 @@ pub fn card_with_action<R, A>(
             color: Color32::from_rgba_unmultiplied(60, 50, 90, 18),
         },
         fill: color::SURFACE,
-        stroke: Stroke::new(1.0, color::OUTLINE_VARIANT),
+        stroke: Stroke::NONE,
     };
 
     let mut action_value: Option<A> = None;

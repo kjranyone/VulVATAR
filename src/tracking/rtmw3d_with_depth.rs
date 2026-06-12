@@ -1,6 +1,6 @@
-//! RTMW3D + Depth Anything V2 Small streaming pipeline.
+//! RTMW3D + Depth Anything V2 Small streaming pipeline — the single
+//! production pose provider, sized for 30-fps virtual-camera output.
 //!
-//! The third pose provider, sized for 30-fps virtual-camera output.
 //! RTMW3D's 2D body / hand / face landmarks are excellent and run in
 //! ~38 ms; its baked-in z is a body-prior fiction that doesn't
 //! capture forward / backward limb motion. DAv2-Small's relative
@@ -38,15 +38,6 @@
 //! drift on a moving wrist; the small `SAMPLE_RADIUS_PX` median
 //! window absorbs most of it.
 //!
-//! ## Trade-off vs the other depth-aware provider
-//!
-//! `cigpose-metric-depth` runs MoGe-2 ViT for true metric
-//! coordinates (~175 ms) and is the right choice when accuracy
-//! matters more than fps — offline analysis, ground-truth
-//! comparisons. This provider trades MoGe's true metric for DAv2's
-//! relative-then-calibrated metric so the inference budget fits
-//! inside the streaming frame budget.
-//!
 //! ## Calibration math
 //!
 //! DAv2 emits inverse-depth-style values (`d_raw`, larger ≈ closer).
@@ -80,16 +71,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 #[cfg(feature = "inference")]
-use super::cigpose::{DecodedJoint2d, NUM_JOINTS};
-#[cfg(feature = "inference")]
 use super::depth_anything::{DepthAnythingFrame, DepthAnythingV2Inference};
-#[cfg(feature = "inference")]
-use super::metric_depth::{FrameCrop, MoGeFrame};
 #[cfg(feature = "inference")]
 use super::rtmw3d::Rtmw3dInference;
 #[cfg(feature = "inference")]
 use super::skeleton_from_depth::{
-    build_options_from_calibration, build_skeleton, resolve_origin_metric, SAMPLE_RADIUS_PX,
+    build_options_from_calibration, build_skeleton, resolve_origin_metric, DecodedJoint2d,
+    FrameCrop, MetricDepthFrame, NUM_JOINTS, SAMPLE_RADIUS_PX,
 };
 #[cfg(feature = "inference")]
 use log::{debug, error, info, warn};
@@ -121,7 +109,7 @@ const ASSUMED_VERTICAL_FOV_DEG: f32 = 60.0;
 /// pose rate. Off-tick frames reuse the sticky outbox result.
 ///
 /// Why: under DirectML EP, DAv2 and RTMW3D contend for the GPU
-/// command queue (see docs/pose-provider-benchmark.md). Skipping
+/// command queue (see docs/onnx-tracking-pipeline.md). Skipping
 /// every other frame frees the GPU on off-ticks so RTMW3D runs at
 /// its uncontested speed (~38 ms vs ~43 ms contended). Combined with
 /// the DAv2 worker's cold-start sticky-outbox semantics, depth
@@ -172,6 +160,12 @@ struct DepthRequest {
     height: u32,
     frame_index: u64,
     crop_origin: Option<(f32, f32, f32, f32)>,
+    /// Temporal-state generation at submit time. Bumped by
+    /// `reset_temporal_state`; results from an older generation are
+    /// in-flight leftovers of a previous input and must not satisfy
+    /// the next input's cold-start wait (measured as cross-image
+    /// depth contamination in the benchmark sweep).
+    generation: u64,
 }
 
 #[cfg(feature = "inference")]
@@ -180,6 +174,7 @@ struct DepthResult {
     depth: DepthAnythingFrame,
     inference_ms: f32,
     crop_origin: Option<(f32, f32, f32, f32)>,
+    generation: u64,
 }
 
 /// Sticky outbox: the latest completed depth result. `Arc<DepthResult>`
@@ -244,6 +239,9 @@ pub struct Rtmw3dWithDepthProvider {
     /// captured an explicit pose calibration.
     #[cfg(feature = "inference")]
     scale_c_ema: Option<f32>,
+    /// Current temporal-state generation; see `DepthRequest::generation`.
+    #[cfg(feature = "inference")]
+    depth_generation: u64,
     /// Active torso-template capture buffer, set by the GUI while
     /// the calibration modal is in `Collecting`. `Some` means each
     /// successful frame contributes one sample per cell to the
@@ -280,49 +278,101 @@ impl Rtmw3dWithDepthProvider {
 
     #[cfg(feature = "inference")]
     pub fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
+        Self::from_models_dir_with_config(
+            models_dir,
+            super::provider::TrackingPipelineConfig::default(),
+        )
+    }
+
+    #[cfg(feature = "inference")]
+    pub fn from_models_dir_with_config(
+        models_dir: impl AsRef<Path>,
+        config: super::provider::TrackingPipelineConfig,
+    ) -> Result<Self, String> {
         let dir = models_dir.as_ref();
 
-        // Force FaceMesh on CPU EP: with DAv2 on DirectML running
-        // concurrently in the worker thread, sharing the GPU command
-        // queue inflates FaceMesh from ~3 ms to ~13 ms. CPU runs the
-        // small face cascade in ~7 ms uncontested, net win of ~6 ms
-        // per frame.
-        let mut rtmw3d = Rtmw3dInference::from_models_dir_with_face_ep(
-            dir,
-            super::face_mediapipe::FaceMeshEp::ForceCpu,
-        )?;
-        let warnings = rtmw3d.take_load_warnings();
-        let dav2 = DepthAnythingV2Inference::from_model_path(dir.join("dav2_small.onnx"))?;
-        let depth_backend_label = dav2.backend().label().to_string();
+        // The depth stage is optional: it needs both the user toggle
+        // and `dav2_small.onnx` on disk. Without it the provider runs
+        // the identical RTMW3D pipeline and z falls back to the
+        // body-prior synthetic. `estimate_pose_internal` skips every
+        // depth phase when `depth_tx` is `None`.
+        let dav2_path = dir.join("dav2_small.onnx");
+        let depth_enabled = config.depth_enabled && dav2_path.is_file();
 
-        let (depth_tx, depth_rx) = channel::<DepthRequest>();
+        // FaceMesh EP follows the depth stage: with DAv2 on DirectML
+        // running concurrently in the worker thread, sharing the GPU
+        // command queue inflates FaceMesh from ~3 ms to ~13 ms — CPU
+        // runs the small face cascade in ~7 ms uncontested, net win
+        // of ~6 ms per frame. Without DAv2 there is no contention and
+        // DirectML's ~3 ms wins. (`force_cpu` overrides this inside
+        // `Rtmw3dInference` regardless.)
+        let face_ep = if depth_enabled {
+            super::face_mediapipe::FaceMeshEp::ForceCpu
+        } else {
+            super::face_mediapipe::FaceMeshEp::Auto
+        };
+        let mut rtmw3d = Rtmw3dInference::from_models_dir_with_options(
+            dir,
+            super::rtmw3d::Rtmw3dOptions {
+                face_ep,
+                force_cpu: config.force_cpu,
+                yolox_enabled: config.yolox_enabled,
+            },
+        )?;
+        let mut warnings = rtmw3d.take_load_warnings();
+
         let depth_outbox = Arc::new(DepthOutbox {
             slot: Mutex::new(None),
             cvar: Condvar::new(),
         });
-        let depth_outbox_for_thread = Arc::clone(&depth_outbox);
-        let depth_thread = thread::Builder::new()
-            .name("dav2-depth".into())
-            .spawn(move || depth_worker_loop(dav2, depth_rx, depth_outbox_for_thread))
-            .map_err(|e| format!("spawn depth worker: {e}"))?;
 
-        info!(
-            "RTMW3D+DAv2 provider ready (RTMW3D: {}, DAv2: {} async)",
-            rtmw3d.backend().label(),
-            depth_backend_label,
-        );
+        let (depth_tx, depth_thread, depth_backend_label) = if depth_enabled {
+            let dav2 = DepthAnythingV2Inference::from_model_path(&dav2_path)?;
+            let depth_backend_label = dav2.backend().label().to_string();
+            let (depth_tx, depth_rx) = channel::<DepthRequest>();
+            let depth_outbox_for_thread = Arc::clone(&depth_outbox);
+            let depth_thread = thread::Builder::new()
+                .name("dav2-depth".into())
+                .spawn(move || depth_worker_loop(dav2, depth_rx, depth_outbox_for_thread))
+                .map_err(|e| format!("spawn depth worker: {e}"))?;
+            info!(
+                "RTMW3D+DAv2 provider ready (RTMW3D: {}, DAv2: {} async)",
+                rtmw3d.backend().label(),
+                depth_backend_label,
+            );
+            (Some(depth_tx), Some(depth_thread), depth_backend_label)
+        } else {
+            if config.depth_enabled {
+                // User asked for depth but the model is missing —
+                // degrade loudly so it shows up as a GUI toast, not
+                // just a log line.
+                warn!(
+                    "dav2_small.onnx not found at {} — running without the metric-depth stage \
+                     (z falls back to RTMW3D's body prior)",
+                    dav2_path.display()
+                );
+                warnings.push(format!(
+                    "Depth model missing ({}); tracking runs without metric depth",
+                    dav2_path.display()
+                ));
+            } else {
+                info!("metric-depth stage disabled by pipeline config");
+            }
+            (None, None, String::new())
+        };
 
         Ok(Self {
             rtmw3d,
-            depth_tx: Some(depth_tx),
+            depth_tx,
             depth_outbox,
-            depth_thread: Some(depth_thread),
+            depth_thread,
             depth_thread_dead_logged: false,
             depth_backend_label,
             load_warnings: warnings,
             pose_calibration: None,
             calibration_mode_hint: None,
             scale_c_ema: None,
+            depth_generation: 0,
             torso_capture: None,
             last_calib_warn_at: None,
             calib_was_failing: false,
@@ -368,7 +418,9 @@ fn depth_worker_loop(
             req = newer;
         }
         let t0 = std::time::Instant::now();
+        crate::tracking::stagelog::mark(req.frame_index, "dav2_infer_begin");
         let depth_opt = dav2.estimate(&req.rgb, req.width, req.height);
+        crate::tracking::stagelog::mark(req.frame_index, "dav2_infer_end");
         let inference_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let depth = match depth_opt {
             Some(d) => d,
@@ -379,6 +431,7 @@ fn depth_worker_loop(
             depth,
             inference_ms,
             crop_origin: req.crop_origin,
+            generation: req.generation,
         });
         {
             let mut slot = outbox.slot.lock().unwrap();
@@ -392,11 +445,15 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
     fn label(&self) -> String {
         #[cfg(feature = "inference")]
         {
-            format!(
-                "RTMW3D+DAv2 / {} + {} async",
-                self.rtmw3d.backend().label(),
-                self.depth_backend_label
-            )
+            if self.depth_tx.is_some() {
+                format!(
+                    "RTMW3D+DAv2 / {} + {} async",
+                    self.rtmw3d.backend().label(),
+                    self.depth_backend_label
+                )
+            } else {
+                format!("RTMW3D / {} (no depth)", self.rtmw3d.backend().label())
+            }
         }
         #[cfg(not(feature = "inference"))]
         {
@@ -445,6 +502,22 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
         #[cfg(feature = "inference")]
         {
             self.rtmw3d.force_shoulder_anchor_hint = hint;
+        }
+    }
+
+    fn reset_temporal_state(&mut self) {
+        #[cfg(feature = "inference")]
+        {
+            // Drop the sticky depth result: the next estimate sees an
+            // empty outbox, submits the new frame, and blocks for a
+            // fresh depth map — restoring per-input cold-start
+            // semantics for benchmarks.
+            *self.depth_outbox.slot.lock().unwrap() = None;
+            self.depth_generation = self.depth_generation.wrapping_add(1);
+            self.scale_c_ema = None;
+            self.calib_was_failing = false;
+            self.last_calib_warn_at = None;
+            self.rtmw3d.reset_temporal_state();
         }
     }
 
@@ -542,6 +615,14 @@ impl Rtmw3dWithDepthProvider {
             return rtmw_est;
         }
 
+        // Depth stage disabled (dav2_small.onnx absent at startup):
+        // the RTMW3D estimate, with its body-prior synthetic z, IS the
+        // result. Returning here also avoids the cold-start outbox
+        // wait below, which would block forever with no worker.
+        if self.depth_tx.is_none() {
+            return rtmw_est;
+        }
+
         // Phase 0: dispatch DAv2 work for this frame to the worker
         // thread. We submit only on every `DEPTH_REFRESH_PERIOD`-th
         // frame to halve GPU contention between RTMW3D + DAv2 — but
@@ -583,10 +664,14 @@ impl Rtmw3dWithDepthProvider {
             None => (rgb_data.to_vec(), width, height, None),
         };
 
-        let outbox_empty = self.depth_outbox.slot.lock().unwrap().is_none();
+        let outbox_empty = {
+            let slot = self.depth_outbox.slot.lock().unwrap();
+            !matches!(&*slot, Some(r) if r.generation == self.depth_generation)
+        };
         let submit_depth_this_frame =
             outbox_empty || frame_index.is_multiple_of(DEPTH_REFRESH_PERIOD);
         if submit_depth_this_frame {
+            crate::tracking::stagelog::mark(frame_index, "depth_submit");
             if let Some(tx) = self.depth_tx.as_ref() {
                 let req = DepthRequest {
                     rgb: dav2_rgb,
@@ -594,6 +679,7 @@ impl Rtmw3dWithDepthProvider {
                     height: dav2_h,
                     frame_index,
                     crop_origin,
+                    generation: self.depth_generation,
                 };
                 // SendError only happens if the worker thread died —
                 // at which point we'll fall back to whatever's left
@@ -619,9 +705,14 @@ impl Rtmw3dWithDepthProvider {
         // after that the outbox always has *some* result so we read
         // non-blocking, possibly using a 1–2-frame-old depth.
         let t_wait = std::time::Instant::now();
+        crate::tracking::stagelog::mark(frame_index, "depth_wait_begin");
         let depth_result = {
             let mut slot = self.depth_outbox.slot.lock().unwrap();
-            while slot.is_none() {
+            // Generation check inside the wait: an in-flight result
+            // submitted before the last temporal reset may land
+            // after the reset cleared the slot — it belongs to the
+            // previous input and must not satisfy this wait.
+            while !matches!(&*slot, Some(r) if r.generation == self.depth_generation) {
                 slot = self.depth_outbox.cvar.wait(slot).unwrap();
             }
             // Sticky: don't take, just clone the Arc — subsequent
@@ -629,6 +720,7 @@ impl Rtmw3dWithDepthProvider {
             // arrived yet.
             Arc::clone(slot.as_ref().unwrap())
         };
+        crate::tracking::stagelog::mark(frame_index, "depth_wait_end");
         let dt_wait = t_wait.elapsed();
         let depth_age = frame_index.saturating_sub(depth_result.frame_index);
         let dav2_frame = &depth_result.depth;
@@ -751,7 +843,7 @@ impl Rtmw3dWithDepthProvider {
             calib.anchor_label, calib.d_raw_a, calib.d_raw_b, raw_c, smoothed_c
         );
 
-        // Phase 4: build a MoGeFrame-shaped point cloud out of DAv2 +
+        // Phase 4: build a MetricDepthFrame-shaped point cloud out of DAv2 +
         // calibration so the shared `skeleton_from_depth` helpers
         // apply unchanged. The DAv2 grid (392×294 ≈ 115 K pixels)
         // back-projects in well under a millisecond.
@@ -878,6 +970,19 @@ impl Rtmw3dWithDepthProvider {
             l.zip(r)
         };
 
+        // Snapshot the depth-built (metric back-projected) arm chain
+        // before Phase 7 wipes it: the metric RELATIVE segment
+        // vectors (elbow−shoulder, wrist−elbow) are the only signal
+        // in the pipeline that survives perspective — at desk
+        // distances a hand 0.35 m from the lens projects ~1.7× wider
+        // than the same hand at torso depth, so RTMW3D's normalised
+        // (nx, ny) makes a forward-pointing arm look sideways-
+        // extended and no orthographic bone-length trick can undo
+        // it. DAv2's lateral DC bias cancels in these short-baseline
+        // relative vectors (same argument as the bz injection
+        // below).
+        let metric_arms = snapshot_metric_arms(&skeleton);
+
         for (bone, joint) in skeleton.joints.iter_mut() {
             if let Some(rtmw_joint) = rtmw_est.skeleton.joints.get(bone) {
                 joint.position = rtmw_joint.position;
@@ -887,6 +992,22 @@ impl Rtmw3dWithDepthProvider {
             if let Some(rtmw_joint) = rtmw_est.skeleton.fingertips.get(bone) {
                 joint.position = rtmw_joint.position;
             }
+        }
+        // UNION, not intersection: a joint the depth builder dropped
+        // (its sample landed outside the stale depth crop or on a
+        // masked pixel — routine during fast arm motion at 30 fps
+        // with the ~170 ms CPU depth cadence) must not delete the
+        // limb. RTMW3D itself tracked it fine; missing metric data
+        // only means "no depth refinement this frame". Without this,
+        // moving arms intermittently vanish from the source skeleton
+        // and the avatar snaps to rest pose — the live "T-pose"
+        // symptom that the per-image benchmark (fresh depth every
+        // frame) could never reproduce.
+        for (bone, joint) in rtmw_est.skeleton.joints.iter() {
+            skeleton.joints.entry(*bone).or_insert(*joint);
+        }
+        for (bone, joint) in rtmw_est.skeleton.fingertips.iter() {
+            skeleton.fingertips.entry(*bone).or_insert(*joint);
         }
 
         // Phase 7.5: re-inject Z components from DAv2 metric depth.
@@ -927,6 +1048,19 @@ impl Rtmw3dWithDepthProvider {
             let cal = self.pose_calibration.as_ref();
             inject_shoulder_bz_from_dav2(&mut skeleton, sl_metric_x, sr_metric_x, cal);
             inject_elbow_z_from_dav2(&mut skeleton, sl_metric_x, sr_metric_x);
+            // Phase 7.6: re-place the arm chains from the metric
+            // relative vectors captured before the overwrite —
+            // perspective-true elbow/wrist placement (all three
+            // axes, not just z). Falls back per side to whatever the
+            // injections above produced when the metric samples were
+            // missing or implausible.
+            replace_arm_chains_from_metric(
+                &mut skeleton,
+                &metric_arms,
+                sl_metric_x,
+                sr_metric_x,
+                &joints_2d,
+            );
         }
         // Hand orientation is also re-derived from RTMW3D's own
         // (unbiased) hand-keypoint xyz — same rationale as the body
@@ -960,6 +1094,243 @@ impl Rtmw3dWithDepthProvider {
             skeleton,
         }
     }
+}
+
+/// Metric (depth-built) arm-chain snapshot taken before the Phase-7
+/// position overwrite: per side, the shoulder / elbow / wrist
+/// camera-relative source positions as the depth back-projection
+/// produced them, plus per-joint confidence.
+#[cfg(feature = "inference")]
+#[derive(Default)]
+struct MetricArmSnapshot {
+    /// [left, right] → (shoulder, elbow, wrist) positions.
+    sides: [Option<([f32; 3], [f32; 3], [f32; 3])>; 2],
+}
+
+#[cfg(feature = "inference")]
+fn snapshot_metric_arms(sk: &SourceSkeleton) -> MetricArmSnapshot {
+    const MIN_CONF: f32 = 0.4;
+    let mut out = MetricArmSnapshot::default();
+    for (i, (sh, el, wr)) in [
+        (
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::LeftLowerArm,
+            HumanoidBone::LeftHand,
+        ),
+        (
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::RightLowerArm,
+            HumanoidBone::RightHand,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let g = |b: HumanoidBone, require_metric_flag: bool| -> Option<[f32; 3]> {
+            let j = sk.joints.get(&b)?;
+            if j.confidence < MIN_CONF {
+                return None;
+            }
+            // Body joints whose position came from a depth sample
+            // carry `metric_depth_m`; a fallback-built joint must not
+            // masquerade as measured geometry. The wrist is exempt:
+            // the depth builder constructs it as the MCP-centroid of
+            // metric samples but surfaces no scalar — in the depth
+            // skeleton it is depth-built by construction.
+            if require_metric_flag {
+                j.metric_depth_m?;
+            }
+            Some(j.position)
+        };
+        let (gs, ge, gw) = (g(sh, true), g(el, true), g(wr, false));
+        debug!(
+            "metric-arm snapshot side {}: shoulder={} elbow={} wrist={}",
+            i,
+            gs.is_some(),
+            ge.is_some(),
+            gw.is_some()
+        );
+        if let (Some(s), Some(e), Some(w)) = (gs, ge, gw) {
+            out.sides[i] = Some((s, e, w));
+        }
+    }
+    out
+}
+
+/// Re-place the elbow and wrist from the metric relative segment
+/// vectors. The nz-based shoulder position (Phase 7) stays the
+/// anchor; the metric vectors are scaled into source units via the
+/// shoulder-span conversion factor and bounded by anatomical segment
+/// lengths so a hand-occluded or background-contaminated sample
+/// can't fling the chain.
+#[cfg(feature = "inference")]
+fn replace_arm_chains_from_metric(
+    sk: &mut SourceSkeleton,
+    arms: &MetricArmSnapshot,
+    shoulder_l_metric_x: f32,
+    shoulder_r_metric_x: f32,
+    joints_2d: &[DecodedJoint2d],
+) {
+    /// Anatomical bounds on metric segment lengths (metres). The
+    /// upper caps reject "sampled the bookshelf" outliers; the lower
+    /// floors reject occlusion collapse — a wrist depth sample
+    /// landing on the elbow/torso surface yields an impossibly short
+    /// segment (observed 0.11 m forearm on the lean-left validation
+    /// image) that would fold the avatar's arm flat.
+    const MAX_UPPER_ARM_M: f32 = 0.45;
+    const MAX_FOREARM_M: f32 = 0.42;
+    const MIN_UPPER_ARM_M: f32 = 0.15;
+    const MIN_FOREARM_M: f32 = 0.15;
+
+    let metric_x_span = (shoulder_l_metric_x - shoulder_r_metric_x).abs();
+    if metric_x_span < 1e-3 {
+        return;
+    }
+    let source_x_span = match (
+        sk.joints.get(&HumanoidBone::LeftUpperArm),
+        sk.joints.get(&HumanoidBone::RightUpperArm),
+    ) {
+        (Some(l), Some(r)) => (l.position[0] - r.position[0]).abs(),
+        _ => return,
+    };
+    if source_x_span < 1e-3 {
+        return;
+    }
+    let mpsu = metric_x_span / source_x_span;
+
+    for (i, (sh_bone, el_bone, wr_bone)) in [
+        (
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::LeftLowerArm,
+            HumanoidBone::LeftHand,
+        ),
+        (
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::RightLowerArm,
+            HumanoidBone::RightHand,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Some((s_m, e_m, w_m)) = arms.sides[i] else {
+            continue;
+        };
+        // Skip sides whose wrist has left the frame: the depth was
+        // sampled at the hallucinated in-frame stump position and
+        // would override the edge-exit extrapolation with garbage.
+        // The forearm-length reference is unknown here; 0.20
+        // frame-normalised (~0.4 source units on a typical deskcrop
+        // span) errs toward keeping the metric path active.
+        let get = |k: usize| -> Option<(f32, f32, f32)> {
+            joints_2d.get(k).map(|j| (j.nx, j.ny, j.score))
+        };
+        if crate::tracking::rtmw3d::wrist_out_of_frame(&get, i, 0.20) {
+            continue;
+        }
+        let seg = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+        };
+        let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        // NOTE: the snapshot positions are already in source units
+        // (the depth builder back-projects then divides by its own
+        // calibration), so the segment vectors are source-space and
+        // the metre caps are applied after converting BACK to metres
+        // via mpsu.
+        let ua = seg(s_m, e_m);
+        let fa = seg(e_m, w_m);
+        debug!(
+            "metric-arm side {}: ua={:.3}m fa={:.3}m (caps {:.2}/{:.2}) ua_vec=({:+.2},{:+.2},{:+.2}) fa_vec=({:+.2},{:+.2},{:+.2})",
+            i,
+            len(ua) * mpsu,
+            len(fa) * mpsu,
+            MAX_UPPER_ARM_M,
+            MAX_FOREARM_M,
+            ua[0], ua[1], ua[2],
+            fa[0], fa[1], fa[2],
+        );
+        let ua_m = len(ua) * mpsu;
+        let fa_m = len(fa) * mpsu;
+        let ua_valid = (MIN_UPPER_ARM_M..=MAX_UPPER_ARM_M).contains(&ua_m);
+        let fa_valid = (MIN_FOREARM_M..=MAX_FOREARM_M).contains(&fa_m);
+        debug!("metric-arm side {i}: ua_valid={ua_valid} fa_valid={fa_valid}");
+        if !ua_valid {
+            continue; // no trustworthy anchor for the chain
+        }
+        let Some(sh_now) = sk.joints.get(&sh_bone).map(|j| j.position) else {
+            continue;
+        };
+        let old_elbow = sk.joints.get(&el_bone).map(|j| j.position);
+        let new_elbow = [sh_now[0] + ua[0], sh_now[1] + ua[1], sh_now[2] + ua[2]];
+        // Wrist: metric forearm vector when plausible; otherwise keep
+        // the fallback forearm vector (nz + bone-length recon) and
+        // carry it on the relocated elbow, so a collapsed wrist
+        // sample degrades to "metric elbow + reconstructed forearm"
+        // instead of folding the arm.
+        let new_wrist = if fa_valid {
+            [
+                new_elbow[0] + fa[0],
+                new_elbow[1] + fa[1],
+                new_elbow[2] + fa[2],
+            ]
+        } else {
+            match (old_elbow, sk.joints.get(&wr_bone).map(|j| j.position)) {
+                (Some(oe), Some(ow)) => [
+                    new_elbow[0] + (ow[0] - oe[0]),
+                    new_elbow[1] + (ow[1] - oe[1]),
+                    new_elbow[2] + (ow[2] - oe[2]),
+                ],
+                _ => continue,
+            }
+        };
+        let wrist_delta = match sk.joints.get(&wr_bone) {
+            Some(j) => [
+                new_wrist[0] - j.position[0],
+                new_wrist[1] - j.position[1],
+                new_wrist[2] - j.position[2],
+            ],
+            None => [0.0; 3],
+        };
+        if let Some(j) = sk.joints.get_mut(&el_bone) {
+            j.position = new_elbow;
+        }
+        if let Some(j) = sk.joints.get_mut(&wr_bone) {
+            j.position = new_wrist;
+        }
+        // Carry the finger chain with the wrist so hand orientation
+        // and finger solving stay coherent.
+        let left = i == 0;
+        for (bone, joint) in sk.joints.iter_mut() {
+            if metric_is_finger_side(*bone, left) {
+                joint.position[0] += wrist_delta[0];
+                joint.position[1] += wrist_delta[1];
+                joint.position[2] += wrist_delta[2];
+            }
+        }
+        for (bone, joint) in sk.fingertips.iter_mut() {
+            if metric_is_finger_side(*bone, left) {
+                joint.position[0] += wrist_delta[0];
+                joint.position[1] += wrist_delta[1];
+                joint.position[2] += wrist_delta[2];
+            }
+        }
+    }
+}
+
+#[cfg(feature = "inference")]
+fn metric_is_finger_side(bone: HumanoidBone, left: bool) -> bool {
+    let name = format!("{bone:?}");
+    let side_ok = if left {
+        name.starts_with("Left")
+    } else {
+        name.starts_with("Right")
+    };
+    side_ok
+        && (name.contains("Thumb")
+            || name.contains("Index")
+            || name.contains("Middle")
+            || name.contains("Ring")
+            || name.contains("Little"))
 }
 
 fn empty_estimate(frame_index: u64) -> PoseEstimate {
@@ -1041,6 +1412,18 @@ fn inject_elbow_z_from_dav2(
             },
             _ => continue,
         };
+        // Same-side hand's metric depth, read before the elbow's
+        // mutable borrow. Used by the hand-adhesion guard below.
+        let hand_bone = if elbow_bone == HumanoidBone::LeftLowerArm {
+            HumanoidBone::LeftHand
+        } else {
+            HumanoidBone::RightHand
+        };
+        let hand_z_m = skeleton
+            .joints
+            .get(&hand_bone)
+            .and_then(|j| j.metric_depth_m);
+
         let Some(elbow_joint_mut) = skeleton.joints.get_mut(&elbow_bone) else {
             continue;
         };
@@ -1050,6 +1433,28 @@ fn inject_elbow_z_from_dav2(
         let Some(elbow_z_m) = elbow_joint_mut.metric_depth_m else {
             continue;
         };
+
+        // Hand-adhesion guard: when the hand is held toward the
+        // camera it visually covers the elbow region, and the
+        // elbow's depth window samples the *hand surface* — the
+        // sampled elbow z glues to the wrist z instead of sitting
+        // between shoulder and wrist as a real bent/extended arm
+        // does. Reject the injection when the elbow's metric depth
+        // sits in the hand's depth neighbourhood rather than along
+        // the shoulder→hand depth span. (A background mis-sample at
+        // the hand pixel reads 3–5 m and simply fails the adhesion
+        // predicate, so the unreliable-MCP-sample caveat that keeps
+        // wrist z un-injected does not destabilise this gate.)
+        if let Some(hand_z_m) = hand_z_m {
+            let arm_extent = (shoulder_z_m - hand_z_m).abs();
+            const MIN_EXTENT_M: f32 = 0.10;
+            const ADHESION_RATIO: f32 = 0.25;
+            if arm_extent > MIN_EXTENT_M
+                && (elbow_z_m - hand_z_m).abs() < arm_extent * ADHESION_RATIO
+            {
+                continue;
+            }
+        }
         // Δ in metric: positive when the elbow is forward (closer to
         // the camera) than the shoulder. Source-z convention matches
         // `rtmw3d::skeleton::to_source` — +z is toward the camera —
@@ -1059,6 +1464,37 @@ fn inject_elbow_z_from_dav2(
             continue;
         }
         let delta_source = delta_metric / metres_per_source_unit;
+
+        // Own-body occlusion guard. A hand (own or other arm's) in
+        // front of the elbow pixel reads as the subject at a
+        // plausible depth, defeating the anatomical band. RTMW3D's
+        // nz reads the elbow itself (at roughly half magnitude on
+        // genuine extension), so DAv2's delta must refine — not
+        // contradict or wildly amplify — the nz-based delta Phase 7
+        // left in `position[2]`. Span-normalised tangents; thresholds
+        // tuned on the deskcrop validation sweep (a metric-space
+        // blind allowance was tried instead and regressed the
+        // hand-near-camera cases to 34.9 deg — close-range framings
+        // make sub-0.25 m poison deltas span-large).
+        let delta_nz = elbow_joint_mut.position[2] - shoulder_z_src;
+        let tan_dav2 = delta_source.abs() / source_x_span.max(1e-3);
+        let tan_nz = delta_nz.abs() / source_x_span.max(1e-3);
+        const NZ_AMPLIFY_MAX: f32 = 2.5;
+        const NZ_REFINE_FLOOR_TAN: f32 = 0.25;
+        const NZ_DECISIVE_TAN: f32 = 0.20;
+        if tan_dav2 > tan_nz * NZ_AMPLIFY_MAX + NZ_REFINE_FLOOR_TAN {
+            continue;
+        }
+        // Direction veto only when DAv2 itself claims something
+        // significant — a near-zero DAv2 delta has no meaningful
+        // sign to contradict.
+        const SIGN_CHECK_MIN_TAN: f32 = 0.05;
+        if tan_dav2 > SIGN_CHECK_MIN_TAN
+            && tan_nz > NZ_DECISIVE_TAN
+            && delta_nz.signum() != delta_source.signum()
+        {
+            continue;
+        }
         elbow_joint_mut.position[2] = shoulder_z_src + delta_source;
     }
 }
@@ -1222,6 +1658,36 @@ fn inject_shoulder_bz_from_dav2(
     if abs_bz > MAX_BZ_METRIC_M {
         return;
     }
+
+    // Own-body occlusion guard. A hand held in front of one shoulder
+    // defeats every guard above: the sample is the subject (passes
+    // the depth band) at a plausible offset (passes MAX_BZ). The
+    // tell is RTMW3D's own nz: it reads the *shoulder*, not the
+    // occluder. The injection exists because nz under-reports small
+    // and mid yaws, so a Δz inside the blind allowance passes
+    // unconditionally; past it (|Δz| > 0.25 m ≈ 38° of yaw on a
+    // 0.40 m span) nz clearly senses a genuine rotation at roughly
+    // half magnitude, so DAv2 must be corroborated in direction and
+    // rough magnitude. A large Δz against a flat or contradicting nz
+    // is the hand-in-front signature (deskcrop validation:
+    // shoulder_line errors up to 176° from exactly this).
+    let bz_nz_src = l.position[2] - r.position[2];
+    let bz_dav2_src = bz_metric / metres_per_source_unit;
+    let tan_dav2 = bz_dav2_src.abs() / source_x_span.max(1e-3);
+    let tan_nz = bz_nz_src.abs() / source_x_span.max(1e-3);
+    const NZ_AMPLIFY_MAX: f32 = 3.0;
+    const NZ_REFINE_FLOOR_TAN: f32 = 0.27; // tan 15°
+    const NZ_DECISIVE_TAN: f32 = 0.14; // tan 8°
+    if tan_dav2 > tan_nz * NZ_AMPLIFY_MAX + NZ_REFINE_FLOOR_TAN {
+        return;
+    }
+    const SIGN_CHECK_MIN_TAN: f32 = 0.05;
+    if tan_dav2 > SIGN_CHECK_MIN_TAN
+        && tan_nz > NZ_DECISIVE_TAN
+        && bz_nz_src.signum() != bz_dav2_src.signum()
+    {
+        return;
+    }
     // Soft blend: linearly ramp from 0 at BZ_BLEND_START to 1 at
     // BZ_BLEND_END. Avoids the hard jump at the old MIN_BZ cutoff
     // that made small-angle body twists (10°–30°) invisible to the
@@ -1383,7 +1849,7 @@ pub fn calibrate_scale(
     let h_half = v_half * (src_w as f32 / src_h.max(1) as f32);
 
     // Anchor preference: shoulder pair (5, 6) → hip pair (11, 12).
-    // Shoulders are visible in every framing CIGPose / RTMW3D handle
+    // Shoulders are visible in every framing RTMW3D handles
     // well and have tight inter-subject variance.
     let candidates: &[(usize, usize, &'static str, f32)] = &[
         (5, 6, "shoulder-span", ASSUMED_SHOULDER_SPAN_M),
@@ -1572,12 +2038,12 @@ pub fn calibrate_scale(
 
 /// Back-project every DAv2 pixel into a metric `(x, y, z)` triple in
 /// camera-space (x-right, y-down, z-forward) and pack into a
-/// MoGeFrame-shaped point cloud so the shared skeleton helpers can
+/// MetricDepthFrame-shaped point cloud so the shared skeleton helpers can
 /// consume it. Pixels with non-positive raw depth (background /
 /// out-of-domain) are stored as NaN — `sample_metric_point`'s window
 /// median ignores them naturally.
 #[cfg(feature = "inference")]
-pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibration) -> MoGeFrame {
+pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibration) -> MetricDepthFrame {
     let w = dav2.width;
     let h = dav2.height;
     let pixel_count = (w as usize) * (h as usize);
@@ -1620,7 +2086,7 @@ pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibrati
         h_frac: h,
     });
 
-    MoGeFrame {
+    MetricDepthFrame {
         width: w,
         height: h,
         points_m,
@@ -1650,6 +2116,28 @@ mod elbow_z_injection_tests {
         elbow_initial_src_z: f32,
         elbow_confidence: f32,
     ) -> (SourceSkeleton, f32, f32) {
+        skeleton_with_elbows_nz(
+            elbow_z_m_l,
+            elbow_z_m_r,
+            elbow_initial_src_z,
+            elbow_confidence,
+            true,
+        )
+    }
+
+    /// `corroborating_nz`: seed the elbow's source z (the RTMW3D nz
+    /// stand-in) with a same-sign, ~40%-magnitude echo of the
+    /// DAv2-implied delta — what a genuine extension looks like to
+    /// nz. `false` keeps the caller's `elbow_initial_src_z` verbatim
+    /// (for rejection-path tests where the fixture IS the flat-nz
+    /// poison signature).
+    fn skeleton_with_elbows_nz(
+        elbow_z_m_l: Option<f32>,
+        elbow_z_m_r: Option<f32>,
+        elbow_initial_src_z: f32,
+        elbow_confidence: f32,
+        corroborating_nz: bool,
+    ) -> (SourceSkeleton, f32, f32) {
         let sl_metric_x = 0.20;
         let sr_metric_x = -0.20;
         let mk_shoulder = |src_x: f32| SourceJoint {
@@ -1657,10 +2145,20 @@ mod elbow_z_injection_tests {
             confidence: 1.0,
             metric_depth_m: Some(1.00),
         };
-        let mk_elbow = |z_m: f32| SourceJoint {
-            position: [0.0, 0.0, elbow_initial_src_z],
-            confidence: elbow_confidence,
-            metric_depth_m: Some(z_m),
+        let mk_elbow = |z_m: f32| {
+            // Shoulder metric z = 1.00, so the DAv2-implied source
+            // delta is (1.00 - z_m) / 0.80; nz echoes ~40% of it on
+            // genuine extension.
+            let src_z = if corroborating_nz {
+                0.4 * (1.00 - z_m) / 0.80
+            } else {
+                elbow_initial_src_z
+            };
+            SourceJoint {
+                position: [0.0, 0.0, src_z],
+                confidence: elbow_confidence,
+                metric_depth_m: Some(z_m),
+            }
         };
         let mut sk = SourceSkeleton::empty(0);
         sk.joints
@@ -1699,11 +2197,11 @@ mod elbow_z_injection_tests {
     fn implausible_forward_displacement_is_rejected_and_keeps_source_z() {
         // Elbow 0.50 m forward of shoulder — past anatomical
         // MAX_UPPER_ARM_DZ_M of 0.45.
-        let initial = 0.42;
-        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.50), None, initial);
+        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.50), None, 0.42);
+        let z0 = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        assert!((z - initial).abs() < 1e-6, "got {z}");
+        assert!((z - z0).abs() < 1e-6, "got {z}");
     }
 
     #[test]
@@ -1725,11 +2223,11 @@ mod elbow_z_injection_tests {
 
     #[test]
     fn degenerate_metric_shoulder_span_skips_silently() {
-        let initial = 0.07;
-        let (mut sk, _, _) = skeleton_with_elbows(Some(0.84), None, initial);
+        let (mut sk, _, _) = skeleton_with_elbows(Some(0.84), None, 0.07);
+        let z0 = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         inject_elbow_z_from_dav2(&mut sk, 0.0001, -0.0001);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        assert!((z - initial).abs() < 1e-6, "got {z}");
+        assert!((z - z0).abs() < 1e-6, "got {z}");
     }
 
     #[test]
@@ -1737,8 +2235,7 @@ mod elbow_z_injection_tests {
         // Source-X span < 1mm — both shoulders coincide post-Phase-7.
         // Function must skip even though the metric span we pass in
         // looks fine.
-        let initial = 0.07;
-        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.84), None, initial);
+        let (mut sk, sl, sr) = skeleton_with_elbows(Some(0.84), None, 0.07);
         // Collapse the source-X span by overwriting both shoulders to
         // the same X.
         for bone in [HumanoidBone::LeftUpperArm, HumanoidBone::RightUpperArm] {
@@ -1746,9 +2243,10 @@ mod elbow_z_injection_tests {
                 j.position[0] = 0.10;
             }
         }
+        let z0 = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        assert!((z - initial).abs() < 1e-6, "got {z}");
+        assert!((z - z0).abs() < 1e-6, "got {z}");
     }
 
     #[test]
@@ -1757,11 +2255,11 @@ mod elbow_z_injection_tests {
         // about its 2D pixel — DAv2 sample is centred on a maybe-wrong
         // location, so we should fall back to the RTMW3D nz value
         // instead of trusting the depth sample.
-        let initial = 0.07;
-        let (mut sk, sl, sr) = skeleton_with_elbows_and_confidence(Some(0.84), None, initial, 0.30);
+        let (mut sk, sl, sr) = skeleton_with_elbows_and_confidence(Some(0.84), None, 0.07, 0.30);
+        let z0 = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
         inject_elbow_z_from_dav2(&mut sk, sl, sr);
         let z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        assert!((z - initial).abs() < 1e-6, "got {z}");
+        assert!((z - z0).abs() < 1e-6, "got {z}");
     }
 
     #[test]
@@ -1792,21 +2290,77 @@ mod shoulder_bz_injection_tests {
     ) -> (SourceSkeleton, f32, f32) {
         let sl_metric_x = 0.20;
         let sr_metric_x = -0.20;
-        let mk = |src_x: f32, z_m: Option<f32>| SourceJoint {
-            position: [src_x, 0.0, 0.04],
+        // RTMW3D-nz baseline: a *genuine* yaw is sensed by nz at
+        // roughly half the DAv2 magnitude (the occlusion gate
+        // requires this corroboration past the blind allowance), so
+        // the fixture seeds the source z with a 40%-of-DAv2,
+        // same-sign asymmetry around the 0.04 mid. Injection
+        // overwrites these with the DAv2-derived values, so the
+        // per-test expectations are unchanged.
+        let bz_nz_src = match (l_metric_z, r_metric_z) {
+            (Some(l), Some(r)) => 0.4 * (r - l) / 0.80,
+            _ => 0.0,
+        };
+        let mk = |src_x: f32, src_z: f32, z_m: Option<f32>| SourceJoint {
+            position: [src_x, 0.0, src_z],
             confidence,
             metric_depth_m: z_m,
         };
+        let l_src_z = 0.04 + bz_nz_src * 0.5;
+        let r_src_z = 0.04 - bz_nz_src * 0.5;
         let mut sk = SourceSkeleton::empty(0);
         sk.joints
-            .insert(HumanoidBone::LeftShoulder, mk(0.25, l_metric_z));
+            .insert(HumanoidBone::LeftShoulder, mk(0.25, l_src_z, l_metric_z));
         sk.joints
-            .insert(HumanoidBone::LeftUpperArm, mk(0.25, l_metric_z));
+            .insert(HumanoidBone::LeftUpperArm, mk(0.25, l_src_z, l_metric_z));
         sk.joints
-            .insert(HumanoidBone::RightShoulder, mk(-0.25, r_metric_z));
+            .insert(HumanoidBone::RightShoulder, mk(-0.25, r_src_z, r_metric_z));
         sk.joints
-            .insert(HumanoidBone::RightUpperArm, mk(-0.25, r_metric_z));
+            .insert(HumanoidBone::RightUpperArm, mk(-0.25, r_src_z, r_metric_z));
         (sk, sl_metric_x, sr_metric_x)
+    }
+
+    /// Occlusion gate: a large DAv2 Δz with a flat nz (the
+    /// hand-in-front-of-shoulder signature) must be rejected.
+    #[test]
+    fn large_bz_with_flat_nz_is_rejected() {
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 1.0);
+        // Flatten the nz baseline the helper seeded — this is now a
+        // frontal pose according to RTMW3D, while DAv2 claims 0.40 m.
+        for bone in [
+            HumanoidBone::LeftShoulder,
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::RightShoulder,
+            HumanoidBone::RightUpperArm,
+        ] {
+            sk.joints.get_mut(&bone).unwrap().position[2] = 0.04;
+        }
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        assert!((l_z - 0.04).abs() < 1e-6, "L got {l_z}");
+        assert!((r_z - 0.04).abs() < 1e-6, "R got {r_z}");
+    }
+
+    /// Occlusion gate: a large DAv2 Δz whose *direction* contradicts
+    /// a decisive nz must be rejected, even when the magnitude is
+    /// within the amplification bound.
+    #[test]
+    fn large_bz_contradicting_nz_sign_is_rejected() {
+        let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.80), Some(1.20), 1.0);
+        // Invert the seeded nz baseline: nz says "right shoulder
+        // forward" while DAv2 says "left shoulder forward".
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z0 = sk.joints[&HumanoidBone::RightShoulder].position[2];
+        for bone in [HumanoidBone::LeftShoulder, HumanoidBone::LeftUpperArm] {
+            sk.joints.get_mut(&bone).unwrap().position[2] = r_z0;
+        }
+        for bone in [HumanoidBone::RightShoulder, HumanoidBone::RightUpperArm] {
+            sk.joints.get_mut(&bone).unwrap().position[2] = l_z0;
+        }
+        inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
+        let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        assert!((l_z - r_z0).abs() < 1e-6, "L got {l_z}");
     }
 
     #[test]
@@ -1872,11 +2426,13 @@ mod shoulder_bz_injection_tests {
         // this floor the noise would inflate `span_xz` in
         // `compute_body_yaw_3d` and produce a phantom rotation.
         let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.98), Some(1.02), 1.0);
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z0 = sk.joints[&HumanoidBone::RightShoulder].position[2];
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
-        assert!((l_z - 0.04).abs() < 1e-6, "L got {l_z}");
-        assert!((r_z - 0.04).abs() < 1e-6, "R got {r_z}");
+        assert!((l_z - l_z0).abs() < 1e-6, "L got {l_z}");
+        assert!((r_z - r_z0).abs() < 1e-6, "R got {r_z}");
     }
 
     #[test]
@@ -1906,19 +2462,22 @@ mod shoulder_bz_injection_tests {
         // DAv2 sample landing on the wrong surface. Bail and let the
         // RTMW3D nz value through.
         let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.70), Some(1.30), 1.0);
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z0 = sk.joints[&HumanoidBone::RightShoulder].position[2];
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
-        assert!((l_z - 0.04).abs() < 1e-6);
-        assert!((r_z - 0.04).abs() < 1e-6);
+        assert!((l_z - l_z0).abs() < 1e-6);
+        assert!((r_z - r_z0).abs() < 1e-6);
     }
 
     #[test]
     fn missing_metric_depth_skips_silently() {
         let (mut sk, sl, sr) = skeleton_with_shoulders(None, Some(1.00), 1.0);
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
-        assert!((l_z - 0.04).abs() < 1e-6);
+        assert!((l_z - l_z0).abs() < 1e-6);
     }
 
     #[test]
@@ -1927,9 +2486,10 @@ mod shoulder_bz_injection_tests {
         // centred on the wrong location and propagating the bz would
         // amplify the error.
         let (mut sk, sl, sr) = skeleton_with_shoulders(Some(0.92), Some(1.08), 0.30);
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
-        assert!((l_z - 0.04).abs() < 1e-6);
+        assert!((l_z - l_z0).abs() < 1e-6);
     }
 
     #[test]
@@ -1974,11 +2534,13 @@ mod shoulder_bz_injection_tests {
         // injection writes a garbage offset onto the source-Z. With
         // the guard we bail and let the RTMW3D nz fallback through.
         let (mut sk, sl, sr) = skeleton_with_shoulders(Some(8.0), Some(1.08), 1.0);
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
+        let r_z0 = sk.joints[&HumanoidBone::RightShoulder].position[2];
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, None);
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         let r_z = sk.joints[&HumanoidBone::RightShoulder].position[2];
-        assert!((l_z - 0.04).abs() < 1e-6);
-        assert!((r_z - 0.04).abs() < 1e-6);
+        assert!((l_z - l_z0).abs() < 1e-6);
+        assert!((r_z - r_z0).abs() < 1e-6);
     }
 
     #[test]
@@ -2004,8 +2566,9 @@ mod shoulder_bz_injection_tests {
             neutral_expressions: Vec::new(),
         };
         let (mut sk, sl, sr) = skeleton_with_shoulders(Some(1.0), Some(1.0), 1.0);
+        let l_z0 = sk.joints[&HumanoidBone::LeftShoulder].position[2];
         inject_shoulder_bz_from_dav2(&mut sk, sl, sr, Some(&cal));
         let l_z = sk.joints[&HumanoidBone::LeftShoulder].position[2];
-        assert!((l_z - 0.04).abs() < 1e-6);
+        assert!((l_z - l_z0).abs() < 1e-6);
     }
 }

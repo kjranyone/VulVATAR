@@ -9,6 +9,20 @@
 //!
 //! Usage:
 //!   cargo run --bin render_matrix -- <input.vrm> [output_dir]
+//!                                    [--bloom [threshold]] [--msaa N]
+//!                                    [--background [time]]
+//!
+//! `--bloom` enables the bloom post-effect for every cell (default
+//! threshold 1.0, optionally overridden by the following number) — the
+//! manual smoke test for the HDR post-effect chain. Without it the
+//! composite pass still runs but is a passthrough, which is the
+//! baseline-comparison mode.
+//!
+//! `--background` enables the generative flow-field background at a fixed
+//! animation time (default 1.234 s, optionally overridden by the following
+//! number). Tracking anchors stay invalid, so only the non-reactive field
+//! is exercised — the render is fully deterministic (two runs must produce
+//! byte-identical PNGs).
 //!
 //! Writes:
 //!   <output_dir>/srgb_opaque.png
@@ -38,10 +52,46 @@ use vulvatar_lib::renderer::VulkanRenderer;
 fn main() -> Result<(), String> {
     env_logger::init();
 
-    let mut args = std::env::args().skip(1);
-    let input_path = args
-        .next()
-        .ok_or_else(|| "usage: render_matrix <input.vrm> [output_dir]".to_string())?;
+    let mut bloom = vulvatar_lib::renderer::frame_input::BloomSettings::default();
+    let mut background =
+        vulvatar_lib::renderer::frame_input::GenerativeBackgroundSettings::default();
+    let mut background_time = 1.234_f32;
+    let mut msaa = vulvatar_lib::renderer::frame_input::MsaaMode::Off;
+    let mut positional: Vec<String> = Vec::new();
+    let mut raw_args = std::env::args().skip(1).peekable();
+    while let Some(arg) = raw_args.next() {
+        if arg == "--bloom" {
+            bloom.enabled = true;
+            if let Some(next) = raw_args.peek() {
+                if let Ok(threshold) = next.parse::<f32>() {
+                    bloom.threshold = threshold;
+                    raw_args.next();
+                }
+            }
+        } else if arg == "--background" {
+            background.enabled = true;
+            if let Some(next) = raw_args.peek() {
+                if let Ok(time) = next.parse::<f32>() {
+                    background_time = time;
+                    raw_args.next();
+                }
+            }
+        } else if arg == "--msaa" {
+            let n: usize = raw_args
+                .next()
+                .ok_or_else(|| "--msaa requires a level (0/1/2/3 = Off/2x/4x/8x)".to_string())?
+                .parse()
+                .map_err(|e| format!("--msaa parse: {e}"))?;
+            msaa = vulvatar_lib::renderer::frame_input::MsaaMode::from_index(n);
+        } else {
+            positional.push(arg);
+        }
+    }
+    let mut args = positional.into_iter();
+    let input_path = args.next().ok_or_else(|| {
+        "usage: render_matrix <input.vrm> [output_dir] [--bloom [threshold]] [--msaa N] [--background [time]]"
+            .to_string()
+    })?;
     let input_path = PathBuf::from(input_path);
 
     let output_dir = match args.next() {
@@ -80,6 +130,8 @@ fn main() -> Result<(), String> {
     eprintln!("gpu_vertex={:?}", GpuVertex::per_vertex());
 
     let extent = [1024u32, 1024];
+    eprintln!("bloom: {:?}", bloom);
+    eprintln!("background: {:?} (time {background_time})", background);
     let mut renderer = VulkanRenderer::new();
     renderer.initialize();
 
@@ -94,8 +146,16 @@ fn main() -> Result<(), String> {
     ];
 
     for (label, color_space, transparent) in cells {
-        let frame_input =
-            build_frame_input(&avatar, extent, color_space.clone(), transparent);
+        let frame_input = build_frame_input(
+            &avatar,
+            extent,
+            color_space.clone(),
+            transparent,
+            bloom,
+            background,
+            background_time,
+            msaa,
+        );
         // Two render() invocations per cell: the first kicks off a
         // pipelined CPU readback, the second harvests it. Without the
         // second call the first cell only produces an empty result.
@@ -128,11 +188,16 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_frame_input(
     avatar: &AvatarInstance,
     extent: [u32; 2],
     color_space: RenderColorSpace,
     transparent_background: bool,
+    bloom: vulvatar_lib::renderer::frame_input::BloomSettings,
+    background: vulvatar_lib::renderer::frame_input::GenerativeBackgroundSettings,
+    background_time: f32,
+    msaa: vulvatar_lib::renderer::frame_input::MsaaMode,
 ) -> RenderFrameInput {
     let mesh_instances: Vec<RenderMeshInstance> = avatar
         .asset
@@ -218,13 +283,17 @@ fn build_frame_input(
             color_space,
             alpha_mode,
             export_mode: RenderExportMode::CpuReadback,
-            msaa: vulvatar_lib::renderer::frame_input::MsaaMode::Off,
+            msaa,
         },
         background_image_path: None,
         show_ground_grid: false,
         background_color: [0.1, 0.1, 0.1],
         transparent_background,
         avatar_opacity: 1.0,
+        bloom,
+        generative_background: background,
+        background_tracking: Default::default(),
+        time_seconds: background_time,
     }
 }
 

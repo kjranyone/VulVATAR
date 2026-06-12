@@ -73,6 +73,17 @@ pub struct FrameInputConfig {
     /// offscreen render pass / pipelines (affects both the preview and the
     /// exported frame, which share the offscreen target).
     pub output_msaa: crate::renderer::frame_input::MsaaMode,
+    /// Bloom post-effect parameters. Forwarded to `RenderFrameInput.bloom`
+    /// each frame; the renderer applies them via push constants without any
+    /// pipeline rebuild.
+    pub bloom: crate::renderer::frame_input::BloomSettings,
+    /// Generative background parameters. Forwarded to
+    /// `RenderFrameInput.generative_background` each frame; push constants
+    /// only, no pipeline rebuild.
+    pub generative_background: crate::renderer::frame_input::GenerativeBackgroundSettings,
+    /// Snapshot of `Application::background_time` for this frame, already
+    /// wrapped to keep f32 precision.
+    pub time_seconds: f32,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -174,12 +185,24 @@ pub struct Application {
     /// effects on render target format and MF media type land in later
     /// stages.
     pub output_color_space: crate::renderer::frame_input::RenderColorSpace,
-    /// User-selected MSAA level. Synced from the GUI Rendering panel
-    /// (`rendering.msaa_index`) each frame and forwarded to the renderer
+    /// User-selected MSAA level. Synced from the GUI Output panel
+    /// (`output.msaa_index`) each frame and forwarded to the renderer
     /// through `OutputTargetRequest.msaa`. The renderer clamps it to device
     /// support (and caps integrated GPUs at 4x); the offscreen target is
     /// shared by preview + export, so the chosen level antialiases both.
     pub output_msaa: crate::renderer::frame_input::MsaaMode,
+    /// Bloom post-effect parameters. Synced from the GUI Rendering
+    /// inspector (Composition section) each frame and forwarded to the
+    /// renderer through `RenderFrameInput.bloom`.
+    pub bloom: crate::renderer::frame_input::BloomSettings,
+    /// Generative background parameters. Synced from the Inspector's
+    /// "Scene Background" panel each frame and forwarded to the renderer
+    /// through `RenderFrameInput.generative_background`.
+    pub generative_background: crate::renderer::frame_input::GenerativeBackgroundSettings,
+    /// Background animation clock in seconds, advanced by `frame_dt` every
+    /// `run_frame`. Accumulated in f64 and wrapped at 4096 s so the f32
+    /// handed to the shader keeps sub-millisecond precision.
+    pub background_time: f64,
     /// Solid background colour the Vulkan renderer clears to when
     /// `transparent_background` is false. Synced from the Inspector's
     /// "Scene Background" panel each frame.
@@ -275,9 +298,29 @@ impl Application {
         self.avatars.get_mut(self.active_avatar_index)
     }
 
-    pub fn add_avatar(&mut self, instance: AvatarInstance) {
-        self.active_avatar_index = self.avatars.len();
+    /// Load `instance` as **the** scene avatar, disposing whatever was
+    /// loaded before: the previous physics character body is removed,
+    /// the old `AvatarInstance`s are dropped, and the render thread is
+    /// told to evict its GPU caches so the old textures/meshes don't
+    /// stay pinned in VRAM.
+    ///
+    /// Loading is deliberately replace-only — the app drives a single
+    /// avatar from a single tracked person. Multi-avatar scenes would
+    /// need per-avatar inference routing that doesn't exist, so an
+    /// additive load would only stack identically-posed copies at the
+    /// origin while leaking the old ones' physics bodies and VRAM.
+    pub fn set_avatar(&mut self, instance: AvatarInstance) {
+        let had_existing = !self.avatars.is_empty();
+        if had_existing {
+            self.detach_avatar();
+            self.avatars.clear();
+        }
+        self.physics.attach_avatar(&instance.asset);
+        self.active_avatar_index = 0;
         self.avatars.push(instance);
+        if had_existing {
+            self.evict_render_caches();
+        }
     }
 
     pub fn remove_avatar_at(&mut self, index: usize) {
@@ -354,6 +397,10 @@ impl Application {
             output_preserve_alpha: false,
             output_color_space: crate::renderer::frame_input::RenderColorSpace::Srgb,
             output_msaa: crate::renderer::frame_input::MsaaMode::Off,
+            bloom: crate::renderer::frame_input::BloomSettings::default(),
+            generative_background:
+                crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
+            background_time: 0.0,
             background_color: [0.1, 0.1, 0.1],
             transparent_background: true,
             tracking_worker: None,
@@ -428,8 +475,7 @@ impl Application {
                 Ok(asset) => {
                     let instance_id = AvatarInstanceId(self.next_avatar_instance_id);
                     self.next_avatar_instance_id += 1;
-                    self.physics.attach_avatar(&asset);
-                    self.add_avatar(AvatarInstance::new(instance_id, asset));
+                    self.set_avatar(AvatarInstance::new(instance_id, asset));
                     info!("bootstrap: loaded default avatar from {}", default_path);
                 }
                 Err(e) => {
@@ -479,13 +525,7 @@ impl Application {
         let instance_id = AvatarInstanceId(self.next_avatar_instance_id);
         self.next_avatar_instance_id += 1;
 
-        self.detach_avatar();
-        self.physics.attach_avatar(&asset);
-        let new_instance = AvatarInstance::new(instance_id, asset);
-        if self.active_avatar_index < self.avatars.len() {
-            self.avatars[self.active_avatar_index] = new_instance;
-        }
-        self.evict_render_caches();
+        self.set_avatar(AvatarInstance::new(instance_id, asset));
     }
 
     // ---------------------------------------------------------------------
@@ -652,6 +692,46 @@ impl Drop for Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a restored session can carry `tracking.enabled = true`
+    /// and `fade_on_tracking_loss = true` while no tracking worker is
+    /// running (the worker only starts from the Tracking Setup panel).
+    /// That state must NOT read as "person lost" — it faded the
+    /// freshly-loaded avatar to opacity 0 on startup, leaving a blank
+    /// viewport with no hint why (2026-06-12). The fade may only engage
+    /// once the worker is actually running.
+    #[test]
+    fn fade_keeps_avatar_opaque_until_tracking_worker_runs() {
+        let mut app = Application::new();
+        assert!(app.tracking_worker.is_none());
+        let config = FrameConfig {
+            toggles: RuntimeToggles {
+                tracking_enabled: true,
+                spring_enabled: false,
+                cloth_enabled: false,
+                collision_debug: false,
+                skeleton_debug: false,
+            },
+            smoothing: crate::tracking::TrackingSmoothingParams::default(),
+            material_mode_index: 0,
+            hand_tracking_enabled: false,
+            face_tracking_enabled: false,
+            lower_body_tracking_enabled: false,
+            root_translation_enabled: false,
+            fade_on_tracking_loss: true,
+            mouth_source: crate::tracking::MouthSource::Audio,
+            frame_dt: 1.0 / 60.0,
+        };
+        // 5 s of frames — far past the 0.6 s fade ramp, so any fade
+        // toward 0 would be fully visible in the opacity by now.
+        for _ in 0..300 {
+            app.run_frame(&config);
+        }
+        assert_eq!(
+            app.tracking_fade_opacity, 1.0,
+            "avatar must stay opaque while the tracking worker is not running"
+        );
+    }
 
     fn mat4_mul_vec4(m: &crate::asset::Mat4, v: [f32; 4]) -> [f32; 4] {
         let mut out = [0.0f32; 4];

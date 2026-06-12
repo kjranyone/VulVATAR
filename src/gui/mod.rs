@@ -162,12 +162,20 @@ pub struct ScenePresetUiState {
 }
 
 /// Cloth-authoring panel UI state lifted out of `GuiApp` (architecture
-/// finding #10). Bundles the cloth-sim playback toggle, the
+/// finding #10). Bundles the cloth-sim pause toggle, the
 /// rename / save-status widget buffers, the per-vertex region
 /// selection driven by mesh picking, and the sim-parameter widgets
 /// (distance stiffness, bend stiffness, collider toggles, pin node).
 pub struct ClothAuthoringUiState {
-    pub sim_playing: bool,
+    /// Session-scoped pause for the cloth simulation (Pause/Play in the
+    /// Cloth panel's Preview section, used while authoring to inspect a
+    /// static drape or single-step the solver). Deliberately **not**
+    /// persisted and `false` by default: the runtime gate is
+    /// `rendering.toggle_cloth` (which *is* persisted), so a saved
+    /// project resumes simulating on restart without a visit to the
+    /// Cloth panel. The previous polarity (`sim_playing`, default
+    /// false) silently disabled cloth after every restart.
+    pub sim_paused: bool,
     pub rename_buf: String,
     pub save_status: Option<String>,
     pub region_selection: Option<crate::editor::cloth_authoring::RegionSelection>,
@@ -188,7 +196,7 @@ pub struct ClothAuthoringUiState {
 impl Default for ClothAuthoringUiState {
     fn default() -> Self {
         Self {
-            sim_playing: false,
+            sim_paused: false,
             rename_buf: String::new(),
             save_status: None,
             region_selection: None,
@@ -373,10 +381,9 @@ pub struct TrackingGuiState {
     pub tracking_mirror: bool,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
-    /// When true, the inference layer's model picker prefers a CIGPose
-    /// `wholebody` variant over `ubody` so hip/knee/ankle keypoints are
-    /// emitted and the leg humanoid bones get driven. Toggle takes
-    /// effect on the next start-tracking; mid-session it's a no-op.
+    /// When true, hip/knee/ankle keypoints drive the leg humanoid
+    /// bones; when false the solver keeps the whole lower-body chain
+    /// at rest pose (see `SolverParams::lower_body_tracking_enabled`).
     pub lower_body_tracking_enabled: bool,
     /// When true, the avatar's `Hips` follows the subject's side-step /
     /// lean / crouch (translation, on top of body-yaw rotation). When
@@ -393,6 +400,43 @@ pub struct TrackingGuiState {
     /// blend / confidence fields are user-editable — `stale_timeout_nanos`
     /// keeps its default.
     pub smoothing: TrackingSmoothingParams,
+    /// Run the DAv2 metric-depth stage (needs `models/dav2_small.onnx`).
+    /// Bound at tracking start; mid-session changes apply on restart.
+    pub depth_enabled: bool,
+    /// Run every tracking ONNX session on the CPU EP, keeping DirectML
+    /// off the GPU entirely. Slower but isolates tracking from GPU
+    /// driver instability. Bound at tracking start.
+    pub force_cpu_inference: bool,
+    /// Run the YOLOX person-crop stage; off = whole-frame RTMW3D.
+    /// Bound at tracking start.
+    pub yolox_enabled: bool,
+    /// Session-only safe-mode latch set from the unclean-exit banner.
+    /// While true, tracking starts use the degraded
+    /// `TrackingPipelineConfig::safe_mode()` regardless of the saved
+    /// toggles above, and the camera is clamped to 720p/30. Never
+    /// persisted.
+    pub safe_mode_armed: bool,
+    /// Sentinel content from a previous session that died uncleanly
+    /// (`stagelog::stale_sentinel()`, read once at startup). `Some`
+    /// shows the unclean-exit banner; cleared when the user picks
+    /// safe mode or dismisses. Never persisted.
+    pub unclean_exit_log: Option<String>,
+}
+
+impl TrackingGuiState {
+    /// Pipeline configuration for the next tracking start: the saved
+    /// toggles, unless the safe-mode latch is armed.
+    pub fn pipeline_config(&self) -> crate::tracking::provider::TrackingPipelineConfig {
+        if self.safe_mode_armed {
+            crate::tracking::provider::TrackingPipelineConfig::safe_mode()
+        } else {
+            crate::tracking::provider::TrackingPipelineConfig {
+                depth_enabled: self.depth_enabled,
+                force_cpu: self.force_cpu_inference,
+                yolox_enabled: self.yolox_enabled,
+            }
+        }
+    }
 }
 
 pub struct LipSyncGuiState {
@@ -417,12 +461,12 @@ pub struct RenderingGuiState {
     pub main_light_intensity: f32,
     pub ambient_intensity: [f32; 3],
     pub alpha_preview: bool,
-    /// Anti-aliasing (MSAA) level: 0=Off, 1=2x, 2=4x, 3=8x. Reconciled into
-    /// `app.output_msaa` each frame and persisted (stored in the project's
-    /// `output.msaa_index` slot). The renderer clamps the level to the
-    /// device's framebuffer sample-count support (and caps iGPUs at 4x), so
-    /// an unsupported pick silently degrades.
-    pub msaa_index: usize,
+    pub bloom_enabled: bool,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+    /// Generative background parameters, edited in the Preview inspector's
+    /// "Scene Background" section and synced to `Application` every frame.
+    pub generative_background: crate::renderer::frame_input::GenerativeBackgroundSettings,
     pub toggle_spring: bool,
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
@@ -445,11 +489,18 @@ pub struct RenderingGuiState {
 ///   → VGTK / shared-memory alpha flag.
 /// - `output_color_space_index` → `app.output_color_space` → Vulkan colour
 ///   attachment format (sRGB vs UNORM) + frame metadata.
+/// - `msaa_index` → `app.output_msaa` → `OutputTargetRequest.msaa`.
 pub struct OutputGuiState {
     pub output_resolution_index: usize,
     pub output_framerate_index: usize,
     pub output_has_alpha: bool,
     pub output_color_space_index: usize,
+    /// Anti-aliasing (MSAA) level: 0=Off, 1=2x, 2=4x, 3=8x. Applies to the
+    /// shared offscreen render target, so it antialiases both the viewport
+    /// preview and the exported frame. The renderer clamps the level to the
+    /// device's framebuffer sample-count support (and caps integrated GPUs
+    /// at 4x), so an unsupported pick silently degrades.
+    pub msaa_index: usize,
 }
 
 pub struct SettingsGuiState {
@@ -529,6 +580,19 @@ pub struct ProjectStatusUi {
     /// disk (`%APPDATA%\VulVATAR\profiles.json`). Mirrors
     /// `project_dirty` but flushes via `save_profiles`.
     pub profiles_dirty: bool,
+    /// Set whenever an app-level setting (Settings pane: locale,
+    /// viewport input sensitivities; cloth-autosave consent dialog)
+    /// diverges from `%APPDATA%\VulVATAR\settings.json`. Mirrors
+    /// `profiles_dirty` but flushes via `save_app_settings`. App
+    /// settings deliberately do NOT ride `project_dirty`: they follow
+    /// the user, not the scene.
+    pub app_settings_dirty: bool,
+    /// Throttle clock for the `settings.json` flush. The Settings
+    /// pane's sensitivity sliders set `app_settings_dirty` every frame
+    /// of a drag (~60/s); without this the autosave would `atomic_write`
+    /// (backup-copy + temp + rename) on every one of those frames. Same
+    /// 250 ms cap the project autosave uses.
+    pub last_app_settings_save: Instant,
 }
 
 impl ProjectStatusUi {
@@ -545,6 +609,8 @@ impl ProjectStatusUi {
             recovery_manager,
             overlay_dirty: false,
             profiles_dirty: false,
+            app_settings_dirty: false,
+            last_app_settings_save: now,
         }
     }
 }
@@ -652,6 +718,22 @@ impl GuiApp {
         // inspector — without this, file:// URIs return UnknownLoader.
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
+        // App-level settings (locale, input sensitivities, consents)
+        // load FIRST — before fonts, because the locale drives the CJK
+        // fallback order, and before any project/session restore,
+        // because these are user preferences that no scene file may
+        // override. Installs that predate `settings.json` migrate the
+        // values out of the legacy last-session slot exactly once.
+        let app_settings = crate::persistence::load_app_settings().unwrap_or_else(|| {
+            let migrated =
+                crate::persistence::migrate_legacy_app_settings().unwrap_or_default();
+            if let Err(e) = crate::persistence::save_app_settings(&migrated) {
+                warn!("persistence: could not write initial settings.json: {e}");
+            }
+            migrated
+        });
+        crate::i18n::set_locale(&app_settings.locale);
+
         if let Some(fonts) = build_font_definitions(&crate::i18n::locale()) {
             cc.egui_ctx.set_fonts(fonts);
         }
@@ -733,6 +815,11 @@ impl GuiApp {
                 root_translation_enabled: true,
                 fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
+                depth_enabled: true,
+                force_cpu_inference: false,
+                yolox_enabled: true,
+                safe_mode_armed: false,
+                unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
@@ -743,7 +830,11 @@ impl GuiApp {
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
                 alpha_preview: false,
-                msaa_index: 0,
+                bloom_enabled: false,
+                bloom_intensity: 0.6,
+                bloom_threshold: 1.0,
+                generative_background:
+                    crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
                 toggle_spring: true,
                 toggle_cloth: false,
                 toggle_collision_debug: false,
@@ -754,13 +845,14 @@ impl GuiApp {
                 output_framerate_index: 0,
                 output_has_alpha: true,
                 output_color_space_index: 0,
+                msaa_index: 0,
             },
 
             settings: SettingsGuiState {
-                locale: crate::i18n::locale(),
-                zoom_sensitivity: 0.002,
-                orbit_sensitivity: 0.3,
-                pan_sensitivity: 1.0,
+                locale: app_settings.locale.clone(),
+                zoom_sensitivity: app_settings.zoom_sensitivity,
+                orbit_sensitivity: app_settings.orbit_sensitivity,
+                pan_sensitivity: app_settings.pan_sensitivity,
             },
 
             camera_index: 0,
@@ -780,7 +872,12 @@ impl GuiApp {
                 mouth_source: crate::tracking::MouthSource::Both,
             },
 
-            cloth_authoring: ClothAuthoringUiState::default(),
+            cloth_authoring: ClothAuthoringUiState {
+                // Consent is a user-level preference; it rides
+                // settings.json, not the project file.
+                autosave_consent: app_settings.cloth_autosave_consent,
+                ..ClothAuthoringUiState::default()
+            },
             inspector_open: true,
 
             scene_preset: ScenePresetUiState {
@@ -949,6 +1046,11 @@ impl GuiApp {
                 root_translation_enabled: true,
                 fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
+                depth_enabled: true,
+                force_cpu_inference: false,
+                yolox_enabled: true,
+                safe_mode_armed: false,
+                unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
             },
             rendering: RenderingGuiState {
                 material_mode_index: 2,
@@ -959,7 +1061,11 @@ impl GuiApp {
                 main_light_intensity: 1.0,
                 ambient_intensity: [0.2, 0.2, 0.2],
                 alpha_preview: false,
-                msaa_index: 0,
+                bloom_enabled: false,
+                bloom_intensity: 0.6,
+                bloom_threshold: 1.0,
+                generative_background:
+                    crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
                 toggle_spring: true,
                 toggle_cloth: false,
                 toggle_collision_debug: false,
@@ -970,6 +1076,7 @@ impl GuiApp {
                 output_framerate_index: 0,
                 output_has_alpha: true,
                 output_color_space_index: 0,
+                msaa_index: 0,
             },
 
             settings: SettingsGuiState {
@@ -1057,9 +1164,155 @@ impl GuiApp {
         RuntimeToggles {
             tracking_enabled: self.tracking.toggle_tracking,
             spring_enabled: self.rendering.toggle_spring,
-            cloth_enabled: self.rendering.toggle_cloth && self.cloth_authoring.sim_playing,
+            // The persisted Rendering-panel toggle is the gate; the Cloth
+            // panel's transport only *pauses* an otherwise-enabled sim.
+            // (The per-avatar `avatar.cloth_enabled` leg of the gate is
+            // applied in `Application::run_frame`.)
+            cloth_enabled: self.rendering.toggle_cloth && !self.cloth_authoring.sim_paused,
             collision_debug: self.rendering.toggle_collision_debug,
             skeleton_debug: self.rendering.toggle_skeleton_debug,
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // GUI → pipeline wiring. Every setting reaches the pipeline through
+    // exactly one of four sanctioned paths (see docs/architecture.md,
+    // "GUI → pipeline settings wiring"):
+    //
+    //   1. Reconciled — continuous scene/view/output parameters owned by
+    //      the GUI and pushed idempotently into `Application` fields once
+    //      per frame in [`Self::sync_app_settings`].
+    //   2. FrameConfig — per-frame pipeline inputs (toggles, smoothing,
+    //      tracking flags, mouth source) built in
+    //      [`Self::build_frame_config`] and consumed inside `run_frame`.
+    //   3. Requested (Phase D) — runtime resources that can fail to start
+    //      (output sink, lipsync). Written via
+    //      `Application::set_requested_*`; the GUI reads back the
+    //      requested/active pair instead of holding its own copy.
+    //   4. Instance-bound — per-avatar runtime state (expression weights,
+    //      collider mask, cloth attachments) bound directly to
+    //      `AvatarInstance`; resets with the avatar by design.
+    //
+    // When adding a new setting, pick the matching path — don't invent a
+    // fifth.
+    // ---------------------------------------------------------------------
+
+    /// Path 1: reconcile GUI-owned scene / view / output parameters into
+    /// their `Application` mirrors. Called exactly once per `update`,
+    /// before `run_frame`, so the render thread always sees this frame's
+    /// values. Every write here is idempotent — the GUI fields are the
+    /// source of truth and `Application` holds per-frame mirrors.
+    fn sync_app_settings(&mut self) {
+        // Avatar world transform from the Preview panel's gizmo fields.
+        if let Some(avatar) = self.app.active_avatar_mut() {
+            avatar.world_transform.translation = self.transform.position;
+            // Convert Euler degrees to a quaternion (XYZ order).
+            let [rx, ry, rz] = self.transform.rotation;
+            let (rx, ry, rz) = (
+                rx.to_radians() * 0.5,
+                ry.to_radians() * 0.5,
+                rz.to_radians() * 0.5,
+            );
+            let (sx, cx) = (rx.sin(), rx.cos());
+            let (sy, cy) = (ry.sin(), ry.cos());
+            let (sz, cz) = (rz.sin(), rz.cos());
+            avatar.world_transform.rotation = [
+                sx * cy * cz - cx * sy * sz,
+                cx * sy * cz + sx * cy * sz,
+                cx * cy * sz - sx * sy * cz,
+                cx * cy * cz + sx * sy * sz,
+            ];
+            let s = self.transform.scale;
+            avatar.world_transform.scale = [s, s, s];
+        }
+
+        // Smooth zoom: lerp distance toward target_distance each frame.
+        let t = (1.0 - (-5.0 * self.runtime_status.frame_time_ms / 1000.0).exp()) as f32;
+        self.camera_orbit.distance +=
+            (self.camera_orbit.target_distance - self.camera_orbit.distance) * t;
+
+        // Viewport camera from the orbit controls + Rendering-panel FOV.
+        self.app.viewport_camera.yaw_deg = self.camera_orbit.yaw_deg;
+        self.app.viewport_camera.pitch_deg = self.camera_orbit.pitch_deg;
+        self.app.viewport_camera.distance = self.camera_orbit.distance;
+        self.app.viewport_camera.pan = self.camera_orbit.pan;
+        self.app.viewport_camera.fov_deg = self.rendering.camera_fov;
+
+        // Lighting parameters from the Rendering inspector.
+        self.app.viewport_lighting.main_light_dir_ws = self.rendering.main_light_dir;
+        self.app.viewport_lighting.main_light_intensity = self.rendering.main_light_intensity;
+        self.app.viewport_lighting.ambient_term = self.rendering.ambient_intensity;
+
+        // Scene Background → the Vulkan renderer's clear color. Until
+        // T11 found this gap the inspector toggle was a pure egui-side hint
+        // and the renderer always cleared to (0,0,0,0), which made the MF
+        // virtual camera output appear all-black to clients that don't
+        // honour the alpha channel (Meet / Zoom).
+        self.app.background_color = self.rendering.background_color;
+        self.app.transparent_background = self.rendering.transparent_background;
+
+        // Output resolution preference. The renderer reads this through
+        // OutputTargetRequest.extent, so changing the combo immediately
+        // resizes the next render's output target.
+        self.app.output_extent = Some(output_resolution_for_index(
+            self.output.output_resolution_index,
+        ));
+
+        // Phase B-3: throttle the output cadence to the user's selection.
+        // P3-03: routes through `RuntimeGpuBudget` so the user's intent is
+        // stored as `user_render_fps` and the *effective* target may be
+        // clamped below it under pressure. Idempotent so calling each
+        // GUI update is cheap.
+        self.app
+            .set_user_render_fps(output_fps_for_index(self.output.output_framerate_index));
+
+        // Phase B-4: alpha preference. Read each frame in
+        // process_render_result to tag OutputFrame.alpha_mode.
+        self.app.output_preserve_alpha = self.output.output_has_alpha;
+
+        // Colour space pick → the renderer's OutputTargetRequest. Stage 1
+        // plumbing: the value reaches ExportMetadata + OutputFrame
+        // .color_space; format / shader / MF media type changes land in
+        // later stages.
+        self.app.output_color_space = match self.output.output_color_space_index {
+            1 => crate::renderer::frame_input::RenderColorSpace::LinearSrgb,
+            _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
+        };
+
+        // Anti-aliasing pick. The renderer rebuilds its render pass +
+        // pipelines on change and clamps the level to device support.
+        self.app.output_msaa =
+            crate::renderer::frame_input::MsaaMode::from_index(self.output.msaa_index);
+
+        // Bloom post-effect parameters. Push-constant driven on the
+        // renderer side — no pipeline rebuild on change.
+        self.app.bloom = crate::renderer::frame_input::BloomSettings {
+            enabled: self.rendering.bloom_enabled,
+            intensity: self.rendering.bloom_intensity,
+            threshold: self.rendering.bloom_threshold,
+        };
+
+        // Generative background parameters. Push-constant driven on the
+        // renderer side — no pipeline rebuild on change.
+        self.app.generative_background = self.rendering.generative_background;
+    }
+
+    /// Path 2: bundle the per-frame pipeline inputs for `run_frame`.
+    /// These are read inside the frame step (pose solver, simulation,
+    /// material mode) and never need to outlive it, so they ride a value
+    /// struct instead of `Application` fields.
+    fn build_frame_config(&self, frame_dt: f32) -> crate::app::FrameConfig {
+        crate::app::FrameConfig {
+            toggles: self.runtime_toggles(),
+            smoothing: self.tracking.smoothing.clone(),
+            material_mode_index: self.rendering.material_mode_index,
+            hand_tracking_enabled: self.tracking.hand_tracking_enabled,
+            face_tracking_enabled: self.tracking.face_tracking_enabled,
+            lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
+            root_translation_enabled: self.tracking.root_translation_enabled,
+            fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
+            mouth_source: self.lipsync.mouth_source,
+            frame_dt,
         }
     }
 
@@ -1133,86 +1386,10 @@ impl eframe::App for GuiApp {
         // unrelated repaint reason fires).
         self.sync_calibration_mode_hint();
 
-        // Sync GUI-driven state into the application before running the frame.
-        if let Some(avatar) = self.app.active_avatar_mut() {
-            avatar.world_transform.translation = self.transform.position;
-            // Convert Euler degrees to a quaternion (XYZ order).
-            let [rx, ry, rz] = self.transform.rotation;
-            let (rx, ry, rz) = (
-                rx.to_radians() * 0.5,
-                ry.to_radians() * 0.5,
-                rz.to_radians() * 0.5,
-            );
-            let (sx, cx) = (rx.sin(), rx.cos());
-            let (sy, cy) = (ry.sin(), ry.cos());
-            let (sz, cz) = (rz.sin(), rz.cos());
-            avatar.world_transform.rotation = [
-                sx * cy * cz - cx * sy * sz,
-                cx * sy * cz + sx * cy * sz,
-                cx * cy * sz - sx * sy * cz,
-                cx * cy * cz + sx * sy * sz,
-            ];
-            let s = self.transform.scale;
-            avatar.world_transform.scale = [s, s, s];
-        }
-
-        // Smooth zoom: lerp distance toward target_distance each frame.
-        let t = (1.0 - (-5.0 * self.runtime_status.frame_time_ms / 1000.0).exp()) as f32;
-        self.camera_orbit.distance +=
-            (self.camera_orbit.target_distance - self.camera_orbit.distance) * t;
-
-        // Sync GUI camera controls into the Application's viewport camera.
-        self.app.viewport_camera.yaw_deg = self.camera_orbit.yaw_deg;
-        self.app.viewport_camera.pitch_deg = self.camera_orbit.pitch_deg;
-        self.app.viewport_camera.distance = self.camera_orbit.distance;
-        self.app.viewport_camera.pan = self.camera_orbit.pan;
-        self.app.viewport_camera.fov_deg = self.rendering.camera_fov;
-
-        // Sync lighting parameters from GUI inspector.
-        self.app.viewport_lighting.main_light_dir_ws = self.rendering.main_light_dir;
-        self.app.viewport_lighting.main_light_intensity = self.rendering.main_light_intensity;
-        self.app.viewport_lighting.ambient_term = self.rendering.ambient_intensity;
-
-        // Sync Scene Background to the Vulkan renderer's clear color. Until
-        // T11 found this gap the inspector toggle was a pure egui-side hint
-        // and the renderer always cleared to (0,0,0,0), which made the MF
-        // virtual camera output appear all-black to clients that don't
-        // honour the alpha channel (Meet / Zoom).
-        self.app.background_color = self.rendering.background_color;
-        self.app.transparent_background = self.rendering.transparent_background;
-
-        // Sync output resolution preference from GUI inspector. The renderer
-        // reads this through OutputTargetRequest.extent, so changing the
-        // combo immediately resizes the next render's output target.
-        self.app.output_extent = Some(output_resolution_for_index(
-            self.output.output_resolution_index,
-        ));
-
-        // Phase B-3: throttle the output cadence to the user's selection.
-        // P3-03: routes through `RuntimeGpuBudget` so the user's intent is
-        // stored as `user_render_fps` and the *effective* target may be
-        // clamped below it under pressure. Idempotent so calling each
-        // GUI update is cheap.
-        self.app
-            .set_user_render_fps(output_fps_for_index(self.output.output_framerate_index));
-
-        // Phase B-4: forward the alpha preference. Read each frame in
-        // process_render_result to tag OutputFrame.alpha_mode.
-        self.app.output_preserve_alpha = self.output.output_has_alpha;
-
-        // Forward the user's colour space pick so the renderer's
-        // OutputTargetRequest carries it. Stage 1 plumbing: the value
-        // reaches ExportMetadata + OutputFrame.color_space; format /
-        // shader / MF media type changes land in later stages.
-        self.app.output_color_space = match self.output.output_color_space_index {
-            1 => crate::renderer::frame_input::RenderColorSpace::LinearSrgb,
-            _ => crate::renderer::frame_input::RenderColorSpace::Srgb,
-        };
-
-        // Forward the anti-aliasing pick. The renderer rebuilds its render
-        // pass + pipelines on change and clamps the level to device support.
-        self.app.output_msaa =
-            crate::renderer::frame_input::MsaaMode::from_index(self.rendering.msaa_index);
+        // Path 1: reconcile GUI-owned settings into Application before
+        // running the frame. See the wiring overview above
+        // `sync_app_settings`.
+        self.sync_app_settings();
 
         if !self.runtime_status.paused {
             let real_dt = (self.runtime_status.frame_time_ms / 1000.0) as f32;
@@ -1230,18 +1407,8 @@ impl eframe::App for GuiApp {
                 self.lipsync.current_volume = rms;
             }
 
-            let frame_config = crate::app::FrameConfig {
-                toggles: self.runtime_toggles(),
-                smoothing: self.tracking.smoothing.clone(),
-                material_mode_index: self.rendering.material_mode_index,
-                hand_tracking_enabled: self.tracking.hand_tracking_enabled,
-                face_tracking_enabled: self.tracking.face_tracking_enabled,
-                lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
-                root_translation_enabled: self.tracking.root_translation_enabled,
-                fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
-                mouth_source: self.lipsync.mouth_source,
-                frame_dt,
-            };
+            // Path 2: per-frame pipeline inputs ride the FrameConfig.
+            let frame_config = self.build_frame_config(frame_dt);
             self.app.run_frame(&frame_config);
             self.runtime_status.frame_count += 1;
         } else {
@@ -1269,17 +1436,19 @@ impl eframe::App for GuiApp {
                 ui.horizontal(|ui| {
                     if components::filled_button(ui, None, &t!("dialog.yes"), true).clicked() {
                         self.cloth_authoring.autosave_consent = Some(true);
+                        self.project_status.app_settings_dirty = true;
                     }
-                    if components::outlined_button(
+                    if components::tonal_button(
                         ui,
                         None,
                         &t!("dialog.no"),
-                        theme::color::PRIMARY,
+                        components::ButtonTone::Primary,
                         true,
                     )
                     .clicked()
                     {
                         self.cloth_authoring.autosave_consent = Some(false);
+                        self.project_status.app_settings_dirty = true;
                     }
                 });
             });
@@ -1376,7 +1545,11 @@ impl eframe::App for GuiApp {
             || animation_playing
             || render_in_flight
             || calibration_modal_open;
-        if needs_animation_frame || self.project_status.project_dirty || self.project_status.profiles_dirty {
+        if needs_animation_frame
+            || self.project_status.project_dirty
+            || self.project_status.profiles_dirty
+            || self.project_status.app_settings_dirty
+        {
             // Dirty flags imply an unsaved (and almost always also
             // un-rendered) GUI mutation. Repaint immediately so the new
             // state reaches the screen on the next render-thread cycle

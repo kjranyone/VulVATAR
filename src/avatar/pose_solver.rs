@@ -173,6 +173,19 @@ pub struct PoseSolverState {
     /// Wall-clock timestamp of the previous solve, used to derive `dt`
     /// for the dt-aware blend / 1€ filter. `None` until the first call.
     last_solve_instant: Option<Instant>,
+    /// Previous frame's solved local rotation per skeleton node.
+    /// `run_frame` rebuilds the base pose every frame, so the value
+    /// sitting in `local_transforms` at solve time is REST, not the
+    /// previous frame's pose — blending from it makes
+    /// `rotation_blend < 1.0` display a permanent `alpha` fraction of
+    /// every rotation (measured: a 150-deg arm fold showed a constant
+    /// ~45-deg shortfall at the 0.7 default) instead of exponentially
+    /// converging. The solver blends from THIS map and writes the
+    /// result back, restoring true time-constant smoothing.
+    prev_local_rotations: std::collections::HashMap<usize, Quat>,
+    /// Previous frame's solved Hips local translation (same rationale
+    /// as `prev_local_rotations` for the root-translation lerp).
+    prev_hips_translation: Option<[f32; 3]>,
     /// Slow EMA of the source-skeleton `root_offset`, used as the
     /// "where the subject normally stands" reference. The avatar's
     /// Hips is translated by `(root_offset − reference) * sensitivity`
@@ -224,6 +237,8 @@ impl PoseSolverState {
         self.mouth_viseme_ema.clear();
         self.joint_active.clear();
         self.last_solve_instant = None;
+        self.prev_local_rotations.clear();
+        self.prev_hips_translation = None;
         self.root_reference = None;
         // `running_shoulder_x_span_max` is intentionally NOT reset
         // here — it captures the subject's anatomical shoulder width
@@ -573,14 +588,15 @@ pub fn solve_avatar_pose(
     // an outlier from a single bad frame.
     //
     // Caveat: `shoulder_span_m` is in whatever source-space units the
-    // provider that captured the calibration emits (RTMW3D-normalised
-    // for the rtmw3d / rtmw3d-with-depth paths, metres for
-    // cigpose-metric-depth). Switching providers mid-session would put
-    // the seed in the wrong unit; the user is expected to re-calibrate
-    // after such a switch (the inspector flags low-sample / stale
-    // calibrations independently). Only seeded when `running_*` is
-    // still zero (cold start) so a session that's already learned a
-    // larger max keeps it.
+    // pipeline that captured the calibration emitted (metres when the
+    // DAv2 depth stage was active, RTMW3D-normalised when it wasn't).
+    // Toggling the depth stage (adding/removing dav2_small.onnx)
+    // between calibration and use would put the seed in the wrong
+    // unit; the user is expected to re-calibrate after such a change
+    // (the inspector flags low-sample / stale calibrations
+    // independently). Only seeded when `running_*` is still zero
+    // (cold start) so a session that's already learned a larger max
+    // keeps it.
     if state.running_shoulder_x_span_max == 0.0 {
         if let Some(span) = params
             .pose_calibration
@@ -683,9 +699,10 @@ pub fn solve_avatar_pose(
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]);
             let new_local_rot =
                 quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &target_world));
-            let prev_local_rot = local_transforms[hips_idx].rotation;
-            local_transforms[hips_idx].rotation = quat_slerp_short(
-                &prev_local_rot,
+            local_transforms[hips_idx].rotation = blend_local_rotation(
+                state,
+                hips_idx,
+                local_transforms[hips_idx].rotation,
                 &new_local_rot,
                 dt_aware_blend(params.rotation_blend, dt),
             );
@@ -831,12 +848,19 @@ pub fn solve_avatar_pose(
                     // translation responsiveness scales with the user's
                     // `rotation_blend` setting (one fewer slider).
                     let blend = dt_aware_blend(params.rotation_blend, dt);
-                    let prev = local_transforms[hips_idx].translation;
-                    local_transforms[hips_idx].translation = [
+                    // Blend from the previous frame's solved value,
+                    // not the freshly-rebuilt base pose — see
+                    // `PoseSolverState::prev_hips_translation`.
+                    let prev = state
+                        .prev_hips_translation
+                        .unwrap_or(local_transforms[hips_idx].translation);
+                    let blended = [
                         prev[0] + blend * (target[0] - prev[0]),
                         prev[1] + blend * (target[1] - prev[1]),
                         prev[2] + blend * (target[2] - prev[2]),
                     ];
+                    state.prev_hips_translation = Some(blended);
+                    local_transforms[hips_idx].translation = blended;
                     // Refresh the world transform so any downstream
                     // bone that reads `current_world[hips_idx].position`
                     // sees the translated origin.
@@ -893,6 +917,7 @@ pub fn solve_avatar_pose(
                 &mut current_world,
                 local_transforms,
                 params,
+                state,
                 dt,
             );
             solve_wrist_orientation(
@@ -907,6 +932,7 @@ pub fn solve_avatar_pose(
                 &mut current_world,
                 local_transforms,
                 params,
+                state,
                 dt,
             );
             wrists_oriented = true;
@@ -1244,9 +1270,10 @@ pub fn solve_avatar_pose(
         let new_local_rot = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
 
-        let prev_local_rot = local_transforms[node_idx].rotation;
-        local_transforms[node_idx].rotation = quat_slerp_short(
-            &prev_local_rot,
+        local_transforms[node_idx].rotation = blend_local_rotation(
+            state,
+            node_idx,
+            local_transforms[node_idx].rotation,
             &new_local_rot,
             dt_aware_blend(params.rotation_blend, dt),
         );
@@ -1276,6 +1303,7 @@ pub fn solve_avatar_pose(
                             skeleton,
                             local_transforms,
                             &current_world,
+                            state,
                             dt_aware_blend(params.rotation_blend, dt),
                         );
                     }
@@ -1532,7 +1560,29 @@ fn compute_body_yaw_3d(
         // width and gives a more stable magnitude.
         let target_span = running_shoulder_x_span_max.max(span_xz);
         let cos_yaw = (bx / target_span).clamp(-1.0, 1.0);
-        let yaw_magnitude = cos_yaw.acos();
+        let yaw_from_span = cos_yaw.acos();
+        // bz corroboration: foreshortening alone cannot distinguish
+        // a genuine yaw from a perspective-inflated reference span
+        // (leaning toward a near webcam widens the observed shoulder
+        // span, ratchets `running_shoulder_x_span_max`, and from then
+        // on a perfectly frontal pose reads acos(<1) ≈ 30–45° with
+        // its sign flapping on bz noise — observed live as the
+        // avatar locking to ±45° and never facing front). A real yaw
+        // MUST also separate the shoulders in z: cap the magnitude
+        // by the bz-supported yaw plus a small allowance.
+        // Back-facing poses also have bz ≈ 0 (shoulders in-plane
+        // again), so the cap applies to the *deviation from the
+        // nearest in-plane orientation* (0° when bx > 0, 180° when
+        // bx < 0), not to the raw magnitude.
+        const YAW_BZ_ALLOWANCE_RAD: f32 = 0.17; // ~10°
+        let yaw_from_bz = (bz.abs() / target_span).clamp(0.0, 1.0).asin();
+        let deviation = yaw_from_span.min(std::f32::consts::PI - yaw_from_span);
+        let capped_dev = deviation.min(yaw_from_bz + YAW_BZ_ALLOWANCE_RAD);
+        let yaw_magnitude = if cos_yaw >= 0.0 {
+            capped_dev
+        } else {
+            std::f32::consts::PI - capped_dev
+        };
         // Sign convention: positive yaw = standard right-hand-rule
         // CCW rotation around +Y (= subject turns to **her left**,
         // bringing her right side toward camera). For the source's
@@ -1553,6 +1603,7 @@ fn apply_face_pose(
     skeleton: &SkeletonAsset,
     local_transforms: &mut [Transform],
     current_world: &[WorldXform],
+    state: &mut PoseSolverState,
     blend: f32,
 ) {
     // Face pose is in body-local Y-up convention: a positive yaw turns the
@@ -1576,8 +1627,13 @@ fn apply_face_pose(
     );
     let rest_local_rot = skeleton.nodes[head_idx].rest_local.rotation;
     let target_local = quat_normalize(&quat_mul(&rest_local_rot, &delta_local));
-    let prev = local_transforms[head_idx].rotation;
-    local_transforms[head_idx].rotation = quat_slerp_short(&prev, &target_local, blend);
+    local_transforms[head_idx].rotation = blend_local_rotation(
+        state,
+        head_idx,
+        local_transforms[head_idx].rotation,
+        &target_local,
+        blend,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,6 +1716,29 @@ fn midpoint(a: &Vec3, b: &Vec3) -> Vec3 {
 /// it as a time-constant means the same slider value behaves
 /// identically whether the camera ships 30 or 60 fps and whether
 /// the renderer hitches occasionally.
+/// Slerp toward `target` from the PREVIOUS FRAME's solved rotation
+/// for this node (falling back to `fallback` — the rest-pose value —
+/// on the first frame or after a reset), recording the result for
+/// the next frame. See `PoseSolverState::prev_local_rotations` for
+/// why blending from `local_transforms` directly is wrong.
+#[inline]
+fn blend_local_rotation(
+    state: &mut PoseSolverState,
+    node_idx: usize,
+    fallback: Quat,
+    target: &Quat,
+    alpha: f32,
+) -> Quat {
+    let from = state
+        .prev_local_rotations
+        .get(&node_idx)
+        .copied()
+        .unwrap_or(fallback);
+    let out = quat_slerp_short(&from, target, alpha);
+    state.prev_local_rotations.insert(node_idx, out);
+    out
+}
+
 #[inline]
 fn dt_aware_blend(slider_blend: f32, dt: f32) -> f32 {
     if dt <= 0.0 {
@@ -1921,6 +2000,7 @@ fn solve_wrist_orientation(
     current_world: &mut [WorldXform],
     local_transforms: &mut [Transform],
     params: &SolverParams,
+    state: &mut PoseSolverState,
     dt: f32,
 ) {
     let Some(orient) = source_orientation else {
@@ -2041,19 +2121,23 @@ fn solve_wrist_orientation(
     // `current_world[la_idx].rotation` (which IS kept up-to-date) and
     // the bone's rest forearm direction instead.
     let twist_axis = lower_arm_idx.and_then(|la_idx| {
-        let rest_la_pos = rest_world[la_idx].position;
-        // Forearm rest direction in LowerArm's parent-relative space.
-        // Use the wrist child's rest_world position as the tip — same
-        // reference frame the per-bone direction-match used.
-        let rest_wrist_pos = rest_world[wrist_idx].position;
-        let rest_dir_local = vec3_normalize(&vec3_sub(&rest_wrist_pos, &rest_la_pos));
+        // The bone vector in the LowerArm's OWN (parent-of-wrist)
+        // space is the wrist's rest LOCAL translation. The previous
+        // formulation rotated the rest *world* direction
+        // (rest_world[wrist] − rest_world[la]) by the LowerArm's
+        // current world rotation — that double-applies the
+        // LowerArm's rest world rotation (the world rest direction
+        // already contains it), tilting the axis on any rig whose
+        // rest rotations are not identity. A tilted axis lets swing
+        // leak into the "twist" half that's transferred to the
+        // LowerArm, dragging the hand off the just-solved forearm
+        // direction (measured: 0.41 foreshortening error on the
+        // lean-left open-palm validation pose; 0.02 with the correct
+        // axis).
+        let rest_dir_local = vec3_normalize(&skeleton.nodes[wrist_idx].rest_local.translation);
         if rest_dir_local == [0.0; 3] {
             return None;
         }
-        // Apply the LowerArm's current world rotation to the rest
-        // direction to get the *current* world-space forearm axis.
-        // This stays the same when only twist is added, and rotates
-        // with any direction change the LowerArm has undergone.
         let current_world_dir =
             quat_rotate_vec3(&current_world[la_idx].rotation, &rest_dir_local);
         let normalized = vec3_normalize(&current_world_dir);
@@ -2083,9 +2167,13 @@ fn solve_wrist_orientation(
             &quat_conjugate(&upper_arm_world_rot),
             &lower_arm_world_new,
         ));
-        let lower_arm_prev_local = local_transforms[la_idx].rotation;
-        local_transforms[la_idx].rotation =
-            quat_slerp_short(&lower_arm_prev_local, &lower_arm_local_target, blend);
+        local_transforms[la_idx].rotation = blend_local_rotation(
+            state,
+            la_idx,
+            local_transforms[la_idx].rotation,
+            &lower_arm_local_target,
+            blend,
+        );
         let actual_lower_arm_world =
             quat_mul(&upper_arm_world_rot, &local_transforms[la_idx].rotation);
         current_world[la_idx].rotation = actual_lower_arm_world;
@@ -2099,9 +2187,13 @@ fn solve_wrist_orientation(
             &quat_conjugate(&actual_lower_arm_world),
             &new_world_rot,
         ));
-        let prev_local_rot = local_transforms[wrist_idx].rotation;
-        local_transforms[wrist_idx].rotation =
-            quat_slerp_short(&prev_local_rot, &hand_local_target, blend);
+        local_transforms[wrist_idx].rotation = blend_local_rotation(
+            state,
+            wrist_idx,
+            local_transforms[wrist_idx].rotation,
+            &hand_local_target,
+            blend,
+        );
         let updated_world =
             quat_mul(&actual_lower_arm_world, &local_transforms[wrist_idx].rotation);
         current_world[wrist_idx].rotation = updated_world;
@@ -2111,9 +2203,13 @@ fn solve_wrist_orientation(
         // behaviour for edge cases.
         let new_local_rot =
             quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
-        let prev_local_rot = local_transforms[wrist_idx].rotation;
-        local_transforms[wrist_idx].rotation =
-            quat_slerp_short(&prev_local_rot, &new_local_rot, blend);
+        local_transforms[wrist_idx].rotation = blend_local_rotation(
+            state,
+            wrist_idx,
+            local_transforms[wrist_idx].rotation,
+            &new_local_rot,
+            blend,
+        );
         let updated_world =
             quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
         current_world[wrist_idx].rotation = updated_world;
@@ -2407,13 +2503,19 @@ mod body_yaw_tests {
             "frontal frame should prime running max to 0.40, got {span_max}"
         );
 
-        // Frame 2: same subject rotated; bx shrinks (foreshortening)
-        // but bz is small / underestimated by RTMW3D. Pure atan2 would
-        // give ≈ atan2(0.05, 0.20) ≈ 14° magnitude, but with running
-        // max we recover ≈ acos(0.20/0.40) = 60°.
+        // Frame 2: same subject rotated. bx shrinks (foreshortening)
+        // and bz carries the metric-injected inter-shoulder Δz a real
+        // 60° yaw produces (≈ sin60 × span, slightly under-reported).
+        // The span running-max recovers the full ≈ acos(0.20/0.40) =
+        // 60° magnitude; the bz corroboration cap stays out of the
+        // way because bz genuinely supports the rotation. (A large
+        // span-implied yaw with bz ≈ 0 is now CAPPED instead — that
+        // signature is a perspective-inflated reference span from
+        // leaning toward a near webcam, which live locked the avatar
+        // at ±45° on perfectly frontal poses.)
         let mut rotated = SourceSkeleton::empty(0);
-        put(&mut rotated, HumanoidBone::LeftShoulder, [0.10, 0.5, -0.025], 1.0);
-        put(&mut rotated, HumanoidBone::RightShoulder, [-0.10, 0.5, 0.025], 1.0);
+        put(&mut rotated, HumanoidBone::LeftShoulder, [0.10, 0.5, -0.15], 1.0);
+        put(&mut rotated, HumanoidBone::RightShoulder, [-0.10, 0.5, 0.15], 1.0);
         let yaw_deg = compute_body_yaw_3d(&rotated, 0.1, &mut span_max)
             .expect("shoulders")
             .to_degrees();

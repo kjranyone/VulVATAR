@@ -206,6 +206,23 @@ impl RenderThreadInner {
 
             match cmd {
                 RenderCommand::RenderFrame(input) => {
+                    // Cooperative GPU exclusivity: while heavyweight
+                    // DirectML initialisation is in flight (tracking
+                    // start), skip Vulkan work entirely instead of
+                    // racing the driver on one device — see
+                    // `gpu_coordination` for the incident evidence.
+                    // Publish an empty result so the app's
+                    // `render_results_pending` gate doesn't leak.
+                    if crate::gpu_coordination::is_exclusive_active() {
+                        self.publish_result(crate::renderer::RenderResult {
+                            extent: [0, 0],
+                            timestamp_nanos: 0,
+                            has_alpha: false,
+                            stats: crate::renderer::RenderStats::default(),
+                            exported_frame: None,
+                        });
+                        continue;
+                    }
                     // On render error we still publish an empty result back
                     // to the app — `Application::render_results_pending`
                     // was bumped on submit and would otherwise leak

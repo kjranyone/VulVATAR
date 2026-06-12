@@ -269,9 +269,19 @@ pub(super) fn finalize_range_collection(
                 }
                 warn!(
                     "calibration: finalize_range entered without an existing pose \
-                     (modal_state mismatch?); closing modal without writing"
+                     (modal_state mismatch?); reporting failure without writing"
                 );
-                return CalibrationModalState::Closed;
+                // Surface the failure through the normal `Done` pane
+                // (1.5 s message, then auto-close) instead of vanishing
+                // the modal with no feedback — the user needs to know
+                // this attempt produced nothing so they retry.
+                return CalibrationModalState::Done {
+                    mode,
+                    shown_at: now,
+                    outcome: DoneOutcome::Insufficient {
+                        samples_collected: 0,
+                    },
+                };
             }
         };
 

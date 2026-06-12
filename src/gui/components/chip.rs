@@ -1,8 +1,10 @@
 //! Pill-shaped chip used for sort options, filters, and tags.
 //! Selected chips render with the primary container fill; unselected
-//! chips render with a subtle outline-only style.
+//! chips render with the neutral input fill. State is expressed by
+//! fill only — no outline (see `theme::color::state_layer` for why
+//! hairline strokes are avoided).
 
-use eframe::egui::{Align2, Color32, Response, Rounding, Sense, Stroke, Ui, Vec2};
+use eframe::egui::{Align2, Response, Rounding, Sense, Ui, Vec2};
 
 use crate::gui::theme::{color, radius, space, typography};
 
@@ -15,31 +17,19 @@ pub fn chip(ui: &mut Ui, label: &str, selected: bool) -> Response {
     let w = pad_x + label_galley.size().x + pad_x;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
 
-    let (bg, fg, stroke) = if selected {
-        (
-            color::PRIMARY_CONTAINER,
-            color::ON_PRIMARY_CONTAINER,
-            Stroke::NONE,
-        )
-    } else if resp.hovered() {
-        (
-            Color32::from_rgba_unmultiplied(124, 92, 255, 16),
-            color::ON_SURFACE,
-            Stroke::new(1.0, color::PRIMARY),
-        )
+    let (base_bg, fg) = if selected {
+        (color::PRIMARY_CONTAINER, color::ON_PRIMARY_CONTAINER)
     } else {
-        (
-            Color32::TRANSPARENT,
-            color::ON_SURFACE_VARIANT,
-            Stroke::new(1.0, color::OUTLINE),
-        )
+        (color::SURFACE_VARIANT, color::ON_SURFACE_VARIANT)
+    };
+    let bg = if resp.hovered() {
+        color::state_layer(base_bg, color::PRIMARY)
+    } else {
+        base_bg
     };
 
     let painter = ui.painter_at(rect);
-    // Shrink by 0.5 px so the 1 px stroke (when present) lands fully
-    // inside the painter's clip rect; otherwise the outer half of the
-    // outline is clipped on the unselected / hover variants.
-    painter.rect(rect.shrink(0.5), Rounding::same(radius::PILL), bg, stroke);
+    painter.rect_filled(rect, Rounding::same(radius::PILL), bg);
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -47,6 +37,5 @@ pub fn chip(ui: &mut Ui, label: &str, selected: bool) -> Response {
         typography::label(),
         fg,
     );
-    let _ = label_galley;
     resp
 }

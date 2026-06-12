@@ -47,22 +47,13 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
     state.library.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
 
-/// UI-thread post-load work: build an `AvatarInstance`, attach it to physics,
-/// register it in the library, and update recent-avatar history.
+/// UI-thread post-load work: build an `AvatarInstance` and install it as
+/// the scene avatar (replacing any previous one — see
+/// `Application::set_avatar`), register it in the library, and update
+/// recent-avatar history.
 pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAsset>) {
-    // If we're replacing an avatar that's already loaded at the same
-    // library slot, the previous asset's GPU textures + meshes are
-    // about to become unreferenced. The renderer caches them by URI
-    // / MeshId and never evicts on its own, so without this nudge
-    // they stay pinned in VRAM until process exit. `add_avatar`
-    // below grows the avatar list rather than replacing in place,
-    // but the active-avatar pointer moves — visual effect is the
-    // same: the prior caches are stale.
-    let had_existing_avatar = state.app.active_avatar().is_some();
-
     let instance_id = crate::avatar::AvatarInstanceId(state.app.next_avatar_instance_id);
     state.app.next_avatar_instance_id += 1;
-    state.app.physics.attach_avatar(&asset);
 
     let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
     entry.update_from_asset_with_thumbnail_dir(&asset, state.library.thumbnail_gen.output_dir());
@@ -85,10 +76,7 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     state.camera_orbit.pitch_deg = 0.0;
 
     let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
-    state.app.add_avatar(instance);
-    if had_existing_avatar {
-        state.app.evict_render_caches();
-    }
+    state.app.set_avatar(instance);
     state.add_recent_avatar(path.to_path_buf());
     info!("avatar loaded: {}", path.display());
     state.push_notification(t!("top_bar.loaded_avatar", path = path.display().to_string()));
@@ -394,7 +382,7 @@ fn topbar_icon_button(ui: &mut Ui, glyph: char, hover_text: &str) -> Response {
     let size = Vec2::splat(36.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let bg = if resp.hovered() {
-        Color32::from_rgba_unmultiplied(124, 92, 255, 18)
+        color::with_alpha(color::PRIMARY, 18)
     } else {
         Color32::TRANSPARENT
     };
@@ -424,7 +412,7 @@ fn topbar_action(ui: &mut Ui, glyph: char, label: &str) -> Response {
     let w = pad_x + icon_size + icon_label_gap + label_w + pad_x;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
     let bg = if resp.hovered() {
-        Color32::from_rgba_unmultiplied(124, 92, 255, 18)
+        color::with_alpha(color::PRIMARY, 18)
     } else {
         Color32::TRANSPARENT
     };

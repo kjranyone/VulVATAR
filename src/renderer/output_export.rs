@@ -345,7 +345,7 @@ impl OutputExporter {
                 after_future
                     .then_signal_fence_and_flush()
                     .ok()
-                    .map(|f| f.wait(None).ok());
+                    .map(|f| super::gpu_wait::wait_fence_bounded(f, "export_none_drain").ok());
                 ExportResult {
                     exported_frame: None,
                     export_succeeded: false,
@@ -404,7 +404,7 @@ impl OutputExporter {
                 };
             }
         };
-        if let Err(e) = fence.wait(None) {
+        if let Err(e) = super::gpu_wait::wait_fence_bounded(fence, "export_gpu") {
             self.export_image_pool.abandon_render(reservation);
             log::error!("failed to wait for gpu export: {e}");
             return ExportResult {
@@ -653,7 +653,7 @@ impl OutputExporter {
             }
         };
 
-        if let Err(e) = fence.wait(None) {
+        if let Err(e) = super::gpu_wait::wait_fence_bounded(fence, "lease_readback") {
             log::error!("failed to wait for readback: {}", e);
             return Vec::new();
         }
@@ -684,7 +684,7 @@ impl OutputExporter {
             after_future
                 .then_signal_fence_and_flush()
                 .ok()
-                .map(|f| f.wait(None).ok());
+                .map(|f| super::gpu_wait::wait_fence_bounded(f, "export_disabled_drain").ok());
             return ExportResult {
                 exported_frame: None,
                 export_succeeded: false,
@@ -776,7 +776,7 @@ impl OutputExporter {
             }
         };
 
-        if let Err(e) = fence.wait(None) {
+        if let Err(e) = super::gpu_wait::wait_fence_bounded(fence, "export_readback") {
             log::error!("export_readback: failed to wait: {}", e);
             return ExportResult {
                 exported_frame: None,

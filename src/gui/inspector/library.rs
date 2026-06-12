@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::gui::components::{card, chip, icon_button, icon_text, outlined_button};
+use crate::gui::components::{card, chip, icon_button, icon_text, tonal_button, ButtonTone};
 use crate::gui::theme::{color, icon as ic, radius, space, typography};
 use crate::gui::{GuiApp, LibrarySortMode};
 use crate::t;
@@ -52,11 +52,11 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             ui.add_space(space::XS);
             ui.horizontal(|ui| {
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::ADD),
                     &t!("watched_folders.watch_folder"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -74,11 +74,11 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                         }
                     }
                 }
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::REFRESH),
                     &t!("tracking.refresh"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     !watched.is_empty(),
                 )
                 .on_hover_text(t!("watched_folders.refresh_tooltip"))
@@ -139,11 +139,11 @@ pub(super) fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .color(color::ON_SURFACE_MUTED),
             );
             ui.add_space(space::XS);
-            if outlined_button(
+            if tonal_button(
                 ui,
                 Some(ic::DELETE),
                 &t!("avatar_cache.clear_cache"),
-                color::ERROR,
+                ButtonTone::Error,
                 true,
             )
             .clicked()
@@ -298,19 +298,22 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .as_ref()
                         .is_some_and(|p| *p == row.path);
 
-                    let (row_fill, row_stroke) = if is_current {
-                        (color::PRIMARY_CONTAINER, color::PRIMARY)
+                    // Row state is fill-only (selected = primary
+                    // container, missing file = error container,
+                    // rest = input surface) — same no-hairline rule
+                    // as the buttons; see `color::state_layer`.
+                    let row_fill = if is_current {
+                        color::PRIMARY_CONTAINER
                     } else if !row.exists {
-                        (color::ERROR_CONTAINER, color::ERROR)
+                        color::ERROR_CONTAINER
                     } else {
-                        (color::SURFACE, color::OUTLINE_VARIANT)
+                        color::SURFACE_VARIANT
                     };
 
                     let frame = egui::Frame {
                         fill: row_fill,
                         rounding: egui::Rounding::same(radius::SM),
                         inner_margin: egui::Margin::symmetric(space::SM, space::SM),
-                        stroke: egui::Stroke::new(1.0, row_stroke),
                         ..Default::default()
                     };
 
@@ -452,11 +455,11 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                     let _ = menu_resp;
 
                                     if row.exists {
-                                        if outlined_button(
+                                        if tonal_button(
                                             ui,
                                             None,
                                             &t!("inspector.load"),
-                                            color::PRIMARY,
+                                            ButtonTone::Primary,
                                             true,
                                         )
                                         .clicked()
@@ -564,11 +567,11 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                     );
                     ui.text_edit_multiline(&mut entry.notes);
                 });
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::SAVE),
                     &t!("inspector.save_details"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -605,11 +608,11 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
         ui.separator();
         ui.add_space(space::SM);
         ui.horizontal(|ui| {
-            if outlined_button(
+            if tonal_button(
                 ui,
                 Some(ic::DELETE),
                 &t!("inspector.purge_missing"),
-                color::ERROR,
+                ButtonTone::Error,
                 true,
             )
             .clicked()
@@ -630,11 +633,11 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 t!("inspector.add_file"),
                 state.hotkeys.label_for(crate::gui::hotkey::HotkeyAction::LoadAvatar),
             );
-            let add_resp = outlined_button(
+            let add_resp = tonal_button(
                 ui,
                 Some(ic::ADD),
                 &add_label_with_hotkey,
-                color::PRIMARY,
+                ButtonTone::Primary,
                 true,
             );
             if add_resp.clicked()

@@ -252,10 +252,11 @@ pub(in crate::tracking) fn build_source_skeleton(
     }
     sk.overall_confidence = if n > 0 { sum / n as f32 } else { 0.0 };
 
-    // Anatomical sanity check for leg chain (knee → ankle). ViTPose
-    // occasionally misdetects the ankle as a point well off the
-    // anatomical "downward" axis from the knee — observed on
-    // shoulders_003 where the LeftFoot landed at x=+0.775 vs y=-0.632
+    // Anatomical sanity check for leg chain (knee → ankle). 2D pose
+    // decodes occasionally misdetect the ankle as a point well off the
+    // anatomical "downward" axis from the knee — observed (with the
+    // former ViTPose backend) on shoulders_003 where the LeftFoot
+    // landed at x=+0.775 vs y=-0.632
     // from the knee, giving a 51° shin angle from vertical that the
     // avatar's solver can't follow without rig damage. Cap the shin
     // x/y ratio so a wildly tilted source ankle gets pulled back to
@@ -266,10 +267,9 @@ pub(in crate::tracking) fn build_source_skeleton(
     sanity_check_shin(&mut sk, HumanoidBone::RightLowerLeg, HumanoidBone::RightFoot);
 
     // 2D-only foreshortening → spine forward-pitch inference. Fires
-    // only when the upper-body source-z is essentially flat (= caller
-    // is a 2D-only provider like ViTPose with `nz = 0.5`). RTMW3D's
-    // own 3D output produces non-trivial source z so the gate inside
-    // skips the inference. See the function docstring for the
+    // only when the upper-body source-z is essentially flat (a planar
+    // source with `nz = 0.5`). RTMW3D's own 3D output produces
+    // non-trivial source z so the gate inside skips the inference. See the function docstring for the
     // anatomy reasoning. `pitch_sign` is derived from head /
     // face landmarks (chin-down vs chin-up) so backward-leaning
     // poses get -z injection instead of the default forward bias.
@@ -315,8 +315,8 @@ pub(in crate::tracking) fn build_source_skeleton(
 }
 
 /// Recover a spine forward-pitch (around X axis) signal from 2D
-/// foreshortening of the shoulder-hip y span. ViTPose and any other
-/// 2D-only provider emits `position[2] = 0` for every joint, so the
+/// foreshortening of the shoulder-hip y span. A planar source emits
+/// `position[2] = 0` for every joint, so the
 /// solver's direction-matching path sees the spine direction as
 /// pure `+y` regardless of whether the subject is upright or
 /// deeply bowed. This routine bridges the gap by injecting a
@@ -346,7 +346,7 @@ pub(in crate::tracking) fn build_source_skeleton(
 /// - Skips when compression is < 5 % (subject is upright; jitter
 ///   should not push the avatar around).
 /// Constrain the shin direction (knee → ankle) to a plausibly
-/// downward orientation. ViTPose's ankle detection misfires on
+/// downward orientation. 2D ankle detection can misfire on
 /// some images, placing the foot at a wildly off-axis position
 /// (51°+ from vertical) that the avatar's leg chain can't follow.
 /// We cap the horizontal offset to half the vertical offset

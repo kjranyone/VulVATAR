@@ -23,9 +23,9 @@ use super::consts::{INPUT_H, INPUT_W, MEAN_RGB, STD_RGB};
 // ---------------------------------------------------------------------------
 
 /// Pad the YOLOX-detected bbox, adjust it toward RTMW3D's 288:384 input
-/// aspect, and clamp to the frame. Shared with the CIGPose+MoGe-2
-/// provider, which also feeds CIGPose at 288×384 — keep the same
-/// aspect target so the helper stays single-sourced.
+/// aspect, and clamp to the frame. Shared with the rtmw3d_with_depth
+/// provider's DAv2 person-crop stage — keep the same aspect target so
+/// the helper stays single-sourced.
 pub(in crate::tracking) fn pad_and_clamp_bbox(
     bbox: &PersonBbox,
     width: u32,
@@ -54,8 +54,8 @@ pub(in crate::tracking) fn pad_and_clamp_bbox(
 /// Copy the rectangle `[(ox, oy), (ox+cw, oy+ch))` out of `rgb`
 /// (`width × height × 3` u8) into a contiguous tightly-packed buffer.
 /// Caller has already clamped the rectangle into the source bounds.
-/// Shared with the CIGPose+MoGe-2 provider for the same person-crop
-/// flow.
+/// Shared with the rtmw3d_with_depth provider for the same
+/// person-crop flow.
 pub(in crate::tracking) fn crop_rgb(
     rgb: &[u8],
     width: u32,

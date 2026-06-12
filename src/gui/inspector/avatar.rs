@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::gui::components::{card, card_action_icon, kv_grid, kv_row, outlined_button};
+use crate::gui::components::{card, card_action_icon, kv_grid, kv_row, tonal_button, ButtonTone};
 use crate::gui::theme::{color, icon as ic, space, typography};
 use crate::gui::GuiApp;
 use crate::t;
@@ -180,22 +180,22 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(space::MD);
 
                 ui.horizontal(|ui| {
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         Some(ic::REFRESH),
                         &t!("inspector.reload"),
-                        color::PRIMARY,
+                        ButtonTone::Primary,
                         true,
                     )
                     .clicked()
                     {
                         state.app.reload_avatar();
                     }
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         Some(ic::REMOVE),
                         &t!("inspector.detach"),
-                        color::ERROR,
+                        ButtonTone::Error,
                         true,
                     )
                     .clicked()
@@ -330,11 +330,11 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         });
         ui.add_space(space::SM);
-        if outlined_button(
+        if tonal_button(
             ui,
             Some(ic::HISTORY),
             &t!("inspector.reset_camera"),
-            color::PRIMARY,
+            ButtonTone::Primary,
             true,
         )
         .clicked()

@@ -217,7 +217,7 @@ impl VulkanRenderer {
             .ok()?
             .then_signal_fence_and_flush()
             .ok()?;
-        future.wait(None).ok()?;
+        super::gpu_wait::wait_fence_bounded(future, "texture_upload").ok()?;
 
         ImageView::new_default(gpu_image).ok()
     }
