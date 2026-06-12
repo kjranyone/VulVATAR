@@ -2,14 +2,17 @@ mod cloth_cache;
 pub mod debug;
 pub mod frame_input;
 pub mod frame_pool;
+mod gpu_wait;
 pub mod gpu_handle;
 pub mod material;
 pub mod mtoon;
 pub mod output_export;
+mod background;
 pub mod pipeline;
 #[allow(clippy::module_inception)]
 mod pipeline_lint_tests;
 mod pipeline_targets;
+mod post_effects;
 mod readback;
 mod texture_cache;
 pub mod thumbnail;
@@ -317,6 +320,18 @@ pub struct VulkanRenderer {
     outline_pipeline: Option<Arc<GraphicsPipeline>>,
     sampler: Option<Arc<Sampler>>,
     default_texture_view: Option<Arc<ImageView>>,
+    /// ClampToEdge linear sampler for the post-effect passes (the material
+    /// `sampler` uses Repeat, which would wrap bloom taps across edges).
+    post_sampler: Option<Arc<Sampler>>,
+    /// 1x1 transparent-black texture bound as the composite's bloom input
+    /// while bloom is disabled. Device-lifetime.
+    black_texture_view: Option<Arc<ImageView>>,
+    /// Post-effect layer (bloom chain + composite/encode pass + final 8-bit
+    /// readback/export image). Rebuilt with the offscreen targets.
+    post_effects: Option<post_effects::PostEffectResources>,
+    /// Generative background pipeline (scene render pass, fixed viewport,
+    /// baked MSAA sample count). Rebuilt with the scene pipelines.
+    background_pipeline: Option<Arc<GraphicsPipeline>>,
     offscreen_color: Option<Arc<Image>>,
     offscreen_color_view: Option<Arc<ImageView>>,
     offscreen_depth: Option<Arc<Image>>,
@@ -338,7 +353,8 @@ pub struct VulkanRenderer {
     current_sample_count: u32,
     /// Multisampled colour target, present only when `current_sample_count > 1`.
     /// The subpass renders into this and resolves into `offscreen_color` (the
-    /// single-sample readback / export image). `None` on the no-MSAA path.
+    /// single-sample HDR scene image the post passes sample). `None` on the
+    /// no-MSAA path.
     msaa_color: Option<Arc<Image>>,
     msaa_color_view: Option<Arc<ImageView>>,
     camera_ring: Option<CameraRing>,
@@ -402,6 +418,10 @@ impl VulkanRenderer {
             outline_pipeline: None,
             sampler: None,
             default_texture_view: None,
+            post_sampler: None,
+            black_texture_view: None,
+            post_effects: None,
+            background_pipeline: None,
             offscreen_color: None,
             offscreen_color_view: None,
             offscreen_depth: None,
@@ -525,16 +545,13 @@ impl VulkanRenderer {
             Default::default(),
         ));
 
-        // Build the render pass for the renderer's currently configured
-        // colour space. Defaults to sRGB; a user-driven switch to Linear
-        // sRGB triggers a render-pass + pipeline rebuild later via
-        // `apply_color_space`.
-        // Startup always builds the single-sample path; the first frame's
-        // `apply_output_format` upgrades to the user's requested MSAA level
-        // (clamped to device support) if it differs.
+        // The scene render pass always uses the HDR working format; the
+        // user's output colour space only affects the post-effect composite
+        // pass built below. Startup always builds the single-sample path;
+        // the first frame's `apply_output_format` upgrades to the user's
+        // requested MSAA level (clamped to device support) if it differs.
         let sample_count = self.current_sample_count;
-        let render_pass =
-            Self::build_render_pass(device.clone(), &self.current_color_space, sample_count);
+        let render_pass = Self::build_render_pass(device.clone(), sample_count);
 
         let extent = self.current_extent;
         let viewport = Viewport {
@@ -634,6 +651,14 @@ impl VulkanRenderer {
         )
         .expect("failed to create front-cull cutout pipeline");
 
+        let background_pipeline = background::create_background_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            sample_count,
+        )
+        .expect("failed to create background pipeline");
+
         let outline_pipeline = pipeline::create_outline_pipeline(
             device.clone(),
             render_pass.clone(),
@@ -643,7 +668,6 @@ impl VulkanRenderer {
         .expect("failed to create outline pipeline");
 
         let targets = Self::create_offscreen_targets(
-            device.clone(),
             memory_allocator.clone(),
             render_pass.clone(),
             extent,
@@ -668,6 +692,25 @@ impl VulkanRenderer {
             queue.clone(),
         );
 
+        let post_sampler = Self::create_post_sampler(device.clone());
+        let black_texture_view = Self::create_transparent_black_texture(
+            device.clone(),
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            queue.clone(),
+        );
+        let post_effects = Self::build_post_effect_resources(
+            device.clone(),
+            memory_allocator.clone(),
+            descriptor_set_allocator.clone(),
+            &self.current_color_space,
+            extent,
+            targets.color_view.clone(),
+            post_sampler.clone(),
+            black_texture_view.clone(),
+        )
+        .expect("failed to create post-effect resources");
+
         self.device = Some(device);
         self.queue = Some(queue);
         self.memory_allocator = Some(memory_allocator.clone());
@@ -684,6 +727,7 @@ impl VulkanRenderer {
         self.pipeline_no_cull_cutout = Some(no_cull_pipeline_cutout);
         self.pipeline_front_cull_cutout = Some(front_cull_pipeline_cutout);
         self.outline_pipeline = Some(outline_pipeline.clone());
+        self.background_pipeline = Some(background_pipeline);
         // Build the transform compute pipeline alongside the graphics
         // pipelines. The render loop dispatches it every frame to fuse
         // skinning + morph + cloth into world-space vertices, so failure
@@ -728,6 +772,9 @@ impl VulkanRenderer {
         self.cloth_normal_pipeline = Some(cloth_normal_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
+        self.post_sampler = Some(post_sampler);
+        self.black_texture_view = Some(black_texture_view);
+        self.post_effects = Some(post_effects);
         self.offscreen_color = Some(targets.color);
         self.offscreen_color_view = Some(targets.color_view);
         self.offscreen_depth = Some(targets.depth);
@@ -843,24 +890,28 @@ impl VulkanRenderer {
         let prev_cs = self.current_color_space.clone();
         let prev_samples = self.current_sample_count;
 
-        let new_render_pass = Self::build_render_pass(device, &target_cs, target_samples);
+        let new_render_pass = Self::build_render_pass(device, target_samples);
         self.render_pass = Some(new_render_pass.clone());
 
         let extent = self.current_extent;
+        // The colour space must be set *before* the rebuild: the post-effect
+        // composite pass reads `self.current_color_space` to pick the final
+        // image format. (The scene render pass itself is colour-space
+        // independent — always HDR.)
+        self.current_color_space = target_cs.clone();
         // `rebuild_pipelines_and_targets` sets `current_extent` and
-        // `current_sample_count`; the colour space is set below.
+        // `current_sample_count`.
         self.rebuild_pipelines_and_targets(new_render_pass, extent, target_samples)
             .map_err(|e| format!("apply_output_format: {e}"))?;
 
         info!(
-            "renderer: output format colour {:?} -> {:?} (target {:?}), MSAA {}x -> {}x",
+            "renderer: output format colour {:?} -> {:?} (composite target {:?}), MSAA {}x -> {}x",
             prev_cs,
             target_cs,
             Self::color_attachment_format(&target_cs),
             prev_samples,
             target_samples,
         );
-        self.current_color_space = target_cs;
         Ok(())
     }
 
@@ -950,10 +1001,14 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no framebuffer")?
             .clone();
-        let color_image = self
-            .offscreen_color
+        // Readback / export source: the post-effect layer's final 8-bit
+        // image, written by the composite pass recorded after the scene
+        // render pass below.
+        let final_color_image = self
+            .post_effects
             .as_ref()
-            .ok_or("renderer: no color image")?
+            .ok_or("renderer: no post-effect resources")?
+            .final_color
             .clone();
         let sampler = self.sampler.as_ref().ok_or("renderer: no sampler")?.clone();
         let default_tex = self
@@ -1333,8 +1388,25 @@ impl VulkanRenderer {
                         }
                         let groups = particle_count.div_ceil(TRANSFORM_LOCAL_SIZE);
                         // S2.1 — XPBD constraint projection resources.
-                        let constraint_iters = ctrl.solver_iterations.max(1);
-                        let substeps = ctrl.substeps.max(1);
+                        //
+                        // Upper clamps are defence-in-depth at the GPU
+                        // boundary: `substeps` is already capped at 8 by
+                        // `SimulationClock` and `solver_iterations` at 32
+                        // by the cloth inspector's DragValue, but a
+                        // hand-edited project file bypasses both. The
+                        // dispatch count below is
+                        // `substeps × (1 + 3 × constraint_iters) + 1` in
+                        // ONE command buffer — unbounded values turn a
+                        // frame into a GPU burst long enough to trip the
+                        // driver watchdog (Intel Arc TDR history).
+                        let constraint_iters = ctrl.solver_iterations.clamp(1, 32);
+                        let substeps = ctrl.substeps.clamp(1, 8);
+                        if ctrl.solver_iterations > 32 || ctrl.substeps > 8 {
+                            warn!(
+                                "render: cloth dispatch params clamped (substeps {} → {}, iterations {} → {})",
+                                ctrl.substeps, substeps, ctrl.solver_iterations, constraint_iters
+                            );
+                        }
                         let constraint_resources = self
                             .transform_cache
                             .get(&key)
@@ -1766,7 +1838,22 @@ impl VulkanRenderer {
                     ..Default::default()
                 },
             )
-            .map_err(|e| format!("render: begin_render_pass failed: {e}"))?
+            .map_err(|e| format!("render: begin_render_pass failed: {e}"))?;
+
+        // Generative background: first draw inside the scene pass. Painter's
+        // order alone keeps it behind the avatar (its pipeline neither tests
+        // nor writes depth), and being inside the HDR scene pass means the
+        // bloom chain picks up its highlights like any other scene content.
+        if input.generative_background.enabled {
+            let bg_pipeline = self
+                .background_pipeline
+                .as_ref()
+                .ok_or("render: no background pipeline")?;
+            let push = background::build_push_constants(input);
+            background::record_background(&mut builder, bg_pipeline, push)?;
+        }
+
+        builder
             .bind_pipeline_graphics(gfx_pipeline.clone())
             .map_err(|e| format!("render: bind_pipeline_graphics failed: {e}"))?
             .bind_descriptor_sets(
@@ -1854,13 +1941,31 @@ impl VulkanRenderer {
             .end_render_pass(SubpassEndInfo::default())
             .map_err(|e| format!("render: end_render_pass failed: {e}"))?;
 
+        // ── Post effects: bloom chain + composite/encode ────────────────
+        // The composite always runs — it is the HDR→8-bit encode stage that
+        // produces the readback / export image. The bloom chain only runs
+        // when enabled; otherwise the composite samples the 1x1 transparent
+        // black fallback with zero intensity (a passthrough).
+        {
+            let post = self
+                .post_effects
+                .as_ref()
+                .ok_or("renderer: no post-effect resources")?;
+            let use_bloom = input.bloom.enabled && post.has_bloom_chain();
+            if use_bloom {
+                Self::record_bloom_chain(&mut builder, post, &input.bloom)?;
+            }
+            let intensity = if use_bloom { input.bloom.intensity } else { 0.0 };
+            Self::record_composite(&mut builder, post, intensity, use_bloom)?;
+        }
+
         // ── Readback: two-stage copy to avoid slow Intel DMA path ───────
         let (staging_buffer, readback_buffer) =
             self.ensure_readback_buffers(self.current_extent)?;
 
         builder
             .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
-                color_image,
+                final_color_image,
                 staging_buffer.clone(),
             ))
             .map_err(|e| format!("render: copy_image_to_buffer failed: {e}"))?;
@@ -1876,6 +1981,7 @@ impl VulkanRenderer {
             .build()
             .map_err(|e| format!("render: failed to build command buffer: {e}"))?;
 
+        crate::tracking::stagelog::mark(self.frame_counter, "render_submit");
         let fence_future = vulkano::sync::now(device.clone())
             .then_execute(queue.clone(), command_buffer)
             .map_err(|e| format!("render: then_execute failed: {e}"))?
@@ -1911,9 +2017,7 @@ impl VulkanRenderer {
 
         self.pending_readback = Some(PendingReadbackState {
             wait_fn: Box::new(move || {
-                fence_future
-                    .wait(None)
-                    .map_err(|e| format!("render: fence wait failed: {e}"))
+                gpu_wait::wait_fence_bounded(fence_future, "frame_readback")
             }),
             readback_buffer,
             extent,
@@ -2136,6 +2240,36 @@ struct CameraUniform {
     /// fade-out-when-no-person-detected feature; reuses the former
     /// `_pad2` slot so the std140 layout is unchanged.
     fade_opacity: f32,
+}
+
+/// Project a world-space point through the **row-major** camera view +
+/// projection matrices to a `[0,1]²` screen UV (matching the fullscreen
+/// triangle's `frag_uv` orientation — the Vulkan Y flip is baked into the
+/// projection matrix). Returns `None` when the point is at or behind the
+/// near plane. Bone `global_transforms` are column-major, but only their
+/// translation column is fed here, so no conversion is needed.
+fn project_world_to_uv(
+    view: &crate::asset::Mat4,
+    proj: &crate::asset::Mat4,
+    p: [f32; 3],
+) -> Option<[f32; 2]> {
+    fn mul_row_major(m: &crate::asset::Mat4, v: [f32; 4]) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        for (row, out_v) in out.iter_mut().enumerate() {
+            for (col, v_v) in v.iter().enumerate() {
+                *out_v += m[row][col] * v_v;
+            }
+        }
+        out
+    }
+    let clip = mul_row_major(proj, mul_row_major(view, [p[0], p[1], p[2], 1.0]));
+    if clip[3] <= 1e-6 {
+        return None;
+    }
+    Some([
+        clip[0] / clip[3] * 0.5 + 0.5,
+        clip[1] / clip[3] * 0.5 + 0.5,
+    ])
 }
 
 /// Convert row-major camera matrices into column-major for GLSL.

@@ -2,7 +2,7 @@
 
 ## Why
 
-The depth-aware tracking providers (`rtmw3d-with-depth`, `cigpose-metric-depth`) read the subject's pelvic anchor from a per-pixel depth map (DAv2 / MoGe). When something other than the subject occupies depth pixels near the keypoint sampling window — a desk in front of the user, a monitor between hips and lens, a chair back, a tall plant — the metric depth read for the hip drifts by 0.3–1.5 m. That biased reading propagates through:
+The tracking pipeline's depth stage reads the subject's pelvic anchor from a per-pixel depth map (DAv2). When something other than the subject occupies depth pixels near the keypoint sampling window — a desk in front of the user, a monitor between hips and lens, a chair back, a tall plant — the metric depth read for the hip drifts by 0.3–1.5 m. That biased reading propagates through:
 
 1. The calibration scale `c` (DAv2's metric refinement) → all joint Z values
 2. Body yaw computation (uses shoulder Z spread relative to hip)

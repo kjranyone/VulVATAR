@@ -95,6 +95,9 @@ impl GuiApp {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
+            depth_enabled: self.tracking.depth_enabled,
+            force_cpu_inference: self.tracking.force_cpu_inference,
+            yolox_enabled: self.tracking.yolox_enabled,
             camera_index: self.camera_index,
             show_camera_wipe: self.viewport.show_camera_wipe,
             show_detection_annotations: self.viewport.show_detection_annotations,
@@ -124,6 +127,16 @@ impl GuiApp {
             toggle_collision_debug: self.rendering.toggle_collision_debug,
             toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,
             alpha_preview: self.rendering.alpha_preview,
+            bloom_enabled: self.rendering.bloom_enabled,
+            bloom_intensity: self.rendering.bloom_intensity,
+            bloom_threshold: self.rendering.bloom_threshold,
+            bg_enabled: self.rendering.generative_background.enabled,
+            bg_intensity: self.rendering.generative_background.intensity,
+            bg_speed: self.rendering.generative_background.speed,
+            bg_scale: self.rendering.generative_background.scale,
+            bg_reactivity: self.rendering.generative_background.reactivity,
+            bg_color_a: self.rendering.generative_background.color_a,
+            bg_color_b: self.rendering.generative_background.color_b,
 
             // Save user **intent** (Phase D), not the currently-running
             // state. If MF init failed this session, runtime is on a
@@ -133,21 +146,30 @@ impl GuiApp {
             lipsync_mic_device_index: self.app.lipsync_mic_device_index(),
             lipsync_volume_threshold: self.lipsync.volume_threshold,
             lipsync_smoothing: self.lipsync.smoothing,
+            mouth_source_index: self.lipsync.mouth_source.to_index(),
 
             output_sink_index: self.app.requested_sink().to_gui_index(),
             output_resolution_index: self.output.output_resolution_index,
             output_framerate_index: self.output.output_framerate_index,
             output_has_alpha: self.output.output_has_alpha,
             output_color_space_index: self.output.output_color_space_index,
-            // MSAA lives on the Rendering panel (RenderingGuiState) but is
-            // stored in the project's output.msaa_index slot.
-            output_msaa_index: self.rendering.msaa_index,
+            output_msaa_index: self.output.msaa_index,
+        }
+    }
 
-            settings_locale: self.settings.locale.clone(),
-            settings_zoom_sensitivity: self.settings.zoom_sensitivity,
-            settings_orbit_sensitivity: self.settings.orbit_sensitivity,
-            settings_pan_sensitivity: self.settings.pan_sensitivity,
+    /// Snapshot the app-level settings for `settings.json`. Kept next
+    /// to `to_project_state` so the "which file owns which setting"
+    /// split stays visible in one place: locale + input sensitivities +
+    /// consents follow the user (settings.json); everything above
+    /// follows the scene (.vvtproj).
+    fn collect_app_settings(&self) -> crate::persistence::AppSettings {
+        crate::persistence::AppSettings {
+            locale: self.settings.locale.clone(),
+            zoom_sensitivity: self.settings.zoom_sensitivity,
+            orbit_sensitivity: self.settings.orbit_sensitivity,
+            pan_sensitivity: self.settings.pan_sensitivity,
             cloth_autosave_consent: self.cloth_authoring.autosave_consent,
+            ..crate::persistence::AppSettings::default()
         }
     }
 
@@ -183,6 +205,9 @@ impl GuiApp {
         self.rendering.camera_fov = profile.camera_fov;
         self.output.output_resolution_index = profile.output_resolution_index;
         self.output.output_framerate_index = profile.output_framerate_index;
+        self.output.output_has_alpha = profile.output_has_alpha;
+        self.output.output_color_space_index = profile.output_color_space_index;
+        self.output.msaa_index = profile.output_msaa_index;
         // Pose calibration follows the profile — switching to "Office
         // desk" pulls in the office calibration; switching to "Home
         // setup" pulls in the home one. Push to both Application
@@ -230,6 +255,9 @@ impl GuiApp {
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
         self.tracking.fade_on_tracking_loss = state.fade_on_tracking_loss;
+        self.tracking.depth_enabled = state.depth_enabled;
+        self.tracking.force_cpu_inference = state.force_cpu_inference;
+        self.tracking.yolox_enabled = state.yolox_enabled;
         self.camera_index = state.camera_index;
         self.viewport.show_camera_wipe = state.show_camera_wipe;
         self.viewport.show_detection_annotations = state.show_detection_annotations;
@@ -285,22 +313,35 @@ impl GuiApp {
         self.rendering.toggle_collision_debug = state.toggle_collision_debug;
         self.rendering.toggle_skeleton_debug = state.toggle_skeleton_debug;
         self.rendering.alpha_preview = state.alpha_preview;
+        self.rendering.bloom_enabled = state.bloom_enabled;
+        self.rendering.bloom_intensity = state.bloom_intensity;
+        self.rendering.bloom_threshold = state.bloom_threshold;
+        self.rendering.generative_background =
+            crate::renderer::frame_input::GenerativeBackgroundSettings {
+                enabled: state.bg_enabled,
+                intensity: state.bg_intensity,
+                speed: state.bg_speed,
+                scale: state.bg_scale,
+                reactivity: state.bg_reactivity,
+                color_a: state.bg_color_a,
+                color_b: state.bg_color_b,
+            };
 
         self.lipsync.volume_threshold = state.lipsync_volume_threshold;
         self.lipsync.smoothing = state.lipsync_smoothing;
+        self.lipsync.mouth_source =
+            crate::tracking::MouthSource::from_index(state.mouth_source_index);
 
         self.output.output_resolution_index = state.output_resolution_index;
         self.output.output_framerate_index = state.output_framerate_index;
         self.output.output_has_alpha = state.output_has_alpha;
         self.output.output_color_space_index = state.output_color_space_index;
-        self.rendering.msaa_index = state.output_msaa_index;
+        self.output.msaa_index = state.output_msaa_index;
 
-        self.settings.locale = state.settings_locale.clone();
-        self.settings.zoom_sensitivity = state.settings_zoom_sensitivity;
-        self.settings.orbit_sensitivity = state.settings_orbit_sensitivity;
-        self.settings.pan_sensitivity = state.settings_pan_sensitivity;
-        self.cloth_authoring.autosave_consent = state.cloth_autosave_consent;
-        crate::i18n::set_locale(&self.settings.locale);
+        // App-level settings (locale, sensitivities, consents) are
+        // deliberately NOT applied from project state — they live in
+        // settings.json and follow the user, not the scene. A project
+        // file must never switch the UI language.
 
         self.apply_pipeline_bound_settings(
             state.output_sink_index,
@@ -480,6 +521,32 @@ impl GuiApp {
                     // config dir doesn't trigger a save attempt
                     // on every frame for the rest of the session.
                     self.project_status.profiles_dirty = false;
+                }
+            }
+        }
+
+        // App-settings autosave (`settings.json`): locale / input
+        // sensitivities / consents. Own dirty flag + own file, but
+        // throttled like the project save above — the sensitivity
+        // sliders re-set the flag every frame of a drag, and each write
+        // is a backup-copy + temp + rename, so an unthrottled flush
+        // would hammer the disk (~180 fs ops/s) for the duration of a
+        // drag.
+        if self.project_status.app_settings_dirty
+            && self.project_status.last_app_settings_save.elapsed() >= AUTOSAVE_THROTTLE
+        {
+            match crate::persistence::save_app_settings(&self.collect_app_settings()) {
+                Ok(()) => {
+                    self.project_status.app_settings_dirty = false;
+                    self.project_status.last_app_settings_save = Instant::now();
+                }
+                Err(e) => {
+                    warn!("persistence: save_app_settings failed: {}", e);
+                    // Bump the clock and clear the flag so a
+                    // permanently-read-only config dir doesn't retry
+                    // every frame; the next Settings change re-arms it.
+                    self.project_status.last_app_settings_save = Instant::now();
+                    self.project_status.app_settings_dirty = false;
                 }
             }
         }

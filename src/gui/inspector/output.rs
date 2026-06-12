@@ -58,6 +58,7 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
     let prev_fps = state.output.output_framerate_index;
     let prev_alpha = state.output.output_has_alpha;
     let prev_cs = state.output.output_color_space_index;
+    let prev_msaa = state.output.msaa_index;
 
     egui::CollapsingHeader::new(t!("inspector.frame_format"))
         .default_open(true)
@@ -100,12 +101,35 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                         &*cs_names[1],
                     );
                 });
+            // Anti-aliasing (MSAA). Applies to both the viewport preview and
+            // the exported frame (they share the offscreen render target). The
+            // renderer clamps the pick to device sample-count support (and
+            // caps integrated GPUs at 4x), so an unsupported pick degrades.
+            let msaa_names: [String; 4] = [
+                t!("inspector.msaa_off"),
+                t!("inspector.msaa_2x"),
+                t!("inspector.msaa_4x"),
+                t!("inspector.msaa_8x"),
+            ];
+            egui::ComboBox::from_label(t!("inspector.antialiasing"))
+                .selected_text(
+                    msaa_names
+                        .get(state.output.msaa_index)
+                        .map(|s: &String| s.as_str())
+                        .unwrap_or("Unknown"),
+                )
+                .show_ui(ui, |ui| {
+                    for (i, name) in msaa_names.iter().enumerate() {
+                        ui.selectable_value(&mut state.output.msaa_index, i, name);
+                    }
+                });
         });
 
     if state.output.output_resolution_index != prev_res
         || state.output.output_framerate_index != prev_fps
         || state.output.output_has_alpha != prev_alpha
         || state.output.output_color_space_index != prev_cs
+        || state.output.msaa_index != prev_msaa
     {
         state.project_status.project_dirty = true;
     }

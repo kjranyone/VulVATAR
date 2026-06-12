@@ -3,18 +3,21 @@
 use log::{info, warn};
 
 use super::Application;
+use crate::tracking::provider::TrackingPipelineConfig;
 use crate::tracking::{CameraBackend, TrackingWorker};
 
 impl Application {
-    /// Start (or restart) the tracking worker thread with the given backend
-    /// and capture parameters. If a worker is already running it is stopped
-    /// and replaced so the caller can switch backends at any time.
+    /// Start (or restart) the tracking worker thread with the given backend,
+    /// capture parameters and pipeline configuration. If a worker is already
+    /// running it is stopped and replaced so the caller can switch backends
+    /// at any time.
     pub fn start_tracking_with_params(
         &mut self,
         backend: CameraBackend,
         width: u32,
         height: u32,
         fps: u32,
+        pipeline: TrackingPipelineConfig,
     ) {
         if let Some(ref mut worker) = self.tracking_worker {
             if !worker.stop() {
@@ -35,7 +38,7 @@ impl Application {
         }
         let shared_mailbox = self.tracking.shared_mailbox();
         let mut worker = TrackingWorker::new(shared_mailbox);
-        worker.start_with_params(backend, width, height, fps);
+        worker.start_with_params(backend, width, height, fps, pipeline);
         if worker.is_running() {
             info!("app: tracking worker started");
         } else {

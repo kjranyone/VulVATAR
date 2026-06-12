@@ -2,24 +2,25 @@
 //! from `VulkanRenderer` as a follow-up slice of the #12 renderer
 //! split. Owns:
 //!
-//! - `build_render_pass` — one of two `single_pass_renderpass!`
-//!   instantiations based on the requested colour-attachment format
-//!   (sRGB vs LinearSrgb).
+//! - `build_render_pass` — the scene render pass. Its colour attachment
+//!   is always the HDR working format (`R16G16B16A16_SFLOAT`); the
+//!   user-selected output colour space only affects the post-effect
+//!   composite pass (see `post_effects.rs`), which encodes into the
+//!   final 8-bit image.
 //! - `create_offscreen_targets` — colour + depth `Image`s plus the
-//!   framebuffer wired to the active render pass. The colour image
-//!   tries to allocate with `OPAQUE_WIN32_KMT` external-memory
-//!   handle types when the device supports them (for GPU sharing
-//!   with the MF Virtual Camera DLL); falls back to a vanilla
-//!   `COLOR_ATTACHMENT | TRANSFER_SRC | SAMPLED` image otherwise.
+//!   framebuffer wired to the active render pass. The colour image is
+//!   GPU-internal (`COLOR_ATTACHMENT | SAMPLED`): the post-effect
+//!   passes sample it, and readback / export run against the
+//!   post-effect layer's final 8-bit image instead.
 //! - `rebuild_pipelines_and_targets` — the orchestration that
 //!   bundles `create_offscreen_targets` with the six graphics
 //!   pipeline variants (cull mode × alpha mode) plus the outline
-//!   pipeline, then re-seeds `CameraRing` against the new layouts
-//!   and drops caches that pinned old `PipelineLayout` Arcs.
+//!   pipeline and the post-effect resources, then re-seeds
+//!   `CameraRing` against the new layouts and drops caches that
+//!   pinned old `PipelineLayout` Arcs.
 
 use std::sync::Arc;
 
-use log::{info, warn};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
@@ -34,10 +35,11 @@ use crate::renderer::{frame_input, pipeline, CameraRing, VulkanRenderer};
 
 /// Bundle of offscreen render-target resources produced by
 /// [`VulkanRenderer::create_offscreen_targets`]. `color` is always the
-/// single-sample image used as the readback / export source; on the MSAA
-/// path it doubles as the render pass' resolve target. `msaa_color` is the
-/// multisampled image the subpass actually renders into, present only when
-/// MSAA is active.
+/// single-sample HDR scene image sampled by the post-effect passes; on the
+/// MSAA path it doubles as the render pass' resolve target. `msaa_color` is
+/// the multisampled image the subpass actually renders into, present only
+/// when MSAA is active. The readback / export source is the post-effect
+/// layer's final 8-bit image, not anything in this bundle.
 pub(super) struct OffscreenTargets {
     pub color: Arc<Image>,
     pub color_view: Arc<ImageView>,
@@ -49,34 +51,28 @@ pub(super) struct OffscreenTargets {
 }
 
 impl VulkanRenderer {
-    /// Build a render pass whose colour attachment matches the requested
-    /// output colour space and MSAA level.
+    /// Build the scene render pass for the requested MSAA level. The colour
+    /// attachment is always the HDR working format
+    /// ([`super::post_effects::HDR_COLOR_FORMAT`]); the user's output colour
+    /// space is applied later by the post-effect composite pass.
     ///
-    /// `single_pass_renderpass!` takes the colour `format` and the attachment
-    /// `samples` as *expressions* (the macro calls
-    /// `SampleCount::try_from($samples)` internally), so both can be runtime
-    /// values here — only the resolve-vs-no-resolve attachment *structure*
-    /// has to branch:
+    /// `single_pass_renderpass!` takes the attachment `samples` as an
+    /// *expression* (the macro calls `SampleCount::try_from($samples)`
+    /// internally), so it can be a runtime value here — only the
+    /// resolve-vs-no-resolve attachment *structure* has to branch:
     ///
     /// - `sample_count == 1`: the historical two-attachment pass — a
-    ///   single-sample colour target (stored, then read back) plus depth.
+    ///   single-sample colour target (stored, then sampled by the post
+    ///   passes) plus depth.
     /// - `sample_count > 1`: a three-attachment pass — an N-sample colour
     ///   target (`msaa_color`) that the subpass renders into and *resolves*
     ///   into the single-sample `color` target, plus an N-sample depth
-    ///   target. The resolve target is the same external-memory / readback
-    ///   image used on the no-MSAA path, so the export + readback paths stay
-    ///   single-sample. The macro leaves the resolve target in
-    ///   `TransferDstOptimal`; vulkano inserts the transition to
-    ///   `TransferSrcOptimal` automatically before the readback copy.
+    ///   target. The resolve keeps the post-effect input single-sample.
     ///
     /// `sample_count` is expected to already be clamped to device support by
     /// [`VulkanRenderer::clamp_sample_count`].
-    pub(super) fn build_render_pass(
-        device: Arc<Device>,
-        color_space: &frame_input::RenderColorSpace,
-        sample_count: u32,
-    ) -> Arc<RenderPass> {
-        let color_format = Self::color_attachment_format(color_space);
+    pub(super) fn build_render_pass(device: Arc<Device>, sample_count: u32) -> Arc<RenderPass> {
+        let color_format = super::post_effects::HDR_COLOR_FORMAT;
         let depth_format = Format::D32_SFLOAT_S8_UINT;
         if sample_count <= 1 {
             vulkano::single_pass_renderpass!(
@@ -135,7 +131,6 @@ impl VulkanRenderer {
     }
 
     pub(super) fn create_offscreen_targets(
-        device: Arc<Device>,
         memory_allocator: Arc<StandardMemoryAllocator>,
         render_pass: Arc<RenderPass>,
         extent: [u32; 2],
@@ -154,47 +149,20 @@ impl VulkanRenderer {
             .unwrap_or(Format::R8G8B8A8_SRGB);
         let samples = SampleCount::try_from(sample_count).unwrap_or(SampleCount::Sample1);
 
-        let mut color_create_info = ImageCreateInfo {
+        // GPU-internal HDR scene target: rendered into by the scene pass and
+        // sampled by the post-effect passes. The external-memory export
+        // allocation lives on the post-effect layer's final 8-bit image.
+        // TRANSFER_DST is required by the MSAA path: vulkano's
+        // `single_pass_renderpass!` macro hardwires the resolve attachment
+        // reference to the `TransferDstOptimal` layout, and that layout is
+        // only valid on images carrying this usage bit.
+        let color_create_info = ImageCreateInfo {
             image_type: ImageType::Dim2d,
             format: color_format,
             extent: [extent[0], extent[1], 1],
-            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             ..Default::default()
         };
-
-        let enabled_exts = device.enabled_extensions();
-        if enabled_exts.khr_external_memory {
-            use vulkano::image::ImageFormatInfo;
-            use vulkano::memory::{ExternalMemoryHandleType, ExternalMemoryHandleTypes};
-            let fmt_info = ImageFormatInfo {
-                format: color_format,
-                image_type: ImageType::Dim2d,
-                usage: ImageUsage::COLOR_ATTACHMENT
-                    | ImageUsage::TRANSFER_SRC
-                    | ImageUsage::SAMPLED,
-                external_memory_handle_type: Some(ExternalMemoryHandleType::OpaqueWin32Kmt),
-                ..Default::default()
-            };
-            let external_ok = device
-                .physical_device()
-                .image_format_properties(fmt_info)
-                .ok()
-                .flatten()
-                .is_some();
-            if external_ok {
-                color_create_info.external_memory_handle_types =
-                    ExternalMemoryHandleTypes::OPAQUE_WIN32_KMT;
-                info!(
-                    "renderer: exportable color image ({:?}) with OPAQUE_WIN32_KMT",
-                    color_format
-                );
-            } else {
-                warn!(
-                    "renderer: external memory unsupported for {:?} color target, skipping",
-                    color_format
-                );
-            }
-        }
 
         let color_image = Image::new(
             memory_allocator.clone(),
@@ -302,7 +270,6 @@ impl VulkanRenderer {
             .clone();
 
         let targets = Self::create_offscreen_targets(
-            device.clone(),
             memory_allocator,
             render_pass.clone(),
             extent,
@@ -405,12 +372,53 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("failed to create front-cull cutout pipeline: {e}"))?;
 
+        let background_pipeline = super::background::create_background_pipeline(
+            device.clone(),
+            render_pass.clone(),
+            viewport.clone(),
+            sample_count,
+        )
+        .map_err(|e| format!("failed to create background pipeline: {e}"))?;
+
         let outline_pipeline =
-            pipeline::create_outline_pipeline(device, render_pass, viewport, sample_count)
+            pipeline::create_outline_pipeline(device.clone(), render_pass, viewport, sample_count)
                 .map_err(|e| format!("failed to create outline pipeline: {e}"))?;
+
+        // Post-effect resources are extent- and colour-space-dependent
+        // (bloom chain, final 8-bit image, cached descriptor sets), so they
+        // rebuild together with the offscreen targets.
+        let ds_allocator = self
+            .descriptor_set_allocator
+            .as_ref()
+            .ok_or("renderer: no descriptor set allocator")?
+            .clone();
+        let post_sampler = self
+            .post_sampler
+            .as_ref()
+            .ok_or("renderer: no post sampler")?
+            .clone();
+        let black_view = self
+            .black_texture_view
+            .as_ref()
+            .ok_or("renderer: no black texture")?
+            .clone();
+        let post_effects = Self::build_post_effect_resources(
+            device,
+            self.memory_allocator
+                .as_ref()
+                .ok_or("renderer: no memory allocator")?
+                .clone(),
+            ds_allocator,
+            &self.current_color_space,
+            extent,
+            targets.color_view.clone(),
+            post_sampler,
+            black_view,
+        )?;
 
         self.offscreen_color = Some(targets.color);
         self.offscreen_color_view = Some(targets.color_view);
+        self.post_effects = Some(post_effects);
         self.offscreen_depth = Some(targets.depth);
         self.offscreen_depth_view = Some(targets.depth_view);
         self.offscreen_framebuffer = Some(targets.framebuffer);
@@ -426,6 +434,7 @@ impl VulkanRenderer {
         self.pipeline_no_cull_cutout = Some(no_cull_pipeline_cutout);
         self.pipeline_front_cull_cutout = Some(front_cull_pipeline_cutout);
         self.outline_pipeline = Some(outline_pipeline.clone());
+        self.background_pipeline = Some(background_pipeline);
         self.current_extent = extent;
         self.current_sample_count = sample_count;
 

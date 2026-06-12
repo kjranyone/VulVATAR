@@ -66,7 +66,7 @@ fn make_avatar_with_node(node_id: u64, node_name: &str) -> Arc<AvatarAsset> {
 fn install_avatar(harness: &mut GuiApp, asset: Arc<AvatarAsset>) {
     harness
         .app
-        .add_avatar(AvatarInstance::new(AvatarInstanceId(1), asset));
+        .set_avatar(AvatarInstance::new(AvatarInstanceId(1), asset));
 }
 
 fn make_overlay_pinning_to(name: &str, old_id: u64) -> ClothAsset {

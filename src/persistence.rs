@@ -39,6 +39,9 @@ pub struct ProjectState {
     pub lower_body_tracking_enabled: bool,
     pub root_translation_enabled: bool,
     pub fade_on_tracking_loss: bool,
+    pub depth_enabled: bool,
+    pub force_cpu_inference: bool,
+    pub yolox_enabled: bool,
     pub camera_index: usize,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
@@ -69,12 +72,24 @@ pub struct ProjectState {
     pub toggle_collision_debug: bool,
     pub toggle_skeleton_debug: bool,
     pub alpha_preview: bool,
+    pub bloom_enabled: bool,
+    pub bloom_intensity: f32,
+    pub bloom_threshold: f32,
+    pub bg_enabled: bool,
+    pub bg_intensity: f32,
+    pub bg_speed: f32,
+    pub bg_scale: f32,
+    pub bg_reactivity: f32,
+    pub bg_color_a: [f32; 3],
+    pub bg_color_b: [f32; 3],
 
     // Lip sync config
     pub lipsync_enabled: bool,
     pub lipsync_mic_device_index: usize,
     pub lipsync_volume_threshold: f32,
     pub lipsync_smoothing: f32,
+    /// Mouth viseme driver: 0=Audio, 1=Image, 2=Both. See `MouthSource`.
+    pub mouth_source_index: usize,
 
     // Output config
     pub output_sink_index: usize,
@@ -85,16 +100,6 @@ pub struct ProjectState {
     /// Anti-aliasing (MSAA) level index: 0=Off, 1=2x, 2=4x, 3=8x.
     pub output_msaa_index: usize,
 
-    // Settings
-    pub settings_locale: String,
-    pub settings_zoom_sensitivity: f32,
-    pub settings_orbit_sensitivity: f32,
-    pub settings_pan_sensitivity: f32,
-    /// User's answer to the "include cloth overlay in recovery
-    /// snapshots?" prompt. `Some(true)` = opt-in, `Some(false)` = opt-out,
-    /// `None` = never asked. Persisted so the dialog doesn't re-appear
-    /// every launch after the user has already chosen.
-    pub cloth_autosave_consent: Option<bool>,
 }
 
 /// Serializable project state saved as `.vvtproj`.
@@ -127,8 +132,16 @@ pub struct ProjectFile {
     #[serde(default)]
     pub lipsync: LipSyncConfig,
     pub output: OutputConfig,
-    #[serde(default)]
-    pub settings: SettingsConfig,
+    /// Legacy slot: app-level settings (UI language, viewport input
+    /// sensitivities, consents) used to ride the project file, which
+    /// made them follow the *scene* instead of the *user* — opening
+    /// someone else's project switched your UI language, and a session
+    /// that only touched the Settings pane never persisted at all.
+    /// They now live in `settings.json` ([`AppSettings`]). Kept as an
+    /// `Option` so pre-split project files still parse (and can be
+    /// migrated once at startup); never written back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsConfig>,
 }
 
 /// Warnings produced during project reload validation.
@@ -169,6 +182,7 @@ fn pose_calibration_to_dto(
                 bbox_normalized: t.bbox_normalized,
             }
         }),
+        neutral_expressions: cal.neutral_expressions.clone(),
     }
 }
 
@@ -217,6 +231,7 @@ fn dto_to_pose_calibration(
                 bbox_normalized: t.bbox_normalized,
             }
         }),
+        neutral_expressions: dto.neutral_expressions.clone(),
     })
 }
 
@@ -255,6 +270,16 @@ pub struct TrackingConfig {
     pub root_translation_enabled: bool,
     #[serde(default)]
     pub fade_on_tracking_loss: bool,
+    /// Pipeline-stage toggles (bound at tracking start). Defaults
+    /// mirror `TrackingPipelineConfig::default()` so projects predating
+    /// the Pipeline inspector section load with the same pipeline the
+    /// provider previously hardcoded.
+    #[serde(default = "default_true")]
+    pub depth_enabled: bool,
+    #[serde(default)]
+    pub force_cpu_inference: bool,
+    #[serde(default = "default_true")]
+    pub yolox_enabled: bool,
     #[serde(default)]
     pub camera_index: usize,
     #[serde(default)]
@@ -319,6 +344,12 @@ pub struct PoseCalibrationDto {
     /// struct (same pattern as `PoseCalibrationDto` itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torso_depth_template: Option<TorsoDepthTemplateDto>,
+    /// Per-person resting expression baseline — see
+    /// `crate::tracking::PoseCalibration::neutral_expressions`. Stored
+    /// as `(name, weight)` pairs; defaults to empty for older saves /
+    /// captures taken with face tracking off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutral_expressions: Vec<(String, f32)>,
 }
 
 /// On-disk DTO mirror of `crate::tracking::TorsoDepthTemplate`.
@@ -360,6 +391,55 @@ pub struct RenderingConfig {
     pub toggle_skeleton_debug: bool,
     #[serde(default)]
     pub alpha_preview: bool,
+    /// Bloom post-effect. Defaults keep pre-bloom project files on the
+    /// historical no-post-processing output.
+    #[serde(default)]
+    pub bloom_enabled: bool,
+    #[serde(default = "default_bloom_intensity")]
+    pub bloom_intensity: f32,
+    #[serde(default = "default_bloom_threshold")]
+    pub bloom_threshold: f32,
+    /// Generative background. Defaults keep older project files on the
+    /// historical clear-color background; the parameter defaults mirror
+    /// `GenerativeBackgroundSettings::default()`.
+    #[serde(default)]
+    pub bg_enabled: bool,
+    #[serde(default = "default_bg_unit")]
+    pub bg_intensity: f32,
+    #[serde(default = "default_bg_unit")]
+    pub bg_speed: f32,
+    #[serde(default = "default_bg_scale")]
+    pub bg_scale: f32,
+    #[serde(default = "default_bg_unit")]
+    pub bg_reactivity: f32,
+    #[serde(default = "default_bg_color_a")]
+    pub bg_color_a: [f32; 3],
+    #[serde(default = "default_bg_color_b")]
+    pub bg_color_b: [f32; 3],
+}
+
+fn default_bloom_intensity() -> f32 {
+    0.6
+}
+
+fn default_bloom_threshold() -> f32 {
+    1.0
+}
+
+fn default_bg_unit() -> f32 {
+    1.0
+}
+
+fn default_bg_scale() -> f32 {
+    2.0
+}
+
+fn default_bg_color_a() -> [f32; 3] {
+    [0.02, 0.05, 0.18]
+}
+
+fn default_bg_color_b() -> [f32; 3] {
+    [0.10, 0.85, 1.00]
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -372,10 +452,18 @@ pub struct LipSyncConfig {
     pub volume_threshold: f32,
     #[serde(default = "default_lipsync_smoothing")]
     pub smoothing: f32,
+    /// 0=Audio, 1=Image, 2=Both. Defaults to Both so the camera mouth works
+    /// out of the box without silently overriding audio.
+    #[serde(default = "default_mouth_source_index")]
+    pub mouth_source_index: usize,
 }
 
 fn default_volume_threshold() -> f32 {
     0.01
+}
+
+fn default_mouth_source_index() -> usize {
+    2
 }
 
 fn default_lipsync_smoothing() -> f32 {
@@ -440,6 +528,117 @@ pub struct SettingsConfig {
 
 fn default_locale() -> String {
     "en".to_string()
+}
+
+/// App-level user preferences: UI language, viewport input
+/// sensitivities, and cross-session consents. Lives in its own
+/// `%APPDATA%\VulVATAR\settings.json`, deliberately OUTSIDE the
+/// project file: these follow the user, not the scene. Saved by the
+/// GUI's autosave tick whenever `app_settings_dirty` is set (any
+/// Settings-pane change), loaded once at startup *before* font setup
+/// so the locale drives the CJK fallback order.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct AppSettings {
+    #[serde(default = "default_app_settings_version")]
+    pub format_version: u32,
+    #[serde(default = "default_locale")]
+    pub locale: String,
+    #[serde(default = "default_zoom_sensitivity")]
+    pub zoom_sensitivity: f32,
+    #[serde(default = "default_orbit_sensitivity")]
+    pub orbit_sensitivity: f32,
+    #[serde(default = "default_pan_sensitivity")]
+    pub pan_sensitivity: f32,
+    /// User's answer to the "include cloth overlay in recovery
+    /// snapshots?" prompt. `Some(true)` = opt-in, `Some(false)` =
+    /// opt-out, `None` = never asked (dialog fires on first overlay
+    /// attach).
+    #[serde(default)]
+    pub cloth_autosave_consent: Option<bool>,
+}
+
+fn default_app_settings_version() -> u32 {
+    1
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            format_version: default_app_settings_version(),
+            locale: default_locale(),
+            zoom_sensitivity: default_zoom_sensitivity(),
+            orbit_sensitivity: default_orbit_sensitivity(),
+            pan_sensitivity: default_pan_sensitivity(),
+            cloth_autosave_consent: None,
+        }
+    }
+}
+
+pub fn app_settings_path() -> std::path::PathBuf {
+    app_data_dir().join("settings.json")
+}
+
+/// Load `settings.json`. `None` when the file doesn't exist or fails
+/// to parse — the caller falls back to [`migrate_legacy_app_settings`]
+/// / defaults. Field-level `serde(default)`s keep partially-old files
+/// loading as the file grows new fields.
+pub fn load_app_settings() -> Option<AppSettings> {
+    load_app_settings_from(&app_settings_path())
+}
+
+fn load_app_settings_from(path: &Path) -> Option<AppSettings> {
+    let data = std::fs::read_to_string(path).ok()?;
+    // Tolerate a UTF-8 BOM: Windows editors (and PowerShell 5.1's
+    // `-Encoding utf8`) prepend one, and serde_json rejects it. An
+    // unreadable file falls back to migration/defaults — i.e. a BOM
+    // would silently RESET the user's settings, the exact failure
+    // this file exists to prevent.
+    match serde_json::from_str(data.trim_start_matches('\u{feff}')) {
+        Ok(settings) => Some(settings),
+        Err(e) => {
+            warn!("persistence: settings.json unreadable ({e}); using defaults");
+            None
+        }
+    }
+}
+
+pub fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
+    save_app_settings_to(settings, &app_settings_path())
+}
+
+fn save_app_settings_to(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("serialise app settings: {e}"))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    atomic_write(path, &data).map_err(|e| format!("write app settings: {e}"))
+}
+
+/// One-time upgrade path for installs that predate `settings.json`:
+/// pull the app-level settings out of the legacy slot in
+/// `last_session.vvtproj` (where they used to ride along with the
+/// project state). Returns `None` when there's nothing to migrate.
+pub fn migrate_legacy_app_settings() -> Option<AppSettings> {
+    let migrated = migrate_legacy_app_settings_from(&last_session_path());
+    if migrated.is_some() {
+        info!("persistence: migrated app settings from legacy last-session slot");
+    }
+    migrated
+}
+
+fn migrate_legacy_app_settings_from(path: &Path) -> Option<AppSettings> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let file: ProjectFile = serde_json::from_str(&data).ok()?;
+    let legacy = file.settings?;
+    Some(AppSettings {
+        format_version: default_app_settings_version(),
+        locale: legacy.locale,
+        zoom_sensitivity: legacy.zoom_sensitivity,
+        orbit_sensitivity: legacy.orbit_sensitivity,
+        pan_sensitivity: legacy.pan_sensitivity,
+        cloth_autosave_consent: legacy.cloth_autosave_consent,
+    })
 }
 
 /// Full cloth overlay file for `.vvtcloth` files, including the complete ClothAsset data.
@@ -591,6 +790,9 @@ impl ProjectFile {
                 lower_body_tracking_enabled: state.lower_body_tracking_enabled,
                 root_translation_enabled: state.root_translation_enabled,
                 fade_on_tracking_loss: state.fade_on_tracking_loss,
+                depth_enabled: state.depth_enabled,
+                force_cpu_inference: state.force_cpu_inference,
+                yolox_enabled: state.yolox_enabled,
                 camera_index: state.camera_index,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
@@ -613,12 +815,23 @@ impl ProjectFile {
                 toggle_collision_debug: state.toggle_collision_debug,
                 toggle_skeleton_debug: state.toggle_skeleton_debug,
                 alpha_preview: state.alpha_preview,
+                bloom_enabled: state.bloom_enabled,
+                bloom_intensity: state.bloom_intensity,
+                bloom_threshold: state.bloom_threshold,
+                bg_enabled: state.bg_enabled,
+                bg_intensity: state.bg_intensity,
+                bg_speed: state.bg_speed,
+                bg_scale: state.bg_scale,
+                bg_reactivity: state.bg_reactivity,
+                bg_color_a: state.bg_color_a,
+                bg_color_b: state.bg_color_b,
             },
             lipsync: LipSyncConfig {
                 enabled: state.lipsync_enabled,
                 mic_device_index: state.lipsync_mic_device_index,
                 volume_threshold: state.lipsync_volume_threshold,
                 smoothing: state.lipsync_smoothing,
+                mouth_source_index: state.mouth_source_index,
             },
             output: OutputConfig {
                 sink_index: state.output_sink_index,
@@ -628,13 +841,9 @@ impl ProjectFile {
                 color_space_index: state.output_color_space_index,
                 msaa_index: state.output_msaa_index,
             },
-            settings: SettingsConfig {
-                locale: state.settings_locale.clone(),
-                zoom_sensitivity: state.settings_zoom_sensitivity,
-                orbit_sensitivity: state.settings_orbit_sensitivity,
-                pan_sensitivity: state.settings_pan_sensitivity,
-                cloth_autosave_consent: state.cloth_autosave_consent,
-            },
+            // App-level settings are not part of the project any more —
+            // see the field's doc comment.
+            settings: None,
         }
     }
 
@@ -664,6 +873,9 @@ impl ProjectFile {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
+            depth_enabled: self.tracking.depth_enabled,
+            force_cpu_inference: self.tracking.force_cpu_inference,
+            yolox_enabled: self.tracking.yolox_enabled,
             camera_index: self.tracking.camera_index,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,
@@ -685,11 +897,22 @@ impl ProjectFile {
             toggle_collision_debug: self.rendering.toggle_collision_debug,
             toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,
             alpha_preview: self.rendering.alpha_preview,
+            bloom_enabled: self.rendering.bloom_enabled,
+            bloom_intensity: self.rendering.bloom_intensity,
+            bloom_threshold: self.rendering.bloom_threshold,
+            bg_enabled: self.rendering.bg_enabled,
+            bg_intensity: self.rendering.bg_intensity,
+            bg_speed: self.rendering.bg_speed,
+            bg_scale: self.rendering.bg_scale,
+            bg_reactivity: self.rendering.bg_reactivity,
+            bg_color_a: self.rendering.bg_color_a,
+            bg_color_b: self.rendering.bg_color_b,
 
             lipsync_enabled: self.lipsync.enabled,
             lipsync_mic_device_index: self.lipsync.mic_device_index,
             lipsync_volume_threshold: self.lipsync.volume_threshold,
             lipsync_smoothing: self.lipsync.smoothing,
+            mouth_source_index: self.lipsync.mouth_source_index,
 
             output_sink_index: self.output.sink_index,
             output_resolution_index: self.output.resolution_index,
@@ -697,12 +920,6 @@ impl ProjectFile {
             output_has_alpha: self.output.has_alpha,
             output_color_space_index: self.output.color_space_index,
             output_msaa_index: self.output.msaa_index,
-
-            settings_locale: self.settings.locale.clone(),
-            settings_zoom_sensitivity: self.settings.zoom_sensitivity,
-            settings_orbit_sensitivity: self.settings.orbit_sensitivity,
-            settings_pan_sensitivity: self.settings.pan_sensitivity,
-            cloth_autosave_consent: self.settings.cloth_autosave_consent,
         }
     }
 }
@@ -1194,13 +1411,43 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     );
     let temp_path = parent.join(&temp_name);
 
-    std::fs::write(&temp_path, data).map_err(|e| {
-        format!(
-            "atomic_write: failed to write temp file {}: {}",
-            temp_path.display(),
-            e
-        )
-    })?;
+    // Write + fsync the temp file BEFORE the rename. A plain
+    // `fs::write` + rename is atomic against a process crash, but NOT
+    // against power loss / a hard GPU-driver freeze: the rename can
+    // commit in the directory while the temp file's data blocks are
+    // still in the OS write cache, so after the freeze the file exists
+    // at full length but reads back as all-zero. That is exactly how
+    // the 2026-06-12 Arc freeze NUL-corrupted `last_session.vvtproj`
+    // (and its `.bak`). `sync_all` forces the bytes to stable storage
+    // first, so the rename only ever publishes durable data. Cost is
+    // one fsync per write; every caller is throttled (autosave 4/s,
+    // recovery on a timer) so the added latency is immaterial.
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&temp_path).map_err(|e| {
+            format!(
+                "atomic_write: failed to create temp file {}: {}",
+                temp_path.display(),
+                e
+            )
+        })?;
+        f.write_all(data.as_bytes()).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!(
+                "atomic_write: failed to write temp file {}: {}",
+                temp_path.display(),
+                e
+            )
+        })?;
+        f.sync_all().map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!(
+                "atomic_write: failed to fsync temp file {}: {}",
+                temp_path.display(),
+                e
+            )
+        })?;
+    }
 
     if cfg!(windows) {
         if std::fs::rename(&temp_path, path).is_err() {
@@ -1479,6 +1726,111 @@ pub fn save_scene_presets(presets: &[ScenePreset]) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn settings_tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vulvatar_app_settings_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    #[test]
+    fn app_settings_roundtrip() {
+        let dir = settings_tempdir("roundtrip");
+        let path = dir.join("settings.json");
+        // Every field differs from `AppSettings::default()` so a save
+        // or load that silently fell back to defaults is caught.
+        let original = AppSettings {
+            format_version: 1,
+            locale: "ja".to_string(),
+            zoom_sensitivity: 0.007,
+            orbit_sensitivity: 0.9,
+            pan_sensitivity: 3.5,
+            cloth_autosave_consent: Some(true),
+        };
+        save_app_settings_to(&original, &path).expect("save");
+        let loaded = load_app_settings_from(&path).expect("load");
+        assert_eq!(loaded.locale, "ja");
+        assert_eq!(loaded.zoom_sensitivity, 0.007);
+        assert_eq!(loaded.orbit_sensitivity, 0.9);
+        assert_eq!(loaded.pan_sensitivity, 3.5);
+        assert_eq!(loaded.cloth_autosave_consent, Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_settings_missing_file_is_none() {
+        let dir = settings_tempdir("missing");
+        assert!(load_app_settings_from(&dir.join("nope.json")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-split installs carry the app settings inside the project
+    /// file's `settings` block. The one-time migration must lift them
+    /// out so an upgrade doesn't reset the user's language.
+    #[test]
+    fn legacy_last_session_settings_migrate() {
+        let dir = settings_tempdir("migrate");
+        let legacy_session = dir.join("last_session.vvtproj");
+        // Minimal legacy file: serde(default)s fill the config blocks,
+        // but `settings` must be the genuine pre-split shape.
+        let legacy = json!({
+            "format_version": 1,
+            "created_with": "0.1.0",
+            "last_saved_with": "0.1.0",
+            "avatar_source_path": null,
+            "avatar_source_hash": null,
+            "avatar_transform": {"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": 1.0},
+            "active_overlay_path": null,
+            "tracking": {},
+            "rendering": {},
+            "output": {},
+            "settings": {
+                "locale": "ko",
+                "zoom_sensitivity": 0.004,
+                "orbit_sensitivity": 0.6,
+                "pan_sensitivity": 2.0,
+                "cloth_autosave_consent": false
+            }
+        });
+        std::fs::write(&legacy_session, legacy.to_string()).expect("write legacy");
+        let migrated =
+            migrate_legacy_app_settings_from(&legacy_session).expect("legacy settings present");
+        assert_eq!(migrated.locale, "ko");
+        assert_eq!(migrated.zoom_sensitivity, 0.004);
+        assert_eq!(migrated.cloth_autosave_consent, Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Post-split project files omit the `settings` key entirely
+    /// (skip_serializing_if) — re-saving a legacy file must not write
+    /// the key back, and a settings-less file must not migrate.
+    #[test]
+    fn post_split_project_files_omit_settings() {
+        let minimal = json!({
+            "format_version": 1,
+            "created_with": "0.1.0",
+            "last_saved_with": "0.1.0",
+            "avatar_source_path": null,
+            "avatar_source_hash": null,
+            "avatar_transform": {"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": 1.0},
+            "active_overlay_path": null,
+            "tracking": {},
+            "rendering": {},
+            "output": {}
+        });
+        let file: ProjectFile =
+            serde_json::from_value(minimal).expect("settings-less project parses");
+        assert!(file.settings.is_none());
+        let rewritten = serde_json::to_value(&file).expect("serialise");
+        assert!(
+            rewritten.get("settings").is_none(),
+            "project files must not carry app settings any more"
+        );
+    }
 
     #[test]
     fn tracking_config_silently_drops_legacy_smoothing_fields() {

@@ -3,9 +3,16 @@ use eframe::egui;
 use crate::gui::GuiApp;
 use crate::t;
 
+/// Settings pane. Everything in here is an APP-level preference —
+/// persisted to `%APPDATA%\VulVATAR\settings.json` via
+/// `app_settings_dirty`, never to the project file. When adding a new
+/// widget, set `app_settings_dirty` on change (not `project_dirty`),
+/// and add the field to `persistence::AppSettings` +
+/// `GuiApp::collect_app_settings`.
 pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
     let locales = crate::i18n::available_locales();
     let current_locale = state.settings.locale.clone();
+    let mut changed = false;
 
     egui::CollapsingHeader::new(t!("settings.heading"))
         .default_open(true)
@@ -19,6 +26,7 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
                         if ui.selectable_label(current_locale == *code, name).clicked() {
                             state.settings.locale = code.to_string();
                             crate::i18n::set_locale(code);
+                            changed = true;
                             // Reorder the CJK font fallback chain so the
                             // newly-active locale's native shape wins per
                             // glyph (e.g. 飞 vs 飛). No-op if the user
@@ -39,23 +47,33 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("settings.viewport_controls"))
         .default_open(true)
         .show(ui, |ui| {
-            ui.add(
-                // Feeds `exp(-scroll * sens)` in the viewport: ~2.5%/notch at
-                // the low end to ~40%/notch at the high end. Logarithmic so the
-                // gentle end (where most users want to be) gets slider travel.
-                egui::Slider::new(&mut state.settings.zoom_sensitivity, 0.0005..=0.01)
-                    .logarithmic(true)
-                    .text(t!("settings.zoom_sensitivity")),
-            );
-            ui.add(
-                egui::Slider::new(&mut state.settings.orbit_sensitivity, 0.05..=1.0)
-                    .text(t!("settings.orbit_sensitivity")),
-            );
-            ui.add(
-                egui::Slider::new(&mut state.settings.pan_sensitivity, 0.1..=5.0)
-                    .text(t!("settings.pan_sensitivity")),
-            );
+            changed |= ui
+                .add(
+                    // Feeds `exp(-scroll * sens)` in the viewport: ~2.5%/notch at
+                    // the low end to ~40%/notch at the high end. Logarithmic so the
+                    // gentle end (where most users want to be) gets slider travel.
+                    egui::Slider::new(&mut state.settings.zoom_sensitivity, 0.0005..=0.01)
+                        .logarithmic(true)
+                        .text(t!("settings.zoom_sensitivity")),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut state.settings.orbit_sensitivity, 0.05..=1.0)
+                        .text(t!("settings.orbit_sensitivity")),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut state.settings.pan_sensitivity, 0.1..=5.0)
+                        .text(t!("settings.pan_sensitivity")),
+                )
+                .changed();
         });
+
+    if changed {
+        state.project_status.app_settings_dirty = true;
+    }
 
     ui.add_space(4.0);
 }

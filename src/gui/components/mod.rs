@@ -8,7 +8,7 @@ mod chip;
 mod icon;
 mod kv;
 
-pub use button::{filled_button, outlined_button};
+pub use button::{filled_button, tonal_button, ButtonTone};
 pub use card::{card, card_action_icon, card_with_action};
 pub use chip::chip;
 pub use icon::{icon_button, icon_label, icon_text};

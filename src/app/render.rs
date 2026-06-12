@@ -50,6 +50,13 @@ impl Application {
         self.update_render_dt_ema(frame_dt);
         self.update_runtime_gpu_budget(std::time::Instant::now());
 
+        // Background animation clock. Wrapped at 4096 s (≈68 min) so the f32
+        // handed to the shader keeps sub-millisecond precision; the wrap is a
+        // one-off pattern jump in an abstract field, accepted trade-off.
+        if frame_dt.is_finite() && frame_dt > 0.0 {
+            self.background_time = (self.background_time + frame_dt as f64) % 4096.0;
+        }
+
         // 1. input update
         self.input_update(frame_dt);
 
@@ -122,10 +129,24 @@ impl Application {
         // window) and zero once detection has been lost past the hold window;
         // the feature off or tracking off pins it opaque. Linear ramp over
         // FADE_DURATION so a lost/recovered subject fades out/in smoothly.
+        //
+        // Gated on the tracking *worker* actually running, not just the
+        // GUI toggle: both `tracking.enabled` and `fade_on_tracking_loss`
+        // persist in the project / last-session file, so a restart after a
+        // fade-enabled tracking session restores toggle=on with no camera
+        // worker. Without the worker gate that state reads as "person
+        // lost" and silently fades the freshly-loaded avatar to opacity 0
+        // — a blank viewport with no hint why. No camera running means
+        // "nothing to lose": stay opaque until tracking actually starts.
         {
             const FADE_DURATION_S: f32 = 0.6;
+            let worker_running = self
+                .tracking_worker
+                .as_ref()
+                .is_some_and(|w| w.is_running());
             let fade_target = if config.fade_on_tracking_loss
                 && toggles.tracking_enabled
+                && worker_running
                 && !tracking_present
             {
                 0.0
@@ -184,6 +205,8 @@ impl Application {
                         Some(&avatar.expression_weights),
                         smoothing_params.expression_blend,
                         smoothing_params.face_confidence_threshold,
+                        config.mouth_source,
+                        &mut avatar.pose_solver_state,
                     );
                     avatar.expression_weights = new_weights;
                 }
@@ -244,6 +267,9 @@ impl Application {
                 avatar_opacity: self.tracking_fade_opacity,
                 output_color_space: self.output_color_space.clone(),
                 output_msaa: self.output_msaa,
+                bloom: self.bloom,
+                generative_background: self.generative_background,
+                time_seconds: self.background_time as f32,
                 export_mode,
             };
             let frame_input = Self::build_frame_input_multi(
@@ -747,6 +773,44 @@ impl Application {
         let (view, eye_pos) = Self::build_view_matrix(cam);
         let projection = Self::build_projection_matrix(cam.fov_deg, aspect, 0.1, 1000.0);
 
+        // Tracking anchors for the generative background. Bone positions are
+        // the translation column of the column-major `global_transforms`
+        // (avatar-root space — the same space the renderer draws vertices
+        // in). Mouth-open is the max of the five VRM mouth visemes; the
+        // loader canonicalises expression names to VRM 1.0, so "jawOpen"
+        // never appears here.
+        let background_tracking = avatars
+            .first()
+            .and_then(|avatar| {
+                let humanoid = avatar.asset.humanoid.as_ref()?;
+                let bone_pos = |bone: crate::asset::HumanoidBone| {
+                    humanoid
+                        .bone_map
+                        .get(&bone)
+                        .and_then(|node| avatar.pose.global_transforms.get(node.0 as usize))
+                        .map(crate::math_utils::mat4_translation)
+                };
+                let head_ws = bone_pos(crate::asset::HumanoidBone::Head)?;
+                let left_hand_ws =
+                    bone_pos(crate::asset::HumanoidBone::LeftHand).unwrap_or(head_ws);
+                let right_hand_ws =
+                    bone_pos(crate::asset::HumanoidBone::RightHand).unwrap_or(head_ws);
+                let mouth_open = avatar
+                    .expression_weights
+                    .iter()
+                    .filter(|ew| matches!(ew.name.as_str(), "aa" | "ih" | "ou" | "ee" | "oh"))
+                    .map(|ew| ew.weight)
+                    .fold(0.0f32, f32::max);
+                Some(crate::renderer::frame_input::BackgroundTracking {
+                    head_ws,
+                    left_hand_ws,
+                    right_hand_ws,
+                    mouth_open: mouth_open.clamp(0.0, 1.0),
+                    valid: true,
+                })
+            })
+            .unwrap_or_default();
+
         RenderFrameInput {
             camera: CameraState {
                 view,
@@ -770,6 +834,10 @@ impl Application {
             background_color: fi_config.background_color,
             transparent_background: fi_config.transparent_background,
             avatar_opacity: fi_config.avatar_opacity,
+            bloom: fi_config.bloom,
+            generative_background: fi_config.generative_background,
+            background_tracking,
+            time_seconds: fi_config.time_seconds,
         }
     }
 

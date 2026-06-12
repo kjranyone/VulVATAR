@@ -14,6 +14,18 @@ pub struct StreamProfile {
     pub output_sink_index: usize,
     pub output_resolution_index: usize,
     pub output_framerate_index: usize,
+    /// Output alpha / colour-space / MSAA travel with the profile so a
+    /// profile switch can't leave the Output panel in a mixed state
+    /// (sink + resolution + fps from the new profile, alpha / colour
+    /// space / MSAA lingering from the previous one). `serde(default)`
+    /// keeps pre-existing `profiles.json` files loading; the defaults
+    /// match the GUI's initial values.
+    #[serde(default = "default_output_has_alpha")]
+    pub output_has_alpha: bool,
+    #[serde(default)]
+    pub output_color_space_index: usize,
+    #[serde(default)]
+    pub output_msaa_index: usize,
     /// Per-setup pose calibration. Lives on the profile (rather than
     /// the project file) so the user's "home desk" setup vs.
     /// "office desk" setup can each carry its own anchor / range
@@ -23,6 +35,10 @@ pub struct StreamProfile {
     /// `docs/calibration-ux.md`.
     #[serde(default)]
     pub pose_calibration: Option<PoseCalibration>,
+}
+
+fn default_output_has_alpha() -> bool {
+    true
 }
 
 impl StreamProfile {
@@ -37,6 +53,9 @@ impl StreamProfile {
             output_sink_index: 0,
             output_resolution_index: 0,
             output_framerate_index: 0,
+            output_has_alpha: true,
+            output_color_space_index: 0,
+            output_msaa_index: 0,
             pose_calibration: None,
         }
     }
@@ -54,6 +73,9 @@ impl StreamProfile {
             output_sink_index: 3,
             output_resolution_index: 1,
             output_framerate_index: 1,
+            output_has_alpha: true,
+            output_color_space_index: 0,
+            output_msaa_index: 0,
             pose_calibration: None,
         }
     }
@@ -71,6 +93,9 @@ impl StreamProfile {
             output_sink_index: 0,
             output_resolution_index: 0,
             output_framerate_index: 0,
+            output_has_alpha: true,
+            output_color_space_index: 0,
+            output_msaa_index: 0,
             pose_calibration: None,
         }
     }
@@ -206,6 +231,12 @@ mod profile_roundtrip_tests {
             output_sink_index: 2,
             output_resolution_index: 4,
             output_framerate_index: 5,
+            // All three differ from the serde defaults (true / 0 / 0) so
+            // a deserialization that silently fell back to the defaults
+            // is caught by the assertions below.
+            output_has_alpha: false,
+            output_color_space_index: 1,
+            output_msaa_index: 3,
             // Distinctive non-default values so a missing-field
             // deserialization that filled in `None` would be caught
             // by the assertions below. The captured-at* / frame_count
@@ -233,6 +264,7 @@ mod profile_roundtrip_tests {
                     depths_m: vec![1.80, 1.85, 1.78, 1.83],
                     bbox_normalized: [0.30, 0.20, 0.70, 0.65],
                 }),
+                neutral_expressions: Vec::new(),
             }),
         }
     }
@@ -272,6 +304,9 @@ mod profile_roundtrip_tests {
         assert_eq!(r.output_sink_index, o.output_sink_index);
         assert_eq!(r.output_resolution_index, o.output_resolution_index);
         assert_eq!(r.output_framerate_index, o.output_framerate_index);
+        assert_eq!(r.output_has_alpha, o.output_has_alpha);
+        assert_eq!(r.output_color_space_index, o.output_color_space_index);
+        assert_eq!(r.output_msaa_index, o.output_msaa_index);
 
         // pose_calibration must round-trip every field — the per-axis
         // anchor + depth + jitter + range values all drive solver
@@ -390,13 +425,15 @@ mod profile_roundtrip_tests {
 
     #[test]
     fn import_rejects_missing_required_fields() {
-        // Today there are no `#[serde(default)]` attributes on
-        // StreamProfile, so a partial JSON must error rather than
-        // silently fill in zeros. If a future change adds serde
-        // defaults for backwards compat, this test will start passing
-        // unexpectedly — that's the moment to revisit whether the
-        // chosen default is what the GUI actually wants and to expand
-        // the round-trip coverage above to pin the new defaults.
+        // The core fields (tracking_mirror, lighting, fov, sink /
+        // resolution / framerate indices) carry no `#[serde(default)]`,
+        // so a partial JSON must error rather than silently fill in
+        // zeros. Only later-added fields (pose_calibration, the output
+        // alpha / colour-space / MSAA trio) default for backwards
+        // compat. If a future change adds defaults to the core fields,
+        // this test will start passing unexpectedly — that's the moment
+        // to revisit whether the chosen default is what the GUI
+        // actually wants and to expand the round-trip coverage above.
         let dir = make_tempdir("partial");
         let path = dir.join("partial.json");
         // Missing every field except `name`.

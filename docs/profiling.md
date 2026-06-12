@@ -8,7 +8,8 @@ and identifies the known bottlenecks discovered during initial tuning.
 Related documents:
 
 - [threading-model.md](threading-model.md)
-- [renderer-implementation-brief.md](renderer-implementation-brief.md)
+- [vulkano-renderer-design.md](vulkano-renderer-design.md)
+- [gpu-runtime-roadmap.md](gpu-runtime-roadmap.md)
 
 ## Quick Start
 

@@ -23,10 +23,12 @@ struct DetectRequest {
     rgb: Vec<u8>,
     width: u32,
     height: u32,
+    generation: u64,
 }
 
 pub(super) struct DetectResult {
     pub bbox: Option<PersonBbox>,
+    pub generation: u64,
 }
 
 pub(super) struct DetectOutbox {
@@ -38,6 +40,10 @@ pub(super) struct YoloxWorker {
     tx: Option<Sender<DetectRequest>>,
     outbox: Arc<DetectOutbox>,
     thread: Option<thread::JoinHandle<()>>,
+    /// Temporal-state generation; results from an older generation
+    /// are in-flight leftovers of a previous input (see the DAv2
+    /// worker's equivalent guard) and are treated as absent.
+    generation: u64,
 }
 
 impl YoloxWorker {
@@ -56,6 +62,7 @@ impl YoloxWorker {
             tx: Some(tx),
             outbox,
             thread: Some(thread),
+            generation: 0,
         })
     }
 
@@ -68,6 +75,7 @@ impl YoloxWorker {
                 rgb: rgb.to_vec(),
                 width,
                 height,
+                generation: self.generation,
             });
         }
     }
@@ -78,7 +86,7 @@ impl YoloxWorker {
     /// frames until the worker writes a newer one.
     pub fn wait_latest(&self) -> Arc<DetectResult> {
         let mut slot = self.outbox.slot.lock().unwrap();
-        while slot.is_none() {
+        while !matches!(&*slot, Some(r) if r.generation == self.generation) {
             slot = self.outbox.cvar.wait(slot).unwrap();
         }
         Arc::clone(slot.as_ref().unwrap())
@@ -88,7 +96,21 @@ impl YoloxWorker {
     /// has produced anything. Used to decide whether to force a
     /// submit even outside the refresh period (cold-start safeguard).
     pub fn has_result(&self) -> bool {
-        self.outbox.slot.lock().unwrap().is_some()
+        matches!(
+            &*self.outbox.slot.lock().unwrap(),
+            Some(r) if r.generation == self.generation
+        )
+    }
+
+    /// Drop the sticky result, restoring cold-start semantics: the
+    /// next pipeline call re-submits and blocks for a fresh
+    /// detection. Part of `reset_temporal_state` — without this the
+    /// sticky bbox from one input leaks into the next unrelated one
+    /// (measured at up to 7° of solver error on the deskcrop
+    /// validation set when image N runs inside image N-1's bbox).
+    pub fn clear_result(&mut self) {
+        *self.outbox.slot.lock().unwrap() = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -113,7 +135,10 @@ fn worker_loop(
             req = newer;
         }
         let bbox = detector.detect_largest_person(&req.rgb, req.width, req.height);
-        let result = Arc::new(DetectResult { bbox });
+        let result = Arc::new(DetectResult {
+            bbox,
+            generation: req.generation,
+        });
         {
             let mut slot = outbox.slot.lock().unwrap();
             *slot = Some(result);

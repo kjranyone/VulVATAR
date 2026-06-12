@@ -174,11 +174,11 @@ pub struct FaceBbox {
 
 /// Which execution provider to use for FaceMesh + Blendshape.
 ///
-/// `Auto` is right when nothing else heavy uses DirectML (standalone
-/// `rtmw3d` provider): GPU runs the small face cascade in ~3 ms.
-/// `ForceCpu` is right when DAv2 / MoGe is colocated on DirectML
-/// (depth-aware providers): ~7 ms on CPU avoids the 13 ms-tier
-/// inflation we observed under DirectML EP queue contention.
+/// `Auto` is right when nothing else heavy uses DirectML: GPU runs
+/// the small face cascade in ~3 ms. `ForceCpu` is right when DAv2 is
+/// colocated on DirectML (the depth stage): ~7 ms on CPU avoids the
+/// 13 ms-tier inflation we observed under DirectML EP queue
+/// contention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceMeshEp {
     Auto,
@@ -686,6 +686,30 @@ fn map_blendshapes_to_expressions(weights: &[f32; FACE_BLENDSHAPE_COUNT]) -> Vec
     out.push(SourceExpression {
         name: "aa".into(),
         weight: jaw_open,
+    });
+    // Image-based viseme shapes beyond open/close, so a VRM rig's
+    // `ih`/`ou`/`ee`/`oh` mouth presets get a richer signal from the
+    // camera (the "image lip-sync" path). Approximate ARKit→viseme map:
+    //   ih (wide)    ← mouthStretch L/R
+    //   ou (pursed)  ← mouthPucker
+    //   oh (rounded) ← mouthFunnel
+    //   ee           ← wide + a little jaw
+    let stretch = ((weights[46] + weights[47]) * 0.5).clamp(0.0, 1.0);
+    out.push(SourceExpression {
+        name: "ih".into(),
+        weight: stretch,
+    });
+    out.push(SourceExpression {
+        name: "ou".into(),
+        weight: weights[38].clamp(0.0, 1.0),
+    });
+    out.push(SourceExpression {
+        name: "oh".into(),
+        weight: weights[32].clamp(0.0, 1.0),
+    });
+    out.push(SourceExpression {
+        name: "ee".into(),
+        weight: (stretch * 0.6 + jaw_open * 0.4).clamp(0.0, 1.0),
     });
     let smile = ((weights[44] + weights[45]) * 0.5).clamp(0.0, 1.0);
     out.push(SourceExpression {

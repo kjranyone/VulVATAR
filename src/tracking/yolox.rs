@@ -50,7 +50,7 @@ use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::Path;
 
-use super::rtmw3d::{build_session, InferenceBackend};
+use super::rtmw3d::{build_session_cpu_only, InferenceBackend};
 
 const MMDEPLOY_INPUT_SIZE: u32 = 640;
 const RAW_INPUT_SIZE: u32 = 416;
@@ -146,6 +146,19 @@ impl YoloxPersonDetector {
     /// Try to load a YOLOX person detector. Returns `Ok(None)` if no
     /// supported model is present, so the caller can fall back to
     /// whole-frame RTMW3D.
+    ///
+    /// **CPU EP only, by design.** YOLOX runs on its own worker
+    /// thread; on DirectML it was the second concurrent DirectML
+    /// session submitting to the same GPU device as RTMW3D from a
+    /// different thread, on top of the Vulkan render queue. This
+    /// codebase has two recorded driver-hang incidents from exactly
+    /// that stacking pattern (FaceMesh contention inflation, DAv2 TDR
+    /// 0x116, and the 2026-06-11 Arc B570 system freeze under
+    /// investigation). The detector is small, runs every
+    /// `YOLOX_REFRESH_PERIOD` frames on a dedicated thread, and its
+    /// result is consumed via a sticky outbox — CPU latency is hidden
+    /// by design, and the 25% downstream bbox pad absorbs the extra
+    /// staleness.
     pub fn try_from_models_dir(dir: &Path) -> Result<Option<Self>, String> {
         let (path, schema, input_size) = {
             let mmdeploy = dir.join("yolox.onnx");
@@ -166,7 +179,10 @@ impl YoloxPersonDetector {
         let model_path = path
             .to_str()
             .ok_or_else(|| "YOLOX: model path is not valid UTF-8".to_string())?;
-        let (session, backend) = build_session(model_path, 1, "YOLOX")
+        // 2 intra-op threads: enough to keep YOLOX-m near real-time on
+        // CPU without starving RTMW3D's own 4 pre/post threads on the
+        // tracking thread.
+        let (session, backend) = build_session_cpu_only(model_path, 2, "YOLOX")
             .map_err(|e| format!("YOLOX: failed to build session: {}", e))?;
         let input_name = session
             .inputs()

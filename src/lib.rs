@@ -3,6 +3,7 @@ pub mod asset;
 pub mod avatar;
 pub mod editor;
 pub mod frame_handoff;
+pub mod gpu_coordination;
 pub mod gui;
 pub mod i18n;
 pub mod lipsync;

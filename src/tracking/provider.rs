@@ -1,30 +1,60 @@
-//! Pose provider boundary for swapping tracking pipelines.
+//! Pose provider boundary.
 //!
-//! `TrackingWorker` talks to this module instead of binding directly to a
-//! specific model. That keeps RTMW3D as the default path while making the
-//! experimental CIGPose + metric-depth pipeline selectable and easy to
-//! compare or roll back.
+//! `TrackingWorker` talks to this module instead of binding directly to
+//! a specific model. There is a single production pipeline: RTMW3D
+//! (body + hands + face) with an async Depth Anything V2 metric-depth
+//! stage. When `dav2_small.onnx` is absent the provider runs the same
+//! pipeline without the depth stage (z falls back to RTMW3D's
+//! body-prior synthetic), so one provider covers both the fast and the
+//! accurate configuration.
 
 use std::path::Path;
 
-use super::cigpose_metric_depth::CigposeMetricDepthProvider;
 use super::rtmw3d_with_depth::Rtmw3dWithDepthProvider;
-use super::vitpose_provider::VitposeWholebodyProvider;
-use super::hmr2_provider::Hmr2Provider;
-use super::vitpose_rtmw3d_hybrid::VitposeRtmw3dHybridProvider;
-use super::vitpose_with_depth::VitposeWithDepthProvider;
 use super::PoseEstimate;
 
-/// Selects which tracking pipeline runs. Set to one of:
-///
-/// * `rtmw3d` (default) — single-pass 3D body+hands+face, fast,
-///   z is hip-relative synthetic from a body prior.
-/// * `rtmw3d-with-depth` — RTMW3D 2D + Depth Anything V2 Small
-///   relative depth + body-anchor calibration. Real measured z, sized
-///   for ~30 fps streaming.
-/// * `cigpose-metric-depth` — CIGPose 2D + MoGe-2 true metric
-///   depth. Highest depth accuracy, slow (~3 fps) — reference path.
-pub const POSE_PROVIDER_ENV: &str = "VULVATAR_POSE_PROVIDER";
+/// User-facing pipeline configuration, bound once at tracking start.
+/// Surfaced as toggles in the Tracking inspector and persisted with
+/// the project; the safe-mode banner substitutes
+/// [`TrackingPipelineConfig::safe_mode`] after an unclean exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackingPipelineConfig {
+    /// Run the async DAv2 metric-depth stage (requires
+    /// `models/dav2_small.onnx`; missing model degrades with a
+    /// visible warning).
+    pub depth_enabled: bool,
+    /// Force every ONNX session onto the CPU EP, keeping DirectML —
+    /// and the GPU driver's compute queue — out of the tracking
+    /// pipeline entirely. Slower, but isolates tracking from
+    /// GPU-driver instability (see the 2026-06-11 freeze incident).
+    pub force_cpu: bool,
+    /// Run the YOLOX person-crop stage; off falls back to whole-frame
+    /// RTMW3D inference.
+    pub yolox_enabled: bool,
+}
+
+impl Default for TrackingPipelineConfig {
+    fn default() -> Self {
+        Self {
+            depth_enabled: true,
+            force_cpu: false,
+            yolox_enabled: true,
+        }
+    }
+}
+
+impl TrackingPipelineConfig {
+    /// Degraded configuration offered after an unclean exit: no
+    /// DirectML sessions, no depth stage, no person crop. Trades
+    /// accuracy and latency for the most conservative driver load.
+    pub fn safe_mode() -> Self {
+        Self {
+            depth_enabled: false,
+            force_cpu: true,
+            yolox_enabled: false,
+        }
+    }
+}
 
 /// Runtime pose-estimation implementation used by the tracking worker.
 pub trait PoseProvider {
@@ -47,20 +77,18 @@ pub trait PoseProvider {
     /// Update the provider's view of the user's pose calibration. The
     /// tracking worker calls this each iteration with the latest value
     /// from `Application::tracking_calibration.pose` (forwarded via
-    /// the calibration mailbox); providers that route the depth
-    /// pipeline use it to switch anchor selection (`Upper Body` mode
-    /// forces shoulder anchor) and — eventually — to clamp the
-    /// metric calibration scale against the captured jitter range.
-    /// The default no-op covers providers without a depth path.
+    /// the calibration mailbox); the depth pipeline uses it to switch
+    /// anchor selection (`Upper Body` mode forces shoulder anchor) and
+    /// to clamp the metric calibration scale against the captured
+    /// jitter range.
     fn set_calibration(&mut self, _calibration: Option<crate::tracking::PoseCalibration>) {}
 
     /// Toggle per-frame torso depth capture on/off. While enabled the
-    /// depth-aware providers accumulate one `TorsoDepthGridFrame`
-    /// per inference frame (subject to the visibility-floor gate)
-    /// into an internal buffer. The GUI calibration-modal flips this
-    /// on at the start of `Collecting`, off when the window closes,
-    /// then calls [`take_torso_template`] to harvest the
-    /// median-aggregated result.
+    /// depth stage accumulates one `TorsoDepthGridFrame` per inference
+    /// frame (subject to the visibility-floor gate) into an internal
+    /// buffer. The GUI calibration-modal flips this on at the start of
+    /// `Collecting`, off when the window closes, then calls
+    /// [`take_torso_template`] to harvest the median-aggregated result.
     ///
     /// **Why a stateful capture mode rather than streaming the depth
     /// map every frame**: the depth map is large (frame.width ×
@@ -70,24 +98,32 @@ pub trait PoseProvider {
     /// the per-frame mailbox-cloning cost for the 99.9% of frames
     /// where no calibration is in flight.
     ///
-    /// Default no-op covers providers without a depth path (rtmw3d-only).
+    /// [`take_torso_template`]: Self::take_torso_template
     fn set_torso_capture(&mut self, _enabled: bool) {}
 
     /// Drain the accumulated torso depth template from the provider
     /// and return its median-aggregated form, or `None` when no
     /// frames cleared the visibility floor during the most recent
-    /// capture window. Resets the internal buffer so a subsequent
-    /// capture starts clean.
+    /// capture window (or the depth stage is disabled). Resets the
+    /// internal buffer so a subsequent capture starts clean.
     ///
     /// The GUI calibration-modal calls this once when transitioning
     /// `Collecting → AnchorDone`, stitches the result onto the
     /// `PoseCalibration` it just finalized, and re-publishes the
     /// enriched calibration via the mailbox.
-    ///
-    /// Default no-op covers providers without a depth path.
     fn take_torso_template(&mut self) -> Option<crate::tracking::TorsoDepthTemplate> {
         None
     }
+
+    /// Reset per-session temporal state: wrist temporal holds, the
+    /// sticky depth outbox, smoothing EMAs, self-tracking crop.
+    /// Called between *unrelated* inputs — `validate_pipeline` calls
+    /// this before every image so image N's sticky depth map and
+    /// temporal holds can't contaminate image N+1's skeleton (the
+    /// depth path otherwise reuses the previous image's depth for 3
+    /// of every 4 frames via `DEPTH_REFRESH_PERIOD`). Live tracking
+    /// never calls it mid-session.
+    fn reset_temporal_state(&mut self) {}
 
     /// Hint from the GUI about the calibration mode the user is *currently
     /// collecting* (modal open, samples about to flow), independent of any
@@ -111,227 +147,15 @@ pub trait PoseProvider {
     ///   every collected sample.)
     /// * `None` → modal closed, fall back to the persisted calibration's
     ///   mode.
-    ///
-    /// Default no-op covers providers that don't differentiate anchor
-    /// modes.
     fn set_calibration_mode_hint(&mut self, _hint: Option<crate::tracking::CalibrationMode>) {}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PoseProviderKind {
-    Rtmw3d,
-    Rtmw3dWithDepth,
-    CigposeMetricDepth,
-    VitposeWholebody,
-    VitposeWithDepth,
-    VitposeRtmw3dHybrid,
-    Hmr2,
-}
-
-impl PoseProviderKind {
-    pub fn from_env() -> Result<Self, String> {
-        let raw = std::env::var(POSE_PROVIDER_ENV).unwrap_or_else(|_| "rtmw3d".to_string());
-        Self::parse(&raw).ok_or_else(|| {
-            format!(
-                "unknown pose provider '{}'. Set {} to one of: rtmw3d, rtmw3d-with-depth, cigpose-metric-depth, vitpose-wholebody",
-                raw, POSE_PROVIDER_ENV
-            )
-        })
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
-        match normalized.as_str() {
-            "" | "rtmw3d" | "rtmpose3d" => Some(Self::Rtmw3d),
-            "rtmw3d-with-depth" | "rtmw3d-depth" | "rtmw3d-da" | "rtmw3d-dav2" | "rtmw3d+dav2" => {
-                Some(Self::Rtmw3dWithDepth)
-            }
-            "cig-depth"
-            | "cigpose-depth"
-            | "cigpose-depth-anything"
-            | "cigpose-metric-depth"
-            | "cigpose-metric"
-            | "cigpose-3d" => Some(Self::CigposeMetricDepth),
-            "vitpose" | "vitpose-wholebody" | "vit-pose" | "vitpose-s" | "vitpose-s-wholebody" => {
-                Some(Self::VitposeWholebody)
-            }
-            "vitpose-with-depth"
-            | "vitpose-depth"
-            | "vitpose-da"
-            | "vitpose-dav2"
-            | "vitpose+dav2" => Some(Self::VitposeWithDepth),
-            "vitpose-rtmw3d"
-            | "vitpose+rtmw3d"
-            | "vitpose-rtmw3d-hybrid"
-            | "vitpose-rtmw3d-z"
-            | "hybrid" => Some(Self::VitposeRtmw3dHybrid),
-            "hmr2" | "4d-humans" | "smpl" => Some(Self::Hmr2),
-            _ => None,
-        }
-    }
-}
-
-pub fn create_pose_provider_from_env(
-    models_dir: impl AsRef<Path>,
-) -> Result<Box<dyn PoseProvider>, String> {
-    create_pose_provider(PoseProviderKind::from_env()?, models_dir)
-}
-
+/// Build the production pose provider: RTMW3D with the async DAv2
+/// metric-depth stage, shaped by the user's pipeline configuration.
 pub fn create_pose_provider(
-    kind: PoseProviderKind,
     models_dir: impl AsRef<Path>,
+    config: TrackingPipelineConfig,
 ) -> Result<Box<dyn PoseProvider>, String> {
-    match kind {
-        PoseProviderKind::Rtmw3d => create_rtmw3d_provider(models_dir),
-        PoseProviderKind::Rtmw3dWithDepth => Rtmw3dWithDepthProvider::from_models_dir(models_dir)
-            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
-        PoseProviderKind::CigposeMetricDepth => {
-            CigposeMetricDepthProvider::from_models_dir(models_dir)
-                .map(|p| Box::new(p) as Box<dyn PoseProvider>)
-        }
-        PoseProviderKind::VitposeWholebody => VitposeWholebodyProvider::from_models_dir(models_dir)
-            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
-        PoseProviderKind::VitposeWithDepth => VitposeWithDepthProvider::from_models_dir(models_dir)
-            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
-        PoseProviderKind::VitposeRtmw3dHybrid => {
-            VitposeRtmw3dHybridProvider::from_models_dir(models_dir)
-                .map(|p| Box::new(p) as Box<dyn PoseProvider>)
-        }
-        PoseProviderKind::Hmr2 => Hmr2Provider::from_models_dir(models_dir)
-            .map(|p| Box::new(p) as Box<dyn PoseProvider>),
-    }
-}
-
-#[cfg(feature = "inference")]
-fn create_rtmw3d_provider(models_dir: impl AsRef<Path>) -> Result<Box<dyn PoseProvider>, String> {
-    Rtmw3dPoseProvider::from_models_dir(models_dir).map(|p| Box::new(p) as Box<dyn PoseProvider>)
-}
-
-#[cfg(not(feature = "inference"))]
-fn create_rtmw3d_provider(_: impl AsRef<Path>) -> Result<Box<dyn PoseProvider>, String> {
-    Err("RTMW3D provider requires the `inference` cargo feature".to_string())
-}
-
-#[cfg(feature = "inference")]
-struct Rtmw3dPoseProvider {
-    inner: super::rtmw3d::Rtmw3dInference,
-}
-
-#[cfg(feature = "inference")]
-impl Rtmw3dPoseProvider {
-    fn from_models_dir(models_dir: impl AsRef<Path>) -> Result<Self, String> {
-        Ok(Self {
-            inner: super::rtmw3d::Rtmw3dInference::from_models_dir(models_dir)?,
-        })
-    }
-}
-
-#[cfg(feature = "inference")]
-impl PoseProvider for Rtmw3dPoseProvider {
-    fn label(&self) -> String {
-        format!("RTMW3D / {}", self.inner.backend().label())
-    }
-
-    fn take_load_warnings(&mut self) -> Vec<String> {
-        self.inner.take_load_warnings()
-    }
-
-    fn estimate_pose(
-        &mut self,
-        rgb_data: &[u8],
-        width: u32,
-        height: u32,
-        frame_index: u64,
-    ) -> PoseEstimate {
-        self.inner
-            .estimate_pose(rgb_data, width, height, frame_index)
-    }
-
-    /// Match the depth-aware providers' policy: in `UpperBody` mode the
-    /// hip pair is treated as not-visible upstream so phantom legs
-    /// don't enter the source skeleton. The depth-aware path uses
-    /// [`super::skeleton_from_depth::build_options_from_calibration`]
-    /// to derive the same flag from the calibration; this is the
-    /// non-depth equivalent.
-    fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
-        self.inner.force_shoulder_anchor = calibration
-            .map(|c| matches!(c.mode, crate::tracking::CalibrationMode::UpperBody))
-            .unwrap_or(false);
-    }
-
-    /// Forward the GUI's calibration-modal mode straight through —
-    /// `Rtmw3dInference::process_pose` interprets it as an
-    /// **override** of the persisted `force_shoulder_anchor` flag (so
-    /// `Some(FullBody)` clears the flag the persisted UpperBody
-    /// calibration set, allowing re-calibration; `Some(UpperBody)`
-    /// sets it even when no calibration has been persisted yet;
-    /// `None` falls back to the persisted value).
-    fn set_calibration_mode_hint(&mut self, hint: Option<crate::tracking::CalibrationMode>) {
-        self.inner.force_shoulder_anchor_hint = hint;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{PoseProviderKind, POSE_PROVIDER_ENV};
-
-    #[test]
-    fn parses_pose_provider_aliases() {
-        assert_eq!(
-            PoseProviderKind::parse("rtmw3d"),
-            Some(PoseProviderKind::Rtmw3d)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("rtmpose3d"),
-            Some(PoseProviderKind::Rtmw3d)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("cigpose_depth"),
-            Some(PoseProviderKind::CigposeMetricDepth)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("cigpose-metric-depth"),
-            Some(PoseProviderKind::CigposeMetricDepth)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("rtmw3d-with-depth"),
-            Some(PoseProviderKind::Rtmw3dWithDepth)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("rtmw3d_with_depth"),
-            Some(PoseProviderKind::Rtmw3dWithDepth)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("rtmw3d-da"),
-            Some(PoseProviderKind::Rtmw3dWithDepth)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("vitpose"),
-            Some(PoseProviderKind::VitposeWholebody)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("vitpose-wholebody"),
-            Some(PoseProviderKind::VitposeWholebody)
-        );
-        assert_eq!(
-            PoseProviderKind::parse("vitpose_s_wholebody"),
-            Some(PoseProviderKind::VitposeWholebody)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_pose_provider() {
-        let err = PoseProviderKind::parse("depth-only");
-        assert_eq!(err, None);
-
-        let message = PoseProviderKind::parse("depth-only")
-            .ok_or_else(|| {
-                format!(
-                    "unknown pose provider 'depth-only'. Set {} to one of: rtmw3d, cigpose-metric-depth",
-                    POSE_PROVIDER_ENV
-                )
-            })
-            .unwrap_err();
-        assert!(message.contains(POSE_PROVIDER_ENV));
-    }
+    Rtmw3dWithDepthProvider::from_models_dir_with_config(models_dir, config)
+        .map(|p| Box::new(p) as Box<dyn PoseProvider>)
 }

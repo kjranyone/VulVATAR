@@ -1,7 +1,7 @@
 use eframe::egui;
 
-use crate::gui::components::{filled_button, outlined_button};
-use crate::gui::theme::{color, icon as ic};
+use crate::gui::components::{filled_button, tonal_button, ButtonTone};
+use crate::gui::theme::icon as ic;
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -16,11 +16,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if outlined_button(
+                if tonal_button(
                     ui,
                     Some(ic::ADD),
                     &t!("inspector.new_overlay"),
-                    color::PRIMARY,
+                    ButtonTone::Primary,
                     true,
                 )
                 .clicked()
@@ -71,11 +71,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 ui.selectable_value(&mut state.cloth_authoring.material_pick_index, i, name);
                             }
                         });
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         None,
                         &t!("inspector.select_by_material"),
-                        color::PRIMARY,
+                        ButtonTone::Primary,
                         true,
                     )
                     .clicked()
@@ -95,11 +95,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         None,
                         &t!("inspector.grow_selection"),
-                        color::PRIMARY,
+                        ButtonTone::Primary,
                         true,
                     )
                     .clicked()
@@ -108,11 +108,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                             sel.grow_selection(&avatar.asset);
                         }
                     }
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         None,
                         &t!("inspector.shrink_selection"),
-                        color::PRIMARY,
+                        ButtonTone::Primary,
                         true,
                     )
                     .clicked()
@@ -121,11 +121,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                             sel.shrink_selection(&avatar.asset);
                         }
                     }
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         None,
                         &t!("inspector.clear_selection"),
-                        color::ERROR,
+                        ButtonTone::Error,
                         true,
                     )
                     .clicked()
@@ -465,29 +465,29 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.cloth_simulation"));
 
                 ui.horizontal(|ui| {
-                    if state.cloth_authoring.sim_playing {
-                        if outlined_button(
-                            ui,
-                            Some(ic::PAUSE),
-                            &t!("inspector.pause"),
-                            color::PRIMARY,
-                            true,
-                        )
-                        .clicked()
+                    if state.cloth_authoring.sim_paused {
+                        if filled_button(ui, Some(ic::PLAY), &t!("inspector.play"), true)
+                            .clicked()
                         {
-                            state.cloth_authoring.sim_playing = false;
+                            state.cloth_authoring.sim_paused = false;
                         }
-                    } else if filled_button(ui, Some(ic::PLAY), &t!("inspector.play"), true)
-                        .clicked()
+                    } else if tonal_button(
+                        ui,
+                        Some(ic::PAUSE),
+                        &t!("inspector.pause"),
+                        ButtonTone::Primary,
+                        true,
+                    )
+                    .clicked()
                     {
-                        state.cloth_authoring.sim_playing = true;
+                        state.cloth_authoring.sim_paused = true;
                     }
-                    if outlined_button(ui, None, &t!("inspector.step"), color::PRIMARY, true)
+                    if tonal_button(ui, None, &t!("inspector.step"), ButtonTone::Primary, true)
                         .clicked()
                     {
                         crate::simulation::cloth_solver::step_cloth(1.0 / 60.0, avatar, &[]);
                     }
-                    if outlined_button(ui, None, &t!("inspector.reset"), color::ERROR, true)
+                    if tonal_button(ui, None, &t!("inspector.reset"), ButtonTone::Error, true)
                         .clicked()
                     {
                         avatar.cloth_sim = None;

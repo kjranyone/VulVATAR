@@ -1,23 +1,64 @@
 //! Shared "2D keypoints + per-pixel metric depth → SourceSkeleton"
-//! pipeline used by both [`super::cigpose_metric_depth`] and
-//! [`super::rtmw3d_with_depth`].
+//! pipeline, consumed by [`super::rtmw3d_with_depth`].
 //!
-//! The two providers feed differently-sourced 2D keypoints (CIGPose
-//! and RTMW3D respectively) and differently-derived depth maps (MoGe
-//! true-metric vs DAv2 calibrated-relative), but both produce a
-//! [`super::metric_depth::MoGeFrame`]-shaped point cloud and consume
-//! [`super::cigpose::DecodedJoint2d`]-shaped 2D landmarks. The
+//! The provider feeds RTMW3D-sourced 2D keypoints and a DAv2
+//! calibrated-relative depth map shaped as a [`MetricDepthFrame`]
+//! point cloud with [`DecodedJoint2d`]-shaped 2D landmarks. The
 //! skeleton-building math (origin selection, axis flips, hand chain
-//! attachment, head-pose derivation) is identical past that point —
-//! keeping it single-sourced here avoids the two providers drifting.
+//! attachment, head-pose derivation) is single-sourced here.
 
 use crate::asset::HumanoidBone;
 
-use super::cigpose::DecodedJoint2d;
-use super::face_mediapipe::{derive_face_bbox, FaceBbox};
-use super::metric_depth::{FrameCrop, MoGeFrame};
 use super::source_skeleton::HandOrientation;
-use super::{FacePose, SourceJoint, SourceSkeleton};
+use super::{SourceJoint, SourceSkeleton};
+
+/// Number of COCO-Wholebody keypoints every 2D decode emits.
+pub const NUM_JOINTS: usize = 133;
+
+/// A decoded whole-frame 2D keypoint, normalised image-relative.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodedJoint2d {
+    /// Image-relative `[0, 1]`, x-right.
+    pub nx: f32,
+    /// Image-relative `[0, 1]`, y-down.
+    pub ny: f32,
+    /// Confidence in `[0, 1]`.
+    pub score: f32,
+}
+
+/// Describes the region of the full camera frame that a depth map
+/// covers when the depth model was fed a cropped (person-only) input
+/// rather than the full frame. All values are in normalised
+/// full-frame coordinates `[0, 1]`. `None` on `MetricDepthFrame::crop`
+/// means the depth map covers the entire frame.
+#[derive(Clone, Debug)]
+pub struct FrameCrop {
+    /// Left edge of the crop in normalised full-frame X.
+    pub x1_frac: f32,
+    /// Top edge of the crop in normalised full-frame Y.
+    pub y1_frac: f32,
+    /// Width of the crop as a fraction of full-frame width.
+    pub w_frac: f32,
+    /// Height of the crop as a fraction of full-frame height.
+    pub h_frac: f32,
+}
+
+/// Per-pixel metric point cloud, in metres, in the depth model's
+/// input pixel grid (`width × height`). Invalid pixels (mask below
+/// threshold or non-finite output) are stored as `NaN` in `points_m`
+/// so the consumer's local-window median sampling naturally rejects
+/// them. Per-pixel metric Z is `points_m[i][2]` — no separate depth
+/// map is kept since the only current consumer samples the full xyz,
+/// not depth alone.
+pub struct MetricDepthFrame {
+    pub width: u32,
+    pub height: u32,
+    pub points_m: Vec<[f32; 3]>,
+    /// If this frame was produced from a cropped input (e.g. DAv2 fed
+    /// a YOLOX person crop), the crop region in full-frame normalised
+    /// coordinates. `None` means the depth map covers the entire frame.
+    pub crop: Option<FrameCrop>,
+}
 
 /// Per-keypoint visibility floor — anything below is treated as "no
 /// detection" rather than a low-confidence detection. The user-tunable
@@ -45,7 +86,7 @@ fn remap_to_crop(crop: &FrameCrop, nx: f32, ny: f32) -> Option<(f32, f32)> {
 
 /// デプスフレームの解像度上で、肩幅ピクセル数に応じた安全なサンプリング半径を計算。
 /// 肩幅の 1/4 を超えないよう制限し、最小 0 (単一ピクセル)、最大 SAMPLE_RADIUS_PX。
-pub fn adaptive_sample_radius(depth_frame: &MoGeFrame, shoulder_px_span: Option<f32>) -> i32 {
+pub fn adaptive_sample_radius(_depth_frame: &MetricDepthFrame, shoulder_px_span: Option<f32>) -> i32 {
     match shoulder_px_span {
         Some(span) if span > 0.0 => {
             let max_safe = (span * 0.25).floor() as i32;
@@ -54,8 +95,6 @@ pub fn adaptive_sample_radius(depth_frame: &MoGeFrame, shoulder_px_span: Option<
         _ => SAMPLE_RADIUS_PX, // フォールバック: 固定値
     }
 }
-
-const NUM_JOINTS: usize = 133;
 
 // ---------------------------------------------------------------------------
 // COCO-Wholebody index → HumanoidBone tables. Same convention RTMW3D
@@ -142,7 +181,7 @@ pub(super) const HAND_TIPS_LEFT: &[(usize, HumanoidBone)] = &[
 /// `(nx, ny)` keypoint with a local-window median. Returns `None` when
 /// the keypoint falls outside the frame or every sample in the window
 /// is masked / non-finite.
-pub fn sample_metric_point(frame: &MoGeFrame, nx: f32, ny: f32) -> Option<[f32; 3]> {
+pub fn sample_metric_point(frame: &MetricDepthFrame, nx: f32, ny: f32) -> Option<[f32; 3]> {
     sample_metric_point_with_radius(frame, nx, ny, SAMPLE_RADIUS_PX)
 }
 
@@ -150,7 +189,7 @@ pub fn sample_metric_point(frame: &MoGeFrame, nx: f32, ny: f32) -> Option<[f32; 
 /// half-size as an argument. Used by diagnostics to compare radius=0
 /// (single pixel) / 1 (3×3) / 3 (7×7, the runtime default).
 pub fn sample_metric_point_with_radius(
-    frame: &MoGeFrame,
+    frame: &MetricDepthFrame,
     nx: f32,
     ny: f32,
     radius_px: i32,
@@ -225,7 +264,7 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
 /// 13 body keypoints, plus all face / hand keypoints, continue to
 /// use the vanilla median sample which trusts the keypoint position.
 pub fn sample_metric_point_back_percentile(
-    frame: &MoGeFrame,
+    frame: &MetricDepthFrame,
     nx: f32,
     ny: f32,
 ) -> Option<[f32; 3]> {
@@ -258,7 +297,7 @@ const SURFACE_BAND_HALF_M: f32 = 0.50;
 /// window half-size as an argument. Mirrors the
 /// [`sample_metric_point_with_radius`] split for diagnostic use.
 pub fn sample_metric_point_back_percentile_with_radius(
-    frame: &MoGeFrame,
+    frame: &MetricDepthFrame,
     nx: f32,
     ny: f32,
     radius_px: i32,
@@ -407,7 +446,7 @@ impl TorsoCaptureBuffer {
     /// variant could fall back to "shoulder line + a fixed offset"
     /// or to MediaPipe's torso segmentation, but that's outside the
     /// minimum-version scope.
-    pub fn add_frame(&mut self, joints: &[DecodedJoint2d], frame: &MoGeFrame) -> bool {
+    pub fn add_frame(&mut self, joints: &[DecodedJoint2d], frame: &MetricDepthFrame) -> bool {
         if joints.len() < NUM_JOINTS {
             return false;
         }
@@ -610,7 +649,7 @@ const TEMPLATE_BIAS_BAND_M: f32 = 0.5;
 pub fn compute_torso_bias(
     template: &crate::tracking::TorsoDepthTemplate,
     joints: &[DecodedJoint2d],
-    frame: &MoGeFrame,
+    frame: &MetricDepthFrame,
 ) -> Option<f32> {
     let bbox = current_torso_bbox(joints)?;
     let cur_w = bbox[2] - bbox[0];
@@ -734,12 +773,10 @@ pub struct BuildOptions {
     pub subject_lower_arm_m: Option<f32>,
 }
 
-/// Build [`BuildOptions`] from the depth-providers' cached
+/// Build [`BuildOptions`] from the provider's cached
 /// `pose_calibration` and the GUI's transient calibration-modal mode
-/// hint. Single-sourced so both depth providers
-/// (rtmw3d-with-depth, cigpose-metric-depth) compute the same opts
-/// and any future calibration-derived knob (c-clamp from jitter,
-/// anchor-bias rejection) lands in one place.
+/// hint. Single-sourced so any future calibration-derived knob
+/// (c-clamp from jitter, anchor-bias rejection) lands in one place.
 ///
 /// `mode_hint` carries the mode the user has selected in the
 /// **currently open** calibration modal. When `Some`, it **overrides**
@@ -787,7 +824,7 @@ pub(super) fn build_options_from_calibration(
 }
 
 /// Resolve the body anchor origin in metric camera-space coords.
-/// Hip mid is preferred (CIGPose 11/12); falls back to shoulder mid
+/// Hip mid is preferred (COCO 11/12); falls back to shoulder mid
 /// (5/6) for upper-body crops. Returns `None` when neither pair is
 /// usable — the frame produces no skeleton.
 ///
@@ -795,7 +832,7 @@ pub(super) fn build_options_from_calibration(
 /// see [`BuildOptions`] for the defensive rationale.
 pub(super) fn resolve_origin_metric(
     joints: &[DecodedJoint2d],
-    depth: &MoGeFrame,
+    depth: &MetricDepthFrame,
     opts: BuildOptions,
     calibration: Option<&crate::tracking::PoseCalibration>,
 ) -> Option<ResolvedAnchor> {
@@ -841,7 +878,7 @@ pub(super) fn resolve_origin_metric(
         adaptive_sample_radius(depth, shoulder_px_span)
     };
 
-    let sample_metric_point_back_percentile = |frame: &MoGeFrame, nx: f32, ny: f32| {
+    let sample_metric_point_back_percentile = |frame: &MetricDepthFrame, nx: f32, ny: f32| {
         sample_metric_point_back_percentile_with_radius(frame, nx, ny, adaptive_radius)
     };
 
@@ -931,12 +968,11 @@ pub(super) struct ResolvedAnchor {
 /// Wrist position = centroid of the four MCPs (rationale: the
 /// hand-track wrist landmark is unreliable under occlusion). Face
 /// pose / expressions are intentionally left empty here — the caller
-/// populates them via [`derive_face_pose_metric`] and the optional
-/// FaceMesh cascade.
+/// populates them via the optional FaceMesh cascade.
 pub(super) fn build_skeleton(
     frame_index: u64,
     joints: &[DecodedJoint2d],
-    depth: &MoGeFrame,
+    depth: &MetricDepthFrame,
     anchor: ResolvedAnchor,
     opts: BuildOptions,
     calibration: Option<&crate::tracking::PoseCalibration>,
@@ -999,11 +1035,11 @@ pub(super) fn build_skeleton(
         adaptive_sample_radius(depth, shoulder_px_span)
     };
 
-    let sample_metric_point = |frame: &MoGeFrame, nx: f32, ny: f32| {
+    let sample_metric_point = |frame: &MetricDepthFrame, nx: f32, ny: f32| {
         sample_metric_point_with_radius(frame, nx, ny, adaptive_radius)
     };
 
-    let sample_metric_point_back_percentile = |frame: &MoGeFrame, nx: f32, ny: f32| {
+    let sample_metric_point_back_percentile = |frame: &MetricDepthFrame, nx: f32, ny: f32| {
         sample_metric_point_back_percentile_with_radius(frame, nx, ny, adaptive_radius)
     };
 
@@ -1155,7 +1191,7 @@ pub(super) fn build_skeleton(
 fn attach_hand<F>(
     sk: &mut SourceSkeleton,
     joints: &[DecodedJoint2d],
-    depth: &MoGeFrame,
+    depth: &MetricDepthFrame,
     base_index: usize,
     wrist_bone: HumanoidBone,
     phalanges: &[(usize, HumanoidBone)],
@@ -1311,7 +1347,7 @@ fn attach_hand<F>(
 fn inject_spine_chain_proxies<F>(
     sk: &mut SourceSkeleton,
     joints: &[DecodedJoint2d],
-    depth: &MoGeFrame,
+    depth: &MetricDepthFrame,
     to_source: &F,
     anchor_was_hip: bool,
     anchor_score: f32,
@@ -1728,122 +1764,13 @@ fn normalize3(v: [f32; 3]) -> Option<[f32; 3]> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Face cascade helpers
-// ---------------------------------------------------------------------------
-
-/// Derive head yaw / pitch / roll from face keypoints 0..=4 (nose /
-/// left_eye / right_eye / left_ear / right_ear), each lifted into 3D
-/// via metric-depth sampling and routed through the same axis flip +
-/// hip-origin convention as the body skeleton.
-///
-/// Logic mirrors [`super::rtmw3d::face::derive_face_pose_from_body`]:
-/// ear-line yaw, eye-line roll, eye-mid → nose pitch. Confidence is
-/// the min of the 5 input scores. Includes the back-ear reflection
-/// fallback for >45° head turns.
-pub(super) fn derive_face_pose_metric(
-    joints: &[DecodedJoint2d],
-    depth: &MoGeFrame,
-    origin: [f32; 3],
-) -> Option<FacePose> {
-    if joints.len() < 5 {
-        return None;
-    }
-    for j in joints.iter().take(5) {
-        if j.score < KEYPOINT_VISIBILITY_FLOOR {
-            return None;
-        }
-    }
-
-    let to_src = |idx: usize| -> Option<[f32; 3]> {
-        let j = &joints[idx];
-        let p_cam = sample_metric_point(depth, j.nx, j.ny)?;
-        Some([
-            -(p_cam[0] - origin[0]),
-            -(p_cam[1] - origin[1]),
-            -(p_cam[2] - origin[2]),
-        ])
-    };
-
-    let nose = to_src(0)?;
-    // Selfie mirror: subject's left maps to avatar's right.
-    let avatar_right_eye = to_src(1)?;
-    let avatar_left_eye = to_src(2)?;
-    let avatar_right_ear = to_src(3)?;
-    let avatar_left_ear = to_src(4)?;
-
-    const EAR_OCCLUSION_RATIO: f32 = 0.5;
-    let s_right_ear = joints[3].score;
-    let s_left_ear = joints[4].score;
-    let (right_ear_xz, left_ear_xz) = if s_right_ear < s_left_ear * EAR_OCCLUSION_RATIO {
-        let recon = [
-            2.0 * nose[0] - avatar_left_ear[0],
-            avatar_left_ear[1],
-            2.0 * nose[2] - avatar_left_ear[2],
-        ];
-        (recon, avatar_left_ear)
-    } else if s_left_ear < s_right_ear * EAR_OCCLUSION_RATIO {
-        let recon = [
-            2.0 * nose[0] - avatar_right_ear[0],
-            avatar_right_ear[1],
-            2.0 * nose[2] - avatar_right_ear[2],
-        ];
-        (avatar_right_ear, recon)
-    } else {
-        (avatar_right_ear, avatar_left_ear)
-    };
-    let ear_dx = left_ear_xz[0] - right_ear_xz[0];
-    let ear_dz = left_ear_xz[2] - right_ear_xz[2];
-    let ear_dist = (ear_dx * ear_dx + ear_dz * ear_dz).sqrt();
-    if ear_dist < 0.02 {
-        return None;
-    }
-    let yaw = ear_dz.atan2(ear_dx);
-
-    let eye_dx = avatar_left_eye[0] - avatar_right_eye[0];
-    let eye_dy = avatar_left_eye[1] - avatar_right_eye[1];
-    let roll = eye_dy.atan2(eye_dx);
-
-    let mid_eye_y = (avatar_left_eye[1] + avatar_right_eye[1]) * 0.5;
-    let face_width = (eye_dx * eye_dx + eye_dy * eye_dy).sqrt().max(0.02);
-    let pitch_signal = (mid_eye_y - nose[1]) / face_width;
-    let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
-
-    let conf = joints[..5].iter().map(|j| j.score).fold(1.0_f32, f32::min);
-    Some(FacePose {
-        yaw,
-        pitch,
-        roll,
-        confidence: conf,
-    })
-}
-
-/// Pixel-space face bbox derived from face-68 landmarks (indices
-/// 23..=90). Mirrors [`super::rtmw3d::face::build_face_bbox_from_joints`]
-/// but consumes the [`DecodedJoint2d`] type.
-pub(super) fn build_face_bbox_from_joints_2d(
-    joints: &[DecodedJoint2d],
-    width: u32,
-    height: u32,
-) -> Option<FaceBbox> {
-    let mut points_px: Vec<(f32, f32)> = Vec::with_capacity(68);
-    for i in 23..=90 {
-        let Some(j) = joints.get(i) else { continue };
-        if j.score < KEYPOINT_VISIBILITY_FLOOR {
-            continue;
-        }
-        points_px.push((j.nx * width as f32, j.ny * height as f32));
-    }
-    derive_face_bbox(&points_px, width, height)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dummy_frame(width: u32, height: u32, point: [f32; 3]) -> MoGeFrame {
+    fn dummy_frame(width: u32, height: u32, point: [f32; 3]) -> MetricDepthFrame {
         let pixels = (width * height) as usize;
-        MoGeFrame {
+        MetricDepthFrame {
             width,
             height,
             points_m: vec![point; pixels],

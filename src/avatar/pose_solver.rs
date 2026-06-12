@@ -173,6 +173,19 @@ pub struct PoseSolverState {
     /// Wall-clock timestamp of the previous solve, used to derive `dt`
     /// for the dt-aware blend / 1€ filter. `None` until the first call.
     last_solve_instant: Option<Instant>,
+    /// Previous frame's solved local rotation per skeleton node.
+    /// `run_frame` rebuilds the base pose every frame, so the value
+    /// sitting in `local_transforms` at solve time is REST, not the
+    /// previous frame's pose — blending from it makes
+    /// `rotation_blend < 1.0` display a permanent `alpha` fraction of
+    /// every rotation (measured: a 150-deg arm fold showed a constant
+    /// ~45-deg shortfall at the 0.7 default) instead of exponentially
+    /// converging. The solver blends from THIS map and writes the
+    /// result back, restoring true time-constant smoothing.
+    prev_local_rotations: std::collections::HashMap<usize, Quat>,
+    /// Previous frame's solved Hips local translation (same rationale
+    /// as `prev_local_rotations` for the root-translation lerp).
+    prev_hips_translation: Option<[f32; 3]>,
     /// Slow EMA of the source-skeleton `root_offset`, used as the
     /// "where the subject normally stands" reference. The avatar's
     /// Hips is translated by `(root_offset − reference) * sensitivity`
@@ -188,6 +201,14 @@ pub struct PoseSolverState {
     /// per-frame Δz signal at intermediate (~30°–60°) rotations.
     /// `0.0` until the first confident shoulder pair arrives.
     running_shoulder_x_span_max: f32,
+    /// EMA state for the camera-driven mouth visemes (aa/ih/ou/ee/oh),
+    /// keyed by expression name. The image lip-sync path takes the raw
+    /// FaceMesh blendshape, which is noisy frame-to-frame; the eye/brow
+    /// path is already smoothed by `expression_blend` inside
+    /// [`solve_expressions`], but the mouth viseme policy bypasses that
+    /// blend, so it is eased here instead. Empty until the first frame a
+    /// viseme is seen; reset with the rest of the motion smoothing.
+    mouth_viseme_ema: HashMap<String, f32>,
 }
 
 impl PoseSolverState {
@@ -213,8 +234,11 @@ impl PoseSolverState {
         self.joint_filters.clear();
         self.fingertip_filters.clear();
         self.hand_orient_filters = Default::default();
+        self.mouth_viseme_ema.clear();
         self.joint_active.clear();
         self.last_solve_instant = None;
+        self.prev_local_rotations.clear();
+        self.prev_hips_translation = None;
         self.root_reference = None;
         // `running_shoulder_x_span_max` is intentionally NOT reset
         // here — it captures the subject's anatomical shoulder width
@@ -564,14 +588,15 @@ pub fn solve_avatar_pose(
     // an outlier from a single bad frame.
     //
     // Caveat: `shoulder_span_m` is in whatever source-space units the
-    // provider that captured the calibration emits (RTMW3D-normalised
-    // for the rtmw3d / rtmw3d-with-depth paths, metres for
-    // cigpose-metric-depth). Switching providers mid-session would put
-    // the seed in the wrong unit; the user is expected to re-calibrate
-    // after such a switch (the inspector flags low-sample / stale
-    // calibrations independently). Only seeded when `running_*` is
-    // still zero (cold start) so a session that's already learned a
-    // larger max keeps it.
+    // pipeline that captured the calibration emitted (metres when the
+    // DAv2 depth stage was active, RTMW3D-normalised when it wasn't).
+    // Toggling the depth stage (adding/removing dav2_small.onnx)
+    // between calibration and use would put the seed in the wrong
+    // unit; the user is expected to re-calibrate after such a change
+    // (the inspector flags low-sample / stale calibrations
+    // independently). Only seeded when `running_*` is still zero
+    // (cold start) so a session that's already learned a larger max
+    // keeps it.
     if state.running_shoulder_x_span_max == 0.0 {
         if let Some(span) = params
             .pose_calibration
@@ -674,9 +699,10 @@ pub fn solve_avatar_pose(
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]);
             let new_local_rot =
                 quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &target_world));
-            let prev_local_rot = local_transforms[hips_idx].rotation;
-            local_transforms[hips_idx].rotation = quat_slerp_short(
-                &prev_local_rot,
+            local_transforms[hips_idx].rotation = blend_local_rotation(
+                state,
+                hips_idx,
+                local_transforms[hips_idx].rotation,
                 &new_local_rot,
                 dt_aware_blend(params.rotation_blend, dt),
             );
@@ -822,12 +848,19 @@ pub fn solve_avatar_pose(
                     // translation responsiveness scales with the user's
                     // `rotation_blend` setting (one fewer slider).
                     let blend = dt_aware_blend(params.rotation_blend, dt);
-                    let prev = local_transforms[hips_idx].translation;
-                    local_transforms[hips_idx].translation = [
+                    // Blend from the previous frame's solved value,
+                    // not the freshly-rebuilt base pose — see
+                    // `PoseSolverState::prev_hips_translation`.
+                    let prev = state
+                        .prev_hips_translation
+                        .unwrap_or(local_transforms[hips_idx].translation);
+                    let blended = [
                         prev[0] + blend * (target[0] - prev[0]),
                         prev[1] + blend * (target[1] - prev[1]),
                         prev[2] + blend * (target[2] - prev[2]),
                     ];
+                    state.prev_hips_translation = Some(blended);
+                    local_transforms[hips_idx].translation = blended;
                     // Refresh the world transform so any downstream
                     // bone that reads `current_world[hips_idx].position`
                     // sees the translated origin.
@@ -884,6 +917,7 @@ pub fn solve_avatar_pose(
                 &mut current_world,
                 local_transforms,
                 params,
+                state,
                 dt,
             );
             solve_wrist_orientation(
@@ -898,6 +932,7 @@ pub fn solve_avatar_pose(
                 &mut current_world,
                 local_transforms,
                 params,
+                state,
                 dt,
             );
             wrists_oriented = true;
@@ -1235,9 +1270,10 @@ pub fn solve_avatar_pose(
         let new_local_rot = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
 
-        let prev_local_rot = local_transforms[node_idx].rotation;
-        local_transforms[node_idx].rotation = quat_slerp_short(
-            &prev_local_rot,
+        local_transforms[node_idx].rotation = blend_local_rotation(
+            state,
+            node_idx,
+            local_transforms[node_idx].rotation,
             &new_local_rot,
             dt_aware_blend(params.rotation_blend, dt),
         );
@@ -1267,6 +1303,7 @@ pub fn solve_avatar_pose(
                             skeleton,
                             local_transforms,
                             &current_world,
+                            state,
                             dt_aware_blend(params.rotation_blend, dt),
                         );
                     }
@@ -1523,7 +1560,29 @@ fn compute_body_yaw_3d(
         // width and gives a more stable magnitude.
         let target_span = running_shoulder_x_span_max.max(span_xz);
         let cos_yaw = (bx / target_span).clamp(-1.0, 1.0);
-        let yaw_magnitude = cos_yaw.acos();
+        let yaw_from_span = cos_yaw.acos();
+        // bz corroboration: foreshortening alone cannot distinguish
+        // a genuine yaw from a perspective-inflated reference span
+        // (leaning toward a near webcam widens the observed shoulder
+        // span, ratchets `running_shoulder_x_span_max`, and from then
+        // on a perfectly frontal pose reads acos(<1) ≈ 30–45° with
+        // its sign flapping on bz noise — observed live as the
+        // avatar locking to ±45° and never facing front). A real yaw
+        // MUST also separate the shoulders in z: cap the magnitude
+        // by the bz-supported yaw plus a small allowance.
+        // Back-facing poses also have bz ≈ 0 (shoulders in-plane
+        // again), so the cap applies to the *deviation from the
+        // nearest in-plane orientation* (0° when bx > 0, 180° when
+        // bx < 0), not to the raw magnitude.
+        const YAW_BZ_ALLOWANCE_RAD: f32 = 0.17; // ~10°
+        let yaw_from_bz = (bz.abs() / target_span).clamp(0.0, 1.0).asin();
+        let deviation = yaw_from_span.min(std::f32::consts::PI - yaw_from_span);
+        let capped_dev = deviation.min(yaw_from_bz + YAW_BZ_ALLOWANCE_RAD);
+        let yaw_magnitude = if cos_yaw >= 0.0 {
+            capped_dev
+        } else {
+            std::f32::consts::PI - capped_dev
+        };
         // Sign convention: positive yaw = standard right-hand-rule
         // CCW rotation around +Y (= subject turns to **her left**,
         // bringing her right side toward camera). For the source's
@@ -1544,6 +1603,7 @@ fn apply_face_pose(
     skeleton: &SkeletonAsset,
     local_transforms: &mut [Transform],
     current_world: &[WorldXform],
+    state: &mut PoseSolverState,
     blend: f32,
 ) {
     // Face pose is in body-local Y-up convention: a positive yaw turns the
@@ -1567,8 +1627,13 @@ fn apply_face_pose(
     );
     let rest_local_rot = skeleton.nodes[head_idx].rest_local.rotation;
     let target_local = quat_normalize(&quat_mul(&rest_local_rot, &delta_local));
-    let prev = local_transforms[head_idx].rotation;
-    local_transforms[head_idx].rotation = quat_slerp_short(&prev, &target_local, blend);
+    local_transforms[head_idx].rotation = blend_local_rotation(
+        state,
+        head_idx,
+        local_transforms[head_idx].rotation,
+        &target_local,
+        blend,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1634,458 +1699,6 @@ fn compute_world_transforms(
 }
 
 // ---------------------------------------------------------------------------
-// 2-bone IK
-// ---------------------------------------------------------------------------
-
-/// Apply two-bone IK to all four limb chains (left/right arm,
-/// left/right leg). Each call replaces the source skeleton's
-/// `middle` joint position (elbow / knee) with one that's
-/// anatomically consistent with the avatar's rest-pose bone lengths
-/// and the trusted base/tip endpoints.
-///
-/// **Why limb-chain IK at all**
-///
-/// The downstream bone-rotation loop in `solve_avatar_pose` consumes
-/// *direction-only* signals: for each bone it computes
-/// `dir = normalize(tip - base)` and rotates the avatar's bone of
-/// fixed (rest-pose) length to point in that direction. There is no
-/// length-preservation or end-effector constraint downstream, so a
-/// wrong middle-keypoint position propagates verbatim into the
-/// avatar: the upper-arm rotates to point at the (wrong) elbow, the
-/// forearm rotates from there to point at the (correctish) wrist,
-/// and the avatar's hand lands at avatar_shoulder + L_upper *
-/// dir_upper + L_lower * dir_lower — geometrically inconsistent with
-/// where the *real* hand was in the source frame.
-///
-/// The validation case that exposed this: subject raises right hand
-/// to upper chest (palm to camera). RTMW3D detects shoulder and
-/// wrist 2D positions correctly, but the elbow keypoint lands at
-/// hip-mid level — well below where it physically is. The implied
-/// source bone lengths come out forearm > upper-arm (anatomically
-/// reversed), and the avatar's rendered hand lands ~at the hip
-/// instead of upper chest because of the bad elbow direction
-/// dragging the upper-arm down.
-///
-/// **Why arms get pole = -Y, legs get pole = +Z**
-///
-/// The IK has two solutions for the elbow/knee position (both sides
-/// of the chord). The pole hint disambiguates. Default arm pose has
-/// the elbow bending "down/back" relative to the shoulder-wrist
-/// chord (think wave gesture, hand-on-hip, arms-folded — all bend
-/// the elbow toward -Y in source space). Default leg pose has the
-/// knee bending forward (running, sitting, kneeling — all bend the
-/// knee toward +Z, i.e. away from the camera in source-space
-/// convention where +Z is toward camera). These hints break down for
-/// extreme poses (back-handed wave, knee bending sideways), but
-/// `apply_2bone_ik_chain` adapts the hint toward the original
-/// keypoint position when one is available — so a slightly-off
-/// elbow detection still preserves the side it was on.
-fn apply_2bone_ik_arms_and_legs(
-    source: &mut SourceSkeleton,
-    rest_world: &[WorldXform],
-    humanoid: &HumanoidMap,
-    threshold: f32,
-    body_yaw_source: f32,
-) {
-    // Avatar-to-source unit conversion: source positions are in
-    // image-normalised coordinates while rest_world bone lengths are
-    // in avatar-space (typically metres for VRM 1.0). Use shoulder
-    // span as the calibration: it's the most reliably-detected pair
-    // across pose variations and is essentially the same anatomical
-    // measurement on both sides of the conversion.
-    let Some(scale) = compute_avatar_to_source_scale(source, rest_world, humanoid)
-    else {
-        return;
-    };
-
-    // Rotate body-local pole hints by the source body yaw so they
-    // describe the limb's bend direction in **source space** for the
-    // current frame. At rest the subject faces the camera so body-
-    // local +Z (forward) coincides with source +Z; once the body
-    // rotates around Y this no longer holds and the static hint pulls
-    // the knee or elbow toward the wrong half-space.
-    let cos_y = body_yaw_source.cos();
-    let sin_y = body_yaw_source.sin();
-    // R_y(yaw) · (0, 0, 1) = (sin yaw, 0, cos yaw). Body-local +Z
-    // becomes this in source space.
-    let leg_pole = [sin_y, 0.0, cos_y];
-    // Arms: body-local -Y (elbow bends down). Y is the rotation axis
-    // so it's invariant under yaw — same vector in source space.
-    let arm_pole = [0.0, -1.0, 0.0];
-
-    apply_2bone_ik_chain(
-        source,
-        rest_world,
-        humanoid,
-        HumanoidBone::LeftShoulder,
-        HumanoidBone::LeftLowerArm,
-        HumanoidBone::LeftHand,
-        arm_pole,
-        threshold,
-        scale,
-    );
-    apply_2bone_ik_chain(
-        source,
-        rest_world,
-        humanoid,
-        HumanoidBone::RightShoulder,
-        HumanoidBone::RightLowerArm,
-        HumanoidBone::RightHand,
-        arm_pole,
-        threshold,
-        scale,
-    );
-
-    apply_2bone_ik_chain(
-        source,
-        rest_world,
-        humanoid,
-        HumanoidBone::LeftUpperLeg,
-        HumanoidBone::LeftLowerLeg,
-        HumanoidBone::LeftFoot,
-        leg_pole,
-        threshold,
-        scale,
-    );
-    apply_2bone_ik_chain(
-        source,
-        rest_world,
-        humanoid,
-        HumanoidBone::RightUpperLeg,
-        HumanoidBone::RightLowerLeg,
-        HumanoidBone::RightFoot,
-        leg_pole,
-        threshold,
-        scale,
-    );
-}
-
-/// Single-chain 2-bone IK: shoulder → elbow → wrist (or hip → knee →
-/// ankle). Replaces `middle`'s position in `source` with one that
-/// satisfies the avatar's rest-pose bone-length ratios while keeping
-/// the base + tip endpoints fixed.
-///
-/// No-op when:
-/// - The base or tip is missing or below `threshold` confidence
-/// - Avatar bone lengths can't be looked up from `rest_world`
-/// - Chord (base→tip) is degenerately short (< 1mm) or exceeds the
-///   maximum reach by more than 5%; the latter typically means the
-///   keypoint detector wildly misplaced one of the endpoints, and IK
-///   forced into a degenerate elbow at the chord midpoint would look
-///   worse than leaving the original wrong elbow alone.
-/// - The pole hint is parallel to the chord (e.g. arm pointing
-///   straight down with pole = -Y), so the perpendicular component
-///   collapses and the elbow's bend direction is undetermined.
-///
-/// `pole_hint_source` is in source coords. The function projects it
-/// onto the plane perpendicular to the chord and uses the projection
-/// as the elbow's bend direction. If the original middle position is
-/// available, the hint is biased toward whichever side of the chord
-/// the original was on — so a slightly-off keypoint that's on the
-/// correct side still produces the right bend direction.
-#[allow(clippy::too_many_arguments)]
-fn apply_2bone_ik_chain(
-    source: &mut SourceSkeleton,
-    rest_world: &[WorldXform],
-    humanoid: &HumanoidMap,
-    base: HumanoidBone,
-    middle: HumanoidBone,
-    tip: HumanoidBone,
-    pole_hint_source: Vec3,
-    threshold: f32,
-    avatar_to_source_scale: f32,
-) {
-    let Some(base_joint) = source.joints.get(&base).copied() else {
-        return;
-    };
-    if base_joint.confidence < threshold {
-        return;
-    }
-    let Some(tip_joint) = source.joints.get(&tip).copied() else {
-        return;
-    };
-    if tip_joint.confidence < threshold {
-        return;
-    }
-    let base_pos = base_joint.position;
-    let tip_pos = tip_joint.position;
-
-    // Avatar's anatomical bone-length **ratio** from rest pose. We
-    // deliberately don't use avatar bone lengths *directly*: the
-    // global avatar-to-source scale derived from shoulder span is
-    // accurate at the shoulder line but doesn't transfer cleanly to
-    // the leg chain (a person's leg-to-shoulder ratio varies by ±10%
-    // per individual, and per-frame perspective compresses it
-    // differently). Forcing avatar-scaled bone lengths onto a
-    // standing leg whose source-implied length doesn't match (chord
-    // < scaled max_reach) creates a phantom bend at the knee — the
-    // IK has to bend *somewhere* to fit the bones into the chord.
-    //
-    // Instead, take the source's **implied total chain length**
-    // (l_upper_implied + l_lower_implied) and re-distribute it
-    // using only the avatar's *ratio*. This preserves the source's
-    // body-scale signal while fixing the proportion error that
-    // RTMW3D's keypoint-detection inaccuracy introduced.
-    let Some(base_node) = humanoid.bone_map.get(&base).copied() else {
-        return;
-    };
-    let Some(middle_node) = humanoid.bone_map.get(&middle).copied() else {
-        return;
-    };
-    let Some(tip_node) = humanoid.bone_map.get(&tip).copied() else {
-        return;
-    };
-    let base_idx = base_node.0 as usize;
-    let middle_idx = middle_node.0 as usize;
-    let tip_idx = tip_node.0 as usize;
-    if base_idx >= rest_world.len()
-        || middle_idx >= rest_world.len()
-        || tip_idx >= rest_world.len()
-    {
-        return;
-    }
-    let l_upper_avatar = vec3_length(&vec3_sub(
-        &rest_world[middle_idx].position,
-        &rest_world[base_idx].position,
-    ));
-    let l_lower_avatar = vec3_length(&vec3_sub(
-        &rest_world[tip_idx].position,
-        &rest_world[middle_idx].position,
-    ));
-    if l_upper_avatar < 1e-4 || l_lower_avatar < 1e-4 {
-        return;
-    }
-    let avatar_ratio_upper_total = l_upper_avatar / (l_upper_avatar + l_lower_avatar);
-
-    // Source's implied total chain length, derived from the
-    // currently-detected (possibly inaccurate) middle position.
-    // We use this as the budget the IK must redistribute over the
-    // upper + lower bones. The middle keypoint's *position* may be
-    // wrong, but its summed-distance-from-base-via-itself-to-tip
-    // tracks the actual subject geometry better than any avatar
-    // scaling does — see the rationale block above.
-    let original_middle = source.joints.get(&middle).map(|j| j.position);
-    let total_implied = if let Some(orig) = original_middle {
-        vec3_length(&vec3_sub(&orig, &base_pos))
-            + vec3_length(&vec3_sub(&tip_pos, &orig))
-    } else {
-        return; // No middle keypoint to derive total from; can't IK.
-    };
-    let l_upper = total_implied * avatar_ratio_upper_total;
-    let l_lower = total_implied - l_upper;
-
-    // The avatar_to_source_scale parameter is intentionally unused
-    // here — see the rationale block above. Kept on the signature so
-    // callers don't have to recompute it per chain in the future
-    // (e.g. for a metric-aware IK variant if root translation needs
-    // it).
-    let _ = avatar_to_source_scale;
-
-    // Chord = base → tip in source coords.
-    let chord = vec3_sub(&tip_pos, &base_pos);
-    let chord_len = vec3_length(&chord);
-    let max_reach = l_upper + l_lower;
-    if chord_len < 1e-3 || chord_len > max_reach * 1.05 {
-        return;
-    }
-    // Clamp slightly under max_reach to avoid sin_alpha → 0 numerical
-    // collapse at full extension (pole_unit becomes meaningless).
-    let chord_eff = chord_len.min(max_reach * 0.999);
-    let chord_unit = [
-        chord[0] / chord_len,
-        chord[1] / chord_len,
-        chord[2] / chord_len,
-    ];
-
-    // Heavily-bent guard: when the source-detected elbow's foot on
-    // chord lies OUTSIDE the [base, tip] segment (base→elbow→tip
-    // wraps back on itself: think elbows-forward with the wrist
-    // lifted near the face, or hands-behind-the-head), the standard
-    // 2-bone IK with avatar bone-length ratios mathematically cannot
-    // represent that configuration — the law-of-cosines triangle is
-    // forced to put the elbow at +cos_alpha along chord, while the
-    // detected elbow projects to -orig_dot along chord. Forcing the
-    // IK fit produces a 180°-flipped arm in source space (visible on
-    // calibration_effect_validation as elbows-forward and
-    // hands-behind-head poses with the entire forearm wrapping the
-    // wrong way around the avatar's body).
-    //
-    // In these cases the source detection is the more reliable
-    // signal: a deeply bent arm means base + tip + middle are all
-    // mutually close, the keypoints are all on the same side of the
-    // body and so the detector's noise is bounded; the IK adds no
-    // information the detector did not already have. Skip and
-    // preserve the source elbow.
-    if let Some(orig) = original_middle {
-        let orig_off = vec3_sub(&orig, &base_pos);
-        let orig_along_chord = vec3_dot(&orig_off, &chord_unit);
-        // Allow a tiny over-shoot tolerance so a clean fully-extended
-        // arm (foot lands exactly at base or tip) does not flicker in
-        // and out of IK between frames.
-        let lo = -chord_len * 0.05;
-        let hi = chord_len * 1.05;
-        if orig_along_chord < lo || orig_along_chord > hi {
-            return;
-        }
-    }
-
-    // Law of cosines: angle α at base between chord and base→middle.
-    let cos_alpha = ((l_upper * l_upper + chord_eff * chord_eff
-        - l_lower * l_lower)
-        / (2.0 * l_upper * chord_eff))
-        .clamp(-1.0, 1.0);
-    let sin_alpha = (1.0 - cos_alpha * cos_alpha).max(0.0).sqrt();
-
-    // Bend-direction selection. Strategy: prefer the **detected**
-    // elbow's displacement off the chord, falling back to the static
-    // pole hint only when the detected elbow sits too close to the
-    // chord for its direction to be reliable.
-    //
-    // The previous implementation used the static hint unconditionally
-    // — that worked for arms hanging at the sides (chord ≈ -Y, hint
-    // = -Y, perp collapses, IK aborts and the correct keypoint
-    // survives) and for arms-forward (elbow naturally bends down). It
-    // failed for poses where the elbow flares laterally (hands on
-    // hips, "I dunno" shrug, arms-akimbo): the static -Y pole forced
-    // the elbow downward into the hand position, collapsing the
-    // forearm.
-    //
-    // Threshold (`5% of chord length`) is the empirical "above
-    // detection noise" floor. Below it the original elbow's perp is
-    // dominated by RTMW3D jitter and we fall back to the static hint;
-    // above it we trust the detected direction entirely. The
-    // intermediate band (5%-15%) blends so a mid-confidence detection
-    // doesn't snap discontinuously between modes.
-    let static_pole_perp_unit = {
-        let dot = vec3_dot(&pole_hint_source, &chord_unit);
-        let perp = [
-            pole_hint_source[0] - chord_unit[0] * dot,
-            pole_hint_source[1] - chord_unit[1] * dot,
-            pole_hint_source[2] - chord_unit[2] * dot,
-        ];
-        let len = vec3_length(&perp);
-        if len < 1e-4 {
-            None
-        } else {
-            Some([perp[0] / len, perp[1] / len, perp[2] / len])
-        }
-    };
-
-    let detected_pole_perp_unit = original_middle.and_then(|orig| {
-        let orig_off = vec3_sub(&orig, &base_pos);
-        let orig_dot = vec3_dot(&orig_off, &chord_unit);
-        let orig_perp = [
-            orig_off[0] - chord_unit[0] * orig_dot,
-            orig_off[1] - chord_unit[1] * orig_dot,
-            orig_off[2] - chord_unit[2] * orig_dot,
-        ];
-        let orig_perp_len = vec3_length(&orig_perp);
-        // 5% floor = detection-noise margin. Tuned against the
-        // calibration_effect_validation/fixed_camera dataset: at
-        // 5% the hands-on-hips and shrug poses pick up the lateral
-        // bend, while arms-at-sides (perp ≈ 0.5% of chord) still
-        // falls through to the static hint.
-        if orig_perp_len < chord_len * 0.05 {
-            return None;
-        }
-        Some((
-            [
-                orig_perp[0] / orig_perp_len,
-                orig_perp[1] / orig_perp_len,
-                orig_perp[2] / orig_perp_len,
-            ],
-            orig_perp_len,
-        ))
-    });
-
-    let pole_unit = match (detected_pole_perp_unit, static_pole_perp_unit) {
-        (Some((det, det_perp_len)), Some(stat)) => {
-            // Blend zone: 5%–15% of chord length. Below 5% we never
-            // get here (detected returns None); above 15% trust the
-            // detection fully. In between, slerp from static toward
-            // detected so the transition is continuous.
-            let t = ((det_perp_len / chord_len - 0.05) / 0.10).clamp(0.0, 1.0);
-            // Linear blend then renormalise — the two unit vectors
-            // are usually within ~30° of each other in this band, so
-            // the chord length of the lerp is far enough from zero.
-            let mixed = [
-                stat[0] * (1.0 - t) + det[0] * t,
-                stat[1] * (1.0 - t) + det[1] * t,
-                stat[2] * (1.0 - t) + det[2] * t,
-            ];
-            let len = vec3_length(&mixed);
-            if len < 1e-4 {
-                det
-            } else {
-                [mixed[0] / len, mixed[1] / len, mixed[2] / len]
-            }
-        }
-        (Some((det, _)), None) => det,
-        (None, Some(stat)) => stat,
-        (None, None) => {
-            // Both pole sources collapsed (chord parallel to static
-            // hint AND detected elbow on the chord). Bend direction
-            // genuinely undetermined; leave the keypoint alone.
-            return;
-        }
-    };
-
-    let middle_pos = [
-        base_pos[0] + l_upper * (cos_alpha * chord_unit[0] + sin_alpha * pole_unit[0]),
-        base_pos[1] + l_upper * (cos_alpha * chord_unit[1] + sin_alpha * pole_unit[1]),
-        base_pos[2] + l_upper * (cos_alpha * chord_unit[2] + sin_alpha * pole_unit[2]),
-    ];
-
-    if let Some(j) = source.joints.get_mut(&middle) {
-        j.position = middle_pos;
-    }
-}
-
-/// Avatar-to-source coordinate-scale factor, derived from the ratio
-/// of source-vs-avatar shoulder spans on the **horizontal X axis only**.
-/// Used by `apply_2bone_ik_chain` to convert avatar-unit bone lengths
-/// (metres for VRM 1.0) into source-coordinate-unit bone lengths so
-/// the IK math stays in one consistent space.
-///
-/// X-only (rather than full 3D) because the source skeleton's Z is
-/// the (relative) RTMW3D nz signal and includes per-frame depth
-/// noise / bias, which inflates the 3D shoulder span estimate.
-/// Avatar rest-pose shoulders sit at the same Z (T-pose), so the
-/// avatar side has no Z component anyway — comparing 3D source
-/// against 1D avatar would systematically over-scale and inflate
-/// the IK bone-length, pushing the elbow further out than it
-/// belongs.
-///
-/// Returns `None` when either shoulder is missing or the spans are
-/// degenerate (subject in extreme side profile, bad detection
-/// frame). Caller skips IK on that frame in either case.
-fn compute_avatar_to_source_scale(
-    source: &SourceSkeleton,
-    rest_world: &[WorldXform],
-    humanoid: &HumanoidMap,
-) -> Option<f32> {
-    let l_node = humanoid.bone_map.get(&HumanoidBone::LeftShoulder)?;
-    let r_node = humanoid.bone_map.get(&HumanoidBone::RightShoulder)?;
-    let l_idx = l_node.0 as usize;
-    let r_idx = r_node.0 as usize;
-    if l_idx >= rest_world.len() || r_idx >= rest_world.len() {
-        return None;
-    }
-    let avatar_span_x =
-        (rest_world[l_idx].position[0] - rest_world[r_idx].position[0]).abs();
-    if avatar_span_x < 1e-4 {
-        return None;
-    }
-    let l_src = source.joints.get(&HumanoidBone::LeftShoulder)?;
-    let r_src = source.joints.get(&HumanoidBone::RightShoulder)?;
-    let source_span_x = (l_src.position[0] - r_src.position[0]).abs();
-    if source_span_x < 1e-4 {
-        return None;
-    }
-    Some(source_span_x / avatar_span_x)
-}
-
-// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
@@ -2103,6 +1716,29 @@ fn midpoint(a: &Vec3, b: &Vec3) -> Vec3 {
 /// it as a time-constant means the same slider value behaves
 /// identically whether the camera ships 30 or 60 fps and whether
 /// the renderer hitches occasionally.
+/// Slerp toward `target` from the PREVIOUS FRAME's solved rotation
+/// for this node (falling back to `fallback` — the rest-pose value —
+/// on the first frame or after a reset), recording the result for
+/// the next frame. See `PoseSolverState::prev_local_rotations` for
+/// why blending from `local_transforms` directly is wrong.
+#[inline]
+fn blend_local_rotation(
+    state: &mut PoseSolverState,
+    node_idx: usize,
+    fallback: Quat,
+    target: &Quat,
+    alpha: f32,
+) -> Quat {
+    let from = state
+        .prev_local_rotations
+        .get(&node_idx)
+        .copied()
+        .unwrap_or(fallback);
+    let out = quat_slerp_short(&from, target, alpha);
+    state.prev_local_rotations.insert(node_idx, out);
+    out
+}
+
 #[inline]
 fn dt_aware_blend(slider_blend: f32, dt: f32) -> f32 {
     if dt <= 0.0 {
@@ -2364,6 +2000,7 @@ fn solve_wrist_orientation(
     current_world: &mut [WorldXform],
     local_transforms: &mut [Transform],
     params: &SolverParams,
+    state: &mut PoseSolverState,
     dt: f32,
 ) {
     let Some(orient) = source_orientation else {
@@ -2484,19 +2121,23 @@ fn solve_wrist_orientation(
     // `current_world[la_idx].rotation` (which IS kept up-to-date) and
     // the bone's rest forearm direction instead.
     let twist_axis = lower_arm_idx.and_then(|la_idx| {
-        let rest_la_pos = rest_world[la_idx].position;
-        // Forearm rest direction in LowerArm's parent-relative space.
-        // Use the wrist child's rest_world position as the tip — same
-        // reference frame the per-bone direction-match used.
-        let rest_wrist_pos = rest_world[wrist_idx].position;
-        let rest_dir_local = vec3_normalize(&vec3_sub(&rest_wrist_pos, &rest_la_pos));
+        // The bone vector in the LowerArm's OWN (parent-of-wrist)
+        // space is the wrist's rest LOCAL translation. The previous
+        // formulation rotated the rest *world* direction
+        // (rest_world[wrist] − rest_world[la]) by the LowerArm's
+        // current world rotation — that double-applies the
+        // LowerArm's rest world rotation (the world rest direction
+        // already contains it), tilting the axis on any rig whose
+        // rest rotations are not identity. A tilted axis lets swing
+        // leak into the "twist" half that's transferred to the
+        // LowerArm, dragging the hand off the just-solved forearm
+        // direction (measured: 0.41 foreshortening error on the
+        // lean-left open-palm validation pose; 0.02 with the correct
+        // axis).
+        let rest_dir_local = vec3_normalize(&skeleton.nodes[wrist_idx].rest_local.translation);
         if rest_dir_local == [0.0; 3] {
             return None;
         }
-        // Apply the LowerArm's current world rotation to the rest
-        // direction to get the *current* world-space forearm axis.
-        // This stays the same when only twist is added, and rotates
-        // with any direction change the LowerArm has undergone.
         let current_world_dir =
             quat_rotate_vec3(&current_world[la_idx].rotation, &rest_dir_local);
         let normalized = vec3_normalize(&current_world_dir);
@@ -2526,9 +2167,13 @@ fn solve_wrist_orientation(
             &quat_conjugate(&upper_arm_world_rot),
             &lower_arm_world_new,
         ));
-        let lower_arm_prev_local = local_transforms[la_idx].rotation;
-        local_transforms[la_idx].rotation =
-            quat_slerp_short(&lower_arm_prev_local, &lower_arm_local_target, blend);
+        local_transforms[la_idx].rotation = blend_local_rotation(
+            state,
+            la_idx,
+            local_transforms[la_idx].rotation,
+            &lower_arm_local_target,
+            blend,
+        );
         let actual_lower_arm_world =
             quat_mul(&upper_arm_world_rot, &local_transforms[la_idx].rotation);
         current_world[la_idx].rotation = actual_lower_arm_world;
@@ -2542,9 +2187,13 @@ fn solve_wrist_orientation(
             &quat_conjugate(&actual_lower_arm_world),
             &new_world_rot,
         ));
-        let prev_local_rot = local_transforms[wrist_idx].rotation;
-        local_transforms[wrist_idx].rotation =
-            quat_slerp_short(&prev_local_rot, &hand_local_target, blend);
+        local_transforms[wrist_idx].rotation = blend_local_rotation(
+            state,
+            wrist_idx,
+            local_transforms[wrist_idx].rotation,
+            &hand_local_target,
+            blend,
+        );
         let updated_world =
             quat_mul(&actual_lower_arm_world, &local_transforms[wrist_idx].rotation);
         current_world[wrist_idx].rotation = updated_world;
@@ -2554,9 +2203,13 @@ fn solve_wrist_orientation(
         // behaviour for edge cases.
         let new_local_rot =
             quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
-        let prev_local_rot = local_transforms[wrist_idx].rotation;
-        local_transforms[wrist_idx].rotation =
-            quat_slerp_short(&prev_local_rot, &new_local_rot, blend);
+        local_transforms[wrist_idx].rotation = blend_local_rotation(
+            state,
+            wrist_idx,
+            local_transforms[wrist_idx].rotation,
+            &new_local_rot,
+            blend,
+        );
         let updated_world =
             quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
         current_world[wrist_idx].rotation = updated_world;
@@ -2620,7 +2273,14 @@ pub fn solve_expressions(
     previous: Option<&[ResolvedExpressionWeight]>,
     expression_blend: f32,
     face_confidence_threshold: f32,
+    mouth_source: crate::tracking::MouthSource,
+    state: &mut PoseSolverState,
 ) -> Vec<ResolvedExpressionWeight> {
+    use crate::tracking::MouthSource;
+    // VRM mouth visemes whose driver (audio lip-sync vs camera) is
+    // selectable. Everything else (eyes / brows / emotions) always comes
+    // from the camera.
+    const MOUTH_VISEMES: [&str; 5] = ["aa", "ih", "ou", "ee", "oh"];
     // Gate on the face mesh's own confidence (the FaceMesh model
     // outputs an "is this a face" sigmoid). When the gate fails we
     // return the previous weights verbatim — leaves the avatar's
@@ -2647,9 +2307,36 @@ pub fn solve_expressions(
             let raw = tracking.weight.clamp(0.0, 1.0);
             let prev_w = prev_map.get(expr_def.name.as_str()).copied().unwrap_or(raw);
             let blended = prev_w + expression_blend * (raw - prev_w);
+            let weight = if MOUTH_VISEMES.contains(&expr_def.name.as_str()) {
+                // `prev_w` carries the audio lip-sync value: `step_lipsync`
+                // runs just before the face solve each frame and writes the
+                // mouth visemes into the weights `previous` points at. So the
+                // source policy mixes camera against audio (`prev_w`).
+                //
+                // The camera viseme is eased here with its own EMA: the
+                // eye/brow path above is smoothed by `blended`, but the mouth
+                // policy bypasses that, so the raw FaceMesh blendshape would
+                // otherwise jitter the mouth frame-to-frame. The audio side is
+                // already smoothed upstream by the lip-sync `smoothing`.
+                let cam = {
+                    let ema = state
+                        .mouth_viseme_ema
+                        .entry(expr_def.name.clone())
+                        .or_insert(raw);
+                    *ema += expression_blend * (raw - *ema);
+                    *ema
+                };
+                match mouth_source {
+                    MouthSource::Audio => prev_w,
+                    MouthSource::Image => cam,
+                    MouthSource::Both => cam.max(prev_w),
+                }
+            } else {
+                blended
+            };
             Some(ResolvedExpressionWeight {
                 name: expr_def.name.clone(),
-                weight: blended.clamp(0.0, 1.0),
+                weight: weight.clamp(0.0, 1.0),
             })
         })
         .collect()
@@ -2816,13 +2503,19 @@ mod body_yaw_tests {
             "frontal frame should prime running max to 0.40, got {span_max}"
         );
 
-        // Frame 2: same subject rotated; bx shrinks (foreshortening)
-        // but bz is small / underestimated by RTMW3D. Pure atan2 would
-        // give ≈ atan2(0.05, 0.20) ≈ 14° magnitude, but with running
-        // max we recover ≈ acos(0.20/0.40) = 60°.
+        // Frame 2: same subject rotated. bx shrinks (foreshortening)
+        // and bz carries the metric-injected inter-shoulder Δz a real
+        // 60° yaw produces (≈ sin60 × span, slightly under-reported).
+        // The span running-max recovers the full ≈ acos(0.20/0.40) =
+        // 60° magnitude; the bz corroboration cap stays out of the
+        // way because bz genuinely supports the rotation. (A large
+        // span-implied yaw with bz ≈ 0 is now CAPPED instead — that
+        // signature is a perspective-inflated reference span from
+        // leaning toward a near webcam, which live locked the avatar
+        // at ±45° on perfectly frontal poses.)
         let mut rotated = SourceSkeleton::empty(0);
-        put(&mut rotated, HumanoidBone::LeftShoulder, [0.10, 0.5, -0.025], 1.0);
-        put(&mut rotated, HumanoidBone::RightShoulder, [-0.10, 0.5, 0.025], 1.0);
+        put(&mut rotated, HumanoidBone::LeftShoulder, [0.10, 0.5, -0.15], 1.0);
+        put(&mut rotated, HumanoidBone::RightShoulder, [-0.10, 0.5, 0.15], 1.0);
         let yaw_deg = compute_body_yaw_3d(&rotated, 0.1, &mut span_max)
             .expect("shoulders")
             .to_degrees();
@@ -2900,6 +2593,7 @@ mod body_yaw_tests {
             x_range_observed: None,
             z_range_observed: None,
             torso_depth_template: None,
+            neutral_expressions: Vec::new(),
         };
         let params = SolverParams {
             rotation_blend: 1.0,
@@ -2960,6 +2654,7 @@ mod body_yaw_tests {
             x_range_observed: None,
             z_range_observed: None,
             torso_depth_template: None,
+            neutral_expressions: Vec::new(),
         };
         let params = SolverParams {
             rotation_blend: 1.0,

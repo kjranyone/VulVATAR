@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::gui::components::{filled_button, icon_button, outlined_button};
+use crate::gui::components::{filled_button, icon_button, tonal_button, ButtonTone};
 use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
@@ -13,6 +13,48 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         state.project_status.project_dirty = true;
     }
     ui.add_space(4.0);
+
+    // Unclean-exit banner: the previous session's stage-log sentinel
+    // survived (system freeze, process kill). Offer the degraded
+    // safe-mode pipeline for the next start; either choice clears the
+    // sentinel so the banner shows once per incident.
+    if let Some(sentinel) = state.tracking.unclean_exit_log.clone() {
+        let log_path = sentinel.lines().next().unwrap_or("").to_string();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(t!("tracking.unclean_exit_title"))
+                    .strong()
+                    .color(ui.visuals().warn_fg_color),
+            );
+            ui.label(
+                egui::RichText::new(t!("tracking.unclean_exit_body", log = log_path)).small(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button(t!("tracking.unclean_exit_safe_mode")).clicked() {
+                    state.tracking.safe_mode_armed = true;
+                    crate::tracking::stagelog::clear_stale_sentinel();
+                    state.tracking.unclean_exit_log = None;
+                }
+                if ui.button(t!("tracking.unclean_exit_dismiss")).clicked() {
+                    crate::tracking::stagelog::clear_stale_sentinel();
+                    state.tracking.unclean_exit_log = None;
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+    if state.tracking.safe_mode_armed {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(t!("tracking.safe_mode_active"))
+                    .color(ui.visuals().warn_fg_color),
+            );
+            if ui.button(t!("tracking.safe_mode_disarm")).clicked() {
+                state.tracking.safe_mode_armed = false;
+            }
+        });
+        ui.add_space(4.0);
+    }
 
     egui::CollapsingHeader::new(t!("tracking.input_device"))
         .default_open(true)
@@ -63,11 +105,11 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let active = state.is_tracking_active();
                 let ready = state.is_tracking_ready();
                 if active && ready {
-                    if outlined_button(
+                    if tonal_button(
                         ui,
                         Some(ic::PAUSE),
                         &t!("tracking.stop_camera"),
-                        color::ERROR,
+                        ButtonTone::Error,
                         true,
                     )
                     .clicked()
@@ -87,13 +129,24 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     );
                     let fps =
                         crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+                    // Safe mode also caps the capture format — less
+                    // camera bandwidth and per-frame CPU work while
+                    // diagnosing an unclean exit.
+                    let (w, h, fps) = if state.tracking.safe_mode_armed {
+                        (w.min(1280), h.min(720), fps.min(30))
+                    } else {
+                        (w, h, fps)
+                    };
                     #[cfg(feature = "webcam")]
                     let backend = crate::tracking::CameraBackend::Webcam {
                         camera_index: state.camera_index,
                     };
                     #[cfg(not(feature = "webcam"))]
                     let backend = crate::tracking::CameraBackend::Synthetic;
-                    state.app.start_tracking_with_params(backend, w, h, fps);
+                    let pipeline = state.tracking.pipeline_config();
+                    state
+                        .app
+                        .start_tracking_with_params(backend, w, h, fps, pipeline);
                 }
             });
             if ui
@@ -154,15 +207,55 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let (w, h) =
                     crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
                 let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+                let (w, h, fps) = if state.tracking.safe_mode_armed {
+                    (w.min(1280), h.min(720), fps.min(30))
+                } else {
+                    (w, h, fps)
+                };
                 #[cfg(feature = "webcam")]
                 let backend = crate::tracking::CameraBackend::Webcam {
                     camera_index: state.camera_index,
                 };
                 #[cfg(not(feature = "webcam"))]
                 let backend = crate::tracking::CameraBackend::Synthetic;
-                state.app.start_tracking_with_params(backend, w, h, fps);
+                let pipeline = state.tracking.pipeline_config();
+                state
+                    .app
+                    .start_tracking_with_params(backend, w, h, fps, pipeline);
                 state.push_notification(t!("tracking.camera_restarted", w = w, h = h, fps = fps));
             }
+        });
+
+    egui::CollapsingHeader::new(t!("tracking.pipeline"))
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut changed = false;
+            changed |= ui
+                .checkbox(
+                    &mut state.tracking.depth_enabled,
+                    t!("tracking.pipeline_depth"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut state.tracking.yolox_enabled,
+                    t!("tracking.pipeline_yolox"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut state.tracking.force_cpu_inference,
+                    t!("tracking.pipeline_force_cpu"),
+                )
+                .changed();
+            if changed {
+                state.project_status.project_dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(t!("tracking.pipeline_hint"))
+                    .small()
+                    .weak(),
+            );
         });
 
     egui::CollapsingHeader::new(t!("tracking.capture_format"))
@@ -226,11 +319,11 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .on_hover_text(t!("tracking.face_confidence_tooltip"))
                 .changed();
             ui.add_space(4.0);
-            if outlined_button(
+            if tonal_button(
                 ui,
                 Some(ic::HISTORY),
                 &t!("tracking.smoothing_reset"),
-                color::PRIMARY,
+                ButtonTone::Primary,
                 true,
             )
             .clicked()
@@ -276,8 +369,8 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 // Inference backend (ONNX execution provider) — surfaces a
                 // silent CPU fallback when DirectML registration fails. Set
-                // by the worker once CIGPose finishes loading; absent during
-                // synthetic mode or before init completes.
+                // by the worker once the pose provider finishes loading;
+                // absent during synthetic mode or before init completes.
                 if let Some(label) = state
                     .app
                     .tracking_worker
@@ -445,11 +538,11 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             });
-        if outlined_button(
+        if tonal_button(
             ui,
             Some(ic::REFRESH),
             &t!("tracking.refresh"),
-            color::PRIMARY,
+            ButtonTone::Primary,
             true,
         )
         .clicked()
@@ -558,6 +651,28 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text(t!("tracking.smoothing")))
         .changed()
     {
+        state.project_status.project_dirty = true;
+    }
+
+    // Mouth source: how the audio lip-sync and the camera (FaceMesh) mouth
+    // visemes combine. Both = whichever is stronger, so the mouth opens for
+    // speech or a visibly open mouth without one silently overriding the other.
+    use crate::tracking::MouthSource;
+    let mut ms = state.lipsync.mouth_source;
+    let label = |m: MouthSource| match m {
+        MouthSource::Audio => t!("tracking.mouth_source_audio"),
+        MouthSource::Image => t!("tracking.mouth_source_image"),
+        MouthSource::Both => t!("tracking.mouth_source_both"),
+    };
+    egui::ComboBox::from_label(t!("tracking.mouth_source"))
+        .selected_text(label(ms))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut ms, MouthSource::Both, label(MouthSource::Both));
+            ui.selectable_value(&mut ms, MouthSource::Image, label(MouthSource::Image));
+            ui.selectable_value(&mut ms, MouthSource::Audio, label(MouthSource::Audio));
+        });
+    if ms != state.lipsync.mouth_source {
+        state.lipsync.mouth_source = ms;
         state.project_status.project_dirty = true;
     }
 }

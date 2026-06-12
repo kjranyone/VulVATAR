@@ -153,6 +153,14 @@ pub enum CalibrationModalState {
         mode: CalibrationMode,
         started_at: Instant,
         samples: Vec<AnchorSample>,
+        /// Running (sum, count) of each source expression weight seen
+        /// during the window, keyed by VRM expression name. Averaged in
+        /// `finalize_collection` into `PoseCalibration::neutral_expressions`
+        /// — the per-person resting face baseline. Kept here rather than
+        /// on `AnchorSample` (which is `Copy`) because per-frame name→weight
+        /// maps would force a heap allocation per sample. Empty unless face
+        /// tracking is running while the user holds the neutral pose.
+        expr_accum: std::collections::HashMap<String, (f32, usize)>,
         /// Tracks the last mailbox sequence we admitted a sample for,
         /// so we don't double-count when the GUI repaints faster than
         /// the tracking thread emits new frames.

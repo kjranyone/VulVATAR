@@ -458,6 +458,14 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             // WaitingForPose directly) gives the user a chance to
             // re-read the new mode's instructions before the gate
             // starts watching for a match.
+            //
+            // Disarm any in-flight torso capture, matching the Cancel
+            // paths. Today WaitingForPose hasn't toggled capture on
+            // yet, so this is a no-op — but leaving the modal's
+            // capture states must always disarm the worker, or a
+            // future change that starts capture earlier would leak a
+            // running buffer into Idle.
+            state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal = CalibrationModalState::Idle {
                 mode: switch_to,
                 last_anchor_seen: false,

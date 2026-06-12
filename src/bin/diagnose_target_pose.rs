@@ -208,6 +208,10 @@ fn build_frame_input(
         background_color: [0.15, 0.15, 0.18],
         transparent_background: false,
         avatar_opacity: 1.0,
+        bloom: Default::default(),
+        generative_background: Default::default(),
+        background_tracking: Default::default(),
+        time_seconds: 0.0,
     }
 }
 

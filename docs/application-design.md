@@ -22,7 +22,7 @@ Related detailed contracts:
 - [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
 - [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
 - [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
-- [rendering-materials.md](/C:/lib/github/kjranyone/VulVATAR/docs/rendering-materials.md)
+- [vulkano-renderer-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/vulkano-renderer-design.md)
 
 ## Product Goal
 

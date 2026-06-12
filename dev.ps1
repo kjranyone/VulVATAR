@@ -133,33 +133,6 @@ function Install-Models {
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
 }
 
-function Install-ExperimentalPoseModels {
-    # Models for the CIGPose 2D + MoGe-2 metric-depth pipeline.
-    #
-    #   * CIGPose-x UBody — namas191297/cigpose-onnx        (260 MB, 133 2D landmarks)
-    #   * MoGe-2 ViT-S    — Ruicheng/moge-2-vits-normal-onnx (141 MB, metric point cloud)
-    #
-    # MoGe-2 is the only Apache-2.0/MIT licensed metric-depth ONNX with
-    # an officially hosted export at the time of writing. UniDepthV2 is
-    # CC BY-NC (non-commercial) and Depth Pro is Apple ASCL — both
-    # would trip a license issue for users running this in commercial
-    # streaming setups, so they're not offered as backends.
-    Write-Host "Setting up CIGPose + MoGe-2 ONNX models..." -ForegroundColor Cyan
-    if (!(Test-Path "models")) {
-        New-Item -ItemType Directory -Force -Path "models" | Out-Null
-    }
-
-    Install-ZipArchive -Name "CIGPose-x UBody whole-body 2D pose" `
-        -ArchiveUrl "https://github.com/namas191297/cigpose-onnx/releases/latest/download/cigpose_models.zip" `
-        -KeepGlobs @("cigpose-x_coco-ubody_384x288.onnx") `
-        -RenameMap @{ "cigpose-x_coco-ubody_384x288.onnx" = "cigpose.onnx" }
-
-    Install-DirectFiles -Name "MoGe-2 ViT-small metric point cloud" -Files @(
-        @{ Url = "https://huggingface.co/Ruicheng/moge-2-vits-normal-onnx/resolve/main/model.onnx";
-           OutName = "moge_v2.onnx" }
-    )
-}
-
 function Install-DepthAnythingSmall {
     # Depth Anything V2 Small (DPT + DINOv2-S backbone, ~99 MB fp32).
     # Apache 2.0 licensed. Used by the rtmw3d-with-depth provider as
@@ -177,97 +150,6 @@ function Install-DepthAnythingSmall {
         @{ Url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx";
            OutName = "dav2_small.onnx" }
     )
-}
-
-function Install-VitposeWholebody {
-    # ViTPose-s Wholebody (Vision Transformer pose estimator, 97 MB
-    # fp32). MIT-licensed checkpoint from JunkyByte/easy_ViTPose. 2D
-    # only — outputs 133 COCO-Wholebody keypoint heatmaps from a
-    # 256×192 person crop. Adopted as the SOTA-tier 2D backend to
-    # work around RTMW3D-x's asymmetric T-pose wrist detection bias
-    # observed in `validate_pipeline` benchmarking. Pair with DAv2 /
-    # RTMW3D's z lift for full 3D, or fall back to rest-pose z for
-    # purely planar matching.
-    Write-Host "Setting up ViTPose-s Wholebody ONNX..." -ForegroundColor Cyan
-    if (!(Test-Path "models")) {
-        New-Item -ItemType Directory -Force -Path "models" | Out-Null
-    }
-
-    Install-DirectFiles -Name "ViTPose-s Wholebody (2D, 133 keypoints)" -Files @(
-        @{ Url = "https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-s-wholebody.onnx";
-           OutName = "vitpose-s-wholebody.onnx" }
-    )
-}
-
-function Select-PoseProvider {
-    $current = $env:VULVATAR_POSE_PROVIDER
-    if ([string]::IsNullOrWhiteSpace($current)) {
-        $current = "rtmw3d"
-    }
-
-    Write-Host ""
-    Write-Host "Select pose provider (current: $current)" -ForegroundColor Cyan
-    Write-Host "   1. rtmw3d              (~48 fps, prior-based z, default)" -ForegroundColor Green
-    Write-Host "   2. rtmw3d-with-depth   (~40 fps, calibrated metric z via DAv2-Small async)" -ForegroundColor Green
-    Write-Host "   3. cigpose-metric-depth (~5 fps, true metric z via MoGe-2 ViT-S)" -ForegroundColor Yellow
-    Write-Host "   4. vitpose-wholebody   (ViTPose-L 2D, best in-plane accuracy, 2D-only)" -ForegroundColor Green
-    Write-Host "   5. hybrid              (ViTPose-L + RTMW3D z hybrid, torso-only z gate)" -ForegroundColor Green
-    Write-Host "   6. hmr2                (HMR2 SMPL body + MediaPipe Palm+Hand CPU, 3D w/ fingers)" -ForegroundColor Cyan
-    Write-Host "   0. keep current" -ForegroundColor DarkGray
-    $choice = Read-Host "Provider"
-
-    switch ($choice) {
-        "0" {
-            Write-Host "Keeping pose provider: $current" -ForegroundColor DarkGray
-        }
-        "2" {
-            $env:VULVATAR_POSE_PROVIDER = "rtmw3d-with-depth"
-            Write-Host "Using pose provider: rtmw3d-with-depth" -ForegroundColor Green
-            Install-Models
-            Install-DepthAnythingSmall
-        }
-        "3" {
-            $env:VULVATAR_POSE_PROVIDER = "cigpose-metric-depth"
-            Write-Host "Using pose provider: cigpose-metric-depth" -ForegroundColor Yellow
-            Install-Models
-            Install-ExperimentalPoseModels
-        }
-        "4" {
-            $env:VULVATAR_POSE_PROVIDER = "vitpose-wholebody"
-            Write-Host "Using pose provider: vitpose-wholebody" -ForegroundColor Green
-            Install-Models
-        }
-        "5" {
-            $env:VULVATAR_POSE_PROVIDER = "hybrid"
-            Write-Host "Using pose provider: hybrid (ViTPose + RTMW3D z)" -ForegroundColor Green
-            Install-Models
-        }
-        "6" {
-            $env:VULVATAR_POSE_PROVIDER = "hmr2"
-            Write-Host "Using pose provider: hmr2 (SMPL body + MediaPipe Hands)" -ForegroundColor Cyan
-            Install-Models
-            # HMR2 ONNX + MediaPipe hand/palm checks. The HMR2 model is
-            # exported separately (hmr2_export/) — we just verify it's
-            # present here instead of downloading it (2.7 GB).
-            $hmr2 = Test-Path "models/hmr2_fp16.onnx"
-            $palm = Test-Path "models/mediapipe_palm_detection.onnx"
-            $hand = Test-Path "models/mediapipe_hand_landmark.onnx"
-            if (-not $hmr2) {
-                Write-Host "  WARNING: models/hmr2_fp16.onnx missing. Run hmr2_export/export_onnx.py + fp16.py first." -ForegroundColor Red
-            }
-            if (-not $palm) {
-                Write-Host "  WARNING: models/mediapipe_palm_detection.onnx missing." -ForegroundColor Yellow
-            }
-            if (-not $hand) {
-                Write-Host "  WARNING: models/mediapipe_hand_landmark.onnx missing." -ForegroundColor Yellow
-            }
-        }
-        default {
-            $env:VULVATAR_POSE_PROVIDER = "rtmw3d"
-            Write-Host "Using pose provider: rtmw3d" -ForegroundColor Green
-            Install-Models
-        }
-    }
 }
 
 # Download a `.zip` archive, extract to a temp dir, copy ONNX files
@@ -843,12 +725,12 @@ function Build-Distribution {
 }
 
 $commands = @(
-    @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-Font" },
+    @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-DepthAnythingSmall; Install-Font" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
-    @{ Label = "run (debug)";      Cmd = 'Select-PoseProvider; $env:RUST_LOG="vulvatar=info"; cargo run' },
-    @{ Label = "run (debug+lipsync)"; Cmd = 'Select-PoseProvider; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
-    @{ Label = "run (release)";    Cmd = "Select-PoseProvider; cargo run --release" },
+    @{ Label = "run (debug)";      Cmd = 'Install-Models; Install-DepthAnythingSmall; $env:RUST_LOG="vulvatar=info"; cargo run' },
+    @{ Label = "run (debug+lipsync)"; Cmd = 'Install-Models; Install-DepthAnythingSmall; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
+    @{ Label = "run (release)";    Cmd = "Install-Models; Install-DepthAnythingSmall; cargo run --release" },
     @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
     @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
     @{ Label = "package installer (unsigned)";        Cmd = "Build-Distribution" },

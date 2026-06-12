@@ -209,6 +209,12 @@ impl GuiApp {
             background_color: [0.0, 0.0, 0.0],
             transparent_background: true,
             avatar_opacity: 1.0,
+            // Thumbnails must stay deterministic regardless of the
+            // project's bloom / generative-background settings.
+            bloom: Default::default(),
+            generative_background: Default::default(),
+            background_tracking: Default::default(),
+            time_seconds: 0.0,
         }
     }
 
@@ -337,6 +343,10 @@ impl GuiApp {
             background_color: [0.0, 0.0, 0.0],
             transparent_background: true,
             avatar_opacity: 1.0,
+            bloom: Default::default(),
+            generative_background: Default::default(),
+            background_tracking: Default::default(),
+            time_seconds: 0.0,
         }
     }
 

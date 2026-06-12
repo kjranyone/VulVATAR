@@ -93,7 +93,7 @@ fn mode_nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Respons
     let bg = if active {
         color::PRIMARY_CONTAINER
     } else if resp.hovered() {
-        Color32::from_rgba_unmultiplied(124, 92, 255, 18)
+        color::with_alpha(color::PRIMARY, 18)
     } else {
         Color32::TRANSPARENT
     };

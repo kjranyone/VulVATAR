@@ -34,11 +34,19 @@ mod lint_checks {
     use crate::renderer::VulkanRenderer;
     use vulkano::format::Format;
 
-    /// Embedded at compile time. The path is relative to *this* file, so
-    /// the included bytes are `pipeline.rs` only — this lint file is
-    /// not in the scanned text, which keeps the forbidden-pattern
-    /// strings in this file from matching themselves.
-    const PIPELINE_SRC: &str = include_str!("pipeline.rs");
+    /// Embedded at compile time. The paths are relative to *this* file, so
+    /// the included bytes are `pipeline.rs` + `post_effects.rs` +
+    /// `background.rs` only — this lint file is not in the scanned text,
+    /// which keeps the forbidden-pattern strings in this file from matching
+    /// themselves. `post_effects.rs` is scanned because its composite shader
+    /// writes the final 8-bit image and is the most tempting place to sneak
+    /// in a manual encode; `background.rs` because its shader writes scene
+    /// colour and must stay linear.
+    const PIPELINE_SRC: &str = concat!(
+        include_str!("pipeline.rs"),
+        include_str!("post_effects.rs"),
+        include_str!("background.rs")
+    );
 
     #[test]
     fn fragment_shaders_have_no_manual_srgb_encode() {

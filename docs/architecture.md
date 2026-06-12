@@ -2,9 +2,7 @@
 
 ## Scope
 
-This project targets `VRM 1.0 only`.
-
-The near-term goal is not full feature completeness. The goal is to build a POC architecture that can grow into:
+This project targets `VRM 1.0 only`. The implemented scope:
 
 - VRM 1.0 asset loading
 - skinned rendering on `Vulkano`
@@ -14,7 +12,8 @@ The near-term goal is not full feature completeness. The goal is to build a POC 
 - webcam-based motion tracking
 - video output routable into OBS Studio
 
-`VRM 0.x` compatibility is intentionally out of scope.
+`VRM 0.x` compatibility is intentionally out of scope (a best-effort
+loader shim exists, but no compatibility guarantees).
 
 ## Core Design Decision
 
@@ -411,94 +410,13 @@ If you want compositing in OBS, alpha support becomes an architectural requireme
 
 ## Data Model
 
-### `AvatarAsset`
-
-Immutable loaded data:
-
-- skeleton hierarchy
-- inverse bind matrices
-- mesh primitives
-- material definitions
-- humanoid mapping
-- spring definitions
-- collider definitions
-
-### `ClothAsset`
-
-Immutable authored overlay data:
-
-- cloth simulation mesh
-- mapping from simulation mesh to rendered garment geometry
-- stable references into the imported avatar mesh and skeleton
-- pin definitions
-- constraint sets
-- collision proxy bindings
-- optional cloth LoD data
-- solver tuning parameters
-- editor-authored metadata needed for reload
-
-### `AvatarInstance`
-
-Live scene object:
-
-- world transform
-- current local pose
-- current global pose
-- animation runtime state
-- spring runtime state
-- optional attached `ClothAsset`
-- cloth enabled or disabled runtime state
-- optional cloth runtime state
-
-### `TrackingRigPose`
-
-Normalized performer input:
-
-- head transform target
-- body joint targets
-- hand targets
-- facial parameter weights
-- confidence per channel
-- source timestamp
-
-### `AvatarPose`
-
-Final resolved skeleton state:
-
-- local TRS per node
-- global matrices
-- skinning matrices
-
-### `SecondaryMotionState`
-
-Runtime state for spring chains and colliders:
-
-- verlet or explicit integration caches
-- collision cache
-- chain-local parameters
-
-### `ClothState`
-
-Runtime state for cloth:
-
-- particle positions
-- previous particle positions or velocities
-- constraint buffers
-- pinned region bindings
-- collision working set
-- activation state for the currently attached cloth overlay
-
-### `OutputFrame`
-
-Completed render handoff:
-
-- exportable color image handle
-- optional alpha image handle
-- width and height
-- timestamp
-- color space metadata
-- ownership token for async sink handoff
-- synchronization primitive or fence/semaphore metadata
+The core type split — immutable assets (`AvatarAsset`, `ClothAsset`)
+vs. mutable runtime state (`AvatarInstance`, `AvatarPose`,
+`SecondaryMotionState`, `ClothState`) vs. handoff values
+(`TrackingRigPose`, `OutputFrame`) — is specified field-by-field in
+[data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md);
+the implemented structs in `src/asset/mod.rs`, `src/avatar/instance.rs`,
+and `src/output/mod.rs` are the authoritative shapes.
 
 ## Frame Update Order
 
@@ -539,66 +457,70 @@ The simulation contract should also state:
 - latch tracking input once per render frame before entering simulation steps
 - if tracking or output falls behind, prefer stale-sample reuse or frame drop over blocking the main loop
 
-## POC Milestones
+## GUI → pipeline settings wiring
 
-### Phase 0: Asset + Skeleton
+Every user-facing setting reaches the pipeline through exactly one of
+four sanctioned paths. When adding a new setting, pick the matching
+path — do not invent a fifth, and do not mix paths within one setting.
 
-Exit criteria:
+### Path 1: Reconciled (`GuiApp::sync_app_settings`)
 
-- load one VRM 1.0 avatar
-- build skeleton and skinning matrices
-- render a static or bind pose
+Continuous scene / view / output parameters: viewport camera, lighting,
+background, output extent / fps / alpha / colour space / MSAA, avatar
+world transform.
 
-### Phase 1: Basic Rendering
+- The GUI struct (`RenderingGuiState`, `OutputGuiState`, …) owns the
+  value and is what persistence reads/writes.
+- `sync_app_settings` pushes the value into its `Application` mirror
+  field once per `update`, before `run_frame`. Writes must be
+  idempotent; `Application` setters that do real work on change
+  (e.g. `set_user_render_fps`) must be cheap to call every frame.
+- Use this for values the render thread or output worker reads outside
+  the frame step.
 
-Exit criteria:
+### Path 2: FrameConfig (`GuiApp::build_frame_config`)
 
-- skinned mesh rendering on Vulkano
-- camera control
-- simple lit or unlit material path
+Per-frame pipeline inputs consumed inside `Application::run_frame`:
+runtime toggles, smoothing params, hand/face/lower-body/root-translation
+flags, fade-on-loss, mouth source, material mode.
 
-### Phase 2: Secondary Motion
+- The GUI struct owns the value; it rides a `FrameConfig` value struct
+  into `run_frame` and never needs an `Application` field.
+- Use this for values that only the frame step (pose solver,
+  simulation, material selection) reads.
 
-Exit criteria:
+### Path 3: Requested (Phase D, `Application::set_requested_*`)
 
-- spring bone solver works on selected chains
-- avatar colliders affect spring motion
+Stateful runtime resources that can fail to start or stop: output sink,
+lipsync capture (and, structurally, the tracking worker).
 
-### Phase 3: Toon Shading
+- `Application` owns both the *requested* state (user intent, what
+  persistence saves) and the *active* state (what is actually running);
+  they diverge when a runtime transition fails.
+- The GUI holds **no** copy — it reads the requested/active pair via
+  getters and writes via `set_requested_*`. Failures surface as
+  notifications; the requested value survives for retry/autosave.
+- Use this whenever applying the setting can fail at runtime.
 
-Exit criteria:
+### Path 4: Instance-bound (`AvatarInstance` fields)
 
-- toon-like lighting ramp
-- outline pass
-- core MToon-like controls
+Per-avatar runtime state: expression weights, collider enable mask,
+cloth attachments, `avatar.cloth_enabled`.
 
-### Phase 4: Cloth POC
+- Inspector widgets bind directly to the `AvatarInstance` field; there
+  is no GUI-side copy and no project persistence. The state resets with
+  the avatar (reload / switch) by design.
+- Use this for state whose lifetime *is* the avatar instance's.
 
-Exit criteria:
+### Anti-patterns
 
-- one selected cloth region simulates stably
-- cloth pins to skeleton correctly
-- body collision proxies affect cloth
-- cloth can be enabled or disabled per avatar instance at runtime
-- cloth uses a dedicated simulation representation that drives rendered garment deformation
-
-### Phase 5: World Physics
-
-Exit criteria:
-
-- optional Rapier-backed world interaction
-- cloth and spring can query world collision where needed
-
-### Phase 6: Tracking + Output
-
-Exit criteria:
-
-- webcam tracking drives head and upper body
-- retargeted motion feeds the avatar runtime cleanly
-- rendered output is routable to OBS through a frame sink
-- tracking runs on an async worker path
-- output sink handoff is async and does not stall rendering
-- preferred OBS path uses GPU-resident shared frame handoff with explicit synchronization
+- A GUI-side shadow copy of a Path 3 value (drifts on runtime failure —
+  the exact bug Phase C/D removed).
+- Gating a persisted Path 2 toggle on non-persisted session state
+  (the pre-refactor `toggle_cloth && sim_playing` bug: cloth silently
+  froze after every restart).
+- Syncing a value into an `Application` field *and* passing it through
+  `FrameConfig` — one consumer model per setting.
 
 ## Failure Modes To Avoid
 
@@ -638,101 +560,10 @@ per-concern sibling files:
 - `src/tracking/rtmw3d/{mod,consts,decode,preprocess,skeleton,wrist,face,annotation,session,math}.rs`
 - `src/gui/inspector/{mod,avatar,preview,tracking,rendering,output,cloth,library,settings}.rs`
 
-## Recommended Directory Structure
-
-The crate started flat and now follows the per-concern directory
-pattern. Split by responsibility inside each top-level domain rather
-than letting any single file grow past ~1.5 kLOC.
-
-```text
-src/
-  main.rs
-  app/
-    mod.rs
-    render.rs
-    tracking_lifecycle.rs
-    lipsync.rs
-    output_sink.rs
-    avatar_library.rs
-    bake_cache.rs
-    folder_watcher.rs
-    render_thread.rs
-  asset/
-    mod.rs
-    cache.rs
-    cloth_rebind.rs
-    vrm/
-      mod.rs
-      extensions.rs
-      gltf_decode.rs
-      mtoon.rs
-      v0.rs
-      v1.rs
-  editor/
-    mod.rs
-    cloth_authoring.rs
-  avatar/
-    mod.rs
-    instance.rs
-    pose.rs
-    pose_solver.rs
-  simulation/
-    mod.rs
-    cloth.rs
-    cloth_solver/
-      mod.rs
-      integrator.rs
-      constraints.rs
-      collision.rs
-      output.rs
-    spring.rs
-  renderer/
-    mod.rs
-    pipeline.rs
-    material.rs
-    mtoon.rs
-    frame_input.rs
-    frame_pool.rs
-    output_export.rs
-    thumbnail.rs
-    debug.rs
-    gpu_handle.rs
-  tracking/
-    mod.rs
-    provider.rs
-    rtmw3d/...
-    face_mediapipe.rs
-    yolox.rs
-    cigpose_metric_depth.rs
-    pose_estimation.rs
-  gui/
-    mod.rs
-    inspector/...
-    viewport.rs
-    top_bar.rs
-    status_bar.rs
-    mesh_picking.rs
-    profile.rs
-  output/
-    mod.rs
-    frame_sink.rs
-    virtual_camera_native.rs
-```
-
-Good examples of per-domain splits:
-
-- `src/avatar/pose.rs`, `instance.rs`, `pose_solver.rs`
-- `src/simulation/cloth_solver/{integrator,constraints,collision,output}.rs`
-- `src/renderer/{pipeline,material,mtoon,output_export}.rs`
-- `src/output/{frame_sink,virtual_camera_native}.rs`
-
-Bad direction:
-
-- `src/types.rs`
-- `src/utils.rs`
-- `src/common.rs`
-
-Those files quickly become dumping grounds and erase the architectural boundaries.
+Directory discipline: split by responsibility inside each top-level
+domain rather than letting any single file grow past ~1.5 kLOC. Never
+add `src/types.rs` / `src/utils.rs` / `src/common.rs` — dumping-ground
+modules erase the architectural boundaries.
 
 ## Dependency Direction Rules
 
@@ -758,42 +589,23 @@ Avoid reverse edges such as:
 
 If a feature pressures you into one of those edges, the boundary is probably wrong.
 
-## Recommended Next Design Task
-
-The next useful step is not more implementation. It is to pin down concrete Rust structs for:
-
-- `AvatarAsset`
-- `ClothAsset`
-- `AvatarInstance`
-- `AvatarPose`
-- `SpringBoneAsset`
-- `ClothState`
-- `TrackingRigPose`
-- `OutputFrame`
-- `SimulationClock`
-- `TrackingMailbox`
-- `FrameSinkQueuePolicy`
-- `GpuFrameToken`
-- `ClothMeshMapping`
-
-That will decide whether the architecture is actually clean enough to implement.
+## Document Map
 
 For application-level GUI structure and user workflows, see [application-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/application-design.md).
 
-Detailed contracts for data shapes, persistence, threading, tracking, and output interop live in:
+Detailed contracts per domain:
 
-- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
-- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
-- [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md)
-- [gpu-runtime-roadmap.md](/C:/lib/github/kjranyone/VulVATAR/docs/gpu-runtime-roadmap.md)
-- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
-- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
-- [rendering-materials.md](/C:/lib/github/kjranyone/VulVATAR/docs/rendering-materials.md)
-- [mtoon-compatibility.md](/C:/lib/github/kjranyone/VulVATAR/docs/mtoon-compatibility.md)
-- [vulkano-renderer-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/vulkano-renderer-design.md)
-- [shader-implementation-notes.md](/C:/lib/github/kjranyone/VulVATAR/docs/shader-implementation-notes.md)
-- [renderer-module-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/renderer-module-design.md)
-- [renderer-api-contract.md](/C:/lib/github/kjranyone/VulVATAR/docs/renderer-api-contract.md)
-- [renderer-implementation-checklist.md](/C:/lib/github/kjranyone/VulVATAR/docs/renderer-implementation-checklist.md)
-- [renderer-implementation-brief.md](/C:/lib/github/kjranyone/VulVATAR/docs/renderer-implementation-brief.md)
-- [mtoon-test-matrix.md](/C:/lib/github/kjranyone/VulVATAR/docs/mtoon-test-matrix.md)
+- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md) — data shape contracts and identifier strategy
+- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md) — file formats, versioning, migration
+- [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md) — thread roles, ownership, shutdown order
+- [gpu-runtime-roadmap.md](/C:/lib/github/kjranyone/VulVATAR/docs/gpu-runtime-roadmap.md) — GPU pressure policy (`RuntimeGpuBudget`)
+- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md) — tracking → rig contract
+- [onnx-tracking-pipeline.md](/C:/lib/github/kjranyone/VulVATAR/docs/onnx-tracking-pipeline.md) — inference pipeline, coordinate conventions
+- [calibration-ux.md](/C:/lib/github/kjranyone/VulVATAR/docs/calibration-ux.md) — pose calibration spec
+- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md) — GPU frame handoff / VGTK sidecar protocol
+- [mf-virtual-camera.md](/C:/lib/github/kjranyone/VulVATAR/docs/mf-virtual-camera.md) — MediaFoundation virtual camera contract
+- [vulkano-renderer-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/vulkano-renderer-design.md) — renderer design, API boundary, materials, MToon status
+- [shader-implementation-notes.md](/C:/lib/github/kjranyone/VulVATAR/docs/shader-implementation-notes.md) — shader-level contracts and gotchas
+- [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md) — cloth authoring UX spec + status
+- [model-library.md](/C:/lib/github/kjranyone/VulVATAR/docs/model-library.md) — avatar library and folder watching
+- [profiling.md](/C:/lib/github/kjranyone/VulVATAR/docs/profiling.md) — instrumentation recipes and known bottlenecks

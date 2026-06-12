@@ -21,6 +21,93 @@ pub struct RenderFrameInput {
     /// the per-frame camera uniform and multiplies it into every avatar
     /// fragment's alpha.
     pub avatar_opacity: f32,
+    pub bloom: BloomSettings,
+    pub generative_background: GenerativeBackgroundSettings,
+    /// Tracking-derived signals consumed by the generative background
+    /// shader. `valid == false` (the default) zeroes every reactive term.
+    pub background_tracking: BackgroundTracking,
+    /// Background animation clock in seconds. The app accumulates wall time
+    /// and wraps it at 4096 s to preserve f32 precision; validation binaries
+    /// pass a fixed value so renders stay deterministic.
+    pub time_seconds: f32,
+}
+
+/// Generative (procedural) background parameters, forwarded per frame.
+/// Changing any field never rebuilds pipelines — everything reaches the
+/// fullscreen background shader as push constants. While `enabled` is
+/// false the background draw is skipped entirely and the scene keeps the
+/// historical clear-color / transparent background.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenerativeBackgroundSettings {
+    pub enabled: bool,
+    /// Linear-space brightness multiplier. Streak highlights exceed 1.0 so
+    /// the bloom chain picks them up at its default threshold.
+    pub intensity: f32,
+    pub speed: f32,
+    /// Noise/domain scale of the flow field.
+    pub scale: f32,
+    /// Strength of the tracking-reactive terms (hand swirl, head wave,
+    /// mouth pulse). 0.0 turns the background into a pure flow field.
+    pub reactivity: f32,
+    pub color_a: [f32; 3],
+    pub color_b: [f32; 3],
+}
+
+impl Default for GenerativeBackgroundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            intensity: 1.0,
+            speed: 1.0,
+            scale: 2.0,
+            reactivity: 1.0,
+            color_a: [0.02, 0.05, 0.18],
+            color_b: [0.10, 0.85, 1.00],
+        }
+    }
+}
+
+/// Avatar-derived world-space anchors for the reactive background. Bone
+/// positions live in avatar-root space (the same space the renderer draws
+/// vertices in — `RenderAvatarInstance::world_transform` is never applied),
+/// so the renderer projects them with the frame's view/projection as-is.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BackgroundTracking {
+    pub head_ws: [f32; 3],
+    pub left_hand_ws: [f32; 3],
+    pub right_hand_ws: [f32; 3],
+    /// Mouth-open amount in `[0, 1]` — the max of the five VRM mouth
+    /// viseme expression weights ("aa", "ih", "ou", "ee", "oh").
+    pub mouth_open: f32,
+    /// False when no avatar (or no humanoid map) is loaded; the renderer
+    /// then drops every reactive term.
+    pub valid: bool,
+}
+
+/// Bloom post-effect parameters, forwarded per frame. Changing any field
+/// never rebuilds pipelines — the renderer feeds them to the bloom passes as
+/// push constants and skips the down/upsample chain entirely while
+/// `enabled` is false.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BloomSettings {
+    pub enabled: bool,
+    /// Linear-space multiplier applied to the blurred bloom contribution at
+    /// composite time (both RGB and alpha, so the glow halo carries
+    /// fractional alpha over a transparent background).
+    pub intensity: f32,
+    /// Soft-knee luminance threshold in linear space. 1.0 means only
+    /// HDR-bright pixels (emissive, strong lights) feed the bloom chain.
+    pub threshold: f32,
+}
+
+impl Default for BloomSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            intensity: 0.6,
+            threshold: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -333,7 +420,25 @@ pub enum RenderExportMode {
 
 #[cfg(test)]
 mod tests {
-    use super::MsaaMode;
+    use super::{BloomSettings, GenerativeBackgroundSettings, MsaaMode};
+
+    #[test]
+    fn generative_background_default_is_disabled() {
+        // Existing projects (and every construction site that fills the
+        // field with `Default::default()`) must keep the historical
+        // clear-color background.
+        let bg = GenerativeBackgroundSettings::default();
+        assert!(!bg.enabled);
+    }
+
+    #[test]
+    fn bloom_settings_default_is_disabled() {
+        // Existing projects (and every diagnostic binary that fills the
+        // field with `Default::default()`) must keep the historical
+        // no-post-processing output.
+        let bloom = BloomSettings::default();
+        assert!(!bloom.enabled);
+    }
 
     #[test]
     fn msaa_mode_sample_count_maps_to_vulkan_levels() {
