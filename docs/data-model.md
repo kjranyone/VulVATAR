@@ -7,7 +7,7 @@ This document defines the core runtime and persistence-facing data shapes for Vu
 It sits between:
 
 - `architecture.md`, which defines ownership and layer boundaries
-- implementation, which will turn these contracts into concrete Rust types
+- the implemented Rust types (see "Implemented Shapes" at the end)
 
 Related documents:
 
@@ -376,68 +376,20 @@ Variants:
 - `ReplaceLatest`
 - `BlockNotAllowed`
 
-## Rust Skeleton
+## Implemented Shapes
 
-The following sketch is intentionally incomplete but sets the shape:
+The types above are all implemented; the code is the authoritative
+field-level reference (the implementations carry more fields than the
+contracts here — animation clips, caches, per-overlay slots, GPU
+buffers):
 
-```rust
-pub struct AvatarAsset {
-    pub id: AvatarAssetId,
-    pub source_path: PathBuf,
-    pub source_hash: AssetSourceHash,
-    pub skeleton: SkeletonAsset,
-    pub meshes: Vec<MeshAsset>,
-    pub materials: Vec<MaterialAsset>,
-    pub humanoid: Option<HumanoidMap>,
-    pub spring_bones: Vec<SpringBoneAsset>,
-    pub colliders: Vec<ColliderAsset>,
-    pub default_expressions: ExpressionAssetSet,
-}
-
-pub struct ClothAsset {
-    pub id: ClothOverlayId,
-    pub target_avatar: AvatarAssetId,
-    pub target_avatar_hash: AssetSourceHash,
-    pub stable_refs: ClothStableRefSet,
-    pub simulation_mesh: ClothSimulationMesh,
-    pub render_bindings: Vec<ClothRenderRegionBinding>,
-    pub mesh_mapping: ClothMeshMapping,
-    pub pins: Vec<ClothPin>,
-    pub constraints: ClothConstraintSet,
-    pub collision_bindings: Vec<ClothCollisionBinding>,
-    pub lods: Vec<ClothLod>,
-    pub solver_params: ClothSolverParams,
-    pub metadata: ClothOverlayMetadata,
-}
-
-pub struct AvatarInstance {
-    pub id: AvatarInstanceId,
-    pub asset_id: AvatarAssetId,
-    pub world_transform: Transform,
-    pub pose: AvatarPose,
-    pub animation_state: AnimationState,
-    pub secondary_motion: SecondaryMotionState,
-    pub tracking_input: Option<TrackingRigPose>,
-    pub attached_cloth: Option<ClothOverlayId>,
-    pub cloth_enabled: bool,
-    pub cloth_state: Option<ClothState>,
-}
-
-pub struct OutputFrame {
-    pub frame_id: OutputFrameId,
-    pub timestamp: FrameTimestamp,
-    pub extent: UVec2,
-    pub color_space: OutputColorSpace,
-    pub alpha_mode: AlphaMode,
-    pub gpu_token: GpuFrameToken,
-}
-```
-
-## Next Decisions
-
-The next unresolved modeling choices are:
-
-- exact stable-reference encoding for cloth persistence
-- whether `AvatarPose` stores matrices, TRS, or both as canonical
-- whether expression weights live inside `TrackingRigPose`, `AvatarInstance`, or both
-- whether `ClothDeformOutput` is CPU-side, GPU-side, or dual-path
+- `AvatarAsset`, `ClothAsset`, identifier types — `src/asset/mod.rs`
+- `AvatarInstance`, `AvatarPose` — `src/avatar/instance.rs`,
+  `src/avatar/pose.rs` (pose stores local TRS, global matrices, and
+  skinning matrices)
+- `ClothState`, `ClothDeformOutput` (dual-path: CPU solver output,
+  GPU-consumed SSBO) — `src/avatar/instance.rs`,
+  `src/simulation/cloth.rs`
+- `TrackingRigPose` / mailbox — `src/tracking/mod.rs`
+- `OutputFrame`, `GpuFrameToken` — `src/output/mod.rs`,
+  `src/frame_handoff.rs`

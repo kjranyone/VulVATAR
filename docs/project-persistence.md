@@ -121,6 +121,12 @@ It should not contain:
 - editor-only transient selection state
 - runtime output queues
 - raw tracking frames
+- app-level user preferences (UI language, viewport input
+  sensitivities, consent answers) — these follow the user, not the
+  scene, and live in `%APPDATA%\VulVATAR\settings.json`
+  (`persistence::AppSettings`). Pre-split project files carried them
+  in a `settings` block; it is read once for migration and never
+  written back.
 
 ## Overlay File Contents
 

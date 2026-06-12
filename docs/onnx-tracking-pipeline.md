@@ -2,34 +2,157 @@
 
 This document describes the design and implementation of the ONNX
 Runtime-based whole-body tracking pipeline used in VulVATAR. The
-default `rtmw3d` provider is the focus of this document — see
-[`pose-provider-benchmark.md`](pose-provider-benchmark.md) for the
-two depth-aware alternatives and the throughput / quality
-trade-offs between them.
+2026-06 provider unification removed the alternative pipelines
+(ViTPose, CIGPose+MoGe-2, HMR2, MediaPipe hands); RTMW3D (+ optional
+DAv2 depth) won the benchmark on accuracy-per-walltime and is now the
+single pipeline.
 
-## Provider selection
+## The pipeline
 
-VulVATAR ships three interchangeable pose providers behind the
-`PoseProvider` trait in `src/tracking/provider.rs`. Selection is
-runtime via the `VULVATAR_POSE_PROVIDER` environment variable
-(defaults to `rtmw3d`). `dev.ps1`'s `Select-PoseProvider` step
-exposes this in the dev menu and downloads the right model set
-on demand.
+VulVATAR ships a single pose pipeline behind the `PoseProvider`
+trait in `src/tracking/provider.rs`: **RTMW3D with an optional async
+DAv2 metric-depth stage** (`src/tracking/rtmw3d_with_depth.rs`).
 
-| Provider | env value | Median walltime | Mean fps | Z source |
-|---|---|---:|---:|---|
-| **`rtmw3d`** (default) | `rtmw3d` | 18 ms | **48** | Body-prior synthetic z (RTMW3D's SimCC Z heatmap, normalised) |
-| **`rtmw3d-with-depth`** | `rtmw3d-with-depth` | 24 ms | **41** | Calibrated metric z: DAv2-Small relative depth + body-anchor 1-DoF solve, async worker |
-| **`cigpose-metric-depth`** | `cigpose-metric-depth` | 220 ms | 5 | True metric z: MoGe-2 ViT-S Apache-2.0 metric depth (reference path) |
+| Stage | Walltime | Z source |
+|---|---:|---|
+| RTMW3D (always) | ~18 ms | Body-prior synthetic z (RTMW3D's SimCC Z heatmap, normalised) |
+| + DAv2 depth stage (when `dav2_small.onnx` is present) | ~24 ms combined | Calibrated metric z: DAv2-Small relative depth + body-anchor 1-DoF solve, async worker |
 
-The two depth-aware providers reuse the SourceSkeleton / pose-solver
-machinery described in §3–§5 below; only the joint-z derivation
-differs. See `src/tracking/skeleton_from_depth.rs` for the shared
-"depth grid → skeleton" stage they both consume.
+When `dav2_small.onnx` is absent the provider logs a load warning
+and runs the identical RTMW3D pipeline without the depth stage. The
+depth path consumes the "depth grid → skeleton" stage in
+`src/tracking/skeleton_from_depth.rs`; the SourceSkeleton /
+pose-solver machinery described in §3–§5 below is shared by both
+configurations — only the joint-z derivation differs.
+
+## Pipeline configuration, stage log, safe mode
+
+The pipeline shape is bound once at tracking start from
+`TrackingPipelineConfig` (`src/tracking/provider.rs`), surfaced as
+the Tracking inspector's *Pipeline* section and persisted with the
+project:
+
+| Toggle | Effect |
+|---|---|
+| Metric depth (DAv2) | Runs the async depth stage (needs `dav2_small.onnx`; missing model degrades with a visible toast) |
+| Person crop (YOLOX) | Off = whole-frame RTMW3D inference |
+| CPU-only inference | Every ONNX session on the CPU EP — DirectML (and the GPU driver's compute queue) stays out of tracking entirely |
+
+**Crash forensics** (`src/tracking/stagelog.rs`): every tracking
+session appends flushed per-stage markers (camera grab, YOLOX,
+RTMW3D run, FaceMesh, depth submit/wait, publish) to
+`logs/tracking_<unix-secs>.log` (kept: last 10). After a hard system
+freeze the last line names the stage that never completed.
+
+**Safe mode**: `logs/tracking.active` is created at session start
+and removed on clean exit (including panic unwinds). If it survives
+to the next launch, the Tracking inspector shows an unclean-exit
+banner offering a degraded one-session configuration
+(`TrackingPipelineConfig::safe_mode()`: CPU-only, no depth, no
+person crop, camera capped at 720p30). Motivated by the 2026-06-11
+hard freeze (Kernel-Power 41, Intel Arc B570, no TDR event flushed)
+where no evidence survived to diagnose the trigger.
+
+**GPU-call hardening** (same incident, see the audit in the PR
+history): every CPU-side wait on Vulkan work goes through
+`renderer::gpu_wait::wait_fence_bounded` (5 s ceiling, device-lost
+classification, stage-log stamp, leak-on-failure to dodge vulkano's
+blocking `FenceSignalFuture::drop`); the renderer stamps
+`render_submit` into the stage log each frame; cloth dispatch counts
+are clamped at the GPU boundary (`substeps ≤ 8`,
+`solver_iterations ≤ 32`); and **YOLOX is CPU-only by design** so
+RTMW3D is the single DirectML session in the process — concurrent
+DirectML submission from two threads on one device is a recorded
+driver-hang pattern on Intel GPUs.
+
+**GPU init exclusivity** (`src/gpu_coordination.rs`): the 2026-06-12
+stage log pinned the freeze precisely — the system died ~240 ms into
+`provider_load_begin` while `render_submit` kept firing at 60 fps.
+DirectML session initialisation (370 MB graph upload + kernel
+compilation) racing the live Vulkan submission stream is the
+trigger. The tracking worker now holds a `GpuExclusiveGuard` across
+provider creation *plus one warm-up inference* (so lazy first-run
+kernel compilation also lands inside the window), and the render
+thread skips frames while the guard is held. Cost: the viewport
+pauses ~1–3 s once per tracking start.
+
+## Arm depth: measured + geometric (2026-06 redesign)
+
+A foreshortening-aware audit (see `validate_pipeline`'s `fs_score`)
+showed the dominant desk-streaming arm pose — forearms toward the
+camera — rendered as a spread-arm T-pose on all 64
+`streamer_display_webcam_capture` images while the xy-angle metric
+reported ~0°. Three layers fix it:
+
+1. **Metric arm chains** (`replace_arm_chains_from_metric`): the
+   depth back-projection's *relative* segment vectors (elbow−shoulder,
+   wrist−elbow) survive perspective (a hand 0.35 m from the lens
+   projects ~1.7× wider than at torso depth) and cancel DAv2's
+   lateral DC bias. Bounded by anatomical min/max segment lengths
+   (occlusion-collapsed or background samples degrade per-segment,
+   never fold or fling the arm). Joints the depth builder drops
+   (stale-crop sample misses during motion) are unioned back from
+   RTMW3D so limbs never vanish.
+2. **Bone-length-invariant z reconstruction** (`rtmw3d::arm_z`):
+   depth-off fallback — `|dz| = sqrt(L² − xy²)` with session
+   running-max lengths + anthropometric floors, forward-default sign.
+3. **bz-corroborated body yaw** (`compute_body_yaw_3d`): the span-
+   foreshortening yaw magnitude is capped by the inter-shoulder Δz
+   evidence (deviation from the nearest in-plane orientation), fixing
+   the live ±45° yaw lock caused by perspective-inflated span
+   running-max.
+
+Validation: `streamer_display_webcam_capture` 16:9 — 63/64 at
+`fs ≤ 0.15` (one borderline 0.162 traced to the wrist-twist
+redistribution shifting the hand, gross pose visually correct);
+4:3 640×480 webcam-format variants — 64/64; all other categories —
+no regression (`fs_max 0.144`).
+
+## Out-of-frame limbs (edge exit)
+
+SimCC cannot emit coordinates outside its input: a hand leaving the
+frame is either clamped onto the boundary bins or hallucinated at the
+visible forearm stump — at healthy confidence either way, so neither
+position nor confidence detects it. The reliable signature is the
+**hand-keypoint block spread**: a real hand (including one held
+toward the camera) decodes its 21 points over 0.10+ of the frame; the
+hallucination collapses them to a point (measured 0.000). Detection
+(`arm_z::wrist_out_of_frame`) combines that spread gate with either a
+border-clamped wrist or a bone-length ray that exits the frame.
+
+On detection the wrist is treated as missing data, NOT edge data —
+source space does not end at the image border. The arm is re-placed
+at full bone length along the **held direction** from the last frame
+the hand was genuinely visible (an arm slides out, so that direction
+is the best continuation; geometric stub/straight-arm extension is
+the cold-start fallback), and the depth pipeline's metric arm
+replacement is skipped for that side (its samples were taken at the
+clamp pixel).
+
+Temporal hardening (validated on real slide-out footage via
+`diagnose_video_replay` + `diagnostics/analyze_video_replay.py`):
+
+- **Length band clamp** — running-max segment estimates are clamped
+  to ×0.8..×1.35 of the anthropometric span ratios, so one
+  hallucinated long frame cannot poison the held length (R forearm
+  median went 1.44 → 0.99 source units on the validation video).
+- **Detector hysteresis** — `oof_streak` engages after 2 consecutive
+  fired frames and releases after 3 consecutive clear frames,
+  removing boundary flapping when the wrist hovers at the edge.
+- **Engagement cross-fade** — repair strength ramps ±0.34/frame and
+  the re-placed elbow/wrist are lerped against the raw decode, so
+  engaging/releasing the extension cannot snap the arm.
+
+The static crop-pair benchmark (`diagnose_edge_exit`,
+`diagnostics/edge_exit_inputs`) deliberately under-scores this path:
+its 2-pass-per-image window is shorter than the hysteresis engage
+time, and a crop is a camera jump that invalidates held state by
+construction. It remains useful only as a cold-start lower bound;
+sequence replay on fixed-camera footage is the authoritative gate.
 
 ## Architecture Overview
 
-`rtmw3d` is the default — a 3D-native single-model whole-body pose
+RTMW3D is a 3D-native single-model whole-body pose
 estimator (mmpose / OpenMMLab) running on a background
 `TrackingWorker` thread so it never blocks the main rendering loop.
 YOLOX person detection runs on its own worker thread (see "Async
@@ -38,7 +161,7 @@ RTMW3D-x model itself.
 
 ```mermaid
 graph TD;
-    Camera[Webcam / Video Source] --> |RGB Frame| YoloxAsync[YOLOX-m person bbox<br/>async worker, 1/4 rate]
+    Camera[Webcam / Video Source] --> |RGB Frame| YoloxAsync[YOLOX-m person bbox<br/>async worker CPU EP, 1/4 rate]
     YoloxAsync --> |latest bbox + 25% pad| Crop[Crop to subject]
     Crop --> |RGB crop| Resize[Resize to 288×384]
     Resize --> |NCHW [1,3,384,288]| RTMW3D[RTMW3D ONNX]
@@ -51,11 +174,10 @@ graph TD;
 
 ## Models
 
-Five ONNX files cover all three providers; only what the active
-provider needs is downloaded by `dev.ps1`'s `Select-PoseProvider`
-step.
+`dev.ps1`'s setup / run targets download the full set
+(`Install-Models; Install-DepthAnythingSmall`).
 
-### Default (`rtmw3d`) — `Install-Models`
+### Core — `Install-Models`
 
 | File                    | Source                       | Size    | Role                                                  |
 |-------------------------|------------------------------|---------|-------------------------------------------------------|
@@ -64,7 +186,7 @@ step.
 | `face_landmark.onnx`    | PINTO 410 FaceMeshV2         | 4.8 MB  | 478 dense face landmarks                              |
 | `face_blendshapes.onnx` | PINTO 390 BlendshapeV2       | 1.8 MB  | 146 face landmarks → 52 ARKit blendshape coefficients |
 
-### Plus for `rtmw3d-with-depth` — `Install-DepthAnythingSmall`
+### Depth stage — `Install-DepthAnythingSmall`
 
 | File              | Source                              | Size   | Role                              |
 |-------------------|-------------------------------------|--------|-----------------------------------|
@@ -74,15 +196,7 @@ Locked to a 392×294 input (multiples of 14 = DINOv2 patch size,
 ~588 image tokens); run on a worker thread so it overlaps with
 RTMW3D on the calling thread. Calibrated to metric scale via a
 single-DoF body-anchor solve (shoulder span ≈ 0.40 m, hip span
-fallback). Details in
-[`pose-provider-benchmark.md`](pose-provider-benchmark.md).
-
-### Plus for `cigpose-metric-depth` — `Install-ExperimentalPoseModels`
-
-| File             | Source                                   | Size    | Role                                          |
-|------------------|------------------------------------------|---------|-----------------------------------------------|
-| `cigpose.onnx`   | `namas191297/cigpose-onnx` GH releases   | 240 MB  | CIGPose-x UBody 2D landmarks (133, transformer) |
-| `moge_v2.onnx`   | `Ruicheng/moge-2-vits-normal-onnx` HF   | 141 MB  | MoGe-2 ViT-S true-metric point cloud (MIT)    |
+fallback) in `src/tracking/skeleton_from_depth.rs`.
 
 Soykaf's HuggingFace mirror hosts the official mmpose RTMW3D export
 (`rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx`,
@@ -105,7 +219,30 @@ bilinear) to ~0.683 (bbox-cropped, +25% pad), and weak categories
 
 ## Pipeline
 
-### 0. Person bbox crop (YOLOX-m)
+### 0. Person bbox crop (self-tracking, YOLOX-m for acquisition)
+
+In steady state the crop comes from the **self-tracking bbox**: the
+previous frame's own high-confidence keypoints, padded 25%. It
+refreshes at full frame rate and by construction encloses every
+keypoint — the person-class YOLOX bbox routinely cuts off a hand
+extended toward the camera on deskcrop framings (validation sweep:
+up to 16.9° of solver error), and on the CPU EP its result is also
+~300 ms stale. YOLOX serves acquisition and re-acquisition only
+(cold start, or after a frame with fewer than 8 confident body
+keypoints releases the track).
+
+The DAv2 z-injections (`inject_shoulder_bz_from_dav2` /
+`inject_elbow_z_from_dav2`) carry **own-body occlusion gates**: a
+hand held in front of a shoulder/elbow pixel reads as the subject at
+a plausible depth — defeating the depth band and anatomical bounds —
+so a large DAv2 delta must be corroborated by RTMW3D's own nz in
+direction and rough magnitude (span-normalised tangents, plus a
+hand-adhesion check for the elbow). Tuned against the
+`streamer_display_webcam_capture` validation set: category mean
+3.29° → 0.61°, max 56.4° → 4.95°, with zero regression on the
+rotation categories the injections exist to serve.
+
+### 0b. YOLOX-m details
 
 When `models/yolox.onnx` is present, `tracking::yolox` runs first on
 the full camera frame. The Human-Art tuned YOLOX-m emits post-NMS
@@ -126,15 +263,18 @@ config.
 
 #### Async workers
 
-YOLOX (and DAv2 in the depth-aware provider) run on dedicated
+YOLOX (and DAv2 when the depth stage is active) run on dedicated
 background threads with a drain-old `mpsc::channel` inbox and a
 sticky `Arc<DetectResult>` outbox. The main RTMW3D pipeline:
 
 - submits a frame on every `YOLOX_REFRESH_PERIOD = 4` frames (cold
   start always submits so `wait_latest` doesn't deadlock),
 - always reads the latest available result via `Arc` clone (cheap),
-- never pays the 22 ms YOLOX walltime on the critical path past
-  the cold-start frame.
+- never pays the YOLOX walltime on the critical path past the
+  cold-start frame. (YOLOX runs on the CPU EP by design — see
+  `YoloxPersonDetector::try_from_models_dir` — so RTMW3D is the only
+  DirectML session in the process; the worker pattern hides the
+  larger CPU latency the same way it hid the 22 ms GPU latency.)
 
 The cached bbox lags by 1–2 frames in steady state; the 25%
 downstream pad already absorbs the few-pixel subject motion that
@@ -142,14 +282,14 @@ accumulates over that window. See
 `src/tracking/rtmw3d/yolox_worker.rs` and the matching DAv2 worker
 inside `src/tracking/rtmw3d_with_depth.rs`.
 
-#### FaceMesh EP per provider
+#### FaceMesh EP selection
 
 The small FaceMesh + Blendshape cascade (4.8 + 1.8 MB) is sensitive
-to DirectML EP queue contention: when DAv2 / MoGe is colocated on
-DirectML the cascade inflates from ~3 ms to ~13 ms. Each provider
-opts in via `FaceMeshEp::Auto` (DirectML, default for `rtmw3d`) or
-`FaceMeshEp::ForceCpu` (depth-aware providers). CPU runs the
-cascade in ~7 ms uncontested.
+to DirectML EP queue contention: when DAv2 is colocated on
+DirectML the cascade inflates from ~3 ms to ~13 ms. The provider
+picks `FaceMeshEp::ForceCpu` when the depth stage is active (~7 ms
+uncontested) and `FaceMeshEp::Auto` (DirectML, ~3 ms) when it
+isn't.
 
 ### 1. RTMW3D preprocessing
 
