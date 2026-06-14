@@ -242,6 +242,30 @@ pub struct Rtmw3dWithDepthProvider {
     /// Current temporal-state generation; see `DepthRequest::generation`.
     #[cfg(feature = "inference")]
     depth_generation: u64,
+    /// Ray-IK state for the POST-MERGE arm re-solve (migration step 3,
+    /// first slice): after the Phase 7.5–7.6 metric injections the
+    /// skeleton carries DAv2 `metric_depth_m` samples, and re-running
+    /// the arm solve there fuses them as depth evidence and restores
+    /// the hands-contact coherence link that the metric chain
+    /// replacement severs. Separate state from the inner RTMW3D
+    /// pass's own solve (different input distribution).
+    #[cfg(feature = "inference")]
+    arm_ray_ik_post: crate::tracking::rtmw3d::arm_ray_ik::ArmRayIk,
+    /// Last-valid metric forearm vector (source units, elbow→wrist)
+    /// per side, with its age in frames. DAv2 refreshes every 2–4
+    /// frames; on the STALE frames in between, the depth builder
+    /// samples the current keypoints against the old depth map and
+    /// the forearm sample is garbage, failing `fa_valid` in
+    /// `replace_arm_chains_from_metric`. The old fallback reverted to
+    /// the nz-flat reconstruction, which for a raised palm pointing
+    /// at the camera is wrong — so the wrist z flip-flopped forward
+    /// (fresh) ↔ flat (stale) at the refresh period, snapping a
+    /// raised hand toward the face every other frame (caught only by
+    /// real-footage replay, f96–136). Holding the last-valid metric
+    /// direction across the gap keeps the depth dimension coherent
+    /// while the elbow still tracks in 2D every frame.
+    #[cfg(feature = "inference")]
+    metric_forearm_hold: [Option<([f32; 3], u32)>; 2],
     /// Active torso-template capture buffer, set by the GUI while
     /// the calibration modal is in `Collecting`. `Some` means each
     /// successful frame contributes one sample per cell to the
@@ -373,6 +397,8 @@ impl Rtmw3dWithDepthProvider {
             calibration_mode_hint: None,
             scale_c_ema: None,
             depth_generation: 0,
+            arm_ray_ik_post: Default::default(),
+            metric_forearm_hold: [None, None],
             torso_capture: None,
             last_calib_warn_at: None,
             calib_was_failing: false,
@@ -517,6 +543,8 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
             self.scale_c_ema = None;
             self.calib_was_failing = false;
             self.last_calib_warn_at = None;
+            self.arm_ray_ik_post.reset();
+            self.metric_forearm_hold = [None, None];
             self.rtmw3d.reset_temporal_state();
         }
     }
@@ -1060,8 +1088,23 @@ impl Rtmw3dWithDepthProvider {
                 sl_metric_x,
                 sr_metric_x,
                 &joints_2d,
+                &mut self.metric_forearm_hold,
             );
         }
+        // Post-merge ray-IK re-solve, CONTACT-ONLY (migration step 3,
+        // first slice). Phase 7.6 places the arms from real measured
+        // vectors — better than any prior-based re-solve — but its
+        // independent per-side chains cannot keep the two wrists
+        // depth-coherent when the hands touch. When (and only when)
+        // the hands-contact gate fires, re-fuse the arms with the
+        // contact link plus the DAv2 `metric_depth_m` evidence the
+        // merged skeleton now carries.
+        crate::tracking::rtmw3d::arm_ray_ik::solve_arm_depth_contact_only(
+            &mut skeleton,
+            width as f32 / height.max(1) as f32,
+            &mut self.arm_ray_ik_post,
+        );
+
         // Hand orientation is also re-derived from RTMW3D's own
         // (unbiased) hand-keypoint xyz — same rationale as the body
         // joints. Keep the dav2-built one only as a fallback for
@@ -1170,7 +1213,13 @@ fn replace_arm_chains_from_metric(
     shoulder_l_metric_x: f32,
     shoulder_r_metric_x: f32,
     joints_2d: &[DecodedJoint2d],
+    forearm_hold: &mut [Option<([f32; 3], u32)>; 2],
 ) {
+    /// Max frames a held metric forearm vector stays usable. DAv2's
+    /// refresh period is 2–4 frames; 6 covers a doubled gap (a
+    /// dropped depth result) without letting a truly stale direction
+    /// persist into a genuinely new arm pose.
+    const MAX_FOREARM_HOLD_FRAMES: u32 = 6;
     /// Anatomical bounds on metric segment lengths (metres). The
     /// upper caps reject "sampled the bookshelf" outliers; the lower
     /// floors reject occlusion collapse — a wrist depth sample
@@ -1262,16 +1311,38 @@ fn replace_arm_chains_from_metric(
         };
         let old_elbow = sk.joints.get(&el_bone).map(|j| j.position);
         let new_elbow = [sh_now[0] + ua[0], sh_now[1] + ua[1], sh_now[2] + ua[2]];
-        // Wrist: metric forearm vector when plausible; otherwise keep
-        // the fallback forearm vector (nz + bone-length recon) and
-        // carry it on the relocated elbow, so a collapsed wrist
-        // sample degrades to "metric elbow + reconstructed forearm"
-        // instead of folding the arm.
-        let new_wrist = if fa_valid {
+        // Wrist forearm vector, in priority order:
+        //   1. this frame's metric vector when plausible (fresh depth)
+        //      — also refreshes the temporal hold;
+        //   2. the last-valid metric vector held across the stale-
+        //      depth gap (carries the forward extension that the
+        //      nz-flat reconstruction loses, killing the every-other-
+        //      frame forward↔flat flip);
+        //   3. the nz + bone-length reconstruction, when no recent
+        //      metric direction exists at all.
+        // All three are carried on the freshly-relocated (2D-tracked)
+        // elbow, so the wrist responds in-plane every frame regardless
+        // of which depth source supplies its forward extension.
+        let forearm_vec = if fa_valid {
+            forearm_hold[i] = Some((fa, 0));
+            Some(fa)
+        } else if let Some((held, age)) = forearm_hold[i] {
+            if age < MAX_FOREARM_HOLD_FRAMES {
+                forearm_hold[i] = Some((held, age + 1));
+                debug!("metric-arm side {i}: forearm hold reused (age {})", age + 1);
+                Some(held)
+            } else {
+                forearm_hold[i] = None;
+                None
+            }
+        } else {
+            None
+        };
+        let new_wrist = if let Some(fa_vec) = forearm_vec {
             [
-                new_elbow[0] + fa[0],
-                new_elbow[1] + fa[1],
-                new_elbow[2] + fa[2],
+                new_elbow[0] + fa_vec[0],
+                new_elbow[1] + fa_vec[1],
+                new_elbow[2] + fa_vec[2],
             ]
         } else {
             match (old_elbow, sk.joints.get(&wr_bone).map(|j| j.position)) {

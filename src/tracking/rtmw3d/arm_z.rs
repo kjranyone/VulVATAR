@@ -1,39 +1,29 @@
-//! Arm-depth reconstruction from the bone-length invariant.
+//! Arm keypoint repair on the projected (xy) plane: edge-exit
+//! detection + restoration of clamp-shortened limbs, plus the
+//! session length bookkeeping the repair's band clamp reads.
 //!
-//! RTMW3D's SimCC nz is nearly blind to limbs pointing at the camera:
-//! an arm reaching toward the lens decodes with the same near-flat z
-//! as an arm lying in the image plane, so the avatar renders the
-//! dominant desk-streaming pose ("forearms on the desk, hands toward
-//! the camera") as a spread-arm T-pose. The 2026-06 GUI-parity audit
-//! made this measurable: a foreshortening metric over the
-//! `streamer_display_webcam_capture` set scored 64/64 images broken
-//! (mean fs error 0.61) while the xy-direction metric — blind to
-//! exactly this axis — reported 0.02°.
+//! The z-depth reconstruction that used to live here (`|dz| =
+//! sqrt(L² − xy²)` against a session running-max length) moved to the
+//! ray-IK stage (`super::arm_ray_ik`, `docs/ray-ik-depth-solve.md`):
+//! the running max was structurally corruptible — one near-lens hand
+//! sweep inflated it past anatomy (measured 2×) and a pure max never
+//! recovers, after which every in-plane arm read as foreshortened and
+//! gained fake forward depth every frame. The ray-IK solve uses
+//! anatomical metric lengths instead, so near-lens magnification
+//! resolves into depth by construction.
 //!
-//! The fix is geometric, not learned: a bone's 3D length is constant,
-//! so when its projected xy length shrinks below the known length the
-//! missing component is depth: `|dz| = sqrt(L² − xy²)`.
+//! What remains here:
 //!
-//! * **L (per segment)**: running session maximum of the segment's
-//!   *projected xy* length (an in-plane arm reveals its true length;
-//!   xy is used, not 3D, so the reconstruction can never feed its own
-//!   output back into the estimate), floored by an anthropometric
-//!   prior expressed against the shoulder span (upper arm ≈ 0.76 ×
-//!   biacromial span, forearm ≈ 0.62 × — standard proportions).
-//! * **Sign**: toward the camera by default — in the webcam setting a
-//!   foreshortened arm is overwhelmingly reaching forward, not folded
-//!   behind the back — unless the model's own nz already shows a
-//!   decisive backward displacement, which we then respect.
-//! * **Magnitude guard**: reconstruction only ever *adds* missing
-//!   forward depth — when nz already reports a larger displacement
-//!   than the invariant implies, nz wins untouched.
-//!
-//! Runs on the RTMW3D source skeleton before the face cascade, so the
-//! depth pipeline inherits the reconstructed baseline through its
-//! Phase-7 position copy (its gated DAv2 elbow refinement then layers
-//! on top).
+//! * [`observe_lengths`] — running maxima of projected segment
+//!   lengths, used (band-clamped!) by the edge repair.
+//! * [`wrist_out_of_frame`] / [`repair_edge_clamped_arms`] — keypoints
+//!   clamped at the frame border are observation clamps, not
+//!   positions; restore the limb along the last visible direction.
+//! * [`shift_hand_chain`] — translate a wrist's finger chain
+//!   coherently (shared with the ray-IK stage).
 
 use crate::asset::HumanoidBone;
+use log::debug;
 
 use super::super::source_skeleton::SourceSkeleton;
 
@@ -47,11 +37,6 @@ const FOREARM_SPAN_RATIO: f32 = 0.62;
 
 /// Minimum keypoint confidence for a segment to participate.
 const MIN_CONF: f32 = 0.3;
-
-/// nz must show at least this much *backward* displacement (as a
-/// fraction of the shoulder span) before the forward-default sign is
-/// flipped. Below it, nz's z is noise-level and the desk prior wins.
-const BACKWARD_DECISIVE_SPAN_FRAC: f32 = 0.15;
 
 /// Per-session running maxima of projected segment lengths.
 /// `[left, right]` per segment; reset with the rest of the temporal
@@ -77,12 +62,20 @@ pub(super) struct ArmLengthState {
     /// replay measured 44–60 per-frame jumps >0.6 source units at
     /// exit/re-entry transitions before this).
     engagement: [f32; 2],
+    /// Diagnostics: frame counter plus last logged maxima — growth
+    /// logs gate behind a 5% threshold so warmup creep stays quiet.
+    /// Per-event lines need
+    /// `RUST_LOG=vulvatar_lib::tracking::rtmw3d::arm_z=debug`.
+    frame: u64,
+    logged_span: f32,
+    logged_upper_max: [f32; 2],
+    logged_forearm_max: [f32; 2],
 }
 
 /// Fold the current frame's observable segment lengths into the
-/// running maxima. Called by [`reconstruct_arm_z`] and — earlier in
-/// the frame — by the edge-exit repair, so the very first frame
-/// already has a usable span reference (idempotent: pure max()).
+/// running maxima (idempotent: pure max()). Called by the edge-exit
+/// repair at the top of the frame; the repair's band clamp is the
+/// only consumer of the maxima.
 pub(super) fn observe_lengths(sk: &SourceSkeleton, state: &mut ArmLengthState) {
     if let (Some(l), Some(r)) = (
         sk.joints.get(&HumanoidBone::LeftUpperArm),
@@ -92,18 +85,18 @@ pub(super) fn observe_lengths(sk: &SourceSkeleton, state: &mut ArmLengthState) {
             let span = xy_len(l.position, r.position);
             if span > state.span_max {
                 state.span_max = span;
+                if span > state.logged_span * 1.05 {
+                    debug!(
+                        "arm-z diag f{}: span_max grew {:.3} -> {:.3}",
+                        state.frame, state.logged_span, span
+                    );
+                    state.logged_span = span;
+                }
             }
         }
     }
-}
 
-pub(super) fn reconstruct_arm_z(sk: &mut SourceSkeleton, state: &mut ArmLengthState) {
-    observe_lengths(sk, state);
-    if state.span_max <= 0.0 {
-        return;
-    }
     let span_ref = state.span_max.max(1e-3);
-
     for (side, shoulder, elbow, wrist) in [
         (
             0usize,
@@ -118,116 +111,60 @@ pub(super) fn reconstruct_arm_z(sk: &mut SourceSkeleton, state: &mut ArmLengthSt
             HumanoidBone::RightHand,
         ),
     ] {
-        // ---- upper arm: shoulder → elbow -----------------------------
-        let (sh_pos, sh_conf) = match sk.joints.get(&shoulder) {
-            Some(j) => (j.position, j.confidence),
-            None => continue,
-        };
-        let Some(el) = sk.joints.get(&elbow).copied() else {
+        let Some(sh) = sk.joints.get(&shoulder) else {
             continue;
         };
-        if sh_conf < MIN_CONF || el.confidence < MIN_CONF {
+        let Some(el) = sk.joints.get(&elbow) else {
+            continue;
+        };
+        if sh.confidence < MIN_CONF || el.confidence < MIN_CONF {
             continue;
         }
-        let ua_xy = xy_len(sh_pos, el.position);
+        let ua_xy = xy_len(sh.position, el.position);
         if ua_xy > state.upper_xy_max[side] {
             state.upper_xy_max[side] = ua_xy;
-        }
-        let l_ua = state.upper_xy_max[side].max(UPPER_ARM_SPAN_RATIO * span_ref);
-        // Original (pre-reconstruction) nz values: the backward-sign
-        // evidence must be read in the model's own frame — comparing
-        // an un-reconstructed wrist nz against an already-advanced
-        // elbow z would fabricate "decisively backward" out of the
-        // reconstruction itself.
-        let elbow_z_nz = el.position[2];
-        let new_elbow_z = reconstruct_segment_z(
-            sh_pos[2],
-            el.position[2],
-            sh_pos[2],
-            el.position[2],
-            ua_xy,
-            l_ua,
-            span_ref,
-        );
-        if let Some(z) = new_elbow_z {
-            if let Some(j) = sk.joints.get_mut(&elbow) {
-                j.position[2] = z;
+            if ua_xy > state.logged_upper_max[side] * 1.05 {
+                let prior = UPPER_ARM_SPAN_RATIO * span_ref;
+                debug!(
+                    "arm-z diag f{} {}: upper_xy_max grew to {:.3} ({:.2}x prior {:.3})",
+                    state.frame,
+                    side_tag(side),
+                    ua_xy,
+                    ua_xy / prior.max(1e-6),
+                    prior
+                );
+                state.logged_upper_max[side] = ua_xy;
             }
         }
-        let elbow_z = sk.joints.get(&elbow).map(|j| j.position[2]).unwrap_or(el.position[2]);
-
-        // ---- forearm: elbow → wrist ----------------------------------
-        let Some(wr) = sk.joints.get(&wrist).copied() else {
+        let Some(wr) = sk.joints.get(&wrist) else {
             continue;
         };
         if wr.confidence < MIN_CONF {
             continue;
         }
-        let el_pos = sk.joints.get(&elbow).map(|j| j.position).unwrap_or(el.position);
-        let fa_xy = xy_len(el_pos, wr.position);
+        let fa_xy = xy_len(el.position, wr.position);
         if fa_xy > state.forearm_xy_max[side] {
             state.forearm_xy_max[side] = fa_xy;
-        }
-        let l_fa = state.forearm_xy_max[side].max(FOREARM_SPAN_RATIO * span_ref);
-        if let Some(z) = reconstruct_segment_z(
-            elbow_z,
-            wr.position[2],
-            elbow_z_nz,
-            wr.position[2],
-            fa_xy,
-            l_fa,
-            span_ref,
-        ) {
-            let dz = z - wr.position[2];
-            if let Some(j) = sk.joints.get_mut(&wrist) {
-                j.position[2] = z;
+            if fa_xy > state.logged_forearm_max[side] * 1.05 {
+                let prior = FOREARM_SPAN_RATIO * span_ref;
+                debug!(
+                    "arm-z diag f{} {}: forearm_xy_max grew to {:.3} ({:.2}x prior {:.3})",
+                    state.frame,
+                    side_tag(side),
+                    fa_xy,
+                    fa_xy / prior.max(1e-6),
+                    prior
+                );
+                state.logged_forearm_max[side] = fa_xy;
             }
-            // Keep the finger chain coherent with the relocated
-            // wrist so hand orientation and finger solving see a
-            // consistent hand, mirroring the wrist module's
-            // translate-chain policy.
-            shift_hand_chain_z(sk, wrist, dz);
         }
     }
 }
 
-/// Compute the reconstructed tip z for one segment, or `None` when
-/// the existing z already satisfies (or exceeds) the bone-length
-/// invariant.
-fn reconstruct_segment_z(
-    base_z: f32,
-    tip_z: f32,
-    base_z_nz: f32,
-    tip_z_nz: f32,
-    xy: f32,
-    length: f32,
-    span_ref: f32,
-) -> Option<f32> {
-    let dz_needed_sq = length * length - xy * xy;
-    if dz_needed_sq <= 0.0 {
-        return None; // segment is at (or past) full extension in-plane
-    }
-    let dz_needed = dz_needed_sq.sqrt();
-    let dz_existing = tip_z - base_z;
-    if dz_existing.abs() >= dz_needed {
-        return None; // existing z already explains the foreshortening
-    }
-    // Forward (toward camera, +z) unless the model's own nz — read in
-    // its original frame on both endpoints — decisively says backward.
-    let dz_nz = tip_z_nz - base_z_nz;
-    let sign = if dz_nz < -BACKWARD_DECISIVE_SPAN_FRAC * span_ref {
-        -1.0
-    } else {
-        1.0
-    };
-    Some(base_z + sign * dz_needed)
-}
-
-fn shift_hand_chain_z(sk: &mut SourceSkeleton, wrist: HumanoidBone, dz: f32) {
-    shift_hand_chain(sk, wrist, [0.0, 0.0, dz]);
-}
-
-fn shift_hand_chain(sk: &mut SourceSkeleton, wrist: HumanoidBone, d: [f32; 3]) {
+/// Translate a wrist's whole finger chain (phalanges + fingertips) by
+/// `d` so the hand stays coherent when the wrist is relocated. Shared
+/// with the ray-IK stage.
+pub(super) fn shift_hand_chain(sk: &mut SourceSkeleton, wrist: HumanoidBone, d: [f32; 3]) {
     let left = wrist == HumanoidBone::LeftHand;
     for (bone, joint) in sk.joints.iter_mut() {
         if is_finger_bone_side(*bone, left) {
@@ -245,7 +182,7 @@ fn shift_hand_chain(sk: &mut SourceSkeleton, wrist: HumanoidBone, d: [f32; 3]) {
     }
 }
 
-fn is_finger_bone_side(bone: HumanoidBone, left: bool) -> bool {
+pub(super) fn is_finger_bone_side(bone: HumanoidBone, left: bool) -> bool {
     let name = format!("{bone:?}");
     let side_ok = if left {
         name.starts_with("Left")
@@ -377,6 +314,7 @@ pub(super) fn repair_edge_clamped_arms(
     frame_aspect: f32,
     state: &mut ArmLengthState,
 ) {
+    state.frame += 1;
     observe_lengths(sk, state);
     if state.span_max <= 0.0 {
         return;
@@ -432,7 +370,21 @@ pub(super) fn repair_edge_clamped_arms(
             state.engagement[side] > 0.5
         };
         let eng = &mut state.engagement[side];
+        let prev_eng = *eng;
         *eng = (*eng + if engaged_now { 0.34 } else { -0.34 }).clamp(0.0, 1.0);
+        if prev_eng == 0.0 && *eng > 0.0 {
+            debug!(
+                "arm-z diag f{} {}: edge-exit extension engaged",
+                state.frame,
+                side_tag(side)
+            );
+        } else if prev_eng > 0.0 && *eng == 0.0 {
+            debug!(
+                "arm-z diag f{} {}: edge-exit extension released",
+                state.frame,
+                side_tag(side)
+            );
+        }
         let fired = *eng > 0.0;
         let blend = *eng;
 
@@ -513,6 +465,16 @@ pub(super) fn repair_edge_clamped_arms(
     }
 }
 
+/// Log tag for a side index: 0 → `Left*` bones, 1 → `Right*` bones
+/// (selfie-mirrored, so "L" is the subject's anatomical right).
+fn side_tag(side: usize) -> &'static str {
+    if side == 0 {
+        "L"
+    } else {
+        "R"
+    }
+}
+
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [
         a[0] + (b[0] - a[0]) * t,
@@ -531,72 +493,5 @@ fn unit3(v: [f32; 3]) -> Option<[f32; 3]> {
         None
     } else {
         Some([v[0] / l, v[1] / l, v[2] / l])
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tracking::source_skeleton::SourceJoint;
-
-    fn joint(pos: [f32; 3]) -> SourceJoint {
-        SourceJoint {
-            position: pos,
-            confidence: 0.9,
-            metric_depth_m: None,
-        }
-    }
-
-    /// Arm pointing straight at the camera: xy collapses, z must be
-    /// reconstructed to the full segment length, pointing forward.
-    #[test]
-    fn fully_foreshortened_forearm_gains_forward_z() {
-        let mut sk = SourceSkeleton::empty(0);
-        sk.joints.insert(HumanoidBone::LeftUpperArm, joint([0.25, 0.4, 0.0]));
-        sk.joints.insert(HumanoidBone::RightUpperArm, joint([-0.25, 0.4, 0.0]));
-        // Elbow slightly below shoulder, almost no xy forearm extent.
-        sk.joints.insert(HumanoidBone::LeftLowerArm, joint([0.30, 0.15, 0.0]));
-        sk.joints.insert(HumanoidBone::LeftHand, joint([0.31, 0.13, 0.02]));
-        let mut state = ArmLengthState::default();
-        reconstruct_arm_z(&mut sk, &mut state);
-        let wrist_z = sk.joints[&HumanoidBone::LeftHand].position[2];
-        let elbow_z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        // span 0.5 → forearm prior 0.31; xy ≈ 0.022 → dz ≈ 0.31.
-        assert!(
-            wrist_z - elbow_z > 0.25,
-            "wrist should be reconstructed well toward the camera, got Δ {}",
-            wrist_z - elbow_z
-        );
-    }
-
-    /// In-plane arm at full extension: invariant satisfied, z untouched.
-    #[test]
-    fn in_plane_arm_is_untouched() {
-        let mut sk = SourceSkeleton::empty(0);
-        sk.joints.insert(HumanoidBone::LeftUpperArm, joint([0.25, 0.4, 0.0]));
-        sk.joints.insert(HumanoidBone::RightUpperArm, joint([-0.25, 0.4, 0.0]));
-        // Forearm fully extended sideways: xy 0.40 > prior 0.31.
-        sk.joints.insert(HumanoidBone::LeftLowerArm, joint([0.64, 0.40, 0.01]));
-        sk.joints.insert(HumanoidBone::LeftHand, joint([1.04, 0.40, 0.02]));
-        let mut state = ArmLengthState::default();
-        reconstruct_arm_z(&mut sk, &mut state);
-        assert_eq!(sk.joints[&HumanoidBone::LeftHand].position[2], 0.02);
-    }
-
-    /// nz already reporting a decisive backward arm keeps its sign.
-    #[test]
-    fn decisive_backward_nz_keeps_backward_sign() {
-        let mut sk = SourceSkeleton::empty(0);
-        sk.joints.insert(HumanoidBone::LeftUpperArm, joint([0.25, 0.4, 0.0]));
-        sk.joints.insert(HumanoidBone::RightUpperArm, joint([-0.25, 0.4, 0.0]));
-        sk.joints.insert(HumanoidBone::LeftLowerArm, joint([0.30, 0.30, 0.0]));
-        // Wrist: tiny xy extent, nz says clearly behind (-0.12 < -0.075).
-        sk.joints.insert(HumanoidBone::LeftHand, joint([0.32, 0.28, -0.12]));
-        let mut state = ArmLengthState::default();
-        reconstruct_arm_z(&mut sk, &mut state);
-        let wrist_z = sk.joints[&HumanoidBone::LeftHand].position[2];
-        let elbow_z = sk.joints[&HumanoidBone::LeftLowerArm].position[2];
-        assert!(wrist_z < elbow_z, "backward sign must be preserved");
     }
 }

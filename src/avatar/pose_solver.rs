@@ -41,7 +41,7 @@ use crate::asset::{HumanoidBone, HumanoidMap, NodeId, Quat, SkeletonAsset, Trans
 use crate::math_utils::{
     quat_conjugate, quat_from_basis_pair, quat_from_euler_ypr, quat_from_vectors, quat_mul,
     quat_normalize, quat_rotate_vec3, swing_twist_decompose, vec3_add, vec3_cross, vec3_dot,
-    vec3_length, vec3_normalize, vec3_sub,
+    vec3_length, vec3_normalize, vec3_scale, vec3_sub,
 };
 use crate::tracking::source_skeleton::{FacePose, HandOrientation, SourceSkeleton};
 
@@ -878,6 +878,12 @@ pub fn solve_avatar_pose(
         }
     }
 
+    // Hands-contact arm IK (see `compute_arm_contact_ik`): when the
+    // subject's wrists are close, the four arm-bone directions blend
+    // toward a two-bone positional solve so the avatar's hands
+    // actually meet despite proportion differences.
+    let arm_contact_ik = compute_arm_contact_ik(source, humanoid, &rest_world, params);
+
     // Body chain: direction-match each driven bone using 3D source positions.
     // Wrist orientation pass is fired just-in-time at the body→fingers
     // transition: the wrist bone is not in DRIVEN_BONES, so without
@@ -1132,6 +1138,16 @@ pub fn solve_avatar_pose(
         if source_dir == [0.0, 0.0, 0.0] {
             continue;
         }
+
+        // Hands-contact override: blend the raw source direction
+        // toward the positional-IK direction for the four arm bones.
+        let source_dir = match bone {
+            HumanoidBone::LeftUpperArm => contact_ik_dir(&arm_contact_ik, 0, 0, source_dir),
+            HumanoidBone::LeftLowerArm => contact_ik_dir(&arm_contact_ik, 0, 1, source_dir),
+            HumanoidBone::RightUpperArm => contact_ik_dir(&arm_contact_ik, 1, 0, source_dir),
+            HumanoidBone::RightLowerArm => contact_ik_dir(&arm_contact_ik, 1, 1, source_dir),
+            _ => source_dir,
+        };
 
         // The bone's *current* rest direction must include any rotation
         // the parent has already picked up this frame (notably the Hips
@@ -1708,6 +1724,277 @@ fn midpoint(a: &Vec3, b: &Vec3) -> Vec3 {
         (a[1] + b[1]) * 0.5,
         (a[2] + b[2]) * 0.5,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Hands-contact arm IK
+// ---------------------------------------------------------------------------
+
+/// Per-side IK-corrected arm directions for the hands-contact pass.
+/// Produced by [`compute_arm_contact_ik`], consumed via
+/// [`contact_ik_dir`] inside the body-chain loop.
+struct ArmContactIk {
+    /// Proximity blend weight 0..1 (0 = pure direction-match).
+    weight: f32,
+    /// `[left, right]` → (UpperArm dir, LowerArm dir), source space.
+    dirs: [Option<(Vec3, Vec3)>; 2],
+}
+
+/// Hands-contact positional correction. Direction-match reproduces the
+/// subject's bone DIRECTIONS, but touching hands are a POSITION
+/// constraint: with avatar proportions (shoulder span : arm length)
+/// different from the subject's, perfectly copied directions leave the
+/// avatar's wrists apart when the subject's palms meet. When the two
+/// source wrists are close, each arm is re-solved as a two-bone IK
+/// toward the wrist positions mapped through ONE affine source→avatar
+/// map — a single map preserves coincidence (identical targets stay
+/// identical), which per-side scaling would break. The resulting
+/// directions replace the raw source directions with a proximity-
+/// blended weight, so open poses keep pure direction parity (and the
+/// direction-parity validation metrics stay meaningful there).
+fn compute_arm_contact_ik(
+    source: &SourceSkeleton,
+    humanoid: &HumanoidMap,
+    rest_world: &[WorldXform],
+    params: &SolverParams,
+) -> Option<ArmContactIk> {
+    let thr = params.joint_confidence_threshold;
+    let joint = |b: HumanoidBone| -> Option<Vec3> {
+        source
+            .joints
+            .get(&b)
+            .filter(|x| x.confidence >= thr)
+            .map(|x| x.position)
+    };
+    let s_l = joint(HumanoidBone::LeftUpperArm)?;
+    let s_r = joint(HumanoidBone::RightUpperArm)?;
+    let e_l = joint(HumanoidBone::LeftLowerArm)?;
+    let e_r = joint(HumanoidBone::RightLowerArm)?;
+    let w_l = joint(HumanoidBone::LeftHand)?;
+    let w_r = joint(HumanoidBone::RightHand)?;
+
+    let span_src = vec3_length(&vec3_sub(&s_l, &s_r));
+    if span_src < 1e-4 {
+        return None;
+    }
+    // Proximity gate: full weight when the wrists sit within 0.25×span
+    // (palms together measures ≲0.2×span on the MCP-centroid wrists),
+    // fading to zero by 0.45×span; smoothstep keeps the takeover
+    // pop-free as the hands approach.
+    let d_w = vec3_length(&vec3_sub(&w_l, &w_r));
+    let t = ((d_w / span_src) - 0.25) / (0.45 - 0.25);
+    let raw_w = 1.0 - t.clamp(0.0, 1.0);
+    if raw_w <= 0.0 {
+        return None;
+    }
+    let weight = raw_w * raw_w * (3.0 - 2.0 * raw_w);
+
+    let rest_pos = |b: HumanoidBone| -> Option<Vec3> {
+        humanoid
+            .bone_map
+            .get(&b)
+            .map(|n| n.0 as usize)
+            .filter(|&i| i < rest_world.len())
+            .map(|i| rest_world[i].position)
+    };
+    let rs_l = rest_pos(HumanoidBone::LeftUpperArm)?;
+    let rs_r = rest_pos(HumanoidBone::RightUpperArm)?;
+    let re_l = rest_pos(HumanoidBone::LeftLowerArm)?;
+    let re_r = rest_pos(HumanoidBone::RightLowerArm)?;
+    let rw_l = rest_pos(HumanoidBone::LeftHand)?;
+    let rw_r = rest_pos(HumanoidBone::RightHand)?;
+
+    // Single affine map: anchored at the shoulder midpoints, scaled by
+    // the half-armspan ratio (span/2 + arm length — the natural reach
+    // normaliser: pure span ratio leaves long-armed subjects mapping
+    // forward reaches beyond a short-armed avatar's reach sphere),
+    // rotated by the shoulder-girdle alignment so it stays valid under
+    // body yaw.
+    let arm_src = 0.5
+        * ((vec3_length(&vec3_sub(&e_l, &s_l)) + vec3_length(&vec3_sub(&w_l, &e_l)))
+            + (vec3_length(&vec3_sub(&e_r, &s_r)) + vec3_length(&vec3_sub(&w_r, &e_r))));
+    let arm_av = 0.5
+        * ((vec3_length(&vec3_sub(&re_l, &rs_l)) + vec3_length(&vec3_sub(&rw_l, &re_l)))
+            + (vec3_length(&vec3_sub(&re_r, &rs_r)) + vec3_length(&vec3_sub(&rw_r, &re_r))));
+    let reach_src = 0.5 * span_src + arm_src;
+    let reach_av = 0.5 * vec3_length(&vec3_sub(&rs_l, &rs_r)) + arm_av;
+    if reach_av < 1e-4 || reach_src < 1e-4 {
+        return None;
+    }
+    let s_per_av = reach_src / reach_av;
+    let c_src = midpoint(&s_l, &s_r);
+    let c_av = midpoint(&rs_l, &rs_r);
+    let rest_line = vec3_normalize(&vec3_sub(&rs_l, &rs_r));
+    let src_line = vec3_normalize(&vec3_sub(&s_l, &s_r));
+    if rest_line == [0.0; 3] || src_line == [0.0; 3] {
+        return None;
+    }
+    let girdle = quat_from_vectors(&rest_line, &src_line);
+
+    let solve_side = |rs: Vec3, re: Vec3, rw: Vec3, e_src: Vec3, w_src: Vec3| {
+        let offset = vec3_scale(&quat_rotate_vec3(&girdle, &vec3_sub(&rs, &c_av)), s_per_av);
+        let anchor = vec3_add(&c_src, &offset);
+        let l1 = vec3_length(&vec3_sub(&re, &rs)) * s_per_av;
+        let l2 = vec3_length(&vec3_sub(&rw, &re)) * s_per_av;
+        two_bone_ik(&anchor, &w_src, l1, l2, &e_src)
+    };
+
+    Some(ArmContactIk {
+        weight,
+        dirs: [
+            solve_side(rs_l, re_l, rw_l, e_l, w_l),
+            solve_side(rs_r, re_r, rw_r, e_r, w_r),
+        ],
+    })
+}
+
+/// Analytic two-bone IK: place the elbow so the chain
+/// (anchor → elbow → target) keeps the given segment lengths, choosing
+/// the elbow swivel closest to `pole` (the tracked elbow position).
+/// Returns the (upper, lower) unit directions; the lower direction
+/// points at the TRUE target even when the target is out of reach and
+/// the elbow placement had to clamp, so the hand still aims correctly.
+fn two_bone_ik(
+    anchor: &Vec3,
+    target: &Vec3,
+    l1: f32,
+    l2: f32,
+    pole: &Vec3,
+) -> Option<(Vec3, Vec3)> {
+    let to_t = vec3_sub(target, anchor);
+    let d = vec3_length(&to_t);
+    if d < 1e-5 || l1 < 1e-5 || l2 < 1e-5 {
+        return None;
+    }
+    let axis = vec3_scale(&to_t, 1.0 / d);
+    let d_cl = d.clamp((l1 - l2).abs() + 1e-4, (l1 + l2 - 1e-4).max((l1 - l2).abs() + 2e-4));
+    let a = (l1 * l1 - l2 * l2 + d_cl * d_cl) / (2.0 * d_cl);
+    let r = (l1 * l1 - a * a).max(0.0).sqrt();
+
+    let p = vec3_sub(pole, anchor);
+    let p_perp = vec3_sub(&p, &vec3_scale(&axis, vec3_dot(&p, &axis)));
+    let p_len = vec3_length(&p_perp);
+    let perp = if p_len > 1e-5 {
+        vec3_scale(&p_perp, 1.0 / p_len)
+    } else {
+        // Pole sits on the shoulder→target axis (fully folded or fully
+        // stretched view) — any perpendicular keeps the chain valid.
+        let alt = if axis[1].abs() < 0.9 {
+            [0.0, 1.0, 0.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+        let c = vec3_normalize(&vec3_cross(&axis, &alt));
+        if c == [0.0; 3] {
+            return None;
+        }
+        c
+    };
+    let elbow = vec3_add(
+        &vec3_add(anchor, &vec3_scale(&axis, a)),
+        &vec3_scale(&perp, r),
+    );
+    let upper = vec3_normalize(&vec3_sub(&elbow, anchor));
+    let lower = vec3_normalize(&vec3_sub(target, &elbow));
+    if upper == [0.0; 3] || lower == [0.0; 3] {
+        return None;
+    }
+    Some((upper, lower))
+}
+
+#[cfg(test)]
+mod arm_contact_ik_tests {
+    use super::*;
+
+    fn assert_close(a: Vec3, b: Vec3, eps: f32) {
+        let d = vec3_length(&vec3_sub(&a, &b));
+        assert!(d < eps, "expected {a:?} ≈ {b:?} (|Δ|={d})");
+    }
+
+    /// Reachable target with the pole exactly on the solution circle:
+    /// the elbow lands on the pole and both directions are exact.
+    #[test]
+    fn two_bone_ik_reachable_matches_pole() {
+        let (upper, lower) = two_bone_ik(
+            &[0.0, 0.0, 0.0],
+            &[0.3, 0.0, 0.0],
+            0.25,
+            0.25,
+            &[0.15, -0.2, 0.0],
+        )
+        .expect("solvable");
+        assert_close(upper, [0.6, -0.8, 0.0], 1e-3);
+        assert_close(lower, [0.6, 0.8, 0.0], 1e-3);
+    }
+
+    /// Out-of-reach target: the chain straightens and the lower
+    /// direction still points at the TRUE target.
+    #[test]
+    fn two_bone_ik_clamps_out_of_reach_toward_target() {
+        let (upper, lower) = two_bone_ik(
+            &[0.0, 0.0, 0.0],
+            &[0.6, 0.0, 0.0],
+            0.25,
+            0.25,
+            &[0.2, -0.1, 0.0],
+        )
+        .expect("solvable");
+        assert!(
+            vec3_dot(&upper, &[1.0, 0.0, 0.0]) > 0.99,
+            "upper should straighten toward the target, got {upper:?}"
+        );
+        assert!(
+            vec3_dot(&lower, &[1.0, 0.0, 0.0]) > 0.99,
+            "lower should aim at the true target, got {lower:?}"
+        );
+    }
+
+    /// Coincident targets from two different anchors resolve to the
+    /// SAME wrist position: anchor + l1·upper + l2·lower must agree —
+    /// the property that makes the avatar's palms actually meet.
+    #[test]
+    fn two_bone_ik_coincident_targets_meet() {
+        let target = [0.05, -0.1, 0.3];
+        let (u_l, l_l) =
+            two_bone_ik(&[0.2, 0.0, 0.0], &target, 0.25, 0.25, &[0.25, -0.2, 0.1]).unwrap();
+        let (u_r, l_r) =
+            two_bone_ik(&[-0.2, 0.0, 0.0], &target, 0.25, 0.25, &[-0.25, -0.2, 0.1]).unwrap();
+        let wrist = |anchor: Vec3, u: Vec3, l: Vec3| {
+            vec3_add(
+                &vec3_add(&anchor, &vec3_scale(&u, 0.25)),
+                &vec3_scale(&l, 0.25),
+            )
+        };
+        let w_l = wrist([0.2, 0.0, 0.0], u_l, l_l);
+        let w_r = wrist([-0.2, 0.0, 0.0], u_r, l_r);
+        assert_close(w_l, target, 1e-3);
+        assert_close(w_r, target, 1e-3);
+    }
+}
+
+/// Blend `raw` toward the contact-IK direction for `side` (0 = left,
+/// 1 = right) and `seg` (0 = UpperArm, 1 = LowerArm) by the pass's
+/// proximity weight. Identity when the pass is inactive.
+fn contact_ik_dir(ik: &Option<ArmContactIk>, side: usize, seg: usize, raw: Vec3) -> Vec3 {
+    let Some(ik) = ik else {
+        return raw;
+    };
+    let Some((upper, lower)) = ik.dirs[side] else {
+        return raw;
+    };
+    let target = if seg == 0 { upper } else { lower };
+    let w = ik.weight;
+    let mixed = [
+        raw[0] + (target[0] - raw[0]) * w,
+        raw[1] + (target[1] - raw[1]) * w,
+        raw[2] + (target[2] - raw[2]) * w,
+    ];
+    let n = vec3_normalize(&mixed);
+    if n == [0.0; 3] {
+        raw
+    } else {
+        n
+    }
 }
 
 /// Convert the GUI's frame-rate-naive `rotation_blend` slider value

@@ -20,6 +20,7 @@ pub mod skeleton_from_depth;
 
 pub mod calibration;
 pub mod face_mediapipe;
+pub mod ray_ik;
 pub mod rtmw3d;
 pub mod source_skeleton;
 #[cfg(feature = "inference")]

@@ -93,9 +93,16 @@ reported ~0°. Three layers fix it:
    never fold or fling the arm). Joints the depth builder drops
    (stale-crop sample misses during motion) are unioned back from
    RTMW3D so limbs never vanish.
-2. **Bone-length-invariant z reconstruction** (`rtmw3d::arm_z`):
-   depth-off fallback — `|dz| = sqrt(L² − xy²)` with session
-   running-max lengths + anthropometric floors, forward-default sign.
+2. **Ray-IK arm depth solve** (`rtmw3d::arm_ray_ik`, design:
+   `docs/ray-ik-depth-solve.md`): elbow/wrist depths are re-solved
+   along the 2D observation rays with anatomical *metric* segment
+   lengths (shoulders pinned), fusing nz as weak evidence with a
+   forward prior and a temporal term in one Gauss-Newton problem.
+   Replaced the bone-length running-max heuristic, whose length
+   reference one near-lens hand sweep inflated permanently (after
+   which every in-plane arm read as foreshortened and gained fake
+   forward depth — the "annotation correct, avatar warped" failure).
+   Solved joints reproject exactly onto the observed 2D keypoints.
 3. **bz-corroborated body yaw** (`compute_body_yaw_3d`): the span-
    foreshortening yaw magnitude is capped by the inter-shoulder Δz
    evidence (deviation from the nearest in-plane orientation), fixing

@@ -11,6 +11,7 @@
 //! See `WristTracker` for the per-side state carried frame-to-frame.
 
 use crate::asset::HumanoidBone;
+use log::debug;
 
 use super::super::{SourceJoint, SourceSkeleton};
 use super::math::{length3, sub3};
@@ -106,6 +107,13 @@ pub(super) fn apply_wrist_temporal_hold(
     // Live wrist rejected (or absent). Try to substitute the held
     // value if it's recent enough, propagating the delta to the
     // finger phalanges so the hand chain doesn't tear.
+    if let Some(j) = live_wrist {
+        let forearm = length3(sub3(j.position, elbow.position));
+        debug!(
+            "wrist-hold {:?}: live wrist rejected (forearm {:.3} > {:.1}x arm ref {:.3})",
+            wrist_bone, forearm, ARM_LENGTH_RATIO_LIMIT, arm_baseline
+        );
+    }
     tracker.age = tracker.age.saturating_add(1);
     if tracker.age <= TEMPORAL_HOLD_MAX_FRAMES {
         if let Some(prev_pos) = tracker.last_pos {
@@ -128,6 +136,10 @@ pub(super) fn apply_wrist_temporal_hold(
                 },
             );
             tracker.last_conf = decayed_conf;
+            debug!(
+                "wrist-hold {:?}: holding previous wrist (age {}/{}, conf {:.2})",
+                wrist_bone, tracker.age, TEMPORAL_HOLD_MAX_FRAMES, decayed_conf
+            );
             return;
         }
     }
@@ -172,6 +184,10 @@ pub(super) fn apply_wrist_temporal_hold(
             );
             tracker.last_pos = None;
             tracker.last_conf = 0.0;
+            debug!(
+                "wrist-hold {:?}: synthesised wrist from arm extension (+0.2 toward camera)",
+                wrist_bone
+            );
             return;
         }
     }
@@ -181,6 +197,7 @@ pub(super) fn apply_wrist_temporal_hold(
     clear_finger_chain(sk, wrist_bone);
     tracker.last_pos = None;
     tracker.last_conf = 0.0;
+    debug!("wrist-hold {:?}: dropped (no reliable signal)", wrist_bone);
 }
 
 /// Per-wrist list of finger phalanx + tip bones. Used by the temporal

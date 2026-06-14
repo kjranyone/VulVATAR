@@ -40,6 +40,7 @@
 
 #[cfg(feature = "inference")]
 mod annotation;
+pub(in crate::tracking) mod arm_ray_ik;
 #[cfg(feature = "inference")]
 mod arm_z;
 #[cfg(feature = "inference")]
@@ -181,6 +182,8 @@ pub struct Rtmw3dInference {
     #[cfg(feature = "inference")]
     arm_len: arm_z::ArmLengthState,
     #[cfg(feature = "inference")]
+    arm_ray_ik: arm_ray_ik::ArmRayIk,
+    #[cfg(feature = "inference")]
     left_wrist: wrist::WristTracker,
     #[cfg(feature = "inference")]
     right_wrist: wrist::WristTracker,
@@ -284,6 +287,7 @@ impl Rtmw3dInference {
         self.right_wrist = wrist::WristTracker::default();
         self.self_track_bbox = None;
         self.arm_len = arm_z::ArmLengthState::default();
+        self.arm_ray_ik.reset();
         if let Some(worker) = self.yolox_worker.as_mut() {
             worker.clear_result();
         }
@@ -397,6 +401,7 @@ impl Rtmw3dInference {
             yolox_worker,
             self_track_bbox: None,
             arm_len: arm_z::ArmLengthState::default(),
+            arm_ray_ik: arm_ray_ik::ArmRayIk::default(),
             left_wrist: wrist::WristTracker::default(),
             right_wrist: wrist::WristTracker::default(),
             load_warnings,
@@ -719,11 +724,18 @@ impl Rtmw3dInference {
             &mut self.left_wrist,
         );
 
-        // Arm-depth reconstruction from the bone-length invariant —
-        // restores the forward z that the SimCC nz head cannot
-        // resolve for limbs pointing at the camera (the dominant
-        // desk-streaming arm pose). See `arm_z` for the geometry.
-        arm_z::reconstruct_arm_z(&mut skeleton, &mut self.arm_len);
+        // Arm-depth solve via ray-IK — restores the forward z that
+        // the SimCC nz head cannot resolve for limbs pointing at the
+        // camera, by re-solving elbow/wrist depths along the
+        // observation rays with anatomical metric lengths. Replaces
+        // the bone-length running-max heuristic, whose length
+        // reference perspective magnification corrupted permanently.
+        // See `arm_ray_ik` / `docs/ray-ik-depth-solve.md`.
+        arm_ray_ik::solve_arm_depth(
+            &mut skeleton,
+            width as f32 / height.max(1) as f32,
+            &mut self.arm_ray_ik,
+        );
 
         // Head pose (yaw/pitch/roll) from RTMW3D's body face keypoints
         // 0..=4. These are already in source-skeleton 3D coords, so

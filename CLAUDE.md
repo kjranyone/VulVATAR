@@ -24,6 +24,7 @@ will invalidate that cache and trigger a rebuild.
 - `validation_images/` は **推論入力データ専用** のディレクトリ。検出・診断・可視化など、コードを動かして得たテスト出力をここに書き出してはいけない (`README.md` 末尾にある "synthetic validation assets" の宣言を汚染しない)。
 - 診断系バイナリ (`analyze_depth_provider` など) やアドホック検証スクリプトの出力は、`.gitignore` 済みの `diagnostics/` 配下に書く。バイナリのデフォルト出力先が入力ファイルの隣 (`<stem>_<suffix>/`) になっている場合は、必ず明示的に `diagnostics/...` を渡して実行する。
 - 新しい診断ツールを追加する際も、デフォルト出力先を `diagnostics/` 側にするか、`validation_images/` 配下に書き込もうとしたらエラーにする。
+- ポーズ品質のベンチは 2 本立て: `validate_pipeline` は「アバター vs ソース」の往復一致のみ (トラッキング誤差と骨軸 twist に盲目 — 0.0° でも実機破綻はあり得る)。真値比較は `cargo run --bin validate_gt` — 既知ポーズのアバターをレンダ→追跡→復元し、GT/SRC/REC 3 列で誤差を検出起因とソルバー起因に分解、neutral 比の coupling ゲインも自動算出する (`diagnostics/validation_gt/summary.md`)。
 
 ## Architecture
 
