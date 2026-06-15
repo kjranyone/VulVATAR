@@ -1,9 +1,28 @@
 # Ray-IK: 2D 再投影拘束による深度ソルブ
 
-ステータス: 実装済み (2026-06-12) — `src/tracking/ray_ik.rs` (ソルバー核) +
+ステータス: 実装済み (2026-06-12, wrist 統合完了 2026-06-15) —
+`src/tracking/ray_ik.rs` (ソルバー核) +
 `src/tracking/rtmw3d/arm_ray_ik.rs` (パイプライン統合)。
-`reconstruct_arm_z` は削除済み。Phase 7.5–7.6 の DAv2 証拠項統合と
-wrist Stage 2–4 の退役は未着手 (移行計画 3–4)。
+`reconstruct_arm_z` は削除済み。移行計画 4 (wrist Stage 2–4 退役) 完了:
+`wrist.rs` は丸ごと削除し、Stage 3 (temporal hold) / Stage 4 (前方合成) は
+`arm_ray_ik` の **held-ray 連続性** に吸収 (検出が wrist を落とした
+フレームは最後に観測した 2D レイから深度を解き直す。古い「stale 3D
+位置を凍結」「+0.2 toward camera 合成」を置換)。Stage 2 (前腕長の
+妥当性チェック) も撤廃 — 計測で「上腕 foreshorten × 前腕面内」を
+毎フレーム幻覚と誤判定し実検出を全棄却、アバターの手が Stage 4 合成で
+動いていた (= 実トラッキングしていなかった) ことが判明したため
+(`validate_gt` の SRC 列が `--no-depth` で 0.00 / depth で 18.08 に発散)。
+幻覚ガードは Stage 1 の MCP 信頼度フロアが担う。
+
+2026-06-15 追記 (移行計画 3 の決着): Phase 7.5–7.6 の「DAv2 証拠項
+置換」は計測で覆った。Phase 7.6 (実測メトリックベクトルからの arm
+再配置) の方が prior ベース ray-IK 再ソルブより優秀 (写真ベンチ
+2.4°→3.6° で劣化) なので、アーキは「7.6 + contact-only ray-IK」に
+収束済み。elbow の DAv2 証拠は `arm_ray_ik` で消費。これ以上の置換は
+回帰になるため移行計画 3 はクローズ。残課題は arms-forward 等の
+**前方リーチ深度**: with-depth パスは Phase 7 が inner ray-IK の深度を
+上書きし、DAv2 は手の甲サンプルが背景を拾うため wrist z を注入しない
+(既知)。これは ray-IK とは独立した深度盲目問題。
 
 2026-06-13 追記 (肩ひねり試行の教訓): 肩を自由変数化して span
 投影短縮から Δz を解く案は試行→リバート。(a) 腕セグメントの解剖学
@@ -172,18 +191,25 @@ direction-match は被写体の骨の **方向** を再現するが、合掌は 
    トラッキングされた肘を pole に使う。開いたポーズでは重み 0 で純粋な
    direction-match のまま (方向パリティ検証メトリクスもそこでは有効なまま)。
 
-## 移行計画
+## 移行計画 (全完了)
 
-1. `src/tracking/ray_ik.rs` 新設 — ソルバー核 + 単体テスト
-   (arm_z の既存テスト相当: 完全 foreshortened 前腕 / 平面内の腕 /
-   decisive backward、追加: 近接レンズで骨長推定が膨張しないこと)。
-2. `rtmw3d/mod.rs` — `reconstruct_arm_z` 呼び出しを ray-IK に置換。
-3. `rtmw3d_with_depth.rs` — Phase 7.5–7.6 の注入群を DAv2 証拠項の供給に
-   置換。
-4. `rtmw3d/wrist.rs` — Stage 4 合成を削除 (前方事前分布が代替)。
-   Stage 2–3 は信頼度重み+時間項に吸収後、削除。
-5. `validate_pipeline` の fs_err / angle メトリクスで前後比較
-   (`streamer_display_webcam_capture` セット必須)。
+1. ✅ `src/tracking/ray_ik.rs` 新設 — ソルバー核 + 単体テスト
+   (完全 foreshortened 前腕 / 平面内の腕 / decisive backward /
+   近接レンズで骨長推定が膨張しないこと)。
+2. ✅ `rtmw3d/mod.rs` — `reconstruct_arm_z` 呼び出しを ray-IK に置換。
+3. ✅ (再定義) `rtmw3d_with_depth.rs` — 当初は「Phase 7.5–7.6 の注入群を
+   DAv2 証拠項に置換」だったが計測で覆った: Phase 7.6 (実測ベクトル)
+   が prior ベース再ソルブより優秀。アーキは「7.6 + contact-only
+   ray-IK」に収束、elbow の DAv2 証拠は `arm_ray_ik` で消費。クローズ。
+4. ✅ `rtmw3d/wrist.rs` 削除。Stage 3 (temporal hold) / Stage 4 (前方合成)
+   は `arm_ray_ik` の held-ray 連続性に吸収。Stage 2 (前腕長妥当性) は
+   投影空間アンチパターンとして撤廃 (上記ステータス参照)。連続性は
+   `arm_ray_ik` の単体テスト 3 本 (再構成 / 保持上限 / live リフレッシュ)
+   で担保。
+5. ✅ 真値比較は `validate_gt` (GT/SRC/REC 分解) を使用。`validate_pipeline`
+   は往復一致のみで twist/骨軸に盲目なので主検証には不適。
+   `validate_gt` は `env_logger::init()` 済み、`RUST_LOG=...rtmw3d=debug`
+   で wrist/ray-ik の発火が見える。`VULVATAR_GT_PROBE=1` で生 source 位置。
 
 ## 診断ログ
 

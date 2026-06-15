@@ -182,6 +182,121 @@ pub(super) fn shift_hand_chain(sk: &mut SourceSkeleton, wrist: HumanoidBone, d: 
     }
 }
 
+/// Left/right hand-chain bone pairs swapped together when the detector
+/// transposes the two hand keypoint blocks (see [`correct_hand_lr_swap`]).
+const HAND_LR_PAIRS: [(HumanoidBone, HumanoidBone); 16] = [
+    (HumanoidBone::LeftHand, HumanoidBone::RightHand),
+    (HumanoidBone::LeftThumbProximal, HumanoidBone::RightThumbProximal),
+    (HumanoidBone::LeftThumbIntermediate, HumanoidBone::RightThumbIntermediate),
+    (HumanoidBone::LeftThumbDistal, HumanoidBone::RightThumbDistal),
+    (HumanoidBone::LeftIndexProximal, HumanoidBone::RightIndexProximal),
+    (HumanoidBone::LeftIndexIntermediate, HumanoidBone::RightIndexIntermediate),
+    (HumanoidBone::LeftIndexDistal, HumanoidBone::RightIndexDistal),
+    (HumanoidBone::LeftMiddleProximal, HumanoidBone::RightMiddleProximal),
+    (HumanoidBone::LeftMiddleIntermediate, HumanoidBone::RightMiddleIntermediate),
+    (HumanoidBone::LeftMiddleDistal, HumanoidBone::RightMiddleDistal),
+    (HumanoidBone::LeftRingProximal, HumanoidBone::RightRingProximal),
+    (HumanoidBone::LeftRingIntermediate, HumanoidBone::RightRingIntermediate),
+    (HumanoidBone::LeftRingDistal, HumanoidBone::RightRingDistal),
+    (HumanoidBone::LeftLittleProximal, HumanoidBone::RightLittleProximal),
+    (HumanoidBone::LeftLittleIntermediate, HumanoidBone::RightLittleIntermediate),
+    (HumanoidBone::LeftLittleDistal, HumanoidBone::RightLittleDistal),
+];
+
+/// Minimum elbow x-separation (as a fraction of shoulder span) for the
+/// swap test to arm. A genuine arms-crossed pose tucks the elbows
+/// toward the centre — requiring the elbows to stay clearly L/R
+/// separated restricts the correction to the "hands meet at the
+/// midline, blocks transposed" case and leaves a deliberate cross
+/// alone.
+const SWAP_ELBOW_SEP_RATIO: f32 = 0.3;
+
+/// Correct a left/right HAND-BLOCK transposition from the detector.
+/// When two hands meet at the midline, RTMW3D routinely assigns the
+/// anatomical-left hand keypoints to the right and vice versa: the
+/// elbows stay correctly placed but the MCP-centroid wrists (and their
+/// finger chains) land on the wrong sides, so the avatar's forearms
+/// cross. The signature is unambiguous and measurable — swapping the
+/// two hands sharply SHORTENS both forearms, because each hand belongs
+/// to its nearest elbow. Gated so it only fires when the elbows are
+/// clearly L/R separated (not a tucked genuine cross), the hands are
+/// inverted in x, sit close together (the detector-confusion regime),
+/// and the swap shortens the forearms by a clear margin. Runs before
+/// the edge repair / ray-IK so all downstream stages see correct hands.
+pub(in crate::tracking) fn correct_hand_lr_swap(sk: &mut SourceSkeleton) {
+    let g = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position);
+    let (Some(sl), Some(sr)) = (
+        g(HumanoidBone::LeftUpperArm),
+        g(HumanoidBone::RightUpperArm),
+    ) else {
+        return;
+    };
+    let (Some(el), Some(er)) = (
+        g(HumanoidBone::LeftLowerArm),
+        g(HumanoidBone::RightLowerArm),
+    ) else {
+        return;
+    };
+    let (Some(wl), Some(wr)) = (g(HumanoidBone::LeftHand), g(HumanoidBone::RightHand)) else {
+        return;
+    };
+
+    let dist3 = |a: [f32; 3], b: [f32; 3]| {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+    };
+    let span = dist3(sl, sr);
+    if span < 1e-3 {
+        return;
+    }
+    // Source +x is anatomical-left; left things sit at larger x. The
+    // elbows must stay clearly L/R ordered and separated.
+    if el[0] - er[0] < SWAP_ELBOW_SEP_RATIO * span {
+        return;
+    }
+    // Hands inverted: the Left hand sits on the −x (right) side of the
+    // Right hand.
+    if wl[0] >= wr[0] {
+        return;
+    }
+    // Confusion regime: the two hands are close together.
+    if dist3(wl, wr) > 1.5 * span {
+        return;
+    }
+    // The decisive test, on the projection plane (z is the noisy axis):
+    // swapping must clearly shorten both forearms.
+    let cur = xy_len(el, wl) + xy_len(er, wr);
+    let swapped = xy_len(el, wr) + xy_len(er, wl);
+    if swapped >= 0.8 * cur {
+        return;
+    }
+
+    for (l, r) in HAND_LR_PAIRS {
+        swap_joint_pair(&mut sk.joints, l, r);
+        swap_joint_pair(&mut sk.fingertips, l, r);
+    }
+    std::mem::swap(&mut sk.left_hand_orientation, &mut sk.right_hand_orientation);
+    debug!(
+        "hand-swap: corrected L/R hand-block transposition (forearm cost {:.3} -> {:.3} swapped)",
+        cur, swapped
+    );
+}
+
+fn swap_joint_pair(
+    map: &mut std::collections::HashMap<HumanoidBone, super::super::source_skeleton::SourceJoint>,
+    l: HumanoidBone,
+    r: HumanoidBone,
+) {
+    let lv = map.remove(&l);
+    let rv = map.remove(&r);
+    if let Some(v) = rv {
+        map.insert(l, v);
+    }
+    if let Some(v) = lv {
+        map.insert(r, v);
+    }
+}
+
 pub(super) fn is_finger_bone_side(bone: HumanoidBone, left: bool) -> bool {
     let name = format!("{bone:?}");
     let side_ok = if left {
@@ -493,5 +608,93 @@ fn unit3(v: [f32; 3]) -> Option<[f32; 3]> {
         None
     } else {
         Some([v[0] / l, v[1] / l, v[2] / l])
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+    use super::super::super::source_skeleton::{SourceJoint, SourceSkeleton};
+
+    fn j(p: [f32; 3]) -> SourceJoint {
+        SourceJoint { position: p, confidence: 0.9, metric_depth_m: None }
+    }
+
+    fn arms(sk: &mut SourceSkeleton, sl: [f32; 3], sr: [f32; 3], el: [f32; 3], er: [f32; 3], wl: [f32; 3], wr: [f32; 3]) {
+        sk.joints.insert(HumanoidBone::LeftUpperArm, j(sl));
+        sk.joints.insert(HumanoidBone::RightUpperArm, j(sr));
+        sk.joints.insert(HumanoidBone::LeftLowerArm, j(el));
+        sk.joints.insert(HumanoidBone::RightLowerArm, j(er));
+        sk.joints.insert(HumanoidBone::LeftHand, j(wl));
+        sk.joints.insert(HumanoidBone::RightHand, j(wr));
+    }
+
+    /// Measured fingertips_touch probe: elbows correct, hands swapped.
+    /// The fix relabels them so LeftHand is back on +x, RightHand −x.
+    #[test]
+    fn corrects_measured_hand_block_swap() {
+        let mut sk = SourceSkeleton::empty(0);
+        arms(
+            &mut sk,
+            [0.097, 0.352, 0.025],
+            [-0.062, 0.349, -0.088],
+            [0.168, 0.195, 0.015],
+            [-0.141, 0.213, -0.098],
+            [-0.080, 0.225, 0.034], // LeftHand on the wrong (−x) side
+            [0.129, 0.244, -0.078], // RightHand on the wrong (+x) side
+        );
+        // Tag a finger on each side to confirm the whole chain swaps.
+        sk.joints.insert(HumanoidBone::LeftIndexProximal, j([-0.10, 0.22, 0.03]));
+        sk.joints.insert(HumanoidBone::RightIndexProximal, j([0.11, 0.24, -0.08]));
+
+        correct_hand_lr_swap(&mut sk);
+
+        assert!(sk.joints[&HumanoidBone::LeftHand].position[0] > 0.0, "LeftHand back on +x");
+        assert!(sk.joints[&HumanoidBone::RightHand].position[0] < 0.0, "RightHand back on −x");
+        assert!(sk.joints[&HumanoidBone::LeftIndexProximal].position[0] > 0.0, "L finger chain swapped");
+        assert!(sk.joints[&HumanoidBone::RightIndexProximal].position[0] < 0.0, "R finger chain swapped");
+    }
+
+    /// A clean hands-together pose (hands correctly sided, just close)
+    /// must be left untouched.
+    #[test]
+    fn leaves_clean_hands_together_alone() {
+        let mut sk = SourceSkeleton::empty(0);
+        arms(
+            &mut sk,
+            [0.20, 0.40, 0.0],
+            [-0.20, 0.40, 0.0],
+            [0.28, 0.15, 0.25],
+            [-0.28, 0.15, 0.25],
+            [0.03, 0.0, 0.5],   // LeftHand correctly on +x
+            [-0.03, 0.0, 0.5],  // RightHand correctly on −x
+        );
+        correct_hand_lr_swap(&mut sk);
+        assert!(sk.joints[&HumanoidBone::LeftHand].position[0] > 0.0);
+        assert!(sk.joints[&HumanoidBone::RightHand].position[0] < 0.0);
+    }
+
+    /// Genuine arms-crossed pose with the elbows tucked toward centre
+    /// must NOT be "corrected" — the elbow-separation gate blocks it.
+    #[test]
+    fn leaves_genuine_cross_with_tucked_elbows() {
+        let mut sk = SourceSkeleton::empty(0);
+        // Elbows near the midline (tucked), hands at opposite sides:
+        // a deliberate chest cross, not a detector transposition.
+        arms(
+            &mut sk,
+            [0.20, 0.40, 0.0],
+            [-0.20, 0.40, 0.0],
+            [0.05, 0.10, 0.2],   // L elbow just left of centre
+            [-0.05, 0.10, 0.2],  // R elbow just right of centre
+            [-0.18, 0.05, 0.25], // L hand reaches across to −x
+            [0.18, 0.05, 0.25],  // R hand reaches across to +x
+        );
+        let before = sk.joints[&HumanoidBone::LeftHand].position[0];
+        correct_hand_lr_swap(&mut sk);
+        assert_eq!(
+            sk.joints[&HumanoidBone::LeftHand].position[0], before,
+            "tucked-elbow genuine cross must be left alone"
+        );
     }
 }

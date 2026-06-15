@@ -26,11 +26,13 @@
 //! desk-streaming forward prior breaks the remaining toward/behind
 //! tie, and the temporal term carries occlusion gaps.
 
+use std::collections::HashMap;
+
 use crate::asset::HumanoidBone;
 use log::{debug, info};
 
 use super::super::ray_ik::{self, RayIkConfig, RayIkState, RayObservation, SegmentSpec};
-use super::super::source_skeleton::SourceSkeleton;
+use super::super::source_skeleton::{SourceJoint, SourceSkeleton};
 use super::arm_z;
 
 /// Assumed biacromial span — same constant the depth pipeline uses.
@@ -56,6 +58,18 @@ const Z0_EMA_ALPHA: f32 = 0.2;
 /// twist solve needs to see.
 const ASSUMED_TORSO_LEN_M: f32 = 0.45;
 
+/// Max frames a dropped wrist is reconstructed from its last observed
+/// ray before the hand is released. Matches the legacy wrist temporal
+/// hold (`wrist.rs` Stage 3) this folds in.
+const MAX_WRIST_HOLD_FRAMES: u32 = 6;
+
+/// Confidence assigned to a wrist reconstructed from a held ray. Low
+/// enough that the length invariant + temporal term own its placement
+/// (the held 2D direction is trusted, but the detector did not vouch
+/// for it this frame), high enough to clear the solver's default join
+/// threshold so the hand still participates.
+const HELD_WRIST_CONF: f32 = 0.3;
+
 /// Cross-frame state: the IK solver's temporal depths plus the
 /// torso-depth EMA. Reset with the rest of the temporal state.
 #[derive(Default)]
@@ -68,6 +82,17 @@ pub(in crate::tracking) struct ArmRayIk {
     /// lens, so the max is a legitimate frontal-span estimate here).
     /// Read with an anatomical ceiling only.
     span_m_max: f32,
+    /// Last observed wrist ray per side, held across frames where the
+    /// detector drops the wrist. The 2D ray is a pure function of the
+    /// image point, so holding it == holding the last good 2D wrist;
+    /// the depth then re-solves every frame against current evidence
+    /// instead of freezing a stale 3D position. This is the ray-IK
+    /// replacement for `wrist.rs` Stage 3 (temporal hold) and Stage 4
+    /// (forward-extension synthesis) — the depth solve's forward prior
+    /// + length invariant place the held wrist instead of a hardcoded
+    /// "+0.2 toward camera" nudge. `u32` is the frames-since-observed
+    /// age, capped by `MAX_WRIST_HOLD_FRAMES`.
+    held_wrist: HashMap<HumanoidBone, ([f32; 3], u32)>,
     frame: u64,
 }
 
@@ -198,6 +223,15 @@ fn solve_arm_depth_impl(
             1.0,
         ]
     };
+    // Unit observation ray through a source-space joint, plus the
+    // unnormalized ray length (= the per-unit-depth range scale a
+    // camera-z metric converts through).
+    let ray_of = |pos: [f32; 3]| -> ([f32; 3], f32) {
+        let (nx, ny) = to_n(pos);
+        let u = ray_u(nx, ny);
+        let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        ([u[0] / ulen, u[1] / ulen, u[2] / ulen], ulen)
+    };
     // Build one observation from a source-space joint. `z_cam`
     // attaches absolute depth (camera-z metres, converted to range
     // along the ray); `fixed` additionally pins the joint there
@@ -209,10 +243,7 @@ fn solve_arm_depth_impl(
                     depth_weight: f32,
                     fixed: bool|
      -> RayObservation {
-        let (nx, ny) = to_n(pos);
-        let u = ray_u(nx, ny);
-        let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-        let ray = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
+        let (ray, ulen) = ray_of(pos);
         // Range along the ray = camera z · |u|.
         let metric = z_cam.map(|z| z.max(0.15) * ulen);
         RayObservation {
@@ -222,6 +253,19 @@ fn solve_arm_depth_impl(
             metric_depth_m: metric,
             depth_weight,
             fixed: fixed && metric.is_some(),
+        }
+    };
+    // Build a wrist observation from a held ray (the detector dropped
+    // the wrist this frame): no metric depth, low confidence so the
+    // length invariant + temporal term own the placement.
+    let make_held_obs = |bone: HumanoidBone, ray: [f32; 3]| -> RayObservation {
+        RayObservation {
+            bone,
+            ray,
+            confidence: HELD_WRIST_CONF,
+            metric_depth_m: None,
+            depth_weight: 0.0,
+            fixed: false,
         }
     };
     // Pin depth at the joint's current source z (shoulders). Source
@@ -274,6 +318,9 @@ fn solve_arm_depth_impl(
     // Wrist source positions per side, recorded for the hands-contact
     // coherence pass below.
     let mut wrist_pos: [Option<[f32; 3]>; 2] = [None, None];
+    // Wrists reconstructed from a held ray this frame (absent from the
+    // incoming skeleton); inserted back after the solve.
+    let mut synth_wrist: Vec<HumanoidBone> = Vec::new();
     for (side, (shoulder_bone, shoulder, elbow_bone, wrist_bone)) in [
         (
             HumanoidBone::LeftUpperArm,
@@ -314,12 +361,26 @@ fn solve_arm_depth_impl(
             one_sided: false,
             forward_prior: true,
         });
+        // Wrist: trust the live keypoint when the detector produced one
+        // (any confidence — its weight scales the residuals) and record
+        // its ray for the temporal hold. When the wrist was dropped
+        // upstream (the plausibility filter) or never detected,
+        // reconstruct it from the last held ray for up to
+        // MAX_WRIST_HOLD_FRAMES — the ray-IK fold-in of the legacy
+        // wrist Stage 3 (temporal hold) and Stage 4 (forward-extension
+        // synthesis). The forward prior + forearm-length invariant
+        // place the held wrist; the depth re-solves against current
+        // evidence instead of freezing a stale 3D position or nudging a
+        // hardcoded "+0.2 toward camera".
+        //
+        // The wrist's own DAv2 sample is deliberately NOT consumed
+        // either way: its MCP-centroid pixel lands on the back of the
+        // hand and routinely reads background depth (the documented
+        // reason Phase 7.5 never re-injects wrist z).
         if let Some(wr) = sk.joints.get(&wrist_bone).copied() {
-            // The wrist's DAv2 sample is deliberately NOT consumed:
-            // its MCP-centroid pixel lands on the back of the hand
-            // and routinely reads background depth (the documented
-            // reason Phase 7.5 never re-injects wrist z either).
             obs.push(make_obs(wrist_bone, wr.position, wr.confidence, None, 0.0, false));
+            stage.held_wrist.insert(wrist_bone, (ray_of(wr.position).0, 0));
+            wrist_pos[side] = Some(wr.position);
             segs.push(SegmentSpec {
                 a: elbow_bone,
                 b: wrist_bone,
@@ -329,7 +390,30 @@ fn solve_arm_depth_impl(
                 one_sided: false,
                 forward_prior: true,
             });
-            wrist_pos[side] = Some(wr.position);
+        } else if let Some((held_ray, age)) = stage.held_wrist.get(&wrist_bone).copied() {
+            if age < MAX_WRIST_HOLD_FRAMES {
+                obs.push(make_held_obs(wrist_bone, held_ray));
+                stage.held_wrist.insert(wrist_bone, (held_ray, age + 1));
+                synth_wrist.push(wrist_bone);
+                // No nz evidence for a held wrist (its source z is
+                // stale): the forward prior + length invariant own the
+                // depth, the temporal term carries it from last frame.
+                segs.push(SegmentSpec {
+                    a: elbow_bone,
+                    b: wrist_bone,
+                    length_m: l_fa,
+                    nz_dz_m: None,
+                    nz_weight: 0.0,
+                    one_sided: false,
+                    forward_prior: true,
+                });
+                debug!(
+                    "ray-ik f{} {:?}: wrist held from last ray (age {})",
+                    stage.frame, wrist_bone, age + 1
+                );
+            } else {
+                stage.held_wrist.remove(&wrist_bone);
+            }
         }
     }
     if segs.is_empty() {
@@ -422,21 +506,42 @@ fn solve_arm_depth_impl(
             continue;
         };
         let new_pos = to_source(*p_cam);
-        let Some(j) = sk.joints.get_mut(&bone) else {
-            continue;
-        };
-        let delta = [
-            new_pos[0] - j.position[0],
-            new_pos[1] - j.position[1],
-            new_pos[2] - j.position[2],
-        ];
-        j.position = new_pos;
-        debug!(
-            "ray-ik f{} {:?}: dz_src={:+.3} (z {:+.3}, cam z {:.3} m)",
-            stage.frame, bone, delta[2], new_pos[2], p_cam[2]
-        );
-        if matches!(bone, HumanoidBone::LeftHand | HumanoidBone::RightHand) {
-            arm_z::shift_hand_chain(sk, bone, delta);
+        match sk.joints.get_mut(&bone) {
+            Some(j) => {
+                let delta = [
+                    new_pos[0] - j.position[0],
+                    new_pos[1] - j.position[1],
+                    new_pos[2] - j.position[2],
+                ];
+                j.position = new_pos;
+                debug!(
+                    "ray-ik f{} {:?}: dz_src={:+.3} (z {:+.3}, cam z {:.3} m)",
+                    stage.frame, bone, delta[2], new_pos[2], p_cam[2]
+                );
+                if matches!(bone, HumanoidBone::LeftHand | HumanoidBone::RightHand) {
+                    arm_z::shift_hand_chain(sk, bone, delta);
+                }
+            }
+            None => {
+                // Wrist reconstructed from a held ray: the joint was
+                // absent from the incoming skeleton, so insert it. No
+                // finger chain to shift — a dropped wrist drops its
+                // fingers too (the plausibility filter clears them).
+                if synth_wrist.contains(&bone) {
+                    sk.joints.insert(
+                        bone,
+                        SourceJoint {
+                            position: new_pos,
+                            confidence: HELD_WRIST_CONF,
+                            metric_depth_m: None,
+                        },
+                    );
+                    debug!(
+                        "ray-ik f{} {:?}: held wrist inserted (z {:+.3}, cam z {:.3} m)",
+                        stage.frame, bone, new_pos[2], p_cam[2]
+                    );
+                }
+            }
         }
     }
 
@@ -457,5 +562,131 @@ fn solve_arm_depth_impl(
             z(HumanoidBone::LeftHand),
             z(HumanoidBone::RightHand),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ASPECT: f32 = 1.0;
+
+    /// Unit camera ray through a source-space joint, replicating the
+    /// solver's internal `ray_of` so the test can assert the
+    /// reconstructed wrist reprojects onto the held 2D direction.
+    fn ray_of_pos(root: [f32; 3], pos: [f32; 3]) -> [f32; 3] {
+        let origin_nx = 0.5 - root[0] / (2.0 * ASPECT);
+        let origin_ny = 0.5 - root[1] / 2.0;
+        let nx = origin_nx - pos[0] / (2.0 * ASPECT);
+        let ny = origin_ny - pos[1] / 2.0;
+        let tan_v = (ASSUMED_VERTICAL_FOV_DEG.to_radians() * 0.5).tan();
+        let u = [
+            (nx - 0.5) * 2.0 * tan_v * ASPECT,
+            (ny - 0.5) * 2.0 * tan_v,
+            1.0,
+        ];
+        let l = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        [u[0] / l, u[1] / l, u[2] / l]
+    }
+
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn joint(pos: [f32; 3]) -> SourceJoint {
+        SourceJoint {
+            position: pos,
+            confidence: 0.9,
+            metric_depth_m: None,
+        }
+    }
+
+    /// A plausible both-arms skeleton anchored on the shoulder pair at
+    /// the image centre (root_offset = 0 → origin at 0.5, 0.5).
+    fn make_skeleton() -> SourceSkeleton {
+        let mut sk = SourceSkeleton::empty(0);
+        sk.root_offset = Some([0.0, 0.0, 0.0]);
+        sk.root_anchor_is_hip = false;
+        sk.joints.insert(HumanoidBone::LeftUpperArm, joint([0.2, 0.0, 0.0]));
+        sk.joints.insert(HumanoidBone::RightUpperArm, joint([-0.2, 0.0, 0.0]));
+        sk.joints.insert(HumanoidBone::LeftLowerArm, joint([0.4, -0.2, 0.0]));
+        sk.joints.insert(HumanoidBone::RightLowerArm, joint([-0.4, -0.2, 0.0]));
+        sk.joints.insert(HumanoidBone::LeftHand, joint([0.5, -0.4, 0.0]));
+        sk.joints.insert(HumanoidBone::RightHand, joint([-0.5, -0.4, 0.0]));
+        sk
+    }
+
+    /// A dropped wrist is reconstructed from its last observed ray and
+    /// reprojects onto the same 2D direction (Stage 3 fold-in).
+    #[test]
+    fn dropped_wrist_reconstructed_from_held_ray() {
+        let mut stage = ArmRayIk::default();
+        let mut sk = make_skeleton();
+        // Frame 1: wrist present → records the held ray.
+        solve_arm_depth(&mut sk, ASPECT, &mut stage);
+        let held_ray = ray_of_pos([0.0, 0.0, 0.0], [0.5, -0.4, 0.0]);
+        assert!(stage.held_wrist.contains_key(&HumanoidBone::LeftHand));
+
+        // Frame 2: wrist dropped (plausibility filter / occlusion).
+        sk.joints.remove(&HumanoidBone::LeftHand);
+        solve_arm_depth(&mut sk, ASPECT, &mut stage);
+
+        let rec = sk
+            .joints
+            .get(&HumanoidBone::LeftHand)
+            .expect("wrist reconstructed from held ray");
+        assert!(
+            (rec.confidence - HELD_WRIST_CONF).abs() < 1e-5,
+            "held wrist carries the held confidence"
+        );
+        let rec_ray = ray_of_pos([0.0, 0.0, 0.0], rec.position);
+        assert!(
+            dot(rec_ray, held_ray) > 0.999,
+            "reconstructed wrist reprojects onto the held 2D ray (dot {})",
+            dot(rec_ray, held_ray)
+        );
+    }
+
+    /// After the hold age cap is exceeded the hand is released rather
+    /// than frozen forever (the legacy Stage 3 bound, preserved).
+    #[test]
+    fn held_wrist_released_after_max_age() {
+        let mut stage = ArmRayIk::default();
+        let mut sk = make_skeleton();
+        solve_arm_depth(&mut sk, ASPECT, &mut stage);
+        sk.joints.remove(&HumanoidBone::LeftHand);
+
+        // Hold persists up to MAX_WRIST_HOLD_FRAMES reconstructions.
+        for _ in 0..MAX_WRIST_HOLD_FRAMES {
+            sk.joints.remove(&HumanoidBone::LeftHand);
+            solve_arm_depth(&mut sk, ASPECT, &mut stage);
+            assert!(sk.joints.contains_key(&HumanoidBone::LeftHand));
+        }
+        // The next frame past the cap releases the hand.
+        sk.joints.remove(&HumanoidBone::LeftHand);
+        solve_arm_depth(&mut sk, ASPECT, &mut stage);
+        assert!(
+            !sk.joints.contains_key(&HumanoidBone::LeftHand),
+            "wrist released once the hold age cap is exceeded"
+        );
+    }
+
+    /// A re-observed wrist refreshes the hold (age resets), so a brief
+    /// occlusion does not consume the budget for a later one.
+    #[test]
+    fn live_wrist_refreshes_hold() {
+        let mut stage = ArmRayIk::default();
+        let mut sk = make_skeleton();
+        solve_arm_depth(&mut sk, ASPECT, &mut stage);
+        // Drop for a few frames (under the cap).
+        for _ in 0..3 {
+            sk.joints.remove(&HumanoidBone::LeftHand);
+            solve_arm_depth(&mut sk, ASPECT, &mut stage);
+        }
+        // Re-observe: a fresh wrist resets the age to 0.
+        sk.joints.insert(HumanoidBone::LeftHand, joint([0.5, -0.4, 0.0]));
+        solve_arm_depth(&mut sk, ASPECT, &mut stage);
+        let (_, age) = stage.held_wrist[&HumanoidBone::LeftHand];
+        assert_eq!(age, 0, "a live wrist resets the hold age");
     }
 }

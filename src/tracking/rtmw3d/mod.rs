@@ -58,8 +58,6 @@ mod session;
 #[cfg(feature = "inference")]
 mod skeleton;
 #[cfg(feature = "inference")]
-mod wrist;
-#[cfg(feature = "inference")]
 mod yolox_worker;
 
 #[cfg(feature = "inference")]
@@ -79,8 +77,6 @@ use super::yolox::YoloxPersonDetector;
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{DetectionAnnotation, SourceSkeleton};
-#[cfg(feature = "inference")]
-use crate::asset::HumanoidBone;
 #[cfg(feature = "inference")]
 use log::{debug, error, info, warn};
 #[cfg(feature = "inference")]
@@ -184,10 +180,6 @@ pub struct Rtmw3dInference {
     #[cfg(feature = "inference")]
     arm_ray_ik: arm_ray_ik::ArmRayIk,
     #[cfg(feature = "inference")]
-    left_wrist: wrist::WristTracker,
-    #[cfg(feature = "inference")]
-    right_wrist: wrist::WristTracker,
-    #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
     backend: InferenceBackend,
@@ -278,13 +270,11 @@ impl Rtmw3dInference {
         )
     }
 
-    /// Reset cross-frame temporal state (wrist temporal holds; the
-    /// self-tracking crop when present). See
-    /// `PoseProvider::reset_temporal_state`.
+    /// Reset cross-frame temporal state (the ray-IK held-wrist
+    /// continuity + torso-depth EMA; the self-tracking crop when
+    /// present). See `PoseProvider::reset_temporal_state`.
     #[cfg(feature = "inference")]
     pub fn reset_temporal_state(&mut self) {
-        self.left_wrist = wrist::WristTracker::default();
-        self.right_wrist = wrist::WristTracker::default();
         self.self_track_bbox = None;
         self.arm_len = arm_z::ArmLengthState::default();
         self.arm_ray_ik.reset();
@@ -402,8 +392,6 @@ impl Rtmw3dInference {
             self_track_bbox: None,
             arm_len: arm_z::ArmLengthState::default(),
             arm_ray_ik: arm_ray_ik::ArmRayIk::default(),
-            left_wrist: wrist::WristTracker::default(),
-            right_wrist: wrist::WristTracker::default(),
             load_warnings,
             backend,
             force_shoulder_anchor: false,
@@ -690,6 +678,14 @@ impl Rtmw3dInference {
         let mut skeleton =
             skeleton::build_source_skeleton(frame_index, &joints, width, height, force_shoulder);
 
+        // Left/right hand-block transposition fix: when two hands meet
+        // at the midline the detector routinely swaps the anatomical
+        // left/right hand keypoint blocks (elbows stay correct, wrists +
+        // finger chains land on the wrong sides), so the avatar crosses
+        // its arms on a fingertips-touch. Correct it before any arm
+        // stage consumes the wrists. See `arm_z::correct_hand_lr_swap`.
+        arm_z::correct_hand_lr_swap(&mut skeleton);
+
         // Edge-exit repair: keypoints clamped at the frame / crop
         // boundary are observation clamps, not positions — restore
         // the limb to bone length along the observed direction (the
@@ -706,23 +702,15 @@ impl Rtmw3dInference {
             &mut self.arm_len,
         );
 
-        // Per-side wrist sanity check + temporal hold. Run before
-        // the face cascade so the wrist is settled when the solver
-        // reads it.
-        wrist::apply_wrist_temporal_hold(
-            &mut skeleton,
-            HumanoidBone::RightHand,
-            HumanoidBone::RightShoulder,
-            HumanoidBone::RightLowerArm,
-            &mut self.right_wrist,
-        );
-        wrist::apply_wrist_temporal_hold(
-            &mut skeleton,
-            HumanoidBone::LeftHand,
-            HumanoidBone::LeftShoulder,
-            HumanoidBone::LeftLowerArm,
-            &mut self.left_wrist,
-        );
+        // The detected 2D wrist is trusted as-is: the legacy
+        // projection-space forearm-length plausibility filter (wrist.rs
+        // Stage 2) was removed — it rejected a foreshortened-upper-arm /
+        // in-plane-forearm pose as a "hallucination" every frame (the
+        // exact perspective fallacy ray-IK eliminates), throwing away
+        // real detections so the avatar's hands ran on the now-retired
+        // Stage 4 synthesis instead of tracking. The depth solve below
+        // resolves the perspective; the MCP-confidence floor in
+        // `build_source_skeleton` (Stage 1) gates genuinely bad hands.
 
         // Arm-depth solve via ray-IK — restores the forward z that
         // the SimCC nz head cannot resolve for limbs pointing at the

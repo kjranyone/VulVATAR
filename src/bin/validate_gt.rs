@@ -128,6 +128,19 @@ fn pose_suite() -> Vec<(&'static str, Vec<PoseOp>)> {
                 AimAt { bone: RightLowerArm, tip: RightHand, target_rel: [0.0, -0.15, 0.7] },
             ]),
         ),
+        (
+            // Fingertips touching at the midline in front of the chest
+            // (elbows out, forearms angled inward to meet at x≈0). Lower
+            // than palms_meet so detection has a better chance; the
+            // L/R-swap-at-the-midline crossing repro.
+            "fingertips_touch",
+            with_base(vec![
+                AimAt { bone: LeftUpperArm, tip: LeftLowerArm, target_rel: [0.28, -0.35, 0.30] },
+                AimAt { bone: LeftLowerArm, tip: LeftHand, target_rel: [0.0, -0.35, 0.55] },
+                AimAt { bone: RightUpperArm, tip: RightLowerArm, target_rel: [-0.28, -0.35, 0.30] },
+                AimAt { bone: RightLowerArm, tip: RightHand, target_rel: [0.0, -0.35, 0.55] },
+            ]),
+        ),
     ]
 }
 
@@ -519,6 +532,7 @@ fn build_projection_matrix(fov_deg: f32, aspect: f32, near: f32, far: f32) -> vu
 // -----------------------------------------------------------------------
 
 fn main() -> Result<(), String> {
+    env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut filter: Option<String> = None;
     let mut depth_enabled = true;

@@ -376,11 +376,27 @@ avatar's `Right*` bones rest after the VRM 0.x Y180 root flip.
 Monocular 3D wrist keypoints are the brittlest part of any
 single-camera pose pipeline — they routinely fall behind the torso
 when occluded by an instrument, drift across the body when arms
-cross, or evaporate to low confidence on extreme yaw. A four-stage
-fallback in `tracking::rtmw3d` keeps the avatar's hands stable
-through these failure modes. Stages 1–2 run inline in
-`build_source_skeleton`'s `attach_hand`; stages 3–4 run in
-`apply_wrist_temporal_hold` per side.
+cross, or evaporate to low confidence on extreme yaw. The pipeline
+keeps the avatar's hands stable through these failure modes with a
+detection-confidence gate (Stage 1) plus ray-IK temporal continuity.
+Stage 1 runs inline in `build_source_skeleton`'s `attach_hand`; the
+continuity that used to be Stages 3–4 was folded into `arm_ray_ik`
+(see below and `docs/ray-ik-depth-solve.md`).
+
+> **Stages 2–4 removed (2026-06-15).** The legacy resilience layer
+> (`wrist.rs`) was retired. Stage 2's forearm-length plausibility
+> check was a *projection-space* test — the exact perspective fallacy
+> ray-IK was built to eliminate: a foreshortened upper arm beside an
+> in-plane forearm projects at a >1.4× length ratio and was rejected
+> as a "hallucination" *every frame*. With Stage 2 throwing away the
+> real detections, the avatar's hands ran almost entirely on the
+> Stage 4 forward-extension synthesis (a hardcoded "+0.2 toward
+> camera" pose), never on actual tracking — which is why a real
+> forward arm reach barely registered. The fix is to TRUST the 2D
+> wrist and let the depth solve resolve the perspective (a long-
+> projecting forearm ⇒ near-camera depth, by construction). The
+> remaining hallucination guard is the Stage-1 MCP confidence floor;
+> genuine occlusion is handled by the continuity below.
 
 **Stage 1 — MCP-centroid wrist derivation.** The wrist position
 emitted to the source skeleton is the centroid of the four finger
@@ -401,46 +417,46 @@ A hand is considered tracked only when ≥3 of the 4 MCPs clear the
 for the frame so the solver leaves fingers at rest (preferable to
 emitting a noisy wrist that flicks around).
 
-**Stage 2 — Forearm length sanity check.** `apply_wrist_temporal_hold`
-runs the live MCP-centroid wrist through a length plausibility
-check: `||wrist - elbow|| ≤ 1.4 × max(running_max_upper_arm, 0.18)`.
-The bound rides on a per-side running max of clean upper-arm
-lengths, with a 0.18 floor so the very first frame never rejects
-the wrist outright. The 1.4× ratio limit is loose enough for normal
-arm posture (real arms have upper-arm ≈ forearm) but tight enough
-to catch the "wrist hallucinated across the body" pathology where
-RTMW3D snaps the wrist past the opposite shoulder.
+**L/R hand-block transposition fix (`arm_z::correct_hand_lr_swap`).**
+When two hands meet at the midline — fingertips touching, a clap, a
+prayer pose — RTMW3D routinely assigns the anatomical-left hand
+keypoint block to the right and vice versa. The body elbows stay
+correctly placed, but the MCP-centroid wrists (and their whole finger
+chains) land on the wrong sides, so the solver — faithfully following
+its input — crosses the avatar's forearms. The signature is
+unambiguous and measurable: swapping the two hands sharply *shortens*
+both forearms, because each hand belongs to its nearest elbow
+(measured on the `fingertips_touch` GT pose: forearm cost 0.52 → 0.13
+swapped). The correction relabels both hand chains (wrist + phalanges
++ fingertips + hand orientation) when, and only when, the elbows are
+clearly L/R separated (`SWAP_ELBOW_SEP_RATIO = 0.3 × span`, which
+rules out a deliberate *tucked* arms-cross), the hands are inverted in
+x, sit close together, and the swap shortens the forearms by a clear
+margin. Runs right after `build_source_skeleton`, before any arm
+stage. A deliberate tight wrist-cross with the elbows wide is the
+inherent monocular ambiguity here — it resolves to "meet," the far
+commoner intent.
 
-**Stage 3 — Temporal hold (≤6 frames).** When the live wrist is
-rejected (stage 2) or absent (stage 1 returned no hand), reuse the
-previous frame's accepted wrist position for up to
-`TEMPORAL_HOLD_MAX_FRAMES = 6` frames, decaying confidence by 15%
-per frame (`TEMPORAL_HOLD_DECAY = 0.85`). At 30 fps that's a 200 ms
-window — long enough to bridge a strum stroke or a hand pass behind
-the body, short enough that a genuinely-stationary hand stays at
-its real position.
+**Temporal continuity (folded into `arm_ray_ik`, formerly Stages 3–4).**
+A dropped or absent wrist is reconstructed in the ray-IK depth solve
+from its **last observed 2D ray**, held for up to
+`MAX_WRIST_HOLD_FRAMES = 6` frames (a ~200 ms window at 30 fps —
+long enough to bridge a strum stroke or a hand pass behind the body).
+The 2D ray is a pure function of the image point, so holding it ==
+holding the last good 2D wrist; the depth then **re-solves every
+frame** from the forearm-length invariant + the forward prior +
+the temporal term, rather than freezing a stale 3D position (old
+Stage 3) or nudging a hardcoded "+0.2 toward camera" (old Stage 4).
+The reconstructed wrist carries `HELD_WRIST_CONF = 0.3` so the chain
+still participates while staying distinguishable from a real
+measurement. Past the hold cap the hand is released and the solver
+leaves it at rest. A wrist that is never observed at all (no held
+ray) is simply not placed — there is no synthesis from nothing.
 
-When live fingers exist alongside a rejected wrist (the wrist was
-implausible but the MCPs were OK), the entire hand chain is
-translated by `held_wrist - bogus_wrist` so finger geometry around
-the held wrist stays self-consistent — without this, the held
-wrist + live fingers would form a tear in the chain.
-
-**Stage 4 — Chain-extension synthesis.** When the temporal hold
-window expires *and* both shoulder and elbow are still tracked, the
-wrist is synthesised by extending forward from the elbow along the
-upper-arm direction by the upper-arm length, with a small +0.2 z
-bias toward the camera so the synthesised hand reads as "extended
-in front" rather than "stuck inside the torso". The finger chain is
-cleared (its geometry was suspect anyway) and the wrist is emitted
-with confidence 0.35 — just above the solver's default 0.3 threshold
-so the chain still participates, but visibly damped relative to a
-real measurement so the value is distinguishable in confidence
-histograms.
-
-If neither the held position nor the synth path is available
-(no shoulder, no elbow, no recent good wrist), the wrist + finger
-chain are dropped and the solver leaves the hand at rest.
+Because ray-IK is a depth-only solver (2D reprojection is an identity
+on the observed ray), this continuity owns the wrist's 2D placement
+across occlusion by holding the *ray*, which the depth solve cannot
+fabricate on its own.
 
 ## Feature Flags
 
@@ -497,9 +513,9 @@ we don't have.
 1. **Occluded-hand depth.** Monocular 3D pose places hands behind
    the body when an instrument or object occludes the wrist
    (e.g. guitar strumming hand). RTMW3D handles this better than
-   the previous BlazePose pipeline but not perfectly. The four-stage
-   wrist resilience layer (§5) keeps the avatar's hands stable
-   through the failure modes that remain.
+   the previous BlazePose pipeline but not perfectly. The Stage-1
+   confidence gate + ray-IK held-wrist continuity (§5) keep the
+   avatar's hands stable through the failure modes that remain.
 2. **Single-person only.** YOLOX-m returns multiple detections but
    we always pick the single highest-score person. With more than
    one person in frame, RTMW3D will track whichever the detector

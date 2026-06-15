@@ -1949,6 +1949,77 @@ mod arm_contact_ik_tests {
         );
     }
 
+    use crate::asset::HumanoidMap;
+    use std::collections::HashMap;
+
+    /// Build a HumanoidMap + rest_world for a symmetric T-pose-ish
+    /// avatar, arm bones at node indices 0..=5.
+    fn arm_rig() -> (HumanoidMap, Vec<WorldXform>) {
+        use crate::asset::NodeId;
+        let mut bone_map = HashMap::new();
+        bone_map.insert(HumanoidBone::LeftUpperArm, NodeId(0));
+        bone_map.insert(HumanoidBone::LeftLowerArm, NodeId(1));
+        bone_map.insert(HumanoidBone::LeftHand, NodeId(2));
+        bone_map.insert(HumanoidBone::RightUpperArm, NodeId(3));
+        bone_map.insert(HumanoidBone::RightLowerArm, NodeId(4));
+        bone_map.insert(HumanoidBone::RightHand, NodeId(5));
+        let xf = |p: Vec3| WorldXform { position: p, rotation: [0.0, 0.0, 0.0, 1.0] };
+        // T-pose: arms out along ±x at shoulder height.
+        let rest = vec![
+            xf([0.15, 1.4, 0.0]),  // 0 L upper
+            xf([0.40, 1.4, 0.0]),  // 1 L lower (elbow)
+            xf([0.65, 1.4, 0.0]),  // 2 L hand
+            xf([-0.15, 1.4, 0.0]), // 3 R upper
+            xf([-0.40, 1.4, 0.0]), // 4 R lower
+            xf([-0.65, 1.4, 0.0]), // 5 R hand
+        ];
+        (HumanoidMap { bone_map }, rest)
+    }
+
+    fn src_joint(p: Vec3) -> crate::tracking::SourceJoint {
+        crate::tracking::SourceJoint { position: p, confidence: 1.0, metric_depth_m: None }
+    }
+
+    /// REPRO: hands brought together at the midline in front (the
+    /// "fingertips touching" pose the user reports breaking). The
+    /// contact IK must NOT cross the arms — the left elbow/wrist stay
+    /// on the +x (left) side and the right on −x.
+    #[test]
+    fn hands_together_does_not_cross_arms() {
+        let (humanoid, rest) = arm_rig();
+        let mut source = SourceSkeleton::empty(0);
+        let put = |sk: &mut SourceSkeleton, b, p| {
+            sk.joints.insert(b, src_joint(p));
+        };
+        // Shoulders apart, elbows out + forward, wrists meeting near
+        // the midline in front of the chest.
+        put(&mut source, HumanoidBone::LeftUpperArm, [0.20, 0.40, 0.0]);
+        put(&mut source, HumanoidBone::RightUpperArm, [-0.20, 0.40, 0.0]);
+        put(&mut source, HumanoidBone::LeftLowerArm, [0.28, 0.15, 0.25]);
+        put(&mut source, HumanoidBone::RightLowerArm, [-0.28, 0.15, 0.25]);
+        put(&mut source, HumanoidBone::LeftHand, [0.03, 0.0, 0.5]);
+        put(&mut source, HumanoidBone::RightHand, [-0.03, 0.0, 0.5]);
+
+        let params = SolverParams { joint_confidence_threshold: 0.0, ..Default::default() };
+        let ik = compute_arm_contact_ik(&source, &humanoid, &rest, &params)
+            .expect("contact IK engages when hands meet");
+
+        let (ul, ll) = ik.dirs[0].expect("L dirs");
+        let (ur, lr) = ik.dirs[1].expect("R dirs");
+        eprintln!("weight={:.3}", ik.weight);
+        eprintln!("L upper={ul:?} lower={ll:?}");
+        eprintln!("R upper={ur:?} lower={lr:?}");
+        // Crossing signature: left upper arm pointing toward −x (right).
+        assert!(ul[0] > -0.2, "L upper crosses to the right: {ul:?}");
+        assert!(ur[0] < 0.2, "R upper crosses to the left: {ur:?}");
+        // Lower (forearm) should aim inward toward the midline but not
+        // past it dramatically: left forearm points −x (inward), right
+        // +x — that's correct convergence, not crossing.
+        // Convergence, not crossing: left forearm aims −x (inward to
+        // the midline), right +x; neither overshoots to the far side.
+        assert!(ll[0] < 0.0 && lr[0] > 0.0, "forearms should converge inward");
+    }
+
     /// Coincident targets from two different anchors resolve to the
     /// SAME wrist position: anchor + l1·upper + l2·lower must agree —
     /// the property that makes the avatar's palms actually meet.
