@@ -11,8 +11,8 @@
 //! ## Async architecture
 //!
 //! DAv2 runs on a dedicated worker thread so it overlaps with RTMW3D
-//! on the calling thread. The worker reads a single-slot mailbox
-//! (`mpsc::channel` with drain-old semantics) and writes to a
+//! on the calling thread. The worker reads a bounded single-slot inbox
+//! and writes to a
 //! `Mutex<Option<Arc<DepthResult>>>` outbox. The provider always
 //! reads the *latest available* depth result regardless of frame age,
 //! so steady-state wall time on the calling thread is just RTMW3D
@@ -21,7 +21,7 @@
 //!
 //! ```text
 //!  estimate_pose(N) on caller thread:
-//!    ├─ submit RGB frame N to depth_tx (drains older queued)
+//!    ├─ submit RGB frame N to depth inbox (overwrites any pending)
 //!    ├─ run RTMW3D inline                            ┐
 //!    │                                                │ in parallel
 //!    │  depth-worker thread:                          │ with caller
@@ -64,7 +64,7 @@ use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
 use crate::asset::HumanoidBone;
 
 #[cfg(feature = "inference")]
-use std::sync::mpsc::{channel, Receiver, Sender};
+use crate::tracking::latest_cell::LatestCell;
 #[cfg(feature = "inference")]
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(feature = "inference")]
@@ -193,7 +193,7 @@ pub struct Rtmw3dWithDepthProvider {
     /// Inbox sender. `Option` so `Drop` can take and drop the
     /// sender first to terminate the worker's `recv()` loop.
     #[cfg(feature = "inference")]
-    depth_tx: Option<Sender<DepthRequest>>,
+    depth_inbox: Option<Arc<LatestCell<DepthRequest>>>,
     /// Sticky outbox holding the latest finished depth result. The
     /// worker writes here; the caller reads each frame.
     #[cfg(feature = "inference")]
@@ -319,7 +319,7 @@ impl Rtmw3dWithDepthProvider {
         // and `dav2_small.onnx` on disk. Without it the provider runs
         // the identical RTMW3D pipeline and z falls back to the
         // body-prior synthetic. `estimate_pose_internal` skips every
-        // depth phase when `depth_tx` is `None`.
+        // depth phase when `depth_inbox` is `None`.
         let dav2_path = dir.join("dav2_small.onnx");
         let depth_enabled = config.depth_enabled && dav2_path.is_file();
 
@@ -350,21 +350,24 @@ impl Rtmw3dWithDepthProvider {
             cvar: Condvar::new(),
         });
 
-        let (depth_tx, depth_thread, depth_backend_label) = if depth_enabled {
+        let (depth_inbox, depth_thread, depth_backend_label) = if depth_enabled {
             let dav2 = DepthAnythingV2Inference::from_model_path(&dav2_path)?;
             let depth_backend_label = dav2.backend().label().to_string();
-            let (depth_tx, depth_rx) = channel::<DepthRequest>();
+            let depth_inbox = LatestCell::new();
+            let depth_inbox_for_thread = Arc::clone(&depth_inbox);
             let depth_outbox_for_thread = Arc::clone(&depth_outbox);
             let depth_thread = thread::Builder::new()
                 .name("dav2-depth".into())
-                .spawn(move || depth_worker_loop(dav2, depth_rx, depth_outbox_for_thread))
+                .spawn(move || {
+                    depth_worker_loop(dav2, depth_inbox_for_thread, depth_outbox_for_thread)
+                })
                 .map_err(|e| format!("spawn depth worker: {e}"))?;
             info!(
                 "RTMW3D+DAv2 provider ready (RTMW3D: {}, DAv2: {} async)",
                 rtmw3d.backend().label(),
                 depth_backend_label,
             );
-            (Some(depth_tx), Some(depth_thread), depth_backend_label)
+            (Some(depth_inbox), Some(depth_thread), depth_backend_label)
         } else {
             if config.depth_enabled {
                 // User asked for depth but the model is missing —
@@ -387,7 +390,7 @@ impl Rtmw3dWithDepthProvider {
 
         Ok(Self {
             rtmw3d,
-            depth_tx,
+            depth_inbox,
             depth_outbox,
             depth_thread,
             depth_thread_dead_logged: false,
@@ -414,35 +417,32 @@ impl Rtmw3dWithDepthProvider {
 #[cfg(feature = "inference")]
 impl Drop for Rtmw3dWithDepthProvider {
     fn drop(&mut self) {
-        // Drop the sender first — the worker's `rx.recv()` then
-        // returns Err(RecvError) and the loop exits cleanly. Joining
-        // afterwards waits for any in-flight DAv2 inference to
-        // complete (~50 ms worst case).
-        self.depth_tx.take();
+        // Close the inbox first — the worker's blocked `take_blocking`
+        // then returns `None` and the loop exits cleanly. (Unlike a
+        // channel, dropping our handle would not wake it — it would
+        // deadlock the join.) Joining afterwards waits for any in-flight
+        // DAv2 inference to complete (~50 ms worst case).
+        if let Some(inbox) = self.depth_inbox.take() {
+            inbox.close();
+        }
         if let Some(handle) = self.depth_thread.take() {
             let _ = handle.join();
         }
     }
 }
 
-/// DAv2 worker thread loop. Owns the inference instance, reads
-/// requests via `rx`, drains the queue down to the latest entry
-/// (so a slow worker never falls behind on stale frames), runs
-/// inference, and publishes to the sticky outbox. Exits when `rx`
-/// returns `Err` (provider dropped its `Sender`).
+/// DAv2 worker thread loop. Owns the inference instance, takes the
+/// latest submitted request from the inbox (which already keeps only
+/// the freshest frame, so a slow worker never falls behind on stale
+/// ones), runs inference, and publishes to the sticky outbox. Exits
+/// when the inbox is closed (provider dropped).
 #[cfg(feature = "inference")]
 fn depth_worker_loop(
     mut dav2: DepthAnythingV2Inference,
-    rx: Receiver<DepthRequest>,
+    inbox: Arc<LatestCell<DepthRequest>>,
     outbox: Arc<DepthOutbox>,
 ) {
-    while let Ok(mut req) = rx.recv() {
-        // Drain: consume any newer requests that piled up while we
-        // were processing the previous frame. Keeps depth always on
-        // the latest available frame.
-        while let Ok(newer) = rx.try_recv() {
-            req = newer;
-        }
+    while let Some(req) = inbox.take_blocking() {
         let t0 = std::time::Instant::now();
         crate::tracking::stagelog::mark(req.frame_index, "dav2_infer_begin");
         let depth_opt = dav2.estimate(&req.rgb, req.width, req.height);
@@ -471,7 +471,7 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
     fn label(&self) -> String {
         #[cfg(feature = "inference")]
         {
-            if self.depth_tx.is_some() {
+            if self.depth_inbox.is_some() {
                 format!(
                     "RTMW3D+DAv2 / {} + {} async",
                     self.rtmw3d.backend().label(),
@@ -647,7 +647,7 @@ impl Rtmw3dWithDepthProvider {
         // the RTMW3D estimate, with its body-prior synthetic z, IS the
         // result. Returning here also avoids the cold-start outbox
         // wait below, which would block forever with no worker.
-        if self.depth_tx.is_none() {
+        if self.depth_inbox.is_none() {
             return rtmw_est;
         }
 
@@ -666,7 +666,8 @@ impl Rtmw3dWithDepthProvider {
                 y2: by2 * height as f32,
                 score: 1.0,
             };
-            let (cx1, cy1, cx2, cy2) = crate::tracking::rtmw3d::pad_and_clamp_bbox(&bbox, width, height, 0.25);
+            let (cx1, cy1, cx2, cy2) =
+                crate::tracking::rtmw3d::pad_and_clamp_bbox(&bbox, width, height, 0.25);
             let cw = cx2 - cx1;
             let ch = cy2 - cy1;
             if cw >= 32 && ch >= 32 {
@@ -680,7 +681,8 @@ impl Rtmw3dWithDepthProvider {
 
         let (dav2_rgb, dav2_w, dav2_h, crop_origin) = match crop_info {
             Some((cx1, cy1, cw, ch)) => {
-                let crop = crate::tracking::rtmw3d::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
+                let crop =
+                    crate::tracking::rtmw3d::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
                 let crop_origin = Some((
                     cx1 as f32 / width as f32,
                     cy1 as f32 / height as f32,
@@ -700,7 +702,7 @@ impl Rtmw3dWithDepthProvider {
             outbox_empty || frame_index.is_multiple_of(DEPTH_REFRESH_PERIOD);
         if submit_depth_this_frame {
             crate::tracking::stagelog::mark(frame_index, "depth_submit");
-            if let Some(tx) = self.depth_tx.as_ref() {
+            if let Some(inbox) = self.depth_inbox.clone() {
                 let req = DepthRequest {
                     rgb: dav2_rgb,
                     width: dav2_w,
@@ -709,21 +711,22 @@ impl Rtmw3dWithDepthProvider {
                     crop_origin,
                     generation: self.depth_generation,
                 };
-                // SendError only happens if the worker thread died —
-                // at which point we'll fall back to whatever's left
-                // in the outbox (sticky last result). Log loudly the
-                // first time so a power user diagnosing "tracking
-                // feels stale" sees the cause in the log; gate further
-                // sends behind the same flag so the log isn't
-                // hammered at 30 fps.
-                if let Err(e) = tx.send(req) {
-                    if !self.depth_thread_dead_logged {
-                        error!(
-                            "DAv2 depth worker died (frame {}); falling back to sticky outbox forever: {}",
-                            frame_index, e
-                        );
-                        self.depth_thread_dead_logged = true;
-                    }
+                // Latest-only submit: never blocks and never drops the
+                // newest frame — it just overwrites any still-pending
+                // one, so the worker always runs on the freshest crop.
+                inbox.put(req);
+                // The inbox can't report a dead worker (nothing consumes
+                // the cell if the thread panicked). Detect it via the
+                // join handle and log once, so a power user diagnosing
+                // "tracking feels stale" sees the cause; from then on we
+                // fall back to the sticky outbox's last result forever.
+                let worker_dead = self.depth_thread.as_ref().is_some_and(|h| h.is_finished());
+                if worker_dead && !self.depth_thread_dead_logged {
+                    error!(
+                        "DAv2 depth worker died (frame {}); falling back to sticky outbox forever",
+                        frame_index
+                    );
+                    self.depth_thread_dead_logged = true;
                 }
             }
         }
@@ -1277,9 +1280,8 @@ fn replace_arm_chains_from_metric(
         if crate::tracking::rtmw3d::wrist_out_of_frame(&get, i, 0.20) {
             continue;
         }
-        let seg = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
-            [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
-        };
+        let seg =
+            |a: [f32; 3], b: [f32; 3]| -> [f32; 3] { [b[0] - a[0], b[1] - a[1], b[2] - a[2]] };
         let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         // NOTE: the snapshot positions are already in source units
         // (the depth builder back-projects then divides by its own
@@ -2114,7 +2116,10 @@ pub fn calibrate_scale(
 /// out-of-domain) are stored as NaN — `sample_metric_point`'s window
 /// median ignores them naturally.
 #[cfg(feature = "inference")]
-pub fn build_metric_frame_from_dav2(dav2: &DepthAnythingFrame, calib: &Calibration) -> MetricDepthFrame {
+pub fn build_metric_frame_from_dav2(
+    dav2: &DepthAnythingFrame,
+    calib: &Calibration,
+) -> MetricDepthFrame {
     let w = dav2.width;
     let h = dav2.height;
     let pixel_count = (w as usize) * (h as usize);

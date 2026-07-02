@@ -11,6 +11,8 @@ mod webcam;
 
 #[cfg(feature = "inference")]
 pub mod depth_anything;
+#[cfg(feature = "inference")]
+pub(crate) mod latest_cell;
 mod pose_estimation;
 pub mod provider;
 pub mod rtmw3d_with_depth;
@@ -935,6 +937,35 @@ impl TrackingWorker {
             ready: Arc::new(AtomicBool::new(false)),
             mailbox,
             backend: CameraBackend::default(),
+        }
+    }
+
+    /// Create a worker that reports `is_running()` / `is_ready()` as
+    /// `true` immediately, without spawning a capture thread — for
+    /// callers that drive the mailbox themselves (headless replay /
+    /// diagnostics that publish `PoseEstimate`s via
+    /// [`Self::mailbox`]`().publish_estimate(...)`, e.g.
+    /// `src/bin/diagnose_signal_quality.rs`).
+    ///
+    /// `Application::run_frame` only reads the mailbox when
+    /// `tracking_worker` is `Some` and running (`step_tracking`,
+    /// `src/app/render.rs`) — this gate exists so a freshly loaded
+    /// avatar doesn't fade out before tracking ever starts. Without
+    /// this constructor an external driver has no sanctioned way to
+    /// satisfy that gate short of spawning a real (and here,
+    /// redundant) capture thread via `start_with_params`.
+    /// `backend` is reported as `Synthetic` since `worker_loop` (the
+    /// only reader of `backend` besides display labels) is never
+    /// invoked for a handle-less worker — there is no dedicated
+    /// "externally driven" backend variant to keep that match
+    /// exhaustive over a path that can't be reached this way.
+    pub fn new_external(mailbox: TrackingMailbox) -> Self {
+        Self {
+            handle: None,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(AtomicBool::new(true)),
+            mailbox,
+            backend: CameraBackend::Synthetic,
         }
     }
 

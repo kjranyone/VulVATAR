@@ -67,10 +67,6 @@ pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
 // they're here purely because that's where they were originally
 // written. Promotion-only re-export, no logic change.
 #[cfg(feature = "inference")]
-pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
-#[cfg(feature = "inference")]
-pub(in crate::tracking) use arm_z::wrist_out_of_frame;
-#[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
 use super::yolox::YoloxPersonDetector;
@@ -78,11 +74,15 @@ use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{DetectionAnnotation, SourceSkeleton};
 #[cfg(feature = "inference")]
+pub(in crate::tracking) use arm_z::wrist_out_of_frame;
+#[cfg(feature = "inference")]
 use log::{debug, error, info, warn};
 #[cfg(feature = "inference")]
 use ort::session::Session;
 #[cfg(feature = "inference")]
 use ort::value::TensorRef;
+#[cfg(feature = "inference")]
+pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
 #[cfg(feature = "inference")]
 use std::path::Path;
 #[cfg(feature = "inference")]
@@ -485,8 +485,9 @@ impl Rtmw3dInference {
                 // `all_modes_emit_nonzero_yolox_skip_period` unit
                 // test, but `is_multiple_of(0)` would panic so we
                 // guard against an accidental future regression.
-                let period =
-                    YOLOX_REFRESH_PERIOD.load(std::sync::atomic::Ordering::Relaxed).max(1);
+                let period = YOLOX_REFRESH_PERIOD
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1);
                 if cold_start || frame_index.is_multiple_of(period) {
                     worker.submit(rgb_data, width, height);
                 }

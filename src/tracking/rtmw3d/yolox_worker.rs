@@ -9,14 +9,14 @@
 //! synchronous YOLOX run; here the hitch is hidden behind the
 //! worker.
 //!
-//! Same drain-old / sticky-Arc design as the DAv2 worker in
+//! Same latest-only inbox / sticky-Arc design as the DAv2 worker in
 //! `rtmw3d_with_depth.rs`. Cold start blocks once on the first
 //! result; subsequent frames just clone the Arc.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use super::super::latest_cell::LatestCell;
 use super::super::yolox::{PersonBbox, YoloxPersonDetector};
 
 struct DetectRequest {
@@ -37,7 +37,7 @@ pub(super) struct DetectOutbox {
 }
 
 pub(super) struct YoloxWorker {
-    tx: Option<Sender<DetectRequest>>,
+    inbox: Arc<LatestCell<DetectRequest>>,
     outbox: Arc<DetectOutbox>,
     thread: Option<thread::JoinHandle<()>>,
     /// Temporal-state generation; results from an older generation
@@ -48,36 +48,35 @@ pub(super) struct YoloxWorker {
 
 impl YoloxWorker {
     pub fn spawn(detector: YoloxPersonDetector) -> Result<Self, String> {
-        let (tx, rx) = channel::<DetectRequest>();
+        let inbox = LatestCell::new();
         let outbox = Arc::new(DetectOutbox {
             slot: Mutex::new(None),
             cvar: Condvar::new(),
         });
+        let inbox_for_thread = Arc::clone(&inbox);
         let outbox_for_thread = Arc::clone(&outbox);
         let thread = thread::Builder::new()
             .name("yolox-detect".into())
-            .spawn(move || worker_loop(detector, rx, outbox_for_thread))
+            .spawn(move || worker_loop(detector, inbox_for_thread, outbox_for_thread))
             .map_err(|e| format!("spawn yolox worker: {e}"))?;
         Ok(Self {
-            tx: Some(tx),
+            inbox,
             outbox,
             thread: Some(thread),
             generation: 0,
         })
     }
 
-    /// Submit a new frame for detection. Drops older queued requests
-    /// in the worker so the worker always processes the latest. Cheap
-    /// (one Vec clone of the RGB buffer + channel send).
+    /// Submit a new frame for detection. The latest-only inbox drops any
+    /// still-pending frame so the worker always processes the freshest
+    /// submission. Cheap (one Vec clone of the RGB buffer).
     pub fn submit(&self, rgb: &[u8], width: u32, height: u32) {
-        if let Some(tx) = self.tx.as_ref() {
-            let _ = tx.send(DetectRequest {
-                rgb: rgb.to_vec(),
-                width,
-                height,
-                generation: self.generation,
-            });
-        }
+        self.inbox.put(DetectRequest {
+            rgb: rgb.to_vec(),
+            width,
+            height,
+            generation: self.generation,
+        });
     }
 
     /// Block until the very first detection lands, then return it.
@@ -116,7 +115,9 @@ impl YoloxWorker {
 
 impl Drop for YoloxWorker {
     fn drop(&mut self) {
-        self.tx.take();
+        // Close before join: the worker blocks in `take_blocking`, which
+        // only wakes on `close` (dropping the handle would deadlock).
+        self.inbox.close();
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -125,15 +126,12 @@ impl Drop for YoloxWorker {
 
 fn worker_loop(
     mut detector: YoloxPersonDetector,
-    rx: Receiver<DetectRequest>,
+    inbox: Arc<LatestCell<DetectRequest>>,
     outbox: Arc<DetectOutbox>,
 ) {
-    while let Ok(mut req) = rx.recv() {
-        // Drain: skip any older queued requests. We only ever care
-        // about the latest frame.
-        while let Ok(newer) = rx.try_recv() {
-            req = newer;
-        }
+    // `take_blocking` already yields only the latest submitted frame, so
+    // no drain loop is needed; it returns `None` when the worker is closed.
+    while let Some(req) = inbox.take_blocking() {
         let bbox = detector.detect_largest_person(&req.rgb, req.width, req.height);
         let result = Arc::new(DetectResult {
             bbox,
