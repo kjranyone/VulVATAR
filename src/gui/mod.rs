@@ -468,6 +468,14 @@ pub struct RenderingGuiState {
     /// "Scene Background" section and synced to `Application` every frame.
     pub generative_background: crate::renderer::frame_input::GenerativeBackgroundSettings,
     pub toggle_spring: bool,
+    /// User spring-bone tuning (sway strength / gravity adjust), edited
+    /// next to the spring toggle and passed to the pipeline per frame via
+    /// `FrameConfig` (path 2). Persisted with the project.
+    pub spring_tuning: crate::simulation::spring::SpringTuning,
+    /// Scene-wide gravity (direction + strength) for all physics solvers,
+    /// edited in the Rendering inspector, passed via `FrameConfig`
+    /// (path 2). Persisted with the project.
+    pub scene_gravity: crate::simulation::SceneGravity,
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
     pub toggle_skeleton_debug: bool,
@@ -836,6 +844,8 @@ impl GuiApp {
                 generative_background:
                     crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
                 toggle_spring: true,
+                spring_tuning: crate::simulation::spring::SpringTuning::default(),
+                scene_gravity: crate::simulation::SceneGravity::default(),
                 toggle_cloth: false,
                 toggle_collision_debug: false,
                 toggle_skeleton_debug: false,
@@ -1067,6 +1077,8 @@ impl GuiApp {
                 generative_background:
                     crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
                 toggle_spring: true,
+                spring_tuning: crate::simulation::spring::SpringTuning::default(),
+                scene_gravity: crate::simulation::SceneGravity::default(),
                 toggle_cloth: false,
                 toggle_collision_debug: false,
                 toggle_skeleton_debug: false,
@@ -1312,6 +1324,8 @@ impl GuiApp {
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             mouth_source: self.lipsync.mouth_source,
+            spring_tuning: self.rendering.spring_tuning,
+            scene_gravity: self.rendering.scene_gravity,
             frame_dt,
         }
     }

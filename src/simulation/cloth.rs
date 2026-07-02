@@ -194,7 +194,14 @@ pub struct ClothSimState {
     pub bend_constraints: Vec<ClothBendConstraint>,
     pub pin_targets: Vec<PinTarget>,
     pub solver_iterations: u32,
+    /// Effective gravity for this frame (m/s²). Derived each frame from the
+    /// scene gravity × [`Self::gravity_scale`] by `apply_cloth_gravity`;
+    /// not edited directly (edit `gravity_scale` instead).
     pub gravity: Vec3,
+    /// Per-garment gravity multiplier relative to the scene gravity. Lets
+    /// one cloth hang heavier/lighter than another. Seeded from the
+    /// asset's `gravity_scale`; edited in the Cloth Authoring panel.
+    pub gravity_scale: f32,
     pub damping: f32,
     pub collision_margin: f32,
     pub wind_response: f32,
@@ -332,6 +339,7 @@ impl ClothSimState {
             pin_targets,
             solver_iterations: params.iterations.max(1),
             gravity: [0.0, -9.81 * params.gravity_scale, 0.0],
+            gravity_scale: params.gravity_scale,
             damping: params.damping,
             collision_margin: params.collision_margin,
             wind_response: params.wind_response,
@@ -368,6 +376,7 @@ impl Default for ClothSimState {
             pin_targets: Vec::new(),
             solver_iterations: 8,
             gravity: [0.0, -9.81, 0.0],
+            gravity_scale: 1.0,
             damping: 0.98,
             collision_margin: 0.02,
             wind_response: 0.0,

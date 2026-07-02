@@ -220,17 +220,29 @@ impl Application {
             };
 
             if self.physics.rapier_initialized() {
-                self.physics
-                    .step_all(fixed_dt, substeps, avatar, step_options);
+                self.physics.step_all(
+                    fixed_dt,
+                    substeps,
+                    avatar,
+                    step_options,
+                    &config.spring_tuning,
+                    &config.scene_gravity,
+                );
                 avatar.compute_global_pose();
             } else {
                 if step_options.spring_enabled {
-                    self.physics.step_springs(fixed_dt, substeps, avatar);
+                    self.physics.step_springs(
+                        fixed_dt,
+                        substeps,
+                        avatar,
+                        &config.spring_tuning,
+                        &config.scene_gravity,
+                    );
                     avatar.compute_global_pose();
                 }
                 if step_options.cloth_enabled {
                     for _ in 0..substeps {
-                        self.physics.step_cloth(fixed_dt, avatar);
+                        self.physics.step_cloth(fixed_dt, avatar, &config.scene_gravity);
                     }
                     avatar.compute_global_pose();
                 }

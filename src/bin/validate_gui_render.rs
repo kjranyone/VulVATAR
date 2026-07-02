@@ -223,7 +223,13 @@ fn process_one(
     avatar.compute_global_pose();
     // Match the live session (`toggle_spring: true`) — one substep at
     // 60 Hz mirrors what the GUI runs each frame.
-    physics.step_springs(FRAME_DT, 1, &mut avatar);
+    physics.step_springs(
+        FRAME_DT,
+        1,
+        &mut avatar,
+        &vulvatar_lib::simulation::spring::SpringTuning::default(),
+        &vulvatar_lib::simulation::SceneGravity::default(),
+    );
     avatar.compute_global_pose();
     avatar.build_skinning_matrices();
 

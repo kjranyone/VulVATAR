@@ -1,10 +1,49 @@
 use crate::asset::ColliderShape;
 use crate::avatar::AvatarInstance;
 use crate::math_utils::{
-    closest_point_on_segment, mat4_translation, quat_mul, quat_normalize, vec3_add, vec3_cross,
-    vec3_dot, vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
+    closest_point_on_segment, mat4_translation, quat_from_vectors, quat_mul, quat_normalize,
+    quat_rotate_vec3, vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_length_sq, vec3_scale,
+    vec3_sub, Vec3,
 };
 use crate::simulation::cloth::ResolvedCollider;
+
+/// User-facing spring-bone tuning, layered on top of the VRM asset's
+/// authored per-chain/per-joint values at simulation time (the asset is
+/// never mutated). Edited in the Rendering inspector, persisted with the
+/// project.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpringTuning {
+    /// How freely the chains swing. `1.0` = as authored. Applied as an
+    /// *inverse* scale on both stiffness (rest-pose pull) and drag
+    /// (velocity damping): raising sway softens the pull and lets
+    /// oscillation persist; lowering it stiffens and deadens the chain
+    /// until, near the bottom of the range, hair is effectively rigid.
+    /// One knob moves both because they push the same percept in
+    /// opposite directions — splitting them exposes tuning traps
+    /// (zero stiffness + low drag never settles) for no expressive gain.
+    pub sway_scale: f32,
+    /// Additive adjustment to every joint's authored `gravityPower`,
+    /// clamped so the effective power never goes negative. Additive —
+    /// not a multiplier — because VRM 1.0's *default* gravityPower is
+    /// 0.0: many models ship with no authored gravity at all, and a
+    /// multiplier would be a dead knob on exactly the models whose hair
+    /// most needs the droop.
+    pub gravity_offset: f32,
+}
+
+impl SpringTuning {
+    pub const SWAY_RANGE: std::ops::RangeInclusive<f32> = 0.05..=2.0;
+    pub const GRAVITY_RANGE: std::ops::RangeInclusive<f32> = -1.0..=1.0;
+}
+
+impl Default for SpringTuning {
+    fn default() -> Self {
+        Self {
+            sway_scale: 1.0,
+            gravity_offset: 0.0,
+        }
+    }
+}
 
 /// Verlet integration-based spring bone solver.
 ///
@@ -140,6 +179,18 @@ pub fn step_spring_bones(
     dt: f32,
     avatar: &mut AvatarInstance,
     world_colliders: &[ResolvedCollider],
+    tuning: &SpringTuning,
+    // Scene gravity, resolved into this avatar's local frame: `gravity_dir`
+    // is a unit down vector that *reorients* each chain's authored
+    // `gravity_dir` (via a delta rotation from default-down, so the global
+    // direction control turns all chains uniformly while preserving their
+    // relative authored offsets), and `gravity_scale` is the scene
+    // strength multiplier folded into every joint's power. Default gravity
+    // (down, strength 1) reproduces the authored behaviour for an upright
+    // avatar — including chains whose authored direction is not straight
+    // down.
+    gravity_dir: [f32; 3],
+    gravity_scale: f32,
 ) {
     let chain_count = avatar.secondary_motion.spring_states.len();
     if chain_count == 0 || dt <= 0.0 {
@@ -147,6 +198,23 @@ pub fn step_spring_bones(
     }
 
     let dt2 = dt * dt;
+    // User tuning (see [`SpringTuning`]): sway inversely scales
+    // stiffness/drag. Stiffness is additionally capped at `1/dt` so a
+    // low sway setting cannot push the per-step rest pull past 1.0 and
+    // flip the Verlet integration into overshoot oscillation.
+    let sway_inv = 1.0 / tuning.sway_scale.clamp(0.05, 2.0);
+    let max_stiffness = 1.0 / dt;
+
+    // Scene gravity direction layers *on top of* each chain's authored
+    // `gravity_dir` rather than replacing it: this is the rotation that
+    // carries the default down axis onto the scene's (avatar-local) down,
+    // and it is applied to every authored direction below. When the scene
+    // gravity is default-down for an upright avatar `gravity_dir` is
+    // `[0,-1,0]` and this delta is identity, so authored per-chain
+    // directions (e.g. side-swept hair) are reproduced exactly; tilting
+    // the global gravity reorients all chains uniformly while preserving
+    // their relative authored offsets.
+    let gravity_delta = quat_from_vectors(&[0.0, -1.0, 0.0], &gravity_dir);
 
     for chain_idx in 0..chain_count {
         if chain_idx >= avatar.asset.spring_bones.len() {
@@ -155,7 +223,9 @@ pub fn step_spring_bones(
         let spring_asset = &avatar.asset.spring_bones[chain_idx];
         let chain_stiffness = spring_asset.stiffness;
         let chain_drag = spring_asset.drag_force;
-        let gravity_dir = spring_asset.gravity_dir;
+        // Authored per-chain direction, reoriented by the scene-gravity
+        // delta above (identity when the global gravity is default-down).
+        let gravity_dir = quat_rotate_vec3(&gravity_delta, &spring_asset.gravity_dir);
         let chain_gravity_power = spring_asset.gravity_power;
         let bone_radius = spring_asset.radius;
         let collider_refs: Vec<usize> = spring_asset
@@ -173,21 +243,30 @@ pub fn step_spring_bones(
         }
 
         for j in 1..joints.len() {
-            let stiffness = spring_asset
+            let stiffness = (spring_asset
                 .joint_stiffness
                 .get(j)
                 .copied()
-                .unwrap_or(chain_stiffness);
-            let drag = spring_asset
+                .unwrap_or(chain_stiffness)
+                * sway_inv)
+                .min(max_stiffness);
+            let drag = (spring_asset
                 .joint_drag
                 .get(j)
                 .copied()
-                .unwrap_or(chain_drag);
-            let gravity_power = spring_asset
+                .unwrap_or(chain_drag)
+                * sway_inv)
+                .clamp(0.0, 1.0);
+            // authored power + user offset, then scaled by the scene
+            // gravity strength; clamped non-negative.
+            let gravity_power = ((spring_asset
                 .joint_gravity_power
                 .get(j)
                 .copied()
-                .unwrap_or(chain_gravity_power);
+                .unwrap_or(chain_gravity_power)
+                + tuning.gravity_offset)
+                * gravity_scale)
+                .max(0.0);
             let node_idx = joints[j].0 as usize;
             let parent_idx = joints[j - 1].0 as usize;
 

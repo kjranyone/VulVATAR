@@ -7,7 +7,82 @@ use log::info;
 
 use crate::asset::AvatarAsset;
 use crate::avatar::AvatarInstance;
+use crate::math_utils::{quat_conjugate, quat_rotate_vec3, vec3_normalize, vec3_scale, Quat, Vec3};
 use crate::simulation::cloth::ClothLoDConfig;
+
+/// Scene-wide gravity shared by every secondary-motion solver (spring
+/// bones, cloth, Rapier). One source of truth replaces the three
+/// independent gravities the solvers used to hardcode.
+///
+/// `direction` is a **world-space** vector (need not be unit; normalised
+/// on use). `strength` is a **dimensionless multiplier** on Earth gravity
+/// — 1.0 = normal, 0.0 = weightless, 2.0 = heavy. A dimensionless
+/// multiplier (not m/s²) is deliberate: spring bones integrate a unitless
+/// `gravityPower` gain, not an acceleration, so a single m/s² number
+/// cannot feed all three solvers. Instead every solver keeps its authored
+/// baseline (VRM `gravityPower`, cloth `gravity_scale`) and this scales
+/// them uniformly.
+///
+/// The sims run in **avatar-local** space (`compute_global_transforms`
+/// does not fold in `world_transform`), so for a rotated avatar the
+/// world-space direction is converted into that avatar's local frame with
+/// the inverse of its `world_transform` rotation. Rapier runs in world
+/// space and takes [`Self::world_accel`] directly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SceneGravity {
+    pub direction: [f32; 3],
+    pub strength: f32,
+}
+
+impl SceneGravity {
+    /// Earth gravity magnitude (m/s²), the baseline `strength == 1.0`
+    /// scales. Cloth/Rapier are in m/s²; spring folds `strength` into its
+    /// unitless power directly (see [`Self::spring_power_scale`]).
+    pub const EARTH_G: f32 = 9.81;
+    pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=3.0;
+
+    /// Unit direction, falling back to straight down if `direction` is
+    /// degenerate (so a zeroed control never yields NaNs).
+    fn dir_unit(&self) -> Vec3 {
+        let n = vec3_normalize(&self.direction);
+        if n == [0.0, 0.0, 0.0] {
+            [0.0, -1.0, 0.0]
+        } else {
+            n
+        }
+    }
+
+    /// World-space acceleration vector (m/s²) for Rapier.
+    pub fn world_accel(&self) -> Vec3 {
+        vec3_scale(&self.dir_unit(), Self::EARTH_G * self.strength)
+    }
+
+    /// Avatar-local acceleration vector (m/s²) for cloth, given the
+    /// avatar's `world_transform` rotation (inverse-rotated into local).
+    pub fn local_accel(&self, world_rot: &Quat) -> Vec3 {
+        quat_rotate_vec3(&quat_conjugate(world_rot), &self.world_accel())
+    }
+
+    /// Avatar-local unit down direction for spring bones (the sim applies
+    /// its own unitless power along this axis).
+    pub fn local_dir(&self, world_rot: &Quat) -> Vec3 {
+        vec3_normalize(&quat_rotate_vec3(&quat_conjugate(world_rot), &self.dir_unit()))
+    }
+
+    /// Multiplier folded into each spring joint's authored `gravityPower`.
+    pub fn spring_power_scale(&self) -> f32 {
+        self.strength
+    }
+}
+
+impl Default for SceneGravity {
+    fn default() -> Self {
+        Self {
+            direction: [0.0, -1.0, 0.0],
+            strength: 1.0,
+        }
+    }
+}
 
 pub struct SimulationClock {
     accumulator: f32,
@@ -44,6 +119,28 @@ impl SimulationClock {
 
     pub fn reset(&mut self) {
         self.accumulator = 0.0;
+    }
+}
+
+/// Derive each cloth sim's gravity from the scene gravity, once per frame
+/// before integration. Cloth runs in avatar-local space, so the world
+/// gravity is inverse-rotated by the avatar's `world_transform`; each
+/// sim's own `gravity_scale` is preserved as a relative multiplier so
+/// per-garment heaviness survives. With the default gravity (down,
+/// strength 1) this reproduces the old `[0, -9.81*scale, 0]` exactly.
+///
+/// Public so the Cloth Authoring panel's manual "Step" button (which
+/// calls `cloth_solver::step_cloth` directly, bypassing the
+/// [`PhysicsWorld`] wrappers) can recompute `sim.gravity` from the edited
+/// `gravity_scale` before stepping — otherwise a paused-authoring Step
+/// would integrate a stale gravity and the slider would look dead.
+pub fn apply_cloth_gravity(avatar: &mut AvatarInstance, gravity: &SceneGravity) {
+    let accel = gravity.local_accel(&avatar.world_transform.rotation);
+    if let Some(ref mut sim) = avatar.cloth_sim {
+        sim.gravity = vec3_scale(&accel, sim.gravity_scale);
+    }
+    for slot in &mut avatar.cloth_overlays {
+        slot.sim.gravity = vec3_scale(&accel, slot.sim.gravity_scale);
     }
 }
 
@@ -97,15 +194,25 @@ impl PhysicsWorld {
         }
     }
 
-    pub fn step_springs(&mut self, fixed_dt: f32, substeps: u32, avatar: &mut AvatarInstance) {
+    pub fn step_springs(
+        &mut self,
+        fixed_dt: f32,
+        substeps: u32,
+        avatar: &mut AvatarInstance,
+        tuning: &spring::SpringTuning,
+        gravity: &SceneGravity,
+    ) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        let dir = gravity.local_dir(&avatar.world_transform.rotation);
+        let scale = gravity.spring_power_scale();
         for _ in 0..substeps {
-            spring::step_spring_bones(fixed_dt, avatar, &world_colliders);
+            spring::step_spring_bones(fixed_dt, avatar, &world_colliders, tuning, dir, scale);
         }
     }
 
-    pub fn step_cloth(&mut self, dt: f32, avatar: &mut AvatarInstance) {
+    pub fn step_cloth(&mut self, dt: f32, avatar: &mut AvatarInstance, gravity: &SceneGravity) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        apply_cloth_gravity(avatar, gravity);
         cloth_solver::step_cloth(dt, avatar, &world_colliders);
     }
 
@@ -114,6 +221,7 @@ impl PhysicsWorld {
         dt: f32,
         avatar: &mut AvatarInstance,
         camera_distance: f32,
+        gravity: &SceneGravity,
     ) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
         if let Some(ref mut sim) = avatar.cloth_sim {
@@ -124,6 +232,7 @@ impl PhysicsWorld {
             let lod = ClothLoDConfig::select_for_distance(&self.cloth_lod_presets, camera_distance);
             slot.sim.apply_lod(&lod);
         }
+        apply_cloth_gravity(avatar, gravity);
         cloth_solver::step_cloth(dt, avatar, &world_colliders);
     }
 
@@ -142,21 +251,35 @@ impl PhysicsWorld {
         substeps: u32,
         avatar: &mut AvatarInstance,
         options: SimulationStepOptions,
+        spring_tuning: &spring::SpringTuning,
+        gravity: &SceneGravity,
     ) {
         if substeps == 0 {
             return;
         }
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
+        let spring_dir = gravity.local_dir(&avatar.world_transform.rotation);
+        let spring_scale = gravity.spring_power_scale();
+        #[cfg(feature = "rapier")]
+        let rapier_g = gravity.world_accel();
         for _ in 0..substeps {
             if options.spring_enabled {
-                spring::step_spring_bones(fixed_dt, avatar, &world_colliders);
+                spring::step_spring_bones(
+                    fixed_dt,
+                    avatar,
+                    &world_colliders,
+                    spring_tuning,
+                    spring_dir,
+                    spring_scale,
+                );
             }
             if options.cloth_enabled {
+                apply_cloth_gravity(avatar, gravity);
                 cloth_solver::step_cloth(fixed_dt, avatar, &world_colliders);
             }
             #[cfg(feature = "rapier")]
             if let Some(ref mut rapier) = self.rapier {
-                rapier.step(fixed_dt);
+                rapier.step(fixed_dt, rapier_g);
             }
         }
     }
@@ -351,11 +474,12 @@ impl RapierWorld {
             .insert_with_parent(collider, rb_handle, &mut self.rigid_body_set);
     }
 
-    /// Step the Rapier pipeline by one tick.
-    pub fn step(&mut self, dt: f32) {
+    /// Step the Rapier pipeline by one tick under `gravity` (world-space
+    /// m/s², from the scene gravity).
+    pub fn step(&mut self, dt: f32, gravity: Vec3) {
         self.integration_parameters.dt = dt;
         self.physics_pipeline.step(
-            &vector![0.0, -9.81, 0.0],
+            &vector![gravity[0], gravity[1], gravity[2]],
             &self.integration_parameters,
             &mut self.island_manager,
             &mut self.broad_phase,
@@ -529,6 +653,22 @@ mod tests {
     }
 
     fn make_two_joint_spring_avatar() -> AvatarInstance {
+        // Vertical chain: bone axis parallel to gravity, so gravity has no
+        // angular effect — right for toggle-gating tests that only need
+        // "does the state advance at all".
+        make_two_joint_spring_avatar_with_offset([0.0, 1.0, 0.0])
+    }
+
+    /// Two-joint spring chain with a configurable per-bone rest offset.
+    /// Pass a horizontal offset (e.g. `[1,0,0]`) when the test needs
+    /// gravity to actually swing the chain: with the default vertical
+    /// layout the pull is parallel to the bone and `enforce_bone_length`
+    /// cancels it exactly.
+    fn make_two_joint_spring_avatar_with_offset(offset: [f32; 3]) -> AvatarInstance {
+        make_two_joint_spring_avatar_with(offset, [0.0, -1.0, 0.0])
+    }
+
+    fn make_two_joint_spring_avatar_with(offset: [f32; 3], gravity_dir: [f32; 3]) -> AvatarInstance {
         let nodes = vec![
             SkeletonNode {
                 id: NodeId(0),
@@ -544,7 +684,7 @@ mod tests {
                 parent: Some(NodeId(0)),
                 children: vec![NodeId(2)],
                 rest_local: Transform {
-                    translation: [0.0, 1.0, 0.0],
+                    translation: offset,
                     rotation: [0.0, 0.0, 0.0, 1.0],
                     scale: [1.0, 1.0, 1.0],
                 },
@@ -556,7 +696,7 @@ mod tests {
                 parent: Some(NodeId(1)),
                 children: vec![],
                 rest_local: Transform {
-                    translation: [0.0, 1.0, 0.0],
+                    translation: offset,
                     rotation: [0.0, 0.0, 0.0, 1.0],
                     scale: [1.0, 1.0, 1.0],
                 },
@@ -573,7 +713,7 @@ mod tests {
             joints: vec![NodeId(1), NodeId(2)],
             stiffness: 1.0,
             drag_force: 0.4,
-            gravity_dir: [0.0, -1.0, 0.0],
+            gravity_dir,
             gravity_power: 1.0,
             radius: 0.0,
             collider_refs: vec![],
@@ -639,6 +779,8 @@ mod tests {
                 spring_enabled: false,
                 cloth_enabled: false,
             },
+            &spring::SpringTuning::default(),
+            &SceneGravity::default(),
         );
 
         let after: Vec<Vec<[f32; 3]>> = avatar
@@ -672,6 +814,8 @@ mod tests {
                 spring_enabled: true,
                 cloth_enabled: false,
             },
+            &spring::SpringTuning::default(),
+            &SceneGravity::default(),
         );
 
         let after: Vec<Vec<[f32; 3]>> = avatar
@@ -681,5 +825,184 @@ mod tests {
             .map(|s| s.positions.clone())
             .collect();
         assert_ne!(before, after);
+    }
+
+    /// Runs the two-joint chain for `steps` ticks under `tuning` and
+    /// returns the final tip position.
+    fn settle_tip(tuning: &spring::SpringTuning, steps: u32) -> [f32; 3] {
+        let mut world = PhysicsWorld::new();
+        // Horizontal chain — see `make_two_joint_spring_avatar_with_offset`:
+        // gravity must be perpendicular to the bone to produce droop.
+        let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
+        for _ in 0..steps {
+            world.step_springs(1.0 / 60.0, 1, &mut avatar, tuning, &SceneGravity::default());
+            avatar.compute_global_pose();
+        }
+        *avatar.secondary_motion.spring_states[0]
+            .positions
+            .last()
+            .unwrap()
+    }
+
+    /// `gravity_offset` is additive on the authored per-joint power: a
+    /// negative offset large enough to cancel the asset's `1.0` must
+    /// leave the tip hanging higher (less droop) than the authored run.
+    #[test]
+    fn spring_tuning_gravity_offset_changes_droop() {
+        let authored = settle_tip(&spring::SpringTuning::default(), 120);
+        let no_gravity = settle_tip(
+            &spring::SpringTuning {
+                gravity_offset: -1.0,
+                ..Default::default()
+            },
+            120,
+        );
+        assert!(
+            no_gravity[1] > authored[1] + 1e-4,
+            "cancelling gravity should reduce droop: authored y={} no-gravity y={}",
+            authored[1],
+            no_gravity[1]
+        );
+    }
+
+    /// Low sway stiffens the chain: under identical gravity the rigid
+    /// setting must stay closer to the rest pose than the loose one.
+    #[test]
+    fn spring_tuning_sway_scale_controls_stiffness() {
+        let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
+        avatar.compute_global_pose();
+        let rest_tip = {
+            let node = avatar.asset.spring_bones[0].joints[1].0 as usize;
+            crate::math_utils::mat4_translation(&avatar.pose.global_transforms[node])
+        };
+        let dist = |a: &[f32; 3], b: &[f32; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let rigid = settle_tip(
+            &spring::SpringTuning {
+                sway_scale: 0.05,
+                ..Default::default()
+            },
+            120,
+        );
+        let loose = settle_tip(
+            &spring::SpringTuning {
+                sway_scale: 2.0,
+                ..Default::default()
+            },
+            120,
+        );
+        assert!(
+            dist(&rigid, &rest_tip) < dist(&loose, &rest_tip),
+            "rigid sway must hold the tip nearer rest: rigid={:?} loose={:?} rest={:?}",
+            rigid,
+            loose,
+            rest_tip
+        );
+    }
+
+    // -- Scene gravity ----------------------------------------------------
+
+    fn approx(a: [f32; 3], b: [f32; 3]) -> bool {
+        (0..3).all(|i| (a[i] - b[i]).abs() < 1e-4)
+    }
+
+    /// Default scene gravity (down, strength 1) must reproduce the old
+    /// hardcoded Rapier / cloth vector exactly — no behaviour change for
+    /// existing projects.
+    #[test]
+    fn scene_gravity_default_is_earth_down() {
+        let g = SceneGravity::default();
+        assert!(approx(g.world_accel(), [0.0, -9.81, 0.0]));
+        // identity avatar rotation => local == world
+        assert!(approx(g.local_accel(&[0.0, 0.0, 0.0, 1.0]), [0.0, -9.81, 0.0]));
+        assert!(approx(g.local_dir(&[0.0, 0.0, 0.0, 1.0]), [0.0, -1.0, 0.0]));
+    }
+
+    /// Strength is a linear multiplier; 0 is weightless, 2 doubles.
+    #[test]
+    fn scene_gravity_strength_scales_linearly() {
+        let weightless = SceneGravity {
+            strength: 0.0,
+            ..Default::default()
+        };
+        assert!(approx(weightless.world_accel(), [0.0, 0.0, 0.0]));
+        assert_eq!(weightless.spring_power_scale(), 0.0);
+        let heavy = SceneGravity {
+            strength: 2.0,
+            ..Default::default()
+        };
+        assert!(approx(heavy.world_accel(), [0.0, -19.62, 0.0]));
+    }
+
+    /// World-space direction is inverse-rotated into the avatar's local
+    /// frame: an avatar yawed 90° about Y should see world-down stay down
+    /// in local Y (rotation about the gravity axis leaves it unchanged),
+    /// while a 90° roll about Z maps world-down onto local ±X.
+    #[test]
+    fn scene_gravity_direction_is_world_space() {
+        let g = SceneGravity::default();
+        // 90° about Y (quat = [0, sin45, 0, cos45]): down stays down.
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let yaw90 = [0.0, s, 0.0, s];
+        assert!(approx(g.local_accel(&yaw90), [0.0, -9.81, 0.0]));
+        // 90° about Z: world down rotates into local +X (magnitude kept).
+        let roll90 = [0.0, 0.0, s, s];
+        let la = g.local_accel(&roll90);
+        assert!((la[0].abs() - 9.81).abs() < 1e-3, "expected ~9.81 on X, got {la:?}");
+        assert!(la[1].abs() < 1e-3 && la[2].abs() < 1e-3, "off-axis leak: {la:?}");
+    }
+
+    /// Regression: a spring chain whose authored `gravity_dir` is not
+    /// straight down must keep pulling along its authored direction under
+    /// default scene gravity — the scene direction *reorients* (delta from
+    /// down), it does not overwrite. A vertical chain with authored
+    /// gravity_dir = +X should swing sideways (tip.x grows); if the code
+    /// forced the scene down axis instead, gravity would lie along the
+    /// bone and `enforce_bone_length` would cancel it (tip.x ~ 0).
+    #[test]
+    fn spring_preserves_authored_gravity_dir_at_default_scene() {
+        let mut world = PhysicsWorld::new();
+        // Vertical bones (offset +Y), authored gravity swept to +X.
+        let mut avatar = make_two_joint_spring_avatar_with([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+        avatar.compute_global_pose();
+        let soft = spring::SpringTuning {
+            sway_scale: 2.0,
+            ..Default::default()
+        };
+        let strong = SceneGravity {
+            direction: [0.0, -1.0, 0.0],
+            strength: 3.0,
+        };
+        for _ in 0..240 {
+            world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &strong);
+            avatar.compute_global_pose();
+        }
+        let tip = *avatar.secondary_motion.spring_states[0]
+            .positions
+            .last()
+            .unwrap();
+        // Layered (correct): authored +X preserved → tip swings to
+        // x ≈ 0.10. Override (the bug): gravity forced to scene-down lies
+        // along the bone → enforce_bone_length cancels it → x ≈ 0. The
+        // 0.03 threshold sits far from both.
+        assert!(
+            tip[0] > 0.03,
+            "authored +X gravity must swing the tip sideways, got tip = {tip:?}"
+        );
+    }
+
+    /// `apply_cloth_gravity` with default scene gravity reproduces the old
+    /// `[0, -9.81 * scale, 0]` per-cloth formula.
+    #[test]
+    fn apply_cloth_gravity_default_matches_legacy() {
+        let mut avatar = make_two_joint_spring_avatar();
+        avatar.cloth_sim = Some(cloth::ClothSimState {
+            gravity_scale: 1.5,
+            ..Default::default()
+        });
+        apply_cloth_gravity(&mut avatar, &SceneGravity::default());
+        let g = avatar.cloth_sim.as_ref().unwrap().gravity;
+        assert!(approx(g, [0.0, -9.81 * 1.5, 0.0]), "got {g:?}");
     }
 }

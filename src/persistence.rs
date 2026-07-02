@@ -68,6 +68,12 @@ pub struct ProjectState {
     pub background_color: [f32; 3],
     pub transparent_background: bool,
     pub toggle_spring: bool,
+    /// Spring-bone user tuning (see `simulation::spring::SpringTuning`).
+    pub spring_sway_scale: f32,
+    pub spring_gravity_offset: f32,
+    /// Scene gravity (see `simulation::SceneGravity`).
+    pub scene_gravity_direction: [f32; 3],
+    pub scene_gravity_strength: f32,
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
     pub toggle_skeleton_debug: bool,
@@ -100,6 +106,21 @@ pub struct ProjectState {
     /// Anti-aliasing (MSAA) level index: 0=Off, 1=2x, 2=4x, 3=8x.
     pub output_msaa_index: usize,
 
+}
+
+fn default_spring_sway_scale() -> f32 {
+    1.0
+}
+
+/// Neutral 1.0 multiplier for scale-type settings loaded from
+/// pre-feature projects (kept separate from `default_spring_sway_scale`
+/// so the two defaults can never move together by accident).
+fn default_unit_scale() -> f32 {
+    1.0
+}
+
+fn default_gravity_direction() -> [f32; 3] {
+    [0.0, -1.0, 0.0]
 }
 
 /// Serializable project state saved as `.vvtproj`.
@@ -383,6 +404,16 @@ pub struct RenderingConfig {
     pub transparent_background: bool,
     #[serde(default = "default_true")]
     pub toggle_spring: bool,
+    /// Spring-bone user tuning. Defaults keep projects saved before the
+    /// feature behaving as-authored (sway 1.0, gravity offset 0.0).
+    #[serde(default = "default_spring_sway_scale")]
+    pub spring_sway_scale: f32,
+    #[serde(default)]
+    pub spring_gravity_offset: f32,
+    #[serde(default = "default_gravity_direction")]
+    pub scene_gravity_direction: [f32; 3],
+    #[serde(default = "default_unit_scale")]
+    pub scene_gravity_strength: f32,
     #[serde(default)]
     pub toggle_cloth: bool,
     #[serde(default)]
@@ -811,6 +842,10 @@ impl ProjectFile {
                 background_color: state.background_color,
                 transparent_background: state.transparent_background,
                 toggle_spring: state.toggle_spring,
+                spring_sway_scale: state.spring_sway_scale,
+                spring_gravity_offset: state.spring_gravity_offset,
+                scene_gravity_direction: state.scene_gravity_direction,
+                scene_gravity_strength: state.scene_gravity_strength,
                 toggle_cloth: state.toggle_cloth,
                 toggle_collision_debug: state.toggle_collision_debug,
                 toggle_skeleton_debug: state.toggle_skeleton_debug,
@@ -893,6 +928,10 @@ impl ProjectFile {
             background_color: self.rendering.background_color,
             transparent_background: self.rendering.transparent_background,
             toggle_spring: self.rendering.toggle_spring,
+            spring_sway_scale: self.rendering.spring_sway_scale,
+            spring_gravity_offset: self.rendering.spring_gravity_offset,
+            scene_gravity_direction: self.rendering.scene_gravity_direction,
+            scene_gravity_strength: self.rendering.scene_gravity_strength,
             toggle_cloth: self.rendering.toggle_cloth,
             toggle_collision_debug: self.rendering.toggle_collision_debug,
             toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,

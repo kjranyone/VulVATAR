@@ -37,6 +37,12 @@ pub struct FrameConfig {
     pub fade_on_tracking_loss: bool,
     /// Which signal drives the mouth visemes (audio lip-sync / camera / both).
     pub mouth_source: crate::tracking::MouthSource,
+    /// User spring-bone tuning from the Rendering inspector, layered on
+    /// top of the VRM asset's authored values at simulation time.
+    pub spring_tuning: crate::simulation::spring::SpringTuning,
+    /// Scene-wide gravity (direction + strength) shared by spring / cloth
+    /// / Rapier solvers.
+    pub scene_gravity: crate::simulation::SceneGravity,
     pub frame_dt: f32,
 }
 
@@ -720,6 +726,8 @@ mod tests {
             root_translation_enabled: false,
             fade_on_tracking_loss: true,
             mouth_source: crate::tracking::MouthSource::Audio,
+            spring_tuning: crate::simulation::spring::SpringTuning::default(),
+            scene_gravity: crate::simulation::SceneGravity::default(),
             frame_dt: 1.0 / 60.0,
         };
         // 5 s of frames — far past the 0.6 s fade ramp, so any fade

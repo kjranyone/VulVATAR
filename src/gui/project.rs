@@ -123,6 +123,10 @@ impl GuiApp {
             background_color: self.rendering.background_color,
             transparent_background: self.rendering.transparent_background,
             toggle_spring: self.rendering.toggle_spring,
+            spring_sway_scale: self.rendering.spring_tuning.sway_scale,
+            spring_gravity_offset: self.rendering.spring_tuning.gravity_offset,
+            scene_gravity_direction: self.rendering.scene_gravity.direction,
+            scene_gravity_strength: self.rendering.scene_gravity.strength,
             toggle_cloth: self.rendering.toggle_cloth,
             toggle_collision_debug: self.rendering.toggle_collision_debug,
             toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,
@@ -309,6 +313,10 @@ impl GuiApp {
         self.rendering.background_color = state.background_color;
         self.rendering.transparent_background = state.transparent_background;
         self.rendering.toggle_spring = state.toggle_spring;
+        self.rendering.spring_tuning.sway_scale = state.spring_sway_scale;
+        self.rendering.spring_tuning.gravity_offset = state.spring_gravity_offset;
+        self.rendering.scene_gravity.direction = state.scene_gravity_direction;
+        self.rendering.scene_gravity.strength = state.scene_gravity_strength;
         self.rendering.toggle_cloth = state.toggle_cloth;
         self.rendering.toggle_collision_debug = state.toggle_collision_debug;
         self.rendering.toggle_skeleton_debug = state.toggle_skeleton_debug;

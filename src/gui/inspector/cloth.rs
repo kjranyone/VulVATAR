@@ -6,6 +6,9 @@ use crate::gui::GuiApp;
 use crate::t;
 
 pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
+    // Copied up front (it is `Copy`) so the manual Step handler can pass it
+    // without conflicting with the `&mut` avatar borrow taken from `state`.
+    let scene_gravity = state.rendering.scene_gravity;
     egui::CollapsingHeader::new(t!("inspector.cloth_overlay"))
         .default_open(true)
         .show(ui, |ui| {
@@ -388,11 +391,16 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         ui.add(egui::DragValue::new(&mut sim.solver_iterations).range(1..=32));
                     });
                     ui.horizontal(|ui| {
-                        ui.label(t!("inspector.gravity"));
+                        // Per-garment multiplier relative to the scene
+                        // gravity (edited in the Rendering inspector). The
+                        // absolute `sim.gravity` vector is derived each
+                        // frame from scene gravity × this scale, so editing
+                        // it directly would be overwritten.
+                        ui.label(t!("inspector.gravity_scale"));
                         ui.add(
-                            egui::DragValue::new(&mut sim.gravity[1])
-                                .speed(0.1)
-                                .range(-20.0..=0.0),
+                            egui::DragValue::new(&mut sim.gravity_scale)
+                                .speed(0.05)
+                                .range(0.0..=2.0),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -485,6 +493,12 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     if tonal_button(ui, None, &t!("inspector.step"), ButtonTone::Primary, true)
                         .clicked()
                     {
+                        // Recompute sim.gravity from the edited gravity_scale
+                        // (and the scene gravity) before stepping — the
+                        // manual Step bypasses PhysicsWorld::step_cloth where
+                        // apply_cloth_gravity normally runs, so without this
+                        // the Gravity Scale slider would be inert while paused.
+                        crate::simulation::apply_cloth_gravity(avatar, &scene_gravity);
                         crate::simulation::cloth_solver::step_cloth(1.0 / 60.0, avatar, &[]);
                     }
                     if tonal_button(ui, None, &t!("inspector.reset"), ButtonTone::Error, true)
