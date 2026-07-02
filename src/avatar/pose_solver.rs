@@ -69,6 +69,218 @@ const ONE_EURO_MIN_CUTOFF_HZ: f32 = 1.0;
 const ONE_EURO_BETA: f32 = 0.05;
 const ONE_EURO_D_CUTOFF_HZ: f32 = 1.0;
 
+/// Per-channel 1€ tuning for the wrists + fingers. Monocular hand
+/// keypoints measure 3–5× noisier than the torso at the detector
+/// (measured via `diagnose_signal_quality`: SRC `jitter_hf` 0.09–0.11
+/// on hands/forearms vs 0.02–0.04 on head/torso), and after the solver
+/// the hands are still the jitteriest bones (AV `jitter_hf` ~0.036 and
+/// `wander_lf` ~0.11, ~3–4× the torso). A uniform filter can't win
+/// that: the cutoff that keeps the latency-critical head crisp leaves
+/// the hands buzzing. So the hand tier gets a lower rest cutoff (more
+/// smoothing of the in-place oscillation) and a higher velocity gain so
+/// intentional fast motion — a strum, a wave — still tracks through the
+/// 1€ speed coupling, which the hand can afford far more than the head.
+const HAND_MIN_CUTOFF_HZ: f32 = 0.5;
+const HAND_BETA: f32 = 0.10;
+
+/// Rest deadband radius for the hand tier, in source-skeleton units.
+/// The 1€ tuning above is *lever-arm-limited* — it cut the solved hand
+/// jitter only ~5% because the hand's world position is dominated by
+/// upstream arm-angle noise amplified over a ~0.5 m lever, not by the
+/// wrist keypoint directly. The deadband attacks what's left at the
+/// source: while a joint is genuinely at rest, freeze any per-frame
+/// movement under this radius so both the micro-oscillation ("same
+/// place but shaking") and the slow drift stop leaking through. `0`
+/// disables it (the body default) — the head/torso must stay live.
+const HAND_DEAD_RADIUS: f32 = 0.02;
+
+/// Rest-gate speed band (source units/sec) over which the deadband and
+/// the arm rotation hold fade out. Below `LO` the joint is fully at rest
+/// (hold at full strength); above `HI` it is moving and the hold is off,
+/// smoothstep-faded in between so there is no chatter or snap.
+///
+/// The gate keys off the 1€ *output* speed — the filter's own smoothed
+/// position step per frame — NOT the d_cutoff-smoothed raw velocity in
+/// `vel`. Measured on real footage, the raw hand keypoint is so noisy
+/// that even after the 1 Hz velocity low-pass its speed reads median
+/// ~2.3 units/s *at rest* (jitter does not fully cancel), so a gate on
+/// `vel` almost never opened (full hold on only 10% of frames). The
+/// filter *output* separates cleanly: at rest it converges and its step
+/// speed collapses, while intentional motion tracks through. The band is
+/// sized from the measured class split on real footage (wrist/elbow
+/// output speed: at-rest median ≈ 0.10, p75 ≈ 0.14–0.18; in-motion
+/// median ≈ 0.31–0.42): below `LO` is firmly inside the rest cluster,
+/// above `HI` firmly in motion, and the overlap zone gets a partial,
+/// smoothstep-faded hold.
+///
+/// `HI` sits at the *bottom* of the motion cluster (≈ the in-motion
+/// median), not above it: a band that ran past the motion speeds would
+/// leave `rest > 0` during ordinary deliberate gestures, and the hold's
+/// soft threshold would then shrink small per-frame rotation steps of a
+/// *real* slow move — the arm would lag and catch up in jumps. `LO`
+/// sits at the rest cluster's p75 so the full hold spans the whole rest
+/// distribution. The narrow overlap is intentional (the two clusters
+/// nearly touch); the smoothstep keeps the transition chatter-free.
+const REST_SPEED_LO: f32 = 0.18;
+const REST_SPEED_HI: f32 = 0.32;
+
+/// End-effector rotation hold for the arm chain, in radians of per-frame
+/// rotation step frozen while the wrist is at rest. The source-keypoint
+/// filters (1€ + deadband) hit a ceiling on hand *world* stability
+/// because the hand sits at the end of a ~0.5 m lever: tiny angle noise
+/// on the shoulder/upper-arm — bones the source filters never touch — is
+/// amplified into large hand displacement (measured: the rest deadband
+/// cut forearm rest jitter −6% but the hand only −0%, because the hand is
+/// upstream-dominated). This hold attacks it in rotation space, *after*
+/// that amplification: while the wrist reads at rest, any per-frame
+/// rotation step below this angle on the arm chain (upper arm → forearm →
+/// hand) is frozen, so upstream jitter can no longer reach the hand. It
+/// gates the freeze on step *magnitude*, so a large intentional pose
+/// change always passes (its step dwarfs this radius) — only the residual
+/// buzz of a converged, held pose is frozen. The rest gate reuses
+/// [`REST_SPEED_LO`]/[`REST_SPEED_HI`] on the wrist filter's output speed
+/// (same signal, same rest concept), and the release is a smoothstep, so
+/// a deliberate move is never frozen and there is no snap on release.
+/// Sized to the measured buzz: the at-rest UpperArm residual works out
+/// to ~2.4° of equivalent per-frame rotation (0.0105 units over a
+/// ~0.25 m bone), so the first attempt at 0.5° froze almost none of it.
+const ARM_HOLD_ANG_DEAD: f32 = 0.035; // ≈ 2.0°
+
+/// Resolved 1€ + deadband tuning for one channel. The XY plane and the
+/// Z (depth) axis are tuned independently: the source frame is
+/// camera-aligned (+Z = away from camera), and monocular Z is the
+/// lowest-information axis — measured per-axis on real footage, source
+/// Z jitter runs 1.4–3× the XY axes (head worst at 3×) and the at-rest
+/// slow wander is Z-dominated on every bone. Z is also the axis where
+/// latency is perceptually cheapest (a depth lag is nearly invisible
+/// on screen), so Z can afford a much lower cutoff and a wider deadband
+/// without the response cost that would make XY feel draggy.
+#[derive(Clone, Copy)]
+struct OneEuroTuning {
+    min_cutoff: f32,
+    beta: f32,
+    /// Rest deadband radius on the XY step (source units); `0` disables.
+    dead_radius: f32,
+    /// 1€ rest cutoff for the Z axis.
+    z_min_cutoff: f32,
+    /// 1€ velocity gain for the Z axis. Sized against the *noise floor*
+    /// of the smoothed Z velocity (≈1.0 units/s on the hands, ≈0.45 on
+    /// the head — pure detector jitter that never cancels), so noise
+    /// alone cannot open the filter but a genuinely fast depth move
+    /// (a lean, a reach toward the camera) still raises the cutoff.
+    z_beta: f32,
+    /// Rest deadband radius on the Z step (source units); `0` disables.
+    z_dead_radius: f32,
+}
+
+impl OneEuroTuning {
+    /// The body default: standard 1€ on XY with no XY deadband (stays
+    /// fully live), heavy Z smoothing + small rest deadband.
+    const BODY: Self = Self {
+        min_cutoff: ONE_EURO_MIN_CUTOFF_HZ,
+        beta: ONE_EURO_BETA,
+        dead_radius: 0.0,
+        z_min_cutoff: 0.15,
+        z_beta: 0.15,
+        z_dead_radius: 0.01,
+    };
+    /// The wrist/forearm/finger tier: smoother XY 1€ + rest deadband,
+    /// and the heaviest Z treatment (hands measure the noisiest Z).
+    const HAND: Self = Self {
+        min_cutoff: HAND_MIN_CUTOFF_HZ,
+        beta: HAND_BETA,
+        dead_radius: HAND_DEAD_RADIUS,
+        z_min_cutoff: 0.10,
+        z_beta: 0.15,
+        z_dead_radius: 0.02,
+    };
+    /// The root-translation channel (`root_offset`). The root is a
+    /// presence channel, not a gesture channel — per the signal-quality
+    /// design discussion it can afford to be sluggish, and its wobble
+    /// moves the *whole* avatar, so it gets low cutoffs and a deadband
+    /// on both planes.
+    const ROOT: Self = Self {
+        min_cutoff: 0.3,
+        beta: 0.05,
+        dead_radius: 0.01,
+        z_min_cutoff: 0.1,
+        z_beta: 0.1,
+        z_dead_radius: 0.02,
+    };
+}
+
+#[inline]
+fn smoothstep(x: f32, lo: f32, hi: f32) -> f32 {
+    if hi <= lo {
+        return if x < lo { 0.0 } else { 1.0 };
+    }
+    let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// True for the distal-arm bones that get the [`HAND_MIN_CUTOFF_HZ`] /
+/// [`HAND_BETA`] 1€ tuning instead of the body default: the wrists, the
+/// **forearms/elbows** (`*LowerArm`), and all fingers. The forearms are
+/// included because the avatar hand's world position is
+/// `elbow + L·normalize(wrist − elbow)` — the elbow keypoint's noise
+/// (measured just as high as the wrist's, SRC `jitter_hf` ~0.09)
+/// contributes to the hand position *twice* (elbow origin + forearm
+/// direction), so smoothing only the wrist barely moved the hand (−5%
+/// in the first pass). The `*UpperArm`/`*Shoulder` bones stay on the
+/// body default — they measure clean (~0.022) and are more structural.
+/// The fingertip auxiliary map is keyed by the distal finger bones, so
+/// it resolves through this predicate too.
+fn is_hand_or_finger(bone: HumanoidBone) -> bool {
+    use HumanoidBone::*;
+    matches!(
+        bone,
+        LeftHand
+            | RightHand
+            | LeftLowerArm
+            | RightLowerArm
+            | LeftThumbProximal
+            | LeftThumbIntermediate
+            | LeftThumbDistal
+            | LeftIndexProximal
+            | LeftIndexIntermediate
+            | LeftIndexDistal
+            | LeftMiddleProximal
+            | LeftMiddleIntermediate
+            | LeftMiddleDistal
+            | LeftRingProximal
+            | LeftRingIntermediate
+            | LeftRingDistal
+            | LeftLittleProximal
+            | LeftLittleIntermediate
+            | LeftLittleDistal
+            | RightThumbProximal
+            | RightThumbIntermediate
+            | RightThumbDistal
+            | RightIndexProximal
+            | RightIndexIntermediate
+            | RightIndexDistal
+            | RightMiddleProximal
+            | RightMiddleIntermediate
+            | RightMiddleDistal
+            | RightRingProximal
+            | RightRingIntermediate
+            | RightRingDistal
+            | RightLittleProximal
+            | RightLittleIntermediate
+            | RightLittleDistal
+    )
+}
+
+/// 1€ + deadband tuning for a bone: the hand tier for wrists/forearms/
+/// fingers, the body default for everything else.
+fn one_euro_params_for(bone: HumanoidBone) -> OneEuroTuning {
+    if is_hand_or_finger(bone) {
+        OneEuroTuning::HAND
+    } else {
+        OneEuroTuning::BODY
+    }
+}
+
 /// Input knobs for the solver. All fields have sensible defaults; callers
 /// only need to tweak when surfacing UI sliders.
 #[derive(Clone, Debug)]
@@ -186,6 +398,14 @@ pub struct PoseSolverState {
     /// Previous frame's solved Hips local translation (same rationale
     /// as `prev_local_rotations` for the root-translation lerp).
     prev_hips_translation: Option<[f32; 3]>,
+    /// 1€ + deadband state for the raw `root_offset` samples, applied at
+    /// the channel's entry (before the reference EMA / deviation math).
+    /// The reference EMA is deliberately slow (~10 s) — it defines
+    /// "neutral", it does not filter jitter — and at the production
+    /// `rotation_blend = 1.0` the hips lerp is a passthrough, so without
+    /// this filter the detector's root wobble lands on the avatar's Hips
+    /// verbatim and sways the entire body.
+    root_offset_filter: OneEuroFilterState,
     /// Slow EMA of the source-skeleton `root_offset`, used as the
     /// "where the subject normally stands" reference. The avatar's
     /// Hips is translated by `(root_offset − reference) * sensitivity`
@@ -240,6 +460,7 @@ impl PoseSolverState {
         self.prev_local_rotations.clear();
         self.prev_hips_translation = None;
         self.root_reference = None;
+        self.root_offset_filter = Default::default();
         // `running_shoulder_x_span_max` is intentionally NOT reset
         // here — it captures the subject's anatomical shoulder width
         // and persists across smoothing resets so a calibration-prime
@@ -256,17 +477,26 @@ struct OneEuroFilterState {
     initialized: bool,
     pos: [f32; 3],
     vel: [f32; 3],
+    /// Speed of the filter's *output* over the last frame (units/sec) —
+    /// the rest-gate signal for the deadband and the arm rotation hold.
+    /// See [`REST_SPEED_LO`] for why the output (not `vel`) is gated on.
+    out_speed: f32,
 }
 
 impl OneEuroFilterState {
     /// Apply the filter to a raw position and return the smoothed
     /// position. `dt` is seconds since the previous update for this
-    /// stream. Self-initializes on the first call (no smoothing).
-    fn apply(&mut self, raw: [f32; 3], dt: f32) -> [f32; 3] {
+    /// stream. `min_cutoff` is the rest cutoff (lower → smoother when
+    /// still) and `beta` the velocity-coupling gain (higher → more
+    /// responsive in motion) — passed per call so different channels
+    /// (hands vs head) get different tunings from one filter. Self-
+    /// initializes on the first call (no smoothing).
+    fn apply(&mut self, raw: [f32; 3], dt: f32, t: OneEuroTuning) -> [f32; 3] {
         if !self.initialized || dt <= 0.0 {
             self.initialized = true;
             self.pos = raw;
             self.vel = [0.0, 0.0, 0.0];
+            self.out_speed = 0.0;
             return raw;
         }
         // Velocity from raw delta, then low-pass it via d_cutoff.
@@ -281,16 +511,65 @@ impl OneEuroFilterState {
         }
         // Position cutoff scales with velocity magnitude — high-speed
         // motion gets a higher cutoff (less smoothing, more responsive).
-        let speed = (self.vel[0] * self.vel[0]
-            + self.vel[1] * self.vel[1]
-            + self.vel[2] * self.vel[2])
-            .sqrt();
-        let cutoff = ONE_EURO_MIN_CUTOFF_HZ + ONE_EURO_BETA * speed;
-        let alpha = one_euro_alpha(dt, cutoff);
-        for (pos, raw) in self.pos.iter_mut().zip(raw.iter()) {
-            *pos += alpha * (raw - *pos);
+        // XY and Z are cut independently (see [`OneEuroTuning`]): each
+        // plane's cutoff opens only on *its own* speed, so Z's heavy
+        // smoothing is not defeated by a fast XY gesture and vice versa.
+        let speed_xy = (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt();
+        let speed_z = self.vel[2].abs();
+        let alpha_xy = one_euro_alpha(dt, t.min_cutoff + t.beta * speed_xy);
+        let alpha_z = one_euro_alpha(dt, t.z_min_cutoff + t.z_beta * speed_z);
+
+        // 1€ candidate movement for this frame (before the deadband).
+        let mut delta = [
+            alpha_xy * (raw[0] - self.pos[0]),
+            alpha_xy * (raw[1] - self.pos[1]),
+            alpha_z * (raw[2] - self.pos[2]),
+        ];
+        let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        // The rest-gate signal: the filter output's own speed. At rest
+        // the filter converges and this collapses toward zero (raw
+        // jitter is already absorbed by the cutoff above); in motion it
+        // tracks the true speed. See [`REST_SPEED_LO`] for why this is
+        // used instead of the noisier `vel`.
+        self.out_speed = mag / dt;
+        let rest = 1.0 - smoothstep(self.out_speed, REST_SPEED_LO, REST_SPEED_HI);
+
+        // Rest deadband, per plane. Faded in by how *at-rest* the joint
+        // is: `rest` = 1 below REST_SPEED_LO, 0 above REST_SPEED_HI, so
+        // slow intentional motion (sustained output speed) is never
+        // frozen — only true rest jitter sees the full radius. The shrink
+        // is a soft threshold (`(mag - dead)/mag`) so movement past the
+        // radius passes through continuously — no snap when it releases.
+        if t.dead_radius > 0.0 && rest > 0.0 {
+            let mag_xy = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            let keep = soft_threshold_keep(mag_xy, t.dead_radius * rest);
+            delta[0] *= keep;
+            delta[1] *= keep;
+        }
+        if t.z_dead_radius > 0.0 && rest > 0.0 {
+            let keep = soft_threshold_keep(delta[2].abs(), t.z_dead_radius * rest);
+            delta[2] *= keep;
+        }
+
+        for (pos, d) in self.pos.iter_mut().zip(delta.iter()) {
+            *pos += *d;
         }
         self.pos
+    }
+}
+
+/// Soft-threshold retention factor for a rest deadband: 0 when the
+/// movement `mag` is at/below `dead`, ramping to 1 as it exceeds it via
+/// `(mag - dead) / mag`, so crossing the boundary is continuous (no snap
+/// on release). Shared by the position deadband (XY / Z planes) and the
+/// arm rotation hold so all three gates use identical falloff — change
+/// the shape here and every gate stays consistent.
+#[inline]
+fn soft_threshold_keep(mag: f32, dead: f32) -> f32 {
+    if mag <= dead {
+        0.0
+    } else {
+        (mag - dead) / mag
     }
 }
 
@@ -722,6 +1001,10 @@ pub fn solve_avatar_pose(
     // motion still reads while accidental drift gets absorbed.
     if params.root_translation_enabled {
         if let Some(raw_offset) = source.root_offset {
+            // Filter the raw channel at its entry — see
+            // `PoseSolverState::root_offset_filter` for why the EMA and
+            // the blend below cannot do this job.
+            let raw_offset = state.root_offset_filter.apply(raw_offset, dt, OneEuroTuning::ROOT);
             // Calibration-aware EMA seed. When the user has captured
             // an explicit pose calibration (see docs/calibration-ux.md)
             // *and* the runtime anchor type matches the calibration's
@@ -1286,12 +1569,20 @@ pub fn solve_avatar_pose(
         let new_local_rot = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
 
 
-        local_transforms[node_idx].rotation = blend_local_rotation(
+        // End-effector rotation hold: freeze the arm chain's residual
+        // rotation jitter while its driving joint is at rest, defeating
+        // the lever-arm amplification of upstream angle noise that the
+        // source-keypoint filters can't reach. Non-arm bones get
+        // `rest = 0`, which is exactly `blend_local_rotation`. See
+        // [`ARM_HOLD_ANG_DEAD`] / [`arm_hold_rest`].
+        let hold_rest = arm_hold_rest(state, bone);
+        local_transforms[node_idx].rotation = blend_arm_rotation(
             state,
             node_idx,
             local_transforms[node_idx].rotation,
             &new_local_rot,
             dt_aware_blend(params.rotation_blend, dt),
+            hold_rest,
         );
 
         // Keep the world rotation cache in sync so child bones in this
@@ -2097,6 +2388,72 @@ fn blend_local_rotation(
     out
 }
 
+/// [`blend_local_rotation`] plus the end-effector rotation hold: when
+/// `rest > 0` (the arm is at rest, see [`ARM_HOLD_ANG_DEAD`]) the blend's
+/// per-frame rotation step is soft-thresholded, freezing the residual
+/// jitter of a converged pose while letting any larger — i.e. intentional
+/// — step through. `rest == 0` reduces exactly to [`blend_local_rotation`],
+/// so non-arm bones are provably unaffected.
+#[inline]
+fn blend_arm_rotation(
+    state: &mut PoseSolverState,
+    node_idx: usize,
+    fallback: Quat,
+    target: &Quat,
+    alpha: f32,
+    rest: f32,
+) -> Quat {
+    let from = state
+        .prev_local_rotations
+        .get(&node_idx)
+        .copied()
+        .unwrap_or(fallback);
+    let mut eff_alpha = alpha;
+    if rest > 0.0 {
+        // The slerp would rotate `from` toward `target` by `ang * alpha`
+        // this frame. Freeze that step below `dead`; soft-threshold above
+        // it so crossing the boundary is continuous (no snap on release).
+        let ang = quat_angle_between(&from, target);
+        let step = ang * alpha;
+        let keep = soft_threshold_keep(step, ARM_HOLD_ANG_DEAD * rest);
+        eff_alpha = alpha * keep;
+    }
+    let out = quat_slerp_short(&from, target, eff_alpha);
+    state.prev_local_rotations.insert(node_idx, out);
+    out
+}
+
+/// Rest factor for `joint`'s filter output speed: 1 at rest
+/// (≤ [`REST_SPEED_LO`]), 0 moving (≥ [`REST_SPEED_HI`]). The filter
+/// output is the key — at rest it converges so its speed collapses
+/// toward zero, while intentional motion sustains it — so this gate never
+/// freezes a deliberate move, only true rest buzz. Falls back to 0 (no
+/// hold) when the joint filter has no sample yet.
+fn arm_rest_factor(state: &PoseSolverState, joint: HumanoidBone) -> f32 {
+    match state.joint_filters.get(&joint) {
+        Some(f) if f.initialized => 1.0 - smoothstep(f.out_speed, REST_SPEED_LO, REST_SPEED_HI),
+        _ => 0.0,
+    }
+}
+
+/// The rest gate for one arm bone's rotation hold, keyed by the joint
+/// that *drives* that bone's direction match — the upper arm follows the
+/// elbow keypoint and the forearm follows the wrist (`DRIVEN_BONES`'
+/// `Tip::Joint` targets). Gating the upper arm on the wrist was measured
+/// wrong: the elbow can orbit the shoulder while the wrist stays put in
+/// world space, which would freeze the upper arm mid-gesture. Non-arm
+/// bones return 0 (no hold).
+fn arm_hold_rest(state: &PoseSolverState, bone: HumanoidBone) -> f32 {
+    let driving_joint = match bone {
+        HumanoidBone::LeftUpperArm => HumanoidBone::LeftLowerArm,
+        HumanoidBone::LeftLowerArm | HumanoidBone::LeftHand => HumanoidBone::LeftHand,
+        HumanoidBone::RightUpperArm => HumanoidBone::RightLowerArm,
+        HumanoidBone::RightLowerArm | HumanoidBone::RightHand => HumanoidBone::RightHand,
+        _ => return 0.0,
+    };
+    arm_rest_factor(state, driving_joint)
+}
+
 #[inline]
 fn dt_aware_blend(slider_blend: f32, dt: f32) -> f32 {
     if dt <= 0.0 {
@@ -2129,8 +2486,9 @@ fn preprocess_source(
     let exit = enter * SCHMITT_EXIT_RATIO;
 
     for (bone, joint) in out.joints.iter_mut() {
+        let tuning = one_euro_params_for(*bone);
         let filt = state.joint_filters.entry(*bone).or_default();
-        joint.position = filt.apply(joint.position, dt);
+        joint.position = filt.apply(joint.position, dt, tuning);
         // Schmitt hysteresis: a single dropout below `enter` does
         // not turn the joint off as long as it stays above `exit`.
         let active = state.joint_active.entry(*bone).or_insert(false);
@@ -2148,8 +2506,9 @@ fn preprocess_source(
     }
 
     for (bone, joint) in out.fingertips.iter_mut() {
+        let tuning = one_euro_params_for(*bone);
         let filt = state.fingertip_filters.entry(*bone).or_default();
-        joint.position = filt.apply(joint.position, dt);
+        joint.position = filt.apply(joint.position, dt, tuning);
         // Fingertips don't go through the body-bone DRIVEN_BONES list
         // for confidence gating directly — the distal bone owns the
         // gate — so we only smooth the position here.
@@ -2168,13 +2527,26 @@ fn preprocess_source(
             v
         }
     };
+    // Palm forward/up are the hand tier (the wrist's own orientation
+    // stream), so they use the smoother 1€ cutoff — but NOT the
+    // positional deadband (unit direction vectors are a different scale
+    // from the position radius; freezing them would need an angular
+    // threshold — left as future work) and NOT the Z anisotropy (the
+    // third component of a unit direction is not camera depth).
+    let orient = OneEuroTuning {
+        dead_radius: 0.0,
+        z_min_cutoff: HAND_MIN_CUTOFF_HZ,
+        z_beta: HAND_BETA,
+        z_dead_radius: 0.0,
+        ..OneEuroTuning::HAND
+    };
     if let Some(o) = out.left_hand_orientation.as_mut() {
-        o.forward = normalize3(state.hand_orient_filters[0].apply(o.forward, dt));
-        o.up = normalize3(state.hand_orient_filters[1].apply(o.up, dt));
+        o.forward = normalize3(state.hand_orient_filters[0].apply(o.forward, dt, orient));
+        o.up = normalize3(state.hand_orient_filters[1].apply(o.up, dt, orient));
     }
     if let Some(o) = out.right_hand_orientation.as_mut() {
-        o.forward = normalize3(state.hand_orient_filters[2].apply(o.forward, dt));
-        o.up = normalize3(state.hand_orient_filters[3].apply(o.up, dt));
+        o.forward = normalize3(state.hand_orient_filters[2].apply(o.forward, dt, orient));
+        o.up = normalize3(state.hand_orient_filters[3].apply(o.up, dt, orient));
     }
 
     // Anatomical finger constraints (run on the smoothed keypoints): clamp
@@ -2368,6 +2740,12 @@ fn solve_wrist_orientation(
         return;
     }
 
+    // Same rest hold as the arm chain in the main loop: this pass is the
+    // final writer of the forearm-twist and hand rotations, so without
+    // the hold here the wrist's residual orientation buzz would bypass
+    // the arm hold entirely.
+    let hold_rest = arm_rest_factor(state, wrist_bone);
+
     let Some(wrist_node) = humanoid.bone_map.get(&wrist_bone).copied() else {
         return;
     };
@@ -2525,12 +2903,13 @@ fn solve_wrist_orientation(
             &quat_conjugate(&upper_arm_world_rot),
             &lower_arm_world_new,
         ));
-        local_transforms[la_idx].rotation = blend_local_rotation(
+        local_transforms[la_idx].rotation = blend_arm_rotation(
             state,
             la_idx,
             local_transforms[la_idx].rotation,
             &lower_arm_local_target,
             blend,
+            hold_rest,
         );
         let actual_lower_arm_world =
             quat_mul(&upper_arm_world_rot, &local_transforms[la_idx].rotation);
@@ -2545,12 +2924,13 @@ fn solve_wrist_orientation(
             &quat_conjugate(&actual_lower_arm_world),
             &new_world_rot,
         ));
-        local_transforms[wrist_idx].rotation = blend_local_rotation(
+        local_transforms[wrist_idx].rotation = blend_arm_rotation(
             state,
             wrist_idx,
             local_transforms[wrist_idx].rotation,
             &hand_local_target,
             blend,
+            hold_rest,
         );
         let updated_world =
             quat_mul(&actual_lower_arm_world, &local_transforms[wrist_idx].rotation);
@@ -2561,12 +2941,13 @@ fn solve_wrist_orientation(
         // behaviour for edge cases.
         let new_local_rot =
             quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &new_world_rot));
-        local_transforms[wrist_idx].rotation = blend_local_rotation(
+        local_transforms[wrist_idx].rotation = blend_arm_rotation(
             state,
             wrist_idx,
             local_transforms[wrist_idx].rotation,
             &new_local_rot,
             blend,
+            hold_rest,
         );
         let updated_world =
             quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
@@ -2574,6 +2955,14 @@ fn solve_wrist_orientation(
     }
 }
 // Slerp / lerp
+/// Shortest-arc angle between two unit quaternions, in radians. Uses the
+/// absolute dot so `q` and `−q` (same orientation) read as zero angle.
+#[inline]
+fn quat_angle_between(a: &Quat, b: &Quat) -> f32 {
+    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]).abs().clamp(0.0, 1.0);
+    2.0 * dot.acos()
+}
+
 fn quat_slerp_short(a: &Quat, b: &Quat, t: f32) -> Quat {
     // Ensure shortest-arc blend.
     let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
