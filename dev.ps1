@@ -724,6 +724,33 @@ function Build-Distribution {
     }
 }
 
+# Launch the RealSense D435 depth-capture / calibration utility
+# (scripts/depth_capture.py) via uv: live RGB|depth preview, labelled
+# `.db3` recording into diagnostics/depth/ for the depth-camera pose
+# rebuild. The Python version + deps (pyrealsense2 / opencv / numpy)
+# are declared inline in the script (PEP 723); uv resolves them into
+# its own cache and runs in an ephemeral env, so nothing touches the
+# system Python. First launch downloads Qt essentials + deps (~90 MB),
+# cached thereafter.
+function Start-DepthCapture {
+    $script = "scripts\depth_capture.py"
+    if (-not (Test-Path $script)) {
+        throw "$script not found — run this from the repo root."
+    }
+    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+        throw "uv not found on PATH. Install it (https://docs.astral.sh/uv/) — it provisions the capture deps from the script's inline PEP 723 metadata."
+    }
+
+    Write-Host "Launching D435 capture via uv: 1-6 pick label, space rec, d dump, q/esc quit." -ForegroundColor Cyan
+    & uv run --script $script
+    if ($LASTEXITCODE -ne 0) {
+        # depth_capture.py sys.exit()s with its own message (e.g. no
+        # camera); surface the code but don't throw, so the dev menu
+        # stays alive for another selection.
+        Write-Host "depth_capture.py exited with code $LASTEXITCODE (see message above)." -ForegroundColor Yellow
+    }
+}
+
 $commands = @(
     @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-DepthAnythingSmall; Install-Font" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
@@ -731,6 +758,7 @@ $commands = @(
     @{ Label = "run (debug)";      Cmd = 'Install-Models; Install-DepthAnythingSmall; $env:RUST_LOG="vulvatar=info"; cargo run' },
     @{ Label = "run (debug+lipsync)"; Cmd = 'Install-Models; Install-DepthAnythingSmall; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
     @{ Label = "run (release)";    Cmd = "Install-Models; Install-DepthAnythingSmall; cargo run --release" },
+    @{ Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
     @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
     @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
     @{ Label = "package installer (unsigned)";        Cmd = "Build-Distribution" },
