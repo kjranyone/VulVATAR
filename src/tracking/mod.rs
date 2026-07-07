@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "webcam")]
 mod webcam;
 
+#[cfg(feature = "realsense")]
+pub mod realsense;
+
 #[cfg(feature = "inference")]
 pub mod depth_anything;
 #[cfg(feature = "inference")]

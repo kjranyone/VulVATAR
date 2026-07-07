@@ -1,0 +1,9 @@
+prefix=C:/Users/kojiro/DOCUME~1/REALSE~1.0
+includedir=${prefix}/include
+libdir=${prefix}/lib/x64
+
+Name: realsense2
+Description: Intel RealSense SDK 2.0
+Version: 2.58.2
+Cflags: -I${includedir} -DDLL_FOLDER=${prefix}/bin/x64
+Libs: -L${libdir} -lrealsense2
