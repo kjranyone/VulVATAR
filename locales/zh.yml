@@ -192,6 +192,7 @@ tracking:
   requested_but_failed: "(已请求，但无法打开音频设备)"
   camera_restarted: "摄像头已重启：%{w}x%{h} @ %{fps} fps"
   error_camera_open: "摄像头 %{index} 打开失败：%{error}。请检查是否有其他应用正在使用摄像头。"
+  error_realsense_open: "RealSense D435 打开失败：%{error}。请检查摄像头是否已连接且未被其他应用占用。"
   error_model_warning: "姿势追踪质量警告：%{warnings}。运行 ./dev.ps1 setup 安装完整模型包。"
   error_model_unavailable: "姿势模型不可用：%{error} 回退到低质量 HSV 追踪。"
   error_camera_stopped: "连续 %{count} 次读取错误后摄像头已停止。可能有其他应用正在使用摄像头，或设备已断开。"

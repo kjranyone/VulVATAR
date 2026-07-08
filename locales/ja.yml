@@ -192,6 +192,7 @@ tracking:
   requested_but_failed: "(要求しましたが、オーディオデバイスを開けませんでした)"
   camera_restarted: "カメラを再起動: %{w}x%{h} @ %{fps} fps"
   error_camera_open: "カメラ %{index} のオープンに失敗: %{error}。他のアプリがカメラを使用していないか確認してください。"
+  error_realsense_open: "RealSense D435 のオープンに失敗: %{error}。カメラが接続され、他のアプリに使用されていないか確認してください。"
   error_model_warning: "ポーズトラッキング品質警告: %{warnings}。./dev.ps1 setup を実行してフルモデルバンドルをインストールしてください。"
   error_model_unavailable: "ポーズモデルが見つかりません: %{error} 低品質のHSVトラッキングにフォールバックします。"
   error_camera_stopped: "%{count} 回連続で読み取りエラーが発生し、カメラを停止しました。他のアプリがカメラを使用しているか、デバイスが切断された可能性があります。"

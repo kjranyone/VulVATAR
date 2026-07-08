@@ -288,6 +288,16 @@ pub struct Rtmw3dWithDepthProvider {
     /// the WARN spam.
     #[cfg(feature = "inference")]
     calib_was_failing: bool,
+    /// Metric depth frame supplied by an external sensor (RealSense D435)
+    /// for the *next* `estimate_pose`, via
+    /// [`super::provider::PoseProvider::set_external_depth`]. When `Some`,
+    /// the entire DAv2 acquisition + scale-calibration + Phase-7 lateral-
+    /// bias-correction path is bypassed: the frame is already absolute
+    /// metric depth aligned to the color image with a true principal
+    /// point, so `estimate_from_external_depth` builds the skeleton
+    /// straight from it. Taken (consumed) each frame.
+    #[cfg(feature = "realsense")]
+    external_depth: Option<super::skeleton_from_depth::MetricDepthFrame>,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -405,6 +415,8 @@ impl Rtmw3dWithDepthProvider {
             torso_capture: None,
             last_calib_warn_at: None,
             calib_was_failing: false,
+            #[cfg(feature = "realsense")]
+            external_depth: None,
         })
     }
 
@@ -598,6 +610,14 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
             empty_estimate(frame_index)
         }
     }
+
+    #[cfg(feature = "realsense")]
+    fn set_external_depth(
+        &mut self,
+        depth: super::skeleton_from_depth::MetricDepthFrame,
+    ) {
+        self.external_depth = Some(depth);
+    }
 }
 
 #[cfg(feature = "inference")]
@@ -641,6 +661,22 @@ impl Rtmw3dWithDepthProvider {
             // RTMW3D failed to emit a full keypoint set — pass its
             // empty estimate through unchanged.
             return rtmw_est;
+        }
+
+        // External metric depth (RealSense D435) supplied for THIS color
+        // frame short-circuits the entire DAv2 acquisition + scale-
+        // calibration + Phase-7 lateral-bias-correction path: the depth is
+        // already absolute metric, aligned to this exact frame, with a
+        // true principal point — so build the skeleton straight from it.
+        // `take` clears it so a dropped next frame can't reuse stale depth.
+        #[cfg(feature = "realsense")]
+        if let Some(metric_frame) = self.external_depth.take() {
+            return self.estimate_from_external_depth(
+                frame_index,
+                rtmw_est,
+                &joints_2d,
+                metric_frame,
+            );
         }
 
         // Depth stage disabled (dav2_small.onnx absent at startup):
@@ -1135,6 +1171,137 @@ impl Rtmw3dWithDepthProvider {
 
         // Annotation reuses RTMW3D's bbox + 2D keypoints. Skeleton is
         // the new metric one.
+        PoseEstimate {
+            annotation: rtmw_est.annotation,
+            skeleton,
+        }
+    }
+
+    /// Build a pose estimate from an externally-supplied metric depth
+    /// frame (RealSense D435). Unlike the DAv2 path this needs no scale
+    /// calibration (the depth is absolute metres) and no Phase-7 lateral-
+    /// bias correction (the metric XY is accurate from the real
+    /// intrinsics), so it is just: torso capture -> resolve origin ->
+    /// build skeleton -> inherit RTMW3D's face. The DAv2 guess-layer
+    /// (ray-IK, arm_z, fold, contact) is intentionally absent — the
+    /// metric depth replaces it.
+    #[cfg(feature = "realsense")]
+    fn estimate_from_external_depth(
+        &mut self,
+        frame_index: u64,
+        mut rtmw_est: PoseEstimate,
+        joints_2d: &[DecodedJoint2d],
+        metric_frame: super::skeleton_from_depth::MetricDepthFrame,
+    ) -> PoseEstimate {
+        // Torso-template capture (calibration), same visibility-gated path
+        // as the DAv2 branch. No-op when no capture window is active.
+        if let Some(buf) = self.torso_capture.as_mut() {
+            let _ = buf.add_frame(joints_2d, &metric_frame);
+        }
+
+        let opts = build_options_from_calibration(
+            self.pose_calibration.as_ref(),
+            self.calibration_mode_hint,
+        );
+        let mut skeleton = match resolve_origin_metric(
+            joints_2d,
+            &metric_frame,
+            opts,
+            self.pose_calibration.as_ref(),
+        ) {
+            Some(anchor) => build_skeleton(
+                frame_index,
+                joints_2d,
+                &metric_frame,
+                anchor,
+                opts,
+                self.pose_calibration.as_ref(),
+            ),
+            None => {
+                warn!("RTMW3D+D435: no body anchor — emitting empty skeleton");
+                SourceSkeleton::empty(frame_index)
+            }
+        };
+
+        // Inherit RTMW3D's face pose + FaceMesh cascade output (the face
+        // track is body-derived and unrelated to the depth source).
+        skeleton.face = rtmw_est.skeleton.face;
+        skeleton.expressions = std::mem::take(&mut rtmw_est.skeleton.expressions);
+        skeleton.face_mesh_confidence = rtmw_est.skeleton.face_mesh_confidence;
+        if let (Some(ref mut fp), Some(mesh_conf)) =
+            (skeleton.face.as_mut(), skeleton.face_mesh_confidence)
+        {
+            fp.confidence = fp.confidence.max(mesh_conf);
+        }
+
+        // `build_skeleton` emits camera-metric positions (metres, y-down).
+        // The pose solver expects the normalised source frame and reads
+        // `position[xyz]` (it never reads `metric_depth_m`), so — exactly
+        // as the retired DAv2 path did — map into the source frame here.
+        // These two phases are NOT DAv2-specific: they turn *any* metric
+        // point cloud into a solver-ready skeleton.
+
+        // Snapshot the metric arm geometry + shoulder span BEFORE the
+        // overwrite: the metric relative vectors (elbow-shoulder,
+        // wrist-elbow) are the perspective-true depth signal, and the
+        // shoulder metric-X gives the metres-per-source-unit conversion.
+        let shoulder_metric_x_pre = {
+            let l = skeleton
+                .joints
+                .get(&HumanoidBone::LeftUpperArm)
+                .map(|j| j.position[0]);
+            let r = skeleton
+                .joints
+                .get(&HumanoidBone::RightUpperArm)
+                .map(|j| j.position[0]);
+            l.zip(r)
+        };
+        let metric_arms = snapshot_metric_arms(&skeleton);
+
+        // Phase 7: overwrite each joint's position with RTMW3D's own
+        // (unbiased, normalised) source coordinates; UNION in any joint the
+        // depth builder dropped so a missing metric sample never deletes a
+        // limb RTMW3D tracked fine; inherit hand orientation.
+        for (bone, joint) in skeleton.joints.iter_mut() {
+            if let Some(rtmw_joint) = rtmw_est.skeleton.joints.get(bone) {
+                joint.position = rtmw_joint.position;
+            }
+        }
+        for (bone, joint) in skeleton.fingertips.iter_mut() {
+            if let Some(rtmw_joint) = rtmw_est.skeleton.fingertips.get(bone) {
+                joint.position = rtmw_joint.position;
+            }
+        }
+        for (bone, joint) in rtmw_est.skeleton.joints.iter() {
+            skeleton.joints.entry(*bone).or_insert(*joint);
+        }
+        for (bone, joint) in rtmw_est.skeleton.fingertips.iter() {
+            skeleton.fingertips.entry(*bone).or_insert(*joint);
+        }
+        if let Some(rt) = rtmw_est.skeleton.left_hand_orientation {
+            skeleton.left_hand_orientation = Some(rt);
+        }
+        if let Some(rt) = rtmw_est.skeleton.right_hand_orientation {
+            skeleton.right_hand_orientation = Some(rt);
+        }
+
+        // Phase 7.6: re-place the arm chains from the metric relative
+        // vectors — perspective-true elbow/wrist in all three axes, which
+        // is the whole point of the depth camera. Unlike the DAv2 path this
+        // needs no lateral-bias correction, so the DAv2-band `inject_*_bz`
+        // hacks are intentionally omitted; the D435 metric samples are used
+        // directly.
+        if let Some((sl_metric_x, sr_metric_x)) = shoulder_metric_x_pre {
+            replace_arm_chains_from_metric(
+                &mut skeleton,
+                &metric_arms,
+                sl_metric_x,
+                sr_metric_x,
+                joints_2d,
+                &mut self.metric_forearm_hold,
+            );
+        }
+
         PoseEstimate {
             annotation: rtmw_est.annotation,
             skeleton,
@@ -2107,6 +2274,38 @@ pub fn calibrate_scale(
         shoulder: shoulder_outcome,
         hip: hip_outcome,
     })
+}
+
+/// Build a `MetricDepthFrame` from a RealSense D435 color-aligned frame:
+/// deproject every pixel through the *real* camera intrinsics into a
+/// metric point cloud (metres, x-right / y-down / z-forward), marking
+/// no-return pixels as `NaN` so `sample_metric_point`'s window median
+/// rejects them. Unlike [`build_metric_frame_from_dav2`] there is no
+/// learned scale and no centered-principal-point assumption: the D435
+/// supplies absolute metres and a true `(cx, cy)`, so this is a straight
+/// per-pixel deprojection. `crop` is `None` — the depth is full-frame,
+/// aligned 1:1 to the color image the keypoints were detected in.
+#[cfg(feature = "realsense")]
+pub fn build_metric_frame_from_d435(
+    frame: &crate::tracking::realsense::RealSenseFrame,
+) -> MetricDepthFrame {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let mut points_m = Vec::with_capacity(w * h);
+    for v in 0..h {
+        for u in 0..w {
+            match frame.point_m(u, v) {
+                Some(p) => points_m.push(p),
+                None => points_m.push([f32::NAN, f32::NAN, f32::NAN]),
+            }
+        }
+    }
+    MetricDepthFrame {
+        width: frame.width,
+        height: frame.height,
+        points_m,
+        crop: None,
+    }
 }
 
 /// Back-project every DAv2 pixel into a metric `(x, y, z)` triple in

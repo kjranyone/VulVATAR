@@ -1,4 +1,4 @@
-#[cfg(feature = "webcam")]
+#[cfg(any(feature = "webcam", feature = "realsense"))]
 use crate::t;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -817,6 +817,11 @@ pub enum CameraBackend {
     /// Only available when compiled with the `webcam` cargo feature.
     #[cfg(feature = "webcam")]
     Webcam { camera_index: usize },
+    /// Capture color + metric depth from an Intel RealSense D400-series
+    /// (D435) device. The device selects itself (first D400 found), so
+    /// there is no index. Only available with the `realsense` feature.
+    #[cfg(feature = "realsense")]
+    RealSense,
 }
 
 impl CameraBackend {
@@ -826,6 +831,8 @@ impl CameraBackend {
             Self::Synthetic => "Synthetic",
             #[cfg(feature = "webcam")]
             Self::Webcam { .. } => "Webcam",
+            #[cfg(feature = "realsense")]
+            Self::RealSense => "RealSense D435",
         }
     }
 }
@@ -1107,6 +1114,19 @@ impl TrackingWorker {
                     pipeline,
                 );
             }
+            #[cfg(feature = "realsense")]
+            CameraBackend::RealSense => {
+                Self::run_realsense(
+                    &mailbox,
+                    &running,
+                    &ready,
+                    frame_interval,
+                    width,
+                    height,
+                    fps,
+                    pipeline,
+                );
+            }
         }
         // Ensure running is cleared when the thread exits for any reason.
         running.store(false, Ordering::SeqCst);
@@ -1339,6 +1359,190 @@ impl TrackingWorker {
                     };
 
                     let frame = Some(downscale_for_gui(&rgb_data, width, height, 320));
+                    mailbox.publish_estimate(estimate, frame);
+                    stagelog::mark(frame_index, "publish");
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors == 1 {
+                        error!("tracking-worker: frame grab error: {}", e);
+                    }
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!(
+                            "tracking-worker: {} consecutive grab failures, stopping worker",
+                            consecutive_errors
+                        );
+                        mailbox.report_error(
+                            t!("tracking.error_camera_stopped", count = consecutive_errors),
+                            TrackingErrorLevel::Blocking,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            frame_index += 1;
+
+            let elapsed = loop_start.elapsed();
+            if elapsed < interval {
+                thread::sleep(interval - elapsed);
+            }
+        }
+
+        info!("tracking-worker: stopped");
+    }
+
+    /// Capture color + aligned metric depth from a RealSense D435 and run
+    /// the full RTMW3D pose pipeline, feeding the depth in via
+    /// [`provider::PoseProvider::set_external_depth`] so the provider skips
+    /// its internal DAv2 stage. Structurally mirrors [`Self::run_webcam`];
+    /// the only per-frame difference is building a `MetricDepthFrame` from
+    /// the D435 depth and handing it to the provider before `estimate_pose`.
+    #[cfg(feature = "realsense")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_realsense(
+        mailbox: &TrackingMailbox,
+        running: &AtomicBool,
+        ready: &AtomicBool,
+        interval: Duration,
+        width: u32,
+        height: u32,
+        fps: u32,
+        pipeline: provider::TrackingPipelineConfig,
+    ) {
+        // The D435 supplies absolute metric depth, so the internal DAv2
+        // stage is neither needed nor wanted: force it off regardless of
+        // the user toggle. Depth reaches the provider each frame via
+        // `set_external_depth`, not the DAv2 worker (which would otherwise
+        // load `dav2_small.onnx` and contend for the GPU for nothing).
+        let pipeline = provider::TrackingPipelineConfig {
+            depth_enabled: false,
+            ..pipeline
+        };
+
+        info!(
+            "tracking-worker: opening RealSense D435 ({}x{} @ {} fps)",
+            width, height, fps
+        );
+
+        let _stage_session =
+            stagelog::SessionGuard::begin(&format!("realsense {width}x{height}@{fps}"));
+        stagelog::mark(0, "camera_open_begin");
+
+        let mut capture = match realsense::RealSenseCapture::open(width, height, fps) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("tracking-worker: failed to open RealSense: {}", e);
+                mailbox.report_error(
+                    t!("tracking.error_realsense_open", error = e.to_string()),
+                    TrackingErrorLevel::Blocking,
+                );
+                warn!("tracking-worker: falling back to synthetic backend");
+                ready.store(true, Ordering::SeqCst);
+                Self::run_synthetic(mailbox, running, interval);
+                return;
+            }
+        };
+
+        // Provider init under cooperative GPU exclusivity — identical to
+        // `run_webcam` (see that method for the Arc-driver rationale).
+        stagelog::mark(0, "provider_load_begin");
+        let mut pose_provider = {
+            let _gpu_exclusive =
+                crate::gpu_coordination::GpuExclusiveGuard::acquire("pose-provider-init");
+            match provider::create_pose_provider("models", pipeline) {
+                Ok(mut provider) => {
+                    let warnings = provider.take_load_warnings();
+                    if !warnings.is_empty() {
+                        mailbox.report_error(
+                            t!(
+                                "tracking.error_model_warning",
+                                warnings = warnings.join("; ")
+                            ),
+                            TrackingErrorLevel::Warning,
+                        );
+                    }
+                    mailbox.set_inference_backend_label(Some(provider.label()));
+                    stagelog::mark(0, "provider_warmup_begin");
+                    let blank =
+                        vec![0u8; (capture.width() as usize) * (capture.height() as usize) * 3];
+                    let _ = provider.estimate_pose(&blank, capture.width(), capture.height(), 0);
+                    stagelog::mark(0, "provider_warmup_end");
+                    provider.reset_temporal_state();
+                    Some(provider)
+                }
+                Err(e) => {
+                    error!("tracking-worker: inference disabled: {}", e);
+                    mailbox.report_error(
+                        t!("tracking.error_model_unavailable", error = e.to_string()),
+                        TrackingErrorLevel::Blocking,
+                    );
+                    None
+                }
+            }
+        };
+
+        info!("tracking-worker: RealSense opened successfully");
+        stagelog::mark(0, "provider_load_end");
+        ready.store(true, Ordering::SeqCst);
+        let mut frame_index: u64 = 0;
+        let mut consecutive_errors: u32 = 0;
+        let mut last_calibration_seq: u64 = 0;
+        let mut last_torso_capture_seq: u64 = 0;
+        let mut last_calibration_mode_hint_seq: u64 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 30;
+
+        while running.load(Ordering::SeqCst) {
+            let loop_start = std::time::Instant::now();
+
+            // Forward calibration / torso-capture / mode-hint transitions
+            // to the provider (same edge-detected pattern as run_webcam).
+            if let Some(ref mut provider) = pose_provider {
+                if let Some((cal, seq)) = mailbox.poll_calibration(last_calibration_seq) {
+                    provider.set_calibration(cal);
+                    last_calibration_seq = seq;
+                }
+                if let Some((enabled, seq)) = mailbox.poll_torso_capture(last_torso_capture_seq) {
+                    if enabled {
+                        provider.set_torso_capture(true);
+                    } else {
+                        if let Some(template) = provider.take_torso_template() {
+                            mailbox.publish_torso_template(template);
+                        }
+                        provider.set_torso_capture(false);
+                    }
+                    last_torso_capture_seq = seq;
+                }
+                if let Some((hint, seq)) =
+                    mailbox.poll_calibration_mode_hint(last_calibration_mode_hint_seq)
+                {
+                    provider.set_calibration_mode_hint(hint);
+                    last_calibration_mode_hint_seq = seq;
+                }
+            }
+
+            stagelog::mark(frame_index, "grab_begin");
+            match capture.grab_frame() {
+                Ok(rs_frame) => {
+                    consecutive_errors = 0;
+                    let width = rs_frame.width;
+                    let height = rs_frame.height;
+
+                    stagelog::mark(frame_index, "estimate_begin");
+                    let estimate = if let Some(ref mut provider) = pose_provider {
+                        // Hand the D435's color-aligned metric depth to the
+                        // provider for THIS frame; it replaces the DAv2 stage.
+                        let metric =
+                            crate::tracking::rtmw3d_with_depth::build_metric_frame_from_d435(
+                                &rs_frame,
+                            );
+                        provider.set_external_depth(metric);
+                        provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
+                    } else {
+                        pose_estimation::estimate_pose(&rs_frame.rgb, width, height, frame_index)
+                    };
+
+                    let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
                     mailbox.publish_estimate(estimate, frame);
                     stagelog::mark(frame_index, "publish");
                 }

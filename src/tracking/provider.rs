@@ -148,6 +148,19 @@ pub trait PoseProvider {
     /// * `None` → modal closed, fall back to the persisted calibration's
     ///   mode.
     fn set_calibration_mode_hint(&mut self, _hint: Option<crate::tracking::CalibrationMode>) {}
+
+    /// Supply a metric depth frame captured by an external sensor (e.g. a
+    /// RealSense D435) for the *next* [`Self::estimate_pose`] call,
+    /// replacing the internal DAv2 depth stage. The tracking worker calls
+    /// this each frame with depth aligned to the color image it is about
+    /// to hand to `estimate_pose`. Providers without a depth stage ignore
+    /// it. Consumed once: the provider clears it after the next estimate.
+    #[cfg(feature = "realsense")]
+    fn set_external_depth(
+        &mut self,
+        _depth: crate::tracking::skeleton_from_depth::MetricDepthFrame,
+    ) {
+    }
 }
 
 /// Build the production pose provider: RTMW3D with the async DAv2

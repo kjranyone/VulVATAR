@@ -25,11 +25,12 @@ inference = ["ort", "ndarray"]
 inference-gpu = ["inference", "ort/directml"]
 virtual-camera = []
 lipsync = ["cpal", "rustfft"]
-# RealSense D435 depth capture (Phase A, depth-camera rebuild). Off by
-# default so the normal build is unaffected while the native realsense2
-# link (SDK + pkg-config + LIBCLANG_PATH) is wired up. Build/run with
-# `--features realsense`.
-realsense = ["dep:realsense-rust"]
+# RealSense D435 depth capture (depth-camera rebuild). Off by default so
+# the normal build is unaffected. Pulls in `inference`: the D435 depth is
+# consumed by the RTMW3D provider (MetricDepthFrame / skeleton_from_depth
+# live behind `inference`), so a realsense build is always an inference
+# build. Build/run with `--features realsense`. See docs/realsense-build.md.
+realsense = ["dep:realsense-rust", "inference"]
 
 [dependencies]
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }
@@ -100,4 +101,11 @@ opt-level = 2
 # (pkg-config -> bindgen -> link) before the full capture module lands.
 [[bin]]
 name = "diagnose_realsense"
+required-features = ["realsense"]
+
+# End-to-end Phase B check: D435 depth -> provider (external depth) ->
+# skeleton. Needs the RTMW3D models, so it also pulls in `inference`
+# (which `realsense` already implies).
+[[bin]]
+name = "diagnose_realsense_pose"
 required-features = ["realsense"]

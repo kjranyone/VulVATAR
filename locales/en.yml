@@ -192,6 +192,7 @@ tracking:
   requested_but_failed: "(requested, but audio device couldn't open)"
   camera_restarted: "Camera restarted: %{w}x%{h} @ %{fps} fps"
   error_camera_open: "Camera %{index} open failed: %{error}. Check if another app is using the camera."
+  error_realsense_open: "RealSense D435 open failed: %{error}. Check the camera is connected and not in use by another app."
   error_model_warning: "Pose tracking quality warning: %{warnings}. Run ./dev.ps1 setup to install the full model bundle."
   error_model_unavailable: "Pose model unavailable: %{error} Falling back to low-quality HSV tracking."
   error_camera_stopped: "Camera stopped after %{count} consecutive read errors. Another app may be using the camera, or the device was disconnected."
