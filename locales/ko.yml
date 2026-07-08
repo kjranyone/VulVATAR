@@ -136,7 +136,6 @@ tracking:
   frame_rate: "프레임레이트"
   capture_format: "캡처 포맷"
   pipeline: "파이프라인"
-  pipeline_depth: "메트릭 깊이 (DAv2)"
   pipeline_yolox: "인물 크롭 (YOLOX)"
   pipeline_force_cpu: "CPU 전용 추론 (GPU 미사용)"
   pipeline_hint: "다음 카메라 시작 시 적용됩니다."

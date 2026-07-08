@@ -136,7 +136,6 @@ tracking:
   frame_rate: "帧率"
   capture_format: "采集格式"
   pipeline: "管线"
-  pipeline_depth: "度量深度 (DAv2)"
   pipeline_yolox: "人物裁剪 (YOLOX)"
   pipeline_force_cpu: "仅用 CPU 推理 (不占用 GPU)"
   pipeline_hint: "将在下次启动摄像头时生效。"

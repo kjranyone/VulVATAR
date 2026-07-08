@@ -73,7 +73,7 @@ use super::yolox::YoloxPersonDetector;
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{DetectionAnnotation, SourceSkeleton};
-#[cfg(feature = "inference")]
+#[cfg(feature = "realsense")]
 pub(in crate::tracking) use arm_z::wrist_out_of_frame;
 #[cfg(feature = "inference")]
 use log::{debug, error, info, warn};
@@ -81,8 +81,6 @@ use log::{debug, error, info, warn};
 use ort::session::Session;
 #[cfg(feature = "inference")]
 use ort::value::TensorRef;
-#[cfg(feature = "inference")]
-pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
 #[cfg(feature = "inference")]
 use std::path::Path;
 #[cfg(feature = "inference")]

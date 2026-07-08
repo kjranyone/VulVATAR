@@ -95,7 +95,6 @@ impl GuiApp {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
-            depth_enabled: self.tracking.depth_enabled,
             force_cpu_inference: self.tracking.force_cpu_inference,
             yolox_enabled: self.tracking.yolox_enabled,
             camera_index: self.camera_index,
@@ -259,7 +258,6 @@ impl GuiApp {
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
         self.tracking.fade_on_tracking_loss = state.fade_on_tracking_loss;
-        self.tracking.depth_enabled = state.depth_enabled;
         self.tracking.force_cpu_inference = state.force_cpu_inference;
         self.tracking.yolox_enabled = state.yolox_enabled;
         self.camera_index = state.camera_index;

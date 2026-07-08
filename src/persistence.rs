@@ -39,7 +39,6 @@ pub struct ProjectState {
     pub lower_body_tracking_enabled: bool,
     pub root_translation_enabled: bool,
     pub fade_on_tracking_loss: bool,
-    pub depth_enabled: bool,
     pub force_cpu_inference: bool,
     pub yolox_enabled: bool,
     pub camera_index: usize,
@@ -295,8 +294,6 @@ pub struct TrackingConfig {
     /// mirror `TrackingPipelineConfig::default()` so projects predating
     /// the Pipeline inspector section load with the same pipeline the
     /// provider previously hardcoded.
-    #[serde(default = "default_true")]
-    pub depth_enabled: bool,
     #[serde(default)]
     pub force_cpu_inference: bool,
     #[serde(default = "default_true")]
@@ -821,7 +818,6 @@ impl ProjectFile {
                 lower_body_tracking_enabled: state.lower_body_tracking_enabled,
                 root_translation_enabled: state.root_translation_enabled,
                 fade_on_tracking_loss: state.fade_on_tracking_loss,
-                depth_enabled: state.depth_enabled,
                 force_cpu_inference: state.force_cpu_inference,
                 yolox_enabled: state.yolox_enabled,
                 camera_index: state.camera_index,
@@ -908,7 +904,6 @@ impl ProjectFile {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
-            depth_enabled: self.tracking.depth_enabled,
             force_cpu_inference: self.tracking.force_cpu_inference,
             yolox_enabled: self.tracking.yolox_enabled,
             camera_index: self.tracking.camera_index,

@@ -136,7 +136,6 @@ tracking:
   frame_rate: "Frame Rate"
   capture_format: "Capture Format"
   pipeline: "Pipeline"
-  pipeline_depth: "Metric depth (DAv2)"
   pipeline_yolox: "Person crop (YOLOX)"
   pipeline_force_cpu: "CPU-only inference (keep GPU free)"
   pipeline_hint: "Applies the next time the camera starts."

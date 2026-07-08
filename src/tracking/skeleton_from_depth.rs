@@ -1,11 +1,18 @@
 //! Shared "2D keypoints + per-pixel metric depth → SourceSkeleton"
 //! pipeline, consumed by [`super::rtmw3d_with_depth`].
 //!
-//! The provider feeds RTMW3D-sourced 2D keypoints and a DAv2
-//! calibrated-relative depth map shaped as a [`MetricDepthFrame`]
+//! The provider feeds RTMW3D-sourced 2D keypoints and an absolute
+//! metric depth map (RealSense D435) shaped as a [`MetricDepthFrame`]
 //! point cloud with [`DecodedJoint2d`]-shaped 2D landmarks. The
 //! skeleton-building math (origin selection, axis flips, hand chain
 //! attachment, head-pose derivation) is single-sourced here.
+//!
+//! The skeleton *builders* run only when a depth source is present —
+//! i.e. the `realsense` feature. Without it the module is still compiled
+//! (it is `inference`-gated for the shared [`MetricDepthFrame`] /
+//! [`DecodedJoint2d`] / `TorsoCaptureBuffer` types) but the builders are
+//! dormant, hence the dead-code allowance below.
+#![cfg_attr(not(feature = "realsense"), allow(dead_code))]
 
 use crate::asset::HumanoidBone;
 

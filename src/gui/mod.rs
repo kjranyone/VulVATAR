@@ -400,9 +400,6 @@ pub struct TrackingGuiState {
     /// blend / confidence fields are user-editable — `stale_timeout_nanos`
     /// keeps its default.
     pub smoothing: TrackingSmoothingParams,
-    /// Run the DAv2 metric-depth stage (needs `models/dav2_small.onnx`).
-    /// Bound at tracking start; mid-session changes apply on restart.
-    pub depth_enabled: bool,
     /// Run every tracking ONNX session on the CPU EP, keeping DirectML
     /// off the GPU entirely. Slower but isolates tracking from GPU
     /// driver instability. Bound at tracking start.
@@ -431,7 +428,6 @@ impl TrackingGuiState {
             crate::tracking::provider::TrackingPipelineConfig::safe_mode()
         } else {
             crate::tracking::provider::TrackingPipelineConfig {
-                depth_enabled: self.depth_enabled,
                 force_cpu: self.force_cpu_inference,
                 yolox_enabled: self.yolox_enabled,
             }
@@ -823,7 +819,6 @@ impl GuiApp {
                 root_translation_enabled: true,
                 fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
-                depth_enabled: true,
                 force_cpu_inference: false,
                 yolox_enabled: true,
                 safe_mode_armed: false,
@@ -1056,7 +1051,6 @@ impl GuiApp {
                 root_translation_enabled: true,
                 fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
-                depth_enabled: true,
                 force_cpu_inference: false,
                 yolox_enabled: true,
                 safe_mode_armed: false,

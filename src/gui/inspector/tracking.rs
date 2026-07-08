@@ -232,12 +232,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             let mut changed = false;
             changed |= ui
                 .checkbox(
-                    &mut state.tracking.depth_enabled,
-                    t!("tracking.pipeline_depth"),
-                )
-                .changed();
-            changed |= ui
-                .checkbox(
                     &mut state.tracking.yolox_enabled,
                     t!("tracking.pipeline_yolox"),
                 )

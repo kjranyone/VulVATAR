@@ -136,7 +136,6 @@ tracking:
   frame_rate: "フレームレート"
   capture_format: "キャプチャフォーマット"
   pipeline: "パイプライン"
-  pipeline_depth: "メトリック深度 (DAv2)"
   pipeline_yolox: "人物クロップ (YOLOX)"
   pipeline_force_cpu: "CPU のみで推論 (GPU を使わない)"
   pipeline_hint: "次回のカメラ開始時に反映されます。"

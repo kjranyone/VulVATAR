@@ -43,10 +43,7 @@ fn main() -> Result<(), String> {
         .unwrap_or_else(|| "diagnostics/rtmw3d_2d".to_string());
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
 
-    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig {
-        depth_enabled: false,
-        ..Default::default()
-    };
+    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
     let mut provider = vulvatar_lib::tracking::provider::create_pose_provider("models", config)?;
     let _ = provider.take_load_warnings();
 

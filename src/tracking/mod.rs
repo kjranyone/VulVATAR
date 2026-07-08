@@ -13,8 +13,6 @@ mod webcam;
 pub mod realsense;
 
 #[cfg(feature = "inference")]
-pub mod depth_anything;
-#[cfg(feature = "inference")]
 pub(crate) mod latest_cell;
 mod pose_estimation;
 pub mod provider;
@@ -1410,16 +1408,6 @@ impl TrackingWorker {
         fps: u32,
         pipeline: provider::TrackingPipelineConfig,
     ) {
-        // The D435 supplies absolute metric depth, so the internal DAv2
-        // stage is neither needed nor wanted: force it off regardless of
-        // the user toggle. Depth reaches the provider each frame via
-        // `set_external_depth`, not the DAv2 worker (which would otherwise
-        // load `dav2_small.onnx` and contend for the GPU for nothing).
-        let pipeline = provider::TrackingPipelineConfig {
-            depth_enabled: false,
-            ..pipeline
-        };
-
         info!(
             "tracking-worker: opening RealSense D435 ({}x{} @ {} fps)",
             width, height, fps

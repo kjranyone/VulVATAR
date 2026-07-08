@@ -535,21 +535,12 @@ fn main() -> Result<(), String> {
     env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut filter: Option<String> = None;
-    let mut depth_enabled = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--filter" => {
                 filter = args.get(i + 1).cloned();
                 i += 2;
-            }
-            // Provenance probe: shoulder z is touched only by raw
-            // RTMW3D nz and by the depth pipeline's DAv2 bz
-            // injection; A/B-ing this flag attributes spurious
-            // shoulder Δz to one or the other.
-            "--no-depth" => {
-                depth_enabled = false;
-                i += 1;
             }
             other => return Err(format!("unknown arg: {other}")),
         }
@@ -561,11 +552,8 @@ fn main() -> Result<(), String> {
         .load(&vrm)
         .map_err(|e| format!("load VRM: {e:?}"))?;
 
-    eprintln!("loading pose provider (depth_enabled={depth_enabled})…");
-    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig {
-        depth_enabled,
-        ..Default::default()
-    };
+    eprintln!("loading pose provider…");
+    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
     let mut infer =
         create_pose_provider("models", config).map_err(|e| format!("provider: {e}"))?;
     for w in infer.take_load_warnings() {

@@ -22,14 +22,7 @@ fn main() -> Result<(), String> {
     env_logger::init();
 
     let mut cap = RealSenseCapture::open(1280, 720, 30)?;
-    // depth_enabled: false — the D435 replaces the DAv2 stage entirely.
-    let mut provider = create_pose_provider(
-        "models",
-        TrackingPipelineConfig {
-            depth_enabled: false,
-            ..Default::default()
-        },
-    )?;
+    let mut provider = create_pose_provider("models", TrackingPipelineConfig::default())?;
     println!("provider: {}", provider.label());
 
     for i in 0..30u64 {
