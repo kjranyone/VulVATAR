@@ -352,10 +352,19 @@ impl Rtmw3dWithDepthProvider {
             let _ = buf.add_frame(joints_2d, &metric_frame);
         }
 
-        let opts = build_options_from_calibration(
+        let mut opts = build_options_from_calibration(
             self.pose_calibration.as_ref(),
             self.calibration_mode_hint,
         );
+        // RealSense desk-up default: with no pose calibration at all, anchor
+        // on the shoulders rather than trusting a phantom desk-edge / chair
+        // "hip" — or emitting an empty skeleton when the hips are simply out
+        // of frame. An explicit calibration (UpperBody or FullBody) is
+        // honoured as-is by `build_options_from_calibration`; this only fills
+        // the fully-uncalibrated gap, so a FullBody user is never overridden.
+        if self.pose_calibration.is_none() && self.calibration_mode_hint.is_none() {
+            opts.force_shoulder_anchor = true;
+        }
         let mut skeleton = match resolve_origin_metric(
             joints_2d,
             &metric_frame,

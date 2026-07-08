@@ -124,6 +124,7 @@ calibration:
 tracking:
   enabled: "추적 활성화"
   input_device: "입력 장치"
+  backend_realsense: "RealSense D435 사용 (깊이)"
   camera: "카메라"
   no_cameras: "카메라가 감지되지 않았습니다. 🔄를 클릭하여 검색하세요."
   camera_n: "카메라 %{index}"

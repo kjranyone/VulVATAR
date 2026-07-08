@@ -680,6 +680,11 @@ pub struct GuiApp {
 
     pub camera_index: usize,
     pub available_cameras: Vec<crate::tracking::CameraInfo>,
+    /// Use the RealSense D435 depth camera as the tracking source instead
+    /// of a webcam (the metric-depth path). Only honoured when the
+    /// `realsense` feature is built; the webcam `camera_index` is unused
+    /// while this is set.
+    pub use_realsense: bool,
 
     // Viewport-pane state: rendered-scene texture handle, the
     // Blender-style drag-grab state, and the camera-wipe PIP toggle +
@@ -862,6 +867,7 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
+            use_realsense: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
@@ -1094,6 +1100,7 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: Vec::new(),
+            use_realsense: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()

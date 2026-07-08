@@ -124,6 +124,7 @@ calibration:
 tracking:
   enabled: "启用追踪"
   input_device: "输入设备"
+  backend_realsense: "使用 RealSense D435 (深度)"
   camera: "摄像头"
   no_cameras: "未检测到摄像头。点击 🔄 扫描。"
   camera_n: "摄像头 %{index}"

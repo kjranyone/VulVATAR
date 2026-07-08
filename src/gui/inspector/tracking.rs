@@ -5,6 +5,28 @@ use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
 
+/// The camera backend the current input-device selection maps to:
+/// RealSense (when the feature is built and the toggle is on) takes
+/// precedence, else the chosen webcam device, else Synthetic when no
+/// webcam backend is compiled in.
+fn selected_camera_backend(state: &GuiApp) -> crate::tracking::CameraBackend {
+    #[cfg(feature = "realsense")]
+    if state.use_realsense {
+        return crate::tracking::CameraBackend::RealSense;
+    }
+    #[cfg(feature = "webcam")]
+    {
+        crate::tracking::CameraBackend::Webcam {
+            camera_index: state.camera_index,
+        }
+    }
+    #[cfg(not(feature = "webcam"))]
+    {
+        let _ = state;
+        crate::tracking::CameraBackend::Synthetic
+    }
+}
+
 pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     if ui
         .checkbox(&mut state.tracking.toggle_tracking, t!("tracking.enabled"))
@@ -59,6 +81,19 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("tracking.input_device"))
         .default_open(true)
         .show(ui, |ui| {
+            #[cfg(feature = "realsense")]
+            {
+                // Depth-camera source. While set, the webcam device combo
+                // below is unused — the D435 self-selects the first D400
+                // device and supplies its own aligned metric depth.
+                if ui
+                    .checkbox(&mut state.use_realsense, t!("tracking.backend_realsense"))
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+                ui.add_space(4.0);
+            }
             // Captured before the device combo so a mid-session device switch
             // triggers the same auto-restart as a resolution / FPS change.
             let prev_camera = state.camera_index;
@@ -137,12 +172,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     } else {
                         (w, h, fps)
                     };
-                    #[cfg(feature = "webcam")]
-                    let backend = crate::tracking::CameraBackend::Webcam {
-                        camera_index: state.camera_index,
-                    };
-                    #[cfg(not(feature = "webcam"))]
-                    let backend = crate::tracking::CameraBackend::Synthetic;
+                    let backend = selected_camera_backend(state);
                     let pipeline = state.tracking.pipeline_config();
                     state
                         .app
@@ -212,12 +242,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 } else {
                     (w, h, fps)
                 };
-                #[cfg(feature = "webcam")]
-                let backend = crate::tracking::CameraBackend::Webcam {
-                    camera_index: state.camera_index,
-                };
-                #[cfg(not(feature = "webcam"))]
-                let backend = crate::tracking::CameraBackend::Synthetic;
+                let backend = selected_camera_backend(state);
                 let pipeline = state.tracking.pipeline_config();
                 state
                     .app
