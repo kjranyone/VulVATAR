@@ -125,6 +125,8 @@ tracking:
   enabled: "トラッキング有効"
   input_device: "入力デバイス"
   backend_realsense: "RealSense D435 を使用 (深度)"
+  backend_realsense_hint: "実測深度 — 腕・手の前後3Dが正確。"
+  webcam_no_depth: "webカメラ: 2Dのみ・深度なし。腕/手の前後は追跡されません。"
   camera: "カメラ"
   no_cameras: "カメラが検出されません。🔄をクリックしてスキャン。"
   camera_n: "カメラ %{index}"

@@ -125,6 +125,8 @@ tracking:
   enabled: "추적 활성화"
   input_device: "입력 장치"
   backend_realsense: "RealSense D435 사용 (깊이)"
+  backend_realsense_hint: "실측 깊이 — 팔·손의 앞뒤 3D가 정확합니다."
+  webcam_no_depth: "웹캠: 2D 전용 — 깊이 없음. 팔/손의 앞뒤는 추적되지 않습니다."
   camera: "카메라"
   no_cameras: "카메라가 감지되지 않았습니다. 🔄를 클릭하여 검색하세요."
   camera_n: "카메라 %{index}"

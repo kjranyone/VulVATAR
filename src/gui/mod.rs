@@ -867,7 +867,7 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
-            use_realsense: false,
+            use_realsense: cfg!(feature = "realsense"),
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
@@ -1100,7 +1100,7 @@ impl GuiApp {
 
             camera_index: 0,
             available_cameras: Vec::new(),
-            use_realsense: false,
+            use_realsense: cfg!(feature = "realsense"),
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()

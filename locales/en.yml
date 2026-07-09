@@ -125,6 +125,8 @@ tracking:
   enabled: "Tracking Enabled"
   input_device: "Input Device"
   backend_realsense: "Use RealSense D435 (depth)"
+  backend_realsense_hint: "Metric depth — accurate forward/back 3D for arms & hands."
+  webcam_no_depth: "Webcam: 2D only — no depth. Arm/hand forward-back isn't tracked."
   camera: "Camera"
   no_cameras: "No cameras detected. Click 🔄 to scan."
   camera_n: "Camera %{index}"

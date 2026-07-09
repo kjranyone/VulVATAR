@@ -83,14 +83,25 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         .show(ui, |ui| {
             #[cfg(feature = "realsense")]
             {
-                // Depth-camera source. While set, the webcam device combo
-                // below is unused — the D435 self-selects the first D400
-                // device and supplies its own aligned metric depth.
+                // Depth-camera source (recommended). When set, the webcam
+                // device combo below is unused — the D435 self-selects the
+                // first D400 device and supplies its own aligned metric
+                // depth. When cleared, tracking falls back to a webcam,
+                // which has no measured depth (2D only).
                 if ui
                     .checkbox(&mut state.use_realsense, t!("tracking.backend_realsense"))
                     .changed()
                 {
                     state.project_status.project_dirty = true;
+                }
+                if state.use_realsense {
+                    ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
+                } else {
+                    ui.label(
+                        egui::RichText::new(t!("tracking.webcam_no_depth"))
+                            .small()
+                            .color(ui.visuals().warn_fg_color),
+                    );
                 }
                 ui.add_space(4.0);
             }

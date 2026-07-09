@@ -133,25 +133,6 @@ function Install-Models {
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
 }
 
-function Install-DepthAnythingSmall {
-    # Depth Anything V2 Small (DPT + DINOv2-S backbone, ~99 MB fp32).
-    # Apache 2.0 licensed. Used by the rtmw3d-with-depth provider as
-    # the relative-depth source — RTMW3D supplies fast 2D landmarks +
-    # face cascade, this fills in measured per-pixel depth which the
-    # provider then calibrates to approximate metric via the body
-    # anchor (shoulder span ≈ 0.40 m). Designed for 30 fps streaming
-    # where MoGe-2's true-metric pass at ~200 ms is too heavy.
-    Write-Host "Setting up Depth Anything V2 Small ONNX..." -ForegroundColor Cyan
-    if (!(Test-Path "models")) {
-        New-Item -ItemType Directory -Force -Path "models" | Out-Null
-    }
-
-    Install-DirectFiles -Name "Depth Anything V2 Small (relative depth)" -Files @(
-        @{ Url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx";
-           OutName = "dav2_small.onnx" }
-    )
-}
-
 # Download a `.zip` archive, extract to a temp dir, copy ONNX files
 # matching `KeepGlobs` into `models\`, optionally renaming via
 # `RenameMap`, and remove the temp dir. Used for OpenMMLab mmdeploy
@@ -752,12 +733,12 @@ function Start-DepthCapture {
 }
 
 $commands = @(
-    @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-DepthAnythingSmall; Install-Font" },
+    @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-Font" },
     @{ Label = "build (debug)";    Cmd = "cargo build" },
     @{ Label = "build (release)";  Cmd = "cargo build --release" },
-    @{ Label = "run (debug)";      Cmd = 'Install-Models; Install-DepthAnythingSmall; $env:RUST_LOG="vulvatar=info"; cargo run' },
-    @{ Label = "run (debug+lipsync)"; Cmd = 'Install-Models; Install-DepthAnythingSmall; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
-    @{ Label = "run (release)";    Cmd = "Install-Models; Install-DepthAnythingSmall; cargo run --release" },
+    @{ Label = "run (debug)";      Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run' },
+    @{ Label = "run (debug+lipsync)"; Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
+    @{ Label = "run (release)";    Cmd = "Install-Models; cargo run --release" },
     @{ Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
     @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
     @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },

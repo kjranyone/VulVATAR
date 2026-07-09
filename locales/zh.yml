@@ -125,6 +125,8 @@ tracking:
   enabled: "启用追踪"
   input_device: "输入设备"
   backend_realsense: "使用 RealSense D435 (深度)"
+  backend_realsense_hint: "实测深度 — 手臂和手部的前后3D准确。"
+  webcam_no_depth: "网络摄像头：仅2D — 无深度。手臂/手部的前后不被追踪。"
   camera: "摄像头"
   no_cameras: "未检测到摄像头。点击 🔄 扫描。"
   camera_n: "摄像头 %{index}"

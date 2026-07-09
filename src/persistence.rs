@@ -175,6 +175,14 @@ fn default_true() -> bool {
     true
 }
 
+/// On-disk default for `use_realsense`: RealSense is the default tracking
+/// source when the depth-camera feature is built (metric depth is the
+/// accurate path); otherwise a webcam. Projects predating the field adopt
+/// this so a depth-camera build defaults to the D435.
+fn default_use_realsense() -> bool {
+    cfg!(feature = "realsense")
+}
+
 /// Convert the in-memory pose calibration to its on-disk DTO form.
 /// Round-trips through `pose_calibration_from_dto`. Returns `None` when
 /// the in-memory struct represents "no capture yet" so saved projects
@@ -301,7 +309,7 @@ pub struct TrackingConfig {
     pub yolox_enabled: bool,
     #[serde(default)]
     pub camera_index: usize,
-    #[serde(default)]
+    #[serde(default = "default_use_realsense")]
     pub use_realsense: bool,
     #[serde(default)]
     pub show_camera_wipe: bool,
