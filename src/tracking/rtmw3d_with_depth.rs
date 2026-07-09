@@ -53,15 +53,6 @@ pub struct Rtmw3dWithDepthProvider {
     /// [`super::skeleton_from_depth::build_options_from_calibration`]
     /// for the full contract). `None` whenever the modal is closed.
     calibration_mode_hint: Option<crate::tracking::CalibrationMode>,
-    /// Ray-IK state for the POST-MERGE arm re-solve (migration step 3,
-    /// first slice): after the Phase 7.5–7.6 metric injections the
-    /// skeleton carries DAv2 `metric_depth_m` samples, and re-running
-    /// the arm solve there fuses them as depth evidence and restores
-    /// the hands-contact coherence link that the metric chain
-    /// replacement severs. Separate state from the inner RTMW3D
-    /// pass's own solve (different input distribution).
-    #[cfg(feature = "inference")]
-    arm_ray_ik_post: crate::tracking::rtmw3d::arm_ray_ik::ArmRayIk,
     /// Last-valid metric forearm vector (source units, elbow→wrist)
     /// per side, with its age in frames. DAv2 refreshes every 2–4
     /// frames; on the STALE frames in between, the depth builder
@@ -133,7 +124,6 @@ impl Rtmw3dWithDepthProvider {
             load_warnings: warnings,
             pose_calibration: None,
             calibration_mode_hint: None,
-            arm_ray_ik_post: Default::default(),
             metric_forearm_hold: [None, None],
             torso_capture: None,
             #[cfg(feature = "realsense")]
@@ -206,7 +196,6 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
     fn reset_temporal_state(&mut self) {
         #[cfg(feature = "inference")]
         {
-            self.arm_ray_ik_post.reset();
             self.metric_forearm_hold = [None, None];
             self.rtmw3d.reset_temporal_state();
         }
