@@ -104,6 +104,51 @@ pub struct HandOrientation {
     pub confidence: f32,
 }
 
+/// Pinhole camera intrinsics captured from the depth sensor. Plain fields
+/// (a copy of the realsense `CamIntrinsics`) so this avatar-agnostic module
+/// stays free of backend-specific types. Consumed by the 1:1 sensor-matched
+/// render to reproduce the exact projection the physical camera saw.
+#[derive(Clone, Copy, Debug)]
+pub struct CameraIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Present on a [`SourceSkeleton`] iff it was built from a true metric-depth
+/// backend (RealSense D435). Its presence is THE signal that downstream
+/// consumers (solver orientation/root, sensor-matched render) should treat
+/// the joint positions as faithful camera-space 3D rather than monocular
+/// heuristics: `metric_frame_info.is_some()` == "3D-native / metric path".
+///
+/// It carries the pieces the metric path needs beyond the joint positions:
+/// the raw camera-space anchor (for 1:1 metric root placement), whether it
+/// came from the hip or shoulder pair, the metres-per-source-unit scale used
+/// to normalise the positions into the source frame, and the camera
+/// intrinsics (for the mirror render).
+#[derive(Clone, Copy, Debug)]
+pub struct MetricFrameInfo {
+    /// Anchor origin in RAW camera metres (x-right, y-down, z-forward) —
+    /// i.e. the torso-fit anchor (`TorsoFit.anchor_cam`) before the
+    /// source-frame axis flip.
+    pub anchor_cam_m: [f32; 3],
+    /// `true` when the anchor came from the hip pair, `false` for shoulders.
+    pub anchor_is_hip: bool,
+    /// Metres per source unit used to normalise `SourceJoint.position` into
+    /// the source frame. `source_units = metres / mpsu`.
+    pub mpsu: f32,
+    /// The subject's real shoulder span in metres used as the normalisation
+    /// reference (calibration, else this frame's measured span, else an
+    /// anatomical mean). The solver derives the metres→avatar-unit scale for
+    /// 1:1 root placement from this: `avatar_rest_shoulder_span / reference_span_m`.
+    pub reference_span_m: f32,
+    /// Colour-image pinhole intrinsics for the frame this skeleton came from.
+    pub intrinsics: CameraIntrinsics,
+}
+
 /// One tracker sample.
 ///
 /// Body joints are sparse: only the humanoid bones for which the detector
@@ -173,6 +218,12 @@ pub struct SourceSkeleton {
     /// shouldn't drive translation off a shoulder-anchor frame and
     /// vice-versa).
     pub root_anchor_is_hip: bool,
+    /// `Some` iff this skeleton was built from a true metric-depth backend
+    /// (RealSense D435). See [`MetricFrameInfo`] — its presence is the single
+    /// signal that switches the solver and render onto the metric-3D-direct
+    /// path (faithful camera-space projection) instead of the monocular
+    /// heuristics kept for the 2D webcam fallback. `None` for 2D providers.
+    pub metric_frame_info: Option<MetricFrameInfo>,
 }
 
 impl SourceSkeleton {
@@ -189,6 +240,7 @@ impl SourceSkeleton {
             overall_confidence: 0.0,
             root_offset: None,
             root_anchor_is_hip: false,
+            metric_frame_info: None,
         }
     }
 
