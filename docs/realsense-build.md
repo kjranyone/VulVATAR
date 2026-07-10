@@ -61,5 +61,10 @@ cargo run --bin diagnose_realsense --features realsense
 - `diagnose_realsense` is a feature-gated smoke test that only proves the
   native toolchain (link + device enumeration), not streaming.
 
-TODO: fold these env vars into a `dev.ps1` menu entry so the feature
-builds without manual setup.
+`dev.ps1` wires these three env vars up automatically: use the
+**`build (realsense)`** / **`run (realsense)`** menu entries (helper
+`Invoke-CargoRealsense`). `PKG_CONFIG_PATH` resolves to the repo's
+`build-support\pkgconfig`; the SDK root defaults to
+`%USERPROFILE%\Documents\RealSense SDK 2.0` and LLVM to
+`%ProgramFiles%\LLVM\bin`, both overridable via
+`$env:VULVATAR_REALSENSE_SDK` / `$env:LIBCLANG_PATH`.

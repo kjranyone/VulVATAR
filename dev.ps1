@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+#region Asset & model downloads
 function Install-Font {
     # Load JP / KR / SC subsets so the egui font fallback chain covers
     # Hangul (only in KR) and SC-specific glyph forms in addition to
@@ -286,6 +287,9 @@ function Install-DirectFiles {
     }
 }
 
+#endregion
+
+#region MediaFoundation virtual camera
 function Test-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -293,25 +297,10 @@ function Test-Admin {
 }
 
 function Build-MfCameraDll {
+    # Static CRT (see Invoke-CargoStaticCrt) so svchost can load the DLL in
+    # Session 0 with no VC runtime dependency in its walk.
     Write-Host "Building MediaFoundation virtual camera DLL..." -ForegroundColor Cyan
-    $oldRustFlags = $env:RUSTFLAGS
-    try {
-        if ([string]::IsNullOrWhiteSpace($oldRustFlags)) {
-            $env:RUSTFLAGS = "-C target-feature=+crt-static"
-        } elseif ($oldRustFlags -notmatch "crt-static") {
-            $env:RUSTFLAGS = "$oldRustFlags -C target-feature=+crt-static"
-        }
-        cargo build -p vulvatar-mf-camera
-        if ($LASTEXITCODE -ne 0) {
-            throw "cargo build -p vulvatar-mf-camera failed (exit $LASTEXITCODE)"
-        }
-    } finally {
-        if ($null -eq $oldRustFlags) {
-            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
-        } else {
-            $env:RUSTFLAGS = $oldRustFlags
-        }
-    }
+    Invoke-CargoStaticCrt -CargoArgs @('build', '-p', 'vulvatar-mf-camera')
 }
 
 # Split from Install-MfCameraSystem so the HKLM/icacls/FrameServer work
@@ -479,6 +468,9 @@ function Uninstall-MfCamera {
     # clean up.
 }
 
+#endregion
+
+#region Code signing
 # Locate signtool.exe. Prefer PATH; fall back to the latest x64 build
 # under the Windows 10 SDK install. Returns the absolute path or throws.
 function Find-SignTool {
@@ -596,6 +588,9 @@ function Invoke-SignTool {
     }
 }
 
+#endregion
+
+#region Build & packaging
 # Verify the asset/model files installer\vulvatar.iss copies into the
 # install image are present. cargo handles the binaries; the asset
 # pipeline (fonts + ONNX) is a manual `setup` step the developer has
@@ -619,28 +614,89 @@ function Test-DistributionPrereqs {
     }
 }
 
-# Run cargo with $env:RUSTFLAGS extended to include +crt-static, then
-# restore RUSTFLAGS. Used for the camera DLL so it has no VC runtime
-# dependency when FrameServer's svchost loads it.
+# Run a script block with the given $env vars temporarily set, restoring
+# each to its prior value — or removing it if it was previously unset — on
+# exit, so a toolchain-specific build env never leaks into the caller's
+# shell. Shared by the crt-static and realsense cargo wrappers below.
+function Invoke-WithEnv {
+    param(
+        [Parameter(Mandatory)] [hashtable]$Vars,
+        [Parameter(Mandatory)] [scriptblock]$Script
+    )
+    $saved = @{}
+    foreach ($k in $Vars.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+    try {
+        foreach ($k in $Vars.Keys) { Set-Item "Env:$k" -Value $Vars[$k] }
+        & $Script
+    } finally {
+        foreach ($k in $saved.Keys) {
+            if ($null -eq $saved[$k]) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+            else { Set-Item "Env:$k" -Value $saved[$k] }
+        }
+    }
+}
+
+# Run cargo with +crt-static appended to RUSTFLAGS. Used for the camera
+# DLL so it carries no VC runtime dependency when FrameServer's svchost
+# loads it in Session 0.
 function Invoke-CargoStaticCrt {
     param([Parameter(Mandatory)] [string[]]$CargoArgs)
 
-    $oldRustFlags = $env:RUSTFLAGS
-    try {
-        if ([string]::IsNullOrWhiteSpace($oldRustFlags)) {
-            $env:RUSTFLAGS = "-C target-feature=+crt-static"
-        } elseif ($oldRustFlags -notmatch "crt-static") {
-            $env:RUSTFLAGS = "$oldRustFlags -C target-feature=+crt-static"
-        }
+    $flags = if ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+        "-C target-feature=+crt-static"
+    } elseif ($env:RUSTFLAGS -notmatch "crt-static") {
+        "$env:RUSTFLAGS -C target-feature=+crt-static"
+    } else {
+        $env:RUSTFLAGS
+    }
+    Invoke-WithEnv -Vars @{ RUSTFLAGS = $flags } -Script {
         & cargo @CargoArgs
         if ($LASTEXITCODE -ne 0) {
             throw "cargo $($CargoArgs -join ' ') failed (exit $LASTEXITCODE)"
         }
-    } finally {
-        if ($null -eq $oldRustFlags) {
-            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
-        } else {
-            $env:RUSTFLAGS = $oldRustFlags
+    }
+}
+
+# Run cargo with the `realsense` feature appended, wiring up the three
+# env vars realsense-sys needs on Windows (see docs/realsense-build.md):
+#   * PKG_CONFIG_PATH → our hand-written build-support\pkgconfig\realsense2.pc
+#   * LIBCLANG_PATH   → libclang for buildtime-bindgen
+#   * PATH            → WinGet pkg-config + the SDK's bin\x64 (realsense2.dll)
+# Paths default to the documented install locations and are overridable
+# with $env:VULVATAR_REALSENSE_SDK (SDK root) and $env:LIBCLANG_PATH.
+function Invoke-CargoRealsense {
+    param([Parameter(Mandatory)] [string[]]$CargoArgs)
+
+    $pkgConfig   = Join-Path (Get-Location).Path "build-support\pkgconfig"
+    $sdkRoot     = if ($env:VULVATAR_REALSENSE_SDK) { $env:VULVATAR_REALSENSE_SDK }
+                   else { Join-Path $env:USERPROFILE "Documents\RealSense SDK 2.0" }
+    $sdkBin      = Join-Path $sdkRoot "bin\x64"
+    $llvmBin     = if ($env:LIBCLANG_PATH) { $env:LIBCLANG_PATH }
+                   else { Join-Path $env:ProgramFiles "LLVM\bin" }
+    $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
+
+    if (-not (Test-Path (Join-Path $pkgConfig "realsense2.pc"))) {
+        throw "build-support\pkgconfig\realsense2.pc missing — see docs/realsense-build.md."
+    }
+    if (-not (Test-Path $llvmBin)) {
+        throw "libclang not found at '$llvmBin'. Install LLVM (winget install LLVM.LLVM) or set `$env:LIBCLANG_PATH. See docs/realsense-build.md."
+    }
+    if (-not (Test-Path $sdkBin)) {
+        throw "RealSense SDK not found at '$sdkBin'. Install it or set `$env:VULVATAR_REALSENSE_SDK to its root. See docs/realsense-build.md."
+    }
+    if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue) -and
+        -not (Test-Path (Join-Path $wingetLinks "pkg-config.exe"))) {
+        throw "pkg-config not found (winget install bloodrock.pkg-config-lite). See docs/realsense-build.md."
+    }
+
+    Invoke-WithEnv -Vars @{
+        PKG_CONFIG_PATH = $pkgConfig
+        LIBCLANG_PATH   = $llvmBin
+        PATH            = "$wingetLinks;$sdkBin;$($env:PATH)"
+    } -Script {
+        & cargo @CargoArgs --features realsense
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo $($CargoArgs -join ' ') --features realsense failed (exit $LASTEXITCODE)"
         }
     }
 }
@@ -705,6 +761,9 @@ function Build-Distribution {
     }
 }
 
+#endregion
+
+#region Depth capture
 # Launch the RealSense D435 depth-capture / calibration utility
 # (scripts/depth_capture.py) via uv: live RGB|depth preview, labelled
 # `.db3` recording into diagnostics/depth/ for the depth-camera pose
@@ -732,36 +791,53 @@ function Start-DepthCapture {
     }
 }
 
+#endregion
+
+#region Dev menu
 $commands = @(
-    @{ Label = "setup (download pose models + CJK font)"; Cmd = "Install-Models; Install-Font" },
-    @{ Label = "build (debug)";    Cmd = "cargo build" },
-    @{ Label = "build (release)";  Cmd = "cargo build --release" },
-    @{ Label = "run (debug)";      Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run' },
-    @{ Label = "run (debug+lipsync)"; Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
-    @{ Label = "run (release)";    Cmd = "Install-Models; cargo run --release" },
-    @{ Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
-    @{ Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
-    @{ Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
-    @{ Label = "package installer (unsigned)";        Cmd = "Build-Distribution" },
-    @{ Label = "package installer (signed, USB token)"; Cmd = "Build-Distribution -Sign" },
-    @{ Label = "test";             Cmd = "cargo test" },
-    @{ Label = "clippy";           Cmd = "cargo clippy" },
-    @{ Label = "fmt";              Cmd = "cargo fmt" },
-    @{ Label = "fmt check";        Cmd = "cargo fmt -- --check" },
-    @{ Label = "check";            Cmd = "cargo check" },
-    @{ Label = "clean";            Cmd = "cargo clean" },
-    @{ Label = "doc";              Cmd = "cargo doc --open" },
-    @{ Label = "update";           Cmd = "cargo update" },
-    @{ Label = "tree";             Cmd = "cargo tree" }
+    @{ Group = "Setup";          Label = "setup (download pose models + CJK fonts)"; Cmd = "Install-Models; Install-Font" },
+
+    @{ Group = "Build & run (webcam)"; Label = "build (debug)";       Cmd = "cargo build" },
+    @{ Group = "Build & run (webcam)"; Label = "build (release)";     Cmd = "cargo build --release" },
+    @{ Group = "Build & run (webcam)"; Label = "run (debug)";         Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run' },
+    @{ Group = "Build & run (webcam)"; Label = "run (debug+lipsync)"; Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
+    @{ Group = "Build & run (webcam)"; Label = "run (release)";       Cmd = "Install-Models; cargo run --release" },
+
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (realsense)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('build')" },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (realsense)";   Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
+
+    @{ Group = "Camera & depth"; Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
+    @{ Group = "Camera & depth"; Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
+    @{ Group = "Camera & depth"; Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },
+
+    @{ Group = "Packaging"; Label = "package installer (unsigned)";        Cmd = "Build-Distribution" },
+    @{ Group = "Packaging"; Label = "package installer (signed, USB token)"; Cmd = "Build-Distribution -Sign" },
+
+    @{ Group = "Cargo utilities"; Label = "test";      Cmd = "cargo test" },
+    @{ Group = "Cargo utilities"; Label = "clippy";    Cmd = "cargo clippy" },
+    @{ Group = "Cargo utilities"; Label = "fmt";       Cmd = "cargo fmt" },
+    @{ Group = "Cargo utilities"; Label = "fmt check"; Cmd = "cargo fmt -- --check" },
+    @{ Group = "Cargo utilities"; Label = "check";     Cmd = "cargo check" },
+    @{ Group = "Cargo utilities"; Label = "clean";     Cmd = "cargo clean" },
+    @{ Group = "Cargo utilities"; Label = "doc";       Cmd = "cargo doc --open" },
+    @{ Group = "Cargo utilities"; Label = "update";    Cmd = "cargo update" },
+    @{ Group = "Cargo utilities"; Label = "tree";      Cmd = "cargo tree" }
 )
 
 function Show-Menu {
     Write-Host ""
     Write-Host "=== VulVATAR dev menu ===" -ForegroundColor Cyan
+    $lastGroup = $null
     for ($i = 0; $i -lt $commands.Count; $i++) {
-        Write-Host ("  {0,2}. {1}" -f ($i + 1), $commands[$i].Label)
+        if ($commands[$i].Group -ne $lastGroup) {
+            $lastGroup = $commands[$i].Group
+            Write-Host ""
+            Write-Host "  $lastGroup" -ForegroundColor DarkCyan
+        }
+        Write-Host ("   {0,2}. {1}" -f ($i + 1), $commands[$i].Label)
     }
-    Write-Host "   0. exit"
+    Write-Host ""
+    Write-Host "    0. exit"
     Write-Host ""
 }
 
@@ -799,14 +875,16 @@ if ($MyInvocation.InvocationName -eq '.') {
 
 while ($true) {
     Show-Menu
-    $input = Read-Host "Select"
+    # NB: not $input — that is a PowerShell automatic variable (the pipeline
+    # enumerator); shadowing it here is a well-known footgun.
+    $selection = Read-Host "Select"
 
-    if ($input -eq "0" -or $input -eq "q") {
+    if ($selection -eq "0" -or $selection -eq "q") {
         break
     }
 
     $idx = 0
-    if ([int]::TryParse($input, [ref]$idx) -and $idx -ge 1 -and $idx -le $commands.Count) {
+    if ([int]::TryParse($selection, [ref]$idx) -and $idx -ge 1 -and $idx -le $commands.Count) {
         Invoke-DevCommand -Index $idx
         Write-Host ""
         Write-Host "Done. Press any key to continue..." -ForegroundColor DarkGray
@@ -815,3 +893,5 @@ while ($true) {
         Write-Host "Invalid selection." -ForegroundColor Red
     }
 }
+
+#endregion
