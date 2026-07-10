@@ -18,6 +18,9 @@ use crate::renderer::{frame_input, output_export, RenderResult, RenderStats, Vul
 pub(super) struct PendingReadbackState {
     pub(super) wait_fn: Box<dyn FnOnce() -> Result<(), String> + Send>,
     pub(super) readback_buffer: Subbuffer<[u8]>,
+    /// Host buffer holding the frame's depth aspect (D32_SFLOAT NDC) when the
+    /// caller enabled depth readback; `None` on the live path.
+    pub(super) depth_buffer: Option<Subbuffer<[u8]>>,
     pub(super) extent: [u32; 2],
     pub(super) timestamp_nanos: u64,
     pub(super) stats: RenderStats,
@@ -50,6 +53,25 @@ impl VulkanRenderer {
             .map_err(|e| format!("render: readback buffer read failed: {e}"))?
             .to_vec();
 
+        // Depth aspect (D32_SFLOAT NDC), when the caller enabled depth readback.
+        // The buffer is oversized to the D32S8 block (see `render`); the depth
+        // occupies the leading `w*h` f32s, tightly packed — take exactly those.
+        let depth_ndc = match pending.depth_buffer {
+            Some(ref buf) => {
+                let bytes = buf
+                    .read()
+                    .map_err(|e| format!("render: depth readback buffer read failed: {e}"))?;
+                let count = (pending.extent[0] as usize) * (pending.extent[1] as usize);
+                let floats: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .take(count)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                Some(floats)
+            }
+            None => None,
+        };
+
         let exported_frame = output_export::ExportedFrame {
             pixel_data: output_export::ExportedPixelData::CpuReadback(Arc::new(pixel_data)),
             extent: pending.extent,
@@ -74,6 +96,7 @@ impl VulkanRenderer {
             has_alpha: true,
             stats: pending.stats,
             exported_frame: Some(exported_frame),
+            depth_ndc,
         }))
     }
 

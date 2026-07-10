@@ -198,7 +198,10 @@ fn process_one(
     let img = image::open(image_path).map_err(|e| format!("open: {e}"))?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
-    let est = provider.estimate_pose(rgb.as_raw(), w, h, frame_index);
+    let mut est = provider.estimate_pose(rgb.as_raw(), w, h, frame_index);
+    // Image-only bench: stamp the metric flag so the solver takes the shipping
+    // metric path (D435-exclusive) rather than the None fallback.
+    est.skeleton.stamp_synthetic_metric_frame();
 
     // 2. Build avatar + solve pose (restored — we verified rest-pose
     // renders clean, so the breakage must come in via the solver).

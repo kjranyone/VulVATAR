@@ -57,6 +57,7 @@ pub struct FrameCrop {
 /// them. Per-pixel metric Z is `points_m[i][2]` — no separate depth
 /// map is kept since the only current consumer samples the full xyz,
 /// not depth alone.
+#[derive(Clone)]
 pub struct MetricDepthFrame {
     pub width: u32,
     pub height: u32,

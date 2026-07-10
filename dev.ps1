@@ -797,14 +797,14 @@ function Start-DepthCapture {
 $commands = @(
     @{ Group = "Setup";          Label = "setup (download pose models + CJK fonts)"; Cmd = "Install-Models; Install-Font" },
 
-    @{ Group = "Build & run (webcam)"; Label = "build (debug)";       Cmd = "cargo build" },
-    @{ Group = "Build & run (webcam)"; Label = "build (release)";     Cmd = "cargo build --release" },
-    @{ Group = "Build & run (webcam)"; Label = "run (debug)";         Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run' },
-    @{ Group = "Build & run (webcam)"; Label = "run (debug+lipsync)"; Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; cargo run --features lipsync' },
-    @{ Group = "Build & run (webcam)"; Label = "run (release)";       Cmd = "Install-Models; cargo run --release" },
-
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (realsense)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('build')" },
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (realsense)";   Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
+    # D435-exclusive build: `realsense` ships in default features and its
+    # build.rs needs the pkg-config + LIBCLANG env, so every build/run goes
+    # through Invoke-CargoRealsense (sets the env, appends --features realsense).
+    # There is no webcam path — no camera means the tracker idles.
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (debug)";   Cmd = "Invoke-CargoRealsense -CargoArgs @('build')" },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (release)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('build','--release')" },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
 
     @{ Group = "Camera & depth"; Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
     @{ Group = "Camera & depth"; Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },

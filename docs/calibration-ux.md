@@ -48,7 +48,7 @@ Picking a mode opens a fullscreen-modal egui `Window` that suspends the normal v
 └───────────────────────────────────────────────────────────┘
 ```
 
-The webcam preview is the same `RenderAnnotations` overlay the camera-wipe already produces; we re-route it to a larger ImageWidget when the modal is open.
+The camera preview is the same `RenderAnnotations` overlay the camera-wipe already produces; we re-route it to a larger ImageWidget when the modal is open.
 
 ### Capture sequence
 

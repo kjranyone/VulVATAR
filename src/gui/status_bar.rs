@@ -34,12 +34,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 let tracking_active = state.is_tracking_active();
                 let tracking_enabled = state.tracking.toggle_tracking;
                 let (dot_color, txt) = if tracking_active {
-                    let backend_label = state
-                        .app
-                        .tracking_worker
-                        .as_ref()
-                        .map(|w| w.active_backend().label())
-                        .unwrap_or("Unknown");
+                    let backend_label = crate::tracking::CAPTURE_BACKEND_LABEL;
                     if tracking_enabled {
                         (
                             color::SUCCESS,

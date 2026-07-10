@@ -287,7 +287,11 @@ fn main() -> Result<(), String> {
         // during this call leaves "f{i} estimate_pose ENTER" as the
         // durable last line — the frame that killed the machine.
         forensic_mark(&mut forensic, &format!("f{i} estimate_pose ENTER"));
-        let est = provider.estimate_pose(img.as_raw(), w, h, i as u64);
+        let mut est = provider.estimate_pose(img.as_raw(), w, h, i as u64);
+        // Image-only bench: stamp the metric flag so `run_frame`'s solver takes
+        // the shipping metric path (D435-exclusive) rather than the None
+        // fallback.
+        est.skeleton.stamp_synthetic_metric_frame();
         let sk = est.skeleton.clone();
         forensic_mark(
             &mut forensic,

@@ -244,6 +244,57 @@ impl SourceSkeleton {
         }
     }
 
+    /// Bench/test helper — stamp a synthetic [`MetricFrameInfo`] so this
+    /// skeleton drives the solver's metric path.
+    ///
+    /// Since the D435-exclusive rebuild, [`crate::avatar::pose_solver::solve_avatar_pose`]
+    /// reads `metric_frame_info` only for the root-translation scale
+    /// (`avatar_span / reference_span_m`); every other solver behaviour is
+    /// identical with or without it. Image-only benches have no depth to feed
+    /// through `set_external_depth`, so this lets them exercise the same
+    /// `Some(..)` path the shipping D435 pipeline takes rather than the `None`
+    /// 1:1 fallback. `reference_span_m` is the skeleton's own measured L/R
+    /// `UpperArm` span so the scale lands as it would on a real metric frame;
+    /// the anchor / intrinsics fields the solver never reads carry
+    /// placeholders. Not for production use — the real path sets this in
+    /// `skeleton_from_depth`.
+    pub fn stamp_synthetic_metric_frame(&mut self) {
+        // Mirrors `skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN` (the source
+        // normalisation target) when the shoulders are absent.
+        const FALLBACK_SPAN_M: f32 = 0.75;
+        let reference_span_m = match (
+            self.joints.get(&HumanoidBone::LeftUpperArm),
+            self.joints.get(&HumanoidBone::RightUpperArm),
+        ) {
+            (Some(l), Some(r)) => {
+                let dx = l.position[0] - r.position[0];
+                let dy = l.position[1] - r.position[1];
+                let dz = l.position[2] - r.position[2];
+                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                if d > 0.05 {
+                    d
+                } else {
+                    FALLBACK_SPAN_M
+                }
+            }
+            _ => FALLBACK_SPAN_M,
+        };
+        self.metric_frame_info = Some(MetricFrameInfo {
+            anchor_cam_m: self.root_offset.unwrap_or([0.0, 0.0, 0.0]),
+            anchor_is_hip: self.root_anchor_is_hip,
+            mpsu: 1.0,
+            reference_span_m,
+            intrinsics: CameraIntrinsics {
+                fx: 600.0,
+                fy: 600.0,
+                cx: 320.0,
+                cy: 240.0,
+                width: 640,
+                height: 480,
+            },
+        });
+    }
+
     /// Insert a joint only if its confidence clears `min_conf`.
     pub fn put_joint(&mut self, bone: HumanoidBone, joint: SourceJoint, min_conf: f32) {
         if joint.confidence >= min_conf {

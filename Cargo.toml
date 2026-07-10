@@ -13,8 +13,7 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [features]
-default = ["webcam", "lipsync", "rapier", "inference", "inference-gpu", "virtual-camera"]
-webcam = ["nokhwa"]
+default = ["realsense", "lipsync", "rapier", "inference", "inference-gpu", "virtual-camera"]
 rapier = ["rapier3d"]
 inference = ["ort", "ndarray"]
 # Routes ORT through the DirectML execution provider, falling back to
@@ -25,15 +24,14 @@ inference = ["ort", "ndarray"]
 inference-gpu = ["inference", "ort/directml"]
 virtual-camera = []
 lipsync = ["cpal", "rustfft"]
-# RealSense D435 depth capture (depth-camera rebuild). Off by default so
-# the normal build is unaffected. Pulls in `inference`: the D435 depth is
+# RealSense D435 depth capture — the sole capture backend (D435-exclusive
+# build), shipped in `default`. Pulls in `inference`: the D435 depth is
 # consumed by the RTMW3D provider (MetricDepthFrame / skeleton_from_depth
 # live behind `inference`), so a realsense build is always an inference
-# build. Build/run with `--features realsense`. See docs/realsense-build.md.
+# build. See docs/realsense-build.md.
 realsense = ["dep:realsense-rust", "inference"]
 
 [dependencies]
-nokhwa = { version = "0.10", features = ["input-native"], optional = true }
 # RealSense D435 depth camera (feature = "realsense"). buildtime-bindgen
 # regenerates librealsense2 bindings against the locally-installed SDK
 # (located via pkg-config's realsense2.pc under build-support/pkgconfig);
@@ -115,4 +113,12 @@ required-features = ["realsense"]
 # and the metric branch against a real frame. `realsense` pulls in `inference`.
 [[bin]]
 name = "diagnose_depth_replay"
+required-features = ["realsense"]
+
+# GT round-trip renders an aligned metric depth buffer and feeds it via
+# `set_external_depth` (the shipping D435 skeleton path) so the recovered pose
+# is scored end-to-end through `skeleton_from_depth`, not a monocular fallback.
+# That path is `realsense`-gated, so the bench is too.
+[[bin]]
+name = "validate_gt"
 required-features = ["realsense"]

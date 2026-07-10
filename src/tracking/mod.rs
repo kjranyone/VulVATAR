@@ -1,13 +1,14 @@
-#[cfg(any(feature = "webcam", feature = "realsense"))]
+#[cfg(feature = "realsense")]
 use crate::t;
-use log::{error, info, warn};
+use log::{error, warn};
+// `info!` only fires from the realsense capture loop; gate the import so a
+// no-capture-backend build doesn't warn on it being unused.
+#[cfg(feature = "realsense")]
+use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-#[cfg(feature = "webcam")]
-mod webcam;
 
 #[cfg(feature = "realsense")]
 pub mod realsense;
@@ -23,7 +24,6 @@ pub mod skeleton_from_depth;
 
 pub mod calibration;
 pub mod face_mediapipe;
-pub mod ray_ik;
 pub mod rtmw3d;
 pub mod source_skeleton;
 #[cfg(feature = "inference")]
@@ -288,10 +288,10 @@ mod calibration_apply_tests {
 pub struct TrackingMailbox {
     /// Hot path: worker writes per inference cycle, app reads every
     /// frame from `run_frame`. Keeping this isolated from the heavier
-    /// `WebcamFrame` clone in the preview mailbox is the main reason
+    /// `PreviewFrame` clone in the preview mailbox is the main reason
     /// for the split.
     pose: Arc<Mutex<PoseMailboxInner>>,
-    /// GUI display: webcam frame + detection annotation. Cloned per
+    /// GUI display: camera preview frame + detection annotation. Cloned per
     /// GUI tick. Larger payloads (RGB pixel buffers) so the lock is
     /// occasionally held a little longer, but never while the pose
     /// mutex is also held.
@@ -314,7 +314,7 @@ struct PoseMailboxInner {
 }
 
 struct PreviewMailboxInner {
-    latest_frame: Option<WebcamFrame>,
+    latest_frame: Option<PreviewFrame>,
     latest_annotation: Option<DetectionAnnotation>,
     /// Bumped on every preview write so GUI consumers can dedup
     /// texture uploads on a counter that strictly corresponds to
@@ -398,7 +398,7 @@ fn now_nanos() -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct MailboxSnapshot {
     pub pose: Option<SourceSkeleton>,
-    pub frame: Option<WebcamFrame>,
+    pub frame: Option<PreviewFrame>,
     pub annotation: Option<DetectionAnnotation>,
     pub sequence: u64,
     pub preview_sequence: u64,
@@ -444,7 +444,7 @@ impl Default for TrackingMailbox {
 
 impl TrackingMailbox {
     /// Thread-safe publish (pose-only path used by synthetic / test
-    /// drivers that don't attach a webcam frame).
+    /// drivers that don't attach a preview frame).
     pub fn publish(&self, pose: SourceSkeleton) {
         let mut p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
         p.latest_pose = Some(pose);
@@ -456,7 +456,7 @@ impl TrackingMailbox {
     /// Writes to two mutexes sequentially (pose, then preview) — see the
     /// module-level comment above `TrackingMailbox` for the cross-lock
     /// atomicity trade-off.
-    pub fn publish_estimate(&self, estimate: PoseEstimate, frame: Option<WebcamFrame>) {
+    pub fn publish_estimate(&self, estimate: PoseEstimate, frame: Option<PreviewFrame>) {
         {
             let mut p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
             p.latest_pose = Some(estimate.skeleton);
@@ -646,8 +646,8 @@ impl TrackingMailbox {
         p.latest_pose.clone()
     }
 
-    /// Read the latest webcam frame (downscaled for GUI display).
-    pub fn latest_frame(&self) -> Option<WebcamFrame> {
+    /// Read the latest camera preview frame (downscaled for GUI display).
+    pub fn latest_frame(&self) -> Option<PreviewFrame> {
         let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
         v.latest_frame.clone()
     }
@@ -775,12 +775,12 @@ mod mailbox_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Webcam frame & detection annotation (for GUI PIP wipe display)
+// Camera preview frame & detection annotation (for GUI PIP wipe display)
 // ---------------------------------------------------------------------------
 
-/// A downscaled webcam frame for the GUI camera-preview overlay.
+/// A downscaled camera preview frame for the GUI camera-preview overlay.
 #[derive(Clone, Debug)]
-pub struct WebcamFrame {
+pub struct PreviewFrame {
     pub rgb_data: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -804,64 +804,15 @@ pub struct PoseEstimate {
 }
 
 // ---------------------------------------------------------------------------
-// CameraBackend
+// Capture backend
 // ---------------------------------------------------------------------------
 
-/// Selects the capture backend for the tracking source.
-#[derive(Clone, Debug, Default)]
-pub enum CameraBackend {
-    /// Generate synthetic tracking data (no real camera needed).
-    #[default]
-    Synthetic,
-    /// Capture from a real webcam at the given device index.
-    /// Only available when compiled with the `webcam` cargo feature.
-    #[cfg(feature = "webcam")]
-    Webcam { camera_index: usize },
-    /// Capture color + metric depth from an Intel RealSense D400-series
-    /// (D435) device. The device selects itself (first D400 found), so
-    /// there is no index. Only available with the `realsense` feature.
-    #[cfg(feature = "realsense")]
-    RealSense,
-}
-
-impl CameraBackend {
-    /// Short label for display in the GUI status bar.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Synthetic => "Synthetic",
-            #[cfg(feature = "webcam")]
-            Self::Webcam { .. } => "Webcam",
-            #[cfg(feature = "realsense")]
-            Self::RealSense => "RealSense D435",
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Camera information (available with or without the feature, but only
-// populated when the webcam feature is enabled)
-// ---------------------------------------------------------------------------
-
-/// Describes a camera device discovered on the system.
-#[derive(Clone, Debug)]
-pub struct CameraInfo {
-    pub index: usize,
-    pub name: String,
-}
-
-/// Enumerate available cameras on the system.
-///
-/// Returns an empty list when compiled without the `webcam` feature.
-pub fn list_cameras() -> Vec<CameraInfo> {
-    #[cfg(feature = "webcam")]
-    {
-        webcam::list_cameras_impl()
-    }
-    #[cfg(not(feature = "webcam"))]
-    {
-        Vec::new()
-    }
-}
+/// Display label for the sole capture backend. This is a D435-exclusive
+/// build: the Intel RealSense D435 (color-aligned metric depth) is the only
+/// camera path, so the former "which backend" selector collapsed to a
+/// constant. Shown in the status bar / tracking inspector while capture is
+/// live.
+pub const CAPTURE_BACKEND_LABEL: &str = "RealSense D435";
 
 // ---------------------------------------------------------------------------
 // TrackingSource
@@ -869,14 +820,12 @@ pub fn list_cameras() -> Vec<CameraInfo> {
 
 pub struct TrackingSource {
     mailbox: TrackingMailbox,
-    backend: CameraBackend,
 }
 
 impl TrackingSource {
     pub fn new() -> Self {
         Self {
             mailbox: TrackingMailbox::new(),
-            backend: CameraBackend::default(),
         }
     }
 }
@@ -888,28 +837,6 @@ impl Default for TrackingSource {
 }
 
 impl TrackingSource {
-    /// Create a tracking source with a specific backend.
-    pub fn with_backend(backend: CameraBackend) -> Self {
-        Self {
-            backend,
-            ..Self::new()
-        }
-    }
-
-    /// Switch the active backend. Does not affect any running worker thread;
-    /// stop and restart the worker after calling this.
-    pub fn set_backend(&mut self, backend: CameraBackend) {
-        self.backend = backend;
-    }
-
-    /// Select a webcam by device index. Convenience wrapper around `set_backend`.
-    #[cfg(feature = "webcam")]
-    pub fn select_camera(&mut self, index: usize) {
-        self.set_backend(CameraBackend::Webcam {
-            camera_index: index,
-        });
-    }
-
     pub fn mailbox(&self) -> &TrackingMailbox {
         &self.mailbox
     }
@@ -933,7 +860,6 @@ pub struct TrackingWorker {
     running: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     mailbox: TrackingMailbox,
-    backend: CameraBackend,
 }
 
 impl TrackingWorker {
@@ -946,7 +872,6 @@ impl TrackingWorker {
             running: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
             mailbox,
-            backend: CameraBackend::default(),
         }
     }
 
@@ -964,18 +889,12 @@ impl TrackingWorker {
     /// this constructor an external driver has no sanctioned way to
     /// satisfy that gate short of spawning a real (and here,
     /// redundant) capture thread via `start_with_params`.
-    /// `backend` is reported as `Synthetic` since `worker_loop` (the
-    /// only reader of `backend` besides display labels) is never
-    /// invoked for a handle-less worker — there is no dedicated
-    /// "externally driven" backend variant to keep that match
-    /// exhaustive over a path that can't be reached this way.
     pub fn new_external(mailbox: TrackingMailbox) -> Self {
         Self {
             handle: None,
             running: Arc::new(AtomicBool::new(true)),
             ready: Arc::new(AtomicBool::new(true)),
             mailbox,
-            backend: CameraBackend::Synthetic,
         }
     }
 
@@ -995,18 +914,12 @@ impl TrackingWorker {
         self.ready.load(Ordering::SeqCst)
     }
 
-    /// Returns the backend this worker was started with.
-    pub fn active_backend(&self) -> &CameraBackend {
-        &self.backend
-    }
-
-    /// Spawn the tracking worker thread with the given backend / capture
-    /// parameters. The thread loops at approximately `fps` frames per second,
-    /// capturing frames and publishing poses to the shared mailbox. If a
-    /// worker is already running this is a no-op.
+    /// Spawn the tracking worker thread with the given capture parameters.
+    /// The thread loops at approximately `fps` frames per second, capturing
+    /// frames and publishing poses to the shared mailbox. If a worker is
+    /// already running this is a no-op.
     pub fn start_with_params(
         &mut self,
-        backend: CameraBackend,
         width: u32,
         height: u32,
         fps: u32,
@@ -1016,7 +929,6 @@ impl TrackingWorker {
             return;
         }
 
-        self.backend = backend.clone();
         self.running = Arc::new(AtomicBool::new(true));
         self.ready = Arc::new(AtomicBool::new(false));
         let running = Arc::clone(&self.running);
@@ -1029,7 +941,6 @@ impl TrackingWorker {
             .name("tracking-worker".into())
             .spawn(move || {
                 Self::worker_loop(
-                    backend,
                     mailbox,
                     running,
                     ready,
@@ -1084,7 +995,6 @@ impl TrackingWorker {
 
     #[allow(clippy::too_many_arguments)]
     fn worker_loop(
-        backend: CameraBackend,
         mailbox: TrackingMailbox,
         running: Arc<AtomicBool>,
         ready: Arc<AtomicBool>,
@@ -1094,39 +1004,26 @@ impl TrackingWorker {
         fps: u32,
         pipeline: provider::TrackingPipelineConfig,
     ) {
-        match backend {
-            CameraBackend::Synthetic => {
-                let _ = (width, height, fps, pipeline);
-                ready.store(true, Ordering::SeqCst);
-                Self::run_synthetic(&mailbox, &running, frame_interval);
-            }
-            #[cfg(feature = "webcam")]
-            CameraBackend::Webcam { camera_index } => {
-                Self::run_webcam(
-                    camera_index,
-                    &mailbox,
-                    &running,
-                    &ready,
-                    frame_interval,
-                    width,
-                    height,
-                    fps,
-                    pipeline,
-                );
-            }
-            #[cfg(feature = "realsense")]
-            CameraBackend::RealSense => {
-                Self::run_realsense(
-                    &mailbox,
-                    &running,
-                    &ready,
-                    frame_interval,
-                    width,
-                    height,
-                    fps,
-                    pipeline,
-                );
-            }
+        // D435-exclusive: the RealSense depth camera is the sole capture
+        // backend. When the `realsense` feature is compiled out there is no
+        // camera to drive the pipeline, so the worker reports ready and
+        // exits immediately — the app falls back to the avatar rest pose.
+        #[cfg(feature = "realsense")]
+        Self::run_realsense(
+            &mailbox,
+            &running,
+            &ready,
+            frame_interval,
+            width,
+            height,
+            fps,
+            pipeline,
+        );
+        #[cfg(not(feature = "realsense"))]
+        {
+            let _ = (frame_interval, width, height, fps, pipeline);
+            warn!("tracking-worker: `realsense` feature disabled — no capture backend, idling");
+            ready.store(true, Ordering::SeqCst);
         }
         // Ensure running is cleared when the thread exits for any reason.
         running.store(false, Ordering::SeqCst);
@@ -1135,269 +1032,12 @@ impl TrackingWorker {
         mailbox.set_inference_backend_label(None);
     }
 
-    /// Generate synthetic tracking data in a loop.
-    fn run_synthetic(mailbox: &TrackingMailbox, running: &AtomicBool, interval: Duration) {
-        info!("tracking-worker: started (synthetic, ~30 fps)");
-        let mut frame_index: u64 = 0;
-
-        while running.load(Ordering::SeqCst) {
-            let loop_start = std::time::Instant::now();
-
-            let t = frame_index as f32 * 0.05;
-            let pose = synthetic_pose(frame_index, t);
-            mailbox.publish(pose);
-            frame_index += 1;
-
-            let elapsed = loop_start.elapsed();
-            if elapsed < interval {
-                thread::sleep(interval - elapsed);
-            }
-        }
-
-        info!("tracking-worker: stopped");
-    }
-
-    /// Capture from a real webcam and run simplified pose estimation.
-    #[cfg(feature = "webcam")]
-    #[allow(clippy::too_many_arguments)]
-    fn run_webcam(
-        camera_index: usize,
-        mailbox: &TrackingMailbox,
-        running: &AtomicBool,
-        ready: &AtomicBool,
-        interval: Duration,
-        width: u32,
-        height: u32,
-        fps: u32,
-        pipeline: provider::TrackingPipelineConfig,
-    ) {
-        info!(
-            "tracking-worker: opening webcam {} ({}x{} @ {} fps)",
-            camera_index, width, height, fps
-        );
-
-        // Crash-forensics session: stage markers flush to
-        // `logs/tracking_*.log` and the sentinel flags unclean exits
-        // (system freeze, process kill) for the safe-mode banner. The
-        // guard ends the session on every normal exit path including
-        // panic unwinds.
-        let _stage_session = stagelog::SessionGuard::begin(&format!(
-            "webcam{camera_index} {width}x{height}@{fps}"
-        ));
-        stagelog::mark(0, "camera_open_begin");
-
-        let mut capture = match webcam::WebcamCapture::open(camera_index, width, height, fps) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(
-                    "tracking-worker: failed to open camera {}: {}",
-                    camera_index, e
-                );
-                mailbox.report_error(
-                    t!(
-                        "tracking.error_camera_open",
-                        index = camera_index,
-                        error = e.to_string()
-                    ),
-                    TrackingErrorLevel::Blocking,
-                );
-                warn!("tracking-worker: falling back to synthetic backend");
-                ready.store(true, Ordering::SeqCst);
-                Self::run_synthetic(mailbox, running, interval);
-                return;
-            }
-        };
-
-        // Initialize the pose provider under cooperative GPU
-        // exclusivity. DirectML session creation (uploading the
-        // 370 MB RTMW3D-x graph + compiling its kernels) hung the
-        // Arc B570 driver when it raced the Vulkan render loop on
-        // one device — the 2026-06-12 stage log shows the system
-        // dying ~240 ms into `provider_load_begin` with
-        // `render_submit` still firing at 60 fps. While the guard is
-        // held the render thread skips frames (see
-        // `gpu_coordination`); we also run one warm-up inference
-        // inside the section so DirectML's lazy first-run kernel
-        // compilation happens here too, not on the first camera
-        // frame after the renderer resumes.
-        stagelog::mark(0, "provider_load_begin");
-        #[cfg(not(feature = "inference"))]
-        let _ = pipeline;
-        #[cfg(feature = "inference")]
-        let mut pose_provider = {
-            let _gpu_exclusive =
-                crate::gpu_coordination::GpuExclusiveGuard::acquire("pose-provider-init");
-            match provider::create_pose_provider("models", pipeline) {
-                Ok(mut provider) => {
-                    let warnings = provider.take_load_warnings();
-                    if !warnings.is_empty() {
-                        mailbox.report_error(
-                            t!(
-                                "tracking.error_model_warning",
-                                warnings = warnings.join("; ")
-                            ),
-                            TrackingErrorLevel::Warning,
-                        );
-                    }
-                    mailbox.set_inference_backend_label(Some(provider.label()));
-
-                    // Warm-up on a black frame at the capture
-                    // resolution. The result is discarded; the point
-                    // is to force every lazy first-run compilation
-                    // (RTMW3D DirectML kernels, YOLOX/DAv2 cold-start
-                    // worker results) to complete while the render
-                    // thread is paused. FaceMesh stays cold (a black
-                    // frame produces no face bbox) — it is the
-                    // smallest session by two orders of magnitude.
-                    stagelog::mark(0, "provider_warmup_begin");
-                    let blank =
-                        vec![0u8; (capture.width() as usize) * (capture.height() as usize) * 3];
-                    let _ = provider.estimate_pose(&blank, capture.width(), capture.height(), 0);
-                    stagelog::mark(0, "provider_warmup_end");
-                    // The black frame exists only to force kernel
-                    // compilation — its garbage estimate must not
-                    // seed the session's temporal state (wrist
-                    // holds, sticky depth map, self-track bbox).
-                    provider.reset_temporal_state();
-                    Some(provider)
-                }
-                Err(e) => {
-                    error!("tracking-worker: inference disabled: {}", e);
-                    mailbox.report_error(
-                        t!("tracking.error_model_unavailable", error = e.to_string()),
-                        TrackingErrorLevel::Blocking,
-                    );
-                    None
-                }
-            }
-        };
-        #[cfg(not(feature = "inference"))]
-        let mut pose_provider: Option<Box<dyn provider::PoseProvider>> = None;
-
-        info!("tracking-worker: webcam opened successfully");
-        stagelog::mark(0, "provider_load_end");
-        ready.store(true, Ordering::SeqCst);
-        let mut frame_index: u64 = 0;
-        let mut consecutive_errors: u32 = 0;
-        // Last calibration-mailbox sequence we forwarded to the
-        // provider. Updated only when `poll_calibration` returns
-        // `Some`, so per-frame cost is one mutex-guarded integer
-        // compare in the hot path.
-        let mut last_calibration_seq: u64 = 0;
-        // Same edge-detect pattern for the torso-capture toggle.
-        // The actual capture work happens inside the provider's
-        // `estimate_pose` (one Option-is-some branch per frame), so
-        // this loop only needs to forward on/off transitions.
-        let mut last_torso_capture_seq: u64 = 0;
-        // Same edge-detect for the calibration-mode hint pushed by the
-        // GUI while the calibration modal is open. Lets the provider
-        // suppress phantom hip keypoints during the very first
-        // `UpperBody` capture, before any persisted calibration exists.
-        let mut last_calibration_mode_hint_seq: u64 = 0;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 30;
-
-        while running.load(Ordering::SeqCst) {
-            let loop_start = std::time::Instant::now();
-
-            // Forward any newly-captured pose calibration to the
-            // provider. The capture is a rare event (user-initiated
-            // via the modal) so the mismatch branch fires once per
-            // calibration, not once per frame.
-            #[cfg(feature = "inference")]
-            if let Some(ref mut provider) = pose_provider {
-                if let Some((cal, seq)) =
-                    mailbox.poll_calibration(last_calibration_seq)
-                {
-                    provider.set_calibration(cal);
-                    last_calibration_seq = seq;
-                }
-                // Torso-capture toggle. On `true` we just enable the
-                // provider's per-frame accumulation. On `false` we
-                // first drain whatever's in the buffer (via
-                // `take_torso_template`) and publish it back to the
-                // GUI before disabling — that's the canonical
-                // finalize path. A drained `None` (no qualifying
-                // frames during the window) silently skips the
-                // publish and the modal falls back to anchor-only.
-                if let Some((enabled, seq)) =
-                    mailbox.poll_torso_capture(last_torso_capture_seq)
-                {
-                    if enabled {
-                        provider.set_torso_capture(true);
-                    } else {
-                        if let Some(template) = provider.take_torso_template() {
-                            mailbox.publish_torso_template(template);
-                        }
-                        provider.set_torso_capture(false);
-                    }
-                    last_torso_capture_seq = seq;
-                }
-                // Calibration-mode hint forwarding. Active for the
-                // lifetime of the open modal; cleared on close so the
-                // provider falls back to whatever the persisted
-                // calibration says.
-                if let Some((hint, seq)) =
-                    mailbox.poll_calibration_mode_hint(last_calibration_mode_hint_seq)
-                {
-                    provider.set_calibration_mode_hint(hint);
-                    last_calibration_mode_hint_seq = seq;
-                }
-            }
-
-            stagelog::mark(frame_index, "grab_begin");
-            match capture.grab_frame() {
-                Ok(rgb_data) => {
-                    consecutive_errors = 0;
-                    let width = capture.width();
-                    let height = capture.height();
-
-                    stagelog::mark(frame_index, "estimate_begin");
-                    let estimate = if let Some(ref mut provider) = pose_provider {
-                        provider.estimate_pose(&rgb_data, width, height, frame_index)
-                    } else {
-                        pose_estimation::estimate_pose(&rgb_data, width, height, frame_index)
-                    };
-
-                    let frame = Some(downscale_for_gui(&rgb_data, width, height, 320));
-                    mailbox.publish_estimate(estimate, frame);
-                    stagelog::mark(frame_index, "publish");
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors == 1 {
-                        error!("tracking-worker: frame grab error: {}", e);
-                    }
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!(
-                            "tracking-worker: {} consecutive grab failures, stopping worker",
-                            consecutive_errors
-                        );
-                        mailbox.report_error(
-                            t!("tracking.error_camera_stopped", count = consecutive_errors),
-                            TrackingErrorLevel::Blocking,
-                        );
-                        return;
-                    }
-                }
-            }
-
-            frame_index += 1;
-
-            let elapsed = loop_start.elapsed();
-            if elapsed < interval {
-                thread::sleep(interval - elapsed);
-            }
-        }
-
-        info!("tracking-worker: stopped");
-    }
-
     /// Capture color + aligned metric depth from a RealSense D435 and run
     /// the full RTMW3D pose pipeline, feeding the depth in via
     /// [`provider::PoseProvider::set_external_depth`] so the provider skips
-    /// its internal DAv2 stage. Structurally mirrors [`Self::run_webcam`];
-    /// the only per-frame difference is building a `MetricDepthFrame` from
-    /// the D435 depth and handing it to the provider before `estimate_pose`.
+    /// its internal DAv2 stage. Each per-frame step builds a
+    /// `MetricDepthFrame` from the D435 depth and hands it to the provider
+    /// before `estimate_pose`.
     #[cfg(feature = "realsense")]
     #[allow(clippy::too_many_arguments)]
     fn run_realsense(
@@ -1427,15 +1067,16 @@ impl TrackingWorker {
                     t!("tracking.error_realsense_open", error = e.to_string()),
                     TrackingErrorLevel::Blocking,
                 );
-                warn!("tracking-worker: falling back to synthetic backend");
+                // No synthetic fallback in the D435-exclusive build: surface
+                // the blocking error and idle. `worker_loop` clears `running`
+                // on return, so the app drops to the avatar rest pose.
                 ready.store(true, Ordering::SeqCst);
-                Self::run_synthetic(mailbox, running, interval);
                 return;
             }
         };
 
-        // Provider init under cooperative GPU exclusivity — identical to
-        // `run_webcam` (see that method for the Arc-driver rationale).
+        // Provider init under cooperative GPU exclusivity: the ONNX/EP
+        // load bursts the GPU, so serialize it against other init work.
         stagelog::mark(0, "provider_load_begin");
         let mut pose_provider = {
             let _gpu_exclusive =
@@ -1486,7 +1127,7 @@ impl TrackingWorker {
             let loop_start = std::time::Instant::now();
 
             // Forward calibration / torso-capture / mode-hint transitions
-            // to the provider (same edge-detected pattern as run_webcam).
+            // to the provider (edge-detected: forward only on change).
             if let Some(ref mut provider) = pose_provider {
                 if let Some((cal, seq)) = mailbox.poll_calibration(last_calibration_seq) {
                     provider.set_calibration(cal);
@@ -1578,54 +1219,10 @@ impl Drop for TrackingWorker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Synthetic pose generation
-// ---------------------------------------------------------------------------
-
-/// Build a synthetic tracking sample with gentle animation driven by `t`.
-/// Used by `CameraBackend::Synthetic` when no webcam is available.
-fn synthetic_pose(frame_index: u64, t: f32) -> SourceSkeleton {
-    use crate::asset::HumanoidBone;
-    let mut sk = SourceSkeleton::empty(frame_index);
-
-    // Shoulders bob a few cm laterally so the pose solver produces a
-    // visible spine lean on synthetic input.
-    let sx = t.cos() * 0.01;
-    sk.joints.insert(
-        HumanoidBone::LeftShoulder,
-        SourceJoint {
-            position: [-0.15 + sx, 1.4, 0.0],
-            confidence: 0.88,
-            metric_depth_m: None,
-        },
-    );
-    sk.joints.insert(
-        HumanoidBone::RightShoulder,
-        SourceJoint {
-            position: [0.15 + sx, 1.4, 0.0],
-            confidence: 0.88,
-            metric_depth_m: None,
-        },
-    );
-
-    sk.face = Some(FacePose {
-        yaw: t.sin() * 0.1,
-        pitch: (t * 0.7).cos() * 0.05,
-        roll: 0.0,
-        confidence: 0.95,
-    });
-    sk.expressions = vec![SourceExpression {
-        name: "blink".to_string(),
-        weight: 0.1,
-    }];
-    sk.overall_confidence = 0.9;
-    sk
-}
-
 /// Downscale an RGB frame to a maximum width, preserving aspect ratio.
-fn downscale_for_gui(rgb_data: &[u8], src_w: u32, src_h: u32, max_w: u32) -> WebcamFrame {
+fn downscale_for_gui(rgb_data: &[u8], src_w: u32, src_h: u32, max_w: u32) -> PreviewFrame {
     if src_w <= max_w {
-        return WebcamFrame {
+        return PreviewFrame {
             rgb_data: rgb_data.to_vec(),
             width: src_w,
             height: src_h,
@@ -1646,7 +1243,7 @@ fn downscale_for_gui(rgb_data: &[u8], src_w: u32, src_h: u32, max_w: u32) -> Web
             out[di + 2] = rgb_data[si + 2];
         }
     }
-    WebcamFrame {
+    PreviewFrame {
         rgb_data: out,
         width: dst_w,
         height: dst_h,

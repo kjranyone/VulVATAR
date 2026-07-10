@@ -41,8 +41,6 @@ pub struct ProjectState {
     pub fade_on_tracking_loss: bool,
     pub force_cpu_inference: bool,
     pub yolox_enabled: bool,
-    pub camera_index: usize,
-    pub use_realsense: bool,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
     // Pose-solver smoothing (Advanced smoothing inspector section). The
@@ -175,14 +173,6 @@ fn default_true() -> bool {
     true
 }
 
-/// On-disk default for `use_realsense`: RealSense is the default tracking
-/// source when the depth-camera feature is built (metric depth is the
-/// accurate path); otherwise a webcam. Projects predating the field adopt
-/// this so a depth-camera build defaults to the D435.
-fn default_use_realsense() -> bool {
-    cfg!(feature = "realsense")
-}
-
 /// Convert the in-memory pose calibration to its on-disk DTO form.
 /// Round-trips through `pose_calibration_from_dto`. Returns `None` when
 /// the in-memory struct represents "no capture yet" so saved projects
@@ -307,10 +297,6 @@ pub struct TrackingConfig {
     pub force_cpu_inference: bool,
     #[serde(default = "default_true")]
     pub yolox_enabled: bool,
-    #[serde(default)]
-    pub camera_index: usize,
-    #[serde(default = "default_use_realsense")]
-    pub use_realsense: bool,
     #[serde(default)]
     pub show_camera_wipe: bool,
     #[serde(default)]
@@ -831,8 +817,6 @@ impl ProjectFile {
                 fade_on_tracking_loss: state.fade_on_tracking_loss,
                 force_cpu_inference: state.force_cpu_inference,
                 yolox_enabled: state.yolox_enabled,
-                camera_index: state.camera_index,
-                use_realsense: state.use_realsense,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
                 smoothing_rotation_blend: state.smoothing_rotation_blend,
@@ -918,8 +902,6 @@ impl ProjectFile {
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             force_cpu_inference: self.tracking.force_cpu_inference,
             yolox_enabled: self.tracking.yolox_enabled,
-            camera_index: self.tracking.camera_index,
-            use_realsense: self.tracking.use_realsense,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,
             smoothing_rotation_blend: self.tracking.smoothing_rotation_blend,

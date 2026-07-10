@@ -352,14 +352,6 @@ pub struct SolverParams {
     /// output should stay framed regardless of how the subject drifts
     /// in front of the camera.
     pub root_translation_enabled: bool,
-    /// Per-axis sensitivity for the root translation. Multiplied
-    /// against the source-skeleton `root_offset` deviation (relative
-    /// to a slow EMA reference) before being added to the Hips rest
-    /// local position. `1.0` follows the subject 1:1 in source-space
-    /// units (note that depth-aware providers emit METERS while
-    /// rtmw3d-only emits normalised image units, so the comfortable
-    /// value differs per provider). Defaults pick a moderate follow.
-    pub root_translation_sensitivity: [f32; 3],
     /// Optional pose-calibration capture from the `Calibrate Pose ▼`
     /// modal. When present, the solver uses the captured anchor as
     /// the explicit EMA reference seed for root translation —
@@ -385,12 +377,6 @@ impl Default for SolverParams {
             face_tracking_enabled: true,
             lower_body_tracking_enabled: true,
             root_translation_enabled: true,
-            // 0.6 horizontal/vertical, 0.3 depth: in-plane motion reads
-            // most naturally at near-1:1 follow, while depth (already in
-            // metric metres for depth-aware providers) needs to be
-            // dampened so a 0.5 m forward step doesn't shove the avatar
-            // through the camera plane.
-            root_translation_sensitivity: [0.6, 0.6, 0.3],
             pose_calibration: None,
         }
     }
@@ -460,15 +446,6 @@ pub struct PoseSolverState {
     /// so the feature self-calibrates to the user's typical pose.
     /// `None` until the first hip-visible frame.
     root_reference: Option<[f32; 3]>,
-    /// Running max of `|L.shoulder.x − R.shoulder.x|` observed across
-    /// frames. This proxies the subject's true frontal shoulder width:
-    /// the X-span shrinks as the body yaws away from frontal, so the
-    /// historical maximum approximates the un-foreshortened width.
-    /// [`compute_body_yaw_3d`] uses this to recover the yaw magnitude
-    /// from X-foreshortening, which is more stable than RTMW3D's
-    /// per-frame Δz signal at intermediate (~30°–60°) rotations.
-    /// `0.0` until the first confident shoulder pair arrives.
-    running_shoulder_x_span_max: f32,
     /// EMA state for the camera-driven mouth visemes (aa/ih/ou/ee/oh),
     /// keyed by expression name. The image lip-sync path takes the raw
     /// FaceMesh blendshape, which is noisy frame-to-frame; the eye/brow
@@ -510,12 +487,6 @@ impl PoseSolverState {
         self.root_reference = None;
         self.root_offset_filter = Default::default();
         self.face_angle_filter = Default::default();
-        // `running_shoulder_x_span_max` is intentionally NOT reset
-        // here — it captures the subject's anatomical shoulder width
-        // and persists across smoothing resets so a calibration-prime
-        // frame's reading still informs subsequent test frames in the
-        // diagnose_pose workflow (and survives view switches in live
-        // tracking, since the user's anatomy has not changed).
     }
 }
 
@@ -896,73 +867,11 @@ pub fn solve_avatar_pose(
         skeleton.nodes[node_idx].rest_local.clone()
     });
 
-    // Metric-native path signal: a RealSense D435 skeleton carries faithful
-    // camera-space 3D on every joint, so the torso orientation is read
-    // directly from the real shoulder/hip line and the monocular
-    // foreshortening machinery below (running-max seed + `compute_body_yaw_3d`)
-    // is disabled. `None` ⇒ 2D webcam fallback, which keeps that machinery.
-    let metric_native = source_owned.metric_frame_info.is_some();
-
-    // Seed `running_shoulder_x_span_max` from the calibrated shoulder
-    // span when the user has captured a `PoseCalibration`. Without this
-    // seed the running max accumulates from zero across the first few
-    // frames of the session — if those frames happen to be at a
-    // non-frontal yaw, the captured max is an under-estimate of the
-    // user's true frontal X-span, and `compute_body_yaw_3d`'s
-    // foreshortening recovery under-shoots until a frontal pose lands.
-    //
-    // Robustness against unusual clothing: 2D shoulder keypoint
-    // detection latches onto whatever silhouette boundary the model
-    // picks up. Wide collars, padded jackets, costume armour all push
-    // the keypoint outward from the anatomical shoulder, so the
-    // session's running max can creep beyond the user's true span as
-    // pose variation surfaces ever-wider detections. A calibrated
-    // shoulder span captured under the *same* outfit anchors the
-    // expected magnitude — `compute_body_yaw_3d` then divides bx by a
-    // floor that matches the user's actual frontal extent rather than
-    // an outlier from a single bad frame.
-    //
-    // Caveat: `shoulder_span_m` is in whatever source-space units the
-    // pipeline that captured the calibration emitted (metres when the
-    // DAv2 depth stage was active, RTMW3D-normalised when it wasn't).
-    // Toggling the depth stage (adding/removing dav2_small.onnx)
-    // between calibration and use would put the seed in the wrong
-    // unit; the user is expected to re-calibrate after such a change
-    // (the inspector flags low-sample / stale calibrations
-    // independently). Only seeded when `running_*` is still zero
-    // (cold start) so a session that's already learned a larger max
-    // keeps it.
-    if !metric_native && state.running_shoulder_x_span_max == 0.0 {
-        if let Some(span) = params
-            .pose_calibration
-            .as_ref()
-            .and_then(|c| c.shoulder_span_m)
-        {
-            if span.is_finite() && span > 0.0 {
-                state.running_shoulder_x_span_max = span;
-            }
-        }
-    }
-
-    // Source body yaw, computed early so the IK pole hints (which
-    // describe limb-bend direction in body-local terms — knee bends
-    // forward, elbow bends down) can be rotated into the source frame
-    // before IK runs. Without this rotation the leg IK assumes the
-    // subject is facing the camera and bends knees toward +Z even when
-    // the body has rotated 45°+ to the side, producing a visibly
-    // dislocated leg in three-quarter / profile poses.
-    let body_yaw_source = if metric_native {
-        // Metric path: torso yaw is read directly from the real 3D
-        // shoulder/hip line in the Hips block below, never the monocular
-        // foreshortening estimate.
-        None
-    } else {
-        compute_body_yaw_3d(
-            &source_owned,
-            params.joint_confidence_threshold,
-            &mut state.running_shoulder_x_span_max,
-        )
-    };
+    // D435-exclusive: every joint carries faithful camera-space 3D, so torso
+    // orientation is read directly from the real shoulder / hip lines in the
+    // Hips block below. There is no monocular foreshortening yaw to compute
+    // and no running-max width to maintain — when no 3D torso line is
+    // available the Hips are left at rest (forward) rather than guessing.
 
     // Two-bone IK: disabled. The reconstruction biases the elbow /
     // knee toward a "natural bend" pole, which corrupts genuine
@@ -984,27 +893,18 @@ pub fn solve_avatar_pose(
     let mut current_world = compute_world_transforms(skeleton, |i| local_transforms[i].clone());
 
     // Hips rotation — derived **directly from the source's L/R UpperLeg
-    // direction** rather than the shoulder-derived `body_yaw`. The
-    // per-bone benchmark compares the avatar's `RightUpperLeg →
-    // LeftUpperLeg` world direction against the source's, and the
-    // only way to match that is to align Hips so the two vectors
-    // coincide. The previous shoulder-yaw approach kept the avatar's
-    // hips at an anatomically consistent orientation but produced
-    // a 60°–90° gap on side-profile validation images because
-    // shoulder yaw and source's noisy hip direction disagree there.
+    // direction**. The per-bone benchmark compares the avatar's
+    // `RightUpperLeg → LeftUpperLeg` world direction against the source's,
+    // and the only way to match that is to align Hips so the two vectors
+    // coincide. We use `quat_from_vectors` (shortest-arc 3D rotation) so the
+    // alignment is *exact* — including the small Y component of the source
+    // hip vector.
     //
-    // We use `quat_from_vectors` (shortest-arc 3D rotation) so the
-    // alignment is *exact* — including the small Y component of the
-    // source hip vector. Falls back to shoulder-derived `body_yaw`
-    // when the hip pair is missing / below confidence (e.g. seated
-    // subject with legs out of frame).
-    // Torso orientation: hip line preferred, then — on the metric path — the
-    // real 3D shoulder line when the hips are out of frame (desk-up). Both
-    // are exact shortest-arc alignments of the avatar rest line to the source
-    // line. The monocular foreshortening `body_yaw` only takes over when no
-    // 3D line is available (webcam fallback); on the metric path
-    // `body_yaw_source` is `None`, so a missing 3D line leaves the Hips at
-    // rest (forward) instead of guessing — the fix for the desk-up wild-yaw.
+    // Torso orientation: hip line preferred, then the real 3D shoulder line
+    // when the hips are out of frame (desk-up). Both are exact shortest-arc
+    // alignments of the avatar rest line to the source line. A missing 3D
+    // line leaves the Hips at rest (forward) rather than guessing — the fix
+    // for the desk-up wild-yaw.
     let torso_align = compute_hip_align_rotation(
         &source_owned,
         &rest_world,
@@ -1012,41 +912,22 @@ pub fn solve_avatar_pose(
         params.joint_confidence_threshold,
     )
     .or_else(|| {
-        if metric_native {
-            compute_shoulder_align_rotation(
-                &source_owned,
-                &rest_world,
-                humanoid,
-                params.joint_confidence_threshold,
-            )
-        } else {
-            None
-        }
+        // Hips out of frame (desk-up): fall back to the real 3D shoulder line.
+        compute_shoulder_align_rotation(
+            &source_owned,
+            &rest_world,
+            humanoid,
+            params.joint_confidence_threshold,
+        )
     });
-    let hips_target_world_rot = if let Some(align_q) = torso_align {
+    let hips_target_world_rot = torso_align.and_then(|align_q| {
         // Rotates the rest torso line to the source torso line; compose
         // with the rest hips world rotation.
-        let hips_idx = humanoid
+        humanoid
             .bone_map
             .get(&HumanoidBone::Hips)
-            .map(|n| n.0 as usize);
-        hips_idx.map(|i| quat_mul(&align_q, &rest_world[i].rotation))
-    } else if let Some(body_yaw) = body_yaw_source {
-        if body_yaw.abs() > 0.01 {
-            let hips_idx = humanoid
-                .bone_map
-                .get(&HumanoidBone::Hips)
-                .map(|n| n.0 as usize);
-            hips_idx.map(|i| {
-                let yaw_delta_world = quat_from_euler_ypr(0.0, body_yaw, 0.0);
-                quat_mul(&yaw_delta_world, &rest_world[i].rotation)
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+            .map(|n| quat_mul(&align_q, &rest_world[n.0 as usize].rotation))
+    });
 
     if let (Some(hips_node), Some(target_world)) = (
         humanoid.bone_map.get(&HumanoidBone::Hips).copied(),
@@ -1149,111 +1030,50 @@ pub fn solve_avatar_pose(
                 raw_offset[1] - new_ref[1],
                 raw_offset[2] - new_ref[2],
             ];
-            // Two translation regimes, selected by the metric-native flag.
+            // Metric translation (D435): `root_offset` is RAW metres, so `dev`
+            // is a real-world displacement of the subject from their neutral
+            // position. Map it 1:1 into avatar units — scaled only by the
+            // avatar's proportion relative to the subject, so a human-sized rig
+            // stays ≈1:1 — with NO room-size sensitivity gain and NO clamp.
+            // This is the "camera-space projects straight to the avatar"
+            // contract: a 30 cm side-step moves the hips 30 cm.
             //
-            // Metric path (D435): `root_offset` is RAW metres, so `dev` is a
-            // real-world displacement of the subject from their neutral
-            // position. We map it 1:1 into avatar units — scaled only by the
-            // avatar's proportion relative to the subject, so a human-sized
-            // rig stays ≈1:1 — with NO room-size sensitivity gain and NO
-            // clamp. This is the "camera-space projects straight to the
-            // avatar" contract the redesign exists to honour: a 30 cm
-            // side-step moves the hips 30 cm. The monocular gain/clamp
-            // machinery below would fight that, so it is bypassed here.
-            //
-            // Monocular path (webcam): `root_offset` is unitless source space,
-            // so we derive a per-axis sensitivity from the calibration's
-            // observed X/Z range (or static defaults) to turn an arbitrary
-            // envelope into a bounded avatar sweep. Unchanged from before.
-            let translation_delta = if metric_native {
-                // Avatar proportion = rest shoulder span / subject shoulder
-                // span. Both are metres-equivalent (the rig's rest world is
-                // authored ~1 unit ≈ 1 m), so this is ≈1.0 for a human-sized
-                // avatar. Defaults to true 1:1 when either span is unknown.
-                let avatar_rest_shoulder_span = {
-                    let li = humanoid
-                        .bone_map
-                        .get(&HumanoidBone::LeftUpperArm)
-                        .map(|n| n.0 as usize);
-                    let ri = humanoid
-                        .bone_map
-                        .get(&HumanoidBone::RightUpperArm)
-                        .map(|n| n.0 as usize);
-                    match (
-                        li.and_then(|i| rest_world.get(i)),
-                        ri.and_then(|i| rest_world.get(i)),
-                    ) {
-                        (Some(l), Some(r)) => {
-                            let d = vec3_length(&vec3_sub(&l.position, &r.position));
-                            (d > 0.05).then_some(d)
-                        }
-                        _ => None,
+            // Avatar proportion = rest shoulder span / subject shoulder span.
+            // Both are metres-equivalent (the rig's rest world is authored
+            // ~1 unit ≈ 1 m), so this is ≈1.0 for a human-sized avatar.
+            // Defaults to true 1:1 when either span is unknown.
+            let avatar_rest_shoulder_span = {
+                let li = humanoid
+                    .bone_map
+                    .get(&HumanoidBone::LeftUpperArm)
+                    .map(|n| n.0 as usize);
+                let ri = humanoid
+                    .bone_map
+                    .get(&HumanoidBone::RightUpperArm)
+                    .map(|n| n.0 as usize);
+                match (
+                    li.and_then(|i| rest_world.get(i)),
+                    ri.and_then(|i| rest_world.get(i)),
+                ) {
+                    (Some(l), Some(r)) => {
+                        let d = vec3_length(&vec3_sub(&l.position, &r.position));
+                        (d > 0.05).then_some(d)
                     }
-                };
-                let subject_to_avatar_scale = source
-                    .metric_frame_info
-                    .as_ref()
-                    .map(|m| m.reference_span_m)
-                    .filter(|s| *s > 0.05)
-                    .and_then(|ref_span| avatar_rest_shoulder_span.map(|av| av / ref_span))
-                    .unwrap_or(1.0);
-                [
-                    dev[0] * subject_to_avatar_scale,
-                    dev[1] * subject_to_avatar_scale,
-                    dev[2] * subject_to_avatar_scale,
-                ]
-            } else {
-                // Per-axis sensitivity. The static defaults
-                // (`[0.6, 0.6, 0.3]`) are the right floor when we know
-                // nothing about the user's room, but a calibration that
-                // captured an explicit X/Z range (multi-step calibration:
-                // step left/right, lean in/out) lets us derive the gain
-                // from the *observed* envelope — a user with a narrow
-                // room (small ±X) gets a higher gain so a 30 cm step
-                // still moves the avatar across half its world-space
-                // horizontal envelope, while a large studio gets a lower
-                // gain so motion stays within frame.
-                //
-                // Formula: `sens = TARGET / (range / 2)` so the avatar's
-                // hip reaches `±TARGET` units when the subject reaches
-                // their captured extremes. The half-range is what's
-                // relevant because the EMA reference sits in the middle
-                // of the captured sweep.
-                //
-                // Clamp keeps a tiny captured range (user barely moved)
-                // from producing runaway gain, and a huge one from
-                // dropping below the static default.
-                const TARGET_AVATAR_X: f32 = 0.5;
-                const TARGET_AVATAR_Z: f32 = 0.3;
-                const SENS_X_CLAMP: (f32, f32) = (0.3, 2.5);
-                const SENS_Z_CLAMP: (f32, f32) = (0.15, 1.0);
-
-                let static_sens = params.root_translation_sensitivity;
-                let derived_sens_x = params
-                    .pose_calibration
-                    .as_ref()
-                    .and_then(|c| c.x_range_observed)
-                    .map(|range| {
-                        let half = (range * 0.5).max(0.05);
-                        (TARGET_AVATAR_X / half).clamp(SENS_X_CLAMP.0, SENS_X_CLAMP.1)
-                    })
-                    .unwrap_or(static_sens[0]);
-                let derived_sens_z = params
-                    .pose_calibration
-                    .as_ref()
-                    .and_then(|c| c.z_range_observed)
-                    .map(|range| {
-                        let half = (range * 0.5).max(0.05);
-                        (TARGET_AVATAR_Z / half).clamp(SENS_Z_CLAMP.0, SENS_Z_CLAMP.1)
-                    })
-                    .unwrap_or(static_sens[2]);
-
-                [
-                    dev[0] * derived_sens_x,
-                    dev[1] * static_sens[1],
-                    dev[2] * derived_sens_z,
-                ]
+                    _ => None,
+                }
             };
+            let subject_to_avatar_scale = source
+                .metric_frame_info
+                .as_ref()
+                .map(|m| m.reference_span_m)
+                .filter(|s| *s > 0.05)
+                .and_then(|ref_span| avatar_rest_shoulder_span.map(|av| av / ref_span))
+                .unwrap_or(1.0);
+            let translation_delta = [
+                dev[0] * subject_to_avatar_scale,
+                dev[1] * subject_to_avatar_scale,
+                dev[2] * subject_to_avatar_scale,
+            ];
 
             if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {
                 let hips_idx = hips_node.0 as usize;
@@ -1954,18 +1774,17 @@ fn compute_hip_align_rotation(
     Some(quat_from_vectors(&av_n, &src_n))
 }
 
-/// Metric-path counterpart of [`compute_hip_align_rotation`] for the upper
-/// body: align the avatar's rest `R_UpperArm → L_UpperArm` line to the
-/// source skeleton's, giving the torso orientation directly from the real
-/// 3D shoulder line. Used only on the metric-depth path, where the shoulder
-/// positions carry true camera-space depth — so, unlike the monocular
-/// `compute_body_yaw_3d`, there is no foreshortening inference and no
-/// running-max ratchet (the bug that made a corner-clamped shoulder swing
-/// the whole body). Returns `None` when either shoulder is missing / below
-/// confidence (e.g. gated out of frame) or the two are coincident, so the
-/// caller leaves the Hips at rest (forward) rather than guessing. The
-/// UpperArm roots ARE the shoulder joints and are present in every humanoid
-/// rig, so this is more robust than keying on the optional clavicle bones.
+/// Upper-body counterpart of [`compute_hip_align_rotation`]: align the
+/// avatar's rest `R_UpperArm → L_UpperArm` line to the source skeleton's,
+/// giving the torso orientation directly from the real 3D shoulder line. The
+/// D435 shoulder positions carry true camera-space depth, so this is a plain
+/// shortest-arc alignment — no foreshortening inference, no running-max
+/// ratchet (the bug that made a corner-clamped shoulder swing the whole
+/// body). Returns `None` when either shoulder is missing / below confidence
+/// (e.g. gated out of frame) or the two are coincident, so the caller leaves
+/// the Hips at rest (forward) rather than guessing. The UpperArm roots ARE the
+/// shoulder joints and are present in every humanoid rig, so this is more
+/// robust than keying on the optional clavicle bones.
 fn compute_shoulder_align_rotation(
     source: &SourceSkeleton,
     rest_world: &[WorldXform],
@@ -2004,93 +1823,6 @@ fn compute_shoulder_align_rotation(
     let av_n = [av_dir[0] / av_len, av_dir[1] / av_len, av_dir[2] / av_len];
 
     Some(quat_from_vectors(&av_n, &src_n))
-}
-
-fn compute_body_yaw_3d(
-    source: &SourceSkeleton,
-    threshold: f32,
-    running_shoulder_x_span_max: &mut f32,
-) -> Option<f32> {
-    use HumanoidBone::*;
-    // Shoulders first; hips are a fallback for shoulder-cropped frames.
-    let pairs = [
-        (LeftShoulder, RightShoulder),
-        (LeftUpperLeg, RightUpperLeg),
-    ];
-    for (left_bone, right_bone) in pairs {
-        let Some(l) = source.joints.get(&left_bone) else {
-            continue;
-        };
-        let Some(r) = source.joints.get(&right_bone) else {
-            continue;
-        };
-        if l.confidence < threshold || r.confidence < threshold {
-            continue;
-        }
-        let bx = l.position[0] - r.position[0];
-        let bz = l.position[2] - r.position[2];
-        let span_xz = (bx * bx + bz * bz).sqrt();
-        // Dead-zone: with the torso-width vector tiny (subject in
-        // exact side profile or hip pair degenerate), atan2 amplifies
-        // any noise into wild yaw flips. Require a minimum span
-        // before we trust the angle, and let the next pair (or
-        // None) take over otherwise.
-        if span_xz < 0.05 {
-            continue;
-        }
-        // Update the running max only on the shoulder pair — shoulders
-        // have stable anatomy and clean keypoints; hips are a noisy
-        // fallback signal we don't want polluting the historical
-        // reference. Use `|bx|` so a back-facing pose (bx negative)
-        // also contributes its full extent.
-        let abs_bx = bx.abs();
-        if matches!(left_bone, LeftShoulder) && abs_bx > *running_shoulder_x_span_max {
-            *running_shoulder_x_span_max = abs_bx;
-        }
-        // Yaw recovery from X-foreshortening:
-        //   |bx| / true_x_span = |cos(yaw)|
-        // The "true x-span" is the X-axis shoulder width at frontal pose
-        // (yaw = 0). RTMW3D's per-frame Δz under-estimates depth at
-        // intermediate yaw (~30°–60°) where bz is small; the running
-        // max of the observed X-span captures the un-foreshortened
-        // width and gives a more stable magnitude.
-        let target_span = running_shoulder_x_span_max.max(span_xz);
-        let cos_yaw = (bx / target_span).clamp(-1.0, 1.0);
-        let yaw_from_span = cos_yaw.acos();
-        // bz corroboration: foreshortening alone cannot distinguish
-        // a genuine yaw from a perspective-inflated reference span
-        // (leaning toward a near webcam widens the observed shoulder
-        // span, ratchets `running_shoulder_x_span_max`, and from then
-        // on a perfectly frontal pose reads acos(<1) ≈ 30–45° with
-        // its sign flapping on bz noise — observed live as the
-        // avatar locking to ±45° and never facing front). A real yaw
-        // MUST also separate the shoulders in z: cap the magnitude
-        // by the bz-supported yaw plus a small allowance.
-        // Back-facing poses also have bz ≈ 0 (shoulders in-plane
-        // again), so the cap applies to the *deviation from the
-        // nearest in-plane orientation* (0° when bx > 0, 180° when
-        // bx < 0), not to the raw magnitude.
-        const YAW_BZ_ALLOWANCE_RAD: f32 = 0.17; // ~10°
-        let yaw_from_bz = (bz.abs() / target_span).clamp(0.0, 1.0).asin();
-        let deviation = yaw_from_span.min(std::f32::consts::PI - yaw_from_span);
-        let capped_dev = deviation.min(yaw_from_bz + YAW_BZ_ALLOWANCE_RAD);
-        let yaw_magnitude = if cos_yaw >= 0.0 {
-            capped_dev
-        } else {
-            std::f32::consts::PI - capped_dev
-        };
-        // Sign convention: positive yaw = standard right-hand-rule
-        // CCW rotation around +Y (= subject turns to **her left**,
-        // bringing her right side toward camera). For the source's
-        // unmirrored Y-up frame this corresponds to L.shoulder going
-        // *back* (-Z) and R.shoulder coming *forward* (+Z), i.e.
-        // bz = L.z - R.z is **negative**. Hence `yaw_sign = -sign(bz)`.
-        // bz = 0 (exact frontal/back) yields zero magnitude so the
-        // sign choice is moot; pick `+` deterministically.
-        let yaw_sign = if bz <= 0.0 { 1.0 } else { -1.0 };
-        return Some(yaw_sign * yaw_magnitude);
-    }
-    None
 }
 
 fn apply_face_pose(
@@ -3377,339 +3109,6 @@ mod metric_orientation_tests {
         put(&mut sk, HumanoidBone::LeftUpperArm, [0.2, 0.5, 0.0], 1.0);
         put(&mut sk, HumanoidBone::RightUpperArm, [-0.2, 0.5, 0.0], 0.02);
         assert!(compute_shoulder_align_rotation(&sk, &rest_world, &humanoid, 0.1).is_none());
-    }
-}
-
-#[cfg(test)]
-mod body_yaw_tests {
-    use super::*;
-    use crate::tracking::source_skeleton::SourceJoint;
-
-    fn put(sk: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3], confidence: f32) {
-        sk.joints.insert(bone, SourceJoint { position: pos, confidence, metric_depth_m: None });
-    }
-
-    /// Three-quarter view (~45°): shoulder Δz is tiny (+0.004) but
-    /// **correctly signed** for the yaw direction. The hip pair's Δz at
-    /// the same pose carries the **opposite sign** (-0.014) per the
-    /// plan/body-twist-yaw-investigation.md row 045°, so any averaging
-    /// would flip the result. This regression test pins us to "shoulders
-    /// first": the magnitude is small but the sign must be right, never
-    /// wrong. Sign convention: bz > 0 (LEFT shoulder forward) ⇒ subject
-    /// turned to her RIGHT ⇒ R_y CW from above ⇒ negative yaw.
-    #[test]
-    fn three_quarter_view_keeps_shoulder_sign() {
-        let mut sk = SourceSkeleton::empty(0);
-        put(&mut sk, HumanoidBone::LeftShoulder, [0.059, 0.486, -0.083], 1.0);
-        put(&mut sk, HumanoidBone::RightShoulder, [-0.155, 0.486, -0.087], 1.0);
-        put(&mut sk, HumanoidBone::LeftUpperLeg, [0.046, -0.004, -0.007], 1.0);
-        put(&mut sk, HumanoidBone::RightUpperLeg, [-0.046, 0.004, 0.007], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("shoulder pair clears threshold");
-        // Shoulder-only: bx=+0.214, bz=+0.004 → small magnitude (~1°),
-        // sign negative (subject turned right).
-        assert!(
-            yaw < 0.0 && yaw > -0.05,
-            "45° shoulder yaw should be small -ε, got {yaw}"
-        );
-    }
-
-    /// 90° side profile: large yaw (≈ -48°). Subject's left shoulder
-    /// forward (bz > 0) ⇒ subject turned to her right ⇒ negative yaw.
-    /// Sanity-check that the function recovers a real yaw signal once
-    /// Δz comes off the noise floor.
-    #[test]
-    fn side_profile_90_gives_large_negative_yaw() {
-        let mut sk = SourceSkeleton::empty(0);
-        put(&mut sk, HumanoidBone::LeftShoulder, [0.054, 0.534, 0.019], 1.0);
-        put(&mut sk, HumanoidBone::RightShoulder, [-0.029, 0.531, -0.075], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw_deg = compute_body_yaw_3d(&sk, 0.1, &mut span_max)
-            .expect("shoulders")
-            .to_degrees();
-        assert!(
-            (-55.0..-45.0).contains(&yaw_deg),
-            "90° side profile expected ≈-48°, got {yaw_deg:.1}°"
-        );
-    }
-
-    /// 270° side profile: large yaw (≈ -62°). Different magnitude than
-    /// 90° because RTMW3D's Z asymmetry biases the two side views
-    /// unequally; both lie in the same negative quadrant.
-    #[test]
-    fn side_profile_270_gives_large_negative_yaw() {
-        let mut sk = SourceSkeleton::empty(0);
-        put(&mut sk, HumanoidBone::LeftShoulder, [0.031, 0.523, 0.012], 1.0);
-        put(&mut sk, HumanoidBone::RightShoulder, [-0.017, 0.523, -0.078], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw_deg = compute_body_yaw_3d(&sk, 0.1, &mut span_max)
-            .expect("shoulders")
-            .to_degrees();
-        assert!(
-            (-68.0..-58.0).contains(&yaw_deg),
-            "270° side profile expected ≈-62°, got {yaw_deg:.1}°"
-        );
-    }
-
-    /// Back-facing (180°): bx is strongly negative so atan2 lands near
-    /// ±π regardless of Δz noise. Pin |yaw| > 170° to confirm the wrap.
-    #[test]
-    fn back_facing_yaw_near_pi() {
-        let mut sk = SourceSkeleton::empty(0);
-        put(&mut sk, HumanoidBone::LeftShoulder, [-0.166, 0.504, 0.061], 1.0);
-        put(&mut sk, HumanoidBone::RightShoulder, [0.140, 0.520, 0.047], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw_deg = compute_body_yaw_3d(&sk, 0.1, &mut span_max)
-            .expect("shoulders")
-            .to_degrees();
-        assert!(
-            yaw_deg.abs() > 170.0,
-            "back-facing yaw should be near ±180°, got {yaw_deg:.1}°"
-        );
-    }
-
-    /// Both pairs confident but with **disagreeing sign** on Δz — the
-    /// pathology that broke Option A averaging. Shoulders give a small
-    /// negative yaw (subject turned right); hips alone would give a
-    /// positive one (opposite sign). The shoulders-first contract
-    /// requires the result to come out negative.
-    #[test]
-    fn shoulders_authoritative_when_hips_disagree() {
-        let mut sk = SourceSkeleton::empty(0);
-        // Shoulder Δz=+0.004, Δx=+0.214 → small magnitude, sign neg.
-        put(&mut sk, HumanoidBone::LeftShoulder, [0.107, 0.486, -0.085], 1.0);
-        put(&mut sk, HumanoidBone::RightShoulder, [-0.107, 0.486, -0.089], 1.0);
-        // Hip Δz=-0.014, Δx=+0.092 → opposite sign (positive).
-        put(&mut sk, HumanoidBone::LeftUpperLeg, [0.046, 0.0, -0.007], 1.0);
-        put(&mut sk, HumanoidBone::RightUpperLeg, [-0.046, 0.0, 0.007], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("shoulders win");
-        assert!(
-            yaw < 0.0,
-            "shoulders must dominate even when hips disagree in sign, got {yaw}"
-        );
-    }
-
-    /// Shoulder-only fallback (lower-body cropped out of frame). Front
-    /// pose has bx large and bz near zero → yaw ≈ 0.
-    #[test]
-    fn shoulder_only_falls_back_to_single_pair() {
-        let mut sk = SourceSkeleton::empty(0);
-        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.4, 0.0], 1.0);
-        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.4, 0.0], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("shoulder-only fallback");
-        assert!(
-            yaw.abs() < 0.05,
-            "front-pose shoulder span should give ~0 yaw, got {yaw}"
-        );
-    }
-
-    /// No torso joints visible at all → `None` so the caller doesn't
-    /// snap the avatar to a stale value.
-    #[test]
-    fn no_torso_joints_returns_none() {
-        let sk = SourceSkeleton::empty(0);
-        let mut span_max = 0.0;
-        assert!(compute_body_yaw_3d(&sk, 0.1, &mut span_max).is_none());
-    }
-
-    /// Foreshortening recovery: once the running max of `|Δx|` has
-    /// captured the subject's true frontal shoulder width, a subsequent
-    /// rotated frame should report a **larger** yaw magnitude than the
-    /// pure-atan2 first call would. This is the live-tracking win — we
-    /// trade single-shot atan2 (matches first-frame behavior in tests
-    /// above) for cumulative magnitude correction across a session.
-    #[test]
-    fn running_max_amplifies_under_rotated_yaw() {
-        let mut span_max = 0.0;
-
-        // Frame 1: subject roughly frontal — primes the running max
-        // with a wide |Δx|.
-        let mut frontal = SourceSkeleton::empty(0);
-        put(&mut frontal, HumanoidBone::LeftShoulder, [0.20, 0.5, 0.0], 1.0);
-        put(&mut frontal, HumanoidBone::RightShoulder, [-0.20, 0.5, 0.0], 1.0);
-        let _ = compute_body_yaw_3d(&frontal, 0.1, &mut span_max);
-        assert!(
-            (span_max - 0.40).abs() < 1e-4,
-            "frontal frame should prime running max to 0.40, got {span_max}"
-        );
-
-        // Frame 2: same subject rotated. bx shrinks (foreshortening)
-        // and bz carries the metric-injected inter-shoulder Δz a real
-        // 60° yaw produces (≈ sin60 × span, slightly under-reported).
-        // The span running-max recovers the full ≈ acos(0.20/0.40) =
-        // 60° magnitude; the bz corroboration cap stays out of the
-        // way because bz genuinely supports the rotation. (A large
-        // span-implied yaw with bz ≈ 0 is now CAPPED instead — that
-        // signature is a perspective-inflated reference span from
-        // leaning toward a near webcam, which live locked the avatar
-        // at ±45° on perfectly frontal poses.)
-        let mut rotated = SourceSkeleton::empty(0);
-        put(&mut rotated, HumanoidBone::LeftShoulder, [0.10, 0.5, -0.15], 1.0);
-        put(&mut rotated, HumanoidBone::RightShoulder, [-0.10, 0.5, 0.15], 1.0);
-        let yaw_deg = compute_body_yaw_3d(&rotated, 0.1, &mut span_max)
-            .expect("shoulders")
-            .to_degrees();
-        // Foreshortening recovery: |bx|=0.20, target=0.40,
-        // cos⁻¹(0.5) = 60°. Sign convention: bz<0 (LEFT back, RIGHT
-        // forward) ⇒ subject turned LEFT (CCW) ⇒ POSITIVE yaw.
-        assert!(
-            (yaw_deg - 60.0).abs() < 2.0,
-            "foreshortening recovery should yield ≈ +60°, got {yaw_deg:.1}°"
-        );
-    }
-
-    /// Shoulders present but below the confidence threshold while hips
-    /// are confident: the function falls through to the hip pair. This
-    /// is the asymmetric robustness gain over a shoulder-only baseline.
-    #[test]
-    fn low_confidence_shoulders_falls_through_to_hips() {
-        let mut sk = SourceSkeleton::empty(0);
-        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 1.4, 0.0], 0.05);
-        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 1.4, 0.0], 0.05);
-        put(&mut sk, HumanoidBone::LeftUpperLeg, [0.18, 0.0, 0.05], 1.0);
-        put(&mut sk, HumanoidBone::RightUpperLeg, [-0.18, 0.0, -0.05], 1.0);
-
-        let mut span_max = 0.0;
-        let yaw = compute_body_yaw_3d(&sk, 0.1, &mut span_max).expect("hip pair carries the signal");
-        // Hip-only: bx=0.36, bz=+0.10 (LEFT forward → subject right turn)
-        // ⇒ negative yaw, magnitude ≈ atan2(0.10, 0.36) ≈ 0.27 rad.
-        assert!(
-            (yaw - (-0.27)).abs() < 0.02,
-            "hip-only yaw mismatch: {yaw}"
-        );
-    }
-
-    /// `solve_avatar_pose` seeds `running_shoulder_x_span_max` from the
-    /// active `PoseCalibration::shoulder_span_m` on the cold-start
-    /// frame. Without this seed, an initial frame caught at a non-
-    /// frontal yaw would lock the running max to the foreshortened bx
-    /// for the rest of the session.
-    #[test]
-    fn calibration_seeds_running_shoulder_max_on_cold_start() {
-        use crate::asset::{HumanoidMap, NodeId, SkeletonNode, Transform};
-        use std::collections::HashMap;
-
-        // Minimal skeleton: a single Hips node so `solve_avatar_pose`
-        // doesn't bail early on a missing humanoid map. The seed runs
-        // before any geometry, so the rig topology is irrelevant.
-        let skeleton = SkeletonAsset {
-            nodes: vec![SkeletonNode {
-                id: NodeId(0),
-                name: "Hips".to_string(),
-                parent: None,
-                children: Vec::new(),
-                rest_local: Transform::default(),
-                humanoid_bone: Some(HumanoidBone::Hips),
-            }],
-            root_nodes: vec![NodeId(0)],
-            inverse_bind_matrices: Vec::new(),
-        };
-        let mut bone_map = HashMap::new();
-        bone_map.insert(HumanoidBone::Hips, NodeId(0));
-        let humanoid = HumanoidMap { bone_map };
-        let mut local = vec![Transform::default()];
-
-        let cal = crate::tracking::PoseCalibration {
-            mode: crate::tracking::CalibrationMode::FullBody,
-            captured_at: String::new(),
-            captured_at_unix: 0,
-            frame_count: 12,
-            anchor_x: 0.0,
-            anchor_y: 0.0,
-            anchor_depth_m: Some(1.8),
-            confidence: 1.0,
-            anchor_depth_jitter_m: None,
-            shoulder_span_m: Some(0.412),
-            x_range_observed: None,
-            z_range_observed: None,
-            torso_depth_template: None,
-            neutral_expressions: Vec::new(),
-        };
-        let params = SolverParams {
-            rotation_blend: 1.0,
-            joint_confidence_threshold: 0.5,
-            pose_calibration: Some(cal),
-            ..Default::default()
-        };
-        let mut state = PoseSolverState::new();
-        let source = SourceSkeleton::empty(0);
-
-        assert_eq!(state.running_shoulder_x_span_max, 0.0);
-        solve_avatar_pose(&source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
-        assert!(
-            (state.running_shoulder_x_span_max - 0.412).abs() < 1e-6,
-            "expected seed=0.412, got {}",
-            state.running_shoulder_x_span_max
-        );
-    }
-
-    /// Already-warm session: a session that has accumulated a max
-    /// larger than the calibrated value (e.g. user shifted closer to
-    /// camera mid-session, or the detector caught a transient wider
-    /// silhouette) keeps the larger value. The seed is a *floor*, not
-    /// an override.
-    #[test]
-    fn warm_running_max_is_not_overwritten_by_calibration_seed() {
-        use crate::asset::{HumanoidMap, NodeId, SkeletonNode, Transform};
-        use std::collections::HashMap;
-
-        let skeleton = SkeletonAsset {
-            nodes: vec![SkeletonNode {
-                id: NodeId(0),
-                name: "Hips".to_string(),
-                parent: None,
-                children: Vec::new(),
-                rest_local: Transform::default(),
-                humanoid_bone: Some(HumanoidBone::Hips),
-            }],
-            root_nodes: vec![NodeId(0)],
-            inverse_bind_matrices: Vec::new(),
-        };
-        let mut bone_map = HashMap::new();
-        bone_map.insert(HumanoidBone::Hips, NodeId(0));
-        let humanoid = HumanoidMap { bone_map };
-        let mut local = vec![Transform::default()];
-
-        let cal = crate::tracking::PoseCalibration {
-            mode: crate::tracking::CalibrationMode::FullBody,
-            captured_at: String::new(),
-            captured_at_unix: 0,
-            frame_count: 12,
-            anchor_x: 0.0,
-            anchor_y: 0.0,
-            anchor_depth_m: Some(1.8),
-            confidence: 1.0,
-            anchor_depth_jitter_m: None,
-            shoulder_span_m: Some(0.412),
-            x_range_observed: None,
-            z_range_observed: None,
-            torso_depth_template: None,
-            neutral_expressions: Vec::new(),
-        };
-        let params = SolverParams {
-            rotation_blend: 1.0,
-            joint_confidence_threshold: 0.5,
-            pose_calibration: Some(cal),
-            ..Default::default()
-        };
-        let mut state = PoseSolverState::new();
-        state.running_shoulder_x_span_max = 0.55;
-        let source = SourceSkeleton::empty(0);
-
-        solve_avatar_pose(&source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
-        assert!(
-            (state.running_shoulder_x_span_max - 0.55).abs() < 1e-6,
-            "warm value 0.55 must survive seed=0.412, got {}",
-            state.running_shoulder_x_span_max
-        );
     }
 }
 

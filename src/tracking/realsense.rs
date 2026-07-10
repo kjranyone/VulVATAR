@@ -6,9 +6,8 @@
 //! It streams synchronized color + depth and, each frame, aligns the depth
 //! image into the color image so that a color pixel indexes the matching depth
 //! sample directly. Each grabbed frame is handed to the pipeline as:
-//!   - an RGB8 buffer with the **exact same layout** as
-//!     [`super::webcam::WebcamCapture::grab_frame`] (`w*h*3`, row-major,
-//!     top-down) so the RTMW3D provider consumes it unchanged, plus
+//!   - an RGB8 buffer (`w*h*3`, row-major, top-down) so the RTMW3D provider
+//!     consumes it unchanged, plus
 //!   - the aligned depth as raw Z16 + the metric scale + the color intrinsics,
 //!     ready to be deprojected into a metric point cloud.
 //!
@@ -73,8 +72,7 @@ impl CamIntrinsics {
 
 /// One synchronized, color-aligned frame from the D435.
 pub struct RealSenseFrame {
-    /// Color image: `width*height*3` bytes, row-major RGB8, top-down — the same
-    /// layout as [`super::webcam::WebcamCapture::grab_frame`].
+    /// Color image: `width*height*3` bytes, row-major RGB8, top-down.
     pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -111,8 +109,8 @@ impl RealSenseFrame {
 /// Streams color + depth from a RealSense D400-series device, aligning depth
 /// into the color image each frame.
 ///
-/// Mirror of [`super::webcam::WebcamCapture`]: created and polled on the
-/// tracking-worker thread, so it does not need to be `Send`.
+/// Created and polled on the tracking-worker thread, so it does not need
+/// to be `Send`.
 pub struct RealSenseCapture {
     // Field order is also drop order: the pipeline must be torn down before the
     // context that produced it, so `_context` is declared last.

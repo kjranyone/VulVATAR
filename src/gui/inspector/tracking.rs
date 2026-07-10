@@ -1,31 +1,9 @@
 use eframe::egui;
 
-use crate::gui::components::{filled_button, icon_button, tonal_button, ButtonTone};
+use crate::gui::components::{filled_button, tonal_button, ButtonTone};
 use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
-
-/// The camera backend the current input-device selection maps to:
-/// RealSense (when the feature is built and the toggle is on) takes
-/// precedence, else the chosen webcam device, else Synthetic when no
-/// webcam backend is compiled in.
-fn selected_camera_backend(state: &GuiApp) -> crate::tracking::CameraBackend {
-    #[cfg(feature = "realsense")]
-    if state.use_realsense {
-        return crate::tracking::CameraBackend::RealSense;
-    }
-    #[cfg(feature = "webcam")]
-    {
-        crate::tracking::CameraBackend::Webcam {
-            camera_index: state.camera_index,
-        }
-    }
-    #[cfg(not(feature = "webcam"))]
-    {
-        let _ = state;
-        crate::tracking::CameraBackend::Synthetic
-    }
-}
 
 pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     if ui
@@ -83,88 +61,17 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         .show(ui, |ui| {
             #[cfg(feature = "realsense")]
             {
-                // Depth-camera source (recommended). When set, the webcam
-                // device combo below is unused — the D435 self-selects the
-                // first D400 device and supplies its own aligned metric
-                // depth. When cleared, tracking falls back to a webcam,
-                // which has no measured depth (2D only).
-                if ui
-                    .checkbox(&mut state.use_realsense, t!("tracking.backend_realsense"))
-                    .changed()
-                {
-                    state.project_status.project_dirty = true;
-                }
-                if state.use_realsense {
-                    ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
-                    // 1:1 sensor-matched mirror render. Only meaningful on the
-                    // metric depth path (needs the D435 intrinsics), so it
-                    // lives under the RealSense toggle and is gated on it.
-                    ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
-                    ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
-                } else {
-                    ui.label(
-                        egui::RichText::new(t!("tracking.webcam_no_depth"))
-                            .small()
-                            .color(ui.visuals().warn_fg_color),
-                    );
-                }
+                // D435-exclusive capture: the sole input is the Intel
+                // RealSense D435. It self-selects the first D400 device and
+                // supplies its own color-aligned metric depth to the pose
+                // pipeline — there is no device / backend to choose.
+                ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
+                // 1:1 sensor-matched mirror render (needs the D435 intrinsics,
+                // so it is realsense-only).
+                ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
+                ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
                 ui.add_space(4.0);
             }
-            // Webcam device picker. Hidden when the RealSense depth source is
-            // selected: the D435 self-selects its own D400 device, so the
-            // webcam `camera_index` combo would be a dead control. Resolution
-            // and frame-rate below still apply to both backends.
-            let camera_changed = if state.use_realsense {
-                false
-            } else {
-                // Captured before the device combo so a mid-session device
-                // switch triggers the same auto-restart as a res / FPS change.
-                let prev_camera = state.camera_index;
-                ui.horizontal(|ui| {
-                    let selected_text = state
-                        .available_cameras
-                        .iter()
-                        .find(|c| c.index == state.camera_index)
-                        .map(|c| format!("{}: {}", c.index, c.name))
-                        .unwrap_or_else(|| {
-                            t!("tracking.camera_n", index = state.camera_index).to_string()
-                        });
-                    egui::ComboBox::from_label(t!("tracking.camera"))
-                        .selected_text(selected_text)
-                        .show_ui(ui, |ui| {
-                            if state.available_cameras.is_empty() {
-                                ui.label(t!("tracking.no_cameras"));
-                            } else {
-                                for cam in &state.available_cameras {
-                                    let label = format!("{}: {}", cam.index, cam.name);
-                                    ui.selectable_value(
-                                        &mut state.camera_index,
-                                        cam.index,
-                                        label,
-                                    );
-                                }
-                            }
-                        });
-                    if state.camera_index != prev_camera {
-                        state.project_status.project_dirty = true;
-                    }
-                    if icon_button(ui, ic::REFRESH, &t!("tracking.refresh")).clicked() {
-                        state.available_cameras = crate::tracking::list_cameras();
-                        if !state
-                            .available_cameras
-                            .iter()
-                            .any(|c| c.index == state.camera_index)
-                        {
-                            state.camera_index = state
-                                .available_cameras
-                                .first()
-                                .map(|c| c.index)
-                                .unwrap_or(0);
-                        }
-                    }
-                });
-                state.camera_index != prev_camera
-            };
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let active = state.is_tracking_active();
@@ -202,11 +109,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     } else {
                         (w, h, fps)
                     };
-                    let backend = selected_camera_backend(state);
                     let pipeline = state.tracking.pipeline_config();
                     state
                         .app
-                        .start_tracking_with_params(backend, w, h, fps, pipeline);
+                        .start_tracking_with_params(w, h, fps, pipeline);
                 }
             });
             if ui
@@ -257,13 +163,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             if fps_changed {
                 state.project_status.project_dirty = true;
             }
-            // Phase B-1: if the webcam is currently running, restart it with
-            // the new params so the change takes effect immediately rather
-            // than only at the next Stop / Start Camera cycle. The device
-            // dropdown (`camera_changed`) restarts the same way — previously
-            // it only flagged the project dirty and the running camera kept
-            // the old device until a manual Stop / Start.
-            if (res_changed || fps_changed || camera_changed) && state.app.is_tracking_running() {
+            // If the camera is currently running, restart it with the new
+            // params so a resolution / frame-rate change takes effect
+            // immediately rather than only at the next Stop / Start cycle.
+            if (res_changed || fps_changed) && state.app.is_tracking_running() {
                 let (w, h) =
                     crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
                 let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
@@ -272,11 +175,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 } else {
                     (w, h, fps)
                 };
-                let backend = selected_camera_backend(state);
                 let pipeline = state.tracking.pipeline_config();
                 state
                     .app
-                    .start_tracking_with_params(backend, w, h, fps, pipeline);
+                    .start_tracking_with_params(w, h, fps, pipeline);
                 state.push_notification(t!("tracking.camera_restarted", w = w, h = h, fps = fps));
             }
         });
@@ -408,18 +310,15 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             };
             ui.label(egui::RichText::new(status_text).color(status_color));
             if camera_running {
-                let camera_label = state
-                    .app
-                    .tracking_worker
-                    .as_ref()
-                    .map(|w| w.active_backend().label())
-                    .unwrap_or("Unknown");
-                ui.label(t!("tracking.camera_label", label = camera_label.to_string()));
+                ui.label(t!(
+                    "tracking.camera_label",
+                    label = crate::tracking::CAPTURE_BACKEND_LABEL.to_string()
+                ));
 
                 // Inference backend (ONNX execution provider) — surfaces a
                 // silent CPU fallback when DirectML registration fails. Set
                 // by the worker once the pose provider finishes loading;
-                // absent during synthetic mode or before init completes.
+                // absent before init completes.
                 if let Some(label) = state
                     .app
                     .tracking_worker

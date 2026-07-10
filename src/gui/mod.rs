@@ -678,14 +678,6 @@ pub struct GuiApp {
     pub output: OutputGuiState,
     pub settings: SettingsGuiState,
 
-    pub camera_index: usize,
-    pub available_cameras: Vec<crate::tracking::CameraInfo>,
-    /// Use the RealSense D435 depth camera as the tracking source instead
-    /// of a webcam (the metric-depth path). Only honoured when the
-    /// `realsense` feature is built; the webcam `camera_index` is unused
-    /// while this is set.
-    pub use_realsense: bool,
-
     /// 1:1 sensor-matched mirror render toggle. When on and the live pose is
     /// metric-native (D435 depth path), the render camera adopts the sensor's
     /// intrinsics + a front view so the avatar is framed like a mirror. A
@@ -871,9 +863,6 @@ impl GuiApp {
                 pan_sensitivity: app_settings.pan_sensitivity,
             },
 
-            camera_index: 0,
-            available_cameras: crate::tracking::list_cameras(),
-            use_realsense: cfg!(feature = "realsense"),
             mirror_view: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
@@ -1015,8 +1004,8 @@ impl GuiApp {
     /// * `eframe::CreationContext` (no egui context available in tests)
     /// * disk reads (avatar library, scene presets, recent avatars,
     ///   recovery snapshot, watched folders) — start with empty state
-    /// * system probes (`list_cameras`, `list_audio_devices`) — empty
-    ///   vecs, since the test doesn't drive the GUI
+    /// * system probes (`list_audio_devices`) — empty vecs, since the
+    ///   test doesn't drive the GUI
     /// * environment-driven autostart (autoload avatar, virtual-camera)
     ///
     /// The test can then populate `app.avatars` directly and exercise
@@ -1105,9 +1094,6 @@ impl GuiApp {
                 pan_sensitivity: 1.0,
             },
 
-            camera_index: 0,
-            available_cameras: Vec::new(),
-            use_realsense: cfg!(feature = "realsense"),
             mirror_view: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,

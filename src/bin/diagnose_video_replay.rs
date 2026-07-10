@@ -112,7 +112,10 @@ fn main() -> Result<(), String> {
         let img = image::open(f).map_err(|e| format!("open {}: {e}", f.display()))?.to_rgb8();
         let (w, h) = (img.width(), img.height());
         let est = provider.estimate_pose(img.as_raw(), w, h, i as u64);
-        let sk = est.skeleton;
+        let mut sk = est.skeleton;
+        // Image-only bench: stamp the metric flag so the solver takes the
+        // shipping metric path (D435-exclusive) rather than the None fallback.
+        sk.stamp_synthetic_metric_frame();
 
         avatar.build_base_pose();
         solve_avatar_pose(
