@@ -196,11 +196,7 @@ fn main() -> Result<(), String> {
     }
     let _session = stagelog::SessionGuard::begin("diagnose_signal_quality");
 
-    let depth_enabled = std::env::var("VULVATAR_REPLAY_NO_DEPTH").is_err();
-    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig {
-        depth_enabled,
-        ..Default::default()
-    };
+    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
     eprintln!("creating pose provider (DirectML session init — the known-risky step)…");
     stagelog::mark(0, "provider_load_begin");
     let mut provider = create_pose_provider("models", config)?;
@@ -326,6 +322,30 @@ fn main() -> Result<(), String> {
                 record(&mut channels, &mut index, total_frames, i, &format!("av.{b:?}"), false, sample);
             }
         }
+        // Post-solve head ORIENTATION. The face-pose path drives the head
+        // bone rotation, and the perceptually-dominant rest jitter is head
+        // *orientation* (SRC roll ~4°), which the position channels above
+        // are blind to. Record the head's world basis axes as unit-vector
+        // channels: `fwd` (z-axis) captures yaw/pitch wobble, `up` (y-axis)
+        // captures roll (which leaves `fwd` invariant). Column-major, so
+        // m[1]/m[2] are the y/z basis columns (m[3] is translation).
+        if let Some(avatar) = app.active_avatar() {
+            if let Some(idx) = humanoid_map
+                .bone_map
+                .get(&HumanoidBone::Head)
+                .copied()
+                .map(|n| n.0 as usize)
+            {
+                if let Some(m) = avatar.pose.global_transforms.get(idx) {
+                    let fwd = [m[2][0], m[2][1], m[2][2]];
+                    let up = [m[1][0], m[1][1], m[1][2]];
+                    record(&mut channels, &mut index, total_frames, i, "av.Head.fwd", false,
+                        Sample { value: fwd, dims: 3, confidence: 1.0 });
+                    record(&mut channels, &mut index, total_frames, i, "av.Head.up", false,
+                        Sample { value: up, dims: 3, confidence: 1.0 });
+                }
+            }
+        }
         if let Some(ro) = sk.root_offset {
             let sample = Sample { value: ro, dims: 3, confidence: 1.0 };
             record(&mut channels, &mut index, total_frames, i, "src.RootOffset", true, sample);
@@ -340,6 +360,16 @@ fn main() -> Result<(), String> {
         for expr in &sk.expressions {
             let sample = Sample { value: [expr.weight, 0.0, 0.0], dims: 1, confidence: expr_conf };
             record(&mut channels, &mut index, total_frames, i, &format!("src.Expr.{}", expr.name), true, sample);
+        }
+        // Post-solve (applied) expression weights — the output of
+        // `solve_expressions` after its EMA (and any rest deadband). The
+        // raw `src.Expr` above cannot show how much flutter actually
+        // reaches the avatar (eye "pikupiku" twitch etc.); this can.
+        if let Some(avatar) = app.active_avatar() {
+            for ew in &avatar.expression_weights {
+                let sample = Sample { value: [ew.weight, 0.0, 0.0], dims: 1, confidence: 1.0 };
+                record(&mut channels, &mut index, total_frames, i, &format!("av.Expr.{}", ew.name), false, sample);
+            }
         }
 
         let mut obj = Map::new();

@@ -70,6 +70,36 @@ const MAX_WRIST_HOLD_FRAMES: u32 = 6;
 /// threshold so the hand still participates.
 const HELD_WRIST_CONF: f32 = 0.3;
 
+/// Whole-arm foreshortening ("folded-arm") forward prior. Per-segment
+/// ray-IK resolves each bone's own toward/behind depth, but when the
+/// WHOLE arm folds toward the body — palms together at the chest, hands
+/// framing the face — every segment stays near-vertical in 2D (no
+/// per-segment foreshortening) while the shoulder→wrist span collapses.
+/// The solve then leaves the wrist only just forward of the elbow, the
+/// arm folds to ~half extension, and the rigid bones force the elbow to
+/// wing out. Detect the fold and inject the forward depth it implies as
+/// soft wrist evidence: sliding the wrist along its OWN ray keeps the 2D
+/// reprojection exact (the annotation is never contradicted) while the
+/// forearm-length invariant carries the elbow to keep the bone rigid.
+///
+/// `FOLD_2D_FRAC`: shoulder→wrist 2D span below this fraction of full
+/// arm length counts as folded. `FOLD_TARGET_FRAC`: the 3D extension the
+/// injected depth targets (a natural hands-in-front pose sits near 0.6).
+/// `FOLD_FWD_WEIGHT`: soft depth weight — the length invariant and any
+/// contact link still shape the result. `FOLD_MIN_RAISE`: the wrist must
+/// sit above the elbow (forearm pointing up, a raised hand in front of
+/// the torso) so hands resting low never trip the prior.
+const FOLD_2D_FRAC: f32 = 0.65;
+const FOLD_TARGET_FRAC: f32 = 0.62;
+const FOLD_FWD_WEIGHT: f32 = 0.6;
+const FOLD_MIN_RAISE: f32 = 0.02;
+/// Wrist-separation / hand-size ceiling that gates the forward prior to
+/// a genuine palms-together pose. Pressed-together hands measure ≈0.35–
+/// 0.45; hands framing the face / cupping the ears sit ≈1.1 and overlap
+/// raised-beside-the-head poses that must not be pushed forward, so the
+/// prior stops well below that band.
+const FOLD_CONTACT_MAX: f32 = 0.7;
+
 /// Cross-frame state: the IK solver's temporal depths plus the
 /// torso-depth EMA. Reset with the rest of the temporal state.
 #[derive(Default)]
@@ -321,6 +351,14 @@ fn solve_arm_depth_impl(
     // Wrists reconstructed from a held ray this frame (absent from the
     // incoming skeleton); inserted back after the solve.
     let mut synth_wrist: Vec<HumanoidBone> = Vec::new();
+    // Per side: a pending whole-arm foreshortening forward prior
+    // (wrist obs index + the forward metric-depth target). Computed in
+    // the loop but only APPLIED once the hands-contact gate confirms a
+    // palms-together pose — the case where the forward reach is both
+    // needed and unambiguous. A raised-but-separated hand (framing the
+    // face, waving) is left to Phase 7.6 so this prior can never
+    // over-extend an already-correct open pose.
+    let mut fold_pending: [Option<(usize, f32)>; 2] = [None, None];
     for (side, (shoulder_bone, shoulder, elbow_bone, wrist_bone)) in [
         (
             HumanoidBone::LeftUpperArm,
@@ -378,6 +416,7 @@ fn solve_arm_depth_impl(
         // hand and routinely reads background depth (the documented
         // reason Phase 7.5 never re-injects wrist z).
         if let Some(wr) = sk.joints.get(&wrist_bone).copied() {
+            let wrist_obs_idx = obs.len();
             obs.push(make_obs(wrist_bone, wr.position, wr.confidence, None, 0.0, false));
             stage.held_wrist.insert(wrist_bone, (ray_of(wr.position).0, 0));
             wrist_pos[side] = Some(wr.position);
@@ -390,6 +429,31 @@ fn solve_arm_depth_impl(
                 one_sided: false,
                 forward_prior: true,
             });
+            // Whole-arm foreshortening prior (see the FOLD_* constants).
+            // The shoulder→wrist 2D span in metres; source x/y are the
+            // image plane (z is depth), so their planar distance is the
+            // projected arm span.
+            let sw_2d_m = {
+                let dx = shoulder.position[0] - wr.position[0];
+                let dy = shoulder.position[1] - wr.position[1];
+                (dx * dx + dy * dy).sqrt() * m_per_src
+            };
+            let arm_len_m = l_ua + l_fa;
+            // Source +y is up (`to_n` maps larger y to a higher image
+            // point); a wrist above the elbow is a raised forearm.
+            let raised = wr.position[1] > el.position[1] + FOLD_MIN_RAISE;
+            if raised && sw_2d_m < FOLD_2D_FRAC * arm_len_m {
+                // Forward depth that lifts the fold to FOLD_TARGET_FRAC of
+                // full extension: 3D span² = 2D span² + Δz². Stored, not
+                // applied — the contact gate below decides whether this
+                // pose qualifies.
+                let target_3d = FOLD_TARGET_FRAC * arm_len_m;
+                let dz = (target_3d * target_3d - sw_2d_m * sw_2d_m).max(0.0).sqrt();
+                let sh_cam_z = z0 - shoulder.position[2] * m_per_src;
+                let wrist_cam_z = (sh_cam_z - dz).max(0.15);
+                let ulen = ray_of(wr.position).1;
+                fold_pending[side] = Some((wrist_obs_idx, wrist_cam_z * ulen));
+            }
         } else if let Some((held_ray, age)) = stage.held_wrist.get(&wrist_bone).copied() {
             if age < MAX_WRIST_HOLD_FRAMES {
                 obs.push(make_held_obs(wrist_bone, held_ray));
@@ -429,6 +493,9 @@ fn solve_arm_depth_impl(
     // of the other and must NOT be glued), link the pair at the
     // lateral distance the 2D separation implies at equal depth.
     let mut contact_engaged = false;
+    // Tighter subset of contact used to gate the folded-arm forward
+    // prior (pressed-together hands only — see `FOLD_CONTACT_MAX`).
+    let mut fold_apply = false;
     if let (Some(wl), Some(wr)) = (wrist_pos[0], wrist_pos[1]) {
         let spread = |left: bool| -> f32 {
             let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -476,10 +543,37 @@ fn solve_arm_depth_impl(
                 stage.frame, d2d, sp_l, sp_r
             );
             contact_engaged = true;
+            // The forward prior needs the hands NEARLY TOUCHING, not
+            // merely near. Measured wrist separation over hand size:
+            // palms pressed together ≈ 0.35–0.45, but hands framing the
+            // face or cupping the ears sit ≈ 1.1 — and those overlap the
+            // hands-raised-beside-the-head poses that must stay put (the
+            // forward push collapses them to the chest). No geometric
+            // axis separates that ≈1.1 band, so the forward prior fires
+            // only for the unambiguous pressed-together case; the looser
+            // contact link (depth coherence) still engages above.
+            fold_apply = d2d < FOLD_CONTACT_MAX * sp_max;
         }
     }
     if contact_only && !contact_engaged {
         return;
+    }
+
+    // Apply the folded-arm forward prior now that the contact gate has
+    // fired: palms pressed together in front of the body are folded in
+    // 2D with no per-segment foreshortening, so the depth solve would
+    // otherwise leave them at chest depth and wing the elbows out (see
+    // the FOLD_* constants). Sliding the wrist forward along its ray is
+    // annotation-exact; the forearm invariant carries the elbow.
+    if fold_apply {
+        for (idx, metric) in fold_pending.into_iter().flatten() {
+            obs[idx].metric_depth_m = Some(metric);
+            obs[idx].depth_weight = FOLD_FWD_WEIGHT;
+            debug!(
+                "ray-ik f{}: folded-arm forward prior applied (obs {idx}, metric {metric:.3})",
+                stage.frame
+            );
+        }
     }
 
     let solved = ray_ik::solve(&obs, &segs, &RayIkConfig::default(), &mut stage.ik);

@@ -126,6 +126,8 @@ tracking:
   input_device: "入力デバイス"
   backend_realsense: "RealSense D435 を使用 (深度)"
   backend_realsense_hint: "実測深度 — 腕・手の前後3Dが正確。"
+  mirror_view: "1:1 センサー一致ミラー描画"
+  mirror_view_hint: "D435 実機のレンズ (画角・主点) でアバターを描画 — 鏡像。"
   webcam_no_depth: "webカメラ: 2Dのみ・深度なし。腕/手の前後は追跡されません。"
   camera: "カメラ"
   no_cameras: "カメラが検出されません。🔄をクリックしてスキャン。"

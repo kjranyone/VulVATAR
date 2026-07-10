@@ -5,7 +5,9 @@
 use log::{info, warn};
 use std::sync::Arc;
 
-use super::{Application, FrameConfig, FrameInputConfig, RuntimeToggles, ViewportCamera};
+use super::{
+    Application, FrameConfig, FrameInputConfig, RuntimeToggles, SensorCamera, ViewportCamera,
+};
 use crate::app::render_thread::RenderCommand;
 use crate::avatar::pose_solver::{self, SolverParams};
 use crate::avatar::AvatarInstance;
@@ -283,6 +285,25 @@ impl Application {
                 generative_background: self.generative_background,
                 time_seconds: self.background_time as f32,
                 export_mode,
+                // 1:1 mirror camera: only when the toggle is on AND the live
+                // pose is metric-native (carries the D435 intrinsics). On the
+                // webcam path `metric_frame_info` is `None`, so this stays
+                // `None` and the free orbit camera is used — the toggle is a
+                // no-op there, exactly as intended.
+                sensor_camera: if toggles.mirror_view {
+                    self.last_tracking_pose
+                        .as_ref()
+                        .and_then(|p| p.metric_frame_info.as_ref())
+                        .map(|m| SensorCamera {
+                            intrinsics: m.intrinsics,
+                            // `anchor_cam_m[2]` is raw camera z (forward
+                            // distance, positive). The eye sits this far in
+                            // front of the avatar so it frames at sensor scale.
+                            anchor_depth_m: m.anchor_cam_m[2].abs(),
+                        })
+                } else {
+                    None
+                },
             };
             let frame_input = Self::build_frame_input_multi(
                 &self.avatars,
@@ -614,6 +635,79 @@ impl Application {
         ]
     }
 
+    /// Perspective projection from pinhole camera intrinsics (fx, fy, cx, cy,
+    /// width, height). Same row-major layout, Vulkan `[0,1]` depth mapping and
+    /// y-flip as [`Self::build_projection_matrix`], but the FOV comes from
+    /// `fx`/`fy` and the principal point `(cx, cy)` makes the frustum
+    /// asymmetric so the optical axis lands at `(cx, cy)` rather than the image
+    /// centre. Reduces exactly to the symmetric form when `cx = w/2, cy = h/2`.
+    ///
+    /// Derivation: a view-space point `(x, y, z)` (z < 0 in front) projects to
+    /// pixel `u = -fx·x/z + cx`, `v =  fy·y/z + cy` (camera y-up, image v-down).
+    /// With `w_clip = -z`, matching `u = (ndc_x·0.5 + 0.5)·w` gives
+    /// `P[0][0] = 2fx/w`, `P[0][2] = 1 − 2cx/w`; likewise for y.
+    pub(crate) fn build_projection_from_intrinsics(
+        intr: &crate::tracking::CameraIntrinsics,
+        near: f32,
+        far: f32,
+    ) -> crate::asset::Mat4 {
+        let w = intr.width.max(1) as f32;
+        let h = intr.height.max(1) as f32;
+        let a = far / (near - far);
+        let b = far * near / (near - far);
+        [
+            [2.0 * intr.fx / w, 0.0, 1.0 - 2.0 * intr.cx / w, 0.0],
+            [0.0, -2.0 * intr.fy / h, 1.0 - 2.0 * intr.cy / h, 0.0],
+            [0.0, 0.0, a, b],
+            [0.0, 0.0, -1.0, 0.0],
+        ]
+    }
+
+    /// View matrix for the 1:1 sensor mirror: eye straight in front of
+    /// `target` (`+Z`) at `depth` metres, looking back along `-Z` with `+Y`
+    /// up — the same handedness as the orbit camera at yaw 0, so the source
+    /// skeleton's selfie x-negation is NOT doubled into a re-mirror. `depth`
+    /// is clamped to a small positive so a zero / garbage anchor can't drop
+    /// the eye onto the subject. With no rotation the view is a pure
+    /// translation by `-eye`.
+    pub(crate) fn build_sensor_view_matrix(
+        target: [f32; 3],
+        depth: f32,
+    ) -> (crate::asset::Mat4, [f32; 3]) {
+        let eye = [target[0], target[1], target[2] + depth.max(0.2)];
+        let view = [
+            [1.0, 0.0, 0.0, -eye[0]],
+            [0.0, 1.0, 0.0, -eye[1]],
+            [0.0, 0.0, 1.0, -eye[2]],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        (view, eye)
+    }
+
+    /// Upper-body centre of an avatar in avatar-root space (the space the
+    /// renderer draws in), used to aim the sensor-mirror camera. Midpoint of
+    /// the two upper-arm (shoulder) bones, falling back to the head, then the
+    /// hips. `None` when the avatar carries no humanoid rig.
+    fn avatar_upper_body_center(avatar: &AvatarInstance) -> Option<[f32; 3]> {
+        use crate::asset::HumanoidBone::*;
+        let humanoid = avatar.asset.humanoid.as_ref()?;
+        let bone_pos = |bone: crate::asset::HumanoidBone| {
+            humanoid
+                .bone_map
+                .get(&bone)
+                .and_then(|node| avatar.pose.global_transforms.get(node.0 as usize))
+                .map(crate::math_utils::mat4_translation)
+        };
+        if let (Some(l), Some(r)) = (bone_pos(LeftUpperArm), bone_pos(RightUpperArm)) {
+            return Some([
+                (l[0] + r[0]) * 0.5,
+                (l[1] + r[1]) * 0.5,
+                (l[2] + r[2]) * 0.5,
+            ]);
+        }
+        bone_pos(Head).or_else(|| bone_pos(Hips))
+    }
+
     fn build_frame_input_multi(
         avatars: &[AvatarInstance],
         fi_config: &FrameInputConfig,
@@ -781,9 +875,26 @@ impl Application {
             })
             .collect();
 
-        let aspect = output_extent[0] as f32 / output_extent[1].max(1) as f32;
-        let (view, eye_pos) = Self::build_view_matrix(cam);
-        let projection = Self::build_projection_matrix(cam.fov_deg, aspect, 0.1, 1000.0);
+        // Camera: free orbit by default, or the 1:1 sensor mirror when a
+        // `sensor_camera` rode along (mirror toggle on + metric-native pose).
+        // The mirror looks at the avatar's upper-body centre from straight in
+        // front at the subject's real distance and projects through the
+        // sensor's own intrinsics; the selfie flip is already in the source
+        // skeleton, so the front view does not re-mirror.
+        let (view, projection, eye_pos) = if let Some(sensor) = fi_config.sensor_camera.as_ref() {
+            let target = avatars
+                .first()
+                .and_then(Self::avatar_upper_body_center)
+                .unwrap_or([0.0, 1.0, 0.0]);
+            let (v, eye) = Self::build_sensor_view_matrix(target, sensor.anchor_depth_m);
+            let p = Self::build_projection_from_intrinsics(&sensor.intrinsics, 0.1, 10.0);
+            (v, p, eye)
+        } else {
+            let aspect = output_extent[0] as f32 / output_extent[1].max(1) as f32;
+            let (v, eye) = Self::build_view_matrix(cam);
+            let p = Self::build_projection_matrix(cam.fov_deg, aspect, 0.1, 1000.0);
+            (v, p, eye)
+        };
 
         // Tracking anchors for the generative background. Bone positions are
         // the translation column of the column-major `global_transforms`
@@ -981,6 +1092,88 @@ fn collect_cloth_deforms<'a>(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod sensor_camera_tests {
+    use super::*;
+
+    /// Row-major Mat4 · column vec4.
+    fn mul(m: &crate::asset::Mat4, v: &[f32; 4]) -> [f32; 4] {
+        let mut o = [0.0f32; 4];
+        for (r, row) in m.iter().enumerate() {
+            o[r] = row[0] * v[0] + row[1] * v[1] + row[2] * v[2] + row[3] * v[3];
+        }
+        o
+    }
+
+    fn intrinsics(cx: f32, cy: f32) -> crate::tracking::CameraIntrinsics {
+        crate::tracking::CameraIntrinsics { fx: 600.0, fy: 600.0, cx, cy, width: 1280, height: 720 }
+    }
+
+    /// Centred principal point: a view-space point straight down the optical
+    /// axis projects to the NDC centre.
+    #[test]
+    fn axis_point_maps_to_ndc_centre() {
+        let p = Application::build_projection_from_intrinsics(&intrinsics(640.0, 360.0), 0.1, 10.0);
+        let clip = mul(&p, &[0.0, 0.0, -1.0, 1.0]);
+        let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
+        assert!(ndc[0].abs() < 1e-5 && ndc[1].abs() < 1e-5, "axis → centre, got {ndc:?}");
+    }
+
+    /// A pixel offset maps to the matching NDC offset. A point at x=+0.5,
+    /// z=−1 projects to pixel u = −fx·x/z + cx = 940 → ndc_x = 0.46875.
+    #[test]
+    fn off_axis_point_maps_to_matching_ndc() {
+        let p = Application::build_projection_from_intrinsics(&intrinsics(640.0, 360.0), 0.1, 10.0);
+        let clip = mul(&p, &[0.5, 0.0, -1.0, 1.0]);
+        let ndc_x = clip[0] / clip[3];
+        assert!((ndc_x - 0.46875).abs() < 1e-4, "expected 0.46875, got {ndc_x}");
+    }
+
+    /// A principal point right-of-centre (cx > w/2) shifts the on-axis point
+    /// to +NDC — the asymmetric frustum the sensor's real optics need.
+    #[test]
+    fn principal_point_offset_shifts_frustum() {
+        let p = Application::build_projection_from_intrinsics(&intrinsics(700.0, 360.0), 0.1, 10.0);
+        let clip = mul(&p, &[0.0, 0.0, -1.0, 1.0]);
+        let ndc_x = clip[0] / clip[3];
+        // ndc_x = 2·700/1280 − 1 = 0.09375.
+        assert!((ndc_x - 0.09375).abs() < 1e-4, "principal offset → 0.09375, got {ndc_x}");
+    }
+
+    /// Near plane → NDC z 0, far plane → NDC z 1 (Vulkan depth range), same
+    /// mapping as the symmetric projection.
+    #[test]
+    fn depth_maps_near_zero_far_one() {
+        let p = Application::build_projection_from_intrinsics(&intrinsics(640.0, 360.0), 0.1, 10.0);
+        let near = mul(&p, &[0.0, 0.0, -0.1, 1.0]);
+        let far = mul(&p, &[0.0, 0.0, -10.0, 1.0]);
+        assert!((near[2] / near[3]).abs() < 1e-4, "near → 0");
+        assert!(((far[2] / far[3]) - 1.0).abs() < 1e-4, "far → 1");
+    }
+
+    /// The sensor view eye sits `depth` in front (+Z) of the target, and the
+    /// target maps to (0,0,−depth) in view space — straight ahead, no rotation.
+    #[test]
+    fn sensor_view_places_eye_in_front_and_looks_back() {
+        let target = [0.1, 1.0, 0.0];
+        let (view, eye) = Application::build_sensor_view_matrix(target, 1.5);
+        assert_eq!(eye, [0.1, 1.0, 1.5]);
+        let vt = mul(&view, &[target[0], target[1], target[2], 1.0]);
+        assert!(
+            vt[0].abs() < 1e-6 && vt[1].abs() < 1e-6 && (vt[2] + 1.5).abs() < 1e-6,
+            "target should sit at (0,0,-1.5) in view space, got {vt:?}"
+        );
+    }
+
+    /// A garbage/zero anchor depth can't drop the eye onto the subject — it's
+    /// clamped to a small positive standoff.
+    #[test]
+    fn sensor_view_clamps_zero_depth() {
+        let (_v, eye) = Application::build_sensor_view_matrix([0.0, 1.0, 0.0], 0.0);
+        assert!(eye[2] >= 0.2, "zero depth must clamp to a positive standoff, got {}", eye[2]);
+    }
 }
 
 #[cfg(test)]

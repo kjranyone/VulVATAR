@@ -109,3 +109,10 @@ required-features = ["realsense"]
 [[bin]]
 name = "diagnose_realsense_pose"
 required-features = ["realsense"]
+
+# Tier 1 offline replay: recorded colour PNG + aligned depth .npy -> the same
+# external-depth provider path, NO live camera. Locks TARGET_SRC_SHOULDER_SPAN
+# and the metric branch against a real frame. `realsense` pulls in `inference`.
+[[bin]]
+name = "diagnose_depth_replay"
+required-features = ["realsense"]

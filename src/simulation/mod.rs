@@ -39,7 +39,7 @@ impl SceneGravity {
     /// scales. Cloth/Rapier are in m/s²; spring folds `strength` into its
     /// unitless power directly (see [`Self::spring_power_scale`]).
     pub const EARTH_G: f32 = 9.81;
-    pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=3.0;
+    pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=5.0;
 
     /// Unit direction, falling back to straight down if `direction` is
     /// degenerate (so a zeroed control never yields NaNs).

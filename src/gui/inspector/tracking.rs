@@ -96,6 +96,11 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
                 if state.use_realsense {
                     ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
+                    // 1:1 sensor-matched mirror render. Only meaningful on the
+                    // metric depth path (needs the D435 intrinsics), so it
+                    // lives under the RealSense toggle and is gated on it.
+                    ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
+                    ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
                 } else {
                     ui.label(
                         egui::RichText::new(t!("tracking.webcam_no_depth"))
@@ -105,47 +110,61 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 }
                 ui.add_space(4.0);
             }
-            // Captured before the device combo so a mid-session device switch
-            // triggers the same auto-restart as a resolution / FPS change.
-            let prev_camera = state.camera_index;
-            ui.horizontal(|ui| {
-                let selected_text = state
-                    .available_cameras
-                    .iter()
-                    .find(|c| c.index == state.camera_index)
-                    .map(|c| format!("{}: {}", c.index, c.name))
-                    .unwrap_or_else(|| t!("tracking.camera_n", index = state.camera_index).to_string());
-                egui::ComboBox::from_label(t!("tracking.camera"))
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        if state.available_cameras.is_empty() {
-                            ui.label(t!("tracking.no_cameras"));
-                        } else {
-                            for cam in &state.available_cameras {
-                                let label = format!("{}: {}", cam.index, cam.name);
-                                ui.selectable_value(&mut state.camera_index, cam.index, label);
-                            }
-                        }
-                    });
-                if state.camera_index != prev_camera {
-                    state.project_status.project_dirty = true;
-                }
-                if icon_button(ui, ic::REFRESH, &t!("tracking.refresh")).clicked() {
-                    state.available_cameras = crate::tracking::list_cameras();
-                    if !state
+            // Webcam device picker. Hidden when the RealSense depth source is
+            // selected: the D435 self-selects its own D400 device, so the
+            // webcam `camera_index` combo would be a dead control. Resolution
+            // and frame-rate below still apply to both backends.
+            let camera_changed = if state.use_realsense {
+                false
+            } else {
+                // Captured before the device combo so a mid-session device
+                // switch triggers the same auto-restart as a res / FPS change.
+                let prev_camera = state.camera_index;
+                ui.horizontal(|ui| {
+                    let selected_text = state
                         .available_cameras
                         .iter()
-                        .any(|c| c.index == state.camera_index)
-                    {
-                        state.camera_index = state
-                            .available_cameras
-                            .first()
-                            .map(|c| c.index)
-                            .unwrap_or(0);
+                        .find(|c| c.index == state.camera_index)
+                        .map(|c| format!("{}: {}", c.index, c.name))
+                        .unwrap_or_else(|| {
+                            t!("tracking.camera_n", index = state.camera_index).to_string()
+                        });
+                    egui::ComboBox::from_label(t!("tracking.camera"))
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            if state.available_cameras.is_empty() {
+                                ui.label(t!("tracking.no_cameras"));
+                            } else {
+                                for cam in &state.available_cameras {
+                                    let label = format!("{}: {}", cam.index, cam.name);
+                                    ui.selectable_value(
+                                        &mut state.camera_index,
+                                        cam.index,
+                                        label,
+                                    );
+                                }
+                            }
+                        });
+                    if state.camera_index != prev_camera {
+                        state.project_status.project_dirty = true;
                     }
-                }
-            });
-            let camera_changed = state.camera_index != prev_camera;
+                    if icon_button(ui, ic::REFRESH, &t!("tracking.refresh")).clicked() {
+                        state.available_cameras = crate::tracking::list_cameras();
+                        if !state
+                            .available_cameras
+                            .iter()
+                            .any(|c| c.index == state.camera_index)
+                        {
+                            state.camera_index = state
+                                .available_cameras
+                                .first()
+                                .map(|c| c.index)
+                                .unwrap_or(0);
+                        }
+                    }
+                });
+                state.camera_index != prev_camera
+            };
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let active = state.is_tracking_active();

@@ -146,6 +146,16 @@ const REST_SPEED_HI: f32 = 0.32;
 /// ~0.25 m bone), so the first attempt at 0.5° froze almost none of it.
 const ARM_HOLD_ANG_DEAD: f32 = 0.035; // ≈ 2.0°
 
+/// Rest deadband on expression weights (`solve_expressions`, eye/brow
+/// path). The FaceMesh blink/eye blendshapes jitter ±0.04 per frame at
+/// rest — the visible eye "twitch" — while a real blink is a Δ≈1.0 jump.
+/// A soft threshold on the per-frame weight *delta* freezes sub-threshold
+/// flutter and passes real expressions unshrunk; because it gates on the
+/// delta magnitude it is self-gating (no separate rest-speed signal, which
+/// a 0–1 weight channel doesn't have). Sized just above the measured
+/// flutter so genuine expression onsets are untouched.
+const EXPR_REST_DEAD: f32 = 0.06;
+
 /// Resolved 1€ + deadband tuning for one channel. The XY plane and the
 /// Z (depth) axis are tuned independently: the source frame is
 /// camera-aligned (+Z = away from camera), and monocular Z is the
@@ -174,12 +184,24 @@ struct OneEuroTuning {
 }
 
 impl OneEuroTuning {
-    /// The body default: standard 1€ on XY with no XY deadband (stays
-    /// fully live), heavy Z smoothing + small rest deadband.
+    /// The body default: standard 1€ on XY plus a small velocity-gated
+    /// XY rest deadband, heavy Z smoothing + small rest deadband.
+    ///
+    /// The XY deadband is the shared-root attack on rest jitter: the torso
+    /// / shoulder / neck / head keypoints carry a ~0.008–0.011 (AV
+    /// jitter_hf) floor that every downstream bone inherits — it reaches
+    /// the head directly and the hands amplified over the arm lever, so a
+    /// still torso quiets both. It is gated on the joint's own filter
+    /// output speed (see [`REST_SPEED_LO`]/`HI`), so it only freezes a
+    /// genuinely at-rest joint and releases the instant real motion
+    /// starts — this is compatible with keeping the torso "live" for head
+    /// latency (that constraint forbids a heavier *low-pass*, not a
+    /// rest-only freeze). Sized well below the hand tier's 0.02 since the
+    /// torso keypoints are the cleanest.
     const BODY: Self = Self {
         min_cutoff: ONE_EURO_MIN_CUTOFF_HZ,
         beta: ONE_EURO_BETA,
-        dead_radius: 0.0,
+        dead_radius: 0.012,
         z_min_cutoff: 0.15,
         z_beta: 0.15,
         z_dead_radius: 0.01,
@@ -206,6 +228,23 @@ impl OneEuroTuning {
         z_min_cutoff: 0.1,
         z_beta: 0.1,
         z_dead_radius: 0.02,
+    };
+    /// The face-pose angle tier (yaw, pitch, roll), packed so roll rides
+    /// the `z_*` slot. The head-orientation channel had *no* 1€ at all —
+    /// raw yaw/pitch/roll went straight to the head bone — and measures
+    /// the noisiest angular signal on the avatar (SRC roll ≈ 4°/frame at
+    /// rest, velocity fully noise-dominated). yaw/pitch get a standard
+    /// rest cutoff; roll gets the heaviest smoothing because it is both
+    /// the noisiest and the least intentional (people rarely roll their
+    /// head deliberately). `beta` is kept low so the noise-dominated
+    /// angular velocity cannot open the cutoff on jitter alone.
+    const FACE: Self = Self {
+        min_cutoff: 1.0,
+        beta: 0.15,
+        dead_radius: 0.0,
+        z_min_cutoff: 0.5,
+        z_beta: 0.10,
+        z_dead_radius: 0.0,
     };
 }
 
@@ -406,6 +445,15 @@ pub struct PoseSolverState {
     /// this filter the detector's root wobble lands on the avatar's Hips
     /// verbatim and sways the entire body.
     root_offset_filter: OneEuroFilterState,
+    /// 1€ filter state for the face pose angles (yaw, pitch, roll),
+    /// applied in `preprocess_source` before the head bone is driven.
+    /// The face track emits head orientation with heavy per-frame jitter
+    /// (measured SRC roll ≈ 4°/frame at rest) and `apply_face_pose`
+    /// otherwise passes it straight through — this is the only smoothing
+    /// on the head-orientation channel, which the position filters never
+    /// touch. Packed `[yaw, pitch, roll]` so roll rides the `z_*` (heavier)
+    /// slot of [`OneEuroTuning::FACE`].
+    face_angle_filter: OneEuroFilterState,
     /// Slow EMA of the source-skeleton `root_offset`, used as the
     /// "where the subject normally stands" reference. The avatar's
     /// Hips is translated by `(root_offset − reference) * sensitivity`
@@ -461,6 +509,7 @@ impl PoseSolverState {
         self.prev_hips_translation = None;
         self.root_reference = None;
         self.root_offset_filter = Default::default();
+        self.face_angle_filter = Default::default();
         // `running_shoulder_x_span_max` is intentionally NOT reset
         // here — it captures the subject's anatomical shoulder width
         // and persists across smoothing resets so a calibration-prime
@@ -847,6 +896,13 @@ pub fn solve_avatar_pose(
         skeleton.nodes[node_idx].rest_local.clone()
     });
 
+    // Metric-native path signal: a RealSense D435 skeleton carries faithful
+    // camera-space 3D on every joint, so the torso orientation is read
+    // directly from the real shoulder/hip line and the monocular
+    // foreshortening machinery below (running-max seed + `compute_body_yaw_3d`)
+    // is disabled. `None` ⇒ 2D webcam fallback, which keeps that machinery.
+    let metric_native = source_owned.metric_frame_info.is_some();
+
     // Seed `running_shoulder_x_span_max` from the calibrated shoulder
     // span when the user has captured a `PoseCalibration`. Without this
     // seed the running max accumulates from zero across the first few
@@ -876,7 +932,7 @@ pub fn solve_avatar_pose(
     // independently). Only seeded when `running_*` is still zero
     // (cold start) so a session that's already learned a larger max
     // keeps it.
-    if state.running_shoulder_x_span_max == 0.0 {
+    if !metric_native && state.running_shoulder_x_span_max == 0.0 {
         if let Some(span) = params
             .pose_calibration
             .as_ref()
@@ -895,11 +951,18 @@ pub fn solve_avatar_pose(
     // subject is facing the camera and bends knees toward +Z even when
     // the body has rotated 45°+ to the side, producing a visibly
     // dislocated leg in three-quarter / profile poses.
-    let body_yaw_source = compute_body_yaw_3d(
-        &source_owned,
-        params.joint_confidence_threshold,
-        &mut state.running_shoulder_x_span_max,
-    );
+    let body_yaw_source = if metric_native {
+        // Metric path: torso yaw is read directly from the real 3D
+        // shoulder/hip line in the Hips block below, never the monocular
+        // foreshortening estimate.
+        None
+    } else {
+        compute_body_yaw_3d(
+            &source_owned,
+            params.joint_confidence_threshold,
+            &mut state.running_shoulder_x_span_max,
+        )
+    };
 
     // Two-bone IK: disabled. The reconstruction biases the elbow /
     // knee toward a "natural bend" pole, which corrupts genuine
@@ -935,20 +998,39 @@ pub fn solve_avatar_pose(
     // source hip vector. Falls back to shoulder-derived `body_yaw`
     // when the hip pair is missing / below confidence (e.g. seated
     // subject with legs out of frame).
-    let hip_align = compute_hip_align_rotation(
+    // Torso orientation: hip line preferred, then — on the metric path — the
+    // real 3D shoulder line when the hips are out of frame (desk-up). Both
+    // are exact shortest-arc alignments of the avatar rest line to the source
+    // line. The monocular foreshortening `body_yaw` only takes over when no
+    // 3D line is available (webcam fallback); on the metric path
+    // `body_yaw_source` is `None`, so a missing 3D line leaves the Hips at
+    // rest (forward) instead of guessing — the fix for the desk-up wild-yaw.
+    let torso_align = compute_hip_align_rotation(
         &source_owned,
         &rest_world,
         humanoid,
         params.joint_confidence_threshold,
-    );
-    let hips_target_world_rot = if let Some(hip_q) = hip_align {
-        // hip_q rotates rest hip_line to source hip_line; compose
+    )
+    .or_else(|| {
+        if metric_native {
+            compute_shoulder_align_rotation(
+                &source_owned,
+                &rest_world,
+                humanoid,
+                params.joint_confidence_threshold,
+            )
+        } else {
+            None
+        }
+    });
+    let hips_target_world_rot = if let Some(align_q) = torso_align {
+        // Rotates the rest torso line to the source torso line; compose
         // with the rest hips world rotation.
         let hips_idx = humanoid
             .bone_map
             .get(&HumanoidBone::Hips)
             .map(|n| n.0 as usize);
-        hips_idx.map(|i| quat_mul(&hip_q, &rest_world[i].rotation))
+        hips_idx.map(|i| quat_mul(&align_q, &rest_world[i].rotation))
     } else if let Some(body_yaw) = body_yaw_source {
         if body_yaw.abs() > 0.01 {
             let hips_idx = humanoid
@@ -1067,56 +1149,111 @@ pub fn solve_avatar_pose(
                 raw_offset[1] - new_ref[1],
                 raw_offset[2] - new_ref[2],
             ];
-            // Per-axis sensitivity. The static defaults
-            // (`[0.6, 0.6, 0.3]`) are the right floor when we know
-            // nothing about the user's room, but a calibration that
-            // captured an explicit X/Z range (multi-step calibration:
-            // step left/right, lean in/out) lets us derive the gain
-            // from the *observed* envelope — a user with a narrow
-            // room (small ±X) gets a higher gain so a 30 cm step
-            // still moves the avatar across half its world-space
-            // horizontal envelope, while a large studio gets a lower
-            // gain so motion stays within frame.
+            // Two translation regimes, selected by the metric-native flag.
             //
-            // Formula: `sens = TARGET / (range / 2)` so the avatar's
-            // hip reaches `±TARGET` units when the subject reaches
-            // their captured extremes. The half-range is what's
-            // relevant because the EMA reference sits in the middle
-            // of the captured sweep.
+            // Metric path (D435): `root_offset` is RAW metres, so `dev` is a
+            // real-world displacement of the subject from their neutral
+            // position. We map it 1:1 into avatar units — scaled only by the
+            // avatar's proportion relative to the subject, so a human-sized
+            // rig stays ≈1:1 — with NO room-size sensitivity gain and NO
+            // clamp. This is the "camera-space projects straight to the
+            // avatar" contract the redesign exists to honour: a 30 cm
+            // side-step moves the hips 30 cm. The monocular gain/clamp
+            // machinery below would fight that, so it is bypassed here.
             //
-            // Clamp keeps a tiny captured range (user barely moved)
-            // from producing runaway gain, and a huge one from
-            // dropping below the static default.
-            const TARGET_AVATAR_X: f32 = 0.5;
-            const TARGET_AVATAR_Z: f32 = 0.3;
-            const SENS_X_CLAMP: (f32, f32) = (0.3, 2.5);
-            const SENS_Z_CLAMP: (f32, f32) = (0.15, 1.0);
+            // Monocular path (webcam): `root_offset` is unitless source space,
+            // so we derive a per-axis sensitivity from the calibration's
+            // observed X/Z range (or static defaults) to turn an arbitrary
+            // envelope into a bounded avatar sweep. Unchanged from before.
+            let translation_delta = if metric_native {
+                // Avatar proportion = rest shoulder span / subject shoulder
+                // span. Both are metres-equivalent (the rig's rest world is
+                // authored ~1 unit ≈ 1 m), so this is ≈1.0 for a human-sized
+                // avatar. Defaults to true 1:1 when either span is unknown.
+                let avatar_rest_shoulder_span = {
+                    let li = humanoid
+                        .bone_map
+                        .get(&HumanoidBone::LeftUpperArm)
+                        .map(|n| n.0 as usize);
+                    let ri = humanoid
+                        .bone_map
+                        .get(&HumanoidBone::RightUpperArm)
+                        .map(|n| n.0 as usize);
+                    match (
+                        li.and_then(|i| rest_world.get(i)),
+                        ri.and_then(|i| rest_world.get(i)),
+                    ) {
+                        (Some(l), Some(r)) => {
+                            let d = vec3_length(&vec3_sub(&l.position, &r.position));
+                            (d > 0.05).then_some(d)
+                        }
+                        _ => None,
+                    }
+                };
+                let subject_to_avatar_scale = source
+                    .metric_frame_info
+                    .as_ref()
+                    .map(|m| m.reference_span_m)
+                    .filter(|s| *s > 0.05)
+                    .and_then(|ref_span| avatar_rest_shoulder_span.map(|av| av / ref_span))
+                    .unwrap_or(1.0);
+                [
+                    dev[0] * subject_to_avatar_scale,
+                    dev[1] * subject_to_avatar_scale,
+                    dev[2] * subject_to_avatar_scale,
+                ]
+            } else {
+                // Per-axis sensitivity. The static defaults
+                // (`[0.6, 0.6, 0.3]`) are the right floor when we know
+                // nothing about the user's room, but a calibration that
+                // captured an explicit X/Z range (multi-step calibration:
+                // step left/right, lean in/out) lets us derive the gain
+                // from the *observed* envelope — a user with a narrow
+                // room (small ±X) gets a higher gain so a 30 cm step
+                // still moves the avatar across half its world-space
+                // horizontal envelope, while a large studio gets a lower
+                // gain so motion stays within frame.
+                //
+                // Formula: `sens = TARGET / (range / 2)` so the avatar's
+                // hip reaches `±TARGET` units when the subject reaches
+                // their captured extremes. The half-range is what's
+                // relevant because the EMA reference sits in the middle
+                // of the captured sweep.
+                //
+                // Clamp keeps a tiny captured range (user barely moved)
+                // from producing runaway gain, and a huge one from
+                // dropping below the static default.
+                const TARGET_AVATAR_X: f32 = 0.5;
+                const TARGET_AVATAR_Z: f32 = 0.3;
+                const SENS_X_CLAMP: (f32, f32) = (0.3, 2.5);
+                const SENS_Z_CLAMP: (f32, f32) = (0.15, 1.0);
 
-            let static_sens = params.root_translation_sensitivity;
-            let derived_sens_x = params
-                .pose_calibration
-                .as_ref()
-                .and_then(|c| c.x_range_observed)
-                .map(|range| {
-                    let half = (range * 0.5).max(0.05);
-                    (TARGET_AVATAR_X / half).clamp(SENS_X_CLAMP.0, SENS_X_CLAMP.1)
-                })
-                .unwrap_or(static_sens[0]);
-            let derived_sens_z = params
-                .pose_calibration
-                .as_ref()
-                .and_then(|c| c.z_range_observed)
-                .map(|range| {
-                    let half = (range * 0.5).max(0.05);
-                    (TARGET_AVATAR_Z / half).clamp(SENS_Z_CLAMP.0, SENS_Z_CLAMP.1)
-                })
-                .unwrap_or(static_sens[2]);
+                let static_sens = params.root_translation_sensitivity;
+                let derived_sens_x = params
+                    .pose_calibration
+                    .as_ref()
+                    .and_then(|c| c.x_range_observed)
+                    .map(|range| {
+                        let half = (range * 0.5).max(0.05);
+                        (TARGET_AVATAR_X / half).clamp(SENS_X_CLAMP.0, SENS_X_CLAMP.1)
+                    })
+                    .unwrap_or(static_sens[0]);
+                let derived_sens_z = params
+                    .pose_calibration
+                    .as_ref()
+                    .and_then(|c| c.z_range_observed)
+                    .map(|range| {
+                        let half = (range * 0.5).max(0.05);
+                        (TARGET_AVATAR_Z / half).clamp(SENS_Z_CLAMP.0, SENS_Z_CLAMP.1)
+                    })
+                    .unwrap_or(static_sens[2]);
 
-            let translation_delta = [
-                dev[0] * derived_sens_x,
-                dev[1] * static_sens[1],
-                dev[2] * derived_sens_z,
-            ];
+                [
+                    dev[0] * derived_sens_x,
+                    dev[1] * static_sens[1],
+                    dev[2] * derived_sens_z,
+                ]
+            };
 
             if let Some(hips_node) = humanoid.bone_map.get(&HumanoidBone::Hips).copied() {
                 let hips_idx = hips_node.0 as usize;
@@ -1805,6 +1942,58 @@ fn compute_hip_align_rotation(
     // computed here is *additive* on top of the rest Hips rotation.
     let l_idx = humanoid.bone_map.get(&LeftUpperLeg).map(|n| n.0 as usize)?;
     let r_idx = humanoid.bone_map.get(&RightUpperLeg).map(|n| n.0 as usize)?;
+    let l_world = rest_world.get(l_idx)?.position;
+    let r_world = rest_world.get(r_idx)?.position;
+    let av_dir = vec3_sub(&l_world, &r_world);
+    let av_len = vec3_length(&av_dir);
+    if av_len < 1.0e-4 {
+        return None;
+    }
+    let av_n = [av_dir[0] / av_len, av_dir[1] / av_len, av_dir[2] / av_len];
+
+    Some(quat_from_vectors(&av_n, &src_n))
+}
+
+/// Metric-path counterpart of [`compute_hip_align_rotation`] for the upper
+/// body: align the avatar's rest `R_UpperArm → L_UpperArm` line to the
+/// source skeleton's, giving the torso orientation directly from the real
+/// 3D shoulder line. Used only on the metric-depth path, where the shoulder
+/// positions carry true camera-space depth — so, unlike the monocular
+/// `compute_body_yaw_3d`, there is no foreshortening inference and no
+/// running-max ratchet (the bug that made a corner-clamped shoulder swing
+/// the whole body). Returns `None` when either shoulder is missing / below
+/// confidence (e.g. gated out of frame) or the two are coincident, so the
+/// caller leaves the Hips at rest (forward) rather than guessing. The
+/// UpperArm roots ARE the shoulder joints and are present in every humanoid
+/// rig, so this is more robust than keying on the optional clavicle bones.
+fn compute_shoulder_align_rotation(
+    source: &SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    threshold: f32,
+) -> Option<Quat> {
+    use HumanoidBone::*;
+    let l = source.joints.get(&LeftUpperArm)?;
+    let r = source.joints.get(&RightUpperArm)?;
+    if l.confidence < threshold || r.confidence < threshold {
+        return None;
+    }
+    let src_dir = vec3_sub(&l.position, &r.position);
+    let src_len = vec3_length(&src_dir);
+    // Plausibility floor. The metric skeleton is normalised so the shoulder
+    // span is ≈ `TARGET_SRC_SHOULDER_SPAN` (0.75). A span far below that means
+    // the two shoulder keypoints collapsed onto the same point (a degenerate
+    // detection whose direction is pure noise — seen on the wave replay at
+    // span ≈ 0.03). Reject it so the caller leaves the hips at rest rather
+    // than snapping the torso to a garbage yaw.
+    const MIN_SHOULDER_SPAN: f32 = 0.30;
+    if src_len < MIN_SHOULDER_SPAN {
+        return None;
+    }
+    let src_n = [src_dir[0] / src_len, src_dir[1] / src_len, src_dir[2] / src_len];
+
+    let l_idx = humanoid.bone_map.get(&LeftUpperArm).map(|n| n.0 as usize)?;
+    let r_idx = humanoid.bone_map.get(&RightUpperArm).map(|n| n.0 as usize)?;
     let l_world = rest_world.get(l_idx)?.position;
     let r_world = rest_world.get(r_idx)?.position;
     let av_dir = vec3_sub(&l_world, &r_world);
@@ -2549,6 +2738,22 @@ fn preprocess_source(
         o.up = normalize3(state.hand_orient_filters[3].apply(o.up, dt, orient));
     }
 
+    // Smooth the face pose angles. The head-orientation channel is
+    // otherwise unfiltered — `apply_face_pose` passes raw yaw/pitch/roll
+    // straight to the head bone — and it is the noisiest angular signal on
+    // the avatar (measured SRC roll ≈ 4°/frame at rest), so at rest the
+    // head visibly wobbles. Pack `[yaw, pitch, roll]` so roll takes the
+    // heavier `z_*` slot of the FACE tuning; the 1€ collapses to its low
+    // rest cutoff when the head is still and opens on a genuine turn.
+    if let Some(face) = out.face.as_mut() {
+        let s = state
+            .face_angle_filter
+            .apply([face.yaw, face.pitch, face.roll], dt, OneEuroTuning::FACE);
+        face.yaw = s[0];
+        face.pitch = s[1];
+        face.roll = s[2];
+    }
+
     // Anatomical finger constraints (run on the smoothed keypoints): clamp
     // each finger's curl to a single hinge plane with physiological angle
     // limits, removing the impossible twist / lateral wobble that noisy
@@ -3053,7 +3258,13 @@ pub fn solve_expressions(
                 .find(|e| e.name == expr_def.name)?;
             let raw = tracking.weight.clamp(0.0, 1.0);
             let prev_w = prev_map.get(expr_def.name.as_str()).copied().unwrap_or(raw);
-            let blended = prev_w + expression_blend * (raw - prev_w);
+            // Rest deadband (eye/brow path): shrink a sub-threshold
+            // per-frame delta toward zero so blink/eye micro-flutter is
+            // frozen, while a real blink (Δ≈1.0) passes almost unshrunk.
+            // Soft-thresholded so crossing the boundary is continuous.
+            let delta = raw - prev_w;
+            let deadbanded = prev_w + delta * soft_threshold_keep(delta.abs(), EXPR_REST_DEAD);
+            let blended = prev_w + expression_blend * (deadbanded - prev_w);
             let weight = if MOUTH_VISEMES.contains(&expr_def.name.as_str()) {
                 // `prev_w` carries the audio lip-sync value: `step_lipsync`
                 // runs just before the face solve each frame and writes the
@@ -3087,6 +3298,86 @@ pub fn solve_expressions(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod metric_orientation_tests {
+    use super::*;
+    use crate::asset::{HumanoidMap, NodeId};
+    use crate::math_utils::quat_rotate_vec3;
+    use crate::tracking::source_skeleton::SourceJoint;
+    use std::collections::HashMap;
+
+    fn put(sk: &mut SourceSkeleton, bone: HumanoidBone, pos: [f32; 3], confidence: f32) {
+        sk.joints
+            .insert(bone, SourceJoint { position: pos, confidence, metric_depth_m: None });
+    }
+
+    /// Minimal rig for [`compute_shoulder_align_rotation`], which reads only
+    /// the two upper-arm bones: LeftUpperArm at node 0, RightUpperArm at
+    /// node 1, with the given rest world positions.
+    fn rest_rig(l: [f32; 3], r: [f32; 3]) -> (HumanoidMap, Vec<WorldXform>) {
+        let mut bone_map = HashMap::new();
+        bone_map.insert(HumanoidBone::LeftUpperArm, NodeId(0));
+        bone_map.insert(HumanoidBone::RightUpperArm, NodeId(1));
+        let rest_world = vec![
+            WorldXform { position: l, rotation: [0.0, 0.0, 0.0, 1.0] },
+            WorldXform { position: r, rotation: [0.0, 0.0, 0.0, 1.0] },
+        ];
+        (HumanoidMap { bone_map }, rest_world)
+    }
+
+    /// Frontal subject whose shoulder line matches the avatar's rest line →
+    /// (near-)identity: the metric torso-align adds no yaw when the subject
+    /// faces the camera square-on. This is the real-3D counterpart to the
+    /// monocular `shoulder_only_falls_back_to_single_pair` front case, with
+    /// NO foreshortening/running-max machinery in the path.
+    #[test]
+    fn frontal_shoulders_give_identity() {
+        let (humanoid, rest_world) = rest_rig([0.15, 1.4, 0.0], [-0.15, 1.4, 0.0]);
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftUpperArm, [0.2, 0.5, 0.0], 1.0);
+        put(&mut sk, HumanoidBone::RightUpperArm, [-0.2, 0.5, 0.0], 1.0);
+        let q = compute_shoulder_align_rotation(&sk, &rest_world, &humanoid, 0.1)
+            .expect("both shoulders clear threshold");
+        // Rotating the avatar's rest shoulder dir (+X) by q must land back on
+        // the source dir (+X) — i.e. q ≈ identity.
+        let rotated = quat_rotate_vec3(&q, &[1.0, 0.0, 0.0]);
+        assert!(
+            (rotated[0] - 1.0).abs() < 1e-3 && rotated[1].abs() < 1e-3 && rotated[2].abs() < 1e-3,
+            "frontal → identity, got {rotated:?}"
+        );
+    }
+
+    /// 90° yaw: the subject's real shoulder line runs along the camera Z
+    /// axis. The alignment rotation carries the avatar's +X rest line straight
+    /// onto that −Z line — the 3D shoulder direction drives yaw directly.
+    #[test]
+    fn quarter_turn_maps_rest_line_onto_source_line() {
+        let (humanoid, rest_world) = rest_rig([0.15, 1.4, 0.0], [-0.15, 1.4, 0.0]);
+        let mut sk = SourceSkeleton::empty(0);
+        // Left shoulder behind, right in front → shoulder dir L−R = (0,0,−0.4).
+        put(&mut sk, HumanoidBone::LeftUpperArm, [0.0, 0.5, -0.2], 1.0);
+        put(&mut sk, HumanoidBone::RightUpperArm, [0.0, 0.5, 0.2], 1.0);
+        let q = compute_shoulder_align_rotation(&sk, &rest_world, &humanoid, 0.1).expect("shoulders");
+        let rotated = quat_rotate_vec3(&q, &[1.0, 0.0, 0.0]);
+        assert!(
+            rotated[2] < -0.99 && rotated[0].abs() < 1e-2 && rotated[1].abs() < 1e-2,
+            "quarter-turn should map +X→−Z, got {rotated:?}"
+        );
+    }
+
+    /// A shoulder below the confidence threshold (e.g. gated out of frame by
+    /// the 2D border gate) → `None`, so the caller leaves the hips at rest
+    /// ("unmeasured") rather than inventing an orientation from one point.
+    #[test]
+    fn low_confidence_shoulder_returns_none() {
+        let (humanoid, rest_world) = rest_rig([0.15, 1.4, 0.0], [-0.15, 1.4, 0.0]);
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftUpperArm, [0.2, 0.5, 0.0], 1.0);
+        put(&mut sk, HumanoidBone::RightUpperArm, [-0.2, 0.5, 0.0], 0.02);
+        assert!(compute_shoulder_align_rotation(&sk, &rest_world, &humanoid, 0.1).is_none());
+    }
 }
 
 #[cfg(test)]

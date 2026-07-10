@@ -126,6 +126,8 @@ tracking:
   input_device: "输入设备"
   backend_realsense: "使用 RealSense D435 (深度)"
   backend_realsense_hint: "实测深度 — 手臂和手部的前后3D准确。"
+  mirror_view: "1:1 传感器一致镜像渲染"
+  mirror_view_hint: "以 D435 实机镜头(视场角·主点)渲染虚拟形象 — 镜像。"
   webcam_no_depth: "网络摄像头：仅2D — 无深度。手臂/手部的前后不被追踪。"
   camera: "摄像头"
   no_cameras: "未检测到摄像头。点击 🔄 扫描。"

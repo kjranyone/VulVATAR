@@ -126,6 +126,8 @@ tracking:
   input_device: "입력 장치"
   backend_realsense: "RealSense D435 사용 (깊이)"
   backend_realsense_hint: "실측 깊이 — 팔·손의 앞뒤 3D가 정확합니다."
+  mirror_view: "1:1 센서 일치 미러 렌더링"
+  mirror_view_hint: "D435 실제 렌즈(화각·주점)로 아바타를 렌더링 — 거울상."
   webcam_no_depth: "웹캠: 2D 전용 — 깊이 없음. 팔/손의 앞뒤는 추적되지 않습니다."
   camera: "카메라"
   no_cameras: "카메라가 감지되지 않았습니다. 🔄를 클릭하여 검색하세요."

@@ -73,8 +73,6 @@ use super::yolox::YoloxPersonDetector;
 use super::PoseEstimate;
 #[cfg(feature = "inference")]
 use super::{DetectionAnnotation, SourceSkeleton};
-#[cfg(feature = "realsense")]
-pub(in crate::tracking) use arm_z::wrist_out_of_frame;
 #[cfg(feature = "inference")]
 use log::{debug, error, info, warn};
 #[cfg(feature = "inference")]

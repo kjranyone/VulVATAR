@@ -30,7 +30,9 @@ pub mod source_skeleton;
 pub mod yolox;
 
 pub use calibration::{CalibrationMode, PoseCalibration, TorsoDepthTemplate};
-pub use source_skeleton::{FacePose, SourceExpression, SourceJoint, SourceSkeleton};
+pub use source_skeleton::{
+    CameraIntrinsics, FacePose, MetricFrameInfo, SourceExpression, SourceJoint, SourceSkeleton,
+};
 
 /// Smoothing / threshold params consumed by
 /// [`crate::avatar::pose_solver::solve_avatar_pose`] via

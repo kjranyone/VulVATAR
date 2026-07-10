@@ -686,6 +686,12 @@ pub struct GuiApp {
     /// while this is set.
     pub use_realsense: bool,
 
+    /// 1:1 sensor-matched mirror render toggle. When on and the live pose is
+    /// metric-native (D435 depth path), the render camera adopts the sensor's
+    /// intrinsics + a front view so the avatar is framed like a mirror. A
+    /// live view control, not persisted; defaults off each session.
+    pub mirror_view: bool,
+
     // Viewport-pane state: rendered-scene texture handle, the
     // Blender-style drag-grab state, and the camera-wipe PIP toggle +
     // its companion texture / scratch buffer. See `ViewportUiState`.
@@ -868,6 +874,7 @@ impl GuiApp {
             camera_index: 0,
             available_cameras: crate::tracking::list_cameras(),
             use_realsense: cfg!(feature = "realsense"),
+            mirror_view: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
@@ -1101,6 +1108,7 @@ impl GuiApp {
             camera_index: 0,
             available_cameras: Vec::new(),
             use_realsense: cfg!(feature = "realsense"),
+            mirror_view: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
@@ -1184,6 +1192,7 @@ impl GuiApp {
             cloth_enabled: self.rendering.toggle_cloth && !self.cloth_authoring.sim_paused,
             collision_debug: self.rendering.toggle_collision_debug,
             skeleton_debug: self.rendering.toggle_skeleton_debug,
+            mirror_view: self.mirror_view,
         }
     }
 

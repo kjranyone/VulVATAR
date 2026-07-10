@@ -90,6 +90,11 @@ pub struct FrameInputConfig {
     /// Snapshot of `Application::background_time` for this frame, already
     /// wrapped to keep f32 precision.
     pub time_seconds: f32,
+    /// When `Some`, the render camera is the depth sensor's own intrinsics +
+    /// a front view (1:1 mirror), overriding the orbit `camera` field. Set
+    /// only when the mirror toggle is on and the live pose is metric-native;
+    /// `None` keeps the free orbit camera. See [`SensorCamera`].
+    pub sensor_camera: Option<SensorCamera>,
 }
 
 /// Runtime toggles controlled by the GUI that gate pipeline steps in `run_frame()`.
@@ -100,6 +105,13 @@ pub struct RuntimeToggles {
     pub cloth_enabled: bool,
     pub collision_debug: bool,
     pub skeleton_debug: bool,
+    /// 1:1 sensor-matched mirror render. When set AND the current tracking
+    /// pose carries `metric_frame_info` (D435 metric path), the render camera
+    /// switches from the free orbit camera to the depth sensor's own
+    /// intrinsics + a front-facing view, so the avatar is framed with the
+    /// real lens (FOV, principal point) — a mirror. Ignored on the webcam
+    /// path (no intrinsics) and while unset.
+    pub mirror_view: bool,
 }
 
 impl Default for RuntimeToggles {
@@ -110,8 +122,20 @@ impl Default for RuntimeToggles {
             cloth_enabled: false,
             collision_debug: false,
             skeleton_debug: false,
+            mirror_view: false,
         }
     }
+}
+
+/// Depth-sensor camera parameters for the 1:1 mirror render, plumbed from
+/// [`crate::tracking::MetricFrameInfo`] into [`FrameInputConfig`] when the
+/// mirror toggle is on. `intrinsics` gives the projection (FOV + principal
+/// point); `anchor_depth_m` is the subject's neutral forward distance in
+/// metres, used to place the eye so the avatar frames at the sensor's scale.
+#[derive(Clone, Copy, Debug)]
+pub struct SensorCamera {
+    pub intrinsics: crate::tracking::CameraIntrinsics,
+    pub anchor_depth_m: f32,
 }
 
 /// Camera parameters driven by the GUI viewport controls.
@@ -717,6 +741,7 @@ mod tests {
                 cloth_enabled: false,
                 collision_debug: false,
                 skeleton_debug: false,
+                mirror_view: false,
             },
             smoothing: crate::tracking::TrackingSmoothingParams::default(),
             material_mode_index: 0,

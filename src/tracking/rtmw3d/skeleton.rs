@@ -18,6 +18,39 @@ use super::consts::{
 use super::decode::{DecodedJoint, NUM_JOINTS, RTMW3D_SOURCE_Z_SCALE};
 use super::math::{length3, sub3};
 
+/// Zero the score of any torso-anchor keypoint (shoulders 5/6, hips 11/12)
+/// clamped to the image border, so [`build_source_skeleton`] treats it as
+/// undetected.
+///
+/// At "desk-up" framing the subject's shoulders sit at / beyond the frame's
+/// edges; RTMW3D clamps the off-frame keypoint to the border (nx ≈ 0.998)
+/// with a spuriously passing score. Admitted unchecked, that corner position
+/// inflates the shoulder x-difference, and `compute_body_yaw_3d` (the
+/// monocular fallback used when the hips are out of frame) turns it into a
+/// garbage body yaw that — via the parented spine chain — swings the head in
+/// world space even when the face track is stable.
+///
+/// A border-clamped keypoint is not reliably localised, so we drop it: the
+/// body-yaw fallback then finds no shoulder pair and the Hips rest
+/// (forward-facing), the stable face drives a stable head. No-op when the
+/// anchors are in frame, so a real torso turn is preserved. This is the
+/// monocular (2D-only) counterpart of the metric-depth path's
+/// [`super::super::skeleton_from_depth::gate_border_clamped_2d`]; both are
+/// the uniform validity gate that replaced the ad-hoc shoulder patches.
+fn gate_border_clamped(joints: &mut [DecodedJoint]) {
+    if joints.len() < NUM_JOINTS {
+        return;
+    }
+    const BORDER_EPS: f32 = 0.02;
+    for &idx in &[5usize, 6usize, 11usize, 12usize] {
+        let (nx, ny) = (joints[idx].nx, joints[idx].ny);
+        if nx <= BORDER_EPS || nx >= 1.0 - BORDER_EPS || ny <= BORDER_EPS || ny >= 1.0 - BORDER_EPS
+        {
+            joints[idx].score = 0.0;
+        }
+    }
+}
+
 pub(in crate::tracking) fn build_source_skeleton(
     frame_index: u64,
     joints: &[DecodedJoint],
@@ -29,6 +62,15 @@ pub(in crate::tracking) fn build_source_skeleton(
     if joints.len() < NUM_JOINTS {
         return sk;
     }
+
+    // Gate border-clamped torso anchors BEFORE any origin / body-yaw /
+    // spine-midpoint derivation consumes them. A shoulder clamped to the
+    // frame edge (desk-up framing) otherwise injects a garbage 3D position
+    // that swings the whole torso — and, via the parented chain, the head —
+    // even when the face track is stable. See fn docs.
+    let mut joints_owned = joints.to_vec();
+    gate_border_clamped(&mut joints_owned);
+    let joints = joints_owned.as_slice();
 
     // Origin selection. Hips (COCO 11/12) are the canonical choice
     // because every body bone direction is most stable when measured
@@ -65,19 +107,25 @@ pub(in crate::tracking) fn build_source_skeleton(
     } else {
         let ls = &joints[5];
         let rs = &joints[6];
-        let shoulder_score = ls.score.min(rs.score);
-        if shoulder_score < KEYPOINT_VISIBILITY_FLOOR {
-            // No reliable hips *and* no reliable shoulders — there is
-            // no anatomical anchor we trust. Leave the skeleton empty
-            // so the solver leaves the avatar at rest pose this
-            // frame instead of latching onto noise.
-            return sk;
+        let ls_ok = ls.score >= KEYPOINT_VISIBILITY_FLOOR;
+        let rs_ok = rs.score >= KEYPOINT_VISIBILITY_FLOOR;
+        // A shoulder suppressed as out-of-frame (score zeroed above) drops
+        // out of the anchor here; the remaining in-frame shoulder still
+        // anchors the origin so the skeleton is not discarded (its body yaw
+        // simply falls back to forward — see the suppress rationale). Only
+        // when BOTH shoulders are gone is there no anatomical anchor we
+        // trust: leave the skeleton empty so the solver holds the avatar at
+        // rest this frame instead of latching onto noise.
+        match (ls_ok, rs_ok) {
+            (true, true) => (
+                (ls.nx + rs.nx) * 0.5,
+                (ls.ny + rs.ny) * 0.5,
+                (ls.nz + rs.nz) * 0.5,
+            ),
+            (true, false) => (ls.nx, ls.ny, ls.nz),
+            (false, true) => (rs.nx, rs.ny, rs.nz),
+            (false, false) => return sk,
         }
-        (
-            (ls.nx + rs.nx) * 0.5,
-            (ls.ny + rs.ny) * 0.5,
-            (ls.nz + rs.nz) * 0.5,
-        )
     };
 
     // Source-space coord conversion. Aspect is recovered by scaling

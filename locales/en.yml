@@ -126,6 +126,8 @@ tracking:
   input_device: "Input Device"
   backend_realsense: "Use RealSense D435 (depth)"
   backend_realsense_hint: "Metric depth — accurate forward/back 3D for arms & hands."
+  mirror_view: "1:1 sensor mirror render"
+  mirror_view_hint: "Frame the avatar through the D435's own lens (FOV, principal point) — a mirror."
   webcam_no_depth: "Webcam: 2D only — no depth. Arm/hand forward-back isn't tracked."
   camera: "Camera"
   no_cameras: "No cameras detected. Click 🔄 to scan."
