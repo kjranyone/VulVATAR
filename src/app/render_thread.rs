@@ -220,6 +220,7 @@ impl RenderThreadInner {
                             has_alpha: false,
                             stats: crate::renderer::RenderStats::default(),
                             exported_frame: None,
+                            depth_ndc: None,
                         });
                         continue;
                     }
@@ -241,6 +242,7 @@ impl RenderThreadInner {
                                 has_alpha: false,
                                 stats: crate::renderer::RenderStats::default(),
                                 exported_frame: None,
+                                depth_ndc: None,
                             }
                         }
                     };
@@ -324,6 +326,7 @@ mod tests {
             has_alpha: false,
             stats: RenderStats::default(),
             exported_frame: None,
+            depth_ndc: None,
         }
     }
 
@@ -349,6 +352,7 @@ mod tests {
                 fallback_reason: Some(FallbackReason::RequestedCpuReadback),
                 preview_pixels: None,
             }),
+            depth_ndc: None,
         }
     }
 
@@ -384,6 +388,7 @@ mod tests {
                 fallback_reason: None,
                 preview_pixels: None,
             }),
+            depth_ndc: None,
         }
     }
 

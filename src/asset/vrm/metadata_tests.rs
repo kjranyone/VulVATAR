@@ -263,6 +263,9 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         confidence: 1.0,
     });
     source.overall_confidence = 1.0;
+    // Drive the solver's metric path (D435-exclusive); without it the solver
+    // still runs but through the None 1:1 translation fallback.
+    source.stamp_synthetic_metric_frame();
 
     let params = SolverParams {
         rotation_blend: 1.0,
@@ -407,6 +410,9 @@ fn sample_vrm0_solver_bends_fingers() {
         },
     );
     source.overall_confidence = 1.0;
+    // Drive the solver's metric path (D435-exclusive); without it the solver
+    // still runs but through the None 1:1 translation fallback.
+    source.stamp_synthetic_metric_frame();
 
     let params = SolverParams {
         rotation_blend: 1.0,

@@ -56,7 +56,7 @@ Rules:
 
 Responsibilities:
 
-- acquire webcam frames
+- acquire RealSense D435 depth + colour frames
 - run inference
 - normalize landmarks
 - publish latest `TrackingRigPose`

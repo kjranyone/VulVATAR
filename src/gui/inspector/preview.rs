@@ -437,6 +437,39 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_status.project_dirty = true;
             }
+            ui.add_enabled_ui(state.rendering.toggle_spring, |ui| {
+                use crate::simulation::spring::SpringTuning;
+                ui.horizontal(|ui| {
+                    ui.label(t!("inspector.spring_sway"));
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut state.rendering.spring_tuning.sway_scale,
+                                SpringTuning::SWAY_RANGE,
+                            )
+                            .fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        state.project_status.project_dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t!("inspector.spring_gravity"));
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut state.rendering.spring_tuning.gravity_offset,
+                                SpringTuning::GRAVITY_RANGE,
+                            )
+                            .fixed_decimals(2),
+                        )
+                        .changed()
+                    {
+                        state.project_status.project_dirty = true;
+                    }
+                });
+            });
             if ui
                 .checkbox(&mut state.rendering.toggle_cloth, t!("inspector.cloth_enabled"))
                 .changed()
@@ -461,6 +494,47 @@ pub(super) fn draw_preview(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.project_status.project_dirty = true;
             }
+        });
+
+    egui::CollapsingHeader::new(t!("inspector.gravity_global"))
+        .default_open(false)
+        .show(ui, |ui| {
+            use crate::simulation::SceneGravity;
+            ui.horizontal(|ui| {
+                ui.label(t!("inspector.gravity_strength"));
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.scene_gravity.strength,
+                            SceneGravity::STRENGTH_RANGE,
+                        )
+                        .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    state.project_status.project_dirty = true;
+                }
+            });
+            // World-space direction (default straight down). Applied to
+            // spring / cloth / Rapier uniformly; sims inverse-rotate it
+            // into each avatar's local frame.
+            ui.horizontal(|ui| {
+                ui.label(t!("inspector.gravity_direction"));
+                let d = &mut state.rendering.scene_gravity.direction;
+                let mut changed = false;
+                changed |= ui
+                    .add(egui::DragValue::new(&mut d[0]).speed(0.05).prefix("X "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut d[1]).speed(0.05).prefix("Y "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut d[2]).speed(0.05).prefix("Z "))
+                    .changed();
+                if changed {
+                    state.project_status.project_dirty = true;
+                }
+            });
         });
 
     draw_expression_control(ui, state);

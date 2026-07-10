@@ -333,7 +333,11 @@ fn process_image(
     // from the previous image.
     let _ = infer.estimate_pose(rgb_in.as_raw(), iw, ih, frame_index);
     let est_input = infer.estimate_pose(rgb_in.as_raw(), iw, ih, frame_index + 1);
-    let sk_input = est_input.skeleton;
+    let mut sk_input = est_input.skeleton;
+    // Real photos carry no depth to feed `set_external_depth`, so stamp a
+    // synthetic metric frame: the solver then scores the shipping metric path
+    // (D435-exclusive) instead of the None 1:1 fallback.
+    sk_input.stamp_synthetic_metric_frame();
 
     // Step 2: solve avatar pose. After this, the avatar's
     // pose.global_transforms hold each bone's world-space transform —

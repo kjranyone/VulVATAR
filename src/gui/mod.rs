@@ -400,9 +400,6 @@ pub struct TrackingGuiState {
     /// blend / confidence fields are user-editable — `stale_timeout_nanos`
     /// keeps its default.
     pub smoothing: TrackingSmoothingParams,
-    /// Run the DAv2 metric-depth stage (needs `models/dav2_small.onnx`).
-    /// Bound at tracking start; mid-session changes apply on restart.
-    pub depth_enabled: bool,
     /// Run every tracking ONNX session on the CPU EP, keeping DirectML
     /// off the GPU entirely. Slower but isolates tracking from GPU
     /// driver instability. Bound at tracking start.
@@ -431,7 +428,6 @@ impl TrackingGuiState {
             crate::tracking::provider::TrackingPipelineConfig::safe_mode()
         } else {
             crate::tracking::provider::TrackingPipelineConfig {
-                depth_enabled: self.depth_enabled,
                 force_cpu: self.force_cpu_inference,
                 yolox_enabled: self.yolox_enabled,
             }
@@ -468,6 +464,14 @@ pub struct RenderingGuiState {
     /// "Scene Background" section and synced to `Application` every frame.
     pub generative_background: crate::renderer::frame_input::GenerativeBackgroundSettings,
     pub toggle_spring: bool,
+    /// User spring-bone tuning (sway strength / gravity adjust), edited
+    /// next to the spring toggle and passed to the pipeline per frame via
+    /// `FrameConfig` (path 2). Persisted with the project.
+    pub spring_tuning: crate::simulation::spring::SpringTuning,
+    /// Scene-wide gravity (direction + strength) for all physics solvers,
+    /// edited in the Rendering inspector, passed via `FrameConfig`
+    /// (path 2). Persisted with the project.
+    pub scene_gravity: crate::simulation::SceneGravity,
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
     pub toggle_skeleton_debug: bool,
@@ -674,8 +678,11 @@ pub struct GuiApp {
     pub output: OutputGuiState,
     pub settings: SettingsGuiState,
 
-    pub camera_index: usize,
-    pub available_cameras: Vec<crate::tracking::CameraInfo>,
+    /// 1:1 sensor-matched mirror render toggle. When on and the live pose is
+    /// metric-native (D435 depth path), the render camera adopts the sensor's
+    /// intrinsics + a front view so the avatar is framed like a mirror. A
+    /// live view control, not persisted; defaults off each session.
+    pub mirror_view: bool,
 
     // Viewport-pane state: rendered-scene texture handle, the
     // Blender-style drag-grab state, and the camera-wipe PIP toggle +
@@ -815,7 +822,6 @@ impl GuiApp {
                 root_translation_enabled: true,
                 fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
-                depth_enabled: true,
                 force_cpu_inference: false,
                 yolox_enabled: true,
                 safe_mode_armed: false,
@@ -836,6 +842,8 @@ impl GuiApp {
                 generative_background:
                     crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
                 toggle_spring: true,
+                spring_tuning: crate::simulation::spring::SpringTuning::default(),
+                scene_gravity: crate::simulation::SceneGravity::default(),
                 toggle_cloth: false,
                 toggle_collision_debug: false,
                 toggle_skeleton_debug: false,
@@ -855,8 +863,7 @@ impl GuiApp {
                 pan_sensitivity: app_settings.pan_sensitivity,
             },
 
-            camera_index: 0,
-            available_cameras: crate::tracking::list_cameras(),
+            mirror_view: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
@@ -997,8 +1004,8 @@ impl GuiApp {
     /// * `eframe::CreationContext` (no egui context available in tests)
     /// * disk reads (avatar library, scene presets, recent avatars,
     ///   recovery snapshot, watched folders) — start with empty state
-    /// * system probes (`list_cameras`, `list_audio_devices`) — empty
-    ///   vecs, since the test doesn't drive the GUI
+    /// * system probes (`list_audio_devices`) — empty vecs, since the
+    ///   test doesn't drive the GUI
     /// * environment-driven autostart (autoload avatar, virtual-camera)
     ///
     /// The test can then populate `app.avatars` directly and exercise
@@ -1046,7 +1053,6 @@ impl GuiApp {
                 root_translation_enabled: true,
                 fade_on_tracking_loss: false,
                 smoothing: TrackingSmoothingParams::default(),
-                depth_enabled: true,
                 force_cpu_inference: false,
                 yolox_enabled: true,
                 safe_mode_armed: false,
@@ -1067,6 +1073,8 @@ impl GuiApp {
                 generative_background:
                     crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
                 toggle_spring: true,
+                spring_tuning: crate::simulation::spring::SpringTuning::default(),
+                scene_gravity: crate::simulation::SceneGravity::default(),
                 toggle_cloth: false,
                 toggle_collision_debug: false,
                 toggle_skeleton_debug: false,
@@ -1086,8 +1094,7 @@ impl GuiApp {
                 pan_sensitivity: 1.0,
             },
 
-            camera_index: 0,
-            available_cameras: Vec::new(),
+            mirror_view: false,
             viewport: ViewportUiState {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
@@ -1171,6 +1178,7 @@ impl GuiApp {
             cloth_enabled: self.rendering.toggle_cloth && !self.cloth_authoring.sim_paused,
             collision_debug: self.rendering.toggle_collision_debug,
             skeleton_debug: self.rendering.toggle_skeleton_debug,
+            mirror_view: self.mirror_view,
         }
     }
 
@@ -1312,6 +1320,8 @@ impl GuiApp {
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             mouth_source: self.lipsync.mouth_source,
+            spring_tuning: self.rendering.spring_tuning,
+            scene_gravity: self.rendering.scene_gravity,
             frame_dt,
         }
     }

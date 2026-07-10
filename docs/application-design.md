@@ -30,7 +30,7 @@ The application should let a user:
 
 - load a generic `VRM 1.0` avatar
 - preview and position that avatar in a live scene
-- drive the avatar from webcam-based tracking
+- drive the avatar from RealSense D435 depth-camera tracking
 - tune rendering and output behavior
 - optionally attach authored cloth overlays
 - route the result to OBS or other output sinks
@@ -42,7 +42,7 @@ The first version should be usable as a live avatar application, not only as a r
 The application should support these core scenarios:
 
 1. load an avatar and preview it locally
-2. connect and tune webcam tracking
+2. connect and tune RealSense D435 depth tracking
 3. adjust avatar placement and visual presentation
 4. configure output for OBS ingestion
 5. open cloth authoring for a selected avatar and save an overlay
@@ -73,7 +73,7 @@ Purpose:
 
 Purpose:
 
-- choose webcam input
+- choose the RealSense D435 depth device
 - inspect tracking confidence
 - tune retargeting behavior
 - validate latency and stability
@@ -431,7 +431,7 @@ The first-run experience should be short and practical:
 1. open application
 2. load VRM avatar
 3. see avatar in preview
-4. choose webcam
+4. choose the RealSense D435 depth device
 5. enable tracking
 6. adjust avatar transform
 7. pick output sink
@@ -443,7 +443,7 @@ Cloth authoring should not block first-run success.
 
 - avatar load failure
 - unsupported or invalid VRM data
-- webcam unavailable
+- RealSense D435 depth camera unavailable
 - low-confidence tracking
 - output sink unavailable
 - cloth overlay validation failure

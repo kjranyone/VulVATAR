@@ -70,7 +70,10 @@ fn main() -> Result<(), String> {
         // Acquisition pass + steady-state pass (matches the live
         // self-tracking crop behaviour).
         let _ = provider.estimate_pose(img.as_raw(), w, h, 0);
-        let est = provider.estimate_pose(img.as_raw(), w, h, 1);
+        let mut est = provider.estimate_pose(img.as_raw(), w, h, 1);
+        // Image-only bench: stamp the metric flag so the solver takes the
+        // shipping metric path (D435-exclusive) rather than the None fallback.
+        est.skeleton.stamp_synthetic_metric_frame();
 
         let mut avatar = AvatarInstance::new(AvatarInstanceId(1), Arc::clone(&asset));
         avatar.build_base_pose();

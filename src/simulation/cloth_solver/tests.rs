@@ -25,6 +25,7 @@ fn make_simple_sim(particle_count: usize) -> ClothSimState {
         pin_targets: Vec::new(),
         solver_iterations: 4,
         gravity: [0.0, -9.81, 0.0],
+        gravity_scale: 1.0,
         damping: 0.01,
         collision_margin: 0.0,
         wind_response: 0.0,

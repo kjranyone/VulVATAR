@@ -95,10 +95,8 @@ impl GuiApp {
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
-            depth_enabled: self.tracking.depth_enabled,
             force_cpu_inference: self.tracking.force_cpu_inference,
             yolox_enabled: self.tracking.yolox_enabled,
-            camera_index: self.camera_index,
             show_camera_wipe: self.viewport.show_camera_wipe,
             show_detection_annotations: self.viewport.show_detection_annotations,
             smoothing_rotation_blend: self.tracking.smoothing.rotation_blend,
@@ -123,6 +121,10 @@ impl GuiApp {
             background_color: self.rendering.background_color,
             transparent_background: self.rendering.transparent_background,
             toggle_spring: self.rendering.toggle_spring,
+            spring_sway_scale: self.rendering.spring_tuning.sway_scale,
+            spring_gravity_offset: self.rendering.spring_tuning.gravity_offset,
+            scene_gravity_direction: self.rendering.scene_gravity.direction,
+            scene_gravity_strength: self.rendering.scene_gravity.strength,
             toggle_cloth: self.rendering.toggle_cloth,
             toggle_collision_debug: self.rendering.toggle_collision_debug,
             toggle_skeleton_debug: self.rendering.toggle_skeleton_debug,
@@ -255,10 +257,8 @@ impl GuiApp {
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
         self.tracking.root_translation_enabled = state.root_translation_enabled;
         self.tracking.fade_on_tracking_loss = state.fade_on_tracking_loss;
-        self.tracking.depth_enabled = state.depth_enabled;
         self.tracking.force_cpu_inference = state.force_cpu_inference;
         self.tracking.yolox_enabled = state.yolox_enabled;
-        self.camera_index = state.camera_index;
         self.viewport.show_camera_wipe = state.show_camera_wipe;
         self.viewport.show_detection_annotations = state.show_detection_annotations;
         self.tracking.smoothing.rotation_blend = state.smoothing_rotation_blend;
@@ -309,6 +309,10 @@ impl GuiApp {
         self.rendering.background_color = state.background_color;
         self.rendering.transparent_background = state.transparent_background;
         self.rendering.toggle_spring = state.toggle_spring;
+        self.rendering.spring_tuning.sway_scale = state.spring_sway_scale;
+        self.rendering.spring_tuning.gravity_offset = state.spring_gravity_offset;
+        self.rendering.scene_gravity.direction = state.scene_gravity_direction;
+        self.rendering.scene_gravity.strength = state.scene_gravity_strength;
         self.rendering.toggle_cloth = state.toggle_cloth;
         self.rendering.toggle_collision_debug = state.toggle_collision_debug;
         self.rendering.toggle_skeleton_debug = state.toggle_skeleton_debug;

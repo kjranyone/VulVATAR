@@ -70,9 +70,10 @@ pub struct AnchorSample {
     /// missing this frame, or for rtmw3d-only paths where source
     /// positions are not metric. Aggregated by `aggregate()` as the
     /// median of finite samples to give a per-subject body-scale
-    /// reference that the depth pipeline uses for bone-length-aware
-    /// Z reconstruction (see
-    /// [`crate::tracking::skeleton_from_depth::reconstruct_arm_z_magnitudes`]).
+    /// reference. On the depth path this drives the metric-frame `mpsu`
+    /// (metres-per-source-unit) normalisation in
+    /// [`crate::tracking::skeleton_from_depth::build_skeleton`], scaling
+    /// the metric skeleton into the isotropic source frame.
     pub shoulder_span_m: Option<f32>,
 }
 

@@ -88,7 +88,11 @@ impl VulkanRenderer {
                         format: depth_format,
                         samples: 1,
                         load_op: Clear,
-                        store_op: DontCare,
+                        // `Store` (not `DontCare`) so the metric-depth benches
+                        // can read the depth aspect back after the pass. The
+                        // cost on the live 1× path is one depth-buffer store's
+                        // bandwidth — negligible on desktop GPUs.
+                        store_op: Store,
                     },
                 },
                 pass: {
@@ -175,14 +179,17 @@ impl VulkanRenderer {
         .expect("failed to create offscreen color image");
 
         // Depth must carry the same sample count as the colour attachment it
-        // is paired with in the subpass.
+        // is paired with in the subpass. `TRANSFER_SRC` lets the 1× path copy
+        // the depth aspect to a CPU buffer for the metric-depth benches
+        // (`validate_gt`); it is inert on the live path, which never enqueues a
+        // depth readback.
         let depth_image = Image::new(
             memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::D32_SFLOAT_S8_UINT,
                 extent: [extent[0], extent[1], 1],
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSFER_SRC,
                 samples,
                 ..Default::default()
             },

@@ -55,6 +55,12 @@ pub struct RenderResult {
     pub has_alpha: bool,
     pub stats: RenderStats,
     pub exported_frame: Option<output_export::ExportedFrame>,
+    /// Per-pixel non-linear NDC depth (`[0,1]`, `extent[0] × extent[1]`,
+    /// row-major top-down, matching the colour readback) — populated only
+    /// when [`VulkanRenderer::set_depth_readback`]`(true)` is active and the
+    /// frame rendered at 1× (MSAA off). `None` on the live path. Consumers
+    /// (`validate_gt`) linearise it against their projection to metres.
+    pub depth_ndc: Option<Vec<f32>>,
 }
 
 /// Output of a one-shot thumbnail render. Carries decoded RGBA pixels
@@ -364,6 +370,10 @@ pub struct VulkanRenderer {
     readback_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
     readback_slot: usize,
     pending_readback: Option<PendingReadbackState>,
+    // When set, the 1× render path copies the depth aspect to a CPU buffer and
+    // surfaces it as `RenderResult::depth_ndc`. Off on the live path; enabled
+    // only by the metric-depth benches (`validate_gt`) via `set_depth_readback`.
+    depth_readback_enabled: bool,
     // Cached skinning buffer + descriptor set per avatar instance slot.
     skinning_cache: Vec<SkinningCacheEntry>,
 }
@@ -438,6 +448,7 @@ impl VulkanRenderer {
             readback_buffers: [None, None],
             readback_slot: 0,
             pending_readback: None,
+            depth_readback_enabled: false,
             skinning_cache: Vec::new(),
         }
     }
@@ -929,6 +940,17 @@ impl VulkanRenderer {
         self.output_exporter.release_token(lease_id);
     }
 
+    /// Enable/disable per-frame depth-aspect CPU readback. When on, `render`
+    /// (1× only) copies the offscreen depth image to a host buffer and
+    /// surfaces it as [`RenderResult::depth_ndc`] — pipelined like the colour
+    /// readback, so it is harvested on the *next* `render` call. Off by
+    /// default; used by the metric-depth benches (`validate_gt`) to
+    /// reconstruct a `MetricDepthFrame` from a self-consistency render. No
+    /// effect under MSAA (the depth attachment is multisampled + `DontCare`).
+    pub fn set_depth_readback(&mut self, enabled: bool) {
+        self.depth_readback_enabled = enabled;
+    }
+
     pub fn render(&mut self, input: &RenderFrameInput) -> Result<RenderResult, String> {
         if !self.initialized {
             warn!("renderer: skipped because Vulkan is not initialized");
@@ -938,6 +960,7 @@ impl VulkanRenderer {
                 has_alpha: false,
                 stats: RenderStats::default(),
                 exported_frame: None,
+                depth_ndc: None,
             });
         }
 
@@ -1977,6 +2000,59 @@ impl VulkanRenderer {
             ))
             .map_err(|e| format!("render: copy_buffer staging→readback failed: {e}"))?;
 
+        // Optional depth-aspect readback (metric-depth benches only). 1× only
+        // — the MSAA depth attachment is multisampled + `DontCare`. The depth
+        // image carries `TRANSFER_SRC` and is `Store`d (see `pipeline_targets`);
+        // we copy only the DEPTH aspect of the combined D32S8 format to a
+        // host-visible buffer harvested next frame alongside the colour.
+        let depth_buffer = if self.depth_readback_enabled && self.current_sample_count == 1 {
+            match self.offscreen_depth.clone() {
+                Some(depth_image) => {
+                    let ext = self.current_extent;
+                    // vulkano validates the buffer against the combined
+                    // D32_SFLOAT_S8_UINT block size (8 B), even though a DEPTH-
+                    // aspect copy writes the depth tightly packed at 4 B/texel
+                    // (Vulkan spec) into the leading `w*h*4` bytes. Size for the
+                    // 8 B block so validation passes; the harvest reads the
+                    // tightly-packed depth prefix.
+                    let bytes = (ext[0] as u64) * (ext[1] as u64) * 8;
+                    let buf = vulkano::buffer::Buffer::new_slice::<u8>(
+                        memory_allocator.clone(),
+                        vulkano::buffer::BufferCreateInfo {
+                            usage: vulkano::buffer::BufferUsage::TRANSFER_DST,
+                            ..Default::default()
+                        },
+                        AllocationCreateInfo {
+                            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                            ..Default::default()
+                        },
+                        bytes,
+                    )
+                    .map_err(|e| format!("render: depth readback buffer alloc failed: {e}"))?;
+                    let region = vulkano::command_buffer::BufferImageCopy {
+                        image_subresource: vulkano::image::ImageSubresourceLayers {
+                            aspects: vulkano::image::ImageAspects::DEPTH,
+                            mip_level: 0,
+                            array_layers: 0..1,
+                        },
+                        image_extent: [ext[0], ext[1], 1],
+                        ..Default::default()
+                    };
+                    builder
+                        .copy_image_to_buffer(CopyImageToBufferInfo {
+                            regions: [region].into_iter().collect(),
+                            ..CopyImageToBufferInfo::image_buffer(depth_image, buf.clone())
+                        })
+                        .map_err(|e| format!("render: depth copy_image_to_buffer failed: {e}"))?;
+                    Some(buf)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let command_buffer = builder
             .build()
             .map_err(|e| format!("render: failed to build command buffer: {e}"))?;
@@ -2020,6 +2096,7 @@ impl VulkanRenderer {
                 gpu_wait::wait_fence_bounded(fence_future, "frame_readback")
             }),
             readback_buffer,
+            depth_buffer,
             extent,
             timestamp_nanos,
             stats: stats.clone(),
@@ -2032,6 +2109,7 @@ impl VulkanRenderer {
             has_alpha: true,
             stats,
             exported_frame: None,
+            depth_ndc: None,
         }))
     }
 

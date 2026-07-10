@@ -79,16 +79,7 @@ fn main() -> Result<(), String> {
     files.sort();
     eprintln!("{} frames", files.len());
 
-    // Depth A/B: `VULVATAR_REPLAY_NO_DEPTH=1` runs the RTMW3D-only
-    // path (no Phase 7 overwrite / 7.6 metric replacement), which
-    // keeps the inner ray-IK wrist depth — the control for attributing
-    // a flat forward reach to the with-depth pipeline vs the detector.
-    let depth_enabled = std::env::var("VULVATAR_REPLAY_NO_DEPTH").is_err();
-    eprintln!("depth_enabled={depth_enabled}");
-    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig {
-        depth_enabled,
-        ..Default::default()
-    };
+    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
     let mut provider = create_pose_provider("models", config)?;
     let _ = provider.take_load_warnings();
 
@@ -121,7 +112,10 @@ fn main() -> Result<(), String> {
         let img = image::open(f).map_err(|e| format!("open {}: {e}", f.display()))?.to_rgb8();
         let (w, h) = (img.width(), img.height());
         let est = provider.estimate_pose(img.as_raw(), w, h, i as u64);
-        let sk = est.skeleton;
+        let mut sk = est.skeleton;
+        // Image-only bench: stamp the metric flag so the solver takes the
+        // shipping metric path (D435-exclusive) rather than the None fallback.
+        sk.stamp_synthetic_metric_frame();
 
         avatar.build_base_pose();
         solve_avatar_pose(

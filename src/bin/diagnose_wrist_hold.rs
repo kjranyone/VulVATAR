@@ -63,7 +63,10 @@ fn main() -> Result<(), String> {
     for i in 0..(n_a + n_b) {
         let (img, tag) = if i < n_a { (&a, "A") } else { (&b, "B") };
         let est = provider.estimate_pose(img.as_raw(), img.width(), img.height(), i);
-        let sk = est.skeleton;
+        let mut sk = est.skeleton;
+        // Image-only bench: stamp the metric flag so the solver takes the
+        // shipping metric path (D435-exclusive) rather than the None fallback.
+        sk.stamp_synthetic_metric_frame();
 
         avatar.build_base_pose();
         solve_avatar_pose(

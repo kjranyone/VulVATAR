@@ -43,6 +43,10 @@ models/vitpose-h-wholebody_onnx/
 # Diagnostic output
 /diagnostics/
 
+# Python bytecode (depth_capture.py and other scripts run via uv)
+__pycache__/
+*.pyc
+
 # Profiling logs (see docs/profiling.md)
 /profile/
 

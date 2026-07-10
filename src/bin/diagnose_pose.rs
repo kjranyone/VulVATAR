@@ -126,7 +126,10 @@ fn main() -> Result<(), String> {
         let pimg = image::open(prime).map_err(|e| format!("open prime '{}': {e}", prime.display()))?;
         let prgb = pimg.to_rgb8();
         let (pw, ph) = (prgb.width(), prgb.height());
-        let pestimate = infer.estimate_pose(prgb.as_raw(), pw, ph, 0);
+        let mut pestimate = infer.estimate_pose(prgb.as_raw(), pw, ph, 0);
+        // Image-only bench: stamp the metric flag so the solver takes the
+        // shipping metric path (D435-exclusive) rather than the None fallback.
+        pestimate.skeleton.stamp_synthetic_metric_frame();
         eprintln!(
             "  inferred {} keypoints (prime)",
             pestimate.annotation.keypoints.len(),
@@ -157,7 +160,8 @@ fn main() -> Result<(), String> {
     solver_state.reset_motion_smoothing();
 
     eprintln!("running inference…");
-    let estimate = infer.estimate_pose(rgb.as_raw(), iw, ih, 0);
+    let mut estimate = infer.estimate_pose(rgb.as_raw(), iw, ih, 0);
+    estimate.skeleton.stamp_synthetic_metric_frame();
     eprintln!(
         "inferred {} keypoints, bbox={:?}",
         estimate.annotation.keypoints.len(),

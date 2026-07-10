@@ -9,7 +9,7 @@ This project targets `VRM 1.0 only`. The implemented scope:
 - `MToon-like` shading
 - secondary motion with spring bones
 - cloth simulation for selected garments or accessories
-- webcam-based motion tracking
+- RealSense D435 depth-camera motion tracking
 - video output routable into OBS Studio
 
 `VRM 0.x` compatibility is intentionally out of scope (a best-effort
@@ -165,7 +165,7 @@ without caring how simulation produced them.
 
 Responsibilities:
 
-- acquire webcam frames on a non-render-thread path
+- acquire RealSense D435 depth + colour frames on a non-render-thread path
 - run pose or face or hand estimation asynchronously
 - retarget estimated landmarks into the avatar rig space
 - smooth, filter, and stabilize tracking output
@@ -179,7 +179,7 @@ Outputs:
 
 Rules:
 
-- webcam and CV code do not become the authoritative skeleton state
+- depth-camera and CV code do not become the authoritative skeleton state
 - tracking writes into retargeting inputs, then avatar runtime resolves final pose
 - tracking must tolerate missing landmarks and low-confidence frames
 - the POC should run tracking asynchronously and hand off timestamped results through a narrow mailbox or queue
@@ -238,11 +238,11 @@ Bad candidate for first ownership:
 
 ## Motion Tracking Strategy
 
-Webcam tracking is a separate input problem, not an animation substitute.
+Depth-camera tracking is a separate input problem, not an animation substitute.
 
 Recommended pipeline:
 
-1. webcam frame acquisition
+1. RealSense D435 depth + colour frame acquisition
 2. human landmark estimation
 3. head, face, upper body, and optional hand extraction
 4. confidence filtering and temporal smoothing
@@ -278,7 +278,7 @@ For the POC, target:
 - upper arms
 - facial expressions if feasible
 
-Do not make lower-body full-body webcam inference a hard requirement for the first pass unless your camera setup and CV stack already support it robustly.
+Do not make lower-body full-body depth-camera inference a hard requirement for the first pass unless your camera setup and CV stack already support it robustly.
 
 ## Cloth Simulation Positioning
 
@@ -544,7 +544,7 @@ cloth attachments, `avatar.cloth_enabled`.
 - `src/avatar/`: runtime avatar state and pose ownership
 - `src/simulation/`: spring, cloth, collider, and future world-physics logic
 - `src/renderer/`: Vulkano rendering and material pipelines
-- `src/tracking/`: webcam tracking and retargeting inputs
+- `src/tracking/`: RealSense D435 depth tracking and retargeting inputs
 - `src/output/`: OBS-facing and external frame sink integration
 
 The implementations the original baseline anticipated are all in

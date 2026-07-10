@@ -44,6 +44,7 @@ use vulvatar_lib::renderer::frame_input::{
 use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
 use vulvatar_lib::renderer::VulkanRenderer;
 use vulvatar_lib::tracking::provider::create_pose_provider;
+use vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame;
 
 const RENDER_EXTENT: [u32; 2] = [1024, 1024];
 /// AliciaSolid, NOT AvatarSample_A: the tracker reads Alicia's
@@ -366,11 +367,15 @@ fn make_instance(asset: &Arc<AvatarAsset>, locals: Vec<Transform>) -> AvatarInst
     avatar
 }
 
+/// Render `avatar` and return `(rgba8, depth_ndc)`. The depth (per-pixel NDC,
+/// present because `set_depth_readback(true)` is active) is harvested from the
+/// pipelined readback — the second render harvests the first's, and both
+/// render the same frame, so the depth matches the returned colour.
 fn render_avatar(
     renderer: &mut VulkanRenderer,
     avatar: &AvatarInstance,
     extent: [u32; 2],
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Option<Vec<f32>>), String> {
     let frame_input = build_frame_input(avatar, extent);
     let _warm = renderer
         .render(&frame_input)
@@ -383,7 +388,69 @@ fn render_avatar(
         .as_ref()
         .and_then(|f| f.cpu_pixel_data())
         .ok_or_else(|| "no pixel data".to_string())?;
-    Ok((*pixels).clone())
+    Ok(((*pixels).clone(), result.depth_ndc))
+}
+
+/// Camera near/far planes fed to `build_projection_matrix` in
+/// `build_frame_input`. Kept in sync so the depth linearisation matches the
+/// projection the depth buffer was rendered with.
+const CAM_NEAR: f32 = 0.1;
+const CAM_FAR: f32 = 1000.0;
+
+/// Linearise the renderer's NDC depth (`build_projection_matrix` convention:
+/// Vulkan `[0,1]`, camera looking down `-Z`) into a camera-space metric point
+/// cloud — `x` right, `y` down, `z` forward metres — i.e. the
+/// [`MetricDepthFrame`] the shipping D435 skeleton path consumes. Cleared /
+/// background pixels (`d ≈ 1`, the far plane) become `NaN`, matching the D435's
+/// invalid-pixel convention. `fov_deg` is the vertical FOV that fed the
+/// projection; extent is square so `fx == fy`.
+fn build_metric_frame_from_depth(
+    depth_ndc: &[f32],
+    extent: [u32; 2],
+    fov_deg: f32,
+) -> MetricDepthFrame {
+    let (w, h) = (extent[0], extent[1]);
+    let a = CAM_FAR / (CAM_NEAR - CAM_FAR);
+    let b = CAM_FAR * CAM_NEAR / (CAM_NEAR - CAM_FAR);
+    // Vertical FOV drives both axes (P[1][1] = -1/tan(fov/2); P[0][0] divides
+    // by aspect), so fx = fy = (height/2) / tan(fov/2). cx/cy = image centre.
+    let f = 1.0 / (fov_deg.to_radians() * 0.5).tan();
+    let fx = (h as f32) * 0.5 * f;
+    let fy = fx;
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let mut points_m = Vec::with_capacity((w as usize) * (h as usize));
+    for i in 0..(w as usize) * (h as usize) {
+        let d = depth_ndc.get(i).copied().unwrap_or(1.0);
+        if !d.is_finite() || d >= 1.0 {
+            points_m.push([f32::NAN; 3]);
+            continue;
+        }
+        // NDC depth d ∈ [0,1] → forward distance: d = -a - b/z_view, and
+        // camera-forward Z = -z_view = b/(a+d). Verified: d=0→near, d=1→far.
+        let z = b / (a + d);
+        if !z.is_finite() || z <= 0.0 || z > 50.0 {
+            points_m.push([f32::NAN; 3]);
+            continue;
+        }
+        let u = (i as u32 % w) as f32 + 0.5;
+        let v = (i as u32 / w) as f32 + 0.5;
+        points_m.push([(u - cx) / fx * z, (v - cy) / fy * z, z]);
+    }
+    MetricDepthFrame {
+        width: w,
+        height: h,
+        points_m,
+        crop: None,
+        intrinsics: Some(vulvatar_lib::tracking::source_skeleton::CameraIntrinsics {
+            fx,
+            fy,
+            cx,
+            cy,
+            width: w,
+            height: h,
+        }),
+    }
 }
 
 fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameInput {
@@ -535,21 +602,12 @@ fn main() -> Result<(), String> {
     env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut filter: Option<String> = None;
-    let mut depth_enabled = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--filter" => {
                 filter = args.get(i + 1).cloned();
                 i += 2;
-            }
-            // Provenance probe: shoulder z is touched only by raw
-            // RTMW3D nz and by the depth pipeline's DAv2 bz
-            // injection; A/B-ing this flag attributes spurious
-            // shoulder Δz to one or the other.
-            "--no-depth" => {
-                depth_enabled = false;
-                i += 1;
             }
             other => return Err(format!("unknown arg: {other}")),
         }
@@ -561,11 +619,8 @@ fn main() -> Result<(), String> {
         .load(&vrm)
         .map_err(|e| format!("load VRM: {e:?}"))?;
 
-    eprintln!("loading pose provider (depth_enabled={depth_enabled})…");
-    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig {
-        depth_enabled,
-        ..Default::default()
-    };
+    eprintln!("loading pose provider…");
+    let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
     let mut infer =
         create_pose_provider("models", config).map_err(|e| format!("provider: {e}"))?;
     for w in infer.take_load_warnings() {
@@ -575,6 +630,11 @@ fn main() -> Result<(), String> {
     eprintln!("initializing Vulkan renderer…");
     let mut renderer = VulkanRenderer::new();
     renderer.initialize();
+    // True metric round-trip: read the render's depth aspect back so each
+    // tracked frame is fed real aligned depth via `set_external_depth`,
+    // exercising the shipping `skeleton_from_depth` path end-to-end.
+    renderer.set_depth_readback(true);
+    let cam_fov = ViewportCamera::default().fov_deg;
 
     let out_dir = PathBuf::from(OUT_DIR);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -596,7 +656,7 @@ fn main() -> Result<(), String> {
     // each pose as an isolated single frame instead would deny the
     // pipeline exactly the calibration the live session always has —
     // and the anatomical floor then fabricates twist on narrow rigs.
-    let neutral_rgba = {
+    let (neutral_rgba, neutral_depth) = {
         let locals = build_gt_pose(&asset, &pose_suite()[0].1);
         let avatar = make_instance(&asset, locals);
         render_avatar(&mut renderer, &avatar, RENDER_EXTENT)?
@@ -605,6 +665,11 @@ fn main() -> Result<(), String> {
         .chunks_exact(4)
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
+    let neutral_metric = build_metric_frame_from_depth(
+        &neutral_depth.ok_or_else(|| "validate_gt: neutral render produced no depth".to_string())?,
+        RENDER_EXTENT,
+        cam_fov,
+    );
 
     let mut rows: Vec<(String, PoseMetrics, PoseMetrics, PoseMetrics)> = Vec::new();
     for (idx, (name, ops)) in pose_suite().into_iter().enumerate() {
@@ -617,21 +682,40 @@ fn main() -> Result<(), String> {
         let gt_locals = build_gt_pose(&asset, &ops);
         let gt_metrics = metrics(&asset, &gt_locals, &rest_head);
         let gt_avatar = make_instance(&asset, gt_locals.clone());
-        let rgba = render_avatar(&mut renderer, &gt_avatar, RENDER_EXTENT)?;
+        let (rgba, gt_depth) = render_avatar(&mut renderer, &gt_avatar, RENDER_EXTENT)?;
 
         // RGBA → RGB for the tracker.
         let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        // Aligned metric depth for THIS pose's render, fed before each
+        // estimate_pose so the provider back-projects the skeleton through the
+        // shipping `skeleton_from_depth` path (one frame consumed per call).
+        let gt_metric = build_metric_frame_from_depth(
+            &gt_depth.ok_or_else(|| "validate_gt: GT render produced no depth".to_string())?,
+            RENDER_EXTENT,
+            cam_fov,
+        );
+
+        // Depth-map triage: dump the linearised metric z as grayscale +
+        // print the finite-z range so the depth faithfulness can be judged
+        // independently of the RTMW3D 2D detection quality.
+        if std::env::var("VULVATAR_GT_PROBE").is_ok() {
+            dump_depth_stats(name, &gt_metric, &out_dir);
+        }
 
         // Track + solve: reset, neutral warmup (session calibration),
         // then two passes on the pose frame (acquire + self-tracked
-        // crop — same protocol as validate_pipeline).
+        // crop — same protocol as validate_pipeline). Each pass is fed its
+        // frame's aligned depth (neutral vs GT), mirroring the live worker.
         infer.reset_temporal_state();
         infer.set_calibration_mode_hint(Some(vulvatar_lib::tracking::CalibrationMode::FullBody));
         let base = (idx as u64) * 8;
         for k in 0..3 {
+            infer.set_external_depth(neutral_metric.clone());
             let _ = infer.estimate_pose(&neutral_rgb, RENDER_EXTENT[0], RENDER_EXTENT[1], base + k);
         }
+        infer.set_external_depth(gt_metric.clone());
         let _ = infer.estimate_pose(&rgb, RENDER_EXTENT[0], RENDER_EXTENT[1], base + 3);
+        infer.set_external_depth(gt_metric.clone());
         let est = infer.estimate_pose(&rgb, RENDER_EXTENT[0], RENDER_EXTENT[1], base + 4);
 
         let mut rec_locals = rest_locals.clone();
@@ -673,7 +757,7 @@ fn main() -> Result<(), String> {
 
         // Side-by-side composite GT | recovered for visual triage.
         let rec_avatar = make_instance(&asset, rec_locals);
-        if let Ok(rec_rgba) = render_avatar(&mut renderer, &rec_avatar, RENDER_EXTENT) {
+        if let Ok((rec_rgba, _)) = render_avatar(&mut renderer, &rec_avatar, RENDER_EXTENT) {
             let _ = save_composite(&out_dir.join(format!("{name}.png")), &rgba, &rec_rgba);
         }
 
@@ -695,6 +779,45 @@ fn main() -> Result<(), String> {
     write_summary(&out_dir.join("summary.md"), &rows)?;
     eprintln!("wrote: {}", out_dir.display());
     Ok(())
+}
+
+/// Temporary depth triage: print finite-z stats and save a grayscale of the
+/// linearised metric depth (near=white .. far=black over [0.8, 1.8] m) so the
+/// depth render can be judged by eye, independent of 2D detection.
+fn dump_depth_stats(name: &str, frame: &MetricDepthFrame, out_dir: &std::path::Path) {
+    let (w, h) = (frame.width, frame.height);
+    let zs: Vec<f32> = frame.points_m.iter().map(|p| p[2]).collect();
+    let finite: Vec<f32> = zs.iter().copied().filter(|z| z.is_finite()).collect();
+    if finite.is_empty() {
+        eprintln!("  depth[{name}]: NO finite z (all background)");
+        return;
+    }
+    let mut sorted = finite.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize];
+    eprintln!(
+        "  depth[{name}]: finite={}/{} min={:.3} p05={:.3} p50={:.3} p95={:.3} max={:.3} m",
+        finite.len(),
+        zs.len(),
+        sorted[0],
+        pct(0.05),
+        pct(0.50),
+        pct(0.95),
+        sorted[sorted.len() - 1],
+    );
+    // Grayscale: near (0.8 m) = white, far (1.8 m) = black; background = mid-gray.
+    let (near_m, far_m) = (0.8f32, 1.8f32);
+    let mut img = image::GrayImage::new(w, h);
+    for (i, z) in zs.iter().enumerate() {
+        let g = if z.is_finite() {
+            let t = ((z - near_m) / (far_m - near_m)).clamp(0.0, 1.0);
+            (255.0 * (1.0 - t)) as u8
+        } else {
+            96
+        };
+        img.put_pixel((i as u32) % w, (i as u32) / w, image::Luma([g]));
+    }
+    let _ = img.save(out_dir.join(format!("{name}_depth.png")));
 }
 
 fn save_composite(path: &std::path::Path, left: &[u8], right: &[u8]) -> Result<(), String> {

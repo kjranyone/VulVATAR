@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::gui::components::{filled_button, icon_button, tonal_button, ButtonTone};
+use crate::gui::components::{filled_button, tonal_button, ButtonTone};
 use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
@@ -59,47 +59,19 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     egui::CollapsingHeader::new(t!("tracking.input_device"))
         .default_open(true)
         .show(ui, |ui| {
-            // Captured before the device combo so a mid-session device switch
-            // triggers the same auto-restart as a resolution / FPS change.
-            let prev_camera = state.camera_index;
-            ui.horizontal(|ui| {
-                let selected_text = state
-                    .available_cameras
-                    .iter()
-                    .find(|c| c.index == state.camera_index)
-                    .map(|c| format!("{}: {}", c.index, c.name))
-                    .unwrap_or_else(|| t!("tracking.camera_n", index = state.camera_index).to_string());
-                egui::ComboBox::from_label(t!("tracking.camera"))
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        if state.available_cameras.is_empty() {
-                            ui.label(t!("tracking.no_cameras"));
-                        } else {
-                            for cam in &state.available_cameras {
-                                let label = format!("{}: {}", cam.index, cam.name);
-                                ui.selectable_value(&mut state.camera_index, cam.index, label);
-                            }
-                        }
-                    });
-                if state.camera_index != prev_camera {
-                    state.project_status.project_dirty = true;
-                }
-                if icon_button(ui, ic::REFRESH, &t!("tracking.refresh")).clicked() {
-                    state.available_cameras = crate::tracking::list_cameras();
-                    if !state
-                        .available_cameras
-                        .iter()
-                        .any(|c| c.index == state.camera_index)
-                    {
-                        state.camera_index = state
-                            .available_cameras
-                            .first()
-                            .map(|c| c.index)
-                            .unwrap_or(0);
-                    }
-                }
-            });
-            let camera_changed = state.camera_index != prev_camera;
+            #[cfg(feature = "realsense")]
+            {
+                // D435-exclusive capture: the sole input is the Intel
+                // RealSense D435. It self-selects the first D400 device and
+                // supplies its own color-aligned metric depth to the pose
+                // pipeline — there is no device / backend to choose.
+                ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
+                // 1:1 sensor-matched mirror render (needs the D435 intrinsics,
+                // so it is realsense-only).
+                ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
+                ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
+                ui.add_space(4.0);
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let active = state.is_tracking_active();
@@ -137,16 +109,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     } else {
                         (w, h, fps)
                     };
-                    #[cfg(feature = "webcam")]
-                    let backend = crate::tracking::CameraBackend::Webcam {
-                        camera_index: state.camera_index,
-                    };
-                    #[cfg(not(feature = "webcam"))]
-                    let backend = crate::tracking::CameraBackend::Synthetic;
                     let pipeline = state.tracking.pipeline_config();
                     state
                         .app
-                        .start_tracking_with_params(backend, w, h, fps, pipeline);
+                        .start_tracking_with_params(w, h, fps, pipeline);
                 }
             });
             if ui
@@ -197,13 +163,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             if fps_changed {
                 state.project_status.project_dirty = true;
             }
-            // Phase B-1: if the webcam is currently running, restart it with
-            // the new params so the change takes effect immediately rather
-            // than only at the next Stop / Start Camera cycle. The device
-            // dropdown (`camera_changed`) restarts the same way — previously
-            // it only flagged the project dirty and the running camera kept
-            // the old device until a manual Stop / Start.
-            if (res_changed || fps_changed || camera_changed) && state.app.is_tracking_running() {
+            // If the camera is currently running, restart it with the new
+            // params so a resolution / frame-rate change takes effect
+            // immediately rather than only at the next Stop / Start cycle.
+            if (res_changed || fps_changed) && state.app.is_tracking_running() {
                 let (w, h) =
                     crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
                 let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
@@ -212,16 +175,10 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 } else {
                     (w, h, fps)
                 };
-                #[cfg(feature = "webcam")]
-                let backend = crate::tracking::CameraBackend::Webcam {
-                    camera_index: state.camera_index,
-                };
-                #[cfg(not(feature = "webcam"))]
-                let backend = crate::tracking::CameraBackend::Synthetic;
                 let pipeline = state.tracking.pipeline_config();
                 state
                     .app
-                    .start_tracking_with_params(backend, w, h, fps, pipeline);
+                    .start_tracking_with_params(w, h, fps, pipeline);
                 state.push_notification(t!("tracking.camera_restarted", w = w, h = h, fps = fps));
             }
         });
@@ -230,12 +187,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         .default_open(false)
         .show(ui, |ui| {
             let mut changed = false;
-            changed |= ui
-                .checkbox(
-                    &mut state.tracking.depth_enabled,
-                    t!("tracking.pipeline_depth"),
-                )
-                .changed();
             changed |= ui
                 .checkbox(
                     &mut state.tracking.yolox_enabled,
@@ -359,18 +310,15 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             };
             ui.label(egui::RichText::new(status_text).color(status_color));
             if camera_running {
-                let camera_label = state
-                    .app
-                    .tracking_worker
-                    .as_ref()
-                    .map(|w| w.active_backend().label())
-                    .unwrap_or("Unknown");
-                ui.label(t!("tracking.camera_label", label = camera_label.to_string()));
+                ui.label(t!(
+                    "tracking.camera_label",
+                    label = crate::tracking::CAPTURE_BACKEND_LABEL.to_string()
+                ));
 
                 // Inference backend (ONNX execution provider) — surfaces a
                 // silent CPU fallback when DirectML registration fails. Set
                 // by the worker once the pose provider finishes loading;
-                // absent during synthetic mode or before init completes.
+                // absent before init completes.
                 if let Some(label) = state
                     .app
                     .tracking_worker

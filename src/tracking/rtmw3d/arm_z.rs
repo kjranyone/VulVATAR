@@ -3,14 +3,12 @@
 //! session length bookkeeping the repair's band clamp reads.
 //!
 //! The z-depth reconstruction that used to live here (`|dz| =
-//! sqrt(L² − xy²)` against a session running-max length) moved to the
-//! ray-IK stage (`super::arm_ray_ik`, `docs/ray-ik-depth-solve.md`):
-//! the running max was structurally corruptible — one near-lens hand
-//! sweep inflated it past anatomy (measured 2×) and a pure max never
-//! recovers, after which every in-plane arm read as foreshortened and
-//! gained fake forward depth every frame. The ray-IK solve uses
-//! anatomical metric lengths instead, so near-lens magnification
-//! resolves into depth by construction.
+//! sqrt(L² − xy²)` against a session running-max length) is gone: the
+//! running max was structurally corruptible — one near-lens hand sweep
+//! inflated it past anatomy (measured 2×) and a pure max never recovers.
+//! On the D435-exclusive pipeline the metric depth path
+//! (`skeleton_from_depth`) supplies limb z directly, so this module now
+//! only repairs 2D-plane keypoints.
 //!
 //! What remains here:
 //!

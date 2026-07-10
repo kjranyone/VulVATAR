@@ -2,11 +2,10 @@
 //!
 //! `TrackingWorker` talks to this module instead of binding directly to
 //! a specific model. There is a single production pipeline: RTMW3D
-//! (body + hands + face) with an async Depth Anything V2 metric-depth
-//! stage. When `dav2_small.onnx` is absent the provider runs the same
-//! pipeline without the depth stage (z falls back to RTMW3D's
-//! body-prior synthetic), so one provider covers both the fast and the
-//! accurate configuration.
+//! (body + hands + face). Metric depth is supplied externally by a
+//! RealSense D435 (`set_external_depth`, `realsense` feature); without
+//! it the provider runs RTMW3D-only and z falls back to RTMW3D's
+//! body-prior synthetic.
 
 use std::path::Path;
 
@@ -19,10 +18,6 @@ use super::PoseEstimate;
 /// [`TrackingPipelineConfig::safe_mode`] after an unclean exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrackingPipelineConfig {
-    /// Run the async DAv2 metric-depth stage (requires
-    /// `models/dav2_small.onnx`; missing model degrades with a
-    /// visible warning).
-    pub depth_enabled: bool,
     /// Force every ONNX session onto the CPU EP, keeping DirectML —
     /// and the GPU driver's compute queue — out of the tracking
     /// pipeline entirely. Slower, but isolates tracking from
@@ -36,7 +31,6 @@ pub struct TrackingPipelineConfig {
 impl Default for TrackingPipelineConfig {
     fn default() -> Self {
         Self {
-            depth_enabled: true,
             force_cpu: false,
             yolox_enabled: true,
         }
@@ -49,7 +43,6 @@ impl TrackingPipelineConfig {
     /// accuracy and latency for the most conservative driver load.
     pub fn safe_mode() -> Self {
         Self {
-            depth_enabled: false,
             force_cpu: true,
             yolox_enabled: false,
         }
@@ -115,14 +108,11 @@ pub trait PoseProvider {
         None
     }
 
-    /// Reset per-session temporal state: wrist temporal holds, the
-    /// sticky depth outbox, smoothing EMAs, self-tracking crop.
-    /// Called between *unrelated* inputs — `validate_pipeline` calls
-    /// this before every image so image N's sticky depth map and
-    /// temporal holds can't contaminate image N+1's skeleton (the
-    /// depth path otherwise reuses the previous image's depth for 3
-    /// of every 4 frames via `DEPTH_REFRESH_PERIOD`). Live tracking
-    /// never calls it mid-session.
+    /// Reset per-session temporal state: wrist temporal holds,
+    /// smoothing EMAs, self-tracking crop. Called between *unrelated*
+    /// inputs — `validate_pipeline` calls this before every image so
+    /// image N's temporal holds can't contaminate image N+1's
+    /// skeleton. Live tracking never calls it mid-session.
     fn reset_temporal_state(&mut self) {}
 
     /// Hint from the GUI about the calibration mode the user is *currently
@@ -148,10 +138,24 @@ pub trait PoseProvider {
     /// * `None` → modal closed, fall back to the persisted calibration's
     ///   mode.
     fn set_calibration_mode_hint(&mut self, _hint: Option<crate::tracking::CalibrationMode>) {}
+
+    /// Supply a metric depth frame captured by an external sensor (e.g. a
+    /// RealSense D435) for the *next* [`Self::estimate_pose`] call,
+    /// replacing the internal DAv2 depth stage. The tracking worker calls
+    /// this each frame with depth aligned to the color image it is about
+    /// to hand to `estimate_pose`. Providers without a depth stage ignore
+    /// it. Consumed once: the provider clears it after the next estimate.
+    #[cfg(feature = "realsense")]
+    fn set_external_depth(
+        &mut self,
+        _depth: crate::tracking::skeleton_from_depth::MetricDepthFrame,
+    ) {
+    }
 }
 
-/// Build the production pose provider: RTMW3D with the async DAv2
-/// metric-depth stage, shaped by the user's pipeline configuration.
+/// Build the production pose provider: RTMW3D, shaped by the user's
+/// pipeline configuration. Metric depth, when present, is fed in
+/// externally via [`PoseProvider::set_external_depth`].
 pub fn create_pose_provider(
     models_dir: impl AsRef<Path>,
     config: TrackingPipelineConfig,

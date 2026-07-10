@@ -40,7 +40,6 @@
 
 #[cfg(feature = "inference")]
 mod annotation;
-pub(in crate::tracking) mod arm_ray_ik;
 #[cfg(feature = "inference")]
 mod arm_z;
 #[cfg(feature = "inference")]
@@ -66,10 +65,6 @@ pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
 // person-crop stage. The functions don't depend on RTMW3D internals;
 // they're here purely because that's where they were originally
 // written. Promotion-only re-export, no logic change.
-#[cfg(feature = "inference")]
-pub(in crate::tracking) use preprocess::{crop_rgb, pad_and_clamp_bbox};
-#[cfg(feature = "inference")]
-pub(in crate::tracking) use arm_z::wrist_out_of_frame;
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
@@ -178,8 +173,6 @@ pub struct Rtmw3dInference {
     #[cfg(feature = "inference")]
     arm_len: arm_z::ArmLengthState,
     #[cfg(feature = "inference")]
-    arm_ray_ik: arm_ray_ik::ArmRayIk,
-    #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
     backend: InferenceBackend,
@@ -277,7 +270,6 @@ impl Rtmw3dInference {
     pub fn reset_temporal_state(&mut self) {
         self.self_track_bbox = None;
         self.arm_len = arm_z::ArmLengthState::default();
-        self.arm_ray_ik.reset();
         if let Some(worker) = self.yolox_worker.as_mut() {
             worker.clear_result();
         }
@@ -391,7 +383,6 @@ impl Rtmw3dInference {
             yolox_worker,
             self_track_bbox: None,
             arm_len: arm_z::ArmLengthState::default(),
-            arm_ray_ik: arm_ray_ik::ArmRayIk::default(),
             load_warnings,
             backend,
             force_shoulder_anchor: false,
@@ -485,8 +476,9 @@ impl Rtmw3dInference {
                 // `all_modes_emit_nonzero_yolox_skip_period` unit
                 // test, but `is_multiple_of(0)` would panic so we
                 // guard against an accidental future regression.
-                let period =
-                    YOLOX_REFRESH_PERIOD.load(std::sync::atomic::Ordering::Relaxed).max(1);
+                let period = YOLOX_REFRESH_PERIOD
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(1);
                 if cold_start || frame_index.is_multiple_of(period) {
                     worker.submit(rgb_data, width, height);
                 }
@@ -711,19 +703,6 @@ impl Rtmw3dInference {
         // Stage 4 synthesis instead of tracking. The depth solve below
         // resolves the perspective; the MCP-confidence floor in
         // `build_source_skeleton` (Stage 1) gates genuinely bad hands.
-
-        // Arm-depth solve via ray-IK — restores the forward z that
-        // the SimCC nz head cannot resolve for limbs pointing at the
-        // camera, by re-solving elbow/wrist depths along the
-        // observation rays with anatomical metric lengths. Replaces
-        // the bone-length running-max heuristic, whose length
-        // reference perspective magnification corrupted permanently.
-        // See `arm_ray_ik` / `docs/ray-ik-depth-solve.md`.
-        arm_ray_ik::solve_arm_depth(
-            &mut skeleton,
-            width as f32 / height.max(1) as f32,
-            &mut self.arm_ray_ik,
-        );
 
         // Head pose (yaw/pitch/roll) from RTMW3D's body face keypoints
         // 0..=4. These are already in source-skeleton 3D coords, so

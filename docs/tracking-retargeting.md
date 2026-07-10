@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document defines how webcam-driven tracking data becomes avatar-driving input.
+This document defines how RealSense D435 depth-driven tracking data becomes avatar-driving input.
 
 It covers:
 
@@ -30,7 +30,7 @@ Avatar runtime resolves that intent into the final pose.
 
 Recommended pipeline:
 
-1. capture webcam frame
+1. capture RealSense D435 depth + colour frame
 2. run landmark inference
 3. build normalized body and face targets
 4. attach confidence values
