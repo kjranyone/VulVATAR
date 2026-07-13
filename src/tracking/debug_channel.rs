@@ -93,10 +93,27 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
             .get(&b)
             .map(|j| serde_json::json!({ "p": j.position, "c": j.confidence }))
     };
+    // Face pose (head orientation) + the source torso/head 3D that drives the
+    // neck/spine chain: lets an external tool tell whether an over-pitched
+    // avatar head comes from the face track (pitch) or from a contaminated
+    // shoulder→head geometry (the "face is forward but the head looks down"
+    // case, which is coupled to the arms via the shoulder samples).
+    let face = est.skeleton.face.map(|f| {
+        serde_json::json!({ "yaw": f.yaw, "pitch": f.pitch, "roll": f.roll, "c": f.confidence })
+    });
     let state = serde_json::json!({
         "frame": frame_index,
         "overall": est.skeleton.overall_confidence,
         "kp": kps,
+        "face": face,
+        "torso": {
+            "Head": arm(HumanoidBone::Head),
+            "Neck": arm(HumanoidBone::Neck),
+            "UpperChest": arm(HumanoidBone::UpperChest),
+            "LSh": arm(HumanoidBone::LeftShoulder),
+            "RSh": arm(HumanoidBone::RightShoulder),
+            "Hips": arm(HumanoidBone::Hips),
+        },
         "arm": {
             "LUp": arm(HumanoidBone::LeftUpperArm),
             "LLo": arm(HumanoidBone::LeftLowerArm),
@@ -118,7 +135,15 @@ static AVATAR_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// WITHOUT a GPU render — enough to see torso tilt, elbow placement, whole-body
 /// rotation, etc. Overwrites `debug_avatar.json` each frame (a `seq` counter
 /// lets a reader detect fresh frames). No-op unless the debug flag file exists.
-pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(pos: F) {
+/// `head_axes`, when present, are the Head bone's world-space X/Y/Z basis
+/// vectors (normalised) — its facing. With the neck upright and the head
+/// position UP, an avatar head that still looks DOWN reveals itself here as the
+/// world Y (up) axis pitched forward / the Z axis pitched down, isolating a
+/// face-track over-pitch from a neck-chain one.
+pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(
+    pos: F,
+    head_axes: Option<[[f32; 3]; 3]>,
+) {
     if !enabled() {
         return;
     }
@@ -144,7 +169,7 @@ pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(pos: F) {
         .filter_map(|(name, b)| pos(*b).map(|p| (name.to_string(), serde_json::json!(p))))
         .collect();
     let seq = AVATAR_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let state = serde_json::json!({ "seq": seq, "joints": map });
+    let state = serde_json::json!({ "seq": seq, "joints": map, "head_axes": head_axes });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_avatar.json"), &bytes);
     }

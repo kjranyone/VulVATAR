@@ -239,13 +239,34 @@ impl Application {
             if avatar_idx == 0 {
                 let humanoid = avatar.asset.humanoid.as_ref();
                 let gt = &avatar.pose.global_transforms;
-                crate::tracking::debug_channel::dump_avatar_pose(|b| {
-                    humanoid
-                        .and_then(|h| h.bone_map.get(&b))
-                        .map(|n| n.0 as usize)
-                        .and_then(|i| gt.get(i))
-                        .map(|m| [m[3][0], m[3][1], m[3][2]])
-                });
+                // Head bone's world basis (normalised X/Y/Z columns of its
+                // column-major global matrix) = its facing, so the external tool
+                // can see an over-pitched head directly.
+                let head_axes = humanoid
+                    .and_then(|h| h.bone_map.get(&crate::asset::HumanoidBone::Head))
+                    .map(|n| n.0 as usize)
+                    .and_then(|i| gt.get(i))
+                    .map(|m| {
+                        let norm = |v: [f32; 3]| {
+                            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+                            [v[0] / l, v[1] / l, v[2] / l]
+                        };
+                        [
+                            norm([m[0][0], m[0][1], m[0][2]]),
+                            norm([m[1][0], m[1][1], m[1][2]]),
+                            norm([m[2][0], m[2][1], m[2][2]]),
+                        ]
+                    });
+                crate::tracking::debug_channel::dump_avatar_pose(
+                    |b| {
+                        humanoid
+                            .and_then(|h| h.bone_map.get(&b))
+                            .map(|n| n.0 as usize)
+                            .and_then(|i| gt.get(i))
+                            .map(|m| [m[3][0], m[3][1], m[3][2]])
+                    },
+                    head_axes,
+                );
             }
 
             let step_options = SimulationStepOptions {
