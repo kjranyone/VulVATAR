@@ -2290,14 +2290,25 @@ fn compute_arm_reach_elbows(
         if l1 < 1e-4 || l2 < 1e-4 {
             continue;
         }
-        // Swivel pole: the observed elbow if the keypoint exists at all (it
-        // steers the bend direction without dictating the reach), else a natural
-        // bend biased behind the shoulder→wrist line (toward the body, −Z is
-        // away from the camera) so the elbow does not hyper-extend straight.
-        let pole = source.joints.get(&el_b).map(|x| x.position).unwrap_or_else(|| {
-            let mid = midpoint(&sh.position, &wr.position);
-            [mid[0], mid[1], mid[2] - 0.4 * src_span]
-        });
+        // Swivel pole: the observed elbow ONLY when it is confidently tracked
+        // (it steers the bend direction without dictating the reach). A
+        // low-confidence elbow is trusted for NOTHING geometric: when the elbow
+        // leaves the frame the keypoint clamps to the image edge with a fabricated
+        // depth, and steering the swivel toward that point wrenches the forearm
+        // sideways — the "arm fractures when the elbow is out of frame" artefact
+        // (手首は見えているのに肘が視界外だと腕が骨折する). Below threshold we fall
+        // back to a natural bend biased behind the shoulder→wrist line (toward the
+        // body, −Z is away from the camera) so the elbow does not hyper-extend
+        // straight — the same default used when no elbow keypoint exists at all.
+        let pole = source
+            .joints
+            .get(&el_b)
+            .filter(|x| x.confidence >= thr)
+            .map(|x| x.position)
+            .unwrap_or_else(|| {
+                let mid = midpoint(&sh.position, &wr.position);
+                [mid[0], mid[1], mid[2] - 0.4 * src_span]
+            });
         let Some((upper_dir, _lower_dir)) =
             two_bone_ik(&sh.position, &wr.position, l1, l2, &pole)
         else {
@@ -2505,6 +2516,51 @@ mod arm_contact_ik_tests {
         let w_r = wrist([-0.2, 0.0, 0.0], u_r, l_r);
         assert_close(w_l, target, 1e-3);
         assert_close(w_r, target, 1e-3);
+    }
+
+    /// REPRO: the elbow leaves the camera frame while the hand stays
+    /// tracked ("手を認識してるのに肘が視界外だと腕が骨折する"). Off-frame the
+    /// elbow keypoint clamps to the image edge with a fabricated position and
+    /// only a weak score; `compute_arm_reach_elbows` must NOT steer the swivel
+    /// toward that garbage — a low-confidence elbow is ignored as the pole and
+    /// the arm falls back to a natural behind-the-line bend (no fracture).
+    #[test]
+    fn offframe_elbow_ignored_as_swivel_pole() {
+        let (humanoid, rest) = arm_rig();
+        let mut source = SourceSkeleton::empty(0);
+        // Confident shoulders (span 0.30 == avatar span → scale 1) and a
+        // confident left wrist reaching forward-down at the midline.
+        source.joints.insert(HumanoidBone::LeftUpperArm, src_joint([0.15, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::RightUpperArm, src_joint([-0.15, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::LeftHand, src_joint([0.15, 1.25, 0.15]));
+        // Off-frame elbow: clamped far out to +x (image edge) with a weak score.
+        source.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            crate::tracking::SourceJoint {
+                position: [0.90, 1.40, 0.0],
+                confidence: 0.2,
+                metric_depth_m: None,
+            },
+        );
+
+        let params = SolverParams { joint_confidence_threshold: 0.5, ..Default::default() };
+        let out = compute_arm_reach_elbows(&source, &rest, &humanoid, &params);
+        let elbow = out[0].expect("left arm reaches the tracked wrist").position;
+        eprintln!("synth elbow = {elbow:?}");
+        // The garbage pole sits at x=0.90; steered toward it the elbow swings
+        // out to x≈0.38, z≈+0.08 (a sideways wrench — the fracture). Ignored,
+        // the natural behind-line bend keeps the elbow on the shoulder→wrist
+        // line (both at x=0.15 → symmetric → x≈0.15) and BEHIND it (z<0, −Z is
+        // away from the camera). Both thresholds sit strictly between the two
+        // outcomes so this test fails on the ungated pole.
+        assert!(
+            elbow[0] < 0.25,
+            "elbow wrenched sideways toward the off-frame garbage pole: {elbow:?}"
+        );
+        assert!(
+            elbow[2] < 0.0,
+            "elbow should bend behind the shoulder→wrist line, got {elbow:?}"
+        );
     }
 }
 
