@@ -14,6 +14,7 @@
 //!     changes) into a [`Tuning`]; the app applies it each frame.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -107,6 +108,45 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
     });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_state.json"), &bytes);
+    }
+}
+
+static AVATAR_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the SOLVED avatar's key joint world positions (after
+/// `compute_global_pose`) so the external overlay can draw the avatar skeleton
+/// WITHOUT a GPU render — enough to see torso tilt, elbow placement, whole-body
+/// rotation, etc. Overwrites `debug_avatar.json` each frame (a `seq` counter
+/// lets a reader detect fresh frames). No-op unless the debug flag file exists.
+pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(pos: F) {
+    if !enabled() {
+        return;
+    }
+    use HumanoidBone::*;
+    let bones: [(&str, HumanoidBone); 14] = [
+        ("Hips", Hips),
+        ("Spine", Spine),
+        ("Chest", Chest),
+        ("UpperChest", UpperChest),
+        ("Neck", Neck),
+        ("Head", Head),
+        ("LSh", LeftShoulder),
+        ("RSh", RightShoulder),
+        ("LUp", LeftUpperArm),
+        ("RUp", RightUpperArm),
+        ("LLo", LeftLowerArm),
+        ("RLo", RightLowerArm),
+        ("LHa", LeftHand),
+        ("RHa", RightHand),
+    ];
+    let map: serde_json::Map<String, serde_json::Value> = bones
+        .iter()
+        .filter_map(|(name, b)| pos(*b).map(|p| (name.to_string(), serde_json::json!(p))))
+        .collect();
+    let seq = AVATAR_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let state = serde_json::json!({ "seq": seq, "joints": map });
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        atomic_write(&base_dir().join("debug_avatar.json"), &bytes);
     }
 }
 

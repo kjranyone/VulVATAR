@@ -197,7 +197,7 @@ impl Application {
         let substeps = self.sim_clock.advance(frame_dt);
         let fixed_dt = self.sim_clock.fixed_dt();
 
-        for avatar in self.avatars.iter_mut() {
+        for (avatar_idx, avatar) in self.avatars.iter_mut().enumerate() {
             avatar.build_base_pose();
 
             if let Some(ref mut source) = tracking_sample.clone() {
@@ -228,6 +228,22 @@ impl Application {
             }
 
             avatar.compute_global_pose();
+
+            // Live debug: publish the primary avatar's solved joint world
+            // positions so the external overlay can draw the avatar skeleton
+            // without a GPU render (torso tilt, elbow placement, whole-body
+            // rotation). No-op unless %ProgramData%\VulVATAR\debug.on exists.
+            if avatar_idx == 0 {
+                let humanoid = avatar.asset.humanoid.as_ref();
+                let gt = &avatar.pose.global_transforms;
+                crate::tracking::debug_channel::dump_avatar_pose(|b| {
+                    humanoid
+                        .and_then(|h| h.bone_map.get(&b))
+                        .map(|n| n.0 as usize)
+                        .and_then(|i| gt.get(i))
+                        .map(|m| [m[3][0], m[3][1], m[3][2]])
+                });
+            }
 
             let step_options = SimulationStepOptions {
                 spring_enabled: toggles.spring_enabled,
