@@ -194,6 +194,8 @@ tracking:
   error_model_warning: "ポーズトラッキング品質警告: %{warnings}。./dev.ps1 setup を実行してフルモデルバンドルをインストールしてください。"
   error_model_unavailable: "ポーズモデルが見つかりません: %{error} 低品質のHSVトラッキングにフォールバックします。"
   error_camera_stopped: "%{count} 回連続で読み取りエラーが発生し、カメラを停止しました。他のアプリがカメラを使用しているか、デバイスが切断された可能性があります。"
+  error_usb_link_speed: "RealSense D435 が USB %{detected} のリンク速度で接続されています。深度トラッキングには USB 3.0 が必要です。カメラを青い USB 3.0 ポートに、USB 3.0 対応ケーブルで直接挿してください（USB 2.0 ポート・USB ハブ・延長ケーブルでは必要な速度が出ません）。"
+  error_no_device: "RealSense D435 が見つかりません。カメラが USB で接続されているか確認してください。"
   advanced_smoothing: "詳細スムージング"
   advanced_smoothing_hint: "既定値で大半のセットアップに適合します。ノイズの多いカメラや表情のチラつきがある場合のみ調整してください。"
   rotation_blend: "回転ブレンド"
@@ -491,6 +493,8 @@ toast:
 dialog:
   cloth_autosave_title: "クロス自動保存の同意"
   cloth_autosave_body: "クロスオーバーレイがアクティブです。リカバリスナップショットに含めますか？"
+  tracking_error_title: "トラッキングを開始できません"
+  tracking_error_dismiss: "閉じる"
   yes: "はい"
   no: "いいえ"
   loading_avatar: "アバターを読み込み中"

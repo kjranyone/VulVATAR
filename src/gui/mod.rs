@@ -671,6 +671,12 @@ pub struct GuiApp {
     // M10: Notification/toast system
     pub notifications: Vec<Notification>,
 
+    /// Latest blocking tracking error, shown as a persistent modal dialog
+    /// until the user dismisses it. Unlike a toast it never auto-expires, so
+    /// a connection failure the user glanced away from stays on screen and
+    /// actionable, stating its root cause + remedy.
+    pub blocking_error: Option<String>,
+
     pub transform: TransformState,
     pub camera_orbit: CameraOrbitState,
     pub tracking: TrackingGuiState,
@@ -798,6 +804,7 @@ impl GuiApp {
             profiles: crate::persistence::load_profiles().unwrap_or_default(),
 
             notifications: Vec::new(),
+            blocking_error: None,
 
             transform: TransformState {
                 position: [0.0, 0.0, 0.0],
@@ -1029,6 +1036,7 @@ impl GuiApp {
             profiles: profile::ProfileLibrary::new(),
 
             notifications: Vec::new(),
+            blocking_error: None,
 
             transform: TransformState {
                 position: [0.0, 0.0, 0.0],
@@ -1378,7 +1386,10 @@ impl eframe::App for GuiApp {
 
         if let Some((err, level)) = self.app.tracking.mailbox().drain_error() {
             match level {
-                TrackingErrorLevel::Blocking => self.push_error_notification(err),
+                // Blocking errors get a persistent modal (drawn below) so a
+                // camera/connection failure can't be missed; warnings stay as
+                // auto-expiring toasts.
+                TrackingErrorLevel::Blocking => self.blocking_error = Some(err),
                 TrackingErrorLevel::Warning => self.push_notification(err),
             }
         }
@@ -1510,6 +1521,38 @@ impl eframe::App for GuiApp {
                         });
                     });
                 });
+        }
+
+        // Blocking tracking error — persistent modal until dismissed. Drawn
+        // above the viewport and other windows (Foreground) so a
+        // camera/connection failure is impossible to miss and states its root
+        // cause + remedy, rather than flashing past in a 15 s toast.
+        if let Some(msg) = self.blocking_error.clone() {
+            let mut dismiss = false;
+            egui::Window::new(t!("dialog.tracking_error_title"))
+                .id(egui::Id::new("tracking_blocking_error_modal"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(egui::RichText::new(&msg));
+                    ui.add_space(12.0);
+                    if components::filled_button(
+                        ui,
+                        None,
+                        &t!("dialog.tracking_error_dismiss"),
+                        true,
+                    )
+                    .clicked()
+                    {
+                        dismiss = true;
+                    }
+                });
+            if dismiss {
+                self.blocking_error = None;
+            }
         }
 
         self.draw_toasts(ctx);

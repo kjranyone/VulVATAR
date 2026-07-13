@@ -1063,10 +1063,19 @@ impl TrackingWorker {
             Ok(c) => c,
             Err(e) => {
                 error!("tracking-worker: failed to open RealSense: {}", e);
-                mailbox.report_error(
-                    t!("tracking.error_realsense_open", error = e.to_string()),
-                    TrackingErrorLevel::Blocking,
-                );
+                // Map the typed open failure to a root-cause-specific,
+                // localized message so the GUI dialog names the real problem
+                // (e.g. a USB-2 link speed) instead of an opaque driver string.
+                let msg = match e {
+                    realsense::OpenFailure::UsbLinkTooSlow { detected } => {
+                        t!("tracking.error_usb_link_speed", detected = detected)
+                    }
+                    realsense::OpenFailure::NoDevice => t!("tracking.error_no_device"),
+                    realsense::OpenFailure::Other(m) => {
+                        t!("tracking.error_realsense_open", error = m)
+                    }
+                };
+                mailbox.report_error(msg, TrackingErrorLevel::Blocking);
                 // No synthetic fallback in the D435-exclusive build: surface
                 // the blocking error and idle. `worker_loop` clears `running`
                 // on return, so the app drops to the avatar rest pose.

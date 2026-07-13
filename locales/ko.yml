@@ -194,6 +194,8 @@ tracking:
   error_model_warning: "포즈 추적 품질 경고: %{warnings}. ./dev.ps1 setup 을 실행하여 전체 모델 번들을 설치하세요."
   error_model_unavailable: "포즈 모델을 사용할 수 없습니다: %{error} 저품질 HSV 추적으로 대체합니다."
   error_camera_stopped: "%{count}회 연속 읽기 오류로 카메라를 정지했습니다. 다른 앱이 카메라를 사용 중이거나 장치가 분리되었을 수 있습니다."
+  error_usb_link_speed: "RealSense D435가 USB %{detected} 링크 속도로 연결되었습니다. 깊이 트래킹에는 USB 3.0이 필요합니다. 카메라를 파란색 USB 3.0 포트에 USB 3.0 케이블로 직접 연결하세요 (USB 2.0 포트·허브·연장 케이블로는 필요한 속도가 나오지 않습니다)."
+  error_no_device: "RealSense D435를 찾을 수 없습니다. 카메라가 USB로 연결되어 있는지 확인하세요."
   advanced_smoothing: "고급 스무딩"
   advanced_smoothing_hint: "기본값이 대부분의 환경에 적합합니다 — 노이즈가 많은 카메라나 표정이 떨리는 경우에만 조정하세요."
   rotation_blend: "회전 블렌드"
@@ -491,6 +493,8 @@ toast:
 dialog:
   cloth_autosave_title: "의상 자동 저장 동의"
   cloth_autosave_body: "의상 오버레이가 활성화되어 있습니다. 복구 스냅샷에 포함하도록 허용하시겠습니까?"
+  tracking_error_title: "트래킹을 시작할 수 없습니다"
+  tracking_error_dismiss: "닫기"
   yes: "예"
   no: "아니오"
   loading_avatar: "아바타 로딩 중"

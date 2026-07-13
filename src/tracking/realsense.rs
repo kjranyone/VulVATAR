@@ -124,36 +124,73 @@ pub struct RealSenseCapture {
     _context: Context,
 }
 
+/// Why opening the D435 stream failed. Typed (rather than a flat `String`)
+/// so the GUI can show a root-cause-specific dialog — above all the USB-2
+/// link-speed case, which is the usual reason a healthy, enumerable D435
+/// still can't start the 30 fps depth+color profiles this backend needs.
+#[derive(Debug, Clone)]
+pub enum OpenFailure {
+    /// No D400-series device is connected at all.
+    NoDevice,
+    /// A device is present but negotiated a USB-2 link, so the requested
+    /// high-rate profiles don't exist. `detected` is the reported USB type
+    /// descriptor, e.g. `"2.1"`.
+    UsbLinkTooSlow { detected: String },
+    /// Any other librealsense failure; carries the raw driver message.
+    Other(String),
+}
+
+impl std::fmt::Display for OpenFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenFailure::NoDevice => write!(f, "realsense: no D400-series device found"),
+            OpenFailure::UsbLinkTooSlow { detected } => write!(
+                f,
+                "realsense: USB link negotiated at USB {detected} (needs USB 3.0) — the requested \
+                 depth+color profiles are unavailable at this link speed"
+            ),
+            OpenFailure::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+// Lets the diagnostic bins keep `open(..)?` inside a `-> Result<_, String>`
+// `main` without change.
+impl From<OpenFailure> for String {
+    fn from(e: OpenFailure) -> String {
+        e.to_string()
+    }
+}
+
 impl RealSenseCapture {
     /// Open the first connected D400-series device and start streaming color
     /// (`width`x`height` @ `fps`) plus depth, with depth aligned to color.
-    pub fn open(width: u32, height: u32, fps: u32) -> Result<Self, String> {
-        let context = Context::new().map_err(|e| format!("realsense: context: {e}"))?;
+    pub fn open(width: u32, height: u32, fps: u32) -> Result<Self, OpenFailure> {
+        let context =
+            Context::new().map_err(|e| OpenFailure::Other(format!("realsense: context: {e}")))?;
 
         let mut product = HashSet::new();
         product.insert(Rs2ProductLine::D400);
         let devices = context.query_devices(product);
-        let device = devices
-            .first()
-            .ok_or_else(|| "realsense: no D400-series device found".to_string())?;
+        let device = devices.first().ok_or(OpenFailure::NoDevice)?;
 
-        let serial = device
-            .info(Rs2CameraInfo::SerialNumber)
-            .ok_or_else(|| "realsense: device reports no serial number".to_string())?;
+        let serial = device.info(Rs2CameraInfo::SerialNumber).ok_or_else(|| {
+            OpenFailure::Other("realsense: device reports no serial number".to_string())
+        })?;
         let name = device
             .info(Rs2CameraInfo::Name)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "RealSense".to_string());
 
         let inactive = InactivePipeline::try_from(&context)
-            .map_err(|e| format!("realsense: create pipeline: {e}"))?;
+            .map_err(|e| OpenFailure::Other(format!("realsense: create pipeline: {e}")))?;
 
         let mut config = Config::new();
         config
             .enable_device_from_serial(serial)
-            .map_err(|e| format!("realsense: enable device: {e}"))?
+            .map_err(|e| OpenFailure::Other(format!("realsense: enable device: {e}")))?
             .disable_all_streams()
-            .map_err(|e| format!("realsense: disable all streams: {e}"))?
+            .map_err(|e| OpenFailure::Other(format!("realsense: disable all streams: {e}")))?
             .enable_stream(
                 Rs2StreamKind::Depth,
                 None,
@@ -162,7 +199,7 @@ impl RealSenseCapture {
                 Rs2Format::Z16,
                 fps as usize,
             )
-            .map_err(|e| format!("realsense: enable depth stream: {e}"))?
+            .map_err(|e| OpenFailure::Other(format!("realsense: enable depth stream: {e}")))?
             .enable_stream(
                 Rs2StreamKind::Color,
                 None,
@@ -171,15 +208,30 @@ impl RealSenseCapture {
                 Rs2Format::Rgb8,
                 fps as usize,
             )
-            .map_err(|e| format!("realsense: enable color stream: {e}"))?;
+            .map_err(|e| OpenFailure::Other(format!("realsense: enable color stream: {e}")))?;
 
-        let pipeline = inactive
-            .start(Some(config))
-            .map_err(|e| format!("realsense: start pipeline: {e}"))?;
+        // The usual reason a present, healthy D435 refuses to start at the
+        // requested profile is a USB-2 link: the high-rate depth+color modes
+        // simply don't exist below USB 3.0. On failure, read the negotiated
+        // link speed and, if it's USB 2.x, report *that* as the root cause
+        // instead of the opaque "config cannot be resolved" driver string.
+        let pipeline = match inactive.start(Some(config)) {
+            Ok(p) => p,
+            Err(e) => {
+                let usb = device
+                    .info(Rs2CameraInfo::UsbTypeDescriptor)
+                    .map(|s| s.to_string_lossy().trim().to_string());
+                return Err(match usb {
+                    Some(u) if u.starts_with('2') => OpenFailure::UsbLinkTooSlow { detected: u },
+                    _ => OpenFailure::Other(format!("realsense: start pipeline: {e}")),
+                });
+            }
+        };
 
         // Align depth INTO the color image so color pixels index depth directly.
         let align =
-            Align::new(Rs2StreamKind::Color, 10).map_err(|e| format!("realsense: align: {e}"))?;
+            Align::new(Rs2StreamKind::Color, 10)
+                .map_err(|e| OpenFailure::Other(format!("realsense: align: {e}")))?;
 
         info!(
             "realsense: opened {} (serial {}) — color {}x{} @ {} fps, depth {}x{} aligned to color",
