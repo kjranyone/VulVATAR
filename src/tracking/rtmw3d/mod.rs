@@ -495,19 +495,25 @@ impl Rtmw3dInference {
                     // Tested at 10% — produced regressions on walking
                     // / cross-step poses where the leading limb fell
                     // outside the crop.
-                    let (cx1, cy1, cx2, cy2) =
-                        preprocess::pad_and_clamp_bbox(&bbox, width, height, 0.25);
-                    let cw = cx2 - cx1;
-                    let ch = cy2 - cy1;
+                    // Aspect-preserving crop: keep the model's 288:384 ratio and
+                    // zero-pad any out-of-frame region instead of clamping (which
+                    // squashes a frame-filling subject). The self-track SEED is
+                    // clamped to the frame (`derive_self_track_bbox`), so this
+                    // beyond-frame crop stays bounded — no zoom-out runaway.
+                    let (fx1, fy1, fx2, fy2) = preprocess::pad_bbox_to_aspect(&bbox, 0.25);
+                    let cw = (fx2 - fx1).round() as u32;
+                    let ch = (fy2 - fy1).round() as u32;
+                    let (ox, oy) = (fx1.round() as i32, fy1.round() as i32);
                     debug!(
-                        "RTMW3D: YOLOX bbox=[{:.0},{:.0},{:.0},{:.0}] score={:.2} → crop {}x{} (orig {}x{})",
-                        bbox.x1, bbox.y1, bbox.x2, bbox.y2, bbox.score, cw, ch, width, height
+                        "RTMW3D: crop bbox=[{:.0},{:.0},{:.0},{:.0}] score={:.2} → {}x{} @({},{}) aspect={:.2} (orig {}x{})",
+                        bbox.x1, bbox.y1, bbox.x2, bbox.y2, bbox.score, cw, ch, ox, oy,
+                        cw as f32 / ch.max(1) as f32, width, height
                     );
                     if cw < 32 || ch < 32 {
                         // Bbox too small to crop usefully — fall through.
                         (None, rgb_data, width, height, None, None)
                     } else {
-                        let crop = preprocess::crop_rgb(rgb_data, width, height, cx1, cy1, cw, ch);
+                        let crop = preprocess::crop_rgb_padded(rgb_data, width, height, ox, oy, cw, ch);
                         let ann = Some((
                             bbox.x1 / width as f32,
                             bbox.y1 / height as f32,
@@ -519,7 +525,7 @@ impl Rtmw3dInference {
                             &[][..],
                             cw,
                             ch,
-                            Some((cx1 as f32, cy1 as f32, cw as f32, ch as f32)),
+                            Some((ox as f32, oy as f32, cw as f32, ch as f32)),
                             ann,
                         )
                     }
@@ -811,6 +817,18 @@ fn derive_self_track_bbox(
         x2 = x2.max(px);
         y2 = y2.max(py);
     }
+    // Clamp the seed to the frame. The crop derived from this bbox is allowed to
+    // extend past the frame (aspect-preserving, zero-padded) — but the SEED must
+    // stay inside it: an aspect crop places some keypoints in the padded region
+    // beyond the frame, which map back to out-of-frame coords, and feeding those
+    // back into the seed grows the crop every frame (an unbounded zoom-out that
+    // shrinks the subject to a speck). Clamping breaks that feedback loop; the
+    // 25% pad + aspect expansion at the crop site still covers limbs just
+    // outside the frame.
+    x1 = x1.max(0.0);
+    y1 = y1.max(0.0);
+    x2 = x2.min(width as f32);
+    y2 = y2.min(height as f32);
     if x2 - x1 < MIN_BBOX_PX || y2 - y1 < MIN_BBOX_PX {
         return None;
     }
