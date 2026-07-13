@@ -369,6 +369,14 @@ pub struct SolverParams {
     /// Default `true`; exposed so the live debug channel can isolate whether
     /// this stage is the one crossing the arms at the midline.
     pub contact_ik_enabled: bool,
+    /// Horizon (seconds) over which the root-translation neutral re-centres
+    /// toward the subject's current position. `None` (default) = **full mirror**:
+    /// after a brief startup lock-in the neutral FREEZES, so a real side-step /
+    /// lean / walk-in persists on the avatar instead of drifting back to centre
+    /// (metric depth is absolute — there is no drift to absorb, so the old ~10 s
+    /// self-recentring fought the true distance signal). `Some(h)` restores that
+    /// self-recentring EMA for a framed-avatar mode that should stay centred.
+    pub root_recenter_horizon_s: Option<f32>,
 }
 
 impl Default for SolverParams {
@@ -390,6 +398,7 @@ impl Default for SolverParams {
             pose_calibration: None,
             arm_reach_ik_enabled: true,
             contact_ik_enabled: true,
+            root_recenter_horizon_s: None,
         }
     }
 }
@@ -458,6 +467,13 @@ pub struct PoseSolverState {
     /// so the feature self-calibrates to the user's typical pose.
     /// `None` until the first hip-visible frame.
     root_reference: Option<[f32; 3]>,
+    /// Frames since `root_reference` was seeded. Drives the full-mirror
+    /// lock-in: the neutral converges for the first `ROOT_REFERENCE_LOCK_IN_FRAMES`
+    /// (averaging out a noisy startup frame), then freezes.
+    root_reference_frames: u32,
+    /// `root_reference` was seeded from an explicit pose calibration → trust it
+    /// immediately (freeze with no lock-in convergence toward the current pose).
+    root_reference_calibrated: bool,
     /// EMA state for the camera-driven mouth visemes (aa/ih/ou/ee/oh),
     /// keyed by expression name. The image lip-sync path takes the raw
     /// FaceMesh blendshape, which is noisy frame-to-frame; the eye/brow
@@ -497,6 +513,8 @@ impl PoseSolverState {
         self.prev_local_rotations.clear();
         self.prev_hips_translation = None;
         self.root_reference = None;
+        self.root_reference_frames = 0;
+        self.root_reference_calibrated = false;
         self.root_offset_filter = Default::default();
         self.face_angle_filter = Default::default();
     }
@@ -1015,19 +1033,30 @@ pub fn solve_avatar_pose(
                             cal.anchor_y,
                             -cal.anchor_depth_m.unwrap_or(0.0),
                         ]);
+                        state.root_reference_calibrated = true;
                     }
                 }
             }
 
-            // EMA blend factor: the reference should drift slowly
-            // (~10 s effective horizon at 30 fps). Faster on the very
-            // first hip-visible frame (no calibration-derived seed
-            // either) so the auto-EMA locks in quickly without
-            // introducing a big initial jump.
+            // Neutral-reference update. Full-mirror (default,
+            // `root_recenter_horizon_s == None`): seed on the first hip-visible
+            // frame, converge for a brief lock-in that averages out a noisy
+            // startup frame, then FREEZE — so a real side-step / lean / walk-in
+            // persists on the avatar instead of drifting back to centre. Metric
+            // depth is absolute, so there is nothing to self-recentre against.
+            // A calibrated seed is trusted immediately (no lock-in). `Some(h)`
+            // restores the old self-recentring EMA (h-second horizon).
+            const ROOT_REFERENCE_LOCK_IN_FRAMES: u32 = 30; // ~1 s at 30 fps
             let alpha = if state.root_reference.is_none() {
                 1.0
+            } else if let Some(h) = params.root_recenter_horizon_s.filter(|h| *h > 0.0) {
+                (dt / h).clamp(0.0, 0.2)
+            } else if state.root_reference_calibrated
+                || state.root_reference_frames >= ROOT_REFERENCE_LOCK_IN_FRAMES
+            {
+                0.0 // frozen → full mirror
             } else {
-                (dt / 10.0).clamp(0.0, 0.2)
+                0.1 // lock-in: converge over ~1 s, then freeze
             };
             let prev_ref = state.root_reference.unwrap_or(raw_offset);
             let new_ref = [
@@ -1036,6 +1065,7 @@ pub fn solve_avatar_pose(
                 prev_ref[2] + alpha * (raw_offset[2] - prev_ref[2]),
             ];
             state.root_reference = Some(new_ref);
+            state.root_reference_frames = state.root_reference_frames.saturating_add(1);
 
             let dev = [
                 raw_offset[0] - new_ref[0],
