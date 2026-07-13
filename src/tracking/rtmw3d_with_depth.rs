@@ -22,13 +22,13 @@ use super::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
 use super::rtmw3d::Rtmw3dInference;
 #[cfg(feature = "inference")]
 use super::skeleton_from_depth::{DecodedJoint2d, NUM_JOINTS};
-#[cfg(feature = "realsense")]
+#[cfg(feature = "inference")]
 use super::skeleton_from_depth::{
     build_options_from_calibration, build_skeleton, torso_fit, MetricDepthFrame,
 };
 #[cfg(feature = "inference")]
 use log::info;
-#[cfg(feature = "realsense")]
+#[cfg(feature = "inference")]
 use log::warn;
 
 pub struct Rtmw3dWithDepthProvider {
@@ -66,8 +66,14 @@ pub struct Rtmw3dWithDepthProvider {
     /// metric depth aligned to the color image with a true principal
     /// point, so `estimate_from_external_depth` builds the skeleton
     /// straight from it. Taken (consumed) each frame.
-    #[cfg(feature = "realsense")]
+    #[cfg(feature = "inference")]
     external_depth: Option<super::skeleton_from_depth::MetricDepthFrame>,
+    /// Temporal stabiliser for the avatar's global scale + root distance (the
+    /// zoom-glitch fix). The raw per-frame shoulder span and anchor depth swing
+    /// when a hand contaminates a shoulder's depth sample; EMA-holding them
+    /// keeps the avatar's size and distance steady. Reset per session.
+    #[cfg(feature = "inference")]
+    torso_scale: super::skeleton_from_depth::TorsoScaleStabilizer,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -108,8 +114,10 @@ impl Rtmw3dWithDepthProvider {
             pose_calibration: None,
             calibration_mode_hint: None,
             torso_capture: None,
-            #[cfg(feature = "realsense")]
+            #[cfg(feature = "inference")]
             external_depth: None,
+            #[cfg(feature = "inference")]
+            torso_scale: super::skeleton_from_depth::TorsoScaleStabilizer::default(),
         })
     }
 
@@ -179,6 +187,7 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
         #[cfg(feature = "inference")]
         {
             self.rtmw3d.reset_temporal_state();
+            self.torso_scale.reset();
         }
     }
 
@@ -232,7 +241,7 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
         }
     }
 
-    #[cfg(feature = "realsense")]
+    #[cfg(feature = "inference")]
     fn set_external_depth(
         &mut self,
         depth: super::skeleton_from_depth::MetricDepthFrame,
@@ -285,7 +294,7 @@ impl Rtmw3dWithDepthProvider {
         // already absolute metric, aligned to this exact frame, with a
         // true principal point — so build the skeleton straight from it.
         // `take` clears it so a dropped next frame can't reuse stale depth.
-        #[cfg(feature = "realsense")]
+        #[cfg(feature = "inference")]
         if let Some(metric_frame) = self.external_depth.take() {
             return self.estimate_from_external_depth(
                 frame_index,
@@ -308,7 +317,7 @@ impl Rtmw3dWithDepthProvider {
     /// build skeleton -> inherit RTMW3D's face. The DAv2 guess-layer
     /// (ray-IK, arm_z, fold, contact) is intentionally absent — the
     /// metric depth replaces it.
-    #[cfg(feature = "realsense")]
+    #[cfg(feature = "inference")]
     fn estimate_from_external_depth(
         &mut self,
         frame_index: u64,
@@ -343,13 +352,31 @@ impl Rtmw3dWithDepthProvider {
             opts.force_shoulder_anchor = true;
         }
         let mut skeleton = match torso_fit::fit_torso(&metric_frame, joints_2d, opts) {
-            Some(fit) => build_skeleton(
-                frame_index,
-                joints_2d,
-                &metric_frame,
-                fit,
-                self.pose_calibration.as_ref(),
-            ),
+            Some(mut fit) => {
+                // Zoom-glitch fix: the raw per-frame shoulder span and anchor
+                // depth swing when a hand crosses in front of a shoulder and
+                // contaminates its depth sample — scaling / moving the whole
+                // avatar. Hold both steady with the provider's temporal EMA
+                // before they drive the avatar's scale and root placement.
+                let raw_span = match (fit.r_shoulder_cam, fit.l_shoulder_cam) {
+                    (Some(r), Some(l)) => {
+                        let d = [r[0] - l[0], r[1] - l[1], r[2] - l[2]];
+                        let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        (s > 0.05).then_some(s)
+                    }
+                    _ => None,
+                };
+                let stable_span = raw_span.map(|s| self.torso_scale.stable_span(s));
+                fit.anchor_cam = self.torso_scale.stable_anchor(fit.anchor_cam);
+                build_skeleton(
+                    frame_index,
+                    joints_2d,
+                    &metric_frame,
+                    fit,
+                    self.pose_calibration.as_ref(),
+                    stable_span,
+                )
+            }
             None => {
                 warn!("RTMW3D+D435: no torso fit — emitting empty skeleton");
                 SourceSkeleton::empty(frame_index)

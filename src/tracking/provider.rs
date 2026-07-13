@@ -145,7 +145,13 @@ pub trait PoseProvider {
     /// this each frame with depth aligned to the color image it is about
     /// to hand to `estimate_pose`. Providers without a depth stage ignore
     /// it. Consumed once: the provider clears it after the next estimate.
-    #[cfg(feature = "realsense")]
+    ///
+    /// Gated on `inference`, not `realsense`: the depth is consumed by the
+    /// inference-stage skeleton lift (`skeleton_from_depth`), and offline
+    /// benches inject a recorded/synthetic `MetricDepthFrame` here without
+    /// the native realsense toolchain. Only the live D435 *source*
+    /// (`build_metric_frame_from_d435`) needs the `realsense` feature.
+    #[cfg(feature = "inference")]
     fn set_external_depth(
         &mut self,
         _depth: crate::tracking::skeleton_from_depth::MetricDepthFrame,
