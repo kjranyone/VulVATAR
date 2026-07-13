@@ -110,10 +110,13 @@ required-features = ["realsense"]
 
 # Tier 1 offline replay: recorded colour PNG + aligned depth .npy -> the same
 # external-depth provider path, NO live camera. Locks TARGET_SRC_SHOULDER_SPAN
-# and the metric branch against a real frame. `realsense` pulls in `inference`.
+# and the metric branch against a real frame. Only needs `inference` (it injects
+# depth via `set_external_depth`, never opens the camera) — so it builds without
+# the realsense-sys native toolchain / DLL, which also lets it run while the live
+# app holds realsense2.dll.
 [[bin]]
 name = "diagnose_depth_replay"
-required-features = ["realsense"]
+required-features = ["inference"]
 
 # GT round-trip renders an aligned metric depth buffer and feeds it via
 # `set_external_depth` (the shipping D435 skeleton path) so the recovered pose
