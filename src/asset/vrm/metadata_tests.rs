@@ -332,6 +332,78 @@ fn sample_vrm0_solver_drives_head_and_arm() {
     );
 }
 
+/// An UNTRACKED arm (no arm joints in the source) should rest in a relaxed
+/// A-pose — elbow below the shoulder — not the T-pose bind that juts it out
+/// flat. The `idle_arm_apose_enabled` toggle must gate it: with the toggle off
+/// the same undriven arm stays at bind. Regression for "T-pose じゃなく A-pose".
+#[test]
+fn sample_vrm0_untracked_arm_rests_in_a_pose() {
+    use crate::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
+    use crate::avatar::{AvatarInstance, AvatarInstanceId};
+    use crate::tracking::source_skeleton::SourceSkeleton;
+
+    let loader = VrmAssetLoader::new();
+    let Some(asset) = load_or_skip(&loader, SAMPLE_VRM0) else {
+        return;
+    };
+    let humanoid = asset.humanoid.as_ref().unwrap();
+    let ua_idx = humanoid.bone_map.get(&HumanoidBone::LeftUpperArm).unwrap().0 as usize;
+    let la_idx = humanoid.bone_map.get(&HumanoidBone::LeftLowerArm).unwrap().0 as usize;
+
+    // World Y of a node's origin (bone matrices are column-major → translation
+    // is the 4th column).
+    let world_y = |avatar: &AvatarInstance, idx: usize| avatar.pose.global_transforms[idx][3][1];
+
+    // A source with NO arm joints — the whole arm chain is undriven.
+    let mut source = SourceSkeleton::empty(0);
+    source.overall_confidence = 1.0;
+    source.stamp_synthetic_metric_frame();
+
+    // Bind (T-pose) elbow height relative to the shoulder, for reference.
+    let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset.clone());
+    avatar.build_base_pose();
+    avatar.compute_global_pose();
+    let bind_drop = world_y(&avatar, la_idx) - world_y(&avatar, ua_idx);
+
+    let solve = |avatar: &mut AvatarInstance, idle: bool| {
+        avatar.build_base_pose();
+        let params = SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.1,
+            idle_arm_apose_enabled: idle,
+            ..Default::default()
+        };
+        let mut st = PoseSolverState::default();
+        solve_avatar_pose(
+            &source,
+            &avatar.asset.skeleton,
+            avatar.asset.humanoid.as_ref(),
+            &mut avatar.pose.local_transforms,
+            &params,
+            &mut st,
+        );
+        avatar.compute_global_pose();
+        world_y(avatar, la_idx) - world_y(avatar, ua_idx)
+    };
+
+    let idle_drop = solve(&mut avatar, true);
+    let off_drop = solve(&mut avatar, false);
+    eprintln!("elbow−shoulder Y  bind={bind_drop:.4}  idle_on={idle_drop:.4}  idle_off={off_drop:.4}");
+
+    // Idle off leaves the arm at bind (unchanged).
+    assert!(
+        (off_drop - bind_drop).abs() < 1e-3,
+        "idle OFF should leave the untracked arm at bind ({off_drop} vs {bind_drop})"
+    );
+    // Idle on drops the elbow clearly below the shoulder (A-pose)…
+    assert!(idle_drop < -0.05, "idle arm elbow should hang below the shoulder: {idle_drop}");
+    // …and clearly lower than the bind pose.
+    assert!(
+        idle_drop < bind_drop - 0.05,
+        "A-pose idle should lower the elbow vs the T-pose bind ({idle_drop} vs {bind_drop})"
+    );
+}
+
 /// Synthesise a bent index finger on one hand and assert the solver
 /// drives the avatar's corresponding finger bones. This is the
 /// regression test for "making a fist / peace sign / open hand doesn't

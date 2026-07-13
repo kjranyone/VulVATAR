@@ -146,6 +146,12 @@ const REST_SPEED_HI: f32 = 0.32;
 /// ~0.25 m bone), so the first attempt at 0.5° froze almost none of it.
 const ARM_HOLD_ANG_DEAD: f32 = 0.035; // ≈ 2.0°
 
+/// A-pose idle angle for an UNTRACKED arm, measured from straight-down (0°) in
+/// the frontal plane. A relaxed A-pose sits the arm ~40° out from the body; the
+/// alternative — the model's T-pose bind — juts it straight out (~90°) and reads
+/// as broken the moment tracking drops. See `apply_idle_arm_pose`.
+const IDLE_ARM_ANGLE_FROM_DOWN_DEG: f32 = 40.0;
+
 /// Rest deadband on expression weights (`solve_expressions`, eye/brow
 /// path). The FaceMesh blink/eye blendshapes jitter ±0.04 per frame at
 /// rest — the visible eye "twitch" — while a real blink is a Δ≈1.0 jump.
@@ -359,6 +365,31 @@ pub struct SolverParams {
     /// with a user-acknowledged neutral position. Falls through to
     /// the auto-EMA when `None`. See `docs/calibration-ux.md`.
     pub pose_calibration: Option<crate::tracking::PoseCalibration>,
+    /// Fill a dropped elbow with a two-bone IK toward the wrist so a
+    /// recognised hand doesn't leave the arm at a bind T-pose (see
+    /// `compute_arm_reach_elbows`). Default `true`; exposed so the live debug
+    /// channel can A/B it.
+    pub arm_reach_ik_enabled: bool,
+    /// Blend the arm directions toward a positional two-bone solve when the
+    /// hands are close, so touching hands meet (see `compute_arm_contact_ik`).
+    /// Default `true`; exposed so the live debug channel can isolate whether
+    /// this stage is the one crossing the arms at the midline.
+    pub contact_ik_enabled: bool,
+    /// Horizon (seconds) over which the root-translation neutral re-centres
+    /// toward the subject's current position. `None` (default) = **full mirror**:
+    /// after a brief startup lock-in the neutral FREEZES, so a real side-step /
+    /// lean / walk-in persists on the avatar instead of drifting back to centre
+    /// (metric depth is absolute — there is no drift to absorb, so the old ~10 s
+    /// self-recentring fought the true distance signal). `Some(h)` restores that
+    /// self-recentring EMA for a framed-avatar mode that should stay centred.
+    pub root_recenter_horizon_s: Option<f32>,
+    /// Rest an UNTRACKED arm in a relaxed A-pose (arms angled down) instead of
+    /// leaving it at the model's bind, which for the common T-pose rig juts the
+    /// arm straight out and snaps in the instant the arm leaves frame. When on,
+    /// an undriven arm fades to the A-pose via the same blend as a tracked one,
+    /// so drop-out and re-acquire are smooth. Tracked arms are unaffected (their
+    /// direction-match is bind-relative). Default `true`; exposed for A/B.
+    pub idle_arm_apose_enabled: bool,
 }
 
 impl Default for SolverParams {
@@ -378,6 +409,10 @@ impl Default for SolverParams {
             lower_body_tracking_enabled: true,
             root_translation_enabled: true,
             pose_calibration: None,
+            arm_reach_ik_enabled: true,
+            contact_ik_enabled: true,
+            root_recenter_horizon_s: None,
+            idle_arm_apose_enabled: true,
         }
     }
 }
@@ -446,6 +481,13 @@ pub struct PoseSolverState {
     /// so the feature self-calibrates to the user's typical pose.
     /// `None` until the first hip-visible frame.
     root_reference: Option<[f32; 3]>,
+    /// Frames since `root_reference` was seeded. Drives the full-mirror
+    /// lock-in: the neutral converges for the first `ROOT_REFERENCE_LOCK_IN_FRAMES`
+    /// (averaging out a noisy startup frame), then freezes.
+    root_reference_frames: u32,
+    /// `root_reference` was seeded from an explicit pose calibration → trust it
+    /// immediately (freeze with no lock-in convergence toward the current pose).
+    root_reference_calibrated: bool,
     /// EMA state for the camera-driven mouth visemes (aa/ih/ou/ee/oh),
     /// keyed by expression name. The image lip-sync path takes the raw
     /// FaceMesh blendshape, which is noisy frame-to-frame; the eye/brow
@@ -485,6 +527,8 @@ impl PoseSolverState {
         self.prev_local_rotations.clear();
         self.prev_hips_translation = None;
         self.root_reference = None;
+        self.root_reference_frames = 0;
+        self.root_reference_calibrated = false;
         self.root_offset_filter = Default::default();
         self.face_angle_filter = Default::default();
     }
@@ -912,8 +956,14 @@ pub fn solve_avatar_pose(
         params.joint_confidence_threshold,
     )
     .or_else(|| {
-        // Hips out of frame (desk-up): fall back to the real 3D shoulder line.
-        compute_shoulder_align_rotation(
+        // Hips out of frame (desk-up): the shoulder line gives the torso facing,
+        // but only its HORIZONTAL (yaw) part goes to the root Hips — applying the
+        // full roll here would spin the whole avatar about the pelvis (the
+        // "zero-g rotation" a user sees when tilting their shoulders on an
+        // upper-body framing). The shoulder ROLL is applied to the upper torso
+        // in the driven-bone loop (UpperChest alignment), so the pelvis stays
+        // grounded and the spine leans instead.
+        compute_shoulder_yaw_rotation(
             &source_owned,
             &rest_world,
             humanoid,
@@ -1003,19 +1053,30 @@ pub fn solve_avatar_pose(
                             cal.anchor_y,
                             -cal.anchor_depth_m.unwrap_or(0.0),
                         ]);
+                        state.root_reference_calibrated = true;
                     }
                 }
             }
 
-            // EMA blend factor: the reference should drift slowly
-            // (~10 s effective horizon at 30 fps). Faster on the very
-            // first hip-visible frame (no calibration-derived seed
-            // either) so the auto-EMA locks in quickly without
-            // introducing a big initial jump.
+            // Neutral-reference update. Full-mirror (default,
+            // `root_recenter_horizon_s == None`): seed on the first hip-visible
+            // frame, converge for a brief lock-in that averages out a noisy
+            // startup frame, then FREEZE — so a real side-step / lean / walk-in
+            // persists on the avatar instead of drifting back to centre. Metric
+            // depth is absolute, so there is nothing to self-recentre against.
+            // A calibrated seed is trusted immediately (no lock-in). `Some(h)`
+            // restores the old self-recentring EMA (h-second horizon).
+            const ROOT_REFERENCE_LOCK_IN_FRAMES: u32 = 30; // ~1 s at 30 fps
             let alpha = if state.root_reference.is_none() {
                 1.0
+            } else if let Some(h) = params.root_recenter_horizon_s.filter(|h| *h > 0.0) {
+                (dt / h).clamp(0.0, 0.2)
+            } else if state.root_reference_calibrated
+                || state.root_reference_frames >= ROOT_REFERENCE_LOCK_IN_FRAMES
+            {
+                0.0 // frozen → full mirror
             } else {
-                (dt / 10.0).clamp(0.0, 0.2)
+                0.1 // lock-in: converge over ~1 s, then freeze
             };
             let prev_ref = state.root_reference.unwrap_or(raw_offset);
             let new_ref = [
@@ -1024,6 +1085,7 @@ pub fn solve_avatar_pose(
                 prev_ref[2] + alpha * (raw_offset[2] - prev_ref[2]),
             ];
             state.root_reference = Some(new_ref);
+            state.root_reference_frames = state.root_reference_frames.saturating_add(1);
 
             let dev = [
                 raw_offset[0] - new_ref[0],
@@ -1118,11 +1180,41 @@ pub fn solve_avatar_pose(
         }
     }
 
+    // Arm-reach IK: when the hand is recognised but the elbow keypoint dropped,
+    // synthesise the elbow toward the wrist so the arm reaches the hand instead
+    // of collapsing to a bind-pose T. Augments a local copy of the source with
+    // the solved `*LowerArm` joints; everything below (contact IK + the body
+    // chain) then drives the arm normally. No-op (no clone) when both elbows are
+    // adequately observed, so well-tracked frames are untouched.
+    let arm_reach_elbows = if params.arm_reach_ik_enabled {
+        compute_arm_reach_elbows(source, &rest_world, humanoid, params)
+    } else {
+        [None, None]
+    };
+    let augmented_source;
+    let source: &SourceSkeleton = if arm_reach_elbows[0].is_some() || arm_reach_elbows[1].is_some() {
+        let mut s = source.clone();
+        if let Some(j) = arm_reach_elbows[0] {
+            s.joints.insert(HumanoidBone::LeftLowerArm, j);
+        }
+        if let Some(j) = arm_reach_elbows[1] {
+            s.joints.insert(HumanoidBone::RightLowerArm, j);
+        }
+        augmented_source = s;
+        &augmented_source
+    } else {
+        source
+    };
+
     // Hands-contact arm IK (see `compute_arm_contact_ik`): when the
     // subject's wrists are close, the four arm-bone directions blend
     // toward a two-bone positional solve so the avatar's hands
     // actually meet despite proportion differences.
-    let arm_contact_ik = compute_arm_contact_ik(source, humanoid, &rest_world, params);
+    let arm_contact_ik = if params.contact_ik_enabled {
+        compute_arm_contact_ik(source, humanoid, &rest_world, params)
+    } else {
+        None
+    };
 
     // Body chain: direction-match each driven bone using 3D source positions.
     // Wrist orientation pass is fired just-in-time at the body→fingers
@@ -1136,6 +1228,10 @@ pub fn solve_avatar_pose(
     // installs a full 3-DoF wrist rotation derived from the four MCPs
     // (palm plane normal) before the first finger entry runs.
     let mut wrists_oriented = false;
+    // Which arm bones the loop actually drove this frame — an undriven arm bone
+    // gets the A-pose idle below instead of snapping to the T-pose bind.
+    // Index: 0 = LeftUpperArm, 1 = LeftLowerArm, 2 = RightUpperArm, 3 = RightLowerArm.
+    let mut arm_driven = [false; 4];
     for &(bone, tip) in DRIVEN_BONES {
         // GUI retargeting toggles. `hand_tracking_enabled` skips both the
         // wrist 3-DoF orientation pass and every finger bone, so the hand
@@ -1427,12 +1523,32 @@ pub fn solve_avatar_pose(
         // it works under arbitrary body yaw (front, back, profile alike)
         // — no facing detection needed.
         if matches!(bone, HumanoidBone::UpperChest) {
-            if let (Some(l_node), Some(r_node), Some(l_src), Some(r_src)) = (
-                humanoid.bone_map.get(&HumanoidBone::LeftShoulder).copied(),
-                humanoid.bone_map.get(&HumanoidBone::RightShoulder).copied(),
-                source.joints.get(&HumanoidBone::LeftShoulder),
-                source.joints.get(&HumanoidBone::RightShoulder),
-            ) {
+            // Prefer the clavicle (Shoulder) bones, but fall back to the UpperArm
+            // roots — which every rig has and which ARE the shoulder joints — so
+            // this shoulder-line alignment still carries a shoulder TILT onto the
+            // upper torso on clavicle-less rigs. This is now the primary tilt
+            // path in upper-body mode, where the root Hips takes only the yaw.
+            let l_node = humanoid
+                .bone_map
+                .get(&HumanoidBone::LeftShoulder)
+                .or_else(|| humanoid.bone_map.get(&HumanoidBone::LeftUpperArm))
+                .copied();
+            let r_node = humanoid
+                .bone_map
+                .get(&HumanoidBone::RightShoulder)
+                .or_else(|| humanoid.bone_map.get(&HumanoidBone::RightUpperArm))
+                .copied();
+            let l_src = source
+                .joints
+                .get(&HumanoidBone::LeftShoulder)
+                .or_else(|| source.joints.get(&HumanoidBone::LeftUpperArm));
+            let r_src = source
+                .joints
+                .get(&HumanoidBone::RightShoulder)
+                .or_else(|| source.joints.get(&HumanoidBone::RightUpperArm));
+            if let (Some(l_node), Some(r_node), Some(l_src), Some(r_src)) =
+                (l_node, r_node, l_src, r_src)
+            {
                 if l_src.confidence >= params.joint_confidence_threshold
                     && r_src.confidence >= params.joint_confidence_threshold
                 {
@@ -1546,6 +1662,46 @@ pub fn solve_avatar_pose(
         // same pass see the updated parent orientation.
         let updated_world = quat_mul(&parent_world_rot, &local_transforms[node_idx].rotation);
         current_world[node_idx].rotation = updated_world;
+
+        match bone {
+            HumanoidBone::LeftUpperArm => arm_driven[0] = true,
+            HumanoidBone::LeftLowerArm => arm_driven[1] = true,
+            HumanoidBone::RightUpperArm => arm_driven[2] = true,
+            HumanoidBone::RightLowerArm => arm_driven[3] = true,
+            _ => {}
+        }
+    }
+
+    // A-pose idle: any arm bone the loop could not drive (arm out of frame /
+    // wrist not tracked) rests in a relaxed A-pose rather than the T-pose bind.
+    if params.idle_arm_apose_enabled {
+        let idle_alpha = dt_aware_blend(params.rotation_blend, dt);
+        apply_idle_arm_pose(
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::LeftLowerArm,
+            arm_driven[0],
+            arm_driven[1],
+            skeleton,
+            humanoid,
+            &rest_world,
+            &mut current_world,
+            local_transforms,
+            state,
+            idle_alpha,
+        );
+        apply_idle_arm_pose(
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::RightLowerArm,
+            arm_driven[2],
+            arm_driven[3],
+            skeleton,
+            humanoid,
+            &rest_world,
+            &mut current_world,
+            local_transforms,
+            state,
+            idle_alpha,
+        );
     }
 
     // Face pose: drive the Head bone independently. The face track
@@ -1825,6 +1981,161 @@ fn compute_shoulder_align_rotation(
     Some(quat_from_vectors(&av_n, &src_n))
 }
 
+/// Upper-body-mode facing for the root Hips: the HORIZONTAL (yaw) part of the
+/// shoulder-line alignment only. Applying the full shoulder-line rotation
+/// (which includes the roll of a shoulder tilt) to the root spins the WHOLE
+/// avatar about the pelvis — the "zero-g rotation" artefact when only the upper
+/// body is framed. Projecting both shoulder lines onto the horizontal plane
+/// keeps the pelvis upright and grounded; the shoulder ROLL is applied to the
+/// upper torso (see the `UpperChest` alignment in the driven-bone loop) so the
+/// spine leans instead. Returns `None` if either shoulder is missing / the
+/// projected line is degenerate (near-vertical), leaving the Hips at rest.
+fn compute_shoulder_yaw_rotation(
+    source: &SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    threshold: f32,
+) -> Option<Quat> {
+    use HumanoidBone::*;
+    let l = source.joints.get(&LeftUpperArm)?;
+    let r = source.joints.get(&RightUpperArm)?;
+    if l.confidence < threshold || r.confidence < threshold {
+        return None;
+    }
+    // Horizontal projection (drop Y) of the source shoulder line.
+    let src_h = [l.position[0] - r.position[0], 0.0, l.position[2] - r.position[2]];
+    let src_len = vec3_length(&src_h);
+    // A near-vertical shoulder line has almost no horizontal component — its yaw
+    // is ill-defined; keep the previous facing rather than snapping.
+    const MIN_HORIZ_SPAN: f32 = 0.20;
+    if src_len < MIN_HORIZ_SPAN {
+        return None;
+    }
+    let src_n = [src_h[0] / src_len, 0.0, src_h[2] / src_len];
+
+    let l_idx = humanoid.bone_map.get(&LeftUpperArm).map(|n| n.0 as usize)?;
+    let r_idx = humanoid.bone_map.get(&RightUpperArm).map(|n| n.0 as usize)?;
+    let l_world = rest_world.get(l_idx)?.position;
+    let r_world = rest_world.get(r_idx)?.position;
+    let av_h = [l_world[0] - r_world[0], 0.0, l_world[2] - r_world[2]];
+    let av_len = vec3_length(&av_h);
+    if av_len < 1.0e-4 {
+        return None;
+    }
+    let av_n = [av_h[0] / av_len, 0.0, av_h[2] / av_len];
+
+    Some(quat_from_vectors(&av_n, &src_n))
+}
+
+/// A-pose idle world direction for an arm whose rest bone axis is `rest_dir`,
+/// under torso rotation `torso_delta` (rest → current). Down-and-out at
+/// `IDLE_ARM_ANGLE_FROM_DOWN_DEG` from straight-down, in the frontal plane, with
+/// the horizontal sign taken from `rest_dir` so each arm stays on its own side.
+fn idle_arm_direction(rest_dir: Vec3, torso_delta: Quat) -> Vec3 {
+    let s = if rest_dir[0] >= 0.0 { 1.0 } else { -1.0 };
+    let th = IDLE_ARM_ANGLE_FROM_DOWN_DEG.to_radians();
+    let idle_body = [s * th.sin(), -th.cos(), 0.0];
+    quat_rotate_vec3(&torso_delta, &idle_body)
+}
+
+/// Rest an untracked arm in a relaxed A-pose instead of the T-pose bind. Bones
+/// the direction-match loop drove are flagged and skipped here; only a bone the
+/// loop left at rest is touched. The upper arm is aimed
+/// `IDLE_ARM_ANGLE_FROM_DOWN_DEG` out from straight-down — in the CURRENT torso
+/// frame so it follows body yaw/tilt — and the forearm fades straight. Both go
+/// through `blend_arm_rotation`, so losing the arm eases into the A-pose and
+/// re-acquiring it eases back out (no snap, unlike the bind which appears the
+/// instant the loop stops writing the bone). Tracked arms are untouched: their
+/// direction-match is bind-relative, so A-pose vs T-pose bind is invisible while
+/// tracking holds.
+#[allow(clippy::too_many_arguments)]
+fn apply_idle_arm_pose(
+    ua_bone: HumanoidBone,
+    la_bone: HumanoidBone,
+    ua_driven: bool,
+    la_driven: bool,
+    skeleton: &SkeletonAsset,
+    humanoid: &HumanoidMap,
+    rest_world: &[WorldXform],
+    current_world: &mut [WorldXform],
+    local_transforms: &mut [Transform],
+    state: &mut PoseSolverState,
+    alpha: f32,
+) {
+    if ua_driven && la_driven {
+        return;
+    }
+    let (Some(ua), Some(la)) = (
+        humanoid.bone_map.get(&ua_bone).copied(),
+        humanoid.bone_map.get(&la_bone).copied(),
+    ) else {
+        return;
+    };
+    let (ua_idx, la_idx) = (ua.0 as usize, la.0 as usize);
+    if ua_idx >= rest_world.len() || la_idx >= rest_world.len() {
+        return;
+    }
+
+    // Torso delta (rest → current) so the idle arm follows body yaw / tilt.
+    let torso_delta = humanoid
+        .bone_map
+        .get(&HumanoidBone::Hips)
+        .map(|h| h.0 as usize)
+        .filter(|&i| i < rest_world.len())
+        .map(|i| quat_mul(&current_world[i].rotation, &quat_conjugate(&rest_world[i].rotation)))
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+
+    let parent_world = |idx: usize, cw: &[WorldXform]| -> Quat {
+        skeleton.nodes[idx]
+            .parent
+            .map(|NodeId(p)| cw[p as usize].rotation)
+            .unwrap_or([0.0, 0.0, 0.0, 1.0])
+    };
+
+    if !ua_driven {
+        // Rest bone axis (shoulder → elbow); its X sign keeps the arm on its own
+        // side so the A-pose is left/right correct on any rig.
+        let rest_dir = vec3_normalize(&vec3_sub(
+            &rest_world[la_idx].position,
+            &rest_world[ua_idx].position,
+        ));
+        if rest_dir != [0.0; 3] {
+            let rest_dir_w = quat_rotate_vec3(&torso_delta, &rest_dir);
+            let idle_dir_w = idle_arm_direction(rest_dir, torso_delta);
+            let q = quat_from_vectors(&rest_dir_w, &idle_dir_w);
+            let target_world =
+                quat_mul(&q, &quat_mul(&torso_delta, &rest_world[ua_idx].rotation));
+            let pw = parent_world(ua_idx, current_world);
+            let new_local = quat_normalize(&quat_mul(&quat_conjugate(&pw), &target_world));
+            local_transforms[ua_idx].rotation = blend_arm_rotation(
+                state,
+                ua_idx,
+                local_transforms[ua_idx].rotation,
+                &new_local,
+                alpha,
+                0.0,
+            );
+            current_world[ua_idx].rotation = quat_mul(&pw, &local_transforms[ua_idx].rotation);
+        }
+    }
+
+    if !la_driven {
+        // Straighten the forearm: fade toward its rest-local (a continuation of
+        // the upper arm) so it hangs straight instead of holding a stale bend.
+        let rest_local = skeleton.nodes[la_idx].rest_local.rotation;
+        local_transforms[la_idx].rotation = blend_arm_rotation(
+            state,
+            la_idx,
+            local_transforms[la_idx].rotation,
+            &rest_local,
+            alpha,
+            0.0,
+        );
+        let pw = parent_world(la_idx, current_world);
+        current_world[la_idx].rotation = quat_mul(&pw, &local_transforms[la_idx].rotation);
+    }
+}
+
 fn apply_face_pose(
     face: FacePose,
     head_idx: usize,
@@ -2060,6 +2371,126 @@ fn compute_arm_contact_ik(
     })
 }
 
+/// Arm-reach IK: solve the whole arm by two-bone IK to the OBSERVED wrist so
+/// the avatar's hand actually reaches the recognised hand.
+///
+/// The body-chain retarget is otherwise pure direction-match, which copies the
+/// USER'S joint angles onto the avatar's bones. That has two failure modes this
+/// solve fixes:
+///   1. A *dropped* elbow keypoint (depth hole / off-frame) leaves BOTH arm
+///      bones undriven — `LeftUpperArm` needs the elbow as its tip and
+///      `LeftLowerArm` needs it as its base — so they stay at bind (a T-pose)
+///      even though the wrist was tracked fine ("hand recognised, arm T-posed").
+///   2. Even with the elbow observed, direction-match reaches only
+///      `avatar_bone_length` along each copied direction. When avatar and user
+///      proportions differ, the hand lands SHORT of the observed wrist: the
+///      arms collapse toward the chest and, near the midline, the residual
+///      jitters sign so the forearms appear to cross (measured: hands-together
+///      spread ~8% of source, occasional sign flip — the "arms cross when the
+///      hands meet" artefact).
+///
+/// So whenever the shoulder + wrist are confident we place the elbow with a
+/// two-bone IK toward the wrist (avatar rest bone-lengths scaled into source
+/// space; the observed elbow, if any, is only the swivel pole, else a natural
+/// behind-the-line bend). The caller inserts the result as the `*LowerArm`
+/// source joint so the existing loop drives the whole arm to the hand — now
+/// re-proportioned to the avatar, so the hand reaches. Undriven only when the
+/// wrist itself is missing/weak (arm at rest). Returns `[left, right]`.
+fn compute_arm_reach_elbows(
+    source: &SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    params: &SolverParams,
+) -> [Option<crate::tracking::SourceJoint>; 2] {
+    let thr = params.joint_confidence_threshold;
+    let rest_pos = |b: HumanoidBone| -> Option<Vec3> {
+        humanoid
+            .bone_map
+            .get(&b)
+            .map(|n| n.0 as usize)
+            .filter(|&i| i < rest_world.len())
+            .map(|i| rest_world[i].position)
+    };
+    let av_span = match (
+        rest_pos(HumanoidBone::LeftUpperArm),
+        rest_pos(HumanoidBone::RightUpperArm),
+    ) {
+        (Some(a), Some(b)) => vec3_length(&vec3_sub(&a, &b)),
+        _ => return [None, None],
+    };
+    let src_span = match (
+        source.joints.get(&HumanoidBone::LeftUpperArm),
+        source.joints.get(&HumanoidBone::RightUpperArm),
+    ) {
+        (Some(a), Some(b)) => vec3_length(&vec3_sub(&a.position, &b.position)),
+        _ => return [None, None],
+    };
+    if av_span < 1e-4 || src_span < 1e-4 {
+        return [None, None];
+    }
+    let scale = src_span / av_span;
+
+    let sides = [
+        (HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand),
+        (HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
+    ];
+    let mut out = [None, None];
+    for (side, &(sh_b, el_b, wr_b)) in sides.iter().enumerate() {
+        // Require a confident shoulder + wrist. Given both, solve the whole arm
+        // by IK to the observed wrist EVEN WHEN the elbow is also observed:
+        // direction-match copies the user's angles at avatar bone lengths and
+        // lands the hand short of the wrist when proportions differ (collapse /
+        // midline cross). IK re-proportions the chain so the hand reaches; the
+        // observed elbow, if any, becomes the swivel pole below.
+        let Some(sh) = source.joints.get(&sh_b).filter(|x| x.confidence >= thr) else {
+            continue;
+        };
+        let Some(wr) = source.joints.get(&wr_b).filter(|x| x.confidence >= thr) else {
+            continue;
+        };
+        let (Some(rsh), Some(rel), Some(rwr)) = (rest_pos(sh_b), rest_pos(el_b), rest_pos(wr_b))
+        else {
+            continue;
+        };
+        let l1 = vec3_length(&vec3_sub(&rel, &rsh)) * scale;
+        let l2 = vec3_length(&vec3_sub(&rwr, &rel)) * scale;
+        if l1 < 1e-4 || l2 < 1e-4 {
+            continue;
+        }
+        // Swivel pole: the observed elbow ONLY when it is confidently tracked
+        // (it steers the bend direction without dictating the reach). A
+        // low-confidence elbow is trusted for NOTHING geometric: when the elbow
+        // leaves the frame the keypoint clamps to the image edge with a fabricated
+        // depth, and steering the swivel toward that point wrenches the forearm
+        // sideways — the "arm fractures when the elbow is out of frame" artefact
+        // (手首は見えているのに肘が視界外だと腕が骨折する). Below threshold we fall
+        // back to a natural bend biased behind the shoulder→wrist line (toward the
+        // body, −Z is away from the camera) so the elbow does not hyper-extend
+        // straight — the same default used when no elbow keypoint exists at all.
+        let pole = source
+            .joints
+            .get(&el_b)
+            .filter(|x| x.confidence >= thr)
+            .map(|x| x.position)
+            .unwrap_or_else(|| {
+                let mid = midpoint(&sh.position, &wr.position);
+                [mid[0], mid[1], mid[2] - 0.4 * src_span]
+            });
+        let Some((upper_dir, _lower_dir)) =
+            two_bone_ik(&sh.position, &wr.position, l1, l2, &pole)
+        else {
+            continue;
+        };
+        let elbow_pos = vec3_add(&sh.position, &vec3_scale(&upper_dir, l1));
+        out[side] = Some(crate::tracking::SourceJoint {
+            position: elbow_pos,
+            confidence: wr.confidence.min(sh.confidence),
+            metric_depth_m: None,
+        });
+    }
+    out
+}
+
 /// Analytic two-bone IK: place the elbow so the chain
 /// (anchor → elbow → target) keeps the given segment lengths, choosing
 /// the elbow swivel closest to `pole` (the tracked elbow position).
@@ -2252,6 +2683,82 @@ mod arm_contact_ik_tests {
         let w_r = wrist([-0.2, 0.0, 0.0], u_r, l_r);
         assert_close(w_l, target, 1e-3);
         assert_close(w_r, target, 1e-3);
+    }
+
+    /// REPRO: the elbow leaves the camera frame while the hand stays
+    /// tracked ("手を認識してるのに肘が視界外だと腕が骨折する"). Off-frame the
+    /// elbow keypoint clamps to the image edge with a fabricated position and
+    /// only a weak score; `compute_arm_reach_elbows` must NOT steer the swivel
+    /// toward that garbage — a low-confidence elbow is ignored as the pole and
+    /// the arm falls back to a natural behind-the-line bend (no fracture).
+    #[test]
+    fn offframe_elbow_ignored_as_swivel_pole() {
+        let (humanoid, rest) = arm_rig();
+        let mut source = SourceSkeleton::empty(0);
+        // Confident shoulders (span 0.30 == avatar span → scale 1) and a
+        // confident left wrist reaching forward-down at the midline.
+        source.joints.insert(HumanoidBone::LeftUpperArm, src_joint([0.15, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::RightUpperArm, src_joint([-0.15, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::LeftHand, src_joint([0.15, 1.25, 0.15]));
+        // Off-frame elbow: clamped far out to +x (image edge) with a weak score.
+        source.joints.insert(
+            HumanoidBone::LeftLowerArm,
+            crate::tracking::SourceJoint {
+                position: [0.90, 1.40, 0.0],
+                confidence: 0.2,
+                metric_depth_m: None,
+            },
+        );
+
+        let params = SolverParams { joint_confidence_threshold: 0.5, ..Default::default() };
+        let out = compute_arm_reach_elbows(&source, &rest, &humanoid, &params);
+        let elbow = out[0].expect("left arm reaches the tracked wrist").position;
+        eprintln!("synth elbow = {elbow:?}");
+        // The garbage pole sits at x=0.90; steered toward it the elbow swings
+        // out to x≈0.38, z≈+0.08 (a sideways wrench — the fracture). Ignored,
+        // the natural behind-line bend keeps the elbow on the shoulder→wrist
+        // line (both at x=0.15 → symmetric → x≈0.15) and BEHIND it (z<0, −Z is
+        // away from the camera). Both thresholds sit strictly between the two
+        // outcomes so this test fails on the ungated pole.
+        assert!(
+            elbow[0] < 0.25,
+            "elbow wrenched sideways toward the off-frame garbage pole: {elbow:?}"
+        );
+        assert!(
+            elbow[2] < 0.0,
+            "elbow should bend behind the shoulder→wrist line, got {elbow:?}"
+        );
+    }
+
+    /// The A-pose idle direction sits an untracked arm down-and-out at the
+    /// configured angle (40° from straight-down), on its own side, and follows
+    /// a torso yaw — replacing the T-pose bind that would jut the arm out flat.
+    #[test]
+    fn idle_arm_direction_is_a_pose() {
+        let ident = [0.0, 0.0, 0.0, 1.0];
+        let down = [0.0, -1.0, 0.0];
+
+        // Left arm (rest axis +x): down-and-out to the left, 40° off vertical.
+        let l = idle_arm_direction([1.0, 0.0, 0.0], ident);
+        assert!(l[1] < 0.0, "left idle arm should point downward: {l:?}");
+        assert!(l[0] > 0.0, "left idle arm should stay on the +x side: {l:?}");
+        let ang_l = vec3_dot(&vec3_normalize(&l), &down).clamp(-1.0, 1.0).acos().to_degrees();
+        assert!((ang_l - 40.0).abs() < 0.5, "left arm angle from down = {ang_l}, want 40");
+
+        // Right arm (rest axis −x): mirror — stays on the −x side.
+        let r = idle_arm_direction([-1.0, 0.0, 0.0], ident);
+        assert!(r[1] < 0.0 && r[0] < 0.0, "right idle arm should point down-right: {r:?}");
+
+        // Under a 90° torso yaw (about +y) the arm still points down, but its
+        // outward component rotates out of the x axis into z (sign is the quat
+        // handedness convention — assert magnitude, not sign).
+        let yaw90 = [0.0, (std::f32::consts::FRAC_PI_4).sin(), 0.0, (std::f32::consts::FRAC_PI_4).cos()];
+        let ly = idle_arm_direction([1.0, 0.0, 0.0], yaw90);
+        assert!(ly[1] < 0.0, "yawed idle arm still points down: {ly:?}");
+        assert!(
+            ly[0].abs() < 0.2 && ly[2].abs() > 0.4,
+            "yawed idle arm's outward axis should rotate from x into z: {ly:?}"
+        );
     }
 }
 

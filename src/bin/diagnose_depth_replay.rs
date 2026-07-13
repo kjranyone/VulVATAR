@@ -197,11 +197,65 @@ struct FrameMetrics {
     lsh: Option<[f32; 3]>,
     rsh: Option<[f32; 3]>,
     metric_present: bool,
+    // --- head / face orientation probe ---
+    head: Option<[f32; 3]>,
+    neck: Option<[f32; 3]>,
+    /// Inherited RGB face pose (yaw, pitch, roll, confidence), degrees.
+    face: Option<[f32; 4]>,
+    // --- hand L/R probe (source x; +x = anatomical-left per module docs) ---
+    l_hand_x: Option<f32>,
+    r_hand_x: Option<f32>,
+    l_elbow_x: Option<f32>,
+    r_elbow_x: Option<f32>,
+    // --- global scale / root probe (the zoom-glitch suspects) ---
+    /// The normalisation reference span (metres). Uncalibrated = this frame's
+    /// measured shoulder span → its per-frame jitter scales the whole avatar
+    /// (`avatar_scale = rest_span / reference_span_m`) = the zoom glitch.
+    ref_span_m: Option<f32>,
+    /// Raw anchor depth (metres). Its jitter moves the avatar toward/away.
+    anchor_z: Option<f32>,
+    mpsu: Option<f32>,
+}
+
+impl FrameMetrics {
+    /// Neck-bend proxy for the head's *base* frame (contributor B): the
+    /// horizontal (lean L/R) and depth (lean fwd/back) tilt of the
+    /// Head-from-Neck vector, in degrees. This is the depth-driven part of
+    /// the head orientation the solver's `HeadFromShoulders` tip consumes;
+    /// the RGB `face` pose rides on top of it.
+    fn head_tilt(&self) -> Option<(f32, f32)> {
+        let (h, n) = (self.head?, self.neck?);
+        let dx = h[0] - n[0];
+        let dy = h[1] - n[1];
+        let dz = h[2] - n[2];
+        // +y is up; a head straight above the neck gives ~0/0.
+        let lean_lr = dx.atan2(dy.abs().max(1e-3)).to_degrees();
+        let lean_fb = dz.atan2(dy.abs().max(1e-3)).to_degrees();
+        Some((lean_lr, lean_fb))
+    }
+
+    /// Heuristic: do the two hands look L/R-swapped this frame? In source
+    /// coords +x is anatomical-left, so a non-swapped pose has the
+    /// anatomical-left hand at greater x than the right *when the elbows are
+    /// clearly separated the same way*. Fires when the hand x-order is
+    /// inverted relative to the elbow x-order (the classic midline mix-up
+    /// the depth path does NOT correct).
+    fn hands_swapped(&self) -> Option<bool> {
+        let (lhx, rhx) = (self.l_hand_x?, self.r_hand_x?);
+        let (lex, rex) = (self.l_elbow_x?, self.r_elbow_x?);
+        // Elbows tell us the true side; require them meaningfully apart.
+        if (lex - rex).abs() < 0.15 {
+            return None;
+        }
+        Some((lhx - rhx).signum() != (lex - rex).signum())
+    }
 }
 
 fn frame_metrics(sk: &SourceSkeleton) -> FrameMetrics {
     use HumanoidBone::*;
     let z = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position[2]);
+    let x = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position[0]);
+    let pos = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position);
     let lsh = sk.joints.get(&LeftUpperArm).map(|j| j.position);
     let rsh = sk.joints.get(&RightUpperArm).map(|j| j.position);
     let (span, yaw) = match (lsh, rsh) {
@@ -234,6 +288,23 @@ fn frame_metrics(sk: &SourceSkeleton) -> FrameMetrics {
         lsh,
         rsh,
         metric_present: sk.metric_frame_info.is_some(),
+        head: pos(Head),
+        neck: pos(Neck).or_else(|| pos(UpperChest)),
+        face: sk.face.map(|f| {
+            [
+                f.yaw.to_degrees(),
+                f.pitch.to_degrees(),
+                f.roll.to_degrees(),
+                f.confidence,
+            ]
+        }),
+        l_hand_x: x(LeftHand),
+        r_hand_x: x(RightHand),
+        l_elbow_x: x(LeftLowerArm),
+        r_elbow_x: x(RightLowerArm),
+        ref_span_m: sk.metric_frame_info.as_ref().map(|m| m.reference_span_m),
+        anchor_z: sk.metric_frame_info.as_ref().map(|m| m.anchor_cam_m[2]),
+        mpsu: sk.metric_frame_info.as_ref().map(|m| m.mpsu),
     }
 }
 
@@ -266,7 +337,11 @@ fn batch(dir: &Path) -> Result<(), String> {
     eprintln!("provider: {} — {} frames", provider.label(), pairs.len());
 
     let fz = |o: Option<f32>| o.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "".into());
-    println!("frame,joints,span_src,yaw_deg,Rwrist_z,Rhand_z,Lwrist_z,Lhand_z,Lsh_x,Lsh_z,Rsh_x,Rsh_z,metric");
+    println!(
+        "frame,joints,span_src,yaw_deg,Rwrist_z,Rhand_z,Lwrist_z,Lhand_z,Lsh_x,Lsh_z,Rsh_x,Rsh_z,metric,\
+         head_x,head_y,head_z,neck_x,neck_y,neck_z,headLeanLR,headLeanFB,fyaw,fpitch,froll,fconf,Lhand_x,Rhand_x,swap,\
+         ref_span_m,anchor_z,mpsu"
+    );
 
     // Temporal accumulators. The "inversion" signature we hunt is the OLD
     // bug: a limb's forward/back (source z) jumping across zero by a large
@@ -281,6 +356,13 @@ fn batch(dir: &Path) -> Result<(), String> {
     let mut prev_yaw: Option<f32> = None;
     let mut metric_frames = 0u32;
     let (mut hand_fwd, mut hand_tot, mut hand_outliers) = (0u32, 0u32, 0u32);
+    // Head-orientation probe (contributor B = neck bend; C = RGB face pose).
+    let mut head_lr: Vec<f32> = Vec::new();
+    let mut head_fb: Vec<f32> = Vec::new();
+    let mut fyaws: Vec<f32> = Vec::new();
+    // Hand L/R-swap probe + hard dropouts (empty skeleton = avatar rests).
+    let (mut swap_frames, mut swap_eligible) = (0u32, 0u32);
+    let mut empty_frames = 0u32;
 
     for (n, (idx, cp, dp)) in pairs.iter().enumerate() {
         let (rgb, metric) = load_metric_frame(cp, dp, false)?;
@@ -289,8 +371,14 @@ fn batch(dir: &Path) -> Result<(), String> {
         let sk = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64).skeleton;
         let m = frame_metrics(&sk);
 
+        let (lean_lr, lean_fb) = m.head_tilt().map(|(a, b)| (Some(a), Some(b))).unwrap_or((None, None));
+        let swap_flag = match m.hands_swapped() {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "",
+        };
         println!(
-            "{idx},{},{:.3},{:.1},{},{},{},{},{},{},{},{},{}",
+            "{idx},{},{:.3},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             m.joints,
             m.span,
             m.yaw,
@@ -302,11 +390,49 @@ fn batch(dir: &Path) -> Result<(), String> {
             fz(m.lsh.map(|p| p[2])),
             fz(m.rsh.map(|p| p[0])),
             fz(m.rsh.map(|p| p[2])),
-            m.metric_present as u8
+            m.metric_present as u8,
+            fz(m.head.map(|p| p[0])),
+            fz(m.head.map(|p| p[1])),
+            fz(m.head.map(|p| p[2])),
+            fz(m.neck.map(|p| p[0])),
+            fz(m.neck.map(|p| p[1])),
+            fz(m.neck.map(|p| p[2])),
+            fz(lean_lr),
+            fz(lean_fb),
+            fz(m.face.map(|f| f[0])),
+            fz(m.face.map(|f| f[1])),
+            fz(m.face.map(|f| f[2])),
+            fz(m.face.map(|f| f[3])),
+            fz(m.l_hand_x),
+            fz(m.r_hand_x),
+            swap_flag,
+            fz(m.ref_span_m),
+            fz(m.anchor_z),
+            fz(m.mpsu),
         );
 
         if m.metric_present {
             metric_frames += 1;
+        }
+        if m.joints == 0 {
+            empty_frames += 1;
+        }
+        // Head-orientation inputs. Only trust them on well-detected frames so a
+        // degraded frame's guessed head doesn't skew the head-jitter stats.
+        if m.joints >= 20 {
+            if let Some((lr, fb)) = m.head_tilt() {
+                head_lr.push(lr);
+                head_fb.push(fb);
+            }
+            if let Some(f) = m.face {
+                fyaws.push(f[0]);
+            }
+            if let Some(sw) = m.hands_swapped() {
+                swap_eligible += 1;
+                if sw {
+                    swap_frames += 1;
+                }
+            }
         }
         // End-effector forward/back: during a wave the hand stays in front of
         // the torso (+z). A SYSTEMATIC inversion (hand reading behind) is the
@@ -386,6 +512,41 @@ fn batch(dir: &Path) -> Result<(), String> {
     );
     eprintln!(
         "forearm z sign-flips (limb jitter, solver-smoothed): R={r_flips} L={l_flips}"
+    );
+
+    // --- head orientation probe (the symptom the yaw stat cannot see) ---
+    let stats = |v: &[f32]| -> (f32, f32, f32, f32) {
+        if v.is_empty() {
+            return (f32::NAN, f32::NAN, f32::NAN, f32::NAN);
+        }
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        let std = (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
+        let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        (mean, std, mn, mx)
+    };
+    let (lr_m, lr_s, lr_mn, lr_mx) = stats(&head_lr);
+    let (fb_m, fb_s, fb_mn, fb_mx) = stats(&head_fb);
+    let (fy_m, fy_s, fy_mn, fy_mx) = stats(&fyaws);
+    eprintln!(
+        "head neck-bend L/R   : mean {lr_m:+.1}° std {lr_s:.1}° range [{lr_mn:+.1},{lr_mx:+.1}]  (contributor B, depth ear-mid)"
+    );
+    eprintln!(
+        "head neck-bend F/B   : mean {fb_m:+.1}° std {fb_s:.1}° range [{fb_mn:+.1},{fb_mx:+.1}]"
+    );
+    eprintln!(
+        "face pose yaw (RGB)  : mean {fy_m:+.1}° std {fy_s:.1}° range [{fy_mn:+.1},{fy_mx:+.1}]  (contributor C, depth-independent)"
+    );
+    let swap_pct = if swap_eligible > 0 {
+        100.0 * swap_frames as f32 / swap_eligible as f32
+    } else {
+        f32::NAN
+    };
+    eprintln!(
+        "hand L/R swapped     : {swap_frames}/{swap_eligible} ({swap_pct:.0}%) of elbow-separated frames  (depth path has NO hand-block swap fix)"
+    );
+    eprintln!(
+        "empty-skeleton frames: {empty_frames}/{n}  (no torso fit → avatar snaps to rest)"
     );
 
     // Hard-fail only on the SEVERE signatures of the original bug — the torso

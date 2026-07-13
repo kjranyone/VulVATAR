@@ -160,7 +160,7 @@ impl Application {
             self.tracking_fade_opacity = (self.tracking_fade_opacity + delta).clamp(0.0, 1.0);
         }
 
-        let solver_params = SolverParams {
+        let mut solver_params = SolverParams {
             rotation_blend: smoothing_params.rotation_blend,
             joint_confidence_threshold: smoothing_params.joint_confidence_threshold,
             face_confidence_threshold: smoothing_params.face_confidence_threshold,
@@ -176,6 +176,22 @@ impl Application {
             pose_calibration: self.tracking_calibration.pose.clone(),
             ..SolverParams::default()
         };
+        // Live debug overrides (no-op unless %ProgramData%\VulVATAR\debug.on
+        // exists): lets an external tool A/B the arm IK stages or sweep the
+        // confidence threshold against the running app without a rebuild.
+        let tuning = crate::tracking::debug_channel::load_tuning();
+        if let Some(v) = tuning.arm_reach_ik {
+            solver_params.arm_reach_ik_enabled = v;
+        }
+        if let Some(v) = tuning.contact_ik {
+            solver_params.contact_ik_enabled = v;
+        }
+        if let Some(v) = tuning.idle_arm_apose {
+            solver_params.idle_arm_apose_enabled = v;
+        }
+        if let Some(v) = tuning.joint_confidence_threshold {
+            solver_params.joint_confidence_threshold = v;
+        }
 
         // Advance the simulation clock once per frame so every avatar in the
         // scene observes the same `(fixed_dt, substeps)`. Previously this was
@@ -184,7 +200,7 @@ impl Application {
         let substeps = self.sim_clock.advance(frame_dt);
         let fixed_dt = self.sim_clock.fixed_dt();
 
-        for avatar in self.avatars.iter_mut() {
+        for (avatar_idx, avatar) in self.avatars.iter_mut().enumerate() {
             avatar.build_base_pose();
 
             if let Some(ref mut source) = tracking_sample.clone() {
@@ -215,6 +231,43 @@ impl Application {
             }
 
             avatar.compute_global_pose();
+
+            // Live debug: publish the primary avatar's solved joint world
+            // positions so the external overlay can draw the avatar skeleton
+            // without a GPU render (torso tilt, elbow placement, whole-body
+            // rotation). No-op unless %ProgramData%\VulVATAR\debug.on exists.
+            if avatar_idx == 0 {
+                let humanoid = avatar.asset.humanoid.as_ref();
+                let gt = &avatar.pose.global_transforms;
+                // Head bone's world basis (normalised X/Y/Z columns of its
+                // column-major global matrix) = its facing, so the external tool
+                // can see an over-pitched head directly.
+                let head_axes = humanoid
+                    .and_then(|h| h.bone_map.get(&crate::asset::HumanoidBone::Head))
+                    .map(|n| n.0 as usize)
+                    .and_then(|i| gt.get(i))
+                    .map(|m| {
+                        let norm = |v: [f32; 3]| {
+                            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+                            [v[0] / l, v[1] / l, v[2] / l]
+                        };
+                        [
+                            norm([m[0][0], m[0][1], m[0][2]]),
+                            norm([m[1][0], m[1][1], m[1][2]]),
+                            norm([m[2][0], m[2][1], m[2][2]]),
+                        ]
+                    });
+                crate::tracking::debug_channel::dump_avatar_pose(
+                    |b| {
+                        humanoid
+                            .and_then(|h| h.bone_map.get(&b))
+                            .map(|n| n.0 as usize)
+                            .and_then(|i| gt.get(i))
+                            .map(|m| [m[3][0], m[3][1], m[3][2]])
+                    },
+                    head_axes,
+                );
+            }
 
             let step_options = SimulationStepOptions {
                 spring_enabled: toggles.spring_enabled,

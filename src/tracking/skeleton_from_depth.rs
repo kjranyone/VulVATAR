@@ -78,6 +78,17 @@ pub struct MetricDepthFrame {
 /// `joint_confidence_threshold` slider lives in the solver.
 pub const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
+/// Is this whole-frame-normalised 2D keypoint inside the camera image? The
+/// aligned depth frame only spans `[0, 1]²`; a keypoint the detector places
+/// OUTSIDE it (RTMW3D extrapolates a limb that has left the frame — e.g. an
+/// elbow below a head-and-shoulders crop, `ny > 1`) has NO depth pixel, so its
+/// metric 3D cannot be observed and must not be fabricated. Callers use this to
+/// deny the bone-length ray fallback for off-frame joints (an in-frame depth
+/// HOLE is different — the joint is visible, its IR return was just absorbed).
+pub(super) fn keypoint_in_frame(nx: f32, ny: f32) -> bool {
+    (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny)
+}
+
 /// Half-size of the square depth-sampling window when reading metric
 /// depth at a 2D keypoint. Small enough to track fingers without
 /// dragging in neighbouring depth, large enough that single-pixel
@@ -176,6 +187,13 @@ pub(super) const HAND_TIPS_LEFT: &[(usize, HumanoidBone)] = &[
 // Depth sampling
 // ---------------------------------------------------------------------------
 
+/// How far toward the camera (metres) from the torso a keypoint may sit and
+/// still count as "on the person" — a fully forward-reached hand.
+const PERSON_NEAR_M: f32 = 0.75;
+/// How far behind the torso (metres) a keypoint may sit — a leaned-back or
+/// trailing limb. Anything deeper than this is background.
+const PERSON_FAR_M: f32 = 0.45;
+
 /// Sample a metric-depth frame's point cloud at a frame-relative
 /// `(nx, ny)` keypoint with a local-window median. Returns `None` when
 /// the keypoint falls outside the frame or every sample in the window
@@ -192,6 +210,42 @@ pub fn sample_metric_point_with_radius(
     nx: f32,
     ny: f32,
     radius_px: i32,
+) -> Option<[f32; 3]> {
+    sample_window(frame, nx, ny, radius_px, None)
+}
+
+/// **Person-aware** depth sample: like [`sample_metric_point_with_radius`] but
+/// keeps only window samples whose depth lies on the person — within
+/// `[z_ref - PERSON_NEAR_M, z_ref + PERSON_FAR_M]`, where `z_ref` is the
+/// torso-anchor depth (metres). This is the root fix for the head/hand
+/// teleport: a *correctly-placed* keypoint that sits at the body's occluding
+/// silhouette (hair, headphone, hand edge) has a window full of the wall
+/// metres behind it — the naive median then returns background and the joint
+/// flies off. Rejecting the background at the sample boundary means a joint
+/// whose depth is genuinely unobservable returns `None` (caller rests/holds)
+/// instead of teleporting.
+pub fn sample_metric_point_person(
+    frame: &MetricDepthFrame,
+    nx: f32,
+    ny: f32,
+    radius_px: i32,
+    z_ref: f32,
+) -> Option<[f32; 3]> {
+    let band = z_ref
+        .is_finite()
+        .then(|| (z_ref - PERSON_NEAR_M, z_ref + PERSON_FAR_M));
+    sample_window(frame, nx, ny, radius_px, band)
+}
+
+/// Shared window-median sampler. `z_band`, when set, restricts admitted
+/// samples to `[lo, hi]` metres of depth (the person band) so background /
+/// silhouette-edge pixels are discarded.
+fn sample_window(
+    frame: &MetricDepthFrame,
+    nx: f32,
+    ny: f32,
+    radius_px: i32,
+    z_band: Option<(f32, f32)>,
 ) -> Option<[f32; 3]> {
     if !nx.is_finite() || !ny.is_finite() {
         return None;
@@ -218,11 +272,17 @@ pub fn sample_metric_point_with_radius(
         for xx in (cx - radius_px).max(0)..=(cx + radius_px).min(w - 1) {
             let idx = yy as usize * frame.width as usize + xx as usize;
             let [px, py, pz] = frame.points_m[idx];
-            if px.is_finite() && py.is_finite() && pz.is_finite() && pz > 0.0 {
-                xs.push(px);
-                ys.push(py);
-                zs.push(pz);
+            if !(px.is_finite() && py.is_finite() && pz.is_finite() && pz > 0.0) {
+                continue;
             }
+            if let Some((lo, hi)) = z_band {
+                if pz < lo || pz > hi {
+                    continue;
+                }
+            }
+            xs.push(px);
+            ys.push(py);
+            zs.push(pz);
         }
     }
     Some([median(xs)?, median(ys)?, median(zs)?])
@@ -674,6 +734,112 @@ pub(super) mod torso_fit {
 }
 
 // ---------------------------------------------------------------------------
+// Global scale + root stabiliser (zoom-glitch fix)
+// ---------------------------------------------------------------------------
+
+/// Temporal stabiliser for the avatar's GLOBAL scale and root distance.
+///
+/// The subject's shoulder span and torso anchor are near-constant physically,
+/// but a hand crossing in front of a shoulder contaminates that shoulder's
+/// depth sample — swinging the raw per-frame span (measured 0.26–0.42 m across
+/// palms/namaste) and the anchor depth (frame-to-frame jumps up to 0.4 m).
+/// Because `reference_span_m` scales the whole avatar
+/// (`avatar_scale = rest_span / reference_span_m`, and `mpsu` normalises every
+/// joint by it) and the anchor sets the avatar's distance, that raw jitter
+/// makes the character zoom in/out and lurch toward/away — the reported glitch.
+/// Both quantities change slowly in reality, so hold them with an EMA: the span
+/// with outlier rejection (a contaminated frame reads far off and is ignored),
+/// the anchor with an adaptive rate (follow a genuine lean, hold sampling
+/// jitter). Provider-owned; reset per session.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::tracking) struct TorsoScaleStabilizer {
+    span_m: Option<f32>,
+    anchor_cam: Option<[f32; 3]>,
+}
+
+impl TorsoScaleStabilizer {
+    /// Plausible biacromial span band (m) used to reject a contaminated seed.
+    const SPAN_SEED_LO: f32 = 0.28;
+    const SPAN_SEED_HI: f32 = 0.48;
+    /// Anatomical fallback span used when the first reading is implausible.
+    const SPAN_DEFAULT: f32 = 0.38;
+    /// A raw span this far (fraction) from the held value is contamination.
+    /// Tight, because a real biacromial span barely changes frame to frame.
+    const SPAN_OUTLIER_FRAC: f32 = 0.25;
+    /// Per-frame easing toward an accepted span. Small: the span is a physical
+    /// constant, so once seeded it should hold near-locked, letting the avatar
+    /// scale stay put instead of breathing with shoulder-depth noise.
+    const SPAN_ALPHA: f32 = 0.05;
+    /// A per-frame anchor jump larger than this (m) is physically impossible for
+    /// a torso (> ~3.5 m/s at 30 fps) → it is shoulder-depth contamination (a
+    /// hand crossing in front), NOT a real move, so REJECT it (creep only). A
+    /// real lean / walk-in is well under this (~1 m/s ≈ 0.03 m/frame) and passes
+    /// through almost untouched, because the subject's distance (root_offset,
+    /// hence the avatar's near/far) MUST reflect real movement — the downstream
+    /// 1€ ROOT filter, not this gate, owns jitter smoothing. The old gate had
+    /// this inverted (followed big jumps, held small ones) and so lagged genuine
+    /// approach/retreat by ~25% while partly chasing contamination spikes.
+    const ANCHOR_SPIKE_M: f32 = 0.12;
+    /// Plausible movement: track it fast (near pass-through, ~0 lag).
+    const ANCHOR_FOLLOW: f32 = 0.80;
+    /// Rejected spike: creep slowly so a one-frame spike barely moves the anchor,
+    /// yet a genuinely sustained large displacement still converges (never stuck).
+    const ANCHOR_REJECT_CREEP: f32 = 0.15;
+
+    pub(in crate::tracking) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Fold a raw measured shoulder span into the stable estimate and return
+    /// it. Seeds within the anatomical band (a wildly off first frame seeds the
+    /// default instead), then eases toward plausible readings and ignores
+    /// gross outliers so a hand-contaminated frame can't shrink/grow the avatar.
+    pub(in crate::tracking) fn stable_span(&mut self, raw: f32) -> f32 {
+        let next = match self.span_m {
+            None => {
+                if (Self::SPAN_SEED_LO..=Self::SPAN_SEED_HI).contains(&raw) {
+                    raw
+                } else {
+                    Self::SPAN_DEFAULT
+                }
+            }
+            Some(cur) => {
+                if (raw - cur).abs() <= Self::SPAN_OUTLIER_FRAC * cur {
+                    cur + Self::SPAN_ALPHA * (raw - cur)
+                } else {
+                    cur
+                }
+            }
+        };
+        self.span_m = Some(next);
+        next
+    }
+
+    /// Spike-reject the torso anchor (camera metres): a real lean / walk-in
+    /// passes through nearly untouched so the avatar's distance tracks it, while
+    /// a physically-impossible one-frame jump (shoulder depth contaminated by a
+    /// hand in front) is rejected. This is a contamination gate, NOT a jitter
+    /// smoother — the downstream 1€ ROOT filter owns jitter.
+    pub(in crate::tracking) fn stable_anchor(&mut self, raw: [f32; 3]) -> [f32; 3] {
+        let next = match self.anchor_cam {
+            None => raw,
+            Some(cur) => {
+                let d = [raw[0] - cur[0], raw[1] - cur[1], raw[2] - cur[2]];
+                let dev = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let a = if dev > Self::ANCHOR_SPIKE_M {
+                    Self::ANCHOR_REJECT_CREEP
+                } else {
+                    Self::ANCHOR_FOLLOW
+                };
+                [cur[0] + a * d[0], cur[1] + a * d[1], cur[2] + a * d[2]]
+            }
+        };
+        self.anchor_cam = Some(next);
+        next
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bone-length-constrained limb solve
 // ---------------------------------------------------------------------------
 
@@ -942,22 +1108,26 @@ fn correct_upper_body_lr_swap(sk: &mut SourceSkeleton) {
 /// Build a [`SourceSkeleton`] from 2D keypoints + a fitted torso surface
 /// ([`torso_fit`]) via a **geometric model fit**, not per-keypoint depth
 /// sampling. Torso joints ride the fitted plane; limb joints are placed by
-/// bone-length-constrained ray–sphere intersection from their parent.
-/// Camera-space metric `(x-right, y-down, z-forward)` is flipped on every
-/// axis to match the source-space convention `(selfie-mirror x, y-up, z
-/// toward camera)`. Selfie mirror: subject's anatomical-left landmarks drive
-/// avatar `Right*` bones.
+/// their own directly-observed metric depth sample (person-aware, so a
+/// silhouette/occluder pixel is rejected at the source rather than read as the
+/// joint); a bone-length ray–sphere from the parent is only a fallback for a
+/// joint whose depth is a hole. Camera-space metric `(x-right, y-down,
+/// z-forward)` is flipped on every axis to match the source-space convention
+/// `(selfie-mirror x, y-up, z toward camera)`. Selfie mirror: subject's
+/// anatomical-left landmarks drive avatar `Right*` bones.
 ///
-/// The wrist is re-pinned to the forearm chain (elbow + forearm length), not
-/// the raw MCP-centroid depth, so a hand over the background stays one
-/// forearm from the elbow instead of teleporting. Face pose / expressions are
-/// left empty here — the caller populates them via the FaceMesh cascade.
+/// The wrist/hand is the observed wrist keypoint's metric 3D (knuckle-centroid
+/// fallback), NOT a forearm-length re-pin — the sensor's measured forward reach
+/// is the pose, so an extended hand keeps its depth instead of floating to face
+/// height. Face pose / expressions are left empty here — the caller populates
+/// them via the FaceMesh cascade.
 pub(super) fn build_skeleton(
     frame_index: u64,
     joints: &[DecodedJoint2d],
     depth: &MetricDepthFrame,
     fit: torso_fit::TorsoFit,
     calibration: Option<&crate::tracking::PoseCalibration>,
+    reference_span_override: Option<f32>,
 ) -> SourceSkeleton {
     let mut sk = SourceSkeleton::empty(frame_index);
     if joints.len() < NUM_JOINTS {
@@ -995,6 +1165,9 @@ pub(super) fn build_skeleton(
     let reference_span_m = calibration
         .and_then(|c| c.shoulder_span_m)
         .filter(|s| *s > 0.05)
+        // Provider's temporally-stabilised span (uncalibrated path): holds the
+        // avatar's scale steady against per-frame shoulder-depth contamination.
+        .or_else(|| reference_span_override.filter(|s| *s > 0.05))
         .or_else(|| {
             let r = fit.r_shoulder_cam?;
             let l = fit.l_shoulder_cam?;
@@ -1004,18 +1177,41 @@ pub(super) fn build_skeleton(
         .unwrap_or(0.38);
     let bones = anthropometric_bones(reference_span_m);
 
-    // A local median depth prior only disambiguates the two ray–sphere roots.
-    let depth_prior = |nx: f32, ny: f32| -> Option<f32> {
-        sample_metric_point_with_radius(depth, nx, ny, SAMPLE_RADIUS_PX).map(|p| p[2])
-    };
-    // Solve a limb child on its observation ray at `bone_len` from `parent`.
+    // Torso-anchor depth = the person-depth reference every keypoint sample is
+    // gated against (shoulders/hips sample cleanly, so this is reliable).
+    let person_z_ref = origin[2];
+    // Place a limb child at its DIRECTLY OBSERVED metric 3D — the sensor's own
+    // person-aware depth sample at the keypoint IS the pose. Sampling already
+    // rejects background/occluder depth, so the point is on-body; using it keeps
+    // a forward-reached limb's TRUE depth instead of discarding it for an
+    // anthropometric bone length (the old ray-sphere pin threw the measured
+    // reach away, floating extended arms to the wrong height). Bone-length
+    // ray-sphere (`solve_limb_joint`) is a FALLBACK only — when the child depth
+    // is missing (a hole / off-frame) the joint is pinned one bone from the
+    // parent along its 2D ray instead of dropped.
     let solve_child = |parent: [f32; 3], coco_idx: usize, bone_len: f32| -> Option<([f32; 3], f32)> {
         let j = joints.get(coco_idx)?;
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
-        let z = depth_prior(j.nx, j.ny);
-        let cam = solve_limb_joint(&intr, j.nx, j.ny, parent, bone_len, z)?;
+        let cam = match sample_metric_point_person(depth, j.nx, j.ny, SAMPLE_RADIUS_PX, person_z_ref)
+        {
+            Some(observed) => observed,
+            // Depth miss. The bone-length ray solve is a fallback for an
+            // IN-FRAME hole (dark hair / clothing eats the IR) — it pins the
+            // joint one bone from its parent along the observed 2D ray. For an
+            // OFF-FRAME keypoint there is no ray to trust: the joint has left
+            // the image and `solve_limb_joint` would fabricate a false
+            // toward-camera depth, planting the elbow FORWARD of the hand and
+            // folding the forearm (the "hands spread in front of the chest but
+            // the avatar breaks" case — the elbow is below a head+shoulders
+            // crop at ny>1). Drop it; the arm solver then bends a natural elbow
+            // toward the still-visible wrist instead.
+            None if keypoint_in_frame(j.nx, j.ny) => {
+                solve_limb_joint(&intr, j.nx, j.ny, parent, bone_len, None)?
+            }
+            None => return None,
+        };
         Some((cam, j.score))
     };
 
@@ -1067,22 +1263,17 @@ pub(super) fn build_skeleton(
         }
     }
 
-    // --- Limb chains: bone-length-constrained ray–sphere from the parent ---
-    // Arms: shoulder → elbow (upper arm). The wrist is solved inside
-    // `attach_hand` from the elbow, so the hand block's MCP centroid drives
-    // its direction; keep the elbow position to pass along.
-    let r_elbow_cam = fit.r_shoulder_cam.and_then(|sh| {
-        solve_child(sh, 7, bones.upper_arm_m).map(|(c, s)| {
-            sk.joints.insert(HumanoidBone::RightLowerArm, src_joint(c, s));
-            c
-        })
-    });
-    let l_elbow_cam = fit.l_shoulder_cam.and_then(|sh| {
-        solve_child(sh, 8, bones.upper_arm_m).map(|(c, s)| {
-            sk.joints.insert(HumanoidBone::LeftLowerArm, src_joint(c, s));
-            c
-        })
-    });
+    // --- Limb chains: DIRECT observed depth, bone-length only as fallback ---
+    // Arms: shoulder → elbow (upper arm). `solve_child` returns the elbow's own
+    // observed metric 3D (bone-length ray-sphere only when its depth is a hole);
+    // the wrist is likewise observed inside `attach_hand`, so no elbow position
+    // is threaded between them any more.
+    if let Some((c, s)) = fit.r_shoulder_cam.and_then(|sh| solve_child(sh, 7, bones.upper_arm_m)) {
+        sk.joints.insert(HumanoidBone::RightLowerArm, src_joint(c, s));
+    }
+    if let Some((c, s)) = fit.l_shoulder_cam.and_then(|sh| solve_child(sh, 8, bones.upper_arm_m)) {
+        sk.joints.insert(HumanoidBone::LeftLowerArm, src_joint(c, s));
+    }
 
     // Legs: hip → knee (thigh) → ankle (shin) → toe-tip (foot). Hip-anchored
     // only; the desk-up shoulder-anchored path has no legs in frame.
@@ -1124,33 +1315,32 @@ pub(super) fn build_skeleton(
         &to_source,
         anchor_was_hip,
         anchor_score,
+        person_z_ref,
     );
 
     attach_hand(
         &mut sk,
         joints,
         depth,
-        &intr,
         91,
         HumanoidBone::RightHand,
         HAND_PHALANGES_RIGHT,
         HAND_TIPS_RIGHT,
         &to_source,
-        r_elbow_cam,
         bones.forearm_m,
+        person_z_ref,
     );
     attach_hand(
         &mut sk,
         joints,
         depth,
-        &intr,
         112,
         HumanoidBone::LeftHand,
         HAND_PHALANGES_LEFT,
         HAND_TIPS_LEFT,
         &to_source,
-        l_elbow_cam,
         bones.forearm_m,
+        person_z_ref,
     );
 
     // Undo a whole-body left/right transposition from the 2D detector before
@@ -1209,14 +1399,13 @@ fn attach_hand<F>(
     sk: &mut SourceSkeleton,
     joints: &[DecodedJoint2d],
     depth: &MetricDepthFrame,
-    intr: &CameraIntrinsics,
     base_index: usize,
     wrist_bone: HumanoidBone,
     phalanges: &[(usize, HumanoidBone)],
     tips: &[(usize, HumanoidBone)],
     to_source: &F,
-    elbow_cam: Option<[f32; 3]>,
     forearm_len_m: f32,
+    person_z_ref: f32,
 ) where
     F: Fn([f32; 3]) -> [f32; 3],
 {
@@ -1230,20 +1419,18 @@ fn attach_hand<F>(
     const MAX_HAND_SPAN_M: f32 = 0.30;
 
     // Sample the MCP knuckles in CAMERA space — the ray–sphere wrist solve and
-    // the centroid both need camera coords. No anchor-relative z gate here;
-    // plausibility is wrist-relative (below).
+    // the centroid both need camera coords. Person-aware: a knuckle keypoint at
+    // the hand's silhouette against a far wall must not sample the wall.
     let sample_cam = |local: usize| -> Option<([f32; 3], f32)> {
         let j = joints.get(base_index + local)?;
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
-        let p = sample_metric_point(depth, j.nx, j.ny)?;
+        let p = sample_metric_point_person(depth, j.nx, j.ny, SAMPLE_RADIUS_PX, person_z_ref)?;
         Some((p, j.score))
     };
 
     let mut sum = [0.0_f32; 3];
-    let mut sum_nx = 0.0_f32;
-    let mut sum_ny = 0.0_f32;
     let mut min_conf = f32::INFINITY;
     let mut found = 0_u32;
     let mut index_mcp: Option<[f32; 3]> = None;
@@ -1254,9 +1441,6 @@ fn attach_hand<F>(
             sum[0] += p[0];
             sum[1] += p[1];
             sum[2] += p[2];
-            let j = &joints[base_index + local];
-            sum_nx += j.nx;
-            sum_ny += j.ny;
             min_conf = min_conf.min(score);
             found += 1;
             match local {
@@ -1273,26 +1457,18 @@ fn attach_hand<F>(
     }
     let inv = 1.0 / found as f32;
     let mcp_centroid_cam = [sum[0] * inv, sum[1] * inv, sum[2] * inv];
-    let mcp_nx = sum_nx * inv;
-    let mcp_ny = sum_ny * inv;
 
-    // Re-pin the wrist to the forearm chain: place it at `forearm_len` from
-    // the elbow along the MCP-centroid ray, disambiguated by the sampled
-    // depth. A background depth can no longer drag the wrist off — the bone
-    // length sets the distance. Falls back to the raw centroid with no elbow.
-    let wrist_cam = match elbow_cam {
-        Some(elbow) if forearm_len_m > 1e-4 => {
-            solve_limb_joint(intr, mcp_nx, mcp_ny, elbow, forearm_len_m, Some(mcp_centroid_cam[2]))
-                .unwrap_or(mcp_centroid_cam)
-        }
-        _ => mcp_centroid_cam,
-    };
+    // The wrist's DIRECTLY OBSERVED metric 3D IS the hand position: its own
+    // person-aware sample, falling back to the knuckle centroid (which the
+    // >=3-sample gate above guarantees). Person-aware sampling already keeps
+    // these on-body, so the old forearm-length re-pin — which discarded the
+    // measured forward reach and floated an extended hand up to face height — is
+    // gone, along with its dependence on the elbow chain / bone length.
+    let wrist_cam = sample_cam(0).map(|(p, _)| p).unwrap_or(mcp_centroid_cam);
 
-    // Sanity bound: a wrist implausibly far from the torso anchor is a
-    // background/occlusion sample. This can only arise from the raw-centroid
-    // fallback (no elbow chain) — a bone-pinned wrist is already bounded to
-    // one forearm from the elbow. Rest the hand instead of letting it
-    // teleport to the far wall (the -4 m outliers in the palms/namaste replay).
+    // Sanity bound: an observed wrist implausibly far from the torso anchor is a
+    // stray sample the person-aware gate let through. Rest the hand instead of
+    // letting it fly out (the -4 m outliers in the palms/namaste replay).
     let wrist_src = to_source(wrist_cam);
     let wrist_reach =
         (wrist_src[0] * wrist_src[0] + wrist_src[1] * wrist_src[1] + wrist_src[2] * wrist_src[2])
@@ -1301,12 +1477,10 @@ fn attach_hand<F>(
         return;
     }
 
-    // Rigid shift that carries the sampled hand onto the re-pinned wrist.
-    let delta = [
-        wrist_cam[0] - mcp_centroid_cam[0],
-        wrist_cam[1] - mcp_centroid_cam[1],
-        wrist_cam[2] - mcp_centroid_cam[2],
-    ];
+    // Wrist and fingers are observed in the same camera frame, so they are
+    // already coherent — no rigid shift (the shift existed only to carry the
+    // hand onto the synthetic re-pinned wrist, which is gone).
+    let delta = [0.0_f32; 3];
 
     sk.joints.insert(
         wrist_bone,
@@ -1403,6 +1577,7 @@ fn inject_spine_chain_proxies<F>(
     to_source: &F,
     anchor_was_hip: bool,
     anchor_score: f32,
+    person_z_ref: f32,
 ) where
     F: Fn([f32; 3]) -> [f32; 3],
 {
@@ -1438,12 +1613,23 @@ fn inject_spine_chain_proxies<F>(
     const LEFT_EAR_IDX: usize = 3;
     const RIGHT_EAR_IDX: usize = 4;
 
+    // Head position from the ear/nose depth samples. The 2-D keypoints are
+    // located correctly, but an ear at the head's occluding silhouette (against
+    // a bright far wall) or on IR-absorbing hair / a headphone cup has a
+    // sampling window full of the background — which the naive median returned
+    // as the head depth, flinging the head metres away (measured: a correct
+    // left-ear keypoint whose 7x7 window was 40/40 background at ~4.8 m). The
+    // person-aware sampler discards those samples at the source, so a genuinely
+    // unobservable ear returns `None` and we fall back to the visible ear / the
+    // nose / the anatomical rest above the neck instead of teleporting.
+    let neck_pos = sk.joints.get(&HumanoidBone::Neck).map(|j| j.position);
+
     let sample_face = |idx: usize| -> Option<SourceJoint> {
         let j = joints.get(idx)?;
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
-        let p_cam = sample_metric_point(depth, j.nx, j.ny)?;
+        let p_cam = sample_metric_point_person(depth, j.nx, j.ny, SAMPLE_RADIUS_PX, person_z_ref)?;
         Some(SourceJoint {
             position: to_source(p_cam),
             confidence: j.score,
@@ -1461,13 +1647,35 @@ fn inject_spine_chain_proxies<F>(
             confidence: l.confidence.min(r.confidence),
             metric_depth_m: None,
         }),
-        _ => sample_face(NOSE_IDX),
+        // One ear occluded (common at desk-up): drive off the visible one
+        // rather than discarding the whole head.
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (None, None) => sample_face(NOSE_IDX),
     };
+
+    // No trustworthy face depth this frame → anatomical rest above the neck,
+    // so the head holds a sane upright pose instead of teleporting.
+    let head = head.or_else(|| {
+        neck_pos.map(|n| SourceJoint {
+            position: [n[0], n[1] + HEAD_ABOVE_NECK_M, n[2]],
+            confidence: sk
+                .joints
+                .get(&HumanoidBone::Neck)
+                .map(|j| j.confidence)
+                .unwrap_or(0.0),
+            metric_depth_m: None,
+        })
+    });
 
     if let Some(h) = head {
         sk.joints.insert(HumanoidBone::Head, h);
     }
 }
+
+/// Anatomical offset (metres, pre-normalisation) of the ear-midpoint "head"
+/// keypoint above the neck (shoulder midpoint) — the fallback head height
+/// when no face keypoint has a trustworthy depth this frame.
+const HEAD_ABOVE_NECK_M: f32 = 0.16;
 
 #[inline]
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -1497,6 +1705,65 @@ fn normalize3(v: [f32; 3]) -> Option<[f32; 3]> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scale_stabilizer_holds_span_through_contamination() {
+        // A steady 0.36 m span with an occasional hand-contaminated frame
+        // (0.20 m / 0.55 m) must not swing the held span: the outlier is
+        // ignored and the avatar scale stays put.
+        let mut s = TorsoScaleStabilizer::default();
+        let seed = s.stable_span(0.36);
+        assert!((seed - 0.36).abs() < 1e-6, "seeds on the first plausible span");
+        let after_low = s.stable_span(0.20); // hand in front → far too small
+        let after_high = s.stable_span(0.55); // finger merge → far too large
+        assert!(
+            (after_low - 0.36).abs() < 0.02 && (after_high - 0.36).abs() < 0.02,
+            "contaminated frames are rejected, span holds near 0.36 (got {after_low}, {after_high})"
+        );
+        // A genuine (plausible) reading eases the estimate slightly.
+        let eased = s.stable_span(0.34);
+        assert!(eased < 0.36 && eased > 0.34, "plausible reading eases in slowly");
+    }
+
+    #[test]
+    fn scale_stabilizer_seeds_default_on_bad_first_frame() {
+        // If the very first frame is contaminated (implausible span), seed the
+        // anatomical default rather than locking onto garbage.
+        let mut s = TorsoScaleStabilizer::default();
+        let seed = s.stable_span(0.12);
+        assert!((seed - 0.38).abs() < 1e-6, "implausible first span → default seed");
+    }
+
+    #[test]
+    fn scale_stabilizer_passes_real_move_rejects_spike() {
+        let mut s = TorsoScaleStabilizer::default();
+        let a0 = s.stable_anchor([0.0, 0.0, 1.60]);
+        assert_eq!(a0, [0.0, 0.0, 1.60], "seeds on the first anchor");
+        // A realistic walk-in step (~0.03 m/frame ≈ 1 m/s) passes through almost
+        // fully: the avatar's near/far MUST reflect real movement.
+        let step = s.stable_anchor([0.0, 0.0, 1.57]);
+        assert!(step[2] < 1.585, "a real approach step is tracked promptly (got {})", step[2]);
+        // A physically-impossible one-frame jump (a hand contaminating shoulder
+        // depth) is rejected — the anchor barely moves.
+        let spike = s.stable_anchor([0.0, 0.0, 1.05])[2]; // ~0.5 m in one frame
+        assert!(spike > 1.45, "a contamination spike is rejected (got {spike})");
+    }
+
+    #[test]
+    fn scale_stabilizer_tracks_sustained_approach_without_lag() {
+        // The old heavy EMA lagged a real approach ~0.16 m and dropped ~25% of
+        // the motion (the "near/far not reflected" regression). A sustained ramp
+        // must now converge to within a few cm.
+        let mut s = TorsoScaleStabilizer::default();
+        let mut z = 1.60;
+        s.stable_anchor([0.0, 0.0, z]);
+        let mut last = z;
+        for _ in 0..60 {
+            z -= 0.01; // 1.60 -> 1.00 over 2 s at 30 fps (~0.3 m/s)
+            last = s.stable_anchor([0.0, 0.0, z])[2];
+        }
+        assert!((last - 1.00).abs() < 0.03, "ramp tracked with <3 cm lag (got {last})");
+    }
+
     fn dummy_frame(width: u32, height: u32, point: [f32; 3]) -> MetricDepthFrame {
         let pixels = (width * height) as usize;
         MetricDepthFrame {
@@ -1522,6 +1789,30 @@ mod tests {
         let frame = dummy_frame(644, 476, [0.0, 0.0, 1.0]);
         assert!(sample_metric_point(&frame, -0.1, 0.5).is_none());
         assert!(sample_metric_point(&frame, 1.1, 0.5).is_none());
+    }
+
+    #[test]
+    fn person_aware_sample_rejects_background_keeps_person() {
+        // 5x5 frame; fill with background (5 m), then paint a person patch
+        // (0.6 m) covering the left half. A window centred on the person edge
+        // must return the person depth, not the background median.
+        let mut points = vec![[0.0f32, 0.0, 5.0]; 25];
+        for y in 0..5 {
+            for x in 0..3 {
+                points[y * 5 + x] = [0.0, 0.0, 0.6];
+            }
+        }
+        let frame = MetricDepthFrame { width: 5, height: 5, points_m: points, crop: None, intrinsics: None };
+        // Centre pixel (x=2) sits at the silhouette: naive median leans toward
+        // whichever half dominates, but person-aware with z_ref=0.6 keeps 0.6.
+        let p = sample_metric_point_person(&frame, 0.5, 0.5, 2, 0.6).unwrap();
+        assert!((p[2] - 0.6).abs() < 1e-6, "person-aware sample kept background: {}", p[2]);
+        // A keypoint whose whole window is background (no person within band)
+        // is unobservable → None, so the caller rests instead of teleporting.
+        let bg = MetricDepthFrame {
+            width: 5, height: 5, points_m: vec![[0.0, 0.0, 5.0]; 25], crop: None, intrinsics: None,
+        };
+        assert!(sample_metric_point_person(&bg, 0.5, 0.5, 2, 0.6).is_none());
     }
 
     fn dj(nx: f32, ny: f32, score: f32) -> DecodedJoint2d {
@@ -1638,6 +1929,65 @@ mod tests {
         // Re-seated to the body depth → equal z (frontal), not 1.2 vs 2.0.
         assert!((r[2] - l[2]).abs() < 0.05, "r={:?} l={:?}", r, l);
         assert!(r[2] > 1.8, "occluded shoulder pulled to body depth: {:?}", r);
+    }
+
+    /// An elbow the detector places BELOW a head+shoulders crop (`ny > 1`,
+    /// off-frame) has no depth pixel; it must be DROPPED, not fabricated at a
+    /// false toward-camera depth. The fabricated forward elbow is what folds the
+    /// forearm and breaks "hands spread in front of the chest". coco 7 → avatar
+    /// RightLowerArm, coco 8 → LeftLowerArm.
+    #[test]
+    fn offframe_elbow_is_dropped_not_fabricated() {
+        let intr = intr_640();
+        let frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9); // R shoulder (image-left)
+        joints[6] = dj(0.58, 0.40, 0.9); // L shoulder (image-right)
+        joints[9] = dj(0.55, 0.80, 0.7); // L wrist, in frame
+        joints[10] = dj(0.45, 0.80, 0.7); // R wrist, in frame
+        joints[7] = dj(0.62, 1.05, 0.7); // R elbow BELOW the frame
+        joints[8] = dj(0.38, 1.05, 0.7); // L elbow BELOW the frame
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None);
+        assert!(
+            sk.joints.get(&HumanoidBone::RightLowerArm).is_none(),
+            "off-frame right elbow (coco7) must be dropped, got {:?}",
+            sk.joints.get(&HumanoidBone::RightLowerArm)
+        );
+        assert!(
+            sk.joints.get(&HumanoidBone::LeftLowerArm).is_none(),
+            "off-frame left elbow (coco8) must be dropped, got {:?}",
+            sk.joints.get(&HumanoidBone::LeftLowerArm)
+        );
+    }
+
+    /// Contrast: an IN-FRAME elbow whose depth window is a HOLE (a dark sleeve
+    /// eats the IR) is still recovered by the bone-length ray fallback — the
+    /// off-frame gate must not regress the in-frame-hole path.
+    #[test]
+    fn inframe_hole_elbow_is_recovered_by_bone_length() {
+        let intr = intr_640();
+        let mut frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9);
+        joints[6] = dj(0.58, 0.40, 0.9);
+        let (enx, eny) = (0.62_f32, 0.60_f32); // R elbow, IN frame
+        joints[7] = dj(enx, eny, 0.7);
+        // Punch a NaN depth hole around the elbow pixel (leaves shoulders valid).
+        let (cx, cy) = ((enx * intr.width as f32) as i32, (eny * intr.height as f32) as i32);
+        for v in (cy - 8).max(0)..=(cy + 8).min(intr.height as i32 - 1) {
+            for u in (cx - 8).max(0)..=(cx + 8).min(intr.width as i32 - 1) {
+                frame.points_m[(v as u32 * intr.width + u as u32) as usize] = [f32::NAN; 3];
+            }
+        }
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None);
+        assert!(
+            sk.joints.get(&HumanoidBone::RightLowerArm).is_some(),
+            "in-frame elbow at a depth hole should be recovered by the bone-length fallback"
+        );
     }
 
     /// When the detector collapses both shoulders onto the central hands (3-D

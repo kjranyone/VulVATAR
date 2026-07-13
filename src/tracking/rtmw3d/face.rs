@@ -8,7 +8,7 @@ use crate::asset::HumanoidBone;
 
 use super::super::face_mediapipe::{derive_face_bbox, FaceBbox};
 use super::super::{FacePose, SourceSkeleton};
-use super::consts::KEYPOINT_VISIBILITY_FLOOR;
+use super::consts::{INPUT_H, INPUT_W, KEYPOINT_VISIBILITY_FLOOR};
 use super::decode::DecodedJoint;
 
 /// Derive head yaw / pitch / roll from RTMW3D's body face keypoints
@@ -130,9 +130,35 @@ pub(super) fn derive_face_pose_from_body(
     let eye_dy = avatar_left_eye[1] - avatar_right_eye[1];
     let roll = eye_dy.atan2(eye_dx);
 
-    let mid_eye_y = (avatar_left_eye[1] + avatar_right_eye[1]) * 0.5;
-    let face_width = (eye_dx * eye_dx + eye_dy * eye_dy).sqrt().max(0.01);
-    let pitch_signal = (mid_eye_y - nose[1]) / face_width;
+    // PITCH from nose-below-eye-line, with an anatomical neutral
+    // subtracted — mirroring the FaceMesh path
+    // (`derive_face_pose_from_landmarks`, which subtracts its own
+    // `PITCH_NEUTRAL_SIGNAL`). The body path never had this: at a frontal
+    // neutral pose the nose tip sits a fixed fraction below the eye line,
+    // so the raw ratio maps to a large spurious `+pitch` (chin-down). The
+    // stored `neutral_face_pose` was meant to absorb it per-session, but
+    // that channel is never populated (`TrackingCalibration` only ever
+    // holds the default), so the bias reached the Head bone unmodified —
+    // a forward-facing head decoded ~50° down.
+    //
+    // Computed in model-pixel space (`nx·INPUT_W, ny·INPUT_H`) rather than
+    // source space so the ratio is independent of the shoulder-derived
+    // `aspect` and metric depth, keeping the constant stable across
+    // framings. Image y-down: nose below the eye line → positive → source
+    // `+pitch` (chin drops). The selfie mirror is horizontal, so vertical
+    // `ny` is untouched by it. The COCO 5-point set uses eye *centres*
+    // (closer together than FaceMesh's outer eye corners), so the neutral
+    // ratio is larger than that path's 0.49 — measured ≈ 1.25 on neutral
+    // frames (live desk pose + the palms_front capture).
+    const PITCH_NEUTRAL_SIGNAL: f32 = 1.25;
+    let nose_py = joints[0].ny * INPUT_H as f32;
+    let le_px = (joints[1].nx * INPUT_W as f32, joints[1].ny * INPUT_H as f32);
+    let re_px = (joints[2].nx * INPUT_W as f32, joints[2].ny * INPUT_H as f32);
+    let eye_mid_py = (le_px.1 + re_px.1) * 0.5;
+    let inter_eye_px = ((le_px.0 - re_px.0).powi(2) + (le_px.1 - re_px.1).powi(2))
+        .sqrt()
+        .max(1.0);
+    let pitch_signal = (nose_py - eye_mid_py) / inter_eye_px - PITCH_NEUTRAL_SIGNAL;
     let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
 
     let conf = joints[..5].iter().map(|j| j.score).fold(1.0_f32, f32::min);
@@ -166,4 +192,75 @@ pub(super) fn build_face_bbox_from_joints(
         points_px.push((j.nx * width as f32, j.ny * height as f32));
     }
     derive_face_bbox(&points_px, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracking::source_skeleton::SourceJoint;
+
+    fn dj(nx: f32, ny: f32, nz: f32) -> DecodedJoint {
+        DecodedJoint { nx, ny, nz, score: 0.9 }
+    }
+
+    /// Front-facing synthetic face with the nose at `nose_py` pixels
+    /// (model space is `INPUT_W×INPUT_H`). Eyes at py=150, inter-eye 32 px,
+    /// ears symmetric at equal depth (yaw≈0), shoulders/hips set so
+    /// `aspect` and the origin are well-defined. A frontal neutral head
+    /// has the nose ~1.25·inter-eye (= 40 px) below the eye line.
+    fn neutral_joints(nose_py: f32) -> Vec<DecodedJoint> {
+        let w = INPUT_W as f32;
+        let h = INPUT_H as f32;
+        let px = |x: f32, y: f32, z: f32| dj(x / w, y / h, z);
+        let mut j = vec![DecodedJoint::default(); 13];
+        j[0] = px(144.0, nose_py, 0.5); // nose
+        j[1] = px(160.0, 150.0, 0.5); // subject-left eye
+        j[2] = px(128.0, 150.0, 0.5); // subject-right eye
+        j[3] = px(174.0, 150.0, 0.5); // subject-left ear
+        j[4] = px(114.0, 150.0, 0.5); // subject-right ear
+        j[5] = px(200.0, 280.0, 0.5); // subject-left shoulder
+        j[6] = px(88.0, 280.0, 0.5); // subject-right shoulder
+        j[11] = px(168.0, 376.0, 0.5); // subject-left hip
+        j[12] = px(120.0, 376.0, 0.5); // subject-right hip
+        j
+    }
+
+    fn skeleton_with_shoulder() -> SourceSkeleton {
+        let mut sk = SourceSkeleton::default();
+        sk.joints.insert(
+            HumanoidBone::LeftShoulder,
+            SourceJoint { position: [0.18, 0.0, 0.0], confidence: 0.9, ..Default::default() },
+        );
+        sk
+    }
+
+    #[test]
+    fn neutral_forward_face_has_near_zero_pitch() {
+        // A front-facing head (nose the anatomical ~1.25·inter-eye below
+        // the eye line) must decode to ~0 pitch — not the ~50°-down bias
+        // the un-subtracted body path used to emit.
+        let sk = skeleton_with_shoulder();
+        let face = derive_face_pose_from_body(&sk, &neutral_joints(190.0)).unwrap();
+        assert!(
+            face.pitch.abs() < 0.12,
+            "neutral face pitch should be ~0, got {} rad",
+            face.pitch
+        );
+    }
+
+    #[test]
+    fn chin_down_is_positive_pitch() {
+        // Nose dropped further below the eye line → chin-down → +pitch.
+        let sk = skeleton_with_shoulder();
+        let face = derive_face_pose_from_body(&sk, &neutral_joints(214.0)).unwrap();
+        assert!(face.pitch > 0.3, "chin-down should be +pitch, got {}", face.pitch);
+    }
+
+    #[test]
+    fn chin_up_is_negative_pitch() {
+        // Nose lifted toward the eye line → chin-up → -pitch.
+        let sk = skeleton_with_shoulder();
+        let face = derive_face_pose_from_body(&sk, &neutral_joints(166.0)).unwrap();
+        assert!(face.pitch < -0.3, "chin-up should be -pitch, got {}", face.pitch);
+    }
 }

@@ -23,6 +23,7 @@ pub mod stagelog;
 pub mod skeleton_from_depth;
 
 pub mod calibration;
+pub mod debug_channel;
 pub mod face_mediapipe;
 pub mod rtmw3d;
 pub mod source_skeleton;
@@ -1181,6 +1182,11 @@ impl TrackingWorker {
                     } else {
                         pose_estimation::estimate_pose(&rs_frame.rgb, width, height, frame_index)
                     };
+
+                    // Live debug channel: publish camera + 2D keypoints + source
+                    // arm joints for an external overlay (no-op unless the debug
+                    // flag file exists). Before the estimate is moved below.
+                    debug_channel::dump_observation(frame_index, &rs_frame.rgb, width, height, &estimate);
 
                     let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
                     mailbox.publish_estimate(estimate, frame);
