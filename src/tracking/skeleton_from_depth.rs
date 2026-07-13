@@ -78,6 +78,17 @@ pub struct MetricDepthFrame {
 /// `joint_confidence_threshold` slider lives in the solver.
 pub const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
+/// Is this whole-frame-normalised 2D keypoint inside the camera image? The
+/// aligned depth frame only spans `[0, 1]²`; a keypoint the detector places
+/// OUTSIDE it (RTMW3D extrapolates a limb that has left the frame — e.g. an
+/// elbow below a head-and-shoulders crop, `ny > 1`) has NO depth pixel, so its
+/// metric 3D cannot be observed and must not be fabricated. Callers use this to
+/// deny the bone-length ray fallback for off-frame joints (an in-frame depth
+/// HOLE is different — the joint is visible, its IR return was just absorbed).
+pub(super) fn keypoint_in_frame(nx: f32, ny: f32) -> bool {
+    (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny)
+}
+
 /// Half-size of the square depth-sampling window when reading metric
 /// depth at a 2D keypoint. Small enough to track fingers without
 /// dragging in neighbouring depth, large enough that single-pixel
@@ -1186,7 +1197,20 @@ pub(super) fn build_skeleton(
         let cam = match sample_metric_point_person(depth, j.nx, j.ny, SAMPLE_RADIUS_PX, person_z_ref)
         {
             Some(observed) => observed,
-            None => solve_limb_joint(&intr, j.nx, j.ny, parent, bone_len, None)?,
+            // Depth miss. The bone-length ray solve is a fallback for an
+            // IN-FRAME hole (dark hair / clothing eats the IR) — it pins the
+            // joint one bone from its parent along the observed 2D ray. For an
+            // OFF-FRAME keypoint there is no ray to trust: the joint has left
+            // the image and `solve_limb_joint` would fabricate a false
+            // toward-camera depth, planting the elbow FORWARD of the hand and
+            // folding the forearm (the "hands spread in front of the chest but
+            // the avatar breaks" case — the elbow is below a head+shoulders
+            // crop at ny>1). Drop it; the arm solver then bends a natural elbow
+            // toward the still-visible wrist instead.
+            None if keypoint_in_frame(j.nx, j.ny) => {
+                solve_limb_joint(&intr, j.nx, j.ny, parent, bone_len, None)?
+            }
+            None => return None,
         };
         Some((cam, j.score))
     };
@@ -1905,6 +1929,65 @@ mod tests {
         // Re-seated to the body depth → equal z (frontal), not 1.2 vs 2.0.
         assert!((r[2] - l[2]).abs() < 0.05, "r={:?} l={:?}", r, l);
         assert!(r[2] > 1.8, "occluded shoulder pulled to body depth: {:?}", r);
+    }
+
+    /// An elbow the detector places BELOW a head+shoulders crop (`ny > 1`,
+    /// off-frame) has no depth pixel; it must be DROPPED, not fabricated at a
+    /// false toward-camera depth. The fabricated forward elbow is what folds the
+    /// forearm and breaks "hands spread in front of the chest". coco 7 → avatar
+    /// RightLowerArm, coco 8 → LeftLowerArm.
+    #[test]
+    fn offframe_elbow_is_dropped_not_fabricated() {
+        let intr = intr_640();
+        let frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9); // R shoulder (image-left)
+        joints[6] = dj(0.58, 0.40, 0.9); // L shoulder (image-right)
+        joints[9] = dj(0.55, 0.80, 0.7); // L wrist, in frame
+        joints[10] = dj(0.45, 0.80, 0.7); // R wrist, in frame
+        joints[7] = dj(0.62, 1.05, 0.7); // R elbow BELOW the frame
+        joints[8] = dj(0.38, 1.05, 0.7); // L elbow BELOW the frame
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None);
+        assert!(
+            sk.joints.get(&HumanoidBone::RightLowerArm).is_none(),
+            "off-frame right elbow (coco7) must be dropped, got {:?}",
+            sk.joints.get(&HumanoidBone::RightLowerArm)
+        );
+        assert!(
+            sk.joints.get(&HumanoidBone::LeftLowerArm).is_none(),
+            "off-frame left elbow (coco8) must be dropped, got {:?}",
+            sk.joints.get(&HumanoidBone::LeftLowerArm)
+        );
+    }
+
+    /// Contrast: an IN-FRAME elbow whose depth window is a HOLE (a dark sleeve
+    /// eats the IR) is still recovered by the bone-length ray fallback — the
+    /// off-frame gate must not regress the in-frame-hole path.
+    #[test]
+    fn inframe_hole_elbow_is_recovered_by_bone_length() {
+        let intr = intr_640();
+        let mut frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9);
+        joints[6] = dj(0.58, 0.40, 0.9);
+        let (enx, eny) = (0.62_f32, 0.60_f32); // R elbow, IN frame
+        joints[7] = dj(enx, eny, 0.7);
+        // Punch a NaN depth hole around the elbow pixel (leaves shoulders valid).
+        let (cx, cy) = ((enx * intr.width as f32) as i32, (eny * intr.height as f32) as i32);
+        for v in (cy - 8).max(0)..=(cy + 8).min(intr.height as i32 - 1) {
+            for u in (cx - 8).max(0)..=(cx + 8).min(intr.width as i32 - 1) {
+                frame.points_m[(v as u32 * intr.width + u as u32) as usize] = [f32::NAN; 3];
+            }
+        }
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None);
+        assert!(
+            sk.joints.get(&HumanoidBone::RightLowerArm).is_some(),
+            "in-frame elbow at a depth hole should be recovered by the bone-length fallback"
+        );
     }
 
     /// When the detector collapses both shoulders onto the central hands (3-D
