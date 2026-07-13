@@ -1118,6 +1118,28 @@ pub fn solve_avatar_pose(
         }
     }
 
+    // Arm-reach IK: when the hand is recognised but the elbow keypoint dropped,
+    // synthesise the elbow toward the wrist so the arm reaches the hand instead
+    // of collapsing to a bind-pose T. Augments a local copy of the source with
+    // the solved `*LowerArm` joints; everything below (contact IK + the body
+    // chain) then drives the arm normally. No-op (no clone) when both elbows are
+    // adequately observed, so well-tracked frames are untouched.
+    let arm_reach_elbows = compute_arm_reach_elbows(source, &rest_world, humanoid, params);
+    let augmented_source;
+    let source: &SourceSkeleton = if arm_reach_elbows[0].is_some() || arm_reach_elbows[1].is_some() {
+        let mut s = source.clone();
+        if let Some(j) = arm_reach_elbows[0] {
+            s.joints.insert(HumanoidBone::LeftLowerArm, j);
+        }
+        if let Some(j) = arm_reach_elbows[1] {
+            s.joints.insert(HumanoidBone::RightLowerArm, j);
+        }
+        augmented_source = s;
+        &augmented_source
+    } else {
+        source
+    };
+
     // Hands-contact arm IK (see `compute_arm_contact_ik`): when the
     // subject's wrists are close, the four arm-bone directions blend
     // toward a two-bone positional solve so the avatar's hands
@@ -2058,6 +2080,105 @@ fn compute_arm_contact_ik(
             solve_side(rs_r, re_r, rw_r, e_r, w_r),
         ],
     })
+}
+
+/// Arm-reach IK: synthesise a missing elbow so the arm still REACHES a
+/// recognised hand instead of collapsing to bind (T-pose).
+///
+/// The body-chain retarget is pure direction-match (NOT IK): `LeftUpperArm`
+/// needs the elbow as its tip and `LeftLowerArm` needs the elbow as its base,
+/// so a *dropped* elbow keypoint (depth hole / off-frame elbow) leaves BOTH arm
+/// bones undriven — they stay at `build_base_pose`'s bind, i.e. a T-pose, even
+/// though the wrist/hand was tracked fine. This is the "the hand is recognised
+/// but the arm is a T-pose" failure.
+///
+/// When the shoulder + wrist are present but the elbow is missing / below
+/// confidence, we place the elbow with a two-bone IK toward the wrist (avatar
+/// rest bone-lengths scaled into source space; the observed low-confidence
+/// elbow, if any, is the swivel pole, else a natural behind-the-line bend). The
+/// caller inserts the result as the `*LowerArm` source joint so the existing
+/// loop drives the whole arm to the hand. An adequately-observed elbow is left
+/// untouched, so well-tracked frames are unchanged. Returns `[left, right]`.
+fn compute_arm_reach_elbows(
+    source: &SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    params: &SolverParams,
+) -> [Option<crate::tracking::SourceJoint>; 2] {
+    let thr = params.joint_confidence_threshold;
+    let rest_pos = |b: HumanoidBone| -> Option<Vec3> {
+        humanoid
+            .bone_map
+            .get(&b)
+            .map(|n| n.0 as usize)
+            .filter(|&i| i < rest_world.len())
+            .map(|i| rest_world[i].position)
+    };
+    let av_span = match (
+        rest_pos(HumanoidBone::LeftUpperArm),
+        rest_pos(HumanoidBone::RightUpperArm),
+    ) {
+        (Some(a), Some(b)) => vec3_length(&vec3_sub(&a, &b)),
+        _ => return [None, None],
+    };
+    let src_span = match (
+        source.joints.get(&HumanoidBone::LeftUpperArm),
+        source.joints.get(&HumanoidBone::RightUpperArm),
+    ) {
+        (Some(a), Some(b)) => vec3_length(&vec3_sub(&a.position, &b.position)),
+        _ => return [None, None],
+    };
+    if av_span < 1e-4 || src_span < 1e-4 {
+        return [None, None];
+    }
+    let scale = src_span / av_span;
+
+    let sides = [
+        (HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand),
+        (HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
+    ];
+    let mut out = [None, None];
+    for (side, &(sh_b, el_b, wr_b)) in sides.iter().enumerate() {
+        // Require a confident shoulder + wrist; only fill a MISSING / weak elbow.
+        let Some(sh) = source.joints.get(&sh_b).filter(|x| x.confidence >= thr) else {
+            continue;
+        };
+        let Some(wr) = source.joints.get(&wr_b).filter(|x| x.confidence >= thr) else {
+            continue;
+        };
+        if source.joints.get(&el_b).is_some_and(|x| x.confidence >= thr) {
+            continue; // elbow adequately observed → leave the direction-match alone
+        }
+        let (Some(rsh), Some(rel), Some(rwr)) = (rest_pos(sh_b), rest_pos(el_b), rest_pos(wr_b))
+        else {
+            continue;
+        };
+        let l1 = vec3_length(&vec3_sub(&rel, &rsh)) * scale;
+        let l2 = vec3_length(&vec3_sub(&rwr, &rel)) * scale;
+        if l1 < 1e-4 || l2 < 1e-4 {
+            continue;
+        }
+        // Swivel pole: the low-confidence observed elbow if the keypoint exists
+        // at all, else a natural bend biased behind the shoulder→wrist line
+        // (toward the body, −Z is away from the camera) so the elbow does not
+        // hyper-extend straight.
+        let pole = source.joints.get(&el_b).map(|x| x.position).unwrap_or_else(|| {
+            let mid = midpoint(&sh.position, &wr.position);
+            [mid[0], mid[1], mid[2] - 0.4 * src_span]
+        });
+        let Some((upper_dir, _lower_dir)) =
+            two_bone_ik(&sh.position, &wr.position, l1, l2, &pole)
+        else {
+            continue;
+        };
+        let elbow_pos = vec3_add(&sh.position, &vec3_scale(&upper_dir, l1));
+        out[side] = Some(crate::tracking::SourceJoint {
+            position: elbow_pos,
+            confidence: wr.confidence.min(sh.confidence),
+            metric_depth_m: None,
+        });
+    }
+    out
 }
 
 /// Analytic two-bone IK: place the elbow so the chain
