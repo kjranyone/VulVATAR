@@ -194,6 +194,8 @@ tracking:
   error_model_warning: "Pose tracking quality warning: %{warnings}. Run ./dev.ps1 setup to install the full model bundle."
   error_model_unavailable: "Pose model unavailable: %{error} Falling back to low-quality HSV tracking."
   error_camera_stopped: "Camera stopped after %{count} consecutive read errors. Another app may be using the camera, or the device was disconnected."
+  error_usb_link_speed: "The RealSense D435 is connected over a USB %{detected} link. Depth tracking needs USB 3.0. Plug the camera directly into a blue USB 3.0 port using a USB 3.0 cable (USB 2.0 ports, hubs, and extension cables can't reach the required speed)."
+  error_no_device: "No RealSense D435 found. Check that the camera is plugged in over USB."
   advanced_smoothing: "Advanced Smoothing"
   advanced_smoothing_hint: "Defaults suit most setups — adjust only for noisy cameras or jittery expression rigs."
   rotation_blend: "Rotation Blend"
@@ -491,6 +493,8 @@ toast:
 dialog:
   cloth_autosave_title: "Cloth Autosave Consent"
   cloth_autosave_body: "A cloth overlay is active. Allow it to be included in recovery snapshots?"
+  tracking_error_title: "Can't start tracking"
+  tracking_error_dismiss: "Close"
   yes: "Yes"
   no: "No"
   loading_avatar: "Loading avatar"

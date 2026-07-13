@@ -33,6 +33,153 @@ use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest
 use vulvatar_lib::renderer::VulkanRenderer;
 use vulvatar_lib::tracking::provider::create_pose_provider;
 
+// D435 colour intrinsics (aligned depth stream), matching diagnose_depth_replay.
+const D435_FX: f32 = 924.0;
+const D435_FY: f32 = 924.0;
+const D435_CX: f32 = 640.0;
+const D435_CY: f32 = 360.0;
+
+/// `<stem>_color.png` → `<stem>_depth_mm.npy`.
+fn depth_sibling(color: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(color.to_string_lossy().replace("_color.png", "_depth_mm.npy"))
+}
+
+/// Minimal `.npy` reader for a 2-D little-endian `u16` array → (rows, cols, data).
+fn parse_npy_u16(bytes: &[u8]) -> Result<(usize, usize, Vec<u16>), String> {
+    if bytes.len() < 12 || &bytes[0..6] != b"\x93NUMPY" {
+        return Err("not a .npy file".into());
+    }
+    let major = bytes[6];
+    let (header_len, data_start) = if major == 1 {
+        (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10)
+    } else {
+        (u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize, 12)
+    };
+    let data_start = data_start + header_len;
+    let shape = std::str::from_utf8(&bytes[10.min(data_start)..data_start])
+        .map_err(|e| e.to_string())?
+        .split("'shape':").nth(1).and_then(|s| s.split('(').nth(1))
+        .and_then(|s| s.split(')').next()).ok_or("no shape")?;
+    let dims: Vec<usize> = shape.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+    let (rows, cols) = match dims.as_slice() { [r, c, ..] => (*r, *c), _ => return Err("not 2D".into()) };
+    let count = rows * cols;
+    let data = &bytes[data_start..];
+    if data.len() < count * 2 { return Err("npy short".into()); }
+    let out = (0..count).map(|i| u16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect();
+    Ok((rows, cols, out))
+}
+
+/// Deproject an aligned `*_depth_mm.npy` into a `MetricDepthFrame` (camera
+/// metres, x-right/y-down/z-forward) — the exact input the D435 provider path
+/// consumes via `set_external_depth`.
+fn load_metric_depth(
+    depth_path: &std::path::Path,
+) -> Result<vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame, String> {
+    use vulvatar_lib::tracking::source_skeleton::CameraIntrinsics;
+    let (rows, cols, depth_mm) = parse_npy_u16(&std::fs::read(depth_path).map_err(|e| e.to_string())?)?;
+    let (dw, dh) = (cols as u32, rows as u32);
+    let intr = CameraIntrinsics { fx: D435_FX, fy: D435_FY, cx: D435_CX, cy: D435_CY, width: dw, height: dh };
+    let mut points_m = Vec::with_capacity(depth_mm.len());
+    for v in 0..rows {
+        for u in 0..cols {
+            let z = depth_mm[v * cols + u] as f32 * 0.001;
+            points_m.push([(u as f32 - intr.cx) / intr.fx * z, (v as f32 - intr.cy) / intr.fy * z, z]);
+        }
+    }
+    Ok(vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame {
+        width: dw, height: dh, points_m, crop: None, intrinsics: Some(intr),
+    })
+}
+
+// ---- registered-overlay math (avatar joints → camera image, torso-aligned) ----
+// The user's acceptance test: "avatar rendering overlaps the 2D keypoints = OK".
+// We register the avatar's 3D joints to camera space using ONLY the stable torso
+// (both shoulders + nose) as a similarity anchor, then project every joint through
+// the D435 intrinsics. This deliberately factors OUT root-translation error so the
+// overlay isolates POSE fidelity: if the avatar's wrist/elbow dots land on the
+// RTMW3D wrist/elbow keypoints, the lift+retarget faithfully mirrors the subject.
+fn v_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+fn v_mid(a: [f32; 3], b: [f32; 3]) -> [f32; 3] { [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5] }
+fn v_dot(a: [f32; 3], b: [f32; 3]) -> f32 { a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+fn v_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+fn v_len(a: [f32; 3]) -> f32 { v_dot(a, a).sqrt() }
+fn v_norm(a: [f32; 3]) -> [f32; 3] { let l = v_len(a).max(1e-6); [a[0] / l, a[1] / l, a[2] / l] }
+
+/// Orthonormal torso frame from two shoulders (x-axis) and an up DIRECTION:
+/// returns (origin, [x, y, z]). Built identically in camera and avatar space so
+/// `R = F_cam · F_avᵀ` follows from expressing a point in the avatar frame and
+/// reconstructing it in the camera frame. The up direction is passed in (rather
+/// than derived from a point) so the caller can cache the camera's static
+/// up-axis and survive frames where the vertical reference (nose) is occluded.
+fn torso_frame_dir(lsh: [f32; 3], rsh: [f32; 3], up_dir: [f32; 3]) -> ([f32; 3], [[f32; 3]; 3]) {
+    let origin = v_mid(lsh, rsh);
+    let x = v_norm(v_sub(rsh, lsh));
+    let up = v_norm(up_dir);
+    let z = v_norm(v_cross(x, up));
+    let y = v_cross(z, x);
+    (origin, [x, y, z])
+}
+
+/// Camera-space 3D at a normalised keypoint, as the valid-depth median of a
+/// window in the deprojected metric grid (`None` if the window is all holes).
+fn cam_point_at(pts: &[[f32; 3]], cols: usize, rows: usize, nx: f32, ny: f32, win: i32) -> Option<[f32; 3]> {
+    let cx = (nx * cols as f32).round() as i32;
+    let cy = (ny * rows as f32).round() as i32;
+    let mut vals: Vec<[f32; 3]> = Vec::new();
+    for dy in -win..=win {
+        for dx in -win..=win {
+            let (x, y) = (cx + dx, cy + dy);
+            if x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 { continue; }
+            let p = pts[y as usize * cols + x as usize];
+            if p[2] > 0.05 { vals.push(p); }
+        }
+    }
+    if vals.is_empty() { return None; }
+    vals.sort_by(|a, b| a[2].partial_cmp(&b[2]).unwrap());
+    Some(vals[vals.len() / 2])
+}
+
+fn project(p: [f32; 3], fx: f32, fy: f32, cx: f32, cy: f32) -> Option<(f32, f32)> {
+    if p[2] < 0.05 { return None; }
+    Some((fx * p[0] / p[2] + cx, fy * p[1] / p[2] + cy))
+}
+
+fn draw_dot(img: &mut image::RgbImage, x: i32, y: i32, r: i32, col: [u8; 3]) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= r * r {
+                let (px, py) = (x + dx, y + dy);
+                if px >= 0 && px < w && py >= 0 && py < h {
+                    img.put_pixel(px as u32, py as u32, image::Rgb(col));
+                }
+            }
+        }
+    }
+}
+
+fn draw_line(img: &mut image::RgbImage, a: (i32, i32), b: (i32, i32), col: [u8; 3]) {
+    let (mut x0, mut y0) = a;
+    let (x1, y1) = b;
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    loop {
+        if x0 >= 0 && x0 < w && y0 >= 0 && y0 < h {
+            img.put_pixel(x0 as u32, y0 as u32, image::Rgb(col));
+        }
+        if x0 == x1 && y0 == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy { err += dy; x0 += sx; }
+        if e2 <= dx { err += dx; y0 += sy; }
+    }
+}
+
 fn render_extent() -> [u32; 2] {
     std::env::var("VULVATAR_REPLAY_RES")
         .ok()
@@ -93,11 +240,25 @@ fn main() -> Result<(), String> {
     let humanoid_map = asset.humanoid.as_ref().ok_or("no humanoid")?;
     let mut avatar = AvatarInstance::new(AvatarInstanceId(1), Arc::clone(&asset));
     let mut solver_state = PoseSolverState::default();
+    // Bisection toggles for the hands-together cross: set VULVATAR_REPLAY_ARM_REACH_IK=0
+    // or VULVATAR_REPLAY_CONTACT_IK=0 to disable that solver stage and see which one
+    // stops the avatar arms crossing. Default on (matches the shipping app).
+    let env_bool = |k: &str| {
+        std::env::var(k)
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true)
+    };
     let params = SolverParams {
         rotation_blend: 1.0,
         lower_body_tracking_enabled: false,
+        arm_reach_ik_enabled: env_bool("VULVATAR_REPLAY_ARM_REACH_IK"),
+        contact_ik_enabled: env_bool("VULVATAR_REPLAY_CONTACT_IK"),
         ..Default::default()
     };
+    eprintln!(
+        "solver toggles: arm_reach_ik={} contact_ik={}",
+        params.arm_reach_ik_enabled, params.contact_ik_enabled
+    );
 
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(&out_path).map_err(|e| format!("create {out_path}: {e}"))?,
@@ -108,14 +269,43 @@ fn main() -> Result<(), String> {
         ("R", HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
     ];
 
+    // The camera is static, so the world-up expressed in camera space is a fixed
+    // extrinsic. Cache it from any frame where the nose is visible and reuse it on
+    // frames where the face is occluded (e.g. a hand covering it).
+    let mut last_cam_up: Option<[f32; 3]> = None;
+
     for (i, f) in files.iter().enumerate() {
-        let img = image::open(f).map_err(|e| format!("open {}: {e}", f.display()))?.to_rgb8();
+        let mut img = image::open(f).map_err(|e| format!("open {}: {e}", f.display()))?.to_rgb8();
         let (w, h) = (img.width(), img.height());
+        let rendering = render_every > 0 && renderer.is_some() && i % render_every == 0;
+        // Feed the REAL D435 metric path when an aligned depth sibling exists
+        // (set_external_depth → estimate_from_external_depth) — the exact
+        // pipeline the live app runs — so the rendered avatar reflects the
+        // shipping behaviour, not a monocular fallback. Only stamp a synthetic
+        // metric frame when there is no depth (a plain colour-only frame dir).
+        let depth_path = depth_sibling(f);
+        let has_depth = depth_path.exists();
+        // On rendered frames, keep the deprojected metric grid so the overlay can
+        // back-project torso keypoints into camera-space 3D for the registration.
+        let mut overlay_depth: Option<(usize, usize, Vec<[f32; 3]>)> = None;
+        if has_depth {
+            match load_metric_depth(&depth_path) {
+                Ok(metric) => {
+                    if rendering {
+                        overlay_depth =
+                            Some((metric.width as usize, metric.height as usize, metric.points_m.clone()));
+                    }
+                    provider.set_external_depth(metric);
+                }
+                Err(e) => eprintln!("depth {i}: {e}"),
+            }
+        }
         let est = provider.estimate_pose(img.as_raw(), w, h, i as u64);
+        let keypoints: Vec<(f32, f32, f32)> = est.annotation.keypoints.clone();
         let mut sk = est.skeleton;
-        // Image-only bench: stamp the metric flag so the solver takes the
-        // shipping metric path (D435-exclusive) rather than the None fallback.
-        sk.stamp_synthetic_metric_frame();
+        if !has_depth {
+            sk.stamp_synthetic_metric_frame();
+        }
 
         avatar.build_base_pose();
         solve_avatar_pose(
@@ -128,32 +318,121 @@ fn main() -> Result<(), String> {
         );
         avatar.compute_global_pose();
 
-        if let Some(r) = renderer.as_mut() {
-            if i % render_every == 0 {
-                avatar.build_skinning_matrices();
-                let ext = render_extent();
-                if let Ok(rgba) = render_avatar(r, &avatar, ext) {
-                    let _ = save_composite(&render_dir.join(format!("f{i:04}.png")), &img, &rgba, ext);
-                }
-            }
-        }
-
         let av_pos = |b: HumanoidBone| -> Option<[f32; 3]> {
             let idx = humanoid_map.bone_map.get(&b).copied().map(|n| n.0 as usize)?;
             let m = avatar.pose.global_transforms.get(idx)?;
             Some([m[3][0], m[3][1], m[3][2]])
         };
 
+        // ---- Registered overlay (the user's acceptance test) ----
+        // Draw the RTMW3D 2D arm keypoints (GREEN) and the avatar's projected
+        // arm joints (MAGENTA) on the camera image, registered on the torso.
+        // Overlap ⇒ the avatar faithfully mirrors the subject's pose.
+        if rendering {
+            if let Some((cols, rows, pts)) = overlay_depth.as_ref() {
+                let (cols, rows) = (*cols, *rows);
+                let kget = |idx: usize| -> Option<(f32, f32)> {
+                    keypoints
+                        .get(idx)
+                        .and_then(|&(nx, ny, s)| if s > 0.2 { Some((nx, ny)) } else { None })
+                };
+                let cam_at = |idx: usize| -> Option<[f32; 3]> {
+                    let (nx, ny) = kget(idx)?;
+                    cam_point_at(pts, cols, rows, nx, ny, 4)
+                };
+                let kp_px = |idx: usize| -> Option<(i32, i32)> {
+                    let (nx, ny) = kget(idx)?;
+                    Some(((nx * w as f32).round() as i32, (ny * h as f32).round() as i32))
+                };
+                const GREEN: [u8; 3] = [0, 230, 0]; // detected 2D keypoints
+                const MAGENTA: [u8; 3] = [235, 0, 235]; // avatar projected joints
+                let chains = [
+                    (5usize, 7usize, 9usize, HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand),
+                    (6, 8, 10, HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
+                ];
+
+                // Numeric dump of the raw arm keypoints (pixel + score) so the
+                // 2D-correct-vs-lift-broken question is answered by data, not eyeball.
+                {
+                    let names = [(5, "Lsh"), (7, "Lel"), (9, "Lwr"), (6, "Rsh"), (8, "Rel"), (10, "Rwr")];
+                    let mut s = format!("f{i:04} 2Dkp:");
+                    for (idx, nm) in names {
+                        if let Some(&(nx, ny, sc)) = keypoints.get(idx) {
+                            s.push_str(&format!(" {nm}=({:.0},{:.0} s={:.2})", nx * w as f32, ny * h as f32, sc));
+                        }
+                    }
+                    eprintln!("{s}");
+                }
+
+                // (1) Detected 2D arm skeleton (GREEN) — registration-free, always drawn.
+                for (si, ei, wi, _, _, _) in chains {
+                    let (ks, ke, kw) = (kp_px(si), kp_px(ei), kp_px(wi));
+                    if let (Some(a), Some(b)) = (ks, ke) { draw_line(&mut img, a, b, GREEN); }
+                    if let (Some(a), Some(b)) = (ke, kw) { draw_line(&mut img, a, b, GREEN); }
+                    for p in [ks, ke, kw].into_iter().flatten() { draw_dot(&mut img, p.0, p.1, 7, GREEN); }
+                }
+
+                // (2) Avatar arm skeleton (MAGENTA) — needs the torso similarity.
+                // Requires both shoulders in camera-space depth; the vertical axis
+                // comes from the nose when visible, else the cached (static-camera)
+                // up-axis so a hand over the face doesn't kill the registration.
+                if let (Some(cl), Some(cr)) = (cam_at(5), cam_at(6)) {
+                    if let Some(cn) = cam_at(0) {
+                        last_cam_up = Some(v_norm(v_sub(cn, v_mid(cl, cr))));
+                    }
+                    let av = (av_pos(HumanoidBone::LeftUpperArm), av_pos(HumanoidBone::RightUpperArm), av_pos(HumanoidBone::Head));
+                    if let (Some(cam_up), (Some(al), Some(ar), Some(an))) = (last_cam_up, av) {
+                        let av_up = v_sub(an, v_mid(al, ar));
+                        let (o_cam, f_cam) = torso_frame_dir(cl, cr, cam_up);
+                        let (o_av, f_av) = torso_frame_dir(al, ar, av_up);
+                        let scale = v_len(v_sub(cr, cl)) / v_len(v_sub(ar, al)).max(1e-6);
+                        let to_cam = |p: [f32; 3]| -> [f32; 3] {
+                            let d = v_sub(p, o_av);
+                            let l = [v_dot(d, f_av[0]), v_dot(d, f_av[1]), v_dot(d, f_av[2])];
+                            [
+                                o_cam[0] + scale * (l[0] * f_cam[0][0] + l[1] * f_cam[1][0] + l[2] * f_cam[2][0]),
+                                o_cam[1] + scale * (l[0] * f_cam[0][1] + l[1] * f_cam[1][1] + l[2] * f_cam[2][1]),
+                                o_cam[2] + scale * (l[0] * f_cam[0][2] + l[1] * f_cam[1][2] + l[2] * f_cam[2][2]),
+                            ]
+                        };
+                        let (sxp, syp) = (w as f32 / cols as f32, h as f32 / rows as f32);
+                        let av_px = |b: HumanoidBone| -> Option<(i32, i32)> {
+                            let (px, py) = project(to_cam(av_pos(b)?), D435_FX, D435_FY, D435_CX, D435_CY)?;
+                            Some(((px * sxp).round() as i32, (py * syp).round() as i32))
+                        };
+                        for (_, _, _, sb, eb, wb) in chains {
+                            let (asx, ae, aw) = (av_px(sb), av_px(eb), av_px(wb));
+                            if let (Some(a), Some(b)) = (asx, ae) { draw_line(&mut img, a, b, MAGENTA); }
+                            if let (Some(a), Some(b)) = (ae, aw) { draw_line(&mut img, a, b, MAGENTA); }
+                            for p in [asx, ae, aw].into_iter().flatten() { draw_dot(&mut img, p.0, p.1, 5, MAGENTA); }
+                        }
+                    }
+                } else {
+                    eprintln!("f{i:04} overlay: shoulders missing in depth — no magenta");
+                }
+            }
+        }
+
         // Avatar reference heights (world y) so hand elevation can be
         // judged WITHOUT reading the render — disambiguates a raised
         // hand from long hanging hair that visually mimics a lowered
         // forearm on some rigs.
         let avy = |b: HumanoidBone| av_pos(b).map(|p| p[1]).unwrap_or(f32::NAN);
+        // Hips roll: x-component of the Hips' world up-axis (global transform
+        // column 1). ~0 = pelvis grounded/upright; large = the whole body is
+        // rotating about the root (the "zero-g spin" artefact).
+        let hip_roll = humanoid_map
+            .bone_map
+            .get(&HumanoidBone::Hips)
+            .and_then(|n| avatar.pose.global_transforms.get(n.0 as usize))
+            .map(|m| m[1][0])
+            .unwrap_or(f32::NAN);
         let mut parts: Vec<String> = vec![format!(
-            "\"frame\":{i},\"av_head_y\":{:.3},\"av_hip_y\":{:.3},\"av_sh_y\":{:.3}",
+            "\"frame\":{i},\"av_head_y\":{:.3},\"av_hip_y\":{:.3},\"av_sh_y\":{:.3},\"hip_roll\":{:.4}",
             avy(HumanoidBone::Head),
             avy(HumanoidBone::Hips),
-            avy(HumanoidBone::LeftUpperArm)
+            avy(HumanoidBone::LeftUpperArm),
+            hip_roll
         )];
         for (tag, sh, el, wr) in sides {
             let g = |b: HumanoidBone| sk.joints.get(&b);
@@ -187,8 +466,70 @@ fn main() -> Result<(), String> {
                 ));
             }
         }
+        // Shoulder tilt (roll): source shoulder-height difference vs the avatar's.
+        // Source y is image-DOWN (a raised L shoulder => smaller y), avatar y is
+        // world-UP, so a faithful mirror makes these ANTI-correlated. If the avatar
+        // tilt stays ~flat while the source varies, the shoulder roll is dropped.
+        {
+            let sp = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position[1]);
+            let src_tilt = match (sp(HumanoidBone::LeftUpperArm), sp(HumanoidBone::RightUpperArm)) {
+                (Some(l), Some(r)) => l - r,
+                _ => f32::NAN,
+            };
+            let av_tilt = match (
+                av_pos(HumanoidBone::LeftUpperArm),
+                av_pos(HumanoidBone::RightUpperArm),
+            ) {
+                (Some(l), Some(r)) => l[1] - r[1],
+                _ => f32::NAN,
+            };
+            parts.push(format!("\"tilt\":{{\"src\":{:.4},\"av\":{:.4}}}", src_tilt, av_tilt));
+        }
+        // Full avatar skeleton (world joint positions) so an offline drawer can
+        // render the stick figure — GPU-free FK, to iterate torso tilt / elbow.
+        {
+            let names: [(&str, HumanoidBone); 14] = [
+                ("Hips", HumanoidBone::Hips),
+                ("Spine", HumanoidBone::Spine),
+                ("Chest", HumanoidBone::Chest),
+                ("UpperChest", HumanoidBone::UpperChest),
+                ("Neck", HumanoidBone::Neck),
+                ("Head", HumanoidBone::Head),
+                ("LSh", HumanoidBone::LeftShoulder),
+                ("RSh", HumanoidBone::RightShoulder),
+                ("LUp", HumanoidBone::LeftUpperArm),
+                ("RUp", HumanoidBone::RightUpperArm),
+                ("LLo", HumanoidBone::LeftLowerArm),
+                ("RLo", HumanoidBone::RightLowerArm),
+                ("LHa", HumanoidBone::LeftHand),
+                ("RHa", HumanoidBone::RightHand),
+            ];
+            let sk_parts: Vec<String> = names
+                .iter()
+                .filter_map(|(n, b)| {
+                    av_pos(*b).map(|p| format!("\"{}\":[{:.3},{:.3},{:.3}]", n, p[0], p[1], p[2]))
+                })
+                .collect();
+            parts.push(format!("\"skel\":{{{}}}", sk_parts.join(",")));
+        }
         parts.push(format!("\"overall\":{:.2}", sk.overall_confidence));
         writeln!(out, "{{{}}}", parts.join(",")).map_err(|e| e.to_string())?;
+
+        // Render + composite AFTER the av_pos closure's last use so the mutable
+        // `build_skinning_matrices` borrow doesn't conflict with it. The overlay
+        // was already drawn onto `img` above.
+        if rendering {
+            avatar.build_skinning_matrices();
+            let ext = render_extent();
+            // Full-resolution camera-with-overlay, un-shrunk, so the GREEN (2D
+            // detected) vs MAGENTA (avatar projected) overlap is actually legible.
+            let _ = img.save(render_dir.join(format!("f{i:04}_overlay.png")));
+            if let Some(r) = renderer.as_mut() {
+                if let Ok(rgba) = render_avatar(r, &avatar, ext) {
+                    let _ = save_composite(&render_dir.join(format!("f{i:04}.png")), &img, &rgba, ext);
+                }
+            }
+        }
         if i % 100 == 0 {
             eprintln!("frame {i}");
         }

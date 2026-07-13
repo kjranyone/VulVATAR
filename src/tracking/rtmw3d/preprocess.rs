@@ -2,16 +2,18 @@
 //!
 //! Two related concerns live here:
 //!
-//! * The **YOLOX crop** helpers (`pad_and_clamp_bbox`, `crop_rgb`) take
-//!   a raw `PersonBbox` from the YOLOX detector and produce a
-//!   contiguous RGB slice that gets fed into the model. The crop is
-//!   sized to RTMW3D's 288:384 input aspect so the squash inside
-//!   `preprocess` is minimal.
+//! * The **YOLOX crop** helpers (`pad_bbox_to_aspect`, `crop_rgb_padded`)
+//!   take a raw `PersonBbox` and produce a contiguous RGB slice at
+//!   RTMW3D's exact 288:384 input aspect. The crop is allowed to run past
+//!   the frame edges (zero-padded) so the subject's aspect is preserved —
+//!   the mmpose `TopdownAffine` contract. The crop's SEED (the
+//!   self-tracking bbox in `mod.rs`) is clamped to the frame so this
+//!   beyond-frame crop cannot feed an unbounded zoom-out loop.
 //! * The **288×384 NCHW resize** (`preprocess`) does OpenCV-style
-//!   bilinear resampling + ImageNet mean/std normalization. Aspect is
-//!   squashed (no letterbox) — the model is robust to it for
-//!   centred-subject inputs and the YOLOX crop above already brought
-//!   the source aspect close to the model's.
+//!   bilinear resampling + ImageNet mean/std normalization. Because the
+//!   crop is already 288:384, the resize is a pure scale with no aspect
+//!   squash (the earlier clamp-to-frame crop left a landscape rectangle
+//!   that squashed a frame-filling subject and flattened the heatmaps).
 
 use ndarray::Array4;
 
@@ -22,16 +24,19 @@ use super::consts::{INPUT_H, INPUT_W, MEAN_RGB, STD_RGB};
 // YOLOX crop helpers
 // ---------------------------------------------------------------------------
 
-/// Pad the YOLOX-detected bbox, adjust it toward RTMW3D's 288:384 input
-/// aspect, and clamp to the frame. Shared with the rtmw3d_with_depth
-/// provider's DAv2 person-crop stage — keep the same aspect target so
-/// the helper stays single-sourced.
-pub(in crate::tracking) fn pad_and_clamp_bbox(
-    bbox: &PersonBbox,
-    width: u32,
-    height: u32,
-    pad_ratio: f32,
-) -> (u32, u32, u32, u32) {
+/// Aspect-correct the padded bbox to the model's input ratio WITHOUT clamping
+/// to the frame — out-of-frame regions are zero-padded later by
+/// [`crop_rgb_padded`]. This is the mmpose `TopdownAffine` contract the model
+/// was trained on: the crop preserves the subject's aspect so the squash-resize
+/// into `INPUT_W × INPUT_H` does not horizontally compress a frame-filling
+/// subject. A clamp-to-frame crop grows the deficient dimension to hit the
+/// aspect and THEN clamps, which for a 16:9 desk-mirror frame leaves a landscape
+/// crop (aspect ~1.3) that squashes the subject to ~55% width — flattening
+/// RTMW3D's heatmaps to uniform low confidence and edge-clamped elbows. Returns
+/// `(x1, y1, x2, y2)` in source pixels, possibly negative or past `width`/
+/// `height`. The SEED bbox is clamped upstream (`derive_self_track_bbox`) so
+/// this beyond-frame crop cannot drive an unbounded zoom-out feedback loop.
+pub(in crate::tracking) fn pad_bbox_to_aspect(bbox: &PersonBbox, pad_ratio: f32) -> (f32, f32, f32, f32) {
     let mut bw = (bbox.x2 - bbox.x1).max(1.0) * (1.0 + pad_ratio);
     let mut bh = (bbox.y2 - bbox.y1).max(1.0) * (1.0 + pad_ratio);
     let cx = (bbox.x1 + bbox.x2) * 0.5;
@@ -42,35 +47,41 @@ pub(in crate::tracking) fn pad_and_clamp_bbox(
     } else {
         bw = bh * target_aspect;
     }
-    let half_w = bw * 0.5;
-    let half_h = bh * 0.5;
-    let x1 = (cx - half_w).max(0.0).floor() as u32;
-    let y1 = (cy - half_h).max(0.0).floor() as u32;
-    let x2 = (cx + half_w).min(width as f32).ceil() as u32;
-    let y2 = (cy + half_h).min(height as f32).ceil() as u32;
-    (x1, y1, x2, y2)
+    let (half_w, half_h) = (bw * 0.5, bh * 0.5);
+    (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 }
 
-/// Copy the rectangle `[(ox, oy), (ox+cw, oy+ch))` out of `rgb`
-/// (`width × height × 3` u8) into a contiguous tightly-packed buffer.
-/// Caller has already clamped the rectangle into the source bounds.
-/// Shared with the rtmw3d_with_depth provider for the same
-/// person-crop flow.
-pub(in crate::tracking) fn crop_rgb(
+/// Copy an aspect-correct rectangle that MAY extend past the frame bounds into a
+/// tightly-packed `cw × ch × 3` buffer, zero-padding (black) any out-of-frame
+/// pixels. `ox`/`oy` are the top-left in source pixels (may be negative). Black
+/// matches mmpose's `warpAffine` border and normalises to a constant the model
+/// learned to ignore. One `copy_from_slice` per row over the in-bounds x-span.
+pub(in crate::tracking) fn crop_rgb_padded(
     rgb: &[u8],
     width: u32,
-    _height: u32,
-    ox: u32,
-    oy: u32,
+    height: u32,
+    ox: i32,
+    oy: i32,
     cw: u32,
     ch: u32,
 ) -> Vec<u8> {
-    let stride = (width as usize) * 3;
-    let crop_stride = (cw as usize) * 3;
-    let mut out = Vec::with_capacity(crop_stride * (ch as usize));
-    for y in 0..(ch as usize) {
-        let src_row = (oy as usize + y) * stride + (ox as usize) * 3;
-        out.extend_from_slice(&rgb[src_row..src_row + crop_stride]);
+    let stride = width as usize * 3;
+    let crop_stride = cw as usize * 3;
+    let mut out = vec![0u8; crop_stride * ch as usize];
+    let x_start = ox.max(0);
+    let x_end = (ox + cw as i32).min(width as i32);
+    if x_end <= x_start {
+        return out;
+    }
+    let n = ((x_end - x_start) * 3) as usize;
+    for dy in 0..ch as i32 {
+        let sy = oy + dy;
+        if sy < 0 || sy >= height as i32 {
+            continue;
+        }
+        let src = sy as usize * stride + x_start as usize * 3;
+        let dst = dy as usize * crop_stride + ((x_start - ox) as usize) * 3;
+        out[dst..dst + n].copy_from_slice(&rgb[src..src + n]);
     }
     out
 }

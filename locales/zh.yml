@@ -194,6 +194,8 @@ tracking:
   error_model_warning: "姿势追踪质量警告：%{warnings}。运行 ./dev.ps1 setup 安装完整模型包。"
   error_model_unavailable: "姿势模型不可用：%{error} 回退到低质量 HSV 追踪。"
   error_camera_stopped: "连续 %{count} 次读取错误后摄像头已停止。可能有其他应用正在使用摄像头，或设备已断开。"
+  error_usb_link_speed: "RealSense D435 以 USB %{detected} 链路速度连接。深度追踪需要 USB 3.0。请使用 USB 3.0 数据线将摄像头直接连接到蓝色 USB 3.0 端口（USB 2.0 端口、集线器和延长线均无法达到所需速度）。"
+  error_no_device: "未找到 RealSense D435。请检查摄像头是否已通过 USB 连接。"
   advanced_smoothing: "高级平滑"
   advanced_smoothing_hint: "默认值适合大多数配置 — 仅在摄像头噪声大或表情抖动时调整。"
   rotation_blend: "旋转混合"
@@ -491,6 +493,8 @@ toast:
 dialog:
   cloth_autosave_title: "布料自动保存同意"
   cloth_autosave_body: "布料覆盖层处于活动状态。是否允许将其包含在恢复快照中？"
+  tracking_error_title: "无法开始追踪"
+  tracking_error_dismiss: "关闭"
   yes: "是"
   no: "否"
   loading_avatar: "正在加载虚拟形象"

@@ -23,6 +23,7 @@ pub mod stagelog;
 pub mod skeleton_from_depth;
 
 pub mod calibration;
+pub mod debug_channel;
 pub mod face_mediapipe;
 pub mod rtmw3d;
 pub mod source_skeleton;
@@ -1063,10 +1064,19 @@ impl TrackingWorker {
             Ok(c) => c,
             Err(e) => {
                 error!("tracking-worker: failed to open RealSense: {}", e);
-                mailbox.report_error(
-                    t!("tracking.error_realsense_open", error = e.to_string()),
-                    TrackingErrorLevel::Blocking,
-                );
+                // Map the typed open failure to a root-cause-specific,
+                // localized message so the GUI dialog names the real problem
+                // (e.g. a USB-2 link speed) instead of an opaque driver string.
+                let msg = match e {
+                    realsense::OpenFailure::UsbLinkTooSlow { detected } => {
+                        t!("tracking.error_usb_link_speed", detected = detected)
+                    }
+                    realsense::OpenFailure::NoDevice => t!("tracking.error_no_device"),
+                    realsense::OpenFailure::Other(m) => {
+                        t!("tracking.error_realsense_open", error = m)
+                    }
+                };
+                mailbox.report_error(msg, TrackingErrorLevel::Blocking);
                 // No synthetic fallback in the D435-exclusive build: surface
                 // the blocking error and idle. `worker_loop` clears `running`
                 // on return, so the app drops to the avatar rest pose.
@@ -1172,6 +1182,11 @@ impl TrackingWorker {
                     } else {
                         pose_estimation::estimate_pose(&rs_frame.rgb, width, height, frame_index)
                     };
+
+                    // Live debug channel: publish camera + 2D keypoints + source
+                    // arm joints for an external overlay (no-op unless the debug
+                    // flag file exists). Before the estimate is moved below.
+                    debug_channel::dump_observation(frame_index, &rs_frame.rgb, width, height, &estimate);
 
                     let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
                     mailbox.publish_estimate(estimate, frame);
