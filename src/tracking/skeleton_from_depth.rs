@@ -759,11 +759,21 @@ impl TorsoScaleStabilizer {
     /// constant, so once seeded it should hold near-locked, letting the avatar
     /// scale stay put instead of breathing with shoulder-depth noise.
     const SPAN_ALPHA: f32 = 0.05;
-    /// Anchor moved beyond this (m) from the held value = a real lean → follow
-    /// fast; below it, hold against jitter.
-    const ANCHOR_DEV_M: f32 = 0.18;
-    const ANCHOR_FOLLOW: f32 = 0.30;
-    const ANCHOR_HOLD: f32 = 0.06;
+    /// A per-frame anchor jump larger than this (m) is physically impossible for
+    /// a torso (> ~3.5 m/s at 30 fps) → it is shoulder-depth contamination (a
+    /// hand crossing in front), NOT a real move, so REJECT it (creep only). A
+    /// real lean / walk-in is well under this (~1 m/s ≈ 0.03 m/frame) and passes
+    /// through almost untouched, because the subject's distance (root_offset,
+    /// hence the avatar's near/far) MUST reflect real movement — the downstream
+    /// 1€ ROOT filter, not this gate, owns jitter smoothing. The old gate had
+    /// this inverted (followed big jumps, held small ones) and so lagged genuine
+    /// approach/retreat by ~25% while partly chasing contamination spikes.
+    const ANCHOR_SPIKE_M: f32 = 0.12;
+    /// Plausible movement: track it fast (near pass-through, ~0 lag).
+    const ANCHOR_FOLLOW: f32 = 0.80;
+    /// Rejected spike: creep slowly so a one-frame spike barely moves the anchor,
+    /// yet a genuinely sustained large displacement still converges (never stuck).
+    const ANCHOR_REJECT_CREEP: f32 = 0.15;
 
     pub(in crate::tracking) fn reset(&mut self) {
         *self = Self::default();
@@ -794,19 +804,21 @@ impl TorsoScaleStabilizer {
         next
     }
 
-    /// EMA the torso anchor (camera metres) with an adaptive rate so the
-    /// avatar's distance holds steady through sampling jitter but still tracks
-    /// a real lean forward/back.
+    /// Spike-reject the torso anchor (camera metres): a real lean / walk-in
+    /// passes through nearly untouched so the avatar's distance tracks it, while
+    /// a physically-impossible one-frame jump (shoulder depth contaminated by a
+    /// hand in front) is rejected. This is a contamination gate, NOT a jitter
+    /// smoother — the downstream 1€ ROOT filter owns jitter.
     pub(in crate::tracking) fn stable_anchor(&mut self, raw: [f32; 3]) -> [f32; 3] {
         let next = match self.anchor_cam {
             None => raw,
             Some(cur) => {
                 let d = [raw[0] - cur[0], raw[1] - cur[1], raw[2] - cur[2]];
                 let dev = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                let a = if dev > Self::ANCHOR_DEV_M {
-                    Self::ANCHOR_FOLLOW
+                let a = if dev > Self::ANCHOR_SPIKE_M {
+                    Self::ANCHOR_REJECT_CREEP
                 } else {
-                    Self::ANCHOR_HOLD
+                    Self::ANCHOR_FOLLOW
                 };
                 [cur[0] + a * d[0], cur[1] + a * d[1], cur[2] + a * d[2]]
             }
@@ -1698,19 +1710,34 @@ mod tests {
     }
 
     #[test]
-    fn scale_stabilizer_holds_anchor_but_follows_lean() {
+    fn scale_stabilizer_passes_real_move_rejects_spike() {
         let mut s = TorsoScaleStabilizer::default();
-        let a0 = s.stable_anchor([0.0, 0.0, 0.60]);
-        assert_eq!(a0, [0.0, 0.0, 0.60], "seeds on the first anchor");
-        // Small jitter is mostly held back.
-        let jit = s.stable_anchor([0.0, 0.0, 0.64]);
-        assert!(jit[2] < 0.61, "sampling jitter is largely held (got {})", jit[2]);
-        // A large genuine lean is followed noticeably within a couple frames.
-        let mut z = jit[2];
-        for _ in 0..3 {
-            z = s.stable_anchor([0.0, 0.0, 1.00])[2];
+        let a0 = s.stable_anchor([0.0, 0.0, 1.60]);
+        assert_eq!(a0, [0.0, 0.0, 1.60], "seeds on the first anchor");
+        // A realistic walk-in step (~0.03 m/frame ≈ 1 m/s) passes through almost
+        // fully: the avatar's near/far MUST reflect real movement.
+        let step = s.stable_anchor([0.0, 0.0, 1.57]);
+        assert!(step[2] < 1.585, "a real approach step is tracked promptly (got {})", step[2]);
+        // A physically-impossible one-frame jump (a hand contaminating shoulder
+        // depth) is rejected — the anchor barely moves.
+        let spike = s.stable_anchor([0.0, 0.0, 1.05])[2]; // ~0.5 m in one frame
+        assert!(spike > 1.45, "a contamination spike is rejected (got {spike})");
+    }
+
+    #[test]
+    fn scale_stabilizer_tracks_sustained_approach_without_lag() {
+        // The old heavy EMA lagged a real approach ~0.16 m and dropped ~25% of
+        // the motion (the "near/far not reflected" regression). A sustained ramp
+        // must now converge to within a few cm.
+        let mut s = TorsoScaleStabilizer::default();
+        let mut z = 1.60;
+        s.stable_anchor([0.0, 0.0, z]);
+        let mut last = z;
+        for _ in 0..60 {
+            z -= 0.01; // 1.60 -> 1.00 over 2 s at 30 fps (~0.3 m/s)
+            last = s.stable_anchor([0.0, 0.0, z])[2];
         }
-        assert!(z > 0.75, "a real lean forward is tracked (got {z})");
+        assert!((last - 1.00).abs() < 0.03, "ramp tracked with <3 cm lag (got {last})");
     }
 
     fn dummy_frame(width: u32, height: u32, point: [f32; 3]) -> MetricDepthFrame {
