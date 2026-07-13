@@ -942,8 +942,14 @@ pub fn solve_avatar_pose(
         params.joint_confidence_threshold,
     )
     .or_else(|| {
-        // Hips out of frame (desk-up): fall back to the real 3D shoulder line.
-        compute_shoulder_align_rotation(
+        // Hips out of frame (desk-up): the shoulder line gives the torso facing,
+        // but only its HORIZONTAL (yaw) part goes to the root Hips — applying the
+        // full roll here would spin the whole avatar about the pelvis (the
+        // "zero-g rotation" a user sees when tilting their shoulders on an
+        // upper-body framing). The shoulder ROLL is applied to the upper torso
+        // in the driven-bone loop (UpperChest alignment), so the pelvis stays
+        // grounded and the spine leans instead.
+        compute_shoulder_yaw_rotation(
             &source_owned,
             &rest_world,
             humanoid,
@@ -1499,12 +1505,32 @@ pub fn solve_avatar_pose(
         // it works under arbitrary body yaw (front, back, profile alike)
         // — no facing detection needed.
         if matches!(bone, HumanoidBone::UpperChest) {
-            if let (Some(l_node), Some(r_node), Some(l_src), Some(r_src)) = (
-                humanoid.bone_map.get(&HumanoidBone::LeftShoulder).copied(),
-                humanoid.bone_map.get(&HumanoidBone::RightShoulder).copied(),
-                source.joints.get(&HumanoidBone::LeftShoulder),
-                source.joints.get(&HumanoidBone::RightShoulder),
-            ) {
+            // Prefer the clavicle (Shoulder) bones, but fall back to the UpperArm
+            // roots — which every rig has and which ARE the shoulder joints — so
+            // this shoulder-line alignment still carries a shoulder TILT onto the
+            // upper torso on clavicle-less rigs. This is now the primary tilt
+            // path in upper-body mode, where the root Hips takes only the yaw.
+            let l_node = humanoid
+                .bone_map
+                .get(&HumanoidBone::LeftShoulder)
+                .or_else(|| humanoid.bone_map.get(&HumanoidBone::LeftUpperArm))
+                .copied();
+            let r_node = humanoid
+                .bone_map
+                .get(&HumanoidBone::RightShoulder)
+                .or_else(|| humanoid.bone_map.get(&HumanoidBone::RightUpperArm))
+                .copied();
+            let l_src = source
+                .joints
+                .get(&HumanoidBone::LeftShoulder)
+                .or_else(|| source.joints.get(&HumanoidBone::LeftUpperArm));
+            let r_src = source
+                .joints
+                .get(&HumanoidBone::RightShoulder)
+                .or_else(|| source.joints.get(&HumanoidBone::RightUpperArm));
+            if let (Some(l_node), Some(r_node), Some(l_src), Some(r_src)) =
+                (l_node, r_node, l_src, r_src)
+            {
                 if l_src.confidence >= params.joint_confidence_threshold
                     && r_src.confidence >= params.joint_confidence_threshold
                 {
@@ -1893,6 +1919,52 @@ fn compute_shoulder_align_rotation(
         return None;
     }
     let av_n = [av_dir[0] / av_len, av_dir[1] / av_len, av_dir[2] / av_len];
+
+    Some(quat_from_vectors(&av_n, &src_n))
+}
+
+/// Upper-body-mode facing for the root Hips: the HORIZONTAL (yaw) part of the
+/// shoulder-line alignment only. Applying the full shoulder-line rotation
+/// (which includes the roll of a shoulder tilt) to the root spins the WHOLE
+/// avatar about the pelvis — the "zero-g rotation" artefact when only the upper
+/// body is framed. Projecting both shoulder lines onto the horizontal plane
+/// keeps the pelvis upright and grounded; the shoulder ROLL is applied to the
+/// upper torso (see the `UpperChest` alignment in the driven-bone loop) so the
+/// spine leans instead. Returns `None` if either shoulder is missing / the
+/// projected line is degenerate (near-vertical), leaving the Hips at rest.
+fn compute_shoulder_yaw_rotation(
+    source: &SourceSkeleton,
+    rest_world: &[WorldXform],
+    humanoid: &HumanoidMap,
+    threshold: f32,
+) -> Option<Quat> {
+    use HumanoidBone::*;
+    let l = source.joints.get(&LeftUpperArm)?;
+    let r = source.joints.get(&RightUpperArm)?;
+    if l.confidence < threshold || r.confidence < threshold {
+        return None;
+    }
+    // Horizontal projection (drop Y) of the source shoulder line.
+    let src_h = [l.position[0] - r.position[0], 0.0, l.position[2] - r.position[2]];
+    let src_len = vec3_length(&src_h);
+    // A near-vertical shoulder line has almost no horizontal component — its yaw
+    // is ill-defined; keep the previous facing rather than snapping.
+    const MIN_HORIZ_SPAN: f32 = 0.20;
+    if src_len < MIN_HORIZ_SPAN {
+        return None;
+    }
+    let src_n = [src_h[0] / src_len, 0.0, src_h[2] / src_len];
+
+    let l_idx = humanoid.bone_map.get(&LeftUpperArm).map(|n| n.0 as usize)?;
+    let r_idx = humanoid.bone_map.get(&RightUpperArm).map(|n| n.0 as usize)?;
+    let l_world = rest_world.get(l_idx)?.position;
+    let r_world = rest_world.get(r_idx)?.position;
+    let av_h = [l_world[0] - r_world[0], 0.0, l_world[2] - r_world[2]];
+    let av_len = vec3_length(&av_h);
+    if av_len < 1.0e-4 {
+        return None;
+    }
+    let av_n = [av_h[0] / av_len, 0.0, av_h[2] / av_len];
 
     Some(quat_from_vectors(&av_n, &src_n))
 }
