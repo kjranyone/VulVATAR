@@ -359,6 +359,16 @@ pub struct SolverParams {
     /// with a user-acknowledged neutral position. Falls through to
     /// the auto-EMA when `None`. See `docs/calibration-ux.md`.
     pub pose_calibration: Option<crate::tracking::PoseCalibration>,
+    /// Fill a dropped elbow with a two-bone IK toward the wrist so a
+    /// recognised hand doesn't leave the arm at a bind T-pose (see
+    /// `compute_arm_reach_elbows`). Default `true`; exposed so the live debug
+    /// channel can A/B it.
+    pub arm_reach_ik_enabled: bool,
+    /// Blend the arm directions toward a positional two-bone solve when the
+    /// hands are close, so touching hands meet (see `compute_arm_contact_ik`).
+    /// Default `true`; exposed so the live debug channel can isolate whether
+    /// this stage is the one crossing the arms at the midline.
+    pub contact_ik_enabled: bool,
 }
 
 impl Default for SolverParams {
@@ -378,6 +388,8 @@ impl Default for SolverParams {
             lower_body_tracking_enabled: true,
             root_translation_enabled: true,
             pose_calibration: None,
+            arm_reach_ik_enabled: true,
+            contact_ik_enabled: true,
         }
     }
 }
@@ -1124,7 +1136,11 @@ pub fn solve_avatar_pose(
     // the solved `*LowerArm` joints; everything below (contact IK + the body
     // chain) then drives the arm normally. No-op (no clone) when both elbows are
     // adequately observed, so well-tracked frames are untouched.
-    let arm_reach_elbows = compute_arm_reach_elbows(source, &rest_world, humanoid, params);
+    let arm_reach_elbows = if params.arm_reach_ik_enabled {
+        compute_arm_reach_elbows(source, &rest_world, humanoid, params)
+    } else {
+        [None, None]
+    };
     let augmented_source;
     let source: &SourceSkeleton = if arm_reach_elbows[0].is_some() || arm_reach_elbows[1].is_some() {
         let mut s = source.clone();
@@ -1144,7 +1160,11 @@ pub fn solve_avatar_pose(
     // subject's wrists are close, the four arm-bone directions blend
     // toward a two-bone positional solve so the avatar's hands
     // actually meet despite proportion differences.
-    let arm_contact_ik = compute_arm_contact_ik(source, humanoid, &rest_world, params);
+    let arm_contact_ik = if params.contact_ik_enabled {
+        compute_arm_contact_ik(source, humanoid, &rest_world, params)
+    } else {
+        None
+    };
 
     // Body chain: direction-match each driven bone using 3D source positions.
     // Wrist orientation pass is fired just-in-time at the body→fingers

@@ -160,7 +160,7 @@ impl Application {
             self.tracking_fade_opacity = (self.tracking_fade_opacity + delta).clamp(0.0, 1.0);
         }
 
-        let solver_params = SolverParams {
+        let mut solver_params = SolverParams {
             rotation_blend: smoothing_params.rotation_blend,
             joint_confidence_threshold: smoothing_params.joint_confidence_threshold,
             face_confidence_threshold: smoothing_params.face_confidence_threshold,
@@ -176,6 +176,19 @@ impl Application {
             pose_calibration: self.tracking_calibration.pose.clone(),
             ..SolverParams::default()
         };
+        // Live debug overrides (no-op unless %ProgramData%\VulVATAR\debug.on
+        // exists): lets an external tool A/B the arm IK stages or sweep the
+        // confidence threshold against the running app without a rebuild.
+        let tuning = crate::tracking::debug_channel::load_tuning();
+        if let Some(v) = tuning.arm_reach_ik {
+            solver_params.arm_reach_ik_enabled = v;
+        }
+        if let Some(v) = tuning.contact_ik {
+            solver_params.contact_ik_enabled = v;
+        }
+        if let Some(v) = tuning.joint_confidence_threshold {
+            solver_params.joint_confidence_threshold = v;
+        }
 
         // Advance the simulation clock once per frame so every avatar in the
         // scene observes the same `(fixed_dt, substeps)`. Previously this was
