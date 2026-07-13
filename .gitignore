@@ -43,6 +43,9 @@ models/vitpose-h-wholebody_onnx/
 # Diagnostic output
 /diagnostics/
 
+# Scratch / ad-hoc tooling workspace (live debug scripts, throwaway probes)
+/scratchpad/
+
 # Python bytecode (depth_capture.py and other scripts run via uv)
 __pycache__/
 *.pyc
