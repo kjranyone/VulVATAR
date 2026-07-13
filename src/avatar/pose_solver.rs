@@ -146,6 +146,12 @@ const REST_SPEED_HI: f32 = 0.32;
 /// ~0.25 m bone), so the first attempt at 0.5° froze almost none of it.
 const ARM_HOLD_ANG_DEAD: f32 = 0.035; // ≈ 2.0°
 
+/// A-pose idle angle for an UNTRACKED arm, measured from straight-down (0°) in
+/// the frontal plane. A relaxed A-pose sits the arm ~40° out from the body; the
+/// alternative — the model's T-pose bind — juts it straight out (~90°) and reads
+/// as broken the moment tracking drops. See `apply_idle_arm_pose`.
+const IDLE_ARM_ANGLE_FROM_DOWN_DEG: f32 = 40.0;
+
 /// Rest deadband on expression weights (`solve_expressions`, eye/brow
 /// path). The FaceMesh blink/eye blendshapes jitter ±0.04 per frame at
 /// rest — the visible eye "twitch" — while a real blink is a Δ≈1.0 jump.
@@ -377,6 +383,13 @@ pub struct SolverParams {
     /// self-recentring fought the true distance signal). `Some(h)` restores that
     /// self-recentring EMA for a framed-avatar mode that should stay centred.
     pub root_recenter_horizon_s: Option<f32>,
+    /// Rest an UNTRACKED arm in a relaxed A-pose (arms angled down) instead of
+    /// leaving it at the model's bind, which for the common T-pose rig juts the
+    /// arm straight out and snaps in the instant the arm leaves frame. When on,
+    /// an undriven arm fades to the A-pose via the same blend as a tracked one,
+    /// so drop-out and re-acquire are smooth. Tracked arms are unaffected (their
+    /// direction-match is bind-relative). Default `true`; exposed for A/B.
+    pub idle_arm_apose_enabled: bool,
 }
 
 impl Default for SolverParams {
@@ -399,6 +412,7 @@ impl Default for SolverParams {
             arm_reach_ik_enabled: true,
             contact_ik_enabled: true,
             root_recenter_horizon_s: None,
+            idle_arm_apose_enabled: true,
         }
     }
 }
@@ -1214,6 +1228,10 @@ pub fn solve_avatar_pose(
     // installs a full 3-DoF wrist rotation derived from the four MCPs
     // (palm plane normal) before the first finger entry runs.
     let mut wrists_oriented = false;
+    // Which arm bones the loop actually drove this frame — an undriven arm bone
+    // gets the A-pose idle below instead of snapping to the T-pose bind.
+    // Index: 0 = LeftUpperArm, 1 = LeftLowerArm, 2 = RightUpperArm, 3 = RightLowerArm.
+    let mut arm_driven = [false; 4];
     for &(bone, tip) in DRIVEN_BONES {
         // GUI retargeting toggles. `hand_tracking_enabled` skips both the
         // wrist 3-DoF orientation pass and every finger bone, so the hand
@@ -1644,6 +1662,46 @@ pub fn solve_avatar_pose(
         // same pass see the updated parent orientation.
         let updated_world = quat_mul(&parent_world_rot, &local_transforms[node_idx].rotation);
         current_world[node_idx].rotation = updated_world;
+
+        match bone {
+            HumanoidBone::LeftUpperArm => arm_driven[0] = true,
+            HumanoidBone::LeftLowerArm => arm_driven[1] = true,
+            HumanoidBone::RightUpperArm => arm_driven[2] = true,
+            HumanoidBone::RightLowerArm => arm_driven[3] = true,
+            _ => {}
+        }
+    }
+
+    // A-pose idle: any arm bone the loop could not drive (arm out of frame /
+    // wrist not tracked) rests in a relaxed A-pose rather than the T-pose bind.
+    if params.idle_arm_apose_enabled {
+        let idle_alpha = dt_aware_blend(params.rotation_blend, dt);
+        apply_idle_arm_pose(
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::LeftLowerArm,
+            arm_driven[0],
+            arm_driven[1],
+            skeleton,
+            humanoid,
+            &rest_world,
+            &mut current_world,
+            local_transforms,
+            state,
+            idle_alpha,
+        );
+        apply_idle_arm_pose(
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::RightLowerArm,
+            arm_driven[2],
+            arm_driven[3],
+            skeleton,
+            humanoid,
+            &rest_world,
+            &mut current_world,
+            local_transforms,
+            state,
+            idle_alpha,
+        );
     }
 
     // Face pose: drive the Head bone independently. The face track
@@ -1967,6 +2025,115 @@ fn compute_shoulder_yaw_rotation(
     let av_n = [av_h[0] / av_len, 0.0, av_h[2] / av_len];
 
     Some(quat_from_vectors(&av_n, &src_n))
+}
+
+/// A-pose idle world direction for an arm whose rest bone axis is `rest_dir`,
+/// under torso rotation `torso_delta` (rest → current). Down-and-out at
+/// `IDLE_ARM_ANGLE_FROM_DOWN_DEG` from straight-down, in the frontal plane, with
+/// the horizontal sign taken from `rest_dir` so each arm stays on its own side.
+fn idle_arm_direction(rest_dir: Vec3, torso_delta: Quat) -> Vec3 {
+    let s = if rest_dir[0] >= 0.0 { 1.0 } else { -1.0 };
+    let th = IDLE_ARM_ANGLE_FROM_DOWN_DEG.to_radians();
+    let idle_body = [s * th.sin(), -th.cos(), 0.0];
+    quat_rotate_vec3(&torso_delta, &idle_body)
+}
+
+/// Rest an untracked arm in a relaxed A-pose instead of the T-pose bind. Bones
+/// the direction-match loop drove are flagged and skipped here; only a bone the
+/// loop left at rest is touched. The upper arm is aimed
+/// `IDLE_ARM_ANGLE_FROM_DOWN_DEG` out from straight-down — in the CURRENT torso
+/// frame so it follows body yaw/tilt — and the forearm fades straight. Both go
+/// through `blend_arm_rotation`, so losing the arm eases into the A-pose and
+/// re-acquiring it eases back out (no snap, unlike the bind which appears the
+/// instant the loop stops writing the bone). Tracked arms are untouched: their
+/// direction-match is bind-relative, so A-pose vs T-pose bind is invisible while
+/// tracking holds.
+#[allow(clippy::too_many_arguments)]
+fn apply_idle_arm_pose(
+    ua_bone: HumanoidBone,
+    la_bone: HumanoidBone,
+    ua_driven: bool,
+    la_driven: bool,
+    skeleton: &SkeletonAsset,
+    humanoid: &HumanoidMap,
+    rest_world: &[WorldXform],
+    current_world: &mut [WorldXform],
+    local_transforms: &mut [Transform],
+    state: &mut PoseSolverState,
+    alpha: f32,
+) {
+    if ua_driven && la_driven {
+        return;
+    }
+    let (Some(ua), Some(la)) = (
+        humanoid.bone_map.get(&ua_bone).copied(),
+        humanoid.bone_map.get(&la_bone).copied(),
+    ) else {
+        return;
+    };
+    let (ua_idx, la_idx) = (ua.0 as usize, la.0 as usize);
+    if ua_idx >= rest_world.len() || la_idx >= rest_world.len() {
+        return;
+    }
+
+    // Torso delta (rest → current) so the idle arm follows body yaw / tilt.
+    let torso_delta = humanoid
+        .bone_map
+        .get(&HumanoidBone::Hips)
+        .map(|h| h.0 as usize)
+        .filter(|&i| i < rest_world.len())
+        .map(|i| quat_mul(&current_world[i].rotation, &quat_conjugate(&rest_world[i].rotation)))
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+
+    let parent_world = |idx: usize, cw: &[WorldXform]| -> Quat {
+        skeleton.nodes[idx]
+            .parent
+            .map(|NodeId(p)| cw[p as usize].rotation)
+            .unwrap_or([0.0, 0.0, 0.0, 1.0])
+    };
+
+    if !ua_driven {
+        // Rest bone axis (shoulder → elbow); its X sign keeps the arm on its own
+        // side so the A-pose is left/right correct on any rig.
+        let rest_dir = vec3_normalize(&vec3_sub(
+            &rest_world[la_idx].position,
+            &rest_world[ua_idx].position,
+        ));
+        if rest_dir != [0.0; 3] {
+            let rest_dir_w = quat_rotate_vec3(&torso_delta, &rest_dir);
+            let idle_dir_w = idle_arm_direction(rest_dir, torso_delta);
+            let q = quat_from_vectors(&rest_dir_w, &idle_dir_w);
+            let target_world =
+                quat_mul(&q, &quat_mul(&torso_delta, &rest_world[ua_idx].rotation));
+            let pw = parent_world(ua_idx, current_world);
+            let new_local = quat_normalize(&quat_mul(&quat_conjugate(&pw), &target_world));
+            local_transforms[ua_idx].rotation = blend_arm_rotation(
+                state,
+                ua_idx,
+                local_transforms[ua_idx].rotation,
+                &new_local,
+                alpha,
+                0.0,
+            );
+            current_world[ua_idx].rotation = quat_mul(&pw, &local_transforms[ua_idx].rotation);
+        }
+    }
+
+    if !la_driven {
+        // Straighten the forearm: fade toward its rest-local (a continuation of
+        // the upper arm) so it hangs straight instead of holding a stale bend.
+        let rest_local = skeleton.nodes[la_idx].rest_local.rotation;
+        local_transforms[la_idx].rotation = blend_arm_rotation(
+            state,
+            la_idx,
+            local_transforms[la_idx].rotation,
+            &rest_local,
+            alpha,
+            0.0,
+        );
+        let pw = parent_world(la_idx, current_world);
+        current_world[la_idx].rotation = quat_mul(&pw, &local_transforms[la_idx].rotation);
+    }
 }
 
 fn apply_face_pose(
@@ -2560,6 +2727,37 @@ mod arm_contact_ik_tests {
         assert!(
             elbow[2] < 0.0,
             "elbow should bend behind the shoulder→wrist line, got {elbow:?}"
+        );
+    }
+
+    /// The A-pose idle direction sits an untracked arm down-and-out at the
+    /// configured angle (40° from straight-down), on its own side, and follows
+    /// a torso yaw — replacing the T-pose bind that would jut the arm out flat.
+    #[test]
+    fn idle_arm_direction_is_a_pose() {
+        let ident = [0.0, 0.0, 0.0, 1.0];
+        let down = [0.0, -1.0, 0.0];
+
+        // Left arm (rest axis +x): down-and-out to the left, 40° off vertical.
+        let l = idle_arm_direction([1.0, 0.0, 0.0], ident);
+        assert!(l[1] < 0.0, "left idle arm should point downward: {l:?}");
+        assert!(l[0] > 0.0, "left idle arm should stay on the +x side: {l:?}");
+        let ang_l = vec3_dot(&vec3_normalize(&l), &down).clamp(-1.0, 1.0).acos().to_degrees();
+        assert!((ang_l - 40.0).abs() < 0.5, "left arm angle from down = {ang_l}, want 40");
+
+        // Right arm (rest axis −x): mirror — stays on the −x side.
+        let r = idle_arm_direction([-1.0, 0.0, 0.0], ident);
+        assert!(r[1] < 0.0 && r[0] < 0.0, "right idle arm should point down-right: {r:?}");
+
+        // Under a 90° torso yaw (about +y) the arm still points down, but its
+        // outward component rotates out of the x axis into z (sign is the quat
+        // handedness convention — assert magnitude, not sign).
+        let yaw90 = [0.0, (std::f32::consts::FRAC_PI_4).sin(), 0.0, (std::f32::consts::FRAC_PI_4).cos()];
+        let ly = idle_arm_direction([1.0, 0.0, 0.0], yaw90);
+        assert!(ly[1] < 0.0, "yawed idle arm still points down: {ly:?}");
+        assert!(
+            ly[0].abs() < 0.2 && ly[2].abs() > 0.4,
+            "yawed idle arm's outward axis should rotate from x into z: {ly:?}"
         );
     }
 }

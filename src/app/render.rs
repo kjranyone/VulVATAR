@@ -186,6 +186,9 @@ impl Application {
         if let Some(v) = tuning.contact_ik {
             solver_params.contact_ik_enabled = v;
         }
+        if let Some(v) = tuning.idle_arm_apose {
+            solver_params.idle_arm_apose_enabled = v;
+        }
         if let Some(v) = tuning.joint_confidence_threshold {
             solver_params.joint_confidence_threshold = v;
         }

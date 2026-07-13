@@ -158,6 +158,7 @@ pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(pos: F) {
 pub struct Tuning {
     pub arm_reach_ik: Option<bool>,
     pub contact_ik: Option<bool>,
+    pub idle_arm_apose: Option<bool>,
     pub joint_confidence_threshold: Option<f32>,
 }
 
@@ -166,6 +167,7 @@ static TUNING_CACHE: Mutex<(Option<SystemTime>, Tuning)> = Mutex::new((
     Tuning {
         arm_reach_ik: None,
         contact_ik: None,
+        idle_arm_apose: None,
         joint_confidence_threshold: None,
     },
 ));
@@ -189,6 +191,7 @@ pub fn load_tuning() -> Tuning {
         .map(|v| Tuning {
             arm_reach_ik: v.get("arm_reach_ik").and_then(|x| x.as_bool()),
             contact_ik: v.get("contact_ik").and_then(|x| x.as_bool()),
+            idle_arm_apose: v.get("idle_arm_apose").and_then(|x| x.as_bool()),
             joint_confidence_threshold: v
                 .get("joint_confidence_threshold")
                 .and_then(|x| x.as_f64())
