@@ -8,9 +8,9 @@ The goal is to make async tracking and async output explicit without making the 
 
 Related documents:
 
-- [architecture.md](/C:/lib/github/kjranyone/VulVATAR/docs/architecture.md)
-- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
-- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
+- [architecture.md](architecture.md)
+- [tracking-retargeting.md](tracking-retargeting.md)
+- [output-interop.md](output-interop.md)
 
 ## Thread Roles
 

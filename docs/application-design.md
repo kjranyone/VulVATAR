@@ -15,14 +15,14 @@ It does not replace `architecture.md`.
 
 `architecture.md` defines runtime boundaries, data ownership, and update order.
 
-Detailed cloth authoring workflow lives in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
+Detailed cloth authoring workflow lives in [editor-cloth-authoring.md](editor-cloth-authoring.md).
 
 Related detailed contracts:
 
-- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
-- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
-- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
-- [vulkano-renderer-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/vulkano-renderer-design.md)
+- [project-persistence.md](project-persistence.md)
+- [tracking-retargeting.md](tracking-retargeting.md)
+- [output-interop.md](output-interop.md)
+- [vulkano-renderer-design.md](vulkano-renderer-design.md)
 
 ## Product Goal
 
@@ -102,7 +102,7 @@ Purpose:
 - preview cloth simulation
 - save overlay data
 
-Detailed flow is defined in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
+Detailed flow is defined in [editor-cloth-authoring.md](editor-cloth-authoring.md).
 
 ## Top-Level Layout
 
@@ -386,7 +386,7 @@ Indicators:
 
 This mode is a specialized editor entry point, not a separate application.
 
-Its detailed structure is defined in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
+Its detailed structure is defined in [editor-cloth-authoring.md](editor-cloth-authoring.md).
 
 At the application level, the important rule is:
 

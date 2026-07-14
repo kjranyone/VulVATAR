@@ -3,26 +3,45 @@
 This document describes the design and implementation of the ONNX
 Runtime-based whole-body tracking pipeline used in VulVATAR. The
 2026-06 provider unification removed the alternative pipelines
-(ViTPose, CIGPose+MoGe-2, HMR2, MediaPipe hands); RTMW3D (+ optional
-DAv2 depth) won the benchmark on accuracy-per-walltime and is now the
-single pipeline.
+(ViTPose, CIGPose+MoGe-2, HMR2, MediaPipe hands); RTMW3D won the
+benchmark on accuracy-per-walltime and is now the single pipeline.
+
+> **Capture is RealSense D435 — exclusive.** Metric depth for the live
+> build comes from the **RealSense D435** (the sole capture backend,
+> `realsense` feature, shipped in `default`). The tracking worker aligns
+> the D435 depth to the colour frame and injects it per frame via
+> `PoseProvider::set_external_depth`
+> (`build_metric_frame_from_d435` → `estimate_from_external_depth`), so
+> the skeleton is back-projected straight from absolute-metre depth with
+> a true principal point — no scale calibration, no lateral-bias
+> correction. The **DAv2-Small monocular depth stage** described below
+> (and the elaborate §3–§5 guess-layers: ray-IK, `arm_z`, fold, contact)
+> is **legacy / removed from the live path** — it predates the D435
+> metric-depth source and is retained here as historical design context
+> and for the offline RGB-replay benches. With no external depth the
+> provider runs RTMW3D-only and z falls back to RTMW3D's body-prior
+> synthetic.
 
 ## The pipeline
 
 VulVATAR ships a single pose pipeline behind the `PoseProvider`
-trait in `src/tracking/provider.rs`: **RTMW3D with an optional async
-DAv2 metric-depth stage** (`src/tracking/rtmw3d_with_depth.rs`).
+trait in `src/tracking/provider.rs`: **RTMW3D**, lifted to metric
+depth either by the live D435 or (legacy) the DAv2 stage
+(`src/tracking/rtmw3d_with_depth.rs`).
 
 | Stage | Walltime | Z source |
 |---|---:|---|
 | RTMW3D (always) | ~18 ms | Body-prior synthetic z (RTMW3D's SimCC Z heatmap, normalised) |
-| + DAv2 depth stage (when `dav2_small.onnx` is present) | ~24 ms combined | Calibrated metric z: DAv2-Small relative depth + body-anchor 1-DoF solve, async worker |
+| + D435 metric depth (live, `realsense`) | — | Absolute metres from the aligned D435 depth + true principal point, injected via `set_external_depth` |
+| + DAv2 depth stage (legacy, when `dav2_small.onnx` is present) | ~24 ms combined | Calibrated metric z: DAv2-Small relative depth + body-anchor 1-DoF solve, async worker |
 
-When `dav2_small.onnx` is absent the provider logs a load warning
-and runs the identical RTMW3D pipeline without the depth stage. The
-depth path consumes the "depth grid → skeleton" stage in
+The live app always has a D435, so it runs the D435 metric-depth row;
+the DAv2 row is the legacy/offline path. When `dav2_small.onnx` is
+absent the provider logs a load warning and runs the identical RTMW3D
+pipeline without the depth stage. Both depth rows consume the
+"depth grid → skeleton" stage in
 `src/tracking/skeleton_from_depth.rs`; the SourceSkeleton /
-pose-solver machinery described in §3–§5 below is shared by both
+pose-solver machinery described in §3–§5 below is shared by all
 configurations — only the joint-z derivation differs.
 
 ## Pipeline configuration, stage log, safe mode
@@ -460,6 +479,11 @@ fabricate on its own.
 
 ## Feature Flags
 
+- `realsense` — **the capture backend** (RealSense D435, the sole
+  supported camera). Implies `inference` because the D435 metric depth
+  is consumed by the RTMW3D depth lift (`skeleton_from_depth`). Shipped
+  in `default`; see [realsense-build.md](realsense-build.md) for the
+  native `librealsense2` build wiring.
 - `inference` — enables ONNX Runtime + the `Rtmw3dInference` path.
   Without it, the worker falls back to a simple skin-colour HSV
   centroid in `tracking::pose_estimation` (no body joints, just a
@@ -471,7 +495,7 @@ fabricate on its own.
   CPU fallback is visible.
 
 ```bash
-cargo build --features "webcam inference inference-gpu"
+cargo build --features "realsense inference inference-gpu"
 ```
 
 ## Face cascade

@@ -8,12 +8,12 @@ It is intentionally separate from `architecture.md`.
 
 `architecture.md` defines runtime ownership, data boundaries, and frame update rules.
 
-Application-level mode structure and non-cloth GUI design live in [application-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/application-design.md).
+Application-level mode structure and non-cloth GUI design live in [application-design.md](application-design.md).
 
 Persistence and data contracts live in:
 
-- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
-- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
+- [data-model.md](data-model.md)
+- [project-persistence.md](project-persistence.md)
 
 This document defines:
 

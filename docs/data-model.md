@@ -11,10 +11,10 @@ It sits between:
 
 Related documents:
 
-- [architecture.md](/C:/lib/github/kjranyone/VulVATAR/docs/architecture.md)
-- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md)
-- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md)
-- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
+- [architecture.md](architecture.md)
+- [project-persistence.md](project-persistence.md)
+- [tracking-retargeting.md](tracking-retargeting.md)
+- [output-interop.md](output-interop.md)
 
 ## Modeling Rules
 

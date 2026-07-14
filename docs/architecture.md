@@ -89,7 +89,7 @@ Rules:
 - runtime must function when no cloth overlay exists
 - editor state must not become a required dependency for playback
 
-Detailed GUI flow and authoring interactions live in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
+Detailed GUI flow and authoring interactions live in [editor-cloth-authoring.md](editor-cloth-authoring.md).
 
 ### Avatar Layer
 
@@ -308,7 +308,7 @@ That means:
 - `ClothAsset` comes from editor-authored overlay data, not from standard VRM 1.0 content
 - the first runtime target should support zero or one optional cloth overlay per avatar instance
 
-The recommended authored representation is not "a few attachment points with local cloth motion". It is a dedicated cloth simulation representation that can drive the rendered garment region. The editor-facing workflow for creating that data is specified separately in [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md).
+The recommended authored representation is not "a few attachment points with local cloth motion". It is a dedicated cloth simulation representation that can drive the rendered garment region. The editor-facing workflow for creating that data is specified separately in [editor-cloth-authoring.md](editor-cloth-authoring.md).
 
 ### Recommended cloth architecture
 
@@ -414,7 +414,7 @@ The core type split — immutable assets (`AvatarAsset`, `ClothAsset`)
 vs. mutable runtime state (`AvatarInstance`, `AvatarPose`,
 `SecondaryMotionState`, `ClothState`) vs. handoff values
 (`TrackingRigPose`, `OutputFrame`) — is specified field-by-field in
-[data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md);
+[data-model.md](data-model.md);
 the implemented structs in `src/asset/mod.rs`, `src/avatar/instance.rs`,
 and `src/output/mod.rs` are the authoritative shapes.
 
@@ -591,21 +591,21 @@ If a feature pressures you into one of those edges, the boundary is probably wro
 
 ## Document Map
 
-For application-level GUI structure and user workflows, see [application-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/application-design.md).
+For application-level GUI structure and user workflows, see [application-design.md](application-design.md).
 
 Detailed contracts per domain:
 
-- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md) — data shape contracts and identifier strategy
-- [project-persistence.md](/C:/lib/github/kjranyone/VulVATAR/docs/project-persistence.md) — file formats, versioning, migration
-- [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md) — thread roles, ownership, shutdown order
-- [gpu-runtime-roadmap.md](/C:/lib/github/kjranyone/VulVATAR/docs/gpu-runtime-roadmap.md) — GPU pressure policy (`RuntimeGpuBudget`)
-- [tracking-retargeting.md](/C:/lib/github/kjranyone/VulVATAR/docs/tracking-retargeting.md) — tracking → rig contract
-- [onnx-tracking-pipeline.md](/C:/lib/github/kjranyone/VulVATAR/docs/onnx-tracking-pipeline.md) — inference pipeline, coordinate conventions
-- [calibration-ux.md](/C:/lib/github/kjranyone/VulVATAR/docs/calibration-ux.md) — pose calibration spec
-- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md) — GPU frame handoff / VGTK sidecar protocol
-- [mf-virtual-camera.md](/C:/lib/github/kjranyone/VulVATAR/docs/mf-virtual-camera.md) — MediaFoundation virtual camera contract
-- [vulkano-renderer-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/vulkano-renderer-design.md) — renderer design, API boundary, materials, MToon status
-- [shader-implementation-notes.md](/C:/lib/github/kjranyone/VulVATAR/docs/shader-implementation-notes.md) — shader-level contracts and gotchas
-- [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md) — cloth authoring UX spec + status
-- [model-library.md](/C:/lib/github/kjranyone/VulVATAR/docs/model-library.md) — avatar library and folder watching
-- [profiling.md](/C:/lib/github/kjranyone/VulVATAR/docs/profiling.md) — instrumentation recipes and known bottlenecks
+- [data-model.md](data-model.md) — data shape contracts and identifier strategy
+- [project-persistence.md](project-persistence.md) — file formats, versioning, migration
+- [threading-model.md](threading-model.md) — thread roles, ownership, shutdown order
+- [gpu-runtime-roadmap.md](gpu-runtime-roadmap.md) — GPU pressure policy (`RuntimeGpuBudget`)
+- [tracking-retargeting.md](tracking-retargeting.md) — tracking → rig contract
+- [onnx-tracking-pipeline.md](onnx-tracking-pipeline.md) — inference pipeline, coordinate conventions
+- [calibration-ux.md](calibration-ux.md) — pose calibration spec
+- [output-interop.md](output-interop.md) — GPU frame handoff / VGTK sidecar protocol
+- [mf-virtual-camera.md](mf-virtual-camera.md) — MediaFoundation virtual camera contract
+- [vulkano-renderer-design.md](vulkano-renderer-design.md) — renderer design, API boundary, materials, MToon status
+- [shader-implementation-notes.md](shader-implementation-notes.md) — shader-level contracts and gotchas
+- [editor-cloth-authoring.md](editor-cloth-authoring.md) — cloth authoring UX spec + status
+- [model-library.md](model-library.md) — avatar library and folder watching
+- [profiling.md](profiling.md) — instrumentation recipes and known bottlenecks

@@ -14,9 +14,9 @@ It covers:
 
 Related documents:
 
-- [architecture.md](/C:/lib/github/kjranyone/VulVATAR/docs/architecture.md)
-- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
-- [threading-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/threading-model.md)
+- [architecture.md](architecture.md)
+- [data-model.md](data-model.md)
+- [threading-model.md](threading-model.md)
 
 ## Core Rule
 

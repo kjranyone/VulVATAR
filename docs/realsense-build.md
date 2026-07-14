@@ -1,10 +1,12 @@
 # Building the `realsense` feature (RealSense D435 depth capture)
 
 The `realsense` cargo feature links `realsense-rust` → `realsense-sys` →
-the native **librealsense2** SDK. It is **off by default**; the normal
-build is unaffected. This wiring is fiddly on Windows because
-`realsense-sys` discovers the SDK purely through `pkg-config` (a Unix
-convention), so a few pieces must be provided by hand.
+the native **librealsense2** SDK. RealSense D435 is the **sole capture
+backend**, so `realsense` ships in the `default` feature set (it implies
+`inference`, since the D435 metric depth is consumed by the RTMW3D depth
+lift). This wiring is fiddly on Windows because `realsense-sys`
+discovers the SDK purely through `pkg-config` (a Unix convention), so a
+few pieces must be provided by hand.
 
 ## System prerequisites
 

@@ -5,7 +5,7 @@
 This document captures implementation-facing shader notes for VulVATAR.
 
 It is intentionally more technical and lower-level than
-[vulkano-renderer-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/vulkano-renderer-design.md)
+[vulkano-renderer-design.md](vulkano-renderer-design.md)
 (which also owns the material strategy and MToon compatibility status).
 
 It focuses on:

@@ -10,9 +10,9 @@ strategy, MToon compatibility status, and validation checklist.
 
 Related documents:
 
-- [architecture.md](/C:/lib/github/kjranyone/VulVATAR/docs/architecture.md)
-- [output-interop.md](/C:/lib/github/kjranyone/VulVATAR/docs/output-interop.md)
-- [shader-implementation-notes.md](/C:/lib/github/kjranyone/VulVATAR/docs/shader-implementation-notes.md)
+- [architecture.md](architecture.md)
+- [output-interop.md](output-interop.md)
+- [shader-implementation-notes.md](shader-implementation-notes.md)
 
 ## Core Rule
 

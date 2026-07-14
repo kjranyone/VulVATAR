@@ -6,9 +6,9 @@ This document defines what VulVATAR saves, where it saves it, and how saved stat
 
 Related documents:
 
-- [application-design.md](/C:/lib/github/kjranyone/VulVATAR/docs/application-design.md)
-- [data-model.md](/C:/lib/github/kjranyone/VulVATAR/docs/data-model.md)
-- [editor-cloth-authoring.md](/C:/lib/github/kjranyone/VulVATAR/docs/editor-cloth-authoring.md)
+- [application-design.md](application-design.md)
+- [data-model.md](data-model.md)
+- [editor-cloth-authoring.md](editor-cloth-authoring.md)
 
 ## Persistence Classes
 
