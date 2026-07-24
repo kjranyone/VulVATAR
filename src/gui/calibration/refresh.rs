@@ -12,7 +12,7 @@ use crate::gui::GuiApp;
 use crate::tracking::{CalibrationMode, MailboxSnapshot};
 
 use super::finalize::measure_shoulder_span;
-use super::pose_match::{pose_match_score, POSE_MATCH_THRESHOLD};
+use super::pose_match::{pose_match_score, stillness_score, POSE_MATCH_THRESHOLD};
 use super::state::{relevant_mode, AnchorSample, CalibrationModalState};
 use super::MIN_FRAME_CONF;
 
@@ -85,6 +85,9 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
             last_confidence,
             no_anchor_since,
             no_lower_arms_since,
+            stillness_fallback,
+            last_anchor_pos,
+            last_seq_consumed,
         } => {
             *last_anchor_seen = anchor_seen;
             *last_confidence = confidence;
@@ -105,21 +108,77 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
             } else if no_lower_arms_since.is_none() {
                 *no_lower_arms_since = Some(now);
             }
-            // Pose-match scoring. Drives the progress bar fill *and*
-            // the auto-transition to Collecting. If no live pose this
-            // frame, score collapses to 0 and `frames_at_match`
-            // resets — a brief tracking dropout doesn't leak into a
-            // stale "almost-matching" state.
-            let score = snap
-                .pose
-                .as_ref()
-                .map(|p| pose_match_score(p, *mode))
-                .unwrap_or(0.0);
-            *last_score = score;
-            if score >= POSE_MATCH_THRESHOLD {
-                *frames_at_match = frames_at_match.saturating_add(1);
+            // Bust-up framing fallback (docs/calibration-ux.md,
+            // Phase H): shoulders visible but elbows cropped out for
+            // the whole hint window means the arm-direction gate can
+            // never fire at this framing. Latch onto the stillness
+            // gate instead of leaving the user stuck at 0 % with a
+            // "step back" hint they can't act on. UpperBody only —
+            // at full-body framing, missing elbows really do mean
+            // "camera too close for a T-pose".
+            if !*stillness_fallback && *mode == CalibrationMode::UpperBody {
+                let elbows_gone_for = no_lower_arms_since
+                    .map(|t| now.duration_since(t).as_secs_f32())
+                    .unwrap_or(0.0);
+                if elbows_gone_for >= super::NO_ANCHOR_HINT_SECONDS {
+                    *stillness_fallback = true;
+                    *last_score = 0.0;
+                    *frames_at_match = 0;
+                    *last_anchor_pos = None;
+                }
+            }
+            if *stillness_fallback {
+                // Stillness gate: score anchor displacement per
+                // *tracking frame* (mailbox sequence), never per GUI
+                // repaint — repaint-rate deltas read as near-zero
+                // motion at any speed.
+                if snap.sequence > *last_seq_consumed {
+                    *last_seq_consumed = snap.sequence;
+                    // Same admission bar Collecting applies to its
+                    // samples: no point starting a capture from
+                    // frames the collection window would reject.
+                    let admitted = snap.pose.as_ref().and_then(|p| {
+                        (anchor_seen && p.overall_confidence >= MIN_FRAME_CONF)
+                            .then_some(p.root_offset)
+                            .flatten()
+                    });
+                    if let Some(pos) = admitted {
+                        let curr = [pos[0], pos[1]];
+                        if let Some(prev) = *last_anchor_pos {
+                            let score = stillness_score(prev, curr);
+                            *last_score = score;
+                            if score > 0.0 {
+                                *frames_at_match = frames_at_match.saturating_add(1);
+                            } else {
+                                *frames_at_match = 0;
+                            }
+                        }
+                        *last_anchor_pos = Some(curr);
+                    } else {
+                        // Dropout: reset the hold *and* the previous
+                        // position so we don't compare across a gap.
+                        *last_score = 0.0;
+                        *frames_at_match = 0;
+                        *last_anchor_pos = None;
+                    }
+                }
             } else {
-                *frames_at_match = 0;
+                // Pose-match scoring. Drives the progress bar fill
+                // *and* the auto-transition to Collecting. If no live
+                // pose this frame, score collapses to 0 and
+                // `frames_at_match` resets — a brief tracking dropout
+                // doesn't leak into a stale "almost-matching" state.
+                let score = snap
+                    .pose
+                    .as_ref()
+                    .map(|p| pose_match_score(p, *mode))
+                    .unwrap_or(0.0);
+                *last_score = score;
+                if score >= POSE_MATCH_THRESHOLD {
+                    *frames_at_match = frames_at_match.saturating_add(1);
+                } else {
+                    *frames_at_match = 0;
+                }
             }
         }
         CalibrationModalState::RangeHoldStill {
@@ -148,6 +207,8 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         mode,
         ref mut samples,
         ref mut expr_accum,
+        ref mut face_accum_mesh,
+        ref mut face_accum_body,
         ref mut last_seq_consumed,
         ..
     } = state.calibration.modal
@@ -176,6 +237,48 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
                         let acc = expr_accum.entry(expr.name.clone()).or_insert((0.0, 0));
                         acc.0 += expr.weight;
                         acc.1 += 1;
+                    }
+                    // Resting head pose for `neutral_face_ypr_{mesh,body}`.
+                    // The snapshot pose is raw (calibration is applied at
+                    // solve time on a clone), so this captures the
+                    // absolute camera-relative angles — no risk of
+                    // subtracting a previous calibration twice. Gate on
+                    // the face's own confidence: a collapsed FaceMesh /
+                    // occluded ear-line pose must not drag the median.
+                    //
+                    // Accumulated per estimator: the published `face`
+                    // feeds the accumulator of whichever source produced
+                    // it, and the always-raw body pose feeds the body
+                    // accumulator so both neutrals are measured in one
+                    // frontal hold (where the mesh wins selection nearly
+                    // every frame).
+                    if let Some(face) = pose.face {
+                        // Mid-crossfade frames carry the TARGET source's
+                        // tag over MIXED angles — admitting them would
+                        // pollute the target source's neutral with the
+                        // other estimator's residual. Skip them; the
+                        // window has ~60 steady frames to spare 6.
+                        if face.confidence >= 0.5 && face.blend.is_none() {
+                            match face.source {
+                                crate::tracking::FaceSource::Mesh => {
+                                    face_accum_mesh.push([face.yaw, face.pitch, face.roll])
+                                }
+                                crate::tracking::FaceSource::Body => {
+                                    face_accum_body.push([face.yaw, face.pitch, face.roll])
+                                }
+                            }
+                        }
+                    }
+                    if let Some(body) = pose.face_body_raw {
+                        // Avoid double-pushing when the body pose was
+                        // also the published selection this frame.
+                        let published_is_body = pose
+                            .face
+                            .map(|f| f.source == crate::tracking::FaceSource::Body)
+                            .unwrap_or(false);
+                        if !published_is_body && body.confidence >= 0.5 {
+                            face_accum_body.push([body.yaw, body.pitch, body.roll]);
+                        }
                     }
                 }
             }

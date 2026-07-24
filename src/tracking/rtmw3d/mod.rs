@@ -133,6 +133,37 @@ pub const YOLOX_REFRESH_PERIOD_DEFAULT: u64 = 4;
 pub static YOLOX_REFRESH_PERIOD: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(YOLOX_REFRESH_PERIOD_DEFAULT);
 
+/// Maximum wall-clock age a sticky YOLOX result may reach before it is
+/// treated as absent — comfortably above the worker's worst observed
+/// latency (~300 ms on the CPU EP) plus the refresh period, but far
+/// below the minutes-old leftovers the sticky outbox holds after a
+/// long self-track run. Compared against device capture timestamps
+/// when both sides carry one.
+#[cfg(feature = "inference")]
+const YOLOX_STICKY_MAX_AGE_S: f64 = 2.0;
+
+/// Frame-count fallback for [`YOLOX_STICKY_MAX_AGE_S`] when capture
+/// timestamps are unavailable (synthetic inputs, offline benches):
+/// 60 frames ≈ 2 s at the nominal 30 fps.
+#[cfg(feature = "inference")]
+const YOLOX_STICKY_MAX_AGE_FRAMES: u64 = 60;
+
+/// Sticky-result staleness: wall-clock when both the current frame and
+/// the detection carry a device timestamp, frame-count fallback
+/// otherwise. Pure so the policy is unit-testable.
+#[cfg(feature = "inference")]
+fn sticky_is_stale(
+    now_ts_ms: Option<f64>,
+    result_ts_ms: Option<f64>,
+    now_frame: u64,
+    result_frame: u64,
+) -> bool {
+    match (now_ts_ms, result_ts_ms) {
+        (Some(now), Some(then)) => now - then > YOLOX_STICKY_MAX_AGE_S * 1000.0,
+        _ => now_frame.saturating_sub(result_frame) > YOLOX_STICKY_MAX_AGE_FRAMES,
+    }
+}
+
 pub struct Rtmw3dInference {
     #[cfg(feature = "inference")]
     session: Session,
@@ -170,8 +201,43 @@ pub struct Rtmw3dInference {
     /// as the (re)acquisition path.
     #[cfg(feature = "inference")]
     self_track_bbox: Option<crate::tracking::yolox::PersonBbox>,
+    /// Last bbox the self-track produced before it (possibly) released.
+    /// Survives a self-track drop and is passed to YOLOX as the
+    /// identity hint: re-acquisition prefers the candidate overlapping
+    /// this region over the highest-score person, so a bystander
+    /// crossing the frame can't steal the track (see
+    /// `YoloxPersonDetector::detect_person`). Cleared with the rest of
+    /// the temporal state on input switch.
+    #[cfg(feature = "inference")]
+    last_self_track: Option<crate::tracking::yolox::PersonBbox>,
+    /// Apparent-size z gain (`crop_h / frame_h`) from the last frame
+    /// whose crop actually tracked the subject. RTMW3D's SimCC-z is
+    /// metric (fixed `RTMW3D_Z_RANGE`), so the remap needs an
+    /// apparent-size gain to keep z proportionate to x/y — but on the
+    /// whole-frame letterbox fallback the crop height is a constant
+    /// unrelated to the subject, so this held gain is used instead
+    /// (continuity across track drops; no ~2.4× z step when the
+    /// subject was framed small). `None` until the first tracked crop
+    /// (fresh session): the fallback's own ratio is the only estimate
+    /// available and matches the pre-track acquisition behaviour.
+    #[cfg(feature = "inference")]
+    last_tracked_z_gain: Option<f32>,
     #[cfg(feature = "inference")]
     arm_len: arm_z::ArmLengthState,
+    /// Stateful mesh↔body head-pose source selection (Schmitt-trigger
+    /// hysteresis + switch crossfade) — see [`face::FaceSourceSelector`].
+    #[cfg(feature = "inference")]
+    face_selector: face::FaceSourceSelector,
+    /// Device capture timestamp (ms) for the NEXT `estimate_pose`, pushed
+    /// by the depth provider via [`Self::set_frame_timestamp_ms`] before
+    /// each call (`None` for synthetic inputs). Consumed once per frame.
+    #[cfg(feature = "inference")]
+    frame_timestamp_ms: Option<f64>,
+    /// Consecutive-timestamp dt derivation for this stage's time-based
+    /// estimators (face-source crossfade, sticky-YOLOX freshness,
+    /// arm-length leaky maxima).
+    #[cfg(feature = "inference")]
+    frame_dt: crate::tracking::skeleton_from_depth::FrameDtTracker,
     #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
@@ -269,10 +335,23 @@ impl Rtmw3dInference {
     #[cfg(feature = "inference")]
     pub fn reset_temporal_state(&mut self) {
         self.self_track_bbox = None;
+        self.last_self_track = None;
+        self.last_tracked_z_gain = None;
         self.arm_len = arm_z::ArmLengthState::default();
+        self.frame_timestamp_ms = None;
+        self.frame_dt.reset();
         if let Some(worker) = self.yolox_worker.as_mut() {
             worker.clear_result();
         }
+    }
+
+    /// Push the device capture timestamp (ms) of the frame about to be
+    /// handed to [`Self::estimate_pose`]. Consumed once per estimate;
+    /// when never pushed (synthetic inputs, benches) the time-based
+    /// estimators run on the nominal 30 fps step.
+    #[cfg(feature = "inference")]
+    pub(in crate::tracking) fn set_frame_timestamp_ms(&mut self, ts_ms: Option<f64>) {
+        self.frame_timestamp_ms = ts_ms;
     }
 
     /// Full-control constructor: EP selection and optional stages per
@@ -382,7 +461,12 @@ impl Rtmw3dInference {
             face_mesh,
             yolox_worker,
             self_track_bbox: None,
+            last_self_track: None,
+            last_tracked_z_gain: None,
             arm_len: arm_z::ArmLengthState::default(),
+            face_selector: face::FaceSourceSelector::default(),
+            frame_timestamp_ms: None,
+            frame_dt: crate::tracking::skeleton_from_depth::FrameDtTracker::default(),
             load_warnings,
             backend,
             force_shoulder_anchor: false,
@@ -440,6 +524,14 @@ impl Rtmw3dInference {
 
         let t_total = std::time::Instant::now();
 
+        // Device capture timestamp for THIS frame (pushed by the depth
+        // provider; `None` on synthetic inputs) and the real dt derived
+        // from consecutive values — the clock for every time-based
+        // estimator in this stage. `take` so a frame that arrives
+        // without a fresh push can't reuse a stale timestamp.
+        let frame_ts_ms = self.frame_timestamp_ms.take();
+        let dt_s = self.frame_dt.tick(frame_ts_ms);
+
         // YOLOX-nano person crop. When a person is detected we crop the
         // frame around them (with padding) before feeding it to RTMW3D
         // — this is the principled fix for small-subject / off-centre /
@@ -479,12 +571,71 @@ impl Rtmw3dInference {
                 let period = YOLOX_REFRESH_PERIOD
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .max(1);
-                if cold_start || frame_index.is_multiple_of(period) {
-                    worker.submit(rgb_data, width, height);
+                let submitted = cold_start || frame_index.is_multiple_of(period);
+                if submitted {
+                    worker.submit(rgb_data, width, height, frame_index, frame_ts_ms, self.last_self_track);
                 }
-                worker.wait_latest().bbox
+                let latest = worker.wait_latest();
+                // Age-gate the sticky result. While the self-track is
+                // live YOLOX receives no submissions, so when the track
+                // eventually drops the outbox may hold a bbox from
+                // minutes ago — cropping to it produces garbage frames
+                // that in turn prevent the self-track from re-forming.
+                // A stale sticky is treated as "no detection" (the
+                // letterboxed whole-frame path takes over) and a fresh
+                // detection is requested immediately instead of waiting
+                // for the next period boundary.
+                if latest.bbox.is_some()
+                    && sticky_is_stale(
+                        frame_ts_ms,
+                        latest.timestamp_ms,
+                        frame_index,
+                        latest.frame_index,
+                    )
+                {
+                    if !submitted {
+                        worker.submit(rgb_data, width, height, frame_index, frame_ts_ms, self.last_self_track);
+                    }
+                    None
+                } else {
+                    latest.bbox
+                }
             } else {
                 None
+            };
+            // Whole-frame fallback: run the frame through the SAME
+            // aspect-preserving virtual-crop path a person bbox takes
+            // (full-frame bbox, zero pad ratio) instead of feeding the
+            // raw frame to `preprocess`'s squash-resize. The squash
+            // contradicted `pad_bbox_to_aspect`'s own documented
+            // rationale (aspect distortion flattens the heatmaps and
+            // edge-clamps elbows) on exactly the acquisition frames
+            // where quality decides whether a self-track ever forms.
+            // Letterboxing costs one extra buffer copy on fallback
+            // frames only.
+            let whole_frame_letterbox = || {
+                let full = crate::tracking::yolox::PersonBbox {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: width as f32,
+                    y2: height as f32,
+                    score: 1.0,
+                };
+                let (fx1, fy1, fx2, fy2) = preprocess::pad_bbox_to_aspect(&full, 0.0);
+                let cw = (fx2 - fx1).round().max(1.0) as u32;
+                let ch = (fy2 - fy1).round().max(1.0) as u32;
+                let (ox, oy) = (fx1.round() as i32, fy1.round() as i32);
+                let crop = preprocess::crop_rgb_padded(rgb_data, width, height, ox, oy, cw, ch);
+                let annotation: Option<(f32, f32, f32, f32)> = None;
+                let empty: &[u8] = &[];
+                (
+                    Some(crop),
+                    empty,
+                    cw,
+                    ch,
+                    Some((ox as f32, oy as f32, cw as f32, ch as f32)),
+                    annotation,
+                )
             };
             match bbox_opt {
                 Some(bbox) => {
@@ -511,7 +662,7 @@ impl Rtmw3dInference {
                     );
                     if cw < 32 || ch < 32 {
                         // Bbox too small to crop usefully — fall through.
-                        (None, rgb_data, width, height, None, None)
+                        whole_frame_letterbox()
                     } else {
                         let crop = preprocess::crop_rgb_padded(rgb_data, width, height, ox, oy, cw, ch);
                         let ann = Some((
@@ -530,7 +681,7 @@ impl Rtmw3dInference {
                         )
                     }
                 }
-                None => (None, rgb_data, width, height, None, None),
+                None => whole_frame_letterbox(),
             }
         };
         let infer_rgb: &[u8] = match &infer_rgb_owned {
@@ -573,14 +724,17 @@ impl Rtmw3dInference {
         crate::tracking::stagelog::mark(frame_index, "rtmw_run_end");
         let dt_run = t_run.elapsed();
 
-        let extract = |name: &Option<String>, expected_len: usize| -> Option<Vec<f32>> {
+        // Decode straight from the borrowed tensor views — the previous
+        // `.to_vec()` per output copied ~1.2 MB of SimCC planes every
+        // frame for no benefit (decode only reads the slices once).
+        let extract = |name: &Option<String>, expected_len: usize| -> Option<&[f32]> {
             let n = name.as_deref()?;
             let v = outputs.get(n)?;
             let (_, data) = v.try_extract_tensor::<f32>().ok()?;
             if data.len() < expected_len {
                 None
             } else {
-                Some(data.to_vec())
+                Some(data)
             }
         };
         let simcc_x = match extract(&x_name, NUM_JOINTS * SIMCC_X_BINS) {
@@ -604,21 +758,33 @@ impl Rtmw3dInference {
                 return empty_estimate(frame_index);
             }
         };
-        drop(outputs);
 
         let t_decode = std::time::Instant::now();
-        let mut joints = decode::decode_simcc(&simcc_x, &simcc_y, &simcc_z);
+        let mut joints = decode::decode_simcc(simcc_x, simcc_y, simcc_z);
+        drop(outputs);
+        let mut applied_z_gain = 1.0f32;
         if let Some((ox, oy, cw, ch)) = crop_origin {
-            // Remap crop-space (nx, ny) ∈ [0, 1]² back to original-frame
-            // (nx, ny). nz is depth — left as-is (model emits it
-            // hip-centred and pose_solver consumes only relative bone
-            // directions, so the absolute z scale is not load-bearing).
-            let inv_w = 1.0 / width as f32;
-            let inv_h = 1.0 / height as f32;
-            for j in joints.iter_mut() {
-                j.nx = (ox + j.nx * cw) * inv_w;
-                j.ny = (oy + j.ny * ch) * inv_h;
-            }
+            // Remap crop-space joints back to original-frame coords,
+            // scaling nz by the subject's apparent size so the x/y/z
+            // unit contract stays distance-invariant. A tracked crop
+            // (bbox / self-track — `annotation_bbox.is_some()`) IS the
+            // apparent-size estimate and refreshes the held gain; the
+            // whole-frame letterbox fallback is not (its crop height is
+            // the constant frame letterbox, ~2.37 on 16:9, regardless
+            // of how small the subject is), so it reuses the last
+            // tracked gain. See `remap_crop_joints` for the metric-z
+            // rationale.
+            let z_gain = if annotation_bbox.is_some() || self.last_tracked_z_gain.is_none() {
+                let g = preprocess::tracked_z_gain(ch, height);
+                if annotation_bbox.is_some() {
+                    self.last_tracked_z_gain = Some(g);
+                }
+                g
+            } else {
+                self.last_tracked_z_gain.unwrap_or_else(|| preprocess::tracked_z_gain(ch, height))
+            };
+            applied_z_gain = z_gain;
+            preprocess::remap_crop_joints(&mut joints, ox, oy, cw, ch, width, height, z_gain);
         }
         // Refresh the self-tracking crop from this frame's own
         // keypoints (whole-frame coords post-remap), with hysteresis.
@@ -659,6 +825,12 @@ impl Rtmw3dInference {
                 }
             }
         };
+        // Remember the most recent live track for YOLOX identity
+        // preference — deliberately NOT cleared when the track drops
+        // (that's exactly when re-acquisition needs the hint).
+        if let Some(b) = self.self_track_bbox {
+            self.last_self_track = Some(b);
+        }
 
         // Hint **overrides** persisted when present, in either direction:
         // the transient GUI hint reflects the mode the user just opened
@@ -676,13 +848,35 @@ impl Rtmw3dInference {
         let mut skeleton =
             skeleton::build_source_skeleton(frame_index, &joints, width, height, force_shoulder);
 
+        // Permanent field instrument for the crop-z contract: raw RTMW3D
+        // source-space z (pre swap-correction, pre depth injection) plus
+        // the nz remap ratio actually applied this frame. Comparing these
+        // lines between a bbox-cropped frame and the same image through
+        // the whole-frame letterbox fallback answers whether the model's
+        // SimCC-z is crop-relative (values match) or metric-fixed (the
+        // letterbox frame inflates by its zratio). Enable with
+        // `RUST_LOG=vulvatar::rawz=debug`.
+        if log::log_enabled!(target: "vulvatar::rawz", log::Level::Debug) {
+            use crate::asset::HumanoidBone::*;
+            let z = |b| skeleton.joints.get(&b).map(|j| j.position[2]);
+            let f = |o: Option<f32>| o.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "-".into());
+            log::debug!(
+                target: "vulvatar::rawz",
+                "frame={} crop={:?} zratio={:.3} Lsh_z={} Rsh_z={} Lel_z={} Rel_z={} Lwr_z={} Rwr_z={}",
+                frame_index, crop_origin, applied_z_gain,
+                f(z(LeftUpperArm)), f(z(RightUpperArm)),
+                f(z(LeftLowerArm)), f(z(RightLowerArm)),
+                f(z(LeftHand)), f(z(RightHand)),
+            );
+        }
+
         // Left/right hand-block transposition fix: when two hands meet
         // at the midline the detector routinely swaps the anatomical
         // left/right hand keypoint blocks (elbows stay correct, wrists +
         // finger chains land on the wrong sides), so the avatar crosses
         // its arms on a fingertips-touch. Correct it before any arm
         // stage consumes the wrists. See `arm_z::correct_hand_lr_swap`.
-        arm_z::correct_hand_lr_swap(&mut skeleton);
+        arm_z::correct_hand_lr_swap(&mut skeleton, &mut self.arm_len);
 
         // Edge-exit repair: keypoints clamped at the frame / crop
         // boundary are observation clamps, not positions — restore
@@ -698,6 +892,7 @@ impl Rtmw3dInference {
             &joints,
             width as f32 / height as f32,
             &mut self.arm_len,
+            dt_s,
         );
 
         // The detected 2D wrist is trusted as-is: the legacy
@@ -719,40 +914,60 @@ impl Rtmw3dInference {
 
         // Face crop → MediaPipe FaceMesh → BlendshapeV2. The bbox is
         // derived from RTMW3D's face-68 landmarks (indices 23..=90)
-        // so the cascade does not need its own face detector. The face
-        // mesh's own confidence is folded into `skeleton.face.confidence`
-        // by taking the max of the body-derived value (5 face landmarks)
-        // and the mesh-model value — they're independent "is the face
-        // visible" signals so the higher one is the better evidence.
-        // The solver's `face_confidence_threshold` then gates head
-        // rotation *and* expressions against this single number.
+        // so the cascade does not need its own face detector. Head-pose
+        // source selection and confidence folding live in
+        // `face::select_face_pose`; the solver's
+        // `face_confidence_threshold` then gates head rotation *and*
+        // expressions against the resulting confidence.
         let t_face = std::time::Instant::now();
         crate::tracking::stagelog::mark(frame_index, "face_begin");
+        let body_face_pose = skeleton.face;
+        let mut dbg_bbox = None;
+        let mut dbg_mesh: Option<(f32, crate::tracking::FacePose)> = None;
+        let mut mesh_face_pose: Option<crate::tracking::FacePose> = None;
+        let mut mesh_conf = 0.0f32;
         if let Some(face_mesh) = self.face_mesh.as_mut() {
             if let Some(bbox) = face::build_face_bbox_from_joints(&joints, width, height) {
-                if let Some((exprs, mesh_conf, mesh_face_pose)) =
+                // Normalised to the image so the overlay tool can draw it
+                // on the down-scaled debug camera frame directly.
+                dbg_bbox = Some((
+                    bbox.x / width as f32,
+                    bbox.y / height as f32,
+                    bbox.size / width as f32,
+                ));
+                if let Some((exprs, conf, pose)) =
                     face_mesh.estimate(rgb_data, width, height, &bbox)
                 {
                     skeleton.expressions = exprs;
-                    skeleton.face_mesh_confidence = Some(mesh_conf);
-                    // Prefer FaceMesh's dense-landmark pose when
-                    // available — it has real Z separation across
-                    // the full 360° head turn including the 22.5°–
-                    // 67.5° "3/4 view" dead-zone where the body-
-                    // derived ear-line pose collapses to ~0 yaw
-                    // (the 5 RTMW3D face landmarks lose nz contrast
-                    // at those angles). Fall back to the body-derived
-                    // pose otherwise. Stamp the FaceMesh model's
-                    // confidence onto the result so the solver can
-                    // still gate against it.
-                    if let Some(mut fp) = mesh_face_pose {
-                        fp.confidence = mesh_conf;
-                        skeleton.face = Some(fp);
-                    } else if let Some(ref mut fp) = skeleton.face {
-                        fp.confidence = fp.confidence.max(mesh_conf);
-                    }
+                    skeleton.face_mesh_confidence = Some(conf);
+                    mesh_conf = conf;
+                    mesh_face_pose = pose;
+                    dbg_mesh = pose.map(|p| (conf, p));
                 }
             }
+        }
+        // Source selection between the body-derived pose and FaceMesh's
+        // dense-landmark pose lives in `face::FaceSourceSelector`: mesh
+        // when it genuinely saw a face (covers the 3/4-view dead-zone
+        // of the body ear-line yaw), body when the mesh score collapses
+        // (profile/back views, where the body pose is strong). Stateful
+        // (hysteresis + crossfade), so it must run every frame — also
+        // on frames where the mesh didn't run at all, which count as
+        // mesh-confidence 0 and release a stale mesh lock.
+        skeleton.face = self
+            .face_selector
+            .select(body_face_pose, mesh_face_pose, mesh_conf, dt_s);
+        // Raw body pose published alongside the selection so the
+        // calibration hold can accumulate a neutral for BOTH sources
+        // in one capture (see `SourceSkeleton::face_body_raw`).
+        skeleton.face_body_raw = body_face_pose;
+        if crate::tracking::debug_channel::enabled() {
+            crate::tracking::debug_channel::stash_face_debug(
+                dbg_bbox,
+                dbg_mesh.map(|(c, _)| c),
+                body_face_pose.map(|p| (p.yaw, p.pitch, p.roll)),
+                dbg_mesh.map(|(_, p)| (p.yaw, p.pitch, p.roll)),
+            );
         }
         crate::tracking::stagelog::mark(frame_index, "face_end");
         let dt_face = t_face.elapsed();
@@ -850,5 +1065,29 @@ fn empty_estimate(frame_index: u64) -> PoseEstimate {
             bounding_box: None,
         },
         skeleton: SourceSkeleton::empty(frame_index),
+    }
+}
+
+#[cfg(all(test, feature = "inference"))]
+mod sticky_age_tests {
+    use super::sticky_is_stale;
+
+    #[test]
+    fn wall_time_governs_when_both_timestamps_present() {
+        // 1.9 s old → fresh; 2.1 s old → stale — regardless of how many
+        // pipeline frames elapsed (a 15 fps stall must not double the
+        // effective hold, nor a 60 fps stream halve it).
+        assert!(!sticky_is_stale(Some(10_000.0), Some(8_100.0), 500, 0));
+        assert!(sticky_is_stale(Some(10_000.0), Some(7_900.0), 500, 440));
+    }
+
+    #[test]
+    fn frame_count_fallback_without_timestamps() {
+        // Synthetic inputs carry no device clock: the nominal-30-fps
+        // frame-count gate takes over, on either side missing.
+        assert!(!sticky_is_stale(None, None, 100, 60));
+        assert!(sticky_is_stale(None, None, 100, 30));
+        assert!(sticky_is_stale(Some(10_000.0), None, 100, 30));
+        assert!(sticky_is_stale(None, Some(8_000.0), 100, 30));
     }
 }

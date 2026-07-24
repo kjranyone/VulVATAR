@@ -202,6 +202,11 @@ fn pose_calibration_to_dto(
             }
         }),
         neutral_expressions: cal.neutral_expressions.clone(),
+        // Legacy mirror of the mesh-source neutral so a downgraded app
+        // still subtracts something sensible.
+        neutral_face_ypr: cal.neutral_face_ypr_mesh.unwrap_or([0.0; 3]),
+        neutral_face_ypr_mesh: cal.neutral_face_ypr_mesh,
+        neutral_face_ypr_body: cal.neutral_face_ypr_body,
     }
 }
 
@@ -251,6 +256,18 @@ fn dto_to_pose_calibration(
             }
         }),
         neutral_expressions: dto.neutral_expressions.clone(),
+        // One-time migration: pre-split saves carried a single neutral
+        // that was, in practice, mesh-sourced (the mesh wins selection
+        // during a frontal calibration hold), so a non-zero legacy
+        // value loads as the mesh neutral when the new field is absent.
+        neutral_face_ypr_mesh: dto.neutral_face_ypr_mesh.or_else(|| {
+            if dto.neutral_face_ypr != [0.0; 3] {
+                Some(dto.neutral_face_ypr)
+            } else {
+                None
+            }
+        }),
+        neutral_face_ypr_body: dto.neutral_face_ypr_body,
     })
 }
 
@@ -365,6 +382,27 @@ pub struct PoseCalibrationDto {
     /// captures taken with face tracking off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub neutral_expressions: Vec<(String, f32)>,
+    /// Legacy single-source resting head pose `[yaw, pitch, roll]`
+    /// (radians). Written by app versions that predate the per-source
+    /// split; on load it migrates to
+    /// [`Self::neutral_face_ypr_mesh`] when the new field is absent
+    /// (the legacy capture path accumulated the *published* face pose,
+    /// which during a frontal hold was effectively always the
+    /// mesh-sourced one). Still written on save (mirroring the mesh
+    /// value) so a downgraded app keeps a usable neutral. Zeros mean
+    /// "not captured".
+    #[serde(default)]
+    pub neutral_face_ypr: [f32; 3],
+    /// Per-source resting head pose (FaceMesh estimator) — see
+    /// `crate::tracking::PoseCalibration::neutral_face_ypr_mesh`.
+    /// `None` for older saves (migrated from the legacy field above)
+    /// and for captures where too few confident mesh frames were seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neutral_face_ypr_mesh: Option<[f32; 3]>,
+    /// Per-source resting head pose (RTMW3D body estimator) — see
+    /// `crate::tracking::PoseCalibration::neutral_face_ypr_body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neutral_face_ypr_body: Option<[f32; 3]>,
 }
 
 /// On-disk DTO mirror of `crate::tracking::TorsoDepthTemplate`.
@@ -580,6 +618,15 @@ pub struct AppSettings {
     /// attach).
     #[serde(default)]
     pub cloth_autosave_consent: Option<bool>,
+    /// Path of the last explicitly opened / saved `.vvtproj`, so the
+    /// next launch re-opens the same project automatically (with the
+    /// title bar showing the real file — unlike the implicit
+    /// `last_session.vvtproj` slot, which stays anonymous). `None` when
+    /// the user never opened or saved a named project, or when the file
+    /// went missing at startup (the field is then cleared so a deleted
+    /// project doesn't warn on every launch).
+    #[serde(default)]
+    pub last_project_path: Option<String>,
 }
 
 fn default_app_settings_version() -> u32 {
@@ -595,6 +642,7 @@ impl Default for AppSettings {
             orbit_sensitivity: default_orbit_sensitivity(),
             pan_sensitivity: default_pan_sensitivity(),
             cloth_autosave_consent: None,
+            last_project_path: None,
         }
     }
 }
@@ -663,6 +711,7 @@ fn migrate_legacy_app_settings_from(path: &Path) -> Option<AppSettings> {
         orbit_sensitivity: legacy.orbit_sensitivity,
         pan_sensitivity: legacy.pan_sensitivity,
         cloth_autosave_consent: legacy.cloth_autosave_consent,
+        last_project_path: None,
     })
 }
 
@@ -1779,6 +1828,7 @@ mod tests {
             orbit_sensitivity: 0.9,
             pan_sensitivity: 3.5,
             cloth_autosave_consent: Some(true),
+            last_project_path: Some("C:/projects/stream.vvtproj".to_string()),
         };
         save_app_settings_to(&original, &path).expect("save");
         let loaded = load_app_settings_from(&path).expect("load");
@@ -1787,6 +1837,32 @@ mod tests {
         assert_eq!(loaded.orbit_sensitivity, 0.9);
         assert_eq!(loaded.pan_sensitivity, 3.5);
         assert_eq!(loaded.cloth_autosave_consent, Some(true));
+        assert_eq!(
+            loaded.last_project_path.as_deref(),
+            Some("C:/projects/stream.vvtproj")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `settings.json` written before `last_project_path` existed
+    /// must keep loading (serde default → `None`), not reset the user's
+    /// preferences to defaults via the parse-failure fallback.
+    #[test]
+    fn app_settings_without_last_project_path_still_load() {
+        let dir = settings_tempdir("pre_last_project");
+        let path = dir.join("settings.json");
+        let pre_split = json!({
+            "format_version": 1,
+            "locale": "zh",
+            "zoom_sensitivity": 0.004,
+            "orbit_sensitivity": 0.6,
+            "pan_sensitivity": 2.0,
+            "cloth_autosave_consent": null
+        });
+        std::fs::write(&path, pre_split.to_string()).expect("write old settings");
+        let loaded = load_app_settings_from(&path).expect("old settings must parse");
+        assert_eq!(loaded.locale, "zh");
+        assert_eq!(loaded.last_project_path, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

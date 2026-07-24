@@ -265,6 +265,8 @@ mod profile_roundtrip_tests {
                     bbox_normalized: [0.30, 0.20, 0.70, 0.65],
                 }),
                 neutral_expressions: Vec::new(),
+                neutral_face_ypr_mesh: Some([-0.61, 0.14, 0.02]),
+                neutral_face_ypr_body: Some([-0.55, 0.31, 0.01]),
             }),
         }
     }
@@ -340,6 +342,16 @@ mod profile_roundtrip_tests {
                     (Some(a), Some(b)) => approx_eq(a, b, "pose.z_range_observed"),
                     (None, None) => {}
                     _ => panic!("pose.z_range_observed presence drifted across round-trip"),
+                }
+                match (rc.neutral_face_ypr_mesh, oc.neutral_face_ypr_mesh) {
+                    (Some(a), Some(b)) => approx_eq_arr3(a, b, "pose.neutral_face_ypr_mesh"),
+                    (None, None) => {}
+                    _ => panic!("pose.neutral_face_ypr_mesh presence drifted across round-trip"),
+                }
+                match (rc.neutral_face_ypr_body, oc.neutral_face_ypr_body) {
+                    (Some(a), Some(b)) => approx_eq_arr3(a, b, "pose.neutral_face_ypr_body"),
+                    (None, None) => {}
+                    _ => panic!("pose.neutral_face_ypr_body presence drifted across round-trip"),
                 }
                 // Torso template — every field, including each cell of
                 // depths_m, must round-trip. A silent drop here would

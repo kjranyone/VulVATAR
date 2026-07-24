@@ -22,6 +22,35 @@ pub(super) const POSE_MATCH_THRESHOLD: f32 = 0.6;
 /// that the user feels the system is laggy after they pose correctly.
 pub(super) const REQUIRED_STABLE_FRAMES: u32 = 15;
 
+/// Per-tracking-frame anchor displacement (source units) below which
+/// a frame counts as "still" for the bust-up stillness fallback gate
+/// (see `docs/calibration-ux.md`, Phase H). Source space is
+/// `y ∈ [-1, 1]`, so 0.010 is 0.5 % of frame height per frame —
+/// generous enough for breathing and keypoint jitter at desk
+/// distance, tight enough that leaning or reaching resets the hold.
+/// Must be evaluated against per-*mailbox-sequence* deltas, not
+/// per-repaint deltas: the GUI repaints faster than the tracker
+/// emits frames and per-repaint displacement reads as near-zero at
+/// any real motion speed.
+pub(super) const STILLNESS_EPS: f32 = 0.010;
+
+/// Stillness score in `[0.0, 1.0]` for the bust-up fallback gate:
+/// `1 − displacement / STILLNESS_EPS`, clamped. `> 0.0` means the
+/// frame counts toward the stable-hold tally; `0.0` (displacement at
+/// or beyond the epsilon) resets it — mirroring how the
+/// arm-direction gate treats sub-threshold match scores. The linear
+/// ramp doubles as the progress-bar fill so the bar keeps its
+/// "closer to ready" meaning while the fallback is engaged.
+pub(super) fn stillness_score(prev: [f32; 2], curr: [f32; 2]) -> f32 {
+    let dx = curr[0] - prev[0];
+    let dy = curr[1] - prev[1];
+    let disp = (dx * dx + dy * dy).sqrt();
+    if !disp.is_finite() {
+        return 0.0;
+    }
+    (1.0 - disp / STILLNESS_EPS).clamp(0.0, 1.0)
+}
+
 /// Score in `[0.0, 1.0]` measuring how well the user's live pose
 /// matches the calibration mode's *target* pose:
 ///
@@ -107,4 +136,35 @@ fn arm_direction(pose: &SourceSkeleton, avatar_left: bool) -> Option<[f32; 2]> {
 fn direction_match(actual: [f32; 2], target: [f32; 2]) -> f32 {
     let dot = actual[0] * target[0] + actual[1] * target[1];
     (((dot + 1.0) * 0.5).clamp(0.0, 1.0)).powi(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stillness_score_perfect_hold_is_one() {
+        assert_eq!(stillness_score([0.2, -0.5], [0.2, -0.5]), 1.0);
+    }
+
+    #[test]
+    fn stillness_score_at_epsilon_is_zero() {
+        // Displacement exactly STILLNESS_EPS must reset the hold —
+        // the gate condition is `score > 0.0`.
+        assert_eq!(stillness_score([0.0, 0.0], [STILLNESS_EPS, 0.0]), 0.0);
+        assert_eq!(stillness_score([0.0, 0.0], [0.0, STILLNESS_EPS * 3.0]), 0.0);
+    }
+
+    #[test]
+    fn stillness_score_sub_epsilon_jitter_counts() {
+        // Half-epsilon jitter (breathing / keypoint noise) must keep
+        // the hold alive with a midway progress-bar fill.
+        let s = stillness_score([0.0, 0.0], [STILLNESS_EPS * 0.5, 0.0]);
+        assert!((s - 0.5).abs() < 1e-6, "got {s}");
+    }
+
+    #[test]
+    fn stillness_score_non_finite_resets() {
+        assert_eq!(stillness_score([f32::NAN, 0.0], [0.0, 0.0]), 0.0);
+    }
 }

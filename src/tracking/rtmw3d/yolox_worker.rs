@@ -24,11 +24,36 @@ struct DetectRequest {
     width: u32,
     height: u32,
     generation: u64,
+    /// Pipeline frame index of the submitted frame — carried through to
+    /// [`DetectResult::frame_index`] so the consumer can age the sticky
+    /// result.
+    frame_index: u64,
+    /// Device capture timestamp (ms) of the submitted frame, when the
+    /// pipeline carries one — carried through to
+    /// [`DetectResult::timestamp_ms`] so staleness is judged in wall
+    /// time rather than frame counts.
+    timestamp_ms: Option<f64>,
+    /// Last known subject bbox (typically the most recent self-track
+    /// crop). When several people clear the detector threshold, the
+    /// candidate overlapping this region wins over the highest-score
+    /// one — re-acquisition must find the SAME person, not whoever is
+    /// currently largest in frame.
+    prefer: Option<PersonBbox>,
 }
 
 pub(super) struct DetectResult {
     pub bbox: Option<PersonBbox>,
     pub generation: u64,
+    /// Frame index the detection ran on. The sticky-outbox design means
+    /// this can be arbitrarily old when no submissions happened for a
+    /// while (self-track live); consumers MUST age-gate on it instead of
+    /// trusting the bbox unconditionally.
+    pub frame_index: u64,
+    /// Device capture timestamp (ms) of the frame the detection ran on;
+    /// `None` when the pipeline carries no device clock (synthetic
+    /// inputs). The wall-time counterpart of `frame_index` for the
+    /// age gate.
+    pub timestamp_ms: Option<f64>,
 }
 
 pub(super) struct DetectOutbox {
@@ -70,12 +95,23 @@ impl YoloxWorker {
     /// Submit a new frame for detection. The latest-only inbox drops any
     /// still-pending frame so the worker always processes the freshest
     /// submission. Cheap (one Vec clone of the RGB buffer).
-    pub fn submit(&self, rgb: &[u8], width: u32, height: u32) {
+    pub fn submit(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        frame_index: u64,
+        timestamp_ms: Option<f64>,
+        prefer: Option<PersonBbox>,
+    ) {
         self.inbox.put(DetectRequest {
             rgb: rgb.to_vec(),
             width,
             height,
             generation: self.generation,
+            frame_index,
+            timestamp_ms,
+            prefer,
         });
     }
 
@@ -132,10 +168,12 @@ fn worker_loop(
     // `take_blocking` already yields only the latest submitted frame, so
     // no drain loop is needed; it returns `None` when the worker is closed.
     while let Some(req) = inbox.take_blocking() {
-        let bbox = detector.detect_largest_person(&req.rgb, req.width, req.height);
+        let bbox = detector.detect_person(&req.rgb, req.width, req.height, req.prefer.as_ref());
         let result = Arc::new(DetectResult {
             bbox,
             generation: req.generation,
+            frame_index: req.frame_index,
+            timestamp_ms: req.timestamp_ms,
         });
         {
             let mut slot = outbox.slot.lock().unwrap();

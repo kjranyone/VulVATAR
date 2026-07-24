@@ -170,6 +170,35 @@ pub struct PoseCalibration {
     /// Stored as an ordered `Vec` (not a map) for stable on-disk JSON.
     #[serde(default)]
     pub neutral_expressions: Vec<(String, f32)>,
+    /// Resting head pose `[yaw, pitch, roll]` (radians) captured from
+    /// the **FaceMesh** estimator across the calibration window while
+    /// the user holds their natural "facing forward" posture.
+    /// Subtracted from live *mesh-sourced* face poses by
+    /// [`crate::tracking::TrackingCalibration::apply_calibration`] so
+    /// "neutral" really is `yaw = pitch = roll = 0` *for this person's
+    /// setup*: a camera mounted off eye line (moderately — the atan
+    /// saturation and mesh profile collapse cap the correctable offset
+    /// at roughly ±20°) otherwise bakes a constant head turn/tilt into
+    /// the avatar.
+    ///
+    /// Per-source split rationale: the mesh and body estimators carry
+    /// *different* systematic residuals (different landmark sets and
+    /// hardcoded anatomical neutrals), so a neutral measured from one
+    /// must never be subtracted from the other — that turns every
+    /// runtime source switch into a visible head step. `None` when too
+    /// few confident mesh frames were seen during the hold; subtraction
+    /// for that source is then a no-op (the hardcoded anatomical
+    /// neutral inside the estimator still applies).
+    #[serde(default)]
+    pub neutral_face_ypr_mesh: Option<[f32; 3]>,
+    /// Resting head pose from the **body** (RTMW3D ear/eye-line)
+    /// estimator over the same window — see
+    /// [`Self::neutral_face_ypr_mesh`] for the per-source rationale.
+    /// Accumulated from `SourceSkeleton::face_body_raw` so a frontal
+    /// hold (where the mesh wins selection nearly every frame) still
+    /// measures the body-path residual.
+    #[serde(default)]
+    pub neutral_face_ypr_body: Option<[f32; 3]>,
 }
 
 /// Calibrated torso surface depth profile. Captured during the
@@ -234,5 +263,19 @@ impl PoseCalibration {
     /// and auto-EMA / hardcoded-clamp behaviour.
     pub fn is_active(&self) -> bool {
         self.frame_count > 0
+    }
+
+    /// The neutral head pose measured for `source`, if the calibration
+    /// hold gathered enough confident frames from that estimator.
+    /// Subtraction must be keyed on the live pose's own source — see
+    /// [`Self::neutral_face_ypr_mesh`].
+    pub fn neutral_face_ypr_for(
+        &self,
+        source: super::source_skeleton::FaceSource,
+    ) -> Option<[f32; 3]> {
+        match source {
+            super::source_skeleton::FaceSource::Mesh => self.neutral_face_ypr_mesh,
+            super::source_skeleton::FaceSource::Body => self.neutral_face_ypr_body,
+        }
     }
 }

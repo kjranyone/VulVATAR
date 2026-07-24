@@ -88,6 +88,9 @@ fn load_metric_depth(
     }
     Ok(vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame {
         width: dw, height: dh, points_m, crop: None, intrinsics: Some(intr),
+        // Offline replay at the recorded cadence — the nominal 30 fps
+        // fallback matches the capture rate.
+        timestamp_ms: None,
     })
 }
 

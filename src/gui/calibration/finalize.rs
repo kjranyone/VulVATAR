@@ -36,12 +36,24 @@ pub(super) fn finalize_collection(
     // escape-hatch path (Capture Now hit before any frames were
     // collected) yields an empty vec.
     type ExprAccum = std::collections::HashMap<String, (f32, usize)>;
-    let (samples, expr_accum): (Vec<AnchorSample>, ExprAccum) = match &mut state.calibration.modal
-    {
+    type FaceAccums = (Vec<[f32; 3]>, Vec<[f32; 3]>);
+    let (samples, expr_accum, (face_accum_mesh, face_accum_body)): (
+        Vec<AnchorSample>,
+        ExprAccum,
+        FaceAccums,
+    ) = match &mut state.calibration.modal {
         CalibrationModalState::Collecting {
-            samples, expr_accum, ..
-        } => (std::mem::take(samples), std::mem::take(expr_accum)),
-        _ => (Vec::new(), ExprAccum::new()),
+            samples,
+            expr_accum,
+            face_accum_mesh,
+            face_accum_body,
+            ..
+        } => (
+            std::mem::take(samples),
+            std::mem::take(expr_accum),
+            (std::mem::take(face_accum_mesh), std::mem::take(face_accum_body)),
+        ),
+        _ => (Vec::new(), ExprAccum::new(), (Vec::new(), Vec::new())),
     };
 
     // Tell the worker to stop accumulating torso template samples
@@ -66,6 +78,15 @@ pub(super) fn finalize_collection(
 
     let mut calibration = aggregate(&samples, mode);
 
+    // A recalibration must not silently destroy face data the previous
+    // calibration captured: the user re-running the *pose* capture
+    // (e.g. after moving the camera) with the face momentarily
+    // backlit / the FaceMesh model absent used to overwrite a good
+    // neutral with zeros and an empty expression baseline — a silent
+    // head-orientation regression. Carry the previous values forward
+    // whenever this capture didn't gather enough of its own.
+    let previous = state.app.tracking_calibration.pose.clone();
+
     // Average the resting expression weights into the per-person neutral
     // face baseline (sorted by name so the on-disk JSON is deterministic).
     // Empty when face tracking was off during the hold — `apply_calibration`
@@ -76,7 +97,24 @@ pub(super) fn finalize_collection(
         .map(|(name, (sum, n))| (name, sum / n as f32))
         .collect();
     neutral.sort_by(|a, b| a.0.cmp(&b.0));
+    if neutral.is_empty() {
+        if let Some(prev) = previous.as_ref() {
+            neutral = prev.neutral_expressions.clone();
+        }
+    }
     calibration.neutral_expressions = neutral;
+
+    // Median resting head pose across the hold, independently per
+    // estimator source → the person's neutral yaw/pitch/roll relative
+    // to the camera as each estimator sees it. Median (not mean) so a
+    // brief glance away during the hold doesn't skew the baseline.
+    // Below 5 confident frames for a source the estimate is too thin —
+    // keep the previous calibration's value for that source (or `None`)
+    // rather than baking one noisy reading into every subsequent frame.
+    calibration.neutral_face_ypr_mesh = neutral_from_accum(&face_accum_mesh)
+        .or(previous.as_ref().and_then(|p| p.neutral_face_ypr_mesh));
+    calibration.neutral_face_ypr_body = neutral_from_accum(&face_accum_body)
+        .or(previous.as_ref().and_then(|p| p.neutral_face_ypr_body));
 
     // Write into Application so the solver / project file see the
     // new value next frame. Also push to the tracking mailbox so the
@@ -389,6 +427,10 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         // `expr_accum`; the aggregate over anchor samples has no view of
         // the expression accumulator, so it leaves the baseline empty.
         neutral_expressions: Vec::new(),
+        // Likewise set by the caller from the medianed per-source
+        // face accumulators.
+        neutral_face_ypr_mesh: None,
+        neutral_face_ypr_body: None,
     }
 }
 
@@ -411,6 +453,49 @@ pub(super) fn measure_shoulder_span(pose: &SourceSkeleton) -> Option<f32> {
     } else {
         None
     }
+}
+
+/// Minimum confident frames a face-pose source must contribute during
+/// the hold before its neutral is trusted.
+const FACE_NEUTRAL_MIN_SAMPLES: usize = 5;
+
+/// Maximum per-channel median-absolute-deviation (radians, ≈ 8.6°)
+/// across the hold before the head is considered "not actually held
+/// still" for that source. The pose-match gate only checks the *body*,
+/// so a user reading the on-screen instructions while glancing around
+/// used to bake whatever direction they looked at into the neutral.
+const FACE_NEUTRAL_MAX_MAD_RAD: f32 = 0.15;
+
+/// Per-channel median of a face-pose accumulator, gated on sample
+/// count and on hold stability (median absolute deviation of yaw and
+/// pitch). Returns `None` when the source didn't gather enough
+/// confident frames or the head visibly wandered during the hold —
+/// callers then keep the previous calibration's value for that source.
+fn neutral_from_accum(accum: &[[f32; 3]]) -> Option<[f32; 3]> {
+    if accum.len() < FACE_NEUTRAL_MIN_SAMPLES {
+        return None;
+    }
+    let channel_median = |channel: usize| -> f32 {
+        let mut v: Vec<f32> = accum.iter().map(|s| s[channel]).collect();
+        median_inplace(&mut v)
+    };
+    let medians = [channel_median(0), channel_median(1), channel_median(2)];
+    // Stability: MAD of yaw / pitch (roll wanders far less and is the
+    // least damaging channel to get slightly wrong).
+    for channel in 0..2 {
+        let mut dev: Vec<f32> = accum
+            .iter()
+            .map(|s| (s[channel] - medians[channel]).abs())
+            .collect();
+        let mad = median_inplace(&mut dev);
+        if mad > FACE_NEUTRAL_MAX_MAD_RAD {
+            warn!(
+                "face neutral capture rejected: channel {channel} MAD {mad:.3} rad exceeds {FACE_NEUTRAL_MAX_MAD_RAD:.3} — head not held still",
+            );
+            return None;
+        }
+    }
+    Some(medians)
 }
 
 /// In-place median: sorts `values` and returns the middle (or average
@@ -460,4 +545,61 @@ fn iso_now_from_unix(secs: u64) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, m, d, hour, minute, second
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn steady(n: usize, ypr: [f32; 3]) -> Vec<[f32; 3]> {
+        vec![ypr; n]
+    }
+
+    #[test]
+    fn neutral_from_accum_needs_minimum_samples() {
+        assert_eq!(neutral_from_accum(&steady(4, [0.1, 0.2, 0.0])), None);
+        assert_eq!(
+            neutral_from_accum(&steady(5, [0.1, 0.2, 0.0])),
+            Some([0.1, 0.2, 0.0])
+        );
+    }
+
+    #[test]
+    fn neutral_from_accum_median_averages_even_middle_pair() {
+        // Even-length accumulator: the median must average the two
+        // middle values, not grab the upper one (the old inline
+        // `v[len / 2]` did the latter and was a second, divergent
+        // median implementation next to `median_inplace`).
+        let accum = vec![
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [0.3, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+        ];
+        let n = neutral_from_accum(&accum).unwrap();
+        assert!((n[0] - 0.25).abs() < 1e-6, "expected mid-pair average, got {}", n[0]);
+    }
+
+    #[test]
+    fn neutral_from_accum_rejects_wandering_head() {
+        // Half the hold spent looking 0.5 rad away: MAD blows past the
+        // stability gate, so no neutral must be produced -- the
+        // previous calibration (or None) wins over a garbage capture.
+        let mut accum = steady(6, [0.0, 0.0, 0.0]);
+        accum.extend(steady(6, [0.5, 0.4, 0.0]));
+        assert_eq!(neutral_from_accum(&accum), None);
+    }
+
+    #[test]
+    fn neutral_from_accum_tolerates_brief_glance() {
+        // A short glance away is exactly what the median is for: 2 of
+        // 12 frames off-target must not reject nor skew the result.
+        let mut accum = steady(10, [0.1, -0.05, 0.02]);
+        accum.extend(steady(2, [0.8, 0.3, 0.0]));
+        let n = neutral_from_accum(&accum).unwrap();
+        assert!((n[0] - 0.1).abs() < 1e-6);
+        assert!((n[1] - -0.05).abs() < 1e-6);
+    }
 }

@@ -74,6 +74,17 @@ pub struct Rtmw3dWithDepthProvider {
     /// keeps the avatar's size and distance steady. Reset per session.
     #[cfg(feature = "inference")]
     torso_scale: super::skeleton_from_depth::TorsoScaleStabilizer,
+    /// Hysteresis state for the whole-body L/R transposition correction —
+    /// keeps the ambiguous-evidence zone from flapping the entire skeleton
+    /// left/right at frame rate. Reset per session.
+    #[cfg(feature = "inference")]
+    lr_swap_latch: super::skeleton_from_depth::LrSwapLatch,
+    /// Capture-timestamp dt derivation for the stabiliser's time-based
+    /// estimators (EMA time constants, rejection windows, spike velocity
+    /// gate). Fed from [`MetricDepthFrame::timestamp_ms`]; nominal-30-fps
+    /// fallback for synthetic frames. Reset per session.
+    #[cfg(feature = "inference")]
+    frame_dt: super::skeleton_from_depth::FrameDtTracker,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -118,6 +129,10 @@ impl Rtmw3dWithDepthProvider {
             external_depth: None,
             #[cfg(feature = "inference")]
             torso_scale: super::skeleton_from_depth::TorsoScaleStabilizer::default(),
+            #[cfg(feature = "inference")]
+            lr_swap_latch: super::skeleton_from_depth::LrSwapLatch::default(),
+            #[cfg(feature = "inference")]
+            frame_dt: super::skeleton_from_depth::FrameDtTracker::default(),
         })
     }
 
@@ -188,6 +203,8 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
         {
             self.rtmw3d.reset_temporal_state();
             self.torso_scale.reset();
+            self.lr_swap_latch = super::skeleton_from_depth::LrSwapLatch::default();
+            self.frame_dt.reset();
         }
     }
 
@@ -266,6 +283,14 @@ impl Rtmw3dWithDepthProvider {
             return empty_estimate(frame_index);
         }
 
+        // Hand the device capture timestamp to the inner RTMW3D stage
+        // BEFORE it runs — its own time-based estimators (face-source
+        // crossfade, YOLOX sticky freshness, arm-length leaky maxima)
+        // derive their dt from consecutive values. `None` (no injected
+        // depth / synthetic input) falls back to the nominal 30 fps step.
+        self.rtmw3d
+            .set_frame_timestamp_ms(self.external_depth.as_ref().and_then(|d| d.timestamp_ms));
+
         // Phase 1: RTMW3D — full pipeline (YOLOX + RTMW3D + FaceMesh).
         // We keep its `annotation.keypoints` (whole-frame normalised 2D
         // + score) and `skeleton.expressions` / `face_mesh_confidence`
@@ -293,7 +318,9 @@ impl Rtmw3dWithDepthProvider {
         // calibration + Phase-7 lateral-bias-correction path: the depth is
         // already absolute metric, aligned to this exact frame, with a
         // true principal point — so build the skeleton straight from it.
-        // `take` clears it so a dropped next frame can't reuse stale depth.
+        // `take` consumes it; the worker re-injects fresh depth before every
+        // estimate, so a frame that early-returns above simply leaves a value
+        // that the next injection overwrites — stale depth is never *used*.
         #[cfg(feature = "inference")]
         if let Some(metric_frame) = self.external_depth.take() {
             return self.estimate_from_external_depth(
@@ -351,37 +378,61 @@ impl Rtmw3dWithDepthProvider {
         if self.pose_calibration.is_none() && self.calibration_mode_hint.is_none() {
             opts.force_shoulder_anchor = true;
         }
-        let mut skeleton = match torso_fit::fit_torso(&metric_frame, joints_2d, opts) {
-            Some(mut fit) => {
-                // Zoom-glitch fix: the raw per-frame shoulder span and anchor
-                // depth swing when a hand crosses in front of a shoulder and
-                // contaminates its depth sample — scaling / moving the whole
-                // avatar. Hold both steady with the provider's temporal EMA
-                // before they drive the avatar's scale and root placement.
-                let raw_span = match (fit.r_shoulder_cam, fit.l_shoulder_cam) {
-                    (Some(r), Some(l)) => {
-                        let d = [r[0] - l[0], r[1] - l[1], r[2] - l[2]];
-                        let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                        (s > 0.05).then_some(s)
-                    }
-                    _ => None,
-                };
-                let stable_span = raw_span.map(|s| self.torso_scale.stable_span(s));
-                fit.anchor_cam = self.torso_scale.stable_anchor(fit.anchor_cam);
-                build_skeleton(
-                    frame_index,
-                    joints_2d,
-                    &metric_frame,
-                    fit,
-                    self.pose_calibration.as_ref(),
-                    stable_span,
-                )
-            }
-            None => {
-                warn!("RTMW3D+D435: no torso fit — emitting empty skeleton");
-                SourceSkeleton::empty(frame_index)
-            }
-        };
+        // Torso keypoint sampling is person-band gated against the PREVIOUS
+        // frame's stabilised anchor depth — the same band that protects the
+        // head/hands. This closes the loop where the band's own reference was
+        // built from unguarded samples (a silhouette shoulder over the far
+        // wall re-seated the whole torso onto the background).
+        let person_z_ref = self.torso_scale.anchor_z();
+        // Real capture dt for the stabiliser's time-based estimators: a
+        // dropped frame must widen the spike gate (velocity, not step) and
+        // advance the rejection windows by the true elapsed time.
+        let dt_s = self.frame_dt.tick(metric_frame.timestamp_ms);
+        let mut skeleton =
+            match torso_fit::fit_torso(&metric_frame, joints_2d, opts, person_z_ref) {
+                Some(mut fit) => {
+                    // Zoom-glitch fix: the raw per-frame shoulder span and anchor
+                    // depth swing when a hand crosses in front of a shoulder and
+                    // contaminates its depth sample — scaling / moving the whole
+                    // avatar. Hold both steady with the provider's temporal EMA
+                    // before they drive the avatar's scale and root placement.
+                    //
+                    // A guard-processed pair (fabricated canonical frontal /
+                    // ray re-seated) is NOT a measurement: feeding its span into
+                    // the EMA slid the scale toward the fabrication constant for
+                    // as long as the pose was held (namaste), then back — the
+                    // very "breathing scale" the stabiliser exists to prevent.
+                    // Such frames contribute no measurement; `stable_span(None)`
+                    // returns the held value.
+                    let raw_span = if fit.pair_fabricated || fit.pair_reseated {
+                        None
+                    } else {
+                        match (fit.r_shoulder_cam, fit.l_shoulder_cam) {
+                            (Some(r), Some(l)) => {
+                                let d = [r[0] - l[0], r[1] - l[1], r[2] - l[2]];
+                                let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                                (s > 0.05).then_some(s)
+                            }
+                            _ => None,
+                        }
+                    };
+                    let stable_span = self.torso_scale.stable_span(raw_span, dt_s);
+                    fit.anchor_cam = self.torso_scale.stable_anchor(fit.anchor_cam, dt_s);
+                    build_skeleton(
+                        frame_index,
+                        joints_2d,
+                        &metric_frame,
+                        fit,
+                        self.pose_calibration.as_ref(),
+                        stable_span,
+                        &mut self.lr_swap_latch,
+                    )
+                }
+                None => {
+                    warn!("RTMW3D+D435: no torso fit — emitting empty skeleton");
+                    SourceSkeleton::empty(frame_index)
+                }
+            };
 
         // Inherit RTMW3D's face pose + FaceMesh cascade output (the face
         // track is body-derived and unrelated to the depth source).
@@ -469,5 +520,6 @@ pub fn build_metric_frame_from_d435(
             width: intr.width,
             height: intr.height,
         }),
+        timestamp_ms: Some(frame.timestamp_ms),
     }
 }

@@ -228,16 +228,24 @@ impl YoloxPersonDetector {
         &self.backend
     }
 
-    /// Run detection on the RGB camera frame. Returns the highest-score
-    /// person bbox, or `None` if nothing was detected above
-    /// [`PERSON_SCORE_THRESHOLD`].
+    /// Run detection on the RGB camera frame. Returns the person bbox
+    /// selected by [`select_person`]: the candidate overlapping `prefer`
+    /// (the caller's last known subject region) when one exists, else
+    /// the highest-score candidate. `None` if nothing was detected
+    /// above [`PERSON_SCORE_THRESHOLD`].
+    ///
+    /// The `prefer` hint is what keeps a multi-person scene from
+    /// hijacking the track: without it, re-acquisition after a
+    /// self-track drop simply grabs whoever scores highest — a person
+    /// walking behind the subject could steal the avatar.
     ///
     /// `rgb` is laid out as `H × W × 3` u8 with RGB channel order.
-    pub fn detect_largest_person(
+    pub fn detect_person(
         &mut self,
         rgb: &[u8],
         width: u32,
         height: u32,
+        prefer: Option<&PersonBbox>,
     ) -> Option<PersonBbox> {
         if width == 0 || height == 0 {
             return None;
@@ -276,7 +284,7 @@ impl YoloxPersonDetector {
             width,
             height,
         };
-        match self.schema {
+        let candidates = match self.schema {
             YoloxOutputSchema::MmdeployNms => decode_mmdeploy_nms(
                 &outputs,
                 output_name.as_str(),
@@ -286,8 +294,51 @@ impl YoloxPersonDetector {
             YoloxOutputSchema::RawHead => {
                 decode_raw_head(&outputs, output_name.as_str(), self.input_size, &lbf)
             }
+        };
+        select_person(candidates, prefer)
+    }
+}
+
+/// Intersection-over-union of two person bboxes in frame pixels.
+fn iou(a: &PersonBbox, b: &PersonBbox) -> f32 {
+    let ix = (a.x2.min(b.x2) - a.x1.max(b.x1)).max(0.0);
+    let iy = (a.y2.min(b.y2) - a.y1.max(b.y1)).max(0.0);
+    let inter = ix * iy;
+    let area_a = (a.x2 - a.x1).max(0.0) * (a.y2 - a.y1).max(0.0);
+    let area_b = (b.x2 - b.x1).max(0.0) * (b.y2 - b.y1).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// Minimum overlap with the `prefer` hint for a candidate to count as
+/// "the same person". Below this, the hint region is empty (subject
+/// really left) and we fall back to highest score.
+const PREFER_MIN_IOU: f32 = 0.20;
+
+/// Pick the detection to track: the candidate with the greatest overlap
+/// with `prefer` when any clears [`PREFER_MIN_IOU`], else the
+/// highest-score candidate. Identity continuity beats detector score —
+/// the largest/most-confident person in frame is not necessarily the
+/// person we were tracking.
+fn select_person(candidates: Vec<PersonBbox>, prefer: Option<&PersonBbox>) -> Option<PersonBbox> {
+    if let Some(hint) = prefer {
+        let best_overlap = candidates
+            .iter()
+            .map(|c| (iou(c, hint), c))
+            .filter(|(v, _)| *v >= PREFER_MIN_IOU)
+            .max_by(|(a, _), (b, _)| a.total_cmp(b))
+            .map(|(_, c)| *c);
+        if best_overlap.is_some() {
+            return best_overlap;
         }
     }
+    candidates
+        .into_iter()
+        .max_by(|a, b| a.score.total_cmp(&b.score))
 }
 
 fn decode_mmdeploy_nms(
@@ -295,18 +346,26 @@ fn decode_mmdeploy_nms(
     dets_name: &str,
     labels_name: &str,
     lbf: &LetterboxFrame,
-) -> Option<PersonBbox> {
-    let dets = outputs.get(dets_name)?;
-    let labels = outputs.get(labels_name)?;
-    let (dets_shape, dets_data) = dets.try_extract_tensor::<f32>().ok()?;
-    let (labels_shape, labels_data) = labels.try_extract_tensor::<i64>().ok()?;
+) -> Vec<PersonBbox> {
+    let Some(dets) = outputs.get(dets_name) else {
+        return Vec::new();
+    };
+    let Some(labels) = outputs.get(labels_name) else {
+        return Vec::new();
+    };
+    let Ok((dets_shape, dets_data)) = dets.try_extract_tensor::<f32>() else {
+        return Vec::new();
+    };
+    let Ok((labels_shape, labels_data)) = labels.try_extract_tensor::<i64>() else {
+        return Vec::new();
+    };
 
     if dets_shape.len() != 3 || dets_shape[2] as usize != 5 {
         warn!(
             "YOLOX: unexpected dets shape {:?} (want [1, N, 5])",
             dets_shape
         );
-        return None;
+        return Vec::new();
     }
     let n = dets_shape[1] as usize;
     if labels_shape.len() != 2 || labels_shape[1] as usize != n {
@@ -314,13 +373,13 @@ fn decode_mmdeploy_nms(
             "YOLOX: labels shape {:?} does not match dets count {}",
             labels_shape, n
         );
-        return None;
+        return Vec::new();
     }
     if dets_data.len() < n * 5 || labels_data.len() < n {
-        return None;
+        return Vec::new();
     }
 
-    let mut best: Option<PersonBbox> = None;
+    let mut candidates = Vec::new();
     for (i, &label) in labels_data.iter().take(n).enumerate() {
         if label != PERSON_CLASS_ID as i64 {
             continue;
@@ -338,20 +397,15 @@ fn decode_mmdeploy_nms(
         ) else {
             continue;
         };
-        let bbox = PersonBbox {
+        candidates.push(PersonBbox {
             x1,
             y1,
             x2,
             y2,
             score,
-        };
-        match best {
-            None => best = Some(bbox),
-            Some(prev) if score > prev.score => best = Some(bbox),
-            _ => {}
-        }
+        });
     }
-    best
+    candidates
 }
 
 fn decode_raw_head(
@@ -359,9 +413,13 @@ fn decode_raw_head(
     output_name: &str,
     input_size: u32,
     lbf: &LetterboxFrame,
-) -> Option<PersonBbox> {
-    let head = outputs.get(output_name)?;
-    let (head_shape, head_data) = head.try_extract_tensor::<f32>().ok()?;
+) -> Vec<PersonBbox> {
+    let Some(head) = outputs.get(output_name) else {
+        return Vec::new();
+    };
+    let Ok((head_shape, head_data)) = head.try_extract_tensor::<f32>() else {
+        return Vec::new();
+    };
 
     // Expect (1, N, 85) where N = Σ (input/stride)² over strides.
     if head_shape.len() != 3 || head_shape[2] as usize != ANCHOR_CHANNELS {
@@ -369,7 +427,7 @@ fn decode_raw_head(
             "YOLOX: unexpected output shape {:?} (want [1, N, {}])",
             head_shape, ANCHOR_CHANNELS
         );
-        return None;
+        return Vec::new();
     }
     let n = head_shape[1] as usize;
     let expected_n: usize = STRIDES
@@ -384,13 +442,17 @@ fn decode_raw_head(
             "YOLOX: anchor count mismatch: got {}, expected {} for {}x{} with strides {:?}",
             n, expected_n, input_size, input_size, STRIDES
         );
-        return None;
+        return Vec::new();
     }
     if head_data.len() < n * ANCHOR_CHANNELS {
-        return None;
+        return Vec::new();
     }
 
-    let mut best: Option<PersonBbox> = None;
+    // Raw-head export has no NMS — keep the per-stride best anchor per
+    // rough grid region simple by collecting every passing anchor; the
+    // caller's `select_person` only needs score/overlap, and duplicate
+    // boxes of the same person all overlap the prefer hint equally.
+    let mut candidates = Vec::new();
     let mut anchor_idx: usize = 0;
     for &stride in &STRIDES {
         let grid = (input_size / stride) as usize;
@@ -421,22 +483,17 @@ fn decode_raw_head(
                 else {
                     continue;
                 };
-                let bbox = PersonBbox {
+                candidates.push(PersonBbox {
                     x1,
                     y1,
                     x2,
                     y2,
                     score,
-                };
-                match best {
-                    None => best = Some(bbox),
-                    Some(prev) if score > prev.score => best = Some(bbox),
-                    _ => {}
-                }
+                });
             }
         }
     }
-    best
+    candidates
 }
 
 /// Letterbox to `input_size × input_size` with 114 padding, BGR raw
@@ -505,4 +562,63 @@ fn preprocess(rgb: &[u8], src_w: u32, src_h: u32, input_size: u32) -> (Array4<f3
         }
     }
     (tensor, scale, pad_x, pad_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bb(x1: f32, y1: f32, x2: f32, y2: f32, score: f32) -> PersonBbox {
+        PersonBbox {
+            x1,
+            y1,
+            x2,
+            y2,
+            score,
+        }
+    }
+
+    #[test]
+    fn select_person_prefers_overlap_over_score() {
+        // The previously-tracked subject sits on the left; a larger,
+        // higher-scoring person entered on the right. Identity must win.
+        let subject = bb(100.0, 100.0, 300.0, 500.0, 0.55);
+        let intruder = bb(600.0, 50.0, 1000.0, 700.0, 0.95);
+        let hint = bb(90.0, 110.0, 310.0, 520.0, 1.0);
+        let got = select_person(vec![intruder, subject], Some(&hint)).unwrap();
+        assert!(
+            (got.x1 - subject.x1).abs() < 1e-3,
+            "must reacquire the overlapping subject, not the higher-score intruder"
+        );
+    }
+
+    #[test]
+    fn select_person_falls_back_to_score_when_hint_region_is_empty() {
+        // Subject genuinely left the hint region — highest score wins.
+        let a = bb(600.0, 50.0, 1000.0, 700.0, 0.95);
+        let b = bb(400.0, 50.0, 550.0, 700.0, 0.60);
+        let hint = bb(0.0, 0.0, 50.0, 50.0, 1.0);
+        let got = select_person(vec![b, a], Some(&hint)).unwrap();
+        assert!((got.score - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn select_person_without_hint_is_highest_score() {
+        let a = bb(0.0, 0.0, 10.0, 10.0, 0.4);
+        let b = bb(20.0, 0.0, 30.0, 10.0, 0.7);
+        let got = select_person(vec![a, b], None).unwrap();
+        assert!((got.score - 0.7).abs() < 1e-6);
+        assert!(select_person(Vec::new(), None).is_none());
+    }
+
+    #[test]
+    fn iou_basic_properties() {
+        let a = bb(0.0, 0.0, 100.0, 100.0, 1.0);
+        assert!((iou(&a, &a) - 1.0).abs() < 1e-6);
+        let disjoint = bb(200.0, 200.0, 300.0, 300.0, 1.0);
+        assert_eq!(iou(&a, &disjoint), 0.0);
+        let half = bb(50.0, 0.0, 150.0, 100.0, 1.0);
+        let v = iou(&a, &half);
+        assert!((v - (5000.0 / 15000.0)).abs() < 1e-4);
+    }
 }

@@ -20,15 +20,19 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use log::info;
+use log::{info, warn};
 use realsense_rust::{
     config::Config,
     context::Context,
-    frame::{ColorFrame, DepthFrame, PixelKind},
+    frame::{ColorFrame, DepthFrame},
     prelude::FrameEx,
-    kind::{Rs2CameraInfo, Rs2Format, Rs2ProductLine, Rs2StreamKind},
+    kind::{Rs2CameraInfo, Rs2Format, Rs2Option, Rs2ProductLine, Rs2StreamKind},
     pipeline::{ActivePipeline, InactivePipeline},
-    processing_blocks::align::Align,
+    processing_blocks::{
+        align::Align,
+        options::TemporalFilterOptions,
+        temporal_filter::TemporalFilter,
+    },
 };
 
 /// Depth stream resolution requested from the device. 848x480 is a native
@@ -41,11 +45,35 @@ const DEPTH_H: usize = 480;
 /// until the real value is read from the depth sensor on the first frame.
 const DEFAULT_DEPTH_UNITS_M: f32 = 0.001;
 
+/// Temporal-filter EMA weight of the *current* frame (librealsense
+/// `FILTER_SMOOTH_ALPHA`, valid 0..=1). Intel's recommended default: high
+/// enough that a moving hand converges within ~2 frames (67 ms at 30 fps),
+/// low enough to cut the D435's static temporal jitter (~1 % of z) by
+/// roughly half. Raising it weakens smoothing; lowering it adds visible
+/// lag to fast limbs.
+const TEMPORAL_SMOOTH_ALPHA: f32 = 0.4;
+
+/// Per-pixel step (in raw Z16 units — 20 = 2 cm at the 1 mm default scale)
+/// beyond which the temporal EMA *resets* instead of blending
+/// (librealsense `FILTER_SMOOTH_DELTA`, valid 1..=100, Intel default 20).
+/// This is what keeps the filter honest on moving edges: a hand sweeping
+/// across the background jumps far past 2 cm per frame, so those pixels
+/// restart from the fresh measurement rather than smearing a ghost.
+const TEMPORAL_SMOOTH_DELTA: f32 = 20.0;
+
+/// Escape hatch for A/B measurement (`.db3` replay comparisons, live
+/// diagnostics): set this env var to any value before `open` to stream
+/// unfiltered depth. Default (unset) = filter enabled.
+const TEMPORAL_BYPASS_ENV: &str = "VULVATAR_RS_TEMPORAL_OFF";
+
 /// Pinhole intrinsics of the color image (== the aligned depth image).
 ///
 /// Lens distortion is ignored: the D435 color/aligned stream uses an
-/// (Inverse-)Brown-Conrady model whose coefficients are effectively zero, so a
+/// (Inverse-)Brown-Conrady model whose coefficients are typically zero, so a
 /// pinhole deprojection is accurate to well under the depth noise floor.
+/// This assumption is *verified at runtime* on the first grabbed frame —
+/// a device reporting non-zero coefficients logs a warning instead of
+/// silently biasing edge-of-frame joints.
 #[derive(Clone, Copy, Debug)]
 pub struct CamIntrinsics {
     pub fx: f32,
@@ -83,6 +111,12 @@ pub struct RealSenseFrame {
     pub depth_units: f32,
     /// Intrinsics of the color image (== the aligned depth image).
     pub intrinsics: CamIntrinsics,
+    /// Device (hardware-clock) capture timestamp of the color frame, in
+    /// milliseconds. This is THE time base for the whole tracking
+    /// pipeline: it is carried through `SourceSkeleton.capture_timestamp_ms`
+    /// so downstream filters derive `dt` from when frames were *captured*,
+    /// not when some thread happened to process them.
+    pub timestamp_ms: f64,
 }
 
 impl RealSenseFrame {
@@ -116,12 +150,92 @@ pub struct RealSenseCapture {
     // context that produced it, so `_context` is declared last.
     pipeline: ActivePipeline,
     align: Align,
+    /// Temporal noise filter applied to the *aligned* depth each frame.
+    /// `None` when bypassed via [`TEMPORAL_BYPASS_ENV`], when construction
+    /// failed at `open` (capture must outlive a broken filter block), or
+    /// after a mid-stream filter error disabled it for the session.
+    ///
+    /// Placement note: librealsense's recommended order is filter-then-
+    /// align, but `Align::queue` only accepts a `CompositeFrame` and the
+    /// crate exposes no frameset composer, so a pre-align filtered depth
+    /// frame cannot be recombined with its color frame. Filtering the
+    /// aligned depth is equivalent for this use: static pixels map to
+    /// stable color-grid coordinates (coherent EMA), and moving edges
+    /// exceed `TEMPORAL_SMOOTH_DELTA` so the filter resets there exactly
+    /// as it would pre-align.
+    ///
+    /// Downstream effect when enabled: per-pixel depth jitter roughly
+    /// halves and brief single-frame holes are back-filled by the block's
+    /// default persistence ("valid in 2 of the last 4 frames" — index 3,
+    /// inside the conservative 2–3 band; the crate cannot set the option
+    /// explicitly, so the librealsense default is relied upon and
+    /// documented here). Downstream gates are relative / hold-based since
+    /// the Round-2 rework, so no threshold recalibration is required —
+    /// the replay harness verifies this with [`TEMPORAL_BYPASS_ENV`].
+    temporal: Option<TemporalFilter>,
+    /// One-shot latch for the first-frame distortion verification log.
+    distortion_logged: bool,
     width: u32,
     height: u32,
     depth_units: f32,
     depth_units_cached: bool,
-    timeout: Duration,
+    /// Frames grabbed while `depth_units` was still the compiled-in
+    /// default. Warned once past `DEPTH_UNITS_WARN_FRAMES` — a device
+    /// whose depth unit was reconfigured (e.g. 100 µm by another tool)
+    /// would otherwise mis-scale the whole body silently.
+    depth_units_fallback_frames: u32,
+    /// Nominal frame period from the requested fps; the depth↔color
+    /// timestamp-consistency gate is half of this.
+    frame_period_ms: f64,
+    /// `wait` ceiling for the *first* frame only: the D435 takes multi-
+    /// hundred-ms to produce it after `start` (sensor warm-up / USB
+    /// negotiation).
+    first_timeout: Duration,
+    /// Steady-state `wait` ceiling. Deliberately short: the capture loop
+    /// must re-check its `running` flag often enough that `stop()` never
+    /// has to wait multiple seconds for a wedged camera to time out.
+    steady_timeout: Duration,
+    got_first_frame: bool,
     _context: Context,
+}
+
+/// Frames the app grabs while `depth_units` still carries the default —
+/// past this, warn (once) that the device never reported its depth scale.
+const DEPTH_UNITS_WARN_FRAMES: u32 = 30;
+
+/// Why a single `grab_frame` call yielded no frame. Split so the caller
+/// can tell transient per-frame conditions from capture-stream failures:
+///
+/// * `SyncMismatch` — the frameset arrived but its depth and color
+///   timestamps diverge more than half a frame period (single-stream
+///   drop / auto-exposure fps sag). The *set* is unusable (stale depth
+///   under fresh keypoints teleports limbs) but the stream is healthy:
+///   drop the set, don't count it toward reconnect logic.
+/// * `Capture` — `wait` timed out or the driver errored; counts toward
+///   the consecutive-failure reconnect policy.
+#[derive(Debug, Clone)]
+pub enum GrabError {
+    Capture(String),
+    SyncMismatch { delta_ms: f64 },
+}
+
+impl std::fmt::Display for GrabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GrabError::Capture(msg) => write!(f, "{msg}"),
+            GrabError::SyncMismatch { delta_ms } => write!(
+                f,
+                "realsense: depth/color timestamp mismatch ({delta_ms:.1} ms) — frameset dropped"
+            ),
+        }
+    }
+}
+
+// Lets diagnostic bins keep `grab_frame()?` inside `-> Result<_, String>`.
+impl From<GrabError> for String {
+    fn from(e: GrabError) -> String {
+        e.to_string()
+    }
 }
 
 /// Why opening the D435 stream failed. Typed (rather than a flat `String`)
@@ -233,6 +347,87 @@ impl RealSenseCapture {
             Align::new(Rs2StreamKind::Color, 10)
                 .map_err(|e| OpenFailure::Other(format!("realsense: align: {e}")))?;
 
+        // Pin the color sensor to the requested frame rate. The D435 ships
+        // with auto-exposure *priority* enabled, which silently halves the
+        // color fps in dim rooms while depth keeps streaming at the full
+        // rate — the resulting framesets pair fresh depth with stale color
+        // (or vice versa) and trip the timestamp-consistency gate on every
+        // frame. Priority OFF tells the sensor to keep the fps and accept a
+        // darker image instead. Best-effort: an option a sensor doesn't
+        // support is skipped, and failure to set it never blocks capture.
+        for mut sensor in pipeline.profile().device().sensors() {
+            if !sensor.supports_option(Rs2Option::AutoExposurePriority) {
+                continue;
+            }
+            match sensor.set_option(Rs2Option::AutoExposurePriority, 0.0) {
+                Ok(()) => info!("realsense: color auto-exposure priority disabled (fps pinned)"),
+                Err(e) => warn!("realsense: could not disable auto-exposure priority: {e}"),
+            }
+        }
+
+        // Read the metric depth scale straight off the depth sensor at open.
+        // The per-frame frameset peek (below, in `grab_frame`) stays as the
+        // fallback, but a device whose depth unit was reconfigured by another
+        // tool (e.g. 100 µm) mis-scales *everything*, so the earliest and
+        // most direct read wins.
+        let mut depth_units = DEFAULT_DEPTH_UNITS_M;
+        let mut depth_units_cached = false;
+        for sensor in pipeline.profile().device().sensors() {
+            if let Some(units) = sensor.get_option(Rs2Option::DepthUnits) {
+                if units > 0.0 {
+                    if (units - DEFAULT_DEPTH_UNITS_M).abs() > f32::EPSILON {
+                        warn!(
+                            "realsense: device depth scale is {units} m/unit (not the usual \
+                             {DEFAULT_DEPTH_UNITS_M}) — honouring it; another tool likely \
+                             reconfigured this camera"
+                        );
+                    } else {
+                        info!("realsense: depth scale {units} m/unit (read from sensor at open)");
+                    }
+                    depth_units = units;
+                    depth_units_cached = true;
+                    break;
+                }
+            }
+        }
+
+        // Temporal depth filter — see the `temporal` field docs for placement
+        // and downstream-effect notes. A filter that cannot be constructed or
+        // configured must never take the capture down with it: fall back to
+        // unfiltered streaming with a warning.
+        let temporal = if std::env::var_os(TEMPORAL_BYPASS_ENV).is_some() {
+            info!("realsense: temporal depth filter bypassed ({TEMPORAL_BYPASS_ENV} set)");
+            None
+        } else {
+            match TemporalFilter::new(10) {
+                Ok(mut tf) => match tf.apply_options(&TemporalFilterOptions {
+                    smooth_alpha: Some(TEMPORAL_SMOOTH_ALPHA),
+                    smooth_delta: Some(TEMPORAL_SMOOTH_DELTA),
+                    // Deliberately None: the crate cannot set the persistence
+                    // option (and warns on stdout if asked to). librealsense's
+                    // default persistency index 3 ("valid in 2 / last 4") is
+                    // already the conservative setting this pipeline wants.
+                    persistence_control: None,
+                }) {
+                    Ok(()) => {
+                        info!(
+                            "realsense: temporal depth filter on (alpha {TEMPORAL_SMOOTH_ALPHA}, \
+                             delta {TEMPORAL_SMOOTH_DELTA}, persistence: librealsense default)"
+                        );
+                        Some(tf)
+                    }
+                    Err(e) => {
+                        warn!("realsense: temporal filter options rejected ({e}) — running unfiltered");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("realsense: temporal filter unavailable ({e}) — running unfiltered");
+                    None
+                }
+            }
+        };
+
         info!(
             "realsense: opened {} (serial {}) — color {}x{} @ {} fps, depth {}x{} aligned to color",
             name,
@@ -247,24 +442,37 @@ impl RealSenseCapture {
         Ok(Self {
             pipeline,
             align,
+            temporal,
+            distortion_logged: false,
             width,
             height,
-            depth_units: DEFAULT_DEPTH_UNITS_M,
-            depth_units_cached: false,
-            // Ceiling, not a fixed delay: `wait` returns the instant a frame is
-            // ready. Generous enough to cover the D435's multi-hundred-ms first
-            // frame after `start` (sensor warm-up / USB negotiation).
-            timeout: Duration::from_millis(5000),
+            depth_units,
+            depth_units_cached,
+            depth_units_fallback_frames: 0,
+            frame_period_ms: 1000.0 / (fps.max(1) as f64),
+            // Ceilings, not fixed delays: `wait` returns the instant a frame
+            // is ready. The first frame needs a generous ceiling (sensor
+            // warm-up / USB negotiation take multi-hundred ms); steady state
+            // stays short so a wedged camera can't hold `stop()` hostage —
+            // the capture loop re-checks `running` after every timeout.
+            first_timeout: Duration::from_millis(5000),
+            steady_timeout: Duration::from_millis(500),
+            got_first_frame: false,
             _context: context,
         })
     }
 
     /// Grab one synchronized, color-aligned frame (blocking, with timeout).
-    pub fn grab_frame(&mut self) -> Result<RealSenseFrame, String> {
+    pub fn grab_frame(&mut self) -> Result<RealSenseFrame, GrabError> {
+        let timeout = if self.got_first_frame {
+            self.steady_timeout
+        } else {
+            self.first_timeout
+        };
         let frames = self
             .pipeline
-            .wait(Some(self.timeout))
-            .map_err(|e| format!("realsense: wait for frames: {e}"))?;
+            .wait(Some(timeout))
+            .map_err(|e| GrabError::Capture(format!("realsense: wait for frames: {e}")))?;
 
         // Cache the metric depth scale once, from the *raw* depth sensor — the
         // aligned (synthetic) frame may not expose a sensor. Do this before
@@ -279,66 +487,149 @@ impl RealSenseCapture {
                     }
                 }
             }
+            if !self.depth_units_cached {
+                self.depth_units_fallback_frames += 1;
+                if self.depth_units_fallback_frames == DEPTH_UNITS_WARN_FRAMES {
+                    warn!(
+                        "realsense: depth sensor never reported its depth scale after {} frames — \
+                         assuming the default {} m/unit. If this device's depth unit was \
+                         reconfigured, every distance will be mis-scaled.",
+                        DEPTH_UNITS_WARN_FRAMES, DEFAULT_DEPTH_UNITS_M
+                    );
+                }
+            }
         }
 
         self.align
             .queue(frames)
-            .map_err(|e| format!("realsense: align.queue: {e}"))?;
+            .map_err(|e| GrabError::Capture(format!("realsense: align.queue: {e}")))?;
         let aligned = self
             .align
-            .wait(self.timeout)
-            .map_err(|e| format!("realsense: align.wait: {e}"))?;
+            .wait(timeout)
+            .map_err(|e| GrabError::Capture(format!("realsense: align.wait: {e}")))?;
 
         let depth_frames: Vec<DepthFrame> = aligned.frames_of_type();
         let color_frames: Vec<ColorFrame> = aligned.frames_of_type();
         let depth = depth_frames
-            .first()
-            .ok_or_else(|| "realsense: aligned set has no depth frame".to_string())?;
+            .into_iter()
+            .next()
+            .ok_or_else(|| GrabError::Capture("realsense: aligned set has no depth frame".into()))?;
         let color = color_frames
             .first()
-            .ok_or_else(|| "realsense: aligned set has no color frame".to_string())?;
+            .ok_or_else(|| GrabError::Capture("realsense: aligned set has no color frame".into()))?;
+
+        // Depth ↔ color capture-time consistency. librealsense's frameset
+        // matcher is best-effort: when one stream drops a frame it happily
+        // pairs the other stream with the previous capture. Sampling
+        // yesterday's depth under today's keypoints teleports fast-moving
+        // limbs, so a set whose two clocks diverge more than half a frame
+        // period is dropped as a unit.
+        let ts_color = color.timestamp();
+        let ts_depth = depth.timestamp();
+        let delta_ms = (ts_color - ts_depth).abs();
+        if delta_ms > self.frame_period_ms * 0.5 {
+            return Err(GrabError::SyncMismatch { delta_ms });
+        }
+
+        // Temporal noise filter on the aligned depth. Runs *after* the sync
+        // gate so a stale mismatched set never enters the filter's history,
+        // and on this capture thread so the inference side pays nothing.
+        // The block preserves frame metadata (timestamp, profile), so the
+        // gate result above stays valid for the filtered frame. take/put-
+        // back: a filter that errors mid-stream stays disabled (taken) —
+        // one dropped frame, then permanent unfiltered streaming, never a
+        // capture-thread crash loop.
+        let depth = if let Some(mut tf) = self.temporal.take() {
+            let filtered = tf
+                .queue(depth)
+                .map_err(|e| format!("realsense: temporal queue: {e}"))
+                .and_then(|()| {
+                    tf.wait(timeout)
+                        .map_err(|e| format!("realsense: temporal wait: {e}"))
+                });
+            match filtered {
+                Ok(f) => {
+                    self.temporal = Some(tf);
+                    f
+                }
+                Err(e) => {
+                    warn!("{e} — disabling the temporal filter for this session");
+                    return Err(GrabError::Capture(e));
+                }
+            }
+        } else {
+            depth
+        };
 
         let w = color.width();
         let h = color.height();
         if depth.width() != w || depth.height() != h {
-            return Err(format!(
+            return Err(GrabError::Capture(format!(
                 "realsense: aligned size mismatch — color {}x{}, depth {}x{}",
                 w,
                 h,
                 depth.width(),
                 depth.height()
-            ));
+            )));
         }
 
-        // Color -> RGB8 (row-major, top-down). We request Rgb8, but stay robust
-        // to a Bgr8 negotiation.
-        let mut rgb = Vec::with_capacity(w * h * 3);
-        for pixel in color.iter() {
-            match pixel {
-                PixelKind::Rgb8 { r, g, b } => {
-                    rgb.push(*r);
-                    rgb.push(*g);
-                    rgb.push(*b);
+        // Color -> RGB8 via bulk row copies. The format was requested as
+        // Rgb8 at `open`; verify what was actually negotiated once per
+        // frame and hard-error on anything else — a silent black-fill
+        // (the old per-pixel match's `_` arm) feeds the pose model an
+        // empty image and turns a format surprise into an undebuggable
+        // "tracking doesn't work".
+        let color_fmt = color.stream_profile().format();
+        let stride = color.stride();
+        let rgb = match color_fmt {
+            Rs2Format::Rgb8 | Rs2Format::Bgr8 => {
+                let data = unsafe {
+                    std::slice::from_raw_parts(
+                        color.get_data() as *const _ as *const u8,
+                        color.get_data_size(),
+                    )
+                };
+                let mut rgb = vec![0u8; w * h * 3];
+                for row in 0..h {
+                    let src = &data[row * stride..row * stride + w * 3];
+                    let dst = &mut rgb[row * w * 3..(row + 1) * w * 3];
+                    dst.copy_from_slice(src);
                 }
-                PixelKind::Bgr8 { b, g, r } => {
-                    rgb.push(*r);
-                    rgb.push(*g);
-                    rgb.push(*b);
+                if color_fmt == Rs2Format::Bgr8 {
+                    for px in rgb.chunks_exact_mut(3) {
+                        px.swap(0, 2);
+                    }
                 }
-                _ => {
-                    rgb.push(0);
-                    rgb.push(0);
-                    rgb.push(0);
-                }
+                rgb
             }
-        }
+            other => {
+                return Err(GrabError::Capture(format!(
+                    "realsense: unsupported color format {other:?} (expected Rgb8/Bgr8)"
+                )))
+            }
+        };
 
-        // Aligned depth -> raw Z16 (row-major, top-down; 0 = invalid).
-        let mut depth_raw = Vec::with_capacity(w * h);
-        for pixel in depth.iter() {
-            match pixel {
-                PixelKind::Z16 { depth } => depth_raw.push(*depth),
-                _ => depth_raw.push(0),
+        // Aligned depth -> raw Z16 (row-major, top-down; 0 = invalid),
+        // same bulk-copy treatment.
+        let depth_fmt = depth.stream_profile().format();
+        if depth_fmt != Rs2Format::Z16 {
+            return Err(GrabError::Capture(format!(
+                "realsense: unsupported depth format {depth_fmt:?} (expected Z16)"
+            )));
+        }
+        let depth_stride = depth.stride();
+        let depth_data = unsafe {
+            std::slice::from_raw_parts(
+                depth.get_data() as *const _ as *const u8,
+                depth.get_data_size(),
+            )
+        };
+        let mut depth_raw = vec![0u16; w * h];
+        for row in 0..h {
+            let src = &depth_data[row * depth_stride..row * depth_stride + w * 2];
+            let dst = &mut depth_raw[row * w..(row + 1) * w];
+            for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                *d = u16::from_le_bytes([s[0], s[1]]);
             }
         }
 
@@ -346,7 +637,30 @@ impl RealSenseCapture {
         let intr = color
             .stream_profile()
             .intrinsics()
-            .map_err(|e| format!("realsense: color intrinsics: {e}"))?;
+            .map_err(|e| GrabError::Capture(format!("realsense: color intrinsics: {e}")))?;
+
+        // Verify (once) the pinhole assumption that `CamIntrinsics` bakes in:
+        // the docs claim the D435 color coefficients are effectively zero,
+        // but that was never checked against the actual device until now.
+        if !self.distortion_logged {
+            self.distortion_logged = true;
+            let dist = intr.distortion();
+            let max_coeff = dist.coeffs.iter().fold(0.0f32, |m, c| m.max(c.abs()));
+            if max_coeff > 1e-6 {
+                warn!(
+                    "realsense: color stream reports non-zero distortion (model {:?}, coeffs \
+                     {:?}) — the pinhole deprojection ignores these, so joints near the frame \
+                     edge carry a small systematic offset on this device",
+                    dist.model, dist.coeffs,
+                );
+            } else {
+                info!(
+                    "realsense: color distortion model {:?}, all coefficients zero — pinhole \
+                     deprojection is exact",
+                    dist.model,
+                );
+            }
+        }
         let intrinsics = CamIntrinsics {
             fx: intr.fx(),
             fy: intr.fy(),
@@ -358,6 +672,7 @@ impl RealSenseCapture {
 
         self.width = w as u32;
         self.height = h as u32;
+        self.got_first_frame = true;
 
         Ok(RealSenseFrame {
             rgb,
@@ -366,6 +681,7 @@ impl RealSenseCapture {
             depth_raw,
             depth_units: self.depth_units,
             intrinsics,
+            timestamp_ms: ts_color,
         })
     }
 
@@ -375,5 +691,32 @@ impl RealSenseCapture {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// librealsense clamps out-of-range block options to *silently wrong*
+    /// values on some SDK builds instead of erroring — pin the constants to
+    /// their documented valid ranges so a future edit can't drift out.
+    #[test]
+    fn temporal_filter_constants_are_within_librealsense_ranges() {
+        // FILTER_SMOOTH_ALPHA: 0..=1.
+        assert!((0.0..=1.0).contains(&TEMPORAL_SMOOTH_ALPHA));
+        // FILTER_SMOOTH_DELTA: 1..=100 (raw Z16 units).
+        assert!((1.0..=100.0).contains(&TEMPORAL_SMOOTH_DELTA));
+        // Delta must stay well below the person-band half-width (~0.45 m =
+        // 450 raw units) — a delta that large would blend the body into
+        // background occluders instead of resetting on them.
+        assert!(TEMPORAL_SMOOTH_DELTA * DEFAULT_DEPTH_UNITS_M < 0.1);
+    }
+
+    /// The bypass env var name is part of the measurement workflow's
+    /// contract (replay A/B harness) — lock it against accidental rename.
+    #[test]
+    fn temporal_bypass_env_name_is_stable() {
+        assert_eq!(TEMPORAL_BYPASS_ENV, "VULVATAR_RS_TEMPORAL_OFF");
     }
 }

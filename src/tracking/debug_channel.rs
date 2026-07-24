@@ -14,10 +14,11 @@
 //!     changes) into a [`Tuning`]; the app applies it each frame.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
+use super::latest_cell::LatestCell;
 use super::PoseEstimate;
 use crate::asset::HumanoidBone;
 
@@ -28,10 +29,28 @@ fn base_dir() -> PathBuf {
         .join("VulVATAR")
 }
 
-/// The master switch. Absent flag file → the whole channel is dead weight of one
-/// `stat` per frame.
+/// The master switch. The flag-file `stat` is cached and refreshed at
+/// most every [`ENABLED_REFRESH_MS`] — the previous stat-per-call design
+/// actually ran *several* filesystem stats per frame (`dump_observation`
+/// + the face/mesh stashes + `load_tuning` each check independently) on
+/// the tracking hot path. Toggling the flag file takes effect within the
+/// refresh interval.
 pub fn enabled() -> bool {
-    base_dir().join("debug.on").exists()
+    const ENABLED_REFRESH_MS: u64 = 2000;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static CACHED: AtomicBool = AtomicBool::new(false);
+
+    let now_ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let last = LAST_CHECK_MS.load(Ordering::Relaxed);
+    if last == u64::MAX || now_ms.saturating_sub(last) >= ENABLED_REFRESH_MS {
+        let value = base_dir().join("debug.on").exists();
+        CACHED.store(value, Ordering::Relaxed);
+        LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
+        value
+    } else {
+        CACHED.load(Ordering::Relaxed)
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) {
@@ -72,13 +91,99 @@ fn write_camera(rgb: &[u8], w: u32, h: u32, dst_w: u32, frame_index: u64) {
     atomic_write(&base_dir().join("debug_camera.bin"), &out);
 }
 
+/// Face-stage diagnostics stashed by the RTMW3D face block (which has the
+/// crop bbox + both pose candidates in scope) and merged into
+/// `debug_state.json` by `dump_observation` (which does not). One slot,
+/// overwritten per frame — the dump runs on the same worker right after.
+static FACE_DEBUG: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+/// The five FaceMesh landmarks the pose derivation reads (nose tip,
+/// eye outers, cheeks), in 256-px crop space — lets the overlay show
+/// where the mesh model actually thinks those anatomical points are.
+static MESH_LANDMARKS: Mutex<Option<[[f32; 2]; 5]>> = Mutex::new(None);
+
+/// Stash the pose-relevant FaceMesh landmarks (crop space, 256 px).
+/// Order: nose, right eye outer, left eye outer, right cheek, left cheek.
+pub fn stash_mesh_landmarks(pts: [[f32; 2]; 5]) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut slot) = MESH_LANDMARKS.lock() {
+        *slot = Some(pts);
+    }
+}
+
+/// Stash the face-crop bbox (image px), the FaceMesh score, and the two
+/// head-pose candidates so the external overlay can show which estimator
+/// won and whether the crop actually frames the face.
+#[allow(clippy::too_many_arguments)]
+pub fn stash_face_debug(
+    bbox: Option<(f32, f32, f32)>,
+    mesh_conf: Option<f32>,
+    body_ypr: Option<(f32, f32, f32)>,
+    mesh_ypr: Option<(f32, f32, f32)>,
+) {
+    if !enabled() {
+        return;
+    }
+    let v = serde_json::json!({
+        "bbox": bbox.map(|(x, y, s)| [x, y, s]),
+        "mesh_c": mesh_conf,
+        "body_ypr": body_ypr.map(|(y, p, r)| [y, p, r]),
+        "mesh_ypr": mesh_ypr.map(|(y, p, r)| [y, p, r]),
+        "mesh_lm": MESH_LANDMARKS.lock().ok().and_then(|mut s| s.take()),
+    });
+    if let Ok(mut slot) = FACE_DEBUG.lock() {
+        *slot = Some(v);
+    }
+}
+
+/// One observation queued for the background dump writer.
+struct DumpJob {
+    frame_index: u64,
+    rgb: Vec<u8>,
+    width: u32,
+    height: u32,
+    state: serde_json::Value,
+}
+
+/// Latest-only handoff to the `debug-dump` writer thread, started lazily
+/// on the first enabled dump and left running for the process lifetime.
+/// The camera down-scale, PNG-ish buffer packing and the two file writes
+/// used to run synchronously on the tracking thread — a diagnostics
+/// channel whose act of being enabled changed the jitter and latency it
+/// was meant to observe. Latest-only semantics also mean a slow disk
+/// drops intermediate debug frames instead of back-pressuring capture.
+fn dump_cell() -> &'static Arc<LatestCell<DumpJob>> {
+    static CELL: OnceLock<Arc<LatestCell<DumpJob>>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let cell = LatestCell::<DumpJob>::new();
+        let worker = Arc::clone(&cell);
+        let spawned = std::thread::Builder::new()
+            .name("debug-dump".into())
+            .spawn(move || {
+                while let Some(job) = worker.take_blocking() {
+                    write_camera(&job.rgb, job.width, job.height, 640, job.frame_index);
+                    if let Ok(bytes) = serde_json::to_vec(&job.state) {
+                        atomic_write(&base_dir().join("debug_state.json"), &bytes);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            log::warn!("debug_channel: could not spawn debug-dump writer thread");
+        }
+        cell
+    })
+}
+
 /// Publish the current frame's camera + 2D keypoints + source arm joints for an
-/// external overlay. No-op unless the debug flag file is present.
+/// external overlay. No-op unless the debug flag file is present. The JSON
+/// value is assembled here (it borrows the estimate); the pixel work and
+/// file I/O happen on the background writer thread.
 pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &PoseEstimate) {
     if !enabled() {
         return;
     }
-    write_camera(rgb, w, h, 640, frame_index);
 
     let kps: Vec<serde_json::Value> = est
         .annotation
@@ -106,6 +211,13 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
         "overall": est.skeleton.overall_confidence,
         "kp": kps,
         "face": face,
+        // FaceMesh's own "is this a face" score, independent of the
+        // published pose's confidence — tells an external tool which
+        // head-pose source (mesh vs body ear-line) actually won.
+        "mesh_c": est.skeleton.face_mesh_confidence,
+        // Crop bbox + per-estimator pose candidates from the face stage
+        // (stashed by the RTMW3D worker just before this dump).
+        "face_dbg": FACE_DEBUG.lock().ok().and_then(|mut s| s.take()),
         "torso": {
             "Head": arm(HumanoidBone::Head),
             "Neck": arm(HumanoidBone::Neck),
@@ -123,9 +235,13 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
             "RHa": arm(HumanoidBone::RightHand),
         },
     });
-    if let Ok(bytes) = serde_json::to_vec(&state) {
-        atomic_write(&base_dir().join("debug_state.json"), &bytes);
-    }
+    dump_cell().put(DumpJob {
+        frame_index,
+        rgb: rgb.to_vec(),
+        width: w,
+        height: h,
+        state,
+    });
 }
 
 static AVATAR_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);

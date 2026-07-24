@@ -442,9 +442,34 @@ pub struct PoseSolverState {
     hand_orient_filters: [OneEuroFilterState; 4],
     /// Per-bone Schmitt hysteresis state for joint confidence.
     joint_active: HashMap<HumanoidBone, bool>,
-    /// Wall-clock timestamp of the previous solve, used to derive `dt`
-    /// for the dt-aware blend / 1€ filter. `None` until the first call.
+    /// Wall-clock timestamp of the previous solve, used to derive the
+    /// *render-side* `dt` for the dt-aware rotation blends. The 1€
+    /// filters do NOT use this when the sample carries a capture
+    /// timestamp — see `filtered_sample_cache`. `None` until the first
+    /// call.
     last_solve_instant: Option<Instant>,
+    /// The filtered output of `preprocess_source` for the most recent
+    /// *distinct* camera sample, keyed by `filtered_sample_key`. The
+    /// render loop solves at display rate (60+ fps) while the camera
+    /// produces 30 fps — without this cache every camera sample passes
+    /// through the 1€ filters once per *render* frame, so `out_speed`
+    /// alternates between ~2× the true speed (fresh sample over a half-
+    /// length wall dt) and ~0 (repeat sample), which defeats every
+    /// speed-calibrated rest gate and makes smoothing depend on the
+    /// viewer's monitor refresh rate. On a repeated sample the cached
+    /// geometry is reused verbatim (filters do not advance) and only
+    /// the confidence channels are refreshed from the live sample so
+    /// the hold/fade decay still reaches the gates. Engaged only when
+    /// the sample carries `capture_timestamp_ms` (the real camera
+    /// path); synthetic producers keep the legacy solve-every-call
+    /// behaviour.
+    filtered_sample_cache: Option<SourceSkeleton>,
+    /// `(source_timestamp, capture_timestamp_ms bits)` of the cached
+    /// filtered sample above.
+    filtered_sample_key: Option<(u64, u64)>,
+    /// Capture timestamp (ms, device clock) of the previous *distinct*
+    /// sample — the true inter-capture interval `dt` for the 1€ filters.
+    last_capture_timestamp_ms: Option<f64>,
     /// Previous frame's solved local rotation per skeleton node.
     /// `run_frame` rebuilds the base pose every frame, so the value
     /// sitting in `local_transforms` at solve time is REST, not the
@@ -488,6 +513,14 @@ pub struct PoseSolverState {
     /// `root_reference` was seeded from an explicit pose calibration → trust it
     /// immediately (freeze with no lock-in convergence toward the current pose).
     root_reference_calibrated: bool,
+    /// Last stable elbow-swivel plane per arm (`[left, right]`): the
+    /// unit perpendicular (⟂ shoulder→wrist axis) the arm-reach IK last
+    /// bent the elbow along. Read when the swivel input degenerates —
+    /// the pole collapses onto the chain axis (fully folded / fully
+    /// stretched view) — so the elbow keeps its previous bend plane
+    /// instead of snapping to an arbitrary world-axis fallback; updated
+    /// only while the bend radius is well-conditioned.
+    arm_swivel_hold: [Option<Vec3>; 2],
     /// EMA state for the camera-driven mouth visemes (aa/ih/ou/ee/oh),
     /// keyed by expression name. The image lip-sync path takes the raw
     /// FaceMesh blendshape, which is noisy frame-to-frame; the eye/brow
@@ -524,6 +557,9 @@ impl PoseSolverState {
         self.mouth_viseme_ema.clear();
         self.joint_active.clear();
         self.last_solve_instant = None;
+        self.filtered_sample_cache = None;
+        self.filtered_sample_key = None;
+        self.last_capture_timestamp_ms = None;
         self.prev_local_rotations.clear();
         self.prev_hips_translation = None;
         self.root_reference = None;
@@ -531,6 +567,7 @@ impl PoseSolverState {
         self.root_reference_calibrated = false;
         self.root_offset_filter = Default::default();
         self.face_angle_filter = Default::default();
+        self.arm_swivel_hold = [None, None];
     }
 }
 
@@ -619,6 +656,19 @@ impl OneEuroFilterState {
             *pos += *d;
         }
         self.pos
+    }
+
+    /// The filter's last output, without advancing it. Used on repeated
+    /// samples (same capture frame observed on a later render frame):
+    /// re-`apply`ing the identical raw value would collapse `out_speed`
+    /// toward zero and make the rest gates see a render-rate-dependent
+    /// speed signal. `None` before the first `apply`.
+    fn last_output(&self) -> Option<[f32; 3]> {
+        if self.initialized {
+            Some(self.pos)
+        } else {
+            None
+        }
     }
 }
 
@@ -885,12 +935,15 @@ pub fn solve_avatar_pose(
         return;
     };
 
-    // Compute per-frame dt against the previous solve; clamp so a
-    // long pause (debugger, GC stall) does not produce a huge α that
-    // snaps the avatar to whatever stale or noisy data arrived first.
-    // On the very first call we have no reference, so substitute the
-    // 30 fps reference period — the slider value then maps to itself
-    // on frame zero, matching the pre-smoothing behaviour.
+    // Render-side dt against the previous solve call (wall clock);
+    // clamped so a long pause (debugger, GC stall) does not produce a
+    // huge α that snaps the avatar to whatever stale or noisy data
+    // arrived first. On the very first call we have no reference, so
+    // substitute the 30 fps reference period — the slider value then
+    // maps to itself on frame zero, matching the pre-smoothing
+    // behaviour. Used ONLY for the display-side dt-aware rotation
+    // blends: the measurement-side filters use the capture-clock dt
+    // below.
     let now = Instant::now();
     let dt = match state.last_solve_instant {
         Some(prev) => (now - prev).as_secs_f32().clamp(0.0, 0.25),
@@ -898,10 +951,51 @@ pub fn solve_avatar_pose(
     };
     state.last_solve_instant = Some(now);
 
+    // Sample identity + measurement dt. A sample from the real camera
+    // path carries `capture_timestamp_ms`; solving the SAME sample again
+    // on a later render frame must not advance any measurement filter
+    // (see `PoseSolverState::filtered_sample_cache`). The filters' dt is
+    // the device-clock interval between distinct captures — the render
+    // cadence is irrelevant to how far the subject actually moved.
+    let sample_key = source
+        .capture_timestamp_ms
+        .map(|ts| (source.source_timestamp, ts.to_bits()));
+    let is_repeat_sample = sample_key.is_some()
+        && sample_key == state.filtered_sample_key
+        && state.filtered_sample_cache.is_some();
+    let sample_dt = match (source.capture_timestamp_ms, state.last_capture_timestamp_ms) {
+        (Some(cur), Some(prev)) if cur > prev => (((cur - prev) / 1000.0) as f32).clamp(1e-3, 0.25),
+        // First camera sample, non-monotonic device clock, or a
+        // synthetic producer without capture timestamps: fall back to
+        // the wall dt (the legacy behaviour, exact for bench drivers
+        // that solve once per sample).
+        _ => dt,
+    };
+
     // Apply the 1€ filter + Schmitt hysteresis on every keypoint
     // before any geometry runs. Working on a local clone keeps
     // `&SourceSkeleton` immutable for callers (tests, other consumers).
-    let mut source_owned = preprocess_source(source, state, dt, params);
+    // On a repeated sample, reuse the cached filtered geometry and only
+    // refresh the confidence channels — the hold/fade policy decays
+    // confidences on a held sample without re-capturing, and that decay
+    // must still reach the solver's gates.
+    let mut source_owned = if is_repeat_sample {
+        let mut cached = state
+            .filtered_sample_cache
+            .clone()
+            .expect("is_repeat_sample checked cache presence");
+        refresh_confidence_channels(&mut cached, source);
+        gate_joint_confidences(&mut cached, state, params);
+        cached
+    } else {
+        let filtered = preprocess_source(source, state, sample_dt, params);
+        if let Some(key) = sample_key {
+            state.filtered_sample_cache = Some(filtered.clone());
+            state.filtered_sample_key = Some(key);
+            state.last_capture_timestamp_ms = source.capture_timestamp_ms;
+        }
+        filtered
+    };
 
     // Rest-pose world transforms, computed from the skeleton's rest_local
     // values. These are the ground truth we measure bone directions against;
@@ -1016,8 +1110,22 @@ pub fn solve_avatar_pose(
         if let Some(raw_offset) = source.root_offset {
             // Filter the raw channel at its entry — see
             // `PoseSolverState::root_offset_filter` for why the EMA and
-            // the blend below cannot do this job.
-            let raw_offset = state.root_offset_filter.apply(raw_offset, dt, OneEuroTuning::ROOT);
+            // the blend below cannot do this job. Measurement-side
+            // state: advances only on a distinct camera sample, with
+            // the capture-clock dt; a repeated sample reuses the last
+            // filtered output (re-applying the identical raw value
+            // would zero `out_speed` and double-run the deadband at
+            // render rate).
+            let raw_offset = if is_repeat_sample {
+                state
+                    .root_offset_filter
+                    .last_output()
+                    .unwrap_or(raw_offset)
+            } else {
+                state
+                    .root_offset_filter
+                    .apply(raw_offset, sample_dt, OneEuroTuning::ROOT)
+            };
             // Calibration-aware EMA seed. When the user has captured
             // an explicit pose calibration (see docs/calibration-ux.md)
             // *and* the runtime anchor type matches the calibration's
@@ -1066,26 +1174,35 @@ pub fn solve_avatar_pose(
             // depth is absolute, so there is nothing to self-recentre against.
             // A calibrated seed is trusted immediately (no lock-in). `Some(h)`
             // restores the old self-recentring EMA (h-second horizon).
-            const ROOT_REFERENCE_LOCK_IN_FRAMES: u32 = 30; // ~1 s at 30 fps
-            let alpha = if state.root_reference.is_none() {
-                1.0
-            } else if let Some(h) = params.root_recenter_horizon_s.filter(|h| *h > 0.0) {
-                (dt / h).clamp(0.0, 0.2)
-            } else if state.root_reference_calibrated
-                || state.root_reference_frames >= ROOT_REFERENCE_LOCK_IN_FRAMES
-            {
-                0.0 // frozen → full mirror
+            // Reference update is measurement-side state: it advances
+            // once per distinct CAMERA sample. Counting render frames
+            // here made the lock-in window (and the `Some(h)` EMA
+            // horizon) scale with the viewer's monitor refresh rate.
+            const ROOT_REFERENCE_LOCK_IN_FRAMES: u32 = 30; // ~1 s of 30 fps camera samples
+            let new_ref = if is_repeat_sample && state.root_reference.is_some() {
+                state.root_reference.unwrap()
             } else {
-                0.1 // lock-in: converge over ~1 s, then freeze
+                let alpha = if state.root_reference.is_none() {
+                    1.0
+                } else if let Some(h) = params.root_recenter_horizon_s.filter(|h| *h > 0.0) {
+                    (sample_dt / h).clamp(0.0, 0.2)
+                } else if state.root_reference_calibrated
+                    || state.root_reference_frames >= ROOT_REFERENCE_LOCK_IN_FRAMES
+                {
+                    0.0 // frozen → full mirror
+                } else {
+                    0.1 // lock-in: converge over ~1 s, then freeze
+                };
+                let prev_ref = state.root_reference.unwrap_or(raw_offset);
+                let new_ref = [
+                    prev_ref[0] + alpha * (raw_offset[0] - prev_ref[0]),
+                    prev_ref[1] + alpha * (raw_offset[1] - prev_ref[1]),
+                    prev_ref[2] + alpha * (raw_offset[2] - prev_ref[2]),
+                ];
+                state.root_reference = Some(new_ref);
+                state.root_reference_frames = state.root_reference_frames.saturating_add(1);
+                new_ref
             };
-            let prev_ref = state.root_reference.unwrap_or(raw_offset);
-            let new_ref = [
-                prev_ref[0] + alpha * (raw_offset[0] - prev_ref[0]),
-                prev_ref[1] + alpha * (raw_offset[1] - prev_ref[1]),
-                prev_ref[2] + alpha * (raw_offset[2] - prev_ref[2]),
-            ];
-            state.root_reference = Some(new_ref);
-            state.root_reference_frames = state.root_reference_frames.saturating_add(1);
 
             let dev = [
                 raw_offset[0] - new_ref[0],
@@ -1187,7 +1304,13 @@ pub fn solve_avatar_pose(
     // chain) then drives the arm normally. No-op (no clone) when both elbows are
     // adequately observed, so well-tracked frames are untouched.
     let arm_reach_elbows = if params.arm_reach_ik_enabled {
-        compute_arm_reach_elbows(source, &rest_world, humanoid, params)
+        compute_arm_reach_elbows(
+            source,
+            &rest_world,
+            humanoid,
+            params,
+            &mut state.arm_swivel_hold,
+        )
     } else {
         [None, None]
     };
@@ -2401,6 +2524,7 @@ fn compute_arm_reach_elbows(
     rest_world: &[WorldXform],
     humanoid: &HumanoidMap,
     params: &SolverParams,
+    swivel_hold: &mut [Option<Vec3>; 2],
 ) -> [Option<crate::tracking::SourceJoint>; 2] {
     let thr = params.joint_confidence_threshold;
     let rest_pos = |b: HumanoidBone| -> Option<Vec3> {
@@ -2418,24 +2542,52 @@ fn compute_arm_reach_elbows(
         (Some(a), Some(b)) => vec3_length(&vec3_sub(&a, &b)),
         _ => return [None, None],
     };
-    let src_span = match (
+    // Source-side scale reference. The per-frame raw shoulder span
+    // foreshortens with torso yaw (and collapses on shoulder depth
+    // holes), which shrinks l1/l2 and re-introduces exactly the
+    // under-reach this pass exists to fix — but only in twisted poses,
+    // where it's hardest to notice in review. The metric pipeline
+    // already maintains a stabilised subject span (TorsoScaleStabilizer
+    // → `MetricFrameInfo.reference_span_m`, metres) and the
+    // metres→source conversion (`mpsu`), so prefer that and fall back
+    // to the raw pair only for non-metric providers.
+    let raw_span = match (
         source.joints.get(&HumanoidBone::LeftUpperArm),
         source.joints.get(&HumanoidBone::RightUpperArm),
     ) {
-        (Some(a), Some(b)) => vec3_length(&vec3_sub(&a.position, &b.position)),
-        _ => return [None, None],
+        (Some(a), Some(b)) => Some(vec3_length(&vec3_sub(&a.position, &b.position))),
+        _ => None,
     };
-    if av_span < 1e-4 || src_span < 1e-4 {
+    let stable_span = source
+        .metric_frame_info
+        .as_ref()
+        .filter(|m| m.mpsu > 1e-6)
+        .map(|m| m.reference_span_m / m.mpsu)
+        .filter(|s| *s > 1e-4);
+    let Some(src_span) = stable_span.or(raw_span).filter(|s| *s > 1e-4) else {
+        return [None, None];
+    };
+    if av_span < 1e-4 {
         return [None, None];
     }
     let scale = src_span / av_span;
 
     let sides = [
-        (HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand),
-        (HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
+        (
+            HumanoidBone::LeftUpperArm,
+            HumanoidBone::LeftLowerArm,
+            HumanoidBone::LeftHand,
+            HumanoidBone::LeftMiddleProximal,
+        ),
+        (
+            HumanoidBone::RightUpperArm,
+            HumanoidBone::RightLowerArm,
+            HumanoidBone::RightHand,
+            HumanoidBone::RightMiddleProximal,
+        ),
     ];
     let mut out = [None, None];
-    for (side, &(sh_b, el_b, wr_b)) in sides.iter().enumerate() {
+    for (side, &(sh_b, el_b, wr_b, palm_b)) in sides.iter().enumerate() {
         // Require a confident shoulder + wrist. Given both, solve the whole arm
         // by IK to the observed wrist EVEN WHEN the elbow is also observed:
         // direction-match copies the user's angles at avatar bone lengths and
@@ -2453,7 +2605,22 @@ fn compute_arm_reach_elbows(
             continue;
         };
         let l1 = vec3_length(&vec3_sub(&rel, &rsh)) * scale;
-        let l2 = vec3_length(&vec3_sub(&rwr, &rel)) * scale;
+        // The IK target is the source wrist joint, which the trackers
+        // place at the four-MCP centroid (≈ half a palm PAST the
+        // anatomical wrist — see `attach_hand`). With a bare forearm
+        // length the chain is asked to cover forearm + palm with l2 =
+        // forearm, so reachable targets over-flex the elbow and
+        // extended ones read as unreachable. Extend l2 by the avatar's
+        // own rest wrist→middle-proximal distance (the same palm
+        // segment, exactly), with an anthropometric fraction as the
+        // fallback for finger-less rigs.
+        const PALM_FRACTION_OF_FOREARM: f32 = 0.35;
+        let fore_rest = vec3_length(&vec3_sub(&rwr, &rel));
+        let palm_rest = rest_pos(palm_b)
+            .map(|p| vec3_length(&vec3_sub(&p, &rwr)))
+            .filter(|l| *l > 1e-4)
+            .unwrap_or(PALM_FRACTION_OF_FOREARM * fore_rest);
+        let l2 = (fore_rest + palm_rest) * scale;
         if l1 < 1e-4 || l2 < 1e-4 {
             continue;
         }
@@ -2467,21 +2634,67 @@ fn compute_arm_reach_elbows(
         // back to a natural bend biased behind the shoulder→wrist line (toward the
         // body, −Z is away from the camera) so the elbow does not hyper-extend
         // straight — the same default used when no elbow keypoint exists at all.
-        let pole = source
-            .joints
-            .get(&el_b)
-            .filter(|x| x.confidence >= thr)
-            .map(|x| x.position)
-            .unwrap_or_else(|| {
-                let mid = midpoint(&sh.position, &wr.position);
-                [mid[0], mid[1], mid[2] - 0.4 * src_span]
-            });
+        // Continuous confidence blend instead of a hard threshold: a
+        // step gate teleports the pole (and with it the forearm swivel)
+        // the frame the elbow confidence crosses `thr`. The observed
+        // elbow fades in over [thr, thr + POLE_CONF_BLEND_BAND].
+        const POLE_CONF_BLEND_BAND: f32 = 0.15;
+        let synth_pole = {
+            let mid = midpoint(&sh.position, &wr.position);
+            [mid[0], mid[1], mid[2] - 0.4 * src_span]
+        };
+        let pole = match source.joints.get(&el_b) {
+            Some(el) => {
+                let t = ((el.confidence - thr) / POLE_CONF_BLEND_BAND).clamp(0.0, 1.0);
+                [
+                    synth_pole[0] + (el.position[0] - synth_pole[0]) * t,
+                    synth_pole[1] + (el.position[1] - synth_pole[1]) * t,
+                    synth_pole[2] + (el.position[2] - synth_pole[2]) * t,
+                ]
+            }
+            None => synth_pole,
+        };
+        // Swivel continuity: when the pole degenerates onto the
+        // shoulder→wrist axis, prefer the held bend plane from the last
+        // well-conditioned frame over two_bone_ik's arbitrary
+        // world-axis fallback (which flips the elbow at random under
+        // micro-noise near full fold / full extension).
+        let to_t = vec3_sub(&wr.position, &sh.position);
+        let d = vec3_length(&to_t);
+        let pole = if d > 1e-5 {
+            let axis = vec3_scale(&to_t, 1.0 / d);
+            let p = vec3_sub(&pole, &sh.position);
+            let p_perp = vec3_sub(&p, &vec3_scale(&axis, vec3_dot(&p, &axis)));
+            if vec3_length(&p_perp) < 0.05 * d {
+                match swivel_hold[side] {
+                    Some(held) => vec3_add(&sh.position, &vec3_scale(&held, d)),
+                    None => pole,
+                }
+            } else {
+                pole
+            }
+        } else {
+            pole
+        };
         let Some((upper_dir, _lower_dir)) =
             two_bone_ik(&sh.position, &wr.position, l1, l2, &pole)
         else {
             continue;
         };
         let elbow_pos = vec3_add(&sh.position, &vec3_scale(&upper_dir, l1));
+        // Refresh the held bend plane only while it is well-conditioned
+        // (meaningful bend radius) — near full extension the achieved
+        // perpendicular is numerical noise and must not overwrite a
+        // good hold.
+        if d > 1e-5 {
+            let axis = vec3_scale(&to_t, 1.0 / d);
+            let e = vec3_sub(&elbow_pos, &sh.position);
+            let e_perp = vec3_sub(&e, &vec3_scale(&axis, vec3_dot(&e, &axis)));
+            let r = vec3_length(&e_perp);
+            if r > 0.05 * l1 {
+                swivel_hold[side] = Some(vec3_scale(&e_perp, 1.0 / r));
+            }
+        }
         out[side] = Some(crate::tracking::SourceJoint {
             position: elbow_pos,
             confidence: wr.confidence.min(sh.confidence),
@@ -2711,7 +2924,8 @@ mod arm_contact_ik_tests {
         );
 
         let params = SolverParams { joint_confidence_threshold: 0.5, ..Default::default() };
-        let out = compute_arm_reach_elbows(&source, &rest, &humanoid, &params);
+        let mut hold = [None, None];
+        let out = compute_arm_reach_elbows(&source, &rest, &humanoid, &params, &mut hold);
         let elbow = out[0].expect("left arm reaches the tracked wrist").position;
         eprintln!("synth elbow = {elbow:?}");
         // The garbage pole sits at x=0.90; steered toward it the elbow swings
@@ -2727,6 +2941,151 @@ mod arm_contact_ik_tests {
         assert!(
             elbow[2] < 0.0,
             "elbow should bend behind the shoulder→wrist line, got {elbow:?}"
+        );
+    }
+
+    /// Torso yaw foreshortens the raw shoulder span; the stabilised
+    /// metric span (`MetricFrameInfo.reference_span_m`) must win so the
+    /// arm keeps its true length instead of shrinking with the twist
+    /// (the under-reach → hands-collapse-to-midline regression class).
+    #[test]
+    fn reach_scale_prefers_stabilized_metric_span() {
+        let (humanoid, rest) = arm_rig();
+        let mut source = SourceSkeleton::empty(0);
+        // Yawed torso: raw span reads 0.15, half the avatar's 0.30.
+        source.joints.insert(HumanoidBone::LeftUpperArm, src_joint([0.075, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::RightUpperArm, src_joint([-0.075, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::LeftHand, src_joint([0.075, 1.00, 0.10]));
+        let params = SolverParams { joint_confidence_threshold: 0.0, ..Default::default() };
+        let sh = [0.075, 1.40, 0.0];
+
+        // No metric info → raw-span fallback: upper arm halves (0.125).
+        let mut hold = [None, None];
+        let raw = compute_arm_reach_elbows(&source, &rest, &humanoid, &params, &mut hold);
+        let raw_l1 = vec3_length(&vec3_sub(&raw[0].expect("raw path solves").position, &sh));
+        assert!((raw_l1 - 0.125).abs() < 1e-3, "raw fallback l1 = {raw_l1}, want 0.125");
+
+        // Stabilised span says the subject really spans 0.30 → scale 1,
+        // full-length upper arm despite the foreshortened raw pair.
+        source.stamp_synthetic_metric_frame();
+        source.metric_frame_info.as_mut().unwrap().reference_span_m = 0.30;
+        let mut hold = [None, None];
+        let stab = compute_arm_reach_elbows(&source, &rest, &humanoid, &params, &mut hold);
+        let stab_l1 = vec3_length(&vec3_sub(&stab[0].expect("metric path solves").position, &sh));
+        assert!((stab_l1 - 0.25).abs() < 1e-3, "stabilised l1 = {stab_l1}, want 0.25");
+    }
+
+    /// The IK target is the MCP-centroid wrist (≈ a palm past the
+    /// anatomical wrist), so l2 must cover forearm + palm. With finger
+    /// rest bones present the palm segment comes from the avatar's own
+    /// wrist→middle-proximal distance.
+    #[test]
+    fn l2_covers_forearm_plus_palm() {
+        use crate::asset::NodeId;
+        let (mut humanoid, mut rest) = arm_rig();
+        humanoid
+            .bone_map
+            .insert(HumanoidBone::LeftMiddleProximal, NodeId(6));
+        rest.push(WorldXform { position: [0.75, 1.4, 0.0], rotation: [0.0, 0.0, 0.0, 1.0] });
+
+        let mut source = SourceSkeleton::empty(0);
+        source.joints.insert(HumanoidBone::LeftUpperArm, src_joint([0.15, 1.40, 0.0]));
+        source.joints.insert(HumanoidBone::RightUpperArm, src_joint([-0.15, 1.40, 0.0]));
+        // Bent-reachable target for l1 = 0.25, l2 = 0.25 + 0.10.
+        source.joints.insert(HumanoidBone::LeftHand, src_joint([0.15, 1.05, 0.15]));
+        let params = SolverParams { joint_confidence_threshold: 0.0, ..Default::default() };
+        let mut hold = [None, None];
+        let out = compute_arm_reach_elbows(&source, &rest, &humanoid, &params, &mut hold);
+        let elbow = out[0].expect("solves").position;
+        let l1 = vec3_length(&vec3_sub(&elbow, &[0.15, 1.40, 0.0]));
+        let l2 = vec3_length(&vec3_sub(&[0.15, 1.05, 0.15], &elbow));
+        assert!((l1 - 0.25).abs() < 1e-3, "l1 = {l1}");
+        assert!(
+            (l2 - 0.35).abs() < 1e-3,
+            "l2 must include the rest palm segment (0.25 + 0.10), got {l2}"
+        );
+    }
+
+    /// Elbow confidence crossing the gate must ROTATE the swivel
+    /// smoothly, not teleport it: just-below vs just-above threshold
+    /// solutions stay close, while the full blend still spans the real
+    /// synthetic↔observed gap.
+    #[test]
+    fn pole_confidence_blend_is_continuous_at_threshold() {
+        let (humanoid, rest) = arm_rig();
+        let thr = 0.5_f32;
+        let params = SolverParams { joint_confidence_threshold: thr, ..Default::default() };
+        let solve_with_conf = |conf: f32| {
+            let mut source = SourceSkeleton::empty(0);
+            source.joints.insert(HumanoidBone::LeftUpperArm, src_joint([0.15, 1.40, 0.0]));
+            source.joints.insert(HumanoidBone::RightUpperArm, src_joint([-0.15, 1.40, 0.0]));
+            source.joints.insert(HumanoidBone::LeftHand, src_joint([0.15, 1.00, 0.0]));
+            source.joints.insert(
+                HumanoidBone::LeftLowerArm,
+                crate::tracking::SourceJoint {
+                    position: [0.35, 1.20, 0.10],
+                    confidence: conf,
+                    metric_depth_m: None,
+                },
+            );
+            let mut hold = [None, None];
+            compute_arm_reach_elbows(&source, &rest, &humanoid, &params, &mut hold)[0]
+                .expect("solves")
+                .position
+        };
+        let below = solve_with_conf(thr - 0.01);
+        let above = solve_with_conf(thr + 0.01);
+        let full = solve_with_conf(thr + 0.20);
+        let step = vec3_length(&vec3_sub(&above, &below));
+        let span = vec3_length(&vec3_sub(&full, &below));
+        assert!(
+            step < 0.05,
+            "crossing the confidence gate must not teleport the elbow: step {step}"
+        );
+        assert!(
+            span > 0.15,
+            "sanity: the blend spans a real synthetic↔observed gap, got {span}"
+        );
+    }
+
+    /// When the observed pole collapses onto the shoulder→wrist axis
+    /// (fully folded / fully stretched view), the held bend plane from
+    /// the previous well-conditioned frame must steer the elbow — not
+    /// the arbitrary world-axis fallback.
+    #[test]
+    fn degenerate_pole_keeps_previous_swivel_plane() {
+        let (humanoid, rest) = arm_rig();
+        let params = SolverParams { joint_confidence_threshold: 0.0, ..Default::default() };
+        let frame = |elbow_z: f32| {
+            let mut source = SourceSkeleton::empty(0);
+            source.joints.insert(HumanoidBone::LeftUpperArm, src_joint([0.15, 1.40, 0.0]));
+            source.joints.insert(HumanoidBone::RightUpperArm, src_joint([-0.15, 1.40, 0.0]));
+            source.joints.insert(HumanoidBone::LeftHand, src_joint([0.15, 1.00, 0.0]));
+            source.joints.insert(HumanoidBone::LeftLowerArm, src_joint([0.15, 1.20, elbow_z]));
+            source
+        };
+
+        // Fresh state, degenerate pole (elbow exactly on the axis):
+        // documents the arbitrary fallback (bends +z here).
+        let mut hold = [None, None];
+        let cold = compute_arm_reach_elbows(&frame(0.0), &rest, &humanoid, &params, &mut hold)[0]
+            .expect("solves")
+            .position;
+        assert!(cold[2] > 0.0, "world-axis fallback bends +z in this rig: {cold:?}");
+
+        // Seeded by a −z bend the frame before, the SAME degenerate
+        // frame must keep bending −z.
+        let mut hold = [None, None];
+        let seeded = compute_arm_reach_elbows(&frame(-0.25), &rest, &humanoid, &params, &mut hold)[0]
+            .expect("solves")
+            .position;
+        assert!(seeded[2] < 0.0, "seed frame bends −z: {seeded:?}");
+        let held = compute_arm_reach_elbows(&frame(0.0), &rest, &humanoid, &params, &mut hold)[0]
+            .expect("solves")
+            .position;
+        assert!(
+            held[2] < 0.0,
+            "degenerate pole must keep the held −z bend plane, got {held:?}"
         );
     }
 
@@ -2910,28 +3269,16 @@ fn preprocess_source(
 ) -> SourceSkeleton {
     let mut out = source.clone();
 
-    let enter = params.joint_confidence_threshold;
-    let exit = enter * SCHMITT_EXIT_RATIO;
-
     for (bone, joint) in out.joints.iter_mut() {
         let tuning = one_euro_params_for(*bone);
         let filt = state.joint_filters.entry(*bone).or_default();
         joint.position = filt.apply(joint.position, dt, tuning);
-        // Schmitt hysteresis: a single dropout below `enter` does
-        // not turn the joint off as long as it stays above `exit`.
-        let active = state.joint_active.entry(*bone).or_insert(false);
-        let raw = joint.confidence;
-        if *active {
-            if raw < exit {
-                *active = false;
-                joint.confidence = 0.0;
-            }
-        } else if raw >= enter {
-            *active = true;
-        } else {
-            joint.confidence = 0.0;
-        }
     }
+    // Schmitt hysteresis: a single dropout below `enter` does not turn
+    // the joint off as long as it stays above `exit`. Shared with the
+    // repeated-sample path, which refreshes confidences from the live
+    // (possibly hold-decayed) sample and must gate them identically.
+    gate_joint_confidences(&mut out, state, params);
 
     for (bone, joint) in out.fingertips.iter_mut() {
         let tuning = one_euro_params_for(*bone);
@@ -3000,6 +3347,70 @@ fn preprocess_source(
     constrain_fingers(&mut out);
 
     out
+}
+
+/// Per-bone Schmitt confidence gate (enter at the threshold, exit at
+/// `SCHMITT_EXIT_RATIO ×` it). Factored out of [`preprocess_source`] so
+/// the repeated-sample path can re-gate refreshed confidences without
+/// re-running the position filters.
+fn gate_joint_confidences(
+    out: &mut SourceSkeleton,
+    state: &mut PoseSolverState,
+    params: &SolverParams,
+) {
+    let enter = params.joint_confidence_threshold;
+    let exit = enter * SCHMITT_EXIT_RATIO;
+    for (bone, joint) in out.joints.iter_mut() {
+        let active = state.joint_active.entry(*bone).or_insert(false);
+        let raw = joint.confidence;
+        if *active {
+            if raw < exit {
+                *active = false;
+                joint.confidence = 0.0;
+            }
+        } else if raw >= enter {
+            *active = true;
+        } else {
+            joint.confidence = 0.0;
+        }
+    }
+}
+
+/// Copy every confidence channel (and the expression weights) from the
+/// live sample onto a cached filtered skeleton. Used when the render
+/// loop observes the SAME camera sample again: geometry comes from the
+/// cache (measurement filters must not advance) but the hold/fade
+/// policy may have decayed the live sample's confidences, and that
+/// decay must still reach the solver's gates.
+fn refresh_confidence_channels(cached: &mut SourceSkeleton, live: &SourceSkeleton) {
+    for (bone, joint) in cached.joints.iter_mut() {
+        if let Some(l) = live.joints.get(bone) {
+            joint.confidence = l.confidence;
+        }
+    }
+    for (bone, tip) in cached.fingertips.iter_mut() {
+        if let Some(l) = live.fingertips.get(bone) {
+            tip.confidence = l.confidence;
+        }
+    }
+    if let (Some(cf), Some(lf)) = (cached.face.as_mut(), live.face.as_ref()) {
+        cf.confidence = lf.confidence;
+    }
+    cached.face_mesh_confidence = live.face_mesh_confidence;
+    if let (Some(c), Some(l)) = (
+        cached.left_hand_orientation.as_mut(),
+        live.left_hand_orientation.as_ref(),
+    ) {
+        c.confidence = l.confidence;
+    }
+    if let (Some(c), Some(l)) = (
+        cached.right_hand_orientation.as_mut(),
+        live.right_hand_orientation.as_ref(),
+    ) {
+        c.confidence = l.confidence;
+    }
+    cached.overall_confidence = live.overall_confidence;
+    cached.expressions = live.expressions.clone();
 }
 
 /// Re-project each finger's PIP/DIP joints onto a single anatomical curl
@@ -4131,6 +4542,194 @@ mod chin_chain_tests {
         assert!(
             head_z.abs() < 0.02,
             "head lean: Head world Z must stay near zero (no spurious pitch), got {head_z}"
+        );
+    }
+}
+
+/// The render loop solves at display rate while the camera captures at
+/// 30 fps — these tests pin down that the *measurement* side of the
+/// solver (1€ filters, confidence gates) advances once per distinct
+/// camera sample, so the solved pose can't depend on the viewer's
+/// monitor refresh rate.
+#[cfg(test)]
+mod sample_dedup_tests {
+    use super::*;
+    use crate::asset::{HumanoidBone, HumanoidMap, NodeId, SkeletonAsset, SkeletonNode};
+    use crate::tracking::source_skeleton::SourceJoint;
+    use std::collections::HashMap;
+
+    fn build_arm_rig() -> (SkeletonAsset, HumanoidMap) {
+        let bones: &[(HumanoidBone, Option<HumanoidBone>, [f32; 3])] = &[
+            (HumanoidBone::Hips, None, [0.0, 0.9, 0.0]),
+            (HumanoidBone::Spine, Some(HumanoidBone::Hips), [0.0, 0.5, 0.0]),
+            (
+                HumanoidBone::LeftUpperArm,
+                Some(HumanoidBone::Spine),
+                [0.2, 0.0, 0.0],
+            ),
+            (
+                HumanoidBone::LeftLowerArm,
+                Some(HumanoidBone::LeftUpperArm),
+                [0.29, 0.0, 0.0],
+            ),
+        ];
+        let bone_to_idx: HashMap<HumanoidBone, usize> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, (b, _, _))| (*b, i))
+            .collect();
+        let mut nodes: Vec<SkeletonNode> = bones
+            .iter()
+            .enumerate()
+            .map(|(i, (bone, _, translation))| SkeletonNode {
+                id: NodeId(i as u64),
+                name: format!("{bone:?}"),
+                parent: None,
+                children: Vec::new(),
+                rest_local: Transform {
+                    translation: *translation,
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: Some(*bone),
+            })
+            .collect();
+        for (i, (_, parent, _)) in bones.iter().enumerate() {
+            if let Some(parent_bone) = parent {
+                let parent_idx = bone_to_idx[parent_bone];
+                nodes[i].parent = Some(NodeId(parent_idx as u64));
+                nodes[parent_idx].children.push(NodeId(i as u64));
+            }
+        }
+        let skeleton = SkeletonAsset {
+            nodes,
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: Vec::new(),
+        };
+        let humanoid = HumanoidMap {
+            bone_map: bone_to_idx
+                .iter()
+                .map(|(b, i)| (*b, NodeId(*i as u64)))
+                .collect(),
+        };
+        (skeleton, humanoid)
+    }
+
+    /// A moving-elbow sample stamped with a device capture time, as the
+    /// real D435 path publishes it.
+    fn camera_sample(step: u64, elbow_y: f32) -> SourceSkeleton {
+        let mut sk = SourceSkeleton::empty(step);
+        sk.capture_timestamp_ms = Some(step as f64 * 33.3);
+        for (bone, pos) in [
+            (HumanoidBone::LeftUpperArm, [0.2, 1.4, 0.0]),
+            (HumanoidBone::LeftLowerArm, [0.45, elbow_y, 0.0]),
+        ] {
+            sk.joints.insert(
+                bone,
+                SourceJoint {
+                    position: pos,
+                    confidence: 1.0,
+                    metric_depth_m: None,
+                },
+            );
+        }
+        sk.overall_confidence = 1.0;
+        sk
+    }
+
+    fn params() -> SolverParams {
+        SolverParams {
+            rotation_blend: 1.0,
+            joint_confidence_threshold: 0.05,
+            // Keep the untracked-arm idler out of the way: these tests
+            // assert what the *tracking* path does and does not drive.
+            idle_arm_apose_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// Solving the same capture sequence once-per-sample (30 Hz render)
+    /// and twice-per-sample (60 Hz render) must land on the same pose:
+    /// the measurement filters advance per *capture*, not per solve
+    /// call. Pre-fix, every repeat pushed the identical raw value
+    /// through the 1€ filters again, so the result depended on how many
+    /// render frames each camera frame was displayed for.
+    #[test]
+    fn double_rate_resolve_matches_single_rate() {
+        let (skeleton, humanoid) = build_arm_rig();
+        let samples: Vec<SourceSkeleton> = (0..8)
+            .map(|i| camera_sample(i, 1.4 - 0.05 * i as f32))
+            .collect();
+
+        let run = |repeats: usize| -> Vec<Transform> {
+            let mut state = PoseSolverState::new();
+            let mut local: Vec<Transform> = skeleton
+                .nodes
+                .iter()
+                .map(|n| n.rest_local.clone())
+                .collect();
+            for s in &samples {
+                for _ in 0..repeats {
+                    // Rebuild base pose each render frame, as run_frame does.
+                    for (t, n) in local.iter_mut().zip(skeleton.nodes.iter()) {
+                        *t = n.rest_local.clone();
+                    }
+                    solve_avatar_pose(s, &skeleton, Some(&humanoid), &mut local, &params(), &mut state);
+                }
+            }
+            local
+        };
+
+        let once = run(1);
+        let twice = run(2);
+        for (idx, (a, b)) in once.iter().zip(twice.iter()).enumerate() {
+            for c in 0..4 {
+                assert!(
+                    (a.rotation[c] - b.rotation[c]).abs() < 1e-4,
+                    "node {idx}: solving each camera sample twice (60 Hz render) must not \
+                     change the pose vs once (30 Hz render); rotation component {c} \
+                     differs: {} vs {}",
+                    a.rotation[c],
+                    b.rotation[c],
+                );
+            }
+        }
+    }
+
+    /// The hold/fade policy re-publishes the SAME capture with decayed
+    /// confidences. The cached-geometry fast path must still let that
+    /// decay reach the confidence gates — a fully decayed repeat leaves
+    /// the arm at rest even though the cache holds a bent-arm pose.
+    #[test]
+    fn confidence_decay_on_repeated_sample_still_gates_joints() {
+        let (skeleton, humanoid) = build_arm_rig();
+        let mut state = PoseSolverState::new();
+        let rest: Vec<Transform> = skeleton
+            .nodes
+            .iter()
+            .map(|n| n.rest_local.clone())
+            .collect();
+
+        // Fresh solve with a clearly bent arm.
+        let bent = camera_sample(0, 1.0);
+        let mut local = rest.clone();
+        solve_avatar_pose(&bent, &skeleton, Some(&humanoid), &mut local, &params(), &mut state);
+        let upper_idx = humanoid.bone_map[&HumanoidBone::LeftUpperArm].0 as usize;
+        let bent_rot = local[upper_idx].rotation;
+        assert!(
+            bent_rot[2].abs() > 0.01 || bent_rot[0].abs() > 0.01 || bent_rot[1].abs() > 0.01,
+            "precondition: bent arm must rotate the upper arm, got {bent_rot:?}"
+        );
+
+        // Same capture, confidences decayed to zero (hold window expiry).
+        let mut decayed = bent.clone();
+        decayed.scale_confidence(0.0);
+        let mut local = rest.clone();
+        solve_avatar_pose(&decayed, &skeleton, Some(&humanoid), &mut local, &params(), &mut state);
+        let r = local[upper_idx].rotation;
+        assert!(
+            r[0].abs() < 1e-5 && r[1].abs() < 1e-5 && r[2].abs() < 1e-5,
+            "fully decayed repeat must leave the arm at rest (gated off), got {r:?}"
         );
     }
 }

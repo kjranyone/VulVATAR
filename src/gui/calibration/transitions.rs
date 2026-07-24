@@ -34,6 +34,9 @@ pub(super) fn begin_capture(state: &mut GuiApp) {
                 last_confidence: 0.0,
                 no_anchor_since: None,
                 no_lower_arms_since: None,
+                stillness_fallback: false,
+                last_anchor_pos: None,
+                last_seq_consumed: 0,
             })
         }
         _ => None,
@@ -144,6 +147,8 @@ pub(super) fn advance_state(state: &mut GuiApp) {
                 started_at: now,
                 samples: Vec::with_capacity(64),
                 expr_accum: std::collections::HashMap::new(),
+                face_accum_mesh: Vec::new(),
+                face_accum_body: Vec::new(),
                 last_seq_consumed: 0,
                 last_anchor_seen: false,
                 last_confidence: 0.0,
@@ -228,6 +233,8 @@ pub(super) fn finish_capture(state: &mut GuiApp) {
                 started_at: now,
                 samples: Vec::with_capacity(64),
                 expr_accum: std::collections::HashMap::new(),
+                face_accum_mesh: Vec::new(),
+                face_accum_body: Vec::new(),
                 last_seq_consumed: 0,
                 last_anchor_seen: false,
                 last_confidence: 0.0,

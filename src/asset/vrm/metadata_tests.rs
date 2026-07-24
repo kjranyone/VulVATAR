@@ -261,6 +261,7 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         pitch: 0.0,
         roll: 0.0,
         confidence: 1.0,
+        ..Default::default()
     });
     source.overall_confidence = 1.0;
     // Drive the solver's metric path (D435-exclusive); without it the solver

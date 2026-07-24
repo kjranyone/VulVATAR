@@ -442,6 +442,9 @@ fn build_metric_frame_from_depth(
         height: h,
         points_m,
         crop: None,
+        // Synthetic frames carry no device clock — the provider's
+        // time-based estimators run on their nominal 30 fps fallback.
+        timestamp_ms: None,
         intrinsics: Some(vulvatar_lib::tracking::source_skeleton::CameraIntrinsics {
             fx,
             fy,

@@ -472,16 +472,17 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 last_confidence: 0.0,
             };
         }
-    } else if framing_hint(&state.calibration.modal) {
+    } else if let Some(key) = framing_hint(&state.calibration.modal) {
         // Anchor is fine but the elbows have been cropped for a
-        // while. T-pose / A-pose scoring both need both elbow
-        // keypoints (see `pose_match::arm_direction`), so without
-        // them the user is stuck at 0% match with no visible cause.
-        // Inline-only — no auxiliary button, the action is physical.
+        // while. In FullBody the fix is physical (step back so a
+        // T-pose fits the frame) and the hint says so; in UpperBody
+        // the stillness fallback has taken over by the time this
+        // fires and the hint instead explains the gate switch.
+        // Inline-only — no auxiliary button either way.
         ui.add_space(8.0);
         ui.colored_label(
             egui::Color32::from_rgb(240, 180, 90),
-            egui::RichText::new(t!("calibration.lower_arms_out_of_frame")).size(12.0),
+            egui::RichText::new(t!(key)).size(12.0),
         );
     }
 
@@ -536,23 +537,36 @@ fn mode_mismatch_hint(
     Some((message, switch_to))
 }
 
-/// True when the user has been in `WaitingForPose` long enough with
-/// the elbows cropped for the framing hint to fire. Reuses
-/// `NO_ANCHOR_HINT_SECONDS` so a transient occlusion of one elbow
-/// (a hand passing over the lap, etc.) doesn't immediately ping;
-/// the threshold is the same load-bearing "ignore short blips,
-/// react to sustained problems" delay the anchor hint uses.
-fn framing_hint(state: &CalibrationModalState) -> bool {
+/// Locale key for the elbow-framing hint, if it should show. Fires
+/// once the user has been in `WaitingForPose` long enough with the
+/// elbows cropped, reusing `NO_ANCHOR_HINT_SECONDS` so a transient
+/// occlusion of one elbow (a hand passing over the lap, etc.) doesn't
+/// immediately ping; the threshold is the same load-bearing "ignore
+/// short blips, react to sustained problems" delay the anchor hint
+/// uses.
+///
+/// Two variants: while the bust-up stillness fallback is engaged
+/// (UpperBody, elbows permanently cropped — see
+/// `docs/calibration-ux.md` Phase H) the "step back" advice is
+/// unactionable, so the hint instead announces the gate switch. The
+/// fallback latch implies the elapsed condition already passed, so
+/// it's checked first.
+fn framing_hint(state: &CalibrationModalState) -> Option<&'static str> {
     let CalibrationModalState::WaitingForPose {
         no_lower_arms_since,
+        stillness_fallback,
         ..
     } = state
     else {
-        return false;
+        return None;
     };
+    if *stillness_fallback {
+        return Some("calibration.stillness_fallback_hint");
+    }
     no_lower_arms_since
         .map(|t| t.elapsed().as_secs_f32() >= NO_ANCHOR_HINT_SECONDS)
         .unwrap_or(false)
+        .then_some("calibration.lower_arms_out_of_frame")
 }
 
 /// AnchorDone pane: result summary + the three branching choices
@@ -649,11 +663,20 @@ fn step_text(state: &CalibrationModalState) -> (String, String) {
         CalibrationModalState::WaitingForPose {
             mode,
             frames_at_match,
+            stillness_fallback,
             ..
         } => {
-            let pose = match mode {
-                CalibrationMode::FullBody => t!("calibration.pose_full_body"),
-                CalibrationMode::UpperBody => t!("calibration.pose_upper_body"),
+            // Once the bust-up fallback has engaged, the arm
+            // instructions are unactionable (the arms aren't in
+            // frame) — swap to the hold-still instruction the
+            // stillness gate actually scores.
+            let pose = if *stillness_fallback {
+                t!("calibration.pose_upper_body_bust_up")
+            } else {
+                match mode {
+                    CalibrationMode::FullBody => t!("calibration.pose_full_body"),
+                    CalibrationMode::UpperBody => t!("calibration.pose_upper_body"),
+                }
             };
             // Step text differs once the user has crossed the match
             // threshold: the system has "locked on" and is waiting

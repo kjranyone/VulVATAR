@@ -528,6 +528,14 @@ pub(super) fn derive_face_pose_from_landmarks(landmarks: &[[f32; 3]]) -> Option<
     let r_cheek = landmarks[RIGHT_CHEEK];
     let l_cheek = landmarks[LEFT_CHEEK];
 
+    crate::tracking::debug_channel::stash_mesh_landmarks([
+        [nose[0], nose[1]],
+        [r_eye[0], r_eye[1]],
+        [l_eye[0], l_eye[1]],
+        [r_cheek[0], r_cheek[1]],
+        [l_cheek[0], l_cheek[1]],
+    ]);
+
     // YAW from 2D nose offset relative to cheek midpoint.
     //
     // The PINTO export's z signal turns out to be ~4× weaker than
@@ -583,7 +591,16 @@ pub(super) fn derive_face_pose_from_landmarks(landmarks: &[[f32; 3]]) -> Option<
     let face_width = ((l_eye[0] - r_eye[0]).powi(2) + (l_eye[1] - r_eye[1]).powi(2))
         .sqrt()
         .max(20.0);
-    let pitch_signal = (nose[1] - eye_mid_y) / face_width - PITCH_NEUTRAL_SIGNAL;
+    // Yaw decoupling: the eye-corner baseline foreshortens by ~cos(yaw)
+    // when the head turns, while the nose-below-eye vertical distance
+    // stays roughly constant — the raw ratio inflates by 1/cos(yaw) and
+    // a head shake used to read as a nod. Recover the frontal-space
+    // signal (which is what PITCH_NEUTRAL_SIGNAL was measured in)
+    // before the subtraction. 0.5 floor: past ~60° the mesh confidence
+    // collapses anyway; don't let cos over-shrink a noisy ratio.
+    let yaw_foreshorten = yaw.cos().clamp(0.5, 1.0);
+    let pitch_signal =
+        (nose[1] - eye_mid_y) / face_width * yaw_foreshorten - PITCH_NEUTRAL_SIGNAL;
     let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
 
     // ROLL from eye-line Y-X. Image y-down: when subject tilts head
@@ -602,6 +619,8 @@ pub(super) fn derive_face_pose_from_landmarks(landmarks: &[[f32; 3]]) -> Option<
         // (the FaceMesh model's "is this a face" sigmoid). The pose
         // itself doesn't carry an independent quality signal.
         confidence: 1.0,
+        source: crate::tracking::FaceSource::Mesh,
+        ..Default::default()
     })
 }
 

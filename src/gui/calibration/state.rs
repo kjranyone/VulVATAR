@@ -143,6 +143,30 @@ pub enum CalibrationModalState {
         /// elbow keypoint, which is the first thing to crop out at
         /// desk distances".
         no_lower_arms_since: Option<Instant>,
+        /// Bust-up framing fallback latch (`docs/calibration-ux.md`,
+        /// Phase H). Set once when `mode == UpperBody` and
+        /// `no_lower_arms_since` survives `NO_ANCHOR_HINT_SECONDS`:
+        /// the shoulder anchor is visible but both elbows are cropped
+        /// out (webcam-streamer framing where the arm-direction gate
+        /// can never fire). While `true`, the gate scores **anchor
+        /// stillness** instead of arm direction, and the instruction
+        /// pane swaps to "face the camera and hold still". Latched —
+        /// never cleared inside this state — so elbows flickering in
+        /// at the frame edge don't bounce the user between two
+        /// different instructions mid-wait; a retry / mode switch
+        /// re-evaluates from scratch.
+        stillness_fallback: bool,
+        /// Previous tracking frame's anchor `(x, y)` for the
+        /// stillness displacement. `None` until the first admitted
+        /// frame after the fallback engages, and reset whenever a
+        /// frame fails admission (anchor missing / low confidence) so
+        /// a dropout doesn't compare positions across a gap.
+        last_anchor_pos: Option<[f32; 2]>,
+        /// Last mailbox sequence folded into the stillness gate.
+        /// Same repaint-vs-tracking-frame guard as `Collecting`'s
+        /// field of the same name: per-repaint deltas would read as
+        /// near-zero motion at any speed.
+        last_seq_consumed: u64,
     },
     /// Active anchor sample collection. Per-frame `AnchorSample` rows
     /// are appended each time the mailbox sequence advances *and* the
@@ -162,6 +186,20 @@ pub enum CalibrationModalState {
         /// maps would force a heap allocation per sample. Empty unless face
         /// tracking is running while the user holds the neutral pose.
         expr_accum: std::collections::HashMap<String, (f32, usize)>,
+        /// Mesh-sourced face poses (`[yaw, pitch, roll]`, radians) seen
+        /// during the window whose confidence cleared the face floor.
+        /// Medianed in `finalize_collection` into
+        /// `PoseCalibration::neutral_face_ypr_mesh` — the person's
+        /// resting head pose relative to the camera as the FaceMesh
+        /// estimator sees it. Empty unless face tracking runs while
+        /// the user holds the neutral pose.
+        face_accum_mesh: Vec<[f32; 3]>,
+        /// Body-sourced (RTMW3D ear/eye-line) face poses over the same
+        /// window, fed from `SourceSkeleton::face_body_raw` so the
+        /// body-path neutral is measured even though the mesh wins
+        /// selection on nearly every frontal-hold frame. Medianed into
+        /// `PoseCalibration::neutral_face_ypr_body`.
+        face_accum_body: Vec<[f32; 3]>,
         /// Tracks the last mailbox sequence we admitted a sample for,
         /// so we don't double-count when the GUI repaints faster than
         /// the tracking thread emits new frames.

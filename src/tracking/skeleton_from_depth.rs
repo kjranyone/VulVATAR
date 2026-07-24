@@ -71,6 +71,54 @@ pub struct MetricDepthFrame {
     /// [`MetricFrameInfo`] for the 1:1 sensor-matched render. `None` when
     /// the frame was synthesised without a real sensor (tests).
     pub intrinsics: Option<CameraIntrinsics>,
+    /// Device capture timestamp of the colour/depth frameset, in
+    /// milliseconds on the sensor's clock (D435 hardware timestamp).
+    /// Consecutive-frame differences drive the dt-normalised temporal
+    /// estimators ([`TorsoScaleStabilizer`], the face-source crossfade,
+    /// the arm-length leaky maxima) so their time constants hold under
+    /// frame drops / non-30-fps streams. `None` for synthetic frames
+    /// (tests, offline benches without recorded timestamps) — consumers
+    /// fall back to a nominal 30 fps step.
+    pub timestamp_ms: Option<f64>,
+}
+
+/// Derives the inter-frame dt (seconds) from consecutive device capture
+/// timestamps, with a nominal-30-fps fallback when timestamps are absent
+/// (synthetic frames, offline benches) or non-monotonic (device clock
+/// reset after a reconnect). Clamped so a single pathological gap can't
+/// blow up a rate gate or an EMA step.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::tracking) struct FrameDtTracker {
+    last_ts_ms: Option<f64>,
+}
+
+/// Nominal frame step used whenever a real capture dt is unavailable.
+/// All dt-normalised constants reproduce their historical 30-fps
+/// behaviour exactly at this step.
+pub(in crate::tracking) const NOMINAL_FRAME_DT_S: f32 = 1.0 / 30.0;
+
+impl FrameDtTracker {
+    /// dt bounds: 5 ms (~200 fps — anything faster is duplicate/burst
+    /// delivery, not subject motion) to 100 ms (~10 fps — beyond that a
+    /// gap is a stall, and stretching rate gates further would let a
+    /// contamination jump masquerade as plausible motion).
+    const DT_MIN_S: f32 = 0.005;
+    const DT_MAX_S: f32 = 0.100;
+
+    pub(in crate::tracking) fn tick(&mut self, ts_ms: Option<f64>) -> f32 {
+        let dt = match (self.last_ts_ms, ts_ms) {
+            (Some(prev), Some(cur)) if cur > prev => ((cur - prev) / 1000.0) as f32,
+            _ => NOMINAL_FRAME_DT_S,
+        };
+        if ts_ms.is_some() {
+            self.last_ts_ms = ts_ms;
+        }
+        dt.clamp(Self::DT_MIN_S, Self::DT_MAX_S)
+    }
+
+    pub(in crate::tracking) fn reset(&mut self) {
+        self.last_ts_ms = None;
+    }
 }
 
 /// Per-keypoint visibility floor — anything below is treated as "no
@@ -390,14 +438,39 @@ impl TorsoCaptureBuffer {
         let min_ny = (min_ny_raw - pad_y).clamp(0.0, 1.0);
         let max_ny = (max_ny_raw + pad_y).clamp(0.0, 1.0);
 
+        // Torso depth reference from the four anchor keypoints' own pixels —
+        // the band the cells are gated against. Temporal median can absorb
+        // RANDOM noise, but background pixels (armpit gaps, above-shoulder
+        // corners of the rectangular bbox) sit at the same place every frame,
+        // so without a band they'd survive the median and be baked into the
+        // template as "torso".
+        let mut anchor_depths: Vec<f32> = [ls, rs, lh, rh]
+            .iter()
+            .filter_map(|j| {
+                let cx = (j.nx * frame.width as f32).round() as i32;
+                let cy = (j.ny * frame.height as f32).round() as i32;
+                if cx < 0 || cy < 0 || cx >= frame.width as i32 || cy >= frame.height as i32 {
+                    return None;
+                }
+                let pz = frame.points_m[cy as usize * frame.width as usize + cx as usize][2];
+                (pz.is_finite() && pz > 0.0).then_some(pz)
+            })
+            .collect();
+        if anchor_depths.len() < 2 {
+            return false;
+        }
+        anchor_depths.sort_by(|a, b| a.total_cmp(b));
+        let z_ref = anchor_depths[anchor_depths.len() / 2];
+        /// A torso surface spans well under this around its anchor depth; a
+        /// cell pixel outside it is background / a foreground limb, not torso.
+        const TORSO_BAND_M: f32 = 0.35;
+
         // Sample one pixel per cell at the cell's centre. Single-
         // pixel sample is fine here because the median over the
-        // capture window absorbs per-frame depth-map noise — using
-        // the 7×7 window-median per cell would just be redundant
-        // smoothing.
+        // capture window absorbs per-frame depth-map noise.
         let grid = Self::GRID;
         let grid_f = grid as f32;
-        let mut frame_admitted = false;
+        let mut valid_cells = 0usize;
         for gy in 0..grid {
             for gx in 0..grid {
                 // Cell centre in image-relative coords.
@@ -410,14 +483,18 @@ impl TorsoCaptureBuffer {
                 }
                 let pixel_idx = cy as usize * frame.width as usize + cx as usize;
                 let [_, _, pz] = frame.points_m[pixel_idx];
-                if pz.is_finite() && pz > 0.0 {
+                if pz.is_finite() && pz > 0.0 && (pz - z_ref).abs() <= TORSO_BAND_M {
                     self.cells[gy * grid + gx].push(pz);
-                    frame_admitted = true;
+                    valid_cells += 1;
                 }
             }
         }
 
-        if !frame_admitted {
+        // Admit the frame only when a meaningful fraction of the grid saw the
+        // torso — previously ONE valid cell out of 1024 admitted a frame, so
+        // near-void frames still dragged the bbox average around.
+        const MIN_VALID_CELL_FRAC: f32 = 0.30;
+        if (valid_cells as f32) < MIN_VALID_CELL_FRAC * (grid * grid) as f32 {
             return false;
         }
         self.bbox_acc[0] += min_nx;
@@ -568,6 +645,15 @@ pub(super) mod torso_fit {
         pub anchor_cam: [f32; 3],
         pub anchor_is_hip: bool,
         pub anchor_score: f32,
+        /// The shoulder pair was FABRICATED as a canonical frontal pair
+        /// (collapse guard): its geometry is a constant, not a measurement.
+        /// Consumers must not feed its span into any scale estimator, and
+        /// the built joints are marked [`crate::tracking::source_skeleton::JointOrigin::Synthesized`].
+        pub pair_fabricated: bool,
+        /// The shoulder pair was RE-SEATED along its rays onto the body depth
+        /// (foreground-occlusion guard). The 2-D rays are real but the depth —
+        /// and hence the 3-D span — is inferred, so span estimators skip it.
+        pub pair_reseated: bool,
     }
 
     #[inline]
@@ -621,10 +707,19 @@ pub(super) mod torso_fit {
     /// windowed-median sample at each shoulder is both more faithful and far
     /// steadier. `None` only when no shoulder (nor hip, full-body) yields a
     /// sample — the sole "emit empty skeleton" case.
+    ///
+    /// `person_z_ref` is the PREVIOUS frame's stabilised anchor depth
+    /// (metres). When present, the shoulder/hip samples themselves are
+    /// person-band gated — closing the hole where a shoulder keypoint on the
+    /// silhouette sampled the wall 4 m back, the occlusion guard then declared
+    /// the wall "the body" (deeper = body) and re-seated BOTH shoulders onto
+    /// it, teleporting the whole torso. The first frame (`None`) seeds
+    /// unbanded, exactly like the head/hand z-band bootstraps.
     pub(in crate::tracking) fn fit_torso(
         frame: &MetricDepthFrame,
         joints: &[DecodedJoint2d],
         opts: BuildOptions,
+        person_z_ref: Option<f32>,
     ) -> Option<TorsoFit> {
         if joints.len() < NUM_JOINTS {
             return None;
@@ -633,9 +728,22 @@ pub(super) mod torso_fit {
 
         // Direct windowed-median depth sample at a torso keypoint, deprojected
         // to camera-space metres. Robust to a few edge pixels; no plane needed.
+        // Person-band gated against the previous stabilised anchor when
+        // available, so a silhouette-edge torso keypoint over the far wall
+        // returns `None` (unobservable) instead of the wall.
+        let z_ref = person_z_ref.filter(|z| z.is_finite() && *z > 0.0);
         let sample = |idx: usize| -> Option<[f32; 3]> {
             let j = visible(joints, idx)?;
-            super::sample_metric_point(frame, j.nx, j.ny)
+            match z_ref {
+                Some(z) => super::sample_metric_point_person(
+                    frame,
+                    j.nx,
+                    j.ny,
+                    super::SAMPLE_RADIUS_PX,
+                    z,
+                ),
+                None => super::sample_metric_point(frame, j.nx, j.ny),
+            }
         };
         let mut r_shoulder_cam = sample(5);
         let mut l_shoulder_cam = sample(6);
@@ -651,12 +759,28 @@ pub(super) mod torso_fit {
         // along their own rays, so the torso reads frontal (dz≈0) instead of a
         // spurious ±60–90° yaw. Both are kept (the arms still root on them);
         // the front-facing prior is the safe default for an unseen orientation.
-        let mut occluded = 0u8;
+        let mut pair_fabricated = false;
+        let mut pair_reseated = false;
         if let (Some(r), Some(l)) = (r_shoulder_cam, l_shoulder_cam) {
             let d = [r[0] - l[0], r[1] - l[1], r[2] - l[2]];
             let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             let depth_gap = (r[2] - l[2]).abs();
-            let body_z = r[2].max(l[2]);
+            // Which of the two depths is "the body"? With a person reference
+            // available, the one CLOSER to it — "deeper = body" silently
+            // declared the wall behind the subject the body whenever a
+            // background pixel slipped through. Without a reference (first
+            // frame) keep the deeper-is-body prior: the common contaminant
+            // there is a hand in FRONT of a shoulder.
+            let body_z = match z_ref {
+                Some(z) => {
+                    if (r[2] - z).abs() <= (l[2] - z).abs() {
+                        r[2]
+                    } else {
+                        l[2]
+                    }
+                }
+                None => r[2].max(l[2]),
+            };
             if dist < MIN_RIGID_SPAN_FRAC * ANATOMICAL_SPAN_M {
                 // Collapsed pair: the detector drew both shoulders onto the
                 // central hands, so BOTH lateral positions are unreliable — a
@@ -668,14 +792,15 @@ pub(super) mod torso_fit {
                 let half = 0.5 * ANATOMICAL_SPAN_M;
                 r_shoulder_cam = Some([m[0] + half, m[1], body_z]);
                 l_shoulder_cam = Some([m[0] - half, m[1], body_z]);
-                occluded = 1;
+                pair_fabricated = true;
             } else if depth_gap > OCCLUSION_GAP_M {
-                // Foreground occlusion of ONE shoulder (a hand in front of it):
-                // its depth is wrong but its 2-D ray is fine, so re-seat the
-                // shallower one onto the body (deeper) depth along its own ray.
+                // Occlusion of ONE shoulder (a hand in front of it, or — with
+                // a person reference — a background pixel past it): its depth
+                // is wrong but its 2-D ray is fine, so re-seat both onto the
+                // body depth along their own rays.
                 r_shoulder_cam = Some(ray_to_depth(r, body_z));
                 l_shoulder_cam = Some(ray_to_depth(l, body_z));
-                occluded = 1;
+                pair_reseated = true;
             }
         }
 
@@ -688,8 +813,12 @@ pub(super) mod torso_fit {
                 (mid(rh, lh), true, joints[11].score.min(joints[12].score))
             } else if let (Some(rs), Some(ls)) = (r_shoulder_cam, l_shoulder_cam) {
                 (mid(rs, ls), false, joints[5].score.min(joints[6].score))
-            } else if let Some(s) = r_shoulder_cam.or(l_shoulder_cam) {
-                (s, false, joints[5].score.max(joints[6].score))
+            } else if let Some(s) = r_shoulder_cam {
+                // Score of the side that actually produced the sample — not
+                // simply the larger of the two.
+                (s, false, joints[5].score)
+            } else if let Some(s) = l_shoulder_cam {
+                (s, false, joints[6].score)
             } else {
                 return None;
             };
@@ -709,6 +838,7 @@ pub(super) mod torso_fit {
                 (Some(r), Some(l)) => (-(l[2] - r[2])).atan2(-(l[0] - r[0])).to_degrees(),
                 _ => f32::NAN,
             };
+            let occluded = u8::from(pair_fabricated) + 2 * u8::from(pair_reseated);
             eprintln!(
                 "TORSODBG#{n} occ={occluded} Rsh={} Lsh={} yaw={:+.1} anchor=[{:+.3},{:+.3},{:+.3}]{}",
                 fmt(r_shoulder_cam),
@@ -729,6 +859,8 @@ pub(super) mod torso_fit {
             anchor_cam,
             anchor_is_hip,
             anchor_score,
+            pair_fabricated,
+            pair_reseated,
         })
     }
 }
@@ -751,10 +883,34 @@ pub(super) mod torso_fit {
 /// with outlier rejection (a contaminated frame reads far off and is ignored),
 /// the anchor with an adaptive rate (follow a genuine lean, hold sampling
 /// jitter). Provider-owned; reset per session.
+/// NOTE ON TIME UNITS: every temporal constant below is expressed in
+/// seconds (EMA time constants, rejection windows) or per-second rates
+/// (the anchor spike gate) and integrated against the real capture dt
+/// supplied by the caller ([`FrameDtTracker`]). At the nominal 30 fps
+/// step each reproduces the historically calibrated per-frame behaviour
+/// exactly (the old per-frame value is quoted in each doc comment).
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::tracking) struct TorsoScaleStabilizer {
     span_m: Option<f32>,
     anchor_cam: Option<[f32; 3]>,
+    /// Accumulated wall time (s) of consecutive span measurements rejected
+    /// as outliers. At [`Self::SPAN_RESEED_S`] the estimator re-seeds
+    /// instead of rejecting forever — the escape hatch for a bad first seed
+    /// (finger-merge frame) or a subject swap, both of which previously
+    /// dead-locked the scale: every subsequent true reading differed from
+    /// the bogus held span by more than the outlier fraction and was
+    /// discarded for the whole session.
+    span_reject_time_s: f32,
+    /// Accumulated wall time (s) of consecutive anchor measurements
+    /// rejected as spikes.
+    anchor_reject_time_s: f32,
+    /// Ring buffer of the most recent REJECTED raw anchors, used as the
+    /// independent evidence for re-seeding: only when the rejected readings
+    /// are mutually consistent (the subject really is somewhere else, not
+    /// noise) does the anchor jump there.
+    anchor_recent: [[f32; 3]; Self::ANCHOR_RING],
+    anchor_recent_len: usize,
+    anchor_recent_head: usize,
 }
 
 impl TorsoScaleStabilizer {
@@ -766,37 +922,75 @@ impl TorsoScaleStabilizer {
     /// A raw span this far (fraction) from the held value is contamination.
     /// Tight, because a real biacromial span barely changes frame to frame.
     const SPAN_OUTLIER_FRAC: f32 = 0.25;
-    /// Per-frame easing toward an accepted span. Small: the span is a physical
-    /// constant, so once seeded it should hold near-locked, letting the avatar
-    /// scale stay put instead of breathing with shoulder-depth noise.
-    const SPAN_ALPHA: f32 = 0.05;
-    /// A per-frame anchor jump larger than this (m) is physically impossible for
-    /// a torso (> ~3.5 m/s at 30 fps) → it is shoulder-depth contamination (a
-    /// hand crossing in front), NOT a real move, so REJECT it (creep only). A
-    /// real lean / walk-in is well under this (~1 m/s ≈ 0.03 m/frame) and passes
+    /// EMA time constant (s) for easing toward an accepted span
+    /// (α = 1 − exp(−dt/τ); 0.05/frame at 30 fps). Long: the span is a
+    /// physical constant, so once seeded it should hold near-locked,
+    /// letting the avatar scale stay put instead of breathing with
+    /// shoulder-depth noise.
+    const SPAN_TAU_S: f32 = 0.650;
+    /// An anchor moving faster than this (m/s) is physically impossible for
+    /// a torso → it is shoulder-depth contamination (a hand crossing in
+    /// front), NOT a real move, so REJECT it (hold). (0.12 m/frame at
+    /// 30 fps.) A real lean / walk-in is well under this (~1 m/s) and passes
     /// through almost untouched, because the subject's distance (root_offset,
     /// hence the avatar's near/far) MUST reflect real movement — the downstream
     /// 1€ ROOT filter, not this gate, owns jitter smoothing. The old gate had
     /// this inverted (followed big jumps, held small ones) and so lagged genuine
     /// approach/retreat by ~25% while partly chasing contamination spikes.
-    const ANCHOR_SPIKE_M: f32 = 0.12;
-    /// Plausible movement: track it fast (near pass-through, ~0 lag).
-    const ANCHOR_FOLLOW: f32 = 0.80;
-    /// Rejected spike: creep slowly so a one-frame spike barely moves the anchor,
-    /// yet a genuinely sustained large displacement still converges (never stuck).
-    const ANCHOR_REJECT_CREEP: f32 = 0.15;
+    const ANCHOR_SPIKE_M_PER_S: f32 = 3.6;
+    /// Follow time constant (s) for plausible movement: near pass-through,
+    /// ~0 lag (α = 1 − exp(−dt/τ); 0.80/frame at 30 fps).
+    const ANCHOR_FOLLOW_TAU_S: f32 = 0.0207;
+    /// Sustained span-rejection time (s) before the estimator re-seeds.
+    /// Long enough that a held namaste (whose fabricated span is
+    /// already filtered upstream) or a burst of contamination can't re-seed,
+    /// short enough that a bad seed / subject swap recovers within seconds.
+    const SPAN_RESEED_S: f32 = 1.5;
+    /// Sustained anchor-rejection time (s) before re-seed is CONSIDERED.
+    /// The predecessor design instead crept 15% toward every rejected
+    /// reading, which meant ~20 frames of a held pose (namaste, a leaning
+    /// cheek-on-hand) walked the anchor fully onto the contamination — and the
+    /// person z-band with it. Rejection now HOLDS; convergence to a genuinely
+    /// changed position goes through the consistency check below.
+    const ANCHOR_RESEED_S: f32 = 2.0;
+    /// Rejected-anchor ring size used for the consistency check.
+    const ANCHOR_RING: usize = 8;
+    /// Re-seed only if every recent rejected reading sits within this of
+    /// their mean — i.e. the "new place" is stable, not flicker.
+    const ANCHOR_RESEED_SPREAD_M: f32 = 0.10;
 
     pub(in crate::tracking) fn reset(&mut self) {
         *self = Self::default();
     }
 
+    /// Depth (camera z, metres) of the held anchor — the person-band
+    /// reference for the NEXT frame's torso sampling. `None` until seeded.
+    pub(in crate::tracking) fn anchor_z(&self) -> Option<f32> {
+        self.anchor_cam.map(|a| a[2])
+    }
+
     /// Fold a raw measured shoulder span into the stable estimate and return
-    /// it. Seeds within the anatomical band (a wildly off first frame seeds the
-    /// default instead), then eases toward plausible readings and ignores
-    /// gross outliers so a hand-contaminated frame can't shrink/grow the avatar.
-    pub(in crate::tracking) fn stable_span(&mut self, raw: f32) -> f32 {
+    /// it. `raw = None` (shoulder pair missing or fabricated this frame)
+    /// returns the HELD value — previously a single dropped shoulder popped
+    /// the scale to the hard-coded anatomical default and back. Seeds within
+    /// the anatomical band (a wildly off first frame seeds the default
+    /// instead), eases toward plausible readings, ignores gross outliers so a
+    /// hand-contaminated frame can't shrink/grow the avatar — and re-seeds
+    /// after [`Self::SPAN_RESEED_S`] of sustained rejection, so a bogus
+    /// seed or a subject swap can't dead-lock the scale forever.
+    ///
+    /// `dt_s` is the capture-timestamp frame step ([`FrameDtTracker`]) —
+    /// the EMA step and the rejection window integrate real time, so a
+    /// 15 fps stall or a 60 fps stream keeps the same wall-clock
+    /// behaviour as the calibrated 30 fps baseline.
+    pub(in crate::tracking) fn stable_span(&mut self, raw: Option<f32>, dt_s: f32) -> Option<f32> {
+        let raw = match raw {
+            Some(r) if r.is_finite() && r > 0.0 => r,
+            _ => return self.span_m,
+        };
         let next = match self.span_m {
             None => {
+                self.span_reject_time_s = 0.0;
                 if (Self::SPAN_SEED_LO..=Self::SPAN_SEED_HI).contains(&raw) {
                     raw
                 } else {
@@ -805,37 +999,107 @@ impl TorsoScaleStabilizer {
             }
             Some(cur) => {
                 if (raw - cur).abs() <= Self::SPAN_OUTLIER_FRAC * cur {
-                    cur + Self::SPAN_ALPHA * (raw - cur)
+                    self.span_reject_time_s = 0.0;
+                    let alpha = 1.0 - (-dt_s / Self::SPAN_TAU_S).exp();
+                    cur + alpha * (raw - cur)
                 } else {
-                    cur
+                    self.span_reject_time_s += dt_s;
+                    if self.span_reject_time_s >= Self::SPAN_RESEED_S {
+                        // The "outliers" have outlasted anything a transient
+                        // contamination produces — the held value is what's
+                        // wrong. Re-seed like a first frame.
+                        self.span_reject_time_s = 0.0;
+                        if (Self::SPAN_SEED_LO..=Self::SPAN_SEED_HI).contains(&raw) {
+                            raw
+                        } else {
+                            Self::SPAN_DEFAULT
+                        }
+                    } else {
+                        cur
+                    }
                 }
             }
         };
         self.span_m = Some(next);
-        next
+        Some(next)
     }
 
     /// Spike-reject the torso anchor (camera metres): a real lean / walk-in
-    /// passes through nearly untouched so the avatar's distance tracks it, while
-    /// a physically-impossible one-frame jump (shoulder depth contaminated by a
-    /// hand in front) is rejected. This is a contamination gate, NOT a jitter
+    /// passes through nearly untouched so the avatar's distance tracks it,
+    /// while a physically-impossible one-frame jump (shoulder depth
+    /// contaminated by a hand in front) is rejected — and, unlike the old
+    /// creep, a SUSTAINED contamination (a pose held for seconds) keeps being
+    /// rejected instead of slowly capitulating. Recovery from a genuine
+    /// discontinuity (subject swap, tracking re-acquired elsewhere) requires
+    /// independent evidence: [`Self::ANCHOR_RESEED_S`] of rejections
+    /// whose readings agree with each other, at which point the anchor
+    /// re-seeds to their mean. This is a contamination gate, NOT a jitter
     /// smoother — the downstream 1€ ROOT filter owns jitter.
-    pub(in crate::tracking) fn stable_anchor(&mut self, raw: [f32; 3]) -> [f32; 3] {
+    ///
+    /// `dt_s` is the capture-timestamp frame step ([`FrameDtTracker`]): the
+    /// spike gate compares a *velocity* (dev/dt vs
+    /// [`Self::ANCHOR_SPIKE_M_PER_S`]), so a dropped frame doesn't turn a
+    /// legitimate 0.5 m/s approach into a "physically impossible" jump, and
+    /// the follow easing + rejection window integrate real time.
+    pub(in crate::tracking) fn stable_anchor(&mut self, raw: [f32; 3], dt_s: f32) -> [f32; 3] {
         let next = match self.anchor_cam {
             None => raw,
             Some(cur) => {
                 let d = [raw[0] - cur[0], raw[1] - cur[1], raw[2] - cur[2]];
                 let dev = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                let a = if dev > Self::ANCHOR_SPIKE_M {
-                    Self::ANCHOR_REJECT_CREEP
+                if dev <= Self::ANCHOR_SPIKE_M_PER_S * dt_s {
+                    self.anchor_reject_time_s = 0.0;
+                    self.anchor_recent_len = 0;
+                    self.anchor_recent_head = 0;
+                    let alpha = 1.0 - (-dt_s / Self::ANCHOR_FOLLOW_TAU_S).exp();
+                    [
+                        cur[0] + alpha * d[0],
+                        cur[1] + alpha * d[1],
+                        cur[2] + alpha * d[2],
+                    ]
                 } else {
-                    Self::ANCHOR_FOLLOW
-                };
-                [cur[0] + a * d[0], cur[1] + a * d[1], cur[2] + a * d[2]]
+                    self.anchor_reject_time_s += dt_s;
+                    self.anchor_recent[self.anchor_recent_head] = raw;
+                    self.anchor_recent_head = (self.anchor_recent_head + 1) % Self::ANCHOR_RING;
+                    self.anchor_recent_len = (self.anchor_recent_len + 1).min(Self::ANCHOR_RING);
+                    if self.anchor_reject_time_s >= Self::ANCHOR_RESEED_S
+                        && self.anchor_recent_len == Self::ANCHOR_RING
+                        && Self::ring_is_consistent(
+                            &self.anchor_recent,
+                            Self::ANCHOR_RESEED_SPREAD_M,
+                        )
+                    {
+                        self.anchor_reject_time_s = 0.0;
+                        self.anchor_recent_len = 0;
+                        self.anchor_recent_head = 0;
+                        Self::ring_mean(&self.anchor_recent)
+                    } else {
+                        cur
+                    }
+                }
             }
         };
         self.anchor_cam = Some(next);
         next
+    }
+
+    fn ring_mean(ring: &[[f32; 3]; Self::ANCHOR_RING]) -> [f32; 3] {
+        let mut m = [0.0f32; 3];
+        for p in ring {
+            m[0] += p[0];
+            m[1] += p[1];
+            m[2] += p[2];
+        }
+        let inv = 1.0 / Self::ANCHOR_RING as f32;
+        [m[0] * inv, m[1] * inv, m[2] * inv]
+    }
+
+    fn ring_is_consistent(ring: &[[f32; 3]; Self::ANCHOR_RING], tol: f32) -> bool {
+        let mean = Self::ring_mean(ring);
+        ring.iter().all(|p| {
+            let d = [p[0] - mean[0], p[1] - mean[1], p[2] - mean[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= tol
+        })
     }
 }
 
@@ -1015,8 +1279,8 @@ const LR_SWAP_PAIRS: &[(HumanoidBone, HumanoidBone)] = &[
     (HumanoidBone::LeftLittleDistal, HumanoidBone::RightLittleDistal),
 ];
 
-fn swap_source_pair(
-    map: &mut std::collections::HashMap<HumanoidBone, SourceJoint>,
+fn swap_source_pair<V>(
+    map: &mut std::collections::HashMap<HumanoidBone, V>,
     l: HumanoidBone,
     r: HumanoidBone,
 ) {
@@ -1028,6 +1292,19 @@ fn swap_source_pair(
     if let Some(v) = lv {
         map.insert(r, v);
     }
+}
+
+/// Temporal hysteresis for [`correct_upper_body_lr_swap`]. RTMW3D's block
+/// transposition genuinely flips per frame (the wave replay shows adjacent
+/// frames alternating), so the *correction* must stay per-frame — the latch
+/// only owns the WEAK-EVIDENCE zone, where the instantaneous geometry can't
+/// tell (shoulder reversal below the clear margin, vote tie): there the
+/// previous frame's decision repeats instead of the whole body flapping
+/// left/right at frame rate around the threshold. Provider-owned, reset per
+/// session.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::tracking) struct LrSwapLatch {
+    last_swapped: bool,
 }
 
 /// Correct a whole-body left/right transposition from the 2D detector on the
@@ -1044,7 +1321,19 @@ fn swap_source_pair(
 /// and we swap every L/R pair back. Front-facing prior: this is a desk-up
 /// self-view app; a genuine >90° turn (which also reverses x-order) is out of
 /// scope, and the metric z channel carries turns up to that point without it.
-fn correct_upper_body_lr_swap(sk: &mut SourceSkeleton) {
+fn correct_upper_body_lr_swap(sk: &mut SourceSkeleton, latch: &mut LrSwapLatch) {
+    /// Shoulders clearly NOT reversed past this fraction of a span → strong
+    /// "no swap" regardless of the latch.
+    const AMBIG_LO_FRAC: f32 = -0.15;
+    /// Shoulders reversed past half a span → strong "swap" (vetoable by a
+    /// clear vote majority the other way). Same value as the old
+    /// `clear_shoulder_reversal` gate.
+    const CLEAR_FRAC: f32 = 0.5;
+    /// Inside the ambiguous band, a vote majority only decides when the
+    /// reversal itself is also past this margin in the agreeing direction;
+    /// otherwise the previous frame's decision holds (hysteresis).
+    const VOTE_MARGIN_FRAC: f32 = 0.15;
+
     let g = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position);
     let (Some(sl), Some(sr)) = (
         g(HumanoidBone::LeftUpperArm),
@@ -1052,10 +1341,6 @@ fn correct_upper_body_lr_swap(sk: &mut SourceSkeleton) {
     ) else {
         return;
     };
-    // Shoulders must themselves be x-reversed for the swap to apply.
-    if sl[0] - sr[0] >= 0.0 {
-        return;
-    }
     let span = {
         let d = [sl[0] - sr[0], sl[1] - sr[1], sl[2] - sr[2]];
         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
@@ -1063,9 +1348,12 @@ fn correct_upper_body_lr_swap(sk: &mut SourceSkeleton) {
     if span < 1e-3 {
         return;
     }
+    // Positive = shoulders x-reversed (front-facing left should sit at
+    // larger source x).
+    let rev_frac = (sr[0] - sl[0]) / span;
     let thresh = 0.15 * span;
     // Vote across confident body pairs (hands excluded — they legitimately
-    // cross). Shoulders are already confirmed inverted above.
+    // cross).
     let vote = [
         (HumanoidBone::LeftUpperArm, HumanoidBone::RightUpperArm),
         (HumanoidBone::LeftLowerArm, HumanoidBone::RightLowerArm),
@@ -1083,24 +1371,34 @@ fn correct_upper_body_lr_swap(sk: &mut SourceSkeleton) {
             }
         }
     }
-    // With ≥2 confident pairs, require a majority inverted so a single noisy
-    // shoulder frame can't flip the whole body. On a DEGRADED frame (arm across
-    // the face → only the shoulders confidently present, <2 vote pairs) fall
-    // back to the shoulders alone, but only when they are CLEARLY reversed
-    // (past half a shoulder span): a front-facing self-view has no in-scope
-    // >90° turn, so a clean x-reversal is an RTMW3D block transposition, not a
-    // real turn — leaving it sends torso yaw to ±180° (the frame-200 spike).
-    let clear_shoulder_reversal = (sr[0] - sl[0]) > 0.5 * span;
-    if total >= 2 {
-        if inverted * 2 <= total {
-            return;
+    let vote_majority = (total >= 2).then(|| inverted * 2 > total);
+    // Three-zone decision with hysteresis. The transposition genuinely flips
+    // per frame, so STRONG evidence still decides instantly in both
+    // directions; only the ambiguous middle repeats the previous decision —
+    // previously a rev_frac oscillating around a hard threshold swapped and
+    // un-swapped the ENTIRE body (16 bone pairs + hand orientations) at frame
+    // rate.
+    let decision = if rev_frac < AMBIG_LO_FRAC {
+        false
+    } else if rev_frac > CLEAR_FRAC {
+        // Clear x-reversal. A confident vote majority the other way (the limbs
+        // say "not transposed") still vetoes, matching the old majority gate.
+        vote_majority.unwrap_or(true)
+    } else {
+        match vote_majority {
+            Some(true) if rev_frac > VOTE_MARGIN_FRAC => true,
+            Some(false) if rev_frac < VOTE_MARGIN_FRAC => false,
+            _ => latch.last_swapped,
         }
-    } else if !clear_shoulder_reversal {
+    };
+    latch.last_swapped = decision;
+    if !decision {
         return;
     }
     for &(l, r) in LR_SWAP_PAIRS {
         swap_source_pair(&mut sk.joints, l, r);
         swap_source_pair(&mut sk.fingertips, l, r);
+        swap_source_pair(&mut sk.joint_origins, l, r);
     }
     std::mem::swap(&mut sk.left_hand_orientation, &mut sk.right_hand_orientation);
 }
@@ -1128,7 +1426,9 @@ pub(super) fn build_skeleton(
     fit: torso_fit::TorsoFit,
     calibration: Option<&crate::tracking::PoseCalibration>,
     reference_span_override: Option<f32>,
+    swap_latch: &mut LrSwapLatch,
 ) -> SourceSkeleton {
+    use crate::tracking::source_skeleton::JointOrigin;
     let mut sk = SourceSkeleton::empty(frame_index);
     if joints.len() < NUM_JOINTS {
         return sk;
@@ -1189,14 +1489,26 @@ pub(super) fn build_skeleton(
     // ray-sphere (`solve_limb_joint`) is a FALLBACK only — when the child depth
     // is missing (a hole / off-frame) the joint is pinned one bone from the
     // parent along its 2D ray instead of dropped.
-    let solve_child = |parent: [f32; 3], coco_idx: usize, bone_len: f32| -> Option<([f32; 3], f32)> {
+    // Returns `(cam, score, origin)` — `origin` is `Extrapolated` when the
+    // position came from the bone-length ray fallback rather than an actual
+    // depth sample, so statistical consumers can tell measurement from
+    // inference.
+    let solve_child = |parent: [f32; 3],
+                       coco_idx: usize,
+                       bone_len: f32|
+     -> Option<([f32; 3], f32, JointOrigin)> {
         let j = joints.get(coco_idx)?;
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
-        let cam = match sample_metric_point_person(depth, j.nx, j.ny, SAMPLE_RADIUS_PX, person_z_ref)
-        {
-            Some(observed) => observed,
+        let (cam, origin) = match sample_metric_point_person(
+            depth,
+            j.nx,
+            j.ny,
+            SAMPLE_RADIUS_PX,
+            person_z_ref,
+        ) {
+            Some(observed) => (observed, JointOrigin::Observed),
             // Depth miss. The bone-length ray solve is a fallback for an
             // IN-FRAME hole (dark hair / clothing eats the IR) — it pins the
             // joint one bone from its parent along the observed 2D ray. For an
@@ -1207,12 +1519,13 @@ pub(super) fn build_skeleton(
             // the avatar breaks" case — the elbow is below a head+shoulders
             // crop at ny>1). Drop it; the arm solver then bends a natural elbow
             // toward the still-visible wrist instead.
-            None if keypoint_in_frame(j.nx, j.ny) => {
-                solve_limb_joint(&intr, j.nx, j.ny, parent, bone_len, None)?
-            }
+            None if keypoint_in_frame(j.nx, j.ny) => (
+                solve_limb_joint(&intr, j.nx, j.ny, parent, bone_len, None)?,
+                JointOrigin::Extrapolated,
+            ),
             None => return None,
         };
-        Some((cam, j.score))
+        Some((cam, j.score, origin))
     };
 
     // Hips + Spine share the pelvic origin. Spine has no COCO keypoint
@@ -1246,13 +1559,27 @@ pub(super) fn build_skeleton(
     sk.root_anchor_is_hip = anchor_was_hip;
 
     // --- Torso joints: on the fitted surface (COCO 5/6 shoulders, 11/12 hips) ---
+    // Provenance: a guard-processed shoulder pair is not a measurement —
+    // fabricated canonical pairs are `Synthesized`, ray re-seated ones
+    // `Extrapolated` — so scale/anchor estimators can refuse to ingest them.
+    let shoulder_origin = if fit.pair_fabricated {
+        JointOrigin::Synthesized
+    } else if fit.pair_reseated {
+        JointOrigin::Extrapolated
+    } else {
+        JointOrigin::Observed
+    };
     if let Some(c) = fit.r_shoulder_cam {
         sk.joints.insert(HumanoidBone::RightShoulder, src_joint(c, joints[5].score));
         sk.joints.insert(HumanoidBone::RightUpperArm, src_joint(c, joints[5].score));
+        sk.mark_origin(HumanoidBone::RightShoulder, shoulder_origin);
+        sk.mark_origin(HumanoidBone::RightUpperArm, shoulder_origin);
     }
     if let Some(c) = fit.l_shoulder_cam {
         sk.joints.insert(HumanoidBone::LeftShoulder, src_joint(c, joints[6].score));
         sk.joints.insert(HumanoidBone::LeftUpperArm, src_joint(c, joints[6].score));
+        sk.mark_origin(HumanoidBone::LeftShoulder, shoulder_origin);
+        sk.mark_origin(HumanoidBone::LeftUpperArm, shoulder_origin);
     }
     if anchor_was_hip {
         if let Some(c) = fit.r_hip_cam {
@@ -1268,33 +1595,39 @@ pub(super) fn build_skeleton(
     // observed metric 3D (bone-length ray-sphere only when its depth is a hole);
     // the wrist is likewise observed inside `attach_hand`, so no elbow position
     // is threaded between them any more.
-    if let Some((c, s)) = fit.r_shoulder_cam.and_then(|sh| solve_child(sh, 7, bones.upper_arm_m)) {
+    if let Some((c, s, o)) = fit.r_shoulder_cam.and_then(|sh| solve_child(sh, 7, bones.upper_arm_m)) {
         sk.joints.insert(HumanoidBone::RightLowerArm, src_joint(c, s));
+        sk.mark_origin(HumanoidBone::RightLowerArm, o);
     }
-    if let Some((c, s)) = fit.l_shoulder_cam.and_then(|sh| solve_child(sh, 8, bones.upper_arm_m)) {
+    if let Some((c, s, o)) = fit.l_shoulder_cam.and_then(|sh| solve_child(sh, 8, bones.upper_arm_m)) {
         sk.joints.insert(HumanoidBone::LeftLowerArm, src_joint(c, s));
+        sk.mark_origin(HumanoidBone::LeftLowerArm, o);
     }
 
     // Legs: hip → knee (thigh) → ankle (shin) → toe-tip (foot). Hip-anchored
     // only; the desk-up shoulder-anchored path has no legs in frame.
     if anchor_was_hip {
         if let Some(hip) = fit.r_hip_cam {
-            if let Some((knee, ks)) = solve_child(hip, 13, bones.thigh_m) {
+            if let Some((knee, ks, ko)) = solve_child(hip, 13, bones.thigh_m) {
                 sk.joints.insert(HumanoidBone::RightLowerLeg, src_joint(knee, ks));
-                if let Some((ankle, ascore)) = solve_child(knee, 15, bones.shin_m) {
+                sk.mark_origin(HumanoidBone::RightLowerLeg, ko);
+                if let Some((ankle, ascore, ao)) = solve_child(knee, 15, bones.shin_m) {
                     sk.joints.insert(HumanoidBone::RightFoot, src_joint(ankle, ascore));
-                    if let Some((toe, ts)) = solve_child(ankle, 17, bones.foot_m) {
+                    sk.mark_origin(HumanoidBone::RightFoot, ao);
+                    if let Some((toe, ts, _)) = solve_child(ankle, 17, bones.foot_m) {
                         sk.fingertips.insert(HumanoidBone::RightFoot, src_joint(toe, ts));
                     }
                 }
             }
         }
         if let Some(hip) = fit.l_hip_cam {
-            if let Some((knee, ks)) = solve_child(hip, 14, bones.thigh_m) {
+            if let Some((knee, ks, ko)) = solve_child(hip, 14, bones.thigh_m) {
                 sk.joints.insert(HumanoidBone::LeftLowerLeg, src_joint(knee, ks));
-                if let Some((ankle, ascore)) = solve_child(knee, 16, bones.shin_m) {
+                sk.mark_origin(HumanoidBone::LeftLowerLeg, ko);
+                if let Some((ankle, ascore, ao)) = solve_child(knee, 16, bones.shin_m) {
                     sk.joints.insert(HumanoidBone::LeftFoot, src_joint(ankle, ascore));
-                    if let Some((toe, ts)) = solve_child(ankle, 20, bones.foot_m) {
+                    sk.mark_origin(HumanoidBone::LeftFoot, ao);
+                    if let Some((toe, ts, _)) = solve_child(ankle, 20, bones.foot_m) {
                         sk.fingertips.insert(HumanoidBone::LeftFoot, src_joint(toe, ts));
                     }
                 }
@@ -1348,7 +1681,7 @@ pub(super) fn build_skeleton(
     // L/R block under motion, x-reversing the shoulders and sending torso yaw
     // to ±180° (proven on the wave replay). Runs on raw metres; the isotropic
     // normalisation below is order-independent so it doesn't matter which side.
-    correct_upper_body_lr_swap(&mut sk);
+    correct_upper_body_lr_swap(&mut sk, swap_latch);
 
     // Normalise the whole metric skeleton (raw metres, camera-space) into the
     // source frame's numeric range by ONE isotropic scale, so the solver's
@@ -1464,7 +1797,9 @@ fn attach_hand<F>(
     // these on-body, so the old forearm-length re-pin — which discarded the
     // measured forward reach and floated an extended hand up to face height — is
     // gone, along with its dependence on the elbow chain / bone length.
-    let wrist_cam = sample_cam(0).map(|(p, _)| p).unwrap_or(mcp_centroid_cam);
+    // Sampled once and reused by the palm-orientation basis below.
+    let wrist_sample = sample_cam(0);
+    let wrist_cam = wrist_sample.map(|(p, _)| p).unwrap_or(mcp_centroid_cam);
 
     // Sanity bound: an observed wrist implausibly far from the torso anchor is a
     // stray sample the person-aware gate let through. Rest the hand instead of
@@ -1476,11 +1811,6 @@ fn attach_hand<F>(
     if wrist_reach > 5.0 * forearm_len_m.max(0.1) {
         return;
     }
-
-    // Wrist and fingers are observed in the same camera frame, so they are
-    // already coherent — no rigid shift (the shift existed only to carry the
-    // hand onto the synthetic re-pinned wrist, which is gone).
-    let delta = [0.0_f32; 3];
 
     sk.joints.insert(
         wrist_bone,
@@ -1496,10 +1826,9 @@ fn attach_hand<F>(
     //   raw_forward = middle_mcp − wrist ; across = index_mcp − pinky_mcp
     //   normal = across × raw_forward   ; forward = normal × across
     // Cross-orthogonalising forward against the normal keeps a noisy wrist Z
-    // from tilting the in-palm forward. Directions are delta-invariant, so the
-    // un-shifted samples are fine.
+    // from tilting the in-palm forward.
     if let (Some((wri_cam, _)), Some(mid), Some(idx), Some(pin)) =
-        (sample_cam(0), middle_mcp, index_mcp, pinky_mcp)
+        (wrist_sample, middle_mcp, index_mcp, pinky_mcp)
     {
         let wri_p = to_source(wri_cam);
         let raw_forward = sub3(to_source(mid), wri_p);
@@ -1522,8 +1851,10 @@ fn attach_hand<F>(
         }
     }
 
-    // Fingers: wrist-relative plausibility bound (replaces the anchor z-band),
-    // then rigid-shifted onto the re-pinned wrist so the hand stays coherent.
+    // Fingers: wrist-relative plausibility bound (replaces the anchor z-band).
+    // Wrist and fingers are observed in the same camera frame, so they are
+    // already coherent — the old rigid shift onto a re-pinned wrist is gone
+    // along with the re-pin itself.
     let within_hand = |p: [f32; 3]| -> bool {
         let d = [
             p[0] - mcp_centroid_cam[0],
@@ -1532,7 +1863,6 @@ fn attach_hand<F>(
         ];
         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= MAX_HAND_SPAN_M
     };
-    let shifted_src = |p: [f32; 3]| to_source([p[0] + delta[0], p[1] + delta[1], p[2] + delta[2]]);
     for &(local_idx, bone) in phalanges {
         if let Some((p, score)) = sample_cam(local_idx) {
             if !within_hand(p) {
@@ -1541,7 +1871,7 @@ fn attach_hand<F>(
             sk.joints.insert(
                 bone,
                 SourceJoint {
-                    position: shifted_src(p),
+                    position: to_source(p),
                     confidence: score,
                     metric_depth_m: None,
                 },
@@ -1556,7 +1886,7 @@ fn attach_hand<F>(
             sk.fingertips.insert(
                 bone,
                 SourceJoint {
-                    position: shifted_src(p),
+                    position: to_source(p),
                     confidence: score,
                     metric_depth_m: None,
                 },
@@ -1624,53 +1954,118 @@ fn inject_spine_chain_proxies<F>(
     // nose / the anatomical rest above the neck instead of teleporting.
     let neck_pos = sk.joints.get(&HumanoidBone::Neck).map(|j| j.position);
 
-    let sample_face = |idx: usize| -> Option<SourceJoint> {
+    // Camera-space face sample, so the one-ear lateral correction below can
+    // work in metres before the source-frame flip.
+    let sample_face_cam = |idx: usize| -> Option<([f32; 3], f32)> {
         let j = joints.get(idx)?;
         if j.score < KEYPOINT_VISIBILITY_FLOOR {
             return None;
         }
         let p_cam = sample_metric_point_person(depth, j.nx, j.ny, SAMPLE_RADIUS_PX, person_z_ref)?;
-        Some(SourceJoint {
-            position: to_source(p_cam),
-            confidence: j.score,
-            metric_depth_m: None,
-        })
+        Some((p_cam, j.score))
+    };
+    let src_head = |cam: [f32; 3], conf: f32| SourceJoint {
+        position: to_source(cam),
+        confidence: conf,
+        metric_depth_m: None,
     };
 
-    let head = match (sample_face(LEFT_EAR_IDX), sample_face(RIGHT_EAR_IDX)) {
-        (Some(l), Some(r)) => Some(SourceJoint {
-            position: [
-                (l.position[0] + r.position[0]) * 0.5,
-                (l.position[1] + r.position[1]) * 0.5,
-                (l.position[2] + r.position[2]) * 0.5,
-            ],
-            confidence: l.confidence.min(r.confidence),
-            metric_depth_m: None,
-        }),
-        // One ear occluded (common at desk-up): drive off the visible one
-        // rather than discarding the whole head.
-        (Some(one), None) | (None, Some(one)) => Some(one),
-        (None, None) => sample_face(NOSE_IDX),
+    use crate::tracking::source_skeleton::JointOrigin;
+    let (head, head_origin) = match (
+        sample_face_cam(LEFT_EAR_IDX),
+        sample_face_cam(RIGHT_EAR_IDX),
+    ) {
+        (Some((l, ls)), Some((r, rs))) => (
+            Some(src_head(
+                [
+                    (l[0] + r[0]) * 0.5,
+                    (l[1] + r[1]) * 0.5,
+                    (l[2] + r[2]) * 0.5,
+                ],
+                ls.min(rs),
+            )),
+            JointOrigin::Observed,
+        ),
+        // One ear occluded (common at desk-up): drive off the visible one,
+        // shifted half an ear-to-ear width toward the head centre. Without
+        // the shift the head jumps ~8 cm sideways every time the far ear
+        // flickers across the visibility floor (both-ears midpoint ⇄ raw
+        // near-ear). The lateral direction comes from the 2-D nose keypoint
+        // (always the centre-ward side of an ear); when the nose is absent
+        // too, the uncorrected ear is still better than no head.
+        (Some((ear, s)), None) => (
+            Some(src_head(one_ear_head(ear, LEFT_EAR_IDX, NOSE_IDX, joints), s)),
+            JointOrigin::Extrapolated,
+        ),
+        (None, Some((ear, s))) => (
+            Some(src_head(one_ear_head(ear, RIGHT_EAR_IDX, NOSE_IDX, joints), s)),
+            JointOrigin::Extrapolated,
+        ),
+        (None, None) => (
+            sample_face_cam(NOSE_IDX).map(|(p, s)| src_head(p, s)),
+            JointOrigin::Observed,
+        ),
     };
 
     // No trustworthy face depth this frame → anatomical rest above the neck,
-    // so the head holds a sane upright pose instead of teleporting.
-    let head = head.or_else(|| {
-        neck_pos.map(|n| SourceJoint {
-            position: [n[0], n[1] + HEAD_ABOVE_NECK_M, n[2]],
-            confidence: sk
-                .joints
-                .get(&HumanoidBone::Neck)
-                .map(|j| j.confidence)
-                .unwrap_or(0.0),
-            metric_depth_m: None,
-        })
-    });
+    // so the head holds a sane upright pose instead of teleporting. The
+    // position is pure fabrication (a constant offset), so it carries a
+    // DECAYED confidence and a `Synthesized` mark — previously it inherited
+    // the neck's full confidence and downstream smoothing blended real⇄
+    // fabricated heads at full weight, bobbing the head on every flicker.
+    let (head, head_origin) = match head {
+        Some(h) => (Some(h), head_origin),
+        None => (
+            neck_pos.map(|n| SourceJoint {
+                position: [n[0], n[1] + HEAD_ABOVE_NECK_M, n[2]],
+                confidence: sk
+                    .joints
+                    .get(&HumanoidBone::Neck)
+                    .map(|j| j.confidence * FABRICATED_HEAD_CONF_SCALE)
+                    .unwrap_or(0.0),
+                metric_depth_m: None,
+            }),
+            JointOrigin::Synthesized,
+        ),
+    };
 
     if let Some(h) = head {
         sk.joints.insert(HumanoidBone::Head, h);
+        sk.mark_origin(HumanoidBone::Head, head_origin);
     }
 }
+
+/// Half the ear-to-ear width (m): the lateral correction applied when only
+/// one ear has a trustworthy depth, so the head estimate stays at the head
+/// CENTRE instead of snapping to the near ear.
+const EAR_HALF_WIDTH_M: f32 = 0.075;
+
+/// Shift a single visible ear's camera-space sample half an ear-to-ear width
+/// toward the head centre. The lateral direction comes from the 2-D nose
+/// keypoint (always centre-ward of an ear); with no confident nose the raw
+/// ear is returned unshifted.
+fn one_ear_head(
+    ear_cam: [f32; 3],
+    ear_idx: usize,
+    nose_idx: usize,
+    joints: &[DecodedJoint2d],
+) -> [f32; 3] {
+    match (joints.get(ear_idx), joints.get(nose_idx)) {
+        (Some(e), Some(n)) if n.score >= KEYPOINT_VISIBILITY_FLOOR => {
+            let toward_centre = (n.nx - e.nx).signum();
+            [
+                ear_cam[0] + toward_centre * EAR_HALF_WIDTH_M,
+                ear_cam[1],
+                ear_cam[2],
+            ]
+        }
+        _ => ear_cam,
+    }
+}
+
+/// Confidence multiplier for the anatomical (neck + offset) fallback head —
+/// fabricated geometry must not carry measurement-grade confidence.
+const FABRICATED_HEAD_CONF_SCALE: f32 = 0.5;
 
 /// Anatomical offset (metres, pre-normalisation) of the ear-midpoint "head"
 /// keypoint above the neck (shoulder midpoint) — the fallback head height
@@ -1705,22 +2100,29 @@ fn normalize3(v: [f32; 3]) -> Option<[f32; 3]> {
 mod tests {
     use super::*;
 
+    /// Nominal 30 fps step — the baseline all historical calibrations
+    /// were measured at.
+    const DT: f32 = NOMINAL_FRAME_DT_S;
+    /// Frame counts equivalent to the reseed horizons at the 30 fps step.
+    const SPAN_RESEED_FRAMES_AT_30: u32 = 45;
+    const ANCHOR_RESEED_FRAMES_AT_30: u32 = 60;
+
     #[test]
     fn scale_stabilizer_holds_span_through_contamination() {
         // A steady 0.36 m span with an occasional hand-contaminated frame
         // (0.20 m / 0.55 m) must not swing the held span: the outlier is
         // ignored and the avatar scale stays put.
         let mut s = TorsoScaleStabilizer::default();
-        let seed = s.stable_span(0.36);
+        let seed = s.stable_span(Some(0.36), DT).unwrap();
         assert!((seed - 0.36).abs() < 1e-6, "seeds on the first plausible span");
-        let after_low = s.stable_span(0.20); // hand in front → far too small
-        let after_high = s.stable_span(0.55); // finger merge → far too large
+        let after_low = s.stable_span(Some(0.20), DT).unwrap(); // hand in front → far too small
+        let after_high = s.stable_span(Some(0.55), DT).unwrap(); // finger merge → far too large
         assert!(
             (after_low - 0.36).abs() < 0.02 && (after_high - 0.36).abs() < 0.02,
             "contaminated frames are rejected, span holds near 0.36 (got {after_low}, {after_high})"
         );
         // A genuine (plausible) reading eases the estimate slightly.
-        let eased = s.stable_span(0.34);
+        let eased = s.stable_span(Some(0.34), DT).unwrap();
         assert!(eased < 0.36 && eased > 0.34, "plausible reading eases in slowly");
     }
 
@@ -1729,23 +2131,193 @@ mod tests {
         // If the very first frame is contaminated (implausible span), seed the
         // anatomical default rather than locking onto garbage.
         let mut s = TorsoScaleStabilizer::default();
-        let seed = s.stable_span(0.12);
+        let seed = s.stable_span(Some(0.12), DT).unwrap();
         assert!((seed - 0.38).abs() < 1e-6, "implausible first span → default seed");
+    }
+
+    #[test]
+    fn scale_stabilizer_span_holds_through_missing_measurement() {
+        // A dropped shoulder (or a fabricated pair) contributes no
+        // measurement: the held span must be returned, not a hard-coded
+        // default — previously this popped the avatar scale to 0.38 and back.
+        let mut s = TorsoScaleStabilizer::default();
+        s.stable_span(Some(0.44), DT);
+        let held = s.stable_span(None, DT);
+        assert_eq!(held, Some(0.44), "missing measurement returns the held span");
+        // And before any seed, None stays None (caller falls back explicitly).
+        let mut fresh = TorsoScaleStabilizer::default();
+        assert_eq!(fresh.stable_span(None, DT), None);
+    }
+
+    #[test]
+    fn scale_stabilizer_span_reseeds_after_sustained_rejection() {
+        // Dead-lock regression: a bogus first seed (0.46, finger-merge frame)
+        // with a true span of 0.32 — |0.32−0.46| > 25% of 0.46 — used to
+        // reject EVERY subsequent true reading forever, freezing the avatar at
+        // the wrong scale for the whole session. After SPAN_RESEED_S of
+        // consistent "outliers" the estimator must re-seed onto them. Also
+        // covers a mid-session subject swap.
+        let mut s = TorsoScaleStabilizer::default();
+        s.stable_span(Some(0.46), DT);
+        let mut last = 0.0;
+        for _ in 0..(SPAN_RESEED_FRAMES_AT_30 + 1) {
+            last = s.stable_span(Some(0.32), DT).unwrap();
+        }
+        assert!(
+            (last - 0.32).abs() < 1e-6,
+            "sustained true readings must re-seed the span (got {last})"
+        );
+        // An INTERMITTENT outlier burst shorter than the horizon still holds.
+        let mut s2 = TorsoScaleStabilizer::default();
+        s2.stable_span(Some(0.36), DT);
+        for _ in 0..10 {
+            s2.stable_span(Some(0.55), DT);
+        }
+        let held = s2.stable_span(Some(0.36), DT).unwrap();
+        assert!((held - 0.36).abs() < 0.02, "short burst does not re-seed (got {held})");
+    }
+
+    #[test]
+    fn scale_stabilizer_span_reseed_time_is_framerate_invariant() {
+        // The reseed horizon is wall time, not a frame count: at 15 fps
+        // (dt = 1/15) half as many rejected frames cover the same 1.5 s,
+        // so the re-seed must fire after ~half the frames — and NOT fire
+        // while the accumulated time is still short of the horizon.
+        let dt15 = 2.0 * DT;
+        let mut s = TorsoScaleStabilizer::default();
+        s.stable_span(Some(0.46), dt15);
+        // 20 rejects × (1/15 s) ≈ 1.33 s < 1.5 s → still held.
+        let mut last = 0.0;
+        for _ in 0..20 {
+            last = s.stable_span(Some(0.32), dt15).unwrap();
+        }
+        assert!(
+            (last - 0.46).abs() < 1e-6,
+            "below the wall-time horizon the bogus seed still holds (got {last})"
+        );
+        // 3 more (≈1.53 s total) → re-seeded. At the old 45-frame count
+        // this would have needed 22 more frames.
+        for _ in 0..3 {
+            last = s.stable_span(Some(0.32), dt15).unwrap();
+        }
+        assert!(
+            (last - 0.32).abs() < 1e-6,
+            "the horizon elapses in wall time at 15 fps (got {last})"
+        );
+    }
+
+    #[test]
+    fn scale_stabilizer_span_ema_is_framerate_invariant() {
+        // Same wall-clock duration of the same plausible reading must land
+        // on (nearly) the same span regardless of the frame rate the
+        // duration was delivered at: 30 frames at 30 fps vs 15 frames at
+        // 15 fps, both 1.0 s of easing 0.36 → 0.40.
+        let mut s30 = TorsoScaleStabilizer::default();
+        s30.stable_span(Some(0.36), DT);
+        let mut a = 0.0;
+        for _ in 0..30 {
+            a = s30.stable_span(Some(0.40), DT).unwrap();
+        }
+        let mut s15 = TorsoScaleStabilizer::default();
+        s15.stable_span(Some(0.36), 2.0 * DT);
+        let mut b = 0.0;
+        for _ in 0..15 {
+            b = s15.stable_span(Some(0.40), 2.0 * DT).unwrap();
+        }
+        assert!(
+            (a - b).abs() < 0.002,
+            "1 s of easing must be frame-rate invariant (30 fps → {a}, 15 fps → {b})"
+        );
     }
 
     #[test]
     fn scale_stabilizer_passes_real_move_rejects_spike() {
         let mut s = TorsoScaleStabilizer::default();
-        let a0 = s.stable_anchor([0.0, 0.0, 1.60]);
+        let a0 = s.stable_anchor([0.0, 0.0, 1.60], DT);
         assert_eq!(a0, [0.0, 0.0, 1.60], "seeds on the first anchor");
         // A realistic walk-in step (~0.03 m/frame ≈ 1 m/s) passes through almost
         // fully: the avatar's near/far MUST reflect real movement.
-        let step = s.stable_anchor([0.0, 0.0, 1.57]);
+        let step = s.stable_anchor([0.0, 0.0, 1.57], DT);
         assert!(step[2] < 1.585, "a real approach step is tracked promptly (got {})", step[2]);
         // A physically-impossible one-frame jump (a hand contaminating shoulder
         // depth) is rejected — the anchor barely moves.
-        let spike = s.stable_anchor([0.0, 0.0, 1.05])[2]; // ~0.5 m in one frame
+        let spike = s.stable_anchor([0.0, 0.0, 1.05], DT)[2]; // ~0.5 m in one frame
         assert!(spike > 1.45, "a contamination spike is rejected (got {spike})");
+    }
+
+    #[test]
+    fn scale_stabilizer_spike_gate_is_a_velocity_not_a_step() {
+        // 0.16 m in one frame is contamination at 30 fps (4.8 m/s > 3.6)
+        // but plausible motion after a dropped frame (dt = 1/15 → 2.4 m/s).
+        // The frame-count gate rejected the latter, so a frame drop during
+        // a genuine approach froze the avatar's distance.
+        let mut fast = TorsoScaleStabilizer::default();
+        fast.stable_anchor([0.0, 0.0, 1.60], DT);
+        let z30 = fast.stable_anchor([0.0, 0.0, 1.44], DT)[2];
+        assert!(
+            (z30 - 1.60).abs() < 1e-6,
+            "0.16 m in 1/30 s is rejected as contamination (got {z30})"
+        );
+        let mut slow = TorsoScaleStabilizer::default();
+        slow.stable_anchor([0.0, 0.0, 1.60], 2.0 * DT);
+        let z15 = slow.stable_anchor([0.0, 0.0, 1.44], 2.0 * DT)[2];
+        assert!(
+            z15 < 1.55,
+            "the same step across a dropped frame (1/15 s) is followed (got {z15})"
+        );
+    }
+
+    #[test]
+    fn scale_stabilizer_anchor_holds_through_sustained_contamination() {
+        // A pose HELD for seconds (namaste, cheek-on-hand) keeps producing the
+        // same contaminated anchor. The old 15% reject-creep fully converged
+        // onto it within ~20 frames (<1 s), dragging the person z-band along.
+        // Rejection must now HOLD for the whole reseed horizon.
+        let mut s = TorsoScaleStabilizer::default();
+        s.stable_anchor([0.0, 0.0, 1.60], DT);
+        let contaminated = [0.0, 0.0, 1.20]; // hand 0.4 m in front, held
+        let mut z = 0.0;
+        for _ in 0..(ANCHOR_RESEED_FRAMES_AT_30 - 2) {
+            z = s.stable_anchor(contaminated, DT)[2];
+        }
+        assert!(
+            (z - 1.60).abs() < 1e-6,
+            "held contamination must not creep the anchor (got {z})"
+        );
+        // But past the horizon, mutually-consistent readings ARE the new
+        // truth (subject swap / re-acquire) → re-seed.
+        for _ in 0..4 {
+            z = s.stable_anchor(contaminated, DT)[2];
+        }
+        assert!(
+            (z - 1.20).abs() < 1e-3,
+            "consistent readings past the horizon re-seed the anchor (got {z})"
+        );
+    }
+
+    #[test]
+    fn scale_stabilizer_anchor_does_not_reseed_onto_flicker() {
+        // Sustained rejection whose readings DISAGREE (alternating between two
+        // contaminants) is noise, not a new position — never re-seed onto it.
+        let mut s = TorsoScaleStabilizer::default();
+        s.stable_anchor([0.0, 0.0, 1.60], DT);
+        let mut z = 0.0;
+        for i in 0..(ANCHOR_RESEED_FRAMES_AT_30 + 20) {
+            let raw = if i % 2 == 0 { [0.0, 0.0, 1.20] } else { [0.3, 0.0, 0.9] };
+            z = s.stable_anchor(raw, DT)[2];
+        }
+        assert!(
+            (z - 1.60).abs() < 1e-6,
+            "inconsistent rejections must never re-seed (got {z})"
+        );
+    }
+
+    #[test]
+    fn scale_stabilizer_anchor_z_exposes_held_depth() {
+        let mut s = TorsoScaleStabilizer::default();
+        assert_eq!(s.anchor_z(), None);
+        s.stable_anchor([0.1, 0.2, 1.5], DT);
+        assert!((s.anchor_z().unwrap() - 1.5).abs() < 1e-6);
     }
 
     #[test]
@@ -1755,13 +2327,32 @@ mod tests {
         // must now converge to within a few cm.
         let mut s = TorsoScaleStabilizer::default();
         let mut z = 1.60;
-        s.stable_anchor([0.0, 0.0, z]);
+        s.stable_anchor([0.0, 0.0, z], DT);
         let mut last = z;
         for _ in 0..60 {
             z -= 0.01; // 1.60 -> 1.00 over 2 s at 30 fps (~0.3 m/s)
-            last = s.stable_anchor([0.0, 0.0, z])[2];
+            last = s.stable_anchor([0.0, 0.0, z], DT)[2];
         }
         assert!((last - 1.00).abs() < 0.03, "ramp tracked with <3 cm lag (got {last})");
+    }
+
+    #[test]
+    fn frame_dt_tracker_derives_clamps_and_falls_back() {
+        let mut t = FrameDtTracker::default();
+        // No previous timestamp → nominal step.
+        assert_eq!(t.tick(Some(1000.0)), NOMINAL_FRAME_DT_S);
+        // Real consecutive-timestamp difference.
+        assert!((t.tick(Some(1066.667)) - 0.066667).abs() < 1e-4);
+        // Non-monotonic (device clock reset) → nominal, and the new
+        // timestamp becomes the reference.
+        assert_eq!(t.tick(Some(50.0)), NOMINAL_FRAME_DT_S);
+        assert!((t.tick(Some(83.333)) - 0.033333).abs() < 1e-4);
+        // Absent timestamps (synthetic frames) → nominal, reference kept.
+        assert_eq!(t.tick(None), NOMINAL_FRAME_DT_S);
+        // Pathological gap clamps to the stall ceiling.
+        assert_eq!(t.tick(Some(9999.0)), 0.100);
+        t.reset();
+        assert_eq!(t.tick(Some(5.0)), NOMINAL_FRAME_DT_S);
     }
 
     fn dummy_frame(width: u32, height: u32, point: [f32; 3]) -> MetricDepthFrame {
@@ -1772,6 +2363,7 @@ mod tests {
             points_m: vec![point; pixels],
             crop: None,
             intrinsics: None,
+            timestamp_ms: None,
         }
     }
 
@@ -1802,7 +2394,10 @@ mod tests {
                 points[y * 5 + x] = [0.0, 0.0, 0.6];
             }
         }
-        let frame = MetricDepthFrame { width: 5, height: 5, points_m: points, crop: None, intrinsics: None };
+        let frame = MetricDepthFrame {
+            width: 5, height: 5, points_m: points, crop: None, intrinsics: None,
+            timestamp_ms: None,
+        };
         // Centre pixel (x=2) sits at the silhouette: naive median leans toward
         // whichever half dominates, but person-aware with z_ref=0.6 keeps 0.6.
         let p = sample_metric_point_person(&frame, 0.5, 0.5, 2, 0.6).unwrap();
@@ -1811,6 +2406,7 @@ mod tests {
         // is unobservable → None, so the caller rests instead of teleporting.
         let bg = MetricDepthFrame {
             width: 5, height: 5, points_m: vec![[0.0, 0.0, 5.0]; 25], crop: None, intrinsics: None,
+            timestamp_ms: None,
         };
         assert!(sample_metric_point_person(&bg, 0.5, 0.5, 2, 0.6).is_none());
     }
@@ -1863,6 +2459,7 @@ mod tests {
             points_m: pts,
             crop: None,
             intrinsics: Some(intr),
+            timestamp_ms: None,
         }
     }
 
@@ -1894,7 +2491,7 @@ mod tests {
         let opts = BuildOptions {
             force_shoulder_anchor: false,
         };
-        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
         assert!(fit.anchor_is_hip, "hip anchor expected");
         for c in [
             fit.r_shoulder_cam,
@@ -1923,12 +2520,45 @@ mod tests {
         let opts = BuildOptions {
             force_shoulder_anchor: true,
         };
-        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
         let r = fit.r_shoulder_cam.unwrap();
         let l = fit.l_shoulder_cam.unwrap();
         // Re-seated to the body depth → equal z (frontal), not 1.2 vs 2.0.
         assert!((r[2] - l[2]).abs() < 0.05, "r={:?} l={:?}", r, l);
         assert!(r[2] > 1.8, "occluded shoulder pulled to body depth: {:?}", r);
+        assert!(fit.pair_reseated && !fit.pair_fabricated, "re-seat must be flagged");
+    }
+
+    /// The torso-teleport hole: a shoulder keypoint at the silhouette samples
+    /// the wall 4 m back. "Deeper = body" then re-seated BOTH shoulders onto
+    /// the wall. With the person band (previous stabilised anchor) the
+    /// background sample is rejected at the source: that shoulder returns no
+    /// sample and the fit anchors on the remaining one at body depth.
+    #[test]
+    fn fit_torso_band_rejects_background_shoulder() {
+        let intr = intr_640();
+        let mut frame = plane_frame(intr, [0.0, 0.0, 2.0], [0.0, 0.0, -1.0]);
+        // idx5's pixels are the far wall at 5.0 m (silhouette overshoot).
+        stamp_block(&mut frame, &intr, 0.42, 0.40, 5.0);
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9);
+        joints[6] = dj(0.58, 0.40, 0.9);
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit =
+            torso_fit::fit_torso(&frame, &joints, opts, Some(2.0)).expect("torso fit");
+        assert!(
+            fit.r_shoulder_cam.is_none(),
+            "background shoulder must be rejected by the band, got {:?}",
+            fit.r_shoulder_cam
+        );
+        let anchor_z = fit.anchor_cam[2];
+        assert!(
+            (anchor_z - 2.0).abs() < 0.05,
+            "anchor stays at body depth (got {anchor_z})"
+        );
+        // Un-banded first frame (no reference yet) keeps the legacy behaviour.
+        let legacy = torso_fit::fit_torso(&frame, &joints, opts, None).expect("fit");
+        assert!(legacy.r_shoulder_cam.is_some());
     }
 
     /// An elbow the detector places BELOW a head+shoulders crop (`ny > 1`,
@@ -1948,8 +2578,9 @@ mod tests {
         joints[7] = dj(0.62, 1.05, 0.7); // R elbow BELOW the frame
         joints[8] = dj(0.38, 1.05, 0.7); // L elbow BELOW the frame
         let opts = BuildOptions { force_shoulder_anchor: true };
-        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
-        let sk = build_skeleton(0, &joints, &frame, fit, None, None);
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
         assert!(
             sk.joints.get(&HumanoidBone::RightLowerArm).is_none(),
             "off-frame right elbow (coco7) must be dropped, got {:?}",
@@ -1982,11 +2613,18 @@ mod tests {
             }
         }
         let opts = BuildOptions { force_shoulder_anchor: true };
-        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
-        let sk = build_skeleton(0, &joints, &frame, fit, None, None);
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
         assert!(
             sk.joints.get(&HumanoidBone::RightLowerArm).is_some(),
             "in-frame elbow at a depth hole should be recovered by the bone-length fallback"
+        );
+        // Provenance: a ray-fallback elbow is inference, not measurement.
+        assert_eq!(
+            sk.origin(HumanoidBone::RightLowerArm),
+            crate::tracking::source_skeleton::JointOrigin::Extrapolated,
+            "bone-length fallback must be marked Extrapolated"
         );
     }
 
@@ -2005,12 +2643,25 @@ mod tests {
         let opts = BuildOptions {
             force_shoulder_anchor: true,
         };
-        let fit = torso_fit::fit_torso(&frame, &joints, opts).expect("torso fit");
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
         let r = fit.r_shoulder_cam.unwrap();
         let l = fit.l_shoulder_cam.unwrap();
         assert!((r[2] - l[2]).abs() < 1e-4, "equal depth expected");
         assert!(r[0] > l[0], "avatar-Right at larger camera-x for frontal");
         assert!((r[0] - l[0]).abs() > 0.25, "span ~0.36 expected, got {}", r[0] - l[0]);
+        assert!(fit.pair_fabricated, "canonical pair must be flagged fabricated");
+        // And the built skeleton carries the Synthesized provenance mark so
+        // the span EMA / any statistical consumer can refuse it.
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
+        assert_eq!(
+            sk.origin(HumanoidBone::LeftUpperArm),
+            crate::tracking::source_skeleton::JointOrigin::Synthesized,
+        );
+        assert_eq!(
+            sk.origin(HumanoidBone::RightUpperArm),
+            crate::tracking::source_skeleton::JointOrigin::Synthesized,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2075,6 +2726,266 @@ mod tests {
         let got = solve_limb_joint(&intr, nx, ny, parent, bone, Some(3.8)).expect("solved");
         assert!((bone_len(parent, got) - bone).abs() < 1e-2, "dist={}", bone_len(parent, got));
         assert!((got[2] - child[2]).abs() < 1e-2, "got={:?}", got);
+    }
+
+    // -----------------------------------------------------------------------
+    // L/R swap hysteresis
+    // -----------------------------------------------------------------------
+
+    fn sk_with(joints: &[(HumanoidBone, [f32; 3])]) -> SourceSkeleton {
+        let mut sk = SourceSkeleton::empty(0);
+        for &(b, p) in joints {
+            sk.joints.insert(
+                b,
+                SourceJoint {
+                    position: p,
+                    confidence: 0.9,
+                    metric_depth_m: None,
+                },
+            );
+        }
+        sk
+    }
+
+    #[test]
+    fn lr_swap_strong_reversal_still_corrects_instantly() {
+        // A clear transposition must be undone on THIS frame (the detector
+        // genuinely flips per frame) — the latch must not delay it.
+        let mut latch = LrSwapLatch::default();
+        let mut sk = sk_with(&[
+            (HumanoidBone::LeftUpperArm, [-0.15, 0.0, 0.0]),
+            (HumanoidBone::RightUpperArm, [0.15, 0.0, 0.0]),
+            (HumanoidBone::LeftLowerArm, [-0.2, -0.3, 0.0]),
+            (HumanoidBone::RightLowerArm, [0.2, -0.3, 0.0]),
+        ]);
+        correct_upper_body_lr_swap(&mut sk, &mut latch);
+        assert!(
+            sk.joints[&HumanoidBone::LeftUpperArm].position[0] > 0.0,
+            "clear transposition corrected on the same frame"
+        );
+    }
+
+    #[test]
+    fn lr_swap_weak_zone_repeats_previous_decision() {
+        // Ambiguous geometry (near-tied shoulders, no confident votes) must
+        // repeat the previous frame's decision instead of flapping the whole
+        // body at frame rate around the threshold.
+        let weak = || {
+            sk_with(&[
+                (HumanoidBone::LeftUpperArm, [0.02, 0.0, 0.0]),
+                (HumanoidBone::RightUpperArm, [-0.02, 0.3, 0.0]),
+            ])
+        };
+
+        // Fresh latch (never swapped) → weak evidence keeps NOT swapping.
+        let mut latch = LrSwapLatch::default();
+        let mut sk = weak();
+        correct_upper_body_lr_swap(&mut sk, &mut latch);
+        assert!(
+            (sk.joints[&HumanoidBone::LeftUpperArm].position[0] - 0.02).abs() < 1e-6,
+            "weak evidence with a cold latch must not swap"
+        );
+
+        // Engage the latch with one strong frame…
+        let mut strong = sk_with(&[
+            (HumanoidBone::LeftUpperArm, [-0.15, 0.0, 0.0]),
+            (HumanoidBone::RightUpperArm, [0.15, 0.0, 0.0]),
+            (HumanoidBone::LeftLowerArm, [-0.2, -0.3, 0.0]),
+            (HumanoidBone::RightLowerArm, [0.2, -0.3, 0.0]),
+        ]);
+        correct_upper_body_lr_swap(&mut strong, &mut latch);
+        // …then the SAME weak frame now keeps the swap decision (hysteresis).
+        let mut sk2 = weak();
+        correct_upper_body_lr_swap(&mut sk2, &mut latch);
+        assert!(
+            (sk2.joints[&HumanoidBone::LeftUpperArm].position[0] + 0.02).abs() < 1e-6,
+            "weak evidence with an engaged latch keeps swapping"
+        );
+
+        // Strongly-normal geometry releases the latch instantly.
+        let mut normal = sk_with(&[
+            (HumanoidBone::LeftUpperArm, [0.15, 0.0, 0.0]),
+            (HumanoidBone::RightUpperArm, [-0.15, 0.0, 0.0]),
+        ]);
+        correct_upper_body_lr_swap(&mut normal, &mut latch);
+        assert!(
+            (normal.joints[&HumanoidBone::LeftUpperArm].position[0] - 0.15).abs() < 1e-6,
+            "clearly-normal frame is left untouched"
+        );
+        let mut sk3 = weak();
+        correct_upper_body_lr_swap(&mut sk3, &mut latch);
+        assert!(
+            (sk3.joints[&HumanoidBone::LeftUpperArm].position[0] - 0.02).abs() < 1e-6,
+            "latch released by the clearly-normal frame"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Head: one-ear lateral correction + fabricated-head provenance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_ear_head_is_shifted_toward_centre() {
+        let intr = intr_640();
+        let frame = plane_frame(intr, [0.0, 0.0, 2.0], [0.0, 0.0, -1.0]);
+        let base = |joints: &mut Vec<DecodedJoint2d>| {
+            joints[5] = dj(0.42, 0.40, 0.9);
+            joints[6] = dj(0.58, 0.40, 0.9);
+            joints[0] = dj(0.50, 0.33, 0.9); // nose
+        };
+        let opts = BuildOptions { force_shoulder_anchor: true };
+
+        // Both ears visible → reference head at the ear midpoint.
+        let mut j_both = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        base(&mut j_both);
+        j_both[3] = dj(0.46, 0.35, 0.9);
+        j_both[4] = dj(0.54, 0.35, 0.9);
+        let fit = torso_fit::fit_torso(&frame, &j_both, opts, None).unwrap();
+        let mut latch = LrSwapLatch::default();
+        let sk_both = build_skeleton(0, &j_both, &frame, fit, None, None, &mut latch);
+        let head_both = sk_both.joints[&HumanoidBone::Head].position;
+
+        // Only the left ear (idx 3) visible → head must sit near the centre,
+        // not at the raw ear (which is ~0.19 source units off-centre here).
+        let mut j_one = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        base(&mut j_one);
+        j_one[3] = dj(0.46, 0.35, 0.9);
+        j_one[4] = dj(0.54, 0.35, 0.0); // below visibility floor
+        let fit = torso_fit::fit_torso(&frame, &j_one, opts, None).unwrap();
+        let mut latch = LrSwapLatch::default();
+        let sk_one = build_skeleton(0, &j_one, &frame, fit, None, None, &mut latch);
+        let head_one = sk_one.joints[&HumanoidBone::Head].position;
+
+        assert!(
+            (head_one[0] - head_both[0]).abs() < 0.06,
+            "one-ear head stays near the centre: both={:?} one={:?}",
+            head_both,
+            head_one
+        );
+        assert_eq!(
+            sk_one.origin(HumanoidBone::Head),
+            crate::tracking::source_skeleton::JointOrigin::Extrapolated,
+            "one-ear head is extrapolated, not observed"
+        );
+    }
+
+    #[test]
+    fn fabricated_fallback_head_has_decayed_confidence() {
+        let intr = intr_640();
+        let frame = plane_frame(intr, [0.0, 0.0, 2.0], [0.0, 0.0, -1.0]);
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9);
+        joints[6] = dj(0.58, 0.40, 0.9);
+        // Nose / ears all below the visibility floor → anatomical fallback.
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).unwrap();
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
+        let head = sk.joints[&HumanoidBone::Head];
+        let neck = sk.joints[&HumanoidBone::Neck];
+        assert!(
+            head.confidence <= neck.confidence * FABRICATED_HEAD_CONF_SCALE + 1e-6,
+            "fabricated head must not carry measurement-grade confidence \
+             (head {} vs neck {})",
+            head.confidence,
+            neck.confidence
+        );
+        assert_eq!(
+            sk.origin(HumanoidBone::Head),
+            crate::tracking::source_skeleton::JointOrigin::Synthesized,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Torso capture buffer: band + admit ratio
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capture_buffer_bands_out_background_and_requires_coverage() {
+        // 64×64 frame: person plane at 1.0 m in the central region, wall at
+        // 5.0 m elsewhere. Anchors sit on the person.
+        let (w, h) = (64u32, 64u32);
+        let mut points = vec![[0.0f32, 0.0, 5.0]; (w * h) as usize];
+        for y in 16..56 {
+            for x in 20..44 {
+                points[y * w as usize + x] = [0.0, 0.0, 1.0];
+            }
+        }
+        // An "armpit gap": a see-through hole INSIDE the torso bbox where the
+        // wall shows every frame — the structural contaminant the temporal
+        // median can't reject (it's not random noise).
+        for y in 18..30 {
+            for x in 30..34 {
+                points[y * w as usize + x] = [0.0, 0.0, 5.0];
+            }
+        }
+        let frame = MetricDepthFrame {
+            width: w,
+            height: h,
+            points_m: points,
+            crop: None,
+            intrinsics: None,
+            timestamp_ms: None,
+        };
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.34, 0.28, 0.9); // shoulders
+        joints[6] = dj(0.66, 0.28, 0.9);
+        joints[11] = dj(0.38, 0.84, 0.9); // hips
+        joints[12] = dj(0.62, 0.84, 0.9);
+        let mut buf = TorsoCaptureBuffer::new();
+        assert!(buf.add_frame(&joints, &frame), "torso frame admitted");
+        let tpl = buf.finalize().expect("template");
+        // Background pixels sit at the same cells every frame: without the
+        // band they'd survive the median and be baked in as torso. Banded,
+        // they must be NaN, and person cells must read the person depth.
+        let has_person = tpl.depths_m.iter().any(|d| d.is_finite() && (d - 1.0).abs() < 0.05);
+        assert!(has_person, "person cells captured");
+        assert!(
+            !tpl.depths_m.iter().any(|d| d.is_finite() && *d > 2.0),
+            "no background depth may survive into the template"
+        );
+        assert!(
+            tpl.depths_m.iter().any(|d| d.is_nan()),
+            "the armpit-gap cells must finalize to NaN, not wall depth"
+        );
+
+        // A frame whose anchors see only the wall (subject gone) is refused
+        // outright — its cells would all be out-of-band.
+        let wall = MetricDepthFrame {
+            width: w,
+            height: h,
+            points_m: vec![[0.0, 0.0, 5.0]; (w * h) as usize],
+            crop: None,
+            intrinsics: None,
+            timestamp_ms: None,
+        };
+        let mut buf2 = TorsoCaptureBuffer::new();
+        // Anchors read 5.0 → z_ref 5.0; every cell is in-band at 5.0, so this
+        // frame IS admitted (the buffer can't know it's a wall) — coverage
+        // still gates. But with the person present and anchors on the person,
+        // a mostly-void depth map must be refused:
+        let mut sparse = wall.points_m.clone();
+        for p in sparse.iter_mut() {
+            *p = [f32::NAN; 3];
+        }
+        // leave a single valid pixel at an anchor so z_ref exists
+        let ax = (0.34 * w as f32).round() as usize;
+        let ay = (0.28 * h as f32).round() as usize;
+        sparse[ay * w as usize + ax] = [0.0, 0.0, 1.0];
+        let bx = (0.66 * w as f32).round() as usize;
+        sparse[ay * w as usize + bx] = [0.0, 0.0, 1.0];
+        let sparse_frame = MetricDepthFrame {
+            width: w,
+            height: h,
+            points_m: sparse,
+            crop: None,
+            intrinsics: None,
+            timestamp_ms: None,
+        };
+        assert!(
+            !buf2.add_frame(&joints, &sparse_frame),
+            "a near-void frame (two valid pixels) must be refused by the coverage gate"
+        );
     }
 
     #[test]

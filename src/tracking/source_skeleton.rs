@@ -56,6 +56,49 @@ pub struct SourceJoint {
     pub metric_depth_m: Option<f32>,
 }
 
+/// Provenance of a joint sample: whether the position was actually
+/// measured by the detector / depth sampler, or manufactured somewhere
+/// along the pipeline. Consumers that feed *statistics* (scale EMAs,
+/// anchor stabilisers, calibration accumulators, depth fusion) must only
+/// ingest [`JointOrigin::Observed`] samples — fabricated positions carry
+/// detector-grade confidence but constant/heuristic geometry, and letting
+/// them into an estimator drags it toward the fabrication constant (e.g.
+/// the canonical-frontal shoulder pair polluting the torso span EMA).
+///
+/// Stored sparsely in [`SourceSkeleton::joint_origins`]; an absent entry
+/// means `Observed` so the many existing observation sites need no change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JointOrigin {
+    /// Position comes from the detector (and, when present, the depth
+    /// window sample) for this very frame.
+    #[default]
+    Observed,
+    /// Derived from real observations of *other* joints or *other*
+    /// frames: anatomical offset from an observed neighbour, held-last
+    /// value, bone-length re-pin of an observed direction.
+    Extrapolated,
+    /// Manufactured from constants or canonical-pose assumptions with no
+    /// per-frame measurement behind the geometry (collapsed-pair
+    /// canonical reconstruction, fixed anatomical fallbacks).
+    Synthesized,
+}
+
+/// Which estimator produced a [`FacePose`]. The two sources have
+/// *different* systematic residuals (different landmark sets, different
+/// hardcoded anatomical neutrals — body ≈ 1.25, mesh ≈ 0.49 pitch
+/// signal), so the per-session neutral captured during calibration is
+/// only valid for the source it was measured from. Consumers that
+/// subtract a calibrated neutral (`TrackingCalibration::apply_calibration`)
+/// and the calibration accumulator itself must key on this tag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FaceSource {
+    /// RTMW3D body face keypoints (nose / eyes / ears, COCO 0..=4).
+    #[default]
+    Body,
+    /// MediaPipe FaceMesh dense 478-landmark pose.
+    Mesh,
+}
+
 /// Head orientation derived from facial keypoints.
 ///
 /// Angles are in radians with neutral at `yaw = pitch = roll = 0`. Sign
@@ -77,6 +120,31 @@ pub struct FacePose {
     pub pitch: f32,
     pub roll: f32,
     pub confidence: f32,
+    /// Which estimator produced these angles — see [`FaceSource`].
+    /// Stamped by the producer (`derive_face_pose_from_body` → `Body`,
+    /// `derive_face_pose_from_landmarks` → `Mesh`) and preserved
+    /// through source selection / crossfade so calibration subtraction
+    /// picks the neutral measured for the *same* estimator.
+    pub source: FaceSource,
+    /// `Some((from_source, t))` while the source-switch crossfade is
+    /// easing this pose between two estimators (`t ∈ (0, 1)`, the
+    /// blend fraction toward [`Self::source`]). Two consumers key on
+    /// it:
+    ///
+    /// * `TrackingCalibration::apply_calibration` interpolates the
+    ///   per-source neutrals with the *same* `t` — the raw angles are
+    ///   a lerp of the two sources' raw spaces, so subtracting the
+    ///   target's neutral outright would re-introduce the
+    ///   inter-source neutral gap as a calibrated-space head step on
+    ///   the very frame the crossfade exists to smooth (lerp is
+    ///   linear, so `lerp(raw) − lerp(neutral) =
+    ///   lerp(raw − neutral)`: exactly a calibrated-space blend).
+    /// * The calibration hold skips these frames entirely — a mixed
+    ///   pose under the target's tag would pollute that source's
+    ///   neutral accumulator.
+    ///
+    /// `None` on every steady-state frame.
+    pub blend: Option<(FaceSource, f32)>,
 }
 
 /// A named expression blend-shape weight (e.g. `"blink" → 0.6`). Names use the
@@ -165,7 +233,36 @@ pub struct MetricFrameInfo {
 #[derive(Clone, Debug, Default)]
 pub struct SourceSkeleton {
     pub source_timestamp: u64,
+    /// Device (hardware-clock) capture time of the camera frame this
+    /// sample was estimated from, in milliseconds. `Some` only on the
+    /// real capture path (D435) — synthetic / bench / test producers
+    /// leave it `None`.
+    ///
+    /// This is the pipeline's single time base: consecutive samples'
+    /// deltas give the true inter-*capture* interval, which is what the
+    /// solver's 1€ filters and rest gates must use as `dt`. Wall-clock
+    /// deltas measured at the consumer conflate capture cadence with
+    /// scheduling (render rate, inference stalls) and were the root
+    /// cause of the render-fps-dependent filter behaviour. Also the
+    /// dedup key half that lets the solver skip re-filtering when the
+    /// same sample is observed on multiple render frames.
+    pub capture_timestamp_ms: Option<f64>,
     pub joints: HashMap<HumanoidBone, SourceJoint>,
+    /// Sparse provenance map for `joints` (and `fingertips`, keyed the
+    /// same way). Absent entry ⇒ [`JointOrigin::Observed`]. Producers
+    /// that fabricate or extrapolate a joint must record it here via
+    /// [`Self::mark_origin`]; statistical consumers filter with
+    /// [`Self::origin`].
+    pub joint_origins: HashMap<HumanoidBone, JointOrigin>,
+    /// Raw body-derived face pose for this frame, published *alongside*
+    /// the selected [`Self::face`] so the calibration hold can
+    /// accumulate a per-source neutral for BOTH estimators in one
+    /// capture (during a frontal hold the mesh wins selection nearly
+    /// every frame, so the body neutral would otherwise never be
+    /// measured). Never calibration-subtracted and never consumed by
+    /// the solver — calibration capture only. `None` when the body
+    /// face keypoints were below the visibility floor.
+    pub face_body_raw: Option<FacePose>,
     /// Auxiliary positions for finger *tips* (the keypoint beyond the
     /// `*Distal` bone). Keyed by the distal bone whose tip it represents —
     /// e.g. `fingertips[LeftIndexDistal]` is the 3D position of the left
@@ -230,7 +327,10 @@ impl SourceSkeleton {
     pub fn empty(source_timestamp: u64) -> Self {
         Self {
             source_timestamp,
+            capture_timestamp_ms: None,
             joints: HashMap::new(),
+            joint_origins: HashMap::new(),
+            face_body_raw: None,
             fingertips: HashMap::new(),
             face: None,
             expressions: Vec::new(),
@@ -299,6 +399,25 @@ impl SourceSkeleton {
     pub fn put_joint(&mut self, bone: HumanoidBone, joint: SourceJoint, min_conf: f32) {
         if joint.confidence >= min_conf {
             self.joints.insert(bone, joint);
+        }
+    }
+
+    /// Provenance for `bone`. Absent entry ⇒ `Observed`.
+    pub fn origin(&self, bone: HumanoidBone) -> JointOrigin {
+        self.joint_origins
+            .get(&bone)
+            .copied()
+            .unwrap_or(JointOrigin::Observed)
+    }
+
+    /// Record provenance for `bone`. `Observed` clears any prior mark so
+    /// the map stays sparse and a re-observed joint doesn't keep a stale
+    /// fabrication flag from an earlier fallback frame.
+    pub fn mark_origin(&mut self, bone: HumanoidBone, origin: JointOrigin) {
+        if origin == JointOrigin::Observed {
+            self.joint_origins.remove(&bone);
+        } else {
+            self.joint_origins.insert(bone, origin);
         }
     }
 
@@ -371,6 +490,8 @@ mod tests {
             pitch: 0.0,
             roll: 0.0,
             confidence: 0.7,
+            source: FaceSource::Body,
+            ..Default::default()
         });
         s.left_hand_orientation = Some(HandOrientation {
             forward: [1.0, 0.0, 0.0],

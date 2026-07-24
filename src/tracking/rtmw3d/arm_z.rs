@@ -36,14 +36,45 @@ const FOREARM_SPAN_RATIO: f32 = 0.62;
 /// Minimum keypoint confidence for a segment to participate.
 const MIN_CONF: f32 = 0.3;
 
+/// Leak time constant (s) of the running maxima toward the current
+/// measurement (only applied while the measurement is BELOW the held
+/// max — an observation above it still snaps up instantly;
+/// α = 1 − exp(−dt/τ), 0.02/frame at 30 fps). A pure running max is
+/// structurally corruptible: one L/R mis-assignment or near-lens sweep
+/// inflates it past anatomy and it never recovers, permanently
+/// shifting the band clamp upward. With τ ≈ 1.65 s a corrupted max
+/// decays back to within 5% of the true value in a few seconds while
+/// genuine maxima (re-confirmed every extension) hold steady — in wall
+/// time, regardless of the capture frame rate.
+const LEN_MAX_TAU_S: f32 = 1.65;
+
+/// Fold `sample` into a leaky running max (see [`LEN_MAX_TAU_S`]).
+/// `dt_s` is the capture-timestamp frame step.
+fn leaky_max(held: f32, sample: f32, dt_s: f32) -> f32 {
+    if sample > held {
+        sample
+    } else {
+        held + (1.0 - (-dt_s / LEN_MAX_TAU_S).exp()) * (sample - held)
+    }
+}
+
 /// Per-session running maxima of projected segment lengths.
 /// `[left, right]` per segment; reset with the rest of the temporal
 /// state on session / benchmark-image boundaries.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ArmLengthState {
+pub(in crate::tracking) struct ArmLengthState {
     upper_xy_max: [f32; 2],
     forearm_xy_max: [f32; 2],
     span_max: f32,
+    /// Hand L/R swap-detector hysteresis (see [`correct_hand_lr_swap`]):
+    /// consecutive frames the engage signature has held (pre-latch) and
+    /// the engaged latch itself. Near the cost-ratio boundary a per-frame
+    /// independent decision flips all 16 hand-chain bone pairs at frame
+    /// rate — visually far worse than the transposition it fixes — so
+    /// engagement requires [`SWAP_ENGAGE_FRAMES`] consecutive signatures
+    /// and release uses a wider ratio ([`SWAP_RELEASE_RATIO`]).
+    swap_streak: i32,
+    swap_engaged: bool,
     /// Last-good unit directions (source space) per side, captured
     /// while the hand was genuinely visible. An arm SLIDES out of
     /// frame, so the direction held from the last visible frame is a
@@ -71,25 +102,24 @@ pub(super) struct ArmLengthState {
 }
 
 /// Fold the current frame's observable segment lengths into the
-/// running maxima (idempotent: pure max()). Called by the edge-exit
-/// repair at the top of the frame; the repair's band clamp is the
-/// only consumer of the maxima.
-pub(super) fn observe_lengths(sk: &SourceSkeleton, state: &mut ArmLengthState) {
+/// leaky running maxima. Called by the edge-exit repair at the top of
+/// the frame; the repair's band clamp is the only consumer of the
+/// maxima. `dt_s` drives the leak in wall time.
+pub(super) fn observe_lengths(sk: &SourceSkeleton, state: &mut ArmLengthState, dt_s: f32) {
     if let (Some(l), Some(r)) = (
         sk.joints.get(&HumanoidBone::LeftUpperArm),
         sk.joints.get(&HumanoidBone::RightUpperArm),
     ) {
         if l.confidence >= MIN_CONF && r.confidence >= MIN_CONF {
             let span = xy_len(l.position, r.position);
-            if span > state.span_max {
-                state.span_max = span;
-                if span > state.logged_span * 1.05 {
-                    debug!(
-                        "arm-z diag f{}: span_max grew {:.3} -> {:.3}",
-                        state.frame, state.logged_span, span
-                    );
-                    state.logged_span = span;
-                }
+            let grew = span > state.span_max;
+            state.span_max = leaky_max(state.span_max, span, dt_s);
+            if grew && span > state.logged_span * 1.05 {
+                debug!(
+                    "arm-z diag f{}: span_max grew {:.3} -> {:.3}",
+                    state.frame, state.logged_span, span
+                );
+                state.logged_span = span;
             }
         }
     }
@@ -119,8 +149,9 @@ pub(super) fn observe_lengths(sk: &SourceSkeleton, state: &mut ArmLengthState) {
             continue;
         }
         let ua_xy = xy_len(sh.position, el.position);
-        if ua_xy > state.upper_xy_max[side] {
-            state.upper_xy_max[side] = ua_xy;
+        let ua_grew = ua_xy > state.upper_xy_max[side];
+        state.upper_xy_max[side] = leaky_max(state.upper_xy_max[side], ua_xy, dt_s);
+        if ua_grew {
             if ua_xy > state.logged_upper_max[side] * 1.05 {
                 let prior = UPPER_ARM_SPAN_RATIO * span_ref;
                 debug!(
@@ -141,8 +172,9 @@ pub(super) fn observe_lengths(sk: &SourceSkeleton, state: &mut ArmLengthState) {
             continue;
         }
         let fa_xy = xy_len(el.position, wr.position);
-        if fa_xy > state.forearm_xy_max[side] {
-            state.forearm_xy_max[side] = fa_xy;
+        let fa_grew = fa_xy > state.forearm_xy_max[side];
+        state.forearm_xy_max[side] = leaky_max(state.forearm_xy_max[side], fa_xy, dt_s);
+        if fa_grew {
             if fa_xy > state.logged_forearm_max[side] * 1.05 {
                 let prior = FOREARM_SPAN_RATIO * span_ref;
                 debug!(
@@ -221,23 +253,62 @@ const SWAP_ELBOW_SEP_RATIO: f32 = 0.3;
 /// inverted in x, sit close together (the detector-confusion regime),
 /// and the swap shortens the forearms by a clear margin. Runs before
 /// the edge repair / ray-IK so all downstream stages see correct hands.
-pub(in crate::tracking) fn correct_hand_lr_swap(sk: &mut SourceSkeleton) {
-    let g = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position);
-    let (Some(sl), Some(sr)) = (
-        g(HumanoidBone::LeftUpperArm),
-        g(HumanoidBone::RightUpperArm),
+/// Cost-ratio below which the swap signature ENGAGES (swap clearly
+/// shortens the forearms) and the wider ratio below which an already
+/// engaged latch keeps applying. The gap is the deadband that stops
+/// boundary oscillation; release also requires the ratio to leave the
+/// deadband, not just dip out of the engage window.
+const SWAP_ENGAGE_RATIO: f32 = 0.8;
+const SWAP_RELEASE_RATIO: f32 = 0.95;
+/// Consecutive signature frames required before the latch engages
+/// (one frame of detector noise must not flip 16 bone pairs).
+const SWAP_ENGAGE_FRAMES: i32 = 2;
+
+pub(in crate::tracking) fn correct_hand_lr_swap(sk: &mut SourceSkeleton, state: &mut ArmLengthState) {
+    let apply = |sk: &mut SourceSkeleton, cur: f32, swapped: f32| {
+        for (l, r) in HAND_LR_PAIRS {
+            swap_joint_pair(&mut sk.joints, l, r);
+            swap_joint_pair(&mut sk.fingertips, l, r);
+        }
+        std::mem::swap(&mut sk.left_hand_orientation, &mut sk.right_hand_orientation);
+        debug!(
+            "hand-swap: corrected L/R hand-block transposition (forearm cost {:.3} -> {:.3} swapped)",
+            cur, swapped
+        );
+    };
+
+    let gj = |sk: &SourceSkeleton, b: HumanoidBone| sk.joints.get(&b).copied();
+    let (Some(wlj), Some(wrj)) = (
+        gj(sk, HumanoidBone::LeftHand),
+        gj(sk, HumanoidBone::RightHand),
     ) else {
+        // No hands at all — the confusion regime is over.
+        state.swap_streak = 0;
+        state.swap_engaged = false;
         return;
     };
-    let (Some(el), Some(er)) = (
-        g(HumanoidBone::LeftLowerArm),
-        g(HumanoidBone::RightLowerArm),
-    ) else {
+    let elbows = (
+        gj(sk, HumanoidBone::LeftLowerArm),
+        gj(sk, HumanoidBone::RightLowerArm),
+    );
+    let shoulders = (
+        gj(sk, HumanoidBone::LeftUpperArm),
+        gj(sk, HumanoidBone::RightUpperArm),
+    );
+    let ((Some(elj), Some(erj)), (Some(slj), Some(srj))) = (elbows, shoulders) else {
+        // A depth hole dropped an elbow/shoulder — exactly the frames
+        // where the confusion is most likely, and where a per-frame
+        // decision used to go silent. The latch carries the last
+        // confident decision across the hole instead of flipping.
+        if state.swap_engaged {
+            apply(sk, f32::NAN, f32::NAN);
+        } else {
+            state.swap_streak = 0;
+        }
         return;
     };
-    let (Some(wl), Some(wr)) = (g(HumanoidBone::LeftHand), g(HumanoidBone::RightHand)) else {
-        return;
-    };
+    let (sl, sr, el, er) = (slj.position, srj.position, elj.position, erj.position);
+    let (wl, wr) = (wlj.position, wrj.position);
 
     let dist3 = |a: [f32; 3], b: [f32; 3]| {
         let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -245,39 +316,51 @@ pub(in crate::tracking) fn correct_hand_lr_swap(sk: &mut SourceSkeleton) {
     };
     let span = dist3(sl, sr);
     if span < 1e-3 {
-        return;
-    }
-    // Source +x is anatomical-left; left things sit at larger x. The
-    // elbows must stay clearly L/R ordered and separated.
-    if el[0] - er[0] < SWAP_ELBOW_SEP_RATIO * span {
-        return;
-    }
-    // Hands inverted: the Left hand sits on the −x (right) side of the
-    // Right hand.
-    if wl[0] >= wr[0] {
-        return;
-    }
-    // Confusion regime: the two hands are close together.
-    if dist3(wl, wr) > 1.5 * span {
-        return;
-    }
-    // The decisive test, on the projection plane (z is the noisy axis):
-    // swapping must clearly shorten both forearms.
-    let cur = xy_len(el, wl) + xy_len(er, wr);
-    let swapped = xy_len(el, wr) + xy_len(er, wl);
-    if swapped >= 0.8 * cur {
+        state.swap_streak = 0;
+        state.swap_engaged = false;
         return;
     }
 
-    for (l, r) in HAND_LR_PAIRS {
-        swap_joint_pair(&mut sk.joints, l, r);
-        swap_joint_pair(&mut sk.fingertips, l, r);
+    // Cost on the projection plane only. This correction runs on the
+    // RTMW3D skeleton BEFORE external-depth injection (`rtmw3d/mod.rs`),
+    // so `metric_depth_m` is always `None` here and z is monocular
+    // noise — a 3D cost would be judging garbage. Depth IS the
+    // strongest hand↔elbow discriminator, but exploiting it belongs to
+    // the post-injection layer (`skeleton_from_depth`), where metric z
+    // actually exists; moving/duplicating the swap test there is a
+    // known future improvement, not this stage's job.
+    let cur = xy_len(el, wl) + xy_len(er, wr);
+    let swapped = xy_len(el, wr) + xy_len(er, wl);
+
+    // Structural arming gates — they define when a NEW engagement may
+    // start; an engaged latch is governed by the cost ratio alone so
+    // momentary gate noise cannot flip the hands mid-hold.
+    //  * elbows clearly L/R separated (source +x is anatomical-left):
+    //    a tucked genuine cross must not arm the detector,
+    //  * hands inverted in x (Left hand on the −x side of Right),
+    //  * hands close together (the detector-confusion regime).
+    let armed = el[0] - er[0] >= SWAP_ELBOW_SEP_RATIO * span
+        && wl[0] < wr[0]
+        && dist3(wl, wr) <= 1.5 * span;
+
+    if state.swap_engaged {
+        if swapped < SWAP_RELEASE_RATIO * cur {
+            apply(sk, cur, swapped);
+        } else {
+            state.swap_engaged = false;
+            state.swap_streak = 0;
+        }
+        return;
     }
-    std::mem::swap(&mut sk.left_hand_orientation, &mut sk.right_hand_orientation);
-    debug!(
-        "hand-swap: corrected L/R hand-block transposition (forearm cost {:.3} -> {:.3} swapped)",
-        cur, swapped
-    );
+    if armed && swapped < SWAP_ENGAGE_RATIO * cur {
+        state.swap_streak += 1;
+        if state.swap_streak >= SWAP_ENGAGE_FRAMES {
+            state.swap_engaged = true;
+            apply(sk, cur, swapped);
+        }
+    } else {
+        state.swap_streak = 0;
+    }
 }
 
 fn swap_joint_pair(
@@ -296,18 +379,24 @@ fn swap_joint_pair(
 }
 
 pub(super) fn is_finger_bone_side(bone: HumanoidBone, left: bool) -> bool {
-    let name = format!("{bone:?}");
-    let side_ok = if left {
-        name.starts_with("Left")
-    } else {
-        name.starts_with("Right")
+    // Direct enum match — this runs per-bone inside shift_hand_chain's
+    // full-map scans, where the previous Debug-format string allocation
+    // was pure hot-path waste.
+    use HumanoidBone::*;
+    let is_left = match bone {
+        LeftThumbProximal | LeftThumbIntermediate | LeftThumbDistal | LeftIndexProximal
+        | LeftIndexIntermediate | LeftIndexDistal | LeftMiddleProximal
+        | LeftMiddleIntermediate | LeftMiddleDistal | LeftRingProximal
+        | LeftRingIntermediate | LeftRingDistal | LeftLittleProximal
+        | LeftLittleIntermediate | LeftLittleDistal => true,
+        RightThumbProximal | RightThumbIntermediate | RightThumbDistal | RightIndexProximal
+        | RightIndexIntermediate | RightIndexDistal | RightMiddleProximal
+        | RightMiddleIntermediate | RightMiddleDistal | RightRingProximal
+        | RightRingIntermediate | RightRingDistal | RightLittleProximal
+        | RightLittleIntermediate | RightLittleDistal => false,
+        _ => return false,
     };
-    side_ok
-        && (name.contains("Thumb")
-            || name.contains("Index")
-            || name.contains("Middle")
-            || name.contains("Ring")
-            || name.contains("Little"))
+    is_left == left
 }
 
 fn xy_len(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -352,10 +441,18 @@ const SHORT_RATIO: f32 = 0.8;
 ///   3. the hand keypoint block is near-invisible (rules out the
 ///      hand-toward-camera reading, which keeps fingers strong).
 /// `get(i)` returns whole-frame-normalised `(nx, ny, score)`.
+/// `forearm_len_src` is the bone length in SOURCE units and
+/// `frame_aspect` the frame's width/height: the observed stub length is
+/// measured isotropically (1 frame unit of x = `2·aspect` source units,
+/// 1 of y = `2`) so a horizontal exit — the overwhelmingly common case —
+/// is judged against the true length instead of a y-scale approximation
+/// that over-fires by up to the aspect ratio (1.78× at 16:9), each
+/// over-fire stretching a real wrist out to full bone length.
 pub(in crate::tracking) fn wrist_out_of_frame(
     get: &dyn Fn(usize) -> Option<(f32, f32, f32)>,
     side: usize,
-    forearm_len_frame: f32,
+    forearm_len_src: f32,
+    frame_aspect: f32,
 ) -> bool {
     let (elbow_kp, wrist_kp, hand_block) = if side == 0 {
         (8usize, 10usize, 112..133usize)
@@ -396,13 +493,19 @@ pub(in crate::tracking) fn wrist_out_of_frame(
     // detectable because the observed forearm is short of bone
     // length AND extending the observed ray to full length exits
     // the frame.
+    // Lengths compare in isotropic source units (1 frame unit of x =
+    // 2·aspect source units, 1 of y = 2); the extension itself is
+    // affine along the ray, so scaling the frame coordinates by the
+    // same factor k stays geometrically exact.
     let dx = wx - ex;
     let dy = wy - ey;
-    let obs = (dx * dx + dy * dy).sqrt();
-    if obs < 1e-4 || obs >= forearm_len_frame * SHORT_RATIO {
+    let dx_src = dx * 2.0 * frame_aspect.max(1e-3);
+    let dy_src = dy * 2.0;
+    let obs = (dx_src * dx_src + dy_src * dy_src).sqrt();
+    if obs < 1e-4 || obs >= forearm_len_src * SHORT_RATIO {
         return false;
     }
-    let k = forearm_len_frame / obs;
+    let k = forearm_len_src / obs;
     let fx = ex + dx * k;
     let fy = ey + dy * k;
     fx < 0.0 || fx > 1.0 || fy < 0.0 || fy > 1.0
@@ -426,9 +529,10 @@ pub(super) fn repair_edge_clamped_arms(
     joints: &[super::decode::DecodedJoint],
     frame_aspect: f32,
     state: &mut ArmLengthState,
+    dt_s: f32,
 ) {
     state.frame += 1;
-    observe_lengths(sk, state);
+    observe_lengths(sk, state, dt_s);
     if state.span_max <= 0.0 {
         return;
     }
@@ -441,11 +545,6 @@ pub(super) fn repair_edge_clamped_arms(
     let get = |i: usize| -> Option<(f32, f32, f32)> {
         joints.get(i).map(|j| (j.nx, j.ny, j.score))
     };
-    // Frame-normalised forearm length: source-space lengths divide by
-    // (2 × half-height = 2.0) in y and the aspect in x; for the ray
-    // test we approximate with the y scale, which is exact for
-    // vertical exits and conservative for horizontal ones.
-    let _ = frame_aspect;
 
     for (_, _, _, sh_bone, el_bone, wr_bone, side) in ARM_KP {
         // Anthropometric BAND clamp: the running max fine-tunes the
@@ -461,10 +560,7 @@ pub(super) fn repair_edge_clamped_arms(
             UPPER_ARM_SPAN_RATIO * span_ref * 0.8,
             UPPER_ARM_SPAN_RATIO * span_ref * 1.35,
         );
-        // source units -> frame-normalised: y spans [-1, 1] over the
-        // frame height, so 1 source unit = 0.5 frame units.
-        let l_fa_frame = l_fa_src * 0.5;
-        let raw_fired = wrist_out_of_frame(&get, side, l_fa_frame);
+        let raw_fired = wrist_out_of_frame(&get, side, l_fa_src, frame_aspect);
 
         // Hysteresis: engage after 2 consecutive detections, release
         // after 3 consecutive clears; engagement cross-fades the
@@ -645,7 +741,15 @@ mod swap_tests {
         sk.joints.insert(HumanoidBone::LeftIndexProximal, j([-0.10, 0.22, 0.03]));
         sk.joints.insert(HumanoidBone::RightIndexProximal, j([0.11, 0.24, -0.08]));
 
-        correct_hand_lr_swap(&mut sk);
+        // The latch engages on the SWAP_ENGAGE_FRAMES-th consecutive
+        // signature frame; the first call only counts.
+        let mut st = ArmLengthState::default();
+        correct_hand_lr_swap(&mut sk, &mut st);
+        assert!(
+            sk.joints[&HumanoidBone::LeftHand].position[0] < 0.0,
+            "one signature frame must not flip the hands yet"
+        );
+        correct_hand_lr_swap(&mut sk, &mut st);
 
         assert!(sk.joints[&HumanoidBone::LeftHand].position[0] > 0.0, "LeftHand back on +x");
         assert!(sk.joints[&HumanoidBone::RightHand].position[0] < 0.0, "RightHand back on −x");
@@ -667,7 +771,9 @@ mod swap_tests {
             [0.03, 0.0, 0.5],   // LeftHand correctly on +x
             [-0.03, 0.0, 0.5],  // RightHand correctly on −x
         );
-        correct_hand_lr_swap(&mut sk);
+        let mut st = ArmLengthState::default();
+        correct_hand_lr_swap(&mut sk, &mut st);
+        correct_hand_lr_swap(&mut sk, &mut st);
         assert!(sk.joints[&HumanoidBone::LeftHand].position[0] > 0.0);
         assert!(sk.joints[&HumanoidBone::RightHand].position[0] < 0.0);
     }
@@ -689,10 +795,194 @@ mod swap_tests {
             [0.18, 0.05, 0.25],  // R hand reaches across to +x
         );
         let before = sk.joints[&HumanoidBone::LeftHand].position[0];
-        correct_hand_lr_swap(&mut sk);
+        let mut st = ArmLengthState::default();
+        correct_hand_lr_swap(&mut sk, &mut st);
+        correct_hand_lr_swap(&mut sk, &mut st);
         assert_eq!(
             sk.joints[&HumanoidBone::LeftHand].position[0], before,
             "tucked-elbow genuine cross must be left alone"
+        );
+    }
+
+    /// Build the raw (detector-output) frame for the hysteresis test:
+    /// elbows fixed L/R at ±0.3, hands at ∓a (inverted), so the
+    /// swapped/current forearm-cost ratio is (0.6−2a)/(0.6+2a).
+    fn raw_frame(a: f32) -> SourceSkeleton {
+        let mut sk = SourceSkeleton::empty(0);
+        arms(
+            &mut sk,
+            [0.20, 0.40, 0.0],
+            [-0.20, 0.40, 0.0],
+            [0.30, 0.0, 0.0],
+            [-0.30, 0.0, 0.0],
+            [-a, 0.0, 0.0], // LeftHand on −x: inverted
+            [a, 0.0, 0.0],
+        );
+        sk
+    }
+
+    /// Boundary oscillation: once engaged, a frame whose cost ratio sits
+    /// between the engage (0.8) and release (0.95) thresholds must KEEP
+    /// the swap applied (a per-frame decision would flip 16 bone pairs
+    /// back), and only a ratio past the release threshold lets go.
+    #[test]
+    fn swap_latch_holds_through_deadband_and_releases_past_it() {
+        let mut st = ArmLengthState::default();
+
+        // Two strong-signature frames (a=0.05 → ratio ≈ 0.73): engage.
+        let mut f = raw_frame(0.05);
+        correct_hand_lr_swap(&mut f, &mut st);
+        let mut f = raw_frame(0.05);
+        correct_hand_lr_swap(&mut f, &mut st);
+        assert!(f.joints[&HumanoidBone::LeftHand].position[0] > 0.0, "engaged");
+
+        // Deadband frame (a=0.016 → ratio ≈ 0.90): would NOT engage on
+        // its own, but the latch must hold.
+        let mut f = raw_frame(0.016);
+        correct_hand_lr_swap(&mut f, &mut st);
+        assert!(
+            f.joints[&HumanoidBone::LeftHand].position[0] > 0.0,
+            "deadband frame must keep the engaged swap applied"
+        );
+
+        // Hands back on their correct sides (swap would LENGTHEN):
+        // release, and the frame passes through unswapped.
+        let mut f = raw_frame(0.05);
+        let (wl, wr) = (
+            f.joints[&HumanoidBone::LeftHand].position,
+            f.joints[&HumanoidBone::RightHand].position,
+        );
+        f.joints.get_mut(&HumanoidBone::LeftHand).unwrap().position = wr;
+        f.joints.get_mut(&HumanoidBone::RightHand).unwrap().position = wl;
+        correct_hand_lr_swap(&mut f, &mut st);
+        assert!(
+            f.joints[&HumanoidBone::LeftHand].position[0] > 0.0,
+            "correctly-sided hands stay put after release"
+        );
+
+        // And re-engagement needs the full streak again.
+        let mut f = raw_frame(0.05);
+        correct_hand_lr_swap(&mut f, &mut st);
+        assert!(
+            f.joints[&HumanoidBone::LeftHand].position[0] < 0.0,
+            "post-release, one signature frame must not re-engage"
+        );
+    }
+
+    /// A depth hole dropping an elbow mid-hold must not flip the hands:
+    /// the engaged latch carries the decision across the hole.
+    #[test]
+    fn swap_latch_carries_across_missing_elbow() {
+        let mut st = ArmLengthState::default();
+        let mut f = raw_frame(0.05);
+        correct_hand_lr_swap(&mut f, &mut st);
+        let mut f = raw_frame(0.05);
+        correct_hand_lr_swap(&mut f, &mut st);
+        assert!(f.joints[&HumanoidBone::LeftHand].position[0] > 0.0, "engaged");
+
+        let mut f = raw_frame(0.05);
+        f.joints.remove(&HumanoidBone::LeftLowerArm);
+        correct_hand_lr_swap(&mut f, &mut st);
+        assert!(
+            f.joints[&HumanoidBone::LeftHand].position[0] > 0.0,
+            "hole frame must keep applying the engaged swap"
+        );
+    }
+
+    /// The session length maxima must recover from a one-off corruption
+    /// (L/R mis-assignment inflating the shoulder span): a pure running
+    /// max never comes back down, permanently shifting the band clamp.
+    #[test]
+    fn span_max_decays_back_after_corruption() {
+        const DT: f32 = 1.0 / 30.0;
+        let mut st = ArmLengthState::default();
+        let frame = |span: f32| {
+            let mut sk = SourceSkeleton::empty(0);
+            sk.joints.insert(HumanoidBone::LeftUpperArm, j([span / 2.0, 0.4, 0.0]));
+            sk.joints.insert(HumanoidBone::RightUpperArm, j([-span / 2.0, 0.4, 0.0]));
+            sk
+        };
+        // One corrupted frame at 2× the true span…
+        observe_lengths(&frame(2.0), &mut st, DT);
+        assert!(st.span_max >= 2.0 - 1e-6);
+        // …then a few seconds of honest frames.
+        for _ in 0..200 {
+            observe_lengths(&frame(1.0), &mut st, DT);
+        }
+        assert!(
+            st.span_max < 1.1,
+            "corrupted span_max must decay back toward the true span, got {}",
+            st.span_max
+        );
+        assert!(st.span_max >= 1.0 - 1e-6, "never decays below the live observation");
+    }
+
+    /// The leak is a wall-time constant, not a per-frame one: the same
+    /// seconds of honest observation must shed the same fraction of a
+    /// corruption at any capture rate.
+    #[test]
+    fn span_max_decay_is_framerate_invariant() {
+        const DT: f32 = 1.0 / 30.0;
+        let frame = |span: f32| {
+            let mut sk = SourceSkeleton::empty(0);
+            sk.joints.insert(HumanoidBone::LeftUpperArm, j([span / 2.0, 0.4, 0.0]));
+            sk.joints.insert(HumanoidBone::RightUpperArm, j([-span / 2.0, 0.4, 0.0]));
+            sk
+        };
+        // 2 s of honest frames after the same corruption, at 30 vs 15 fps.
+        let mut st30 = ArmLengthState::default();
+        observe_lengths(&frame(2.0), &mut st30, DT);
+        for _ in 0..60 {
+            observe_lengths(&frame(1.0), &mut st30, DT);
+        }
+        let mut st15 = ArmLengthState::default();
+        observe_lengths(&frame(2.0), &mut st15, 2.0 * DT);
+        for _ in 0..30 {
+            observe_lengths(&frame(1.0), &mut st15, 2.0 * DT);
+        }
+        assert!(
+            (st30.span_max - st15.span_max).abs() < 0.01,
+            "2 s of decay must match across frame rates (30 fps → {}, 15 fps → {})",
+            st30.span_max,
+            st15.span_max
+        );
+    }
+
+    /// Horizontal-exit judgement must use the true (aspect-corrected)
+    /// stub length: at 16:9 the old y-scale approximation read a fully
+    /// in-frame horizontal stub as "short + exits" and stretched a real
+    /// wrist out to bone length.
+    #[test]
+    fn wrist_out_of_frame_respects_aspect_on_horizontal_stubs() {
+        let aspect = 16.0 / 9.0;
+        let mk = |ex: f32, ey: f32, wx: f32, wy: f32| {
+            move |i: usize| -> Option<(f32, f32, f32)> {
+                match i {
+                    8 => Some((ex, ey, 1.0)),
+                    10 => Some((wx, wy, 1.0)),
+                    _ => None, // hand block absent → spread 0, gate passes
+                }
+            }
+        };
+        // In-frame horizontal stub (obs ≈ 0.36 src of l=0.5): extending
+        // to full length stays inside → must NOT fire. (The y-scale
+        // approximation called this k=2.5 → exit at fx=1.05.)
+        let g = mk(0.8, 0.5, 0.9, 0.5);
+        assert!(
+            !wrist_out_of_frame(&g, 0, 0.5, aspect),
+            "in-frame horizontal stub must not fire at 16:9"
+        );
+        // Genuine horizontal exit: extension leaves the frame → fires.
+        let g = mk(0.88, 0.5, 0.96, 0.5);
+        assert!(
+            wrist_out_of_frame(&g, 0, 0.5, aspect),
+            "true horizontal exit must still fire"
+        );
+        // Vertical exit unaffected by aspect handling.
+        let g = mk(0.5, 0.8, 0.5, 0.93);
+        assert!(
+            wrist_out_of_frame(&g, 0, 0.5, aspect),
+            "vertical exit must still fire"
         );
     }
 }

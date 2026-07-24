@@ -8,12 +8,11 @@ use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "realsense")]
 pub mod realsense;
 
-#[cfg(feature = "inference")]
 pub(crate) mod latest_cell;
 mod pose_estimation;
 pub mod provider;
@@ -32,7 +31,8 @@ pub mod yolox;
 
 pub use calibration::{CalibrationMode, PoseCalibration, TorsoDepthTemplate};
 pub use source_skeleton::{
-    CameraIntrinsics, FacePose, MetricFrameInfo, SourceExpression, SourceJoint, SourceSkeleton,
+    CameraIntrinsics, FacePose, FaceSource, MetricFrameInfo, SourceExpression, SourceJoint,
+    SourceSkeleton,
 };
 
 /// Smoothing / threshold params consumed by
@@ -123,20 +123,18 @@ impl MouthSource {
 
 /// Per-session calibration.
 ///
-/// Two independent calibration channels live here:
-/// - `neutral_face_pose` — operators square up to the camera for a moment
-///   and every subsequent face pose has this reading subtracted so
-///   "neutral" really is `yaw = pitch = roll = 0`.
-/// - `pose` — the user runs the `Calibrate Pose ▼` modal once per project
-///   to capture a known-good pelvic / shoulder anchor reference; the
-///   solver uses it to seed the root-translation EMA and
-///   `skeleton_from_depth` uses it to clamp the metric calibration scale
-///   against a desk-in-foreground bias. `None` until the user runs the
-///   modal — consumers fall back to the existing auto-EMA / hardcoded
-///   clamp behaviour. See `docs/calibration-ux.md`.
+/// `pose` — the user runs the `Calibrate Pose ▼` modal once per project
+/// to capture a known-good pelvic / shoulder anchor reference; the
+/// solver uses it to seed the root-translation EMA and
+/// `skeleton_from_depth` uses it to clamp the metric calibration scale
+/// against a desk-in-foreground bias. The same capture window also
+/// records the per-person neutral expression baseline and the resting
+/// head pose (`neutral_face_ypr`), both subtracted from live samples by
+/// [`Self::apply_calibration`]. `None` until the user runs the modal —
+/// consumers fall back to the existing auto-EMA / hardcoded clamp
+/// behaviour. See `docs/calibration-ux.md`.
 #[derive(Clone, Debug, Default)]
 pub struct TrackingCalibration {
-    pub neutral_face_pose: FacePose,
     pub pose: Option<PoseCalibration>,
 }
 
@@ -150,10 +148,48 @@ impl TrackingCalibration {
     /// depth-aware skeleton builder, so it gets read from those call
     /// sites directly rather than baked into the source sample.
     pub fn apply_calibration(&self, sample: &mut SourceSkeleton) {
-        if let Some(ref mut face) = sample.face {
-            face.yaw -= self.neutral_face_pose.yaw;
-            face.pitch -= self.neutral_face_pose.pitch;
-            face.roll -= self.neutral_face_pose.roll;
+        // Resting head pose captured during the calibration hold: the
+        // camera is rarely dead-ahead of where the user actually looks
+        // (monitor offset, desk mount), so the absolute face angles
+        // carry a constant turn/tilt. Subtracting the calibrated
+        // neutral maps the user's habitual posture to avatar-forward.
+        //
+        // Keyed on the live pose's own source: the mesh and body
+        // estimators have different systematic residuals, so the
+        // neutral is captured per source and only the matching one is
+        // subtracted. A source whose neutral wasn't captured (too few
+        // confident frames during the hold) gets no extra subtraction —
+        // its hardcoded anatomical neutral inside the estimator still
+        // applies, which is exactly the pre-calibration behaviour.
+        if let (Some(face), Some(pose)) = (sample.face.as_mut(), self.pose.as_ref()) {
+            // An uncaptured neutral means "subtract nothing" — encoded
+            // as zeros so the crossfade interpolation below stays a
+            // plain lerp between the two sources' effective baselines.
+            let neutral_of = |source: FaceSource| -> [f32; 3] {
+                pose.neutral_face_ypr_for(source).unwrap_or([0.0; 3])
+            };
+            let target = neutral_of(face.source);
+            let neutral = match face.blend {
+                // Mid-crossfade: the raw angles are a lerp of the two
+                // sources' raw spaces, so the subtracted neutral must
+                // be the SAME lerp of the two neutrals. Lerp is linear,
+                // so this equals blending in calibrated space —
+                // subtracting the target's neutral outright would
+                // re-introduce the inter-source neutral gap as a head
+                // step on the exact frame the crossfade exists to hide.
+                Some((from_source, t)) => {
+                    let from = neutral_of(from_source);
+                    [
+                        from[0] + (target[0] - from[0]) * t,
+                        from[1] + (target[1] - from[1]) * t,
+                        from[2] + (target[2] - from[2]) * t,
+                    ]
+                }
+                None => target,
+            };
+            face.yaw -= neutral[0];
+            face.pitch -= neutral[1];
+            face.roll -= neutral[2];
         }
         // Per-person neutral expression baseline (captured during pose
         // calibration when face tracking was on). Subtract the resting
@@ -193,7 +229,6 @@ mod calibration_apply_tests {
 
     fn cal_with_neutral(neutral: Vec<(String, f32)>) -> TrackingCalibration {
         TrackingCalibration {
-            neutral_face_pose: FacePose::default(),
             pose: Some(PoseCalibration {
                 mode: crate::tracking::CalibrationMode::UpperBody,
                 captured_at: String::new(),
@@ -209,6 +244,8 @@ mod calibration_apply_tests {
                 z_range_observed: None,
                 torso_depth_template: None,
                 neutral_expressions: neutral,
+                neutral_face_ypr_mesh: None,
+                neutral_face_ypr_body: None,
             }),
         }
     }
@@ -254,6 +291,71 @@ mod calibration_apply_tests {
         let mut sk = skeleton_with("blink", 0.7);
         cal.apply_calibration(&mut sk);
         assert!((sk.expressions[0].weight - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn neutral_face_pose_is_subtracted_for_matching_source() {
+        let mut cal = cal_with_neutral(Vec::new());
+        cal.pose.as_mut().unwrap().neutral_face_ypr_mesh = Some([-0.6, 0.4, 0.1]);
+        let mut sk = SourceSkeleton::default();
+        sk.face = Some(FacePose {
+            yaw: -0.6,
+            pitch: 0.4,
+            roll: 0.1,
+            confidence: 0.9,
+            source: crate::tracking::FaceSource::Mesh,
+            ..Default::default()
+        });
+        cal.apply_calibration(&mut sk);
+        let f = sk.face.unwrap();
+        // The habitual monitor-gaze pose maps to avatar-forward.
+        assert!(f.yaw.abs() < 1e-6);
+        assert!(f.pitch.abs() < 1e-6);
+        assert!(f.roll.abs() < 1e-6);
+        assert!((f.confidence - 0.9).abs() < 1e-6, "confidence untouched");
+    }
+
+    #[test]
+    fn neutral_from_one_source_never_touches_the_other() {
+        // The core of the per-source split: a mesh-measured neutral
+        // subtracted from a body-sourced pose would inject the
+        // inter-estimator residual as a head step on every runtime
+        // source switch.
+        let mut cal = cal_with_neutral(Vec::new());
+        cal.pose.as_mut().unwrap().neutral_face_ypr_mesh = Some([-0.6, 0.4, 0.1]);
+        let mut sk = SourceSkeleton::default();
+        sk.face = Some(FacePose {
+            yaw: 0.2,
+            pitch: -0.1,
+            roll: 0.05,
+            confidence: 0.9,
+            source: crate::tracking::FaceSource::Body,
+            ..Default::default()
+        });
+        cal.apply_calibration(&mut sk);
+        let f = sk.face.unwrap();
+        // Body neutral is None → body pose passes through unchanged.
+        assert!((f.yaw - 0.2).abs() < 1e-6);
+        assert!((f.pitch - -0.1).abs() < 1e-6);
+        assert!((f.roll - 0.05).abs() < 1e-6);
+
+        // And with a body neutral present, the body pose uses IT, not
+        // the mesh one.
+        cal.pose.as_mut().unwrap().neutral_face_ypr_body = Some([0.2, -0.1, 0.05]);
+        let mut sk = SourceSkeleton::default();
+        sk.face = Some(FacePose {
+            yaw: 0.2,
+            pitch: -0.1,
+            roll: 0.05,
+            confidence: 0.9,
+            source: crate::tracking::FaceSource::Body,
+            ..Default::default()
+        });
+        cal.apply_calibration(&mut sk);
+        let f = sk.face.unwrap();
+        assert!(f.yaw.abs() < 1e-6);
+        assert!(f.pitch.abs() < 1e-6);
+        assert!(f.roll.abs() < 1e-6);
     }
 
     #[test]
@@ -311,7 +413,13 @@ pub struct TrackingMailbox {
 struct PoseMailboxInner {
     latest_pose: Option<SourceSkeleton>,
     sequence: u64,
-    last_update_nanos: u64,
+    /// Monotonic-clock instant of the last publish. `Instant`, not
+    /// `SystemTime`: freshness is a process-local interval measurement,
+    /// and a wall clock that gets NTP-stepped backwards would make a
+    /// dead worker's sample report as eternally fresh (`saturating_sub`
+    /// pinning the age at zero) — the avatar would freeze in the last
+    /// pose instead of fading. `None` until the first publish.
+    last_update: Option<Instant>,
 }
 
 struct PreviewMailboxInner {
@@ -382,13 +490,6 @@ struct CalibrationChannelInner {
     pending_calibration_mode_hint_seq: u64,
 }
 
-fn now_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
 /// Captured snapshot of the tracking mailbox state. Not strictly
 /// cross-lock-atomic — see `TrackingMailbox::snapshot` for the
 /// torn-read trade-off. `sequence` is the pose-side counter (use for
@@ -411,7 +512,7 @@ impl TrackingMailbox {
             pose: Arc::new(Mutex::new(PoseMailboxInner {
                 latest_pose: None,
                 sequence: 0,
-                last_update_nanos: 0,
+                last_update: None,
             })),
             preview: Arc::new(Mutex::new(PreviewMailboxInner {
                 latest_frame: None,
@@ -450,7 +551,7 @@ impl TrackingMailbox {
         let mut p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
         p.latest_pose = Some(pose);
         p.sequence += 1;
-        p.last_update_nanos = now_nanos();
+        p.last_update = Some(Instant::now());
     }
 
     /// Publish a full estimation result including frame and annotations.
@@ -462,7 +563,7 @@ impl TrackingMailbox {
             let mut p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
             p.latest_pose = Some(estimate.skeleton);
             p.sequence += 1;
-            p.last_update_nanos = now_nanos();
+            p.last_update = Some(Instant::now());
         }
         let mut v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
         v.latest_annotation = Some(estimate.annotation);
@@ -668,11 +769,10 @@ impl TrackingMailbox {
     /// or if no sample has ever been published.
     pub fn is_stale(&self) -> bool {
         let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
-        if p.last_update_nanos == 0 {
-            return true;
+        match p.last_update {
+            None => true,
+            Some(at) => at.elapsed().as_nanos() as u64 > self.stale_timeout_nanos,
         }
-        let elapsed = now_nanos().saturating_sub(p.last_update_nanos);
-        elapsed > self.stale_timeout_nanos
     }
 
     /// Time elapsed since the last published sample. `None` when no
@@ -682,11 +782,7 @@ impl TrackingMailbox {
     /// the binary stale flag.
     pub fn age(&self) -> Option<std::time::Duration> {
         let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
-        if p.last_update_nanos == 0 {
-            return None;
-        }
-        let elapsed_nanos = now_nanos().saturating_sub(p.last_update_nanos);
-        Some(std::time::Duration::from_nanos(elapsed_nanos))
+        p.last_update.map(|at| at.elapsed())
     }
 
     /// Stale-flip threshold the mailbox was constructed with. Surfaced
@@ -756,6 +852,18 @@ mod mailbox_tests {
         assert!(mb.poll_calibration(0).is_some(), "first poll sees the write");
         let observed_seq = mb.poll_calibration(0).map(|(_, s)| s).unwrap();
         assert!(mb.poll_calibration(observed_seq).is_none(), "no advance, no work");
+    }
+
+    #[test]
+    fn publish_makes_mailbox_fresh_with_monotonic_age() {
+        let mb = TrackingMailbox::new();
+        mb.publish(SourceSkeleton::empty(0));
+        assert!(!mb.is_stale(), "just-published sample must be fresh");
+        let age = mb.age().expect("age is Some after a publish");
+        assert!(
+            age < std::time::Duration::from_secs(1),
+            "age of a just-published sample must be near zero, got {age:?}"
+        );
     }
 
     #[test]
@@ -926,8 +1034,28 @@ impl TrackingWorker {
         fps: u32,
         pipeline: provider::TrackingPipelineConfig,
     ) {
-        if self.handle.is_some() {
-            return;
+        // A handle can be left behind by a `stop()` that timed out while
+        // the worker was wedged in a blocking camera call. If that thread
+        // has since finished, reap it here and proceed with the restart —
+        // the old behaviour (silent `return`) left the user with a Start
+        // button that did nothing, with no path back short of an app
+        // restart. Only a thread that is STILL alive blocks the restart
+        // (overlapping GPU inference sessions must never coexist), and
+        // that now gets an explicit error log instead of silence.
+        if let Some(handle) = &self.handle {
+            if handle.is_finished() {
+                if let Some(handle) = self.handle.take() {
+                    if let Err(e) = handle.join() {
+                        error!("tracking-worker: previous thread panicked: {:?}", e);
+                    }
+                }
+            } else {
+                error!(
+                    "tracking-worker: start requested while the previous worker thread is still \
+                     shutting down; retry once it exits"
+                );
+                return;
+            }
         }
 
         self.running = Arc::new(AtomicBool::new(true));
@@ -935,22 +1063,11 @@ impl TrackingWorker {
         let running = Arc::clone(&self.running);
         let ready = Arc::clone(&self.ready);
         let mailbox = self.mailbox.clone();
-        let target_fps: u64 = fps.max(1) as u64;
-        let frame_interval = Duration::from_micros(1_000_000 / target_fps);
 
         let handle = thread::Builder::new()
             .name("tracking-worker".into())
             .spawn(move || {
-                Self::worker_loop(
-                    mailbox,
-                    running,
-                    ready,
-                    frame_interval,
-                    width,
-                    height,
-                    fps,
-                    pipeline,
-                );
+                Self::worker_loop(mailbox, running, ready, width, height, fps, pipeline);
             })
             .expect("failed to spawn tracking-worker thread");
 
@@ -999,7 +1116,6 @@ impl TrackingWorker {
         mailbox: TrackingMailbox,
         running: Arc<AtomicBool>,
         ready: Arc<AtomicBool>,
-        frame_interval: Duration,
         width: u32,
         height: u32,
         fps: u32,
@@ -1010,19 +1126,10 @@ impl TrackingWorker {
         // camera to drive the pipeline, so the worker reports ready and
         // exits immediately — the app falls back to the avatar rest pose.
         #[cfg(feature = "realsense")]
-        Self::run_realsense(
-            &mailbox,
-            &running,
-            &ready,
-            frame_interval,
-            width,
-            height,
-            fps,
-            pipeline,
-        );
+        Self::run_realsense(&mailbox, &running, &ready, width, height, fps, pipeline);
         #[cfg(not(feature = "realsense"))]
         {
-            let _ = (frame_interval, width, height, fps, pipeline);
+            let _ = (width, height, fps, pipeline);
             warn!("tracking-worker: `realsense` feature disabled — no capture backend, idling");
             ready.store(true, Ordering::SeqCst);
         }
@@ -1039,13 +1146,31 @@ impl TrackingWorker {
     /// its internal DAv2 stage. Each per-frame step builds a
     /// `MetricDepthFrame` from the D435 depth and hands it to the provider
     /// before `estimate_pose`.
+    ///
+    /// Two threads:
+    ///
+    /// * **`tracking-capture`** (spawned here) owns the librealsense
+    ///   pipeline: it opens the camera, grabs frames, and drops the
+    ///   freshest one into a [`latest_cell::LatestCell`]. When grabs fail
+    ///   persistently it reopens the device with backoff
+    ///   ([`GrabRecovery`]).
+    /// * **`tracking-worker`** (this thread) blocks on the cell and runs
+    ///   inference + publish on whatever frame is freshest.
+    ///
+    /// The split is what keeps latency bounded: with grab and inference
+    /// serialized on one thread, an inference pass slower than the frame
+    /// period made `pipeline.wait` drain librealsense's internal queue
+    /// oldest-first — the pipeline fell one-plus frames behind and STAYED
+    /// behind. The cell's latest-only semantics discard frames that went
+    /// stale while inference was busy, and the camera itself paces the
+    /// loop (no `thread::sleep`: sleeping after a fast inference pass
+    /// only made the next frame older by the slept amount).
     #[cfg(feature = "realsense")]
     #[allow(clippy::too_many_arguments)]
     fn run_realsense(
         mailbox: &TrackingMailbox,
-        running: &AtomicBool,
+        running: &Arc<AtomicBool>,
         ready: &AtomicBool,
-        interval: Duration,
         width: u32,
         height: u32,
         fps: u32,
@@ -1060,9 +1185,25 @@ impl TrackingWorker {
             stagelog::SessionGuard::begin(&format!("realsense {width}x{height}@{fps}"));
         stagelog::mark(0, "camera_open_begin");
 
-        let mut capture = match realsense::RealSenseCapture::open(width, height, fps) {
-            Ok(c) => c,
-            Err(e) => {
+        let cell = latest_cell::LatestCell::<CaptureItem>::new();
+        let (open_tx, open_rx) =
+            std::sync::mpsc::channel::<Result<(u32, u32), realsense::OpenFailure>>();
+        let capture_handle = {
+            let cell = Arc::clone(&cell);
+            let running = Arc::clone(running);
+            let mailbox = mailbox.clone();
+            thread::Builder::new()
+                .name("tracking-capture".into())
+                .spawn(move || {
+                    capture_loop(cell, running, mailbox, open_tx, width, height, fps);
+                })
+                .expect("failed to spawn tracking-capture thread")
+        };
+
+        // The capture thread reports the open outcome exactly once.
+        let (cap_width, cap_height) = match open_rx.recv() {
+            Ok(Ok(dims)) => dims,
+            Ok(Err(e)) => {
                 error!("tracking-worker: failed to open RealSense: {}", e);
                 // Map the typed open failure to a root-cause-specific,
                 // localized message so the GUI dialog names the real problem
@@ -1081,6 +1222,13 @@ impl TrackingWorker {
                 // the blocking error and idle. `worker_loop` clears `running`
                 // on return, so the app drops to the avatar rest pose.
                 ready.store(true, Ordering::SeqCst);
+                let _ = capture_handle.join();
+                return;
+            }
+            Err(_) => {
+                error!("tracking-worker: capture thread exited before reporting an open result");
+                ready.store(true, Ordering::SeqCst);
+                let _ = capture_handle.join();
                 return;
             }
         };
@@ -1105,9 +1253,8 @@ impl TrackingWorker {
                     }
                     mailbox.set_inference_backend_label(Some(provider.label()));
                     stagelog::mark(0, "provider_warmup_begin");
-                    let blank =
-                        vec![0u8; (capture.width() as usize) * (capture.height() as usize) * 3];
-                    let _ = provider.estimate_pose(&blank, capture.width(), capture.height(), 0);
+                    let blank = vec![0u8; (cap_width as usize) * (cap_height as usize) * 3];
+                    let _ = provider.estimate_pose(&blank, cap_width, cap_height, 0);
                     stagelog::mark(0, "provider_warmup_end");
                     provider.reset_temporal_state();
                     Some(provider)
@@ -1126,15 +1273,21 @@ impl TrackingWorker {
         info!("tracking-worker: RealSense opened successfully");
         stagelog::mark(0, "provider_load_end");
         ready.store(true, Ordering::SeqCst);
-        let mut frame_index: u64 = 0;
-        let mut consecutive_errors: u32 = 0;
         let mut last_calibration_seq: u64 = 0;
         let mut last_torso_capture_seq: u64 = 0;
         let mut last_calibration_mode_hint_seq: u64 = 0;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 30;
 
         while running.load(Ordering::SeqCst) {
-            let loop_start = std::time::Instant::now();
+            // Blocks until the freshest capture is available; wakes with
+            // `None` once the capture thread closed the cell (stop
+            // request or unrecoverable camera loss).
+            let Some(CaptureItem {
+                frame: rs_frame,
+                index: frame_index,
+            }) = cell.take_blocking()
+            else {
+                break;
+            };
 
             // Forward calibration / torso-capture / mode-hint transitions
             // to the provider (edge-detected: forward only on change).
@@ -1162,64 +1315,288 @@ impl TrackingWorker {
                 }
             }
 
-            stagelog::mark(frame_index, "grab_begin");
-            match capture.grab_frame() {
-                Ok(rs_frame) => {
-                    consecutive_errors = 0;
-                    let width = rs_frame.width;
-                    let height = rs_frame.height;
+            let width = rs_frame.width;
+            let height = rs_frame.height;
 
-                    stagelog::mark(frame_index, "estimate_begin");
-                    let estimate = if let Some(ref mut provider) = pose_provider {
-                        // Hand the D435's color-aligned metric depth to the
-                        // provider for THIS frame; it replaces the DAv2 stage.
-                        let metric =
-                            crate::tracking::rtmw3d_with_depth::build_metric_frame_from_d435(
-                                &rs_frame,
-                            );
-                        provider.set_external_depth(metric);
-                        provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
-                    } else {
-                        pose_estimation::estimate_pose(&rs_frame.rgb, width, height, frame_index)
-                    };
+            stagelog::mark(frame_index, "estimate_begin");
+            let mut estimate = if let Some(ref mut provider) = pose_provider {
+                // Hand the D435's color-aligned metric depth to the
+                // provider for THIS frame; it replaces the DAv2 stage.
+                let metric =
+                    crate::tracking::rtmw3d_with_depth::build_metric_frame_from_d435(&rs_frame);
+                provider.set_external_depth(metric);
+                provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
+            } else {
+                pose_estimation::estimate_pose(&rs_frame.rgb, width, height, frame_index)
+            };
+            // Stamp the device capture time onto the published sample —
+            // the solver's measurement filters derive their dt from
+            // consecutive capture timestamps (render/wall clocks say
+            // nothing about when the subject actually moved).
+            estimate.skeleton.capture_timestamp_ms = Some(rs_frame.timestamp_ms);
 
-                    // Live debug channel: publish camera + 2D keypoints + source
-                    // arm joints for an external overlay (no-op unless the debug
-                    // flag file exists). Before the estimate is moved below.
-                    debug_channel::dump_observation(frame_index, &rs_frame.rgb, width, height, &estimate);
+            // Live debug channel: publish camera + 2D keypoints + source
+            // arm joints for an external overlay (no-op unless the debug
+            // flag file exists). Before the estimate is moved below.
+            debug_channel::dump_observation(frame_index, &rs_frame.rgb, width, height, &estimate);
 
-                    let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
-                    mailbox.publish_estimate(estimate, frame);
-                    stagelog::mark(frame_index, "publish");
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors == 1 {
-                        error!("tracking-worker: frame grab error: {}", e);
-                    }
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!(
-                            "tracking-worker: {} consecutive grab failures, stopping worker",
-                            consecutive_errors
-                        );
-                        mailbox.report_error(
-                            t!("tracking.error_camera_stopped", count = consecutive_errors),
-                            TrackingErrorLevel::Blocking,
-                        );
-                        return;
-                    }
-                }
-            }
-
-            frame_index += 1;
-
-            let elapsed = loop_start.elapsed();
-            if elapsed < interval {
-                thread::sleep(interval - elapsed);
-            }
+            let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
+            mailbox.publish_estimate(estimate, frame);
+            stagelog::mark(frame_index, "publish");
         }
 
+        let _ = capture_handle.join();
         info!("tracking-worker: stopped");
+    }
+}
+
+/// One frame handed from the capture thread to the inference thread.
+#[cfg(feature = "realsense")]
+struct CaptureItem {
+    frame: realsense::RealSenseFrame,
+    index: u64,
+}
+
+/// Camera-owning loop of the `tracking-capture` thread: open the device
+/// (reporting the outcome once through `open_tx`), then grab frames and
+/// overwrite the shared [`latest_cell::LatestCell`] with the freshest one.
+/// Persistent grab failures tear the pipeline down and reopen it with
+/// backoff ([`GrabRecovery`]); desynced framesets are dropped without
+/// counting toward that. Closes the cell on exit, which is the inference
+/// thread's wake-up-and-quit signal.
+#[cfg(feature = "realsense")]
+fn capture_loop(
+    cell: Arc<latest_cell::LatestCell<CaptureItem>>,
+    running: Arc<AtomicBool>,
+    mailbox: TrackingMailbox,
+    open_tx: std::sync::mpsc::Sender<Result<(u32, u32), realsense::OpenFailure>>,
+    width: u32,
+    height: u32,
+    fps: u32,
+) {
+    let mut capture = match realsense::RealSenseCapture::open(width, height, fps) {
+        Ok(c) => {
+            let _ = open_tx.send(Ok((c.width(), c.height())));
+            Some(c)
+        }
+        Err(e) => {
+            let _ = open_tx.send(Err(e));
+            cell.close();
+            return;
+        }
+    };
+    drop(open_tx);
+
+    let mut frame_index: u64 = 0;
+    let mut recovery = GrabRecovery::default();
+    let mut sync_drops: u64 = 0;
+
+    while running.load(Ordering::SeqCst) {
+        let Some(cap) = capture.as_mut() else {
+            // Reconnect path: the previous capture was torn down after a
+            // persistent failure streak.
+            match recovery.next_reopen_backoff() {
+                None => {
+                    error!(
+                        "tracking-capture: camera did not come back after {} reconnect attempts, stopping",
+                        GrabRecovery::MAX_REOPEN_ATTEMPTS
+                    );
+                    mailbox.report_error(
+                        t!(
+                            "tracking.error_camera_stopped",
+                            count = recovery.total_errors()
+                        ),
+                        TrackingErrorLevel::Blocking,
+                    );
+                    break;
+                }
+                Some(backoff) => {
+                    if !sleep_while_running(&running, backoff) {
+                        break;
+                    }
+                    match realsense::RealSenseCapture::open(width, height, fps) {
+                        Ok(c) => {
+                            info!("tracking-capture: camera reconnected");
+                            capture = Some(c);
+                            recovery.on_reopen_success();
+                        }
+                        Err(e) => warn!("tracking-capture: reconnect attempt failed: {e}"),
+                    }
+                }
+            }
+            continue;
+        };
+
+        match cap.grab_frame() {
+            Ok(frame) => {
+                recovery.on_success();
+                stagelog::mark(frame_index, "capture_put");
+                cell.put(CaptureItem {
+                    frame,
+                    index: frame_index,
+                });
+                frame_index += 1;
+            }
+            Err(realsense::GrabError::SyncMismatch { delta_ms }) => {
+                // Healthy stream, unusable frameset. Log throttled —
+                // in a dim room with a struggling exposure this can
+                // recur for a while.
+                sync_drops += 1;
+                if sync_drops.is_power_of_two() {
+                    warn!(
+                        "tracking-capture: dropped depth/color-desynced frameset (#{sync_drops}, Δ {delta_ms:.1} ms)"
+                    );
+                }
+            }
+            Err(realsense::GrabError::Capture(msg)) => match recovery.on_capture_error(&msg) {
+                GrabAction::Retry => {}
+                GrabAction::LogAndRetry => {
+                    error!("tracking-capture: frame grab error: {msg}");
+                }
+                GrabAction::Reopen => {
+                    warn!(
+                        "tracking-capture: {} consecutive grab failures — reopening the camera",
+                        GrabRecovery::REOPEN_AFTER
+                    );
+                    capture = None;
+                }
+            },
+        }
+    }
+
+    cell.close();
+    info!("tracking-capture: stopped");
+}
+
+/// Sleep `total` in short slices, re-checking `running` between slices so
+/// a stop request interrupts a reconnect backoff promptly. Returns `false`
+/// when `running` flipped off during the wait.
+#[cfg(feature = "realsense")]
+fn sleep_while_running(running: &AtomicBool, total: Duration) -> bool {
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if !running.load(Ordering::SeqCst) {
+            return false;
+        }
+        let step = remaining.min(Duration::from_millis(100));
+        thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+    running.load(Ordering::SeqCst)
+}
+
+/// Grab-failure recovery ladder for the capture loop. Pure state machine
+/// (no I/O, no clocks) so the retry → log-on-change → reopen → give-up
+/// policy is unit-testable without a camera.
+#[derive(Debug, Default)]
+struct GrabRecovery {
+    consecutive_errors: u32,
+    total_errors: u64,
+    last_logged: Option<String>,
+    reopen_attempts: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GrabAction {
+    /// Same error as already logged — retry silently.
+    Retry,
+    /// New (or changed) error message — log it, then retry. Logging on
+    /// *change* rather than only on the first error of a streak keeps a
+    /// mid-streak transition (timeout → device disconnected) visible.
+    LogAndRetry,
+    /// Failure streak exhausted the retry budget — tear the pipeline
+    /// down and reopen the device.
+    Reopen,
+}
+
+impl GrabRecovery {
+    /// Consecutive capture errors before a reopen. At the 500 ms steady
+    /// grab timeout this is ~5 s of a wedged / unplugged camera.
+    const REOPEN_AFTER: u32 = 10;
+    /// Reopen attempts (each preceded by [`Self::next_reopen_backoff`])
+    /// before giving up for good.
+    const MAX_REOPEN_ATTEMPTS: u32 = 5;
+
+    fn on_success(&mut self) {
+        self.consecutive_errors = 0;
+        self.last_logged = None;
+        self.reopen_attempts = 0;
+    }
+
+    fn on_capture_error(&mut self, msg: &str) -> GrabAction {
+        self.consecutive_errors += 1;
+        self.total_errors += 1;
+        if self.consecutive_errors >= Self::REOPEN_AFTER {
+            self.consecutive_errors = 0;
+            return GrabAction::Reopen;
+        }
+        if self.last_logged.as_deref() != Some(msg) {
+            self.last_logged = Some(msg.to_string());
+            GrabAction::LogAndRetry
+        } else {
+            GrabAction::Retry
+        }
+    }
+
+    /// Backoff before the next reopen attempt: 0.5 s doubling to an 8 s
+    /// cap. `None` once the attempt budget is spent.
+    fn next_reopen_backoff(&mut self) -> Option<Duration> {
+        if self.reopen_attempts >= Self::MAX_REOPEN_ATTEMPTS {
+            return None;
+        }
+        let backoff = Duration::from_millis(500u64 << self.reopen_attempts.min(4));
+        self.reopen_attempts += 1;
+        Some(backoff)
+    }
+
+    fn on_reopen_success(&mut self) {
+        self.on_success();
+    }
+
+    fn total_errors(&self) -> u64 {
+        self.total_errors
+    }
+}
+
+#[cfg(test)]
+mod grab_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn logs_on_error_message_change_not_just_first() {
+        let mut r = GrabRecovery::default();
+        assert_eq!(r.on_capture_error("timeout"), GrabAction::LogAndRetry);
+        assert_eq!(r.on_capture_error("timeout"), GrabAction::Retry);
+        // The mid-streak transition must be visible.
+        assert_eq!(r.on_capture_error("disconnected"), GrabAction::LogAndRetry);
+        assert_eq!(r.on_capture_error("disconnected"), GrabAction::Retry);
+    }
+
+    #[test]
+    fn reopen_after_persistent_streak_and_success_resets() {
+        let mut r = GrabRecovery::default();
+        for _ in 0..GrabRecovery::REOPEN_AFTER - 1 {
+            let a = r.on_capture_error("timeout");
+            assert_ne!(a, GrabAction::Reopen);
+        }
+        assert_eq!(r.on_capture_error("timeout"), GrabAction::Reopen);
+        // A successful grab resets the streak entirely.
+        r.on_success();
+        assert_eq!(r.on_capture_error("timeout"), GrabAction::LogAndRetry);
+    }
+
+    #[test]
+    fn reopen_backoff_doubles_then_gives_up() {
+        let mut r = GrabRecovery::default();
+        let mut seen = Vec::new();
+        while let Some(b) = r.next_reopen_backoff() {
+            seen.push(b.as_millis() as u64);
+        }
+        assert_eq!(seen, vec![500, 1000, 2000, 4000, 8000]);
+        assert!(r.next_reopen_backoff().is_none(), "budget spent");
+        // A successful reopen restores the full budget.
+        r.on_reopen_success();
+        assert_eq!(r.next_reopen_backoff(), Some(Duration::from_millis(500)));
     }
 }
 

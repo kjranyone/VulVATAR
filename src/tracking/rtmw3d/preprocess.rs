@@ -19,6 +19,49 @@ use ndarray::Array4;
 
 use super::super::yolox::PersonBbox;
 use super::consts::{INPUT_H, INPUT_W, MEAN_RGB, STD_RGB};
+use super::decode::DecodedJoint;
+
+/// Remap decoded crop-space joints back to original-frame normalised
+/// coords. `nx`/`ny` get the affine crop→frame transform; `nz` is
+/// multiplied by the caller-supplied `z_gain`.
+///
+/// The nz scaling is the x/y/z unit contract: RTMW3D's SimCC-z is a
+/// *metric* root-relative axis (`RTMW3D_Z_RANGE` = 2.17 m, rtmlib
+/// convention) while Δnx/Δny shrink with the subject's apparent size,
+/// so nz needs an apparent-size gain to stay proportionate to x/y in
+/// frame space. For a crop that tracks the subject, `ch / height` is
+/// that gain (crop height ∝ apparent subject size). For the
+/// whole-frame letterbox fallback the crop height says nothing about
+/// the subject — that is why the gain is a separate parameter: the
+/// caller passes the last *tracked* gain for continuity instead of the
+/// fallback's constant `≈2.37` (see the call site in `mod.rs`). Only
+/// relative Δnz matters downstream (`to_source` subtracts the anchor's
+/// nz), so a plain multiply is sufficient.
+pub(super) fn remap_crop_joints(
+    joints: &mut [DecodedJoint],
+    ox: f32,
+    oy: f32,
+    cw: f32,
+    ch: f32,
+    width: u32,
+    height: u32,
+    z_gain: f32,
+) {
+    let inv_w = 1.0 / (width.max(1) as f32);
+    let inv_h = 1.0 / (height.max(1) as f32);
+    for j in joints.iter_mut() {
+        j.nx = (ox + j.nx * cw) * inv_w;
+        j.ny = (oy + j.ny * ch) * inv_h;
+        j.nz *= z_gain;
+    }
+}
+
+/// Apparent-size z gain for a subject-tracking crop: crop height as a
+/// fraction of frame height. Valid ONLY when the crop follows the
+/// subject (bbox / self-track) — see [`remap_crop_joints`].
+pub(super) fn tracked_z_gain(ch: f32, height: u32) -> f32 {
+    ch / (height.max(1) as f32)
+}
 
 // ---------------------------------------------------------------------------
 // YOLOX crop helpers
@@ -162,4 +205,88 @@ pub(super) fn preprocess(rgb: &[u8], src_w: u32, src_h: u32) -> Array4<f32> {
         }
     }
     tensor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dj(nx: f32, ny: f32, nz: f32) -> DecodedJoint {
+        DecodedJoint {
+            nx,
+            ny,
+            nz,
+            score: 0.9,
+            z_score: 0.9,
+        }
+    }
+
+    /// The same physical pose decoded from a small crop and from a
+    /// large crop must remap to identical relative x:y:z proportions —
+    /// the distance-invariance contract that motivated the nz scaling.
+    #[test]
+    fn remap_scales_z_by_the_same_ratio_as_y() {
+        let (w, h) = (1280u32, 720u32);
+        // Two joints separated in all three axes, in crop space.
+        let base = [dj(0.30, 0.30, 0.40), dj(0.70, 0.80, 0.65)];
+
+        // Near subject: crop is most of the frame.
+        let mut near = base;
+        remap_crop_joints(&mut near, 100.0, 0.0, 540.0, 720.0, w, h, tracked_z_gain(720.0, h));
+        // Far subject: same pose, crop four times smaller.
+        let mut far = base;
+        remap_crop_joints(&mut far, 500.0, 200.0, 135.0, 180.0, w, h, tracked_z_gain(180.0, h));
+
+        let ratios = |pair: &[DecodedJoint; 2]| {
+            let dx = pair[1].nx - pair[0].nx;
+            let dy = pair[1].ny - pair[0].ny;
+            let dz = pair[1].nz - pair[0].nz;
+            (dz / dy, dx / dy)
+        };
+        let (near_zy, near_xy) = ratios(&near);
+        let (far_zy, far_xy) = ratios(&far);
+        assert!(
+            (near_zy - far_zy).abs() < 1e-5,
+            "z:y proportion must be crop-size invariant, near {near_zy} far {far_zy}"
+        );
+        assert!(
+            (near_xy - far_xy).abs() < 1e-5,
+            "x:y proportion must be crop-size invariant, near {near_xy} far {far_xy}"
+        );
+    }
+
+    /// Identity crop (whole frame, no offset) must leave nx/ny/nz
+    /// untouched — the zero-cost baseline the old code special-cased.
+    #[test]
+    fn remap_identity_crop_is_a_noop() {
+        let (w, h) = (640u32, 480u32);
+        let mut joints = [dj(0.25, 0.75, 0.5)];
+        remap_crop_joints(&mut joints, 0.0, 0.0, 640.0, 480.0, w, h, tracked_z_gain(480.0, h));
+        assert!((joints[0].nx - 0.25).abs() < 1e-6);
+        assert!((joints[0].ny - 0.75).abs() < 1e-6);
+        assert!((joints[0].nz - 0.5).abs() < 1e-6);
+    }
+
+    /// Full-frame letterbox bbox: `pad_bbox_to_aspect` with zero pad on
+    /// a 16:9 frame must produce a portrait 288:384 virtual crop that
+    /// contains the whole frame (no squash).
+    #[test]
+    fn whole_frame_aspect_pad_contains_frame_without_squash() {
+        let bbox = PersonBbox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1280.0,
+            y2: 720.0,
+            score: 1.0,
+        };
+        let (x1, y1, x2, y2) = pad_bbox_to_aspect(&bbox, 0.0);
+        let cw = x2 - x1;
+        let ch = y2 - y1;
+        let aspect = cw / ch;
+        assert!(
+            (aspect - INPUT_W as f32 / INPUT_H as f32).abs() < 1e-3,
+            "virtual crop must match the model input aspect, got {aspect}"
+        );
+        assert!(x1 <= 0.0 && x2 >= 1280.0 && y1 <= 0.0 && y2 >= 720.0);
+    }
 }

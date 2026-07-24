@@ -145,8 +145,24 @@ fn load_metric_frame(
             points_m,
             crop: None,
             intrinsics: Some(intr),
+            // Offline replay at the recorded cadence — the nominal
+            // 30 fps fallback matches the capture rate.
+            timestamp_ms: None,
         },
     ))
+}
+
+/// Replay pipeline config: the app default, with an env-var override to
+/// drop the YOLOX person-crop stage (`VULVATAR_REPLAY_NO_YOLOX=1`). The
+/// override forces the whole-frame letterbox fallback on every frame,
+/// which is the A/B lever for the crop-z contract measurement (compare
+/// `vulvatar::rawz` lines for the same image with and without it).
+fn replay_config() -> TrackingPipelineConfig {
+    let mut cfg = TrackingPipelineConfig::default();
+    if std::env::var_os("VULVATAR_REPLAY_NO_YOLOX").is_some() {
+        cfg.yolox_enabled = false;
+    }
+    cfg
 }
 
 fn main() -> Result<(), String> {
@@ -175,7 +191,7 @@ fn main() -> Result<(), String> {
     let (rgb, metric) = load_metric_frame(&color_path, &depth_path, true)?;
     let (cw, ch) = (rgb.width(), rgb.height());
 
-    let mut provider = create_pose_provider("models", TrackingPipelineConfig::default())?;
+    let mut provider = create_pose_provider("models", replay_config())?;
     println!("provider: {}", provider.label());
 
     provider.set_external_depth(metric);
@@ -333,7 +349,7 @@ fn batch(dir: &Path) -> Result<(), String> {
         ));
     }
 
-    let mut provider = create_pose_provider("models", TrackingPipelineConfig::default())?;
+    let mut provider = create_pose_provider("models", replay_config())?;
     eprintln!("provider: {} — {} frames", provider.label(), pairs.len());
 
     let fz = |o: Option<f32>| o.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "".into());

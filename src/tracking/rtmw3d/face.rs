@@ -7,7 +7,7 @@
 use crate::asset::HumanoidBone;
 
 use super::super::face_mediapipe::{derive_face_bbox, FaceBbox};
-use super::super::{FacePose, SourceSkeleton};
+use super::super::{FacePose, FaceSource, SourceSkeleton};
 use super::consts::{INPUT_H, INPUT_W, KEYPOINT_VISIBILITY_FLOOR};
 use super::decode::DecodedJoint;
 
@@ -71,8 +71,9 @@ pub(super) fn derive_face_pose_from_body(
     // the avatar-frame names directly so the geometry below reads
     // without sign confusion.
     let nose = to_src(&joints[0]);
-    let avatar_right_eye = to_src(&joints[1]); // subject left eye
-    let avatar_left_eye = to_src(&joints[2]); // subject right eye
+    // Eyes are consumed in model-pixel space (roll / pitch below) so
+    // they never go through `to_src` — only the ear line (yaw) and the
+    // nose (back-ear reconstruction) need source coords.
     let avatar_right_ear = to_src(&joints[3]); // subject left ear
     let avatar_left_ear = to_src(&joints[4]); // subject right ear
 
@@ -89,11 +90,16 @@ pub(super) fn derive_face_pose_from_body(
     // tracking right when it should be most active. Detect that
     // case by score asymmetry and reconstruct the back ear as the
     // visible ear reflected through the nose's XZ position. Nose
-    // is forward of the head's actual rotation axis so this introduces
-    // a small constant bias in `ear_dz`; the per-session calibration
-    // (`TrackingCalibration::apply_calibration`) absorbs the bias at
-    // the neutral pose, leaving the *delta* — which is all the avatar
-    // head bone consumes — close to correct.
+    // is forward of the head's actual rotation axis, so the
+    // reflection over-rotates the reconstructed ear and `ear_dz`
+    // carries a systematic yaw-magnitude bias in these views. Note
+    // this bias is NOT absorbed by the per-session calibration: the
+    // reconstruction only fires on occluded-ear (turned-head) frames,
+    // and the calibration neutral is captured during a *frontal* hold
+    // where this branch never runs. The bias is accepted as-is —
+    // it overstates how far the head is turned but preserves turn
+    // direction and motion continuity, which is what the avatar's
+    // head bone visibly needs in profile views.
     const EAR_OCCLUSION_RATIO: f32 = 0.5;
     let s_right_ear = joints[3].score;
     let s_left_ear = joints[4].score;
@@ -126,20 +132,35 @@ pub(super) fn derive_face_pose_from_body(
 
     // Eye line: same handedness. Roll positive = head tilts toward
     // avatar's left ear (avatar's left eye drops below the right).
-    let eye_dx = avatar_left_eye[0] - avatar_right_eye[0];
-    let eye_dy = avatar_left_eye[1] - avatar_right_eye[1];
-    let roll = eye_dy.atan2(eye_dx);
+    //
+    // Computed in model-pixel space (like pitch below) rather than
+    // source space: the source-space x carries the shoulder-derived
+    // `aspect` estimate, whose per-frame noise would inject directly
+    // into the roll angle as jitter, and whose 0.5–4.0 gate makes the
+    // roll gain framing-dependent. Pixel space is the geometry the
+    // model actually saw (the crop is letterboxed, not squashed), so
+    // the angle is anatomically correct and aspect-free. Sign check:
+    // avatar-left eye = subject-right eye = joints[2]; source
+    // eye_dy = y_src(left) − y_src(right) = j1.ny − j2.ny (y_src
+    // negates image-y), and source eye_dx = aspect·(j1.nx − j2.nx) —
+    // both preserved below with the fixed pixel scale instead of
+    // `aspect`.
+    let roll_dy_px = (joints[1].ny - joints[2].ny) * INPUT_H as f32;
+    let roll_dx_px = (joints[1].nx - joints[2].nx) * INPUT_W as f32;
+    let roll = roll_dy_px.atan2(roll_dx_px);
 
     // PITCH from nose-below-eye-line, with an anatomical neutral
     // subtracted — mirroring the FaceMesh path
     // (`derive_face_pose_from_landmarks`, which subtracts its own
     // `PITCH_NEUTRAL_SIGNAL`). The body path never had this: at a frontal
     // neutral pose the nose tip sits a fixed fraction below the eye line,
-    // so the raw ratio maps to a large spurious `+pitch` (chin-down). The
-    // stored `neutral_face_pose` was meant to absorb it per-session, but
-    // that channel is never populated (`TrackingCalibration` only ever
-    // holds the default), so the bias reached the Head bone unmodified —
-    // a forward-facing head decoded ~50° down.
+    // so the raw ratio maps to a large spurious `+pitch` (chin-down) —
+    // before this subtraction a forward-facing head decoded ~50° down.
+    // The per-person residual (camera height, face proportions) is
+    // absorbed by `PoseCalibration::neutral_face_ypr_body`, captured
+    // during the Calibrate Pose hold (from `face_body_raw`, so the
+    // body path is measured even while the mesh wins selection) and
+    // subtracted per-source in `apply_calibration`.
     //
     // Computed in model-pixel space (`nx·INPUT_W, ny·INPUT_H`) rather than
     // source space so the ratio is independent of the shoulder-derived
@@ -158,7 +179,18 @@ pub(super) fn derive_face_pose_from_body(
     let inter_eye_px = ((le_px.0 - re_px.0).powi(2) + (le_px.1 - re_px.1).powi(2))
         .sqrt()
         .max(1.0);
-    let pitch_signal = (nose_py - eye_mid_py) / inter_eye_px - PITCH_NEUTRAL_SIGNAL;
+    // Yaw decoupling: under head yaw the inter-eye baseline
+    // foreshortens by ~cos(yaw) while the nose-below-eye-line vertical
+    // distance stays roughly constant, so the raw ratio inflates by
+    // 1/cos(yaw) — a 45° head turn read as a spurious extra nod.
+    // Multiply the measured ratio back by cos(yaw) to recover the
+    // frontal-equivalent signal before subtracting the frontal-space
+    // anatomical neutral. The 0.5 floor stops the correction from
+    // collapsing the signal in profile views where the ear-line yaw
+    // itself saturates and cos would over-shrink a noisy ratio.
+    let yaw_foreshorten = yaw.cos().clamp(0.5, 1.0);
+    let pitch_signal =
+        (nose_py - eye_mid_py) / inter_eye_px * yaw_foreshorten - PITCH_NEUTRAL_SIGNAL;
     let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
 
     let conf = joints[..5].iter().map(|j| j.score).fold(1.0_f32, f32::min);
@@ -167,7 +199,189 @@ pub(super) fn derive_face_pose_from_body(
         pitch,
         roll,
         confidence: conf,
+        source: FaceSource::Body,
+        ..Default::default()
     })
+}
+
+/// FaceMesh confidence above which the selector *switches to* the mesh
+/// pose, and the lower floor below which it *abandons* it. Live
+/// measurements (2026-07-17, headphones + glasses subject): frontal
+/// ≈ 0.95–1.0, 3/4 view ≈ 0.4 (where the mesh yaw is still correct and
+/// the body ear-line yaw reads ~0 because the ears are occluded by the
+/// headphone cups), true collapse ≈ 0.003–0.19 at close-up profile.
+/// The two sources disagree by tens of degrees in exactly the views
+/// where the mesh confidence hovers near the boundary (the module's own
+/// 3/4-view test shows a 59° yaw gap), so a single threshold made the
+/// head snap between them every frame the confidence crossed it. The
+/// enter/exit pair is a Schmitt trigger: the confidence must climb to
+/// 0.3 to adopt the mesh and fall below 0.15 to drop it — chatter
+/// inside [0.15, 0.3) keeps whichever source is currently active.
+const MESH_ENTER_CONFIDENCE: f32 = 0.3;
+const MESH_EXIT_CONFIDENCE: f32 = 0.15;
+
+/// Wall-clock duration of a source-switch crossfade. ~233 ms (the old
+/// 6-blended-frames-at-30-fps schedule reached the target on the 7th
+/// frame) — fast enough to not read as lag, slow enough that the worst
+/// measured inter-source disagreement (~1 rad yaw at 3/4 view) moves
+/// the head smoothly instead of teleporting it. Advanced by the real
+/// capture dt, so the ease takes the same wall time at any frame rate.
+const SOURCE_SWITCH_BLEND_S: f32 = 7.0 / 30.0;
+
+/// Shortest-arc angle interpolation (radians). The inter-source gap is
+/// well under π in practice, but wrap anyway so a pathological pair
+/// can't blend the long way around.
+fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
+    use std::f32::consts::PI;
+    let mut d = to - from;
+    while d > PI {
+        d -= 2.0 * PI;
+    }
+    while d < -PI {
+        d += 2.0 * PI;
+    }
+    from + d * t
+}
+
+/// Stateful head-pose source selection: FaceMesh's dense-landmark pose
+/// when the mesh actually saw a face (it has real Z separation through
+/// the 22.5°–67.5° "3/4 view" dead-zone where the body-derived ear-line
+/// yaw collapses to ~0), otherwise the body-derived pose. Adds two
+/// pieces of temporal state over a pure per-frame pick:
+///
+/// * **Hysteresis** (`MESH_ENTER_CONFIDENCE` / `MESH_EXIT_CONFIDENCE`)
+///   so a mesh confidence flickering around a single threshold can't
+///   flip the source — and with it, each source's tens-of-degrees
+///   systematic offset — every frame.
+/// * **Crossfade** (`SOURCE_SWITCH_BLEND_S`) so the residual
+///   inter-source disagreement at a legitimate switch plays out as a
+///   ~230 ms ease instead of a head snap.
+///
+/// The published pose keeps the *target* source's tag and confidence
+/// during the blend — only the angles are eased.
+#[derive(Debug, Default)]
+pub(super) struct FaceSourceSelector {
+    using_mesh: bool,
+    /// Wall time elapsed since the active crossfade began; the blend is
+    /// live while `blend_from` is `Some` and this is under
+    /// [`SOURCE_SWITCH_BLEND_S`].
+    blend_elapsed_s: f32,
+    blend_from: Option<FacePose>,
+    last_output: Option<FacePose>,
+}
+
+impl FaceSourceSelector {
+    /// `dt_s`: capture-timestamp frame step (nominal 1/30 when the input
+    /// carries no device timestamps) — advances the crossfade in wall
+    /// time so the ease duration is frame-rate independent.
+    pub(super) fn select(
+        &mut self,
+        body: Option<FacePose>,
+        mesh: Option<FacePose>,
+        mesh_conf: f32,
+        dt_s: f32,
+    ) -> Option<FacePose> {
+        // Schmitt-trigger source state. The mesh must exist this frame
+        // to be (or stay) the active source.
+        let mesh_wanted = if self.using_mesh {
+            mesh.is_some() && mesh_conf >= MESH_EXIT_CONFIDENCE
+        } else {
+            mesh.is_some() && mesh_conf >= MESH_ENTER_CONFIDENCE
+        };
+        if mesh_wanted != self.using_mesh {
+            self.using_mesh = mesh_wanted;
+            // Ease from whatever we last published (which may itself be
+            // mid-blend) toward the new source. First-ever frame has no
+            // previous output — no blend, publish the new source as-is.
+            self.blend_from = self.last_output;
+            self.blend_elapsed_s = 0.0;
+            if self.blend_from.is_none() {
+                self.blend_elapsed_s = SOURCE_SWITCH_BLEND_S;
+            }
+        }
+
+        let raw = match (self.using_mesh, body, mesh) {
+            (true, body, Some(mut mesh_pose)) => {
+                // The two confidences are independent "is the face
+                // visible" signals, so the higher one is the better
+                // evidence for the solver's gate — symmetric with the
+                // body-retained arm below.
+                let body_conf = body.map(|b| b.confidence).unwrap_or(0.0);
+                mesh_pose.confidence = mesh_conf.max(body_conf);
+                Some(mesh_pose)
+            }
+            (false, Some(mut body_pose), _) => {
+                body_pose.confidence = body_pose.confidence.max(mesh_conf);
+                Some(body_pose)
+            }
+            (false, None, Some(mut mesh_pose)) => {
+                // No body pose to fall back on — surface the weak mesh
+                // pose with its honest confidence and let the solver
+                // gate decide. Deliberately does NOT flip `using_mesh`:
+                // this is a last resort, not evidence the mesh is
+                // healthy.
+                mesh_pose.confidence = mesh_conf;
+                Some(mesh_pose)
+            }
+            (true, _, None) => unreachable!("using_mesh requires mesh.is_some()"),
+            (false, None, None) => None,
+        };
+
+        let out = match raw {
+            Some(target) => {
+                let eased = if self.blend_elapsed_s < SOURCE_SWITCH_BLEND_S {
+                    if let Some(from) = self.blend_from {
+                        self.blend_elapsed_s += dt_s;
+                        if self.blend_elapsed_s >= SOURCE_SWITCH_BLEND_S {
+                            // The ease's wall time has fully elapsed —
+                            // publish the target outright.
+                            self.blend_from = None;
+                            target
+                        } else {
+                            let t = self.blend_elapsed_s / SOURCE_SWITCH_BLEND_S;
+                            FacePose {
+                                yaw: lerp_angle(from.yaw, target.yaw, t),
+                                pitch: lerp_angle(from.pitch, target.pitch, t),
+                                roll: lerp_angle(from.roll, target.roll, t),
+                                // Calibration must interpolate the per-source
+                                // neutrals with this same t (see
+                                // `FacePose::blend`). `from.source` is exact
+                                // for a switch out of steady state; a switch
+                                // landing mid-blend anchors on the previous
+                                // target's source, whose neutral only
+                                // approximates the mixed anchor pose — the
+                                // residual is bounded by the neutral gap
+                                // times the interrupted blend's remaining
+                                // fraction and decays over this blend.
+                                blend: Some((from.source, t)),
+                                ..target
+                            }
+                        }
+                    } else {
+                        self.blend_elapsed_s = SOURCE_SWITCH_BLEND_S;
+                        target
+                    }
+                } else {
+                    target
+                };
+                Some(eased)
+            }
+            None => {
+                // Full face dropout: forget the blend anchor so a pose
+                // reappearing seconds later doesn't ease from stale
+                // angles.
+                self.blend_elapsed_s = SOURCE_SWITCH_BLEND_S;
+                self.blend_from = None;
+                None
+            }
+        };
+        if out.is_some() {
+            self.last_output = out;
+        } else {
+            self.last_output = None;
+        }
+        out
+    }
 }
 
 /// Pixel-space face bbox derived from RTMW3D's 68 face landmarks
@@ -199,8 +413,20 @@ mod tests {
     use super::*;
     use crate::tracking::source_skeleton::SourceJoint;
 
+    /// Nominal 30 fps step — the baseline the crossfade schedule was
+    /// calibrated at (6 blended frames, target on the 7th).
+    const DT: f32 = 1.0 / 30.0;
+    /// Ideal per-frame calibrated-space increment divisor at 30 fps.
+    const BLEND_STEPS_AT_30: u32 = 7;
+
     fn dj(nx: f32, ny: f32, nz: f32) -> DecodedJoint {
-        DecodedJoint { nx, ny, nz, score: 0.9 }
+        DecodedJoint {
+            nx,
+            ny,
+            nz,
+            score: 0.9,
+            z_score: 0.9,
+        }
     }
 
     /// Front-facing synthetic face with the nose at `nose_py` pixels
@@ -223,6 +449,290 @@ mod tests {
         j[11] = px(168.0, 376.0, 0.5); // subject-left hip
         j[12] = px(120.0, 376.0, 0.5); // subject-right hip
         j
+    }
+
+    fn pose(yaw: f32, confidence: f32) -> FacePose {
+        FacePose {
+            yaw,
+            pitch: 0.0,
+            roll: 0.0,
+            confidence,
+            ..Default::default()
+        }
+    }
+
+    fn mesh_pose(yaw: f32, confidence: f32) -> FacePose {
+        FacePose {
+            source: FaceSource::Mesh,
+            ..pose(yaw, confidence)
+        }
+    }
+
+    #[test]
+    fn collapsed_mesh_confidence_keeps_body_pose() {
+        // Live-measured profile view: body ear-line yaw −0.93 at conf
+        // 0.66, mesh score collapsed to 1.9e-8. The mesh pose must NOT
+        // replace the body pose (the old unconditional preference froze
+        // the avatar's head on every sideways turn).
+        let mut sel = FaceSourceSelector::default();
+        let out = sel
+            .select(Some(pose(-0.93, 0.66)), Some(mesh_pose(-0.2, 1.0)), 1.9e-8, DT)
+            .unwrap();
+        assert!((out.yaw - -0.93).abs() < 1e-6);
+        assert!(out.confidence >= 0.66);
+        assert_eq!(out.source, FaceSource::Body);
+    }
+
+    #[test]
+    fn confident_mesh_pose_wins() {
+        // Front / 3/4 views: the mesh genuinely sees a face, and its
+        // dense-landmark pose covers the body ear-line dead-zone.
+        let mut sel = FaceSourceSelector::default();
+        let out = sel
+            .select(Some(pose(0.05, 0.7)), Some(mesh_pose(0.6, 1.0)), 0.92, DT)
+            .unwrap();
+        assert!((out.yaw - 0.6).abs() < 1e-6);
+        assert!((out.confidence - 0.92).abs() < 1e-6);
+        assert_eq!(out.source, FaceSource::Mesh);
+    }
+
+    #[test]
+    fn three_quarter_view_degraded_mesh_still_wins() {
+        // Live-measured 3/4 view: mesh_c ≈ 0.42 with a correct yaw
+        // while the body ear-line reads ~0 (ears occluded by headphone
+        // cups). The degraded-but-alive mesh pose must win. Confidence
+        // folding is symmetric (max of the two independent visibility
+        // signals), so the healthy body confidence carries through.
+        let mut sel = FaceSourceSelector::default();
+        let out = sel
+            .select(Some(pose(-0.04, 0.7)), Some(mesh_pose(-1.07, 1.0)), 0.42, DT)
+            .unwrap();
+        assert!((out.yaw - -1.07).abs() < 1e-6);
+        assert!((out.confidence - 0.7).abs() < 1e-6);
+        assert_eq!(out.source, FaceSource::Mesh);
+    }
+
+    #[test]
+    fn weak_mesh_pose_is_last_resort_when_body_missing() {
+        // No body pose at all: surface the mesh pose with its honest
+        // (low) confidence so the solver's GUI threshold decides.
+        let mut sel = FaceSourceSelector::default();
+        let out = sel.select(None, Some(mesh_pose(0.3, 1.0)), 0.1, DT).unwrap();
+        assert!((out.yaw - 0.3).abs() < 1e-6);
+        assert!((out.confidence - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mesh_conf_folds_into_body_confidence_when_mesh_pose_absent() {
+        let mut sel = FaceSourceSelector::default();
+        let out = sel.select(Some(pose(-0.4, 0.3)), None, 0.45, DT).unwrap();
+        assert!((out.yaw - -0.4).abs() < 1e-6);
+        assert!((out.confidence - 0.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn confidence_chatter_between_thresholds_does_not_flip_source() {
+        // Regression for the head-snap bug: the 3/4-view sources
+        // disagree by ~59° while mesh confidence hovers around the old
+        // single 0.2 threshold. Inside the Schmitt band [0.15, 0.3)
+        // the active source must not change in either direction.
+        let body = pose(-0.04, 0.7);
+        let mesh = mesh_pose(-1.07, 1.0);
+
+        // Starting on body: 0.2 / 0.29 are below ENTER → stays body.
+        let mut sel = FaceSourceSelector::default();
+        for conf in [0.2, 0.29, 0.18, 0.25] {
+            let out = sel.select(Some(body), Some(mesh), conf, DT).unwrap();
+            assert_eq!(out.source, FaceSource::Body, "conf {conf} flipped to mesh");
+        }
+
+        // Starting on mesh (one confident frame), then chatter in the
+        // band: 0.2 / 0.16 are above EXIT → stays mesh.
+        let mut sel = FaceSourceSelector::default();
+        let out = sel.select(Some(body), Some(mesh), 0.9, DT).unwrap();
+        assert_eq!(out.source, FaceSource::Mesh);
+        for conf in [0.2, 0.16, 0.28, 0.19] {
+            let out = sel.select(Some(body), Some(mesh), conf, DT).unwrap();
+            assert_eq!(out.source, FaceSource::Mesh, "conf {conf} dropped to body");
+        }
+
+        // Genuine collapse below EXIT → back to body.
+        let out = sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
+        assert_eq!(out.source, FaceSource::Body);
+    }
+
+    #[test]
+    fn source_switch_crossfades_instead_of_snapping() {
+        // 59° inter-source yaw gap (live-measured 3/4 view). On the
+        // switch frame the published yaw must land strictly between
+        // the two sources, and successive frames must approach the new
+        // source monotonically until the blend runs out.
+        let body = pose(-0.04, 0.7);
+        let mesh = mesh_pose(-1.07, 1.0);
+        let mut sel = FaceSourceSelector::default();
+        // Establish body as the active source.
+        let out = sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
+        assert!((out.yaw - -0.04).abs() < 1e-6);
+
+        // Mesh becomes confident → switch begins.
+        let mut prev_yaw = out.yaw;
+        let mut reached = false;
+        for frame in 0..12 {
+            let out = sel.select(Some(body), Some(mesh), 0.9, DT).unwrap();
+            assert_eq!(out.source, FaceSource::Mesh, "tag is the target source");
+            assert!(
+                out.yaw <= prev_yaw + 1e-6,
+                "frame {frame}: yaw must move monotonically toward the mesh pose"
+            );
+            if frame == 0 {
+                assert!(
+                    out.yaw < -0.04 - 0.05 && out.yaw > -1.07 + 0.05,
+                    "switch frame must be strictly between sources, got {}",
+                    out.yaw
+                );
+            }
+            prev_yaw = out.yaw;
+            if (out.yaw - -1.07).abs() < 1e-6 {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "blend must converge to the mesh pose, ended at {prev_yaw}");
+    }
+
+    #[test]
+    fn crossfade_is_continuous_in_calibrated_space() {
+        // C1 regression: the crossfade blends RAW angles, but the
+        // per-source neutral subtraction keys on the (target) source
+        // tag. Without interpolating the neutrals with the same t, the
+        // switch frame subtracts the full target neutral from angles
+        // that are still ~6/7 from-source — the inter-source neutral
+        // gap appears as a calibrated-space head step on the exact
+        // frame the crossfade exists to smooth.
+        use crate::tracking::{
+            CalibrationMode, PoseCalibration, SourceSkeleton, TrackingCalibration,
+        };
+        let n_body = [0.3, 0.0, 0.0];
+        let n_mesh = [-0.5, 0.0, 0.0];
+        let cal = TrackingCalibration {
+            pose: Some(PoseCalibration {
+                mode: CalibrationMode::UpperBody,
+                captured_at: String::new(),
+                captured_at_unix: 0,
+                frame_count: 1,
+                anchor_x: 0.0,
+                anchor_y: 0.0,
+                anchor_depth_m: None,
+                confidence: 1.0,
+                anchor_depth_jitter_m: None,
+                shoulder_span_m: None,
+                x_range_observed: None,
+                z_range_observed: None,
+                torso_depth_template: None,
+                neutral_expressions: Vec::new(),
+                neutral_face_ypr_mesh: Some(n_mesh),
+                neutral_face_ypr_body: Some(n_body),
+            }),
+        };
+        let calibrated = |p: FacePose| -> f32 {
+            let mut sk = SourceSkeleton::default();
+            sk.face = Some(p);
+            cal.apply_calibration(&mut sk);
+            sk.face.unwrap().yaw
+        };
+
+        // Body at its own neutral (calibrated 0), mesh well off it.
+        let body = pose(n_body[0], 0.7);
+        let mesh = mesh_pose(-1.07, 1.0);
+        let mesh_cal_target = -1.07 - n_mesh[0]; // −0.57
+
+        let mut sel = FaceSourceSelector::default();
+        let mut prev = calibrated(sel.select(Some(body), Some(mesh), 0.05, DT).unwrap());
+        assert!(prev.abs() < 1e-6, "body at its neutral must calibrate to 0");
+
+        // Switch to mesh: every calibrated-space step must stay near
+        // the ideal per-frame increment (gap / (BLEND+1) ≈ 0.081) —
+        // in particular NO step anywhere near the raw neutral gap
+        // (0.8) or the pre-fix switch-frame jump (~0.6).
+        let gap = (mesh_cal_target - prev).abs();
+        let max_step = gap / BLEND_STEPS_AT_30 as f32 + 0.01;
+        for frame in 0..12 {
+            let now = calibrated(sel.select(Some(body), Some(mesh), 0.9, DT).unwrap());
+            assert!(
+                (now - prev).abs() <= max_step,
+                "frame {frame}: calibrated yaw stepped {:.3} (limit {:.3})",
+                (now - prev).abs(),
+                max_step
+            );
+            prev = now;
+            if (now - mesh_cal_target).abs() < 1e-6 {
+                break;
+            }
+        }
+        assert!(
+            (prev - mesh_cal_target).abs() < 1e-6,
+            "must converge to the mesh calibrated pose, ended at {prev}"
+        );
+    }
+
+    #[test]
+    fn blend_metadata_marks_only_crossfade_frames() {
+        // P4 regression: the calibration hold keys on `FacePose::blend`
+        // to reject mid-crossfade frames (target tag over mixed
+        // angles). Steady frames must NOT carry it, every crossfade
+        // frame must, and it must clear once the blend completes.
+        let body = pose(-0.04, 0.7);
+        let mesh = mesh_pose(-1.07, 1.0);
+        let mut sel = FaceSourceSelector::default();
+        let out = sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
+        assert!(out.blend.is_none(), "steady body frame must not be marked");
+
+        for frame in 0..(BLEND_STEPS_AT_30 - 1) {
+            let out = sel.select(Some(body), Some(mesh), 0.9, DT).unwrap();
+            let (from, t) = out.blend.expect("crossfade frame must be marked");
+            assert_eq!(from, FaceSource::Body, "frame {frame}: blend anchors on the from-source");
+            assert!(t > 0.0 && t < 1.0, "frame {frame}: t={t} out of (0,1)");
+        }
+        let out = sel.select(Some(body), Some(mesh), 0.9, DT).unwrap();
+        assert!(out.blend.is_none(), "post-blend steady mesh frame must clear the mark");
+        assert_eq!(out.source, FaceSource::Mesh);
+    }
+
+    #[test]
+    fn crossfade_duration_is_wall_time_not_frames() {
+        // At 15 fps (dt = 2/30) the same ~233 ms ease must complete in
+        // about half the frames — the old frame-count schedule stretched
+        // it to ~400 ms whenever the capture rate halved.
+        let body = pose(-0.04, 0.7);
+        let mesh = mesh_pose(-1.07, 1.0);
+        let count_blend_frames = |dt: f32| -> u32 {
+            let mut sel = FaceSourceSelector::default();
+            sel.select(Some(body), Some(mesh), 0.05, dt).unwrap();
+            let mut frames = 0;
+            for _ in 0..20 {
+                let out = sel.select(Some(body), Some(mesh), 0.9, dt).unwrap();
+                if out.blend.is_none() {
+                    return frames;
+                }
+                frames += 1;
+            }
+            frames
+        };
+        let at_30 = count_blend_frames(DT);
+        let at_15 = count_blend_frames(2.0 * DT);
+        assert_eq!(at_30, 6, "30 fps keeps the calibrated 6-blended-frame schedule");
+        assert_eq!(at_15, 3, "15 fps covers the same wall time in half the frames");
+    }
+
+    #[test]
+    fn face_dropout_resets_blend_anchor() {
+        // A pose reappearing after a full dropout must not ease from
+        // stale pre-dropout angles.
+        let mut sel = FaceSourceSelector::default();
+        sel.select(Some(pose(0.8, 0.7)), None, 0.0, DT).unwrap();
+        assert!(sel.select(None, None, 0.0, DT).is_none());
+        let out = sel.select(Some(pose(-0.5, 0.7)), None, 0.0, DT).unwrap();
+        assert!((out.yaw - -0.5).abs() < 1e-6, "no blend from stale pose");
     }
 
     fn skeleton_with_shoulder() -> SourceSkeleton {
@@ -262,5 +772,50 @@ mod tests {
         let sk = skeleton_with_shoulder();
         let face = derive_face_pose_from_body(&sk, &neutral_joints(166.0)).unwrap();
         assert!(face.pitch < -0.3, "chin-up should be -pitch, got {}", face.pitch);
+    }
+
+    #[test]
+    fn yawed_head_does_not_leak_into_pitch() {
+        // Head turned ~45° with NO pitch: the inter-eye baseline
+        // foreshortens by cos(45°) while the nose-below-eye vertical
+        // distance stays put, so the raw ratio inflates 1.41× — which
+        // used to decode as a spurious ~27° nod every time the subject
+        // shook their head. With the cos(yaw) decoupling the pitch must
+        // stay near zero.
+        let w = INPUT_W as f32;
+        let h = INPUT_H as f32;
+        let px = |x: f32, y: f32, z: f32| dj(x / w, y / h, z);
+        let c = std::f32::consts::FRAC_1_SQRT_2; // cos 45°
+        let mut j = vec![DecodedJoint::default(); 13];
+        // Horizontal spans compressed by cos(45°); vertical untouched.
+        j[0] = px(144.0, 190.0, 0.5); // nose, 40 px below eye line
+        j[1] = px(144.0 + 16.0 * c, 150.0, 0.5);
+        j[2] = px(144.0 - 16.0 * c, 150.0, 0.5);
+        // Ears: depth-separated so the ear-line reads yaw ≈ +45°
+        // (|ear_dz| chosen equal to the compressed source-space
+        // |ear_dx| = 2 · (30·c/288) · aspect with aspect ≈ 0.9257).
+        let ear_half_nx = 30.0 * c / w;
+        let aspect = 0.18 / ((200.0 - 88.0) / w / 2.0);
+        let d = ear_half_nx * aspect;
+        j[3] = px(144.0 + 30.0 * c, 150.0, 0.5 + d);
+        j[4] = px(144.0 - 30.0 * c, 150.0, 0.5 - d);
+        j[5] = px(200.0, 280.0, 0.5);
+        j[6] = px(88.0, 280.0, 0.5);
+        j[11] = px(168.0, 376.0, 0.5);
+        j[12] = px(120.0, 376.0, 0.5);
+
+        let sk = skeleton_with_shoulder();
+        let face = derive_face_pose_from_body(&sk, &j).unwrap();
+        assert!(
+            face.yaw.abs() > 0.6,
+            "test geometry must actually read as a yawed head, got {} rad",
+            face.yaw
+        );
+        assert!(
+            face.pitch.abs() < 0.12,
+            "yaw must not leak into pitch, got {} rad ({}°)",
+            face.pitch,
+            face.pitch.to_degrees()
+        );
     }
 }

@@ -281,6 +281,7 @@ Pose not calibrated — auto-EMA active
 | E     | Persistence: save/load + status line + "calibrated N min ago" rendering |
 | F     | Multi-step capture: optional X/Z range step → per-axis sensitivity in solver |
 | G     | Per-profile storage: calibration moves from project file to `profiles.json` so each setup carries its own baseline |
+| H     | Bust-up framing fallback: UpperBody wait-gate switches to anchor-stillness when elbows are cropped out (see below) |
 
 ## Multi-step capture (Phase F)
 
@@ -320,6 +321,103 @@ Floors:
 
 The Z range field is only emitted when the anchor was already
 metric (depth-aware providers); rtmw3d-only paths leave it `None`.
+
+## Bust-up framing fallback (Phase H)
+
+### Problem
+
+The `WaitingForPose → Collecting` gate scores the live pose against the
+mode's target pose via **shoulder→elbow direction vectors**
+(`pose_match::pose_match_score`). Both elbows must be visible with
+≥ 0.3 keypoint confidence or the score is pinned at 0 — the capture
+never starts.
+
+Typical webcam-streamer framing (bust-up: head to slightly below the
+shoulders) crops both elbows out **permanently**. The existing
+`no_lower_arms_since` hint ("step back so your elbows are visible")
+assumes the framing is adjustable; for a streamer whose scene layout
+fixes the camera crop, it is not. A T-pose is equally impossible, so
+`FullBody` is not an alternative. The only current escape hatch is the
+`Capture Now` bypass button, which skips the quality gate entirely and
+is not discoverable as *the* intended path.
+
+### What a bust-up capture can and cannot measure
+
+The gate is the only real blocker — the data the calibration actually
+needs is almost fully available without elbows:
+
+| Captured value                          | Available at bust-up framing |
+|-----------------------------------------|------------------------------|
+| Anchor (shoulder-pair midpoint x/y/z)   | ✓ (UpperBody already forces the shoulder anchor) |
+| `shoulder_span_m`                       | ✓ (shoulder pair only)       |
+| `neutral_expressions`, `neutral_face_ypr_{mesh,body}` | ✓ (face only) |
+| Torso depth template                    | △ shrinks to shoulder-line → frame bottom; occluder rejection still works on the covered cells |
+| X/Z range step (Phase F)                | ✓ (anchor-only sweep)        |
+| Arm-direction pose-match gate           | ✗ — this is the blocker      |
+
+### Design: automatic stillness-gate fallback inside UpperBody
+
+No third `CalibrationMode` is added. Adding a `BustUp` variant would
+force the user to self-diagnose their framing before calibrating,
+ripple through serde / persistence / anchor policy for zero data-model
+benefit (the captured values and the anchor policy are identical to
+UpperBody), and leave the failure mode in place for anyone who picks
+the wrong mode. Instead, `UpperBody`'s wait state detects the framing
+and swaps its *gate*, not its mode:
+
+1. **Engage condition** — in `WaitingForPose { mode: UpperBody }`,
+   when the shoulder anchor has been continuously visible while both
+   lower-arm keypoints have been continuously missing for
+   `NO_ANCHOR_HINT_SECONDS` (4 s, same constant the framing hint
+   already uses), the wait state latches `stillness_fallback = true`.
+2. **Latching** — once engaged, the fallback stays engaged until the
+   state machine leaves `WaitingForPose` (capture start, cancel, or
+   retry). Elbows flickering back in at the frame edge must not bounce
+   the user between two different instructions / progress semantics
+   mid-wait. A fresh capture attempt re-evaluates from scratch.
+3. **Stillness gate** — while engaged, the per-frame score is no
+   longer arm direction but **anchor stillness**: each time the
+   tracking mailbox sequence advances, the anchor (`root_offset` x/y,
+   source units) is compared against the previous tracking frame's
+   position. Displacement below `STILLNESS_EPS` per tracking frame
+   scores toward the gate; at or above it resets `frames_at_match`,
+   exactly mirroring the arm-direction gate's hold semantics.
+   `REQUIRED_STABLE_FRAMES` (15 tracking frames ≈ 0.5 s) is shared.
+   The score shown on the progress bar is
+   `1 − (displacement / STILLNESS_EPS)` clamped to `[0, 1]`, so the
+   bar keeps its "closer to ready" meaning.
+   - `STILLNESS_EPS = 0.010` source units per tracking frame. Source
+     space is y ∈ [−1, 1], so this is 0.5 % of frame height —
+     generous enough for breathing / keypoint jitter at typical
+     desk distance, tight enough that leaning or reaching resets
+     the hold. Tracked per *mailbox sequence*, not per GUI repaint:
+     the GUI repaints faster than the tracker emits frames, and
+     per-repaint deltas would read as near-zero motion at any speed.
+   - Frames where the anchor is missing or `overall_confidence <
+     MIN_FRAME_CONF` reset the hold (same bar the Collecting window
+     applies to sample admission — no point starting a capture from
+     frames that Collecting would immediately reject).
+4. **Instruction / hint swap** — while engaged, the status pane stops
+   suggesting "step back so your elbows are visible" (pointless here)
+   and instead instructs "face the camera and hold still". The
+   `FullBody` path keeps the step-back hint unchanged — at full-body
+   framing, missing elbows really do mean the camera is too close for
+   the required T-pose.
+5. **Everything downstream is unchanged** — `Collecting` already
+   admits samples on anchor visibility + confidence alone (elbows are
+   never consulted), the UpperBody target-pose reference render stays
+   hands-at-sides (the un-framed part of the pose is irrelevant), the
+   `PoseCalibration` schema is untouched, and the Phase F range step
+   works as-is on the shoulder anchor.
+
+### Non-goals
+
+- Detecting bust-up framing *before* the user presses Start (Idle has
+  no wait loop; 4 s after Start is soon enough and avoids flicker on
+  the mode picker).
+- Persisting "this calibration was captured at bust-up framing" — no
+  consumer needs it; `torso_depth_template` cell coverage already
+  reflects the reduced torso window organically.
 
 ## Open questions / future work
 

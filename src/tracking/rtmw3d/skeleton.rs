@@ -37,18 +37,36 @@ use super::math::{length3, sub3};
 /// monocular (2D-only) counterpart of the metric-depth path's
 /// [`super::super::skeleton_from_depth::gate_border_clamped_2d`]; both are
 /// the uniform validity gate that replaced the ad-hoc shoulder patches.
-fn gate_border_clamped(joints: &mut [DecodedJoint]) {
+///
+/// Besides the torso anchors, the leg joints (knees 13/14, ankles 15/16)
+/// are gated too: at desk framing the model clamps hallucinated legs to
+/// the bottom border with passing scores, and nothing downstream repairs
+/// them (the arm chain has `arm_z::repair_edge_clamped_arms`; legs have
+/// no equivalent — which is also why elbows/wrists are deliberately NOT
+/// gated here: zeroing them would starve that repair stage of its
+/// input). Returns the number of joints zeroed so the caller can exclude
+/// them from the overall-confidence average.
+fn gate_border_clamped(joints: &mut [DecodedJoint]) -> u32 {
     if joints.len() < NUM_JOINTS {
-        return;
+        return 0;
     }
     const BORDER_EPS: f32 = 0.02;
-    for &idx in &[5usize, 6usize, 11usize, 12usize] {
+    let mut gated = 0u32;
+    for &idx in &[
+        5usize, 6usize, 11usize, 12usize, 13usize, 14usize, 15usize, 16usize,
+    ] {
         let (nx, ny) = (joints[idx].nx, joints[idx].ny);
-        if nx <= BORDER_EPS || nx >= 1.0 - BORDER_EPS || ny <= BORDER_EPS || ny >= 1.0 - BORDER_EPS
+        if joints[idx].score > 0.0
+            && (nx <= BORDER_EPS
+                || nx >= 1.0 - BORDER_EPS
+                || ny <= BORDER_EPS
+                || ny >= 1.0 - BORDER_EPS)
         {
             joints[idx].score = 0.0;
+            gated += 1;
         }
     }
+    gated
 }
 
 pub(in crate::tracking) fn build_source_skeleton(
@@ -69,7 +87,7 @@ pub(in crate::tracking) fn build_source_skeleton(
     // that swings the whole torso — and, via the parented chain, the head —
     // even when the face track is stable. See fn docs.
     let mut joints_owned = joints.to_vec();
-    gate_border_clamped(&mut joints_owned);
+    let border_gated = gate_border_clamped(&mut joints_owned);
     let joints = joints_owned.as_slice();
 
     // Origin selection. Hips (COCO 11/12) are the canonical choice
@@ -128,6 +146,32 @@ pub(in crate::tracking) fn build_source_skeleton(
         }
     };
 
+    // Permanent field diagnostic for the z-head confidence gate below:
+    // per-frame distribution of the SimCC z-peak scores over the visible
+    // body joints, plus how many of them the `KEYPOINT_VISIBILITY_FLOOR`
+    // gate flattens to Δz = 0. The gate threshold was transplanted from
+    // the x/y score channel without a measured z-logit distribution, so
+    // this is the instrument that validates (or indicts) it on real
+    // footage: run any replay bin with
+    // `RUST_LOG=vulvatar::zscore=debug` and read one line per frame.
+    if log::log_enabled!(target: "vulvatar::zscore", log::Level::Debug) {
+        let mut zs: Vec<f32> = joints[..17.min(joints.len())]
+            .iter()
+            .filter(|j| j.score >= KEYPOINT_VISIBILITY_FLOOR)
+            .map(|j| j.z_score)
+            .collect();
+        if !zs.is_empty() {
+            zs.sort_by(|a, b| a.total_cmp(b));
+            let gated = zs.iter().filter(|z| **z < KEYPOINT_VISIBILITY_FLOOR).count();
+            let q = |p: f32| zs[((zs.len() - 1) as f32 * p).round() as usize];
+            log::debug!(
+                target: "vulvatar::zscore",
+                "body_visible={} gated={} min={:.4} p25={:.4} med={:.4} p75={:.4} max={:.4}",
+                zs.len(), gated, zs[0], q(0.25), q(0.5), q(0.75), zs[zs.len() - 1],
+            );
+        }
+    }
+
     // Source-space coord conversion. Aspect is recovered by scaling
     // the x axis: image x in [0, 1] maps to source x in
     // `[-aspect, +aspect]` where aspect = width/height. y is flipped
@@ -148,7 +192,18 @@ pub(in crate::tracking) fn build_source_skeleton(
     let to_source = |j: &DecodedJoint| -> [f32; 3] {
         let sx = -(j.nx - origin_nx) * (2.0 * aspect);
         let sy = -(j.ny - origin_ny) * 2.0;
-        let sz = -(j.nz - origin_nz) * RTMW3D_SOURCE_Z_SCALE;
+        // Depth-head confidence gate: a joint can be firmly localised
+        // in x/y while its z heatmap is flat or bimodal (occlusion,
+        // ambiguous limb ordering). Trusting that garbage z puts a
+        // large phantom depth component into the bone direction, so a
+        // joint whose z peak fails the same pinhole floor the x/y
+        // score uses falls back to the anchor's depth plane (Δz = 0 —
+        // exactly what a 2D-only provider would emit for it).
+        let sz = if j.z_score >= KEYPOINT_VISIBILITY_FLOOR {
+            -(j.nz - origin_nz) * RTMW3D_SOURCE_Z_SCALE
+        } else {
+            0.0
+        };
         [sx, sy, sz]
     };
 
@@ -291,14 +346,20 @@ pub(in crate::tracking) fn build_source_skeleton(
     );
 
     // Overall confidence: average of the body 17 keypoint scores —
-    // gives the GUI status bar a coarse quality signal.
+    // gives the GUI status bar a coarse quality signal. Joints we
+    // *deliberately* zeroed as border-clamped are excluded from the
+    // denominator: they are a framing property (desk-up shots always
+    // have shoulders/legs at the frame edge), not a tracking-quality
+    // deficit, and counting them dragged the GUI quality readout down
+    // permanently on perfectly healthy sessions.
     let mut sum = 0.0_f32;
     let mut n = 0_u32;
     for j in joints.iter().take(17) {
         sum += j.score;
         n += 1;
     }
-    sk.overall_confidence = if n > 0 { sum / n as f32 } else { 0.0 };
+    n = n.saturating_sub(border_gated).max(1);
+    sk.overall_confidence = sum / n as f32;
 
     // Anatomical sanity check for leg chain (knee → ankle). 2D pose
     // decodes occasionally misdetect the ankle as a point well off the
@@ -402,12 +463,20 @@ pub(in crate::tracking) fn build_source_skeleton(
 /// be inline with the knee while preserving the y/z components —
 /// the shin then points roughly downward like the actual anatomy.
 fn sanity_check_shin(sk: &mut SourceSkeleton, knee: HumanoidBone, ankle: HumanoidBone) {
-    /// Max |dx| / |dy| ratio for shin direction. ≈ 27° from
-    /// vertical. Beyond this is a detection error, not a real
-    /// anatomical pose (legs splaying outward extremely is rare
-    /// in standing / standard poses; a kick or sit-cross pose
-    /// would also bend the knee, which we don't model here).
-    const MAX_SHIN_LATERAL_RATIO: f32 = 0.5;
+    /// Max |dx| / |dy| ratio for shin direction. 1.0 ≈ 45° from
+    /// vertical — wide enough that lunges, wide stances and stepping
+    /// poses pass untouched; beyond it is treated as a detection
+    /// error. (The former 0.5 / 27° limit dated from the ViTPose
+    /// backend and flattened legitimate dynamic leg poses.)
+    const MAX_SHIN_LATERAL_RATIO: f32 = 1.0;
+    /// Shin length as a fraction of the observed thigh length, used
+    /// when fabricating an ankle for the impossible ankle-above-knee
+    /// case. Population shin/thigh ratio is ~0.95.
+    const SHIN_FROM_THIGH_RATIO: f32 = 0.95;
+    /// Absolute fallback shin length when no thigh measurement exists
+    /// this frame. Legacy constant; only reachable when the hip pair
+    /// is missing, which already drops the whole leg chain upstream.
+    const FALLBACK_SHIN_LEN: f32 = 0.30;
 
     let Some(knee_j) = sk.joints.get(&knee).copied() else {
         return;
@@ -415,27 +484,49 @@ fn sanity_check_shin(sk: &mut SourceSkeleton, knee: HumanoidBone, ankle: Humanoi
     let Some(ankle_j) = sk.joints.get(&ankle).copied() else {
         return;
     };
+    // A metric-depth-sampled pair is real observed geometry — the D435
+    // path measured both joints, so a steep shin is a steep shin.
+    // This 2D plausibility heuristic exists for the depth-less path
+    // only; overriding measured positions would trample real poses.
+    if knee_j.metric_depth_m.is_some() && ankle_j.metric_depth_m.is_some() {
+        return;
+    }
     let dx = ankle_j.position[0] - knee_j.position[0];
     let dy = ankle_j.position[1] - knee_j.position[1];
     // shin must point downward: dy < 0
     if dy >= 0.0 {
         // Ankle above knee — anatomically impossible; pull it
-        // directly below the knee at expected shin length.
+        // directly below the knee at the expected shin length,
+        // derived from this frame's own thigh (hip→knee) so the
+        // fabricated length scales with the subject's on-frame size
+        // instead of a fixed source-unit constant.
+        let thigh = match knee {
+            HumanoidBone::LeftLowerLeg => sk.joints.get(&HumanoidBone::LeftUpperLeg),
+            HumanoidBone::RightLowerLeg => sk.joints.get(&HumanoidBone::RightUpperLeg),
+            _ => None,
+        };
+        let shin_len = thigh
+            .map(|hip| {
+                let tx = knee_j.position[0] - hip.position[0];
+                let ty = knee_j.position[1] - hip.position[1];
+                (tx.hypot(ty) * SHIN_FROM_THIGH_RATIO).max(1e-3)
+            })
+            .unwrap_or(FALLBACK_SHIN_LEN);
         if let Some(j) = sk.joints.get_mut(&ankle) {
             j.position[0] = knee_j.position[0];
-            j.position[1] = knee_j.position[1] - 0.30;
+            j.position[1] = knee_j.position[1] - shin_len;
         }
         return;
     }
     if dx.abs() > MAX_SHIN_LATERAL_RATIO * dy.abs() {
-        // Lateral offset too large; snap x directly to knee
-        // (= vertical shin). Earlier "clamp to max ratio"
-        // approach left a 20° residual error because the source
-        // detection was unreliable in this regime — better to
-        // default to the anatomically common vertical posture
-        // than partially honour a bad detection.
+        // Lateral offset beyond plausibility: clamp the lateral
+        // component to the max ratio instead of snapping x fully onto
+        // the knee. A full snap discards the entire lateral signal —
+        // it turned every deep lunge into a vertical shin. Clamping
+        // keeps the observed direction while bounding the angle at
+        // the plausibility limit.
         if let Some(j) = sk.joints.get_mut(&ankle) {
-            j.position[0] = knee_j.position[0];
+            j.position[0] = knee_j.position[0] + dx.signum() * MAX_SHIN_LATERAL_RATIO * dy.abs();
         }
     }
 }
@@ -450,10 +541,16 @@ fn infer_spine_pitch_from_foreshortening(
     /// expected y span the per-frame measurement is compared
     /// against.
     const EXPECTED_SHOULDER_HIP_RATIO: f32 = 1.15;
-    /// Above this absolute source-z value on the UpperChest, the
-    /// caller has already produced a depth signal — assume it's the
-    /// truth and don't overwrite.
-    const MAX_EXISTING_Z_FOR_INFERENCE: f32 = 0.05;
+    /// Above this fraction of the expected torso length in |z| on the
+    /// UpperChest, the caller has already produced a real depth signal
+    /// — assume it's the truth and don't overwrite. Expressed as a
+    /// *fraction of body scale* rather than an absolute source-unit
+    /// value: source-z now scales with the crop like x/y do (see the
+    /// nz remap in `mod.rs`), so an absolute threshold would make this
+    /// gate fire or not depending on how large the subject is in
+    /// frame. 0.08 × a typical expected_y of ~0.6 reproduces the old
+    /// 0.05 absolute gate at reference framing.
+    const Z_GATE_FRACTION_OF_EXPECTED_Y: f32 = 0.08;
     /// Below this shoulder x span, the subject is in side-profile
     /// and the foreshortening signal is ambiguous (the shoulders
     /// themselves are now z-separated, not x-separated).
@@ -472,9 +569,6 @@ fn infer_spine_pitch_from_foreshortening(
     let Some(chest) = sk.joints.get(&HumanoidBone::UpperChest).copied() else {
         return;
     };
-    if chest.position[2].abs() > MAX_EXISTING_Z_FOR_INFERENCE {
-        return;
-    }
     let (lsh, rsh) = match (
         sk.joints.get(&HumanoidBone::LeftShoulder),
         sk.joints.get(&HumanoidBone::RightShoulder),
@@ -515,19 +609,29 @@ fn infer_spine_pitch_from_foreshortening(
     }
 
     let expected_y = shoulder_span * EXPECTED_SHOULDER_HIP_RATIO;
+    // Real-depth gate, scaled to the subject's on-frame size (see the
+    // constant's docs). Checked here because `expected_y` is the scale
+    // reference.
+    if chest.position[2].abs() > Z_GATE_FRACTION_OF_EXPECTED_Y * expected_y {
+        return;
+    }
     let compression = (actual_y / expected_y).clamp(-1.0, 1.0);
     if compression >= COMPRESSION_THRESHOLD {
         return;
     }
 
     // Reconstruct the missing z component so the 3-D shoulder-hip
-    // vector still has length `expected_y` but is rotated by
-    // `acos(compression)` toward the camera. cos_pitch = compression,
-    // sin_pitch = √(1 − cos²). Sign comes from the caller's face-
-    // pitch signal (chin-down = +, chin-up = −); default + on no-
-    // signal still picks the more common performer direction.
-    let cos_pitch = compression;
-    let pitch_angle = cos_pitch.acos();
+    // vector still has length `expected_y` but is rotated toward the
+    // camera. The angle ramps CONTINUOUSLY from 0 at the threshold:
+    // `acos(compression / threshold)` re-normalises the compression so
+    // the trigger boundary maps to 0°. A raw `acos(compression)` had a
+    // ~18° step at the boundary (acos has infinite slope near 1), so
+    // one pixel of shoulder-span noise across the threshold popped the
+    // whole spine chain 0°↔18° every frame. Sign comes from the
+    // caller's face-pitch signal (chin-down = +, chin-up = −);
+    // default + on no-signal still picks the more common performer
+    // direction.
+    let pitch_angle = (compression / COMPRESSION_THRESHOLD).clamp(0.0, 1.0).acos();
     // Cap the body pitch by the head pitch estimate when
     // available — body normally pitches ≤ head, so a small
     // head pitch on a "compressed-looking" image means the
@@ -602,8 +706,16 @@ fn infer_body_yaw_from_foreshortening(sk: &mut SourceSkeleton, yaw_sign: f32) {
     /// ratio to torso_y. 0.80 is the population mean for adult hip/
     /// shoulder.
     const HIP_FROM_SHOULDER_RATIO: f32 = 0.80;
-    /// Skip when any joint already carries a real depth signal.
-    const MAX_EXISTING_Z_FOR_INFERENCE: f32 = 0.05;
+    /// Skip when a pair joint's |z| exceeds this fraction of the
+    /// pair's expected x-span — a real depth signal is present.
+    /// Fraction-of-scale for the same reason as the pitch gate:
+    /// source-z scales with the crop, so an absolute gate fired
+    /// distance-dependently. Note this is deliberately ABOVE the
+    /// back-view bias magnitude (0.03 × span, injected before the yaw
+    /// detection below), so the bias no longer suppresses the very
+    /// yaw inference it precedes — the old absolute 0.05 gate tripped
+    /// on the bias itself once the span exceeded 1.67 source units.
+    const Z_GATE_FRACTION_OF_EXPECTED_SPAN: f32 = 0.08;
     /// `compression ≥ this` is treated as upright; below is yawed.
     const COMPRESSION_THRESHOLD: f32 = 0.95;
     const MIN_TORSO_Y: f32 = 0.05;
@@ -697,7 +809,7 @@ fn infer_body_yaw_from_foreshortening(sk: &mut SourceSkeleton, yaw_sign: f32) {
         HumanoidBone::LeftShoulder,
         HumanoidBone::RightShoulder,
         shoulder_expected,
-        MAX_EXISTING_Z_FOR_INFERENCE,
+        Z_GATE_FRACTION_OF_EXPECTED_SPAN * shoulder_expected,
         COMPRESSION_THRESHOLD,
     );
     let Some(shoulder_yaw) = shoulder_yaw else {
@@ -786,7 +898,7 @@ fn infer_body_yaw_from_foreshortening(sk: &mut SourceSkeleton, yaw_sign: f32) {
         HumanoidBone::LeftUpperLeg,
         HumanoidBone::RightUpperLeg,
         observed_shoulder_x_span * HIP_FROM_SHOULDER_RATIO,
-        MAX_EXISTING_Z_FOR_INFERENCE,
+        Z_GATE_FRACTION_OF_EXPECTED_SPAN * observed_shoulder_x_span * HIP_FROM_SHOULDER_RATIO,
         COMPRESSION_THRESHOLD,
     );
     let lower_chain: &[HumanoidBone] = &[
@@ -1072,7 +1184,11 @@ fn detect_yaw_magnitude(
     if compression >= compression_threshold {
         return None;
     }
-    Some(compression.acos())
+    // Continuous ramp from 0 at the trigger boundary — see the pitch
+    // counterpart in `infer_spine_pitch_from_foreshortening`. A raw
+    // `acos(compression)` jumps ~18° the frame the threshold is
+    // crossed, oscillating the whole rotated chain on span noise.
+    Some((compression / compression_threshold).clamp(0.0, 1.0).acos())
 }
 
 /// Rotate every joint in `chain` by `yaw_magnitude` radians around
@@ -1385,12 +1501,14 @@ mod tests {
             nx: 0.40,
             ny: 0.30,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.9,
         };
         joints[6] = DecodedJoint {
             nx: 0.60,
             ny: 0.30,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.9,
         };
         // Hips (11/12) — the hallucinated pair we want to suppress.
@@ -1398,12 +1516,14 @@ mod tests {
             nx: 0.42,
             ny: 0.70,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.8,
         };
         joints[12] = DecodedJoint {
             nx: 0.58,
             ny: 0.70,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.8,
         };
         // Knees (13/14) and ankles (15/16) — same hallucination
@@ -1412,24 +1532,28 @@ mod tests {
             nx: 0.42,
             ny: 0.85,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.7,
         };
         joints[14] = DecodedJoint {
             nx: 0.58,
             ny: 0.85,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.7,
         };
         joints[15] = DecodedJoint {
             nx: 0.42,
             ny: 0.95,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.7,
         };
         joints[16] = DecodedJoint {
             nx: 0.58,
             ny: 0.95,
             nz: 0.5,
+            z_score: 0.9,
             score: 0.7,
         };
         joints
@@ -1469,5 +1593,184 @@ mod tests {
         let sk = build_source_skeleton(0, &joints, 640, 480, false);
         assert!(sk.joints.contains_key(&HumanoidBone::Hips));
         assert!(sk.root_anchor_is_hip);
+    }
+
+    fn sj(x: f32, y: f32, z: f32) -> crate::tracking::SourceJoint {
+        crate::tracking::SourceJoint {
+            position: [x, y, z],
+            confidence: 0.9,
+            metric_depth_m: None,
+        }
+    }
+
+    #[test]
+    fn yaw_magnitude_ramps_continuously_from_the_threshold() {
+        // Just-below-threshold compression must produce a near-zero
+        // yaw, not an ~18° step (the acos discontinuity this guards).
+        let mut sk = SourceSkeleton::empty(0);
+        let expected = 1.0_f32;
+        // span 0.94 → compression 0.94, threshold 0.95.
+        sk.joints.insert(HumanoidBone::LeftShoulder, sj(0.47, 0.5, 0.0));
+        sk.joints.insert(HumanoidBone::RightShoulder, sj(-0.47, 0.5, 0.0));
+        let yaw = detect_yaw_magnitude(
+            &sk,
+            HumanoidBone::LeftShoulder,
+            HumanoidBone::RightShoulder,
+            expected,
+            0.08,
+            0.95,
+        )
+        .expect("compression below threshold must fire");
+        assert!(
+            yaw < 0.20,
+            "yaw at the trigger boundary must ramp from ~0, got {yaw} rad"
+        );
+        // Just above the threshold → no inference at all.
+        sk.joints.insert(HumanoidBone::LeftShoulder, sj(0.48, 0.5, 0.0));
+        sk.joints.insert(HumanoidBone::RightShoulder, sj(-0.48, 0.5, 0.0));
+        assert!(detect_yaw_magnitude(
+            &sk,
+            HumanoidBone::LeftShoulder,
+            HumanoidBone::RightShoulder,
+            expected,
+            0.08,
+            0.95,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn spine_pitch_ramps_continuously_from_the_threshold() {
+        // Same continuity contract for the pitch counterpart: a hair
+        // under the compression threshold must inject only a tiny z.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::Hips, sj(0.0, 0.0, 0.0));
+        // shoulder span 0.6 → expected_y = 0.69; chest at 0.94 × that.
+        sk.joints.insert(HumanoidBone::LeftShoulder, sj(0.3, 0.6486, 0.0));
+        sk.joints.insert(HumanoidBone::RightShoulder, sj(-0.3, 0.6486, 0.0));
+        sk.joints.insert(HumanoidBone::UpperChest, sj(0.0, 0.6486, 0.0));
+        sk.joints.insert(HumanoidBone::Neck, sj(0.0, 0.6486, 0.0));
+        infer_spine_pitch_from_foreshortening(&mut sk, 1.0, None);
+        let z = sk.joints[&HumanoidBone::UpperChest].position[2];
+        assert!(
+            z.abs() < 0.12,
+            "pitch z injection at the boundary must be near zero, got {z}"
+        );
+    }
+
+    #[test]
+    fn border_clamped_legs_are_dropped() {
+        let mut joints = fake_joints_with_visible_hips();
+        // Ankles clamped to the bottom border with passing scores —
+        // the desk-framing hallucination pattern.
+        joints[15].ny = 0.999;
+        joints[16].ny = 0.999;
+        let sk = build_source_skeleton(0, &joints, 640, 480, false);
+        assert!(
+            !sk.joints.contains_key(&HumanoidBone::LeftFoot)
+                && !sk.joints.contains_key(&HumanoidBone::RightFoot),
+            "border-clamped ankles must be gated out, not admitted as positions"
+        );
+        // Knees are mid-frame → still present.
+        assert!(sk.joints.contains_key(&HumanoidBone::LeftLowerLeg));
+    }
+
+    #[test]
+    fn border_gated_joints_do_not_tank_overall_confidence() {
+        let mut joints = fake_joints_with_visible_hips();
+        // Same detection quality, but the framing clamps both ankles.
+        joints[15].ny = 0.999;
+        joints[16].ny = 0.999;
+        let framed = build_source_skeleton(0, &joints, 640, 480, false).overall_confidence;
+        // Contract: deliberately-gated joints leave the denominator.
+        // The naive mean (17-joint denominator with the gated scores
+        // zeroed) is what dragged the GUI quality readout down on
+        // healthy desk-framed sessions.
+        let naive: f32 = {
+            let mut gated = joints.clone();
+            gate_border_clamped(&mut gated);
+            gated.iter().take(17).map(|j| j.score).sum::<f32>() / 17.0
+        };
+        assert!(
+            framed > naive + 1e-6,
+            "renormalised confidence {framed} must exceed the naive zero-counting mean {naive}"
+        );
+    }
+
+    #[test]
+    fn low_z_score_joint_falls_back_to_flat_depth() {
+        let mut joints = fake_joints_with_visible_hips();
+        // Front-facing shoulder arrangement (selfie mirror: subject's
+        // left at high nx) so the back-view z bias stays out of the
+        // assertion below.
+        joints[5].nx = 0.60;
+        joints[6].nx = 0.40;
+        // Subject-left shoulder (→ avatar Right*) with confident x/y
+        // but garbage z head: nz far from the hip anchor's 0.5,
+        // z_score below the pinhole floor.
+        joints[5].nz = 0.9;
+        joints[5].z_score = 0.0;
+        // Subject-right shoulder (→ avatar Left*) with a trusted z.
+        joints[6].nz = 0.6;
+        let sk = build_source_skeleton(0, &joints, 640, 480, false);
+        let untrusted = sk.joints[&HumanoidBone::RightUpperArm].position[2];
+        let trusted = sk.joints[&HumanoidBone::LeftUpperArm].position[2];
+        assert_eq!(
+            untrusted, 0.0,
+            "untrusted z head must flatten to the anchor plane"
+        );
+        assert!(
+            trusted.abs() > 0.01,
+            "trusted z must pass through, got {trusted}"
+        );
+    }
+
+    #[test]
+    fn shin_check_preserves_lunge_and_clamps_outliers() {
+        // 40° lunge (|dx| < |dy|) must be preserved bit-exact.
+        let mut sk = SourceSkeleton::empty(0);
+        sk.joints.insert(HumanoidBone::LeftUpperLeg, sj(0.0, 0.0, 0.0));
+        sk.joints.insert(HumanoidBone::LeftLowerLeg, sj(0.0, -0.4, 0.0));
+        sk.joints.insert(HumanoidBone::LeftFoot, sj(0.33, -0.8, 0.0));
+        sanity_check_shin(&mut sk, HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot);
+        assert_eq!(sk.joints[&HumanoidBone::LeftFoot].position[0], 0.33);
+
+        // 60°+ outlier is clamped to the 45° plausibility limit, not
+        // snapped to vertical.
+        sk.joints.insert(HumanoidBone::LeftFoot, sj(0.9, -0.8, 0.0));
+        sanity_check_shin(&mut sk, HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot);
+        let x = sk.joints[&HumanoidBone::LeftFoot].position[0];
+        assert!(
+            (x - 0.4).abs() < 1e-4,
+            "outlier shin must clamp to ratio × |dy| = 0.4, got {x}"
+        );
+
+        // Ankle-above-knee fabrication derives length from the thigh
+        // (0.4 × 0.95) instead of the fixed 0.30 constant.
+        sk.joints.insert(HumanoidBone::LeftFoot, sj(0.0, 0.2, 0.0));
+        sanity_check_shin(&mut sk, HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot);
+        let y = sk.joints[&HumanoidBone::LeftFoot].position[1];
+        assert!(
+            (y - (-0.4 - 0.38)).abs() < 1e-4,
+            "fabricated shin must scale with the observed thigh, got {y}"
+        );
+    }
+
+    #[test]
+    fn shin_check_trusts_metric_depth_pairs() {
+        // Both joints depth-sampled → measured geometry, no 2D veto.
+        let mut sk = SourceSkeleton::empty(0);
+        let mut knee = sj(0.0, -0.4, 0.0);
+        knee.metric_depth_m = Some(1.5);
+        let mut ankle = sj(0.9, -0.8, 0.0);
+        ankle.metric_depth_m = Some(1.4);
+        sk.joints.insert(HumanoidBone::LeftLowerLeg, knee);
+        sk.joints.insert(HumanoidBone::LeftFoot, ankle);
+        sanity_check_shin(&mut sk, HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot);
+        assert_eq!(
+            sk.joints[&HumanoidBone::LeftFoot].position[0],
+            0.9,
+            "metric-depth shin must pass through unmodified"
+        );
     }
 }
