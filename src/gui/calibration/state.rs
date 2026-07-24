@@ -177,6 +177,13 @@ pub enum CalibrationModalState {
     Collecting {
         mode: CalibrationMode,
         started_at: Instant,
+        /// Carried over from `WaitingForPose::stillness_fallback` so
+        /// the instruction text stays "hold still" through the
+        /// collection window instead of snapping back to the
+        /// hands-at-sides pose description the user can't act on
+        /// (their arms aren't in frame). Display-only — sample
+        /// admission never consults it.
+        stillness_fallback: bool,
         samples: Vec<AnchorSample>,
         /// Running (sum, count) of each source expression weight seen
         /// during the window, keyed by VRM expression name. Averaged in

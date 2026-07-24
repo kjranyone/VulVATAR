@@ -681,18 +681,35 @@ fn step_text(state: &CalibrationModalState) -> (String, String) {
             // Step text differs once the user has crossed the match
             // threshold: the system has "locked on" and is waiting
             // for stability before transitioning to Collecting. Gives
-            // the user feedback that they nailed the pose.
+            // the user feedback that they nailed the pose. The
+            // pre-lock heading also branches on the fallback —
+            // "get into the pose" would contradict the body text's
+            // "no pose needed, just hold still".
             let step = if *frames_at_match > 0 {
                 t!("calibration.step_pose_locked")
+            } else if *stillness_fallback {
+                t!("calibration.step_hold_still")
             } else {
                 t!("calibration.step_waiting_for_pose")
             };
             (step, pose)
         }
-        CalibrationModalState::Collecting { mode, .. } => {
-            let pose = match mode {
-                CalibrationMode::FullBody => t!("calibration.pose_full_body"),
-                CalibrationMode::UpperBody => t!("calibration.pose_upper_body"),
+        CalibrationModalState::Collecting {
+            mode,
+            stillness_fallback,
+            ..
+        } => {
+            // Same body swap as WaitingForPose: a bust-up capture
+            // must keep saying "hold still" through the collection
+            // window instead of reverting to arm instructions the
+            // user can't see themselves follow.
+            let pose = if *stillness_fallback {
+                t!("calibration.pose_upper_body_bust_up")
+            } else {
+                match mode {
+                    CalibrationMode::FullBody => t!("calibration.pose_full_body"),
+                    CalibrationMode::UpperBody => t!("calibration.pose_upper_body"),
+                }
             };
             (t!("calibration.step_collecting"), pose)
         }
@@ -766,6 +783,7 @@ fn progress_for(state: &CalibrationModalState) -> (f32, String) {
         CalibrationModalState::WaitingForPose {
             last_score,
             frames_at_match,
+            stillness_fallback,
             ..
         } => {
             // Two-tier progress bar:
@@ -781,8 +799,15 @@ fn progress_for(state: &CalibrationModalState) -> (f32, String) {
             } else {
                 last_score.clamp(0.0, 1.0)
             };
+            // "Match N%" would misdescribe the stillness gate — the
+            // score there is motion-derived, not pose similarity.
             let label = if *frames_at_match > 0 {
                 t!("calibration.locking_in")
+            } else if *stillness_fallback {
+                t!(
+                    "calibration.stillness_progress",
+                    score = format!("{:.0}", last_score * 100.0)
+                )
             } else {
                 t!(
                     "calibration.match_progress",

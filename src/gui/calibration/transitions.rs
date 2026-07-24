@@ -132,6 +132,7 @@ pub(super) fn advance_state(state: &mut GuiApp) {
         CalibrationModalState::WaitingForPose {
             mode,
             frames_at_match,
+            stillness_fallback,
             ..
         } if *frames_at_match >= REQUIRED_STABLE_FRAMES => {
             // Pose-match gate cleared: user has held the target pose
@@ -145,6 +146,7 @@ pub(super) fn advance_state(state: &mut GuiApp) {
             Some(CalibrationModalState::Collecting {
                 mode: *mode,
                 started_at: now,
+                stillness_fallback: *stillness_fallback,
                 samples: Vec::with_capacity(64),
                 expr_accum: std::collections::HashMap::new(),
                 face_accum_mesh: Vec::new(),
@@ -223,7 +225,11 @@ pub(super) fn advance_state(state: &mut GuiApp) {
 pub(super) fn finish_capture(state: &mut GuiApp) {
     let now = Instant::now();
     let next = match &state.calibration.modal {
-        CalibrationModalState::WaitingForPose { mode, .. } => {
+        CalibrationModalState::WaitingForPose {
+            mode,
+            stillness_fallback,
+            ..
+        } => {
             // Bypass the gate: kick off Collecting straight away so
             // the 2-second sample window starts now. Same torso-capture
             // toggle as the natural pose-match path.
@@ -231,6 +237,7 @@ pub(super) fn finish_capture(state: &mut GuiApp) {
             Some(CalibrationModalState::Collecting {
                 mode: *mode,
                 started_at: now,
+                stillness_fallback: *stillness_fallback,
                 samples: Vec::with_capacity(64),
                 expr_accum: std::collections::HashMap::new(),
                 face_accum_mesh: Vec::new(),

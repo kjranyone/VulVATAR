@@ -282,6 +282,7 @@ Pose not calibrated — auto-EMA active
 | F     | Multi-step capture: optional X/Z range step → per-axis sensitivity in solver |
 | G     | Per-profile storage: calibration moves from project file to `profiles.json` so each setup carries its own baseline |
 | H     | Bust-up framing fallback: UpperBody wait-gate switches to anchor-stillness when elbows are cropped out (see below) |
+| I     | Neutral body yaw: oblique camera placement maps the user's habitual forward to avatar-forward (see below) |
 
 ## Multi-step capture (Phase F)
 
@@ -397,12 +398,28 @@ and swaps its *gate*, not its mode:
      MIN_FRAME_CONF` reset the hold (same bar the Collecting window
      applies to sample admission — no point starting a capture from
      frames that Collecting would immediately reject).
-4. **Instruction / hint swap** — while engaged, the status pane stops
-   suggesting "step back so your elbows are visible" (pointless here)
-   and instead instructs "face the camera and hold still". The
-   `FullBody` path keeps the step-back hint unchanged — at full-body
-   framing, missing elbows really do mean the camera is too close for
-   the required T-pose.
+4. **Guidance text stays coherent end-to-end** — every string the
+   user reads while the fallback is engaged describes the stillness
+   gate, never the arm pose they can't perform:
+   - *Idle*: the UpperBody instruction body ends with a heads-up that
+     capture auto-switches to hold-still detection when the elbows
+     aren't in frame, so a bust-up user knows pressing Start is fine.
+   - *WaitingForPose*: the step heading swaps from "get into the
+     pose" to "face the camera and hold still", the instruction body
+     to the bust-up variant, and the progress-bar label from
+     "Match N%" to "Stillness N%" (the score is motion-derived, not
+     pose similarity). The post-lock "nice, hold it…" heading and the
+     lock-in fill are shared — they mean the same thing in both gates.
+   - *Framing hint*: the "step back so your elbows are visible" row
+     is replaced by "switched to hold-still detection — no pose
+     needed" (the step-back advice is unactionable at fixed streamer
+     framing). The `FullBody` path keeps the step-back hint
+     unchanged — at full-body framing, missing elbows really do mean
+     the camera is too close for the required T-pose.
+   - *Collecting*: the latch is carried into the `Collecting` variant
+     (display-only field) so the body text keeps saying "hold still"
+     through the sample window instead of reverting to hands-at-sides
+     instructions.
 5. **Everything downstream is unchanged** — `Collecting` already
    admits samples on anchor visibility + confidence alone (elbows are
    never consulted), the UpperBody target-pose reference render stays
@@ -419,6 +436,205 @@ and swaps its *gate*, not its mode:
   consumer needs it; `torso_depth_template` cell coverage already
   reflects the reduced torso window organically.
 
+## Neutral body yaw — oblique camera placement (Phase I)
+
+### Problem
+
+A desk-mounted D435 rarely sits dead ahead of where the user actually
+faces (monitor centre); 15–45° of horizontal offset is the norm. Today
+only the **head** is neutralised for this (`neutral_face_ypr_*`,
+subtracted in `apply_calibration`). The **torso** is not:
+`compute_shoulder_yaw_rotation` aims the avatar's shoulder line at the
+observed camera-space shoulder line every frame, so a 30°-oblique
+camera bakes a constant 30° body yaw into the avatar — producing the
+"head faces the viewer, torso faces sideways" composite once the face
+neutral kicks in. Translation axes are similarly camera-aligned: a
+side-step at the desk reads as a diagonal x+z move.
+
+### Semantic contract (decide this first — everything follows)
+
+**Neutral means: the user's habitual working orientation maps to
+avatar-forward.** This is the same contract `neutral_face_ypr` already
+implements ("camera mounted off eye line ... otherwise bakes a
+constant head turn into the avatar"). Consequence for the capture UX:
+the hold instruction must say **"face your usual forward (your
+monitor), in your natural working posture"** — NOT "face the camera".
+The current UpperBody / bust-up strings say "face the camera", which
+coincides with the contract only when the camera happens to be
+frontal; at oblique placement the two instructions produce *different
+calibrations* and the face neutral has silently depended on users
+misreading the instruction in the favourable way. Fixing this wording
+is part of Phase I regardless of the yaw work.
+
+### The core design decision: de-rotate the *scene*, not the root
+
+The naive fix — subtract a captured neutral angle inside
+`compute_shoulder_yaw_rotation` — is **wrong** and was rejected:
+
+- **Rejected A: root-only yaw subtraction.** The solver's driven-bone
+  loop aims every bone at *source-space* directions and the arm
+  two-bone IK targets *source-space* wrist positions. De-rotating only
+  the Hips leaves all of those targets in the oblique camera frame:
+  the pelvis faces forward while spine, shoulders and arms still chase
+  30°-rotated directions — a permanently twisted torso and arms that
+  point wrong by exactly the neutral angle. Any per-consumer patch
+  scheme (subtract here, subtract there) reintroduces this class of
+  bug every time a new consumer of source directions lands.
+- **Rejected B: de-rotation inside the provider
+  (`skeleton_from_depth`).** The tracking mailbox deliberately carries
+  the RAW pose; calibration is applied at solve time on a clone (see
+  `refresh.rs`: "The snapshot pose is raw ... no risk of subtracting a
+  previous calibration twice"). The calibration modal's capture loop
+  reads the mailbox — if the provider published de-rotated skeletons,
+  every *re*-calibration would measure anchors/yaw in
+  already-corrected space, converging the stored neutral toward zero
+  across recaptures (the double-subtraction bug class the raw-mailbox
+  invariant exists to prevent). Provider internals (ray-IK along
+  observation rays, L/R swap correction, arm_z, torso-template
+  registration) are camera-geometry algorithms and must keep operating
+  in camera space anyway.
+
+**Chosen: a single rigid re-expression of the published sample at
+solve time**, in `TrackingCalibration::apply_calibration` — the same
+insertion point, clone semantics and staleness model as the face
+neutral. Conceptually: *re-express the observation as if the camera
+had been placed frontally at the same distance*, i.e. rotate the
+scene by `−θ` about the vertical axis through the calibrated anchor
+`a0`:
+
+```text
+p' = a0 + R_y(−θ) · (p − a0)
+```
+
+One transform, applied uniformly, keeps every downstream consumer
+consistent by construction instead of by per-call-site vigilance.
+
+### Consumer inventory (what rotates, what must NOT)
+
+| Sample field | Rotate? | Why |
+|---|---|---|
+| `joints` positions | ✓ | isotropic source units (normalised by `mpsu`) — rotation is geometrically valid |
+| `fingertips` | ✓ | same space as joints |
+| `left/right_hand_orientation` | ✓ (quaternion pre-multiply by `R_y(−θ)`) | palm frames are source-space; forgetting this leaves wrist twist off by θ — easy to miss because the error is subtle at small angles |
+| `root_offset` | ✓ | on the D435 path this is a raw-metres camera-space vector (`pose_solver` "Metric translation" contract), so the rotation is unit-safe; see units audit below |
+| `face` / `face_body_raw` | ✗ | head neutrality is owned by `neutral_face_ypr_*` (per-estimator residuals); rotating the face pose *and* subtracting its neutral would double-count θ. `face_body_raw` additionally must stay raw (capture-only contract) |
+| `metric_frame_info` (`anchor_cam_m`, `intrinsics`, `mpsu`, spans) | ✗ | documented as RAW camera space; the sensor-matched mirror render and any camera-geometry consumer need the true camera frame |
+
+Both-neutral consistency check: when the user turns their whole body
+by φ, body yaw and camera-relative face yaw each change by φ, and each
+stream subtracts its own captured constant — head stays glued to the
+torso with no double subtraction, because the face pose is *excluded*
+from the rigid rotation.
+
+### Units audit (the trap that would surface months later)
+
+- `joints` / `fingertips`: isotropic source frame (metric skeleton
+  scaled by `mpsu`) — rotation valid.
+- `root_offset` (D435 path): raw metres, all three axes — rotation
+  valid. The stale "x in source units, z in metres" wording on the
+  `SourceSkeleton::root_offset` doc comment predates the metric-path
+  rework and must be reconciled during implementation, not worked
+  around.
+- Pivot `a0`: stored as `anchor_x/anchor_y` (source units) +
+  `anchor_depth_m` (metres). Expressing it in each rotated field's own
+  frame needs the per-frame `mpsu` — available on
+  `metric_frame_info`.
+- **Non-metric path (`metric_frame_info == None`): do not capture and
+  do not apply.** Rotating an `(x, y, 0)` offset about Y fabricates
+  depth from nothing, and monocular z is not trustworthy enough to
+  measure θ in the first place. D435 is the sole capture backend;
+  the guard is for synthetic/bench producers.
+
+### Measurement (capture window)
+
+Per admitted `Collecting` frame, compute the shoulder-line horizontal
+yaw `θ = atan2(Δz, Δx)`-style deviation from frontal, from the same
+`LeftUpperArm`/`RightUpperArm` joints the solver uses, with the same
+`MIN_HORIZ_SPAN` degeneracy floor. Aggregate as the median; store
+`neutral_body_yaw: Option<f32>` (radians) with `#[serde(default)]` —
+`None` (old saves, insufficient samples, non-metric) is a strict
+no-op, preserving today's behaviour exactly.
+
+Floors and clamps:
+- ≥ 5 finite samples, else `None` (matches `FACE_NEUTRAL_MIN_SAMPLES`).
+- `|θ|` clamp at 60°: beyond that the far shoulder is
+  occlusion-shadowed in depth and L/R swap risk dominates — a larger
+  reading is more likely garbage than geometry.
+- Inspector warning above 45°: "camera very oblique — tracking quality
+  degrades" (surfaced, not silently clamped).
+- Sign convention gets dedicated unit tests against synthetic
+  skeletons — the selfie-mirror x-flip (`pose_match.rs` convention
+  reminder: avatar bone names ≠ subject anatomical sides) makes yaw
+  sign the single most likely silent-wrong constant in this design.
+
+### Interactions audited
+
+- **Range step (Phase F)**: `RangeCollecting` folds raw mailbox
+  `(x, z)` into min/max. With de-rotation active at runtime, raw-axis
+  extremes describe a camera-aligned box while runtime offsets live in
+  body frame — so rotate **each sample** by `R_y(−θ)` (θ is already on
+  the in-flight calibration carried in the variant) *before* folding.
+  Rotating the finished box instead would under/over-state the range
+  (an axis-aligned box is not rotation-equivariant).
+- **Per-axis sensitivity** consequently becomes body-frame — which is
+  the semantics the instruction already implies ("step left, lean
+  toward the camera" are body-relative actions).
+- **Sensor-matched overlays** (camera-wipe PIP, `validate_pipeline`
+  composites): these show the true camera view; a de-rotated avatar
+  *intentionally* no longer matches the photo's viewing angle when a
+  neutral yaw is active. Documented here so nobody "fixes" the
+  mismatch later by rotating the render back. Benches run without
+  calibration and are unaffected by default.
+- **EMA / 完全ミラー root reference**: the reference seeds from the
+  calibration anchor and (default) freezes after lock-in; under the
+  single-pivot transform, `dev = R·(c − a0)` — deviations rotate
+  cleanly, no re-seeding needed.
+- **Head**: see consumer table — no interaction beyond the constant
+  each stream already owns.
+
+### Rollout (measure first, then change behaviour)
+
+1. **I1 — measure + surface, zero behaviour change**: capture
+   `neutral_body_yaw` during the existing hold, persist it, show it on
+   the inspector status line ("yaw −28°"), and log it in the
+   signal-quality / live-debug channel. This is the probe that
+   confirms the real-setup magnitude (and sign!) against the physical
+   camera angle before any solve-path change.
+2. **I2 — solve-time rigid de-rotation** of joints / fingertips / hand
+   orientations / root_offset, with the round-trip unit tests below.
+3. **I3 — range-sample rotation + capture-instruction rewording**
+   ("face your usual forward") across all four locales.
+
+Each phase lands complete (no interim fallbacks); the split exists
+because I1's reading validates the constant before I2 spends it.
+
+### Test plan
+
+- Unit: yaw-measurement sign on synthetic skeletons (camera-left vs
+  camera-right placement, mirrored-x convention).
+- Unit: rigid round-trip — build a frontal reference sample, rotate
+  the scene by θ about `a0` (joints, fingertips, hand quats,
+  root_offset), apply a calibration carrying `neutral_body_yaw = θ`,
+  assert the result equals the frontal reference within epsilon.
+- Unit: `None` neutral is a bitwise no-op; non-metric samples are
+  never rotated even with `Some(θ)`.
+- Unit: range folding of rotated samples vs rotating the folded box
+  (must differ; folding-of-rotated is the spec).
+- Live: `diagnose_video_replay` (CPU inference, non-competing) on
+  oblique footage; live-debug protocol to read the measured θ and
+  post-I2 residual shoulder yaw on the user's actual setup.
+
 ## Open questions / future work
 
 - **Person segmentation** as an alternative to calibration: a future option could replace this UX with an automatic per-pixel mask that excludes background depth. Calibration remains useful as an explicit baseline regardless.
+- **Camera pitch / roll neutral** (Phase I deliberately covers yaw only):
+  the shoulder line constrains yaw and roll but carries **zero pitch
+  information**, and at bust-up framing there is no visible spine axis
+  to measure pitch from — a "pitch neutral" would be fit from noise.
+  Camera pitch is also observationally entangled with the user's
+  habitual lean (a D435 has no IMU to break the tie; the D435i does),
+  and shoulder-line roll is already routed into the UpperChest lean by
+  the solver rather than the root. If pitch neutralisation is ever
+  wanted, it needs either an IMU-equipped camera or a dedicated
+  capture step with the user's posture constrained — not a bolt-on to
+  the Phase I transform.
