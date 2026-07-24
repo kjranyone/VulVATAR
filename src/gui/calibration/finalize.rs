@@ -37,23 +37,26 @@ pub(super) fn finalize_collection(
     // collected) yields an empty vec.
     type ExprAccum = std::collections::HashMap<String, (f32, usize)>;
     type FaceAccums = (Vec<[f32; 3]>, Vec<[f32; 3]>);
-    let (samples, expr_accum, (face_accum_mesh, face_accum_body)): (
+    let (samples, expr_accum, (face_accum_mesh, face_accum_body), body_yaw_accum): (
         Vec<AnchorSample>,
         ExprAccum,
         FaceAccums,
+        Vec<f32>,
     ) = match &mut state.calibration.modal {
         CalibrationModalState::Collecting {
             samples,
             expr_accum,
             face_accum_mesh,
             face_accum_body,
+            body_yaw_accum,
             ..
         } => (
             std::mem::take(samples),
             std::mem::take(expr_accum),
             (std::mem::take(face_accum_mesh), std::mem::take(face_accum_body)),
+            std::mem::take(body_yaw_accum),
         ),
-        _ => (Vec::new(), ExprAccum::new(), (Vec::new(), Vec::new())),
+        _ => (Vec::new(), ExprAccum::new(), (Vec::new(), Vec::new()), Vec::new()),
     };
 
     // Tell the worker to stop accumulating torso template samples
@@ -115,6 +118,14 @@ pub(super) fn finalize_collection(
         .or(previous.as_ref().and_then(|p| p.neutral_face_ypr_mesh));
     calibration.neutral_face_ypr_body = neutral_from_accum(&face_accum_body)
         .or(previous.as_ref().and_then(|p| p.neutral_face_ypr_body));
+
+    // Median shoulder-line yaw → neutral body yaw (oblique camera
+    // placement, Phase I). Same carry-forward contract as the face
+    // neutrals: a recapture that couldn't measure (non-metric frames,
+    // torso wandering during the hold) keeps the previous value
+    // instead of silently discarding a good one.
+    calibration.neutral_body_yaw = neutral_body_yaw_from_accum(&body_yaw_accum)
+        .or(previous.as_ref().and_then(|p| p.neutral_body_yaw));
 
     // Write into Application so the solver / project file see the
     // new value next frame. Also push to the tracking mailbox so the
@@ -431,6 +442,9 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         // face accumulators.
         neutral_face_ypr_mesh: None,
         neutral_face_ypr_body: None,
+        // Set by the caller from the medianed shoulder-line yaw
+        // accumulator (metric captures only).
+        neutral_body_yaw: None,
     }
 }
 
@@ -498,6 +512,42 @@ fn neutral_from_accum(accum: &[[f32; 3]]) -> Option<[f32; 3]> {
     Some(medians)
 }
 
+/// Maximum median-absolute-deviation (radians, ≈ 8.6°) of the
+/// shoulder-line yaw across the hold. Same rationale as
+/// [`FACE_NEUTRAL_MAX_MAD_RAD`]: the gate that started the capture
+/// only proves the user WAS still — a torso that swivels mid-window
+/// (turning to read the instructions) must not bake a transient
+/// heading into every subsequent frame.
+const BODY_YAW_MAX_MAD_RAD: f32 = 0.15;
+
+/// Median shoulder-line yaw of the capture window, gated on sample
+/// count, hold stability and the hard plausibility cap. `None` →
+/// caller keeps the previous calibration's value (or stays
+/// uncalibrated, which is a strict runtime no-op).
+fn neutral_body_yaw_from_accum(accum: &[f32]) -> Option<f32> {
+    if accum.len() < crate::tracking::BODY_YAW_MIN_SAMPLES {
+        return None;
+    }
+    let mut v: Vec<f32> = accum.to_vec();
+    let median = median_inplace(&mut v);
+    let mut dev: Vec<f32> = accum.iter().map(|y| (y - median).abs()).collect();
+    let mad = median_inplace(&mut dev);
+    if mad > BODY_YAW_MAX_MAD_RAD {
+        warn!(
+            "body-yaw neutral capture rejected: MAD {mad:.3} rad exceeds {BODY_YAW_MAX_MAD_RAD:.3} — torso not held still",
+        );
+        return None;
+    }
+    if median.abs() > crate::tracking::BODY_YAW_MAX_RAD {
+        warn!(
+            "body-yaw neutral capture rejected: |{median:.3}| rad exceeds the {:.3} plausibility cap — likely an L/R swap, not camera geometry",
+            crate::tracking::BODY_YAW_MAX_RAD,
+        );
+        return None;
+    }
+    Some(median)
+}
+
 /// In-place median: sorts `values` and returns the middle (or average
 /// of the two middles for even length). Returns `0.0` for an empty
 /// slice — callers gate on `MIN_SAMPLES` before reaching here, so
@@ -562,6 +612,39 @@ mod tests {
             neutral_from_accum(&steady(5, [0.1, 0.2, 0.0])),
             Some([0.1, 0.2, 0.0])
         );
+    }
+
+    #[test]
+    fn body_yaw_accum_medians_a_steady_hold() {
+        let accum = [0.48, 0.50, 0.52, 0.49, 0.51];
+        let yaw = neutral_body_yaw_from_accum(&accum).unwrap();
+        assert!((yaw - 0.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn body_yaw_accum_needs_minimum_samples() {
+        assert_eq!(neutral_body_yaw_from_accum(&[0.5; 4]), None);
+        assert!(neutral_body_yaw_from_accum(&[0.5; 5]).is_some());
+    }
+
+    #[test]
+    fn body_yaw_accum_rejects_a_swiveling_torso() {
+        // Median-stable but wildly spread readings (user turned to
+        // read the instructions mid-window): MAD gate must refuse.
+        let accum = [0.0, 0.5, -0.5, 0.6, -0.6, 0.1];
+        assert_eq!(neutral_body_yaw_from_accum(&accum), None);
+    }
+
+    #[test]
+    fn body_yaw_accum_rejects_implausible_magnitude() {
+        // A steady ~86° reading is an L/R swap, not camera geometry —
+        // reject outright rather than clamping to 60° (a clamped value
+        // would apply a wrong-magnitude rotation every frame).
+        let accum = [1.5; 6];
+        assert_eq!(neutral_body_yaw_from_accum(&accum), None);
+        // Negative side too.
+        let accum = [-1.5; 6];
+        assert_eq!(neutral_body_yaw_from_accum(&accum), None);
     }
 
     #[test]

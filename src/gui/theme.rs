@@ -53,7 +53,11 @@ pub mod color {
     pub const ERROR_CONTAINER: Color32 = Color32::from_rgb(252, 232, 232);
     pub const ON_ERROR_CONTAINER: Color32 = Color32::from_rgb(180, 40, 40);
     pub const SUCCESS: Color32 = Color32::from_rgb(46, 160, 67);
+    pub const SUCCESS_CONTAINER: Color32 = Color32::from_rgb(226, 244, 231);
+    pub const ON_SUCCESS_CONTAINER: Color32 = Color32::from_rgb(25, 105, 50);
     pub const WARNING: Color32 = Color32::from_rgb(220, 140, 30);
+    pub const WARNING_CONTAINER: Color32 = Color32::from_rgb(252, 238, 216);
+    pub const ON_WARNING_CONTAINER: Color32 = Color32::from_rgb(150, 90, 10);
 
     // ── Outlines / dividers ───────────────────────────────────────
     pub const OUTLINE: Color32 = Color32::from_rgb(218, 213, 226);
@@ -99,6 +103,58 @@ pub mod color {
     /// the brand purple so the viewport's own affordances don't read
     /// as just-another-button.
     pub const VIEWPORT_OVERLAY_OUTLINE: Color32 = Color32::from_rgb(60, 130, 200);
+}
+
+/// Colours for content painted *inside* the always-dark viewport and
+/// the camera/calibration preview panes: skeleton annotations, grid,
+/// crosshair, overlay badges. Kept separate from [`color`] because the
+/// viewport is its own dark context regardless of app theme — but
+/// still tokenised so the same annotation reads identically in every
+/// pane that draws it (viewport PIP and calibration preview used to
+/// carry copy-pasted literals that could drift apart).
+pub mod viz {
+    use super::Color32;
+
+    // ── Detection annotations (keypoints / skeleton / bbox) ───────
+    // Alpha-carrying tokens are functions: `from_rgba_unmultiplied`
+    // is not const, and hand-premultiplying would hide the authored
+    // channel values.
+    pub fn keypoint() -> Color32 {
+        Color32::from_rgba_unmultiplied(0, 255, 128, 220)
+    }
+    pub fn bone() -> Color32 {
+        Color32::from_rgba_unmultiplied(0, 200, 255, 180)
+    }
+    pub fn bbox() -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 220, 80, 200)
+    }
+
+    // ── Empty-viewport furniture ──────────────────────────────────
+    pub const GRID: Color32 = Color32::from_rgb(45, 45, 55);
+    pub const CROSSHAIR: Color32 = Color32::from_rgb(70, 70, 85);
+    pub const LABEL_PRIMARY: Color32 = Color32::from_rgb(100, 100, 115);
+    pub const LABEL_SECONDARY: Color32 = Color32::from_rgb(75, 75, 85);
+
+    // ── Alpha-preview checkerboards ───────────────────────────────
+    /// Light checker pair drawn *behind the rendered image* when alpha
+    /// preview is on (light so transparency reads as "photo editor").
+    pub const CHECKER_LIGHT_A: Color32 = Color32::from_rgb(180, 180, 180);
+    pub const CHECKER_LIGHT_B: Color32 = Color32::from_rgb(220, 220, 220);
+    /// Dark checker pair for the placeholder (no rendered image yet).
+    pub const CHECKER_DARK_A: Color32 = Color32::from_rgb(30, 30, 35);
+    pub const CHECKER_DARK_B: Color32 = Color32::from_rgb(40, 40, 45);
+
+    // ── Overlay text / badges on dark content ─────────────────────
+    pub const OVERLAY_TEXT: Color32 = Color32::from_rgb(205, 212, 230);
+    pub fn overlay_badge_bg() -> Color32 {
+        Color32::from_rgba_unmultiplied(18, 20, 26, 190)
+    }
+    pub fn selection_text() -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 220, 80, 220)
+    }
+    pub fn muted_overlay_text() -> Color32 {
+        Color32::from_rgba_unmultiplied(180, 180, 180, 160)
+    }
 }
 
 pub mod space {
@@ -161,6 +217,8 @@ pub mod icon {
     pub const CLOTH_AUTHORING: char = '\u{f19e}'; // checkroom
     pub const SETTINGS: char = '\u{e8b8}'; // settings
     pub const HIDE_PANEL: char = '\u{e408}'; // chevron_left
+    pub const CHEVRON_RIGHT: char = '\u{e5cc}'; // chevron_right (collapsed section)
+    pub const EXPAND_MORE: char = '\u{e5cf}'; // expand_more (expanded section)
 
     // Top-bar actions
     pub const MENU: char = '\u{e5d2}'; // menu (hamburger)

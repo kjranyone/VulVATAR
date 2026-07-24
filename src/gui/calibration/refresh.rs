@@ -209,6 +209,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         ref mut expr_accum,
         ref mut face_accum_mesh,
         ref mut face_accum_body,
+        ref mut body_yaw_accum,
         ref mut last_seq_consumed,
         ..
     } = state.calibration.modal
@@ -227,6 +228,16 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
                             confidence: pose.overall_confidence,
                             shoulder_span_m: measure_shoulder_span(pose),
                         });
+                    }
+                    // Shoulder-line yaw for the neutral-body-yaw median
+                    // (oblique camera placement — Phase I). The helper
+                    // refuses non-metric frames, missing shoulders and
+                    // degenerate spans, so a `Some` here is a reading
+                    // worth aggregating. Raw-mailbox invariant holds:
+                    // the snapshot is never calibration-rotated, so a
+                    // recapture measures the true camera angle.
+                    if let Some(yaw) = crate::tracking::shoulder_line_yaw(pose) {
+                        body_yaw_accum.push(yaw);
                     }
                     // Fold the resting expression weights into the running
                     // mean (independent of `root_offset` — a desk-distance
@@ -292,6 +303,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
     // still useful for the X range (and z stays None on rtmw3d-only
     // anyway). The confidence floor is the only quality gate.
     if let CalibrationModalState::RangeCollecting {
+        ref calibration,
         ref mut x_min,
         ref mut x_max,
         ref mut z_min,
@@ -305,7 +317,22 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
             *last_seq_consumed = snap.sequence;
             if let Some(pose) = snap.pose.as_ref() {
                 if pose.overall_confidence >= MIN_FRAME_CONF {
-                    if let Some(pos) = pose.root_offset {
+                    if let Some(raw_pos) = pose.root_offset {
+                        // With a neutral body yaw on the in-flight
+                        // calibration, runtime offsets live in the
+                        // de-rotated (body) frame — so fold range
+                        // extremes over samples rotated the same way.
+                        // Rotating EACH sample (not the finished box)
+                        // matters: an axis-aligned min/max box is not
+                        // rotation-equivariant. The pivot is irrelevant
+                        // for peak-to-peak deltas, so rotate about the
+                        // origin. Metric-gated like the runtime path.
+                        let pos = match calibration.neutral_body_yaw {
+                            Some(theta) if pose.metric_frame_info.is_some() => {
+                                crate::tracking::rotate_xz(raw_pos, theta)
+                            }
+                            _ => raw_pos,
+                        };
                         if pos[0] < *x_min {
                             *x_min = pos[0];
                         }

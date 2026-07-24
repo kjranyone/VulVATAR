@@ -1,19 +1,11 @@
 use eframe::egui;
 
-use crate::gui::components::{filled_button, tonal_button, ButtonTone};
-use crate::gui::theme::{color, icon as ic};
+use crate::gui::components::{collapsible_card, filled_button, tonal_button, ButtonTone};
+use crate::gui::theme::{color, icon as ic, typography};
 use crate::gui::GuiApp;
 use crate::t;
 
 pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
-    if ui
-        .checkbox(&mut state.tracking.toggle_tracking, t!("tracking.enabled"))
-        .changed()
-    {
-        state.project_status.project_dirty = true;
-    }
-    ui.add_space(4.0);
-
     // Unclean-exit banner: the previous session's stage-log sentinel
     // survived (system freeze, process kill). Offer the degraded
     // safe-mode pipeline for the next start; either choice clears the
@@ -56,168 +48,40 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         ui.add_space(4.0);
     }
 
-    egui::CollapsingHeader::new(t!("tracking.input_device"))
-        .default_open(true)
-        .show(ui, |ui| {
-            #[cfg(feature = "realsense")]
-            {
-                // D435-exclusive capture: the sole input is the Intel
-                // RealSense D435. It self-selects the first D400 device and
-                // supplies its own color-aligned metric depth to the pose
-                // pipeline — there is no device / backend to choose.
-                ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
-                // 1:1 sensor-matched mirror render (needs the D435 intrinsics,
-                // so it is realsense-only).
-                ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
-                ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
-                ui.add_space(4.0);
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let active = state.is_tracking_active();
-                let ready = state.is_tracking_ready();
-                if active && ready {
-                    if tonal_button(
-                        ui,
-                        Some(ic::PAUSE),
-                        &t!("tracking.stop_camera"),
-                        ButtonTone::Error,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        state.app.stop_tracking();
-                    }
-                } else if active {
-                    // Camera is initialising — disabled placeholder uses
-                    // the filled-button silhouette so the layout doesn't
-                    // jump when it flips to Stop.
-                    let _ = filled_button(ui, None, &t!("tracking.preparing"), false);
-                } else if filled_button(ui, Some(ic::PLAY), &t!("tracking.start_camera"), true)
-                    .clicked()
-                {
-                    let (w, h) = crate::gui::camera_resolution_for_index(
-                        state.tracking.camera_resolution_index,
-                    );
-                    let fps =
-                        crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
-                    // Safe mode also caps the capture format — less
-                    // camera bandwidth and per-frame CPU work while
-                    // diagnosing an unclean exit.
-                    let (w, h, fps) = if state.tracking.safe_mode_armed {
-                        (w.min(1280), h.min(720), fps.min(30))
-                    } else {
-                        (w, h, fps)
-                    };
-                    let pipeline = state.tracking.pipeline_config();
-                    state
-                        .app
-                        .start_tracking_with_params(w, h, fps, pipeline);
-                }
-            });
-            if ui
-                .checkbox(&mut state.viewport.show_camera_wipe, t!("tracking.camera_wipe"))
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            if state.viewport.show_camera_wipe
-                && ui
-                    .checkbox(&mut state.viewport.show_detection_annotations, t!("tracking.show_annotations"))
-                    .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            let prev_res = state.tracking.camera_resolution_index;
-            egui::ComboBox::from_label(t!("tracking.resolution"))
-                .selected_text(
-                    *["640x480", "1280x720", "1920x1080"]
-                        .get(state.tracking.camera_resolution_index)
-                        .unwrap_or(&"Unknown"),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.tracking.camera_resolution_index, 0, "640x480");
-                    ui.selectable_value(&mut state.tracking.camera_resolution_index, 1, "1280x720");
-                    ui.selectable_value(
-                        &mut state.tracking.camera_resolution_index,
-                        2,
-                        "1920x1080",
-                    );
-                });
-            let res_changed = state.tracking.camera_resolution_index != prev_res;
-            if res_changed {
-                state.project_status.project_dirty = true;
-            }
-            let prev_fps = state.tracking.camera_framerate_index;
-            egui::ComboBox::from_label(t!("tracking.frame_rate"))
-                .selected_text(
-                    *["30 fps", "60 fps"]
-                        .get(state.tracking.camera_framerate_index)
-                        .unwrap_or(&"Unknown"),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.tracking.camera_framerate_index, 0, "30 fps");
-                    ui.selectable_value(&mut state.tracking.camera_framerate_index, 1, "60 fps");
-                });
-            let fps_changed = state.tracking.camera_framerate_index != prev_fps;
-            if fps_changed {
-                state.project_status.project_dirty = true;
-            }
-            // If the camera is currently running, restart it with the new
-            // params so a resolution / frame-rate change takes effect
-            // immediately rather than only at the next Stop / Start cycle.
-            if (res_changed || fps_changed) && state.app.is_tracking_running() {
-                let (w, h) =
-                    crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
-                let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
-                let (w, h, fps) = if state.tracking.safe_mode_armed {
-                    (w.min(1280), h.min(720), fps.min(30))
-                } else {
-                    (w, h, fps)
-                };
-                let pipeline = state.tracking.pipeline_config();
-                state
-                    .app
-                    .start_tracking_with_params(w, h, fps, pipeline);
-                state.push_notification(t!("tracking.camera_restarted", w = w, h = h, fps = fps));
-            }
-        });
+    // ① Camera & tracking control — the button every session starts
+    // with, permanently visible at the top of the panel (it used to be
+    // buried inside the collapsed "Input Device" section).
+    draw_camera_control(ui, state);
 
-    egui::CollapsingHeader::new(t!("tracking.pipeline"))
-        .default_open(false)
-        .show(ui, |ui| {
-            let mut changed = false;
-            changed |= ui
-                .checkbox(
-                    &mut state.tracking.yolox_enabled,
-                    t!("tracking.pipeline_yolox"),
-                )
-                .changed();
-            changed |= ui
-                .checkbox(
-                    &mut state.tracking.force_cpu_inference,
-                    t!("tracking.pipeline_force_cpu"),
-                )
-                .changed();
-            if changed {
-                state.project_status.project_dirty = true;
-            }
+    // ② Calibration — quality lives or dies on this for a depth
+    // pipeline, so it gets its own card right under the start button
+    // (it used to sit at the very bottom of the Retargeting section).
+    draw_calibration_card(ui, state);
+
+    // ③ Which body parts drive the avatar.
+    draw_body_parts(ui, state);
+
+    // ④ Capture format details — visited rarely, collapsed by default.
+    draw_input_device(ui, state);
+
+    // ⑤ Display / mirroring options, with the two distinct "mirror"
+    // concepts finally side by side and explained.
+    draw_display_options(ui, state);
+
+    collapsible_card(ui, "tracking.pipeline", t!("tracking.pipeline"), false, |ui| {
+            ui.checkbox(
+                &mut state.tracking.yolox_enabled,
+                t!("tracking.pipeline_yolox"),
+            );
+            ui.checkbox(
+                &mut state.tracking.force_cpu_inference,
+                t!("tracking.pipeline_force_cpu"),
+            );
             ui.label(
                 egui::RichText::new(t!("tracking.pipeline_hint"))
                     .small()
                     .weak(),
             );
-        });
-
-    egui::CollapsingHeader::new(t!("tracking.capture_format"))
-        .default_open(false)
-        .show(ui, |ui| {
-            if ui
-                .checkbox(&mut state.tracking.tracking_mirror, t!("tracking.mirror_preview"))
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
         });
 
     // Pose-solver smoothing / confidence thresholds. These used to be
@@ -226,49 +90,38 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     // They now live on `state.tracking.smoothing` and flow through
     // `FrameConfig::smoothing` each frame. Collapsed by default — most
     // users should never need to touch them.
-    egui::CollapsingHeader::new(t!("tracking.advanced_smoothing"))
-        .default_open(false)
-        .show(ui, |ui| {
+    collapsible_card(ui, "tracking.advanced_smoothing", t!("tracking.advanced_smoothing"), false, |ui| {
             ui.label(
                 egui::RichText::new(t!("tracking.advanced_smoothing_hint"))
                     .color(color::ON_SURFACE_VARIANT),
             );
             ui.add_space(4.0);
-            let mut changed = false;
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut state.tracking.smoothing.rotation_blend, 0.0..=1.0)
-                        .text(t!("tracking.rotation_blend")),
+            ui.add(
+                egui::Slider::new(&mut state.tracking.smoothing.rotation_blend, 0.0..=1.0)
+                    .text(t!("tracking.rotation_blend")),
+            )
+            .on_hover_text(t!("tracking.rotation_blend_tooltip"));
+            ui.add(
+                egui::Slider::new(&mut state.tracking.smoothing.expression_blend, 0.0..=1.0)
+                    .text(t!("tracking.expression_blend")),
+            )
+            .on_hover_text(t!("tracking.expression_blend_tooltip"));
+            ui.add(
+                egui::Slider::new(
+                    &mut state.tracking.smoothing.joint_confidence_threshold,
+                    0.0..=1.0,
                 )
-                .on_hover_text(t!("tracking.rotation_blend_tooltip"))
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut state.tracking.smoothing.expression_blend, 0.0..=1.0)
-                        .text(t!("tracking.expression_blend")),
+                .text(t!("tracking.joint_confidence")),
+            )
+            .on_hover_text(t!("tracking.joint_confidence_tooltip"));
+            ui.add(
+                egui::Slider::new(
+                    &mut state.tracking.smoothing.face_confidence_threshold,
+                    0.0..=1.0,
                 )
-                .on_hover_text(t!("tracking.expression_blend_tooltip"))
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut state.tracking.smoothing.joint_confidence_threshold,
-                        0.0..=1.0,
-                    )
-                    .text(t!("tracking.joint_confidence")),
-                )
-                .on_hover_text(t!("tracking.joint_confidence_tooltip"))
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut state.tracking.smoothing.face_confidence_threshold,
-                        0.0..=1.0,
-                    )
-                    .text(t!("tracking.face_confidence")),
-                )
-                .on_hover_text(t!("tracking.face_confidence_tooltip"))
-                .changed();
+                .text(t!("tracking.face_confidence")),
+            )
+            .on_hover_text(t!("tracking.face_confidence_tooltip"));
             ui.add_space(4.0);
             if tonal_button(
                 ui,
@@ -286,30 +139,14 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     defaults.joint_confidence_threshold;
                 state.tracking.smoothing.face_confidence_threshold =
                     defaults.face_confidence_threshold;
-                changed = true;
-            }
-            if changed {
-                state.project_status.project_dirty = true;
             }
         });
 
-    egui::CollapsingHeader::new(t!("tracking.inference_status"))
-        .default_open(true)
-        .show(ui, |ui| {
-            let camera_running = state.is_tracking_active();
-            let camera_ready = state.is_tracking_ready();
-            let tracking_on = state.tracking.toggle_tracking;
-            let (status_color, status_text) = if camera_running && !camera_ready {
-                (egui::Color32::YELLOW, t!("tracking.preparing_camera").to_string())
-            } else if camera_running && tracking_on {
-                (egui::Color32::GREEN, t!("tracking.running").to_string())
-            } else if camera_running {
-                (egui::Color32::YELLOW, t!("tracking.camera_active_paused").to_string())
-            } else {
-                (egui::Color32::GRAY, t!("tracking.stopped").to_string())
-            };
-            ui.label(egui::RichText::new(status_text).color(status_color));
-            if camera_running {
+    // Detailed diagnostics — backend labels, raw timestamp, per-joint
+    // confidence. Collapsed: the one-line status in ① is the everyday
+    // read; this is for debugging sessions.
+    collapsible_card(ui, "tracking.inference_status", t!("tracking.inference_status"), false, |ui| {
+            if state.is_tracking_active() {
                 ui.label(t!(
                     "tracking.camera_label",
                     label = crate::tracking::CAPTURE_BACKEND_LABEL.to_string()
@@ -330,107 +167,12 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
 
             if let Some(tracking) = &state.app.last_tracking_pose {
-                ui.label(format!("Timestamp: {}", tracking.source_timestamp));
-            } else {
-                ui.label(t!("tracking.no_tracking_data"));
-            }
-        });
-
-    egui::CollapsingHeader::new(t!("tracking.retargeting"))
-        .default_open(true)
-        .show(ui, |ui| {
-            if ui
-                .checkbox(&mut state.tracking.hand_tracking_enabled, t!("tracking.hand_tracking"))
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            if ui
-                .checkbox(&mut state.tracking.face_tracking_enabled, t!("tracking.face_tracking"))
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            let lower_body_resp = ui
-                .checkbox(
-                    &mut state.tracking.lower_body_tracking_enabled,
-                    t!("tracking.lower_body"),
-                )
-                .on_hover_text(
-                    t!("tracking.lower_body_tooltip"),
-                );
-            if lower_body_resp.changed() {
-                state.project_status.project_dirty = true;
-            }
-            if ui
-                .checkbox(
-                    &mut state.tracking.root_translation_enabled,
-                    t!("tracking.root_translation"),
-                )
-                .on_hover_text(t!("tracking.root_translation_tooltip"))
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            if ui
-                .checkbox(
-                    &mut state.tracking.fade_on_tracking_loss,
-                    t!("tracking.fade_on_loss"),
-                )
-                .on_hover_text(t!("tracking.fade_on_loss_tooltip"))
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                // Pose calibration entry — opens the fullscreen modal
-                // directly. Mode selection (Full Body / Upper Body)
-                // happens *inside* the modal via a Segmented Buttons
-                // control, which fits Material Design better than a
-                // menu_button → modal-launch chain (M3 considers the
-                // latter an anti-pattern: too much depth, indirect
-                // entry point, mode-without-context-of-modal).
-                //
-                // Default-open in FullBody mode; the user flips the
-                // segment if they only have an upper-body crop. The
-                // segment is editable up until Capture begins
-                // (`Collecting` state); the modal disables the
-                // toggle once a sample window has started.
-                // Disable the Calibrate launcher while an avatar load
-                // is in progress — the load Window is its own modal,
-                // and stacking the calibration scrim on top would
-                // visually bury the load progress while leaving its
-                // click target reachable through the (paint-only)
-                // scrim. Same gate enforced on the open() side just
-                // below, in case the button somehow fires anyway.
-                let calib_enabled = state.library.avatar_load_job.is_none();
-                if filled_button(ui, None, &t!("calibration.button"), calib_enabled).clicked()
-                    && calib_enabled
-                {
-                    // Reopen at the mode the active profile was last
-                    // calibrated with, falling back to FullBody for a
-                    // first-time capture (or after a profile that
-                    // never completed calibration). The Segmented
-                    // Buttons inside the modal still let the user
-                    // override before HoldStill expires — this just
-                    // saves the round-trip for the common case where
-                    // they're recalibrating in the same configuration.
-                    let default_mode = state
-                        .app
-                        .tracking_calibration
-                        .pose
-                        .as_ref()
-                        .map(|c| c.mode)
-                        .unwrap_or(crate::tracking::CalibrationMode::FullBody);
-                    state.calibration.modal.open(default_mode);
-                }
-            });
-            draw_calibration_status(ui, state);
-            if let Some(tracking) = &state.app.last_tracking_pose {
+                ui.label(t!(
+                    "tracking.timestamp",
+                    value = tracking.source_timestamp.to_string()
+                ));
                 ui.separator();
                 ui.label(t!("tracking.confidence"));
-                draw_confidence_bar(ui, &t!("tracking.confidence_overall"), tracking.overall_confidence);
                 if let Some(face) = tracking.face {
                     draw_confidence_bar(ui, &t!("tracking.confidence_face"), face.confidence);
                 }
@@ -446,14 +188,301 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 );
                 draw_confidence_bar(ui, &t!("tracking.confidence_left_hand"), joint_conf(HumanoidBone::LeftHand));
                 draw_confidence_bar(ui, &t!("tracking.confidence_right_hand"), joint_conf(HumanoidBone::RightHand));
+            } else {
+                ui.label(t!("tracking.no_tracking_data"));
             }
         });
 
-    egui::CollapsingHeader::new(t!("tracking.lip_sync"))
-        .default_open(false)
-        .show(ui, |ui| {
-            draw_lipsync(ui, state);
+    collapsible_card(ui, "tracking.lip_sync", t!("tracking.lip_sync"), false, |ui| {
+        draw_lipsync(ui, state);
+    });
+}
+
+/// Capture format after the safe-mode clamp. Single source for every
+/// start/restart site — the clamp used to be copy-pasted between the
+/// Start button and the change-while-running restart and had already
+/// begun to drift risk.
+fn effective_capture_params(state: &GuiApp) -> (u32, u32, u32) {
+    let (w, h) = crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
+    let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+    clamp_for_safe_mode(w, h, fps, state.tracking.safe_mode_armed)
+}
+
+/// Safe mode caps the capture format — less camera bandwidth and
+/// per-frame CPU work while diagnosing an unclean exit.
+fn clamp_for_safe_mode(w: u32, h: u32, fps: u32, safe_mode: bool) -> (u32, u32, u32) {
+    if safe_mode {
+        (w.min(1280), h.min(720), fps.min(30))
+    } else {
+        (w, h, fps)
+    }
+}
+
+/// Marker for the capture format the running camera was started with,
+/// kept in egui temp memory. Lets the Input Device card offer an
+/// explicit Apply instead of restarting the camera on every combo
+/// click (crossing two entries used to restart twice).
+fn applied_format_id() -> egui::Id {
+    egui::Id::new("tracking_applied_capture_format")
+}
+
+fn start_camera(state: &mut GuiApp, ctx: &egui::Context) {
+    // Starting the camera IS enabling tracking — the old standalone
+    // "Tracking enabled" checkbox is gone. `toggle_tracking` stays the
+    // single source of truth for the solve gate (the pause hotkey and
+    // status displays still read/write it).
+    if !state.tracking.toggle_tracking {
+        state.tracking.toggle_tracking = true;
+    }
+    let (w, h, fps) = effective_capture_params(state);
+    let pipeline = state.tracking.pipeline_config();
+    state.app.start_tracking_with_params(w, h, fps, pipeline);
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            applied_format_id(),
+            (
+                state.tracking.camera_resolution_index,
+                state.tracking.camera_framerate_index,
+            ),
+        )
+    });
+}
+
+/// ① Always-visible camera / tracking control card.
+fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
+    crate::gui::components::card(ui, t!("tracking.camera_section"), |ui| {
+        let active = state.is_tracking_active();
+        let ready = state.is_tracking_ready();
+        let tracking_on = state.tracking.toggle_tracking;
+
+        ui.horizontal(|ui| {
+            if active && ready {
+                if tonal_button(
+                    ui,
+                    Some(ic::PAUSE),
+                    &t!("tracking.stop_camera"),
+                    ButtonTone::Error,
+                    true,
+                )
+                .clicked()
+                {
+                    state.app.stop_tracking();
+                }
+            } else if active {
+                // Camera is initialising — disabled placeholder uses
+                // the filled-button silhouette so the layout doesn't
+                // jump when it flips to Stop.
+                let _ = filled_button(ui, None, &t!("tracking.preparing"), false);
+            } else if filled_button(ui, Some(ic::PLAY), &t!("tracking.start_camera"), true)
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                start_camera(state, &ctx);
+            }
         });
+
+        // One-line status; details only when something needs attention.
+        let (status_color, status_text) = if active && !ready {
+            (color::WARNING, t!("tracking.preparing_camera").to_string())
+        } else if active && tracking_on {
+            (color::SUCCESS, t!("tracking.running").to_string())
+        } else if active {
+            (color::WARNING, t!("tracking.camera_active_paused").to_string())
+        } else {
+            (color::ON_SURFACE_MUTED, t!("tracking.stopped").to_string())
+        };
+        ui.label(egui::RichText::new(status_text).color(status_color));
+
+        // Camera on but solve paused (pause hotkey) — offer the way back
+        // right where the amber status is shown.
+        if active && !tracking_on
+            && tonal_button(ui, Some(ic::PLAY), &t!("tracking.resume_tracking"), ButtonTone::Primary, true)
+                .clicked()
+        {
+            state.tracking.toggle_tracking = true;
+        }
+
+        if let Some(tracking) = &state.app.last_tracking_pose {
+            draw_confidence_bar(
+                ui,
+                &t!("tracking.confidence_overall"),
+                tracking.overall_confidence,
+            );
+        }
+    });
+}
+
+/// ② Calibration entry + status, promoted to its own card.
+fn draw_calibration_card(ui: &mut egui::Ui, state: &mut GuiApp) {
+    crate::gui::components::card(ui, t!("tracking.calibration_section"), |ui| {
+        // Pose calibration entry — opens the fullscreen modal directly.
+        // Mode selection (Full Body / Upper Body) happens *inside* the
+        // modal via Segmented Buttons. Disabled while an avatar load is
+        // in progress — the load Window is its own modal, and stacking
+        // the calibration scrim on top would bury the load progress
+        // while leaving its click target reachable through the
+        // (paint-only) scrim. Same gate enforced on the open() side.
+        let calib_enabled = state.library.avatar_load_job.is_none();
+        if filled_button(ui, None, &t!("calibration.button"), calib_enabled).clicked()
+            && calib_enabled
+        {
+            // Reopen at the mode the active profile was last calibrated
+            // with, falling back to FullBody for a first-time capture.
+            let default_mode = state
+                .app
+                .tracking_calibration
+                .pose
+                .as_ref()
+                .map(|c| c.mode)
+                .unwrap_or(crate::tracking::CalibrationMode::FullBody);
+            state.calibration.modal.open(default_mode);
+        }
+        draw_calibration_status(ui, state);
+    });
+}
+
+/// ③ Which body parts drive the avatar.
+fn draw_body_parts(ui: &mut egui::Ui, state: &mut GuiApp) {
+    collapsible_card(ui, "tracking.body_parts", t!("tracking.body_parts"), true, |ui| {
+        ui
+            .checkbox(&mut state.tracking.hand_tracking_enabled, t!("tracking.hand_tracking"))
+            .changed();
+        ui
+            .checkbox(&mut state.tracking.face_tracking_enabled, t!("tracking.face_tracking"))
+            .changed();
+        ui
+            .checkbox(
+                &mut state.tracking.lower_body_tracking_enabled,
+                t!("tracking.lower_body"),
+            )
+            .on_hover_text(t!("tracking.lower_body_tooltip"))
+            .changed();
+        ui
+            .checkbox(
+                &mut state.tracking.root_translation_enabled,
+                t!("tracking.root_translation"),
+            )
+            .on_hover_text(t!("tracking.root_translation_tooltip"))
+            .changed();
+        ui
+            .checkbox(
+                &mut state.tracking.fade_on_tracking_loss,
+                t!("tracking.fade_on_loss"),
+            )
+            .on_hover_text(t!("tracking.fade_on_loss_tooltip"))
+            .changed();
+    });
+}
+
+/// ④ Capture format — combo edits are staged and only take effect on
+/// Apply (or the next Start), never by restarting mid-click-through.
+fn draw_input_device(ui: &mut egui::Ui, state: &mut GuiApp) {
+    collapsible_card(ui, "tracking.input_device", t!("tracking.input_device"), false, |ui| {
+        #[cfg(feature = "realsense")]
+        {
+            // D435-exclusive capture: the sole input is the Intel
+            // RealSense D435. It self-selects the first D400 device and
+            // supplies its own color-aligned metric depth to the pose
+            // pipeline — there is no device / backend to choose.
+            ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
+            ui.add_space(4.0);
+        }
+        let unknown = t!("tracking.option_unknown");
+        egui::ComboBox::from_label(t!("tracking.resolution"))
+            .selected_text(
+                ["640x480", "1280x720", "1920x1080"]
+                    .get(state.tracking.camera_resolution_index)
+                    .map(|s| s.to_string())
+                    .unwrap_or(unknown),
+            )
+            .show_ui(ui, |ui| {
+                // Highest-first, matching the Output panel's ordering.
+                // Display order only — the GUI keeps combo positions
+                // 0=640, 1=1280, 2=1920; projects persist the real
+                // width/height values, not these indices.
+                ui.selectable_value(&mut state.tracking.camera_resolution_index, 2, "1920x1080");
+                ui.selectable_value(&mut state.tracking.camera_resolution_index, 1, "1280x720");
+                ui.selectable_value(&mut state.tracking.camera_resolution_index, 0, "640x480");
+            });
+        let unknown = t!("tracking.option_unknown");
+        egui::ComboBox::from_label(t!("tracking.frame_rate"))
+            .selected_text(
+                ["30 fps", "60 fps"]
+                    .get(state.tracking.camera_framerate_index)
+                    .map(|s| s.to_string())
+                    .unwrap_or(unknown),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.tracking.camera_framerate_index, 0, "30 fps");
+                ui.selectable_value(&mut state.tracking.camera_framerate_index, 1, "60 fps");
+            });
+
+        // While running, combo edits are *pending* until Apply — the
+        // camera restart takes seconds, so crossing two entries must
+        // not restart twice. The format the camera actually started
+        // with lives in egui temp memory (seeded on Start; if absent —
+        // e.g. after an egui memory reset — the current selection is
+        // treated as applied, which errs on not offering a stale Apply).
+        if state.app.is_tracking_running() {
+            let current = (
+                state.tracking.camera_resolution_index,
+                state.tracking.camera_framerate_index,
+            );
+            let applied = ui
+                .ctx()
+                .data_mut(|d| *d.get_temp_mut_or(applied_format_id(), current));
+            if applied != current {
+                ui.label(
+                    egui::RichText::new(t!("tracking.format_pending_hint"))
+                        .small()
+                        .color(color::ON_SURFACE_VARIANT),
+                );
+                if filled_button(ui, Some(ic::REFRESH), &t!("tracking.apply_format"), true)
+                    .clicked()
+                {
+                    let (w, h, fps) = effective_capture_params(state);
+                    let pipeline = state.tracking.pipeline_config();
+                    state.app.start_tracking_with_params(w, h, fps, pipeline);
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(applied_format_id(), current));
+                    state.push_notification(t!(
+                        "tracking.camera_restarted",
+                        w = w,
+                        h = h,
+                        fps = fps
+                    ));
+                }
+            }
+        }
+    });
+}
+
+/// ⑤ Display options — both mirror concepts in one place, each with a
+/// caption spelling out what it flips (they used to live in different
+/// sections with no explanation of the difference).
+fn draw_display_options(ui: &mut egui::Ui, state: &mut GuiApp) {
+    collapsible_card(ui, "tracking.display_options", t!("tracking.display_options"), false, |ui| {
+        #[cfg(feature = "realsense")]
+        {
+            // 1:1 sensor-matched mirror render (needs the D435
+            // intrinsics, so it is realsense-only).
+            ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
+            ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
+            ui.add_space(4.0);
+        }
+        ui
+            .checkbox(&mut state.tracking.tracking_mirror, t!("tracking.mirror_preview"))
+            .changed();
+        ui.label(egui::RichText::new(t!("tracking.mirror_preview_hint")).small());
+        ui.add_space(4.0);
+        ui.checkbox(&mut state.viewport.show_camera_wipe, t!("tracking.camera_wipe"));
+        if state.viewport.show_camera_wipe {
+            ui.checkbox(
+                &mut state.viewport.show_detection_annotations,
+                t!("tracking.show_annotations"),
+            );
+        }
+    });
 }
 
 fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
@@ -506,7 +535,6 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     if new_mic != active_mic {
         match state.app.set_requested_lipsync(requested_enabled, new_mic) {
             Ok(()) => {
-                state.project_status.project_dirty = true;
             }
             Err(e) => {
                 // Mic device init failed — surface the error but
@@ -523,7 +551,6 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     if ui.checkbox(&mut new_enabled, t!("tracking.enable_lip_sync")).changed() {
         match state.app.set_requested_lipsync(new_enabled, active_mic) {
             Ok(()) => {
-                state.project_status.project_dirty = true;
                 if new_enabled {
                     state.push_notification(t!("tracking.lip_sync_started").to_string());
                 } else {
@@ -539,10 +566,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 
     if requested_enabled && !runtime_enabled {
-        ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 80),
-            t!("tracking.requested_but_failed"),
-        );
+        ui.colored_label(color::WARNING, t!("tracking.requested_but_failed"));
     }
 
     // Per-frame lipsync inference is owned by `Application::step_lipsync`
@@ -570,12 +594,12 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(30, 30, 35));
+    painter.rect_filled(rect, 2.0, color::SURFACE_VARIANT);
     let fill_w = (vol * 10.0).clamp(0.0, 1.0) * rect.width();
     let fill_color = if vol > state.lipsync.volume_threshold {
-        egui::Color32::from_rgb(80, 200, 80)
+        color::SUCCESS
     } else {
-        egui::Color32::from_rgb(60, 60, 70)
+        color::ON_SURFACE_MUTED
     };
     painter.rect_filled(
         egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height())),
@@ -585,22 +609,16 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.label(t!("tracking.volume", vol = format!("{:.3}", vol)));
 
     ui.add_space(4.0);
-    if ui
+    ui
         .add(
             egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
                 .text(t!("tracking.threshold"))
                 .logarithmic(true),
         )
-        .changed()
-    {
-        state.project_status.project_dirty = true;
-    }
-    if ui
+        .changed();
+    ui
         .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text(t!("tracking.smoothing")))
-        .changed()
-    {
-        state.project_status.project_dirty = true;
-    }
+        .changed();
 
     // Mouth source: how the audio lip-sync and the camera (FaceMesh) mouth
     // visemes combine. Both = whichever is stronger, so the mouth opens for
@@ -621,7 +639,6 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
     if ms != state.lipsync.mouth_source {
         state.lipsync.mouth_source = ms;
-        state.project_status.project_dirty = true;
     }
 }
 
@@ -644,8 +661,8 @@ fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
         None => {
             ui.label(
                 egui::RichText::new(t!("calibration.status_uncalibrated"))
-                    .size(11.0)
-                    .color(egui::Color32::from_rgb(170, 170, 170)),
+                    .font(typography::caption())
+                    .color(color::ON_SURFACE_MUTED),
             );
             return;
         }
@@ -679,8 +696,8 @@ fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
                 age = age_label,
                 mode = mode_label
             ))
-            .size(11.0)
-            .color(egui::Color32::from_rgb(230, 180, 60)),
+            .font(typography::caption())
+            .color(color::WARNING),
         );
     } else {
         ui.label(
@@ -689,8 +706,8 @@ fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
                 age = age_label,
                 mode = mode_label
             ))
-            .size(11.0)
-            .color(egui::Color32::from_rgb(120, 220, 140)),
+            .font(typography::caption())
+            .color(color::SUCCESS),
         );
     }
 
@@ -713,9 +730,38 @@ fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
     };
     ui.label(
         egui::RichText::new(detail)
-            .size(10.0)
-            .color(egui::Color32::from_rgb(150, 150, 160)),
+            .font(typography::caption())
+            .color(color::ON_SURFACE_MUTED),
     );
+
+    // Neutral body yaw (oblique camera placement, Phase I). Surfacing
+    // the measured angle is the I1 probe: the user can sanity-check
+    // the sign/magnitude against their physical camera placement
+    // before trusting the de-rotation. Above BODY_YAW_WARN_RAD the
+    // line turns amber — tracking still runs, but depth shadowing on
+    // the far arm degrades measurably at very oblique angles.
+    if let Some(yaw) = pose.neutral_body_yaw {
+        let deg = yaw.to_degrees();
+        if yaw.abs() >= crate::tracking::BODY_YAW_WARN_RAD {
+            ui.label(
+                egui::RichText::new(t!(
+                    "calibration.status_body_yaw_oblique",
+                    yaw = format!("{:+.0}", deg)
+                ))
+                .font(typography::caption())
+                .color(color::WARNING),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(t!(
+                    "calibration.status_body_yaw",
+                    yaw = format!("{:+.0}", deg)
+                ))
+                .font(typography::caption())
+                .color(color::ON_SURFACE_MUTED),
+            );
+        }
+    }
 }
 
 /// Format a unix timestamp as a relative-age label ("5 min ago",
@@ -743,12 +789,28 @@ fn draw_confidence_bar(ui: &mut egui::Ui, label: &str, value: f32) {
     ui.horizontal(|ui| {
         ui.label(format!("{:>10}", label));
         let color = if value > 0.8 {
-            egui::Color32::GREEN
+            color::SUCCESS
         } else if value > 0.5 {
-            egui::Color32::YELLOW
+            color::WARNING
         } else {
-            egui::Color32::from_rgb(255, 100, 100)
+            color::ERROR
         };
         ui.label(egui::RichText::new(format!("{:.0}%", value * 100.0)).color(color));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_for_safe_mode;
+
+    #[test]
+    fn safe_mode_caps_resolution_and_fps() {
+        assert_eq!(clamp_for_safe_mode(1920, 1080, 60, true), (1280, 720, 30));
+        assert_eq!(clamp_for_safe_mode(640, 480, 30, true), (640, 480, 30));
+    }
+
+    #[test]
+    fn normal_mode_passes_format_through() {
+        assert_eq!(clamp_for_safe_mode(1920, 1080, 60, false), (1920, 1080, 60));
+    }
 }

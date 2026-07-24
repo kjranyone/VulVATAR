@@ -1,7 +1,16 @@
 use eframe::egui;
 
+use crate::gui::components::{collapsible_card, kv_row, scope_badge, SettingScope};
+use crate::gui::theme::space;
 use crate::gui::GuiApp;
 use crate::t;
+
+/// "App" storage-layer badge — every widget in this pane persists to
+/// `settings.json`, and the badge makes that visible (the project /
+/// app / profile split used to be indistinguishable in the UI).
+fn app_badge(ui: &mut egui::Ui) {
+    scope_badge(ui, SettingScope::App, &t!("settings.badge_app"));
+}
 
 /// Settings pane. Everything in here is an APP-level preference —
 /// persisted to `%APPDATA%\VulVATAR\settings.json` via
@@ -14,9 +23,8 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
     let current_locale = state.settings.locale.clone();
     let mut changed = false;
 
-    egui::CollapsingHeader::new(t!("settings.heading"))
-        .default_open(true)
-        .show(ui, |ui| {
+    collapsible_card(ui, "settings.heading", t!("settings.heading"), true, |ui| {
+            app_badge(ui);
             let selected_name = crate::i18n::locale_display_name(&current_locale);
             egui::ComboBox::from_label(t!("settings.language"))
                 .selected_text(selected_name)
@@ -42,11 +50,10 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
         });
 
-    ui.add_space(4.0);
+    ui.add_space(space::SM);
 
-    egui::CollapsingHeader::new(t!("settings.viewport_controls"))
-        .default_open(true)
-        .show(ui, |ui| {
+    collapsible_card(ui, "settings.viewport_controls", t!("settings.viewport_controls"), true, |ui| {
+            app_badge(ui);
             changed |= ui
                 .add(
                     // Feeds `exp(-scroll * sens)` in the viewport: ~2.5%/notch at
@@ -75,5 +82,44 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
         state.project_status.app_settings_dirty = true;
     }
 
-    ui.add_space(4.0);
+    ui.add_space(space::SM);
+
+    // ── Diagnostics ──────────────────────────────────────────────
+    // Session-only (deliberately not persisted): the status-bar debug
+    // counters are a "look at something odd right now" tool, not a
+    // preference worth carrying across launches.
+    collapsible_card(
+        ui,
+        "settings.diagnostics",
+        t!("settings.diagnostics"),
+        false,
+        |ui| {
+            ui.checkbox(
+                &mut state.debug_status_bar,
+                t!("settings.debug_status_bar"),
+            );
+            ui.label(
+                egui::RichText::new(t!("settings.debug_status_bar_hint")).small(),
+            );
+        },
+    );
+
+    ui.add_space(space::SM);
+
+    // ── Keyboard shortcuts (read-only) ───────────────────────────
+    // Generated from the live `HotkeyMap` bindings so this list can
+    // never drift from what the keys actually do.
+    collapsible_card(
+        ui,
+        "settings.shortcuts",
+        t!("settings.shortcuts"),
+        false,
+        |ui| {
+            for (action, key_label) in state.hotkeys.entries() {
+                kv_row(ui, &t!(action.label_key()), &key_label);
+            }
+        },
+    );
+
+    ui.add_space(space::SM);
 }

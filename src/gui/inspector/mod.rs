@@ -8,7 +8,6 @@ mod avatar;
 mod cloth;
 mod library;
 mod output;
-mod preview;
 mod rendering;
 mod settings;
 mod tracking;
@@ -63,11 +62,15 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = space::MD;
-                    match state.mode {
+                    match state.mode.normalized() {
                         AppMode::Avatar => avatar::draw_avatar(ui, state),
-                        AppMode::Preview => preview::draw_preview(ui, state),
+                        // Preview is retired; `normalized()` folds it
+                        // onto Rendering (Scene) so this arm is
+                        // unreachable — kept for match exhaustiveness.
+                        AppMode::Preview | AppMode::Rendering => {
+                            rendering::draw_scene(ui, state)
+                        }
                         AppMode::TrackingSetup => tracking::draw_tracking(ui, state),
-                        AppMode::Rendering => rendering::draw_rendering(ui, state),
                         AppMode::Output => output::draw_output(ui, state),
                         AppMode::ClothAuthoring => cloth::draw_cloth_authoring(ui, state),
                         AppMode::Settings => settings::draw_settings(ui, state),

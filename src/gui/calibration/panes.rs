@@ -10,7 +10,8 @@
 
 use eframe::egui;
 
-use crate::gui::theme::color;
+use crate::gui::components::status_dot_label;
+use crate::gui::theme::{color, space, typography, viz};
 use crate::gui::GuiApp;
 use crate::t;
 use crate::tracking::CalibrationMode;
@@ -36,17 +37,14 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
         return;
     }
 
-    // Esc dismisses the modal at any non-terminal stage. Without this
-    // the only exit during WaitingForPose / Collecting / RangeHoldStill /
+    // Esc dismisses the modal at any stage. Without this the only
+    // exit during WaitingForPose / Collecting / RangeHoldStill /
     // RangeCollecting was the Cancel button — which goes off-screen
     // if the user happens to collapse the inspector mid-capture, and
     // is generally an accessibility miss for keyboard-only users.
-    // The Done state auto-closes after `DONE_LINGER_SECONDS` so we
-    // don't intercept Esc there (let the lingering "Captured!"
-    // message read).
-    if !matches!(state.calibration.modal, CalibrationModalState::Done { .. })
-        && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-    {
+    // Done no longer auto-closes (the user reads the result summary
+    // and clicks Close), so Esc works there too.
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         // Same teardown as the Cancel button: discard any in-flight
         // torso capture buffer so a partial window doesn't leak into
         // the next attempt.
@@ -55,9 +53,7 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
         return;
     }
 
-    // Tick the state machine forward. Done after a `DONE_LINGER_SECONDS`
-    // hold reverts to Closed.
-    const DONE_LINGER_SECONDS: f32 = 1.5;
+    // Tick the state machine forward.
     advance_state(state);
     // Pick up any torso template the worker has just published. This
     // arrives 1–2 frames after `Collecting → AnchorDone` because the
@@ -74,12 +70,11 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     if let Some(mode) = relevant_mode(&state.calibration.modal) {
         state.kick_calibration_target_pose_snapshot(mode);
     }
-    if let CalibrationModalState::Done { shown_at, .. } = &state.calibration.modal {
-        if shown_at.elapsed().as_secs_f32() > DONE_LINGER_SECONDS {
-            state.calibration.modal.close();
-            return;
-        }
-    }
+    // Done deliberately does NOT auto-close: it now carries the
+    // result summary (shoulder span, range, face-neutral status) and
+    // a 1.5 s linger gave the user no chance to read it — worse, the
+    // only visible button was labelled "Cancel", which read as
+    // "discard the calibration I just took".
 
     // Dim the entire viewport so background widgets read as inactive.
     // Placed on `Order::Middle` (the default for Windows) so the
@@ -120,9 +115,9 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
             ui.set_min_size(egui::vec2(972.0, 420.0));
             ui.horizontal_top(|ui| {
                 draw_preview_pane(ui, state);
-                ui.add_space(16.0);
+                ui.add_space(space::MD);
                 draw_target_pose_pane(ui, state);
-                ui.add_space(16.0);
+                ui.add_space(space::MD);
                 draw_status_pane(ui, state);
             });
         });
@@ -164,8 +159,8 @@ fn draw_target_pose_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             rect.center(),
             egui::Align2::CENTER_CENTER,
             t!("calibration.target_pose_loading"),
-            egui::FontId::proportional(13.0),
-            egui::Color32::from_rgb(180, 180, 180),
+            typography::body(),
+            viz::OVERLAY_TEXT,
         );
     }
 
@@ -173,8 +168,8 @@ fn draw_target_pose_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     // pose, not the user's live tracking.
     ui.label(
         egui::RichText::new(t!("calibration.target_pose_caption"))
-            .size(11.0)
-            .color(egui::Color32::from_rgb(180, 180, 180)),
+            .font(typography::caption())
+            .color(color::ON_SURFACE_MUTED),
     );
 }
 
@@ -212,56 +207,65 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         egui::Stroke::new(2.0, color::VIEWPORT_OVERLAY_OUTLINE),
     );
 
-    let snap = state.app.tracking.mailbox().snapshot();
-    let Some(ref frame) = snap.frame else {
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            t!("calibration.no_frame"),
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_rgb(180, 180, 180),
-        );
-        return;
-    };
-
     // Refresh texture on new preview sequence — same path the
     // camera-wipe uses (and same reason: pose `sequence` can advance
     // mid-snapshot while the frame is still the previous publish,
     // which would permanently strand a frame if we deduped on it).
     // Sharing the buffer / handle would couple the two previews;
     // keep them separate so toggling camera-wipe while calibrating
-    // doesn't tear either preview.
-    if snap.preview_sequence != state.calibration.preview_seq {
-        let w = frame.width as usize;
-        let h = frame.height as usize;
-        if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
-            let needed = w * h * 4;
-            if state.calibration.preview_rgba_buf.len() != needed {
-                state.calibration.preview_rgba_buf.resize(needed, 255);
-            }
-            let rgba = &mut state.calibration.preview_rgba_buf;
-            for i in 0..w * h {
-                rgba[i * 4] = frame.rgb_data[i * 3];
-                rgba[i * 4 + 1] = frame.rgb_data[i * 3 + 1];
-                rgba[i * 4 + 2] = frame.rgb_data[i * 3 + 2];
-                rgba[i * 4 + 3] = 255;
-            }
-            let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
-            let options = egui::TextureOptions {
-                magnification: egui::TextureFilter::Linear,
-                minification: egui::TextureFilter::Linear,
-                ..Default::default()
-            };
-            if let Some(ref mut handle) = state.calibration.preview_texture {
-                handle.set(color_image, options);
-            } else {
-                let handle =
-                    ui.ctx()
-                        .load_texture("calibration_preview", color_image, options);
-                state.calibration.preview_texture = Some(handle);
+    // doesn't tear either preview. The cheap `preview_sequence()`
+    // probe runs first so the full snapshot (frame refcount + pose
+    // clone) is only pulled when a new publish actually landed.
+    if state.app.tracking.mailbox().preview_sequence() != state.calibration.preview_seq {
+        let snap = state.app.tracking.mailbox().snapshot();
+        if let Some(ref frame) = snap.frame {
+            let w = frame.width as usize;
+            let h = frame.height as usize;
+            if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
+                let needed = w * h * 4;
+                if state.calibration.preview_rgba_buf.len() != needed {
+                    state.calibration.preview_rgba_buf.resize(needed, 255);
+                }
+                let rgba = &mut state.calibration.preview_rgba_buf;
+                for i in 0..w * h {
+                    rgba[i * 4] = frame.rgb_data[i * 3];
+                    rgba[i * 4 + 1] = frame.rgb_data[i * 3 + 1];
+                    rgba[i * 4 + 2] = frame.rgb_data[i * 3 + 2];
+                    rgba[i * 4 + 3] = 255;
+                }
+                let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+                let options = egui::TextureOptions {
+                    magnification: egui::TextureFilter::Linear,
+                    minification: egui::TextureFilter::Linear,
+                    ..Default::default()
+                };
+                if let Some(ref mut handle) = state.calibration.preview_texture {
+                    handle.set(color_image, options);
+                } else {
+                    let handle =
+                        ui.ctx()
+                            .load_texture("calibration_preview", color_image, options);
+                    state.calibration.preview_texture = Some(handle);
+                }
             }
         }
+        // Annotation + telemetry ride the same freshness gate; cached
+        // so the GUI ticks between publishes redraw without another
+        // snapshot.
+        state.calibration.preview_annotation = snap.annotation.clone();
+        refresh_anchor_telemetry(state, &snap);
         state.calibration.preview_seq = snap.preview_sequence;
+    }
+
+    if state.calibration.preview_texture.is_none() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            t!("calibration.no_frame"),
+            egui::FontId::proportional(14.0),
+            viz::OVERLAY_TEXT,
+        );
+        return;
     }
 
     let Some(ref tex) = state.calibration.preview_texture else {
@@ -295,9 +299,9 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     // into the letterboxed image rect (not the outer pane rect) so
     // overlay points sit on top of the actual camera pixels even
     // when the image is pillarboxed.
-    if let Some(ref ann) = snap.annotation {
-        let kpt_color = egui::Color32::from_rgba_unmultiplied(0, 255, 128, 220);
-        let line_color = egui::Color32::from_rgba_unmultiplied(0, 200, 255, 180);
+    if let Some(ref ann) = state.calibration.preview_annotation {
+        let kpt_color = viz::keypoint();
+        let line_color = viz::bone();
         let mirror = state.tracking.tracking_mirror;
         let map_x = |nx: f32| {
             let x = if mirror { 1.0 - nx } else { nx };
@@ -328,9 +332,6 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         }
     }
 
-    // Latest tracking confidence drives the side panel's "Pose detected?"
-    // indicator without re-querying the mailbox there.
-    refresh_anchor_telemetry(state, &snap);
 }
 
 /// Status pane (right side of the modal). Branches on the
@@ -362,8 +363,8 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// not started yet.
 fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     if let Some(current_mode) = relevant_mode(&state.calibration.modal) {
-        ui.label(egui::RichText::new(t!("calibration.mode_label")).size(12.0));
-        ui.add_space(4.0);
+        ui.label(egui::RichText::new(t!("calibration.mode_label")).font(typography::label()));
+        ui.add_space(space::XS);
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(
@@ -384,20 +385,20 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.calibration.modal.set_mode(CalibrationMode::UpperBody);
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(space::MD);
     }
 
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).size(13.0).strong());
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new(instructions).size(12.0));
-    ui.add_space(12.0);
+    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.add_space(space::XS);
+    ui.label(egui::RichText::new(instructions).font(typography::label()));
+    ui.add_space(space::MD);
 
     // Live framing check: lets the user verify the camera is seeing
     // the right anchor before they commit to the countdown.
     draw_live_telemetry(ui, &state.calibration.modal, false);
 
-    ui.add_space(16.0);
+    ui.add_space(space::MD);
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
@@ -420,10 +421,10 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// without cancelling.
 fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).size(13.0).strong());
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new(instructions).size(12.0));
-    ui.add_space(12.0);
+    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.add_space(space::XS);
+    ui.label(egui::RichText::new(instructions).font(typography::label()));
+    ui.add_space(space::MD);
 
     let (progress, time_left) = progress_for(&state.calibration.modal);
     ui.add(
@@ -431,7 +432,7 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             .desired_width(220.0)
             .text(time_left),
     );
-    ui.add_space(12.0);
+    ui.add_space(space::MD);
 
     draw_live_telemetry(ui, &state.calibration.modal, true);
 
@@ -442,10 +443,10 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     // misconfiguration shows up and the user gets a one-click escape.
     let hint = mode_mismatch_hint(&state.calibration.modal);
     if let Some((message_key, switch_to)) = hint {
-        ui.add_space(8.0);
+        ui.add_space(space::SM);
         ui.colored_label(
-            egui::Color32::from_rgb(240, 180, 90),
-            egui::RichText::new(t!(message_key)).size(12.0),
+            color::WARNING,
+            egui::RichText::new(t!(message_key)).font(typography::label()),
         );
         let label = match switch_to {
             CalibrationMode::FullBody => t!("calibration.switch_mode_full_body"),
@@ -479,14 +480,14 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
         // the stillness fallback has taken over by the time this
         // fires and the hint instead explains the gate switch.
         // Inline-only — no auxiliary button either way.
-        ui.add_space(8.0);
+        ui.add_space(space::SM);
         ui.colored_label(
-            egui::Color32::from_rgb(240, 180, 90),
-            egui::RichText::new(t!(key)).size(12.0),
+            color::WARNING,
+            egui::RichText::new(t!(key)).font(typography::label()),
         );
     }
 
-    ui.add_space(16.0);
+    ui.add_space(space::MD);
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
@@ -575,10 +576,10 @@ fn framing_hint(state: &CalibrationModalState) -> Option<&'static str> {
 /// the aggregated calibration on the variant.
 fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).size(13.0).strong());
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new(instructions).size(12.0));
-    ui.add_space(16.0);
+    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.add_space(space::XS);
+    ui.label(egui::RichText::new(instructions).font(typography::label()));
+    ui.add_space(space::MD);
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
@@ -597,21 +598,70 @@ fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     });
 }
 
-/// Done pane: success/failure message, then auto-close after
-/// `DONE_LINGER_SECONDS`. Cancel is still available so the user
-/// can dismiss the linger immediately.
+/// Done pane: success/failure heading plus a summary of what the
+/// capture actually produced (shoulder span, movement range,
+/// face-neutral status), closed explicitly by the user. The old
+/// 1.5 s auto-close + "Cancel" button pairing both hid the result
+/// and mislabelled "dismiss a finished calibration" as a cancel.
 fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).size(13.0).strong());
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new(instructions).size(12.0));
-    ui.add_space(16.0);
+    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.add_space(space::XS);
+    ui.label(egui::RichText::new(instructions).font(typography::label()));
+    ui.add_space(space::SM);
+
+    if let CalibrationModalState::Done {
+        outcome: DoneOutcome::Success { calibration, .. },
+        ..
+    } = &state.calibration.modal
+    {
+        let span_text = match calibration.shoulder_span_m {
+            Some(s) => t!("calibration.summary_span_value", span = format!("{:.2}", s)),
+            None => t!("calibration.summary_not_captured"),
+        };
+        summary_row(ui, &t!("calibration.summary_span"), &span_text, calibration.shoulder_span_m.is_some());
+
+        let has_range =
+            calibration.x_range_observed.is_some() || calibration.z_range_observed.is_some();
+        let range_text = if has_range {
+            t!("calibration.summary_captured")
+        } else {
+            t!("calibration.summary_skipped")
+        };
+        summary_row(ui, &t!("calibration.summary_range"), &range_text, has_range);
+
+        let has_face = calibration.neutral_face_ypr_mesh.is_some()
+            || calibration.neutral_face_ypr_body.is_some();
+        let face_text = if has_face {
+            t!("calibration.summary_captured")
+        } else {
+            t!("calibration.summary_skipped")
+        };
+        summary_row(ui, &t!("calibration.summary_face"), &face_text, has_face);
+    }
+
+    ui.add_space(space::MD);
 
     ui.horizontal(|ui| {
-        if ui.button(t!("calibration.cancel")).clicked() {
+        if ui.button(t!("calibration.close")).clicked() {
             state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal.close();
         }
+    });
+}
+
+/// One result-summary row: caption label, then a status dot + value.
+/// `captured = false` renders the dot muted (a skipped optional step
+/// is not an error).
+fn summary_row(ui: &mut egui::Ui, label: &str, value: &str, captured: bool) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .font(typography::caption())
+                .color(color::ON_SURFACE_VARIANT),
+        );
+        let dot = if captured { color::SUCCESS } else { color::ON_SURFACE_MUTED };
+        status_dot_label(ui, dot, value);
     });
 }
 
@@ -620,23 +670,18 @@ fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// show yet); `true` for the active-capture states.
 fn draw_live_telemetry(ui: &mut egui::Ui, state: &CalibrationModalState, show_samples: bool) {
     let (anchor_seen, conf, samples) = telemetry(state);
-    let conf_color = if conf >= 0.5 {
-        egui::Color32::from_rgb(120, 220, 140)
-    } else {
-        egui::Color32::from_rgb(220, 130, 120)
-    };
+    let conf_color = if conf >= 0.5 { color::SUCCESS } else { color::ERROR };
     ui.horizontal(|ui| {
         ui.label(t!("calibration.confidence"));
         ui.colored_label(conf_color, format!("{:.2}", conf));
     });
     ui.horizontal(|ui| {
         ui.label(t!("calibration.anchor_visible"));
-        let (label, color) = if anchor_seen {
-            ("✓", egui::Color32::from_rgb(120, 220, 140))
+        if anchor_seen {
+            status_dot_label(ui, color::SUCCESS, &t!("calibration.visible_yes"));
         } else {
-            ("✗", egui::Color32::from_rgb(220, 130, 120))
-        };
-        ui.colored_label(color, label);
+            status_dot_label(ui, color::ERROR, &t!("calibration.visible_no"));
+        }
     });
     if show_samples {
         if let Some(s) = samples {

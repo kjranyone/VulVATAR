@@ -38,6 +38,11 @@ pub enum AfterLoad {
         /// the implicit last-session restore (stays anonymous, no toast).
         project_path: Option<PathBuf>,
         warnings: ProjectLoadWarnings,
+        /// `true` when `project_state` came from the project's
+        /// `.unsaved` sidecar rather than the file itself — the apply
+        /// marks the explicit file stale (title-bar dot) and toasts
+        /// that unsaved changes were restored.
+        restore_unsaved: bool,
     },
 }
 
@@ -140,25 +145,31 @@ impl GuiApp {
                     project_state,
                     project_path,
                     warnings,
+                    restore_unsaved,
                 } = job.after_load
                 {
                     self.apply_project_state(&project_state);
-                    // `finalize_avatar_load` marks the project dirty; the
-                    // state we just applied IS the on-disk state, so clear
-                    // it — otherwise every startup restore would rewrite
+                    // The state we just applied IS the on-disk state —
+                    // re-seed the dirty baseline so the derived probe
+                    // reads clean and a startup restore doesn't rewrite
                     // last_session.vvtproj with identical content.
-                    self.project_status.project_dirty = false;
+                    self.mark_project_baseline();
+                    self.project_status.explicit_file_stale =
+                        restore_unsaved && project_path.is_some();
                     for w in &warnings.warnings {
-                        self.push_notification(t!("toast.warning", msg = w.to_string()));
+                        self.push_warning_notification(t!("toast.warning", msg = w.to_string()));
+                    }
+                    if restore_unsaved {
+                        self.push_notification(t!("toast.restored_unsaved_changes"));
                     }
                     if let Some(project_path) = project_path {
                         self.project_status.project_path = Some(project_path.clone());
-                        self.push_notification(t!("toast.opened_project", path = project_path.display().to_string()));
+                        self.push_success_notification(t!("toast.opened_project", path = project_path.display().to_string()));
                     }
                 }
             }
             LoadOutcome::Error(e) => {
-                self.push_notification(t!("toast.failed_load_avatar", path = job.path.display().to_string(), error = e.to_string()));
+                self.push_error_notification(t!("toast.failed_load_avatar", path = job.path.display().to_string(), error = e.to_string()));
             }
         }
     }

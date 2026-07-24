@@ -27,6 +27,10 @@ pub struct CalibrationUiState {
     pub preview_texture: Option<egui::TextureHandle>,
     pub preview_seq: u64,
     pub preview_rgba_buf: Vec<u8>,
+    /// Annotation from the last consumed preview publish, cached so
+    /// GUI ticks between publishes redraw the keypoint overlay without
+    /// pulling a fresh mailbox snapshot (see `draw_preview_pane`).
+    pub preview_annotation: Option<crate::tracking::DetectionAnnotation>,
     /// Last `torso_template_seq` we consumed from the tracking
     /// mailbox. Drives one-shot stitching of the worker-published
     /// `TorsoDepthTemplate` onto the in-flight `PoseCalibration`.
@@ -207,6 +211,14 @@ pub enum CalibrationModalState {
         /// selection on nearly every frontal-hold frame. Medianed into
         /// `PoseCalibration::neutral_face_ypr_body`.
         face_accum_body: Vec<[f32; 3]>,
+        /// Per-frame shoulder-line horizontal yaw readings
+        /// (`crate::tracking::shoulder_line_yaw`) over the window —
+        /// the torso counterpart of the face accumulators. Medianed
+        /// into `PoseCalibration::neutral_body_yaw` (metric captures
+        /// with enough valid frames only). Empty on non-metric paths;
+        /// the finalizer then carries the previous calibration's
+        /// value forward, same as the face neutrals.
+        body_yaw_accum: Vec<f32>,
         /// Tracks the last mailbox sequence we admitted a sample for,
         /// so we don't double-count when the GUI repaints faster than
         /// the tracking thread emits new frames.

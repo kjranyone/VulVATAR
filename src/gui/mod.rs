@@ -251,6 +251,11 @@ pub struct ViewportUiState {
     /// RGBA scratch buffer reused across uploads so the wipe doesn't
     /// reallocate per frame.
     pub camera_wipe_rgba_buf: Vec<u8>,
+    /// Detection annotation from the last consumed preview publish.
+    /// Cached here so the frames *between* mailbox publishes (GUI
+    /// refresh > camera fps) can redraw the overlay without pulling a
+    /// fresh mailbox snapshot each tick.
+    pub camera_wipe_annotation: Option<crate::tracking::DetectionAnnotation>,
 }
 
 /// Library-panel UI state lifted out of `GuiApp` (architecture
@@ -284,10 +289,44 @@ pub struct LibraryUiState {
     pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
 }
 
+/// A failure that blocks the app's core function until acknowledged,
+/// rendered as a persistent centre modal. Typed (rather than a bare
+/// `String`) so the modal can grow per-kind affordances — a Retry
+/// button for camera-open failures needs to know *what* to retry —
+/// and so producers can't accidentally collapse distinct failures
+/// into indistinguishable text.
+#[derive(Clone, Debug)]
+pub struct BlockingError {
+    pub kind: BlockingErrorKind,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockingErrorKind {
+    /// Tracking worker reported a fatal error (camera open failure,
+    /// model missing, device disconnect past retry budget).
+    Tracking,
+}
+
 pub struct TransformState {
     pub position: [f32; 3],
     pub rotation: [f32; 3],
     pub scale: f32,
+}
+
+// Production defaults for the GUI state blocks. `GuiApp::new` and
+// `GuiApp::for_test` both build from these `Default` impls — the two
+// constructors used to carry hand-copied literal duplicates, so adding
+// a field meant updating both and a drifted default in tests still
+// compiled (tests then exercised different defaults than production).
+impl Default for TransformState {
+    fn default() -> Self {
+        Self {
+            position: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0],
+            scale: 1.0,
+        }
+    }
 }
 
 pub struct CameraOrbitState {
@@ -296,6 +335,18 @@ pub struct CameraOrbitState {
     pub pan: [f32; 2],
     pub distance: f32,
     pub target_distance: f32,
+}
+
+impl Default for CameraOrbitState {
+    fn default() -> Self {
+        Self {
+            yaw_deg: 0.0,
+            pitch_deg: 0.0,
+            pan: [0.0, 0.0],
+            distance: 5.0,
+            target_distance: 5.0,
+        }
+    }
 }
 
 /// Compute camera orbit settings that frame the given AABB with the avatar's
@@ -351,6 +402,36 @@ pub fn camera_fps_for_index(index: usize) -> u32 {
     } else {
         30
     }
+}
+
+/// Inverse of [`camera_resolution_for_index`]: find the combo position
+/// whose real value matches, falling back to the nearest pixel count.
+/// Projects persist VALUES (width/height/fps), so growing or
+/// reordering the combo can never silently retarget a saved format —
+/// this is the only place a value re-becomes a UI position.
+pub fn camera_resolution_index_for(width: u32, height: u32) -> usize {
+    const OPTIONS: [(u32, u32); 3] = [(640, 480), (1280, 720), (1920, 1080)];
+    if let Some(i) = OPTIONS.iter().position(|&(w, h)| (w, h) == (width, height)) {
+        return i;
+    }
+    let target = width as u64 * height as u64;
+    OPTIONS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &(w, h))| (w as u64 * h as u64).abs_diff(target))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Inverse of [`camera_fps_for_index`] — nearest supported rate.
+pub fn camera_fps_index_for(fps: u32) -> usize {
+    const OPTIONS: [u32; 2] = [30, 60];
+    OPTIONS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &f)| f.abs_diff(fps))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 /// Map an `output.output_resolution_index` (Output inspector combo position)
@@ -448,6 +529,18 @@ pub struct LipSyncGuiState {
     pub mouth_source: crate::tracking::MouthSource,
 }
 
+impl Default for LipSyncGuiState {
+    fn default() -> Self {
+        Self {
+            available_mics: Vec::new(),
+            volume_threshold: 0.01,
+            smoothing: 0.5,
+            current_volume: 0.0,
+            mouth_source: crate::tracking::MouthSource::Both,
+        }
+    }
+}
+
 pub struct RenderingGuiState {
     pub material_mode_index: usize,
     pub background_color: [f32; 3],
@@ -475,6 +568,32 @@ pub struct RenderingGuiState {
     pub toggle_cloth: bool,
     pub toggle_collision_debug: bool,
     pub toggle_skeleton_debug: bool,
+}
+
+impl Default for RenderingGuiState {
+    fn default() -> Self {
+        Self {
+            material_mode_index: 2,
+            background_color: [0.1, 0.1, 0.1],
+            transparent_background: true,
+            camera_fov: 60.0,
+            main_light_dir: [0.5, -1.0, 0.3],
+            main_light_intensity: 1.0,
+            ambient_intensity: [0.2, 0.2, 0.2],
+            alpha_preview: false,
+            bloom_enabled: false,
+            bloom_intensity: 0.6,
+            bloom_threshold: 1.0,
+            generative_background:
+                crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
+            toggle_spring: true,
+            spring_tuning: crate::simulation::spring::SpringTuning::default(),
+            scene_gravity: crate::simulation::SceneGravity::default(),
+            toggle_cloth: false,
+            toggle_collision_debug: false,
+            toggle_skeleton_debug: false,
+        }
+    }
 }
 
 /// Output settings the inspector binds to. The pipeline-bound *sink* lives
@@ -507,6 +626,18 @@ pub struct OutputGuiState {
     pub msaa_index: usize,
 }
 
+impl Default for OutputGuiState {
+    fn default() -> Self {
+        Self {
+            output_resolution_index: 0,
+            output_framerate_index: 0,
+            output_has_alpha: true,
+            output_color_space_index: 0,
+            msaa_index: 0,
+        }
+    }
+}
+
 pub struct SettingsGuiState {
     pub locale: String,
     pub zoom_sensitivity: f32,
@@ -518,6 +649,41 @@ pub struct SettingsGuiState {
     /// slot here). Updated by `remember_last_project` on every explicit
     /// project open / save; consumed once at startup for the auto-reopen.
     pub last_project_path: Option<String>,
+}
+
+impl Default for SettingsGuiState {
+    fn default() -> Self {
+        Self {
+            locale: "en".to_string(),
+            zoom_sensitivity: 0.002,
+            orbit_sensitivity: 0.3,
+            pan_sensitivity: 1.0,
+            last_project_path: None,
+        }
+    }
+}
+
+/// Default for the tracking panel state — also the production default
+/// (`GuiApp::new` starts from this and only startup-restore mutates it).
+impl Default for TrackingGuiState {
+    fn default() -> Self {
+        Self {
+            toggle_tracking: true,
+            camera_resolution_index: 0,
+            camera_framerate_index: 0,
+            tracking_mirror: true,
+            hand_tracking_enabled: false,
+            face_tracking_enabled: true,
+            lower_body_tracking_enabled: false,
+            root_translation_enabled: true,
+            fade_on_tracking_loss: false,
+            smoothing: TrackingSmoothingParams::default(),
+            force_cpu_inference: false,
+            yolox_enabled: true,
+            safe_mode_armed: false,
+            unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
+        }
+    }
 }
 
 /// Per-frame timing + pause state lifted out of `GuiApp`
@@ -568,15 +734,28 @@ pub struct ProjectStatusUi {
     /// "Open Recent" submenu and persisted via
     /// `crate::persistence::save_recent_avatars`.
     pub recent_avatars: Vec<PathBuf>,
-    /// Set whenever the in-memory project state diverges from disk.
-    /// The per-frame autosave block compares
-    /// `last_autosave.elapsed()` against `AUTOSAVE_THROTTLE`; once
-    /// the throttle clears, a `save_project` call flips this back
-    /// to `false`.
+    /// Set whenever the in-memory project state diverges from its last
+    /// autosaved snapshot. Cleared by the autosave tick once the state
+    /// lands in `last_session.vvtproj` / the project's `.unsaved`
+    /// sidecar, and by an explicit Save.
     pub project_dirty: bool,
-    /// Immediate-save throttle clock. Updated each time the project
-    /// is saved.
-    pub last_autosave: Instant,
+    /// `true` when the explicitly opened `.vvtproj` on disk is behind
+    /// the autosaved sidecar — i.e. there are changes only an explicit
+    /// Save will persist to the user's real file. Drives the title-bar
+    /// dot together with `project_dirty`; cleared by Save / Save As.
+    pub explicit_file_stale: bool,
+    /// Backoff clocks for the three autosave targets. Base delay is the
+    /// 250 ms write throttle; consecutive failures back off to 10 s.
+    pub(super) project_save_retry: project::SaveRetry,
+    pub(super) profiles_save_retry: project::SaveRetry,
+    pub(super) settings_save_retry: project::SaveRetry,
+    /// Message text of the sticky failure toast currently shown per
+    /// target (if any) so a later success can dismiss exactly it.
+    pub(super) last_project_save_error: Option<String>,
+    pub(super) last_profiles_save_error: Option<String>,
+    pub(super) last_settings_save_error: Option<String>,
+    /// One-shot latch for the recovery-write warning toast.
+    pub(super) recovery_write_warned: bool,
     /// Crash-recovery manager: writes a sidecar snapshot on every
     /// dirty mutation so an abnormal exit can be recovered from
     /// next session.
@@ -597,12 +776,18 @@ pub struct ProjectStatusUi {
     /// settings deliberately do NOT ride `project_dirty`: they follow
     /// the user, not the scene.
     pub app_settings_dirty: bool,
-    /// Throttle clock for the `settings.json` flush. The Settings
-    /// pane's sensitivity sliders set `app_settings_dirty` every frame
-    /// of a drag (~60/s); without this the autosave would `atomic_write`
-    /// (backup-copy + temp + rename) on every one of those frames. Same
-    /// 250 ms cap the project autosave uses.
-    pub last_app_settings_save: Instant,
+    /// The `ProjectState` most recently persisted (autosave target) or
+    /// loaded/applied. `GuiApp::refresh_project_dirty` derives
+    /// `project_dirty` by comparing the live snapshot against this —
+    /// the single mechanism that detects *every* project-visible
+    /// change, replacing per-widget `project_dirty = true` calls
+    /// (each of which was one forgotten line away from a setting
+    /// that silently never saved). `None` only before the first
+    /// probe/baseline of the session.
+    pub(super) project_baseline: Option<crate::persistence::ProjectState>,
+    /// Throttle clock for the dirty probe (compares a <2 KB struct;
+    /// probing at the autosave cadence is plenty).
+    pub(super) last_dirty_probe: Instant,
 }
 
 impl ProjectStatusUi {
@@ -615,12 +800,20 @@ impl ProjectStatusUi {
             project_path: None,
             recent_avatars,
             project_dirty: false,
-            last_autosave: now,
+            explicit_file_stale: false,
+            project_save_retry: project::SaveRetry::new(now),
+            profiles_save_retry: project::SaveRetry::new(now),
+            settings_save_retry: project::SaveRetry::new(now),
+            last_project_save_error: None,
+            last_profiles_save_error: None,
+            last_settings_save_error: None,
+            recovery_write_warned: false,
             recovery_manager,
             overlay_dirty: false,
             profiles_dirty: false,
             app_settings_dirty: false,
-            last_app_settings_save: now,
+            project_baseline: None,
+            last_dirty_probe: now,
         }
     }
 }
@@ -637,9 +830,15 @@ pub enum AppMode {
 }
 
 impl AppMode {
-    pub const ALL: [AppMode; 7] = [
+    /// Navigable modes. `Preview` is intentionally absent: its cards
+    /// were redistributed (avatar info / expressions → Avatar,
+    /// transforms / background / gravity → Scene, cloth attachment →
+    /// Cloth Authoring) and the mode itself retired. The enum variant
+    /// survives only because the hotkey layer still maps
+    /// `SwitchModePreview` to it — [`AppMode::normalized`] folds it
+    /// into `Rendering` (labelled "Scene") before any frame draws.
+    pub const ALL: [AppMode; 6] = [
         AppMode::Avatar,
-        AppMode::Preview,
         AppMode::TrackingSetup,
         AppMode::Rendering,
         AppMode::Output,
@@ -647,12 +846,25 @@ impl AppMode {
         AppMode::Settings,
     ];
 
+    /// Fold retired modes onto their successor. Call sites that accept
+    /// a mode from outside the nav rail (hotkeys, persisted defaults)
+    /// run their value through this so `Preview` can never reach the
+    /// dispatch table as itself.
+    pub fn normalized(self) -> AppMode {
+        match self {
+            AppMode::Preview => AppMode::Rendering,
+            other => other,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             AppMode::Avatar => t!("app.modes.avatar"),
-            AppMode::Preview => t!("app.modes.preview"),
+            // Retired — normalised to Rendering/Scene before display;
+            // keep the arm exhaustive with the successor's label.
+            AppMode::Preview => t!("app.modes.scene"),
             AppMode::TrackingSetup => t!("app.modes.tracking_setup"),
-            AppMode::Rendering => t!("app.modes.rendering"),
+            AppMode::Rendering => t!("app.modes.scene"),
             AppMode::Output => t!("app.modes.output"),
             AppMode::ClothAuthoring => t!("app.modes.cloth_authoring"),
             AppMode::Settings => t!("app.modes.settings"),
@@ -681,7 +893,32 @@ pub struct GuiApp {
     /// until the user dismisses it. Unlike a toast it never auto-expires, so
     /// a connection failure the user glanced away from stays on screen and
     /// actionable, stating its root cause + remedy.
-    pub blocking_error: Option<String>,
+    pub blocking_error: Option<BlockingError>,
+
+    /// In-flight OS file-dialog worker (open/save pickers run off the
+    /// UI thread so the viewport keeps rendering); drained by
+    /// `poll_file_dialog` each frame.
+    pub(crate) pending_file_dialog: Option<top_bar::PendingFileDialog>,
+
+    /// A `.vrm` was dropped while another avatar is active — held here
+    /// until the user confirms the replacement (drag-and-drop is the
+    /// one load entrance where a single stray gesture can nuke the
+    /// current avatar, so it alone gets a confirm step).
+    pub(crate) pending_avatar_drop: Option<PathBuf>,
+
+    /// Profile New / Rename / Delete dialog state (top-bar combo's
+    /// management actions); drawn by `top_bar::draw_profile_dialogs`.
+    pub(crate) profile_dialog: Option<top_bar::ProfileDialog>,
+
+    /// Target index of a profile switch that would drop the current
+    /// pose calibration (calibrated → uncalibrated) — held until the
+    /// user confirms, since re-capturing costs a full hold-still cycle.
+    pub(crate) pending_profile_switch: Option<usize>,
+
+    /// Session-only Settings toggle: show the diagnostic status-bar
+    /// fields (frame counter, output queue/dropped). Off by default —
+    /// they are developer readouts, not streamer-facing signal.
+    pub debug_status_bar: bool,
 
     pub transform: TransformState,
     pub camera_orbit: CameraOrbitState,
@@ -789,7 +1026,7 @@ impl GuiApp {
         }
 
         let mut state = Self {
-            mode: AppMode::Preview,
+            mode: AppMode::Avatar,
             app,
 
             runtime_status: RuntimeStatusUi::new(Instant::now()),
@@ -811,63 +1048,17 @@ impl GuiApp {
 
             notifications: Vec::new(),
             blocking_error: None,
+            pending_file_dialog: None,
+            pending_avatar_drop: None,
+            profile_dialog: None,
+            pending_profile_switch: None,
+            debug_status_bar: false,
 
-            transform: TransformState {
-                position: [0.0, 0.0, 0.0],
-                rotation: [0.0, 0.0, 0.0],
-                scale: 1.0,
-            },
-            camera_orbit: CameraOrbitState {
-                yaw_deg: 0.0,
-                pitch_deg: 0.0,
-                pan: [0.0, 0.0],
-                distance: 5.0,
-                target_distance: 5.0,
-            },
-            tracking: TrackingGuiState {
-                toggle_tracking: true,
-                camera_resolution_index: 0,
-                camera_framerate_index: 0,
-                tracking_mirror: true,
-                hand_tracking_enabled: false,
-                face_tracking_enabled: true,
-                lower_body_tracking_enabled: false,
-                root_translation_enabled: true,
-                fade_on_tracking_loss: false,
-                smoothing: TrackingSmoothingParams::default(),
-                force_cpu_inference: false,
-                yolox_enabled: true,
-                safe_mode_armed: false,
-                unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
-            },
-            rendering: RenderingGuiState {
-                material_mode_index: 2,
-                background_color: [0.1, 0.1, 0.1],
-                transparent_background: true,
-                camera_fov: 60.0,
-                main_light_dir: [0.5, -1.0, 0.3],
-                main_light_intensity: 1.0,
-                ambient_intensity: [0.2, 0.2, 0.2],
-                alpha_preview: false,
-                bloom_enabled: false,
-                bloom_intensity: 0.6,
-                bloom_threshold: 1.0,
-                generative_background:
-                    crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
-                toggle_spring: true,
-                spring_tuning: crate::simulation::spring::SpringTuning::default(),
-                scene_gravity: crate::simulation::SceneGravity::default(),
-                toggle_cloth: false,
-                toggle_collision_debug: false,
-                toggle_skeleton_debug: false,
-            },
-            output: OutputGuiState {
-                output_resolution_index: 0,
-                output_framerate_index: 0,
-                output_has_alpha: true,
-                output_color_space_index: 0,
-                msaa_index: 0,
-            },
+            transform: TransformState::default(),
+            camera_orbit: CameraOrbitState::default(),
+            tracking: TrackingGuiState::default(),
+            rendering: RenderingGuiState::default(),
+            output: OutputGuiState::default(),
 
             settings: SettingsGuiState {
                 locale: app_settings.locale.clone(),
@@ -887,10 +1078,7 @@ impl GuiApp {
 
             lipsync: LipSyncGuiState {
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
-                volume_threshold: 0.01,
-                smoothing: 0.5,
-                current_volume: 0.0,
-                mouth_source: crate::tracking::MouthSource::Both,
+                ..LipSyncGuiState::default()
             },
 
             cloth_authoring: ClothAuthoringUiState {
@@ -936,24 +1124,40 @@ impl GuiApp {
             crate::persistence::ProjectLoadWarnings,
             Option<PathBuf>,
         )> = None;
+        // `true` when the restored state came from the project's
+        // `.unsaved` sidecar (last session quit without an explicit
+        // Save) — apply marks the explicit file stale + toasts.
+        let mut restore_unsaved = false;
         if let Some(last_project) = state.settings.last_project_path.clone() {
             let last_project_path = PathBuf::from(&last_project);
             if last_project_path.exists() {
-                match crate::persistence::load_project(&last_project_path) {
+                // Unsaved changes from the previous session live in the
+                // autosaved sidecar; prefer it when it's newer so a quit
+                // without Save doesn't silently roll the scene back.
+                let sidecar = project::unsaved_sidecar_path(&last_project_path);
+                let load_path = if project::sidecar_is_newer(&last_project_path, &sidecar) {
+                    restore_unsaved = true;
+                    sidecar
+                } else {
+                    last_project_path.clone()
+                };
+                match crate::persistence::load_project(&load_path) {
                     Ok((ps, warnings)) => {
                         info!(
-                            "persistence: reopening last project {}",
-                            last_project_path.display()
+                            "persistence: reopening last project {} (unsaved sidecar: {})",
+                            last_project_path.display(),
+                            restore_unsaved
                         );
                         restored = Some((ps, warnings, Some(last_project_path)));
                     }
                     Err(e) => {
+                        restore_unsaved = false;
                         warn!(
                             "persistence: could not reopen last project {}: {}",
                             last_project_path.display(),
                             e
                         );
-                        state.push_notification(t!(
+                        state.push_error_notification(t!(
                             "top_bar.failed_load_project",
                             error = e.to_string()
                         ));
@@ -964,7 +1168,7 @@ impl GuiApp {
                     "persistence: last project no longer exists: {}",
                     last_project_path.display()
                 );
-                state.push_notification(t!(
+                state.push_warning_notification(t!(
                     "toast.last_project_missing",
                     path = last_project.clone()
                 ));
@@ -1008,7 +1212,7 @@ impl GuiApp {
                 }
                 project::StartupAvatarIssue::ProjectAvatarMissing(p) => {
                     warn!("persistence: restored avatar no longer exists: {p}");
-                    state.push_notification(t!("top_bar.avatar_not_found", path = p));
+                    state.push_warning_notification(t!("top_bar.avatar_not_found", path = p));
                 }
             }
         }
@@ -1029,6 +1233,7 @@ impl GuiApp {
                             project_state: Box::new(ps),
                             project_path,
                             warnings,
+                            restore_unsaved,
                         },
                     ),
                 );
@@ -1038,12 +1243,17 @@ impl GuiApp {
             }
             (None, Some((ps, warnings, project_path))) => {
                 state.apply_project_state(&ps);
-                state.project_status.project_dirty = false;
+                state.mark_project_baseline();
+                state.project_status.explicit_file_stale =
+                    restore_unsaved && project_path.is_some();
                 for w in &warnings.warnings {
-                    state.push_notification(t!("toast.warning", msg = w.to_string()));
+                    state.push_warning_notification(t!("toast.warning", msg = w.to_string()));
+                }
+                if restore_unsaved {
+                    state.push_notification(t!("toast.restored_unsaved_changes"));
                 }
                 if let Some(path) = project_path {
-                    state.push_notification(t!(
+                    state.push_success_notification(t!(
                         "toast.opened_project",
                         path = path.display().to_string()
                     ));
@@ -1128,7 +1338,7 @@ impl GuiApp {
     pub(crate) fn for_test() -> Self {
         let app = Box::new(Application::new());
         Self {
-            mode: AppMode::Preview,
+            mode: AppMode::Avatar,
             app,
 
             runtime_status: RuntimeStatusUi::new(Instant::now()),
@@ -1144,71 +1354,19 @@ impl GuiApp {
 
             notifications: Vec::new(),
             blocking_error: None,
+            pending_file_dialog: None,
+            pending_avatar_drop: None,
+            profile_dialog: None,
+            pending_profile_switch: None,
+            debug_status_bar: false,
 
-            transform: TransformState {
-                position: [0.0, 0.0, 0.0],
-                rotation: [0.0, 0.0, 0.0],
-                scale: 1.0,
-            },
-            camera_orbit: CameraOrbitState {
-                yaw_deg: 0.0,
-                pitch_deg: 0.0,
-                pan: [0.0, 0.0],
-                distance: 5.0,
-                target_distance: 5.0,
-            },
-            tracking: TrackingGuiState {
-                toggle_tracking: true,
-                camera_resolution_index: 0,
-                camera_framerate_index: 0,
-                tracking_mirror: true,
-                hand_tracking_enabled: false,
-                face_tracking_enabled: true,
-                lower_body_tracking_enabled: false,
-                root_translation_enabled: true,
-                fade_on_tracking_loss: false,
-                smoothing: TrackingSmoothingParams::default(),
-                force_cpu_inference: false,
-                yolox_enabled: true,
-                safe_mode_armed: false,
-                unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
-            },
-            rendering: RenderingGuiState {
-                material_mode_index: 2,
-                background_color: [0.1, 0.1, 0.1],
-                transparent_background: true,
-                camera_fov: 60.0,
-                main_light_dir: [0.5, -1.0, 0.3],
-                main_light_intensity: 1.0,
-                ambient_intensity: [0.2, 0.2, 0.2],
-                alpha_preview: false,
-                bloom_enabled: false,
-                bloom_intensity: 0.6,
-                bloom_threshold: 1.0,
-                generative_background:
-                    crate::renderer::frame_input::GenerativeBackgroundSettings::default(),
-                toggle_spring: true,
-                spring_tuning: crate::simulation::spring::SpringTuning::default(),
-                scene_gravity: crate::simulation::SceneGravity::default(),
-                toggle_cloth: false,
-                toggle_collision_debug: false,
-                toggle_skeleton_debug: false,
-            },
-            output: OutputGuiState {
-                output_resolution_index: 0,
-                output_framerate_index: 0,
-                output_has_alpha: true,
-                output_color_space_index: 0,
-                msaa_index: 0,
-            },
+            transform: TransformState::default(),
+            camera_orbit: CameraOrbitState::default(),
+            tracking: TrackingGuiState::default(),
+            rendering: RenderingGuiState::default(),
+            output: OutputGuiState::default(),
 
-            settings: SettingsGuiState {
-                locale: "en".to_string(),
-                zoom_sensitivity: 0.002,
-                orbit_sensitivity: 0.3,
-                pan_sensitivity: 1.0,
-                last_project_path: None,
-            },
+            settings: SettingsGuiState::default(),
 
             mirror_view: false,
             viewport: ViewportUiState {
@@ -1218,13 +1376,7 @@ impl GuiApp {
 
             calibration: calibration::CalibrationUiState::default(),
 
-            lipsync: LipSyncGuiState {
-                available_mics: Vec::new(),
-                volume_threshold: 0.01,
-                smoothing: 0.5,
-                current_volume: 0.0,
-                mouth_source: crate::tracking::MouthSource::Both,
-            },
+            lipsync: LipSyncGuiState::default(),
 
             cloth_authoring: ClothAuthoringUiState::default(),
             inspector_open: true,
@@ -1260,6 +1412,47 @@ impl GuiApp {
             .is_some_and(|w| w.is_ready())
     }
 
+    /// Start the camera with the panel-configured resolution / fps /
+    /// pipeline, applying the safe-mode clamp. Single entry point for
+    /// the top-bar toggle; the Tracking panel's Start button and its
+    /// restart-on-format-change block should migrate onto this helper
+    /// too (left in place for now — the panel file is being reworked
+    /// in parallel; see the Wave-2 shell-redesign handoff note).
+    pub(crate) fn start_camera_with_current_params(&mut self) {
+        let (w, h) = camera_resolution_for_index(self.tracking.camera_resolution_index);
+        let fps = camera_fps_for_index(self.tracking.camera_framerate_index);
+        // Safe mode also caps the capture format — less camera
+        // bandwidth and per-frame CPU work while diagnosing an
+        // unclean exit.
+        let (w, h, fps) = if self.tracking.safe_mode_armed {
+            (w.min(1280), h.min(720), fps.min(30))
+        } else {
+            (w, h, fps)
+        };
+        let pipeline = self.tracking.pipeline_config();
+        self.app.start_tracking_with_params(w, h, fps, pipeline);
+    }
+
+    /// Open the pose-calibration modal at the active profile's last
+    /// calibrated mode (FullBody for a first capture). Mirrors the
+    /// Tracking panel's launcher, including the avatar-load gate —
+    /// the load Window is its own modal and stacking the calibration
+    /// scrim over it would bury the progress readout.
+    pub(crate) fn open_calibration_modal(&mut self) {
+        if self.library.avatar_load_job.is_some() {
+            self.push_warning_notification(t!("top_bar.avatar_load_in_progress"));
+            return;
+        }
+        let default_mode = self
+            .app
+            .tracking_calibration
+            .pose
+            .as_ref()
+            .map(|c| c.mode)
+            .unwrap_or(crate::tracking::CalibrationMode::FullBody);
+        self.calibration.modal.open(default_mode);
+    }
+
     /// Save the avatar library to disk and surface failures as an error
     /// toast. Every former call site used `let _ = save_avatar_library(...)`
     /// — silently swallowing the error meant a full disk or read-only
@@ -1279,7 +1472,11 @@ impl GuiApp {
         self.project_status.recent_avatars.retain(|p| p != &path);
         self.project_status.recent_avatars.insert(0, path);
         self.project_status.recent_avatars.truncate(10);
-        let _ = crate::persistence::save_recent_avatars(&self.project_status.recent_avatars);
+        if let Err(e) =
+            crate::persistence::save_recent_avatars(&self.project_status.recent_avatars)
+        {
+            warn!("persistence: save_recent_avatars failed: {}", e);
+        }
     }
 
     /// Build a `RuntimeToggles` from the current GUI state.
@@ -1461,9 +1658,29 @@ impl GuiApp {
     }
 }
 
+/// Localised label for an avatar-load progress stage. The asset-layer
+/// `LoadStage::label()` is English-only; the GUI maps the enum through
+/// the locale table so the loading spinner speaks the UI language.
+fn load_stage_label(stage: &crate::asset::vrm::LoadStage) -> String {
+    use crate::asset::vrm::LoadStage;
+    match stage {
+        LoadStage::Reading => t!("load_stage.reading"),
+        LoadStage::Parsing => t!("load_stage.parsing"),
+        LoadStage::Skeleton => t!("load_stage.skeleton"),
+        LoadStage::Meshes => t!("load_stage.meshes"),
+        LoadStage::Materials { current, total } => {
+            t!("load_stage.materials", current = current, total = total)
+        }
+        LoadStage::SpringBones => t!("load_stage.spring_bones"),
+        LoadStage::Finalizing => t!("load_stage.finalizing"),
+    }
+}
+
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle drag-and-drop VRM files
+        // Handle dropped files. Every supported project artefact is
+        // accepted, and an unsupported extension gets a toast — a drop
+        // that silently does nothing is indistinguishable from a hang.
         let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             if let Some(path) = file.path {
@@ -1472,12 +1689,86 @@ impl eframe::App for GuiApp {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                if ext == "vrm" {
-                    info!("gui: dropped VRM file: {:?}", path);
-                    top_bar::load_avatar_from_path(self, &path);
+                match ext.as_str() {
+                    "vrm" => {
+                        info!("gui: dropped VRM file: {:?}", path);
+                        // Replacing a live avatar from a stray drag is
+                        // the one accidental-destruction path — ask
+                        // first. First load (no avatar yet) and a
+                        // same-file reload go straight through.
+                        let replaces_other = self
+                            .app
+                            .active_avatar()
+                            .is_some_and(|a| a.asset.source_path != path);
+                        if replaces_other {
+                            self.pending_avatar_drop = Some(path);
+                        } else {
+                            top_bar::load_avatar_from_path(self, &path);
+                        }
+                    }
+                    "vvtproj" => {
+                        info!("gui: dropped project file: {:?}", path);
+                        top_bar::open_project_from_path(self, &path);
+                    }
+                    "vvtcloth" => {
+                        info!("gui: dropped cloth overlay: {:?}", path);
+                        top_bar::open_overlay_from_path(self, &path);
+                    }
+                    _ => {
+                        self.push_warning_notification(t!(
+                            "toast.unsupported_drop",
+                            path = path.display().to_string()
+                        ));
+                    }
                 }
             }
         }
+
+        // Confirm dialog for a dropped VRM that would replace the
+        // active avatar.
+        if let Some(pending) = self.pending_avatar_drop.clone() {
+            let mut decision: Option<bool> = None;
+            let file_label = pending
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| pending.display().to_string());
+            egui::Window::new(t!("dialog.replace_avatar_title"))
+                .id(egui::Id::new("avatar_replace_confirm"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.label(t!("dialog.replace_avatar_body", file = file_label));
+                    ui.add_space(theme::space::SM);
+                    ui.horizontal(|ui| {
+                        if ui.button(t!("dialog.replace_avatar_confirm")).clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button(t!("calibration.cancel")).clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => {
+                    self.pending_avatar_drop = None;
+                    top_bar::load_avatar_from_path(self, &pending);
+                }
+                Some(false) => {
+                    self.pending_avatar_drop = None;
+                }
+                None => {}
+            }
+        }
+
+        // Profile management dialogs (New / Rename / Delete) + the
+        // calibration-loss switch confirmation from the top-bar combo.
+        top_bar::draw_profile_dialogs(ctx, self);
+
+        // Drain any finished OS file-dialog worker (open/save pickers
+        // run off the UI thread — see `top_bar::request_file_dialog`).
+        self.poll_file_dialog();
 
         // E10: Measure frame timing.
         let now = Instant::now();
@@ -1497,8 +1788,13 @@ impl eframe::App for GuiApp {
                 // Blocking errors get a persistent modal (drawn below) so a
                 // camera/connection failure can't be missed; warnings stay as
                 // auto-expiring toasts.
-                TrackingErrorLevel::Blocking => self.blocking_error = Some(err),
-                TrackingErrorLevel::Warning => self.push_notification(err),
+                TrackingErrorLevel::Blocking => {
+                    self.blocking_error = Some(BlockingError {
+                        kind: BlockingErrorKind::Tracking,
+                        message: err,
+                    })
+                }
+                TrackingErrorLevel::Warning => self.push_warning_notification(err),
             }
         }
 
@@ -1548,6 +1844,9 @@ impl eframe::App for GuiApp {
             self.app.drain_render_results();
         }
 
+        // Derive `project_dirty` from an actual state comparison before
+        // the autosave reads it — see `refresh_project_dirty`.
+        self.refresh_project_dirty(Instant::now(), false);
         self.autosave_tick();
         self.write_recovery_snapshot_if_due();
 
@@ -1605,7 +1904,7 @@ impl eframe::App for GuiApp {
 
         // Loading-spinner overlay while a background avatar load is in flight.
         if let Some(job) = self.library.avatar_load_job.as_ref() {
-            let stage_label = job.current_stage.label();
+            let stage_label = load_stage_label(&job.current_stage);
             let file_label = job
                 .path
                 .file_name()
@@ -1635,8 +1934,8 @@ impl eframe::App for GuiApp {
         // above the viewport and other windows (Foreground) so a
         // camera/connection failure is impossible to miss and states its root
         // cause + remedy, rather than flashing past in a 15 s toast.
-        if let Some(msg) = self.blocking_error.clone() {
-            let mut dismiss = false;
+        let mut dismiss_blocking_error = false;
+        if let Some(err) = self.blocking_error.as_ref() {
             egui::Window::new(t!("dialog.tracking_error_title"))
                 .id(egui::Id::new("tracking_blocking_error_modal"))
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -1645,7 +1944,7 @@ impl eframe::App for GuiApp {
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     ui.set_max_width(440.0);
-                    ui.label(egui::RichText::new(&msg));
+                    ui.label(egui::RichText::new(err.message.as_str()));
                     ui.add_space(12.0);
                     if components::filled_button(
                         ui,
@@ -1655,12 +1954,12 @@ impl eframe::App for GuiApp {
                     )
                     .clicked()
                     {
-                        dismiss = true;
+                        dismiss_blocking_error = true;
                     }
                 });
-            if dismiss {
-                self.blocking_error = None;
-            }
+        }
+        if dismiss_blocking_error {
+            self.blocking_error = None;
         }
 
         self.draw_toasts(ctx);
@@ -1733,17 +2032,22 @@ impl eframe::App for GuiApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Final dirty probe, bypassing the 250 ms throttle: a change
+        // made in the last quarter-second before quit must still be
+        // detected before the flush below reads the flag.
+        self.refresh_project_dirty(Instant::now(), true);
         // Flush a pending dirty save synchronously. The per-frame
         // throttle waits 250ms before writing, so a user who flips a
         // checkbox and immediately Alt+F4s would otherwise lose the
-        // change. Falls back to `last_session.vvtproj` when the user
-        // never opened a project file.
+        // change. Like the autosave tick, this never touches the
+        // explicit `.vvtproj` — unsaved changes go to the project's
+        // `.unsaved` sidecar (restored + marked dirty next launch) or
+        // to `last_session.vvtproj` when no project is open.
         if self.project_status.project_dirty {
-            let path = self
-                .project_status
-                .project_path
-                .clone()
-                .unwrap_or_else(crate::persistence::last_session_path);
+            let path = match self.project_status.project_path.clone() {
+                Some(project) => project::unsaved_sidecar_path(&project),
+                None => crate::persistence::last_session_path(),
+            };
             let project_state = self.to_project_state();
             if let Err(e) = crate::persistence::save_project(&project_state, &path) {
                 warn!(
@@ -1751,6 +2055,20 @@ impl eframe::App for GuiApp {
                     path.display(),
                     e
                 );
+            }
+        }
+
+        // Flush the other two dirty stores as well — profiles carry
+        // pose calibrations and settings carry locale/sensitivities;
+        // both used to be silently dropped on a quick quit.
+        if self.project_status.profiles_dirty {
+            if let Err(e) = crate::persistence::save_profiles(&self.profiles) {
+                warn!("persistence: final save_profiles on exit failed: {}", e);
+            }
+        }
+        if self.project_status.app_settings_dirty {
+            if let Err(e) = crate::persistence::save_app_settings(&self.collect_app_settings()) {
+                warn!("persistence: final save_app_settings on exit failed: {}", e);
             }
         }
 

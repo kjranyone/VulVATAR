@@ -26,7 +26,11 @@ impl GuiApp {
             fw.watch(&path, true)?;
             self.library.watched_avatar_dirs.push(path.clone());
             self.push_notification(t!("toast.watched_folder", path = path.display().to_string()));
-            let _ = crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs);
+            if let Err(e) =
+                crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs)
+            {
+                warn!("persistence: save_watched_folders failed: {}", e);
+            }
         }
         Ok(())
     }
@@ -36,7 +40,11 @@ impl GuiApp {
             fw.unwatch(path)?;
             self.library.watched_avatar_dirs.retain(|p| p != path);
             self.push_notification(t!("toast.stopped_watching", path = path.display().to_string()));
-            let _ = crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs);
+            if let Err(e) =
+                crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs)
+            {
+                warn!("persistence: save_watched_folders failed: {}", e);
+            }
             if self.library.watched_avatar_dirs.is_empty() {
                 self.library.folder_watcher = None;
             }

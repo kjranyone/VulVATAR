@@ -1,17 +1,17 @@
 use eframe::egui;
 
-use crate::gui::components::{card, chip, icon_button, icon_text, tonal_button, ButtonTone};
+use crate::gui::components::{
+    card, chip, collapsible_section, icon_button, icon_text, tonal_button, ButtonTone,
+};
 use crate::gui::theme::{color, icon as ic, radius, space, typography};
 use crate::gui::{GuiApp, LibrarySortMode};
 use crate::t;
 
-/// Watched-folder accordion. Stays as `CollapsingHeader` because it
-/// is a sub-section of the Model Library card; the chrome already
-/// reads correctly under the new theme.
+/// Watched-folder accordion — a frameless collapsible sub-section of
+/// the Model Library card (a nested full card would double up the
+/// elevation chrome).
 pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new(t!("watched_folders.heading"))
-        .default_open(false)
-        .show(ui, |ui| {
+    collapsible_section(ui, "watched_folders.heading", t!("watched_folders.heading"), false, |ui| {
             let watched: Vec<std::path::PathBuf> = state.library.watched_avatar_dirs.clone();
 
             if watched.is_empty() {
@@ -111,9 +111,7 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// Avatar Load Cache accordion — surfaces cache stats so users can
 /// see size and wipe without opening Explorer.
 pub(super) fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
-    egui::CollapsingHeader::new(t!("avatar_cache.heading"))
-        .default_open(false)
-        .show(ui, |ui| {
+    collapsible_section(ui, "avatar_cache.heading", t!("avatar_cache.heading"), false, |ui| {
             let stats = crate::asset::cache::stats();
             let dir = crate::persistence::cache_dir();
             ui.label(

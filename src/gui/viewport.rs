@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::gui::theme::color;
+use crate::gui::theme::{color, viz};
 use crate::gui::GuiApp;
 use crate::t;
 use crate::renderer::debug::{self, DebugDrawList};
@@ -199,8 +199,8 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     // rendered image so transparent areas are visible.
                     if state.rendering.alpha_preview {
                         let check = 16.0_f32;
-                        let c1 = egui::Color32::from_rgb(180, 180, 180);
-                        let c2 = egui::Color32::from_rgb(220, 220, 220);
+                        let c1 = viz::CHECKER_LIGHT_A;
+                        let c2 = viz::CHECKER_LIGHT_B;
                         let cols = ((draw_rect.width() / check).ceil() as usize).min(256);
                         let rows = ((draw_rect.height() / check).ceil() as usize).min(256);
                         for row in 0..rows {
@@ -235,10 +235,10 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             } else {
                 // ── Placeholder (no rendered image yet) ────────────────
                 if state.rendering.transparent_background {
-                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
+                    painter.rect_filled(rect, 0.0, color::VIEWPORT_BG);
                     let check = 16.0_f32;
-                    let c1 = egui::Color32::from_rgb(30, 30, 35);
-                    let c2 = egui::Color32::from_rgb(40, 40, 45);
+                    let c1 = viz::CHECKER_DARK_A;
+                    let c2 = viz::CHECKER_DARK_B;
                     let cols = ((rect.width() / check).ceil() as usize).min(256);
                     let rows = ((rect.height() / check).ceil() as usize).min(256);
                     for row in 0..rows {
@@ -271,7 +271,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 }
 
                 // Grid overlay.
-                let grid_color = egui::Color32::from_rgb(45, 45, 55);
+                let grid_color = viz::GRID;
                 let spacing = 40.0_f32;
 
                 let mut y = rect.top();
@@ -294,7 +294,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
                 // Center crosshair and labels.
                 let center = rect.center();
-                let cross_color = egui::Color32::from_rgb(70, 70, 85);
+                let cross_color = viz::CROSSHAIR;
                 painter.line_segment(
                     [
                         egui::pos2(center.x - 12.0, center.y),
@@ -310,20 +310,76 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     egui::Stroke::new(1.0, cross_color),
                 );
 
-                painter.text(
-                    egui::pos2(center.x, center.y - 20.0),
-                    egui::Align2::CENTER_CENTER,
-                    t!("viewport.viewport"),
-                    egui::FontId::proportional(20.0),
-                    egui::Color32::from_rgb(100, 100, 115),
-                );
-                painter.text(
-                    egui::pos2(center.x, center.y + 20.0),
-                    egui::Align2::CENTER_CENTER,
-                    t!("viewport.render_target"),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_rgb(75, 75, 85),
-                );
+                // With an avatar loaded this is a transient "renderer
+                // warming up" moment — one muted caption, no chrome.
+                // (The old "Viewport / Render target" developer labels
+                // said nothing a user could act on.) The no-avatar
+                // empty state is drawn below, outside this branch,
+                // because an empty scene still produces a rendered
+                // texture — gating on "no texture" would never show it.
+                if state.app.active_avatar().is_some() {
+                    painter.text(
+                        egui::pos2(center.x, center.y + 24.0),
+                        egui::Align2::CENTER_CENTER,
+                        t!("viewport.waiting_render"),
+                        crate::gui::theme::typography::body(),
+                        viz::LABEL_PRIMARY,
+                    );
+                }
+            }
+
+            // ── Empty state: no avatar loaded ───────────────────────
+            // The app's mandatory first step gets a real call to
+            // action in the biggest empty space on screen: drop hint
+            // plus the two button paths (file picker / library pane).
+            if state.app.active_avatar().is_none() {
+                egui::Area::new(egui::Id::new("viewport_empty_state"))
+                    .order(egui::Order::Middle)
+                    .pivot(egui::Align2::CENTER_CENTER)
+                    .fixed_pos(rect.center())
+                    .show(ui.ctx(), |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(t!("viewport.empty_headline"))
+                                    .font(crate::gui::theme::typography::heading())
+                                    .color(viz::OVERLAY_TEXT),
+                            );
+                            ui.add_space(crate::gui::theme::space::XS);
+                            ui.label(
+                                egui::RichText::new(t!("viewport.empty_hint"))
+                                    .font(crate::gui::theme::typography::body())
+                                    .color(viz::LABEL_PRIMARY),
+                            );
+                            ui.add_space(crate::gui::theme::space::MD);
+                            ui.horizontal(|ui| {
+                                use crate::gui::components::{
+                                    filled_button, tonal_button, ButtonTone,
+                                };
+                                if filled_button(
+                                    ui,
+                                    None,
+                                    &t!("viewport.empty_open_file"),
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    crate::gui::top_bar::request_load_avatar_dialog(state);
+                                }
+                                if tonal_button(
+                                    ui,
+                                    None,
+                                    &t!("viewport.empty_library"),
+                                    ButtonTone::Primary,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    state.mode = crate::gui::AppMode::Avatar;
+                                    state.inspector_open = true;
+                                }
+                            });
+                        });
+                    });
             }
 
             // Camera interaction: orbit (left-drag), pan (middle-drag/right-drag), zoom (scroll).
@@ -370,13 +426,11 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             if drag_orbit {
                 state.camera_orbit.yaw_deg += delta.x * state.settings.orbit_sensitivity;
                 state.camera_orbit.pitch_deg += delta.y * state.settings.orbit_sensitivity;
-                state.project_status.project_dirty = true;
             }
             if drag_pan {
                 let scale = 0.002 * state.camera_orbit.distance * 0.2 * state.settings.pan_sensitivity;
                 state.camera_orbit.pan[0] += delta.x * scale;
                 state.camera_orbit.pan[1] -= delta.y * scale;
-                state.project_status.project_dirty = true;
             }
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -395,7 +449,6 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                     let factor = (-scroll * sens).exp();
                     state.camera_orbit.target_distance =
                         (state.camera_orbit.target_distance * factor).clamp(0.1, 1000.0);
-                    state.project_status.project_dirty = true;
                 }
             }
 
@@ -496,15 +549,19 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
             // ── Camera PIP wipe ───────────────────────────────────────
             if state.viewport.show_camera_wipe {
-                let snap = state.app.tracking.mailbox().snapshot();
-                if let Some(ref frame) = snap.frame {
-                    // Dedup on `preview_sequence` (the preview-mailbox
-                    // counter) not `sequence` (pose). Using pose here
-                    // would cause "torn snapshot" races to advance
-                    // `camera_wipe_seq` while still uploading the old
-                    // frame, leaving the newer frame permanently un-
-                    // uploaded until the next publish.
-                    if snap.preview_sequence != state.viewport.camera_wipe_seq {
+                // Cheap gate first: only pull a full snapshot (which
+                // refcounts the frame + clones pose/annotation) when the
+                // preview mailbox actually advanced. Dedup on
+                // `preview_sequence` (the preview-mailbox counter) not
+                // `sequence` (pose): using pose here would cause "torn
+                // snapshot" races to advance `camera_wipe_seq` while
+                // still uploading the old frame, leaving the newer
+                // frame permanently un-uploaded until the next publish.
+                if state.app.tracking.mailbox().preview_sequence()
+                    != state.viewport.camera_wipe_seq
+                {
+                    let snap = state.app.tracking.mailbox().snapshot();
+                    if let Some(ref frame) = snap.frame {
                         let w = frame.width as usize;
                         let h = frame.height as usize;
                         if w > 0 && h > 0 && frame.rgb_data.len() == w * h * 3 {
@@ -534,9 +591,15 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 state.viewport.camera_wipe_texture = Some(handle);
                             }
                         }
-                        state.viewport.camera_wipe_seq = snap.preview_sequence;
                     }
+                    // Annotation rides the same freshness gate; kept on
+                    // viewport state so the frames *between* publishes
+                    // redraw the last overlay without re-snapshotting.
+                    state.viewport.camera_wipe_annotation = snap.annotation;
+                    state.viewport.camera_wipe_seq = snap.preview_sequence;
+                }
 
+                {
                     if let Some(ref tex) = state.viewport.camera_wipe_texture {
                         let pip_max_w = 240.0;
                         let tex_size = tex.size_vec2();
@@ -563,13 +626,10 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 
                         // ── Detection annotations ──────────────────────
                         if state.viewport.show_detection_annotations {
-                            if let Some(ref ann) = snap.annotation {
-                                let kpt_color =
-                                    egui::Color32::from_rgba_unmultiplied(0, 255, 128, 220);
-                                let line_color =
-                                    egui::Color32::from_rgba_unmultiplied(0, 200, 255, 180);
-                                let bb_color =
-                                    egui::Color32::from_rgba_unmultiplied(255, 220, 80, 200);
+                            if let Some(ref ann) = state.viewport.camera_wipe_annotation {
+                                let kpt_color = viz::keypoint();
+                                let line_color = viz::bone();
+                                let bb_color = viz::bbox();
 
                                 let mirror = state.tracking.tracking_mirror;
                                 let map_x = |nx: f32| {
@@ -631,7 +691,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             // dark rendered content — the old flat dim-grey text was nearly
             // invisible against the viewport background.
             let info = t!("viewport.camera_info", x = format!("{:.2}", cam_pos[0]), y = format!("{:.2}", cam_pos[1]), z = format!("{:.2}", cam_pos[2]), yaw = format!("{:.1}", state.camera_orbit.yaw_deg), pitch = format!("{:.1}", state.camera_orbit.pitch_deg), dist = format!("{:.2}", state.camera_orbit.distance));
-            let info_color = egui::Color32::from_rgb(205, 212, 230);
+            let info_color = viz::OVERLAY_TEXT;
             let galley =
                 painter.layout_no_wrap(info, egui::FontId::monospace(11.0), info_color);
             let pad = egui::vec2(6.0, 4.0);
@@ -642,7 +702,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             painter.rect_filled(
                 egui::Rect::from_min_size(text_tl - pad, galley.size() + pad * 2.0),
                 4.0,
-                egui::Color32::from_rgba_unmultiplied(18, 20, 26, 190),
+                viz::overlay_badge_bg(),
             );
             painter.galley(text_tl, galley, info_color);
 
@@ -675,7 +735,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     egui::Align2::LEFT_TOP,
                                     line,
                                     egui::FontId::monospace(12.0),
-                                    egui::Color32::from_rgba_unmultiplied(255, 220, 80, 220),
+                                    viz::selection_text(),
                                 );
                                 y += 16.0;
                             }
@@ -686,7 +746,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 egui::Align2::LEFT_TOP,
                                 t!("viewport.no_region"),
                                 egui::FontId::monospace(12.0),
-                                egui::Color32::from_rgba_unmultiplied(180, 180, 180, 160),
+                                viz::muted_overlay_text(),
                             );
                         }
                     }

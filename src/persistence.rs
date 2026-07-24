@@ -5,7 +5,10 @@ use std::path::Path;
 /// Pure-data snapshot of the GUI/app state needed for project serialization.
 /// This struct lives here so that `persistence` never imports `gui::GuiApp`,
 /// breaking the former circular dependency.
-#[derive(Clone, Debug)]
+// `PartialEq` powers the derived-dirty probe (`GuiApp::refresh_project_dirty`):
+// the GUI compares the current snapshot against the last persisted baseline
+// instead of relying on 70+ hand-placed `project_dirty = true` sites.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProjectState {
     // Avatar info (extracted from Application, not GuiApp directly)
     pub avatar_source_path: Option<String>,
@@ -32,8 +35,14 @@ pub struct ProjectState {
     // Tracking config
     pub tracking_enabled: bool,
     pub tracking_mirror: bool,
-    pub camera_resolution_index: usize,
-    pub camera_framerate_index: usize,
+    /// Capture format as REAL values (not combo positions). Persisting
+    /// the combo index meant reordering / inserting an entry in the
+    /// resolution dropdown silently changed every saved project's
+    /// capture format; values survive UI evolution. The GUI converts
+    /// to/from its combo position at the snapshot/apply boundary.
+    pub camera_capture_width: u32,
+    pub camera_capture_height: u32,
+    pub camera_capture_fps: u32,
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
     pub lower_body_tracking_enabled: bool,
@@ -207,6 +216,7 @@ fn pose_calibration_to_dto(
         neutral_face_ypr: cal.neutral_face_ypr_mesh.unwrap_or([0.0; 3]),
         neutral_face_ypr_mesh: cal.neutral_face_ypr_mesh,
         neutral_face_ypr_body: cal.neutral_face_ypr_body,
+        neutral_body_yaw: cal.neutral_body_yaw,
     }
 }
 
@@ -268,6 +278,12 @@ fn dto_to_pose_calibration(
             }
         }),
         neutral_face_ypr_body: dto.neutral_face_ypr_body,
+        // Defensive re-clamp: the capture path already clamps, but a
+        // hand-edited profile with a ±180° value would flip the whole
+        // scene behind the camera every frame.
+        neutral_body_yaw: dto
+            .neutral_body_yaw
+            .map(|y| y.clamp(-crate::tracking::BODY_YAW_MAX_RAD, crate::tracking::BODY_YAW_MAX_RAD)),
     })
 }
 
@@ -287,10 +303,24 @@ pub struct TrackingConfig {
     pub enabled: bool,
     #[serde(default)]
     pub mirror: bool,
+    /// Legacy combo positions — still written (best-effort) for
+    /// downgrade compatibility and still read as the fallback for
+    /// files that predate the value fields below. The mapping is the
+    /// FROZEN table the combos used when these files were written
+    /// (`legacy_camera_*` helpers); do NOT retarget it when the GUI
+    /// grows new combo entries.
     #[serde(default)]
     pub camera_resolution_index: usize,
     #[serde(default)]
     pub camera_framerate_index: usize,
+    /// Real capture format values. `None` in files saved before the
+    /// index→value migration; readers fall back to the legacy indices.
+    #[serde(default)]
+    pub camera_capture_width: Option<u32>,
+    #[serde(default)]
+    pub camera_capture_height: Option<u32>,
+    #[serde(default)]
+    pub camera_capture_fps: Option<u32>,
     #[serde(default)]
     pub hand_tracking_enabled: bool,
     /// `default_true`: matches the GUI's initial value
@@ -403,6 +433,12 @@ pub struct PoseCalibrationDto {
     /// `crate::tracking::PoseCalibration::neutral_face_ypr_body`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neutral_face_ypr_body: Option<[f32; 3]>,
+    /// Neutral body yaw (radians) for oblique camera placement — see
+    /// `crate::tracking::PoseCalibration::neutral_body_yaw`. `None`
+    /// for pre-Phase-I saves and non-metric captures (strict no-op on
+    /// load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neutral_body_yaw: Option<f32>,
 }
 
 /// On-disk DTO mirror of `crate::tracking::TorsoDepthTemplate`.
@@ -857,8 +893,14 @@ impl ProjectFile {
             tracking: TrackingConfig {
                 enabled: state.tracking_enabled,
                 mirror: state.tracking_mirror,
-                camera_resolution_index: state.camera_resolution_index,
-                camera_framerate_index: state.camera_framerate_index,
+                camera_resolution_index: legacy_camera_resolution_index(
+                    state.camera_capture_width,
+                    state.camera_capture_height,
+                ),
+                camera_framerate_index: legacy_camera_fps_index(state.camera_capture_fps),
+                camera_capture_width: Some(state.camera_capture_width),
+                camera_capture_height: Some(state.camera_capture_height),
+                camera_capture_fps: Some(state.camera_capture_fps),
                 hand_tracking_enabled: state.hand_tracking_enabled,
                 face_tracking_enabled: state.face_tracking_enabled,
                 lower_body_tracking_enabled: state.lower_body_tracking_enabled,
@@ -942,8 +984,18 @@ impl ProjectFile {
 
             tracking_enabled: self.tracking.enabled,
             tracking_mirror: self.tracking.mirror,
-            camera_resolution_index: self.tracking.camera_resolution_index,
-            camera_framerate_index: self.tracking.camera_framerate_index,
+            camera_capture_width: self
+                .tracking
+                .camera_capture_width
+                .unwrap_or_else(|| legacy_camera_resolution(self.tracking.camera_resolution_index).0),
+            camera_capture_height: self
+                .tracking
+                .camera_capture_height
+                .unwrap_or_else(|| legacy_camera_resolution(self.tracking.camera_resolution_index).1),
+            camera_capture_fps: self
+                .tracking
+                .camera_capture_fps
+                .unwrap_or_else(|| legacy_camera_fps(self.tracking.camera_framerate_index)),
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
@@ -1004,6 +1056,47 @@ impl ProjectFile {
 
 /// Write a project file to disk as pretty-printed JSON using atomic write
 /// (write to temp file, then rename).
+/// FROZEN mapping of the camera-resolution combo positions as they
+/// were when projects persisted raw indices (0 = 640×480, 1 = 1280×720,
+/// 2 = 1920×1080). Only for migrating old files and for writing the
+/// best-effort legacy index alongside the value fields — the live GUI
+/// combo mapping lives in `gui::camera_resolution_for_index` and may
+/// grow entries freely without touching this table.
+fn legacy_camera_resolution(index: usize) -> (u32, u32) {
+    match index {
+        1 => (1280, 720),
+        2 => (1920, 1080),
+        _ => (640, 480),
+    }
+}
+
+/// Reverse of [`legacy_camera_resolution`]; unknown values map to the
+/// legacy default slot (0) so a downgraded build still opens the file.
+fn legacy_camera_resolution_index(width: u32, height: u32) -> usize {
+    match (width, height) {
+        (1280, 720) => 1,
+        (1920, 1080) => 2,
+        _ => 0,
+    }
+}
+
+/// FROZEN legacy fps combo mapping (0 = 30, 1 = 60).
+fn legacy_camera_fps(index: usize) -> u32 {
+    if index == 1 {
+        60
+    } else {
+        30
+    }
+}
+
+fn legacy_camera_fps_index(fps: u32) -> usize {
+    if fps == 60 {
+        1
+    } else {
+        0
+    }
+}
+
 pub fn save_project(state: &ProjectState, path: &Path) -> Result<(), String> {
     let existing_created_with = if path.exists() {
         std::fs::read_to_string(path)
@@ -1584,7 +1677,13 @@ fn recovery_snapshot_path() -> std::path::PathBuf {
 
 pub struct RecoveryManager {
     interval_secs: u64,
-    last_snapshot_secs: u64,
+    /// Monotonic instant of the last successful snapshot write. The
+    /// interval gate used to compare wall-clock unix seconds, so an
+    /// NTP step backwards silently paused the crash-recovery net (and
+    /// a step forward fired it early). Wall time is still *recorded*
+    /// in the snapshot (`timestamp_secs`) — that's display data, not
+    /// scheduling data.
+    last_snapshot: Option<std::time::Instant>,
     enabled: bool,
 }
 
@@ -1592,7 +1691,7 @@ impl RecoveryManager {
     pub fn new(interval_secs: u64) -> Self {
         Self {
             interval_secs,
-            last_snapshot_secs: 0,
+            last_snapshot: None,
             enabled: true,
         }
     }
@@ -1605,11 +1704,14 @@ impl RecoveryManager {
         self.interval_secs = secs;
     }
 
-    pub fn should_snapshot(&self, now_secs: u64) -> bool {
+    pub fn should_snapshot(&self, now: std::time::Instant) -> bool {
         if !self.enabled {
             return false;
         }
-        now_secs >= self.last_snapshot_secs + self.interval_secs
+        match self.last_snapshot {
+            None => true,
+            Some(last) => now.duration_since(last).as_secs() >= self.interval_secs,
+        }
     }
 
     pub fn write_snapshot(
@@ -1640,7 +1742,7 @@ impl RecoveryManager {
         let path = recovery_snapshot_path();
         atomic_write(&path, &json)?;
 
-        self.last_snapshot_secs = now;
+        self.last_snapshot = Some(std::time::Instant::now());
         Ok(())
     }
 

@@ -7,9 +7,11 @@ mod card;
 mod chip;
 mod icon;
 mod kv;
+mod status;
 
 pub use button::{filled_button, tonal_button, ButtonTone};
-pub use card::{card, card_action_icon, card_with_action};
-pub use chip::chip;
+pub use card::{card, card_action_icon, card_with_action, collapsible_card, collapsible_section};
+pub use chip::{chip, scope_badge, SettingScope};
 pub use icon::{icon_button, icon_label, icon_text};
 pub use kv::{kv_grid, kv_row};
+pub use status::status_dot_label;

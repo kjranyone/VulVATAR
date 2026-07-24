@@ -1,6 +1,8 @@
 use eframe::egui;
 
-use crate::gui::components::{card, card_action_icon, kv_grid, kv_row, tonal_button, ButtonTone};
+use crate::gui::components::{
+    card_action_icon, collapsible_card, kv_grid, kv_row, tonal_button, ButtonTone,
+};
 use crate::gui::theme::{color, icon as ic, space, typography};
 use crate::gui::GuiApp;
 use crate::t;
@@ -10,7 +12,8 @@ use super::library;
 pub(super) fn draw_avatar(ui: &mut egui::Ui, state: &mut GuiApp) {
     draw_model_information_card(ui, state);
     library::draw_model_library(ui, state);
-    draw_camera_transform_card(ui, state);
+    draw_runtime_toggles(ui, state);
+    draw_expression_control(ui, state);
 }
 
 fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
@@ -28,12 +31,12 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 // "musette" title in the mockup.
                 let (chip_bg, chip_fg) = match meta.spec_version {
                     crate::asset::VrmSpecVersion::V1 => (
-                        egui::Color32::from_rgb(220, 246, 226),
-                        egui::Color32::from_rgb(28, 110, 50),
+                        color::SUCCESS_CONTAINER,
+                        color::ON_SUCCESS_CONTAINER,
                     ),
                     crate::asset::VrmSpecVersion::V0 => (
-                        egui::Color32::from_rgb(252, 240, 218),
-                        egui::Color32::from_rgb(150, 95, 20),
+                        color::WARNING_CONTAINER,
+                        color::ON_WARNING_CONTAINER,
                     ),
                     crate::asset::VrmSpecVersion::Unknown => (
                         color::ERROR_CONTAINER,
@@ -215,8 +218,136 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 }
 
-fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
-    card(ui, t!("inspector.camera_transform"), |ui| {
+/// Runtime feature toggles for the loaded avatar (spring / cloth /
+/// debug overlays). Moved here from the retired Preview mode: they
+/// gate per-avatar runtime behaviour, so they belong with the avatar,
+/// not with scene composition.
+fn draw_runtime_toggles(ui: &mut egui::Ui, state: &mut GuiApp) {
+    collapsible_card(ui, "inspector.runtime_toggles", t!("inspector.runtime_toggles"), false, |ui| {
+        ui
+            .checkbox(&mut state.rendering.toggle_spring, t!("inspector.spring_enabled"))
+            .changed();
+        ui.add_enabled_ui(state.rendering.toggle_spring, |ui| {
+            use crate::simulation::spring::SpringTuning;
+            ui.horizontal(|ui| {
+                ui.label(t!("inspector.spring_sway"));
+                ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.spring_tuning.sway_scale,
+                            SpringTuning::SWAY_RANGE,
+                        )
+                        .fixed_decimals(2),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label(t!("inspector.spring_gravity"));
+                ui
+                    .add(
+                        egui::Slider::new(
+                            &mut state.rendering.spring_tuning.gravity_offset,
+                            SpringTuning::GRAVITY_RANGE,
+                        )
+                        .fixed_decimals(2),
+                    )
+                    .changed();
+            });
+        });
+        ui
+            .checkbox(&mut state.rendering.toggle_cloth, t!("inspector.cloth_enabled"))
+            .changed();
+        ui
+            .checkbox(
+                &mut state.rendering.toggle_collision_debug,
+                t!("inspector.collision_debug"),
+            )
+            .changed();
+        ui
+            .checkbox(
+                &mut state.rendering.toggle_skeleton_debug,
+                t!("inspector.skeleton_debug"),
+            )
+            .changed();
+    });
+}
+
+/// Expression weight sliders. Bind directly to
+/// `avatar.expression_weights[i].weight` so the slider widget IS the
+/// avatar's value — no GUI shadow buffer, no per-frame reconcile.
+/// Face tracking writes a fresh weights Vec to the avatar each frame
+/// (`app/render.rs`); the slider sees that new value on the next
+/// paint. When tracking is off, the slider directly drives the avatar.
+fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
+    let Some(avatar) = state.app.active_avatar_mut() else {
+        return;
+    };
+    if avatar.expression_weights.is_empty() {
+        return;
+    }
+
+    collapsible_card(ui, "inspector.expression_control", t!("inspector.expression_control"), false, |ui| {
+        ui.horizontal(|ui| {
+            if tonal_button(
+                ui,
+                None,
+                &t!("inspector.reset_all"),
+                ButtonTone::Primary,
+                true,
+            )
+            .clicked()
+            {
+                for ew in avatar.expression_weights.iter_mut() {
+                    ew.weight = 0.0;
+                }
+            }
+            if tonal_button(
+                ui,
+                None,
+                &t!("inspector.set_all_50"),
+                ButtonTone::Primary,
+                true,
+            )
+            .clicked()
+            {
+                for ew in avatar.expression_weights.iter_mut() {
+                    ew.weight = 0.5;
+                }
+            }
+        });
+
+        ui.separator();
+
+        for ew in avatar.expression_weights.iter_mut() {
+            ui.horizontal(|ui| {
+                ui.label(&ew.name);
+                ui.add(
+                    egui::Slider::new(&mut ew.weight, 0.0..=1.0)
+                        .text("")
+                        .custom_formatter(|n, _| format!("{:.0}%", n * 100.0))
+                        .custom_parser(|s| {
+                            s.trim_end_matches('%')
+                                .parse::<f64>()
+                                .ok()
+                                .map(|v| v / 100.0)
+                        }),
+                );
+            });
+        }
+
+        ui.separator();
+        ui.label(t!(
+            "inspector.expressions_loaded",
+            count = avatar.expression_weights.len()
+        ));
+    });
+}
+
+/// Camera orbit rig editor — drawn by the Scene panel
+/// (`rendering::draw_scene`); defined here historically and re-used
+/// via `pub(super)` so the move stayed a one-line call-site change.
+pub(super) fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
+    collapsible_card(ui, "inspector.camera_transform", t!("inspector.camera_transform"), true, |ui| {
         kv_grid(
             ui,
             &[
@@ -236,26 +367,16 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
         );
         ui.add_space(space::SM);
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
-                        .speed(0.5)
-                        .prefix(format!("{}: ", t!("inspector.yaw"))),
-                )
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
-                        .speed(0.5)
-                        .prefix(format!("{}: ", t!("inspector.pitch"))),
-                )
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
+            ui.add(
+                egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
+                    .speed(0.5)
+                    .prefix(format!("{}: ", t!("inspector.yaw"))),
+            );
+            ui.add(
+                egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
+                    .speed(0.5)
+                    .prefix(format!("{}: ", t!("inspector.pitch"))),
+            );
             if ui
                 .add(
                     egui::DragValue::new(&mut state.camera_orbit.distance)
@@ -266,30 +387,19 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .changed()
             {
                 state.camera_orbit.target_distance = state.camera_orbit.distance;
-                state.project_status.project_dirty = true;
             }
         });
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.camera_orbit.pan[0])
-                        .speed(0.01)
-                        .prefix(format!("{}: ", t!("inspector.pan_x"))),
-                )
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.camera_orbit.pan[1])
-                        .speed(0.01)
-                        .prefix(format!("{}: ", t!("inspector.pan_y"))),
-                )
-                .changed()
-            {
-                state.project_status.project_dirty = true;
-            }
+            ui.add(
+                egui::DragValue::new(&mut state.camera_orbit.pan[0])
+                    .speed(0.01)
+                    .prefix(format!("{}: ", t!("inspector.pan_x"))),
+            );
+            ui.add(
+                egui::DragValue::new(&mut state.camera_orbit.pan[1])
+                    .speed(0.01)
+                    .prefix(format!("{}: ", t!("inspector.pan_y"))),
+            );
         });
         ui.add_space(space::SM);
         // World-space eye position. The camera is an orbit rig, so X/Y/Z is a
@@ -326,7 +436,6 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.camera_orbit.pitch_deg = (eye[1] / d).clamp(-1.0, 1.0).asin().to_degrees();
                 state.camera_orbit.yaw_deg = eye[0].atan2(eye[2]).to_degrees();
                 state.camera_orbit.pan = [0.0, 0.0];
-                state.project_status.project_dirty = true;
             }
         });
         ui.add_space(space::SM);
@@ -344,7 +453,6 @@ fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
             state.camera_orbit.distance = 5.0;
             state.camera_orbit.target_distance = 5.0;
             state.camera_orbit.pan = [0.0, 0.0];
-            state.project_status.project_dirty = true;
         }
     });
 }

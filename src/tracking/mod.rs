@@ -29,7 +29,10 @@ pub mod source_skeleton;
 #[cfg(feature = "inference")]
 pub mod yolox;
 
-pub use calibration::{CalibrationMode, PoseCalibration, TorsoDepthTemplate};
+pub use calibration::{
+    rotate_xz, shoulder_line_yaw, CalibrationMode, PoseCalibration, TorsoDepthTemplate,
+    BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD,
+};
 pub use source_skeleton::{
     CameraIntrinsics, FacePose, FaceSource, MetricFrameInfo, SourceExpression, SourceJoint,
     SourceSkeleton,
@@ -148,6 +151,69 @@ impl TrackingCalibration {
     /// depth-aware skeleton builder, so it gets read from those call
     /// sites directly rather than baked into the source sample.
     pub fn apply_calibration(&self, sample: &mut SourceSkeleton) {
+        // Neutral body yaw (oblique camera placement — Phase I): rigidly
+        // re-express the published sample "as if the camera had been
+        // frontal" by rotating the horizontal plane by the calibrated
+        // shoulder-line yaw. One uniform transform instead of per-consumer
+        // subtraction: the solver's shoulder-yaw, direction-matched bones
+        // and arm-IK wrist targets all read the same de-rotated scene, so
+        // the "pelvis forward, arms chasing oblique targets" twist class
+        // of bug can't exist. See docs/calibration-ux.md Phase I.
+        //
+        // Joints / fingertips are anchor-centred (the depth builder puts
+        // the anchor at the joint-space origin), so their pivot is the
+        // origin. `root_offset` is an absolute source-oriented metric
+        // position, so it pivots about the calibrated anchor — deviations
+        // from neutral rotate, the neutral point itself stays put.
+        //
+        // The face pose is deliberately NOT rotated: head neutrality is
+        // owned by `neutral_face_ypr_*` below (per-estimator residuals);
+        // rotating the face AND subtracting its neutral would double-count
+        // the camera angle. Metric-only: rotating a monocular z≈0 offset
+        // would fabricate depth from nothing, and no yaw is ever captured
+        // on that path anyway (`shoulder_line_yaw` refuses).
+        if let Some(pose) = self.pose.as_ref() {
+            if let Some(theta) = pose.neutral_body_yaw {
+                if sample.metric_frame_info.is_some() && theta != 0.0 {
+                    for j in sample.joints.values_mut() {
+                        j.position = calibration::rotate_xz(j.position, theta);
+                    }
+                    for t in sample.fingertips.values_mut() {
+                        t.position = calibration::rotate_xz(t.position, theta);
+                    }
+                    for hand in [
+                        sample.left_hand_orientation.as_mut(),
+                        sample.right_hand_orientation.as_mut(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        hand.forward = calibration::rotate_xz(hand.forward, theta);
+                        hand.up = calibration::rotate_xz(hand.up, theta);
+                    }
+                    if let Some(offset) = sample.root_offset.as_mut() {
+                        // Same [x, y, −depth] convention the solver's
+                        // root-reference seed uses (`anchor_depth_m` is
+                        // stored as positive camera-forward metres,
+                        // source z is negative-forward).
+                        let a0 = [
+                            pose.anchor_x,
+                            pose.anchor_y,
+                            -pose.anchor_depth_m.unwrap_or(0.0),
+                        ];
+                        let d = calibration::rotate_xz(
+                            [
+                                offset[0] - a0[0],
+                                offset[1] - a0[1],
+                                offset[2] - a0[2],
+                            ],
+                            theta,
+                        );
+                        *offset = [a0[0] + d[0], a0[1] + d[1], a0[2] + d[2]];
+                    }
+                }
+            }
+        }
         // Resting head pose captured during the calibration hold: the
         // camera is rarely dead-ahead of where the user actually looks
         // (monitor offset, desk mount), so the absolute face angles
@@ -246,6 +312,7 @@ mod calibration_apply_tests {
                 neutral_expressions: neutral,
                 neutral_face_ypr_mesh: None,
                 neutral_face_ypr_body: None,
+                neutral_body_yaw: None,
             }),
         }
     }
@@ -365,6 +432,178 @@ mod calibration_apply_tests {
         cal.apply_calibration(&mut sk);
         assert!((sk.expressions[0].weight - 0.42).abs() < 1e-6);
     }
+
+    // --- Neutral body yaw (Phase I) ---
+
+    use crate::asset::HumanoidBone;
+    use crate::tracking::source_skeleton::{HandOrientation, SourceJoint};
+
+    /// A frontal reference sample with joints on both sides of the
+    /// anchor, a fingertip, a palm frame and a root offset displaced
+    /// from the calibrated anchor.
+    fn frontal_metric_skeleton() -> SourceSkeleton {
+        let mut sk = SourceSkeleton::default();
+        let put = |sk: &mut SourceSkeleton, bone, position: [f32; 3]| {
+            sk.joints.insert(
+                bone,
+                SourceJoint {
+                    position,
+                    confidence: 0.9,
+                    metric_depth_m: None,
+                },
+            );
+        };
+        put(&mut sk, HumanoidBone::LeftUpperArm, [0.25, 0.1, 0.0]);
+        put(&mut sk, HumanoidBone::RightUpperArm, [-0.25, 0.1, 0.0]);
+        put(&mut sk, HumanoidBone::LeftHand, [0.4, -0.2, 0.15]);
+        sk.fingertips.insert(
+            HumanoidBone::LeftIndexDistal,
+            SourceJoint {
+                position: [0.45, -0.22, 0.18],
+                confidence: 0.8,
+                metric_depth_m: None,
+            },
+        );
+        sk.left_hand_orientation = Some(HandOrientation {
+            forward: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            confidence: 0.9,
+        });
+        sk.root_offset = Some([0.15, 0.02, -1.6]);
+        sk.stamp_synthetic_metric_frame();
+        sk
+    }
+
+    /// Rotate the frontal scene by −θ about the calibrated anchor —
+    /// i.e. what the same subject looks like observed by a camera
+    /// placed θ off to the side. `rotate_xz(·, θ)` must undo exactly
+    /// this.
+    fn obliquely_observed(frontal: &SourceSkeleton, theta: f32, a0: [f32; 3]) -> SourceSkeleton {
+        let mut sk = frontal.clone();
+        let fwd = |v: [f32; 3]| crate::tracking::calibration::rotate_xz(v, -theta);
+        for j in sk.joints.values_mut() {
+            j.position = fwd(j.position);
+        }
+        for t in sk.fingertips.values_mut() {
+            t.position = fwd(t.position);
+        }
+        let h = sk.left_hand_orientation.as_mut().unwrap();
+        h.forward = fwd(h.forward);
+        h.up = fwd(h.up);
+        let o = sk.root_offset.unwrap();
+        let d = fwd([o[0] - a0[0], o[1] - a0[1], o[2] - a0[2]]);
+        sk.root_offset = Some([a0[0] + d[0], a0[1] + d[1], a0[2] + d[2]]);
+        sk
+    }
+
+    fn cal_with_yaw(theta: f32, a0: [f32; 3]) -> TrackingCalibration {
+        let mut cal = cal_with_neutral(Vec::new());
+        let pose = cal.pose.as_mut().unwrap();
+        pose.neutral_body_yaw = Some(theta);
+        pose.anchor_x = a0[0];
+        pose.anchor_y = a0[1];
+        pose.anchor_depth_m = Some(-a0[2]);
+        cal
+    }
+
+    fn assert_vec3_eq(a: [f32; 3], b: [f32; 3], what: &str) {
+        for i in 0..3 {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-5,
+                "{what}[{i}]: {} vs {}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
+    #[test]
+    fn body_yaw_derotation_restores_the_frontal_scene() {
+        let theta = 0.5_f32; // ~28.6° oblique camera
+        let a0 = [0.1, 0.0, -1.5];
+        let frontal = frontal_metric_skeleton();
+        let mut observed = obliquely_observed(&frontal, theta, a0);
+
+        cal_with_yaw(theta, a0).apply_calibration(&mut observed);
+
+        for (bone, j) in &frontal.joints {
+            assert_vec3_eq(
+                observed.joints[bone].position,
+                j.position,
+                &format!("joint {bone:?}"),
+            );
+        }
+        assert_vec3_eq(
+            observed.fingertips[&HumanoidBone::LeftIndexDistal].position,
+            frontal.fingertips[&HumanoidBone::LeftIndexDistal].position,
+            "fingertip",
+        );
+        let (ho, hf) = (
+            observed.left_hand_orientation.unwrap(),
+            frontal.left_hand_orientation.unwrap(),
+        );
+        assert_vec3_eq(ho.forward, hf.forward, "hand forward");
+        assert_vec3_eq(ho.up, hf.up, "hand up");
+        assert_vec3_eq(
+            observed.root_offset.unwrap(),
+            frontal.root_offset.unwrap(),
+            "root_offset",
+        );
+    }
+
+    #[test]
+    fn body_yaw_pivots_root_offset_about_the_calibrated_anchor() {
+        // A subject AT the calibrated anchor must not move when the
+        // de-rotation kicks in — only deviations from neutral rotate.
+        let a0 = [0.1, 0.0, -1.5];
+        let mut sk = frontal_metric_skeleton();
+        sk.root_offset = Some(a0);
+        cal_with_yaw(0.5, a0).apply_calibration(&mut sk);
+        assert_vec3_eq(sk.root_offset.unwrap(), a0, "anchor stays put");
+    }
+
+    #[test]
+    fn body_yaw_none_is_a_noop() {
+        let frontal = frontal_metric_skeleton();
+        let mut sk = frontal.clone();
+        cal_with_neutral(Vec::new()).apply_calibration(&mut sk);
+        for (bone, j) in &frontal.joints {
+            assert_vec3_eq(sk.joints[bone].position, j.position, "joint");
+        }
+        assert_vec3_eq(sk.root_offset.unwrap(), frontal.root_offset.unwrap(), "offset");
+    }
+
+    #[test]
+    fn body_yaw_never_rotates_non_metric_samples() {
+        // Rotating a monocular z≈0 offset would fabricate depth from
+        // nothing — the guard must hold even if a yaw somehow got
+        // persisted against a non-metric session.
+        let frontal = frontal_metric_skeleton();
+        let mut sk = frontal.clone();
+        sk.metric_frame_info = None;
+        cal_with_yaw(0.5, [0.0, 0.0, 0.0]).apply_calibration(&mut sk);
+        for (bone, j) in &frontal.joints {
+            assert_vec3_eq(sk.joints[bone].position, j.position, "joint");
+        }
+    }
+
+    #[test]
+    fn body_yaw_leaves_the_face_pose_alone() {
+        // Head neutrality is owned by neutral_face_ypr_* — rotating the
+        // face AND subtracting its neutral would double-count θ.
+        let mut sk = frontal_metric_skeleton();
+        sk.face = Some(FacePose {
+            yaw: 0.3,
+            pitch: 0.1,
+            roll: 0.0,
+            confidence: 0.9,
+            source: crate::tracking::FaceSource::Mesh,
+            ..Default::default()
+        });
+        cal_with_yaw(0.5, [0.0, 0.0, 0.0]).apply_calibration(&mut sk);
+        let f = sk.face.unwrap();
+        assert!((f.yaw - 0.3).abs() < 1e-6, "face yaw untouched by body yaw");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +662,13 @@ struct PoseMailboxInner {
 }
 
 struct PreviewMailboxInner {
-    latest_frame: Option<PreviewFrame>,
+    /// `Arc` so `snapshot()` hands the frame out by refcount instead of
+    /// copying the RGB buffer (≈2.7 MB at 1280×720) under the lock on
+    /// every GUI tick. GUI consumers should gate `snapshot()` behind
+    /// [`TrackingMailbox::preview_sequence`] and only pull when it
+    /// advanced — 60 Hz GUI × 30 fps camera used to clone-and-discard
+    /// half the frames without ever reading them.
+    latest_frame: Option<Arc<PreviewFrame>>,
     latest_annotation: Option<DetectionAnnotation>,
     /// Bumped on every preview write so GUI consumers can dedup
     /// texture uploads on a counter that strictly corresponds to
@@ -500,7 +745,11 @@ struct CalibrationChannelInner {
 #[derive(Clone, Debug, Default)]
 pub struct MailboxSnapshot {
     pub pose: Option<SourceSkeleton>,
-    pub frame: Option<PreviewFrame>,
+    /// Shared, not copied — cloning the snapshot bumps a refcount
+    /// instead of duplicating the RGB buffer. Consumers should avoid
+    /// calling [`TrackingMailbox::snapshot`] at all unless
+    /// [`TrackingMailbox::preview_sequence`] advanced.
+    pub frame: Option<Arc<PreviewFrame>>,
     pub annotation: Option<DetectionAnnotation>,
     pub sequence: u64,
     pub preview_sequence: u64,
@@ -565,10 +814,23 @@ impl TrackingMailbox {
             p.sequence += 1;
             p.last_update = Some(Instant::now());
         }
+        // Wrap outside the lock: the one-time Arc allocation is the
+        // publisher's cost; every reader clone afterwards is a refcount.
+        let frame = frame.map(Arc::new);
         let mut v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
         v.latest_annotation = Some(estimate.annotation);
         v.latest_frame = frame;
         v.sequence += 1;
+    }
+
+    /// Current preview-side sequence, read under the preview lock but
+    /// without touching the payloads. GUI consumers poll this every
+    /// tick and call [`Self::snapshot`] only when it advanced — the
+    /// cheap gate that keeps a 60 Hz GUI from cloning a 30 fps
+    /// camera's frames it will never upload.
+    pub fn preview_sequence(&self) -> u64 {
+        let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
+        v.sequence
     }
 
     /// Snapshot the pose + preview slices. NOT cross-lock-atomic: a
@@ -749,7 +1011,7 @@ impl TrackingMailbox {
     }
 
     /// Read the latest camera preview frame (downscaled for GUI display).
-    pub fn latest_frame(&self) -> Option<PreviewFrame> {
+    pub fn latest_frame(&self) -> Option<Arc<PreviewFrame>> {
         let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
         v.latest_frame.clone()
     }

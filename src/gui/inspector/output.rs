@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::gui::components::collapsible_card;
+use crate::gui::theme::color;
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -19,9 +21,7 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
     let active_idx = state.app.output.active_sink().to_gui_index();
     let mut new_idx = requested_idx;
 
-    egui::CollapsingHeader::new(t!("inspector.output_sink"))
-        .default_open(true)
-        .show(ui, |ui| {
+    collapsible_card(ui, "inspector.output_sink", t!("inspector.output_sink"), true, |ui| {
             egui::ComboBox::from_label(t!("inspector.output_sink_label"))
                 .selected_text(sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("Unknown"))
                 .show_ui(ui, |ui| {
@@ -31,7 +31,7 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
             if active_idx != requested_idx {
                 ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 80),
+                    color::WARNING,
                     t!("inspector.sink_mismatch",
                         active = sink_names.get(active_idx).map(|s: &String| s.as_str()).unwrap_or("?"),
                         requested = sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("?"),
@@ -45,24 +45,15 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         match state.app.set_requested_sink(want_sink) {
             Ok(()) => {
                 state.push_notification(t!("inspector.output_sink_changed", name = sink_names[new_idx].to_string()));
-                state.project_status.project_dirty = true;
             }
             Err(e) => {
                 state.push_notification(t!("inspector.output_sink_failed", error = e.to_string()));
-                state.project_status.project_dirty = true;
             }
         }
     }
 
-    let prev_res = state.output.output_resolution_index;
-    let prev_fps = state.output.output_framerate_index;
-    let prev_alpha = state.output.output_has_alpha;
-    let prev_cs = state.output.output_color_space_index;
-    let prev_msaa = state.output.msaa_index;
 
-    egui::CollapsingHeader::new(t!("inspector.frame_format"))
-        .default_open(true)
-        .show(ui, |ui| {
+    collapsible_card(ui, "inspector.frame_format", t!("inspector.frame_format"), true, |ui| {
             egui::ComboBox::from_label(t!("tracking.resolution"))
                 .selected_text(
                     *["1920x1080", "1280x720", "640x480"]
@@ -125,20 +116,9 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 });
         });
 
-    if state.output.output_resolution_index != prev_res
-        || state.output.output_framerate_index != prev_fps
-        || state.output.output_has_alpha != prev_alpha
-        || state.output.output_color_space_index != prev_cs
-        || state.output.msaa_index != prev_msaa
-    {
-        state.project_status.project_dirty = true;
-    }
-
     let diagnostics = state.app.output.diagnostics();
 
-    egui::CollapsingHeader::new(t!("inspector.synchronization"))
-        .default_open(false)
-        .show(ui, |ui| {
+    collapsible_card(ui, "inspector.synchronization", t!("inspector.synchronization"), false, |ui| {
             use crate::output::HandoffPath;
             // Reflect the most recently published frame's handoff_path
             // rather than guessing from the sink variant. Until any frame
@@ -147,26 +127,26 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
             // interop even when every frame was a CPU readback.
             let (label_key, color) = match &diagnostics.active_handoff_path {
                 Some(HandoffPath::GpuSharedFrame) => {
-                    ("inspector.handoff_active_gpu", egui::Color32::GREEN)
+                    ("inspector.handoff_active_gpu", color::SUCCESS)
                 }
                 Some(HandoffPath::CpuReadback) => (
                     "inspector.handoff_active_cpu_readback",
-                    egui::Color32::from_rgb(220, 160, 80),
+                    color::WARNING,
                 ),
                 Some(HandoffPath::SharedMemory) => (
                     "inspector.handoff_active_shared_memory",
-                    egui::Color32::from_rgb(220, 160, 80),
+                    color::WARNING,
                 ),
                 None => (
                     "inspector.handoff_pending",
-                    egui::Color32::from_rgb(180, 180, 180),
+                    color::ON_SURFACE_MUTED,
                 ),
             };
             ui.label(egui::RichText::new(t!(label_key)).color(color));
             if diagnostics.fallback_active {
                 ui.label(
                     egui::RichText::new(t!("inspector.handoff_fallback_warning"))
-                        .color(egui::Color32::from_rgb(220, 160, 80)),
+                        .color(color::WARNING),
                 );
                 if let Some(reason) = diagnostics.fallback_reason.as_ref() {
                     use crate::output::FallbackReason;
@@ -186,24 +166,22 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                     };
                     ui.label(
                         egui::RichText::new(t!(reason_key))
-                            .color(egui::Color32::from_rgb(220, 160, 80)),
+                            .color(color::WARNING),
                     );
                 }
             }
         });
 
-    egui::CollapsingHeader::new(t!("inspector.diagnostics"))
-        .default_open(true)
-        .show(ui, |ui| {
+    collapsible_card(ui, "inspector.diagnostics", t!("inspector.diagnostics"), true, |ui| {
             // "Connected" was unconditional green before — only consider the
             // pipeline connected once a frame has actually been published.
             let (label_key, color) = if diagnostics.last_publish_timestamp == 0 {
                 (
                     "inspector.connection_pending",
-                    egui::Color32::from_rgb(180, 180, 180),
+                    color::ON_SURFACE_MUTED,
                 )
             } else {
-                ("inspector.connected", egui::Color32::GREEN)
+                ("inspector.connected", color::SUCCESS)
             };
             ui.label(egui::RichText::new(t!(label_key)).color(color));
             ui.label(t!("inspector.queue_depth", depth = diagnostics.queue_depth));
@@ -222,16 +200,17 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
             ));
         });
 
-    egui::CollapsingHeader::new(t!("inspector.runtime_budget"))
-        .default_open(false)
-        .show(ui, |ui| {
+    collapsible_card(ui, "inspector.runtime_budget", t!("inspector.runtime_budget"), false, |ui| {
             let budget = &state.app.runtime_gpu_budget;
             use crate::app::runtime_gpu_budget::DegradedMode;
             let mode_color = match budget.degraded_mode() {
-                DegradedMode::Healthy => egui::Color32::GREEN,
-                DegradedMode::PressureLight => egui::Color32::from_rgb(220, 200, 80),
-                DegradedMode::PressureHeavy => egui::Color32::from_rgb(220, 130, 60),
-                DegradedMode::EmergencyCpu => egui::Color32::from_rgb(220, 80, 80),
+                DegradedMode::Healthy => color::SUCCESS,
+                DegradedMode::PressureLight => color::WARNING,
+                // Deep-amber "strong warning" tier between WARNING and
+                // ERROR — reuses the warning container's on-colour so the
+                // ramp stays inside the warning hue family.
+                DegradedMode::PressureHeavy => color::ON_WARNING_CONTAINER,
+                DegradedMode::EmergencyCpu => color::ERROR,
             };
             ui.label(
                 egui::RichText::new(t!(
