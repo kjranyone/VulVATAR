@@ -512,6 +512,12 @@ pub struct SettingsGuiState {
     pub zoom_sensitivity: f32,
     pub orbit_sensitivity: f32,
     pub pan_sensitivity: f32,
+    /// Mirror of [`crate::persistence::AppSettings::last_project_path`]
+    /// (`collect_app_settings` rebuilds the DTO from these fields, so
+    /// anything that must round-trip through `settings.json` needs a
+    /// slot here). Updated by `remember_last_project` on every explicit
+    /// project open / save; consumed once at startup for the auto-reopen.
+    pub last_project_path: Option<String>,
 }
 
 /// Per-frame timing + pause state lifted out of `GuiApp`
@@ -868,6 +874,7 @@ impl GuiApp {
                 zoom_sensitivity: app_settings.zoom_sensitivity,
                 orbit_sensitivity: app_settings.orbit_sensitivity,
                 pan_sensitivity: app_settings.pan_sensitivity,
+                last_project_path: app_settings.last_project_path.clone(),
             },
 
             mirror_view: false,
@@ -908,33 +915,73 @@ impl GuiApp {
             test_no_persist: false,
         };
 
-        if let Some(path) = std::env::var_os("VULVATAR_AUTOSTART_AVATAR") {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                info!("avatar autostart loading {}", path.display());
-                top_bar::load_avatar_from_path(&mut state, &path);
+        // ── Startup restore ─────────────────────────────────────────
+        // Source priority for the restored state:
+        //   1. the last *explicitly* opened / saved project
+        //      (`settings.json::last_project_path`) — reopened with its
+        //      real path in the title bar;
+        //   2. the implicit `last_session.vvtproj` slot — written by the
+        //      per-frame autosave whenever `project_dirty` is set and
+        //      `project_path` is `None`, so a user who never ran File >
+        //      Save still gets their checkboxes / sliders / avatar back.
+        //      `project_path` stays unset for this source so no phantom
+        //      file shows in the title bar.
+        // The restored state's avatar (and the VULVATAR_AUTOSTART_AVATAR
+        // env override, which outranks it) loads asynchronously; the
+        // state itself is applied *after* the avatar lands (AfterLoad::
+        // ApplyProject) so `finalize_avatar_load`'s camera auto-frame
+        // doesn't clobber the restored orbit.
+        let mut restored: Option<(
+            crate::persistence::ProjectState,
+            crate::persistence::ProjectLoadWarnings,
+            Option<PathBuf>,
+        )> = None;
+        if let Some(last_project) = state.settings.last_project_path.clone() {
+            let last_project_path = PathBuf::from(&last_project);
+            if last_project_path.exists() {
+                match crate::persistence::load_project(&last_project_path) {
+                    Ok((ps, warnings)) => {
+                        info!(
+                            "persistence: reopening last project {}",
+                            last_project_path.display()
+                        );
+                        restored = Some((ps, warnings, Some(last_project_path)));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "persistence: could not reopen last project {}: {}",
+                            last_project_path.display(),
+                            e
+                        );
+                        state.push_notification(t!(
+                            "top_bar.failed_load_project",
+                            error = e.to_string()
+                        ));
+                    }
+                }
             } else {
-                warn!("avatar autostart path does not exist: {}", path.display());
+                warn!(
+                    "persistence: last project no longer exists: {}",
+                    last_project_path.display()
+                );
+                state.push_notification(t!(
+                    "toast.last_project_missing",
+                    path = last_project.clone()
+                ));
+                // Clear so a deleted project doesn't warn on every launch.
+                state.settings.last_project_path = None;
+                state.project_status.app_settings_dirty = true;
             }
         }
-
-        // Implicit "last session" restore: if the user never saved a
-        // project, we still want their checkbox / slider values to
-        // survive a quit. The same path is written by the per-frame
-        // autosave block whenever `project_dirty` is set and
-        // `project_path` is `None`. Leave `project_path` unset so the
-        // user doesn't see a phantom file in the title bar — they
-        // never opened one.
         let last_session = crate::persistence::last_session_path();
-        if state.project_status.project_path.is_none() && last_session.exists() {
+        if restored.is_none() && last_session.exists() {
             match crate::persistence::load_project(&last_session) {
-                Ok((project_state, _warnings)) => {
-                    state.apply_project_state(&project_state);
-                    state.project_status.project_dirty = false;
+                Ok((ps, warnings)) => {
                     info!(
-                        "persistence: restored last session from {}",
+                        "persistence: restoring last session from {}",
                         last_session.display()
                     );
+                    restored = Some((ps, warnings, None));
                 }
                 Err(e) => {
                     warn!(
@@ -944,6 +991,66 @@ impl GuiApp {
                     );
                 }
             }
+        }
+
+        let env_avatar = std::env::var_os("VULVATAR_AUTOSTART_AVATAR").map(PathBuf::from);
+        let (startup_avatar, avatar_issues) = project::resolve_startup_avatar(
+            env_avatar,
+            restored
+                .as_ref()
+                .and_then(|(ps, _, _)| ps.avatar_source_path.as_deref()),
+            &|p: &std::path::Path| p.exists(),
+        );
+        for issue in avatar_issues {
+            match issue {
+                project::StartupAvatarIssue::EnvPathMissing(p) => {
+                    warn!("avatar autostart path does not exist: {}", p.display());
+                }
+                project::StartupAvatarIssue::ProjectAvatarMissing(p) => {
+                    warn!("persistence: restored avatar no longer exists: {p}");
+                    state.push_notification(t!("top_bar.avatar_not_found", path = p));
+                }
+            }
+        }
+        let startup_avatar_path = match startup_avatar {
+            project::StartupAvatar::Env(p) => {
+                info!("avatar autostart loading {}", p.display());
+                Some(p)
+            }
+            project::StartupAvatar::Project(p) => Some(p),
+            project::StartupAvatar::None => None,
+        };
+        match (startup_avatar_path, restored) {
+            (Some(avatar), Some((ps, warnings, project_path))) => {
+                state.library.avatar_load_job = Some(
+                    crate::gui::avatar_load::AvatarLoadJob::spawn(
+                        avatar,
+                        crate::gui::avatar_load::AfterLoad::ApplyProject {
+                            project_state: Box::new(ps),
+                            project_path,
+                            warnings,
+                        },
+                    ),
+                );
+            }
+            (Some(avatar), None) => {
+                top_bar::load_avatar_from_path(&mut state, &avatar);
+            }
+            (None, Some((ps, warnings, project_path))) => {
+                state.apply_project_state(&ps);
+                state.project_status.project_dirty = false;
+                for w in &warnings.warnings {
+                    state.push_notification(t!("toast.warning", msg = w.to_string()));
+                }
+                if let Some(path) = project_path {
+                    state.push_notification(t!(
+                        "toast.opened_project",
+                        path = path.display().to_string()
+                    ));
+                    state.project_status.project_path = Some(path);
+                }
+            }
+            (None, None) => {}
         }
 
         // Backfill placeholder thumbnails for library entries that have
@@ -1100,6 +1207,7 @@ impl GuiApp {
                 zoom_sensitivity: 0.002,
                 orbit_sensitivity: 0.3,
                 pan_sensitivity: 1.0,
+                last_project_path: None,
             },
 
             mirror_view: false,

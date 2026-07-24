@@ -78,6 +78,12 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     let instance = crate::avatar::AvatarInstance::new(instance_id, asset);
     state.app.set_avatar(instance);
     state.add_recent_avatar(path.to_path_buf());
+    // The loaded avatar is part of the session state: without this an
+    // "avatar-only" session (load VRM, quit) never triggers the
+    // last-session autosave and the next launch starts empty. The
+    // project-restore path (`AfterLoad::ApplyProject`) clears the flag
+    // again right after applying, so restores don't loop a rewrite.
+    state.project_status.project_dirty = true;
     info!("avatar loaded: {}", path.display());
     state.push_notification(t!("top_bar.loaded_avatar", path = path.display().to_string()));
 
@@ -256,7 +262,16 @@ fn open_project(state: &mut GuiApp) {
                 .avatar_source_path
                 .as_ref()
                 .map(std::path::PathBuf::from)
-                .filter(|p| p.exists());
+                .filter(|p| p.exists())
+                // Already showing this exact avatar (e.g. re-opening the
+                // project that captured the current scene) — skip the
+                // redundant multi-second reload and apply state directly.
+                .filter(|p| {
+                    state
+                        .app
+                        .active_avatar()
+                        .is_none_or(|a| a.asset.source_path != *p)
+                });
             if let Some(missing) = project_state
                 .avatar_source_path
                 .as_ref()
@@ -268,6 +283,7 @@ fn open_project(state: &mut GuiApp) {
                 ));
             }
 
+            state.remember_last_project(&path);
             if let Some(avatar_path) = avatar_to_load {
                 if state.library.avatar_load_job.is_some() {
                     state.push_notification(t!("top_bar.avatar_load_in_progress"));
@@ -280,7 +296,7 @@ fn open_project(state: &mut GuiApp) {
                         avatar_path,
                         AfterLoad::ApplyProject {
                             project_state: Box::new(project_state),
-                            project_path: path.clone(),
+                            project_path: Some(path.clone()),
                             warnings: load_warnings,
                         },
                     ));
@@ -310,6 +326,7 @@ fn save_project(state: &mut GuiApp) {
         match persistence::save_project(&ps, path) {
             Ok(()) => {
                 state.project_status.project_dirty = false;
+                state.remember_last_project(path);
                 state.push_notification(t!("top_bar.project_saved"));
             }
             Err(e) => {
@@ -323,6 +340,7 @@ fn save_project(state: &mut GuiApp) {
     {
         match persistence::save_project(&ps, &path) {
             Ok(()) => {
+                state.remember_last_project(&path);
                 state.project_status.project_path = Some(path);
                 state.project_status.project_dirty = false;
                 state.push_notification(t!("top_bar.project_saved"));

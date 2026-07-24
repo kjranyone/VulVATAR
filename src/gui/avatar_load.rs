@@ -23,12 +23,20 @@ use super::{top_bar, GuiApp};
 
 /// Optional follow-up work to perform on the UI thread once the avatar
 /// finishes loading. `Open Project` uses this to apply the project state
-/// after the referenced avatar has been brought into the scene.
+/// after the referenced avatar has been brought into the scene (the
+/// state must apply *after* `finalize_avatar_load`, which auto-frames
+/// the camera — applying first would let the auto-frame clobber the
+/// restored orbit). The startup last-session restore reuses the same
+/// mechanism with `project_path: None` so the title bar doesn't show a
+/// phantom file the user never opened.
 pub enum AfterLoad {
     None,
     ApplyProject {
         project_state: Box<ProjectState>,
-        project_path: PathBuf,
+        /// `Some` for an explicitly opened `.vvtproj` (sets
+        /// `project_status.project_path` + "opened" toast); `None` for
+        /// the implicit last-session restore (stays anonymous, no toast).
+        project_path: Option<PathBuf>,
         warnings: ProjectLoadWarnings,
     },
 }
@@ -135,12 +143,18 @@ impl GuiApp {
                 } = job.after_load
                 {
                     self.apply_project_state(&project_state);
-                    self.project_status.project_path = Some(project_path.clone());
+                    // `finalize_avatar_load` marks the project dirty; the
+                    // state we just applied IS the on-disk state, so clear
+                    // it — otherwise every startup restore would rewrite
+                    // last_session.vvtproj with identical content.
                     self.project_status.project_dirty = false;
                     for w in &warnings.warnings {
                         self.push_notification(t!("toast.warning", msg = w.to_string()));
                     }
-                    self.push_notification(t!("toast.opened_project", path = project_path.display().to_string()));
+                    if let Some(project_path) = project_path {
+                        self.project_status.project_path = Some(project_path.clone());
+                        self.push_notification(t!("toast.opened_project", path = project_path.display().to_string()));
+                    }
                 }
             }
             LoadOutcome::Error(e) => {

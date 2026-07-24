@@ -171,7 +171,19 @@ impl GuiApp {
             orbit_sensitivity: self.settings.orbit_sensitivity,
             pan_sensitivity: self.settings.pan_sensitivity,
             cloth_autosave_consent: self.cloth_authoring.autosave_consent,
+            last_project_path: self.settings.last_project_path.clone(),
             ..crate::persistence::AppSettings::default()
+        }
+    }
+
+    /// Record `path` as the last explicitly opened / saved project so
+    /// the next launch re-opens it. Rides `settings.json` (a user-level
+    /// preference, not scene state) via the app-settings autosave tick.
+    pub(super) fn remember_last_project(&mut self, path: &std::path::Path) {
+        let as_string = path.to_string_lossy().into_owned();
+        if self.settings.last_project_path.as_deref() != Some(as_string.as_str()) {
+            self.settings.last_project_path = Some(as_string);
+            self.project_status.app_settings_dirty = true;
         }
     }
 
@@ -606,5 +618,122 @@ impl GuiApp {
             self.project_status.overlay_dirty,
             overlay_for_snapshot.as_ref(),
         );
+    }
+}
+
+/// Which avatar the startup flow should load, decided by
+/// [`resolve_startup_avatar`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StartupAvatar {
+    /// `VULVATAR_AUTOSTART_AVATAR` — highest priority (explicit
+    /// per-launch override, e.g. kiosk / streaming scripts).
+    Env(std::path::PathBuf),
+    /// The avatar recorded in the restored project / last-session state.
+    Project(std::path::PathBuf),
+    None,
+}
+
+/// Non-fatal problems found while resolving the startup avatar; the
+/// caller turns these into warn logs / toasts.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StartupAvatarIssue {
+    EnvPathMissing(std::path::PathBuf),
+    ProjectAvatarMissing(String),
+}
+
+/// Pure priority logic for the startup avatar: env override first,
+/// then the restored state's `avatar_source_path`. A set-but-missing
+/// path at either level is reported as an issue and the next source is
+/// considered. Extracted from the GUI init flow so the priority /
+/// missing-file matrix is unit-testable without a filesystem.
+pub(super) fn resolve_startup_avatar(
+    env_path: Option<std::path::PathBuf>,
+    project_avatar: Option<&str>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> (StartupAvatar, Vec<StartupAvatarIssue>) {
+    let mut issues = Vec::new();
+    if let Some(p) = env_path {
+        if exists(&p) {
+            return (StartupAvatar::Env(p), issues);
+        }
+        issues.push(StartupAvatarIssue::EnvPathMissing(p));
+    }
+    if let Some(p) = project_avatar {
+        let path = std::path::PathBuf::from(p);
+        if exists(&path) {
+            return (StartupAvatar::Project(path), issues);
+        }
+        issues.push(StartupAvatarIssue::ProjectAvatarMissing(p.to_string()));
+    }
+    (StartupAvatar::None, issues)
+}
+
+#[cfg(test)]
+mod startup_avatar_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn always(_: &Path) -> bool {
+        true
+    }
+    fn never(_: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn env_override_wins_over_project_avatar() {
+        let (choice, issues) = resolve_startup_avatar(
+            Some(PathBuf::from("env.vrm")),
+            Some("project.vrm"),
+            &always,
+        );
+        assert_eq!(choice, StartupAvatar::Env(PathBuf::from("env.vrm")));
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn missing_env_falls_back_to_project_avatar_with_issue() {
+        let exists = |p: &Path| p == Path::new("project.vrm");
+        let (choice, issues) = resolve_startup_avatar(
+            Some(PathBuf::from("env.vrm")),
+            Some("project.vrm"),
+            &exists,
+        );
+        assert_eq!(choice, StartupAvatar::Project(PathBuf::from("project.vrm")));
+        assert_eq!(
+            issues,
+            vec![StartupAvatarIssue::EnvPathMissing(PathBuf::from("env.vrm"))]
+        );
+    }
+
+    #[test]
+    fn project_avatar_alone_loads_when_present() {
+        let (choice, issues) = resolve_startup_avatar(None, Some("project.vrm"), &always);
+        assert_eq!(choice, StartupAvatar::Project(PathBuf::from("project.vrm")));
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn all_sources_missing_reports_every_issue() {
+        let (choice, issues) = resolve_startup_avatar(
+            Some(PathBuf::from("env.vrm")),
+            Some("project.vrm"),
+            &never,
+        );
+        assert_eq!(choice, StartupAvatar::None);
+        assert_eq!(
+            issues,
+            vec![
+                StartupAvatarIssue::EnvPathMissing(PathBuf::from("env.vrm")),
+                StartupAvatarIssue::ProjectAvatarMissing("project.vrm".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_sources_is_quiet() {
+        let (choice, issues) = resolve_startup_avatar(None, None, &always);
+        assert_eq!(choice, StartupAvatar::None);
+        assert!(issues.is_empty());
     }
 }
