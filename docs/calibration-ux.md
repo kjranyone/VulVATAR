@@ -509,6 +509,15 @@ p' = a0 + R_y(−θ) · (p − a0)
 One transform, applied uniformly, keeps every downstream consumer
 consistent by construction instead of by per-call-site vigilance.
 
+Implementation note: the depth builder publishes joints/fingertips
+**anchor-centred** (the anchor is the joint-space origin), so the
+single pivoted transform decomposes into two pivot-free pieces —
+joints rotate about their own origin, and `root_offset` (an absolute
+source-oriented metric position) pivots about the calibrated anchor
+`[anchor_x, anchor_y, −anchor_depth_m]` (the same convention as the
+solver's root-reference seed). No `mpsu` unit conversion is needed
+anywhere.
+
 ### Consumer inventory (what rotates, what must NOT)
 
 | Sample field | Rotate? | Why |
@@ -555,13 +564,20 @@ yaw `θ = atan2(Δz, Δx)`-style deviation from frontal, from the same
 `None` (old saves, insufficient samples, non-metric) is a strict
 no-op, preserving today's behaviour exactly.
 
-Floors and clamps:
+Floors and gates:
 - ≥ 5 finite samples, else `None` (matches `FACE_NEUTRAL_MIN_SAMPLES`).
-- `|θ|` clamp at 60°: beyond that the far shoulder is
-  occlusion-shadowed in depth and L/R swap risk dominates — a larger
-  reading is more likely garbage than geometry.
+- MAD ≤ 0.15 rad across the window (same stability gate as the face
+  neutrals): a torso that swivels mid-window must not bake a
+  transient heading into every subsequent frame.
+- `|θ|` beyond 60° → **reject** (`None`), not clamp: beyond that the
+  far shoulder is occlusion-shadowed in depth and L/R swap risk
+  dominates, so the reading is more likely garbage than geometry —
+  and a clamped value would apply a wrong-*magnitude* rotation every
+  frame, which is worse than no rotation. The load path re-clamps
+  defensively (hand-edited profile ±180° would flip the scene behind
+  the camera).
 - Inspector warning above 45°: "camera very oblique — tracking quality
-  degrades" (surfaced, not silently clamped).
+  degrades" (surfaced, not silently altered).
 - Sign convention gets dedicated unit tests against synthetic
   skeletons — the selfie-mirror x-flip (`pose_match.rs` convention
   reminder: avatar bone names ≠ subject anatomical sides) makes yaw

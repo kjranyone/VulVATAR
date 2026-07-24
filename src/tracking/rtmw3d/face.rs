@@ -632,6 +632,7 @@ mod tests {
                 neutral_expressions: Vec::new(),
                 neutral_face_ypr_mesh: Some(n_mesh),
                 neutral_face_ypr_body: Some(n_body),
+                neutral_body_yaw: None,
             }),
         };
         let calibrated = |p: FacePose| -> f32 {

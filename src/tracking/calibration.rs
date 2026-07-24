@@ -84,7 +84,7 @@ impl FromStr for CalibrationMode {
 /// Fields are stored in source-skeleton coordinates (`x ∈
 /// [-aspect, +aspect]`, `y ∈ [-1, +1]`, depth in metres) so consumers
 /// can drop them in without unit conversion.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PoseCalibration {
     pub mode: CalibrationMode,
     /// ISO-8601 capture timestamp. `String` rather than `SystemTime`
@@ -199,6 +199,96 @@ pub struct PoseCalibration {
     /// measures the body-path residual.
     #[serde(default)]
     pub neutral_face_ypr_body: Option<[f32; 3]>,
+    /// Neutral **body** yaw (radians): the horizontal angle of the
+    /// user's shoulder line relative to camera-frontal while they hold
+    /// their habitual working orientation ("face your usual forward",
+    /// which at an oblique camera placement is NOT the camera). Median
+    /// of [`shoulder_line_yaw`] across the capture window; the torso
+    /// counterpart of [`Self::neutral_face_ypr_mesh`]. Consumed by
+    /// [`super::TrackingCalibration::apply_calibration`], which
+    /// rigidly re-expresses the whole published sample by
+    /// [`rotate_xz`]`(·, θ)` — "as if the camera had been frontal" —
+    /// so the solver's shoulder-line yaw, direction-matched bones and
+    /// arm IK targets all see a de-rotated scene consistently. See
+    /// `docs/calibration-ux.md` Phase I for why root-only subtraction
+    /// and provider-side rotation were rejected.
+    ///
+    /// Sign convention: positive when the user's shoulder line tilts
+    /// toward +z at its +x end (see [`shoulder_line_yaw`]); pinned by
+    /// unit tests because the selfie-mirror x-flip makes this the most
+    /// likely silently-wrong constant in the pipeline.
+    ///
+    /// `None` for captures without a metric depth backend, captures
+    /// with fewer than [`BODY_YAW_MIN_SAMPLES`] valid frames, and all
+    /// pre-Phase-I saves — each of which must behave exactly like
+    /// today (no rotation applied).
+    #[serde(default)]
+    pub neutral_body_yaw: Option<f32>,
+}
+
+/// Minimum per-frame yaw readings for a capture to publish a
+/// [`PoseCalibration::neutral_body_yaw`]. Matches the face-neutral
+/// floor: below this the estimate is one noisy reading, and baking it
+/// into every subsequent frame is worse than the uncorrected constant.
+pub const BODY_YAW_MIN_SAMPLES: usize = 5;
+
+/// Hard cap on a stored neutral body yaw. Beyond ~60° the far
+/// shoulder is occlusion-shadowed in the depth map and L/R-swap risk
+/// dominates: a larger reading is more likely detector garbage than
+/// camera geometry. The GUI additionally warns (without clamping)
+/// above [`BODY_YAW_WARN_RAD`].
+pub const BODY_YAW_MAX_RAD: f32 = std::f32::consts::PI / 3.0;
+
+/// Inspector-warning threshold (45°): tracking still runs but depth
+/// shadowing measurably degrades the far arm; the user should know
+/// their camera is very oblique rather than silently getting worse
+/// output.
+pub const BODY_YAW_WARN_RAD: f32 = std::f32::consts::PI / 4.0;
+
+/// Minimum horizontal (x, z) shoulder-line length, in isotropic
+/// source units, for its yaw to be well-defined. Same floor as the
+/// solver's `compute_shoulder_yaw_rotation` — a near-vertical
+/// shoulder line has no meaningful heading.
+const YAW_MIN_HORIZ_SPAN: f32 = 0.20;
+
+/// Horizontal shoulder-line yaw of a published sample, in radians:
+/// `atan2(Δz, Δx)` of `LeftUpperArm − RightUpperArm` (avatar bone
+/// names — the source frame is selfie-mirrored, so `LeftUpperArm`
+/// sits at +x for a camera-facing subject and a frontal hold reads
+/// `0`). Positive = the +x shoulder is tilted toward +z (source +z
+/// points toward the camera, so the +x shoulder is the *closer* one).
+/// The unit tests are the normative statement of the sign.
+///
+/// `None` when the sample has no metric backend (monocular z is not
+/// trustworthy enough to measure a constant we then subtract forever),
+/// either shoulder is missing or below the keypoint floor, or the
+/// horizontal span is degenerate.
+pub fn shoulder_line_yaw(sample: &super::SourceSkeleton) -> Option<f32> {
+    use crate::asset::HumanoidBone;
+    sample.metric_frame_info.as_ref()?;
+    let l = sample.joints.get(&HumanoidBone::LeftUpperArm)?;
+    let r = sample.joints.get(&HumanoidBone::RightUpperArm)?;
+    if l.confidence < 0.3 || r.confidence < 0.3 {
+        return None;
+    }
+    let dx = l.position[0] - r.position[0];
+    let dz = l.position[2] - r.position[2];
+    let span = (dx * dx + dz * dz).sqrt();
+    if !span.is_finite() || span < YAW_MIN_HORIZ_SPAN {
+        return None;
+    }
+    Some(dz.atan2(dx))
+}
+
+/// Rotate `v` by `theta` radians about the +Y (vertical) axis, i.e.
+/// in the horizontal (x, z) plane: `x' = x·cosθ + z·sinθ`,
+/// `z' = −x·sinθ + z·cosθ`. Chosen so that
+/// `rotate_xz(shoulder_line, shoulder_line_yaw(...))` maps the
+/// shoulder line back to frontal (+x, z = 0) — the de-rotation
+/// direction. Y passes through untouched.
+pub fn rotate_xz(v: [f32; 3], theta: f32) -> [f32; 3] {
+    let (s, c) = theta.sin_cos();
+    [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]
 }
 
 /// Calibrated torso surface depth profile. Captured during the
@@ -227,7 +317,7 @@ pub struct PoseCalibration {
 /// could not be recovered (depth-map void, occluder during the
 /// entire calibration window) hold `f32::NAN` and are skipped by
 /// the inference-time bias computation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TorsoDepthTemplate {
     /// Cell-grid resolution. Always 32 × 32 for the Step 1 minimal
     /// version; expressed as fields rather than a const so future
@@ -255,6 +345,91 @@ impl TorsoDepthTemplate {
     /// the GUI / provider capture loops can pre-size the accumulation
     /// buffers without re-checking the field at every frame.
     pub const GRID_SIZE: u32 = 32;
+}
+
+#[cfg(test)]
+mod body_yaw_tests {
+    use super::*;
+    use crate::asset::HumanoidBone;
+    use crate::tracking::source_skeleton::{SourceJoint, SourceSkeleton};
+
+    fn skeleton_with_shoulders(l: [f32; 3], r: [f32; 3]) -> SourceSkeleton {
+        let mut sk = SourceSkeleton::default();
+        for (bone, pos) in [
+            (HumanoidBone::LeftUpperArm, l),
+            (HumanoidBone::RightUpperArm, r),
+        ] {
+            sk.joints.insert(
+                bone,
+                SourceJoint {
+                    position: pos,
+                    confidence: 0.9,
+                    metric_depth_m: None,
+                },
+            );
+        }
+        sk.stamp_synthetic_metric_frame();
+        sk
+    }
+
+    #[test]
+    fn frontal_hold_reads_zero() {
+        let sk = skeleton_with_shoulders([0.25, 0.0, 0.0], [-0.25, 0.0, 0.0]);
+        let yaw = shoulder_line_yaw(&sk).unwrap();
+        assert!(yaw.abs() < 1e-6, "frontal must be 0, got {yaw}");
+    }
+
+    #[test]
+    fn yaw_sign_is_positive_when_plus_x_shoulder_is_at_plus_z() {
+        // Normative sign statement: +x shoulder pushed toward +z →
+        // positive yaw. Everything downstream (de-rotation direction,
+        // range folding) is defined against this.
+        let sk = skeleton_with_shoulders([0.25, 0.0, 0.1], [-0.25, 0.0, -0.1]);
+        let yaw = shoulder_line_yaw(&sk).unwrap();
+        assert!(yaw > 0.05, "expected positive yaw, got {yaw}");
+        // Mirror-image placement flips the sign.
+        let sk = skeleton_with_shoulders([0.25, 0.0, -0.1], [-0.25, 0.0, 0.1]);
+        let yaw = shoulder_line_yaw(&sk).unwrap();
+        assert!(yaw < -0.05, "expected negative yaw, got {yaw}");
+    }
+
+    #[test]
+    fn rotate_by_measured_yaw_restores_frontal() {
+        // De-rotation contract: rotate_xz(·, θ) with θ measured by
+        // shoulder_line_yaw maps the shoulder line back to frontal.
+        let sk = skeleton_with_shoulders([0.23, 0.0, 0.13], [-0.21, 0.0, -0.09]);
+        let yaw = shoulder_line_yaw(&sk).unwrap();
+        let l = rotate_xz([0.23, 0.0, 0.13], yaw);
+        let r = rotate_xz([-0.21, 0.0, -0.09], yaw);
+        let dz = l[2] - r[2];
+        assert!(dz.abs() < 1e-6, "residual Δz after de-rotation: {dz}");
+        assert!(l[0] - r[0] > 0.0, "shoulder line must stay +x");
+    }
+
+    #[test]
+    fn non_metric_sample_measures_none() {
+        let mut sk = skeleton_with_shoulders([0.25, 0.0, 0.1], [-0.25, 0.0, -0.1]);
+        sk.metric_frame_info = None;
+        assert!(shoulder_line_yaw(&sk).is_none());
+    }
+
+    #[test]
+    fn degenerate_span_measures_none() {
+        // Near-vertical shoulder line (profile view collapse): heading
+        // undefined, must refuse rather than emit ±90° garbage.
+        let sk = skeleton_with_shoulders([0.02, 0.3, 0.01], [-0.02, -0.3, -0.01]);
+        assert!(shoulder_line_yaw(&sk).is_none());
+    }
+
+    #[test]
+    fn rotate_xz_preserves_y_and_length() {
+        let v = [0.3, -0.7, 0.2];
+        let out = rotate_xz(v, 0.83);
+        assert_eq!(out[1], v[1]);
+        let len_in = (v[0] * v[0] + v[2] * v[2]).sqrt();
+        let len_out = (out[0] * out[0] + out[2] * out[2]).sqrt();
+        assert!((len_in - len_out).abs() < 1e-6);
+    }
 }
 
 impl PoseCalibration {
