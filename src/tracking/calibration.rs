@@ -1,23 +1,18 @@
 //! Per-session pose calibration types.
 //!
 //! See `docs/calibration-ux.md` for the rationale. The short version:
-//! depth-aware tracking providers read the subject's pelvic anchor from
+//! the depth-aware tracking provider reads the subject's anchor from
 //! a per-pixel depth map, and a desk / monitor / chair occluding the
 //! depth window biases that anchor by 0.3–1.5 m. The bias propagates
-//! through every downstream consumer (calibration scale, body yaw,
-//! root translation). This module carries the explicit reference
-//! values the user captures via the `Calibrate Pose ▼` modal so the
-//! solver and `skeleton_from_depth` can clamp / seed against a
-//! known-good baseline rather than the auto-EMA's first frame.
+//! through every downstream consumer (body yaw, root translation).
+//! This module carries the explicit reference values the user
+//! captures via the `Calibrate Pose` modal so the solver and
+//! `skeleton_from_depth` can seed / gate against a known-good
+//! baseline rather than the auto-EMA's first frame.
 //!
-//! Phase A (this commit) only defines the types and the
-//! `apply_calibration` plumbing; the modal UI (Phase B), capture loop
-//! (Phase C), and solver / provider integration (Phase D) land in
-//! follow-up commits. The `TrackingCalibration` struct in
-//! [`super::TrackingCalibration`] now carries an optional
-//! [`PoseCalibration`] so persisted projects with calibration data can
-//! already be loaded into memory; consumers fall back to the existing
-//! auto-EMA / hardcoded clamp behaviour as long as
+//! [`super::TrackingCalibration`] carries an optional
+//! [`PoseCalibration`]; consumers fall back to the auto-EMA /
+//! default behaviour whenever it is absent or
 //! [`PoseCalibration::is_active`] returns false.
 
 use std::str::FromStr;
@@ -76,14 +71,18 @@ impl FromStr for CalibrationMode {
 
 /// One calibration capture's median-aggregated values.
 ///
-/// Built by the modal's capture loop (Phase C) from a 2-second
-/// collection window of source-skeleton samples; consumed by the
-/// solver (root-translation EMA seed) and `skeleton_from_depth`
-/// (calibration-scale clamp + anchor mode).
+/// Built by the modal's capture loop from a 2-second collection
+/// window of source-skeleton samples; consumed by the solver
+/// (root-reference seed, solve-time neutrals via `apply_calibration`)
+/// and the depth-aware skeleton builder (anchor forcing, legacy-path
+/// scale plausibility).
 ///
-/// Fields are stored in source-skeleton coordinates (`x ∈
-/// [-aspect, +aspect]`, `y ∈ [-1, +1]`, depth in metres) so consumers
-/// can drop them in without unit conversion.
+/// Anchor fields are a straight copy of the captured
+/// `SourceSkeleton::root_offset` medians and share its unit contract:
+/// on the metric D435 path `anchor_x`/`anchor_y` are source-oriented
+/// metres; on the legacy rtmw3d-only path they are image-relative
+/// source units. `anchor_depth_m` is always the positive camera-space
+/// forward distance (source z negated).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PoseCalibration {
     pub mode: CalibrationMode,
@@ -115,30 +114,33 @@ pub struct PoseCalibration {
     /// Surfaced on the inspector to flag setups where calibration was
     /// taken under marginal lighting / framing conditions.
     pub confidence: f32,
-    /// Per-frame stddev of the captured anchor depth. Drives the
-    /// dynamic `MIN_C / MAX_C` clamp in `skeleton_from_depth`.
-    /// `None` for non-depth providers.
+    /// Per-frame stddev of the captured anchor depth. A
+    /// capture-quality indicator (inspector status detail), persisted
+    /// for diagnostics — no solver/provider consumer (the D435 metric
+    /// path needs no scale calibration). `None` for non-depth
+    /// captures.
     pub anchor_depth_jitter_m: Option<f32>,
     /// Median per-subject 3D shoulder span (LeftShoulder ↔
-    /// RightShoulder distance) in source-space metres, gathered
-    /// across the calibration window. Drives bone-length-aware Z
-    /// reconstruction in `skeleton_from_depth` so the avatar's arm
-    /// pose becomes outfit-independent (sleeveless skin contrast in
-    /// DAv2 produces a smaller depth signal than long sleeves; the
-    /// reconstruction normalises magnitude to anatomical bone length).
-    /// `None` when fewer than 3 frames produced a finite reading or
-    /// for older saves that predate the field.
+    /// RightShoulder distance) in metres, gathered across the
+    /// calibration window. The depth-aware skeleton builder uses it
+    /// as `reference_span_m` — the subject's true body scale — which
+    /// feeds both the isotropic `mpsu` source-frame normalisation and
+    /// the solver's metres→avatar-units factor for 1:1 root
+    /// placement. `None` when fewer than 3 frames produced a finite
+    /// reading or for older saves that predate the field (the builder
+    /// then falls back to the frame's measured span / anatomical
+    /// mean).
     #[serde(default)]
     pub shoulder_span_m: Option<f32>,
-    /// Optional per-axis range data captured by the multi-step
-    /// calibration extension (steps 2–5: step left/right, lean
-    /// in/out). When present, the solver derives per-axis
-    /// translation sensitivity from the *observed* range — a user
-    /// with a narrow room (small ±X) gets a higher gain so a
-    /// 30 cm step still moves the avatar across half its
-    /// world-space horizontal envelope. `None` when the user
-    /// skipped the extended steps; solver falls back to the
-    /// static [0.6, 0.6, 0.3] default.
+    /// Optional per-axis peak-to-peak movement range captured by the
+    /// optional range step (step left/right, lean in/out). No solver
+    /// consumer: metric root translation is 1:1 (a 30 cm side-step is
+    /// 30 cm of avatar travel, no room-size gain), so there is no
+    /// per-axis sensitivity to derive. Captured for the Done-pane
+    /// summary and persistence, stored **body-frame** (samples
+    /// rotated by the neutral body yaw before folding) so any future
+    /// consumer matches the de-rotated runtime offsets. `None` when
+    /// the user skipped the range step.
     #[serde(default)]
     pub x_range_observed: Option<f32>,
     #[serde(default)]
@@ -210,7 +212,7 @@ pub struct PoseCalibration {
     /// [`rotate_xz`]`(·, θ)` — "as if the camera had been frontal" —
     /// so the solver's shoulder-line yaw, direction-matched bones and
     /// arm IK targets all see a de-rotated scene consistently. See
-    /// `docs/calibration-ux.md` Phase I for why root-only subtraction
+    /// `docs/calibration-ux.md` "Neutral body yaw" for why root-only subtraction
     /// and provider-side rotation were rejected.
     ///
     /// Sign convention: positive when the user's shoulder line tilts
@@ -220,7 +222,7 @@ pub struct PoseCalibration {
     ///
     /// `None` for captures without a metric depth backend, captures
     /// with fewer than [`BODY_YAW_MIN_SAMPLES`] valid frames, and all
-    /// pre-Phase-I saves — each of which must behave exactly like
+    /// older saves that predate the field — each of which must behave exactly like
     /// today (no rotation applied).
     #[serde(default)]
     pub neutral_body_yaw: Option<f32>,

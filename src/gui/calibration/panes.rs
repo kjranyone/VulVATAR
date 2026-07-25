@@ -548,7 +548,7 @@ fn mode_mismatch_hint(
 ///
 /// Two variants: while the bust-up stillness fallback is engaged
 /// (UpperBody, elbows permanently cropped — see
-/// `docs/calibration-ux.md` Phase H) the "step back" advice is
+/// `docs/calibration-ux.md`, "Bust-up framing fallback") the "step back" advice is
 /// unactionable, so the hint instead announces the gate switch. The
 /// fallback latch implies the elapsed condition already passed, so
 /// it's checked first.

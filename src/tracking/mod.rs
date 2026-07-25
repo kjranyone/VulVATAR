@@ -142,23 +142,28 @@ pub struct TrackingCalibration {
 }
 
 impl TrackingCalibration {
-    /// Subtract the stored neutral face pose from the live sample so the
-    /// solver receives deltas relative to calibration, not absolute camera
-    /// angles.
+    /// Apply the solve-time parts of the calibration to a clone of the
+    /// published sample: the neutral-body-yaw scene de-rotation, the
+    /// per-source neutral face-pose subtraction, and the neutral
+    /// expression rescale. The solver then receives deltas relative to
+    /// the user's calibrated setup, not absolute camera geometry.
     ///
-    /// The pose calibration is intentionally *not* applied here — it
-    /// drives anchor selection / EMA seeding inside the solver and the
-    /// depth-aware skeleton builder, so it gets read from those call
-    /// sites directly rather than baked into the source sample.
+    /// The *anchor* part of the pose calibration is intentionally not
+    /// applied here — anchor forcing and EMA seeding are consumed by
+    /// the depth-aware skeleton builder and the solver directly from
+    /// the calibration record. The mailbox always carries the RAW
+    /// sample; only the solve path sees the values transformed here,
+    /// so the calibration modal's recapture loop measures true camera
+    /// geometry (never a previously-corrected frame).
     pub fn apply_calibration(&self, sample: &mut SourceSkeleton) {
-        // Neutral body yaw (oblique camera placement — Phase I): rigidly
+        // Neutral body yaw (oblique camera placement): rigidly
         // re-express the published sample "as if the camera had been
         // frontal" by rotating the horizontal plane by the calibrated
         // shoulder-line yaw. One uniform transform instead of per-consumer
         // subtraction: the solver's shoulder-yaw, direction-matched bones
         // and arm-IK wrist targets all read the same de-rotated scene, so
         // the "pelvis forward, arms chasing oblique targets" twist class
-        // of bug can't exist. See docs/calibration-ux.md Phase I.
+        // of bug can't exist. See docs/calibration-ux.md, "Neutral body yaw".
         //
         // Joints / fingertips are anchor-centred (the depth builder puts
         // the anchor at the joint-space origin), so their pivot is the
@@ -433,7 +438,7 @@ mod calibration_apply_tests {
         assert!((sk.expressions[0].weight - 0.42).abs() < 1e-6);
     }
 
-    // --- Neutral body yaw (Phase I) ---
+    // --- Neutral body yaw ---
 
     use crate::asset::HumanoidBone;
     use crate::tracking::source_skeleton::{HandOrientation, SourceJoint};

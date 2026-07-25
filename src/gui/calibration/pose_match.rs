@@ -24,7 +24,7 @@ pub(super) const REQUIRED_STABLE_FRAMES: u32 = 15;
 
 /// Per-tracking-frame anchor displacement (source units) below which
 /// a frame counts as "still" for the bust-up stillness fallback gate
-/// (see `docs/calibration-ux.md`, Phase H). Source space is
+/// (see `docs/calibration-ux.md`, "Bust-up framing fallback"). Source space is
 /// `y ∈ [-1, 1]`, so 0.010 is 0.5 % of frame height per frame —
 /// generous enough for breathing and keypoint jitter at desk
 /// distance, tight enough that leaning or reaching resets the hold.

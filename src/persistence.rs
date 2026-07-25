@@ -435,7 +435,7 @@ pub struct PoseCalibrationDto {
     pub neutral_face_ypr_body: Option<[f32; 3]>,
     /// Neutral body yaw (radians) for oblique camera placement — see
     /// `crate::tracking::PoseCalibration::neutral_body_yaw`. `None`
-    /// for pre-Phase-I saves and non-metric captures (strict no-op on
+    /// for older saves and non-metric captures (strict no-op on
     /// load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neutral_body_yaw: Option<f32>,

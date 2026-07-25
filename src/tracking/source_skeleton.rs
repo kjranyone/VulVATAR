@@ -297,10 +297,16 @@ pub struct SourceSkeleton {
     /// the pose-calibration modal as the per-frame anchor sample.
     ///
     /// `None` when *neither* the hip pair *nor* the shoulder pair was
-    /// detected — solver leaves the avatar at its rest position. When
-    /// `Some`, components are in the same source-space units as the
-    /// joint positions: `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`,
-    /// `z` in metric units (depth-aware) or `0` (rtmw3d-only).
+    /// detected — solver leaves the avatar at its rest position.
+    ///
+    /// Units depend on the path. Metric (D435,
+    /// `metric_frame_info.is_some()`): all three components are RAW
+    /// camera **metres** with the axes flipped to the source
+    /// orientation (selfie-mirror x, y-up, z toward camera → negative
+    /// for a subject in front of the lens); the solver's "Metric
+    /// translation" 1:1 contract and the calibration anchor fields
+    /// both build on this. Legacy 2D path (`rtmw3d`-only): `x ∈
+    /// [-aspect, +aspect]`, `y ∈ [-1, +1]`, `z = 0`.
     ///
     /// Use [`Self::root_anchor_is_hip`] to disambiguate hip vs
     /// shoulder anchor for downstream consumers (calibration mode

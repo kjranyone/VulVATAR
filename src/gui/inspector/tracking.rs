@@ -734,10 +734,9 @@ fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
             .color(color::ON_SURFACE_MUTED),
     );
 
-    // Neutral body yaw (oblique camera placement, Phase I). Surfacing
-    // the measured angle is the I1 probe: the user can sanity-check
-    // the sign/magnitude against their physical camera placement
-    // before trusting the de-rotation. Above BODY_YAW_WARN_RAD the
+    // Neutral body yaw (oblique camera placement). Surfacing the
+    // measured angle lets the user sanity-check its sign/magnitude
+    // against their physical camera placement. Above BODY_YAW_WARN_RAD the
     // line turns amber — tracking still runs, but depth shadowing on
     // the far arm degrades measurably at very oblique angles.
     if let Some(yaw) = pose.neutral_body_yaw {

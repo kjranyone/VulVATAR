@@ -61,8 +61,10 @@ pub struct CalibrationUiState {
 /// transition to `Done` walks the vec to compute medians + stddev.
 #[derive(Clone, Copy, Debug)]
 pub struct AnchorSample {
-    /// Source-space anchor position (matches `SourceSkeleton::root_offset`).
-    /// For depth-aware paths z is metric metres; for rtmw3d-only z is 0.
+    /// Anchor position (a straight copy of `SourceSkeleton::root_offset`,
+    /// see its unit contract): on the metric D435 path all three
+    /// components are raw source-oriented metres; on the legacy
+    /// rtmw3d-only path x/y are image-relative source units and z is 0.
     pub position: [f32; 3],
     /// Per-frame `overall_confidence`. Aggregated as a separate median
     /// so the surfaced calibration confidence reflects the gathered
@@ -148,13 +150,13 @@ pub enum CalibrationModalState {
         /// desk distances".
         no_lower_arms_since: Option<Instant>,
         /// Bust-up framing fallback latch (`docs/calibration-ux.md`,
-        /// Phase H). Set once when `mode == UpperBody` and
+        /// "Bust-up framing fallback"). Set once when `mode == UpperBody` and
         /// `no_lower_arms_since` survives `NO_ANCHOR_HINT_SECONDS`:
         /// the shoulder anchor is visible but both elbows are cropped
         /// out (webcam-streamer framing where the arm-direction gate
         /// can never fire). While `true`, the gate scores **anchor
         /// stillness** instead of arm direction, and the instruction
-        /// pane swaps to "face the camera and hold still". Latched —
+        /// pane swaps to "face your usual forward and hold still". Latched —
         /// never cleared inside this state — so elbows flickering in
         /// at the frame edge don't bounce the user between two
         /// different instructions mid-wait; a retry / mode switch

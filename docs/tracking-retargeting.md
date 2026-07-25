@@ -151,12 +151,11 @@ Do not make one missing channel invalidate the whole tracking frame.
 
 ## Calibration
 
-The design should leave room for:
-
-- neutral pose calibration
-- scale normalization
-- shoulder width adjustment
-- avatar-specific head offset tuning
+See [calibration-ux.md](calibration-ux.md) for the capture UX and
+data model: neutral pose calibration (anchor + face neutrals +
+neutral body yaw), scale normalization (`shoulder_span_m` →
+`reference_span_m`/`mpsu`), and the per-profile persistence model.
+Avatar-specific head offset tuning remains future work.
 
 These can be basic in the first pass, but the data path should not prevent them.
 

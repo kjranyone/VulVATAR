@@ -108,8 +108,8 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
             } else if no_lower_arms_since.is_none() {
                 *no_lower_arms_since = Some(now);
             }
-            // Bust-up framing fallback (docs/calibration-ux.md,
-            // Phase H): shoulders visible but elbows cropped out for
+            // Bust-up framing fallback (docs/calibration-ux.md):
+            // shoulders visible but elbows cropped out for
             // the whole hint window means the arm-direction gate can
             // never fire at this framing. Latch onto the stillness
             // gate instead of leaving the user stuck at 0 % with a
@@ -230,7 +230,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
                         });
                     }
                     // Shoulder-line yaw for the neutral-body-yaw median
-                    // (oblique camera placement — Phase I). The helper
+                    // (oblique camera placement). The helper
                     // refuses non-metric frames, missing shoulders and
                     // degenerate spans, so a `Some` here is a reading
                     // worth aggregating. Raw-mailbox invariant holds:

@@ -120,7 +120,7 @@ pub(super) fn finalize_collection(
         .or(previous.as_ref().and_then(|p| p.neutral_face_ypr_body));
 
     // Median shoulder-line yaw → neutral body yaw (oblique camera
-    // placement, Phase I). Same carry-forward contract as the face
+    // placement). Same carry-forward contract as the face
     // neutrals: a recapture that couldn't measure (non-metric frames,
     // torso wandering during the hold) keeps the previous value
     // instead of silently discarding a good one.
@@ -633,6 +633,42 @@ mod tests {
         // read the instructions mid-window): MAD gate must refuse.
         let accum = [0.0, 0.5, -0.5, 0.6, -0.6, 0.1];
         assert_eq!(neutral_body_yaw_from_accum(&accum), None);
+    }
+
+    #[test]
+    fn range_folding_rotates_samples_not_the_box() {
+        // Spec (docs/calibration-ux.md, "Neutral body yaw" →
+        // movement-range interaction): with a neutral body yaw active, each range
+        // sample is rotated into the body frame BEFORE min/max
+        // folding. Rotating the already-folded camera-frame box is
+        // NOT equivalent (an axis-aligned box is not
+        // rotation-equivariant) — this pins the difference so a
+        // future refactor can't quietly swap the order.
+        use crate::tracking::rotate_xz;
+        let theta = 0.6_f32;
+        let samples = [
+            [0.30_f32, 0.0, -1.20],
+            [-0.25, 0.0, -1.70],
+            [0.10, 0.0, -1.95],
+        ];
+        let fold = |pts: &[[f32; 3]]| {
+            let mut x = (f32::INFINITY, f32::NEG_INFINITY);
+            let mut z = (f32::INFINITY, f32::NEG_INFINITY);
+            for p in pts {
+                x = (x.0.min(p[0]), x.1.max(p[0]));
+                z = (z.0.min(p[2]), z.1.max(p[2]));
+            }
+            (x.1 - x.0, z.1 - z.0)
+        };
+        let rotated: Vec<[f32; 3]> = samples.iter().map(|p| rotate_xz(*p, theta)).collect();
+        let (fold_rot_x, fold_rot_z) = fold(&rotated);
+        // "Rotate the folded box" degenerates to the raw extents (a
+        // peak-to-peak delta has no orientation to rotate).
+        let (box_x, box_z) = fold(&samples);
+        assert!(
+            (fold_rot_x - box_x).abs() > 1e-3 || (fold_rot_z - box_z).abs() > 1e-3,
+            "fold-of-rotated must differ from the raw-axis box for an oblique sweep"
+        );
     }
 
     #[test]
