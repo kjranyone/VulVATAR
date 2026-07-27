@@ -37,7 +37,15 @@ fn default_color() -> PathBuf {
 }
 
 fn default_depth(color: &Path) -> PathBuf {
-    PathBuf::from(color.to_string_lossy().replace("_color.png", "_depth_mm.npy"))
+    // Extension-agnostic: `<stem>_color.<ext>` → `<stem>_depth_mm.npy`.
+    match color
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_suffix("_color"))
+    {
+        Some(stem) => color.with_file_name(format!("{stem}_depth_mm.npy")),
+        None => PathBuf::from(color.to_string_lossy().replace("_color.png", "_depth_mm.npy")),
+    }
 }
 
 /// Minimal `.npy` reader for a 2-D little-endian `u16` array. Returns
@@ -328,8 +336,20 @@ fn batch(dir: &Path) -> Result<(), String> {
     let mut pairs: Vec<(u64, PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))? {
         let p = entry.map_err(|e| e.to_string())?.path();
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        if let Some(stem) = name.strip_suffix("_color.png") {
+        // Any colour extension: hand-made fixtures are `.png`,
+        // `session_record`'s continuous capture writes uncompressed `.bmp`
+        // so it can keep up with a 30 fps camera in a dev build.
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix("_color"))
+            .filter(|_| {
+                p.extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| x == "png" || x == "bmp" || x == "jpg")
+            })
+            .map(|s| s.to_string());
+        if let Some(stem) = stem {
             let depth = p.with_file_name(format!("{stem}_depth_mm.npy"));
             if depth.exists() {
                 let idx = stem

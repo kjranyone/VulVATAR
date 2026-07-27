@@ -218,6 +218,18 @@ loads with them absent rather than failing; load-time coercions
 `src/gui/profile.rs` asserts every field survives save→load — add the
 assertion when adding a field.
 
+`shoulder_span_m` is stored in **real camera metres**, not the
+normalised source units the published `SourceSkeleton` uses (whose
+shoulder span equals the fixed `TARGET_SRC_SHOULDER_SPAN` (0.75)).
+Measuring it raw would store that constant for every subject; consuming
+it as metres then inflates every anthropometric bone by ~1.8× (depth-hole
+joints fly off along their ray) while shrinking the published skeleton
+to ~58% of the range the solver's dead-zones are tuned for. The capture
+path converts back with `MetricFrameInfo::mpsu`, and the aggregate,
+loader and consumer all gate on `tracking::shoulder_span_plausible`
+(0.20–0.60 m), so a pre-fix profile loads as "not captured" instead of
+poisoning the session.
+
 ## UI status line
 
 Tracking inspector adds a single-line status under the calibrate button:

@@ -1838,6 +1838,18 @@ impl eframe::App for GuiApp {
         // `sync_app_settings`.
         self.sync_app_settings();
 
+        // Heartbeat BEFORE the pause gate: records the raw flags that
+        // decide whether anything below runs. Its `seq` advances on every
+        // GUI frame, so a stalled avatar can be attributed to the exact
+        // switch responsible instead of inferred from which files stopped
+        // being written. No-op unless the debug flag file exists.
+        crate::tracking::debug_channel::dump_gui_heartbeat(
+            self.runtime_status.paused,
+            self.app.avatars.len(),
+            self.tracking.toggle_tracking,
+            self.runtime_status.frame_count,
+        );
+
         if !self.runtime_status.paused {
             let real_dt = (self.runtime_status.frame_time_ms / 1000.0) as f32;
             // Clamp dt to avoid huge steps on first frame or after pauses.

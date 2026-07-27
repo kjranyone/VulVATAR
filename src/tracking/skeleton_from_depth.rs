@@ -1616,18 +1616,32 @@ pub(super) fn build_skeleton(
     // Bone lengths from the calibrated shoulder span (fallback: this frame's
     // measured 3D span, else an anatomical mean). This one scalar also drives
     // the isotropic normalization below as `reference_span_m`.
+    // EVERY source goes through the same plausibility band. This scalar
+    // multiplies each bone length below AND divides the whole skeleton at
+    // the end, so an out-of-band value doesn't degrade the pose, it
+    // destroys it: at the old `> 0.05` floor a 0.06 m span yields
+    // `mpsu = 0.08` and publishes the body at 12× size.
+    //
+    // Guarding only some of the branches is worse than guarding none —
+    // it silently re-routes a setup from a rejected source onto an
+    // unguarded one, which is exactly how a "fix" turns into a new
+    // failure mode for the users who had been taking the guarded branch.
+    let plausible = |s: f32| crate::tracking::shoulder_span_plausible(s);
     let reference_span_m = calibration
         .and_then(|c| c.shoulder_span_m)
-        .filter(|s| *s > 0.05)
+        .filter(|s| plausible(*s))
         // Provider's temporally-stabilised span (uncalibrated path): holds the
         // avatar's scale steady against per-frame shoulder-depth contamination.
-        .or_else(|| reference_span_override.filter(|s| *s > 0.05))
+        .or_else(|| reference_span_override.filter(|s| plausible(*s)))
         .or_else(|| {
             let r = fit.r_shoulder_cam?;
             let l = fit.l_shoulder_cam?;
             let d = ((l[0] - r[0]).powi(2) + (l[1] - r[1]).powi(2) + (l[2] - r[2]).powi(2)).sqrt();
-            (d > 0.05).then_some(d)
+            plausible(d).then_some(d)
         })
+        // Anatomical mean — the last resort is a number that is right for
+        // an average adult, never an arbitrary measurement that merely
+        // cleared a floor.
         .unwrap_or(0.38);
     let bones = anthropometric_bones(reference_span_m);
 
@@ -3189,6 +3203,55 @@ mod tests {
         );
         let z = wrist.metric_depth_m.expect("wrist camera z");
         assert!((z - 0.6).abs() < 0.05, "wrist on the body plane, got {z}");
+    }
+
+    /// The bone-length fallback's reach gate is a *ratio* of the bone
+    /// length (`STRETCH_MAX × bone_len`), so shrinking the bone shrinks the
+    /// window in which a depth-hole joint survives at all.
+    ///
+    /// This is the coupling that turns "the calibrated span is 1.8× too
+    /// long" from a pose-accuracy bug into a *disappearing joint* bug the
+    /// moment the span is corrected: the same camera geometry that an
+    /// inflated bone accepted (and placed badly — the wild-limb symptom) a
+    /// correct bone rejects outright, and a limb whose joints are dropped
+    /// gets rested in the idle A-pose. Pinned here so the trade-off is a
+    /// stated property of the fallback rather than a surprise found in the
+    /// field.
+    #[test]
+    fn ray_fallback_reach_gate_scales_with_the_bone_length() {
+        let intr = intr_640();
+        // Parent 0.5 m to the side of the optical axis at 0.8 m; the
+        // keypoint sits dead centre, so its ray is the +z axis and passes
+        // 0.5 m from the parent — a sphere miss for any plausible bone.
+        let parent = [0.5, 0.0, 0.8];
+        let (nx, ny) = (0.5, 0.5);
+
+        // Inflated bone (0.75 × a 0.692 "shoulder span" recorded in source
+        // units): gate = 1.6 × 0.519 = 0.83 m, so the 0.5 m miss is
+        // accepted and a joint is manufactured.
+        let inflated = solve_limb_joint(&intr, nx, ny, parent, 0.519, None);
+        assert!(
+            inflated.is_some(),
+            "an inflated bone length accepts a 0.5 m ray miss — this is how the \
+             pre-fix pipeline always produced a joint, however wrong its position"
+        );
+
+        // Correct bone (0.75 × a real 0.40 m span): gate = 1.6 × 0.30 =
+        // 0.48 m < 0.5 m, and `solve_child` passes no depth prior, so the
+        // joint is dropped.
+        let correct = solve_limb_joint(&intr, nx, ny, parent, 0.30, None);
+        assert!(
+            correct.is_none(),
+            "a correct bone length rejects the same geometry — the limb loses its \
+             joint and the solver rests it"
+        );
+
+        // A depth prior rescues the drop; the production call site
+        // (`solve_child`) does not pass one.
+        assert!(
+            solve_limb_joint(&intr, nx, ny, parent, 0.30, Some(0.8)).is_some(),
+            "a depth prior is the escape hatch the miss branch already has"
+        );
     }
 
     /// Contrast: an IN-FRAME elbow whose depth window is a HOLE (a dark sleeve

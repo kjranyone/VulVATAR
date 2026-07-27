@@ -71,13 +71,14 @@ pub struct AnchorSample {
     /// samples, not just the first frame's reading.
     pub confidence: f32,
     /// Per-frame measured shoulder span (3D distance between
-    /// LeftShoulder and RightShoulder joints, in source-space metres
-    /// for depth-aware providers). `None` when either shoulder was
-    /// missing this frame, or for rtmw3d-only paths where source
-    /// positions are not metric. Aggregated by `aggregate()` as the
-    /// median of finite samples to give a per-subject body-scale
-    /// reference. On the depth path this drives the metric-frame `mpsu`
-    /// (metres-per-source-unit) normalisation in
+    /// LeftShoulder and RightShoulder joints) in **real camera
+    /// metres** — `super::finalize::measure_shoulder_span` converts the
+    /// normalised source-space distance back with `MetricFrameInfo::mpsu`.
+    /// `None` when either shoulder was missing this frame, or on
+    /// non-metric providers where no conversion exists. Aggregated by
+    /// `aggregate()` as the median of finite samples to give a
+    /// per-subject body-scale reference. On the depth path this drives
+    /// the metric-frame `mpsu` (metres-per-source-unit) normalisation in
     /// [`crate::tracking::skeleton_from_depth::build_skeleton`], scaling
     /// the metric skeleton into the isotropic source frame.
     pub shoulder_span_m: Option<f32>,

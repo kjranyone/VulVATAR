@@ -63,6 +63,62 @@ cargo build --features realsense --bin diagnose_depth_replay
   フレーム番号から実キャプチャ時刻を復元して dt 正規化推定器に供給する
   (ダンプは5フレーム間引きが通例 — 名目 30fps 扱いだと時間系ゲートが実機の5倍厳しく見える)。
 
+## 実機不具合の調べ方 (最優先)
+
+**ライブパイプラインの不具合をコード読解だけで診断するな。** 症状 (「体が暴れる」「棒立ちで固まる」) からコードを読んで因果の物語を組み立てると、もっともらしいが間違った結論に達する。特に `reference_span_m` のような載荷スカラーを未計測のまま変更すると、症状が別の症状に化けるだけで前に進まない。**まず録る。**
+
+### 1. アプリ起動中なら — ライブデバッグチャネル
+
+フラグファイル `%ProgramData%\VulVATAR\debug.on` を作ると 2 秒以内に有効化 (リビルド不要)。同ディレクトリに毎フレーム上書きで出る:
+
+| ファイル | 書き手 | 中身 |
+|---|---|---|
+| `debug_gui.json` | GUI スレッド (**全ゲートの手前**) | `paused` / `avatars_loaded` / `tracking_enabled` / `frame_count` / `seq` |
+| `debug_state.json` | トラッキングワーカー | 2D キーポイント + source 関節 (位置・信頼度) + face pose |
+| `debug_avatar.json` | `run_frame` 内 | ソルブ後のアバター world 関節 + head 軸 |
+| `debug_camera.bin` | トラッキングワーカー | カメラ RGBA (32 byte ヘッダ `VDBG`) |
+| `debug_tuning.json` | **読み込み** | `arm_reach_ik` / `contact_ik` / `idle_arm_apose` / `joint_confidence_threshold` をリビルドなしで A/B |
+
+「アバターが動かない」の切り分けは `debug_gui.json` の 2 値で決まる。`seq` は毎 GUI フレーム、`frame_count` は**非 pause フレームのみ**進む:
+
+- `seq` 進む・`frame_count` 止まる → 一時停止中 (Space が `TogglePause` に**修飾キーなし**でバインド)
+- 両方進む・`avatars_loaded: 0` → アバター未ロード
+- 両方進む・`avatars_loaded: 1` → 原因は `run_frame` より下流
+
+これらは値であって解釈ではない。推測する前に読め。
+
+### 2. キャプチャ → 無人リプレイ (品質改善の本線)
+
+人間がカメラの前に座るのは**一度だけ**にする。録ったら以降は無人で何度でも回す。
+
+```powershell
+$env:VULVATAR_RECORD="1"; $env:VULVATAR_RECORD_RAW="1"
+cargo run                       # 再現させてトラッキング停止 (生フレーム収集は既定 900 frame = 30 秒で打ち切り、アプリは続行)
+```
+
+`diagnostics/session_<unix>/` に出る:
+
+- `pose.jsonl` — published `SourceSkeleton` の全フレーム時系列。各関節に **`JointOrigin`** (`O`=深度実測 / `E`=深度が穴で骨長レイ外挿 / `S`=合成) と `reference_span_m` / `mpsu` / アンカー
+- `frame_NNNNNN_color.bmp` + `_depth_mm.npy` — 生フレーム
+- `manifest.jsonl` — **実 intrinsics とデバイスタイムスタンプ**
+
+以降はカメラ不要:
+
+```powershell
+cargo run --release --bin diagnose_video_replay -- diagnostics\session_<unix>   # 温度状態を継続して本番プロバイダに流す
+cargo run --bin analyze_session -- diagnostics\session_<unix>                   # summary.md に判定
+```
+
+`analyze_session` は「飛んだ関節は測ったのか、でっち上げたのか」を両端の provenance で分類する。`E` 側に偏れば骨長 (=`reference_span_m`) が疑い、`O` 両端に偏れば深度サンプリング側。L/R ブロック反転とグローバルスケール異常も別枠で出す。
+
+**環境変数**: `VULVATAR_RECORD_JUMP` (ジャンプ検出閾値、既定 0.35 source unit)、`VULVATAR_RECORD_RAW_FRAMES` (フレーム上限、既定 900)、`VULVATAR_RECORD_RAW=N` (N フレームおき)。
+
+**注意点**:
+- 生フレームは **BMP (非圧縮)**。dev プロファイルは依存クレートが opt-level 0 で、PNG は 90.8 ms/frame = 11 fps 上限となり 30 fps に追いつかず**静かに間引かれた録画**になる。BMP は 3.6 ms/frame。間引かれた録画はフレーム間隔が実機と違うので温度フィルタ由来の不具合を再現できない。実測は `cargo test -- --ignored --nocapture frame_write_throughput`
+- ディスク 1.5 MB/frame (30 秒で約 1.4 GB)
+- drop が出たら `session_record` が warn を出す。**その録画は使うな**
+- `manifest.jsonl` が無いディレクトリを replay すると、公称 1280×720 の intrinsics (`fx=924`) と名目クロックにフォールバックする。640×480 のキャプチャでは焦点距離が約 2 倍ずれる。replay は必ず「N with recorded intrinsics + device timestamps」を確認してから読む
+
 ## Architecture
 
 - GUI thread: eframe/egui — `src/gui/mod.rs` (`GuiApp::update`)

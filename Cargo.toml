@@ -48,7 +48,12 @@ bincode = "1.3"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.11.0"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# `bmp` is for `tracking::session_record`'s continuous capture only: PNG's
+# deflate costs ~91 ms/frame at the dev profile's opt-level 0 for
+# dependencies (measured, 640x480), which cannot keep up with a 30 fps
+# capture and silently thins the recording. BMP is uncompressed, so the
+# write is a memcpy and the capture keeps up in a plain `cargo run`.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 bytemuck = { version = "1", features = ["derive"] }
 vulkano = "0.35"
 vulkano-shaders = "0.35"

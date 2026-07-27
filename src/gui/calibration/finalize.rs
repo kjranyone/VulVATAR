@@ -397,13 +397,26 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
     // Median the per-frame measured shoulder spans. Only emit when at
     // least three frames produced a finite reading — single-frame
     // medians are trivially the value itself and don't earn the
-    // robustness the median provides.
+    // robustness the median provides. The plausibility gate is not
+    // cosmetic: this scalar multiplies every anthropometric bone length
+    // AND the whole-skeleton normalisation in `skeleton_from_depth`, so
+    // storing garbage here is worse than storing nothing (the
+    // uncalibrated path falls back to the provider's stabilised span).
     let mut spans: Vec<f32> = samples.iter().filter_map(|s| s.shoulder_span_m).collect();
-    let shoulder_span_m = if spans.len() >= 3 {
-        Some(median_inplace(&mut spans))
-    } else {
-        None
-    };
+    let shoulder_span_m = (spans.len() >= 3)
+        .then(|| median_inplace(&mut spans))
+        .filter(|s| {
+            let ok = crate::tracking::shoulder_span_plausible(*s);
+            if !ok {
+                warn!(
+                    "shoulder-span calibration rejected: {s:.3} m outside the plausible \
+                     {:.2}–{:.2} m band — falling back to the auto-measured span",
+                    crate::tracking::SHOULDER_SPAN_MIN_M,
+                    crate::tracking::SHOULDER_SPAN_MAX_M,
+                );
+            }
+            ok
+        });
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -448,22 +461,39 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
     }
 }
 
-/// Source-space 3D distance between LeftShoulder and RightShoulder
-/// joints. Returns `None` when either shoulder is missing (off-frame,
-/// low confidence, etc) or when the result is non-positive (rtmw3d-
-/// only path emits z=0 across joints, so the 3D distance reduces to
-/// the 2D shoulder span — still a reasonable body-scale proxy for
-/// that path, but we gate on positive finite values for safety).
+/// The subject's 3D shoulder span (LeftShoulder ↔ RightShoulder) in
+/// **real camera metres**.
+///
+/// The joint positions on a published `SourceSkeleton` are NOT metres:
+/// `skeleton_from_depth` divides the metric skeleton by `mpsu` so every
+/// subject's shoulder span lands on the fixed `TARGET_SRC_SHOULDER_SPAN`
+/// constant (which is the point — it keeps the solver's
+/// position-magnitude tunings in range). Measuring that span raw
+/// therefore returns the same number for a child and a linebacker, and
+/// storing it in `PoseCalibration::shoulder_span_m` — consumed as
+/// metres, ~1.8× the anatomical mean — inflated every fallback bone
+/// length and shrank the published skeleton out of the tuned range.
+/// Multiplying by `mpsu` (`metres = source_units × mpsu`) undoes the
+/// normalisation exactly and recovers the frame's own measurement.
+///
+/// Returns `None` when the frame has no metric backend (a monocular
+/// span is in arbitrary units with no conversion available — there is
+/// nothing honest to store), when either shoulder is missing
+/// (off-frame, low confidence), or when the result is non-positive.
 pub(super) fn measure_shoulder_span(pose: &SourceSkeleton) -> Option<f32> {
     use crate::asset::HumanoidBone;
+    let mpsu = pose.metric_frame_info.as_ref()?.mpsu;
+    if !mpsu.is_finite() || mpsu <= 1e-6 {
+        return None;
+    }
     let l = pose.joints.get(&HumanoidBone::LeftShoulder)?.position;
     let r = pose.joints.get(&HumanoidBone::RightShoulder)?.position;
     let dx = l[0] - r[0];
     let dy = l[1] - r[1];
     let dz = l[2] - r[2];
-    let span = (dx * dx + dy * dy + dz * dz).sqrt();
-    if span.is_finite() && span > 0.0 {
-        Some(span)
+    let span_m = (dx * dx + dy * dy + dz * dz).sqrt() * mpsu;
+    if span_m.is_finite() && span_m > 0.0 {
+        Some(span_m)
     } else {
         None
     }
@@ -603,6 +633,132 @@ mod tests {
 
     fn steady(n: usize, ypr: [f32; 3]) -> Vec<[f32; 3]> {
         vec![ypr; n]
+    }
+
+    /// A published metric skeleton whose shoulders sit `span_src` apart
+    /// in normalised source units, carrying `mpsu` metres per unit —
+    /// i.e. exactly what `skeleton_from_depth` emits.
+    fn metric_pose(span_src: f32, mpsu: f32) -> SourceSkeleton {
+        use crate::asset::HumanoidBone;
+        use crate::tracking::source_skeleton::{CameraIntrinsics, MetricFrameInfo, SourceJoint};
+
+        let mut sk = SourceSkeleton::default();
+        for (bone, x) in [
+            (HumanoidBone::LeftShoulder, span_src * 0.5),
+            (HumanoidBone::RightShoulder, -span_src * 0.5),
+        ] {
+            sk.joints.insert(
+                bone,
+                SourceJoint {
+                    position: [x, 0.0, 0.0],
+                    confidence: 0.9,
+                    metric_depth_m: None,
+                },
+            );
+        }
+        sk.metric_frame_info = Some(MetricFrameInfo {
+            anchor_cam_m: [0.0, 0.0, 1.0],
+            anchor_is_hip: true,
+            mpsu,
+            reference_span_m: span_src * mpsu,
+            intrinsics: CameraIntrinsics {
+                fx: 600.0,
+                fy: 600.0,
+                cx: 320.0,
+                cy: 240.0,
+                width: 640,
+                height: 480,
+            },
+        });
+        sk
+    }
+
+    #[cfg(feature = "inference")]
+    #[test]
+    fn shoulder_span_is_measured_in_metres_not_source_units() {
+        // The published skeleton is normalised to the fixed
+        // TARGET_SRC_SHOULDER_SPAN, so the raw distance carries no
+        // per-subject information at all — only `× mpsu` recovers the
+        // frame's actual metric measurement.
+        use crate::tracking::skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN;
+        let true_span_m = 0.41;
+        let mpsu = true_span_m / TARGET_SRC_SHOULDER_SPAN;
+        let span = measure_shoulder_span(&metric_pose(TARGET_SRC_SHOULDER_SPAN, mpsu)).unwrap();
+        assert!(
+            (span - true_span_m).abs() < 1e-5,
+            "expected {true_span_m} m, got {span} (source units leaked through?)"
+        );
+        assert!(
+            crate::tracking::shoulder_span_plausible(span),
+            "a real subject's span must survive the plausibility gate"
+        );
+    }
+
+    #[cfg(feature = "inference")]
+    #[test]
+    fn shoulder_span_distinguishes_two_subjects() {
+        // Regression pin for the fixed-point poison: both subjects
+        // publish the SAME normalised span and differ only in mpsu, so
+        // a measurement that ignores mpsu returns one constant for both.
+        use crate::tracking::skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN;
+        let small = measure_shoulder_span(&metric_pose(
+            TARGET_SRC_SHOULDER_SPAN,
+            0.32 / TARGET_SRC_SHOULDER_SPAN,
+        ))
+        .unwrap();
+        let large = measure_shoulder_span(&metric_pose(
+            TARGET_SRC_SHOULDER_SPAN,
+            0.48 / TARGET_SRC_SHOULDER_SPAN,
+        ))
+        .unwrap();
+        assert!(
+            large - small > 0.15,
+            "spans collapsed to a constant ({small} vs {large})"
+        );
+    }
+
+    #[test]
+    fn shoulder_span_refuses_a_non_metric_frame() {
+        // No mpsu → no honest conversion. Storing the raw source span
+        // would hand `skeleton_from_depth` a ~0.75 "metre" reading.
+        let mut sk = metric_pose(0.75, 0.5);
+        sk.metric_frame_info = None;
+        assert_eq!(measure_shoulder_span(&sk), None);
+    }
+
+    #[test]
+    fn aggregate_refuses_to_store_an_implausible_span() {
+        let s = |span: f32| AnchorSample {
+            position: [0.0, 0.0, -0.8],
+            confidence: 0.7,
+            shoulder_span_m: Some(span),
+        };
+        // Pre-fix-shaped readings (the normalised source-space target)
+        // must be dropped, not persisted: the uncalibrated fallback is
+        // the provider's stabilised auto-span, which is strictly better
+        // than a 1.8×-inflated constant.
+        let bad = aggregate(&[s(0.75), s(0.74), s(0.76)], CalibrationMode::FullBody);
+        assert_eq!(bad.shoulder_span_m, None);
+        // A genuine metric measurement survives.
+        let good = aggregate(&[s(0.40), s(0.41), s(0.42)], CalibrationMode::FullBody);
+        assert_eq!(good.shoulder_span_m, Some(0.41));
+    }
+
+    #[test]
+    fn plausibility_band_rejects_a_source_unit_span() {
+        use crate::tracking::shoulder_span_plausible;
+        // The exact value the pre-fix capture path wrote.
+        #[cfg(feature = "inference")]
+        assert!(!shoulder_span_plausible(
+            crate::tracking::skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN
+        ));
+        // …and the one found in a real pre-fix profile.
+        assert!(!shoulder_span_plausible(0.691_979_17));
+        // Real human spans pass.
+        for s in [0.30, 0.38, 0.45, 0.52] {
+            assert!(shoulder_span_plausible(s), "{s} m should be accepted");
+        }
+        assert!(!shoulder_span_plausible(f32::NAN));
     }
 
     #[test]

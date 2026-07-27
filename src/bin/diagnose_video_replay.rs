@@ -39,9 +39,23 @@ const D435_FY: f32 = 924.0;
 const D435_CX: f32 = 640.0;
 const D435_CY: f32 = 360.0;
 
-/// `<stem>_color.png` → `<stem>_depth_mm.npy`.
+/// `<stem>_color.<ext>` → `<stem>_depth_mm.npy`, for any colour extension.
+/// Hand-assembled fixture dirs use `.png`; `session_record`'s continuous
+/// capture writes `.bmp` (uncompressed, so the capture keeps up with a
+/// 30 fps camera in a dev build).
 fn depth_sibling(color: &std::path::Path) -> std::path::PathBuf {
-    std::path::PathBuf::from(color.to_string_lossy().replace("_color.png", "_depth_mm.npy"))
+    color.with_file_name(format!(
+        "{}_depth_mm.npy",
+        colour_stem(color).unwrap_or_default()
+    ))
+}
+
+/// `<dir>/<stem>_color.<ext>` → `<stem>`. Also the manifest key.
+fn colour_stem(color: &std::path::Path) -> Option<&str> {
+    color
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_suffix("_color"))
 }
 
 /// Minimal `.npy` reader for a 2-D little-endian `u16` array → (rows, cols, data).
@@ -74,11 +88,20 @@ fn parse_npy_u16(bytes: &[u8]) -> Result<(usize, usize, Vec<u16>), String> {
 /// consumes via `set_external_depth`.
 fn load_metric_depth(
     depth_path: &std::path::Path,
+    recorded: Option<&FrameMeta>,
 ) -> Result<vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame, String> {
     use vulvatar_lib::tracking::source_skeleton::CameraIntrinsics;
     let (rows, cols, depth_mm) = parse_npy_u16(&std::fs::read(depth_path).map_err(|e| e.to_string())?)?;
     let (dw, dh) = (cols as u32, rows as u32);
-    let intr = CameraIntrinsics { fx: D435_FX, fy: D435_FY, cx: D435_CX, cy: D435_CY, width: dw, height: dh };
+    // Prefer the intrinsics the capture actually recorded. The constants
+    // below are the 1280×720 D435 colour profile; using them on a 640×480
+    // capture deprojects with roughly double the correct focal length and
+    // silently scales every metric position — the replay would then be
+    // measuring the mismatch, not the pipeline.
+    let intr = match recorded {
+        Some(m) => CameraIntrinsics { fx: m.fx, fy: m.fy, cx: m.cx, cy: m.cy, width: dw, height: dh },
+        None => CameraIntrinsics { fx: D435_FX, fy: D435_FY, cx: D435_CX, cy: D435_CY, width: dw, height: dh },
+    };
     let mut points_m = Vec::with_capacity(depth_mm.len());
     for v in 0..rows {
         for u in 0..cols {
@@ -88,10 +111,56 @@ fn load_metric_depth(
     }
     Ok(vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame {
         width: dw, height: dh, points_m, crop: None, intrinsics: Some(intr),
-        // Offline replay at the recorded cadence — the nominal 30 fps
-        // fallback matches the capture rate.
-        timestamp_ms: None,
+        // The device capture timestamp when the capture recorded one. The
+        // pipeline derives every filter dt from consecutive timestamps, so
+        // replaying without them runs the 1€/EMA/reseed constants at a
+        // nominal rate instead of the captured one — a replay that cannot
+        // reproduce a timing-dependent fault is not a replay of it.
+        timestamp_ms: recorded.map(|m| m.t_ms),
     })
+}
+
+/// One line of `manifest.jsonl`, written beside the frames by
+/// `tracking::session_record`. Carries what a PNG + npy pair cannot: the
+/// sensor's own intrinsics and capture clock.
+#[derive(Clone, Copy)]
+struct FrameMeta {
+    t_ms: f64,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+}
+
+/// Load `manifest.jsonl` from a frames directory, keyed by file stem
+/// (`frame_000123`). Absent for hand-assembled frame dirs — the caller
+/// then falls back to the nominal constants and says so.
+fn load_manifest(dir: &std::path::Path) -> std::collections::HashMap<String, FrameMeta> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(dir.join("manifest.jsonl")) else {
+        return out;
+    };
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let get = |k: &str| v.get(k).and_then(|x| x.as_f64());
+        let (Some(stem), Some(t), Some(fx), Some(fy), Some(cx), Some(cy)) = (
+            v.get("stem").and_then(|x| x.as_str()),
+            get("t_ms"),
+            get("fx"),
+            get("fy"),
+            get("cx"),
+            get("cy"),
+        ) else {
+            continue;
+        };
+        out.insert(
+            stem.to_string(),
+            FrameMeta { t_ms: t, fx: fx as f32, fy: fy as f32, cx: cx as f32, cy: cy as f32 },
+        );
+    }
+    out
 }
 
 // ---- registered-overlay math (avatar joints → camera image, torso-aligned) ----
@@ -222,12 +291,28 @@ fn main() -> Result<(), String> {
         .map(|e| e.path())
         .filter(|p| {
             p.extension()
-                .map(|x| x == "jpg" || x == "png")
+                .map(|x| x == "jpg" || x == "png" || x == "bmp")
                 .unwrap_or(false)
         })
         .collect();
     files.sort();
-    eprintln!("{} frames", files.len());
+    let manifest = load_manifest(std::path::Path::new(&dir));
+    if manifest.is_empty() {
+        eprintln!(
+            "{} frames — NO manifest.jsonl: falling back to nominal {}x{} intrinsics \
+             (fx={D435_FX}) and a nominal frame clock. Metric positions and every \
+             dt-driven filter are approximations.",
+            files.len(),
+            D435_CX as u32 * 2,
+            D435_CY as u32 * 2,
+        );
+    } else {
+        eprintln!(
+            "{} frames, {} with recorded intrinsics + device timestamps",
+            files.len(),
+            manifest.len()
+        );
+    }
 
     let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
     let mut provider = create_pose_provider("models", config)?;
@@ -288,11 +373,12 @@ fn main() -> Result<(), String> {
         // metric frame when there is no depth (a plain colour-only frame dir).
         let depth_path = depth_sibling(f);
         let has_depth = depth_path.exists();
+        let meta = colour_stem(f).and_then(|s| manifest.get(s)).copied();
         // On rendered frames, keep the deprojected metric grid so the overlay can
         // back-project torso keypoints into camera-space 3D for the registration.
         let mut overlay_depth: Option<(usize, usize, Vec<[f32; 3]>)> = None;
         if has_depth {
-            match load_metric_depth(&depth_path) {
+            match load_metric_depth(&depth_path, meta.as_ref()) {
                 Ok(mut metric) => {
                     if rendering {
                         overlay_depth =
@@ -309,7 +395,9 @@ fn main() -> Result<(), String> {
                         .and_then(|s| s.strip_suffix("_color"))
                         .and_then(|s| s.rsplit('_').next())
                         .and_then(|s| s.parse::<u64>().ok());
-                    metric.timestamp_ms = cam_idx.map(|n| n as f64 * (1000.0 / 30.0));
+                    if metric.timestamp_ms.is_none() {
+                        metric.timestamp_ms = cam_idx.map(|n| n as f64 * (1000.0 / 30.0));
+                    }
                     provider.set_external_depth(metric);
                 }
                 Err(e) => eprintln!("depth {i}: {e}"),
