@@ -25,6 +25,43 @@ will invalidate that cache and trigger a rebuild.
 - 診断系バイナリ (`analyze_depth_provider` など) やアドホック検証スクリプトの出力は、`.gitignore` 済みの `diagnostics/` 配下に書く。バイナリのデフォルト出力先が入力ファイルの隣 (`<stem>_<suffix>/`) になっている場合は、必ず明示的に `diagnostics/...` を渡して実行する。
 - 新しい診断ツールを追加する際も、デフォルト出力先を `diagnostics/` 側にするか、`validation_images/` 配下に書き込もうとしたらエラーにする。
 - ポーズ品質のベンチは 2 本立て: `validate_pipeline` は「アバター vs ソース」の往復一致のみ (トラッキング誤差と骨軸 twist に盲目 — 0.0° でも実機破綻はあり得る)。真値比較は `cargo run --bin validate_gt` — 既知ポーズのアバターをレンダ→追跡→復元し、GT/SRC/REC 3 列で誤差を検出起因とソルバー起因に分解、neutral 比の coupling ゲインも自動算出する (`diagnostics/validation_gt/summary.md`)。
+- **デスク配信エンベロープが主戦場** (頭+肩のみ・カメラ斜め・手は常時デスク下 = ユーザーの本番運用)。腕・顔まわりの変更は正面系リプレイ (wave/palms/namaste) に加えて必ずデスク系録画でも回すこと。録画は `scripts/depth_capture.py` かヘッドレス캡チャ (アプリのカメラ停止が必要) で `frame_NNNN_color.png + _depth_mm.npy` を `diagnostics/depth/desk_*/` に取り、`diagnose_depth_replay <dir>` の temporal summary で見る。デスク向け指標: hand presence duty / toggle 数 (点滅=hold 欠陥)、snaps>0.3/frame (腕スナップ)、yaw std (胸暴れ)、anchor_z jmax (root 暴れ)。
+
+## Live debugging (実機計測 — アプリを止めない)
+
+ユーザーが「おかしい」と言ったら、**アプリからカメラを奪わずに** live debug
+channel で計測する。アプリがカメラを掴んでいる間は pyrealsense2 等で別プロセスから
+開いてもフレームは来ない (open は通るが `wait_for_frames` がタイムアウトする)。
+
+- 有効化: `C:\ProgramData\VulVATAR\debug.on` (空ファイル)。約2秒以内に反映、再ビルド不要。
+- `debug_state.json` — 推論フレーム毎 (tracking worker)。`kp` (COCO 17 の 2D+score)、
+  `kp_mcp` (両手ブロックの MCP 4点)、`torso`/`arm` の各関節 `{p, c, d}`
+  (`d` = サンプラーが実際に返したカメラ空間深度 m — 「特徴点に正しい深度が付いたか」の一次証拠)、
+  `root` / `root_is_hip` / `metric` (anchor_cam_m, mpsu, ref_span_m)、`face`。
+- `debug_avatar.json` — ソルバー後のアバター主要関節ワールド座標 (`seq` で新フレーム検出)。
+  ユーザーが見ているものの数値化はこちら (rest 判定は Hips y ≈ 0.845 等)。
+- `debug_depth.bin` — 毎秒1回、フル解像度アライン済み深度 (`VDBD` 32B ヘッダ + u16 mm)。
+  任意キーポイント直下の生深度ピクセルの監査用。`debug_camera.bin` は 320px RGBA (`VDBG`)。
+- 計測手順: Python ポーラで `debug_state.json`/`debug_avatar.json` を 5-10ms 間隔で読み
+  (`frame`/`seq` でデデュープ)、jsonl に貯めて統計 (中央値・sd・フレーム間ジャンプ)。
+  ユーザーに「20秒ポーズをキープ」と依頼してから回す。スクリプトは `scratchpad/` に書く。
+
+アプリ稼働中は本 target の `cargo build --features realsense` が **必ず失敗する**
+(realsense-sys の build.rs が `target\debug\deps\realsense2.dll` へコピーを試み、
+稼働プロセスがロック中)。診断バイナリは別 target でビルドする:
+
+```powershell
+$env:CARGO_TARGET_DIR = "$PWD\target-test"
+$env:SHADERC_LIB_DIR  = "$PWD\target\debug\build\shaderc-sys-<hash>\out\lib"  # 本targetのキャッシュ流用 (無いと CMake 非互換で from-source が死ぬ)
+# + docs/realsense-build.md の3環境変数
+cargo build --features realsense --bin diagnose_depth_replay
+```
+
+アプリ本体の再ビルドだけはユーザーにアプリを閉じてもらう必要がある。
+
+- リプレイベンチ (`diagnose_depth_replay` / `diagnose_video_replay`) はファイル名の
+  フレーム番号から実キャプチャ時刻を復元して dt 正規化推定器に供給する
+  (ダンプは5フレーム間引きが通例 — 名目 30fps 扱いだと時間系ゲートが実機の5倍厳しく見える)。
 
 ## Architecture
 

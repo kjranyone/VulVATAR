@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "realsense")]
 pub mod realsense;
+/// Full-rate raw-capture recorder (colour + aligned depth + intrinsics) for
+/// offline estimator evaluation. Needs the D435 frame type, hence the gate.
+#[cfg(feature = "realsense")]
+pub mod sequence_recorder;
 
 pub(crate) mod latest_cell;
 mod pose_estimation;
@@ -21,9 +25,11 @@ pub mod stagelog;
 #[cfg(feature = "inference")]
 pub mod skeleton_from_depth;
 
+pub mod auto_neutral;
 pub mod calibration;
 pub mod debug_channel;
 pub mod face_mediapipe;
+pub mod hand_hold;
 pub mod rtmw3d;
 pub mod source_skeleton;
 #[cfg(feature = "inference")]
@@ -1585,6 +1591,12 @@ impl TrackingWorker {
             let width = rs_frame.width;
             let height = rs_frame.height;
 
+            // Raw-input recorder (off unless the flag file exists). Placed
+            // BEFORE any processing on purpose: the whole point is to keep a
+            // record that no estimator has touched, so a replacement can be
+            // scored on the same sensor data as the incumbent.
+            sequence_recorder::record(frame_index, &rs_frame);
+
             stagelog::mark(frame_index, "estimate_begin");
             let mut estimate = if let Some(ref mut provider) = pose_provider {
                 // Hand the D435's color-aligned metric depth to the
@@ -1606,6 +1618,18 @@ impl TrackingWorker {
             // arm joints for an external overlay (no-op unless the debug
             // flag file exists). Before the estimate is moved below.
             debug_channel::dump_observation(frame_index, &rs_frame.rgb, width, height, &estimate);
+            // Full-res aligned depth snapshot once a second: lets an
+            // external audit read the exact depth pixels under any
+            // keypoint of the live session, without stealing the camera.
+            if frame_index % 30 == 0 {
+                debug_channel::dump_depth_snapshot(
+                    frame_index,
+                    &rs_frame.depth_raw,
+                    width,
+                    height,
+                    rs_frame.depth_units,
+                );
+            }
 
             let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
             mailbox.publish_estimate(estimate, frame);

@@ -31,6 +31,23 @@ use log::info;
 #[cfg(feature = "inference")]
 use log::warn;
 
+/// Diagnostic-only ablation switch for the replay bisect harness:
+/// `VULVATAR_DIAG_DISABLE=engage,hold` bypasses the named stages so a
+/// replay can attribute an artefact to (or exonerate) each layer.
+/// Live builds never set the variable; the answer is cached.
+#[cfg(feature = "inference")]
+fn diag_disabled(stage: &str) -> bool {
+    use std::sync::OnceLock;
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VULVATAR_DIAG_DISABLE")
+            .map(|v| v.split(',').map(|t| t.trim().to_string()).collect())
+            .unwrap_or_default()
+    })
+    .iter()
+    .any(|t| t == stage)
+}
+
 pub struct Rtmw3dWithDepthProvider {
     #[cfg(feature = "inference")]
     rtmw3d: Rtmw3dInference,
@@ -85,6 +102,20 @@ pub struct Rtmw3dWithDepthProvider {
     /// fallback for synthetic frames. Reset per session.
     #[cfg(feature = "inference")]
     frame_dt: super::skeleton_from_depth::FrameDtTracker,
+    /// Sustained-visibility gate for elbows + hand blocks: a border-riding
+    /// end effector (desk framing, hands on the keyboard at the bottom
+    /// image edge) must dwell in frame for a fraction of a second before
+    /// it drives the arm chain, so edge flicker can't snap the avatar's
+    /// arms between rest and observed several times a second. Reset per
+    /// session.
+    #[cfg(feature = "inference")]
+    arm_engage: super::skeleton_from_depth::ArmEngageGate,
+    /// Short-term hold that bridges hand / forearm dropouts (see
+    /// [`super::hand_hold::HandHold`]). `ArmEngageGate` owns the *entry*
+    /// decision (is this hand really in view); this owns the *exit*, so a
+    /// 1-3 frame sampling miss no longer removes the joint and swings the
+    /// avatar's arm to the idle pose and back.
+    hand_hold: super::hand_hold::HandHold,
 }
 
 impl Rtmw3dWithDepthProvider {
@@ -133,6 +164,9 @@ impl Rtmw3dWithDepthProvider {
             lr_swap_latch: super::skeleton_from_depth::LrSwapLatch::default(),
             #[cfg(feature = "inference")]
             frame_dt: super::skeleton_from_depth::FrameDtTracker::default(),
+            #[cfg(feature = "inference")]
+            arm_engage: super::skeleton_from_depth::ArmEngageGate::default(),
+            hand_hold: super::hand_hold::HandHold::default(),
         })
     }
 
@@ -205,6 +239,8 @@ impl PoseProvider for Rtmw3dWithDepthProvider {
             self.torso_scale.reset();
             self.lr_swap_latch = super::skeleton_from_depth::LrSwapLatch::default();
             self.frame_dt.reset();
+            self.arm_engage.reset();
+            self.hand_hold.reset();
         }
     }
 
@@ -388,6 +424,15 @@ impl Rtmw3dWithDepthProvider {
         // dropped frame must widen the spike gate (velocity, not step) and
         // advance the rejection windows by the true elapsed time.
         let dt_s = self.frame_dt.tick(metric_frame.timestamp_ms);
+        // Border-flicker suppression: elbows / hand blocks must dwell
+        // in frame for a fraction of a second before they drive the arm
+        // chain (see `ArmEngageGate`). Torso keypoints pass untouched,
+        // so the fit below is unaffected.
+        let joints_2d = &if diag_disabled("engage") {
+            joints_2d.to_vec()
+        } else {
+            self.arm_engage.tick_and_gate(joints_2d, dt_s)
+        };
         let mut skeleton =
             match torso_fit::fit_torso(&metric_frame, joints_2d, opts, person_z_ref) {
                 Some(mut fit) => {
@@ -433,6 +478,15 @@ impl Rtmw3dWithDepthProvider {
                     SourceSkeleton::empty(frame_index)
                 }
             };
+
+        // Bridge momentary hand / forearm dropouts before anything consumes
+        // the skeleton. Must run here rather than inside `build_skeleton`:
+        // the hold is a property of the published sequence, and this is the
+        // one place that sees every emitted frame (including the empty-fit
+        // fallback above, which must age the hold out rather than freeze it).
+        if !diag_disabled("hold") {
+            self.hand_hold.apply(&mut skeleton, dt_s);
+        }
 
         // Inherit RTMW3D's face pose + FaceMesh cascade output (the face
         // track is body-derived and unrelated to the depth source).

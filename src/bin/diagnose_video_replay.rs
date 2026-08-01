@@ -293,11 +293,23 @@ fn main() -> Result<(), String> {
         let mut overlay_depth: Option<(usize, usize, Vec<[f32; 3]>)> = None;
         if has_depth {
             match load_metric_depth(&depth_path) {
-                Ok(metric) => {
+                Ok(mut metric) => {
                     if rendering {
                         overlay_depth =
                             Some((metric.width as usize, metric.height as usize, metric.points_m.clone()));
                     }
+                    // Reconstruct the capture clock from the ORIGINAL camera
+                    // frame number in the filename (dumps are typically
+                    // every-5th-frame): dt-normalised estimators must
+                    // integrate the real elapsed time between replayed
+                    // frames, not pretend the subsampling ran at 30 fps.
+                    let cam_idx = f
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.strip_suffix("_color"))
+                        .and_then(|s| s.rsplit('_').next())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    metric.timestamp_ms = cam_idx.map(|n| n as f64 * (1000.0 / 30.0));
                     provider.set_external_depth(metric);
                 }
                 Err(e) => eprintln!("depth {i}: {e}"),

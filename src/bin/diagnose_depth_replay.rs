@@ -379,10 +379,26 @@ fn batch(dir: &Path) -> Result<(), String> {
     // Hand L/R-swap probe + hard dropouts (empty skeleton = avatar rests).
     let (mut swap_frames, mut swap_eligible) = (0u32, 0u32);
     let mut empty_frames = 0u32;
+    // Desk-streamer envelope metrics (docs/tracking-retargeting.md,
+    // "Degradation Policy"): a hand blinking in/out at frame rate is THE
+    // desk failure mode — presence duty and toggle count catch it even
+    // when per-frame values look sane; large per-frame hand travel is
+    // the "arm snap" the user sees.
+    let (mut r_present, mut l_present) = (0u32, 0u32);
+    let (mut r_toggles, mut l_toggles) = (0u32, 0u32);
+    let (mut prev_r_present, mut prev_l_present): (Option<bool>, Option<bool>) = (None, None);
+    let mut hand_snaps = 0u32;
+    let (mut prev_r_xy, mut prev_l_xy): (Option<[f32; 2]>, Option<[f32; 2]>) = (None, None);
 
     for (n, (idx, cp, dp)) in pairs.iter().enumerate() {
-        let (rgb, metric) = load_metric_frame(cp, dp, false)?;
+        let (rgb, mut metric) = load_metric_frame(cp, dp, false)?;
         let (cw, ch) = (rgb.width(), rgb.height());
+        // Reconstruct the capture clock from the ORIGINAL camera frame
+        // number in the filename (dumps are typically every-5th-frame):
+        // the dt-normalised estimators (engage gate, stabilisers) must
+        // integrate the real elapsed time between replayed frames, not
+        // pretend the subsampled sequence ran at 30 fps.
+        metric.timestamp_ms = Some(*idx as f64 * (1000.0 / 30.0));
         provider.set_external_depth(metric);
         let sk = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64).skeleton;
         let m = frame_metrics(&sk);
@@ -493,6 +509,29 @@ fn batch(dir: &Path) -> Result<(), String> {
             }
             prev_lz = Some(lz);
         }
+        // Hand presence duty + blink toggles + per-frame snap distance.
+        let rp = m.r_hand_z.is_some();
+        let lp = m.l_hand_z.is_some();
+        r_present += u32::from(rp);
+        l_present += u32::from(lp);
+        if prev_r_present.is_some_and(|p| p != rp) {
+            r_toggles += 1;
+        }
+        if prev_l_present.is_some_and(|p| p != lp) {
+            l_toggles += 1;
+        }
+        prev_r_present = Some(rp);
+        prev_l_present = Some(lp);
+        let mut snap = |xy: Option<[f32; 2]>, prev: &mut Option<[f32; 2]>| {
+            if let (Some(c), Some(p)) = (xy, *prev) {
+                if (c[0] - p[0]).hypot(c[1] - p[1]) > 0.3 {
+                    hand_snaps += 1;
+                }
+            }
+            *prev = xy;
+        };
+        snap(m.r_hand_x.zip(m.r_hand_z).map(|(x, z)| [x, z]), &mut prev_r_xy);
+        snap(m.l_hand_x.zip(m.l_hand_z).map(|(x, z)| [x, z]), &mut prev_l_xy);
     }
 
     // --- temporal summary ---
@@ -528,6 +567,10 @@ fn batch(dir: &Path) -> Result<(), String> {
     );
     eprintln!(
         "forearm z sign-flips (limb jitter, solver-smoothed): R={r_flips} L={l_flips}"
+    );
+    eprintln!(
+        "hand presence        : R {r_present}/{n} ({} toggles)  L {l_present}/{n} ({} toggles)  snaps>0.3/frame: {hand_snaps}",
+        r_toggles, l_toggles
     );
 
     // --- head orientation probe (the symptom the yaw stat cannot see) ---

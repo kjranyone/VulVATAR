@@ -123,8 +123,25 @@ impl Application {
         if sample_is_fresh {
             if let Some(ref tp) = tracking_sample {
                 self.last_tracking_pose = Some(tp.clone());
+                // Automatic neutral estimation over the RAW stream (the
+                // ritual-free counterpart of the Calibrate Pose capture,
+                // see `tracking::auto_neutral`). Fresh samples only —
+                // hold-window republications carry decayed confidences
+                // and would poison the stability windows.
+                self.auto_neutral.ingest(tp);
             }
         }
+
+        // Effective calibration for this frame: an explicit capture
+        // (modal / persisted project) always wins; the automatic
+        // session neutral fills in only while none exists.
+        let effective_pose = self
+            .tracking_calibration
+            .pose
+            .clone()
+            .or_else(|| self.auto_neutral.calibration().cloned());
+        let effective_calibration =
+            crate::tracking::TrackingCalibration { pose: effective_pose.clone() };
 
         // Global avatar fade-out when person detection is lost. Target is full
         // opacity while a person is present (fresh sample or within the hold
@@ -168,12 +185,13 @@ impl Application {
             face_tracking_enabled,
             lower_body_tracking_enabled,
             root_translation_enabled,
-            // Pose calibration captured via the `Calibrate Pose ▼` modal
-            // (`docs/calibration-ux.md`). The solver uses it to seed the
+            // Pose calibration: the `Calibrate Pose` modal capture when
+            // one exists, else the automatic session neutral
+            // (`tracking::auto_neutral`). The solver uses it to seed the
             // root-translation EMA reference so the avatar's neutral
             // position is the user's calibrated stance, not whatever the
             // first hip-visible frame happened to read.
-            pose_calibration: self.tracking_calibration.pose.clone(),
+            pose_calibration: effective_pose.clone(),
             ..SolverParams::default()
         };
         // Live debug overrides (no-op unless %ProgramData%\VulVATAR\debug.on
@@ -204,7 +222,7 @@ impl Application {
             avatar.build_base_pose();
 
             if let Some(ref mut source) = tracking_sample.clone() {
-                self.tracking_calibration.apply_calibration(source);
+                effective_calibration.apply_calibration(source);
 
                 let humanoid = avatar.asset.humanoid.as_ref();
                 pose_solver::solve_avatar_pose(

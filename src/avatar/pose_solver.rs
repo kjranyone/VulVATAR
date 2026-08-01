@@ -19,7 +19,11 @@
 //!
 //! 3. **Face pose is independent.** The head rotation comes from facial
 //!    keypoints (yaw/pitch/roll), not from the nose-to-shoulder vector.
-//!    It is applied as a rest-relative local delta on the Head bone.
+//!    Those angles are absolute in the source (camera) frame, so the Head
+//!    bone's WORLD orientation is set from them directly (the parent
+//!    chain's rotation is divided out rather than composed with) — see
+//!    `apply_face_pose`. The neck/spine chain still carries torso posture;
+//!    it just no longer double-counts into where the head looks.
 //!
 //! The solver assumes `local_transforms` has already been reset to the
 //! skeleton's rest pose (via `AvatarInstance::build_base_pose`). It only
@@ -1779,6 +1783,7 @@ pub fn solve_avatar_pose(
             &new_local_rot,
             dt_aware_blend(params.rotation_blend, dt),
             hold_rest,
+            arm_step_cap(bone),
         );
 
         // Keep the world rotation cache in sync so child bones in this
@@ -1846,6 +1851,7 @@ pub fn solve_avatar_pose(
                             skeleton,
                             local_transforms,
                             &current_world,
+                            &rest_world,
                             state,
                             dt_aware_blend(params.rotation_blend, dt),
                         );
@@ -2237,6 +2243,7 @@ fn apply_idle_arm_pose(
                 &new_local,
                 alpha,
                 0.0,
+                arm_max_step(),
             );
             current_world[ua_idx].rotation = quat_mul(&pw, &local_transforms[ua_idx].rotation);
         }
@@ -2253,6 +2260,7 @@ fn apply_idle_arm_pose(
             &rest_local,
             alpha,
             0.0,
+            arm_max_step(),
         );
         let pw = parent_world(la_idx, current_world);
         current_world[la_idx].rotation = quat_mul(&pw, &local_transforms[la_idx].rotation);
@@ -2265,30 +2273,45 @@ fn apply_face_pose(
     skeleton: &SkeletonAsset,
     local_transforms: &mut [Transform],
     current_world: &[WorldXform],
+    rest_world: &[WorldXform],
     state: &mut PoseSolverState,
     blend: f32,
 ) {
-    // Face pose is in body-local Y-up convention: a positive yaw turns the
-    // head to the avatar's left in its own frame. Compose the delta in the
-    // Head bone's parent-local frame by rotating it through the parent's
-    // world rotation: the avatar's local +Y in world space is the parent's
-    // Y axis rotated by the parent's world rotation, so we build the delta
-    // in world space and then conjugate it back into parent-local.
-    let delta_world = quat_from_euler_ypr(face.pitch, face.yaw, face.roll);
-
-    // Rest-relative: the new local rotation is rest_local * delta_local,
-    // where delta_local is delta_world expressed in the Head bone's
-    // parent-local frame.
+    // Face pose is an ABSOLUTE head orientation in the source (camera) frame:
+    // every channel is measured against the image, not against the torso —
+    // yaw from the ear line's XZ angle, pitch from the face's own vertical
+    // landmark geometry, roll from the eye line — and `apply_calibration`
+    // subtracts the user's neutral from it. So the Head bone's WORLD
+    // rotation is the face pose applied to the head's REST world
+    // orientation; the parent's accumulated rotation must be divided out,
+    // not stacked on.
+    //
+    // Stacking (the previous `head_world = face * parent_world`) let every
+    // upstream rotation double-count into gaze. Live measurement
+    // (2026-07-27, 1123 frames): the depth builder's source Head (ear
+    // midpoint) sits a stable +0.20 shoulder-spans in front of the shoulder
+    // midpoint — part real forward-head desk posture, part depth-surface
+    // sampling geometry — which `Tip::HeadFromShoulders` turns into a ~21 deg
+    // forward bow of the UpperChest/Neck chain. Stacked, that bow landed on
+    // the head as a PERMANENT 21 deg of look-down: with the face track
+    // reporting −5 deg (chin slightly up) the avatar's head forward axis
+    // measured −11 deg (down), and the regression over the whole capture read
+    // `head_elev = −0.79*pitch − 0.156*yaw − 21.5`. Absolute placement leaves
+    // the neck bow in the torso (it is real posture) while gaze follows the
+    // face track alone, and the constant term goes away.
+    //
+    // Note this is a no-op whenever the parent chain sits at its rest
+    // orientation: `conj(rest_parent) * rest_head_world == rest_local`, so
+    // an upright torso reproduces the old rest-relative result exactly.
+    let target_world = quat_mul(
+        &quat_from_euler_ypr(face.pitch, face.yaw, face.roll),
+        &rest_world[head_idx].rotation,
+    );
     let parent_world_rot = skeleton.nodes[head_idx]
         .parent
         .map(|NodeId(p)| current_world[p as usize].rotation)
         .unwrap_or([0.0, 0.0, 0.0, 1.0]);
-    let delta_local = quat_mul(
-        &quat_mul(&quat_conjugate(&parent_world_rot), &delta_world),
-        &parent_world_rot,
-    );
-    let rest_local_rot = skeleton.nodes[head_idx].rest_local.rotation;
-    let target_local = quat_normalize(&quat_mul(&rest_local_rot, &delta_local));
+    let target_local = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &target_world));
     local_transforms[head_idx].rotation = blend_local_rotation(
         state,
         head_idx,
@@ -2519,6 +2542,47 @@ fn compute_arm_contact_ik(
 /// source joint so the existing loop drives the whole arm to the hand — now
 /// re-proportioned to the avatar, so the hand reaches. Undriven only when the
 /// wrist itself is missing/weak (arm at rest). Returns `[left, right]`.
+/// Where the elbow bends when nothing observes it.
+///
+/// The swivel pole only picks a *direction* around the shoulder→wrist axis;
+/// its magnitude is irrelevant. The shipping default pushed the pole to
+/// `-z` — straight behind the subject — which is why clasping the hands in
+/// front swung the avatar's elbows backwards: live capture (2026-07-28) put
+/// the avatar's elbow 24 cm BEHIND its shoulder while the hand was in front
+/// of it, on frames where that arm's source elbow was unobserved.
+///
+/// The replacement direction is measured, not assumed. Over 1311 frames
+/// where the shoulder, elbow AND wrist were all genuinely observed, the
+/// elbow's component perpendicular to the shoulder→wrist axis pointed:
+///
+/// | side  | lateral | vertical | depth |
+/// |-------|---------|----------|-------|
+/// | left  | +0.93 (outward) | +0.11 | +0.36 (toward camera) |
+/// | right | −0.73 (outward) | −0.67 | +0.15 (toward camera) |
+///
+/// Outward dominates on both sides and the depth component is positive on
+/// both — the opposite of the old bias. Vertical disagrees between sides
+/// (it tracks what each hand was doing), so it takes the mean of the two, a
+/// mild downward lean that matches how arms actually hang. `sh` is in source
+/// coords where the shoulder midpoint is the origin, so the sign of its `x`
+/// IS the outward direction for that side.
+fn synthetic_elbow_pole(sh: &Vec3, wr: &Vec3, src_span: f32) -> Vec3 {
+    /// Perpendicular offset shape: outward-dominant, slightly down, slightly
+    /// forward — normalised, then scaled by the same 0.4 spans the previous
+    /// default used (the magnitude never mattered, only the direction).
+    const OUTWARD: f32 = 0.85;
+    const DOWN: f32 = -0.35;
+    const FORWARD: f32 = 0.25;
+    let mid = midpoint(sh, wr);
+    let outward = if sh[0] >= 0.0 { 1.0 } else { -1.0 };
+    let k = 0.4 * src_span;
+    [
+        mid[0] + outward * OUTWARD * k,
+        mid[1] + DOWN * k,
+        mid[2] + FORWARD * k,
+    ]
+}
+
 fn compute_arm_reach_elbows(
     source: &SourceSkeleton,
     rest_world: &[WorldXform],
@@ -2639,10 +2703,7 @@ fn compute_arm_reach_elbows(
         // the frame the elbow confidence crosses `thr`. The observed
         // elbow fades in over [thr, thr + POLE_CONF_BLEND_BAND].
         const POLE_CONF_BLEND_BAND: f32 = 0.15;
-        let synth_pole = {
-            let mid = midpoint(&sh.position, &wr.position);
-            [mid[0], mid[1], mid[2] - 0.4 * src_span]
-        };
+        let synth_pole = synthetic_elbow_pole(&sh.position, &wr.position, src_span);
         let pole = match source.joints.get(&el_b) {
             Some(el) => {
                 let t = ((el.confidence - thr) / POLE_CONF_BLEND_BAND).clamp(0.0, 1.0);
@@ -2927,20 +2988,28 @@ mod arm_contact_ik_tests {
         let mut hold = [None, None];
         let out = compute_arm_reach_elbows(&source, &rest, &humanoid, &params, &mut hold);
         let elbow = out[0].expect("left arm reaches the tracked wrist").position;
-        eprintln!("synth elbow = {elbow:?}");
-        // The garbage pole sits at x=0.90; steered toward it the elbow swings
-        // out to x≈0.38, z≈+0.08 (a sideways wrench — the fracture). Ignored,
-        // the natural behind-line bend keeps the elbow on the shoulder→wrist
-        // line (both at x=0.15 → symmetric → x≈0.15) and BEHIND it (z<0, −Z is
-        // away from the camera). Both thresholds sit strictly between the two
-        // outcomes so this test fails on the ungated pole.
+
+        // The contract is "a sub-threshold elbow contributes NOTHING", so the
+        // reference is the same solve with no elbow keypoint at all — not a
+        // hardcoded position, which would silently re-pin the synthetic
+        // default's own geometry (it changed once already: the old
+        // straight-back bias is what swung the avatar's elbows behind it when
+        // the hands came together in front).
+        let mut without = source.clone();
+        without.joints.remove(&HumanoidBone::LeftLowerArm);
+        let mut hold = [None, None];
+        let baseline = compute_arm_reach_elbows(&without, &rest, &humanoid, &params, &mut hold)[0]
+            .expect("left arm reaches the tracked wrist")
+            .position;
+        let drift = vec3_length(&vec3_sub(&elbow, &baseline));
         assert!(
-            elbow[0] < 0.25,
-            "elbow wrenched sideways toward the off-frame garbage pole: {elbow:?}"
+            drift < 1e-4,
+            "a sub-threshold elbow must not steer the swivel: {elbow:?} vs {baseline:?}"
         );
+        // And it must be nowhere near the garbage keypoint at x = 0.90.
         assert!(
-            elbow[2] < 0.0,
-            "elbow should bend behind the shoulder→wrist line, got {elbow:?}"
+            elbow[0] < 0.5,
+            "elbow wrenched sideways toward the off-frame garbage pole: {elbow:?}"
         );
     }
 
@@ -3023,7 +3092,10 @@ mod arm_contact_ik_tests {
             source.joints.insert(
                 HumanoidBone::LeftLowerArm,
                 crate::tracking::SourceJoint {
-                    position: [0.35, 1.20, 0.10],
+                    // Deliberately opposite the synthetic default (which
+                    // leans outward / forward): inboard and behind, so the
+                    // blend has a real gap to traverse.
+                    position: [0.02, 1.20, -0.25],
                     confidence: conf,
                     metric_depth_m: None,
                 },
@@ -3175,6 +3247,64 @@ fn blend_local_rotation(
     out
 }
 
+/// Largest angle an arm-chain bone may rotate in ONE solved frame.
+///
+/// This is a *continuity* bound, not smoothing. The arm's target is not a
+/// continuous signal: it switches between "driven by the observed elbow /
+/// wrist" and "idle A-pose" whenever the observation set changes, and in this
+/// user's framing (hands below frame most of the time) that happens every few
+/// frames. The two targets are far apart — live capture (2026-07-28) measured
+/// the avatar's hand 0.4-0.7 m away across a single such switch. A per-frame
+/// lerp cannot hide that: `rotation_blend` moves 70 % of the way to the
+/// current target each frame, so a discontinuous target yields a
+/// 70 %-of-the-gap step, which at 20-30 fps reads as a teleport.
+///
+/// Capping the step turns any target discontinuity into a short traversal
+/// (a 60 deg switch takes ~4 frames ≈ 0.2 s) while leaving real motion
+/// untouched: 15 deg/frame is 300-450 deg/s at the shoulder, far above human
+/// arm speed, and the measured p95 of the avatar hand's per-frame travel in
+/// ordinary use is 1.5 mm — three orders of magnitude below the artefact.
+const ARM_MAX_STEP_PER_FRAME: f32 = 0.26; // 15 degrees
+
+/// Bones the step cap applies to: the arm chain, whose target is the one that
+/// switches discontinuously. Fingers ride the hand and the spine/head are
+/// driven from continuously-observed geometry, so neither needs (or should
+/// get) a rate limit.
+/// Per-frame rotation cap for `bone`: the arm-chain bound, or unbounded for
+/// bones whose driving target is continuous.
+fn arm_step_cap(bone: HumanoidBone) -> f32 {
+    if is_arm_chain_bone(bone) {
+        arm_max_step()
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// The arm-chain step bound, liftable via `VULVATAR_DIAG_DISABLE=stepcap`
+/// so the replay bisect harness can attribute artefacts to (or exonerate)
+/// the continuity bound. Live builds never set the variable.
+fn arm_max_step() -> f32 {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let disabled = *DISABLED.get_or_init(|| {
+        std::env::var("VULVATAR_DIAG_DISABLE")
+            .map(|v| v.split(',').any(|t| t.trim() == "stepcap"))
+            .unwrap_or(false)
+    });
+    if disabled {
+        f32::INFINITY
+    } else {
+        ARM_MAX_STEP_PER_FRAME
+    }
+}
+
+fn is_arm_chain_bone(bone: HumanoidBone) -> bool {
+    use HumanoidBone::*;
+    matches!(
+        bone,
+        LeftUpperArm | LeftLowerArm | LeftHand | RightUpperArm | RightLowerArm | RightHand
+    )
+}
+
 /// [`blend_local_rotation`] plus the end-effector rotation hold: when
 /// `rest > 0` (the arm is at rest, see [`ARM_HOLD_ANG_DEAD`]) the blend's
 /// per-frame rotation step is soft-thresholded, freezing the residual
@@ -3189,6 +3319,7 @@ fn blend_arm_rotation(
     target: &Quat,
     alpha: f32,
     rest: f32,
+    max_step: f32,
 ) -> Quat {
     let from = state
         .prev_local_rotations
@@ -3204,6 +3335,14 @@ fn blend_arm_rotation(
         let step = ang * alpha;
         let keep = soft_threshold_keep(step, ARM_HOLD_ANG_DEAD * rest);
         eff_alpha = alpha * keep;
+    }
+    // Continuity bound (see `ARM_MAX_STEP_PER_FRAME`). `max_step` is
+    // infinite for bones whose target is continuous, making this a no-op.
+    if max_step.is_finite() {
+        let ang = quat_angle_between(&from, target);
+        if ang * eff_alpha > max_step {
+            eff_alpha = (max_step / ang.max(1e-6)).min(eff_alpha);
+        }
     }
     let out = quat_slerp_short(&from, target, eff_alpha);
     state.prev_local_rotations.insert(node_idx, out);
@@ -3765,6 +3904,7 @@ fn solve_wrist_orientation(
             &lower_arm_local_target,
             blend,
             hold_rest,
+            arm_max_step(),
         );
         let actual_lower_arm_world =
             quat_mul(&upper_arm_world_rot, &local_transforms[la_idx].rotation);
@@ -3786,6 +3926,7 @@ fn solve_wrist_orientation(
             &hand_local_target,
             blend,
             hold_rest,
+            arm_max_step(),
         );
         let updated_world =
             quat_mul(&actual_lower_arm_world, &local_transforms[wrist_idx].rotation);
@@ -3803,6 +3944,7 @@ fn solve_wrist_orientation(
             &new_local_rot,
             blend,
             hold_rest,
+            arm_max_step(),
         );
         let updated_world =
             quat_mul(&parent_world_rot, &local_transforms[wrist_idx].rotation);
@@ -4166,6 +4308,112 @@ mod clavicle_tests {
         let mut state = PoseSolverState::new();
         solve_avatar_pose(source, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
         (local, humanoid, skeleton)
+    }
+
+    /// Hands clasped in front must not throw the elbows behind the body.
+    ///
+    /// Live regression (2026-07-28): with the source elbow unobserved, the
+    /// synthetic swivel pole pointed straight back, and the avatar's elbow
+    /// solved 24 cm BEHIND its shoulder while the hand was in front of it —
+    /// "手を前で組むと腕が後ろに回る". The measured direction of a real
+    /// elbow (1311 observed shoulder/elbow/wrist triples) is outward and
+    /// slightly toward the camera, never behind.
+    #[test]
+    fn synthetic_elbow_pole_bends_outward_and_forward_not_backward() {
+        let span = 0.75;
+        // Hands clasped in front of the chest: wrist near the midline,
+        // forward of the shoulder (+z is toward the camera).
+        for (side, shoulder) in [("left", [0.33, 0.0, 0.0]), ("right", [-0.33, 0.0, 0.0])] {
+            let wrist = [0.02, -0.05, 0.20];
+            let pole = synthetic_elbow_pole(&shoulder, &wrist, span);
+            let mid = midpoint(&shoulder, &wrist);
+            let off = vec3_sub(&pole, &mid);
+            assert!(
+                off[2] > 0.0,
+                "{side}: pole must not sit behind the subject, z offset {}",
+                off[2]
+            );
+            let outward = if shoulder[0] >= 0.0 { off[0] } else { -off[0] };
+            assert!(outward > 0.0, "{side}: pole must lean outward, got {outward}");
+            assert!(
+                outward > off[2] && outward > off[1].abs(),
+                "{side}: outward must dominate (measured 0.93 / 0.73)"
+            );
+            assert!(off[1] < 0.0, "{side}: elbows hang, not rise");
+        }
+    }
+
+    fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    }
+
+    /// A hand target that vanishes must not teleport the avatar's arm.
+    ///
+    /// Live regression (2026-07-28): with the user's hands below frame, the
+    /// arm's target switched between observation-driven and idle every few
+    /// frames, and each switch moved the avatar's hand 0.4-0.7 m in ONE
+    /// frame. The per-frame lerp cannot fix that — it just makes the step
+    /// 70 % of the gap — so the arm chain carries a rotation-rate bound.
+    #[test]
+    fn losing_the_arm_target_eases_instead_of_teleporting() {
+        let (skeleton, humanoid) = build_upper_body_rig();
+        let mut local: Vec<Transform> =
+            skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        // Snap blend deliberately: `dt_aware_blend` scales the production
+        // 0.7 by wall-clock dt, and a test loop runs in microseconds, so a
+        // "realistic" blend would measure the harness's clock rather than the
+        // solver. At 1.0 the ONLY thing between a discontinuous target and a
+        // one-frame teleport is the step cap — which is what this pins.
+        let params = SolverParams { rotation_blend: 1.0, ..Default::default() };
+        let mut state = PoseSolverState::new();
+
+        let mut driven = SourceSkeleton::empty(0);
+        put(&mut driven, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
+        put(&mut driven, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
+        // Left arm reaching forward and up — far from the idle A-pose.
+        put(&mut driven, HumanoidBone::LeftUpperArm, [0.21, 0.60, 0.0]);
+        put(&mut driven, HumanoidBone::LeftHand, [0.36, 0.80, 0.34]);
+        put(&mut driven, HumanoidBone::LeftLowerArm, [0.30, 0.72, 0.28]);
+
+        let hand_pos = |local: &Vec<Transform>| -> [f32; 3] {
+            let idx = humanoid.bone_map[&HumanoidBone::LeftLowerArm].0 as usize;
+            let world = compute_world_transforms(&skeleton, |i| local[i].clone());
+            world[idx].position
+        };
+
+        // Settle on the driven pose.
+        for _ in 0..30 {
+            solve_avatar_pose(&driven, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
+        }
+        let settled = hand_pos(&local);
+
+        // The observation disappears: only the torso remains.
+        let mut lost = SourceSkeleton::empty(0);
+        put(&mut lost, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
+        put(&mut lost, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
+
+        let mut prev = settled;
+        let mut max_step = 0.0_f32;
+        let mut total = 0.0_f32;
+        for _ in 0..30 {
+            solve_avatar_pose(&lost, &skeleton, Some(&humanoid), &mut local, &params, &mut state);
+            let now = hand_pos(&local);
+            let step = dist3(prev, now);
+            max_step = max_step.max(step);
+            total += step;
+            prev = now;
+        }
+
+        assert!(
+            total > 0.05,
+            "the arm must actually move to idle, travelled {total:.3} m"
+        );
+        // ARM_MAX_STEP_PER_FRAME (15 deg) over a ~0.3 m chain bounds a single
+        // frame's travel well under the measured 0.4-0.7 m teleport.
+        assert!(
+            max_step < 0.10,
+            "losing the target must ease, largest single-frame move {max_step:.3} m"
+        );
     }
 
     /// Symmetric "rest" shoulders → clavicles must end at identity (or
@@ -4542,6 +4790,70 @@ mod chin_chain_tests {
         assert!(
             head_z.abs() < 0.02,
             "head lean: Head world Z must stay near zero (no spurious pitch), got {head_z}"
+        );
+    }
+
+    /// Solve the same chin-thrust source with a face pose attached and
+    /// report the Head bone's world forward (+Z) elevation in degrees —
+    /// positive = looking up, negative = looking down.
+    fn head_forward_elevation_deg(head_forward_z: f32, face_pitch: f32) -> f32 {
+        let mut sk = SourceSkeleton::empty(0);
+        put(&mut sk, HumanoidBone::LeftShoulder, [0.21, 0.60, 0.0]);
+        put(&mut sk, HumanoidBone::RightShoulder, [-0.21, 0.60, 0.0]);
+        put(&mut sk, HumanoidBone::Head, [0.0, 0.90, head_forward_z]);
+        inject_chain_proxies(&mut sk);
+        sk.face = Some(FacePose {
+            yaw: 0.0,
+            pitch: face_pitch,
+            roll: 0.0,
+            confidence: 1.0,
+            ..Default::default()
+        });
+
+        let (local, humanoid, skeleton) = solve_with(&sk);
+        let head_idx = humanoid.bone_map[&HumanoidBone::Head].0 as usize;
+        let world = compute_world_transforms(&skeleton, |i| local[i].clone());
+        let fwd = quat_rotate_vec3(&world[head_idx].rotation, &[0.0, 0.0, 1.0]);
+        fwd[1].clamp(-1.0, 1.0).asin().to_degrees()
+    }
+
+    /// The face track owns gaze. A forward-head posture bows the neck
+    /// chain, and that bow must NOT also tilt where the head looks.
+    ///
+    /// Live regression (2026-07-27): the depth builder's source Head sits
+    /// a steady +0.20 shoulder-spans in front of the shoulder midpoint
+    /// (measured over 1123 frames), so `Tip::HeadFromShoulders` bows the
+    /// chain ~21°. While that bow was composed with the face pose, the
+    /// avatar looked 11° DOWN on a face track reporting 5° UP — the user's
+    /// "I'm looking above the horizon and the avatar is looking down".
+    #[test]
+    fn neck_bow_does_not_tilt_gaze() {
+        // 0.084 forward over a 0.30 chain ≈ the measured 0.20·span bow.
+        let bowed = head_forward_elevation_deg(0.084, 0.0);
+        assert!(
+            bowed.abs() < 1.0,
+            "a bowed neck must leave gaze level, got {bowed}°"
+        );
+        let upright = head_forward_elevation_deg(0.0, 0.0);
+        assert!(
+            (bowed - upright).abs() < 1.0,
+            "gaze must not depend on the neck bow: bowed {bowed}° vs upright {upright}°"
+        );
+    }
+
+    /// ...and the face pose itself still drives gaze one-for-one, with
+    /// `+pitch` = chin down = looking down.
+    #[test]
+    fn face_pitch_drives_gaze_one_for_one() {
+        let up = head_forward_elevation_deg(0.084, -10.0_f32.to_radians());
+        let down = head_forward_elevation_deg(0.084, 10.0_f32.to_radians());
+        assert!(
+            (up - 10.0).abs() < 1.0,
+            "10° chin-up must read as 10° of upward gaze, got {up}°"
+        );
+        assert!(
+            (down + 10.0).abs() < 1.0,
+            "10° chin-down must read as 10° of downward gaze, got {down}°"
         );
     }
 }

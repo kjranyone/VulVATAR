@@ -1,4 +1,8 @@
 /target/
+# Alternate CARGO_TARGET_DIR for diagnostic binaries built while the app is
+# running (the live app locks realsense2.dll in the main target) — see
+# CLAUDE.md "Live debugging".
+/target-test/
 /Cargo.lock
 
 # Local asset staging

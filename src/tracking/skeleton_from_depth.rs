@@ -126,6 +126,160 @@ impl FrameDtTracker {
 /// `joint_confidence_threshold` slider lives in the solver.
 pub const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
+/// Sustained-visibility gate for the hand landmark blocks.
+///
+/// Desk framing — a programming streamer with head + shoulders in frame and
+/// hands on the keyboard BELOW the frame — keeps the wrist/elbow keypoints
+/// hovering around the bottom image border. A border-riding hand pops in and
+/// out of the depth-observable region several times a second, and each pop
+/// snapped the avatar's arm between rest and the observed position (live
+/// trace: 17–23 hand jumps of 0.35–0.55 m world in 20 s while the subject
+/// held still). The gate tracks each end effector's recent in-frame duty
+/// (an EMA over ≈ [`Self::DUTY_TAU_S`] of *capture* time) and lets it drive
+/// the skeleton only while that duty is high ([`Self::DUTY_ON`], with a
+/// Schmitt band down to [`Self::DUTY_OFF`]): a genuine "raise hands into
+/// frame" gesture engages in ≈ 0.3 s, imperceptible against the raise
+/// itself; border peeks at a low duty never engage. Duty — not
+/// consecutive dwell — because the 2D hand detector alternates between
+/// the real hand and a below-frame phantom even on well-framed footage
+/// (palms replay: in-2/out-1), and a phantom frame yields no depth sample
+/// anyway, so the per-frame drop still protects the pose.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::tracking) struct ArmEngageGate {
+    /// Per hand landmark block (91-111, 112-132) — judged on the
+    /// block's own MCP knuckles, the same joints `attach_hand`
+    /// needs 3-of-4 of.
+    ///
+    /// Elbows are deliberately NOT gated: an off-frame elbow is already
+    /// dropped per frame (no depth pixel), a briefly-visible elbow only
+    /// refines the two-bone pole for that frame (no rest⇔observed
+    /// position snap — the arm still aims at the wrist), and gating it
+    /// measurably starved the elbow chain on the palms/namaste replays.
+    hand: [EngageChannel; 2],
+}
+
+/// One end effector's engage state: an exponentially-weighted in-frame
+/// duty ratio with a Schmitt trigger.
+///
+/// Consecutive-dwell hysteresis was tried first and failed on real
+/// footage: even with the hands held statically at the chest (palms
+/// replay) the 2D hand detector alternates between the real hand and a
+/// below-frame phantom at duty cycles like in-2/out-1 — a "must be
+/// continuously visible" gate never re-engages there, while the
+/// hand was genuinely trackable two frames out of three. The
+/// discriminating signal is the *visibility duty over a short window*:
+/// real hand use keeps it well above one-half; a desk-hidden hand
+/// peeking over the bottom border stays far below it.
+#[derive(Clone, Copy, Debug, Default)]
+struct EngageChannel {
+    /// EMA of the in-frame indicator (0/1), time constant
+    /// [`ArmEngageGate::DUTY_TAU_S`].
+    duty: f32,
+    engaged: bool,
+}
+
+impl EngageChannel {
+    /// `in_frame` / `confident` are this frame's observability verdicts.
+    fn advance(&mut self, in_frame: bool, confident: bool, dt_s: f32) {
+        if in_frame && !confident {
+            // In-frame detection dip: pause — bridging momentary noise
+            // on a visibly-present hand is the solver hold policy's job.
+            return;
+        }
+        let target = if in_frame { 1.0 } else { 0.0 };
+        let alpha = 1.0 - (-dt_s / ArmEngageGate::DUTY_TAU_S).exp();
+        self.duty += alpha * (target - self.duty);
+        if self.duty >= ArmEngageGate::DUTY_ON {
+            self.engaged = true;
+        } else if self.duty <= ArmEngageGate::DUTY_OFF {
+            self.engaged = false;
+        }
+        // Between the thresholds: keep the previous state (Schmitt).
+    }
+}
+
+impl ArmEngageGate {
+    /// Time constant of the visibility-duty EMA. A fully-visible hand
+    /// engages from cold in ≈ 0.32 s (`-τ·ln(1-DUTY_ON)`); a hand
+    /// dropped back to the keyboard releases in ≈ 0.34 s.
+    const DUTY_TAU_S: f32 = 0.40;
+    /// Engage when the recent in-frame duty exceeds this. Above the 50%
+    /// a symmetric 1-in/1-out border flicker converges to, below the
+    /// ~67% of the palms replay's worst real-hand phantom-flip zone.
+    const DUTY_ON: f32 = 0.55;
+    /// Release when the duty falls below this. The wide Schmitt band
+    /// keeps a borderline hand from flapping the engagement.
+    const DUTY_OFF: f32 = 0.30;
+    /// A keypoint this close to any image border counts as out of frame:
+    /// RTMW3D border-clamps some off-frame joints to nx/ny ≈ 0.998, and a
+    /// depth window at the border is half background anyway.
+    const BORDER_MARGIN: f32 = 0.01;
+    /// Hand landmark block base index per side.
+    const HAND_BASES: [usize; 2] = [91, 112];
+    /// The four MCP knuckle locals `attach_hand` reads.
+    const MCP_LOCALS: [usize; 4] = [5, 9, 13, 17];
+
+    pub(in crate::tracking) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Advance the engage channels by `dt_s` and return a copy of
+    /// `joints` with every disengaged end effector's scores zeroed
+    /// (below the visibility floor ⇒ all consumers treat it as
+    /// undetected). Torso / leg / face keypoints pass through untouched.
+    ///
+    /// Loss-mode bookkeeping: LEAVING THE FRAME resets the engage dwell
+    /// (the border-flicker this gate exists to suppress), an in-frame
+    /// confidence dip merely pauses it — momentary detection noise on a
+    /// hand plainly in view is the solver hold policy's job.
+    pub(in crate::tracking) fn tick_and_gate(
+        &mut self,
+        joints: &[DecodedJoint2d],
+        dt_s: f32,
+    ) -> Vec<DecodedJoint2d> {
+        let in_frame = |idx: usize| -> bool {
+            joints.get(idx).is_some_and(|j| {
+                let m = Self::BORDER_MARGIN;
+                (m..=1.0 - m).contains(&j.nx) && (m..=1.0 - m).contains(&j.ny)
+            })
+        };
+        let confident = |idx: usize| -> bool {
+            joints
+                .get(idx)
+                .is_some_and(|j| j.score >= KEYPOINT_VISIBILITY_FLOOR)
+        };
+        let mut gated = joints.to_vec();
+        for side in 0..2 {
+            // Hand block, judged on the MCP knuckles `attach_hand` needs
+            // 3-of-4 of: in frame while >= 3 knuckles are, confident
+            // while >= 3 are above the floor.
+            let base = Self::HAND_BASES[side];
+            let count = |pred: &dyn Fn(usize) -> bool| {
+                Self::MCP_LOCALS.iter().filter(|&&l| pred(base + l)).count()
+            };
+            self.hand[side].advance(count(&in_frame) >= 3, count(&confident) >= 3, dt_s);
+            if std::env::var("VULVATAR_ENGAGE_DEBUG").is_ok() {
+                let j = &joints[base + Self::MCP_LOCALS[1]];
+                eprintln!(
+                    "ENGAGE side={side} dt={dt_s:.3} hand={:?} mcp_if={} mcp_conf={} mid=({:.2},{:.2},{:.2})",
+                    self.hand[side],
+                    count(&in_frame),
+                    count(&confident),
+                    j.nx,
+                    j.ny,
+                    j.score,
+                );
+            }
+            if !self.hand[side].engaged {
+                for j in gated.iter_mut().skip(base).take(21) {
+                    j.score = 0.0;
+                }
+            }
+        }
+        gated
+    }
+}
+
 /// Is this whole-frame-normalised 2D keypoint inside the camera image? The
 /// aligned depth frame only spans `[0, 1]²`; a keypoint the detector places
 /// OUTSIDE it (RTMW3D extrapolates a limb that has left the frame — e.g. an
@@ -1595,13 +1749,20 @@ pub(super) fn build_skeleton(
     // observed metric 3D (bone-length ray-sphere only when its depth is a hole);
     // the wrist is likewise observed inside `attach_hand`, so no elbow position
     // is threaded between them any more.
+    // Elbow camera positions are kept for `attach_hand`: when the hand's
+    // depth is fully holed, the wrist is ray-solved a forearm length from
+    // its elbow (same fallback family as `solve_child` itself).
+    let mut r_elbow_cam = None;
+    let mut l_elbow_cam = None;
     if let Some((c, s, o)) = fit.r_shoulder_cam.and_then(|sh| solve_child(sh, 7, bones.upper_arm_m)) {
         sk.joints.insert(HumanoidBone::RightLowerArm, src_joint(c, s));
         sk.mark_origin(HumanoidBone::RightLowerArm, o);
+        r_elbow_cam = Some(c);
     }
     if let Some((c, s, o)) = fit.l_shoulder_cam.and_then(|sh| solve_child(sh, 8, bones.upper_arm_m)) {
         sk.joints.insert(HumanoidBone::LeftLowerArm, src_joint(c, s));
         sk.mark_origin(HumanoidBone::LeftLowerArm, o);
+        l_elbow_cam = Some(c);
     }
 
     // Legs: hip → knee (thigh) → ankle (shin) → toe-tip (foot). Hip-anchored
@@ -1662,6 +1823,7 @@ pub(super) fn build_skeleton(
         &to_source,
         bones.forearm_m,
         person_z_ref,
+        r_elbow_cam,
     );
     attach_hand(
         &mut sk,
@@ -1674,6 +1836,7 @@ pub(super) fn build_skeleton(
         &to_source,
         bones.forearm_m,
         person_z_ref,
+        l_elbow_cam,
     );
 
     // Undo a whole-body left/right transposition from the 2D detector before
@@ -1739,6 +1902,7 @@ fn attach_hand<F>(
     to_source: &F,
     forearm_len_m: f32,
     person_z_ref: f32,
+    elbow_cam: Option<[f32; 3]>,
 ) where
     F: Fn([f32; 3]) -> [f32; 3],
 {
@@ -1763,6 +1927,53 @@ fn attach_hand<F>(
         Some((p, j.score))
     };
 
+    // Replay-bisect probe (`VULVATAR_DIAG_HAND`): classify per frame WHY a
+    // hand fails to attach — 2D score below floor, keypoint off-frame, or
+    // person-band depth sample miss — so low hand duty can be attributed to
+    // the detector vs the depth sampler without guessing.
+    let diag = std::env::var("VULVATAR_DIAG_HAND").is_ok();
+    let mut n_score = 0_u32; // MCPs with a usable 2D score
+    let mut n_depth = 0_u32; // ... that also produced a person-band sample
+    let mut n_raw = 0_u32; // ... that produced ANY depth sample (no band)
+    let mut n_wide = 0_u32; // ... person-band sample with a 21x21 window
+    let mut mean_ny = 0.0_f32;
+    let mut z_probe: Option<f32> = None; // unbanded z of the middle MCP
+    if diag {
+        for &local in &MCP_LOCALS {
+            if let Some(j) = joints.get(base_index + local) {
+                if j.score >= KEYPOINT_VISIBILITY_FLOOR {
+                    n_score += 1;
+                    mean_ny += j.ny;
+                    if sample_metric_point_person(
+                        depth,
+                        j.nx,
+                        j.ny,
+                        SAMPLE_RADIUS_PX,
+                        person_z_ref,
+                    )
+                    .is_some()
+                    {
+                        n_depth += 1;
+                    }
+                    if let Some(p) =
+                        sample_metric_point_with_radius(depth, j.nx, j.ny, SAMPLE_RADIUS_PX)
+                    {
+                        n_raw += 1;
+                        if local == MIDDLE_MCP_LOCAL {
+                            z_probe = Some(p[2]);
+                        }
+                    }
+                    if sample_metric_point_person(depth, j.nx, j.ny, 10, person_z_ref).is_some() {
+                        n_wide += 1;
+                    }
+                }
+            }
+        }
+        if n_score > 0 {
+            mean_ny /= n_score as f32;
+        }
+    }
+
     let mut sum = [0.0_f32; 3];
     let mut min_conf = f32::INFINITY;
     let mut found = 0_u32;
@@ -1784,22 +1995,133 @@ fn attach_hand<F>(
             }
         }
     }
-    if found < 3 {
-        // No usable hand samples → the hand rests (no wrist/finger joints).
+    if diag {
+        let raw_score = joints
+            .get(base_index + MIDDLE_MCP_LOCAL)
+            .map(|j| j.score)
+            .unwrap_or(-1.0);
+        eprintln!(
+            "HANDDIAG side={:?} ns={n_score} nd={n_depth} nr={n_raw} nw={n_wide} zmid={:.3} zref={person_z_ref:.3} found={found} ny={mean_ny:.3} msc={raw_score:.3}",
+            wrist_bone,
+            z_probe.unwrap_or(f32::NAN)
+        );
+    }
+    // 2D admissibility. Depth is NOT required to attach the hand any more —
+    // the 2026-07-28 replay bisect measured the hand's 2D at 4/4 MCP scores
+    // on every frame of the palms/wave replays while the depth under those
+    // same knuckles was a hole in half of them (hands near the D435's
+    // near limit / in its projector shadow). Requiring depth made the hand
+    // BLINK at frame rate, and every downstream arm artefact was that blink
+    // amplified. The elbow chain has had a ray fallback all along
+    // (`solve_limb_joint`); the hand gets the same degradation path.
+    //
+    // What IS required for the depth-free paths: at least 3 confident MCP
+    // keypoints (fewer means the detector — or the engage gate — says the
+    // hand is unobservable), the wrist keypoint itself, and every one of
+    // them safely INSIDE the frame. RTMW3D border-clamps an off-frame hand
+    // to the image edge; a real depth sample proves such a pixel is on the
+    // person, but without depth an edge-riding keypoint must not be pinned
+    // in 3D (that would fabricate a hand for the desk-typing envelope).
+    const FALLBACK_BORDER_MARGIN: f32 = 0.01;
+    let inside = |j: &DecodedJoint2d| {
+        j.nx >= FALLBACK_BORDER_MARGIN
+            && j.nx <= 1.0 - FALLBACK_BORDER_MARGIN
+            && j.ny >= FALLBACK_BORDER_MARGIN
+            && j.ny <= 1.0 - FALLBACK_BORDER_MARGIN
+    };
+    let scored = |local: usize| {
+        joints
+            .get(base_index + local)
+            .filter(|j| j.score >= KEYPOINT_VISIBILITY_FLOOR)
+    };
+    let mcp_kps: Vec<&DecodedJoint2d> =
+        MCP_LOCALS.iter().filter_map(|&l| scored(l)).collect();
+    let wrist_kp = scored(0);
+    let conf_2d = mcp_kps.iter().map(|j| j.score).fold(f32::INFINITY, f32::min);
+    let fallback_ok = mcp_kps.len() >= 3
+        && mcp_kps.iter().all(|j| inside(j))
+        && wrist_kp.is_some_and(inside);
+
+    let mcp_centroid_cam = if found > 0 {
+        let inv = 1.0 / found as f32;
+        [sum[0] * inv, sum[1] * inv, sum[2] * inv]
+    } else {
+        [0.0; 3]
+    };
+
+    // Deproject a full-frame-normalised keypoint at an assumed depth — the
+    // hand-plane reconstruction for keypoints whose own depth is a hole.
+    let deproject = |nx: f32, ny: f32, z: f32| -> Option<[f32; 3]> {
+        let intr = depth.intrinsics.as_ref()?;
+        Some([
+            (nx * intr.width as f32 - intr.cx) / intr.fx * z,
+            (ny * intr.height as f32 - intr.cy) / intr.fy * z,
+            z,
+        ])
+    };
+
+    // The wrist's DIRECTLY OBSERVED metric 3D IS the hand position when the
+    // depth cooperates: its own person-aware sample, else the knuckle
+    // centroid. Person-aware sampling already keeps these on-body, so the
+    // old forearm-length re-pin — which discarded the measured forward reach
+    // and floated an extended hand up to face height — stays gone.
+    // Sampled once and reused by the palm-orientation basis below.
+    use crate::tracking::source_skeleton::JointOrigin;
+    let wrist_sample = sample_cam(0);
+    let (wrist_cam, wrist_origin) = if let Some((p, _)) = wrist_sample {
+        (p, JointOrigin::Observed)
+    } else if found >= 3 {
+        (mcp_centroid_cam, JointOrigin::Observed)
+    } else if fallback_ok && found >= 1 {
+        // Partial knuckle depth: the sampled knuckle(s) fix the hand's depth
+        // plane, the wrist keypoint fixes its ray.
+        let w = wrist_kp.expect("fallback_ok requires the wrist keypoint");
+        match deproject(w.nx, w.ny, mcp_centroid_cam[2]) {
+            Some(p) => (p, JointOrigin::Extrapolated),
+            None => (mcp_centroid_cam, JointOrigin::Extrapolated),
+        }
+    } else if fallback_ok {
+        // Depth fully holed: pin the forearm length along the observed wrist
+        // ray from the elbow — the limb chain's own hole fallback. No depth
+        // prior: the toward-camera root matches how a reaching arm leaves
+        // the near limit in the first place.
+        let w = wrist_kp.expect("fallback_ok requires the wrist keypoint");
+        match (depth.intrinsics.as_ref(), elbow_cam) {
+            (Some(intr), Some(elbow)) => {
+                match solve_limb_joint(intr, w.nx, w.ny, elbow, forearm_len_m, None) {
+                    Some(p) => (p, JointOrigin::Extrapolated),
+                    None => {
+                        if diag {
+                            eprintln!("HANDDIAG side={wrist_bone:?} RAY_FAIL");
+                        }
+                        return;
+                    }
+                }
+            }
+            _ => {
+                if diag {
+                    eprintln!("HANDDIAG side={wrist_bone:?} NO_ELBOW");
+                }
+                return;
+            }
+        }
+    } else {
+        // Too few 2D keypoints, or an edge-riding hand with no depth proof.
+        if diag {
+            eprintln!(
+                "HANDDIAG side={wrist_bone:?} NOT_ADMISSIBLE nkp={} inside={} wrist_kp={} wrist_inside={}",
+                mcp_kps.len(),
+                mcp_kps.iter().all(|j| inside(j)),
+                wrist_kp.is_some(),
+                wrist_kp.is_some_and(inside),
+            );
+        }
+        return;
+    };
+    let min_conf = if min_conf.is_finite() { min_conf } else { conf_2d };
+    if !min_conf.is_finite() {
         return;
     }
-    let inv = 1.0 / found as f32;
-    let mcp_centroid_cam = [sum[0] * inv, sum[1] * inv, sum[2] * inv];
-
-    // The wrist's DIRECTLY OBSERVED metric 3D IS the hand position: its own
-    // person-aware sample, falling back to the knuckle centroid (which the
-    // >=3-sample gate above guarantees). Person-aware sampling already keeps
-    // these on-body, so the old forearm-length re-pin — which discarded the
-    // measured forward reach and floated an extended hand up to face height — is
-    // gone, along with its dependence on the elbow chain / bone length.
-    // Sampled once and reused by the palm-orientation basis below.
-    let wrist_sample = sample_cam(0);
-    let wrist_cam = wrist_sample.map(|(p, _)| p).unwrap_or(mcp_centroid_cam);
 
     // Sanity bound: an observed wrist implausibly far from the torso anchor is a
     // stray sample the person-aware gate let through. Rest the hand instead of
@@ -1809,6 +2131,13 @@ fn attach_hand<F>(
         (wrist_src[0] * wrist_src[0] + wrist_src[1] * wrist_src[1] + wrist_src[2] * wrist_src[2])
             .sqrt();
     if wrist_reach > 5.0 * forearm_len_m.max(0.1) {
+        if diag {
+            eprintln!(
+                "HANDDIAG side={:?} REACH_REJECT reach={wrist_reach:.3} limit={:.3}",
+                wrist_bone,
+                5.0 * forearm_len_m.max(0.1)
+            );
+        }
         return;
     }
 
@@ -1820,17 +2149,40 @@ fn attach_hand<F>(
             metric_depth_m: Some(wrist_cam[2]),
         },
     );
+    sk.mark_origin(wrist_bone, wrist_origin);
+
+    // Resolve a hand keypoint to camera space: its own person-band depth
+    // sample when it exists, else (fallback-admissible frames only) the 2D
+    // ray dropped onto the hand's depth plane. A hand spans ~10 cm in z, so
+    // the plane approximation bounds the error well below the 0.30 m
+    // outlier clamp while keeping palm orientation and finger curl alive
+    // through depth holes.
+    let hand_plane_z = wrist_cam[2];
+    let resolve = |local: usize, sampled: Option<[f32; 3]>| -> Option<[f32; 3]> {
+        if sampled.is_some() {
+            return sampled;
+        }
+        if !fallback_ok {
+            return None;
+        }
+        let j = scored(local).filter(|j| inside(j))?;
+        deproject(j.nx, j.ny, hand_plane_z)
+    };
 
     // Palm orientation basis (KEEP). Computed in SOURCE space so the
     // handedness matches the solver (camera space would flip `forward`):
     //   raw_forward = middle_mcp − wrist ; across = index_mcp − pinky_mcp
     //   normal = across × raw_forward   ; forward = normal × across
     // Cross-orthogonalising forward against the normal keeps a noisy wrist Z
-    // from tilting the in-palm forward.
-    if let (Some((wri_cam, _)), Some(mid), Some(idx), Some(pin)) =
-        (wrist_sample, middle_mcp, index_mcp, pinky_mcp)
-    {
-        let wri_p = to_source(wri_cam);
+    // from tilting the in-palm forward. The wrist end of the basis is the
+    // resolved `wrist_cam` (not the raw sample), so orientation survives
+    // the same depth holes the position now does.
+    if let (Some(mid), Some(idx), Some(pin)) = (
+        resolve(MIDDLE_MCP_LOCAL, middle_mcp),
+        resolve(INDEX_MCP_LOCAL, index_mcp),
+        resolve(PINKY_MCP_LOCAL, pinky_mcp),
+    ) {
+        let wri_p = to_source(wrist_cam);
         let raw_forward = sub3(to_source(mid), wri_p);
         let across = sub3(to_source(idx), to_source(pin));
         let normal_raw = cross3(across, raw_forward);
@@ -1855,16 +2207,24 @@ fn attach_hand<F>(
     // Wrist and fingers are observed in the same camera frame, so they are
     // already coherent — the old rigid shift onto a re-pinned wrist is gone
     // along with the re-pin itself.
+    // Outlier clamp reference: the sampled-knuckle centroid when any depth
+    // exists, else the (ray-solved) wrist — plane-resolved fingers are near
+    // it by construction, real samples still get vetted against it.
+    let hand_ref = if found > 0 { mcp_centroid_cam } else { wrist_cam };
     let within_hand = |p: [f32; 3]| -> bool {
-        let d = [
-            p[0] - mcp_centroid_cam[0],
-            p[1] - mcp_centroid_cam[1],
-            p[2] - mcp_centroid_cam[2],
-        ];
+        let d = [p[0] - hand_ref[0], p[1] - hand_ref[1], p[2] - hand_ref[2]];
         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= MAX_HAND_SPAN_M
     };
+    // Finger position + its 2D score: sampled depth first, hand plane else.
+    let finger_cam = |local: usize| -> Option<([f32; 3], f32)> {
+        let sampled = sample_cam(local);
+        let score = sampled
+            .map(|(_, s)| s)
+            .or_else(|| scored(local).map(|j| j.score))?;
+        resolve(local, sampled.map(|(p, _)| p)).map(|p| (p, score))
+    };
     for &(local_idx, bone) in phalanges {
-        if let Some((p, score)) = sample_cam(local_idx) {
+        if let Some((p, score)) = finger_cam(local_idx) {
             if !within_hand(p) {
                 continue;
             }
@@ -1879,7 +2239,7 @@ fn attach_hand<F>(
         }
     }
     for &(local_idx, bone) in tips {
-        if let Some((p, score)) = sample_cam(local_idx) {
+        if let Some((p, score)) = finger_cam(local_idx) {
             if !within_hand(p) {
                 continue;
             }
@@ -2106,6 +2466,94 @@ mod tests {
     /// Frame counts equivalent to the reseed horizons at the 30 fps step.
     const SPAN_RESEED_FRAMES_AT_30: u32 = 45;
     const ANCHOR_RESEED_FRAMES_AT_30: u32 = 60;
+
+    /// Full keypoint set with confident in-frame shoulders and one hand
+    /// block's MCP knuckles at `(hand_nx, hand_ny)`, scores 0.6 (the
+    /// score RTMW3D gives extrapolated joints).
+    fn engage_joints(hand_nx: f32, hand_ny: f32) -> Vec<DecodedJoint2d> {
+        let mut joints = vec![DecodedJoint2d::default(); NUM_JOINTS];
+        let mk = |nx: f32, ny: f32| DecodedJoint2d { nx, ny, score: 0.6 };
+        joints[5] = mk(0.40, 0.45);
+        joints[6] = mk(0.60, 0.45);
+        joints[7] = mk(0.45, 0.85); // elbow: NOT gated, must always pass
+        for &local in &ArmEngageGate::MCP_LOCALS {
+            joints[91 + local] = mk(hand_nx, hand_ny);
+        }
+        joints
+    }
+
+    #[test]
+    fn engage_gate_border_flicker_never_engages() {
+        // A hand popping across the bottom border every other frame (the
+        // desk-framing live trace) sits at ~50% duty — below DUTY_ON:
+        // its hand block stays gated on every frame.
+        let mut g = ArmEngageGate::default();
+        let inside = engage_joints(0.5, 0.95);
+        let outside = engage_joints(0.5, 1.15);
+        for i in 0..60 {
+            let src = if i % 2 == 0 { &inside } else { &outside };
+            let gated = g.tick_and_gate(src, DT);
+            assert_eq!(gated[91 + 9].score, 0.0, "flickering hand block must stay gated (frame {i})");
+            // Torso keypoints and the elbow always pass.
+            assert_eq!(gated[5].score, 0.6);
+            assert_eq!(gated[6].score, 0.6);
+            assert_eq!(gated[7].score, 0.6, "elbows are not gated");
+        }
+    }
+
+    #[test]
+    fn engage_gate_sustained_visibility_engages_and_lingers_through_phantom_flips() {
+        let mut g = ArmEngageGate::default();
+        let inside = engage_joints(0.5, 0.80);
+        // First frame in view: still gated (duty barely off zero).
+        let first = g.tick_and_gate(&inside, DT);
+        assert_eq!(first[91 + 9].score, 0.0, "cold start → gated");
+        // Hold in frame ~1 s: duty ≈ 0.9, engaged, passes through.
+        let mut last = first;
+        for _ in 0..30 {
+            last = g.tick_and_gate(&inside, DT);
+        }
+        assert_eq!(last[91 + 9].score, 0.6, "sustained in-frame hand block engages");
+        // The palms replay's worst real-hand zone: the 2D detector flips
+        // to a below-frame phantom one frame in three. Duty ≈ 2/3 stays
+        // above DUTY_OFF (and converges above DUTY_ON), so the hand keeps
+        // driving the avatar on its visible frames.
+        let outside = engage_joints(0.5, 1.15);
+        for i in 0..30 {
+            let src = if i % 3 == 2 { &outside } else { &inside };
+            let gated = g.tick_and_gate(src, DT);
+            if i % 3 != 2 {
+                assert_eq!(gated[91 + 9].score, 0.6, "in-2/out-1 phantom flip keeps the hand engaged (frame {i})");
+            }
+        }
+        // Hands back on the keyboard: sustained absence releases, and a
+        // 1-frame re-entry peek stays gated.
+        for _ in 0..30 {
+            g.tick_and_gate(&outside, DT);
+        }
+        let re = g.tick_and_gate(&inside, DT);
+        assert_eq!(re[91 + 9].score, 0.0, "sustained absence releases; a peek does not re-engage");
+    }
+
+    #[test]
+    fn engage_gate_in_frame_confidence_dip_keeps_engagement() {
+        // A hand plainly in view whose detection score dips for a frame
+        // (motion blur) must NOT lose its engagement — bridging that gap
+        // is the solver hold policy's job. Only leaving the frame counts
+        // against the duty.
+        let mut g = ArmEngageGate::default();
+        let inside = engage_joints(0.5, 0.80);
+        for _ in 0..30 {
+            g.tick_and_gate(&inside, DT);
+        }
+        let mut dip = inside.clone();
+        for &local in &ArmEngageGate::MCP_LOCALS {
+            dip[91 + local].score = 0.01;
+        }
+        g.tick_and_gate(&dip, DT);
+        let back = g.tick_and_gate(&inside, DT);
+        assert_eq!(back[91 + 9].score, 0.6, "in-frame score dip must not release the hand");
+    }
 
     #[test]
     fn scale_stabilizer_holds_span_through_contamination() {
@@ -2591,6 +3039,156 @@ mod tests {
             "off-frame left elbow (coco8) must be dropped, got {:?}",
             sk.joints.get(&HumanoidBone::LeftLowerArm)
         );
+    }
+
+    /// Erase every depth pixel in a normalised rect (a D435 near-limit /
+    /// projector-shadow hole over the hand).
+    fn hole_rect(frame: &mut MetricDepthFrame, nx0: f32, nx1: f32, ny0: f32, ny1: f32) {
+        let (w, h) = (frame.width, frame.height);
+        for v in ((ny0 * h as f32) as u32)..((ny1 * h as f32).ceil() as u32).min(h) {
+            for u in ((nx0 * w as f32) as u32)..((nx1 * w as f32).ceil() as u32).min(w) {
+                frame.points_m[(v * w + u) as usize] = [f32::NAN; 3];
+            }
+        }
+    }
+
+    /// Shoulders + right elbow on the body plane, right-hand block (base 91:
+    /// wrist local 0, MCP locals 5/9/13/17) at the given centre.
+    fn hand_scene_joints(hand_nx: f32, hand_ny: f32) -> Vec<DecodedJoint2d> {
+        let mut joints = vec![dj(0.5, 0.5, 0.0); NUM_JOINTS];
+        joints[5] = dj(0.42, 0.40, 0.9); // R shoulder (image-left)
+        joints[6] = dj(0.58, 0.40, 0.9); // L shoulder
+        joints[7] = dj(0.44, 0.58, 0.8); // R elbow, in frame on the body plane
+        joints[91] = dj(hand_nx, hand_ny - 0.03, 0.7); // wrist
+        for &l in &[5usize, 9, 13, 17] {
+            joints[91 + l] = dj(hand_nx + (l as f32 - 11.0) * 0.002, hand_ny, 0.7);
+        }
+        joints
+    }
+
+    /// The 2026-07-28 bisect root cause: the hand's 2D is perfect while the
+    /// depth under every hand keypoint is a hole (palms replay: 54 % of
+    /// frames). The hand must ATTACH anyway — ray-solved a forearm length
+    /// from the elbow and marked `Extrapolated` — instead of blinking out.
+    #[test]
+    fn hand_attaches_through_full_depth_hole_via_forearm_ray() {
+        let intr = intr_640();
+        let mut frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        hole_rect(&mut frame, 0.34, 0.50, 0.66, 0.82);
+        let joints = hand_scene_joints(0.42, 0.72);
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
+        let wrist = sk
+            .joints
+            .get(&HumanoidBone::RightHand)
+            .expect("hand must attach through a full depth hole");
+        assert_eq!(
+            sk.joint_origins.get(&HumanoidBone::RightHand),
+            Some(&crate::tracking::source_skeleton::JointOrigin::Extrapolated),
+            "ray-solved wrist must be marked Extrapolated"
+        );
+        let z = wrist.metric_depth_m.expect("wrist carries its camera z");
+        assert!(
+            (0.15..0.65).contains(&z),
+            "ray-solved wrist depth must be plausible (toward-camera), got {z}"
+        );
+    }
+
+    /// Partial knuckle depth (one MCP sampled, the rest holed): the sampled
+    /// knuckle fixes the hand's depth plane and the wrist keypoint its ray —
+    /// the hand attaches at that plane instead of resting.
+    #[test]
+    fn hand_attaches_on_partial_knuckle_depth_at_the_sampled_plane() {
+        let intr = intr_640();
+        let mut frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        hole_rect(&mut frame, 0.25, 0.60, 0.66, 0.82);
+        // Spread the MCPs wide enough that a tiny real surface under ONE of
+        // them (the middle MCP, local 9 at −0.04) leaves the rest holed.
+        let mut joints = hand_scene_joints(0.42, 0.72);
+        for &l in &[5usize, 9, 13, 17] {
+            joints[91 + l] = dj(0.42 + (l as f32 - 11.0) * 0.02, 0.72, 0.7);
+        }
+        let mid = &joints[91 + 9];
+        let (mu, mv) = (
+            (mid.nx * intr.width as f32).round() as i32,
+            (mid.ny * intr.height as f32).round() as i32,
+        );
+        for v in (mv - 3)..=(mv + 3) {
+            for u in (mu - 3)..=(mu + 3) {
+                let d = [(u as f32 - intr.cx) / intr.fx, (v as f32 - intr.cy) / intr.fy, 1.0];
+                frame.points_m[(v as u32 * intr.width + u as u32) as usize] =
+                    [d[0] * 0.35, d[1] * 0.35, 0.35];
+            }
+        }
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
+        let wrist = sk
+            .joints
+            .get(&HumanoidBone::RightHand)
+            .expect("hand must attach on partial knuckle depth");
+        let z = wrist.metric_depth_m.expect("wrist carries its camera z");
+        assert!(
+            (z - 0.35).abs() < 0.06,
+            "wrist must sit on the sampled knuckle plane (~0.35 m), got {z}"
+        );
+        assert_eq!(
+            sk.joint_origins.get(&HumanoidBone::RightHand),
+            Some(&crate::tracking::source_skeleton::JointOrigin::Extrapolated),
+        );
+        assert!(
+            sk.right_hand_orientation.is_some(),
+            "palm orientation must survive the plane fallback"
+        );
+    }
+
+    /// A border-riding hand block with NO depth proof must not be pinned in
+    /// 3D: RTMW3D border-clamps genuinely off-frame (desk-typing) hands to
+    /// the image edge, and fabricating those would re-open the very artefact
+    /// the fallback exists to fix.
+    #[test]
+    fn borderclamped_hand_without_depth_stays_rested() {
+        let intr = intr_640();
+        let mut frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        hole_rect(&mut frame, 0.30, 0.55, 0.90, 1.0);
+        let mut joints = hand_scene_joints(0.42, 0.995);
+        joints[91] = dj(0.42, 0.995, 0.7); // wrist border-clamped too
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
+        assert!(
+            sk.joints.get(&HumanoidBone::RightHand).is_none(),
+            "border-clamped hand with no depth must rest, got {:?}",
+            sk.joints.get(&HumanoidBone::RightHand)
+        );
+    }
+
+    /// Full depth available → the wrist keeps its directly observed sample
+    /// and stays `Observed` (no origin entry), exactly as before the
+    /// fallback existed.
+    #[test]
+    fn hand_with_full_depth_stays_observed() {
+        let intr = intr_640();
+        let frame = plane_frame(intr, [0.0, 0.0, 0.6], [0.0, 0.0, -1.0]);
+        let joints = hand_scene_joints(0.42, 0.72);
+        let opts = BuildOptions { force_shoulder_anchor: true };
+        let fit = torso_fit::fit_torso(&frame, &joints, opts, None).expect("torso fit");
+        let mut latch = LrSwapLatch::default();
+        let sk = build_skeleton(0, &joints, &frame, fit, None, None, &mut latch);
+        let wrist = sk
+            .joints
+            .get(&HumanoidBone::RightHand)
+            .expect("hand attaches on full depth");
+        assert!(
+            sk.joint_origins.get(&HumanoidBone::RightHand).is_none(),
+            "fully sampled wrist stays Observed"
+        );
+        let z = wrist.metric_depth_m.expect("wrist camera z");
+        assert!((z - 0.6).abs() < 0.05, "wrist on the body plane, got {z}");
     }
 
     /// Contrast: an IN-FRAME elbow whose depth window is a HOLE (a dark sleeve

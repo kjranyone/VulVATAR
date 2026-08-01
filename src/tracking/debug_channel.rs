@@ -91,6 +91,33 @@ fn write_camera(rgb: &[u8], w: u32, h: u32, dst_w: u32, frame_index: u64) {
     atomic_write(&base_dir().join("debug_camera.bin"), &out);
 }
 
+/// Full-resolution aligned depth snapshot for offline pixel audits
+/// ("is the depth under this keypoint actually right?") without stealing
+/// the camera from the app. Layout: 32-byte header (`magic 'VDBD',
+/// u32 w, u32 h, u32 fmt=1 (u16 mm), u32 pad, u64 frame_index@16`) then
+/// `w*h` little-endian u16 millimetres, row-major top-down, 0 = no
+/// return. ~1.8 MB at 1280×720 — callers throttle (once per second).
+pub fn dump_depth_snapshot(frame_index: u64, depth_raw: &[u16], w: u32, h: u32, units_m: f32) {
+    if !enabled() {
+        return;
+    }
+    if depth_raw.len() < (w as usize * h as usize) || w == 0 || h == 0 {
+        return;
+    }
+    let mm_per_unit = units_m * 1000.0;
+    let mut out = vec![0u8; 32 + depth_raw.len() * 2];
+    out[0..4].copy_from_slice(b"VDBD");
+    out[4..8].copy_from_slice(&w.to_le_bytes());
+    out[8..12].copy_from_slice(&h.to_le_bytes());
+    out[12..16].copy_from_slice(&1u32.to_le_bytes());
+    out[16..24].copy_from_slice(&frame_index.to_le_bytes());
+    for (i, &raw) in depth_raw.iter().enumerate() {
+        let mm = (raw as f32 * mm_per_unit).round().clamp(0.0, u16::MAX as f32) as u16;
+        out[32 + i * 2..32 + i * 2 + 2].copy_from_slice(&mm.to_le_bytes());
+    }
+    atomic_write(&base_dir().join("debug_depth.bin"), &out);
+}
+
 /// Face-stage diagnostics stashed by the RTMW3D face block (which has the
 /// crop bbox + both pose candidates in scope) and merged into
 /// `debug_state.json` by `dump_observation` (which does not). One slot,
@@ -192,11 +219,24 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
         .take(17)
         .map(|&(x, y, s)| serde_json::json!([x, y, s]))
         .collect();
+    // MCP knuckle keypoints of both hand landmark blocks (the joints
+    // `attach_hand` needs 3-of-4 of) — lets an external audit correlate
+    // the 2D hand detection with the depth snapshot without re-running
+    // the detector. COCO-Wholebody: 91.. left block, 112.. right block.
+    let mcp = |base: usize| -> Vec<serde_json::Value> {
+        [5usize, 9, 13, 17]
+            .iter()
+            .filter_map(|&l| est.annotation.keypoints.get(base + l))
+            .map(|&(x, y, s)| serde_json::json!([x, y, s]))
+            .collect()
+    };
+    // `d` is the joint's raw camera-space depth in metres (the value the
+    // window-median + person-band sampler actually returned) — the
+    // ground truth for "did this keypoint get the right depth".
     let arm = |b: HumanoidBone| {
-        est.skeleton
-            .joints
-            .get(&b)
-            .map(|j| serde_json::json!({ "p": j.position, "c": j.confidence }))
+        est.skeleton.joints.get(&b).map(
+            |j| serde_json::json!({ "p": j.position, "c": j.confidence, "d": j.metric_depth_m }),
+        )
     };
     // Face pose (head orientation) + the source torso/head 3D that drives the
     // neck/spine chain: lets an external tool tell whether an over-pitched
@@ -210,6 +250,16 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
         "frame": frame_index,
         "overall": est.skeleton.overall_confidence,
         "kp": kps,
+        "kp_mcp": { "l_block": mcp(91), "r_block": mcp(112) },
+        // Root / anchor channel (drives avatar translation + scale).
+        "root": est.skeleton.root_offset,
+        "root_is_hip": est.skeleton.root_anchor_is_hip,
+        "metric": est.skeleton.metric_frame_info.as_ref().map(|m| serde_json::json!({
+            "anchor_cam_m": m.anchor_cam_m,
+            "anchor_is_hip": m.anchor_is_hip,
+            "mpsu": m.mpsu,
+            "ref_span_m": m.reference_span_m,
+        })),
         "face": face,
         // FaceMesh's own "is this a face" score, independent of the
         // published pose's confidence — tells an external tool which

@@ -1434,10 +1434,18 @@ impl GuiApp {
     }
 
     /// Open the pose-calibration modal at the active profile's last
-    /// calibrated mode (FullBody for a first capture). Mirrors the
-    /// Tracking panel's launcher, including the avatar-load gate —
-    /// the load Window is its own modal and stacking the calibration
-    /// scrim over it would bury the progress readout.
+    /// calibrated mode. A FIRST capture defaults from the live framing
+    /// instead of a fixed FullBody: a desk-framed streamer (head +
+    /// shoulders, hips below the image) physically cannot present the
+    /// FullBody T-pose, and being greeted by one reads as "calibration
+    /// is impossible at my setup" — the UpperBody mode (arms down,
+    /// with the bust-up stillness fallback) is the one that actually
+    /// works there. Hip visibility on the latest tracking sample is
+    /// the discriminator the runtime anchor selection itself uses.
+    /// Mirrors the Tracking panel's launcher, including the
+    /// avatar-load gate — the load Window is its own modal and
+    /// stacking the calibration scrim over it would bury the progress
+    /// readout.
     pub(crate) fn open_calibration_modal(&mut self) {
         if self.library.avatar_load_job.is_some() {
             self.push_warning_notification(t!("top_bar.avatar_load_in_progress"));
@@ -1449,7 +1457,21 @@ impl GuiApp {
             .pose
             .as_ref()
             .map(|c| c.mode)
-            .unwrap_or(crate::tracking::CalibrationMode::FullBody);
+            .unwrap_or_else(|| {
+                let hips_tracked = self
+                    .app
+                    .tracking
+                    .mailbox()
+                    .snapshot()
+                    .pose
+                    .as_ref()
+                    .is_some_and(|p| p.root_anchor_is_hip);
+                if hips_tracked {
+                    crate::tracking::CalibrationMode::FullBody
+                } else {
+                    crate::tracking::CalibrationMode::UpperBody
+                }
+            });
         self.calibration.modal.open(default_mode);
     }
 

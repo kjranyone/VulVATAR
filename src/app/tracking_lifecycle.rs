@@ -34,6 +34,10 @@ impl Application {
         for avatar in self.avatars.iter_mut() {
             avatar.pose_solver_state.reset();
         }
+        // Same rationale for the automatic session neutral: a new
+        // session may be a new camera placement, so the previous
+        // session's seeded neutrals must not carry over.
+        self.auto_neutral.reset();
         let shared_mailbox = self.tracking.shared_mailbox();
         let mut worker = TrackingWorker::new(shared_mailbox);
         worker.start_with_params(width, height, fps, pipeline);

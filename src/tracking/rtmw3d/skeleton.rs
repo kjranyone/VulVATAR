@@ -1245,6 +1245,15 @@ fn attach_hand<F>(
     // forward of the true wrist; that's biomechanically slightly
     // wrong but visually invisible and the avatar's solver re-anchors
     // the chain at the same point regardless.
+    //
+    // Every landmark must also be IN FRAME: RTMW3D extrapolates hands
+    // that have left the image (desk framing — hands on the keyboard
+    // below the bottom border) at ny ≈ 1.1–1.3 with scores ~0.6, and
+    // a palm basis built from those hallucinated points aims the
+    // avatar's hands in arbitrary directions. An off-frame landmark
+    // is unobservable, not low-confidence, so it contributes nothing.
+    let in_frame =
+        |j: &DecodedJoint| (0.0..=1.0).contains(&j.nx) && (0.0..=1.0).contains(&j.ny);
     const MCP_LOCALS: [usize; 4] = [5, 9, 13, 17];
     let mut sum = [0.0_f32; 3];
     let mut min_conf = f32::INFINITY;
@@ -1255,7 +1264,7 @@ fn attach_hand<F>(
             continue;
         }
         let j = &joints[global];
-        if j.score < KEYPOINT_VISIBILITY_FLOOR {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR || !in_frame(j) {
             continue;
         }
         let p = to_source(j);
@@ -1287,7 +1296,7 @@ fn attach_hand<F>(
             continue;
         }
         let j = &joints[global];
-        if j.score < KEYPOINT_VISIBILITY_FLOOR {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR || !in_frame(j) {
             continue;
         }
         sk.joints.insert(
@@ -1305,7 +1314,7 @@ fn attach_hand<F>(
             continue;
         }
         let j = &joints[global];
-        if j.score < KEYPOINT_VISIBILITY_FLOOR {
+        if j.score < KEYPOINT_VISIBILITY_FLOOR || !in_frame(j) {
             continue;
         }
         sk.fingertips.insert(
@@ -1348,6 +1357,10 @@ fn attach_hand<F>(
         && joints[l_middle].score >= KEYPOINT_VISIBILITY_FLOOR
         && joints[l_index].score >= KEYPOINT_VISIBILITY_FLOOR
         && joints[l_pinky].score >= KEYPOINT_VISIBILITY_FLOOR
+        && in_frame(&joints[l_wrist])
+        && in_frame(&joints[l_middle])
+        && in_frame(&joints[l_index])
+        && in_frame(&joints[l_pinky])
     {
         let wrist_pos = to_source(&joints[l_wrist]);
         let middle_pos = to_source(&joints[l_middle]);
@@ -1593,6 +1606,72 @@ mod tests {
         let sk = build_source_skeleton(0, &joints, 640, 480, false);
         assert!(sk.joints.contains_key(&HumanoidBone::Hips));
         assert!(sk.root_anchor_is_hip);
+    }
+
+    /// Fill one hand landmark block (21 joints from `base`) around the
+    /// given image-normalised centre with confident scores, laying the
+    /// wrist + MCP knuckles out in a plausible non-collinear palm shape
+    /// so the orientation basis is well-conditioned when in frame.
+    fn fill_hand_block(joints: &mut [DecodedJoint], base: usize, cx: f32, cy: f32) {
+        let mk = |nx: f32, ny: f32| DecodedJoint {
+            nx,
+            ny,
+            nz: 0.5,
+            z_score: 0.6,
+            score: 0.6,
+        };
+        for local in 0..21 {
+            joints[base + local] = mk(cx, cy);
+        }
+        joints[base] = mk(cx, cy + 0.05); // wrist below the knuckle line
+        joints[base + 5] = mk(cx - 0.03, cy); // index MCP
+        joints[base + 9] = mk(cx, cy - 0.01); // middle MCP
+        joints[base + 13] = mk(cx + 0.015, cy); // ring MCP
+        joints[base + 17] = mk(cx + 0.03, cy + 0.01); // pinky MCP
+    }
+
+    #[test]
+    fn off_frame_hand_block_emits_no_orientation_joints_or_fingertips() {
+        // Desk framing: hands on the keyboard BELOW the image. RTMW3D
+        // extrapolates the whole hand block at ny ≈ 1.2 with scores
+        // ~0.6 — hallucinated landmarks that used to build a palm basis
+        // aiming the avatar's hands in arbitrary directions.
+        let mut joints = fake_joints_with_visible_hips();
+        fill_hand_block(&mut joints, 91, 0.30, 1.20);
+        fill_hand_block(&mut joints, 112, 0.70, 1.25);
+        let sk = build_source_skeleton(0, &joints, 640, 480, false);
+        assert!(
+            sk.left_hand_orientation.is_none() && sk.right_hand_orientation.is_none(),
+            "off-frame hallucinated hand blocks must not produce a palm orientation"
+        );
+        assert!(
+            !sk.joints.contains_key(&HumanoidBone::LeftHand)
+                && !sk.joints.contains_key(&HumanoidBone::RightHand),
+            "off-frame hallucinated hand blocks must not produce wrist joints"
+        );
+        assert!(
+            sk.fingertips.is_empty(),
+            "off-frame hallucinated hand blocks must not produce fingertips"
+        );
+    }
+
+    #[test]
+    fn in_frame_hand_block_still_emits_orientation() {
+        // Positive control for the off-frame gate: the same blocks fully
+        // inside the image must keep producing wrists + palm bases.
+        let mut joints = fake_joints_with_visible_hips();
+        fill_hand_block(&mut joints, 91, 0.30, 0.60);
+        fill_hand_block(&mut joints, 112, 0.70, 0.60);
+        let sk = build_source_skeleton(0, &joints, 640, 480, false);
+        assert!(
+            sk.joints.contains_key(&HumanoidBone::LeftHand)
+                && sk.joints.contains_key(&HumanoidBone::RightHand),
+            "in-frame hand blocks must keep producing wrist joints"
+        );
+        assert!(
+            sk.left_hand_orientation.is_some() && sk.right_hand_orientation.is_some(),
+            "in-frame hand blocks must keep producing a palm orientation"
+        );
     }
 
     fn sj(x: f32, y: f32, z: f32) -> crate::tracking::SourceJoint {

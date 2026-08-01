@@ -942,7 +942,38 @@ impl Rtmw3dInference {
                     skeleton.face_mesh_confidence = Some(conf);
                     mesh_conf = conf;
                     mesh_face_pose = pose;
-                    dbg_mesh = pose.map(|p| (conf, p));
+                    // PITCH IS NOT PER-SOURCE. Both estimators used to derive
+                    // it by normalising the nose's drop below the eye line by a
+                    // HORIZONTAL baseline (inter-eye / eye-corner width), which
+                    // foreshortens as `cos(yaw)`, and both compensated with
+                    // their own yaw. That compensation fails in exactly the
+                    // view this user works in — turned ~60 deg toward a monitor
+                    // beside the camera:
+                    //   * body path: ears occluded (headphones), ear-line yaw
+                    //     pinned inside ±5 deg → no compensation at all;
+                    //   * mesh path: its own yaw SATURATES at the ±63.43 deg
+                    //     `atan(clamp(·, 2.0))` bound (measured on 16% of live
+                    //     frames) and `yaw.cos()` is floored at 0.5, so past
+                    //     ~60 deg the correction stops growing while the real
+                    //     foreshortening keeps going.
+                    // Either way the ratio inflates and a head TURN decodes as
+                    // a chin-DOWN nod — the user's "it still looks down when I
+                    // turn". `face::pitch_from_vertical_ratio` sidesteps the
+                    // whole failure mode: it is built from image `y` only
+                    // (eye line → nose tip → chin, RTMW3D's face-68 block), and
+                    // a rotation about the vertical axis cannot change `y`. So
+                    // the mesh keeps what it is genuinely better at (yaw / roll
+                    // through the 3/4-view dead-zone) and takes its pitch from
+                    // the yaw-invariant estimator. Feeding BOTH candidates the
+                    // same pitch also means a source switch can no longer step
+                    // the head in that channel.
+                    if let (Some(p), Some(mesh)) = (
+                        face::pitch_from_vertical_ratio(&joints),
+                        mesh_face_pose.as_mut(),
+                    ) {
+                        mesh.pitch = p;
+                    }
+                    dbg_mesh = mesh_face_pose.map(|p| (conf, p));
                 }
             }
         }

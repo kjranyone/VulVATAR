@@ -38,6 +38,42 @@ pub(super) fn derive_face_pose_from_body(
             return None;
         }
     }
+    // Observability of the two HORIZONTAL baselines, in the same fixed
+    // pixel space the roll/pitch math uses. In an oblique / profile view
+    // both ears (and both eyes) project nearly onto the same image
+    // point; their z separation is SimCC-hallucinated, so
+    // `yaw = atan2(dz, dx≈0)` and `roll = atan2(dy, dx≈0)` amplify pure
+    // noise into whole-hemisphere thrash (live desk capture 2026-07-27:
+    // ear separation ≈ 3% of the head's keypoint spread → published yaw
+    // ranged −154°…+97° with sd 66° while the subject held still — the
+    // avatar's "broken neck"). A collapsed baseline is UNOBSERVABLE,
+    // not low-confidence (the scores stayed ~0.65): refuse the pose so
+    // the selector holds the previous / mesh pose or the head eases to
+    // neutral, instead of publishing an unbounded division.
+    {
+        let px = |j: &DecodedJoint| (j.nx * INPUT_W as f32, j.ny * INPUT_H as f32);
+        let dist = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).hypot(a.1 - b.1);
+        let pts = [px(&joints[0]), px(&joints[1]), px(&joints[2]), px(&joints[3]), px(&joints[4])];
+        let mut head_size = 0.0_f32;
+        for i in 0..pts.len() {
+            for k in i + 1..pts.len() {
+                head_size = head_size.max(dist(pts[i], pts[k]));
+            }
+        }
+        /// Ear baseline below this fraction of the head's keypoint
+        /// spread → the ear-line yaw divides by ~nothing. Frontal sits
+        /// at ~1.0, a 60° turn at ~0.6; the live broken-neck frames at
+        /// 0.03.
+        const MIN_EAR_SEP_FRAC: f32 = 0.15;
+        /// Same for the eye baseline (roll). Frontal ~0.5.
+        const MIN_EYE_SEP_FRAC: f32 = 0.10;
+        if head_size < 1.0
+            || dist(pts[3], pts[4]) < MIN_EAR_SEP_FRAC * head_size
+            || dist(pts[1], pts[2]) < MIN_EYE_SEP_FRAC * head_size
+        {
+            return None;
+        }
+    }
     // We need positions in source-skeleton coords. The COCO body
     // keypoints 0..=4 are not stored in `skeleton.joints` (only
     // shoulders / arms / legs are), so reconstruct via the same
@@ -103,6 +139,13 @@ pub(super) fn derive_face_pose_from_body(
     const EAR_OCCLUSION_RATIO: f32 = 0.5;
     let s_right_ear = joints[3].score;
     let s_left_ear = joints[4].score;
+    // Whether the ear line is evidence a *pitch* estimator may lean on.
+    // Both ears must be genuinely seen (no reconstruction) — a
+    // reconstructed ear carries the documented yaw-magnitude bias, and a
+    // yaw that is merely plausible is not good enough to divide a
+    // horizontal baseline by. See `legacy_pitch_from_inter_eye`.
+    let ears_trustworthy = s_right_ear >= s_left_ear * EAR_OCCLUSION_RATIO
+        && s_left_ear >= s_right_ear * EAR_OCCLUSION_RATIO;
     let (right_ear_xz, left_ear_xz) = if s_right_ear < s_left_ear * EAR_OCCLUSION_RATIO {
         // Subject's left ear (joint 3 / avatar_right_ear) occluded.
         let recon = [
@@ -149,8 +192,118 @@ pub(super) fn derive_face_pose_from_body(
     let roll_dx_px = (joints[1].nx - joints[2].nx) * INPUT_W as f32;
     let roll = roll_dy_px.atan2(roll_dx_px);
 
-    // PITCH from nose-below-eye-line, with an anatomical neutral
-    // subtracted — mirroring the FaceMesh path
+    // PITCH from the face's own VERTICAL landmark geometry — see
+    // `pitch_from_vertical_ratio`. Falls back to the legacy inter-eye
+    // normalisation only while the ear line can vouch for the yaw, and
+    // refuses to publish a pose at all when neither holds: a pitch derived
+    // from a horizontal baseline with an unknown yaw is not a weak reading,
+    // it is a wrong one (live capture decoded a 60 deg head TURN as a 50 deg
+    // chin-DOWN nod).
+    let pitch = match pitch_from_vertical_ratio(joints) {
+        Some(p) => p,
+        None => legacy_pitch_from_inter_eye(joints, yaw, ears_trustworthy)?,
+    };
+
+    let conf = joints[..5].iter().map(|j| j.score).fold(1.0_f32, f32::min);
+    Some(FacePose {
+        yaw,
+        pitch,
+        roll,
+        confidence: conf,
+        source: FaceSource::Body,
+        ..Default::default()
+    })
+}
+
+/// dlib-68 face landmarks start at this COCO-WholeBody index (0..=4 are the
+/// body-face keypoints, 5..=22 the body, 23..=90 the face-68 set — the same
+/// block [`build_face_bbox_from_joints`] consumes).
+const FACE68_BASE: usize = 23;
+/// dlib-68 indices used by the pitch estimator.
+const DLIB_CHIN: usize = 8;
+const DLIB_NOSE_TIP: usize = 30;
+const DLIB_EYE_CORNERS: [usize; 4] = [36, 39, 42, 45];
+
+/// Frontal-neutral value of the vertical ratio below, i.e. how far down the
+/// eye-line→chin span the nose tip sits on a level head. Measured 0.26 over
+/// the live desk capture's level-gaze frames (2026-07-27); the per-person
+/// residual is absorbed by `PoseCalibration::neutral_face_ypr_body`.
+const VERTICAL_RATIO_NEUTRAL: f32 = 0.26;
+/// Converts the ratio's deviation from neutral into `tan(pitch)`. The ratio
+/// moves as `a/b + (d/b)·tan(pitch)` where `b` is the eye-line→chin distance
+/// and `d` the nose tip's protrusion in front of that plane, so the gain is
+/// `b/d`. Live check: a 30 deg chin-down frame read 0.465 against a 0.26
+/// neutral → 2.81. Anthropometry agrees (b ≈ 0.11 m, d ≈ 0.039 m → 2.8).
+const VERTICAL_RATIO_GAIN: f32 = 2.8;
+/// Minimum eye-line→chin separation (normalised image units) for the ratio to
+/// be meaningful. Below this the face is a few pixels tall or the landmarks
+/// have collapsed, and the division amplifies noise without bound.
+const MIN_EYE_CHIN_SPAN: f32 = 1e-3;
+
+/// Head pitch from landmarks that share a vertical line: the nose tip's
+/// height between the eye line and the chin.
+///
+/// Yaw-invariance is the whole point. A head turn is a rotation about the
+/// vertical axis, which leaves every landmark's image `y` untouched, so a
+/// ratio built only from `y` cannot move when the subject looks sideways.
+/// The shipping formula normalised the nose's drop by the INTER-EYE
+/// distance, which foreshortens by `cos(yaw)`; it compensated with a
+/// `cos(yaw)` term read off the ear line — and live capture (2026-07-27)
+/// showed that ear-line yaw pinned inside ±5 deg through a real 45-70 deg
+/// turn (hair and glasses temples hide the ears, so `ear_dz` never
+/// separates). With the compensation dead, the raw 1/cos inflation went
+/// straight to the avatar: measured body pitch +29 deg at a 45 deg turn and
+/// +50 deg at 60 deg, against a true level gaze. The vertical ratio measured
+/// on the same frames held 0.25-0.26 from frontal through profile.
+///
+/// Pitch response comes from the nose tip standing in FRONT of the
+/// eye-line→chin plane: under a nod the plane's projected height shrinks as
+/// `cos(pitch)` while the nose gains `d·sin(pitch)`, so the ratio is
+/// `a/b + (d/b)·tan(pitch)` — monotonic across the usable range and linear
+/// in `tan`, which is exactly what `atan` inverts.
+///
+/// `None` when the face-68 block is absent or any input landmark is below
+/// the visibility floor; the caller then decides whether a fallback estimate
+/// is defensible.
+pub(super) fn pitch_from_vertical_ratio(joints: &[DecodedJoint]) -> Option<f32> {
+    let lm = |dlib: usize| -> Option<&DecodedJoint> {
+        let j = joints.get(FACE68_BASE + dlib)?;
+        (j.score >= KEYPOINT_VISIBILITY_FLOOR).then_some(j)
+    };
+    let chin = lm(DLIB_CHIN)?;
+    let nose = lm(DLIB_NOSE_TIP)?;
+    // Mean of all four eye corners rather than two: the outer corners alone
+    // put the baseline on the two points most likely to be occluded in a
+    // profile view, and averaging halves the per-landmark noise.
+    let mut eye_y = 0.0;
+    for &c in &DLIB_EYE_CORNERS {
+        eye_y += lm(c)?.ny;
+    }
+    let eye_y = eye_y / DLIB_EYE_CORNERS.len() as f32;
+    // Image y grows downward, so both spans are positive on an upright head.
+    let span = chin.ny - eye_y;
+    if span < MIN_EYE_CHIN_SPAN {
+        return None;
+    }
+    let ratio = (nose.ny - eye_y) / span;
+    Some(((ratio - VERTICAL_RATIO_NEUTRAL) * VERTICAL_RATIO_GAIN).atan())
+}
+
+/// Legacy nose-below-eye-line pitch, normalised by the inter-eye distance
+/// and yaw-decoupled by `cos(yaw)`. Only valid while `yaw` itself is
+/// trustworthy — hence `ears_trustworthy`, which the caller sets from the
+/// ear-line evidence that produced the yaw. Kept as the fallback for frames
+/// where the face-68 block is missing or unscored, and returns `None`
+/// (no face pose at all) when the yaw cannot be vouched for.
+fn legacy_pitch_from_inter_eye(
+    joints: &[DecodedJoint],
+    yaw: f32,
+    ears_trustworthy: bool,
+) -> Option<f32> {
+    if !ears_trustworthy {
+        return None;
+    }
+    // An anatomical neutral subtracted — mirroring the FaceMesh path
     // (`derive_face_pose_from_landmarks`, which subtracts its own
     // `PITCH_NEUTRAL_SIGNAL`). The body path never had this: at a frontal
     // neutral pose the nose tip sits a fixed fraction below the eye line,
@@ -191,17 +344,7 @@ pub(super) fn derive_face_pose_from_body(
     let yaw_foreshorten = yaw.cos().clamp(0.5, 1.0);
     let pitch_signal =
         (nose_py - eye_mid_py) / inter_eye_px * yaw_foreshorten - PITCH_NEUTRAL_SIGNAL;
-    let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
-
-    let conf = joints[..5].iter().map(|j| j.score).fold(1.0_f32, f32::min);
-    Some(FacePose {
-        yaw,
-        pitch,
-        roll,
-        confidence: conf,
-        source: FaceSource::Body,
-        ..Default::default()
-    })
+    Some(pitch_signal.clamp(-2.0, 2.0).atan())
 }
 
 /// FaceMesh confidence above which the selector *switches to* the mesh
@@ -219,6 +362,37 @@ pub(super) fn derive_face_pose_from_body(
 /// inside [0.15, 0.3) keeps whichever source is currently active.
 const MESH_ENTER_CONFIDENCE: f32 = 0.3;
 const MESH_EXIT_CONFIDENCE: f32 = 0.15;
+
+/// How long an ACTIVE mesh source survives a confidence dip while its
+/// pose stream stays continuous. The mesh's "is this a face" flag
+/// collapses to ~0 for a few frames during oblique up-looks even
+/// though the landmark pose keeps tracking correctly (live desk
+/// capture 2026-07-27: mesh_c flapped 1.0 → 0.00 → 0.93 → 0.01 → 1.0
+/// over ~2.4 s while mesh yaw stayed a coherent −45…−57°; every dip
+/// kicked the selector to the body path, whose ear-line yaw reads ~0
+/// in profile — the avatar's head snapped to front instead of
+/// following the visible mesh). Score dip ≠ pose invalid: ride it,
+/// bounded by this window so a genuinely dead mesh (sustained
+/// collapse, the frozen-profile case) still releases.
+const MESH_DIP_RIDE_S: f32 = 1.0;
+/// A mesh pose stepping farther than this (radians, any axis, per
+/// frame) from the last published pose during a dip is NOT a
+/// continuous track — it is the mesh reading garbage. Release
+/// immediately instead of riding.
+const MESH_DIP_MAX_STEP_RAD: f32 = 0.8;
+
+/// Wrapped absolute angular difference (radians).
+fn angle_gap(a: f32, b: f32) -> f32 {
+    use std::f32::consts::PI;
+    let mut d = a - b;
+    while d > PI {
+        d -= 2.0 * PI;
+    }
+    while d < -PI {
+        d += 2.0 * PI;
+    }
+    d.abs()
+}
 
 /// Wall-clock duration of a source-switch crossfade. ~233 ms (the old
 /// 6-blended-frames-at-30-fps schedule reached the target on the 7th
@@ -268,6 +442,9 @@ pub(super) struct FaceSourceSelector {
     blend_elapsed_s: f32,
     blend_from: Option<FacePose>,
     last_output: Option<FacePose>,
+    /// Wall time spent in the current below-EXIT confidence dip while
+    /// the mesh source stays active (see [`MESH_DIP_RIDE_S`]).
+    dip_elapsed_s: f32,
 }
 
 impl FaceSourceSelector {
@@ -282,11 +459,34 @@ impl FaceSourceSelector {
         dt_s: f32,
     ) -> Option<FacePose> {
         // Schmitt-trigger source state. The mesh must exist this frame
-        // to be (or stay) the active source.
+        // to be (or stay) the active source. An ACTIVE mesh additionally
+        // rides out brief confidence dips while its pose stream stays
+        // continuous (see [`MESH_DIP_RIDE_S`]) — the flag score lies
+        // during oblique up-looks while the landmarks keep tracking.
         let mesh_wanted = if self.using_mesh {
-            mesh.is_some() && mesh_conf >= MESH_EXIT_CONFIDENCE
+            match &mesh {
+                None => false,
+                Some(_) if mesh_conf >= MESH_EXIT_CONFIDENCE => {
+                    self.dip_elapsed_s = 0.0;
+                    true
+                }
+                Some(m) => {
+                    let continuous = self.last_output.as_ref().is_some_and(|prev| {
+                        angle_gap(m.yaw, prev.yaw)
+                            .max(angle_gap(m.pitch, prev.pitch))
+                            .max(angle_gap(m.roll, prev.roll))
+                            <= MESH_DIP_MAX_STEP_RAD
+                    });
+                    self.dip_elapsed_s += dt_s;
+                    continuous && self.dip_elapsed_s < MESH_DIP_RIDE_S
+                }
+            }
         } else {
-            mesh.is_some() && mesh_conf >= MESH_ENTER_CONFIDENCE
+            let wanted = mesh.is_some() && mesh_conf >= MESH_ENTER_CONFIDENCE;
+            if wanted {
+                self.dip_elapsed_s = 0.0;
+            }
+            wanted
         };
         if mesh_wanted != self.using_mesh {
             self.using_mesh = mesh_wanted;
@@ -429,6 +629,34 @@ mod tests {
         }
     }
 
+    /// Eye-line→chin span used by the face-68 fixtures, in the same
+    /// `INPUT_H` pixel space as the 5-point fixtures below. Eyes sit at
+    /// py=150, so the chin lands at py=270.
+    const CHIN_SPAN_PY: f32 = 120.0;
+
+    /// Add the face-68 block (indices 23..=90) to a 5-point fixture so the
+    /// primary estimator has landmarks to read. The nose tip is placed at
+    /// `ratio` of the eye-line→chin span, i.e. exactly the quantity
+    /// [`pitch_from_vertical_ratio`] measures; eye corners share the eye
+    /// line and the chin closes the span. Landmarks the estimator does not
+    /// read are left at the fixture's default (score 0) — it must not
+    /// depend on them.
+    fn with_face68(mut j: Vec<DecodedJoint>, ratio: f32) -> Vec<DecodedJoint> {
+        let h = INPUT_H as f32;
+        let w = INPUT_W as f32;
+        j.resize(FACE68_BASE + 68, DecodedJoint::default());
+        let eye_py = 150.0;
+        let put = |j: &mut Vec<DecodedJoint>, dlib: usize, px: f32, py: f32| {
+            j[FACE68_BASE + dlib] = dj(px / w, py / h, 0.5);
+        };
+        for (dlib, px) in [(36, 128.0), (39, 140.0), (42, 148.0), (45, 160.0)] {
+            put(&mut j, dlib, px, eye_py);
+        }
+        put(&mut j, DLIB_CHIN, 144.0, eye_py + CHIN_SPAN_PY);
+        put(&mut j, DLIB_NOSE_TIP, 144.0, eye_py + ratio * CHIN_SPAN_PY);
+        j
+    }
+
     /// Front-facing synthetic face with the nose at `nose_py` pixels
     /// (model space is `INPUT_W×INPUT_H`). Eyes at py=150, inter-eye 32 px,
     /// ears symmetric at equal depth (yaw≈0), shoulders/hips set so
@@ -556,9 +784,56 @@ mod tests {
             assert_eq!(out.source, FaceSource::Mesh, "conf {conf} dropped to body");
         }
 
-        // Genuine collapse below EXIT → back to body.
+        // Genuine collapse below EXIT: the dip-ride keeps the mesh for
+        // up to MESH_DIP_RIDE_S while its pose is continuous, then
+        // releases to body.
+        for _ in 0..((MESH_DIP_RIDE_S / DT).ceil() as u32 + 2) {
+            sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
+        }
         let out = sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
-        assert_eq!(out.source, FaceSource::Body);
+        assert_eq!(out.source, FaceSource::Body, "sustained collapse must release the mesh");
+    }
+
+    #[test]
+    fn mesh_confidence_dip_with_continuous_pose_rides_through() {
+        // THE live up-look failure (2026-07-27): mesh_c flaps
+        // 1.0 → 0.00 → 0.93 → 0.01 → 1.0 while the mesh pose stays a
+        // coherent −45…−57° track. Every dip used to flip the selector
+        // to the body path (ear-line yaw ≈ 0 in profile) and the head
+        // snapped to front. The dip must ride on the mesh pose.
+        let body = pose(0.0, 0.7); // body claims "facing forward" — the wrong pose
+        let mut sel = FaceSourceSelector::default();
+        let mut yaw = -0.80;
+        sel.select(Some(body), Some(mesh_pose(yaw, 1.0)), 1.0, DT).unwrap();
+        for i in 0..20 {
+            // Pose keeps drifting slightly (a real head mid-motion)
+            // while the confidence flaps hard every other frame.
+            yaw -= 0.01;
+            let conf = if i % 2 == 0 { 0.005 } else { 0.95 };
+            let out = sel.select(Some(body), Some(mesh_pose(yaw, 1.0)), conf, DT).unwrap();
+            assert_eq!(out.source, FaceSource::Mesh, "frame {i}: dip must not flip to body");
+            assert!(
+                (out.yaw - yaw).abs() < 1e-5,
+                "frame {i}: published yaw must follow the mesh, got {} want {yaw}",
+                out.yaw
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_dip_with_discontinuous_pose_releases_immediately() {
+        // Safety valve: a score collapse WITH a wild pose jump is a mesh
+        // reading garbage (not a lying flag) — release on that frame
+        // instead of riding on nonsense.
+        let body = pose(0.0, 0.7);
+        let mut sel = FaceSourceSelector::default();
+        sel.select(Some(body), Some(mesh_pose(-0.8, 1.0)), 1.0, DT).unwrap();
+        let out = sel.select(Some(body), Some(mesh_pose(1.4, 1.0)), 0.01, DT).unwrap();
+        assert_eq!(
+            out.source,
+            FaceSource::Body,
+            "dip + 2.2 rad pose jump must release the mesh immediately"
+        );
     }
 
     #[test]
@@ -746,10 +1021,134 @@ mod tests {
     }
 
     #[test]
-    fn neutral_forward_face_has_near_zero_pitch() {
-        // A front-facing head (nose the anatomical ~1.25·inter-eye below
-        // the eye line) must decode to ~0 pitch — not the ~50°-down bias
-        // the un-subtracted body path used to emit.
+    fn neutral_face68_has_zero_pitch() {
+        // Primary estimator: nose tip at the neutral fraction of the
+        // eye-line→chin span decodes to ~0.
+        let sk = skeleton_with_shoulder();
+        let joints = with_face68(neutral_joints(190.0), VERTICAL_RATIO_NEUTRAL);
+        let face = derive_face_pose_from_body(&sk, &joints).unwrap();
+        assert!(face.pitch.abs() < 1e-5, "neutral must be 0, got {}", face.pitch);
+    }
+
+    #[test]
+    fn face68_pitch_follows_the_nose_between_eye_line_and_chin() {
+        // Monotonic and signed the documented way: the nose dropping
+        // toward the chin is chin-DOWN (+), rising toward the eye line is
+        // chin-UP (−). Magnitudes follow `atan(Δratio · gain)`.
+        let sk = skeleton_with_shoulder();
+        let pitch_at = |ratio: f32| {
+            derive_face_pose_from_body(&sk, &with_face68(neutral_joints(190.0), ratio))
+                .unwrap()
+                .pitch
+        };
+        let down = pitch_at(VERTICAL_RATIO_NEUTRAL + 0.20);
+        let up = pitch_at(VERTICAL_RATIO_NEUTRAL - 0.20);
+        assert!(
+            (down - (0.20 * VERTICAL_RATIO_GAIN).atan()).abs() < 1e-5,
+            "chin-down magnitude off: {down}"
+        );
+        assert!((up + down).abs() < 1e-5, "must be antisymmetric: {up} vs {down}");
+        assert!(down > 0.5 && up < -0.5, "expected ±29°, got {down} / {up}");
+    }
+
+    #[test]
+    fn dead_ear_yaw_does_not_leak_into_pitch() {
+        // THE live failure (2026-07-27): hair / glasses temples hide both
+        // ears, so the ear-line yaw reads ~0 through a real 60° turn while
+        // the inter-eye baseline foreshortens by cos(60°) = 0.5. The old
+        // inter-eye estimator inflated its ratio 2× and published +50°
+        // chin-down for a level gaze — the avatar slammed its head down
+        // every time the subject looked sideways. The vertical ratio is
+        // built from image `y` alone, which a yaw cannot change.
+        let w = INPUT_W as f32;
+        let h = INPUT_H as f32;
+        let px = |x: f32, y: f32, z: f32| dj(x / w, y / h, z);
+        let c = 0.5_f32; // cos 60°
+        let mut j = vec![DecodedJoint::default(); 13];
+        j[0] = px(144.0, 190.0, 0.5);
+        j[1] = px(144.0 + 16.0 * c, 150.0, 0.5);
+        j[2] = px(144.0 - 16.0 * c, 150.0, 0.5);
+        // Ears at EQUAL depth and equal score: the yaw signal is dead, but
+        // nothing about the scores says so.
+        j[3] = px(144.0 + 30.0 * c, 150.0, 0.5);
+        j[4] = px(144.0 - 30.0 * c, 150.0, 0.5);
+        j[5] = px(200.0, 280.0, 0.5);
+        j[6] = px(88.0, 280.0, 0.5);
+        j[11] = px(168.0, 376.0, 0.5);
+        j[12] = px(120.0, 376.0, 0.5);
+
+        let sk = skeleton_with_shoulder();
+        let turned = with_face68(j, VERTICAL_RATIO_NEUTRAL);
+        let face = derive_face_pose_from_body(&sk, &turned).unwrap();
+        assert!(
+            face.yaw.abs() < 0.1,
+            "fixture must reproduce the DEAD ear-line yaw, got {}",
+            face.yaw
+        );
+        assert!(
+            face.pitch.abs() < 0.02,
+            "a turned head must not decode as a nod, got {} rad ({}°)",
+            face.pitch,
+            face.pitch.to_degrees()
+        );
+    }
+
+    #[test]
+    fn profile_view_collapsed_ear_baseline_refuses_pose() {
+        // THE live "broken neck" (2026-07-27, oblique desk camera): both
+        // ears project onto nearly the same image point (separation ≈ 3%
+        // of the head's keypoint spread) while their SimCC z values are
+        // hallucinated and well-separated. The old `ear_dist` gate mixed
+        // z into its magnitude, so the hallucinated dz let the frame
+        // through — and yaw = atan2(dz, dx≈0) published ±90…±150° noise
+        // every frame. A collapsed 2D baseline must refuse the pose.
+        let w = INPUT_W as f32;
+        let h = INPUT_H as f32;
+        let px = |x: f32, y: f32, z: f32| dj(x / w, y / h, z);
+        let mut j = vec![DecodedJoint::default(); 13];
+        j[0] = px(234.0, 170.0, 0.50); // nose far to the side (profile)
+        j[1] = px(228.0, 150.0, 0.52); // eyes nearly stacked
+        j[2] = px(222.0, 147.0, 0.48);
+        j[3] = px(183.0, 170.0, 0.62); // both ears at ~the same point...
+        j[4] = px(181.0, 166.0, 0.38); // ...but hallucinated z separates
+        j[5] = px(200.0, 280.0, 0.5);
+        j[6] = px(88.0, 280.0, 0.5);
+        j[11] = px(168.0, 376.0, 0.5);
+        j[12] = px(120.0, 376.0, 0.5);
+        let sk = skeleton_with_shoulder();
+        assert!(
+            derive_face_pose_from_body(&sk, &j).is_none(),
+            "collapsed ear baseline must refuse the pose, not divide by it"
+        );
+        // Even with the face-68 pitch block present the yaw/roll are
+        // still unobservable — the refusal must hold.
+        let with68 = with_face68(j, VERTICAL_RATIO_NEUTRAL);
+        assert!(derive_face_pose_from_body(&sk, &with68).is_none());
+    }
+
+    #[test]
+    fn no_face68_and_untrustworthy_ears_publishes_no_pose() {
+        // Fallback refusal: without the face-68 block the only estimator
+        // left divides by a yaw-foreshortened baseline, and with one ear
+        // reconstructed the yaw that would correct it is itself a guess.
+        // Publishing nothing lets the selector hold the mesh / previous
+        // pose instead of nodding the avatar on a bad frame.
+        let sk = skeleton_with_shoulder();
+        let mut j = neutral_joints(190.0);
+        j[3].score = 0.05; // subject-left ear occluded → reconstruction fires
+        assert!(derive_face_pose_from_body(&sk, &j).is_none());
+        // Same frame WITH the face-68 block: the primary estimator does not
+        // need the ears at all, so the pose still publishes.
+        let with68 = with_face68(j, VERTICAL_RATIO_NEUTRAL);
+        assert!(derive_face_pose_from_body(&sk, &with68).is_some());
+    }
+
+    #[test]
+    fn legacy_fallback_neutral_forward_face_has_near_zero_pitch() {
+        // Fallback estimator (no face-68 block, ears trustworthy): a
+        // front-facing head (nose the anatomical ~1.25·inter-eye below the
+        // eye line) must decode to ~0 pitch — not the ~50°-down bias the
+        // un-subtracted body path used to emit.
         let sk = skeleton_with_shoulder();
         let face = derive_face_pose_from_body(&sk, &neutral_joints(190.0)).unwrap();
         assert!(
@@ -760,23 +1159,27 @@ mod tests {
     }
 
     #[test]
-    fn chin_down_is_positive_pitch() {
-        // Nose dropped further below the eye line → chin-down → +pitch.
+    fn legacy_fallback_chin_down_is_positive_pitch() {
+        // Fallback estimator. Nose dropped further below the eye line →
+        // chin-down → +pitch.
         let sk = skeleton_with_shoulder();
         let face = derive_face_pose_from_body(&sk, &neutral_joints(214.0)).unwrap();
         assert!(face.pitch > 0.3, "chin-down should be +pitch, got {}", face.pitch);
     }
 
     #[test]
-    fn chin_up_is_negative_pitch() {
-        // Nose lifted toward the eye line → chin-up → -pitch.
+    fn legacy_fallback_chin_up_is_negative_pitch() {
+        // Fallback estimator. Nose lifted toward the eye line → chin-up →
+        // -pitch.
         let sk = skeleton_with_shoulder();
         let face = derive_face_pose_from_body(&sk, &neutral_joints(166.0)).unwrap();
         assert!(face.pitch < -0.3, "chin-up should be -pitch, got {}", face.pitch);
     }
 
     #[test]
-    fn yawed_head_does_not_leak_into_pitch() {
+    fn legacy_fallback_yawed_head_does_not_leak_into_pitch() {
+        // Fallback estimator, ears trustworthy so its cos(yaw) decoupling
+        // actually has a yaw to work with.
         // Head turned ~45° with NO pitch: the inter-eye baseline
         // foreshortens by cos(45°) while the nose-below-eye vertical
         // distance stays put, so the raw ratio inflates 1.41× — which
