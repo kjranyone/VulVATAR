@@ -89,7 +89,12 @@ impl FusionProvider {
         };
         info!("Fusion provider ready (RTMW3D {})", rtmw3d.backend().label());
         let h = Humanoid::new();
-        let est = Estimator::new(&h.model, Params::default());
+        let mut params = Params::default();
+        // Bench override: dense-cloud information budget (0 = off).
+        if let Some(b) = std::env::var("VULVATAR_FUSION_CLOUD_BUDGET").ok().and_then(|v| v.parse::<f64>().ok()) {
+            params.cloud_budget = b;
+        }
+        let est = Estimator::new(&h.model, params);
         let body_map = BodyMap::new(&h);
         Ok(Self {
             rtmw3d,

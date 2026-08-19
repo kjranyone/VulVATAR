@@ -167,6 +167,9 @@ pub struct Params {
     pub cloud_torso_only: bool,
     /// Use the heavy-tailed Cauchy kernel (vs Geman–McClure) on 2-D terms.
     pub cauchy_2d: bool,
+    /// Associate dense cloud points by the first capsule their camera ray
+    /// hits (model z-buffer) instead of the nearest surface in 3-D.
+    pub cloud_zbuffer: bool,
     /// Kernel scale / gate for the sparse keypoint-lifted surface points.
     pub c_surf: f64,
     pub surf_gate_m: f64,
@@ -201,6 +204,7 @@ impl Default for Params {
             var_max: 25.0,
             lost_rms_px: 40.0,
             cloud_torso_only: true,
+            cloud_zbuffer: true,
             cauchy_2d: true,
             c_surf: 4.0,
             surf_gate_m: 0.20,
@@ -971,6 +975,7 @@ impl Estimator {
                 gate_m: self.params.cloud_gate_m,
                 torso_only: self.params.cloud_torso_only,
                 record_assoc: true,
+                zbuffer: self.params.cloud_zbuffer,
             };
             let (c, n, md) = self.surface_term(model, fk, st, cloud, spec, build);
             cost += c;
@@ -987,6 +992,7 @@ impl Estimator {
                 gate_m: self.params.surf_gate_m,
                 torso_only: false,
                 record_assoc: false,
+                zbuffer: false,
             };
             let (c, n, md) = self.surface_term(model, fk, st, surf, spec, build);
             cost += c;
@@ -1160,14 +1166,44 @@ impl Estimator {
             let mut items: Vec<(usize, usize, f64, V3, f64)> = Vec::with_capacity(cloud.len());
             for (pi, (pt, _sig)) in cloud.iter().enumerate() {
                 let mut best = (usize::MAX, f64::INFINITY, [0.0; 3], 0.0);
-                // Nearest surface among ALL capsules (so a limb in front of the
-                // torso claims its own points); with `torso_only` the point
-                // then only contributes if the winner is a torso/head capsule.
-                for (ci, (a, b, r)) in caps.iter().enumerate() {
-                    let (q, u) = closest_on_segment(*a, *b, *pt);
+                if spec.zbuffer {
+                    // Visibility association: the capsule the camera ray
+                    // through this point hits FIRST owns it (the model as its
+                    // own z-buffer). A point well in front of that surface is
+                    // an un-modelled occluder (desk, other person) and a point
+                    // well behind it cannot be seen — both are skipped. The
+                    // residual is then the distance to that capsule's surface.
+                    let t_obs = norm(*pt);
+                    if t_obs < 1e-6 {
+                        continue;
+                    }
+                    let dir = scale(*pt, 1.0 / t_obs);
+                    let mut first = (usize::MAX, f64::INFINITY);
+                    for (ci, (a, b, r)) in caps.iter().enumerate() {
+                        if let Some(t_hit) = ray_capsule_entry(dir, *a, *b, *r) {
+                            if t_hit < first.1 {
+                                first = (ci, t_hit);
+                            }
+                        }
+                    }
+                    if first.0 == usize::MAX || (t_obs - first.1).abs() > spec.gate_m * self.gnc {
+                        continue;
+                    }
+                    let (a, b, r) = caps[first.0];
+                    let (q, u) = closest_on_segment(a, b, *pt);
                     let d = norm(sub(*pt, q)) - r;
-                    if d.abs() < best.1.abs() {
-                        best = (ci, d, q, u);
+                    best = (first.0, d, q, u);
+                } else {
+                    // Nearest surface among ALL capsules (so a limb in front of
+                    // the torso claims its own points); with `torso_only` the
+                    // point then only contributes if the winner is a torso/head
+                    // capsule.
+                    for (ci, (a, b, r)) in caps.iter().enumerate() {
+                        let (q, u) = closest_on_segment(*a, *b, *pt);
+                        let d = norm(sub(*pt, q)) - r;
+                        if d.abs() < best.1.abs() {
+                            best = (ci, d, q, u);
+                        }
                     }
                 }
                 if best.0 != usize::MAX && best.1.abs() < spec.gate_m * self.gnc {
@@ -1375,6 +1411,8 @@ pub struct SurfaceSpec {
     pub gate_m: f64,
     pub torso_only: bool,
     pub record_assoc: bool,
+    /// Visibility (first-hit) association instead of nearest-surface.
+    pub zbuffer: bool,
 }
 
 /// Parameter-space difference `a ⊖ b` (left perturbation for rotations).
@@ -1428,6 +1466,37 @@ fn point_jac(model: &Model, st: &State, fk: &Fk, mp: ModelPoint, joint: usize, o
             model.attached_point_jacobian(st, fk, joint, pw, out);
         }
     }
+}
+
+/// Entry depth `t` (along the unit ray `dir` from the origin) of a capsule
+/// (segment `ab`, radius `r`), or `None` if the ray misses it. Uses the
+/// closest approach between the ray and the segment: with approach
+/// distance `d* ≤ r` the entry is `t* − sqrt(r² − d*²)`.
+pub fn ray_capsule_entry(dir: V3, a: V3, b: V3, r: f64) -> Option<f64> {
+    // Closest points between ray o + t·dir (t ≥ 0, o = 0) and segment a + u·(b−a).
+    let ab = sub(b, a);
+    let l2 = dot(ab, ab);
+    let (t_star, d_star) = if l2 < 1e-12 {
+        let t = dot(a, dir).max(0.0);
+        (t, norm(sub(scale(dir, t), a)))
+    } else {
+        // Alternating projection (convex; converges in a few steps):
+        // given u → t = max(0, q·dir); given t → u = clamp(((t·dir − a)·ab)/|ab|²).
+        let mut u = (dot(sub(scale(dir, dot(a, dir).max(0.0)), a), ab) / l2).clamp(0.0, 1.0);
+        let mut t = 0.0;
+        for _ in 0..4 {
+            let q = add(a, scale(ab, u));
+            t = dot(q, dir).max(0.0);
+            u = (dot(sub(scale(dir, t), a), ab) / l2).clamp(0.0, 1.0);
+        }
+        let q = add(a, scale(ab, u));
+        (t, norm(sub(scale(dir, t), q)))
+    };
+    if d_star > r {
+        return None;
+    }
+    let back = (r * r - d_star * d_star).max(0.0).sqrt();
+    Some((t_star - back).max(0.0))
 }
 
 /// Closest point on segment `ab` to `p`, with the parameter `u ∈ [0,1]`.
