@@ -56,8 +56,12 @@ pub struct RigPose {
     pub shoulder_span_m: f32,
 }
 
-/// Build the rig pose from the estimator posterior.
-pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64) -> RigPose {
+/// Build the rig pose from the estimator posterior. `shoulder_span_px` is
+/// the projected shoulder span (pixels) — a subject that is tiny in the
+/// image (a poster, a bystander across the room) cannot be tracked at
+/// avatar-driving fidelity and is reported with a low `quality` so the
+/// retarget rests the avatar instead of flailing.
+pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64, shoulder_span_px: Option<f64>) -> RigPose {
     let m = &h.model;
     let fk = m.fk(&est.state);
     let mut bones = HashMap::with_capacity(64);
@@ -89,7 +93,11 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64) -> RigPose {
         .map(|&j| est.joint_sigma(m, j))
         .fold(0.0, f64::max)
         .max(est.var[..3].iter().cloned().fold(0.0, f64::max).sqrt());
-    let quality = (1.0 - torso_sigma / 0.5).clamp(0.0, 1.0) as f32;
+    let mut quality = (1.0 - torso_sigma / 0.5).clamp(0.0, 1.0) as f32;
+    if let Some(px) = shoulder_span_px {
+        // Full trust above ~60 px of shoulder span, none below ~25 px.
+        quality *= ((px - 25.0) / 35.0).clamp(0.0, 1.0) as f32;
+    }
     let shape_var = (m.beta_scale..m.num_params)
         .map(|k| est.var[k])
         .fold(0.0, f64::max);

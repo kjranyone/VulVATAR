@@ -693,7 +693,14 @@ impl PoseProvider for FusionProvider {
         }
 
         // ---- output ----------------------------------------------------------------
-        let rig = output::rig_pose(&self.h, &self.est, t);
+        let span_px = {
+            let fk = self.h.model.fk(&self.est.state);
+            match (intr.project(fk.t[self.h.j.l_shoulder]), intr.project(fk.t[self.h.j.r_shoulder])) {
+                (Some(a), Some(b)) => Some(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()),
+                _ => None,
+            }
+        };
+        let rig = output::rig_pose(&self.h, &self.est, t, span_px);
         let ref_span = {
             let fk = self.h.model.fk(&self.est.state);
             norm(sub(fk.t[self.h.j.l_shoulder], fk.t[self.h.j.r_shoulder])) as f32

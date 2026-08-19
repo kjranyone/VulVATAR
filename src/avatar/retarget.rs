@@ -69,6 +69,8 @@ pub struct RetargetParams {
     pub lower_body_tracking_enabled: bool,
     /// Bones whose joint σ exceeds this are left at rest (rad).
     pub sigma_rest: f32,
+    /// Rig quality below which nothing is driven (subject lost / tiny).
+    pub min_quality: f32,
     /// Seconds of well-tracked data used to seed the root anchor.
     pub anchor_seed_s: f64,
 }
@@ -81,6 +83,7 @@ impl Default for RetargetParams {
             hand_tracking_enabled: true,
             lower_body_tracking_enabled: true,
             sigma_rest: 1.2,
+            min_quality: 0.2,
             anchor_seed_s: 1.0,
         }
     }
@@ -291,10 +294,12 @@ pub fn apply_rig_pose(
             continue;
         }
         let rest_local_rot = skeleton.nodes[node].rest_local.rotation;
-        // Target local rotation.
+        // Target local rotation. A low-quality rig (subject lost / tiny)
+        // drives nothing: every bone relaxes to rest.
         let target = match rig.bones.get(&bone) {
             Some(rb)
-                if rb.sigma <= params.sigma_rest
+                if rig.quality >= params.min_quality
+                    && rb.sigma <= params.sigma_rest
                     && (params.hand_tracking_enabled || !is_finger(bone))
                     && (params.lower_body_tracking_enabled || !is_leg(bone)) =>
             {
@@ -337,7 +342,7 @@ pub fn apply_rig_pose(
                     state.anchor_seed.clear();
                 }
             }
-            let target = match (state.anchor_cam, params.root_translation_enabled) {
+            let target = match (state.anchor_cam, params.root_translation_enabled && rig.quality >= params.min_quality) {
                 (Some(anchor), true) => {
                     // camera → viewer: Rx(180°) = (x, −y, −z); scaled to the
                     // avatar's size so a 10 cm real step is a proportional
@@ -428,7 +433,10 @@ mod tests {
         let mut locals: Vec<Transform> = sk.nodes.iter().map(|n| n.rest_local.clone()).collect();
         // Hips rotated 30° about Y, spine rotated 50° about Y in world.
         let qy = |a: f32| [0.0, (a / 2.0).sin(), 0.0, (a / 2.0).cos()];
-        let mut rig = RigPose::default();
+        let mut rig = RigPose {
+            quality: 1.0,
+            ..Default::default()
+        };
         rig.bones.insert(
             HumanoidBone::Hips,
             RigBone {
