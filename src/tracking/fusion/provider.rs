@@ -45,6 +45,9 @@ pub struct FusionProvider {
     /// Cumulative count of frames where the detector's hand blocks were
     /// re-labelled L↔R against the predicted wrists.
     pub hand_swaps: u64,
+    /// Index in `obs.kp2d` where the hand-crop keypoints of the current
+    /// frame start (for the per-arm σ inflation pass).
+    hand_kp_start: usize,
     /// Per-frame timing (ms) of the last estimate for diagnostics.
     pub last_solve_ms: f32,
     /// Estimator-only time (ms) of the last frame (excludes inference).
@@ -103,6 +106,7 @@ impl FusionProvider {
             frames: 0,
             kp_sigma: KpSigma::default(),
             hand_swaps: 0,
+            hand_kp_start: 0,
             last_solve_ms: 0.0,
             last_est_ms: 0.0,
             last_cloud: Vec::new(),
@@ -122,6 +126,31 @@ impl FusionProvider {
     }
     pub fn mesh_learned(&self) -> usize {
         self.mesh.learned_count()
+    }
+
+    /// Which arm (0 = left, 1 = right) a model point belongs to, if any
+    /// (shoulder joint excluded: it is torso-anchored).
+    fn arm_side_of(&self, mp: super::estimator::ModelPoint) -> Option<usize> {
+        use super::estimator::ModelPoint;
+        let j = match mp {
+            ModelPoint::Joint(j) => j,
+            ModelPoint::Site(s) => self.h.model.sites[s].joint,
+            ModelPoint::Attached { joint, .. } => joint,
+        };
+        let m = &self.h.model;
+        let mut k = j;
+        loop {
+            if k == self.h.j.l_elbow {
+                return Some(0);
+            }
+            if k == self.h.j.r_elbow {
+                return Some(1);
+            }
+            match m.joints[k].parent {
+                Some(p) => k = p,
+                None => return None,
+            }
+        }
     }
 
     fn nominal_intrinsics(width: u32, height: u32) -> Intrinsics {
@@ -237,6 +266,19 @@ impl PoseProvider for FusionProvider {
         // wrists (only when both wrists are currently tracked): keep the
         // labelling unless swapping is clearly better.
         let mut det_kps: Vec<(f32, f32, f32)> = base.annotation.keypoints.clone();
+        if let Some(d) = depth.as_ref() {
+            if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize && det_kps.len() >= 133 {
+                let mut tmp: Vec<RawKp> = det_kps
+                    .iter()
+                    .map(|&(nx, ny, sc)| RawKp { nx, ny, score: sc, sx: 0.0, sy: 0.0 })
+                    .collect();
+                let zs = [fk_pred.t[self.h.j.l_shoulder][2], fk_pred.t[self.h.j.r_shoulder][2]];
+                reach_filter(&mut tmp, &d.points_m, d.width, d.height, zs, 0.75);
+                for (k, t) in det_kps.iter_mut().zip(tmp.iter()) {
+                    k.2 = t.score;
+                }
+            }
+        }
         let mut hands_swapped = false;
         if det_kps.len() >= 133 {
             let wl = det_kps[91];
@@ -285,6 +327,36 @@ impl PoseProvider for FusionProvider {
             }
         }
 
+        // ---- per-arm evidence burn-in -----------------------------------------
+        // An arm that has not been observed for a while sits on its prior;
+        // the first detections after that carry inflated σ (a hallucinated
+        // hand at the desk edge and a real re-entering hand look identical
+        // for one frame) and the inflation decays as the arm's measurement
+        // information accumulates over ~0.3 s. Continuous, not a gate: the
+        // arm still moves on frame one, just proportionally to the evidence.
+        let arm_inflate = |wrist: usize, elbow: usize| -> f64 {
+            let m = &self.h.model;
+            let info = |j: usize| {
+                let p = m.joint_param[j];
+                let n = match m.joints[j].kind {
+                    JointKind::Ball { .. } => 3,
+                    JointKind::Hinge { .. } => 1,
+                };
+                (0..n)
+                    .map(|k| self.est.data_info_ema.get(p + k).copied().unwrap_or(0.0))
+                    .fold(0.0, f64::max)
+            };
+            let trust = (info(wrist).max(info(elbow)) / 200.0).clamp(0.0, 1.0);
+            if std::env::var_os("VULVATAR_FUSION_NO_BURNIN").is_some() {
+                return 1.0;
+            }
+            1.0 + 3.0 * (1.0 - trust)
+        };
+        let inflate = [
+            arm_inflate(self.h.j.l_wrist, self.h.j.l_elbow),
+            arm_inflate(self.h.j.r_wrist, self.h.j.r_elbow),
+        ];
+
         // ---- body keypoints -------------------------------------------------
         let mut face68_px: Vec<[f32; 3]> = Vec::new();
         if let Some(aux) = aux.as_ref() {
@@ -302,6 +374,16 @@ impl PoseProvider for FusionProvider {
             if let Some(crop) = aux.crop {
                 cull_crop_border(&mut raw, crop, width, height, 0.02);
             }
+            // Arm reachability against the predicted shoulders (depth-valid
+            // pixels only) — see `reach_filter`.
+            if let Some(d) = depth.as_ref() {
+                if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize {
+                    let zs = [fk_pred.t[self.h.j.l_shoulder][2], fk_pred.t[self.h.j.r_shoulder][2]];
+                    if std::env::var_os("VULVATAR_FUSION_NO_REACH").is_none() {
+                        reach_filter(&mut raw, &d.points_m, d.width, d.height, zs, 0.75);
+                    }
+                }
+            }
             if hands_swapped {
                 for k in 0..21 {
                     raw.swap(91 + k, 112 + k);
@@ -317,6 +399,7 @@ impl PoseProvider for FusionProvider {
                     }
                 }
             }
+            let n_before = obs.kp2d.len();
             body_kp2d(
                 &self.body_map,
                 &raw,
@@ -326,6 +409,11 @@ impl PoseProvider for FusionProvider {
                 1.5,
                 &mut obs.kp2d,
             );
+            for k in obs.kp2d[n_before..].iter_mut() {
+                if let Some(side) = self.arm_side_of(k.point) {
+                    k.sigma *= inflate[side];
+                }
+            }
             // Depth-lifted joints: the absolute-depth anchor that resolves
             // the projective scale/distance ambiguity of the 2-D terms.
             if let Some(d) = depth.as_ref() {
@@ -411,6 +499,7 @@ impl PoseProvider for FusionProvider {
         obs.kp2d.retain(|k| k.u.is_finite() && k.v.is_finite());
 
         // ---- hand crop observations ---------------------------------------------
+        self.hand_kp_start = obs.kp2d.len();
         for hand in 0..2 {
             let Some(res) = self.last_hands[hand].as_ref() else { continue };
             let wrist_j = if hand == 0 { self.h.j.l_wrist } else { self.h.j.r_wrist };
@@ -472,6 +561,19 @@ impl PoseProvider for FusionProvider {
                 })
                 .collect();
         }
+        // Evidence burn-in on the metric arm terms and the hand-crop terms.
+        for k in obs.kp3d.iter_mut() {
+            if let Some(side) = self.arm_side_of(k.point) {
+                k.sigma *= inflate[side];
+            }
+        }
+        let n_hand_start = self.hand_kp_start.min(obs.kp2d.len());
+        for k in obs.kp2d[n_hand_start..].iter_mut() {
+            if let Some(side) = self.arm_side_of(k.point) {
+                k.sigma *= inflate[side];
+            }
+        }
+
         // ---- solve (with analytic arm re-seeds from metric joints) ------------
         {
             use super::estimator::ModelPoint;
@@ -606,6 +708,25 @@ impl PoseProvider for FusionProvider {
         skeleton.capture_timestamp_ms = ts_ms;
         skeleton.rig = Some(Arc::new(rig));
         self.last_solve_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if crate::tracking::debug_channel::enabled() {
+            let d = self.est.diag;
+            crate::tracking::debug_channel::stash_rig_diag(serde_json::json!({
+                "solve_ms": self.last_solve_ms,
+                "est_ms": self.last_est_ms,
+                "iters": d.iters,
+                "cost": d.cost_final,
+                "n2d": d.n_kp2d,
+                "n3d": d.n_kp3d,
+                "med_2d_px": d.med_2d_px,
+                "lost_events": self.est.lost_events,
+                "seed_wins": d.seed_wins,
+                "cov_failures": d.cov_failures,
+                "hand_crops": [self.last_hands[0].is_some(), self.last_hands[1].is_some()],
+                "face68_learned": self.face68.learned_count(),
+                "mesh_learned": self.mesh.learned_count(),
+                "shape_frozen": self.est.shape_frozen,
+            }));
+        }
 
         PoseEstimate {
             skeleton,

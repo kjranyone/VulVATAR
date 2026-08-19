@@ -1263,6 +1263,15 @@ impl GuiApp {
             (None, None) => {}
         }
 
+        // Environment-driven tracking autostart (automation / headless
+        // validation of the live pipeline): starts the camera with the
+        // restored panel parameters, exactly like the top-bar toggle.
+        if std::env::var_os("VULVATAR_AUTOSTART_TRACKING").is_some() {
+            info!("tracking autostart enabled");
+            state.tracking.toggle_tracking = true;
+            state.start_camera_with_current_params();
+        }
+
         // Backfill placeholder thumbnails for library entries that have
         // none on disk (legacy library data + entries whose VRM lacked an
         // embedded cover image). Cheap — a 128×128 procedural draw per

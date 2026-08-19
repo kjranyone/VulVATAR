@@ -207,6 +207,16 @@ fn dump_cell() -> &'static Arc<LatestCell<DumpJob>> {
 /// external overlay. No-op unless the debug flag file is present. The JSON
 /// value is assembled here (it borrows the estimate); the pixel work and
 /// file I/O happen on the background writer thread.
+/// Fusion estimator per-frame diagnostics, stashed by the provider just
+/// before the dump (solve ms, cost, counts, re-acquisitions).
+static RIG_DIAG: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+pub fn stash_rig_diag(v: serde_json::Value) {
+    if let Ok(mut s) = RIG_DIAG.lock() {
+        *s = Some(v);
+    }
+}
+
 pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &PoseEstimate) {
     if !enabled() {
         return;
@@ -246,9 +256,35 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
     let face = est.skeleton.face.map(|f| {
         serde_json::json!({ "yaw": f.yaw, "pitch": f.pitch, "roll": f.roll, "c": f.confidence })
     });
+    // Tracking-v2 rig summary (quality, σ of key bones, root) when the
+    // fusion estimator produced this sample.
+    let rig = est.skeleton.rig.as_ref().map(|r| {
+        let b = |bone: HumanoidBone| {
+            r.bones
+                .get(&bone)
+                .map(|x| serde_json::json!({ "sigma": x.sigma, "data_sigma": x.data_sigma }))
+        };
+        serde_json::json!({
+            "t": r.t,
+            "quality": r.quality,
+            "shape_confidence": r.shape_confidence,
+            "root_cam_m": r.root_cam_m,
+            "root_sigma_m": r.root_sigma_m,
+            "hand_confidence": r.hand_confidence,
+            "shoulder_span_m": r.shoulder_span_m,
+            "head": b(HumanoidBone::Head),
+            "upper_chest": b(HumanoidBone::UpperChest),
+            "l_upper_arm": b(HumanoidBone::LeftUpperArm),
+            "r_upper_arm": b(HumanoidBone::RightUpperArm),
+            "l_hand": b(HumanoidBone::LeftHand),
+            "r_hand": b(HumanoidBone::RightHand),
+            "diag": RIG_DIAG.lock().ok().and_then(|mut s| s.take()),
+        })
+    });
     let state = serde_json::json!({
         "frame": frame_index,
         "overall": est.skeleton.overall_confidence,
+        "rig": rig,
         "kp": kps,
         "kp_mcp": { "l_block": mcp(91), "r_block": mcp(112) },
         // Root / anchor channel (drives avatar translation + scale).

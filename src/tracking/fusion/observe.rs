@@ -341,6 +341,52 @@ pub fn body_surface_points(
     }
 }
 
+/// Reachability filter on arm keypoints: an elbow / wrist / hand-block
+/// landmark whose pixel has valid depth farther than the arm can reach
+/// from the predicted shoulder (or much nearer than the shoulder plane
+/// allows) is not on this person's arm — it is a detection on the chair,
+/// the wall or a bystander — and its score is zeroed so neither the 2-D
+/// nor the depth-lift terms see it. Pixels without depth are left alone
+/// (near-range holes are common on real hands).
+#[allow(clippy::too_many_arguments)]
+pub fn reach_filter(
+    kps: &mut [RawKp],
+    points: &[[f32; 3]],
+    width: u32,
+    height: u32,
+    shoulder_z: [f64; 2],
+    reach_m: f64,
+) {
+    // (index range, side)
+    let groups: [(usize, usize, usize); 6] = [
+        (7, 8, 0),     // l_elbow
+        (8, 9, 1),     // r_elbow
+        (9, 10, 0),    // l_wrist
+        (10, 11, 1),   // r_wrist
+        (91, 112, 0),  // left hand block
+        (112, 133, 1), // right hand block
+    ];
+    for &(lo, hi, side) in &groups {
+        let zs = shoulder_z[side];
+        if !zs.is_finite() || zs <= 0.0 {
+            continue;
+        }
+        for i in lo..hi.min(kps.len()) {
+            let kp = &mut kps[i];
+            if kp.score <= 0.0 || !(0.0..=1.0).contains(&kp.nx) || !(0.0..=1.0).contains(&kp.ny) {
+                continue;
+            }
+            let u = kp.nx as f64 * width as f64;
+            let v = kp.ny as f64 * height as f64;
+            if let Some(p) = window_point(points, width, height, u, v, 2, 0.15, 8.0) {
+                if p[2] > zs + reach_m || p[2] < zs - reach_m {
+                    kp.score = 0.0;
+                }
+            }
+        }
+    }
+}
+
 /// Shoulder-mid 3-D point from depth (camera metres) — the root seed hint.
 pub fn shoulder_mid_hint(
     kps: &[RawKp],
