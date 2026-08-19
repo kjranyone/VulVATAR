@@ -53,7 +53,7 @@ mod math;
 #[cfg(feature = "inference")]
 mod preprocess;
 #[cfg(feature = "inference")]
-mod session;
+pub(in crate::tracking) mod session;
 #[cfg(feature = "inference")]
 mod skeleton;
 #[cfg(feature = "inference")]

@@ -28,6 +28,9 @@ const MESH_N: usize = 478;
 
 pub struct FusionProvider {
     rtmw3d: Rtmw3dInference,
+    hands: Option<super::hands::HandLandmarker>,
+    /// Last hand-crop results `[left, right]` (diagnostics).
+    pub last_hands: [Option<super::hands::HandResult>; 2],
     h: Humanoid,
     est: Estimator,
     body_map: BodyMap,
@@ -41,6 +44,8 @@ pub struct FusionProvider {
     pub kp_sigma: KpSigma,
     /// Per-frame timing (ms) of the last estimate for diagnostics.
     pub last_solve_ms: f32,
+    /// Estimator-only time (ms) of the last frame (excludes inference).
+    pub last_est_ms: f32,
     /// Diagnostics: the cloud handed to the estimator this frame (subsampled
     /// exactly as the estimator saw it) and the sparse surface points.
     pub last_cloud: Vec<[f32; 3]>,
@@ -63,13 +68,27 @@ impl FusionProvider {
                 yolox_enabled: config.yolox_enabled,
             },
         )?;
-        let warnings = rtmw3d.take_load_warnings();
+        let mut warnings = rtmw3d.take_load_warnings();
+        let hands = match super::hands::HandLandmarker::try_from_models_dir(dir) {
+            Ok(h) => {
+                if h.is_none() {
+                    warnings.push("hand landmarker model missing (models/mediapipe_hand_landmark.onnx): fingers use the body detector only".to_string());
+                }
+                h
+            }
+            Err(e) => {
+                warnings.push(format!("hand landmarker unavailable: {e}"));
+                None
+            }
+        };
         info!("Fusion provider ready (RTMW3D {})", rtmw3d.backend().label());
         let h = Humanoid::new();
         let est = Estimator::new(&h.model, Params::default());
         let body_map = BodyMap::new(&h);
         Ok(Self {
             rtmw3d,
+            hands,
+            last_hands: [None, None],
             h,
             est,
             body_map,
@@ -81,6 +100,7 @@ impl FusionProvider {
             frames: 0,
             kp_sigma: KpSigma::default(),
             last_solve_ms: 0.0,
+            last_est_ms: 0.0,
             last_cloud: Vec::new(),
             last_surface: Vec::new(),
             last_kp3d: Vec::new(),
@@ -207,6 +227,28 @@ impl PoseProvider for FusionProvider {
             )
         };
 
+        // ---- hand crops (state-driven) --------------------------------------
+        let mut hand_done = [false; 2];
+        self.last_hands = [None, None];
+        if let Some(hl) = self.hands.as_mut() {
+            let det_kps: Vec<(f32, f32, f32)> = base.annotation.keypoints.clone();
+            for hand in 0..2 {
+                // Crop source: the body detector's hand block when it is
+                // confident (fresh every frame, independent of the estimator
+                // state), else the model prediction (bridges detector misses
+                // while the hand is tracked).
+                let crop = super::hands::detector_hand_crop(&det_kps, hand, width, height, 0.35, 96.0)
+                    .or_else(|| super::hands::predicted_hand_crop(&self.h, &fk_pred, hand, &intr, 96.0));
+                let Some(crop) = crop else { continue };
+                if let Some(res) = hl.estimate(rgb_data, width, height, crop) {
+                    if res.presence >= 0.5 {
+                        hand_done[hand] = true;
+                        self.last_hands[hand] = Some(res);
+                    }
+                }
+            }
+        }
+
         // ---- body keypoints -------------------------------------------------
         let mut face68_px: Vec<[f32; 3]> = Vec::new();
         if let Some(aux) = aux.as_ref() {
@@ -223,6 +265,16 @@ impl PoseProvider for FusionProvider {
                 .collect();
             if let Some(crop) = aux.crop {
                 cull_crop_border(&mut raw, crop, width, height, 0.02);
+            }
+            // The dedicated hand crop supersedes the body detector's hand
+            // block for that hand (keep the wrist: it anchors the crop).
+            for hand in 0..2 {
+                if hand_done[hand] {
+                    let base = if hand == 0 { 91 } else { 112 };
+                    for k in raw.iter_mut().skip(base + 1).take(20) {
+                        k.score = 0.0;
+                    }
+                }
             }
             body_kp2d(
                 &self.body_map,
@@ -317,6 +369,25 @@ impl PoseProvider for FusionProvider {
         // NaN landmarks produce NaN residuals: drop them defensively.
         obs.kp2d.retain(|k| k.u.is_finite() && k.v.is_finite());
 
+        // ---- hand crop observations ---------------------------------------------
+        for hand in 0..2 {
+            let Some(res) = self.last_hands[hand].as_ref() else { continue };
+            let wrist_j = if hand == 0 { self.h.j.l_wrist } else { self.h.j.r_wrist };
+            // The converted model's "world" output is not metric on this
+            // checkpoint (index MCP reads ~3 cm from the wrist) — 2-D only.
+            let _ = wrist_j;
+            super::hands::hand_observations(
+                &self.h,
+                hand,
+                res,
+                None,
+                width,
+                height,
+                &mut obs.kp2d,
+                &mut obs.kp3d,
+            );
+        }
+
         // ---- point cloud ------------------------------------------------------
         if let Some(d) = depth.as_ref() {
             if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize {
@@ -392,7 +463,9 @@ impl PoseProvider for FusionProvider {
             if l.1.is_some() && r.1.is_some() {
                 seeds.push(&seed_both);
             }
+            let t_est = std::time::Instant::now();
             self.est.update_with_seeds(&self.h.model, &obs, &seeds);
+            self.last_est_ms = t_est.elapsed().as_secs_f32() * 1000.0;
         }
         let dump_frame = std::env::var("VULVATAR_FUSION_OBSDUMP").ok().and_then(|v| v.parse::<u64>().ok());
         if dump_frame == Some(frame_index) || (dump_frame == Some(999_999) && frame_index < 3) {

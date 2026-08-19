@@ -323,7 +323,7 @@ pub fn apply_rig_pose(
         if hips < local_transforms.len() {
             let rest_pos = skeleton.nodes[hips].rest_local.translation;
             // Anchor seeding: median of the first well-tracked second.
-            if state.anchor_cam.is_none() && rig.quality > 0.5 && rig.root_sigma_m < 0.05 {
+            if state.anchor_cam.is_none() && rig.quality > 0.5 && rig.root_sigma_m < 0.08 {
                 let start = *state.anchor_seed_start.get_or_insert(rig.t);
                 state.anchor_seed.push(rig.root_cam_m);
                 if rig.t - start >= params.anchor_seed_s && state.anchor_seed.len() >= 5 {

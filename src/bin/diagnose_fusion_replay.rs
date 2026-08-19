@@ -275,6 +275,8 @@ fn main() -> Result<(), String> {
     let mut head_yaws = Vec::new();
     let mut head_pitches = Vec::new();
     let mut solve_ms = Vec::new();
+    let mut est_ms = Vec::new();
+    let mut hand_frames = [0usize; 2];
     let mut lw_prev: Option<V3> = None;
     let mut rw_prev: Option<V3> = None;
     let mut lw_jumps = Vec::new();
@@ -392,6 +394,20 @@ fn main() -> Result<(), String> {
         head_yaws.push(hy);
         head_pitches.push(hp);
         solve_ms.push(provider.last_solve_ms as f64);
+        est_ms.push(provider.last_est_ms as f64);
+        for hand in 0..2 {
+            if let Some(hr) = provider.last_hands[hand].as_ref() {
+                hand_frames[hand] += 1;
+                if std::env::var_os("VULVATAR_REPLAY_HANDDUMP").is_some() && n % 8 == 0 {
+                    let w = &hr.world;
+                    let tip = w[8];
+                    let mcp = w[5];
+                    eprintln!("idx {idx} hand {hand}: presence {:.2} handed {:.2} crop {:?} wrist px ({:.0},{:.0}) index_mcp world ({:+.3},{:+.3},{:+.3}) index_tip ({:+.3},{:+.3},{:+.3}) |mcp| {:.3}",
+                        hr.presence, hr.handedness, hr.crop, hr.px[0][0], hr.px[0][1], mcp[0], mcp[1], mcp[2], tip[0], tip[1], tip[2],
+                        (mcp[0]*mcp[0]+mcp[1]*mcp[1]+mcp[2]*mcp[2]).sqrt());
+                }
+            }
+        }
         if let Some(p) = lw_prev {
             lw_jumps.push(norm(sub(lw, p)));
         }
@@ -474,6 +490,18 @@ fn main() -> Result<(), String> {
                     draw_dot(&mut img, p, 3, [255, 255, 255]);
                 }
             }
+            // hand crops (yellow box) + hand landmarks (orange)
+            for hr in provider.last_hands.iter().flatten() {
+                let (x, y, sz) = hr.crop;
+                let (x, y, sz) = (x as f64, y as f64, sz as f64);
+                draw_line(&mut img, [x, y], [x + sz, y], [255, 220, 0]);
+                draw_line(&mut img, [x + sz, y], [x + sz, y + sz], [255, 220, 0]);
+                draw_line(&mut img, [x + sz, y + sz], [x, y + sz], [255, 220, 0]);
+                draw_line(&mut img, [x, y + sz], [x, y], [255, 220, 0]);
+                for p in &hr.px {
+                    draw_dot(&mut img, [p[0] as f64, p[1] as f64], 2, [255, 140, 0]);
+                }
+            }
             // detector keypoints (magenta = body 17, cyan = hands, grey = face)
             for (i, &(nx, ny, sc)) in est_out.annotation.keypoints.iter().enumerate() {
                 if sc < 0.2 {
@@ -506,7 +534,8 @@ fn main() -> Result<(), String> {
     let lw_duty = lwr_sig.iter().filter(|&&s| s < 0.4).count() as f64 / lwr_sig.len().max(1) as f64;
     let rw_duty = rwr_sig.iter().filter(|&&s| s < 0.4).count() as f64 / rwr_sig.len().max(1) as f64;
     println!("=== fusion replay: {} frames ===", pairs.len());
-    println!("solve time     : mean {sm:.1} ms  max {smax:.1} ms");
+    let (em, _, _, emax) = stats(&est_ms);
+    println!("solve time     : mean {sm:.1} ms  max {smax:.1} ms (estimator only: mean {em:.1} ms max {emax:.1} ms)");
     println!("torso yaw (deg): mean {ym:+.1} std {ys:.1} range [{ymin:+.1}, {ymax:+.1}]");
     if !yaw_ref_pairs.is_empty() {
         let errs: Vec<f64> = yaw_ref_pairs.iter().map(|(a, b)| a - b).collect();
@@ -528,6 +557,7 @@ fn main() -> Result<(), String> {
         println!("metric-joint residual {name:>9}: n {} mean {:.3} med {:.3} p90 {:.3} max {:.3} m", v.len(), m, s[s.len()/2], s[(s.len()*9/10).min(s.len()-1)], mx);
     }
     println!("estimator: seed wins {}  re-acquisitions {}", provider.estimator().diag.seed_wins, provider.estimator().lost_events);
+    println!("hand crops: L {} R {} frames with presence≥0.5 (of {})", hand_frames[0], hand_frames[1], pairs.len());
     println!("csv: {}", out_dir.join("frames.csv").display());
     Ok(())
 }
