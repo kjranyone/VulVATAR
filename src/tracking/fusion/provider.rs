@@ -42,6 +42,9 @@ pub struct FusionProvider {
     last_t: Option<f64>,
     frames: u64,
     pub kp_sigma: KpSigma,
+    /// Cumulative count of frames where the detector's hand blocks were
+    /// re-labelled L↔R against the predicted wrists.
+    pub hand_swaps: u64,
     /// Per-frame timing (ms) of the last estimate for diagnostics.
     pub last_solve_ms: f32,
     /// Estimator-only time (ms) of the last frame (excludes inference).
@@ -99,6 +102,7 @@ impl FusionProvider {
             last_t: None,
             frames: 0,
             kp_sigma: KpSigma::default(),
+            hand_swaps: 0,
             last_solve_ms: 0.0,
             last_est_ms: 0.0,
             last_cloud: Vec::new(),
@@ -227,11 +231,43 @@ impl PoseProvider for FusionProvider {
             )
         };
 
+        // ---- hand-block L/R assignment --------------------------------------
+        // The detector's left/right hand blocks can be transposed when the
+        // hands cross or touch. Decide the assignment against the predicted
+        // wrists (only when both wrists are currently tracked): keep the
+        // labelling unless swapping is clearly better.
+        let mut det_kps: Vec<(f32, f32, f32)> = base.annotation.keypoints.clone();
+        let mut hands_swapped = false;
+        if det_kps.len() >= 133 {
+            let wl = det_kps[91];
+            let wr = det_kps[112];
+            let pl = intr.project(fk_pred.t[self.h.j.l_wrist]);
+            let pr = intr.project(fk_pred.t[self.h.j.r_wrist]);
+            let tracked = self.est.joint_data_sigma(&self.h.model, self.h.j.l_wrist) < 0.5
+                && self.est.joint_data_sigma(&self.h.model, self.h.j.r_wrist) < 0.5;
+            if let (Some(pl), Some(pr)) = (pl, pr) {
+                if tracked && wl.2 >= 0.3 && wr.2 >= 0.3 {
+                    let d = |a: (f32, f32, f32), b: [f64; 2]| {
+                        ((a.0 as f64 * width as f64 - b[0]).powi(2)
+                            + (a.1 as f64 * height as f64 - b[1]).powi(2))
+                        .sqrt()
+                    };
+                    let same = d(wl, pl) + d(wr, pr);
+                    let swap = d(wl, pr) + d(wr, pl);
+                    if swap < 0.6 * same && same > 60.0 {
+                        for k in 0..21 {
+                            det_kps.swap(91 + k, 112 + k);
+                        }
+                        hands_swapped = true;
+                        self.hand_swaps += 1;
+                    }
+                }
+            }
+        }
         // ---- hand crops (state-driven) --------------------------------------
         let mut hand_done = [false; 2];
         self.last_hands = [None, None];
         if let Some(hl) = self.hands.as_mut() {
-            let det_kps: Vec<(f32, f32, f32)> = base.annotation.keypoints.clone();
             for hand in 0..2 {
                 // Crop source: the body detector's hand block when it is
                 // confident (fresh every frame, independent of the estimator
@@ -265,6 +301,11 @@ impl PoseProvider for FusionProvider {
                 .collect();
             if let Some(crop) = aux.crop {
                 cull_crop_border(&mut raw, crop, width, height, 0.02);
+            }
+            if hands_swapped {
+                for k in 0..21 {
+                    raw.swap(91 + k, 112 + k);
+                }
             }
             // The dedicated hand crop supersedes the body detector's hand
             // block for that hand (keep the wrist: it anchors the crop).

@@ -563,7 +563,7 @@ fn main() -> Result<(), String> {
         println!("metric-joint residual {name:>9}: n {} mean {:.3} med {:.3} p90 {:.3} max {:.3} m", v.len(), m, s[s.len()/2], s[(s.len()*9/10).min(s.len()-1)], mx);
     }
     println!("estimator: seed wins {}  re-acquisitions {}  cov failures {}", provider.estimator().diag.seed_wins, provider.estimator().lost_events, provider.estimator().diag.cov_failures);
-    println!("hand crops: L {} R {} frames with presence≥0.5 (of {})", hand_frames[0], hand_frames[1], pairs.len());
+    println!("hand crops: L {} R {} frames with presence≥0.5 (of {}); hand-block L/R re-labels {}", hand_frames[0], hand_frames[1], pairs.len(), provider.hand_swaps);
     println!("csv: {}", out_dir.join("frames.csv").display());
     Ok(())
 }
