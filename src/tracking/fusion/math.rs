@@ -429,6 +429,20 @@ impl Dense {
     /// Diagonal of the inverse of `H + eps I` (marginal variances), via
     /// the same LDLᵀ. O(n³) but n ≈ 100 → ~1 ms; called once per solve.
     pub fn marginal_variances(&mut self, eps: f64, out: &mut [f64]) -> Option<()> {
+        self.inverse_impl(eps, out, None)
+    }
+
+    /// Full inverse of `H + eps I` (row-major n×n into `full`) plus its
+    /// diagonal into `out`.
+    pub fn full_inverse(&mut self, eps: f64, out: &mut [f64], full: &mut Vec<f64>) -> Option<()> {
+        let n = self.n;
+        if full.len() != n * n {
+            full.resize(n * n, 0.0);
+        }
+        self.inverse_impl(eps, out, Some(full))
+    }
+
+    fn inverse_impl(&mut self, eps: f64, out: &mut [f64], mut full: Option<&mut Vec<f64>>) -> Option<()> {
         let n = self.n;
         // Factor once (λ = 0).
         for i in 0..n {
@@ -481,6 +495,19 @@ impl Dense {
                 col[i] = x;
             }
             out[c] = col[c].max(0.0);
+            if let Some(f) = full.as_deref_mut() {
+                // Backward pass for rows < c too (full column of the inverse).
+                for i in (0..c).rev() {
+                    let mut x = 0.0;
+                    for k in (i + 1)..n {
+                        x -= self.l[k * n + i] * col[k];
+                    }
+                    col[i] = x;
+                }
+                for i in 0..n {
+                    f[i * n + c] = col[i];
+                }
+            }
         }
         Some(())
     }

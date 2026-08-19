@@ -250,6 +250,13 @@ pub struct Estimator {
     /// Per-parameter flag: locked (never solved) — the pelvis ball, which is
     /// redundant with the root rotation.
     locked_param: Vec<bool>,
+    /// Full posterior covariance (n×n, row-major) from the last solve.
+    cov: Vec<f64>,
+    /// Per-joint σ (rad) of the joint's *world* orientation, from the full
+    /// covariance propagated along the kinematic chain (the local split
+    /// between e.g. neck and head is prior-limited, the world orientation
+    /// of the head is what the face landmarks pin).
+    pub world_sigma: Vec<f64>,
     /// Data-only information (diag of H from measurement terms) at the last
     /// accumulate; smoothed into `data_info_ema` per frame.
     data_info: Vec<f64>,
@@ -282,6 +289,8 @@ pub struct SolveDiag {
     pub mean_cloud_m: f64,
     /// Cumulative count of frames where an alternative seed won.
     pub seed_wins: u64,
+    /// Cumulative count of frames whose covariance factorisation failed.
+    pub cov_failures: u64,
 }
 
 impl Estimator {
@@ -319,6 +328,8 @@ impl Estimator {
             locked_param: locked_params(model),
             data_info: vec![0.0; n],
             data_info_ema: vec![0.0; n],
+            cov: Vec::new(),
+            world_sigma: vec![1.0; model.joints.len()],
         }
     }
 
@@ -375,6 +386,75 @@ impl Estimator {
             JointKind::Hinge { .. } => 1,
         };
         (0..n).map(|k| self.var[p + k]).fold(0.0, f64::max).sqrt()
+    }
+
+    /// World-orientation σ of a joint (rad), see `world_sigma`.
+    pub fn joint_world_sigma(&self, j: usize) -> f64 {
+        self.world_sigma.get(j).copied().unwrap_or(1.0)
+    }
+
+    /// Propagate the full covariance along each chain: to first order the
+    /// world rotation perturbation of joint j is
+    /// `Σ_k R_parent(k) δ_k + δ_root` over its ancestors (ball: 3 params in
+    /// the parent frame; hinge: axis·δ), so
+    /// `Cov_world = Σ_{k,l} A_k Σ_{kl} A_lᵀ` with `A_k` the 3×dof_k map.
+    fn update_world_sigmas(&mut self, model: &Model) {
+        let n = model.num_params;
+        if self.cov.len() != n * n {
+            return;
+        }
+        let fk = model.fk(&self.state);
+        if self.world_sigma.len() != model.joints.len() {
+            self.world_sigma = vec![1.0; model.joints.len()];
+        }
+        // Per joint: list of (param index, world-frame 3-vector column).
+        let mut cols: Vec<(usize, V3)> = Vec::with_capacity(48);
+        for j in 0..model.joints.len() {
+            cols.clear();
+            let mut k = j;
+            loop {
+                let jd = &model.joints[k];
+                let pidx = model.joint_param[k];
+                let pr = match jd.parent {
+                    Some(pp) => fk.r[pp],
+                    None => self.state.root_r,
+                };
+                match jd.kind {
+                    JointKind::Ball { .. } => {
+                        for c in 0..3 {
+                            cols.push((pidx + c, col(&pr, c)));
+                        }
+                    }
+                    JointKind::Hinge { axis, .. } => cols.push((pidx, mat_vec(&pr, axis))),
+                }
+                match jd.parent {
+                    Some(pp) => k = pp,
+                    None => break,
+                }
+            }
+            for c in 0..3 {
+                let mut e = [0.0; 3];
+                e[c] = 1.0;
+                cols.push((ROOT_ROT + c, e));
+            }
+            // Cov_world (3×3) = Σ a_i Σ_ij a_jᵀ
+            let mut cw = [[0.0f64; 3]; 3];
+            for &(i, ai) in &cols {
+                for &(jj, aj) in &cols {
+                    let s = self.cov[i * n + jj];
+                    if s == 0.0 {
+                        continue;
+                    }
+                    for r in 0..3 {
+                        for q in 0..3 {
+                            cw[r][q] += ai[r] * s * aj[q];
+                        }
+                    }
+                }
+            }
+            let maxdiag = cw[0][0].max(cw[1][1]).max(cw[2][2]).max(0.0);
+            self.world_sigma[j] = maxdiag.sqrt().min(5.0);
+        }
     }
 
     /// Measurement-only σ of a joint (rad): 1/sqrt(leaky data information),
@@ -668,12 +748,25 @@ impl Estimator {
             let di = self.data_info.get(k).copied().unwrap_or(0.0);
             self.data_info_ema[k] = self.data_info_ema[k] * decay + di * (1.0 - decay);
         }
-        // Marginals from the last accumulated H (state at convergence).
+        // Marginals from the last accumulated H (state at convergence). The
+        // normal matrix spans ~1e-2 (prior-only params) to ~1e7 (face
+        // landmarks); retry with a scaled ridge if the factorisation hits a
+        // non-positive pivot.
         let mut var = vec![0.0; n];
-        if self.dense.marginal_variances(1e-9, &mut var).is_some() {
+        let mut ok = false;
+        for eps in [1e-9, 1e-6, 1e-3] {
+            if self.dense.full_inverse(eps, &mut var, &mut self.cov).is_some() {
+                ok = true;
+                break;
+            }
+        }
+        if ok {
             for k in 0..n {
                 self.var[k] = var[k].clamp(self.params.var_min, self.params.var_max);
             }
+            self.update_world_sigmas(model);
+        } else {
+            self.diag.cov_failures += 1;
         }
         // Velocity: parameter-space difference to the previous posterior.
         let d = param_difference(model, &self.state, prev);

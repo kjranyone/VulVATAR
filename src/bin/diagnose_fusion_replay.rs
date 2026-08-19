@@ -312,7 +312,7 @@ fn main() -> Result<(), String> {
         let cam_to_view = FACING_CAMERA;
         let (ty, tp, tr) = ypr_deg(&mat_mul(&cam_to_view, &fk.r[h.j.spine3]));
         let (hy, hp, hr) = ypr_deg(&mat_mul(&cam_to_view, &fk.r[h.j.head]));
-        let sig = |j: usize| est.joint_sigma(m, j);
+        let sig = |j: usize| est.joint_world_sigma(j);
         let lw = fk.t[h.j.l_wrist];
         let rw = fk.t[h.j.r_wrist];
         let d = est.diag;
@@ -383,6 +383,12 @@ fn main() -> Result<(), String> {
         };
         if let Some(yr) = yaw_ref {
             yaw_ref_pairs.push((ty, yr));
+        }
+        if std::env::var_os("VULVATAR_REPLAY_VARDUMP").is_some() && n % 10 == 5 {
+            let pj = m.joint_param[h.j.head];
+            let pn = m.joint_param[h.j.neck];
+            eprintln!("idx {idx} var head {:?} neck {:?} data_info head {:?} root_t var {:?}",
+                &est.var[pj..pj + 3], &est.var[pn..pn + 3], &est.data_info_ema[pj..pj + 3], &est.var[3..6]);
         }
         // Metric-joint residuals for the key joints (model vs depth-lifted obs).
         for &(j, pobs, _) in &provider.last_kp3d {
@@ -556,7 +562,7 @@ fn main() -> Result<(), String> {
         let (m, _, _, mx) = stats(v);
         println!("metric-joint residual {name:>9}: n {} mean {:.3} med {:.3} p90 {:.3} max {:.3} m", v.len(), m, s[s.len()/2], s[(s.len()*9/10).min(s.len()-1)], mx);
     }
-    println!("estimator: seed wins {}  re-acquisitions {}", provider.estimator().diag.seed_wins, provider.estimator().lost_events);
+    println!("estimator: seed wins {}  re-acquisitions {}  cov failures {}", provider.estimator().diag.seed_wins, provider.estimator().lost_events, provider.estimator().diag.cov_failures);
     println!("hand crops: L {} R {} frames with presence≥0.5 (of {})", hand_frames[0], hand_frames[1], pairs.len());
     println!("csv: {}", out_dir.join("frames.csv").display());
     Ok(())

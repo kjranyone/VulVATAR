@@ -65,15 +65,9 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64) -> RigPose {
         let Some(bone) = jd.bone else { continue };
         // Δ_V = Rx180 · R_w(j)   (see design: rest world = Rx180 · I)
         let dv = mat_mul(&CAM_TO_VIEW, &fk.r[j]);
-        // σ: for the elbow-twist joint (LowerArm bone) fold in the flexion
-        // hinge's σ too, since both drive the forearm.
-        let mut sigma = est.joint_sigma(m, j);
-        if j == h.j.l_elbow_twist {
-            sigma = sigma.max(est.joint_sigma(m, h.j.l_elbow));
-        }
-        if j == h.j.r_elbow_twist {
-            sigma = sigma.max(est.joint_sigma(m, h.j.r_elbow));
-        }
+        // σ of the bone's WORLD orientation (what the retarget applies):
+        // propagated along the chain from the full posterior covariance.
+        let sigma = est.joint_world_sigma(j);
         let mut data_sigma = est.joint_data_sigma(m, j);
         if j == h.j.l_elbow_twist {
             data_sigma = data_sigma.min(est.joint_data_sigma(m, h.j.l_elbow));
