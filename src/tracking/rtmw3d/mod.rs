@@ -282,7 +282,7 @@ pub struct Rtmw3dInference {
 /// consumers (the fusion estimator) that want the keypoints *before* any
 /// skeleton building.
 #[derive(Clone, Debug, Default)]
-pub struct Rtmw3dAux {
+pub(in crate::tracking) struct Rtmw3dAux {
     /// 133 COCO-Wholebody keypoints, whole-frame normalised `[0,1]`.
     pub joints: Vec<decode::DecodedJoint>,
     /// FaceMesh 478 landmarks in frame pixels (`z` in pixel scale) and

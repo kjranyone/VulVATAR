@@ -1,6 +1,7 @@
 # Tracking v2 — 観測融合型ボディフィッタ (根本リライト設計)
 
-Status: **design (2026-08-19)** — 実装未着手。
+Status: **実装中 (2026-08-19)** — Phase 1–3 の骨格は `src/tracking/fusion/` に実装済みで
+本番プロバイダ (`FusionProvider`, `create_pose_provider` の既定) として稼働。実装状況は末尾 §13。
 本書は現行パイプライン (`src/tracking/skeleton_from_depth.rs` + `src/avatar/pose_solver.rs`) を
 **置き換える**設計であり、既存層への追加ではない。
 
@@ -244,3 +245,34 @@ GPU は逐次 (Arc TDR 対策)。合計 ≤ 60 ms/GPU フレームで body 15 Hz
   ロスト時のみ複数初期値からの再収束 (Phase 1 で実測)。
 - 学習姿勢事前を入れる場合の ONNX 化コスト (Phase 4 で判断)。
 - D435 の寄り (30–40 cm) は最小距離近傍で穴が増える → 顔は 2D 478 点が支配、深度は補助として設計済み。
+
+---
+
+## 13. 実装状況 (2026-08-19)
+
+| 項目 | 状態 | 場所 |
+|---|---|---|
+| 関節体モデル (VRM T-pose 基準、~120 DoF、カプセル、解析ヤコビアン) | ✅ | `fusion/model.rs` |
+| 推定器 (LM + 共分散、2D/3D/表面/点群項、関節限界・姿勢・形状事前、時間事前、GNC bootstrap、再捕捉、シード候補) | ✅ | `fusion/estimator.rs`, `fusion/seed.rs` |
+| 観測生成 (SimCC σ、crop 境界カリング、深度リフト + モデル z-buffer 遮蔽判定、学習顔形状、点群 ROI) | ✅ | `fusion/observe.rs`, `rtmw3d/decode.rs` |
+| FaceMesh 478 + face-68 の個人剛体顔 (自己学習) | ✅ | `fusion/observe.rs::FaceShape` |
+| 手 crop (MediaPipe hand landmarker、検出器/予測駆動) | ✅ 2D のみ (world 出力は非メトリックで未使用) | `fusion/hands.rs` |
+| RigPose 出力 + 互換 SourceSkeleton | ✅ | `fusion/output.rs` |
+| リターゲット (world-delta、σ ゲート、root アンカー) | ✅ | `avatar/retarget.rs` |
+| アプリ配線 (render.rs の rig 経路、v1 は `VULVATAR_TRACKING_V1=1`) | ✅ | `app/render.rs`, `tracking/provider.rs` |
+| リプレイベンチ (CSV・オーバーレイ・肩深度 yaw 参照・メトリック関節残差) | ✅ | `src/bin/diagnose_fusion_replay.rs` |
+| 密点群項 | ⚠️ 実装済みだが既定 OFF (`cloud_budget = 0`): 遮蔽・机・腕の誤対応で胴 yaw を壊す。z-buffer 可視性付きの対応付けに作り直すまで無効 | `estimator.rs::surface_term` |
+| align-to-color 廃止 (native 深度 + extrinsics) | ❌ 未着手 (現行は aligned 深度) | — |
+| AprilTag GT リグ / 実データ mm-deg ベンチ | ❌ 未着手 (Phase 0 の物理リグはユーザー作業が必要) | — |
+| 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床/事前なし | — |
+| v1 撤去 | ❌ ライブ検証後 | — |
+
+### リプレイ実測 (2026-08-19, dev build)
+- desk 録画 400 フレーム (640×480): 胴 yaw std **1.0°**、肩メトリック残差中央値 **5 mm**、再捕捉 0、手は非観測 (data-σ duty 0)、推定器 3.3 ms/フレーム。
+- wave (1280×720, 5 フレーム間引き): 胴 yaw std 6–9°、肩残差中央値 1.3 cm、手首 1.8 cm、推定器 13 ms。
+- `validate_gt`: neutral rec yaw 3.4°、twist_left −38° (gt −30)、twist_right +25° (gt +30)。arms_forward は合成深度側の欠陥で評価不能。
+
+### 既知の課題
+- 肘の深度リフト (RTMW3D 肘 + スキン→関節オフセット) は系統誤差 ~14 cm: 推定器は Cauchy で無視しているが観測として改善余地。
+- 手の L/R 入替検出は未実装 (crop は検出器の手ブロック割当に従う)。
+- 密点群項の再設計 (可視性/z-buffer 対応付け) が胴の寄り精度の次の一手。

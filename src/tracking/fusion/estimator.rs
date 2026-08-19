@@ -1146,7 +1146,7 @@ impl Estimator {
                         self.row_idx.clear();
                         // row_acc doubles as "position in local list + 1".
                         let mut bloc: Vec<[f64; 7]> = Vec::with_capacity(64);
-                        let mut touch = |i: usize,
+                        let touch = |i: usize,
                                          k: usize,
                                          v: f64,
                                          row_acc: &mut Vec<f64>,
@@ -1310,14 +1310,6 @@ pub fn param_difference(model: &Model, a: &State, b: &State) -> Vec<f64> {
         d[model.beta_rad + g] = a.rad[g] - b.rad[g];
     }
     d
-}
-
-#[inline]
-fn pref_to_mp(p: PointRef) -> ModelPoint {
-    match p {
-        PointRef::Joint(j) => ModelPoint::Joint(j),
-        PointRef::Site(s) => ModelPoint::Site(s),
-    }
 }
 
 /// World position + owning joint of a model point.
