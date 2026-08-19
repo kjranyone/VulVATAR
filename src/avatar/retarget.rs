@@ -434,6 +434,7 @@ mod tests {
             RigBone {
                 delta_world: qy(0.5),
                 sigma: 0.05,
+                data_sigma: 0.05,
             },
         );
         rig.bones.insert(
@@ -441,6 +442,7 @@ mod tests {
             RigBone {
                 delta_world: qy(0.9),
                 sigma: 0.05,
+                data_sigma: 0.05,
             },
         );
         let mut st = RetargetState::default();

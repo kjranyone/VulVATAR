@@ -79,12 +79,21 @@ fn load_metric_frame(
     let depth_bytes = std::fs::read(depth_path).map_err(|e| format!("read depth: {e}"))?;
     let (rows, cols, depth_mm) = parse_npy_u16(&depth_bytes)?;
     let (dw, dh) = (cols as u32, rows as u32);
-    let sx = dw as f32 / 1280.0;
+    // Nominal D435 colour intrinsics per stream profile (the 4:3 profiles
+    // crop the sensor, so they are not a pure scale of the 16:9 ones).
+    let (fx, fy, cx, cy) = match (dw, dh) {
+        (640, 480) => (616.0, 616.0, 320.0, 240.0),
+        (848, 480) => (612.0, 612.0, 424.0, 240.0),
+        _ => {
+            let sx = dw as f32 / 1280.0;
+            (D435_FX * sx, D435_FY * sx, D435_CX * sx, D435_CY * sx)
+        }
+    };
     let intr = CameraIntrinsics {
-        fx: D435_FX * sx,
-        fy: D435_FY * sx,
-        cx: D435_CX * sx,
-        cy: D435_CY * sx,
+        fx,
+        fy,
+        cx,
+        cy,
         width: dw,
         height: dh,
     };
@@ -395,8 +404,8 @@ fn main() -> Result<(), String> {
         lw_prev = Some(lw);
         rw_prev = Some(rw);
         root_prev = Some(est.state.root_t);
-        lwr_sig.push(sig(h.j.l_wrist));
-        rwr_sig.push(sig(h.j.r_wrist));
+        lwr_sig.push(est.joint_data_sigma(m, h.j.l_wrist));
+        rwr_sig.push(est.joint_data_sigma(m, h.j.r_wrist));
 
         if render_every > 0 && n % render_every == 0 {
             let mut img = rgb.clone();
@@ -508,8 +517,8 @@ fn main() -> Result<(), String> {
     }
     println!("head yaw (deg) : mean {hm:+.1} std {hs:.1} range [{hmin:+.1}, {hmax:+.1}]");
     println!("head pitch(deg): mean {pm:+.1} std {ps:.1} range [{pmin:+.1}, {pmax:+.1}]");
-    println!("L wrist: max jump {lwmax:.3} m, snaps>0.15m {lw_snaps}, σ<0.4 duty {lw_duty:.2}");
-    println!("R wrist: max jump {rwmax:.3} m, snaps>0.15m {rw_snaps}, σ<0.4 duty {rw_duty:.2}");
+    println!("L wrist: max jump {lwmax:.3} m, snaps>0.15m {lw_snaps}, data-σ<0.4 duty {lw_duty:.2}");
+    println!("R wrist: max jump {rwmax:.3} m, snaps>0.15m {rw_snaps}, data-σ<0.4 duty {rw_duty:.2}");
     println!("root: max jump {rjmax:.3} m");
     for (name, v) in ["shoulders", "elbows", "wrists", "other"].iter().zip(kp3d_err.iter()) {
         if v.is_empty() { continue; }

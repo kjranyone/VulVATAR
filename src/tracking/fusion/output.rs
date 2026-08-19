@@ -25,8 +25,12 @@ pub struct RigBone {
     /// World-space delta rotation Δ_V (viewer frame), quaternion `[x,y,z,w]`.
     /// Avatar world rotation = Δ_V · avatar_rest_world_rotation.
     pub delta_world: [f32; 4],
-    /// Marginal σ (rad) of the joint's own rotation parameters.
+    /// Marginal σ (rad) of the joint's own rotation parameters (posterior:
+    /// data + priors).
     pub sigma: f32,
+    /// Measurement-only σ (rad): how well the *data* alone pins this joint
+    /// (leaky over ~0.3 s). Large ⇒ the pose is the prior's relaxed guess.
+    pub data_sigma: f32,
 }
 
 /// The tracking output contract for the retarget: joint rotations as
@@ -70,11 +74,19 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64) -> RigPose {
         if j == h.j.r_elbow_twist {
             sigma = sigma.max(est.joint_sigma(m, h.j.r_elbow));
         }
+        let mut data_sigma = est.joint_data_sigma(m, j);
+        if j == h.j.l_elbow_twist {
+            data_sigma = data_sigma.min(est.joint_data_sigma(m, h.j.l_elbow));
+        }
+        if j == h.j.r_elbow_twist {
+            data_sigma = data_sigma.min(est.joint_data_sigma(m, h.j.r_elbow));
+        }
         bones.insert(
             bone,
             RigBone {
                 delta_world: mat_to_quat(&dv),
                 sigma: sigma as f32,
+                data_sigma: data_sigma as f32,
             },
         );
     }
@@ -93,8 +105,8 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64) -> RigPose {
         (1.0 - (shape_var / 0.0144)).clamp(0.0, 1.0) as f32
     };
     let hand_confidence = [
-        (1.0 - est.joint_sigma(m, h.j.l_wrist) / 0.6).clamp(0.0, 1.0) as f32,
-        (1.0 - est.joint_sigma(m, h.j.r_wrist) / 0.6).clamp(0.0, 1.0) as f32,
+        (1.0 - est.joint_data_sigma(m, h.j.l_wrist) / 0.6).clamp(0.0, 1.0) as f32,
+        (1.0 - est.joint_data_sigma(m, h.j.r_wrist) / 0.6).clamp(0.0, 1.0) as f32,
     ];
     let shoulder_span_m = norm(sub(fk.t[h.j.l_shoulder], fk.t[h.j.r_shoulder])) as f32;
     RigPose {
@@ -142,7 +154,7 @@ pub fn source_skeleton(
     };
     for (j, jd) in m.joints.iter().enumerate() {
         let Some(bone) = jd.bone else { continue };
-        let sigma = est.joint_sigma(m, j);
+        let sigma = est.joint_data_sigma(m, j).max(est.joint_sigma(m, j));
         let conf = confidence_from_sigma(sigma, 0.08, 0.6);
         let p = fk.t[j];
         sk.joints.insert(

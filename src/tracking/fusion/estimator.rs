@@ -250,6 +250,12 @@ pub struct Estimator {
     /// Per-parameter flag: locked (never solved) — the pelvis ball, which is
     /// redundant with the root rotation.
     locked_param: Vec<bool>,
+    /// Data-only information (diag of H from measurement terms) at the last
+    /// accumulate; smoothed into `data_info_ema` per frame.
+    data_info: Vec<f64>,
+    /// Leaky-integrated data information per parameter (tau ~ 0.3 s), so a
+    /// joint that was measured a few frames ago still reads as observed.
+    pub data_info_ema: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -311,6 +317,8 @@ impl Estimator {
             surf_pts: Vec::new(),
             trunk_param: trunk_params(model),
             locked_param: locked_params(model),
+            data_info: vec![0.0; n],
+            data_info_ema: vec![0.0; n],
         }
     }
 
@@ -367,6 +375,26 @@ impl Estimator {
             JointKind::Hinge { .. } => 1,
         };
         (0..n).map(|k| self.var[p + k]).fold(0.0, f64::max).sqrt()
+    }
+
+    /// Measurement-only σ of a joint (rad): 1/sqrt(leaky data information),
+    /// ignoring the pose prior — large (capped at 10) when the joint has not
+    /// been observed recently, regardless of how confident the prior makes
+    /// the posterior look. Uses the best-observed component.
+    pub fn joint_data_sigma(&self, model: &Model, j: usize) -> f64 {
+        let p = model.joint_param[j];
+        let n = match model.joints[j].kind {
+            JointKind::Ball { .. } => 3,
+            JointKind::Hinge { .. } => 1,
+        };
+        let info = (0..n)
+            .map(|k| self.data_info_ema.get(p + k).copied().unwrap_or(0.0))
+            .fold(0.0, f64::max);
+        if info <= 1e-6 {
+            10.0
+        } else {
+            (1.0 / info.sqrt()).min(10.0)
+        }
     }
 
     /// σ of the root translation (max component, metres).
@@ -631,6 +659,15 @@ impl Estimator {
     /// normal matrix, velocity update, timestamps, shape freeze.
     fn finish(&mut self, model: &Model, prev: &State, dt: f64, t: f64) {
         let n = model.num_params;
+        // Observed-ness: leaky integration of the measurement information.
+        let decay = (-dt / 0.3).exp();
+        if self.data_info_ema.len() != n {
+            self.data_info_ema = vec![0.0; n];
+        }
+        for k in 0..n {
+            let di = self.data_info.get(k).copied().unwrap_or(0.0);
+            self.data_info_ema[k] = self.data_info_ema[k] * decay + di * (1.0 - decay);
+        }
         // Marginals from the last accumulated H (state at convergence).
         let mut var = vec![0.0; n];
         if self.dense.marginal_variances(1e-9, &mut var).is_some() {
@@ -865,6 +902,18 @@ impl Estimator {
             ncl += n;
         }
 
+        // Snapshot the data-only information (diagonal of H before any
+        // prior) — the "how much did measurements say about this parameter
+        // this frame" signal used for observed-vs-prior confidence.
+        if build {
+            let n = self.dense.n;
+            if self.data_info.len() != n {
+                self.data_info = vec![0.0; n];
+            }
+            for k in 0..n {
+                self.data_info[k] = self.dense.h[k * n + k];
+            }
+        }
         // ---- joint limits + pose prior ----------------------------------------
         let p = &self.params;
         let cost_before_prior = cost;
