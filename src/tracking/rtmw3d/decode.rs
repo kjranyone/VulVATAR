@@ -32,6 +32,13 @@ pub(in crate::tracking) struct DecodedJoint {
     pub(in crate::tracking) nz: f32,
     pub(in crate::tracking) score: f32,
     pub(in crate::tracking) z_score: f32,
+    /// Localisation σ of the x / y peak in the same normalised units as
+    /// `nx` / `ny` (posterior std of the softmax-normalised SimCC
+    /// distribution in a window around the peak). A sharp peak yields
+    /// ~1 bin; a flat or bimodal distribution yields tens of bins. This
+    /// is the per-keypoint uncertainty the fusion estimator consumes.
+    pub(in crate::tracking) sx: f32,
+    pub(in crate::tracking) sy: f32,
 }
 
 /// SimCC argmax. Returns `(bin, max_value)`.
@@ -76,6 +83,71 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Localisation σ (in bins) of the SimCC peak at `peak`, from the peak's
+/// full width at half maximum: SimCC heads are trained against Gaussian
+/// label vectors, so a confident joint yields a narrow bump (FWHM ≈ 2.355σ
+/// of the label kernel, ~6 bins) while an ambiguous or occluded joint
+/// yields a broad or multi-modal one. Scale-invariant in the output values
+/// (unlike a softmax, whose sharpness depends on the unknown logit scale).
+/// Floored at 0.5 bin, capped at `SIGMA_WINDOW`.
+const SIGMA_WINDOW: usize = 96;
+#[inline]
+fn peak_sigma_bins(slice: &[f32], peak: usize) -> f32 {
+    let m = slice[peak];
+    if !(m > 0.0) {
+        return SIGMA_WINDOW as f32;
+    }
+    let half = 0.5 * m;
+    // Walk left / right until the value drops below half max (or the
+    // window ends). Sub-bin interpolation at the crossing.
+    let mut left = 0.0f32;
+    for k in 1..=SIGMA_WINDOW {
+        if peak < k {
+            left = k as f32 - 1.0;
+            break;
+        }
+        let v = slice[peak - k];
+        if v < half {
+            let prev = slice[peak - k + 1];
+            let frac = if prev > v { (prev - half) / (prev - v) } else { 0.0 };
+            left = (k - 1) as f32 + frac.clamp(0.0, 1.0);
+            break;
+        }
+        if k == SIGMA_WINDOW {
+            left = SIGMA_WINDOW as f32;
+        }
+    }
+    let mut right = 0.0f32;
+    for k in 1..=SIGMA_WINDOW {
+        if peak + k >= slice.len() {
+            right = k as f32 - 1.0;
+            break;
+        }
+        let v = slice[peak + k];
+        if v < half {
+            let prev = slice[peak + k - 1];
+            let frac = if prev > v { (prev - half) / (prev - v) } else { 0.0 };
+            right = (k - 1) as f32 + frac.clamp(0.0, 1.0);
+            break;
+        }
+        if k == SIGMA_WINDOW {
+            right = SIGMA_WINDOW as f32;
+        }
+    }
+    let fwhm = left + right;
+    // A confident RTMW3D peak measures ≈ NOMINAL_FWHM bins wide (the
+    // label kernel); the sub-bin argmax of such a bump localises to a few
+    // bins. Broader / plateaued bumps mean ambiguity: scale the base
+    // precision by the squared broadness ratio.
+    let ratio = (fwhm / NOMINAL_FWHM_BINS).clamp(1.0, 4.0);
+    (BASE_SIGMA_BINS * ratio * ratio).min(SIGMA_WINDOW as f32)
+}
+/// Measured FWHM (bins) of a confident RTMW3D SimCC peak (2026-08-19,
+/// D435 1280×720 replays: half-max at ±22 bins).
+const NOMINAL_FWHM_BINS: f32 = 44.0;
+/// Localisation σ (bins) of a nominal peak after sub-bin refinement.
+const BASE_SIGMA_BINS: f32 = 2.5;
+
 pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) -> Vec<DecodedJoint> {
     let mut out = Vec::with_capacity(NUM_JOINTS);
     for j in 0..NUM_JOINTS {
@@ -99,6 +171,8 @@ pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) ->
             nz: refine_peak(z_slice, zi) / SIMCC_Z_BINS as f32,
             score,
             z_score,
+            sx: peak_sigma_bins(x_slice, xi) / SIMCC_X_BINS as f32,
+            sy: peak_sigma_bins(y_slice, yi) / SIMCC_Y_BINS as f32,
         });
     }
     out

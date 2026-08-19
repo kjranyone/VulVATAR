@@ -1516,14 +1516,14 @@ mod tests {
             nz: 0.5,
             z_score: 0.9,
             score: 0.9,
-        };
+        sx: 0.002, sy: 0.002, };
         joints[6] = DecodedJoint {
             nx: 0.60,
             ny: 0.30,
             nz: 0.5,
             z_score: 0.9,
             score: 0.9,
-        };
+        sx: 0.002, sy: 0.002, };
         // Hips (11/12) — the hallucinated pair we want to suppress.
         joints[11] = DecodedJoint {
             nx: 0.42,
@@ -1531,14 +1531,14 @@ mod tests {
             nz: 0.5,
             z_score: 0.9,
             score: 0.8,
-        };
+        sx: 0.002, sy: 0.002, };
         joints[12] = DecodedJoint {
             nx: 0.58,
             ny: 0.70,
             nz: 0.5,
             z_score: 0.9,
             score: 0.8,
-        };
+        sx: 0.002, sy: 0.002, };
         // Knees (13/14) and ankles (15/16) — same hallucination
         // pattern; downstream consumers must not see any of these.
         joints[13] = DecodedJoint {
@@ -1547,28 +1547,28 @@ mod tests {
             nz: 0.5,
             z_score: 0.9,
             score: 0.7,
-        };
+        sx: 0.002, sy: 0.002, };
         joints[14] = DecodedJoint {
             nx: 0.58,
             ny: 0.85,
             nz: 0.5,
             z_score: 0.9,
             score: 0.7,
-        };
+        sx: 0.002, sy: 0.002, };
         joints[15] = DecodedJoint {
             nx: 0.42,
             ny: 0.95,
             nz: 0.5,
             z_score: 0.9,
             score: 0.7,
-        };
+        sx: 0.002, sy: 0.002, };
         joints[16] = DecodedJoint {
             nx: 0.58,
             ny: 0.95,
             nz: 0.5,
             z_score: 0.9,
             score: 0.7,
-        };
+        sx: 0.002, sy: 0.002, };
         joints
     }
 
@@ -1619,7 +1619,7 @@ mod tests {
             nz: 0.5,
             z_score: 0.6,
             score: 0.6,
-        };
+        sx: 0.002, sy: 0.002, };
         for local in 0..21 {
             joints[base + local] = mk(cx, cy);
         }

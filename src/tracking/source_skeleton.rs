@@ -327,6 +327,11 @@ pub struct SourceSkeleton {
     /// path (faithful camera-space projection) instead of the monocular
     /// heuristics kept for the 2D webcam fallback. `None` for 2D providers.
     pub metric_frame_info: Option<MetricFrameInfo>,
+    /// Tracking-v2 output: joint rotations + root + per-joint σ from the
+    /// fusion estimator (`tracking::fusion`). `Some` ⇒ the avatar is
+    /// driven by `avatar::retarget` from these rotations; the joint
+    /// positions above are then a compatibility projection for the GUI.
+    pub rig: Option<std::sync::Arc<crate::tracking::fusion::output::RigPose>>,
 }
 
 impl SourceSkeleton {
@@ -347,6 +352,7 @@ impl SourceSkeleton {
             root_offset: None,
             root_anchor_is_hip: false,
             metric_frame_info: None,
+            rig: None,
         }
     }
 

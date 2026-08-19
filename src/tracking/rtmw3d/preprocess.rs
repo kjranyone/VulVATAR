@@ -53,6 +53,8 @@ pub(super) fn remap_crop_joints(
         j.nx = (ox + j.nx * cw) * inv_w;
         j.ny = (oy + j.ny * ch) * inv_h;
         j.nz *= z_gain;
+        j.sx *= cw * inv_w;
+        j.sy *= ch * inv_h;
     }
 }
 
@@ -218,7 +220,7 @@ mod tests {
             nz,
             score: 0.9,
             z_score: 0.9,
-        }
+        sx: 0.002, sy: 0.002, }
     }
 
     /// The same physical pose decoded from a small crop and from a

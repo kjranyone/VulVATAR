@@ -626,7 +626,7 @@ mod tests {
             nz,
             score: 0.9,
             z_score: 0.9,
-        }
+        sx: 0.002, sy: 0.002, }
     }
 
     /// Eye-line→chin span used by the face-68 fixtures, in the same

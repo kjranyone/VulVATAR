@@ -166,6 +166,17 @@ pub fn create_pose_provider(
     models_dir: impl AsRef<Path>,
     config: TrackingPipelineConfig,
 ) -> Result<Box<dyn PoseProvider>, String> {
+    // Tracking v2 (fusion estimator) is the production pipeline. The v1
+    // depth-lift pipeline stays selectable for A/B benches only.
+    #[cfg(feature = "inference")]
+    {
+        if std::env::var_os("VULVATAR_TRACKING_V1").is_none() {
+            return super::fusion::provider::FusionProvider::from_models_dir_with_config(
+                models_dir, config,
+            )
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>);
+        }
+    }
     Rtmw3dWithDepthProvider::from_models_dir_with_config(models_dir, config)
         .map(|p| Box::new(p) as Box<dyn PoseProvider>)
 }

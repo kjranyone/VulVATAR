@@ -29,6 +29,7 @@ pub mod auto_neutral;
 pub mod calibration;
 pub mod debug_channel;
 pub mod face_mediapipe;
+pub mod fusion;
 pub mod hand_hold;
 pub mod rtmw3d;
 pub mod source_skeleton;

@@ -225,14 +225,34 @@ impl Application {
                 effective_calibration.apply_calibration(source);
 
                 let humanoid = avatar.asset.humanoid.as_ref();
-                pose_solver::solve_avatar_pose(
-                    source,
-                    &avatar.asset.skeleton,
-                    humanoid,
-                    &mut avatar.pose.local_transforms,
-                    &solver_params,
-                    &mut avatar.pose_solver_state,
-                );
+                if let (Some(rig), Some(hm)) = (source.rig.as_ref(), humanoid) {
+                    // Tracking v2: joint rotations from the fusion estimator.
+                    let rp = crate::avatar::retarget::RetargetParams {
+                        rotation_blend: solver_params.rotation_blend,
+                        root_translation_enabled: solver_params.root_translation_enabled,
+                        hand_tracking_enabled: solver_params.hand_tracking_enabled,
+                        lower_body_tracking_enabled: solver_params.lower_body_tracking_enabled,
+                        ..Default::default()
+                    };
+                    crate::avatar::retarget::apply_rig_pose(
+                        rig,
+                        &avatar.asset.skeleton,
+                        hm,
+                        &mut avatar.pose.local_transforms,
+                        &rp,
+                        &mut avatar.retarget_state,
+                        frame_dt,
+                    );
+                } else {
+                    pose_solver::solve_avatar_pose(
+                        source,
+                        &avatar.asset.skeleton,
+                        humanoid,
+                        &mut avatar.pose.local_transforms,
+                        &solver_params,
+                        &mut avatar.pose_solver_state,
+                    );
+                }
 
                 if face_tracking_enabled {
                     let new_weights = pose_solver::solve_expressions(

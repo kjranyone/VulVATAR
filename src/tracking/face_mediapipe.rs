@@ -186,6 +186,10 @@ pub enum FaceMeshEp {
 }
 
 pub struct FaceMeshInference {
+    /// Full-frame pixel landmarks (+ z in frame-pixel scale) and the
+    /// mesh confidence of the most recent [`Self::estimate`] call.
+    /// Consumed by the fusion provider via [`Self::take_landmarks_px`].
+    pub last_landmarks_px: Option<(Vec<[f32; 3]>, f32)>,
     #[cfg(feature = "inference")]
     face_session: Session,
     #[cfg(feature = "inference")]
@@ -299,6 +303,7 @@ impl FaceMeshInference {
             blendshape_input_name,
             blendshape_output_names,
             backend,
+            last_landmarks_px: None,
         }))
     }
 
@@ -362,6 +367,17 @@ impl FaceMeshInference {
         // run the blendshape session.
         drop(face_outputs);
         let landmarks = decode_face_landmarks(&landmarks_data);
+        // Full-frame pixel copy for the fusion estimator: x/y mapped
+        // through the crop, z kept in crop-pixel units scaled to frame
+        // pixels (MediaPipe's z is in the same scale as x).
+        {
+            let scale = bbox.size / FACE_INPUT_SIZE as f32;
+            let px: Vec<[f32; 3]> = landmarks
+                .iter()
+                .map(|l| [bbox.x + l[0] * scale, bbox.y + l[1] * scale, l[2] * scale])
+                .collect();
+            self.last_landmarks_px = Some((px, face_conf));
+        }
 
         // Run BlendshapeV2 on the 146-landmark subset.
         let bs_input = prepare_blendshape_input(&landmarks);
@@ -415,6 +431,11 @@ impl FaceMeshInference {
         _: &FaceBbox,
     ) -> Option<(Vec<SourceExpression>, f32, Option<FacePose>)> {
         None
+    }
+
+    /// Take the most recent full-frame landmarks (once).
+    pub fn take_landmarks_px(&mut self) -> Option<(Vec<[f32; 3]>, f32)> {
+        self.last_landmarks_px.take()
     }
 
     pub fn backend(&self) -> &InferenceBackend {

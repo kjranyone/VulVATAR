@@ -39,6 +39,8 @@ pub struct AvatarInstance {
     /// foreshortening can be inverted into Z. See
     /// [`PoseSolverState`] for details.
     pub pose_solver_state: PoseSolverState,
+    /// Tracking-v2 retarget state (rig-pose path, see `avatar::retarget`).
+    pub retarget_state: crate::avatar::retarget::RetargetState,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +173,7 @@ impl AvatarInstance {
             collider_enabled: vec![true; collider_count],
             expression_weights: Vec::new(),
             pose_solver_state: PoseSolverState::default(),
+            retarget_state: Default::default(),
         }
     }
 

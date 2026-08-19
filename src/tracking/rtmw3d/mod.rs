@@ -270,6 +270,26 @@ pub struct Rtmw3dInference {
     /// Applied at the call site in `process_pose`.
     #[cfg(feature = "inference")]
     pub(crate) force_shoulder_anchor_hint: Option<crate::tracking::CalibrationMode>,
+    /// Raw per-frame perception outputs for the fusion estimator
+    /// (decoded 133 keypoints with SimCC σ in whole-frame normalised
+    /// coordinates, FaceMesh landmarks in frame pixels). Set by every
+    /// `estimate_pose`, drained by [`Self::take_aux`].
+    #[cfg(feature = "inference")]
+    last_aux: Option<Rtmw3dAux>,
+}
+
+/// Raw perception outputs of one RTMW3D frame, for observation-level
+/// consumers (the fusion estimator) that want the keypoints *before* any
+/// skeleton building.
+#[derive(Clone, Debug, Default)]
+pub struct Rtmw3dAux {
+    /// 133 COCO-Wholebody keypoints, whole-frame normalised `[0,1]`.
+    pub joints: Vec<decode::DecodedJoint>,
+    /// FaceMesh 478 landmarks in frame pixels (`z` in pixel scale) and
+    /// the mesh confidence, when the face cascade ran this frame.
+    pub face_mesh: Option<(Vec<[f32; 3]>, f32)>,
+    /// Person crop actually fed to RTMW3D `(x, y, w, h)` in frame pixels.
+    pub crop: Option<(f32, f32, f32, f32)>,
 }
 
 /// Construction options for [`Rtmw3dInference`]. Lets the GUI's
@@ -333,6 +353,12 @@ impl Rtmw3dInference {
     /// continuity + torso-depth EMA; the self-tracking crop when
     /// present). See `PoseProvider::reset_temporal_state`.
     #[cfg(feature = "inference")]
+    /// Drain the raw perception outputs of the last `estimate_pose`.
+    #[cfg(feature = "inference")]
+    pub fn take_aux(&mut self) -> Option<Rtmw3dAux> {
+        self.last_aux.take()
+    }
+
     pub fn reset_temporal_state(&mut self) {
         self.self_track_bbox = None;
         self.last_self_track = None;
@@ -471,6 +497,7 @@ impl Rtmw3dInference {
             backend,
             force_shoulder_anchor: false,
             force_shoulder_anchor_hint: None,
+            last_aux: None,
         })
     }
 
@@ -786,6 +813,12 @@ impl Rtmw3dInference {
             applied_z_gain = z_gain;
             preprocess::remap_crop_joints(&mut joints, ox, oy, cw, ch, width, height, z_gain);
         }
+        // Raw keypoints for the fusion estimator (whole-frame coords).
+        self.last_aux = Some(Rtmw3dAux {
+            joints: joints.clone(),
+            face_mesh: None,
+            crop: crop_origin,
+        });
         // Refresh the self-tracking crop from this frame's own
         // keypoints (whole-frame coords post-remap), with hysteresis.
         //
@@ -974,6 +1007,11 @@ impl Rtmw3dInference {
                         mesh.pitch = p;
                     }
                     dbg_mesh = mesh_face_pose.map(|p| (conf, p));
+                    if let (Some(aux), Some(lm)) =
+                        (self.last_aux.as_mut(), face_mesh.take_landmarks_px())
+                    {
+                        aux.face_mesh = Some(lm);
+                    }
                 }
             }
         }

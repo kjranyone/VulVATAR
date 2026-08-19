@@ -118,6 +118,10 @@ required-features = ["realsense"]
 name = "diagnose_depth_replay"
 required-features = ["inference"]
 
+[[bin]]
+name = "diagnose_fusion_replay"
+required-features = ["inference"]
+
 # GT round-trip renders an aligned metric depth buffer and feeds it via
 # `set_external_depth` (the shipping D435 skeleton path) so the recovered pose
 # is scored end-to-end through `skeleton_from_depth`, not a monocular fallback.

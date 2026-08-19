@@ -729,14 +729,33 @@ fn main() -> Result<(), String> {
             face_confidence_threshold: 0.1,
             ..Default::default()
         };
-        solve_avatar_pose(
-            &est.skeleton,
-            &asset.skeleton,
-            asset.humanoid.as_ref(),
-            &mut rec_locals,
-            &params,
-            &mut state,
-        );
+        if let (Some(rig), Some(hm)) = (est.skeleton.rig.as_ref(), asset.humanoid.as_ref()) {
+            // Tracking v2: joint rotations from the fusion estimator.
+            let mut rstate = vulvatar_lib::avatar::retarget::RetargetState::default();
+            let rp = vulvatar_lib::avatar::retarget::RetargetParams {
+                rotation_blend: 1.0,
+                root_translation_enabled: false,
+                ..Default::default()
+            };
+            vulvatar_lib::avatar::retarget::apply_rig_pose(
+                rig,
+                &asset.skeleton,
+                hm,
+                &mut rec_locals,
+                &rp,
+                &mut rstate,
+                1.0 / 30.0,
+            );
+        } else {
+            solve_avatar_pose(
+                &est.skeleton,
+                &asset.skeleton,
+                asset.humanoid.as_ref(),
+                &mut rec_locals,
+                &params,
+                &mut state,
+            );
+        }
         // Probe: raw source shoulder positions (z provenance triage).
         if std::env::var("VULVATAR_GT_PROBE").is_ok() {
             for b in [

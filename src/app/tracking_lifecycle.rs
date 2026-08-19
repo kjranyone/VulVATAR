@@ -33,6 +33,7 @@ impl Application {
         // history from the previous session.
         for avatar in self.avatars.iter_mut() {
             avatar.pose_solver_state.reset();
+            avatar.retarget_state.reset();
         }
         // Same rationale for the automatic session neutral: a new
         // session may be a new camera placement, so the previous
