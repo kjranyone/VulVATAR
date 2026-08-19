@@ -1699,45 +1699,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod dbg_tests {
-    use super::*;
-    #[test]
-    fn dbg_recover() {
-        let h = Humanoid::new();
-        let m = &h.model;
-        let intr = Intrinsics { fx: 600.0, fy: 600.0, cx: 320.0, cy: 240.0, width: 640.0, height: 480.0 };
-        let mut gt = State::rest(m);
-        gt.set_relaxed(m);
-        gt.root_r = mat_mul(&so3_exp([0.1, 0.4, 0.05]), &FACING_CAMERA);
-        gt.root_t = [0.1, 0.35, 1.6];
-        gt.set_hinge(m, h.j.l_elbow, 1.1);
-        gt.set_ball(h.j.l_shoulder, [0.3, -0.5, -0.9]);
-        gt.set_ball(h.j.spine2, [0.2, 0.15, 0.0]);
-        gt.set_ball(h.j.head, [0.1, 0.5, 0.0]);
-        gt.set_hinge(m, h.j.r_knee, 0.5);
-        gt.set_hinge(m, h.j.finger[0][1][0], 0.9);
-        let fkg = m.fk(&gt);
-        let mut kp = Vec::new();
-        for j in 0..m.joints.len() { if let Some(uv)=intr.project(fkg.t[j]) { kp.push(Kp2d{point:ModelPoint::Joint(j),u:uv[0],v:uv[1],sigma:1.0}); } }
-        for s in 0..m.sites.len() { if let Some(uv)=intr.project(fkg.site[s]) { kp.push(Kp2d{point:ModelPoint::Site(s),u:uv[0],v:uv[1],sigma:1.0}); } }
-        for use_cloud in [false, true] {
-            let mut est = Estimator::new(m, Params { cloud_budget: 250.0, cloud_torso_only: false, ..Params::default() });
-            est.state.root_t = [0.0, 0.3, 1.5];
-            for i in 0..8 {
-                let obs = FrameObs { t: i as f64/30.0, intr: Some(intr), kp2d: kp.clone(), kp3d: vec![], cloud: if use_cloud { Some(super::tests_helpers::cloud(m,&gt)) } else { None }, torso_hint: None, surface: Vec::new() };
-                est.update(m, &obs);
-                eprintln!("cloud={use_cloud} frame {i}: iters {} cost {:.1} -> {:.1} n_cloud {}", est.diag.iters, est.diag.cost_initial, est.diag.cost_final, est.diag.n_cloud);
-            }
-            let fk = m.fk(&est.state);
-            for j in 0..m.joints.len() {
-                let e = norm(sub(fk.t[j], fkg.t[j]));
-                if e > 0.02 { eprintln!("  {} err {:.3}", m.joints[j].name, e); }
-            }
-            eprintln!("  scale {:.3} len {:?}", est.state.scale, est.state.len);
-        }
-    }
-}
-#[cfg(test)]
 pub mod tests_helpers {
     use super::*;
     pub fn cloud(model:&Model, st:&State)->Cloud{
@@ -1752,10 +1713,10 @@ pub mod tests_helpers {
     }
 }
 #[cfg(test)]
-mod dbg_tests2 {
+mod gradient_tests {
     use super::*;
     #[test]
-    fn dbg_cloud_gradient() {
+    fn cloud_gradient_matches_finite_difference() {
         let h = Humanoid::new();
         let m = &h.model;
         let mut gt = State::rest(m);
@@ -1788,16 +1749,18 @@ mod dbg_tests2 {
             let fkm = m.fk(&sm);
             let cm = est.eval_cost(m, &obs, &fkm, &sm, &pts, &prior_var, 0.033);
             let num = (cp-cm)/(2.0*eps);
-            eprintln!("param {k}: analytic g {:.4}  numeric dcost/dx {:.4} (should be 2g)", g[k], num);
+            // ∂cost/∂x = 2 g (cost = Σ ρ, g = Σ w Jᵀ r)
+            assert!((num - 2.0 * g[k]).abs() < 1e-3 * (1.0 + num.abs()), "param {k}: analytic 2g {} vs numeric {}", 2.0 * g[k], num);
         }
-        eprintln!("c0 {c0}");
+        assert!(c0.is_finite());
     }
 }
 #[cfg(test)]
-mod dbg_timing {
+mod timing_tests {
     use super::*;
     #[test]
-    fn dbg_timing() {
+    #[ignore = "perf probe: cargo test --lib timing_tests -- --ignored --nocapture"]
+    fn timing_dense_cloud() {
         let h = Humanoid::new();
         let m = &h.model;
         let intr = Intrinsics { fx: 600.0, fy: 600.0, cx: 320.0, cy: 240.0, width: 640.0, height: 480.0 };
@@ -1828,10 +1791,11 @@ mod dbg_timing {
     }
 }
 #[cfg(test)]
-mod dbg_timing2 {
+mod timing_tests2 {
     use super::*;
     #[test]
-    fn dbg_timing_parts() {
+    #[ignore = "perf probe: cargo test --lib timing_tests2 -- --ignored --nocapture"]
+    fn timing_parts() {
         let h = Humanoid::new();
         let m = &h.model;
         let intr = Intrinsics { fx: 600.0, fy: 600.0, cx: 320.0, cy: 240.0, width: 640.0, height: 480.0 };
