@@ -1221,11 +1221,10 @@ impl TrackingWorker {
     }
 
     /// Capture color + aligned metric depth from a RealSense D435 and run
-    /// the full RTMW3D pose pipeline, feeding the depth in via
-    /// [`provider::PoseProvider::set_external_depth`] so the provider skips
-    /// its internal DAv2 stage. Each per-frame step builds a
-    /// `MetricDepthFrame` from the D435 depth and hands it to the provider
-    /// before `estimate_pose`.
+    /// the fusion pipeline, feeding the depth in via
+    /// [`provider::PoseProvider::set_external_depth`]. Each per-frame step
+    /// builds a `MetricDepthFrame` from the D435 depth and hands it to
+    /// the provider before `estimate_pose`.
     ///
     /// Two threads:
     ///
@@ -1388,7 +1387,7 @@ impl TrackingWorker {
             stagelog::mark(frame_index, "estimate_begin");
             let mut estimate = if let Some(ref mut provider) = pose_provider {
                 // Hand the D435's color-aligned metric depth to the
-                // provider for THIS frame; it replaces the DAv2 stage.
+                // provider for THIS frame.
                 let metric =
                     crate::tracking::metric_frame::build_metric_frame_from_d435(&rs_frame);
                 provider.set_external_depth(metric);

@@ -939,8 +939,7 @@ pub struct GuiApp {
     pub viewport: ViewportUiState,
 
     // Pose-calibration modal. Aggregated into
-    // `calibration::CalibrationUiState` as part of the GuiApp state
-    // split — see plan/architecture-pipeline-gui-critical-review.md #10.
+    // `calibration::CalibrationUiState`.
     pub calibration: calibration::CalibrationUiState,
 
     // Lip sync

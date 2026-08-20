@@ -9,7 +9,7 @@ The goal is to make async tracking and async output explicit without making the 
 Related documents:
 
 - [architecture.md](architecture.md)
-- [tracking-retargeting.md](tracking-retargeting.md)
+- [tracking-v2-design.md](tracking-v2-design.md)
 - [output-interop.md](output-interop.md)
 
 ## Thread Roles

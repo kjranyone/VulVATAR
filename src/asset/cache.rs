@@ -10,8 +10,8 @@
 //! [VvtCacheHeader (bincode)] [AvatarAsset body (bincode)]
 //! ```
 //!
-//! Texture pixel data is **not** included in the body (Option B from
-//! `plan/handover.md`): `TextureBinding.pixel_data` carries
+//! Texture pixel data is **not** included in the body:
+//! `TextureBinding.pixel_data` carries
 //! `#[serde(skip)]`, so the cache file stays small. Cache loaders MUST
 //! re-decode textures from the on-disk VRM before handing the asset to
 //! the renderer — see `vrm.rs`'s cache-rehydration helper.

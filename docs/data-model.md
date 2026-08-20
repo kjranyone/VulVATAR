@@ -13,7 +13,7 @@ Related documents:
 
 - [architecture.md](architecture.md)
 - [project-persistence.md](project-persistence.md)
-- [tracking-retargeting.md](tracking-retargeting.md)
+- [tracking-v2-design.md](tracking-v2-design.md)
 - [output-interop.md](output-interop.md)
 
 ## Modeling Rules

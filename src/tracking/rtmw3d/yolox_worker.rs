@@ -65,8 +65,8 @@ pub(super) struct YoloxWorker {
     outbox: Arc<DetectOutbox>,
     thread: Option<thread::JoinHandle<()>>,
     /// Temporal-state generation; results from an older generation
-    /// are in-flight leftovers of a previous input (see the DAv2
-    /// worker's equivalent guard) and are treated as absent.
+    /// are in-flight leftovers of a previous input and are treated
+    /// as absent.
     generation: u64,
 }
 

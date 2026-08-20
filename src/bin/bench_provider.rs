@@ -3,7 +3,7 @@
 //! Loads one image, builds the pose provider, runs `estimate_pose`
 //! N times, and reports per-iteration wall time. Same warm-up +
 //! steady-state convention as `bench_pose` but targeting the provider
-//! abstraction so the full pipeline (RTMW3D + async DAv2 depth) is
+//! abstraction so the full pipeline (RTMW3D + fusion estimator) is
 //! measured with the same harness.
 //!
 //! Usage:

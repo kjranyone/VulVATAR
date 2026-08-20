@@ -1,9 +1,9 @@
 //! Bounded single-slot "latest-only" inbox for async worker threads.
 //!
-//! The depth (DAv2) and person-detection (YOLOX) workers only ever need
-//! the *freshest* input frame: intermediate frames that pile up while the
-//! worker is busy are stale and should be discarded. This must hold under
-//! GPU stalls too, so the inbox has to be bounded.
+//! The YOLOX person-detection worker only ever needs the *freshest*
+//! input frame: intermediate frames that pile up while the worker is
+//! busy are stale and should be discarded. This must hold under GPU
+//! stalls too, so the inbox has to be bounded.
 //!
 //! A `sync_channel(1)` + `try_send` gets this backwards — when the single
 //! slot is full it drops the *newest* frame and the worker later consumes

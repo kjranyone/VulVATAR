@@ -19,12 +19,10 @@
 //! Not yet wired (would be follow-up work, with a real consumer in the
 //! same commit so the budget doesn't accumulate dead policy outputs):
 //! - pose worker Hz throttle
-//! - depth refresh period
 //! - FaceMesh ONNX EP preference (today the EP is hard-coded per
-//!   provider: `Auto` for standalone rtmw3d, `ForceCpu` for the depth-
-//!   colocated paths)
+//!   provider)
 //!
-//! See `plan/runtime-gpu-budget.md` for the design and threshold rationale.
+//! See `docs/gpu-runtime-roadmap.md` for the design and threshold rationale.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

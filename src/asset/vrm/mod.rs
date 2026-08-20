@@ -142,7 +142,7 @@ impl VrmAssetLoader {
         on_progress(LoadStage::Reading);
         let file_data = std::fs::read(path)?;
 
-        // Avatar load cache (B1, plan/T10-future-extensions.md). Try the
+        // Avatar load cache. Try the
         // cached parse first; on hit, re-decode textures from the source
         // bytes (Option B: textures aren't included in the cache file) and
         // return without redoing the rest of the glTF / VRM extension /

@@ -1,12 +1,9 @@
 # Pose Calibration UX
 
-> **Note (2026-08-20):** the torso depth template (`torso_depth_template`)
-> and the provider-side calibration hooks it fed were removed with the v1
-> pipeline. The captured `PoseCalibration` today informs the GUI overlay /
-> face-neutral subtraction only; wiring it into the fusion estimator's
-> `q_neutral` is future work (docs/tracking-v2-design.md §6).
-
-
+> The captured `PoseCalibration` is applied at solve time via
+> `TrackingCalibration::apply_calibration` (neutral face / expression /
+> body-yaw). Wiring the same capture into the fusion estimator's
+> `q_neutral` is future work ([tracking-v2-design.md](tracking-v2-design.md) §6).
 > The code is the source of truth for exact thresholds and field sets
 > (`src/tracking/calibration.rs`, `src/gui/calibration/`); this
 > document carries the UX flow, the data contract, and the design
@@ -22,7 +19,7 @@ The tracking pipeline reads the subject's anchor (hip or shoulder midpoint) from
 
 A small bias in one frame is masked by the filtering. A persistent bias from a stationary obstacle is **not** masked — it shifts the entire reference frame and the avatar tracks the wrong baseline forever. Per-frame plausibility gates reject extreme single-frame failures but can't recover from a consistently-biased setup.
 
-Calibration is the explicit fix, modeled on existing VTuber webcam tools (e.g. VSeeFace's "Calibrate VRM"): the user locks in their setup-specific reference values once per setup (profile).
+Calibration is the explicit fix, modeled on existing VTuber tools (e.g. VSeeFace's "Calibrate VRM"): the user locks in their setup-specific reference values once per setup (profile).
 
 ## User flow
 
@@ -34,7 +31,7 @@ A `Calibrate Pose` button in the Tracking inspector (and mirrored in the top bar
 
 ### Modal layout
 
-Left: live webcam preview with the detection-annotation overlay (same
+Left: live camera preview with the detection-annotation overlay (same
 `DetectionAnnotation` data the camera-wipe PIP uses) beside a one-shot
 offscreen render of the avatar in the mode's target pose ("match this
 pose"). Right: the state-driven status pane — instructions, progress
@@ -89,80 +86,30 @@ Re-running calibration overwrites the previous `PoseCalibration` for the current
 ## Data model
 
 Authoritative definitions: `src/tracking/calibration.rs`
-(`CalibrationMode`, `PoseCalibration`, `TorsoDepthTemplate`) and
-`src/tracking/mod.rs` (`TrackingCalibration { pose:
-Option<PoseCalibration> }`). This doc deliberately does not duplicate
-the struct bodies — the field docs there carry the per-field rationale
-and unit contracts. Summary of what one capture stores:
+(`CalibrationMode`, `PoseCalibration`) and `src/tracking/mod.rs`
+(`TrackingCalibration { pose: Option<PoseCalibration> }`). This doc
+deliberately does not duplicate the struct bodies — the field docs
+there carry the per-field rationale and unit contracts. Summary of
+what one capture stores:
 
 | Field group | Contents | Consumer |
 |---|---|---|
 | Identity | `mode`, `captured_at`, `captured_at_unix`, `frame_count`, `confidence` | inspector status line |
-| Anchor | `anchor_x/y` (median `root_offset`; metres on the metric path), `anchor_depth_m` (positive forward metres), `anchor_depth_jitter_m` (*diagnostic only*) | solver root-reference seed; body-yaw pivot |
-| Body scale | `shoulder_span_m` | depth builder `reference_span_m` → `mpsu` normalisation + 1:1 metres→avatar-units |
-| Movement range | `x_range_observed`, `z_range_observed` (body-frame) | Done-pane summary + persistence only (no solver consumer) |
-| Torso shape | `torso_depth_template` (32×32 median depth grid) | depth builder occluder-bias rejection |
+| Anchor | `anchor_x/y` (median `root_offset`; metres), `anchor_depth_m` (positive forward metres), `anchor_depth_jitter_m` (*diagnostic only*) | body-yaw pivot in `apply_calibration` |
+| Body scale | `shoulder_span_m` | Done-pane summary + persistence |
+| Movement range | `x_range_observed`, `z_range_observed` (body-frame) | Done-pane summary + persistence |
 | Neutrals | `neutral_expressions`, `neutral_face_ypr_mesh/_body`, `neutral_body_yaw` | `TrackingCalibration::apply_calibration` at solve time |
 
-## Solver / provider integration
+## Solve-time transforms (`TrackingCalibration::apply_calibration`)
 
-### Anchor selection (`skeleton_from_depth::BuildOptions::force_shoulder_anchor`)
-
-When a `PoseCalibration` is active (or the modal is open with a mode
-hint), the anchor policy changes. The GUI pushes the modal's live mode
-as a hint through the mailbox so the flip happens the moment an
-UpperBody capture opens; otherwise the persisted calibration's mode
-decides (`rtmw3d_with_depth` mirrors both onto the builder).
-
-| Mode       | Behaviour                                                      |
-|------------|----------------------------------------------------------------|
-| Full Body  | Hip preferred → shoulder fallback (default behaviour, unchanged). |
-| Upper Body | **Force** shoulder anchor (`hips_allowed = false`) regardless of hip visibility — even when the hip pair clears the floor, treat it as untrustworthy (likely picking up a desk surface). |
-
-### Calibration scale plausibility (DAv2 offline path only)
-
-The monocular DAv2 path (offline benches; runs only when
-`dav2_small.onnx` is present) checks its per-frame scale solution in
-`rtmw3d_with_depth::calibrate_scale` against the calibrated anchor
-depth as a plausibility band, rejecting the
-desk-suddenly-fills-the-depth-window case. The live D435 path needs
-**no scale calibration at all** — depth is measured, not estimated.
-`anchor_depth_jitter_m` is a capture-quality diagnostic only
-(inspector status detail).
-
-### Root translation reference seed (`pose_solver`)
-
-`root_reference` seeds from the calibration when the live anchor kind
-matches the calibrated mode, as
-`[anchor_x, anchor_y, −anchor_depth_m]` — the negation converts the
-stored positive camera-forward distance back to source-space z (the
-per-frame `root_offset` convention it blends against). A calibrated
-seed is trusted immediately (no lock-in averaging).
-
-Under the default full-mirror behaviour (`root_recenter_horizon_s ==
-None`) the reference **freezes** after seeding — metric depth is
-absolute, so there is nothing to self-recentre against, and a real
-side-step / lean must persist on the avatar instead of drifting back
-to centre. Setting a horizon enables a slow self-recentring EMA
-instead.
-Translation on the metric path is then **1:1**: deviation from the
-reference maps to avatar units scaled only by
-`avatar_rest_shoulder_span / reference_span_m` — no room-size gain,
-no clamp.
-
-### Solve-time transforms (`TrackingCalibration::apply_calibration`)
-
-Applied to a clone of the sample just before the solver each frame
+Applied to a clone of the sample just before retarget each frame
 (the mailbox always carries the RAW sample — the recapture-invariant
 that prevents double subtraction): the neutral-body-yaw scene
 de-rotation, the per-source neutral face-pose subtraction, and the
-neutral-expression rescale.
-
-### Non-metric (2D-only) path
-
-The same calibration is honoured but the depth-dependent parts are
-inert: `anchor_x`/`anchor_y` still seed the root reference, and the
-neutral body yaw is never captured nor applied (no trustworthy z).
+neutral-expression rescale. The fusion estimator does not yet consume
+the capture (`q_neutral` is future work). D435 depth is measured, not
+estimated — there is no scale-calibration step. `anchor_depth_jitter_m`
+is a capture-quality diagnostic only (inspector status detail).
 
 ## Persistence
 
@@ -180,11 +127,9 @@ snaps the depth pipeline to the right baseline immediately.
 
 Save flow: `Calibrate Pose ▼ → finalize → persist_calibration()`
 writes to (a) `Application.tracking_calibration.pose` for the live
-solver, (b) the tracking mailbox for the depth-pipeline provider's
-anchor forcing (and the DAv2 offline path's scale plausibility), and (c)
-the active profile + sets
-`profiles_dirty`. The per-frame autosave block flushes
-`profiles.json` on the next tick.
+`apply_calibration` path, (b) the tracking mailbox, and (c) the
+active profile + sets `profiles_dirty`. The per-frame autosave block
+flushes `profiles.json` on the next tick.
 
 Load flow: `GuiApp` constructor calls
 `crate::persistence::load_profiles()` (falling back to built-in
@@ -286,7 +231,7 @@ The arm-direction gate (`pose_match::pose_match_score`, which drives
 keypoint confidence — without them the score is pinned at 0 and
 capture can never start on that gate alone.
 
-Typical webcam-streamer framing (bust-up: head to slightly below the
+Typical desk-delivery framing (bust-up: head to slightly below the
 shoulders) crops both elbows out **permanently**: the "step back so
 your elbows are visible" framing hint is unactionable when the scene
 layout fixes the camera crop, and a T-pose is equally impossible, so
@@ -385,8 +330,7 @@ and swaps its *gate*, not its mode:
   no wait loop; 4 s after Start is soon enough and avoids flicker on
   the mode picker).
 - Persisting "this calibration was captured at bust-up framing" — no
-  consumer needs it; `torso_depth_template` cell coverage already
-  reflects the reduced torso window organically.
+  consumer needs it.
 
 ## Neutral body yaw — oblique camera placement
 
@@ -428,19 +372,16 @@ The naive fix — subtract a captured neutral angle inside
   point wrong by exactly the neutral angle. Any per-consumer patch
   scheme (subtract here, subtract there) reintroduces this class of
   bug every time a new consumer of source directions lands.
-- **Rejected B: de-rotation inside the provider
-  (`skeleton_from_depth`).** The tracking mailbox deliberately carries
-  the RAW pose; calibration is applied at solve time on a clone (see
-  `refresh.rs`: "The snapshot pose is raw ... no risk of subtracting a
-  previous calibration twice"). The calibration modal's capture loop
-  reads the mailbox — if the provider published de-rotated skeletons,
-  every *re*-calibration would measure anchors/yaw in
-  already-corrected space, converging the stored neutral toward zero
-  across recaptures (the double-subtraction bug class the raw-mailbox
-  invariant exists to prevent). Provider internals (ray-IK along
-  observation rays, L/R swap correction, arm_z, torso-template
-  registration) are camera-geometry algorithms and must keep operating
-  in camera space anyway.
+- **Rejected B: de-rotation inside the provider.** The tracking
+  mailbox deliberately carries the RAW pose; calibration is applied
+  at solve time on a clone (see `refresh.rs`: "The snapshot pose is
+  raw ... no risk of subtracting a previous calibration twice"). The
+  calibration modal's capture loop reads the mailbox — if the
+  provider published de-rotated skeletons, every *re*-calibration
+  would measure anchors/yaw in already-corrected space, converging
+  the stored neutral toward zero across recaptures (the
+  double-subtraction bug class the raw-mailbox invariant exists to
+  prevent).
 
 **Chosen: a single rigid re-expression of the published sample at
 solve time**, in `TrackingCalibration::apply_calibration` — the same
@@ -472,8 +413,7 @@ anywhere.
 |---|---|---|
 | `joints` positions | ✓ | isotropic source units (normalised by `mpsu`) — rotation is geometrically valid |
 | `fingertips` | ✓ | same space as joints |
-| `left/right_hand_orientation` | ✓ (quaternion pre-multiply by `R_y(−θ)`) | palm frames are source-space; forgetting this leaves wrist twist off by θ — easy to miss because the error is subtle at small angles |
-| `root_offset` | ✓ | on the D435 path this is a raw-metres camera-space vector (`pose_solver` "Metric translation" contract), so the rotation is unit-safe; see units audit below |
+| `root_offset` | ✓ | raw-metres camera-space vector; rotation is unit-safe; see units audit below |
 | `face` / `face_body_raw` | ✗ | head neutrality is owned by `neutral_face_ypr_*` (per-estimator residuals); rotating the face pose *and* subtracting its neutral would double-count θ. `face_body_raw` additionally must stay raw (capture-only contract) |
 | `metric_frame_info` (`anchor_cam_m`, `intrinsics`, `mpsu`, spans) | ✗ | documented as RAW camera space; the sensor-matched mirror render and any camera-geometry consumer need the true camera frame |
 
@@ -545,8 +485,7 @@ Floors and gates:
   the ranges are summary/persistence-only (see the movement-range
   consumer status above), so this keeps the *data* future-proof
   rather than changing live behaviour.
-- **Sensor-matched overlays** (camera-wipe PIP, `validate_pipeline`
-  composites): these show the true camera view; a de-rotated avatar
+- **Sensor-matched overlays** (camera-wipe PIP): these show the true camera view; a de-rotated avatar
   *intentionally* no longer matches the photo's viewing angle when a
   neutral yaw is active. Documented here so nobody "fixes" the
   mismatch later by rotating the render back. Benches run without

@@ -175,10 +175,9 @@ pub struct FaceBbox {
 /// Which execution provider to use for FaceMesh + Blendshape.
 ///
 /// `Auto` is right when nothing else heavy uses DirectML: GPU runs
-/// the small face cascade in ~3 ms. `ForceCpu` is right when DAv2 is
-/// colocated on DirectML (the depth stage): ~7 ms on CPU avoids the
-/// 13 ms-tier inflation we observed under DirectML EP queue
-/// contention.
+/// the small face cascade in ~3 ms. `ForceCpu` avoids DirectML EP
+/// queue contention with RTMW3D (~7 ms on CPU vs 13 ms-tier
+/// inflation observed when both sit on the same EP).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceMeshEp {
     Auto,

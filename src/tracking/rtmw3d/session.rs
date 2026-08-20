@@ -63,17 +63,9 @@ fn build_cpu_session(
 }
 
 /// Force a session onto the CPU EP regardless of `inference-gpu`.
-/// Two reasons a caller picks this over [`build_session`]:
-///
-/// * Small models (FaceMesh ~4.8 MB, Blendshape ~1.8 MB) — single-digit
-///   ms on CPU, and forcing them off DirectML removes EP-setup
-///   contention with the concurrently-running heavy models.
-/// * DAv2-Small in the `rtmw3d-with-depth` provider — keeping it off
-///   DirectML when RTMW3D-x is already on DirectML *and* Vulkan is
-///   rendering the avatar on the same Intel iGPU is what prevents the
-///   0x116 VIDEO_TDR_FAILURE hang observed when all three competed for
-///   one device. DAv2 runs in an async worker throttled by
-///   `DEPTH_REFRESH_PERIOD`, so its CPU latency is absorbed.
+/// Used for small models (FaceMesh ~4.8 MB, Blendshape ~1.8 MB) —
+/// single-digit ms on CPU, and keeping them off DirectML removes
+/// EP-setup contention with RTMW3D (and Vulkan on the same iGPU).
 pub(in crate::tracking) fn build_session_cpu_only(
     model_path: &str,
     intra_threads: usize,

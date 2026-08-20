@@ -20,7 +20,7 @@ Detailed cloth authoring workflow lives in [editor-cloth-authoring.md](editor-cl
 Related detailed contracts:
 
 - [project-persistence.md](project-persistence.md)
-- [tracking-retargeting.md](tracking-retargeting.md)
+- [tracking-v2-design.md](tracking-v2-design.md)
 - [output-interop.md](output-interop.md)
 - [vulkano-renderer-design.md](vulkano-renderer-design.md)
 

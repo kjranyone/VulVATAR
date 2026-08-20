@@ -15,7 +15,7 @@ Related documents:
 - [vulkano-renderer-design.md](vulkano-renderer-design.md)
 - [output-interop.md](output-interop.md)
 - [profiling.md](profiling.md)
-- [onnx-tracking-pipeline.md](onnx-tracking-pipeline.md)
+- [tracking-v2-design.md](tracking-v2-design.md)
 
 ## Runtime Shape
 
@@ -24,7 +24,7 @@ camera frame
    │
    ▼
 tracking worker ── DirectML sessions
-   │              RTMW3D / YOLOX / FaceMesh / depth
+   │              RTMW3D / YOLOX / FaceMesh
    │ compact pose + expression data only
    ▼
 app thread
@@ -191,6 +191,6 @@ the same commit, so the budget doesn't accumulate dead policy outputs:
 - Do not optimize the CPU readback path into permanence.
 - Do not pass renderer-owned Vulkan images directly into output worker
   code without a lease/token contract.
-- Do not scatter GPU cadence decisions across RTMW3D, YOLOX, DAv2, GUI,
+- Do not scatter GPU cadence decisions across RTMW3D, YOLOX, GUI,
   and output code — `RuntimeGpuBudget` is the one place that describes
   the system-level policy.

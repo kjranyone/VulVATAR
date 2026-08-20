@@ -139,10 +139,9 @@ impl YoloxPersonDetector {
     /// thread; on DirectML it was the second concurrent DirectML
     /// session submitting to the same GPU device as RTMW3D from a
     /// different thread, on top of the Vulkan render queue. This
-    /// codebase has two recorded driver-hang incidents from exactly
-    /// that stacking pattern (FaceMesh contention inflation, DAv2 TDR
-    /// 0x116, and the 2026-06-11 Arc B570 system freeze under
-    /// investigation). The detector is small, runs every
+    /// codebase has recorded driver-hang incidents from exactly that
+    /// stacking pattern (FaceMesh contention inflation, 2026-06-11
+    /// Arc B570 system freeze). The detector is small, runs every
     /// `YOLOX_REFRESH_PERIOD` frames on a dedicated thread, and its
     /// result is consumed via a sticky outbox — CPU latency is hidden
     /// by design, and the 25% downstream bbox pad absorbs the extra

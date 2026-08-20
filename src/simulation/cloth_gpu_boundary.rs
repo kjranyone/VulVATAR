@@ -1,8 +1,8 @@
 //! Cloth ownership boundary between authoring, CPU simulation, GPU simulation,
 //! and render-consumable deform.
 //!
-//! Scaffolding for the planned compute-cloth migration (`plan/gpu-runtime-roadmap-tasks.md`
-//! P3-01). No runtime behaviour change: this module re-exports the existing
+//! Cloth GPU-state boundary (the compute-cloth migration's P3-01 slot).
+//! No runtime behaviour change: this module re-exports the existing
 //! types under boundary-named aliases and introduces a placeholder
 //! [`ClothGpuSimulationState`] so the eventual GPU solver can land in the
 //! correct slot without renegotiating the avatar/renderer ownership rules.

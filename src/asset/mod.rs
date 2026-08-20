@@ -416,8 +416,8 @@ pub struct MaterialTextureSet {
 pub struct TextureBinding {
     pub uri: String,
     /// Decoded RGBA pixel bytes. Excluded from the avatar load cache
-    /// (Option B in `plan/handover.md`): the cache stays small, and the
-    /// loader re-decodes textures from the source VRM on cache hit.
+    /// so the cache stays small; the loader re-decodes textures from
+    /// the source VRM on cache hit.
     /// Cache loaders MUST repopulate this before handing the asset to
     /// the renderer.
     #[serde(skip)]

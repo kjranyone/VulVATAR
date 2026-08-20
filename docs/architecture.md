@@ -557,8 +557,9 @@ per-concern sibling files:
 - `src/simulation/spring.rs`
 - `src/simulation/cloth_solver/{mod,integrator,constraints,collision,output,tests}.rs`
 - `src/asset/vrm/{mod,extensions,gltf_decode,mtoon,v0,v1,metadata_tests}.rs`
-- `src/tracking/rtmw3d/{mod,consts,decode,preprocess,skeleton,wrist,face,annotation,session,math}.rs`
-- `src/gui/inspector/{mod,avatar,preview,tracking,rendering,output,cloth,library,settings}.rs`
+- `src/tracking/fusion/{mod,estimator,observe,output,provider,model,math,hands,seed}.rs`
+- `src/tracking/rtmw3d/{mod,consts,decode,preprocess,face,annotation,session,yolox_worker}.rs`
+- `src/gui/inspector/{mod,avatar,tracking,rendering,output,cloth,library,settings}.rs`
 
 Directory discipline: split by responsibility inside each top-level
 domain rather than letting any single file grow past ~1.5 kLOC. Never
@@ -599,8 +600,7 @@ Detailed contracts per domain:
 - [project-persistence.md](project-persistence.md) — file formats, versioning, migration
 - [threading-model.md](threading-model.md) — thread roles, ownership, shutdown order
 - [gpu-runtime-roadmap.md](gpu-runtime-roadmap.md) — GPU pressure policy (`RuntimeGpuBudget`)
-- [tracking-retargeting.md](tracking-retargeting.md) — tracking → rig contract
-- [onnx-tracking-pipeline.md](onnx-tracking-pipeline.md) — inference pipeline, coordinate conventions
+- [tracking-v2-design.md](tracking-v2-design.md) — fusion estimator + retarget contract
 - [calibration-ux.md](calibration-ux.md) — pose calibration spec
 - [output-interop.md](output-interop.md) — GPU frame handoff / VGTK sidecar protocol
 - [mf-virtual-camera.md](mf-virtual-camera.md) — MediaFoundation virtual camera contract
