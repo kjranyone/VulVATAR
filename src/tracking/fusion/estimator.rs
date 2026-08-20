@@ -217,6 +217,17 @@ pub struct Params {
     /// the wave replay). Soft: a genuinely pitched camera pushes the
     /// residual tilt into gentle spine flexion instead.
     pub upright_sigma: f64,
+    /// A re-seed candidate replaces the tracked pose only if it cuts the
+    /// total cost to this fraction of it. Accepting ANY improvement makes
+    /// the two hypotheses flap: on a live session 81 of 91 seed wins
+    /// improved the cost by under 10% — statistical noise — while
+    /// teleporting a wrist 0.15–0.56 m per event. Genuine re-acquisitions
+    /// improve it several-fold (0.07–0.55), so a margin costs nothing.
+    /// Swept on the replays: 0.98 and 0.95 both cut seed acceptances by
+    /// ~87% and improve the palms torso error (std 7.8° → 6.4°); 0.90
+    /// starts blocking real re-acquisitions and palms collapses
+    /// (err std 31°).
+    pub seed_win_ratio: f64,
     /// Median 2-D residual (px) above which the track counts as lost.
     pub lost_rms_px: f64,
     /// Restrict the point-cloud term to torso / neck / head capsules (the
@@ -263,6 +274,7 @@ impl Default for Params {
             var_max: 25.0,
             elbow_low_sigma: 0.10,
             upright_sigma: 0.12,
+            seed_win_ratio: 0.95,
             lost_rms_px: 40.0,
             cloud_torso_only: true,
             cloud_zbuffer: true,
@@ -675,7 +687,10 @@ impl Estimator {
             let Some(cand) = seed(&start) else { continue };
             self.state = cand;
             let c = self.lm_loop(model, obs, &cloud_pts, &prior_var, dt);
-            if c < cost {
+            if std::env::var_os("VULVATAR_SEED_DUMP").is_some() {
+                eprintln!("SEEDCAND cost {cost:.1} cand {c:.1} ratio {:.3}", c / cost.max(1e-6));
+            }
+            if c < cost * self.params.seed_win_ratio {
                 cost = c;
                 best_state = self.state.clone();
                 best_diag = self.diag;

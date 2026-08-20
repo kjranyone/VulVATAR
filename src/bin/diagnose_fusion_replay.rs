@@ -608,7 +608,7 @@ fn main() -> Result<(), String> {
                     let jump = norm(sub(cur, p));
                     if jump > 0.15 {
                         eprintln!(
-                            "JUMP idx {idx} {name} {:.2} m | seedΔ {} lostΔ {} med2d {:.1} n3d {} data_σ {:.2} iters {} cost {:.0}",
+                            "JUMP idx {idx} (frame {n}) {name} {:.2} m | seedΔ {} lostΔ {} med2d {:.1} n3d {} data_σ {:.2} iters {} cost {:.0}",
                             jump,
                             seed_now - prev_seed,
                             lost_now - prev_lost,
