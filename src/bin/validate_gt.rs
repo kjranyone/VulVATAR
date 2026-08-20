@@ -709,7 +709,6 @@ fn main() -> Result<(), String> {
         // crop — same protocol as validate_pipeline). Each pass is fed its
         // frame's aligned depth (neutral vs GT), mirroring the live worker.
         infer.reset_temporal_state();
-        infer.set_calibration_mode_hint(Some(vulvatar_lib::tracking::CalibrationMode::FullBody));
         let base = (idx as u64) * 8;
         for k in 0..3 {
             infer.set_external_depth(neutral_metric.clone());

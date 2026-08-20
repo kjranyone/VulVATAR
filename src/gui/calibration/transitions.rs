@@ -59,19 +59,12 @@ pub(super) fn begin_capture(state: &mut GuiApp) {
 /// "I want to redo this" intent: clicking Retry doesn't itself destroy
 /// data; only landing a fresh capture does.
 ///
-/// Also flips the worker's torso-capture toggle off and bumps the
-/// already-consumed template seq, so any template the worker was
-/// about to publish from the previous capture window doesn't leak
-/// into the new attempt's `poll_torso_template`.
 pub(super) fn retry_capture(state: &mut GuiApp) {
     let mode = match &state.calibration.modal {
         CalibrationModalState::AnchorDone { mode, .. } => Some(*mode),
         _ => None,
     };
     if let Some(mode) = mode {
-        state.app.tracking.mailbox().set_torso_capture(false);
-        state.calibration.torso_template_seq =
-            state.app.tracking.mailbox().torso_template_seq();
         state.calibration.modal.open(mode);
     }
 }
@@ -119,7 +112,6 @@ pub(super) fn begin_range_capture(state: &mut GuiApp) {
 /// score. Called every frame from `panes::draw_modal`. Edge cases:
 ///
 /// - `WaitingForPose`         → `Collecting` once the pose-match
-///   gate fires. Triggers torso-template capture on the depth
 ///   provider via the mailbox toggle.
 /// - `Collecting`             → `AnchorDone | Done{Insufficient}` on
 ///   timer expiry, via [`finalize_collection`].
@@ -135,14 +127,6 @@ pub(super) fn advance_state(state: &mut GuiApp) {
             stillness_fallback,
             ..
         } if *frames_at_match >= REQUIRED_STABLE_FRAMES => {
-            // Pose-match gate cleared: user has held the target pose
-            // stably for ~0.5 s. Tell the depth-pipeline provider to
-            // start accumulating per-frame torso depth samples for the
-            // template. The worker forwards this to
-            // `set_torso_capture(true)` on its next iteration; the
-            // actual capture work runs inside `estimate_pose` for the
-            // duration of the Collecting window.
-            state.app.tracking.mailbox().set_torso_capture(true);
             Some(CalibrationModalState::Collecting {
                 mode: *mode,
                 started_at: now,
@@ -231,10 +215,6 @@ pub(super) fn finish_capture(state: &mut GuiApp) {
             stillness_fallback,
             ..
         } => {
-            // Bypass the gate: kick off Collecting straight away so
-            // the 2-second sample window starts now. Same torso-capture
-            // toggle as the natural pose-match path.
-            state.app.tracking.mailbox().set_torso_capture(true);
             Some(CalibrationModalState::Collecting {
                 mode: *mode,
                 started_at: now,

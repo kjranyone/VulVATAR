@@ -1670,23 +1670,6 @@ impl GuiApp {
         }
     }
 
-    /// Push the current calibration-modal mode to the tracking mailbox
-    /// when it differs from the last value pushed. Idempotent — safe to
-    /// call multiple times per frame. The repaint loop calls this both
-    /// before `run_frame` (catches mode-button switches in `Idle`) and
-    /// after `draw_modal` (catches Cancel / Esc / Done auto-close
-    /// transitions whose state change happens inside `draw_modal`,
-    /// after the pre-`run_frame` push has already run).
-    fn sync_calibration_mode_hint(&mut self) {
-        let current = self.calibration.modal.active_mode();
-        if current != self.calibration.last_pushed_mode_hint {
-            self.app
-                .tracking
-                .mailbox()
-                .set_calibration_mode_hint(current);
-            self.calibration.last_pushed_mode_hint = current;
-        }
-    }
 }
 
 /// Localised label for an avatar-load progress stage. The asset-layer
@@ -1840,7 +1823,6 @@ impl eframe::App for GuiApp {
         // `draw_modal`, which would otherwise leave a stale
         // `Some(UpperBody|FullBody)` on the worker until the next
         // unrelated repaint reason fires).
-        self.sync_calibration_mode_hint();
 
         // Path 1: reconcile GUI-owned settings into Application before
         // running the frame. See the wiring overview above
@@ -1931,7 +1913,6 @@ impl eframe::App for GuiApp {
         // `Some(UpperBody|FullBody)` until some unrelated repaint fires,
         // which on a static avatar with no autosave can be never — the
         // provider would override the persisted calibration forever.
-        self.sync_calibration_mode_hint();
 
         // Loading-spinner overlay while a background avatar load is in flight.
         if let Some(job) = self.library.avatar_load_job.as_ref() {

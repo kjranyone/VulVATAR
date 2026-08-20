@@ -16,7 +16,6 @@ use crate::gui::GuiApp;
 use crate::t;
 use crate::tracking::CalibrationMode;
 
-use super::finalize::poll_torso_template;
 use super::pose_match::REQUIRED_STABLE_FRAMES;
 use super::refresh::refresh_anchor_telemetry;
 use super::state::{relevant_mode, CalibrationModalState, DoneOutcome};
@@ -45,21 +44,12 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
     // Done no longer auto-closes (the user reads the result summary
     // and clicks Close), so Esc works there too.
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        // Same teardown as the Cancel button: discard any in-flight
-        // torso capture buffer so a partial window doesn't leak into
-        // the next attempt.
-        state.app.tracking.mailbox().set_torso_capture(false);
         state.calibration.modal.close();
         return;
     }
 
     // Tick the state machine forward.
     advance_state(state);
-    // Pick up any torso template the worker has just published. This
-    // arrives 1–2 frames after `Collecting → AnchorDone` because the
-    // worker drains its buffer + publishes during its next loop
-    // iteration (~33 ms later). The poll is no-op until then.
-    poll_torso_template(state);
     // Drain any in-flight target-pose snapshot from the render thread
     // and upload to the modal's egui texture handle. No-op until the
     // render finishes (typically 1 frame after the kick request).
@@ -402,7 +392,6 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
-            state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal.close();
         }
         if ui.button(t!("calibration.start")).clicked() {
@@ -460,13 +449,6 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             // re-read the new mode's instructions before the gate
             // starts watching for a match.
             //
-            // Disarm any in-flight torso capture, matching the Cancel
-            // paths. Today WaitingForPose hasn't toggled capture on
-            // yet, so this is a no-op — but leaving the modal's
-            // capture states must always disarm the worker, or a
-            // future change that starts capture earlier would leak a
-            // running buffer into Idle.
-            state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal = CalibrationModalState::Idle {
                 mode: switch_to,
                 last_anchor_seen: false,
@@ -491,12 +473,8 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
-            // Discard any in-flight torso capture buffer too —
             // without this, a partial buffer would silently leak
-            // into the next capture's `take_torso_template` call
             // (whose seq edge-detect would surface stale
-            // half-window data as a fresh template).
-            state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal.close();
         }
         if ui.button(t!("calibration.capture_now")).clicked() {
@@ -583,7 +561,6 @@ fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.cancel")).clicked() {
-            state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal.close();
         }
         if ui.button(t!("calibration.retry")).clicked() {
@@ -644,7 +621,6 @@ fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     ui.horizontal(|ui| {
         if ui.button(t!("calibration.close")).clicked() {
-            state.app.tracking.mailbox().set_torso_capture(false);
             state.calibration.modal.close();
         }
     });

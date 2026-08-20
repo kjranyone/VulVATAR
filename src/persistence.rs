@@ -202,14 +202,6 @@ fn pose_calibration_to_dto(
         shoulder_span_m: cal.shoulder_span_m,
         x_range_observed: cal.x_range_observed,
         z_range_observed: cal.z_range_observed,
-        torso_depth_template: cal.torso_depth_template.as_ref().map(|t| {
-            TorsoDepthTemplateDto {
-                width: t.width,
-                height: t.height,
-                depths_m: t.depths_m.clone(),
-                bbox_normalized: t.bbox_normalized,
-            }
-        }),
         neutral_expressions: cal.neutral_expressions.clone(),
         // Legacy mirror of the mesh-source neutral so a downgraded app
         // still subtracts something sensible.
@@ -257,14 +249,6 @@ fn dto_to_pose_calibration(
         shoulder_span_m: dto.shoulder_span_m,
         x_range_observed: dto.x_range_observed,
         z_range_observed: dto.z_range_observed,
-        torso_depth_template: dto.torso_depth_template.as_ref().map(|t| {
-            crate::tracking::TorsoDepthTemplate {
-                width: t.width,
-                height: t.height,
-                depths_m: t.depths_m.clone(),
-                bbox_normalized: t.bbox_normalized,
-            }
-        }),
         neutral_expressions: dto.neutral_expressions.clone(),
         // One-time migration: pre-split saves carried a single neutral
         // that was, in practice, mesh-sourced (the mesh wins selection
@@ -399,13 +383,6 @@ pub struct PoseCalibrationDto {
     pub x_range_observed: Option<f32>,
     #[serde(default)]
     pub z_range_observed: Option<f32>,
-    /// Optional torso depth template captured during calibration —
-    /// see `crate::tracking::TorsoDepthTemplate` for the in-memory
-    /// shape and rationale. Serialised as a flat DTO mirror so the
-    /// on-disk schema can evolve independently of the runtime
-    /// struct (same pattern as `PoseCalibrationDto` itself).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub torso_depth_template: Option<TorsoDepthTemplateDto>,
     /// Per-person resting expression baseline — see
     /// `crate::tracking::PoseCalibration::neutral_expressions`. Stored
     /// as `(name, weight)` pairs; defaults to empty for older saves /
@@ -441,18 +418,6 @@ pub struct PoseCalibrationDto {
     pub neutral_body_yaw: Option<f32>,
 }
 
-/// On-disk DTO mirror of `crate::tracking::TorsoDepthTemplate`.
-/// Keeping the field shape identical to the runtime struct for now;
-/// the indirection exists so schema evolution (e.g. compressing the
-/// `depths_m` Vec, splitting front/back templates) doesn't propagate
-/// into runtime code at the call sites.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TorsoDepthTemplateDto {
-    pub width: u32,
-    pub height: u32,
-    pub depths_m: Vec<f32>,
-    pub bbox_normalized: [f32; 4],
-}
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct RenderingConfig {

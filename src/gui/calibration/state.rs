@@ -12,7 +12,6 @@ use crate::tracking::{CalibrationMode, PoseCalibration};
 
 /// Calibration-related fields lifted out of `GuiApp`. Aggregates the
 /// modal state, the live webcam preview texture used by the modal,
-/// the worker→GUI `torso_template_seq` shadow, the last
 /// calibration-mode hint we pushed (so the GUI only forwards on
 /// edges), and the asynchronous target-pose snapshot render. Part of
 /// the architecture-finding #10 GUI state split.
@@ -31,17 +30,6 @@ pub struct CalibrationUiState {
     /// GUI ticks between publishes redraw the keypoint overlay without
     /// pulling a fresh mailbox snapshot (see `draw_preview_pane`).
     pub preview_annotation: Option<crate::tracking::DetectionAnnotation>,
-    /// Last `torso_template_seq` we consumed from the tracking
-    /// mailbox. Drives one-shot stitching of the worker-published
-    /// `TorsoDepthTemplate` onto the in-flight `PoseCalibration`.
-    /// Initialised to 0 so the first publish (seq starts at 1) is
-    /// always picked up.
-    pub torso_template_seq: u64,
-    /// Last calibration-mode hint pushed to the tracking mailbox via
-    /// `TrackingMailbox::set_calibration_mode_hint`. Tracked here so
-    /// the GUI side only forwards on edges instead of re-locking the
-    /// mailbox every frame.
-    pub last_pushed_mode_hint: Option<CalibrationMode>,
     /// One-shot offscreen render of the active avatar in the
     /// calibration target pose (T-pose for FullBody, hands-at-sides
     /// for UpperBody). Shown beside the webcam preview in the modal

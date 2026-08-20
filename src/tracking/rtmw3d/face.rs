@@ -894,7 +894,6 @@ mod tests {
                 shoulder_span_m: None,
                 x_range_observed: None,
                 z_range_observed: None,
-                torso_depth_template: None,
                 neutral_expressions: Vec::new(),
                 neutral_face_ypr_mesh: Some(n_mesh),
                 neutral_face_ypr_body: Some(n_body),

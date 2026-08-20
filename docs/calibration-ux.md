@@ -1,5 +1,12 @@
 # Pose Calibration UX
 
+> **Note (2026-08-20):** the torso depth template (`torso_depth_template`)
+> and the provider-side calibration hooks it fed were removed with the v1
+> pipeline. The captured `PoseCalibration` today informs the GUI overlay /
+> face-neutral subtraction only; wiring it into the fusion estimator's
+> `q_neutral` is future work (docs/tracking-v2-design.md §6).
+
+
 > The code is the source of truth for exact thresholds and field sets
 > (`src/tracking/calibration.rs`, `src/gui/calibration/`); this
 > document carries the UX flow, the data contract, and the design

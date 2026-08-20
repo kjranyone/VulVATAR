@@ -34,7 +34,7 @@ pub mod source_skeleton;
 pub mod yolox;
 
 pub use calibration::{
-    rotate_xz, shoulder_line_yaw, CalibrationMode, PoseCalibration, TorsoDepthTemplate,
+    rotate_xz, shoulder_line_yaw, CalibrationMode, PoseCalibration,
     BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD,
 };
 pub use source_skeleton::{
@@ -317,7 +317,6 @@ mod calibration_apply_tests {
                 shoulder_span_m: None,
                 x_range_observed: None,
                 z_range_observed: None,
-                torso_depth_template: None,
                 neutral_expressions: neutral,
                 neutral_face_ypr_mesh: None,
                 neutral_face_ypr_body: None,
@@ -712,36 +711,6 @@ struct CalibrationChannelInner {
     /// call on iterations where nothing changed (avoids the per-frame
     /// `Option::clone` of the calibration).
     calibration_seq: u64,
-    /// GUI-driven flag: `true` while the calibration modal is in its
-    /// `Collecting` state and the depth provider should accumulate
-    /// per-frame torso-bbox depth samples for `TorsoDepthTemplate`
-    /// capture. The worker forwards transitions to the provider via
-    /// `PoseProvider::set_torso_capture` and harvests the finished
-    /// template via `take_torso_template` when the flag flips off.
-    torso_capture_enabled: bool,
-    /// Bumped each time `set_torso_capture` writes; same edge-detect
-    /// rationale as `calibration_seq`.
-    torso_capture_seq: u64,
-    /// Worker → GUI: the most recently published torso template,
-    /// posted by the worker after a `Collecting` window closes.
-    /// Consumed by the calibration modal's `take_torso_template`
-    /// poll which stitches it onto the in-flight `PoseCalibration`
-    /// during `finalize_collection`.
-    torso_template_collected: Option<TorsoDepthTemplate>,
-    /// Bumped each time `publish_torso_template` writes. The GUI's
-    /// poll uses the same `seq` pattern to consume each template
-    /// exactly once and avoid double-stitching.
-    torso_template_seq: u64,
-    /// GUI-driven hint: the calibration mode the user is *currently
-    /// collecting* (modal open, samples about to flow), independent of
-    /// any confirmed `PoseCalibration`. The worker forwards this to the
-    /// provider via [`PoseProvider::set_calibration_mode_hint`]; without
-    /// it the very first `UpperBody` capture sees `force_shoulder_anchor=
-    /// false` and the GUI rejects every collected sample.
-    pending_calibration_mode_hint: Option<CalibrationMode>,
-    /// Bumped each time `set_calibration_mode_hint` writes; same edge-
-    /// detect rationale as `calibration_seq`.
-    pending_calibration_mode_hint_seq: u64,
 }
 
 /// Captured snapshot of the tracking mailbox state. Not strictly
@@ -784,12 +753,6 @@ impl TrackingMailbox {
             calibration: Arc::new(Mutex::new(CalibrationChannelInner {
                 calibration: None,
                 calibration_seq: 0,
-                torso_capture_enabled: false,
-                torso_capture_seq: 0,
-                torso_template_collected: None,
-                torso_template_seq: 0,
-                pending_calibration_mode_hint: None,
-                pending_calibration_mode_hint_seq: 0,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -902,101 +865,6 @@ impl TrackingMailbox {
         }
     }
 
-    /// GUI-side push: toggle the per-frame torso depth capture on or
-    /// off. Same replace-don't-queue semantics as `set_calibration`;
-    /// rapid toggles (e.g. modal open → cancel → re-open) collapse
-    /// to whichever transition the worker observes first.
-    pub fn set_torso_capture(&self, enabled: bool) {
-        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        c.torso_capture_enabled = enabled;
-        c.torso_capture_seq += 1;
-    }
-
-    /// Worker-side poll for the torso-capture toggle. Same edge-detect
-    /// pattern as `poll_calibration`. Returns `Some((enabled, seq))`
-    /// only when the GUI flipped the flag since `last_seen_seq`.
-    pub fn poll_torso_capture(&self, last_seen_seq: u64) -> Option<(bool, u64)> {
-        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        if c.torso_capture_seq != last_seen_seq {
-            Some((c.torso_capture_enabled, c.torso_capture_seq))
-        } else {
-            None
-        }
-    }
-
-    /// GUI-side push: the calibration mode the user has selected in the
-    /// open modal, or `None` when the modal is closed. Forwarded to the
-    /// provider as a transient anchor hint so the very first `UpperBody`
-    /// capture isn't dropped by the model's hallucinated-hip output —
-    /// see [`PoseProvider::set_calibration_mode_hint`] for the contract.
-    pub fn set_calibration_mode_hint(&self, hint: Option<CalibrationMode>) {
-        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        c.pending_calibration_mode_hint = hint;
-        c.pending_calibration_mode_hint_seq += 1;
-    }
-
-    /// Worker-side poll for the calibration-mode hint. Same edge-detect
-    /// pattern as `poll_calibration`. Returns `Some((hint, seq))` only
-    /// when the GUI changed the hint since `last_seen_seq`.
-    pub fn poll_calibration_mode_hint(
-        &self,
-        last_seen_seq: u64,
-    ) -> Option<(Option<CalibrationMode>, u64)> {
-        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        if c.pending_calibration_mode_hint_seq != last_seen_seq {
-            Some((
-                c.pending_calibration_mode_hint,
-                c.pending_calibration_mode_hint_seq,
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Worker-side push: publish a finished torso template back to
-    /// the GUI for stitching onto the in-flight `PoseCalibration`.
-    /// Replaces the previous template (if any) — only the most
-    /// recent capture matters; if a user runs two captures in rapid
-    /// succession the second one wins.
-    pub fn publish_torso_template(&self, template: TorsoDepthTemplate) {
-        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        c.torso_template_collected = Some(template);
-        c.torso_template_seq += 1;
-    }
-
-    /// GUI-side peek: read the current torso-template publish seq
-    /// without consuming the template. Used by the modal's `retry`
-    /// path to fast-forward its `last_seen_seq` past any in-flight
-    /// publish from the *previous* capture window — without this
-    /// fast-forward, a publish that lands during the new HoldStill
-    /// (1–2 frames after the user clicked Retry) would be picked up
-    /// as if it belonged to the new capture and silently overwrite
-    /// the wrong calibration.
-    pub fn torso_template_seq(&self) -> u64 {
-        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        c.torso_template_seq
-    }
-
-    /// GUI-side consume: take the most recently published torso
-    /// template if the worker published a new one since
-    /// `last_seen_seq`. Returns `Some((template, seq))` exactly once
-    /// per worker publish; subsequent calls with the new `seq`
-    /// return `None` until the next publish. The template is
-    /// consumed (cleared from the mailbox) so a stale capture from
-    /// an earlier session can't leak into a later one.
-    pub fn take_torso_template(
-        &self,
-        last_seen_seq: u64,
-    ) -> Option<(TorsoDepthTemplate, u64)> {
-        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        if c.torso_template_seq != last_seen_seq {
-            c.torso_template_collected
-                .take()
-                .map(|t| (t, c.torso_template_seq))
-        } else {
-            None
-        }
-    }
 
     /// Set the inference-backend label. Called once by the worker after
     /// `Rtmw3dInference` finishes loading its model. `None` resets it
@@ -1545,8 +1413,6 @@ impl TrackingWorker {
         stagelog::mark(0, "provider_load_end");
         ready.store(true, Ordering::SeqCst);
         let mut last_calibration_seq: u64 = 0;
-        let mut last_torso_capture_seq: u64 = 0;
-        let mut last_calibration_mode_hint_seq: u64 = 0;
 
         while running.load(Ordering::SeqCst) {
             // Blocks until the freshest capture is available; wakes with
@@ -1566,23 +1432,6 @@ impl TrackingWorker {
                 if let Some((cal, seq)) = mailbox.poll_calibration(last_calibration_seq) {
                     provider.set_calibration(cal);
                     last_calibration_seq = seq;
-                }
-                if let Some((enabled, seq)) = mailbox.poll_torso_capture(last_torso_capture_seq) {
-                    if enabled {
-                        provider.set_torso_capture(true);
-                    } else {
-                        if let Some(template) = provider.take_torso_template() {
-                            mailbox.publish_torso_template(template);
-                        }
-                        provider.set_torso_capture(false);
-                    }
-                    last_torso_capture_seq = seq;
-                }
-                if let Some((hint, seq)) =
-                    mailbox.poll_calibration_mode_hint(last_calibration_mode_hint_seq)
-                {
-                    provider.set_calibration_mode_hint(hint);
-                    last_calibration_mode_hint_seq = seq;
                 }
             }
 
