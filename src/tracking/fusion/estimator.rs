@@ -72,6 +72,28 @@ pub struct Kp3d {
     pub point: ModelPoint,
     pub p: V3,
     pub sigma: f64,
+    /// Multiplier on the LATERAL (x/y, ≈ across-ray) σ. 1.0 = isotropic.
+    /// Depth-lifted landmark points carry an honest z (the sensor) but
+    /// lateral coordinates inherited from the 2-D landmark — when that
+    /// landmark systematically frontalizes (dense face mesh), the lateral
+    /// part must not outvote real orientation evidence.
+    pub lat_scale: f64,
+}
+
+/// A direct orientation observation of one joint's WORLD (camera-frame)
+/// rotation — e.g. the FaceMesh-derived head pose. Residual is the SO(3)
+/// log of `R_world(joint) · R_targetᵀ`, whitened by `sigma` (rad).
+#[derive(Clone, Copy, Debug)]
+pub struct OriObs {
+    pub joint: usize,
+    pub target: M3,
+    pub sigma: f64,
+    /// How many joints up the kinematic chain (starting at `joint`) this
+    /// observation is allowed to move. A head-pose obs with `depth: 2`
+    /// adjusts head+neck only — a saturated / wrong face pose can then
+    /// never twist the torso, whose orientation is owned by the body
+    /// keypoints. `usize::MAX` = whole chain incl. root.
+    pub chain_depth: usize,
 }
 
 /// A depth point cloud in the colour camera frame (metres). Points should
@@ -93,6 +115,8 @@ pub struct FrameObs {
     pub kp2d: Vec<Kp2d>,
     pub kp3d: Vec<Kp3d>,
     pub cloud: Option<Cloud>,
+    /// Direct world-orientation observations (see [`OriObs`]).
+    pub ori: Vec<OriObs>,
     /// Coarse torso reference (camera metres, e.g. shoulder-mid from
     /// depth) used only to seed the root on (re)acquisition.
     pub torso_hint: Option<V3>,
@@ -974,7 +998,9 @@ impl Estimator {
             for kp in &obs.kp3d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
                 let inv_s = 1.0 / kp.sigma.max(1e-4);
-                let r = scale(sub(pw, kp.p), inv_s);
+                let inv_lat = inv_s / kp.lat_scale.max(1.0);
+                let d = sub(pw, kp.p);
+                let r = [d[0] * inv_lat, d[1] * inv_lat, d[2] * inv_s];
                 let s = dot(r, r);
                 let (rho, w) = kern.eval(s);
                 cost += rho;
@@ -987,7 +1013,7 @@ impl Estimator {
                 point_jac(model, st, fk, kp.point, joint, &mut self.jac);
                 self.jac2.clear();
                 for &(i, v) in &self.jac {
-                    self.jac2.push((i, scale(v, inv_s)));
+                    self.jac2.push((i, [v[0] * inv_lat, v[1] * inv_lat, v[2] * inv_s]));
                 }
                 self.dense.add_residual3(&self.jac2, r, w);
             }
@@ -1117,6 +1143,65 @@ impl Estimator {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ---- direct orientation observations ---------------------------------------
+        for o in &obs.ori {
+            if o.joint >= model.joints.len() {
+                continue;
+            }
+            let e = so3_log(&mat_mul(&fk.r[o.joint], &transpose(&o.target)));
+            let inv = 1.0 / o.sigma.max(1e-3);
+            let jl_inv = so3_left_jacobian_inv(e);
+            // World-axis columns of every ancestor rotation param (the same
+            // chain walk the covariance propagation uses).
+            let mut cols: Vec<(usize, V3)> = Vec::with_capacity(48);
+            let mut k = o.joint;
+            let mut depth_left = o.chain_depth;
+            loop {
+                if depth_left == 0 {
+                    break;
+                }
+                depth_left -= 1;
+                let jd = &model.joints[k];
+                let pidx = model.joint_param[k];
+                let pr = match jd.parent {
+                    Some(pp) => fk.r[pp],
+                    None => st.root_r,
+                };
+                match jd.kind {
+                    JointKind::Ball { .. } => {
+                        for c in 0..3 {
+                            cols.push((pidx + c, col(&pr, c)));
+                        }
+                    }
+                    JointKind::Hinge { axis, .. } => cols.push((pidx, mat_vec(&pr, axis))),
+                }
+                match jd.parent {
+                    Some(pp) => k = pp,
+                    None => break,
+                }
+            }
+            if depth_left > 0 {
+                for c in 0..3 {
+                    let mut ax = [0.0; 3];
+                    ax[c] = 1.0;
+                    cols.push((ROOT_ROT + c, ax));
+                }
+            }
+            for r_idx in 0..3 {
+                let r = e[r_idx] * inv;
+                cost += r * r;
+                if build {
+                    self.row_out.clear();
+                    for &(i, a) in &cols {
+                        // d e / dδ_i = J_l⁻¹(e) · a
+                        let v = mat_vec(&jl_inv, a);
+                        self.row_out.push((i, v[r_idx] * inv));
+                    }
+                    self.dense.add_residual(&self.row_out, r, 1.0);
                 }
             }
         }
@@ -1729,6 +1814,7 @@ mod tests {
                 point: ModelPoint::Joint(j),
                 p: fk_gt0.t[j],
                 sigma: 0.02,
+                lat_scale: 1.0,
             })
             .collect();
         let obs = FrameObs {
@@ -1737,6 +1823,7 @@ mod tests {
             kp2d: observe(m, &gt, intr, 1.0),
             kp3d,
             cloud: Some(cloud_from_capsules(m, &gt, 12)),
+            ori: Vec::new(),
             torso_hint: None,
             surface: Vec::new(),
         };
@@ -1796,7 +1883,8 @@ mod tests {
                     kp2d: full.clone(),
                     kp3d: Vec::new(),
                     cloud: None,
-                    torso_hint: None,
+                    ori: Vec::new(),
+            torso_hint: None,
             surface: Vec::new(),
                 },
             );
@@ -1829,7 +1917,8 @@ mod tests {
                     kp2d: partial.clone(),
                     kp3d: Vec::new(),
                     cloud: None,
-                    torso_hint: None,
+                    ori: Vec::new(),
+            torso_hint: None,
             surface: Vec::new(),
                 },
             );
@@ -1878,7 +1967,8 @@ mod tests {
                     kp2d: observe(m, &s, intr, 1.0),
                     kp3d: Vec::new(),
                     cloud: None,
-                    torso_hint: None,
+                    ori: Vec::new(),
+            torso_hint: None,
             surface: Vec::new(),
                 },
             );
@@ -1924,7 +2014,7 @@ mod gradient_tests {
         st.apply_delta(m, &d);
         let mut est = Estimator::new(m, Params { cloud_budget: 1.0, ..Params::default() });
         est.state = st.clone();
-        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], cloud: None, torso_hint: None, surface: Vec::new() };
+        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], cloud: None, ori: Vec::new(), torso_hint: None, surface: Vec::new() };
         let prior_var = vec![1e9; m.num_params];
         // Build with only cloud terms: temporarily disable priors by huge sigma? Priors are always on; compare gradient of total instead.
         let fk = m.fk(&st);
@@ -1975,7 +2065,7 @@ mod timing_tests {
         est.state.root_t=[0.0,0.3,1.5];
         let t0 = std::time::Instant::now();
         for i in 0..30 {
-            let obs = FrameObs{ t:i as f64/30.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:Some(Cloud{points:pts.clone(),sigma:vec![]}), torso_hint: None, surface: Vec::new() };
+            let obs = FrameObs{ t:i as f64/30.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:Some(Cloud{points:pts.clone(),sigma:vec![]}), ori: Vec::new(), torso_hint: None, surface: Vec::new() };
             est.update(m,&obs);
         }
         eprintln!("30 frames: {:.1} ms/frame, last iters {} n_cloud {}", t0.elapsed().as_secs_f64()*1000.0/30.0, est.diag.iters, est.diag.n_cloud);
@@ -2006,7 +2096,7 @@ mod timing_tests2 {
         let cl: Vec<([f64;3],f64)> = pts.iter().map(|p| ([p[0] as f64,p[1] as f64,p[2] as f64],0.012)).collect();
         let mut est = Estimator::new(m, Params::default());
         est.state = gt.clone();
-        let obs = FrameObs{ t:0.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:None, torso_hint: None, surface: Vec::new() };
+        let obs = FrameObs{ t:0.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:None, ori: Vec::new(), torso_hint: None, surface: Vec::new() };
         let pv = vec![1.0; m.num_params];
         let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&cl,&pv,0.03,true);} eprintln!("accumulate build: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
         let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&cl,&pv,0.03,false);} eprintln!("accumulate eval: {:.2} ms", t.elapsed().as_secs_f64()*100.0);

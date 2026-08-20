@@ -451,6 +451,18 @@ fn main() -> Result<(), String> {
                 jr(h.j.spine1), jr(h.j.spine2), jr(h.j.spine3), jr(h.j.neck), jr(h.j.head), jr(h.j.l_hip), jr(h.j.l_knee)
             );
         }
+        if std::env::var_os("VULVATAR_REPLAY_HEADREF").is_some() {
+            // Estimator head yaw vs the FaceMesh-selected face channel
+            // (dense 478-landmark pose, trustworthy to ~±45°).
+            if let (Some(f), Some(c)) = (
+                est_out.skeleton.face,
+                est_out.skeleton.face_mesh_confidence,
+            ) {
+                if c > 0.6 {
+                    eprintln!("HEADREF idx {idx} est_yaw {hy:.1} est_pitch {hp:.1} sel_yaw {:.1} sel_pitch {:.1} mesh_c {c:.2}", f.yaw.to_degrees(), f.pitch.to_degrees());
+                }
+            }
+        }
         torso_yaws.push(ty);
         head_yaws.push(hy);
         head_pitches.push(hp);

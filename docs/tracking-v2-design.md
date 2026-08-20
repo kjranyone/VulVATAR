@@ -1,13 +1,10 @@
-# Tracking v2 — 観測融合型ボディフィッタ (根本リライト設計)
+# Tracking v2 — 観測融合型ボディフィッタ
 
-Status: **実装中 (2026-08-19)** — Phase 1–3 の骨格は `src/tracking/fusion/` に実装済みで
-本番プロバイダ (`FusionProvider`, `create_pose_provider` の既定) として稼働。実装状況は末尾 §13。
-本書は現行パイプライン (`src/tracking/skeleton_from_depth.rs` + `src/avatar/pose_solver.rs`) を
-**置き換える**設計であり、既存層への追加ではない。
+Status: **本番 (2026-08-20)** — `FusionProvider` (`src/tracking/fusion/`) が唯一の経路。
+実装状況は末尾 §13。
 
-関連: [tracking-retargeting.md](tracking-retargeting.md) (`TrackingRigPose` 契約は維持),
-[onnx-tracking-pipeline.md](onnx-tracking-pipeline.md) (v1 の記録),
-[threading-model.md](threading-model.md)。
+関連: [architecture.md](architecture.md), [threading-model.md](threading-model.md),
+[calibration-ux.md](calibration-ux.md)。
 
 ---
 
@@ -248,14 +245,15 @@ GPU は逐次 (Arc TDR 対策)。合計 ≤ 60 ms/GPU フレームで body 15 Hz
 
 ---
 
-## 13. 実装状況 (2026-08-19)
+## 13. 実装状況 (2026-08-20)
 
 | 項目 | 状態 | 場所 |
 |---|---|---|
 | 関節体モデル (VRM T-pose 基準、~120 DoF、カプセル、解析ヤコビアン) | ✅ | `fusion/model.rs` |
 | 推定器 (LM + 共分散、2D/3D/表面/点群項、関節限界・姿勢・形状事前、時間事前、GNC bootstrap、再捕捉、シード候補) | ✅ | `fusion/estimator.rs`, `fusion/seed.rs` |
 | 観測生成 (SimCC σ、crop 境界カリング、深度リフト + モデル z-buffer 遮蔽判定、学習顔形状、点群 ROI) | ✅ | `fusion/observe.rs`, `rtmw3d/decode.rs` |
-| FaceMesh 478 + face-68 の個人剛体顔 (自己学習) | ✅ | `fusion/observe.rs::FaceShape` |
+| 顔: MediaPipe canonical face template (固定剛体) + スケール/オフセットのみ学習 | ✅ 自己学習 FaceShape は回転ゲージ自由度で頭部姿勢バイアスを吸収するため廃止 | `fusion/canonical_face.rs`, `fusion/provider.rs` |
+| 頭部方位観測 (OriObs): FaceMesh transformation-matrix 姿勢を head 関節への SO(3) 直接観測として注入 | ✅ 大 yaw 主張は深度頬プロファイルの裏付け必須 (palm-lock 対策)、鼻オクルージョンでクールダウン | `fusion/estimator.rs::OriObs`, `fusion/provider.rs` |
 | 手 crop (MediaPipe hand landmarker、検出器/予測駆動) | ✅ 2D のみ (world 出力は非メトリックで未使用) | `fusion/hands.rs` |
 | RigPose 出力 + 互換 SourceSkeleton | ✅ | `fusion/output.rs` |
 | リターゲット (world-delta、σ ゲート、root アンカー) | ✅ | `avatar/retarget.rs` |
@@ -266,6 +264,14 @@ GPU は逐次 (Arc TDR 対策)。合計 ≤ 60 ms/GPU フレームで body 15 Hz
 | AprilTag GT リグ / 実データ mm-deg ベンチ | ❌ 未着手 (Phase 0 の物理リグはユーザー作業が必要) | — |
 | 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床/事前なし | — |
 | v1 撤去 | ✅ 2026-08-20: `skeleton_from_depth` / `rtmw3d_with_depth` / `hand_hold` / `auto_neutral` / `arm_z` / `rtmw3d::skeleton` / `pose_solver` (位置ベース経路) と v1 専用ベンチ 11 本を削除。式解決は `avatar/expressions.rs`、共有型は `tracking/metric_frame.rs` に残置 | — |
+
+### 品質パス知見 (2026-08-20)
+- **頭部 yaw 振幅の頭打ちの真因は密メッシュの前額化**: FaceMesh のランドマーク x/y は 30° 超で正面配置へ圧縮される (transformation-matrix 姿勢は正しいまま)。468 点 × σ2px の 2D 残差は正直な方位ソースを ~40:1 で圧殺するため、メッシュ 2D は**重心 1 点** (位置アンカー) に集約し、方位は OriObs + 深度 z プロファイルへ委譲。深度リフト 3D 点は lateral σ を 6 倍 (z のみ本物、`Kp3d::lat_scale`)。
+- **FaceMesh は palm-lock する**: 手が顔付近にあると conf 0.9+ のまま yaw が −0.8 rad 級に飽和し続ける (正面顔で)。conf・耳スコア・鼻オフセットは live 真横顔と識別不能 — 唯一の物理的裁定者は深度の頬プロファイル (顔ボックス列中央値の LS 勾配 × 全幅、|Δz| > 4 cm + 符号一致)。|yaw| > 0.35 rad の主張は常時この裏付けが必要。
+- **顎に手は正常運用**: 手矩形×顔ボックス重なりを Ori のハードゲートにすると chin-on-hand で頭が恒久停止する。ハードブロックは「鼻が手矩形内」+5 フレームのみ。
+- **OriObs のチェーン切断は発散**: ヤコビアンを neck/head に限定すると LM 線形化と実コストが不整合になり全録画で胴 ±175° スピン。全チェーン + 悪い target を入れない、が正解。
+- **ハンドクロップは顔で幻覚する**: MediaPipe hand landmarker は顔のクロップに presence 0.9 を返し、前フレーム再クロップ候補で自己永続する。body 検出器の裏付け (手首 kp または手ブロック 6 点が crop 近傍) を 3 フレーム欠くロックは破棄 (`hand_unsupported`)。
+- 実測: live 横顔セッション頭 yaw est 12.3°→**32.7°** (sel 48.1)、palms 胴 yaw std 12.0→**10.2**、wave 13.5 (Ori 毒 0)、namaste 6.0、desk 400f std 1.7。
 
 ### リプレイ実測 (2026-08-19, dev build)
 - desk 録画 400 フレーム (640×480): 胴 yaw std **1.0°**、肩メトリック残差中央値 **5 mm**、再捕捉 0、手は非観測 (data-σ duty 0)、推定器 3.3 ms/フレーム。

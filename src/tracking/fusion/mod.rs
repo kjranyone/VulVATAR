@@ -6,6 +6,7 @@
 //! posterior covariance is carried between frames. The output is joint
 //! angles + root pose + per-joint σ.
 
+pub mod canonical_face;
 pub mod estimator;
 pub mod math;
 pub mod model;

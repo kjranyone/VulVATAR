@@ -303,6 +303,7 @@ pub fn hand_observations(
                     point: pt,
                     p: add(w, rel),
                     sigma: 0.015 * (1.0 + 2.0 * (1.0 - res.presence as f64)),
+                lat_scale: 1.0,
                 });
             }
         }

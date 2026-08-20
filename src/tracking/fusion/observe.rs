@@ -131,7 +131,11 @@ pub fn body_kp2d(
 ) {
     let w = width as f64;
     let h = height as f64;
+    let abl_no_headkp = std::env::var_os("VULVATAR_ABL_NOHEADKP").is_some();
     for (i, kp) in kps.iter().enumerate() {
+        if abl_no_headkp && i < 5 {
+            continue;
+        }
         let Some(Some(point)) = map.points.get(i) else { continue };
         if !(kp.score >= pol.min_score) || !kp.nx.is_finite() || !kp.ny.is_finite() {
             continue;
@@ -214,6 +218,7 @@ pub fn body_kp3d(
             point: *point,
             p: p_joint,
             sigma: s,
+                lat_scale: 1.0,
         });
     }
 }
@@ -306,6 +311,7 @@ pub fn body_torso_leg_depth(
                 point: *point,
                 p: p_joint,
                 sigma: sigma * (1.0 + (1.0 - kp.score as f64)),
+                lat_scale: 1.0,
             });
         }
     }
@@ -529,138 +535,6 @@ pub fn cloud_near_model(
     Cloud {
         points: out,
         sigma: Vec::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Learned face shape (per-landmark head-local offsets)
-// ---------------------------------------------------------------------------
-
-/// Robust running estimate of where each face landmark sits in the head
-/// frame. Landmarks are lifted to 3-D with the depth map while the head
-/// pose is well determined, expressed head-locally, and averaged. Once a
-/// landmark has enough samples it becomes an [`ModelPoint::Attached`]
-/// point with tight σ — a personal rigid face model that turns every
-/// dense landmark into a head-pose constraint.
-pub struct FaceShape {
-    pub local: Vec<V3>,
-    pub count: Vec<u32>,
-    /// Running MAD-ish spread per landmark (m), for outlier gating.
-    pub spread: Vec<f64>,
-    pub min_count: u32,
-}
-
-impl FaceShape {
-    pub fn new(n: usize, min_count: u32) -> Self {
-        Self {
-            local: vec![[0.0; 3]; n],
-            count: vec![0; n],
-            spread: vec![0.02; n],
-            min_count,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        for l in self.local.iter_mut() {
-            *l = [0.0; 3];
-        }
-        for c in self.count.iter_mut() {
-            *c = 0;
-        }
-        for s in self.spread.iter_mut() {
-            *s = 0.02;
-        }
-    }
-
-    /// Learn from one frame. `head_r/head_t` = head joint frame (camera);
-    /// `lm` = landmarks in frame pixels; `depth_at(u,v)` returns the metric
-    /// point under a pixel; `z_ref` = head centre depth for the band gate.
-    pub fn learn<F: Fn(f64, f64) -> Option<V3>>(
-        &mut self,
-        head_r: &M3,
-        head_t: V3,
-        lm: &[[f32; 3]],
-        depth_at: F,
-        z_ref: f64,
-    ) {
-        let rt = transpose(head_r);
-        for (i, l) in lm.iter().enumerate() {
-            if i >= self.local.len() {
-                break;
-            }
-            if !l[0].is_finite() || !l[1].is_finite() {
-                continue;
-            }
-            let Some(p) = depth_at(l[0] as f64, l[1] as f64) else { continue };
-            if (p[2] - z_ref).abs() > 0.15 {
-                continue;
-            }
-            let local = mat_vec(&rt, sub(p, head_t));
-            if norm(local) > 0.25 {
-                continue;
-            }
-            let c = self.count[i];
-            if c == 0 {
-                self.local[i] = local;
-                self.count[i] = 1;
-                continue;
-            }
-            let d = norm(sub(local, self.local[i]));
-            // Outlier gate once we have a few samples.
-            if c >= 5 && d > 3.0 * self.spread[i].max(0.004) {
-                continue;
-            }
-            let alpha = (1.0 / (c as f64 + 1.0)).max(0.02);
-            self.local[i] = add(self.local[i], scale(sub(local, self.local[i]), alpha));
-            self.spread[i] += (d - self.spread[i]) * alpha;
-            self.count[i] = c + 1;
-        }
-    }
-
-    /// Emit 2-D (and, with depth, 3-D) observations for learned landmarks.
-    #[allow(clippy::too_many_arguments)]
-    pub fn observe<F: Fn(f64, f64) -> Option<V3>>(
-        &self,
-        head_joint: usize,
-        lm: &[[f32; 3]],
-        sigma_px: f64,
-        sigma_3d: f64,
-        depth_at: F,
-        z_ref: f64,
-        out2d: &mut Vec<Kp2d>,
-        out3d: &mut Vec<Kp3d>,
-    ) {
-        for (i, l) in lm.iter().enumerate() {
-            if i >= self.local.len() || self.count[i] < self.min_count {
-                continue;
-            }
-            if !l[0].is_finite() || !l[1].is_finite() {
-                continue;
-            }
-            let point = ModelPoint::Attached {
-                joint: head_joint,
-                local: self.local[i],
-            };
-            out2d.push(Kp2d {
-                point,
-                u: l[0] as f64,
-                v: l[1] as f64,
-                sigma: sigma_px,
-            });
-            if let Some(p) = depth_at(l[0] as f64, l[1] as f64) {
-                if (p[2] - z_ref).abs() < 0.15 {
-                    out3d.push(Kp3d {
-                        point,
-                        p,
-                        sigma: sigma_3d,
-                    });
-                }
-            }
-        }
-    }
-
-    pub fn learned_count(&self) -> usize {
-        self.count.iter().filter(|&&c| c >= self.min_count).count()
     }
 }
 
