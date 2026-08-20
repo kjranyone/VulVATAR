@@ -109,8 +109,8 @@ pub struct RuntimeToggles {
     /// pose carries `metric_frame_info` (D435 metric path), the render camera
     /// switches from the free orbit camera to the depth sensor's own
     /// intrinsics + a front-facing view, so the avatar is framed with the
-    /// real lens (FOV, principal point) — a mirror. Ignored on the webcam
-    /// path (no intrinsics) and while unset.
+    /// real lens (FOV, principal point) — a mirror. Ignored when the
+    /// pose has no intrinsics and while unset.
     pub mirror_view: bool,
 }
 

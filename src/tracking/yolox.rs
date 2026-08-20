@@ -9,7 +9,7 @@
 //!
 //! RTMW3D is a top-down model — accuracy degrades roughly linearly with
 //! how much of the model input is "person pixels" vs background. With a
-//! whole 16:9 webcam frame squashed into 288×384, a subject that fills
+//! whole 16:9 camera frame squashed into 288×384, a subject that fills
 //! 60% of the camera height ends up filling ~60% of model height, which
 //! is fine. But on inputs where the subject is smaller (jumping mid-air,
 //! camera further back, or just not centred), the model gets a tiny

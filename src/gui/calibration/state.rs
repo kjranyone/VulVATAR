@@ -11,10 +11,8 @@ use eframe::egui;
 use crate::tracking::{CalibrationMode, PoseCalibration};
 
 /// Calibration-related fields lifted out of `GuiApp`. Aggregates the
-/// modal state, the live webcam preview texture used by the modal,
-/// calibration-mode hint we pushed (so the GUI only forwards on
-/// edges), and the asynchronous target-pose snapshot render. Part of
-/// the architecture-finding #10 GUI state split.
+/// modal state, the live camera preview texture used by the modal,
+/// and the asynchronous target-pose snapshot render.
 #[derive(Default)]
 pub struct CalibrationUiState {
     /// Modal state-machine variant (Closed / Idle / WaitingForPose /
@@ -32,7 +30,7 @@ pub struct CalibrationUiState {
     pub preview_annotation: Option<crate::tracking::DetectionAnnotation>,
     /// One-shot offscreen render of the active avatar in the
     /// calibration target pose (T-pose for FullBody, hands-at-sides
-    /// for UpperBody). Shown beside the webcam preview in the modal
+    /// for UpperBody). Shown beside the camera preview in the modal
     /// as a "this is what you should look like" reference.
     pub target_pose_texture: Option<egui::TextureHandle>,
     /// The mode the current `target_pose_texture` was rendered for.
@@ -141,7 +139,7 @@ pub enum CalibrationModalState {
         /// "Bust-up framing fallback"). Set once when `mode == UpperBody` and
         /// `no_lower_arms_since` survives `NO_ANCHOR_HINT_SECONDS`:
         /// the shoulder anchor is visible but both elbows are cropped
-        /// out (webcam-streamer framing where the arm-direction gate
+        /// out (desk-delivery framing where the arm-direction gate
         /// can never fire). While `true`, the gate scores **anchor
         /// stillness** instead of arm direction, and the instruction
         /// pane swaps to "face your usual forward and hold still". Latched —
@@ -335,16 +333,6 @@ impl CalibrationModalState {
 
     pub fn close(&mut self) {
         *self = CalibrationModalState::Closed;
-    }
-
-    /// The mode currently driving the modal, in any non-`Closed` state.
-    /// Returns `None` when the modal is closed. Used by the GUI's
-    /// per-frame loop to push a calibration-mode hint to the tracking
-    /// worker so the provider's `force_shoulder_anchor` flips on the
-    /// instant the user opens an `UpperBody` capture, instead of waiting
-    /// for `persist_calibration` to fire after a successful capture.
-    pub fn active_mode(&self) -> Option<CalibrationMode> {
-        relevant_mode(self)
     }
 }
 

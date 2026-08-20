@@ -254,10 +254,9 @@ pub struct SourceSkeleton {
     /// vice-versa).
     pub root_anchor_is_hip: bool,
     /// `Some` iff this skeleton was built from a true metric-depth backend
-    /// (RealSense D435). See [`MetricFrameInfo`] — its presence is the single
-    /// signal that switches the solver and render onto the metric-3D-direct
-    /// path (faithful camera-space projection) instead of the monocular
-    /// heuristics kept for the 2D webcam fallback. `None` for 2D providers.
+    /// (RealSense D435). See [`MetricFrameInfo`] — its presence is the
+    /// signal that the sample carries true camera metres / intrinsics.
+    /// `None` for synthetic / 2D-only producers.
     pub metric_frame_info: Option<MetricFrameInfo>,
     /// Tracking-v2 output: joint rotations + root + per-joint σ from the
     /// fusion estimator (`tracking::fusion`). `Some` ⇒ the avatar is

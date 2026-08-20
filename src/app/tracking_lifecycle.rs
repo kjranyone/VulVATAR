@@ -57,7 +57,7 @@ impl Application {
         }
     }
 
-    /// True if the webcam tracking worker is currently running. Used by
+    /// True if the tracking worker is currently running. Used by
     /// the inspector to decide whether a resolution / framerate combo
     /// change should restart the worker in place.
     pub fn is_tracking_running(&self) -> bool {

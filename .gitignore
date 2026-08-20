@@ -18,23 +18,16 @@
 Thumbs.db
 .DS_Store
 
-# ONNX Models
+# ONNX models fetched by `dev.ps1` (not committed).
+# `models/viseme_nn.onnx.data` is the only committed model artifact.
 models/*.onnx
 
-# HMR2 ONNX PoC export artifacts (experimental — see memory project_hmr2_poc;
-# regenerate via hmr2_export/export_onnx.py). These are the 2.7 GB external-data
-# tensors dumped flat into models/ (one file per tensor), plus the fp16/int8
-# variants. `models/viseme_nn.onnx.data` is the only committed model artifact and
-# is unaffected (already tracked).
+# Retired PoC dumps — ignore if they reappear on disk.
 models/hmr2*
 models/backbone.*
 models/onnx__*
 models/smpl_head.*
-
-# Downloaded model bundles (fetched out-of-band, not committed)
 models/vitpose-h-wholebody_onnx/
-
-# HMR2 Python PoC workspace (venv + HF cache + 4D-Humans clone + export scripts)
 /hmr2_export/
 
 # Gemini / Antigravity CLI workspace symlink

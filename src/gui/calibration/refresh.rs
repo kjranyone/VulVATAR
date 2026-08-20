@@ -3,7 +3,7 @@
 //! per-frame keypoint data into `Collecting`'s sample vec /
 //! `RangeCollecting`'s min/max counters. Called once per frame from
 //! [`super::panes::draw_preview_pane`] (which already takes the
-//! mailbox snapshot for the webcam preview, so we piggyback on its
+//! mailbox snapshot for the camera preview, so we piggyback on its
 //! work).
 
 use std::time::Instant;

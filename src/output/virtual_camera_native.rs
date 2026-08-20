@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 use log::{info, warn};
 
 #[derive(Clone, Debug)]

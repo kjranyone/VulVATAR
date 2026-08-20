@@ -28,7 +28,7 @@ use crate::simulation::SimulationStepOptions;
 /// window `[stale_timeout, TRACKING_HOLD_WINDOW]` the last good sample
 /// is reused with its confidence decayed linearly so the avatar
 /// freezes and then fades back instead of snapping. Tuned for typical
-/// webcam tracking hiccups (occluded face, brief out-of-frame); larger
+/// tracking hiccups (occluded face, brief out-of-frame); larger
 /// values risk visible "phantom pose" persistence after the user has
 /// genuinely walked away.
 const TRACKING_HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -324,10 +324,9 @@ impl Application {
                 time_seconds: self.background_time as f32,
                 export_mode,
                 // 1:1 mirror camera: only when the toggle is on AND the live
-                // pose is metric-native (carries the D435 intrinsics). On the
-                // webcam path `metric_frame_info` is `None`, so this stays
-                // `None` and the free orbit camera is used — the toggle is a
-                // no-op there, exactly as intended.
+                // pose is metric-native (carries the D435 intrinsics). When
+                // `metric_frame_info` is `None` this stays `None` and the
+                // free orbit camera is used — the toggle is a no-op there.
                 sensor_camera: if toggles.mirror_view {
                     self.last_tracking_pose
                         .as_ref()

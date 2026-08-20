@@ -1,10 +1,9 @@
 //! Wrapper around `MFCreateVirtualCamera`.
 //!
-//! Replaces the legacy DirectShow-only registrar (`directshow_filter`)
-//! with the modern MediaFoundation virtual camera path. The companion DLL
-//! `vulvatar_mf_camera.dll` (sub-crate `vulvatar-mf-camera`) hosts the
-//! `IMFMediaSource` referenced by the CLSID below. Windows' Frame Server
-//! loads that COM server out of HKLM registration.
+//! The companion DLL `vulvatar_mf_camera.dll` (sub-crate
+//! `vulvatar-mf-camera`) hosts the `IMFMediaSource` referenced by the
+//! CLSID below. Windows' Frame Server loads that COM server out of
+//! HKLM registration.
 //!
 //! The virtual camera is created with `MFVirtualCameraLifetime_Session`
 //! so it disappears the moment the main process exits — no cleanup needed

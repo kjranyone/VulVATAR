@@ -1,8 +1,8 @@
 //! Permissive DACL helper for `Global\` named shared sections.
 //!
 //! When the interactive-user producer (this process) and a non-interactive
-//! consumer (FrameServer-hosted MF DLL or a DirectShow filter loaded into
-//! another user's process) race to be the first to call
+//! consumer (FrameServer-hosted MF DLL loaded into another user's
+//! process) race to be the first to call
 //! `CreateFileMappingW` on the same name, whichever side wins applies its
 //! own DACL to the kernel section object. With `lpFileMappingAttributes =
 //! NULL` the kernel uses the creator's default DACL, which denies the

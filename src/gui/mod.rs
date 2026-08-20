@@ -233,7 +233,7 @@ pub struct ViewportUiState {
     /// Cursor position at drag start; restored when the drag ends.
     /// `None` when no drag is in progress.
     pub drag_origin: Option<egui::Pos2>,
-    /// Whether the camera-wipe PIP (live webcam preview) is shown.
+    /// Whether the camera-wipe PIP (live camera preview) is shown.
     pub show_camera_wipe: bool,
     /// Whether the 2D detection annotation overlay is drawn over the
     /// camera-wipe PIP.
@@ -1815,14 +1815,6 @@ impl eframe::App for GuiApp {
         self.poll_thumbnail_jobs(ctx);
         self.poll_avatar_load_job();
 
-        // Forward the calibration-mode hint on edges. Called twice per
-        // update — once here (covers "user switched mode via the
-        // segmented buttons in Idle"), once after `draw_modal` (covers
-        // Cancel / Esc / auto-close transitions that happen *inside*
-        // `draw_modal`, which would otherwise leave a stale
-        // `Some(UpperBody|FullBody)` on the worker until the next
-        // unrelated repaint reason fires).
-
         // Path 1: reconcile GUI-owned settings into Application before
         // running the frame. See the wiring overview above
         // `sync_app_settings`.
@@ -1905,14 +1897,6 @@ impl eframe::App for GuiApp {
         // inspector panel. No-op when the modal is closed.
         calibration::draw_modal(ctx, self);
 
-        // Re-sync the calibration-mode hint *after* the modal has had a
-        // chance to transition (Cancel / Esc / Done auto-close all
-        // mutate `calibration_modal` from inside `draw_modal`). Without
-        // this second pass the worker keeps the last-pushed
-        // `Some(UpperBody|FullBody)` until some unrelated repaint fires,
-        // which on a static avatar with no autosave can be never — the
-        // provider would override the persisted calibration forever.
-
         // Loading-spinner overlay while a background avatar load is in flight.
         if let Some(job) = self.library.avatar_load_job.as_ref() {
             let stage_label = load_stage_label(&job.current_stage);
@@ -1985,7 +1969,7 @@ impl eframe::App for GuiApp {
         // (clicks, key presses, mouse moves), so we don't have to.
         //
         // Conditions that require a follow-up tick:
-        // - tracking active (live webcam → avatar pose)
+        // - tracking active (live camera → avatar pose)
         // - lipsync active (volume meter, viseme stream)
         // - avatar load in progress (progress bar)
         // - notification toast still visible (fade animation)

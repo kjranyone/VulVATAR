@@ -9,7 +9,7 @@
 //!    avatar in the calibration mode's reference pose (T-pose for
 //!    FullBody, hands-at-sides for UpperBody) uploaded to an egui
 //!    texture, which the calibration modal draws alongside the
-//!    webcam preview pane so the user can mimic it.
+//!    camera preview pane so the user can mimic it.
 //!
 //! Both paths share the render-thread `request_thumbnail` machinery
 //! and the GuiApp-side per-frame poll dispatch — keeping them
@@ -222,7 +222,7 @@ impl GuiApp {
     /// in the calibration target pose (T-pose for FullBody,
     /// hands-at-sides for UpperBody). Output extent is 240x270 so
     /// the rendered image lines up vertically with the modal's
-    /// webcam preview pane.
+    /// camera preview pane.
     fn build_calibration_target_pose_frame_input(
         &self,
         avatar: &crate::avatar::AvatarInstance,
@@ -233,11 +233,11 @@ impl GuiApp {
         use crate::renderer::material::MaterialUploadRequest;
         use std::sync::Arc;
 
-        // Match the modal's webcam preview height (270 px) and pick a
+        // Match the modal's camera preview height (270 px) and pick a
         // width that fits a head-to-hips framing for both T-pose and
         // hands-at-sides without empty space. 240 keeps the modal
         // total width reasonable when the target snapshot is shown
-        // alongside the 480-wide webcam.
+        // alongside the 480-wide camera pane.
         let extent: [u32; 2] = [240, 270];
 
         let mesh_instances: Vec<RenderMeshInstance> = avatar

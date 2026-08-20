@@ -1,5 +1,5 @@
 //! egui rendering for the calibration modal: the entry point
-//! [`draw_modal`], the per-state status panes, the webcam preview
+//! [`draw_modal`], the per-state status panes, the camera preview
 //! pane, and the small view-formatting helpers (`step_text`,
 //! `progress_for`, `telemetry`, `mode_mismatch_hint`).
 //!
@@ -99,8 +99,8 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             // Wider min-size now that the modal carries three columns
-            // (webcam preview + target-pose snapshot + status pane)
-            // instead of the original two. Width = webcam (480) +
+            // (camera preview + target-pose snapshot + status pane)
+            // instead of the original two. Width = camera (480) +
             // target (240) + status (220) + paddings (≈ 32).
             ui.set_min_size(egui::vec2(972.0, 420.0));
             ui.horizontal_top(|ui| {
@@ -114,7 +114,7 @@ pub fn draw_modal(ctx: &egui::Context, state: &mut GuiApp) {
 }
 
 /// Target-pose reference pane (centre of the modal, between the
-/// webcam preview on the left and the status pane on the right).
+/// camera preview on the left and the status pane on the right).
 /// Renders the `calibration_target_pose_texture` snapshot if it's
 /// arrived from the render thread, or a "rendering…" placeholder
 /// while the kick is in flight. The snapshot is one-shot per mode —
