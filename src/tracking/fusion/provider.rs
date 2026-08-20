@@ -31,6 +31,9 @@ pub struct FusionProvider {
     hands: Option<super::hands::HandLandmarker>,
     /// Last hand-crop results `[left, right]` (diagnostics).
     pub last_hands: [Option<super::hands::HandResult>; 2],
+    /// Last LOCKED hand results (persist across a frame where every crop
+    /// missed) — the seed for the temporal crop candidate.
+    prev_hands: [Option<super::hands::HandResult>; 2],
     h: Humanoid,
     est: Estimator,
     body_map: BodyMap,
@@ -100,6 +103,7 @@ impl FusionProvider {
             rtmw3d,
             hands,
             last_hands: [None, None],
+            prev_hands: [None, None],
             h,
             est,
             body_map,
@@ -185,6 +189,7 @@ impl PoseProvider for FusionProvider {
     fn reset_temporal_state(&mut self) {
         self.rtmw3d.reset_temporal_state();
         self.est.reset(&self.h.model);
+        self.prev_hands = [None, None];
         self.face68.reset();
         self.mesh.reset();
         self.last_t = None;
@@ -375,18 +380,60 @@ impl PoseProvider for FusionProvider {
         self.last_hands = [None, None];
         if let Some(hl) = self.hands.as_mut() {
             for hand in 0..2 {
-                // Crop source: the body detector's hand block when it is
-                // confident (fresh every frame, independent of the estimator
-                // state), else the model prediction (bridges detector misses
-                // while the hand is tracked).
-                let crop = super::hands::detector_hand_crop(&det_kps, hand, width, height, 0.35, 96.0)
-                    .or_else(|| super::hands::predicted_hand_crop(&self.h, &fk_pred, hand, &intr, 96.0));
-                let Some(crop) = crop else { continue };
-                if let Some(res) = hl.estimate(rgb_data, width, height, crop) {
-                    if res.presence >= 0.5 {
+                // Crop candidates, best first: (1) last frame's locked hand
+                // re-cropped around its own landmarks (tightest, survives a
+                // detector miss), (2) the body detector's hand block, (3)
+                // the model prediction. Try until one locks (presence is
+                // bimodal — a hit reads ~0.9+, a miss ~0).
+                let mut candidates: Vec<(f32, f32, f32)> = Vec::with_capacity(3);
+                if let Some(prev) = self.prev_hands[hand].as_ref() {
+                    let (mut x0, mut y0, mut x1, mut y1) =
+                        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for p in &prev.px {
+                        x0 = x0.min(p[0]);
+                        y0 = y0.min(p[1]);
+                        x1 = x1.max(p[0]);
+                        y1 = y1.max(p[1]);
+                    }
+                    let span = (x1 - x0).max(y1 - y0).max(48.0);
+                    let size = span * 1.7;
+                    candidates.push((
+                        0.5 * (x0 + x1) - size * 0.5,
+                        0.5 * (y0 + y1) - size * 0.5,
+                        size,
+                    ));
+                }
+                if let Some(c) =
+                    super::hands::detector_hand_crop(&det_kps, hand, width, height, 0.35, 96.0)
+                {
+                    candidates.push(c);
+                }
+                if let Some(c) =
+                    super::hands::predicted_hand_crop(&self.h, &fk_pred, hand, &intr, 96.0)
+                {
+                    candidates.push(c);
+                }
+                let mut best: Option<super::hands::HandResult> = None;
+                for crop in candidates {
+                    if let Some(res) = hl.estimate(rgb_data, width, height, crop) {
+                        let better =
+                            best.as_ref().map(|b| res.presence > b.presence).unwrap_or(true);
+                        if better {
+                            let lock = res.presence >= 0.6;
+                            best = Some(res);
+                            if lock {
+                                break;
+                            }
+                        }
+                    }
+                }
+                match best {
+                    Some(res) if res.presence >= 0.5 => {
                         hand_done[hand] = true;
+                        self.prev_hands[hand] = Some(res.clone());
                         self.last_hands[hand] = Some(res);
                     }
+                    _ => self.prev_hands[hand] = None,
                 }
             }
         }
