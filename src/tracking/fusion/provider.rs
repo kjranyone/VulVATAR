@@ -749,6 +749,7 @@ impl PoseProvider for FusionProvider {
                         d.height,
                         z_ref,
                         0.3,
+                        &in_hand_rect,
                         &mut obs.kp3d,
                     );
                     body_torso_leg_depth(
@@ -909,6 +910,12 @@ impl PoseProvider for FusionProvider {
             obs.kp3d.retain(|k| {
                 use super::estimator::ModelPoint;
                 let pw = match k.point {
+                    // Site-based head points (nose / eyes / ears lifted by
+                    // `body_kp3d`) need the same far-side cull as the 2-D
+                    // ones: the detector places the hidden ear on the
+                    // silhouette, where the depth belongs to the NEAR side
+                    // of the head.
+                    ModelPoint::Site(sid) if head_sites.contains(&sid) => fkp.site[sid],
                     ModelPoint::Attached { joint, local } if joint == h.j.head => {
                         add(fkp.t[joint], mat_vec(&fkp.r[joint], local))
                     }

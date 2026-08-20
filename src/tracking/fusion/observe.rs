@@ -184,11 +184,20 @@ pub fn body_kp3d(
     height: u32,
     z_ref: Option<f64>,
     min_score: f32,
+    // `occluded(u, v)` = the pixel is inside an active hand crop. Face
+    // sites are not depth-lifted there (see below); hand/wrist entries
+    // ignore it, since their pixel is SUPPOSED to be inside a hand crop.
+    occluded: &dyn Fn(f64, f64) -> bool,
     out: &mut Vec<Kp3d>,
 ) {
     // (coco index, skin→joint offset m, σ m). Only limb ends: their pixel is
     // rarely occluded by another body part, so the depth is the joint's own
     // surface. Torso / leg joints go through `body_surface_points`.
+    // Ears were tried as an extra metric head anchor for face-cover
+    // frames and made every replay worse (headphones / hair sit proud of
+    // the anatomical point and the pixel often lands past the silhouette):
+    // torso yaw rms +1.5° on palms and wave, and a 81° pitch spike on
+    // namaste. The nose is the only face site worth lifting.
     const TABLE: [(usize, f64, f64); 7] = [
         (0, 0.0, 0.02),    // nose (site: on the surface)
         (7, 0.035, 0.045), // elbows (foreshortened arms put the pixel on the
@@ -213,6 +222,24 @@ pub fn body_kp3d(
         }
         let u = kp.nx as f64 * width as f64;
         let v = kp.ny as f64 * height as f64;
+        // A FACE keypoint whose pixel falls inside a hand crop is painted
+        // onto the occluder: the depth there is the palm's, ~20 cm nearer
+        // than the face, and lifting it at σ 2 cm drags the whole head —
+        // and with it the torso — into a false bow (measured: namaste
+        // head pitch +36°, torso pitch +21°, torso roll +27°). The 2-D
+        // residual stays and keeps anchoring head position; only the
+        // metric lift is dropped.
+        let sigma = if i < 5 && occluded(u, v) {
+            // Softened rather than dropped: dropping it costs the head its
+            // only metric anchor through a full-face cover (palms torso
+            // yaw swung ±25°), while keeping it at face σ bows the whole
+            // body. The palm sits ~5–10 cm proud of the face, so widen to
+            // that scale — the point still holds the head in place, and
+            // the bias is small against its own σ.
+            sigma * 5.0
+        } else {
+            sigma
+        };
         let Some(p) = window_point(points, width, height, u, v, 3, zlo, zhi) else { continue };
         let n = norm(p);
         if n < 0.1 {
