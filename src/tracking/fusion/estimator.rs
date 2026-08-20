@@ -96,6 +96,24 @@ pub struct OriObs {
     pub chain_depth: usize,
 }
 
+/// Torso-yaw observation: the angle of the shoulder line in the camera
+/// x/z plane, measured from the chest's depth slope. This is the only
+/// channel that carries torso yaw from depth — a torso CAPSULE is
+/// rotationally symmetric about its own axis, so the surface term is
+/// blind to yaw by construction, leaving the 2-D shoulder pixels alone
+/// to fix it (measured +17° of over-rotation against the depth
+/// reference on a live desk session).
+#[derive(Clone, Copy, Debug)]
+pub struct ShoulderYawObs {
+    /// Joint whose position is the LEFT end of the line.
+    pub left: usize,
+    /// … and the right end.
+    pub right: usize,
+    /// atan2(Δz_cam, Δx_cam) of the measured line, radians.
+    pub yaw: f64,
+    pub sigma: f64,
+}
+
 /// A depth point cloud in the colour camera frame (metres). Points should
 /// already be pre-filtered to the person's neighbourhood; the estimator
 /// caps the count and associates every point to the nearest capsule.
@@ -117,6 +135,8 @@ pub struct FrameObs {
     pub cloud: Option<Cloud>,
     /// Direct world-orientation observations (see [`OriObs`]).
     pub ori: Vec<OriObs>,
+    /// Torso yaw from the chest depth slope (see [`ShoulderYawObs`]).
+    pub shoulder_yaw: Option<ShoulderYawObs>,
     /// Coarse torso reference (camera metres, e.g. shoulder-mid from
     /// depth) used only to seed the root on (re)acquisition.
     pub torso_hint: Option<V3>,
@@ -1147,6 +1167,48 @@ impl Estimator {
             }
         }
 
+        // ---- torso yaw from the chest depth slope -----------------------------------
+        if let Some(o) = &obs.shoulder_yaw {
+            if o.left < model.joints.len() && o.right < model.joints.len() {
+                let v = sub(fk.t[o.left], fk.t[o.right]);
+                let d2 = v[0] * v[0] + v[2] * v[2];
+                if d2 > 1e-6 {
+                    let mut e = v[2].atan2(v[0]) - o.yaw;
+                    while e > std::f64::consts::PI {
+                        e -= 2.0 * std::f64::consts::PI;
+                    }
+                    while e < -std::f64::consts::PI {
+                        e += 2.0 * std::f64::consts::PI;
+                    }
+                    let inv = 1.0 / o.sigma.max(1e-3);
+                    let r = e * inv;
+                    cost += r * r;
+                    if build {
+                        // dθ/dv = (−v_z, 0, v_x) / (v_x² + v_z²)
+                        let dth = [-v[2] / d2, 0.0, v[0] / d2];
+                        self.jac.clear();
+                        point_jac(model, st, fk, ModelPoint::Joint(o.left), o.left, &mut self.jac);
+                        let jl = std::mem::take(&mut self.jac);
+                        self.jac.clear();
+                        point_jac(model, st, fk, ModelPoint::Joint(o.right), o.right, &mut self.jac);
+                        let jr = std::mem::take(&mut self.jac);
+                        self.row_out.clear();
+                        for &(i, g) in &jl {
+                            self.row_out.push((i, dot(dth, g) * inv));
+                        }
+                        for &(i, g) in &jr {
+                            // Shared ancestor params appear in both chains;
+                            // the solver's row builder sums duplicates.
+                            self.row_out.push((i, -dot(dth, g) * inv));
+                        }
+                        self.dense.add_residual(&self.row_out, r, 1.0);
+                        self.jac = jl;
+                        let _ = jr;
+                    }
+                }
+            }
+        }
+
         // ---- direct orientation observations ---------------------------------------
         for o in &obs.ori {
             if o.joint >= model.joints.len() {
@@ -1824,6 +1886,7 @@ mod tests {
             kp3d,
             cloud: Some(cloud_from_capsules(m, &gt, 12)),
             ori: Vec::new(),
+            shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
         };
@@ -1884,6 +1947,7 @@ mod tests {
                     kp3d: Vec::new(),
                     cloud: None,
                     ori: Vec::new(),
+            shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
                 },
@@ -1918,6 +1982,7 @@ mod tests {
                     kp3d: Vec::new(),
                     cloud: None,
                     ori: Vec::new(),
+            shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
                 },
@@ -1968,6 +2033,7 @@ mod tests {
                     kp3d: Vec::new(),
                     cloud: None,
                     ori: Vec::new(),
+            shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
                 },
@@ -2014,7 +2080,7 @@ mod gradient_tests {
         st.apply_delta(m, &d);
         let mut est = Estimator::new(m, Params { cloud_budget: 1.0, ..Params::default() });
         est.state = st.clone();
-        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], cloud: None, ori: Vec::new(), torso_hint: None, surface: Vec::new() };
+        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], cloud: None, ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: Vec::new() };
         let prior_var = vec![1e9; m.num_params];
         // Build with only cloud terms: temporarily disable priors by huge sigma? Priors are always on; compare gradient of total instead.
         let fk = m.fk(&st);
@@ -2065,7 +2131,7 @@ mod timing_tests {
         est.state.root_t=[0.0,0.3,1.5];
         let t0 = std::time::Instant::now();
         for i in 0..30 {
-            let obs = FrameObs{ t:i as f64/30.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:Some(Cloud{points:pts.clone(),sigma:vec![]}), ori: Vec::new(), torso_hint: None, surface: Vec::new() };
+            let obs = FrameObs{ t:i as f64/30.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:Some(Cloud{points:pts.clone(),sigma:vec![]}), ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: Vec::new() };
             est.update(m,&obs);
         }
         eprintln!("30 frames: {:.1} ms/frame, last iters {} n_cloud {}", t0.elapsed().as_secs_f64()*1000.0/30.0, est.diag.iters, est.diag.n_cloud);
@@ -2096,7 +2162,7 @@ mod timing_tests2 {
         let cl: Vec<([f64;3],f64)> = pts.iter().map(|p| ([p[0] as f64,p[1] as f64,p[2] as f64],0.012)).collect();
         let mut est = Estimator::new(m, Params::default());
         est.state = gt.clone();
-        let obs = FrameObs{ t:0.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:None, ori: Vec::new(), torso_hint: None, surface: Vec::new() };
+        let obs = FrameObs{ t:0.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:None, ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: Vec::new() };
         let pv = vec![1.0; m.num_params];
         let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&cl,&pv,0.03,true);} eprintln!("accumulate build: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
         let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&cl,&pv,0.03,false);} eprintln!("accumulate eval: {:.2} ms", t.elapsed().as_secs_f64()*100.0);

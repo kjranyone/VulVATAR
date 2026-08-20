@@ -288,6 +288,7 @@ impl PoseProvider for FusionProvider {
             kp3d: Vec::with_capacity(600),
             cloud: None,
             ori: Vec::new(),
+            shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
         };
@@ -766,6 +767,56 @@ impl PoseProvider for FusionProvider {
                         &mut obs.kp3d,
                         &mut obs.surface,
                     );
+                    // Torso yaw from the chest depth slope — the only
+                    // depth channel that carries it (see
+                    // `ShoulderYawObs`). Hand crops and predicted arm
+                    // capsules are excluded so a forearm across the chest
+                    // cannot tilt the fit.
+                    if std::env::var_os("VULVATAR_FUSION_NO_CHESTYAW").is_none() {
+                        let occl = |u: f64, v: f64| -> bool {
+                            if in_hand_rect(u, v) {
+                                return true;
+                            }
+                            let Some(p) = window_point(
+                                &d.points_m,
+                                d.width,
+                                d.height,
+                                u,
+                                v,
+                                1,
+                                0.15,
+                                6.0,
+                            ) else {
+                                return false;
+                            };
+                            let t_obs = norm(p);
+                            if t_obs <= 1e-6 {
+                                return false;
+                            }
+                            let dir = scale(p, 1.0 / t_obs);
+                            arm_capsules.iter().any(|&(a, b, r)| {
+                                super::estimator::ray_capsule_entry(dir, a, b, r)
+                                    .is_some_and(|t| t < t_obs + 0.05)
+                            })
+                        };
+                        if let Some((yaw, n)) = super::observe::chest_yaw_from_depth(
+                            &raw,
+                            &d.points_m,
+                            d.width,
+                            d.height,
+                            z_ref,
+                            &occl,
+                        ) {
+                            obs.shoulder_yaw = Some(super::estimator::ShoulderYawObs {
+                                left: self.h.j.l_shoulder,
+                                right: self.h.j.r_shoulder,
+                                yaw,
+                                // ~7° at a full 15-column fit, widening as
+                                // columns drop out.
+                                sigma: 0.12 * (15.0 / n as f64).sqrt(),
+                            });
+                        }
+                    }
                 }
             }
             // Face-68 block in frame pixels (learned shape).

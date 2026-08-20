@@ -403,24 +403,133 @@ fn main() -> Result<(), String> {
         // Reference torso yaw straight from the detector shoulders + depth
         // (independent of the estimator): atan2(Δz, Δx) of the two shoulder
         // surface points, when both have valid depth and decent score.
+        // Reference torso yaw, independent of the estimator: the depth
+        // slope across the CHEST. Two-point shoulder sampling was not
+        // robust — a forearm or clasped hands in front of a shoulder put
+        // that patch 25 cm nearer and swung the reference by 60°+ — so
+        // sample a strip between the shoulders, reduce each column to its
+        // median depth, reject columns that sit clearly in front of the
+        // chest plane (that is an arm), and fit z(x) over what is left.
         let yaw_ref = {
             let k = &est_out.annotation.keypoints;
-            let sh = |i: usize| -> Option<V3> {
+            let px = |i: usize| -> Option<(f64, f64)> {
                 let (nx, ny, sc) = *k.get(i)?;
                 if sc < 0.5 {
                     return None;
                 }
-                vulvatar_lib::tracking::fusion::observe::window_point(
-                    &depth_pts, cw, ch, nx as f64 * cw as f64, ny as f64 * ch as f64, 3, 0.2, 3.0)
+                Some((nx as f64 * cw as f64, ny as f64 * ch as f64))
             };
-            match (sh(5), sh(6)) {
-                (Some(l), Some(r)) => {
-                    // viewer frame: x right, z toward camera = −cam z
-                    Some((-(l[2] - r[2])).atan2(l[0] - r[0]).to_degrees())
+            match (px(5), px(6)) {
+                (Some(lp), Some(rp)) => {
+                    let span = ((lp.0 - rp.0).powi(2) + (lp.1 - rp.1).powi(2)).sqrt();
+                    let cols = 15usize;
+                    let mut med: Vec<Option<(f64, f64)>> = Vec::with_capacity(cols);
+                    for c in 0..cols {
+                        // Inset 12% at each end so the strip stays on the
+                        // torso rather than straddling the silhouette.
+                        let t = 0.12 + 0.76 * (c as f64 + 0.5) / cols as f64;
+                        let bu = rp.0 + (lp.0 - rp.0) * t;
+                        let bv = rp.1 + (lp.1 - rp.1) * t;
+                        let (mut xs, mut zs): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+                        for row in 0..7 {
+                            let v = bv + span * (0.02 + 0.16 * row as f64 / 6.0);
+                            if let Some(q) = vulvatar_lib::tracking::fusion::observe::window_point(
+                                &depth_pts, cw, ch, bu, v, 1, 0.2, 3.0,
+                            ) {
+                                xs.push(q[0]);
+                                zs.push(q[2]);
+                            }
+                        }
+                        if zs.len() < 4 {
+                            med.push(None);
+                            continue;
+                        }
+                        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        med.push(Some((xs[xs.len() / 2], zs[zs.len() / 2])));
+                    }
+                    let mut all: Vec<f64> = med.iter().flatten().map(|c| c.1).collect();
+                    if all.len() < 8 {
+                        None
+                    } else {
+                        all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let mid = all[all.len() / 2];
+                        let pts: Vec<(f64, f64)> = med
+                            .iter()
+                            .flatten()
+                            .copied()
+                            // In front of the chest plane by > 6 cm = arm
+                            // or hand; behind by > 12 cm = background.
+                            .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
+                            .collect();
+                        let n = pts.len() as f64;
+                        let xspan = pts
+                            .iter()
+                            .map(|p| p.0)
+                            .fold(f64::NEG_INFINITY, f64::max)
+                            - pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                        if pts.len() < 8 || xspan < 0.12 {
+                            None
+                        } else {
+                            let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+                            let mz = pts.iter().map(|p| p.1).sum::<f64>() / n;
+                            let (mut num, mut den) = (0.0, 0.0);
+                            for (x, z) in &pts {
+                                num += (x - mx) * (z - mz);
+                                den += (x - mx) * (x - mx);
+                            }
+                            // θ = atan2(Δz_cam, Δx_cam): body yaw about
+                            // viewer-up takes the shoulder line to
+                            // (cos θ, −sin θ) in viewer x/z, z_v = −z_cam.
+                            Some((num / den.max(1e-9)).atan().to_degrees())
+                        }
+                    }
                 }
                 _ => None,
             }
         };
+        if std::env::var_os("VULVATAR_REPLAY_SHREF").is_some() {
+            // Independent torso-yaw evidence: depth of each detector
+            // shoulder (median of a patch pulled 15% toward the torso
+            // centre so the window cannot straddle the silhouette), the
+            // 2-D shoulder span (|θ| ≈ acos(span / span_frontal)) and the
+            // estimator's own shoulders.
+            let k = &est_out.annotation.keypoints;
+            let sh_px = |i: usize| -> Option<(f64, f64)> {
+                let (nx, ny, sc) = *k.get(i)?;
+                if sc < 0.5 { return None; }
+                Some((nx as f64 * cw as f64, ny as f64 * ch as f64))
+            };
+            if let (Some(lp), Some(rp)) = (sh_px(5), sh_px(6)) {
+                let mid = (0.5 * (lp.0 + rp.0), 0.5 * (lp.1 + rp.1));
+                let inset = |p: (f64, f64)| (p.0 + 0.15 * (mid.0 - p.0), p.1 + 0.15 * (mid.1 - p.1));
+                let med_z = |p: (f64, f64)| -> Option<f64> {
+                    let mut zs: Vec<f64> = Vec::new();
+                    for du in -4i32..=4 {
+                        for dv in -4i32..=4 {
+                            let (u, v) = (p.0 + du as f64 * 2.0, p.1 + dv as f64 * 2.0);
+                            if let Some(q) = vulvatar_lib::tracking::fusion::observe::window_point(
+                                &depth_pts, cw, ch, u, v, 1, 0.2, 3.0) { zs.push(q[2]); }
+                        }
+                    }
+                    if zs.len() < 12 { return None; }
+                    zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    Some(zs[zs.len() / 2])
+                };
+                let span = ((lp.0 - rp.0).powi(2) + (lp.1 - rp.1).powi(2)).sqrt();
+                let lz = med_z(inset(lp));
+                let rz = med_z(inset(rp));
+                let lsh = fk.t[h.j.l_shoulder];
+                let rsh = fk.t[h.j.r_shoulder];
+                eprintln!(
+                    "SHREF idx {idx} est {ty:+.1} ref {:?} span_px {span:.0} lz {:?} rz {:?} est_lz {:.3} est_rz {:.3}",
+                    yaw_ref.map(|v| (v * 10.0).round() / 10.0),
+                    lz.map(|v| (v * 1000.0).round() / 1000.0),
+                    rz.map(|v| (v * 1000.0).round() / 1000.0),
+                    lsh[2], rsh[2]
+                );
+            }
+        }
         if let Some(yr) = yaw_ref {
             yaw_ref_pairs.push((ty, yr));
         }

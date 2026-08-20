@@ -381,6 +381,97 @@ pub fn body_surface_points(
     }
 }
 
+/// Torso yaw from the chest's depth slope, in camera x/z (radians),
+/// with the number of surviving columns.
+///
+/// A torso capsule is rotationally symmetric about its own axis, so the
+/// surface term carries no yaw information at all and the 2-D shoulder
+/// pixels are left to fix it alone — measured +17° of torso
+/// over-rotation against the depth reference on a live desk session.
+/// This samples the chest between the detected shoulders, reduces each
+/// column to its median depth, rejects columns sitting clearly in front
+/// of the chest plane (a forearm or clasped hands, which otherwise swing
+/// the answer by 60°+) and fits z(x) over the rest.
+pub fn chest_yaw_from_depth(
+    kps: &[RawKp],
+    points: &[[f32; 3]],
+    width: u32,
+    height: u32,
+    z_ref: Option<f64>,
+    occluded: &dyn Fn(f64, f64) -> bool,
+) -> Option<(f64, usize)> {
+    let (zlo, zhi) = match z_ref {
+        Some(z) => ((z - 0.5) as f32, (z + 0.5) as f32),
+        None => (0.15, 6.0),
+    };
+    let px = |i: usize| -> Option<(f64, f64)> {
+        let kp = kps.get(i)?;
+        if kp.score < 0.5 || !(0.0..=1.0).contains(&kp.nx) || !(0.0..=1.0).contains(&kp.ny) {
+            return None;
+        }
+        Some((kp.nx as f64 * width as f64, kp.ny as f64 * height as f64))
+    };
+    let (lp, rp) = (px(5)?, px(6)?);
+    let span = ((lp.0 - rp.0).powi(2) + (lp.1 - rp.1).powi(2)).sqrt();
+    if span < 40.0 {
+        return None;
+    }
+    const COLS: usize = 15;
+    let mut med: Vec<(f64, f64)> = Vec::with_capacity(COLS);
+    for c in 0..COLS {
+        // Inset 12% at each end: a column on the silhouette mixes the
+        // background into its median.
+        let t = 0.12 + 0.76 * (c as f64 + 0.5) / COLS as f64;
+        let bu = rp.0 + (lp.0 - rp.0) * t;
+        let bv = rp.1 + (lp.1 - rp.1) * t;
+        let (mut xs, mut zs): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        for row in 0..7 {
+            let v = bv + span * (0.02 + 0.16 * row as f64 / 6.0);
+            if occluded(bu, v) {
+                continue;
+            }
+            if let Some(q) = window_point(points, width, height, bu, v, 1, zlo, zhi) {
+                xs.push(q[0]);
+                zs.push(q[2]);
+            }
+        }
+        if zs.len() < 4 {
+            continue;
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        med.push((xs[xs.len() / 2], zs[zs.len() / 2]));
+    }
+    if med.len() < 8 {
+        return None;
+    }
+    let mut zz: Vec<f64> = med.iter().map(|c| c.1).collect();
+    zz.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = zz[zz.len() / 2];
+    let pts: Vec<(f64, f64)> = med
+        .iter()
+        .copied()
+        .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
+        .collect();
+    if pts.len() < 8 {
+        return None;
+    }
+    let xmin = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let xmax = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    if xmax - xmin < 0.12 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let mz = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let (mut num, mut den) = (0.0, 0.0);
+    for (x, z) in &pts {
+        num += (x - mx) * (z - mz);
+        den += (x - mx) * (x - mx);
+    }
+    Some(((num / den.max(1e-9)).atan(), pts.len()))
+}
+
 /// Reachability filter on arm keypoints: an elbow / wrist / hand-block
 /// landmark whose pixel has valid depth farther than the arm can reach
 /// from the predicted shoulder (or much nearer than the shoulder plane
