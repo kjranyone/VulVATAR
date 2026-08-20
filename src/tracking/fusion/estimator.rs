@@ -305,6 +305,11 @@ pub struct SolveDiag {
     pub cost_cloud: f64,
     pub cost_prior: f64,
     pub cost_temporal: f64,
+    /// Number of 2-D observations that actually projected (model point in
+    /// front of the camera). A collapsed state (body at/behind the camera
+    /// plane) produces near-zero cost with zero projectable points — the
+    /// health check treats that as lost, not as healthy.
+    pub n_2d_proj: usize,
     /// Mean |residual| of the 2-D terms (px) and 3-D terms (m) at the
     /// final state, and mean signed cloud distance (m, + = point outside).
     pub rms_2d_px: f64,
@@ -648,7 +653,12 @@ impl Estimator {
         self.finish(model, &prev, dt, obs.t);
         // ---- track health: a fit whose sparse residuals stay far off is a
         // lost track (association collapse); re-acquire next frame ---------------
-        if self.diag.n_kp2d >= 8 && self.diag.med_2d_px > self.params.lost_rms_px {
+        let unhealthy = self.diag.n_kp2d >= 8
+            && (self.diag.med_2d_px > self.params.lost_rms_px
+                // Collapsed state: plenty of detections, almost nothing
+                // projects — near-zero cost that must not read as healthy.
+                || self.diag.n_2d_proj * 4 < self.diag.n_kp2d);
+        if unhealthy {
             self.lost_frames += 1;
             if self.lost_frames >= 2 {
                 self.mark_lost(model);
@@ -675,9 +685,17 @@ impl Estimator {
         }
     }
 
-    /// Drop the temporal state so the next frame bootstraps from scratch.
+    /// Drop the temporal state AND the pose itself so the next frame
+    /// bootstraps from a sane state — a collapsed pose (body at/behind the
+    /// camera plane) yields no observations at all, so re-optimising from
+    /// it can never recover without this hard reset.
     pub fn mark_lost(&mut self, model: &Model) {
         let n = model.num_params;
+        self.state = State::rest(model);
+        self.state.set_relaxed(model);
+        self.state.root_r = FACING_CAMERA;
+        self.state.root_t = [0.0, 0.3, 1.2];
+        self.pred = self.state.clone();
         self.var = vec![1.0; n];
         self.vel = vec![0.0; n];
         self.last_t = None;
@@ -1220,6 +1238,7 @@ impl Estimator {
             self.diag.cost_cloud = ccl;
             self.diag.cost_prior = cpr;
             self.diag.cost_temporal = ctm;
+            self.diag.n_2d_proj = n2d;
             self.diag.rms_2d_px = if n2d > 0 { sum2d / n2d as f64 } else { 0.0 };
             self.diag.med_2d_px = if n2d > 0 {
                 res2d.sort_by(|a, b| a.partial_cmp(b).unwrap());
