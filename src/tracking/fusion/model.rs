@@ -1096,6 +1096,29 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_pose_hangs_the_arms() {
+        // The bootstrap pose is what a viewer sees before the arms are
+        // ever observed (the desk envelope: hands under the desk for
+        // minutes), so it has to be a natural rest, not a T-pose.
+        let h = Humanoid::new();
+        let mut st = State::rest(&h.model);
+        st.root_r = FACING_CAMERA;
+        st.set_relaxed(&h.model);
+        let fk = h.model.fk(&st);
+        for (sh, wr, name) in [
+            (h.j.l_shoulder, h.j.l_wrist, "left"),
+            (h.j.r_shoulder, h.j.r_wrist, "right"),
+        ] {
+            let d = sub(fk.t[wr], fk.t[sh]);
+            // Camera +y is down: the wrist must hang well below the
+            // shoulder, close to the trunk, and not behind the body.
+            assert!(d[1] > 0.30, "{name} wrist not below shoulder: {d:?}");
+            assert!(d[0].abs() < 0.25, "{name} wrist too far out: {d:?}");
+            assert!(d[2].abs() < 0.25, "{name} wrist too far fore/aft: {d:?}");
+        }
+    }
+
+    #[test]
     fn point_jacobian_matches_finite_difference() {
         let h = Humanoid::new();
         let m = &h.model;

@@ -529,6 +529,25 @@ pub fn reach_filter(
         (91, 112, 0),  // left hand block
         (112, 133, 1), // right hand block
     ];
+    // Does this side's elbow have depth support? (Same window as below.)
+    let elbow_has_depth: [bool; 2] = [7usize, 8]
+        .map(|i| {
+            kps.get(i)
+                .filter(|kp| kp.score > 0.2 && (0.0..=1.0).contains(&kp.nx))
+                .and_then(|kp| {
+                    window_point(
+                        points,
+                        width,
+                        height,
+                        kp.nx as f64 * width as f64,
+                        kp.ny as f64 * height as f64,
+                        2,
+                        0.15,
+                        8.0,
+                    )
+                })
+                .is_some()
+        });
     for &(lo, hi, side) in &groups {
         let zs = shoulder_z[side];
         if !zs.is_finite() || zs <= 0.0 {
@@ -541,9 +560,44 @@ pub fn reach_filter(
             }
             let u = kp.nx as f64 * width as f64;
             let v = kp.ny as f64 * height as f64;
-            if let Some(p) = window_point(points, width, height, u, v, 2, 0.15, 8.0) {
-                if p[2] > zs + reach_m || p[2] < zs - reach_m {
-                    kp.score = 0.0;
+            let probe = window_point(points, width, height, u, v, 2, 0.15, 8.0);
+            if std::env::var_os("VULVATAR_REACH_DUMP").is_some() && (i == 9 || i == 10 || i == 7) {
+                eprintln!(
+                    "REACH kp{i} px ({u:.0},{v:.0}) score {:.2} z {:?} shoulder_z {zs:.3} reach {reach_m:.2}",
+                    kp.score,
+                    probe.map(|p| (p[2] * 1000.0).round() / 1000.0)
+                );
+            }
+            match probe {
+                Some(p) => {
+                    if p[2] > zs + reach_m || p[2] < zs - reach_m {
+                        kp.score = 0.0;
+                    }
+                }
+                // No depth AND at the frame edge: unverifiable. The depth
+                // camera covers the person's working volume, so a limb
+                // keypoint out at the border with nothing behind it is
+                // either off-sensor or a detection on someone else — a
+                // bystander's hand at x = 637/640 captured this user's
+                // left arm for the first ~35 frames of a desk session.
+                // Depth HOLES in frame are left alone: hands close to the
+                // camera lose depth constantly and that is not evidence
+                // of anything.
+                None => {
+                    // A depth-less keypoint out at the frame border is
+                    // unverifiable — but the user's OWN hand loses depth
+                    // there constantly (too close, or past the depth FOV),
+                    // so it is only rejected when nothing else on that arm
+                    // has depth either. A bystander's hand arrives alone;
+                    // the user's hand arrives with an elbow.
+                    // 5% of the frame. Swept: at 2% and 1% the phantom
+                    // comes back (the bystander sat at 0.995 but the
+                    // detector's estimate of it wanders inward).
+                    let border =
+                        !(0.05..0.95).contains(&kp.nx) || !(0.05..0.95).contains(&kp.ny);
+                    if border && !elbow_has_depth[side] {
+                        kp.score = 0.0;
+                    }
                 }
             }
         }
