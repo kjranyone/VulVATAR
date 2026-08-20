@@ -829,40 +829,44 @@ impl PoseProvider for FusionProvider {
                     // capsules are excluded so a forearm across the chest
                     // cannot tilt the fit.
                     if std::env::var_os("VULVATAR_FUSION_NO_CHESTYAW").is_none() {
-                        let occl = |u: f64, v: f64| -> bool {
-                            if in_hand_rect(u, v) {
-                                return true;
-                            }
-                            let Some(p) = window_point(
-                                &d.points_m,
-                                d.width,
-                                d.height,
-                                u,
-                                v,
-                                1,
-                                0.15,
-                                6.0,
-                            ) else {
-                                return false;
-                            };
-                            let t_obs = norm(p);
-                            if t_obs <= 1e-6 {
-                                return false;
-                            }
-                            let dir = scale(p, 1.0 / t_obs);
-                            arm_capsules.iter().any(|&(a, b, r)| {
-                                super::estimator::ray_capsule_entry(dir, a, b, r)
-                                    .is_some_and(|t| t < t_obs + 0.05)
-                            })
-                        };
-                        if let Some((yaw, n)) = super::observe::chest_yaw_from_depth(
+                        // Only hand crops are vetoed per pixel. Testing
+                        // the predicted ARM capsules here was measured and
+                        // is wrong: the upper-arm capsule starts AT the
+                        // shoulder joint, so every sample near a shoulder
+                        // counts as "behind an arm" — 95 of 105 samples
+                        // were rejected on a live session and the
+                        // observation reached 5% of frames. Arm surfaces
+                        // that really do cross the strip are removed by
+                        // the per-column depth-outlier filter inside
+                        // `chest_yaw_from_depth`, which needs no
+                        // prediction to be right.
+                        // Only hand crops are vetoed per pixel. Testing
+                        // the predicted ARM capsules here was measured and
+                        // is wrong: the upper-arm capsule starts AT the
+                        // shoulder joint, so every sample near a shoulder
+                        // counted as "behind an arm" — 95 of 105 samples
+                        // rejected on a live session, and the observation
+                        // reached only 5% of frames. Arm surfaces that
+                        // really do cross the strip are removed by the
+                        // per-column depth-outlier filter inside
+                        // `chest_yaw_from_depth`, which needs no
+                        // prediction to be right.
+                        let occl = |u: f64, v: f64| -> bool { in_hand_rect(u, v) };
+                        let cy = super::observe::chest_yaw_from_depth(
                             &raw,
                             &d.points_m,
                             d.width,
                             d.height,
                             z_ref,
                             &occl,
-                        ) {
+                        );
+                        if cy.is_none() && std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+                            eprintln!("CHEST none");
+                        }
+                        if let Some((yaw, n)) = cy {
+                            if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+                                eprintln!("CHEST fired yaw {:.3} n {}", yaw, n);
+                            }
                             obs.shoulder_yaw = Some(super::estimator::ShoulderYawObs {
                                 left: self.h.j.l_shoulder,
                                 right: self.h.j.r_shoulder,

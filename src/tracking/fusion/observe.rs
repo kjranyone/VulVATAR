@@ -414,25 +414,44 @@ pub fn chest_yaw_from_depth(
     let (lp, rp) = (px(5)?, px(6)?);
     let span = ((lp.0 - rp.0).powi(2) + (lp.1 - rp.1).powi(2)).sqrt();
     if span < 40.0 {
+        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+            eprintln!("CHESTFAIL shspan {:.0}", span);
+        }
         return None;
     }
     const COLS: usize = 15;
+    let (mut n_occl, mut n_nodepth) = (0usize, 0usize);
+    // Sampling bands, tried in order, as (row offset range, skip the
+    // middle third). The chest is the best surface — wide, smooth,
+    // rigidly tied to the trunk — but clasped or folded arms cover it
+    // (measured on a live session: 95 of 105 chest samples occluded, so
+    // the observation reached only 5% of frames). The shoulder tops stay
+    // clear in those poses; their middle third is dropped because the
+    // neck and chin sit there, not the trunk.
+    let bands: [(f64, f64, bool); 2] = [(0.02, 0.18, false), (-0.16, -0.03, true)];
+    for &(row_lo, row_hi, skip_middle) in &bands {
     let mut med: Vec<(f64, f64)> = Vec::with_capacity(COLS);
     for c in 0..COLS {
         // Inset 12% at each end: a column on the silhouette mixes the
         // background into its median.
         let t = 0.12 + 0.76 * (c as f64 + 0.5) / COLS as f64;
+        if skip_middle && (0.33..0.67).contains(&t) {
+            continue;
+        }
         let bu = rp.0 + (lp.0 - rp.0) * t;
         let bv = rp.1 + (lp.1 - rp.1) * t;
         let (mut xs, mut zs): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         for row in 0..7 {
-            let v = bv + span * (0.02 + 0.16 * row as f64 / 6.0);
+            let v = bv + span * (row_lo + (row_hi - row_lo) * row as f64 / 6.0);
             if occluded(bu, v) {
+                n_occl += 1;
                 continue;
             }
             if let Some(q) = window_point(points, width, height, bu, v, 1, zlo, zhi) {
                 xs.push(q[0]);
                 zs.push(q[2]);
+            } else {
+                n_nodepth += 1;
             }
         }
         if zs.len() < 4 {
@@ -442,8 +461,13 @@ pub fn chest_yaw_from_depth(
         zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
         med.push((xs[xs.len() / 2], zs[zs.len() / 2]));
     }
-    if med.len() < 8 {
-        return None;
+    // A band needs enough columns to fit a line; the shoulder-top band
+    // has at most 10 (its middle third is skipped).
+    if med.len() < if skip_middle { 6 } else { 8 } {
+        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+            eprintln!("CHESTFAIL cols {} of {} occl {} nodepth {}", med.len(), COLS, n_occl, n_nodepth);
+        }
+        continue;
     }
     let mut zz: Vec<f64> = med.iter().map(|c| c.1).collect();
     zz.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -453,13 +477,19 @@ pub fn chest_yaw_from_depth(
         .copied()
         .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
         .collect();
-    if pts.len() < 8 {
-        return None;
+    if pts.len() < if skip_middle { 6 } else { 8 } {
+        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+            eprintln!("CHESTFAIL zfilter {} of {}", pts.len(), med.len());
+        }
+        continue;
     }
     let xmin = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     let xmax = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
     if xmax - xmin < 0.12 {
-        return None;
+        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+            eprintln!("CHESTFAIL span {:.3}", xmax - xmin);
+        }
+        continue;
     }
     let n = pts.len() as f64;
     let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
@@ -469,7 +499,9 @@ pub fn chest_yaw_from_depth(
         num += (x - mx) * (z - mz);
         den += (x - mx) * (x - mx);
     }
-    Some(((num / den.max(1e-9)).atan(), pts.len()))
+    return Some(((num / den.max(1e-9)).atan(), pts.len()));
+    }
+    None
 }
 
 /// Reachability filter on arm keypoints: an elbow / wrist / hand-block
