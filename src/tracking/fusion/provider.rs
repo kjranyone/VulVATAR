@@ -1108,6 +1108,21 @@ impl PoseProvider for FusionProvider {
                                 den += (u - mu) * (u - mu);
                             }
                             let dz_full = num / den.max(1e-9) * (x1 - x0) as f64;
+                            if std::env::var_os("VULVATAR_ORI_CAL").is_some() {
+                                // Calibration dump: measured slope vs the
+                                // slope a flat face plane at this yaw would
+                                // give over the sampled width.
+                                let w_m = (x1 - x0) as f64 * head_center_pred[2]
+                                    / intr.fx.max(1.0) as f64;
+                                eprintln!(
+                                    "ORICAL yaw {:.3} dz {:+.4} w_m {:.3} expect {:+.4} ncol {}",
+                                    f.yaw,
+                                    dz_full,
+                                    w_m,
+                                    -w_m * (f.yaw as f64).tan(),
+                                    cols.len()
+                                );
+                            }
                             if std::env::var_os("VULVATAR_ORI_DUMP").is_some() {
                                 let nose = kps[0];
                                 let no = if nose.2 >= 0.3 && x1 - x0 > 1.0 {
@@ -1117,7 +1132,29 @@ impl PoseProvider for FusionProvider {
                                 };
                                 eprintln!("ORI dz {:+.3} ncol {} yaw {:.2} nose_off {:+.2}", dz_full, cols.len(), f.yaw, no);
                             }
-                            Some(dz_full.abs() > 0.04 && (dz_full < 0.0) == (f.yaw < 0.0))
+                            // Sign must match the claim, and the slope
+                            // must clear a threshold calibrated on real
+                            // data: across a 400-frame desk session with
+                            // no hands in frame the measured Δz SATURATES
+                            // at 0.034–0.045 m regardless of how far the
+                            // head is turned (a head is round — the
+                            // visible face narrows as it rotates, so the
+                            // slope stops growing past ~30°), with a 5th
+                            // percentile of 0.026. Palm-locked frames — a
+                            // frontal face claiming 45°+ — sit at 0.018.
+                            // Normalising by the claimed angle was tried
+                            // and is strictly worse: it re-injects the
+                            // very number under test and cost 4–10° of
+                            // head amplitude.
+                            // The bar rises when a hand is near the face:
+                            // that is the only situation in which the
+                            // mesh fabricates a turn, so it is the only
+                            // one that has to pay for the doubt. With no
+                            // hand in the picture the mesh cannot be
+                            // palm-locked and the honest-turn threshold
+                            // applies.
+                            let need = if face_overlaps_hand { 0.040 } else { 0.025 };
+                            Some(dz_full.abs() >= need && (dz_full < 0.0) == (f.yaw < 0.0))
                         } else {
                             None
                         }
@@ -1178,15 +1215,15 @@ impl PoseProvider for FusionProvider {
                     let ann = &base.annotation.keypoints;
                     let fc: f32 = ann.iter().take(5).map(|k| k.2).sum::<f32>() / 5.0;
                     eprintln!(
-                        "ORI fired yaw {:.2} c {:.2} depth {:?} ann_face_c {:.2}",
-                        f.yaw, c, depth_supports, fc
+                        "ORI fired t{:.3} yaw {:.2} c {:.2} depth {:?} ann_face_c {:.2}",
+                        t, f.yaw, c, depth_supports, fc
                     );
                 }
                 }
             } else if std::env::var_os("VULVATAR_ORI_DUMP").is_some() {
                 let ann = &base.annotation.keypoints;
                 let fc: f32 = ann.iter().take(5).map(|k| k.2).sum::<f32>() / 5.0;
-                eprintln!("ORI gated src {:?} c {:.2} yaw {:.2} nose_in_hand {} overlap {} ann_face_c {:.2}", f.source, c, f.yaw, nose_in_hand, face_overlaps_hand, fc);
+                eprintln!("ORI gated t{:.3} src {:?} c {:.2} yaw {:.2} nose_in_hand {} overlap {} ann_face_c {:.2}", t, f.source, c, f.yaw, nose_in_hand, face_overlaps_hand, fc);
             }
         }
 
