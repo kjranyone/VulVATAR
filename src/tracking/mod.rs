@@ -190,16 +190,6 @@ impl TrackingCalibration {
                     for t in sample.fingertips.values_mut() {
                         t.position = calibration::rotate_xz(t.position, theta);
                     }
-                    for hand in [
-                        sample.left_hand_orientation.as_mut(),
-                        sample.right_hand_orientation.as_mut(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        hand.forward = calibration::rotate_xz(hand.forward, theta);
-                        hand.up = calibration::rotate_xz(hand.up, theta);
-                    }
                     if let Some(offset) = sample.root_offset.as_mut() {
                         // Same [x, y, −depth] convention the solver's
                         // root-reference seed uses (`anchor_depth_m` is
@@ -444,7 +434,7 @@ mod calibration_apply_tests {
     // --- Neutral body yaw ---
 
     use crate::asset::HumanoidBone;
-    use crate::tracking::source_skeleton::{HandOrientation, SourceJoint};
+    use crate::tracking::source_skeleton::SourceJoint;
 
     /// A frontal reference sample with joints on both sides of the
     /// anchor, a fingertip, a palm frame and a root offset displaced
@@ -472,11 +462,6 @@ mod calibration_apply_tests {
                 metric_depth_m: None,
             },
         );
-        sk.left_hand_orientation = Some(HandOrientation {
-            forward: [0.0, 0.0, 1.0],
-            up: [0.0, 1.0, 0.0],
-            confidence: 0.9,
-        });
         sk.root_offset = Some([0.15, 0.02, -1.6]);
         sk.stamp_synthetic_metric_frame();
         sk
@@ -495,9 +480,6 @@ mod calibration_apply_tests {
         for t in sk.fingertips.values_mut() {
             t.position = fwd(t.position);
         }
-        let h = sk.left_hand_orientation.as_mut().unwrap();
-        h.forward = fwd(h.forward);
-        h.up = fwd(h.up);
         let o = sk.root_offset.unwrap();
         let d = fwd([o[0] - a0[0], o[1] - a0[1], o[2] - a0[2]]);
         sk.root_offset = Some([a0[0] + d[0], a0[1] + d[1], a0[2] + d[2]]);
@@ -546,12 +528,6 @@ mod calibration_apply_tests {
             frontal.fingertips[&HumanoidBone::LeftIndexDistal].position,
             "fingertip",
         );
-        let (ho, hf) = (
-            observed.left_hand_orientation.unwrap(),
-            frontal.left_hand_orientation.unwrap(),
-        );
-        assert_vec3_eq(ho.forward, hf.forward, "hand forward");
-        assert_vec3_eq(ho.up, hf.up, "hand up");
         assert_vec3_eq(
             observed.root_offset.unwrap(),
             frontal.root_offset.unwrap(),

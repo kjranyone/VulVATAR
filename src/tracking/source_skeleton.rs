@@ -57,33 +57,6 @@ pub struct SourceJoint {
     pub metric_depth_m: Option<f32>,
 }
 
-/// Provenance of a joint sample: whether the position was actually
-/// measured by the detector / depth sampler, or manufactured somewhere
-/// along the pipeline. Consumers that feed *statistics* (scale EMAs,
-/// anchor stabilisers, calibration accumulators, depth fusion) must only
-/// ingest [`JointOrigin::Observed`] samples — fabricated positions carry
-/// detector-grade confidence but constant/heuristic geometry, and letting
-/// them into an estimator drags it toward the fabrication constant (e.g.
-/// the canonical-frontal shoulder pair polluting the torso span EMA).
-///
-/// Stored sparsely in [`SourceSkeleton::joint_origins`]; an absent entry
-/// means `Observed` so the many existing observation sites need no change.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum JointOrigin {
-    /// Position comes from the detector (and, when present, the depth
-    /// window sample) for this very frame.
-    #[default]
-    Observed,
-    /// Derived from real observations of *other* joints or *other*
-    /// frames: anatomical offset from an observed neighbour, held-last
-    /// value, bone-length re-pin of an observed direction.
-    Extrapolated,
-    /// Manufactured from constants or canonical-pose assumptions with no
-    /// per-frame measurement behind the geometry (collapsed-pair
-    /// canonical reconstruction, fixed anatomical fallbacks).
-    Synthesized,
-}
-
 /// Which estimator produced a [`FacePose`]. The two sources have
 /// *different* systematic residuals (different landmark sets, different
 /// hardcoded anatomical neutrals — body ≈ 1.25, mesh ≈ 0.49 pitch
@@ -155,22 +128,6 @@ pub struct FacePose {
 pub struct SourceExpression {
     pub name: String,
     pub weight: f32,
-}
-
-/// Full orientation of a tracked hand. `forward` is the wrist→fingers
-/// axis (typically wrist → middle MCP) and `up` is the palm normal
-/// (away from the back of the hand, toward where the fingernails
-/// face when curled up). Both are unit vectors in source-skeleton
-/// coords. The pair is computed by the tracker from the four MCP
-/// landmarks and used by the solver to drive the wrist bone's full
-/// 3-DoF rotation — without `up`, finger MCPs end up with arbitrary
-/// 90° twist because the wrist→tip direction alone leaves the
-/// twist axis under-constrained.
-#[derive(Clone, Copy, Debug)]
-pub struct HandOrientation {
-    pub forward: [f32; 3],
-    pub up: [f32; 3],
-    pub confidence: f32,
 }
 
 /// Pinhole camera intrinsics captured from the depth sensor. Plain fields
@@ -249,12 +206,6 @@ pub struct SourceSkeleton {
     /// same sample is observed on multiple render frames.
     pub capture_timestamp_ms: Option<f64>,
     pub joints: HashMap<HumanoidBone, SourceJoint>,
-    /// Sparse provenance map for `joints` (and `fingertips`, keyed the
-    /// same way). Absent entry ⇒ [`JointOrigin::Observed`]. Producers
-    /// that fabricate or extrapolate a joint must record it here via
-    /// [`Self::mark_origin`]; statistical consumers filter with
-    /// [`Self::origin`].
-    pub joint_origins: HashMap<HumanoidBone, JointOrigin>,
     /// Raw body-derived face pose for this frame, published *alongside*
     /// the selected [`Self::face`] so the calibration hold can
     /// accumulate a per-source neutral for BOTH estimators in one
@@ -273,12 +224,6 @@ pub struct SourceSkeleton {
     pub fingertips: HashMap<HumanoidBone, SourceJoint>,
     pub face: Option<FacePose>,
     pub expressions: Vec<SourceExpression>,
-    /// Full 3-DoF orientation of the left hand (wrist) when the hand
-    /// track produced enough MCP landmarks to define a palm plane.
-    /// `None` when the hand is not tracked or the MCPs are too
-    /// degenerate to extract a palm normal.
-    pub left_hand_orientation: Option<HandOrientation>,
-    pub right_hand_orientation: Option<HandOrientation>,
     /// Optional FaceMesh-model "is this a face" confidence (post sigmoid)
     /// for the frame's face crop. Distinct from `face.confidence`, which
     /// is body-derived (min over the 5 COCO face landmarks): this one
@@ -341,13 +286,10 @@ impl SourceSkeleton {
             source_timestamp,
             capture_timestamp_ms: None,
             joints: HashMap::new(),
-            joint_origins: HashMap::new(),
             face_body_raw: None,
             fingertips: HashMap::new(),
             face: None,
             expressions: Vec::new(),
-            left_hand_orientation: None,
-            right_hand_orientation: None,
             face_mesh_confidence: None,
             overall_confidence: 0.0,
             root_offset: None,
@@ -415,25 +357,6 @@ impl SourceSkeleton {
         }
     }
 
-    /// Provenance for `bone`. Absent entry ⇒ `Observed`.
-    pub fn origin(&self, bone: HumanoidBone) -> JointOrigin {
-        self.joint_origins
-            .get(&bone)
-            .copied()
-            .unwrap_or(JointOrigin::Observed)
-    }
-
-    /// Record provenance for `bone`. `Observed` clears any prior mark so
-    /// the map stays sparse and a re-observed joint doesn't keep a stale
-    /// fabrication flag from an earlier fallback frame.
-    pub fn mark_origin(&mut self, bone: HumanoidBone, origin: JointOrigin) {
-        if origin == JointOrigin::Observed {
-            self.joint_origins.remove(&bone);
-        } else {
-            self.joint_origins.insert(bone, origin);
-        }
-    }
-
     /// Multiply every confidence channel by `scale`, clamped to
     /// `[0.0, 1.0]`. Used by the tracking hold/fade policy in
     /// [`crate::app::Application::run_frame`]: when the mailbox is
@@ -462,12 +385,6 @@ impl SourceSkeleton {
         }
         if let Some(conf) = self.face_mesh_confidence.as_mut() {
             *conf *= scale;
-        }
-        if let Some(hand) = self.left_hand_orientation.as_mut() {
-            hand.confidence *= scale;
-        }
-        if let Some(hand) = self.right_hand_orientation.as_mut() {
-            hand.confidence *= scale;
         }
         self.overall_confidence *= scale;
     }
@@ -506,11 +423,6 @@ mod tests {
             source: FaceSource::Body,
             ..Default::default()
         });
-        s.left_hand_orientation = Some(HandOrientation {
-            forward: [1.0, 0.0, 0.0],
-            up: [0.0, 1.0, 0.0],
-            confidence: 0.4,
-        });
         s
     }
 
@@ -526,7 +438,6 @@ mod tests {
             (s.fingertips[&HumanoidBone::LeftIndexDistal].confidence - 0.25).abs() < 1e-6,
         );
         assert!((s.face.unwrap().confidence - 0.35).abs() < 1e-6);
-        assert!((s.left_hand_orientation.unwrap().confidence - 0.2).abs() < 1e-6);
         assert_eq!(
             s.joints[&HumanoidBone::Hips].position,
             pos,

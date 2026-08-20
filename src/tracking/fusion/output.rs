@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::asset::HumanoidBone;
 use crate::tracking::source_skeleton::{
-    CameraIntrinsics, JointOrigin, MetricFrameInfo, SourceJoint, SourceSkeleton,
+    CameraIntrinsics, MetricFrameInfo, SourceJoint, SourceSkeleton,
 };
 
 use super::estimator::Estimator;
@@ -167,9 +167,6 @@ pub fn source_skeleton(
                 metric_depth_m: Some(p[2] as f32),
             },
         );
-        if sigma > 0.3 {
-            sk.mark_origin(bone, JointOrigin::Extrapolated);
-        }
     }
     // Fingertips (keyed by the distal bone).
     for hand in 0..2 {
