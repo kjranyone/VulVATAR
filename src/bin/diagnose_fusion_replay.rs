@@ -529,6 +529,39 @@ fn main() -> Result<(), String> {
                     est.diag.dt as f32,
                 );
             }
+            if std::env::var_os("VULVATAR_REPLAY_HEADCMP").is_some() && n % 8 == 0 {
+                // Avatar head world orientation actually applied vs the rig delta.
+                if let Some(hm) = asset.humanoid.as_ref() {
+                    if let Some(node) = hm.bone_map.get(&vulvatar_lib::asset::HumanoidBone::Head) {
+                        // world rot of head node under `locals`
+                        let mut q = [0.0f32, 0.0, 0.0, 1.0];
+                        let mut chain = vec![];
+                        let mut i = node.0 as usize;
+                        loop {
+                            chain.push(i);
+                            match asset.skeleton.nodes[i].parent {
+                                Some(p) => i = p.0 as usize,
+                                None => break,
+                            }
+                        }
+                        for &k in chain.iter().rev() {
+                            q = vulvatar_lib::math_utils::quat_mul(&q, &locals[k].rotation);
+                        }
+                        let fwd = vulvatar_lib::math_utils::quat_rotate_vec3(&q, &[0.0, 0.0, 1.0]);
+                        let pitch_av = (-fwd[1]).asin().to_degrees();
+                        let yaw_av = fwd[0].atan2(fwd[2]).to_degrees();
+                        let rig_head = est_out.skeleton.rig.as_ref().and_then(|r| r.bones.get(&vulvatar_lib::asset::HumanoidBone::Head));
+                        let (ry, rp) = rig_head
+                            .map(|b| {
+                                let m3 = vulvatar_lib::tracking::fusion::math::quat_to_mat(b.delta_world);
+                                ypr_deg(&m3)
+                            })
+                            .map(|(y, p, _)| (y, p))
+                            .unwrap_or((0.0, 0.0));
+                        eprintln!("HEADCMP idx {idx} rig yaw/pitch {ry:.0}/{rp:.0} avatar yaw/pitch {yaw_av:.0}/{pitch_av:.0}");
+                    }
+                }
+            }
             if render_every > 0 && n % render_every == 0 {
                 let inst = offline::make_instance(asset, locals);
                 let side = ch.min(720);

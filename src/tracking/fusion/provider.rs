@@ -614,6 +614,48 @@ impl PoseProvider for FusionProvider {
         // NaN landmarks produce NaN residuals: drop them defensively.
         obs.kp2d.retain(|k| k.u.is_finite() && k.v.is_finite());
 
+        // Far-side head-landmark culling: at a 3/4 or profile view the
+        // detector still emits the occluded eye/ear (and the occluded half
+        // of the dense face landmarks) hallucinated near the visible
+        // silhouette — those 2-D residuals fight the yaw and pin the head
+        // ~50% short of the real turn. A landmark whose *predicted* surface
+        // normal (radial from the head centre) faces away from the camera
+        // is on the far side of the head and cannot be a real observation.
+        {
+            let head_c = fk_pred.site[self.h.s.head_center];
+            let head_sites = [self.h.s.l_eye, self.h.s.r_eye, self.h.s.l_ear, self.h.s.r_ear];
+            let facing_of = |pw: V3| -> f64 {
+                let n = normalize(sub(pw, head_c));
+                let to_cam = normalize(scale(pw, -1.0));
+                dot(n, to_cam)
+            };
+            let h = &self.h;
+            let pred = &pred;
+            let fkp = &fk_pred;
+            obs.kp2d.retain(|k| {
+                use super::estimator::ModelPoint;
+                let pw = match k.point {
+                    ModelPoint::Site(sid) if head_sites.contains(&sid) => fkp.site[sid],
+                    ModelPoint::Attached { joint, local } if joint == h.j.head => {
+                        let _ = pred;
+                        add(fkp.t[joint], mat_vec(&fkp.r[joint], local))
+                    }
+                    _ => return true,
+                };
+                facing_of(pw) > -0.15
+            });
+            obs.kp3d.retain(|k| {
+                use super::estimator::ModelPoint;
+                let pw = match k.point {
+                    ModelPoint::Attached { joint, local } if joint == h.j.head => {
+                        add(fkp.t[joint], mat_vec(&fkp.r[joint], local))
+                    }
+                    _ => return true,
+                };
+                facing_of(pw) > -0.15
+            });
+        }
+
         // ---- hand crop observations ---------------------------------------------
         self.hand_kp_start = obs.kp2d.len();
         for hand in 0..2 {

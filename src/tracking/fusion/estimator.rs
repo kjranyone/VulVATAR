@@ -158,6 +158,13 @@ pub struct Params {
     /// Variance floor / cap of the carried covariance.
     pub var_min: f64,
     pub var_max: f64,
+    /// σ (m) of the elbow-low prior: a hinge penalty on the elbow sitting
+    /// ABOVE its shoulder (camera y is down, so elbow.y < shoulder.y).
+    /// The elbow swivel is unobservable whenever the elbow keypoint is
+    /// out of frame / culled (crop border, extreme close-up) and the LM
+    /// otherwise parks it wherever the basin left it — humans rest
+    /// elbows low. Real elbows-up poses out-pull this through the data.
+    pub elbow_low_sigma: f64,
     /// σ (rad) of the upright-root prior: the pelvis "up" direction in the
     /// camera frame is pulled toward straight up (camera −y). Without it
     /// the pelvis/spine pitch split is unobservable in an upper-body
@@ -210,6 +217,7 @@ impl Default for Params {
             pose_prior_scale: 1.0,
             var_min: 1e-8,
             var_max: 25.0,
+            elbow_low_sigma: 0.10,
             upright_sigma: 0.12,
             lost_rms_px: 40.0,
             cloud_torso_only: true,
@@ -258,6 +266,10 @@ pub struct Estimator {
     pub lost_events: u64,
     /// Sparse surface points of the current frame (set by `update`).
     surf_pts: Vec<([f64; 3], f64)>,
+    idx_l_shoulder: usize,
+    idx_r_shoulder: usize,
+    idx_l_elbow: usize,
+    idx_r_elbow: usize,
     /// Per-parameter flag: belongs to the trunk (slow process noise).
     trunk_param: Vec<bool>,
     /// Per-parameter flag: locked (never solved) — the pelvis ball, which is
@@ -337,6 +349,10 @@ impl Estimator {
             lost_frames: 0,
             lost_events: 0,
             surf_pts: Vec::new(),
+            idx_l_shoulder: model.joints.iter().position(|j| j.name == "l_shoulder").unwrap_or(0),
+            idx_r_shoulder: model.joints.iter().position(|j| j.name == "r_shoulder").unwrap_or(0),
+            idx_l_elbow: model.joints.iter().position(|j| j.name == "l_elbow").unwrap_or(0),
+            idx_r_elbow: model.joints.iter().position(|j| j.name == "r_elbow").unwrap_or(0),
             trunk_param: trunk_params(model),
             locked_param: locked_params(model),
             data_info: vec![0.0; n],
@@ -1087,6 +1103,47 @@ impl Estimator {
             }
         }
 
+        // ---- elbow-low prior --------------------------------------------------------
+        {
+            let inv = 1.0 / self.params.elbow_low_sigma;
+            for (sh, el) in [
+                (self.idx_l_shoulder, self.idx_l_elbow),
+                (self.idx_r_shoulder, self.idx_r_elbow),
+            ] {
+                // camera y is down: elbow above shoulder ⇔ el.y < sh.y
+                let viol = fk.t[sh][1] - fk.t[el][1];
+                if viol <= 0.0 {
+                    continue;
+                }
+                let r = viol * inv;
+                cost += r * r;
+                if build {
+                    // d(viol) = d(sh.y) − d(el.y)
+                    self.row_idx.clear();
+                    let mut jacsh = std::mem::take(&mut self.jac);
+                    jacsh.clear();
+                    point_y_jac(model, st, fk, sh, 1.0, &mut jacsh);
+                    point_y_jac(model, st, fk, el, -1.0, &mut jacsh);
+                    self.row_out.clear();
+                    for &(i, v) in &jacsh {
+                        if self.row_acc[i] == 0.0 {
+                            self.row_idx.push(i);
+                        }
+                        self.row_acc[i] += v[1] * inv;
+                    }
+                    for &i in &self.row_idx {
+                        let v = self.row_acc[i];
+                        if v != 0.0 {
+                            self.row_out.push((i, v));
+                        }
+                        self.row_acc[i] = 0.0;
+                    }
+                    self.dense.add_residual(&self.row_out, r, 1.0);
+                    self.jac = jacsh;
+                }
+            }
+        }
+
         // ---- upright-root prior ---------------------------------------------------
         {
             // Body up (+Y) through the root rotation should be camera up
@@ -1097,7 +1154,7 @@ impl Estimator {
             // solve is upside down (up_cam.y > 0) the prior would be blind
             // through x/z alone; the +y case is handled by the same two
             // residuals growing as the state escapes the basin.
-            let inv = 1.0 / p.upright_sigma;
+            let inv = 1.0 / self.params.upright_sigma;
             for (k, comp) in [(0usize, up[0]), (2usize, up[2])] {
                 let r = comp * inv;
                 cost += r * r;
@@ -1411,6 +1468,15 @@ fn locked_params(model: &Model) -> Vec<bool> {
         }
     }
     v
+}
+
+/// Append `sign ×` the point Jacobian of joint `j` to `out`.
+fn point_y_jac(model: &Model, st: &State, fk: &Fk, j: usize, sign: f64, out: &mut Vec<(usize, V3)>) {
+    let mut tmp = Vec::with_capacity(48);
+    model.point_jacobian(st, fk, PointRef::Joint(j), &mut tmp);
+    for (i, v) in tmp {
+        out.push((i, scale(v, sign)));
+    }
 }
 
 /// Trunk parameters = joints with depth ≤ 4 in the tree that are not part

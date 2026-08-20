@@ -88,7 +88,7 @@ impl Default for RetargetParams {
             sigma_rest: 1.2,
             min_quality: 0.2,
             anchor_seed_s: 1.0,
-            max_root_tilt: 0.20,
+            max_root_tilt: 0.35,
         }
     }
 }
