@@ -171,25 +171,21 @@ fn sample_vrm0_loads_fully() {
 /// End-to-end sanity for VRM 0.x tracking → GPU skinning matrix.
 ///
 /// Loads the real VRM 0.x sample (which ships *two* distinct skins — a
-/// tiny 1-joint skin and the main 172-joint body skin), feeds it a
-/// synthetic `SourceSkeleton` with a raised left arm and a turned head,
-/// runs the solver + skinning pipeline, and asserts:
+/// tiny 1-joint skin and the main 172-joint body skin), applies a
+/// tracking-v2 [`RigPose`] with world-delta rotations on the head, the
+/// left upper arm and a right index finger segment, and asserts:
 ///
-///   1. `pose_solver::solve_avatar_pose` writes the Head bone's local
-///      rotation away from rest when a non-zero face pose is supplied.
-///   2. The LeftUpperArm bone's local rotation is modified when the
-///      solver has both a shoulder and an elbow source joint to work
-///      with — the direction-match path (not just the face-pose path)
-///      reaches the skeleton.
-///   3. After `compute_global_pose` + `build_skinning_matrices`, the
+///   1. `retarget::apply_rig_pose` writes each driven bone's local
+///      rotation away from rest;
+///   2. after `compute_global_pose` + `build_skinning_matrices`, the
 ///      Head bone's skinning matrix (as the shader sees it, indexed by
 ///      glTF node id) reflects the rotation — i.e. multi-skin models
 ///      still feed the right joint.
 #[test]
-fn sample_vrm0_solver_drives_head_and_arm() {
-    use crate::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
+fn sample_vrm0_retarget_drives_head_arm_and_fingers() {
+    use crate::avatar::retarget::{apply_rig_pose, RetargetParams, RetargetState};
     use crate::avatar::{AvatarInstance, AvatarInstanceId};
-    use crate::tracking::source_skeleton::{FacePose, SourceJoint, SourceSkeleton};
+    use crate::tracking::fusion::output::{RigBone, RigPose};
 
     let loader = VrmAssetLoader::new();
     let Some(asset) = load_or_skip(&loader, SAMPLE_VRM0) else {
@@ -199,117 +195,69 @@ fn sample_vrm0_solver_drives_head_and_arm() {
     let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset.clone());
     avatar.build_base_pose();
 
-    let head_idx = asset
-        .humanoid
-        .as_ref()
-        .unwrap()
-        .bone_map
-        .get(&HumanoidBone::Head)
-        .expect("Head mapped")
-        .0 as usize;
-    let left_upper_arm_idx = asset
-        .humanoid
-        .as_ref()
-        .unwrap()
-        .bone_map
-        .get(&HumanoidBone::LeftUpperArm)
-        .expect("LeftUpperArm mapped")
-        .0 as usize;
-
-    let head_rest = avatar.pose.local_transforms[head_idx].rotation;
-    let upper_arm_rest = avatar.pose.local_transforms[left_upper_arm_idx].rotation;
-
-    // Build a synthetic source skeleton:
-    //   * Left shoulder at x = -0.2, elbow up + out (x = -0.4, y = +0.3)
-    //     so the LeftUpperArm direction tilts away from the body.
-    //   * Head face pose yaw = 45°, all other zero.
-    let mut source = SourceSkeleton::empty(0);
-    source.joints.insert(
-        HumanoidBone::LeftShoulder,
-        SourceJoint {
-            position: [-0.2, 1.4, 0.0],
-            confidence: 1.0,
-            metric_depth_m: None,
-        },
-    );
-    source.joints.insert(
+    let humanoid = asset.humanoid.as_ref().unwrap();
+    let node = |b: HumanoidBone| humanoid.bone_map.get(&b).expect("bone mapped").0 as usize;
+    let head_idx = node(HumanoidBone::Head);
+    let probes = [
+        HumanoidBone::Head,
         HumanoidBone::LeftUpperArm,
-        SourceJoint {
-            position: [-0.2, 1.4, 0.0],
-            confidence: 1.0,
-            metric_depth_m: None,
-        },
-    );
-    source.joints.insert(
-        HumanoidBone::LeftLowerArm,
-        SourceJoint {
-            position: [-0.4, 1.7, 0.0],
-            confidence: 1.0,
-            metric_depth_m: None,
-        },
-    );
-    source.joints.insert(
-        HumanoidBone::RightShoulder,
-        SourceJoint {
-            position: [0.2, 1.4, 0.0],
-            confidence: 1.0,
-            metric_depth_m: None,
-        },
-    );
-    source.face = Some(FacePose {
-        yaw: std::f32::consts::FRAC_PI_4,
-        pitch: 0.0,
-        roll: 0.0,
-        confidence: 1.0,
-        ..Default::default()
-    });
-    source.overall_confidence = 1.0;
-    // Drive the solver's metric path (D435-exclusive); without it the solver
-    // still runs but through the None 1:1 translation fallback.
-    source.stamp_synthetic_metric_frame();
+        HumanoidBone::RightIndexProximal,
+    ];
+    let rest: Vec<[f32; 4]> = probes
+        .iter()
+        .map(|&b| avatar.pose.local_transforms[node(b)].rotation)
+        .collect();
 
-    let params = SolverParams {
-        rotation_blend: 1.0,
-        joint_confidence_threshold: 0.1,
-        face_confidence_threshold: 0.1,
+    // World-delta rotations in the viewer frame: 45° head yaw, arm swung
+    // forward, finger curled.
+    let qy = |a: f32| [0.0, (a / 2.0).sin(), 0.0, (a / 2.0).cos()];
+    let qx = |a: f32| [(a / 2.0).sin(), 0.0, 0.0, (a / 2.0).cos()];
+    let mut rig = RigPose {
+        quality: 1.0,
         ..Default::default()
     };
-    let mut solver_state = PoseSolverState::default();
-    solve_avatar_pose(
-        &source,
-        &avatar.asset.skeleton,
-        avatar.asset.humanoid.as_ref(),
+    for (b, q) in [
+        (HumanoidBone::Head, qy(std::f32::consts::FRAC_PI_4)),
+        (HumanoidBone::LeftUpperArm, qx(0.9)),
+        (HumanoidBone::RightIndexProximal, qx(1.1)),
+    ] {
+        rig.bones.insert(
+            b,
+            RigBone {
+                delta_world: q,
+                sigma: 0.05,
+                data_sigma: 0.05,
+            },
+        );
+    }
+    let params = RetargetParams {
+        rotation_blend: 1.0,
+        root_translation_enabled: false,
+        ..Default::default()
+    };
+    let mut state = RetargetState::default();
+    apply_rig_pose(
+        &rig,
+        &asset.skeleton,
+        humanoid,
         &mut avatar.pose.local_transforms,
         &params,
-        &mut solver_state,
+        &mut state,
+        1.0 / 30.0,
     );
 
-    let head_after = avatar.pose.local_transforms[head_idx].rotation;
-    let arm_after = avatar.pose.local_transforms[left_upper_arm_idx].rotation;
-    eprintln!("head rest  : {:?}", head_rest);
-    eprintln!("head after : {:?}", head_after);
-    eprintln!("arm rest   : {:?}", upper_arm_rest);
-    eprintln!("arm after  : {:?}", arm_after);
-
-    let head_diff: f32 = head_rest
-        .iter()
-        .zip(head_after.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max);
-    assert!(
-        head_diff > 1e-4,
-        "Head bone local rotation did not change in response to face pose ({head_diff})"
-    );
-
-    let arm_diff: f32 = upper_arm_rest
-        .iter()
-        .zip(arm_after.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max);
-    assert!(
-        arm_diff > 1e-4,
-        "LeftUpperArm local rotation did not change when elbow moved in source ({arm_diff})"
-    );
+    for (k, &b) in probes.iter().enumerate() {
+        let after = avatar.pose.local_transforms[node(b)].rotation;
+        let diff: f32 = rest[k]
+            .iter()
+            .zip(after.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            diff > 1e-4,
+            "{b:?} local rotation did not change under the rig delta ({diff})"
+        );
+    }
 
     // Confirm the Head's skinning matrix actually changes.
     avatar.compute_global_pose();
@@ -329,199 +277,8 @@ fn sample_vrm0_solver_drives_head_and_arm() {
         .fold(0.0, f32::max);
     assert!(
         max_diff > 1e-4,
-        "Head skinning matrix unchanged after solver — multi-skin indexing regressed ({max_diff})"
+        "Head skinning matrix unchanged after retarget — multi-skin indexing regressed ({max_diff})"
     );
-}
-
-/// An UNTRACKED arm (no arm joints in the source) should rest in a relaxed
-/// A-pose — elbow below the shoulder — not the T-pose bind that juts it out
-/// flat. The `idle_arm_apose_enabled` toggle must gate it: with the toggle off
-/// the same undriven arm stays at bind. Regression for "T-pose じゃなく A-pose".
-#[test]
-fn sample_vrm0_untracked_arm_rests_in_a_pose() {
-    use crate::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
-    use crate::avatar::{AvatarInstance, AvatarInstanceId};
-    use crate::tracking::source_skeleton::SourceSkeleton;
-
-    let loader = VrmAssetLoader::new();
-    let Some(asset) = load_or_skip(&loader, SAMPLE_VRM0) else {
-        return;
-    };
-    let humanoid = asset.humanoid.as_ref().unwrap();
-    let ua_idx = humanoid.bone_map.get(&HumanoidBone::LeftUpperArm).unwrap().0 as usize;
-    let la_idx = humanoid.bone_map.get(&HumanoidBone::LeftLowerArm).unwrap().0 as usize;
-
-    // World Y of a node's origin (bone matrices are column-major → translation
-    // is the 4th column).
-    let world_y = |avatar: &AvatarInstance, idx: usize| avatar.pose.global_transforms[idx][3][1];
-
-    // A source with NO arm joints — the whole arm chain is undriven.
-    let mut source = SourceSkeleton::empty(0);
-    source.overall_confidence = 1.0;
-    source.stamp_synthetic_metric_frame();
-
-    // Bind (T-pose) elbow height relative to the shoulder, for reference.
-    let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset.clone());
-    avatar.build_base_pose();
-    avatar.compute_global_pose();
-    let bind_drop = world_y(&avatar, la_idx) - world_y(&avatar, ua_idx);
-
-    let solve = |avatar: &mut AvatarInstance, idle: bool| {
-        avatar.build_base_pose();
-        let params = SolverParams {
-            rotation_blend: 1.0,
-            joint_confidence_threshold: 0.1,
-            idle_arm_apose_enabled: idle,
-            ..Default::default()
-        };
-        let mut st = PoseSolverState::default();
-        solve_avatar_pose(
-            &source,
-            &avatar.asset.skeleton,
-            avatar.asset.humanoid.as_ref(),
-            &mut avatar.pose.local_transforms,
-            &params,
-            &mut st,
-        );
-        avatar.compute_global_pose();
-        world_y(avatar, la_idx) - world_y(avatar, ua_idx)
-    };
-
-    let idle_drop = solve(&mut avatar, true);
-    let off_drop = solve(&mut avatar, false);
-    eprintln!("elbow−shoulder Y  bind={bind_drop:.4}  idle_on={idle_drop:.4}  idle_off={off_drop:.4}");
-
-    // Idle off leaves the arm at bind (unchanged).
-    assert!(
-        (off_drop - bind_drop).abs() < 1e-3,
-        "idle OFF should leave the untracked arm at bind ({off_drop} vs {bind_drop})"
-    );
-    // Idle on drops the elbow clearly below the shoulder (A-pose)…
-    assert!(idle_drop < -0.05, "idle arm elbow should hang below the shoulder: {idle_drop}");
-    // …and clearly lower than the bind pose.
-    assert!(
-        idle_drop < bind_drop - 0.05,
-        "A-pose idle should lower the elbow vs the T-pose bind ({idle_drop} vs {bind_drop})"
-    );
-}
-
-/// Synthesise a bent index finger on one hand and assert the solver
-/// drives the avatar's corresponding finger bones. This is the
-/// regression test for "making a fist / peace sign / open hand doesn't
-/// register" — the solver has to walk the finger chain (Proximal →
-/// Intermediate → Distal) and turn each bone toward the next joint's
-/// image-space position.
-#[test]
-fn sample_vrm0_solver_bends_fingers() {
-    use crate::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
-    use crate::avatar::{AvatarInstance, AvatarInstanceId};
-    use crate::tracking::source_skeleton::{SourceJoint, SourceSkeleton};
-
-    let loader = VrmAssetLoader::new();
-    let Some(asset) = load_or_skip(&loader, SAMPLE_VRM0) else {
-        return;
-    };
-
-    let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset.clone());
-    avatar.build_base_pose();
-
-    // Pick the LEFT index chain — the 0.x sample maps these to
-    // separate skin nodes (see `sample_vrm0_humanoid_mapping_looks_sane`).
-    // COCO keypoints on the user's anatomical LEFT hand drive the
-    // avatar's RIGHT chain (mirror), but for the solver we can plug
-    // values directly into the source skeleton under either side.
-    let humanoid = asset.humanoid.as_ref().unwrap();
-    let prox = humanoid
-        .bone_map
-        .get(&HumanoidBone::RightIndexProximal)
-        .copied()
-        .unwrap()
-        .0 as usize;
-    let inter = humanoid
-        .bone_map
-        .get(&HumanoidBone::RightIndexIntermediate)
-        .copied()
-        .unwrap()
-        .0 as usize;
-    let distal = humanoid
-        .bone_map
-        .get(&HumanoidBone::RightIndexDistal)
-        .copied()
-        .unwrap()
-        .0 as usize;
-
-    let rest_prox = avatar.pose.local_transforms[prox].rotation;
-    let rest_inter = avatar.pose.local_transforms[inter].rotation;
-    let rest_distal = avatar.pose.local_transforms[distal].rotation;
-
-    // Plant a curled index finger on the right side of the source
-    // skeleton. MCP sits near the palm; PIP/DIP/TIP progressively curl
-    // downward (smaller y). Confidence maxed so the solver does not
-    // threshold us out.
-    let mut source = SourceSkeleton::empty(0);
-    let mut put = |bone, x, y| {
-        source.joints.insert(
-            bone,
-            SourceJoint {
-                position: [x, y, 0.0],
-                confidence: 1.0,
-                metric_depth_m: None,
-            },
-        );
-    };
-    // Wrist / anchor so the arm chain upstream does not move wildly.
-    put(HumanoidBone::RightHand, -0.4, 0.2);
-    put(HumanoidBone::RightIndexProximal, -0.42, 0.15);
-    put(HumanoidBone::RightIndexIntermediate, -0.44, 0.05);
-    put(HumanoidBone::RightIndexDistal, -0.45, -0.05);
-    source.fingertips.insert(
-        HumanoidBone::RightIndexDistal,
-        SourceJoint {
-            position: [-0.44, -0.12, 0.0],
-            confidence: 1.0,
-            metric_depth_m: None,
-        },
-    );
-    source.overall_confidence = 1.0;
-    // Drive the solver's metric path (D435-exclusive); without it the solver
-    // still runs but through the None 1:1 translation fallback.
-    source.stamp_synthetic_metric_frame();
-
-    let params = SolverParams {
-        rotation_blend: 1.0,
-        joint_confidence_threshold: 0.1,
-        face_confidence_threshold: 0.1,
-        ..Default::default()
-    };
-    let mut solver_state = PoseSolverState::default();
-    solve_avatar_pose(
-        &source,
-        &avatar.asset.skeleton,
-        avatar.asset.humanoid.as_ref(),
-        &mut avatar.pose.local_transforms,
-        &params,
-        &mut solver_state,
-    );
-
-    let new_prox = avatar.pose.local_transforms[prox].rotation;
-    let new_inter = avatar.pose.local_transforms[inter].rotation;
-    let new_distal = avatar.pose.local_transforms[distal].rotation;
-
-    for (label, rest, new) in [
-        ("Proximal", rest_prox, new_prox),
-        ("Intermediate", rest_inter, new_inter),
-        ("Distal", rest_distal, new_distal),
-    ] {
-        let diff: f32 = rest
-            .iter()
-            .zip(new.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max);
-        assert!(
-            diff > 1e-4,
-            "Right Index {label} local rotation did not react to bent-finger source ({diff})"
-        );
-    }
 }
 
 /// Dump the VRM 0.x sample's humanoid mapping alongside the skeleton

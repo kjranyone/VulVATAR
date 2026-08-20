@@ -1,5 +1,6 @@
 //! Source skeleton: the avatar-agnostic intermediate representation emitted
-//! by the tracking backends and consumed by [`crate::avatar::pose_solver`].
+//! by the tracking backends; the fusion estimator publishes it as a
+//! compatibility projection for the GUI overlay / expression solve.
 //!
 //! A `SourceSkeleton` carries sparse 3D joint positions (image-space x/y
 //! plus a depth z relative to the body anchor), per-side hand landmark
@@ -29,7 +30,7 @@ use crate::asset::HumanoidBone;
 /// * `position` — `[x, y, z]` in normalised camera coords (see module
 ///   docs for axis conventions). For backends that only produce 2D
 ///   keypoints, set `z = 0`. **The `z` component is intended for
-///   *rotation* / direction-vector consumers** (`pose_solver`,
+///   *rotation* / direction-vector consumers** (retarget,
 ///   `compute_body_yaw_3d`, etc): for the depth-aware providers it
 ///   carries the unbiased relative Z signal (RTMW3D's hip-mid-anchored
 ///   nz), not the metric depth value. Metric depth lives on the
@@ -291,7 +292,7 @@ pub struct SourceSkeleton {
     /// Body-anchor offset from a neutral camera-frame reference
     /// (image centre for 2D-only providers; the calibration-anchor
     /// metric position for depth-aware providers). Used by
-    /// [`crate::avatar::pose_solver`] to translate the avatar's `Hips`
+    /// the retarget to translate the avatar's `Hips`
     /// bone so the avatar follows the subject's side-step / lean-in /
     /// crouch motion instead of just spinning in place, and read by
     /// the pose-calibration modal as the per-frame anchor sample.
@@ -359,7 +360,7 @@ impl SourceSkeleton {
     /// Bench/test helper — stamp a synthetic [`MetricFrameInfo`] so this
     /// skeleton drives the solver's metric path.
     ///
-    /// Since the D435-exclusive rebuild, [`crate::avatar::pose_solver::solve_avatar_pose`]
+    /// Since the D435-exclusive rebuild, the pose consumer
     /// reads `metric_frame_info` only for the root-translation scale
     /// (`avatar_span / reference_span_m`); every other solver behaviour is
     /// identical with or without it. Image-only benches have no depth to feed
@@ -369,7 +370,7 @@ impl SourceSkeleton {
     /// `UpperArm` span so the scale lands as it would on a real metric frame;
     /// the anchor / intrinsics fields the solver never reads carry
     /// placeholders. Not for production use — the real path sets this in
-    /// `skeleton_from_depth`.
+    /// the metric depth path.
     pub fn stamp_synthetic_metric_frame(&mut self) {
         // Mirrors `skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN` (the source
         // normalisation target) when the shoulders are absent.

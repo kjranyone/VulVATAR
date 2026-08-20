@@ -17,7 +17,7 @@ use vulvatar_lib::tracking::fusion::math::*;
 use vulvatar_lib::tracking::fusion::model::*;
 use vulvatar_lib::tracking::fusion::provider::FusionProvider;
 use vulvatar_lib::tracking::provider::{PoseProvider, TrackingPipelineConfig};
-use vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame;
+use vulvatar_lib::tracking::metric_frame::MetricDepthFrame;
 use vulvatar_lib::tracking::CameraIntrinsics;
 
 const D435_FX: f32 = 924.0;

@@ -104,9 +104,6 @@ required-features = ["realsense"]
 # End-to-end Phase B check: D435 depth -> provider (external depth) ->
 # skeleton. Needs the RTMW3D models, so it also pulls in `inference`
 # (which `realsense` already implies).
-[[bin]]
-name = "diagnose_realsense_pose"
-required-features = ["realsense"]
 
 # Tier 1 offline replay: recorded colour PNG + aligned depth .npy -> the same
 # external-depth provider path, NO live camera. Locks TARGET_SRC_SHOULDER_SPAN
@@ -114,9 +111,6 @@ required-features = ["realsense"]
 # depth via `set_external_depth`, never opens the camera) — so it builds without
 # the realsense-sys native toolchain / DLL, which also lets it run while the live
 # app holds realsense2.dll.
-[[bin]]
-name = "diagnose_depth_replay"
-required-features = ["inference"]
 
 [[bin]]
 name = "diagnose_fusion_replay"

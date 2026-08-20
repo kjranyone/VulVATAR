@@ -10,7 +10,7 @@ use log::info;
 
 use crate::tracking::provider::{PoseProvider, TrackingPipelineConfig};
 use crate::tracking::rtmw3d::{Rtmw3dInference, Rtmw3dOptions};
-use crate::tracking::skeleton_from_depth::MetricDepthFrame;
+use crate::tracking::metric_frame::MetricDepthFrame;
 use crate::tracking::source_skeleton::CameraIntrinsics;
 use crate::tracking::PoseEstimate;
 

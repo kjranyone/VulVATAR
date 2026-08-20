@@ -24,14 +24,13 @@ will invalidate that cache and trigger a rebuild.
 - `validation_images/` は **推論入力データ専用** のディレクトリ。検出・診断・可視化など、コードを動かして得たテスト出力をここに書き出してはいけない (`README.md` 末尾にある "synthetic validation assets" の宣言を汚染しない)。
 - 診断系バイナリ (`analyze_depth_provider` など) やアドホック検証スクリプトの出力は、`.gitignore` 済みの `diagnostics/` 配下に書く。バイナリのデフォルト出力先が入力ファイルの隣 (`<stem>_<suffix>/`) になっている場合は、必ず明示的に `diagnostics/...` を渡して実行する。
 - 新しい診断ツールを追加する際も、デフォルト出力先を `diagnostics/` 側にするか、`validation_images/` 配下に書き込もうとしたらエラーにする。
-- ポーズ品質のベンチは 2 本立て: `validate_pipeline` は「アバター vs ソース」の往復一致のみ (トラッキング誤差と骨軸 twist に盲目 — 0.0° でも実機破綻はあり得る)。真値比較は `cargo run --bin validate_gt` — 既知ポーズのアバターをレンダ→追跡→復元し、GT/SRC/REC 3 列で誤差を検出起因とソルバー起因に分解、neutral 比の coupling ゲインも自動算出する (`diagnostics/validation_gt/summary.md`)。
-- **デスク配信エンベロープが主戦場** (頭+肩のみ・カメラ斜め・手は常時デスク下 = ユーザーの本番運用)。腕・顔まわりの変更は正面系リプレイ (wave/palms/namaste) に加えて必ずデスク系録画でも回すこと。録画は `scripts/depth_capture.py` かヘッドレス캡チャ (アプリのカメラ停止が必要) で `frame_NNNN_color.png + _depth_mm.npy` を `diagnostics/depth/desk_*/` に取り、`diagnose_depth_replay <dir>` の temporal summary で見る。デスク向け指標: hand presence duty / toggle 数 (点滅=hold 欠陥)、snaps>0.3/frame (腕スナップ)、yaw std (胸暴れ)、anchor_z jmax (root 暴れ)。
+- ポーズ品質のベンチ: 合成 GT は `cargo run --bin validate_gt` (既知ポーズをレンダ→追跡→復元、coupling ゲイン算出、`diagnostics/validation_gt/summary.md`)、実録画は `diagnose_fusion_replay` (下の Tracking v2 節)。v1 系ベンチ (`validate_pipeline` / `diagnose_depth_replay` ほか) は 2026-08-20 に v1 と共に削除済み。
+- **デスク配信エンベロープが主戦場** (頭+肩のみ・カメラ斜め・手は常時デスク下 = ユーザーの本番運用)。腕・顔まわりの変更は正面系リプレイ (wave/palms/namaste) に加えて必ずデスク系録画 (`diagnostics/sessions/<id>` / `diagnostics/depth/desk_*`) でも `diagnose_fusion_replay` を回すこと。デスク向け指標: 手首ジャンプ/snap 数、data-σ duty (非観測の手が誤駆動されていないか)、胴 yaw std、root ジャンプ。
 
 ## Tracking v2 (fusion estimator) — 2026-08-19 以降の本番経路
 
-- 本番プロバイダは `src/tracking/fusion/provider.rs` (`FusionProvider`)。v1 (`skeleton_from_depth` +
-  `pose_solver` の位置ベース経路) は `VULVATAR_TRACKING_V1=1` で A/B 用に選択可。設計と実装状況は
-  `docs/tracking-v2-design.md` (§13)。
+- 本番プロバイダは `src/tracking/fusion/provider.rs` (`FusionProvider`) の一本のみ
+  (v1 位置ベース経路は 2026-08-20 に全削除)。設計と実装状況は `docs/tracking-v2-design.md` (§13)。
 - オフライン検証: `cargo run --features realsense --bin diagnose_fusion_replay -- <dir> [out_dir] [--render N]`
   (`diagnostics/depth/{wave,palms_front,namaste}_replay`, `diagnostics/sessions/<id>` を食う)。
   summary に 胴 yaw std / 肩深度参照との差 / メトリック関節残差 / 手首ジャンプ / 再捕捉回数、

@@ -9,7 +9,6 @@
 
 use std::path::Path;
 
-use super::rtmw3d_with_depth::Rtmw3dWithDepthProvider;
 use super::PoseEstimate;
 
 /// User-facing pipeline configuration, bound once at tracking start.
@@ -147,14 +146,14 @@ pub trait PoseProvider {
     /// it. Consumed once: the provider clears it after the next estimate.
     ///
     /// Gated on `inference`, not `realsense`: the depth is consumed by the
-    /// inference-stage skeleton lift (`skeleton_from_depth`), and offline
+    /// fusion estimator, and offline
     /// benches inject a recorded/synthetic `MetricDepthFrame` here without
     /// the native realsense toolchain. Only the live D435 *source*
     /// (`build_metric_frame_from_d435`) needs the `realsense` feature.
     #[cfg(feature = "inference")]
     fn set_external_depth(
         &mut self,
-        _depth: crate::tracking::skeleton_from_depth::MetricDepthFrame,
+        _depth: crate::tracking::metric_frame::MetricDepthFrame,
     ) {
     }
 }
@@ -166,17 +165,14 @@ pub fn create_pose_provider(
     models_dir: impl AsRef<Path>,
     config: TrackingPipelineConfig,
 ) -> Result<Box<dyn PoseProvider>, String> {
-    // Tracking v2 (fusion estimator) is the production pipeline. The v1
-    // depth-lift pipeline stays selectable for A/B benches only.
     #[cfg(feature = "inference")]
     {
-        if std::env::var_os("VULVATAR_TRACKING_V1").is_none() {
-            return super::fusion::provider::FusionProvider::from_models_dir_with_config(
-                models_dir, config,
-            )
-            .map(|p| Box::new(p) as Box<dyn PoseProvider>);
-        }
+        super::fusion::provider::FusionProvider::from_models_dir_with_config(models_dir, config)
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>)
     }
-    Rtmw3dWithDepthProvider::from_models_dir_with_config(models_dir, config)
-        .map(|p| Box::new(p) as Box<dyn PoseProvider>)
+    #[cfg(not(feature = "inference"))]
+    {
+        let _ = (models_dir, config);
+        Err("pose provider requires the `inference` cargo feature".to_string())
+    }
 }

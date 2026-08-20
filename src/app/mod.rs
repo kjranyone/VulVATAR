@@ -165,10 +165,6 @@ pub struct Application {
     pub physics: PhysicsWorld,
     pub tracking: TrackingSource,
     pub tracking_calibration: TrackingCalibration,
-    /// Ritual-free session neutral (see `tracking::auto_neutral`): fills
-    /// the `pose_calibration` role while no explicit capture exists.
-    /// Runtime-only — never persisted, reset per tracking session.
-    pub auto_neutral: crate::tracking::auto_neutral::AutoNeutral,
     pub output: OutputRouter,
     /// P3-03: central GPU pressure / pacing policy. Driven per-frame by
     /// [`Self::update_runtime_gpu_budget`]; read by render/output/tracking
@@ -406,7 +402,6 @@ impl Application {
             physics: PhysicsWorld::new(),
             tracking: TrackingSource::new(),
             tracking_calibration: TrackingCalibration::default(),
-            auto_neutral: crate::tracking::auto_neutral::AutoNeutral::default(),
             output: OutputRouter::new(FrameSink::SharedMemory),
             runtime_gpu_budget: runtime_gpu_budget::RuntimeGpuBudget::new(now),
             last_output_drop_count: 0,

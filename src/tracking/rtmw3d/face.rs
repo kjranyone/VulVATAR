@@ -4,10 +4,9 @@
 //! and produces source-space outputs (`FacePose`, `FaceBbox`) — no
 //! ONNX inference of its own.
 
-use crate::asset::HumanoidBone;
 
 use super::super::face_mediapipe::{derive_face_bbox, FaceBbox};
-use super::super::{FacePose, FaceSource, SourceSkeleton};
+use super::super::{FacePose, FaceSource};
 use super::consts::{INPUT_H, INPUT_W, KEYPOINT_VISIBILITY_FLOOR};
 use super::decode::DecodedJoint;
 
@@ -21,8 +20,8 @@ use super::decode::DecodedJoint;
 /// left ear ends up at source `+x`), so the sign conventions match
 /// `quat_from_euler_ypr`.
 pub(super) fn derive_face_pose_from_body(
-    skeleton: &SourceSkeleton,
     joints: &[DecodedJoint],
+    frame_aspect: f32,
 ) -> Option<FacePose> {
     if joints.len() < 5 {
         return None;
@@ -82,17 +81,11 @@ pub(super) fn derive_face_pose_from_body(
     // then read the 5 face keypoints in normalised space and run
     // them through the same axis flip used elsewhere.
     let hip = (joints[11].nx + joints[12].nx) * 0.5;
-    let aspect = skeleton
-        .joints
-        .get(&HumanoidBone::LeftShoulder)
-        .or_else(|| skeleton.joints.get(&HumanoidBone::RightShoulder))
-        .map(|s| s.position[0].abs())
-        .unwrap_or(0.0)
-        / ((joints[5].nx - joints[6].nx).abs() / 2.0).max(1e-3);
-    // Conservative aspect estimate: if we can't read it from the
-    // stored shoulders fall back to assuming square (1.0).
-    let aspect = if aspect.is_finite() && aspect > 0.5 && aspect < 4.0 {
-        aspect
+    // Undo the normalised-coordinate anisotropy with the true image
+    // aspect (the v1 path estimated this from the stored shoulder
+    // joints; the frame aspect is the exact value).
+    let aspect = if frame_aspect.is_finite() && frame_aspect > 0.2 {
+        frame_aspect
     } else {
         1.0
     };
@@ -611,7 +604,6 @@ pub(super) fn build_face_bbox_from_joints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tracking::source_skeleton::SourceJoint;
 
     /// Nominal 30 fps step — the baseline the crossfade schedule was
     /// calibrated at (6 blended frames, target on the 7th).
@@ -625,7 +617,6 @@ mod tests {
             ny,
             nz,
             score: 0.9,
-            z_score: 0.9,
         sx: 0.002, sy: 0.002, }
     }
 
@@ -1011,22 +1002,12 @@ mod tests {
         assert!((out.yaw - -0.5).abs() < 1e-6, "no blend from stale pose");
     }
 
-    fn skeleton_with_shoulder() -> SourceSkeleton {
-        let mut sk = SourceSkeleton::default();
-        sk.joints.insert(
-            HumanoidBone::LeftShoulder,
-            SourceJoint { position: [0.18, 0.0, 0.0], confidence: 0.9, ..Default::default() },
-        );
-        sk
-    }
-
     #[test]
     fn neutral_face68_has_zero_pitch() {
         // Primary estimator: nose tip at the neutral fraction of the
         // eye-line→chin span decodes to ~0.
-        let sk = skeleton_with_shoulder();
         let joints = with_face68(neutral_joints(190.0), VERTICAL_RATIO_NEUTRAL);
-        let face = derive_face_pose_from_body(&sk, &joints).unwrap();
+        let face = derive_face_pose_from_body(&joints, 1.0).unwrap();
         assert!(face.pitch.abs() < 1e-5, "neutral must be 0, got {}", face.pitch);
     }
 
@@ -1035,9 +1016,8 @@ mod tests {
         // Monotonic and signed the documented way: the nose dropping
         // toward the chin is chin-DOWN (+), rising toward the eye line is
         // chin-UP (−). Magnitudes follow `atan(Δratio · gain)`.
-        let sk = skeleton_with_shoulder();
         let pitch_at = |ratio: f32| {
-            derive_face_pose_from_body(&sk, &with_face68(neutral_joints(190.0), ratio))
+            derive_face_pose_from_body(&with_face68(neutral_joints(190.0), ratio), 1.0)
                 .unwrap()
                 .pitch
         };
@@ -1076,10 +1056,8 @@ mod tests {
         j[6] = px(88.0, 280.0, 0.5);
         j[11] = px(168.0, 376.0, 0.5);
         j[12] = px(120.0, 376.0, 0.5);
-
-        let sk = skeleton_with_shoulder();
         let turned = with_face68(j, VERTICAL_RATIO_NEUTRAL);
-        let face = derive_face_pose_from_body(&sk, &turned).unwrap();
+        let face = derive_face_pose_from_body(&turned, 1.0).unwrap();
         assert!(
             face.yaw.abs() < 0.1,
             "fixture must reproduce the DEAD ear-line yaw, got {}",
@@ -1115,15 +1093,14 @@ mod tests {
         j[6] = px(88.0, 280.0, 0.5);
         j[11] = px(168.0, 376.0, 0.5);
         j[12] = px(120.0, 376.0, 0.5);
-        let sk = skeleton_with_shoulder();
         assert!(
-            derive_face_pose_from_body(&sk, &j).is_none(),
+            derive_face_pose_from_body(&j, 1.0).is_none(),
             "collapsed ear baseline must refuse the pose, not divide by it"
         );
         // Even with the face-68 pitch block present the yaw/roll are
         // still unobservable — the refusal must hold.
         let with68 = with_face68(j, VERTICAL_RATIO_NEUTRAL);
-        assert!(derive_face_pose_from_body(&sk, &with68).is_none());
+        assert!(derive_face_pose_from_body(&with68, 1.0).is_none());
     }
 
     #[test]
@@ -1133,14 +1110,13 @@ mod tests {
         // reconstructed the yaw that would correct it is itself a guess.
         // Publishing nothing lets the selector hold the mesh / previous
         // pose instead of nodding the avatar on a bad frame.
-        let sk = skeleton_with_shoulder();
         let mut j = neutral_joints(190.0);
         j[3].score = 0.05; // subject-left ear occluded → reconstruction fires
-        assert!(derive_face_pose_from_body(&sk, &j).is_none());
+        assert!(derive_face_pose_from_body(&j, 1.0).is_none());
         // Same frame WITH the face-68 block: the primary estimator does not
         // need the ears at all, so the pose still publishes.
         let with68 = with_face68(j, VERTICAL_RATIO_NEUTRAL);
-        assert!(derive_face_pose_from_body(&sk, &with68).is_some());
+        assert!(derive_face_pose_from_body(&with68, 1.0).is_some());
     }
 
     #[test]
@@ -1149,8 +1125,7 @@ mod tests {
         // front-facing head (nose the anatomical ~1.25·inter-eye below the
         // eye line) must decode to ~0 pitch — not the ~50°-down bias the
         // un-subtracted body path used to emit.
-        let sk = skeleton_with_shoulder();
-        let face = derive_face_pose_from_body(&sk, &neutral_joints(190.0)).unwrap();
+        let face = derive_face_pose_from_body(&neutral_joints(190.0), 1.0).unwrap();
         assert!(
             face.pitch.abs() < 0.12,
             "neutral face pitch should be ~0, got {} rad",
@@ -1162,8 +1137,7 @@ mod tests {
     fn legacy_fallback_chin_down_is_positive_pitch() {
         // Fallback estimator. Nose dropped further below the eye line →
         // chin-down → +pitch.
-        let sk = skeleton_with_shoulder();
-        let face = derive_face_pose_from_body(&sk, &neutral_joints(214.0)).unwrap();
+        let face = derive_face_pose_from_body(&neutral_joints(214.0), 1.0).unwrap();
         assert!(face.pitch > 0.3, "chin-down should be +pitch, got {}", face.pitch);
     }
 
@@ -1171,8 +1145,7 @@ mod tests {
     fn legacy_fallback_chin_up_is_negative_pitch() {
         // Fallback estimator. Nose lifted toward the eye line → chin-up →
         // -pitch.
-        let sk = skeleton_with_shoulder();
-        let face = derive_face_pose_from_body(&sk, &neutral_joints(166.0)).unwrap();
+        let face = derive_face_pose_from_body(&neutral_joints(166.0), 1.0).unwrap();
         assert!(face.pitch < -0.3, "chin-up should be -pitch, got {}", face.pitch);
     }
 
@@ -1207,9 +1180,7 @@ mod tests {
         j[6] = px(88.0, 280.0, 0.5);
         j[11] = px(168.0, 376.0, 0.5);
         j[12] = px(120.0, 376.0, 0.5);
-
-        let sk = skeleton_with_shoulder();
-        let face = derive_face_pose_from_body(&sk, &j).unwrap();
+        let face = derive_face_pose_from_body(&j, 1.0).unwrap();
         assert!(
             face.yaw.abs() > 0.6,
             "test geometry must actually read as a yawed head, got {} rad",

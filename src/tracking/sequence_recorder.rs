@@ -7,7 +7,7 @@
 //!
 //! The live debug channel publishes *derived* state (source joints, the
 //! solved avatar). That is enough to see what the current pipeline did, and
-//! it is what found the artefacts logged in `hand_hold` and `pose_solver` —
+//! it is what found the v1 hand-blink / solver artefacts —
 //! but it cannot evaluate a DIFFERENT estimator, because every value in it
 //! has already been shaped by the current one's decisions (which joints
 //! "exist", which depth samples were admitted, which frames were held). A

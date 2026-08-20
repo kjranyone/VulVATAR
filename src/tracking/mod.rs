@@ -20,17 +20,14 @@ pub mod sequence_recorder;
 pub(crate) mod latest_cell;
 mod pose_estimation;
 pub mod provider;
-pub mod rtmw3d_with_depth;
 pub mod stagelog;
 #[cfg(feature = "inference")]
-pub mod skeleton_from_depth;
+pub mod metric_frame;
 
-pub mod auto_neutral;
 pub mod calibration;
 pub mod debug_channel;
 pub mod face_mediapipe;
 pub mod fusion;
-pub mod hand_hold;
 pub mod rtmw3d;
 pub mod source_skeleton;
 #[cfg(feature = "inference")]
@@ -46,8 +43,8 @@ pub use source_skeleton::{
 };
 
 /// Smoothing / threshold params consumed by
-/// [`crate::avatar::pose_solver::solve_avatar_pose`] via
-/// [`SolverParams`](crate::avatar::pose_solver::SolverParams).
+/// [`crate::avatar::retarget::apply_rig_pose`] via
+/// [`RetargetParams`](crate::avatar::retarget::RetargetParams).
 ///
 /// The [`Default`] values below are tuned to lean on the upstream 1€ filter
 /// and structural keypoint floors (see the `Default` impl), so most users
@@ -76,7 +73,7 @@ impl Default for TrackingSmoothingParams {
     fn default() -> Self {
         // `rotation_blend = 1.0` snaps each frame straight to the
         // direction-matched output. The 1€ filter on joint positions
-        // (`pose_solver::preprocess_source`) already smooths jitter
+        // (the fusion estimator's process noise) already smooths jitter
         // adaptively, so a separate per-frame rotation LPF on top
         // just adds blanket lag. `joint_confidence_threshold = 0.0`
         // delegates noise gating to the structural floors that already
@@ -100,7 +97,7 @@ impl Default for TrackingSmoothingParams {
 /// selects how they combine so the camera-based path doesn't silently
 /// override audio (or vice-versa). Only the mouth visemes are affected —
 /// eyes / brows / emotions always come from the camera. Consumed by
-/// [`crate::avatar::pose_solver::solve_expressions`].
+/// [`crate::avatar::expressions::solve_expressions`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MouthSource {
     /// Audio lip-sync only — the camera's mouth visemes are ignored.
@@ -136,7 +133,7 @@ impl MouthSource {
 /// `pose` — the user runs the `Calibrate Pose ▼` modal once per project
 /// to capture a known-good pelvic / shoulder anchor reference; the
 /// solver uses it to seed the root-translation EMA and
-/// `skeleton_from_depth` uses it to clamp the metric calibration scale
+/// the depth pipeline used it to clamp the metric calibration scale
 /// against a desk-in-foreground bias. The same capture window also
 /// records the per-person neutral expression baseline and the resting
 /// head pose (`neutral_face_ypr`), both subtracted from live samples by
@@ -1603,7 +1600,7 @@ impl TrackingWorker {
                 // Hand the D435's color-aligned metric depth to the
                 // provider for THIS frame; it replaces the DAv2 stage.
                 let metric =
-                    crate::tracking::rtmw3d_with_depth::build_metric_frame_from_d435(&rs_frame);
+                    crate::tracking::metric_frame::build_metric_frame_from_d435(&rs_frame);
                 provider.set_external_depth(metric);
                 provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
             } else {

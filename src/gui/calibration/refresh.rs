@@ -28,7 +28,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         .unwrap_or(0.0);
     // Anchor visibility: hip pair for FullBody, shoulder pair for
     // UpperBody. Hits the joints map directly so we read the same
-    // floors `skeleton_from_depth` uses.
+    // floors the v1 depth pipeline used.
     let anchor_seen = snap
         .pose
         .as_ref()

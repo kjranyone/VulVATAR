@@ -219,7 +219,6 @@ mod tests {
             ny,
             nz,
             score: 0.9,
-            z_score: 0.9,
         sx: 0.002, sy: 0.002, }
     }
 

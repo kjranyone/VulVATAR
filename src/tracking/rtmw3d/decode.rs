@@ -3,16 +3,12 @@
 //! slices from RTMW3D and returns one [`DecodedJoint`] per
 //! COCO-Wholebody index.
 
-use super::consts::INPUT_H;
 
 pub(in crate::tracking) const NUM_JOINTS: usize = 133;
 pub(super) const SIMCC_X_BINS: usize = 576;
 pub(super) const SIMCC_Y_BINS: usize = 768;
 pub(super) const SIMCC_Z_BINS: usize = 576;
 
-pub(super) const RTMW3D_Z_RANGE: f32 = 2.1744869;
-pub(in crate::tracking) const RTMW3D_SOURCE_Z_SCALE: f32 =
-    (SIMCC_Z_BINS as f32 / INPUT_H as f32) * RTMW3D_Z_RANGE;
 
 /// One decoded keypoint in normalised model space:
 /// `nx, ny ∈ [0, 1]` (image-relative, NY top-to-bottom),
@@ -26,12 +22,11 @@ pub(in crate::tracking) const RTMW3D_SOURCE_Z_SCALE: f32 =
 /// flat or bimodal (low `z_score`); consumers that trust `nz` should
 /// gate on this instead of assuming x/y confidence transfers to depth.
 #[derive(Clone, Copy, Debug, Default)]
-pub(in crate::tracking) struct DecodedJoint {
+pub(crate) struct DecodedJoint {
     pub(in crate::tracking) nx: f32,
     pub(in crate::tracking) ny: f32,
     pub(in crate::tracking) nz: f32,
     pub(in crate::tracking) score: f32,
-    pub(in crate::tracking) z_score: f32,
     /// Localisation σ of the x / y peak in the same normalised units as
     /// `nx` / `ny` (posterior std of the softmax-normalised SimCC
     /// distribution in a window around the peak). A sharp peak yields
@@ -156,7 +151,7 @@ pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) ->
         let z_slice = &simcc_z[j * SIMCC_Z_BINS..(j + 1) * SIMCC_Z_BINS];
         let (xi, xs) = argmax_with_score(x_slice);
         let (yi, ys) = argmax_with_score(y_slice);
-        let (zi, zs) = argmax_with_score(z_slice);
+        let (zi, _zs) = argmax_with_score(z_slice);
         // Per-joint score: take the smaller of x/y heatmap peaks
         // (z is depth — its peak does not localise the joint
         // detection, only its depth) and pass through sigmoid so
@@ -164,13 +159,11 @@ pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) ->
         // its own channel (`z_score`) so depth consumers can gate on
         // the depth head's confidence separately.
         let score = sigmoid(xs.min(ys));
-        let z_score = sigmoid(zs);
         out.push(DecodedJoint {
             nx: refine_peak(x_slice, xi) / SIMCC_X_BINS as f32,
             ny: refine_peak(y_slice, yi) / SIMCC_Y_BINS as f32,
             nz: refine_peak(z_slice, zi) / SIMCC_Z_BINS as f32,
             score,
-            z_score,
             sx: peak_sigma_bins(x_slice, xi) / SIMCC_X_BINS as f32,
             sy: peak_sigma_bins(y_slice, yi) / SIMCC_Y_BINS as f32,
         });
@@ -244,19 +237,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn z_score_reflects_z_peak_independently_of_xy() {
-        // Strong x/y peaks, near-flat z plane → high score, low z_score.
-        let x = full(SIMCC_X_BINS, 100, 1.0, 5.0, 1.0);
-        let y = full(SIMCC_Y_BINS, 100, 1.0, 5.0, 1.0);
-        let z = full(SIMCC_Z_BINS, 100, -8.0, -6.0, -8.0);
-        let joints = decode_simcc(&x, &y, &z);
-        let j = joints[0];
-        assert!(j.score > 0.9, "x/y peak must dominate score, got {}", j.score);
-        assert!(
-            j.z_score < 0.05,
-            "flat z plane must yield a low z_score, got {}",
-            j.z_score
-        );
-    }
 }

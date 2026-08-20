@@ -41,7 +41,6 @@
 #[cfg(feature = "inference")]
 mod annotation;
 #[cfg(feature = "inference")]
-mod arm_z;
 #[cfg(feature = "inference")]
 mod consts;
 #[cfg(feature = "inference")]
@@ -49,13 +48,11 @@ mod decode;
 #[cfg(feature = "inference")]
 mod face;
 #[cfg(feature = "inference")]
-mod math;
 #[cfg(feature = "inference")]
 mod preprocess;
 #[cfg(feature = "inference")]
 pub(in crate::tracking) mod session;
 #[cfg(feature = "inference")]
-mod skeleton;
 #[cfg(feature = "inference")]
 mod yolox_worker;
 
@@ -222,8 +219,6 @@ pub struct Rtmw3dInference {
     /// available and matches the pre-track acquisition behaviour.
     #[cfg(feature = "inference")]
     last_tracked_z_gain: Option<f32>,
-    #[cfg(feature = "inference")]
-    arm_len: arm_z::ArmLengthState,
     /// Stateful mesh↔body head-pose source selection (Schmitt-trigger
     /// hysteresis + switch crossfade) — see [`face::FaceSourceSelector`].
     #[cfg(feature = "inference")]
@@ -237,39 +232,11 @@ pub struct Rtmw3dInference {
     /// estimators (face-source crossfade, sticky-YOLOX freshness,
     /// arm-length leaky maxima).
     #[cfg(feature = "inference")]
-    frame_dt: crate::tracking::skeleton_from_depth::FrameDtTracker,
+    frame_dt: crate::tracking::metric_frame::FrameDtTracker,
     #[cfg(feature = "inference")]
     load_warnings: Vec<String>,
     #[cfg(feature = "inference")]
     backend: InferenceBackend,
-    /// When true, hip pair (COCO 11/12) is unconditionally treated as
-    /// not-visible inside [`skeleton::build_source_skeleton`]. Set by
-    /// the `PoseProvider::set_calibration` override when the user
-    /// picks `CalibrationMode::UpperBody`: webcam framing in that
-    /// mode crops the hips, but the keypoint head still hallucinates
-    /// a confident-looking hip position which would otherwise
-    /// pollute the source skeleton with phantom legs.
-    #[cfg(feature = "inference")]
-    pub(crate) force_shoulder_anchor: bool,
-    /// Transient hint pushed by the GUI while the calibration modal is
-    /// open. Carries the modal's currently selected mode so the provider
-    /// can **override** the persisted [`Self::force_shoulder_anchor`]
-    /// during sample collection — both directions:
-    ///
-    /// * `Some(UpperBody)` → force shoulder anchor (suppress phantom
-    ///   hip), even if the persisted calibration is `FullBody`.
-    /// * `Some(FullBody)`  → do **not** force shoulder anchor, even if
-    ///   the persisted calibration is `UpperBody`. Without this branch,
-    ///   re-calibrating from `UpperBody` to `FullBody` is impossible:
-    ///   the persisted flag stays true, hip never appears as the
-    ///   anchor, and every collected sample is rejected by the GUI's
-    ///   `pose.root_anchor_is_hip` gate.
-    /// * `None`            → modal closed, fall back to the persisted
-    ///   flag.
-    ///
-    /// Applied at the call site in `process_pose`.
-    #[cfg(feature = "inference")]
-    pub(crate) force_shoulder_anchor_hint: Option<crate::tracking::CalibrationMode>,
     /// Raw per-frame perception outputs for the fusion estimator
     /// (decoded 133 keypoints with SimCC σ in whole-frame normalised
     /// coordinates, FaceMesh landmarks in frame pixels). Set by every
@@ -282,7 +249,7 @@ pub struct Rtmw3dInference {
 /// consumers (the fusion estimator) that want the keypoints *before* any
 /// skeleton building.
 #[derive(Clone, Debug, Default)]
-pub(in crate::tracking) struct Rtmw3dAux {
+pub(crate) struct Rtmw3dAux {
     /// 133 COCO-Wholebody keypoints, whole-frame normalised `[0,1]`.
     pub joints: Vec<decode::DecodedJoint>,
     /// FaceMesh 478 landmarks in frame pixels (`z` in pixel scale) and
@@ -355,7 +322,7 @@ impl Rtmw3dInference {
     #[cfg(feature = "inference")]
     /// Drain the raw perception outputs of the last `estimate_pose`.
     #[cfg(feature = "inference")]
-    pub fn take_aux(&mut self) -> Option<Rtmw3dAux> {
+    pub(crate) fn take_aux(&mut self) -> Option<Rtmw3dAux> {
         self.last_aux.take()
     }
 
@@ -363,7 +330,6 @@ impl Rtmw3dInference {
         self.self_track_bbox = None;
         self.last_self_track = None;
         self.last_tracked_z_gain = None;
-        self.arm_len = arm_z::ArmLengthState::default();
         self.frame_timestamp_ms = None;
         self.frame_dt.reset();
         if let Some(worker) = self.yolox_worker.as_mut() {
@@ -489,14 +455,11 @@ impl Rtmw3dInference {
             self_track_bbox: None,
             last_self_track: None,
             last_tracked_z_gain: None,
-            arm_len: arm_z::ArmLengthState::default(),
             face_selector: face::FaceSourceSelector::default(),
             frame_timestamp_ms: None,
-            frame_dt: crate::tracking::skeleton_from_depth::FrameDtTracker::default(),
+            frame_dt: crate::tracking::metric_frame::FrameDtTracker::default(),
             load_warnings,
             backend,
-            force_shoulder_anchor: false,
-            force_shoulder_anchor_hint: None,
             last_aux: None,
         })
     }
@@ -789,7 +752,6 @@ impl Rtmw3dInference {
         let t_decode = std::time::Instant::now();
         let mut joints = decode::decode_simcc(simcc_x, simcc_y, simcc_z);
         drop(outputs);
-        let mut applied_z_gain = 1.0f32;
         if let Some((ox, oy, cw, ch)) = crop_origin {
             // Remap crop-space joints back to original-frame coords,
             // scaling nz by the subject's apparent size so the x/y/z
@@ -810,7 +772,6 @@ impl Rtmw3dInference {
             } else {
                 self.last_tracked_z_gain.unwrap_or_else(|| preprocess::tracked_z_gain(ch, height))
             };
-            applied_z_gain = z_gain;
             preprocess::remap_crop_joints(&mut joints, ox, oy, cw, ch, width, height, z_gain);
         }
         // Raw keypoints for the fusion estimator (whole-frame coords).
@@ -865,84 +826,20 @@ impl Rtmw3dInference {
             self.last_self_track = Some(b);
         }
 
-        // Hint **overrides** persisted when present, in either direction:
-        // the transient GUI hint reflects the mode the user just opened
-        // the calibration modal in, which must take precedence over any
-        // previously-persisted calibration (otherwise re-calibrating from
-        // `UpperBody` to `FullBody` is impossible — the persisted flag
-        // would stay true and the GUI would reject every hip-anchored
-        // sample). When the modal is closed (`None`) the persisted flag
-        // takes over.
-        let force_shoulder = match self.force_shoulder_anchor_hint {
-            Some(crate::tracking::CalibrationMode::UpperBody) => true,
-            Some(crate::tracking::CalibrationMode::FullBody) => false,
-            None => self.force_shoulder_anchor,
+        // Tracking v2: the fusion estimator consumes the raw keypoints
+        // (`take_aux`); this estimate only carries the face channels
+        // (head-pose candidates, FaceMesh expressions) plus the 2-D
+        // annotation for the GUI overlay. The v1 monocular skeleton
+        // builder and its arm heuristics are gone.
+        let mut skeleton = SourceSkeleton::empty(frame_index);
+        skeleton.overall_confidence = {
+            let mut scores: Vec<f32> = joints.iter().take(17).map(|j| j.score).collect();
+            scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            scores.get(scores.len() / 2).copied().unwrap_or(0.0)
         };
-        let mut skeleton =
-            skeleton::build_source_skeleton(frame_index, &joints, width, height, force_shoulder);
 
-        // Permanent field instrument for the crop-z contract: raw RTMW3D
-        // source-space z (pre swap-correction, pre depth injection) plus
-        // the nz remap ratio actually applied this frame. Comparing these
-        // lines between a bbox-cropped frame and the same image through
-        // the whole-frame letterbox fallback answers whether the model's
-        // SimCC-z is crop-relative (values match) or metric-fixed (the
-        // letterbox frame inflates by its zratio). Enable with
-        // `RUST_LOG=vulvatar::rawz=debug`.
-        if log::log_enabled!(target: "vulvatar::rawz", log::Level::Debug) {
-            use crate::asset::HumanoidBone::*;
-            let z = |b| skeleton.joints.get(&b).map(|j| j.position[2]);
-            let f = |o: Option<f32>| o.map(|v| format!("{v:+.3}")).unwrap_or_else(|| "-".into());
-            log::debug!(
-                target: "vulvatar::rawz",
-                "frame={} crop={:?} zratio={:.3} Lsh_z={} Rsh_z={} Lel_z={} Rel_z={} Lwr_z={} Rwr_z={}",
-                frame_index, crop_origin, applied_z_gain,
-                f(z(LeftUpperArm)), f(z(RightUpperArm)),
-                f(z(LeftLowerArm)), f(z(RightLowerArm)),
-                f(z(LeftHand)), f(z(RightHand)),
-            );
-        }
-
-        // Left/right hand-block transposition fix: when two hands meet
-        // at the midline the detector routinely swaps the anatomical
-        // left/right hand keypoint blocks (elbows stay correct, wrists +
-        // finger chains land on the wrong sides), so the avatar crosses
-        // its arms on a fingertips-touch. Correct it before any arm
-        // stage consumes the wrists. See `arm_z::correct_hand_lr_swap`.
-        arm_z::correct_hand_lr_swap(&mut skeleton, &mut self.arm_len);
-
-        // Edge-exit repair: keypoints clamped at the frame / crop
-        // boundary are observation clamps, not positions — restore
-        // the limb to bone length along the observed direction (the
-        // joint may legitimately live OUTSIDE the frame in source
-        // space). Must run before the wrist temporal hold (so the
-        // hold memorises the repaired wrist) and before
-        // `reconstruct_arm_z` (whose bone-length invariant would
-        // otherwise misread the clamp-shortened projection as
-        // forward depth).
-        arm_z::repair_edge_clamped_arms(
-            &mut skeleton,
-            &joints,
-            width as f32 / height as f32,
-            &mut self.arm_len,
-            dt_s,
-        );
-
-        // The detected 2D wrist is trusted as-is: the legacy
-        // projection-space forearm-length plausibility filter (wrist.rs
-        // Stage 2) was removed — it rejected a foreshortened-upper-arm /
-        // in-plane-forearm pose as a "hallucination" every frame (the
-        // exact perspective fallacy ray-IK eliminates), throwing away
-        // real detections so the avatar's hands ran on the now-retired
-        // Stage 4 synthesis instead of tracking. The depth solve below
-        // resolves the perspective; the MCP-confidence floor in
-        // `build_source_skeleton` (Stage 1) gates genuinely bad hands.
-
-        // Head pose (yaw/pitch/roll) from RTMW3D's body face keypoints
-        // 0..=4. These are already in source-skeleton 3D coords, so
-        // the angles fall straight into the solver's frame without
-        // any unprojection.
-        skeleton.face = face::derive_face_pose_from_body(&skeleton, &joints);
+        skeleton.face =
+            face::derive_face_pose_from_body(&joints, width as f32 / height.max(1) as f32);
         let dt_decode = t_decode.elapsed();
 
         // Face crop → MediaPipe FaceMesh → BlendshapeV2. The bbox is

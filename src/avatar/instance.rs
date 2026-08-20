@@ -7,7 +7,7 @@ use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::pose::{
     self as pose_helpers, AvatarPose,
 };
-use crate::avatar::pose_solver::{PoseSolverState, ResolvedExpressionWeight};
+use crate::avatar::expressions::{ExpressionState, ResolvedExpressionWeight};
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,10 +35,8 @@ pub struct AvatarInstance {
     /// Runtime-only (not persisted); resets to all-enabled on (re)load.
     pub collider_enabled: Vec<bool>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
-    /// Per-bone calibration carried between solver frames so 2D
-    /// foreshortening can be inverted into Z. See
-    /// [`PoseSolverState`] for details.
-    pub pose_solver_state: PoseSolverState,
+    /// Temporal state for the expression (blend-shape) solve.
+    pub expression_state: ExpressionState,
     /// Tracking-v2 retarget state (rig-pose path, see `avatar::retarget`).
     pub retarget_state: crate::avatar::retarget::RetargetState,
 }
@@ -172,7 +170,7 @@ impl AvatarInstance {
             cloth_overlays: Vec::new(),
             collider_enabled: vec![true; collider_count],
             expression_weights: Vec::new(),
-            pose_solver_state: PoseSolverState::default(),
+            expression_state: ExpressionState::default(),
             retarget_state: Default::default(),
         }
     }

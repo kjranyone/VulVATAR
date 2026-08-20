@@ -247,7 +247,7 @@ fn dto_to_pose_calibration(
         // *source-space* z (negative for forward subjects). The field
         // is documented as camera-space metric depth (positive), and
         // the live consumers (calibrate_scale plausibility band,
-        // pose_solver root-reference seed) require that. Coerce on
+        // the retired v1 root-reference seed) required that. Coerce on
         // load so stale profiles from before the bug fix don't break
         // tracking; new captures already store the positive value via
         // `aggregate()` so this is a no-op for them.

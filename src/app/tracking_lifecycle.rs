@@ -27,18 +27,14 @@ impl Application {
             info!("app: stopped previous tracking worker for backend switch");
         }
         // Tracking restart most likely means a different camera /
-        // session / subject. Clear every avatar's motion-smoothing
-        // state (1€ filter, hysteresis, root_offset EMA) so the
+        // session / subject. Clear every avatar's retarget state
+        // (display smoothing, root anchor) and expression EMAs so the
         // first frame after restart isn't blended against stale
         // history from the previous session.
         for avatar in self.avatars.iter_mut() {
-            avatar.pose_solver_state.reset();
+            avatar.expression_state.reset();
             avatar.retarget_state.reset();
         }
-        // Same rationale for the automatic session neutral: a new
-        // session may be a new camera placement, so the previous
-        // session's seeded neutrals must not carry over.
-        self.auto_neutral.reset();
         let shared_mailbox = self.tracking.shared_mailbox();
         let mut worker = TrackingWorker::new(shared_mailbox);
         worker.start_with_params(width, height, fps, pipeline);

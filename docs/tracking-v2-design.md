@@ -259,13 +259,13 @@ GPU は逐次 (Arc TDR 対策)。合計 ≤ 60 ms/GPU フレームで body 15 Hz
 | 手 crop (MediaPipe hand landmarker、検出器/予測駆動) | ✅ 2D のみ (world 出力は非メトリックで未使用) | `fusion/hands.rs` |
 | RigPose 出力 + 互換 SourceSkeleton | ✅ | `fusion/output.rs` |
 | リターゲット (world-delta、σ ゲート、root アンカー) | ✅ | `avatar/retarget.rs` |
-| アプリ配線 (render.rs の rig 経路、v1 は `VULVATAR_TRACKING_V1=1`) | ✅ | `app/render.rs`, `tracking/provider.rs` |
+| アプリ配線 (render.rs の rig 経路) | ✅ v1 経路は削除済み | `app/render.rs`, `tracking/provider.rs` |
 | リプレイベンチ (CSV・オーバーレイ・肩深度 yaw 参照・メトリック関節残差) | ✅ | `src/bin/diagnose_fusion_replay.rs` |
 | 密点群項 | ⚠️ 実装済みだが既定 OFF (`cloud_budget = 0`): 遮蔽・机・腕の誤対応で胴 yaw を壊す。z-buffer 可視性付きの対応付けに作り直すまで無効 | `estimator.rs::surface_term` |
 | align-to-color 廃止 (native 深度 + extrinsics) | ❌ 未着手 (現行は aligned 深度) | — |
 | AprilTag GT リグ / 実データ mm-deg ベンチ | ❌ 未着手 (Phase 0 の物理リグはユーザー作業が必要) | — |
 | 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床/事前なし | — |
-| v1 撤去 | ❌ ライブ検証後 | — |
+| v1 撤去 | ✅ 2026-08-20: `skeleton_from_depth` / `rtmw3d_with_depth` / `hand_hold` / `auto_neutral` / `arm_z` / `rtmw3d::skeleton` / `pose_solver` (位置ベース経路) と v1 専用ベンチ 11 本を削除。式解決は `avatar/expressions.rs`、共有型は `tracking/metric_frame.rs` に残置 | — |
 
 ### リプレイ実測 (2026-08-19, dev build)
 - desk 録画 400 フレーム (640×480): 胴 yaw std **1.0°**、肩メトリック残差中央値 **5 mm**、再捕捉 0、手は非観測 (data-σ duty 0)、推定器 3.3 ms/フレーム。

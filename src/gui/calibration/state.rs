@@ -78,7 +78,7 @@ pub struct AnchorSample {
     /// median of finite samples to give a per-subject body-scale
     /// reference. On the depth path this drives the metric-frame `mpsu`
     /// (metres-per-source-unit) normalisation in
-    /// [`crate::tracking::skeleton_from_depth::build_skeleton`], scaling
+    /// the retired v1 depth skeleton builder, scaling
     /// the metric skeleton into the isotropic source frame.
     pub shoulder_span_m: Option<f32>,
 }

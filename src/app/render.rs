@@ -9,7 +9,6 @@ use super::{
     Application, FrameConfig, FrameInputConfig, RuntimeToggles, SensorCamera, ViewportCamera,
 };
 use crate::app::render_thread::RenderCommand;
-use crate::avatar::pose_solver::{self, SolverParams};
 use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
 use crate::renderer::frame_input::RenderDebugFlags;
@@ -123,25 +122,15 @@ impl Application {
         if sample_is_fresh {
             if let Some(ref tp) = tracking_sample {
                 self.last_tracking_pose = Some(tp.clone());
-                // Automatic neutral estimation over the RAW stream (the
-                // ritual-free counterpart of the Calibrate Pose capture,
-                // see `tracking::auto_neutral`). Fresh samples only —
-                // hold-window republications carry decayed confidences
-                // and would poison the stability windows.
-                self.auto_neutral.ingest(tp);
             }
         }
 
-        // Effective calibration for this frame: an explicit capture
-        // (modal / persisted project) always wins; the automatic
-        // session neutral fills in only while none exists.
-        let effective_pose = self
-            .tracking_calibration
-            .pose
-            .clone()
-            .or_else(|| self.auto_neutral.calibration().cloned());
+        // Effective calibration for this frame (explicit modal capture /
+        // persisted project). Applies to the compat source skeleton's
+        // face channels only — the rig pose from the fusion estimator is
+        // already metric and needs no calibration.
         let effective_calibration =
-            crate::tracking::TrackingCalibration { pose: effective_pose.clone() };
+            crate::tracking::TrackingCalibration { pose: self.tracking_calibration.pose.clone() };
 
         // Global avatar fade-out when person detection is lost. Target is full
         // opacity while a person is present (fresh sample or within the hold
@@ -177,39 +166,13 @@ impl Application {
             self.tracking_fade_opacity = (self.tracking_fade_opacity + delta).clamp(0.0, 1.0);
         }
 
-        let mut solver_params = SolverParams {
+        let retarget_params = crate::avatar::retarget::RetargetParams {
             rotation_blend: smoothing_params.rotation_blend,
-            joint_confidence_threshold: smoothing_params.joint_confidence_threshold,
-            face_confidence_threshold: smoothing_params.face_confidence_threshold,
-            hand_tracking_enabled,
-            face_tracking_enabled,
-            lower_body_tracking_enabled,
             root_translation_enabled,
-            // Pose calibration: the `Calibrate Pose` modal capture when
-            // one exists, else the automatic session neutral
-            // (`tracking::auto_neutral`). The solver uses it to seed the
-            // root-translation EMA reference so the avatar's neutral
-            // position is the user's calibrated stance, not whatever the
-            // first hip-visible frame happened to read.
-            pose_calibration: effective_pose.clone(),
-            ..SolverParams::default()
+            hand_tracking_enabled,
+            lower_body_tracking_enabled,
+            ..Default::default()
         };
-        // Live debug overrides (no-op unless %ProgramData%\VulVATAR\debug.on
-        // exists): lets an external tool A/B the arm IK stages or sweep the
-        // confidence threshold against the running app without a rebuild.
-        let tuning = crate::tracking::debug_channel::load_tuning();
-        if let Some(v) = tuning.arm_reach_ik {
-            solver_params.arm_reach_ik_enabled = v;
-        }
-        if let Some(v) = tuning.contact_ik {
-            solver_params.contact_ik_enabled = v;
-        }
-        if let Some(v) = tuning.idle_arm_apose {
-            solver_params.idle_arm_apose_enabled = v;
-        }
-        if let Some(v) = tuning.joint_confidence_threshold {
-            solver_params.joint_confidence_threshold = v;
-        }
 
         // Advance the simulation clock once per frame so every avatar in the
         // scene observes the same `(fixed_dt, substeps)`. Previously this was
@@ -227,42 +190,26 @@ impl Application {
                 let humanoid = avatar.asset.humanoid.as_ref();
                 if let (Some(rig), Some(hm)) = (source.rig.as_ref(), humanoid) {
                     // Tracking v2: joint rotations from the fusion estimator.
-                    let rp = crate::avatar::retarget::RetargetParams {
-                        rotation_blend: solver_params.rotation_blend,
-                        root_translation_enabled: solver_params.root_translation_enabled,
-                        hand_tracking_enabled: solver_params.hand_tracking_enabled,
-                        lower_body_tracking_enabled: solver_params.lower_body_tracking_enabled,
-                        ..Default::default()
-                    };
                     crate::avatar::retarget::apply_rig_pose(
                         rig,
                         &avatar.asset.skeleton,
                         hm,
                         &mut avatar.pose.local_transforms,
-                        &rp,
+                        &retarget_params,
                         &mut avatar.retarget_state,
                         frame_dt,
-                    );
-                } else {
-                    pose_solver::solve_avatar_pose(
-                        source,
-                        &avatar.asset.skeleton,
-                        humanoid,
-                        &mut avatar.pose.local_transforms,
-                        &solver_params,
-                        &mut avatar.pose_solver_state,
                     );
                 }
 
                 if face_tracking_enabled {
-                    let new_weights = pose_solver::solve_expressions(
+                    let new_weights = crate::avatar::expressions::solve_expressions(
                         source,
                         &avatar.asset.default_expressions,
                         Some(&avatar.expression_weights),
                         smoothing_params.expression_blend,
                         smoothing_params.face_confidence_threshold,
                         config.mouth_source,
-                        &mut avatar.pose_solver_state,
+                        &mut avatar.expression_state,
                     );
                     avatar.expression_weights = new_weights;
                 }

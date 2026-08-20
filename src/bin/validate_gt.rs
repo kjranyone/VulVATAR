@@ -30,7 +30,6 @@ use std::sync::Arc;
 use vulvatar_lib::app::ViewportCamera;
 use vulvatar_lib::asset::vrm::VrmAssetLoader;
 use vulvatar_lib::asset::{AvatarAsset, HumanoidBone, NodeId, SkeletonAsset, Transform};
-use vulvatar_lib::avatar::pose_solver::{solve_avatar_pose, PoseSolverState, SolverParams};
 use vulvatar_lib::avatar::{AvatarInstance, AvatarInstanceId};
 use vulvatar_lib::math_utils::{
     quat_conjugate, quat_mul, quat_normalize, quat_rotate_vec3, vec3_add, vec3_length,
@@ -44,7 +43,7 @@ use vulvatar_lib::renderer::frame_input::{
 use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
 use vulvatar_lib::renderer::VulkanRenderer;
 use vulvatar_lib::tracking::provider::create_pose_provider;
-use vulvatar_lib::tracking::skeleton_from_depth::MetricDepthFrame;
+use vulvatar_lib::tracking::metric_frame::MetricDepthFrame;
 
 const RENDER_EXTENT: [u32; 2] = [1024, 1024];
 /// AliciaSolid, NOT AvatarSample_A: the tracker reads Alicia's
@@ -722,15 +721,13 @@ fn main() -> Result<(), String> {
         let est = infer.estimate_pose(&rgb, RENDER_EXTENT[0], RENDER_EXTENT[1], base + 4);
 
         let mut rec_locals = rest_locals.clone();
-        let mut state = PoseSolverState::default();
-        let params = SolverParams {
-            rotation_blend: 1.0,
-            joint_confidence_threshold: 0.1,
-            face_confidence_threshold: 0.1,
-            ..Default::default()
-        };
-        if let (Some(rig), Some(hm)) = (est.skeleton.rig.as_ref(), asset.humanoid.as_ref()) {
-            // Tracking v2: joint rotations from the fusion estimator.
+        {
+            let rig = est
+                .skeleton
+                .rig
+                .as_ref()
+                .expect("fusion provider always publishes a rig pose");
+            let hm = asset.humanoid.as_ref().expect("sample VRM has a humanoid map");
             let mut rstate = vulvatar_lib::avatar::retarget::RetargetState::default();
             let rp = vulvatar_lib::avatar::retarget::RetargetParams {
                 rotation_blend: 1.0,
@@ -745,15 +742,6 @@ fn main() -> Result<(), String> {
                 &rp,
                 &mut rstate,
                 1.0 / 30.0,
-            );
-        } else {
-            solve_avatar_pose(
-                &est.skeleton,
-                &asset.skeleton,
-                asset.humanoid.as_ref(),
-                &mut rec_locals,
-                &params,
-                &mut state,
             );
         }
         // Probe: raw source shoulder positions (z provenance triage).
