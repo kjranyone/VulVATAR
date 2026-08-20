@@ -1,5 +1,13 @@
 # Tracking Retargeting
 
+> **Partially superseded (2026-08-20).** The v1 layers this document
+> references (hand hold, engage gates, degradation policy, pose_solver)
+> were removed with the v1 pipeline; the `TrackingRigPose` contract and
+> the normalization/confidence principles live on in the fusion
+> estimator + `avatar::retarget`. See
+> [tracking-v2-design.md](tracking-v2-design.md).
+
+
 ## Purpose
 
 This document defines how RealSense D435 depth-driven tracking data becomes avatar-driving input.

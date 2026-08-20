@@ -1,5 +1,12 @@
 # ONNX Whole-Body Tracking Pipeline
 
+> **RETIRED (2026-08-20).** This document describes the v1 pipeline
+> (monocular skeleton builder + depth-lift + position-based pose solver),
+> which has been deleted from the tree. The production pipeline is the
+> fusion estimator — see [tracking-v2-design.md](tracking-v2-design.md).
+> Kept for historical context only; module paths below no longer exist.
+
+
 This document describes the design and implementation of the ONNX
 Runtime-based whole-body tracking pipeline used in VulVATAR. The
 2026-06 provider unification removed the alternative pipelines
