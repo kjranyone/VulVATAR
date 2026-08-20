@@ -127,6 +127,7 @@ pub fn body_kp2d(
     height: u32,
     pol: KpSigma,
     hand_scale: f64,
+    head_scale: f64,
     out: &mut Vec<Kp2d>,
 ) {
     let w = width as f64;
@@ -153,6 +154,12 @@ pub fn body_kp2d(
         sigma *= 1.0 + pol.score_inflate * (1.0 - kp.score as f64);
         if i >= 91 {
             sigma *= hand_scale;
+        }
+        if i < 5 {
+            // Face keypoints (nose/eyes/ears). SimCC frontalizes these
+            // past ~30° head yaw just like the dense mesh — the caller
+            // widens them whenever a better head-position anchor exists.
+            sigma *= head_scale;
         }
         out.push(Kp2d {
             point: *point,

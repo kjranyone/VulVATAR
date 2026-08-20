@@ -68,6 +68,14 @@ pub struct FusionProvider {
     /// is accepted immediately.
     ori_last: Option<M3>,
     ori_reject_run: u8,
+    /// Frames since the depth cheek-profile last CONFIRMED a large-yaw
+    /// pose (saturating count-down). The profile signal flickers frame to
+    /// frame (sparse depth columns, headphones, hair), so a confirmed
+    /// large-yaw episode stays trusted for a short window as long as the
+    /// target stays temporally continuous. A palm-locked mesh never earns
+    /// the confirmation in the first place, so the window never opens for
+    /// it.
+    ori_depth_grace: u8,
     external_depth: Option<MetricDepthFrame>,
     load_warnings: Vec<String>,
     /// Last capture time (s) handed to the estimator.
@@ -143,6 +151,7 @@ impl FusionProvider {
             hand_unsupported: [0, 0],
             ori_last: None,
             ori_reject_run: 0,
+            ori_depth_grace: 0,
             external_depth: None,
             load_warnings: warnings,
             last_t: None,
@@ -231,6 +240,7 @@ impl PoseProvider for FusionProvider {
         self.hand_unsupported = [0, 0];
         self.ori_last = None;
         self.ori_reject_run = 0;
+        self.ori_depth_grace = 0;
         self.last_t = None;
         self.frames = 0;
     }
@@ -693,6 +703,19 @@ impl PoseProvider for FusionProvider {
                 }
             }
             let n_before = obs.kp2d.len();
+            // With a dense-mesh centroid anchoring head position, the
+            // SimCC face keypoints only ADD their frontalization bias —
+            // widen them so they stop binding head yaw (~4° measured).
+            let head_scale = if !face_occluded
+                && aux
+                    .face_mesh
+                    .as_ref()
+                    .is_some_and(|(_, c)| *c >= 0.5)
+            {
+                3.0
+            } else {
+                1.0
+            };
             body_kp2d(
                 &self.body_map,
                 &raw,
@@ -700,6 +723,7 @@ impl PoseProvider for FusionProvider {
                 height,
                 self.kp_sigma,
                 1.5,
+                head_scale,
                 &mut obs.kp2d,
             );
             for k in obs.kp2d[n_before..].iter_mut() {
@@ -1052,8 +1076,15 @@ impl PoseProvider for FusionProvider {
                 // the hand-rect proxies miss a fair share of those frames.
                 // Small-yaw claims are harmless (they cannot destabilize
                 // the torso) and stay depth-free.
-                let accept = (step_ok || agrees_pred)
-                    && (f.yaw.abs() <= 0.35 || depth_supports == Some(true));
+                if depth_supports == Some(true) {
+                    self.ori_depth_grace = 20;
+                } else {
+                    self.ori_depth_grace = self.ori_depth_grace.saturating_sub(1);
+                }
+                let depth_ok = depth_supports == Some(true)
+                    || (self.ori_depth_grace > 0 && step_ok);
+                let accept =
+                    (step_ok || agrees_pred) && (f.yaw.abs() <= 0.35 || depth_ok);
                 if !accept {
                     self.ori_reject_run = self.ori_reject_run.saturating_add(1);
                     if self.ori_reject_run >= 15 {
