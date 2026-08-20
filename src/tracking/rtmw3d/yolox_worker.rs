@@ -9,9 +9,8 @@
 //! synchronous YOLOX run; here the hitch is hidden behind the
 //! worker.
 //!
-//! Same latest-only inbox / sticky-Arc design as the DAv2 worker in
-//! `rtmw3d_with_depth.rs`. Cold start blocks once on the first
-//! result; subsequent frames just clone the Arc.
+//! Cold start blocks once on the first result; subsequent frames just
+//! clone the Arc.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;

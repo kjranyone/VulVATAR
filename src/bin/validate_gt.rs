@@ -1,9 +1,9 @@
 //! Ground-truth round-trip validation (self-consistency rendering).
 //!
-//! `validate_pipeline` scores avatar-vs-SOURCE parity, which is blind
-//! to (a) tracking errors (the source itself being wrong) and (b)
-//! twist around bone axes (direction vectors don't change under
-//! twist). This harness closes both holes by inverting the setup:
+//! A source-skeleton comparison is blind to (a) tracking errors (the
+//! source itself being wrong) and (b) twist around bone axes (direction
+//! vectors don't change under twist). This harness closes both holes
+//! by inverting the setup:
 //! pose the avatar with KNOWN joint rotations, render it with a known
 //! camera, run the full tracking+solve pipeline on the render, and
 //! compare the recovered pose against the ground truth with
@@ -440,7 +440,6 @@ fn build_metric_frame_from_depth(
         width: w,
         height: h,
         points_m,
-        crop: None,
         // Synthetic frames carry no device clock — the provider's
         // time-based estimators run on their nominal 30 fps fallback.
         timestamp_ms: None,
@@ -634,7 +633,7 @@ fn main() -> Result<(), String> {
     renderer.initialize();
     // True metric round-trip: read the render's depth aspect back so each
     // tracked frame is fed real aligned depth via `set_external_depth`,
-    // exercising the shipping `skeleton_from_depth` path end-to-end.
+    // exercising the shipping fusion path end-to-end.
     renderer.set_depth_readback(true);
     let cam_fov = ViewportCamera::default().fov_deg;
 
@@ -689,8 +688,8 @@ fn main() -> Result<(), String> {
         // RGBA → RGB for the tracker.
         let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
         // Aligned metric depth for THIS pose's render, fed before each
-        // estimate_pose so the provider back-projects the skeleton through the
-        // shipping `skeleton_from_depth` path (one frame consumed per call).
+        // estimate_pose so the provider fuses the 2-D keypoints against
+        // the same metric cloud the live D435 path uses.
         let gt_metric = build_metric_frame_from_depth(
             &gt_depth.ok_or_else(|| "validate_gt: GT render produced no depth".to_string())?,
             RENDER_EXTENT,
@@ -706,8 +705,8 @@ fn main() -> Result<(), String> {
 
         // Track + solve: reset, neutral warmup (session calibration),
         // then two passes on the pose frame (acquire + self-tracked
-        // crop — same protocol as validate_pipeline). Each pass is fed its
-        // frame's aligned depth (neutral vs GT), mirroring the live worker.
+        // crop). Each pass is fed its frame's aligned depth (neutral vs
+        // GT), mirroring the live worker.
         infer.reset_temporal_state();
         let base = (idx as u64) * 8;
         for k in 0..3 {

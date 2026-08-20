@@ -300,10 +300,8 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
     // negative value). The `anchor_depth_m` field is documented as
     // *Camera-space metric depth* (= the positive forward distance),
     // so we take the absolute value here. Without this, `cal_depth`
-    // ends up negative and the plausibility check in
-    // `rtmw3d_with_depth::calibrate_scale` rejects every live frame
-    // because `predicted_depth` (always positive) can never match a
-    // negative reference.
+    // ends up negative and later consumers that treat the field as a
+    // positive camera-forward distance reject the capture.
     let z_is_metric = zs.iter().any(|&z| z.abs() > 1e-4);
     let anchor_depth_m = z_is_metric.then_some(median_z.abs());
     let anchor_depth_jitter_m = if z_is_metric {

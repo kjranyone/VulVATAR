@@ -26,9 +26,9 @@ virtual-camera = []
 lipsync = ["cpal", "rustfft"]
 # RealSense D435 depth capture — the sole capture backend (D435-exclusive
 # build), shipped in `default`. Pulls in `inference`: the D435 depth is
-# consumed by the RTMW3D provider (MetricDepthFrame / skeleton_from_depth
-# live behind `inference`), so a realsense build is always an inference
-# build. See docs/realsense-build.md.
+# consumed by the fusion estimator (MetricDepthFrame live behind
+# `inference`), so a realsense build is always an inference build.
+# See docs/realsense-build.md.
 realsense = ["dep:realsense-rust", "inference"]
 
 [dependencies]
@@ -101,25 +101,19 @@ opt-level = 2
 name = "diagnose_realsense"
 required-features = ["realsense"]
 
-# End-to-end Phase B check: D435 depth -> provider (external depth) ->
-# skeleton. Needs the RTMW3D models, so it also pulls in `inference`
-# (which `realsense` already implies).
-
-# Tier 1 offline replay: recorded colour PNG + aligned depth .npy -> the same
-# external-depth provider path, NO live camera. Locks TARGET_SRC_SHOULDER_SPAN
-# and the metric branch against a real frame. Only needs `inference` (it injects
-# depth via `set_external_depth`, never opens the camera) — so it builds without
-# the realsense-sys native toolchain / DLL, which also lets it run while the live
-# app holds realsense2.dll.
+# Offline replay: recorded colour PNG + aligned depth .npy -> fusion
+# estimator, no live camera. Only needs `inference` (it injects depth via
+# `set_external_depth`, never opens the camera) — so it builds without the
+# realsense-sys native toolchain / DLL, which also lets it run while the
+# live app holds realsense2.dll.
 
 [[bin]]
 name = "diagnose_fusion_replay"
 required-features = ["inference"]
 
 # GT round-trip renders an aligned metric depth buffer and feeds it via
-# `set_external_depth` (the shipping D435 skeleton path) so the recovered pose
-# is scored end-to-end through `skeleton_from_depth`, not a monocular fallback.
-# That path is `realsense`-gated, so the bench is too.
+# `set_external_depth` so the recovered pose is scored end-to-end through
+# the fusion estimator. That path is `realsense`-gated, so the bench is too.
 [[bin]]
 name = "validate_gt"
 required-features = ["realsense"]

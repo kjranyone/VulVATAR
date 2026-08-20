@@ -158,6 +158,14 @@ pub struct Params {
     /// Variance floor / cap of the carried covariance.
     pub var_min: f64,
     pub var_max: f64,
+    /// σ (rad) of the upright-root prior: the pelvis "up" direction in the
+    /// camera frame is pulled toward straight up (camera −y). Without it
+    /// the pelvis/spine pitch split is unobservable in an upper-body
+    /// framing and the solver parks the pelvis near-horizontal with the
+    /// spine+neck curling to fit the face (measured 75–82° root tilt on
+    /// the wave replay). Soft: a genuinely pitched camera pushes the
+    /// residual tilt into gentle spine flexion instead.
+    pub upright_sigma: f64,
     /// Median 2-D residual (px) above which the track counts as lost.
     pub lost_rms_px: f64,
     /// Restrict the point-cloud term to torso / neck / head capsules (the
@@ -202,6 +210,7 @@ impl Default for Params {
             pose_prior_scale: 1.0,
             var_min: 1e-8,
             var_max: 25.0,
+            upright_sigma: 0.12,
             lost_rms_px: 40.0,
             cloud_torso_only: true,
             cloud_zbuffer: true,
@@ -1074,6 +1083,34 @@ impl Estimator {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ---- upright-root prior ---------------------------------------------------
+        {
+            // Body up (+Y) through the root rotation should be camera up
+            // (−y in the camera frame). Two residuals: the x and z
+            // components of the rotated up vector (0 when upright).
+            let up = mat_vec(&st.root_r, [0.0, 1.0, 0.0]);
+            // A correctly-fitted subject has up_cam ≈ (0, −1, 0). If the
+            // solve is upside down (up_cam.y > 0) the prior would be blind
+            // through x/z alone; the +y case is handled by the same two
+            // residuals growing as the state escapes the basin.
+            let inv = 1.0 / p.upright_sigma;
+            for (k, comp) in [(0usize, up[0]), (2usize, up[2])] {
+                let r = comp * inv;
+                cost += r * r;
+                if build {
+                    // d(up)/dδ = δ × up  →  row_k over ROOT_ROT params.
+                    let mut row: Vec<(usize, f64)> = Vec::with_capacity(3);
+                    for c in 0..3 {
+                        let mut e = [0.0; 3];
+                        e[c] = 1.0;
+                        let d = cross(e, up);
+                        row.push((ROOT_ROT + c, d[k] * inv));
+                    }
+                    self.dense.add_residual(&row, r, 1.0);
                 }
             }
         }

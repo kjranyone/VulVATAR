@@ -36,8 +36,7 @@
 //! # Format
 //!
 //! One directory per session, holding the same pair the existing offline
-//! benches already read (`diagnose_depth_replay`, `diagnose_video_replay`,
-//! `diagnose_rtmw3d_2d`, `score_pose_session`):
+//! benches already read (`diagnose_fusion_replay`, `diagnose_rtmw3d_2d`):
 //!
 //! ```text
 //! diagnostics/sessions/<stamp>/

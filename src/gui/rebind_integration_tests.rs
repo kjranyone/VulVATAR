@@ -13,11 +13,11 @@
 //!   "Could not auto-bind" notification fires, on-disk file
 //!   untouched.
 //! * **Partial** (secondary/tertiary tier resolution) — currently
-//!   unreachable through the resolver: see the TODO at
-//!   `cloth_rebind.rs:198-204`. The persistence leg
-//!   (`save_rebound_overlay` writing `last_rebound_with`) is
-//!   covered by a focused IO test below; once tier-2/3 resolution
-//!   lands, replace that with a true E2E Partial test.
+//!   unreachable through the resolver (name match is the only
+//!   implemented tier). The persistence leg (`save_rebound_overlay`
+//!   writing `last_rebound_with`) is covered by a focused IO test
+//!   below; once tier-2/3 resolution lands, replace that with a true
+//!   E2E Partial test.
 use super::project::save_rebound_overlay;
 use super::*;
 use crate::asset::{

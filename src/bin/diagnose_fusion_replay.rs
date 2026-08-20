@@ -20,6 +20,11 @@ use vulvatar_lib::tracking::provider::{PoseProvider, TrackingPipelineConfig};
 use vulvatar_lib::tracking::metric_frame::MetricDepthFrame;
 use vulvatar_lib::tracking::CameraIntrinsics;
 
+use vulvatar_lib::asset::Transform;
+use vulvatar_lib::avatar::retarget::{apply_rig_pose, RetargetParams, RetargetState};
+use vulvatar_lib::renderer::offline;
+use vulvatar_lib::renderer::VulkanRenderer;
+
 const D435_FX: f32 = 924.0;
 const D435_FY: f32 = 924.0;
 const D435_CX: f32 = 640.0;
@@ -118,7 +123,6 @@ fn load_metric_frame(
             width: dw,
             height: dh,
             points_m,
-            crop: None,
             intrinsics: Some(intr),
             timestamp_ms: None,
         },
@@ -222,6 +226,26 @@ fn main() -> Result<(), String> {
         render_every = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(5);
         args.drain(i..(i + 2).min(args.len()));
     }
+    // --avatar [path]: render the recovered rig pose on a VRM every
+    // `--render N` frames and write camera|avatar composites. The path
+    // defaults to the sample rig (or VULVATAR_VRM).
+    let mut avatar_vrm: Option<String> = None;
+    if let Some(i) = args.iter().position(|a| a == "--avatar") {
+        let next = args.get(i + 1).cloned();
+        if let Some(n) = next.as_ref().filter(|n| !n.starts_with("--")) {
+            avatar_vrm = Some(n.clone());
+            args.drain(i..(i + 2).min(args.len()));
+        } else {
+            avatar_vrm = Some(
+                std::env::var("VULVATAR_VRM")
+                    .unwrap_or_else(|_| "sample_data/AliciaSolid.vrm".to_string()),
+            );
+            args.drain(i..(i + 1));
+        }
+        if render_every == 0 {
+            render_every = 5;
+        }
+    }
     let dir = PathBuf::from(args.first().ok_or("usage: diagnose_fusion_replay <dir> [out_dir] [--render N]")?);
     let out_dir = args
         .get(1)
@@ -264,6 +288,20 @@ fn main() -> Result<(), String> {
         cfg.force_cpu = true;
     }
     let mut provider = FusionProvider::from_models_dir_with_config("models", cfg)?;
+    // Optional avatar rendering rig.
+    let mut avatar_rig = if let Some(vrm) = avatar_vrm.as_ref() {
+        eprintln!("loading VRM {vrm} + Vulkan renderer for composites…");
+        let asset = vulvatar_lib::asset::vrm::VrmAssetLoader::new()
+            .load(vrm)
+            .map_err(|e| format!("load VRM: {e:?}"))?;
+        let mut renderer = VulkanRenderer::new();
+        renderer.initialize();
+        let rest_locals: Vec<Transform> =
+            asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        Some((asset, renderer, rest_locals, RetargetState::default()))
+    } else {
+        None
+    };
     eprintln!("provider: {} — {} frames → {}", provider.label(), pairs.len(), out_dir.display());
 
     let mut csv = String::new();
@@ -283,6 +321,8 @@ fn main() -> Result<(), String> {
     let mut rw_jumps = Vec::new();
     let mut root_prev: Option<V3> = None;
     let mut root_jumps = Vec::new();
+    let mut prev_seed = 0u64;
+    let mut prev_lost = 0u64;
     let mut lwr_sig = Vec::new();
     let mut rwr_sig = Vec::new();
 
@@ -396,6 +436,21 @@ fn main() -> Result<(), String> {
             let slot = if j == h.j.l_shoulder || j == h.j.r_shoulder { 0 } else if j == h.j.l_elbow || j == h.j.r_elbow { 1 } else if j == h.j.l_wrist || j == h.j.r_wrist { 2 } else { 3 };
             kp3d_err[slot].push(e);
         }
+        if std::env::var_os("VULVATAR_REPLAY_POSTURE").is_some() {
+            // Whole-body posture split: root tilt (deg from upright in the
+            // viewer frame) and each spine joint's rotation magnitude.
+            let dv = mat_mul(&FACING_CAMERA, &est.state.root_r);
+            let up = col(&dv, 1);
+            let root_tilt = up[1].clamp(-1.0, 1.0).acos().to_degrees();
+            let jr = |j: usize| {
+                let w = est.state.joint_rotvec(m, j);
+                (norm(w).to_degrees()) as i32
+            };
+            eprintln!(
+                "POSTURE idx {idx} root_tilt {root_tilt:.0}° spine {}/{}/{}° neck {}° head {}° hipsL {}° kneeL {}°",
+                jr(h.j.spine1), jr(h.j.spine2), jr(h.j.spine3), jr(h.j.neck), jr(h.j.head), jr(h.j.l_hip), jr(h.j.l_knee)
+            );
+        }
         torso_yaws.push(ty);
         head_yaws.push(hy);
         head_pitches.push(hp);
@@ -420,6 +475,34 @@ fn main() -> Result<(), String> {
         if let Some(p) = rw_prev {
             rw_jumps.push(norm(sub(rw, p)));
         }
+        // Event log for large wrist jumps: what state produced them.
+        {
+            let seed_now = est.diag.seed_wins;
+            let lost_now = est.lost_events;
+            for (name, cur, prev, sig_d) in [
+                ("L", lw, lw_prev, est.joint_data_sigma(m, h.j.l_wrist)),
+                ("R", rw, rw_prev, est.joint_data_sigma(m, h.j.r_wrist)),
+            ] {
+                if let Some(p) = prev {
+                    let jump = norm(sub(cur, p));
+                    if jump > 0.15 {
+                        eprintln!(
+                            "JUMP idx {idx} {name} {:.2} m | seedΔ {} lostΔ {} med2d {:.1} n3d {} data_σ {:.2} iters {} cost {:.0}",
+                            jump,
+                            seed_now - prev_seed,
+                            lost_now - prev_lost,
+                            est.diag.med_2d_px,
+                            est.diag.n_kp3d,
+                            sig_d,
+                            est.diag.iters,
+                            est.diag.cost_final,
+                        );
+                    }
+                }
+            }
+            prev_seed = seed_now;
+            prev_lost = lost_now;
+        }
         if let Some(p) = root_prev {
             root_jumps.push(norm(sub(est.state.root_t, p)));
         }
@@ -429,7 +512,46 @@ fn main() -> Result<(), String> {
         lwr_sig.push(est.joint_data_sigma(m, h.j.l_wrist));
         rwr_sig.push(est.joint_data_sigma(m, h.j.r_wrist));
 
-        if render_every > 0 && n % render_every == 0 {
+        // Avatar composite: retarget the recovered rig onto the VRM with the
+        // same persistent state the app uses (display smoothing + anchor),
+        // stepped every frame so the composite reflects live behaviour.
+        if let Some((asset, renderer, rest_locals, rstate)) = avatar_rig.as_mut() {
+            let mut locals = rest_locals.clone();
+            if let (Some(rig), Some(hm)) = (est_out.skeleton.rig.as_ref(), asset.humanoid.as_ref())
+            {
+                apply_rig_pose(
+                    rig,
+                    &asset.skeleton,
+                    hm,
+                    &mut locals,
+                    &RetargetParams::default(),
+                    rstate,
+                    est.diag.dt as f32,
+                );
+            }
+            if render_every > 0 && n % render_every == 0 {
+                let inst = offline::make_instance(asset, locals);
+                let side = ch.min(720);
+                let rgba =
+                    offline::render_avatar(renderer, &inst, [side, side], &offline::bench_camera())?;
+                let av = image::RgbaImage::from_raw(side, side, rgba)
+                    .ok_or("avatar pixels")?;
+                let mut comp = image::RgbImage::new(cw + side, ch);
+                for (x, y, p) in rgb.enumerate_pixels() {
+                    comp.put_pixel(x, y, *p);
+                }
+                for (x, y, p) in av.enumerate_pixels() {
+                    let yy = y + (ch - side) / 2;
+                    if yy < ch {
+                        comp.put_pixel(cw + x, yy, image::Rgb([p[0], p[1], p[2]]));
+                    }
+                }
+                let out = out_dir.join(format!("composite_{idx:05}.png"));
+                comp.save(&out).map_err(|e| e.to_string())?;
+            }
+        }
+
+        if render_every > 0 && n % render_every == 0 && avatar_rig.is_none() {
             let mut img = rgb.clone();
             let intr = Intrinsics {
                 fx: intr_cam.fx as f64,

@@ -70,12 +70,12 @@ channel で計測する。アプリがカメラを掴んでいる間は pyrealse
 $env:CARGO_TARGET_DIR = "$PWD\target-test"
 $env:SHADERC_LIB_DIR  = "$PWD\target\debug\build\shaderc-sys-<hash>\out\lib"  # 本targetのキャッシュ流用 (無いと CMake 非互換で from-source が死ぬ)
 # + docs/realsense-build.md の3環境変数
-cargo build --features realsense --bin diagnose_depth_replay
+cargo build --features realsense --bin diagnose_fusion_replay
 ```
 
 アプリ本体の再ビルドだけはユーザーにアプリを閉じてもらう必要がある。
 
-- リプレイベンチ (`diagnose_depth_replay` / `diagnose_video_replay`) はファイル名の
+- リプレイベンチ (`diagnose_fusion_replay`) はファイル名の
   フレーム番号から実キャプチャ時刻を復元して dt 正規化推定器に供給する
   (ダンプは5フレーム間引きが通例 — 名目 30fps 扱いだと時間系ゲートが実機の5倍厳しく見える)。
 

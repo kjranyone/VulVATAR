@@ -182,8 +182,6 @@ impl PoseProvider for FusionProvider {
         std::mem::take(&mut self.load_warnings)
     }
 
-    fn set_calibration(&mut self, _calibration: Option<crate::tracking::PoseCalibration>) {}
-
     fn reset_temporal_state(&mut self) {
         self.rtmw3d.reset_temporal_state();
         self.est.reset(&self.h.model);
@@ -246,23 +244,84 @@ impl PoseProvider for FusionProvider {
         let head_j = self.h.j.head;
         let head_center_pred = fk_pred.site[self.h.s.head_center];
 
-        // Depth accessor over the aligned point cloud (person band around
-        // the predicted head for face landmarks).
+        // Depth accessor over the aligned point cloud for FACE landmarks:
+        // tight person band around the predicted head, plus a model
+        // z-buffer test — a hand / forearm sweeping in front of the face
+        // (the wave) sits within ~15 cm of the face plane, and without the
+        // occlusion test its surface depth would be attributed to the face
+        // landmarks, yanking the head (and with it the root) toward the
+        // camera every pass.
+        let head_depth_pred = norm(head_center_pred);
+        let arm_capsules: Vec<(V3, V3, f64)> = self
+            .h
+            .model
+            .capsules
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.part,
+                    super::model::Part::LeftArm
+                        | super::model::Part::RightArm
+                        | super::model::Part::LeftHand
+                        | super::model::Part::RightHand
+                )
+            })
+            .map(|c| {
+                (
+                    fk_pred.point(c.a),
+                    fk_pred.point(c.b),
+                    self.h.model.capsule_radius(&pred, c) + 0.03,
+                )
+            })
+            .collect();
+        // Active hand regions (crop rectangles, slightly padded): a palm
+        // in front of the face fills these, and any face landmark whose
+        // pixel falls inside must not take depth from there — it would be
+        // the palm's surface, not the face's.
+        let hand_rects: Vec<(f32, f32, f32, f32)> = self
+            .last_hands
+            .iter()
+            .flatten()
+            .map(|hr| {
+                let (x, y, sz) = hr.crop;
+                let pad = sz * 0.05;
+                (x + pad, y + pad, x + sz - pad, y + sz - pad)
+            })
+            .collect();
+        let in_hand_rect = |u: f64, v: f64| -> bool {
+            hand_rects.iter().any(|&(x0, y0, x1, y1)| {
+                u >= x0 as f64 && u <= x1 as f64 && v >= y0 as f64 && v <= y1 as f64
+            })
+        };
         let depth_at = |u: f64, v: f64| -> Option<V3> {
             let d = depth.as_ref()?;
-            if d.crop.is_some() {
+            if in_hand_rect(u, v) {
                 return None;
             }
-            window_point(
+            let p = window_point(
                 &d.points_m,
                 d.width,
                 d.height,
                 u,
                 v,
                 1,
-                (head_center_pred[2] - 0.25) as f32,
-                (head_center_pred[2] + 0.25) as f32,
-            )
+                (head_center_pred[2] - 0.12) as f32,
+                (head_center_pred[2] + 0.12) as f32,
+            )?;
+            // Occlusion: does an arm/hand capsule cut this ray in front of
+            // the head?
+            let t_obs = norm(p);
+            if t_obs > 1e-6 {
+                let dir = scale(p, 1.0 / t_obs);
+                for &(a, b, r) in &arm_capsules {
+                    if let Some(t_hit) = super::estimator::ray_capsule_entry(dir, a, b, r) {
+                        if t_hit < head_depth_pred - 0.05 {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some(p)
         };
 
         // ---- hand-block L/R assignment --------------------------------------
@@ -272,7 +331,7 @@ impl PoseProvider for FusionProvider {
         // labelling unless swapping is clearly better.
         let mut det_kps: Vec<(f32, f32, f32)> = base.annotation.keypoints.clone();
         if let Some(d) = depth.as_ref() {
-            if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize && det_kps.len() >= 133 {
+            if d.points_m.len() == (d.width * d.height) as usize && det_kps.len() >= 133 {
                 let mut tmp: Vec<RawKp> = det_kps
                     .iter()
                     .map(|&(nx, ny, sc)| RawKp { nx, ny, score: sc, sx: 0.0, sy: 0.0 })
@@ -382,7 +441,7 @@ impl PoseProvider for FusionProvider {
             // Arm reachability against the predicted shoulders (depth-valid
             // pixels only) — see `reach_filter`.
             if let Some(d) = depth.as_ref() {
-                if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize {
+                if d.points_m.len() == (d.width * d.height) as usize {
                     let zs = [fk_pred.t[self.h.j.l_shoulder][2], fk_pred.t[self.h.j.r_shoulder][2]];
                     if std::env::var_os("VULVATAR_FUSION_NO_REACH").is_none() {
                         reach_filter(&mut raw, &d.points_m, d.width, d.height, zs, 0.75);
@@ -392,6 +451,58 @@ impl PoseProvider for FusionProvider {
             if hands_swapped {
                 for k in 0..21 {
                     raw.swap(91 + k, 112 + k);
+                }
+            }
+            // Leg gating: in the desk envelope the legs are physically out
+            // of frame, but the detector hallucinates hips/knees/ankles on
+            // chair edges, desks and raised palms with mid confidence,
+            // which flails the avatar's legs. A leg detection is only
+            // meaningful when its hip is confidently in frame AND sits
+            // anatomically below the shoulder line (the hallucinations
+            // cluster at shoulder height on whatever object is in front).
+            {
+                let sh_y = 0.5 * (raw[5].ny + raw[6].ny);
+                let nose_y = raw[0].ny;
+                let torso_ref = (sh_y - nose_y).abs().max(0.05);
+                for side in 0..2 {
+                    let hip = &raw[11 + side];
+                    let hip_ok = hip.score >= 0.5
+                        && hip.nx > 0.02
+                        && hip.nx < 0.98
+                        && hip.ny > 0.02
+                        && hip.ny < 0.98
+                        && hip.ny > sh_y + 0.6 * torso_ref;
+                    if !hip_ok {
+                        raw[11 + side].score = 0.0;
+                        for i in
+                            [13 + side, 15 + side, 17 + 3 * side, 18 + 3 * side, 19 + 3 * side]
+                        {
+                            if i < raw.len() {
+                                raw[i].score = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+            // Duplicate-wrist degeneracy: a single palm thrust at the camera
+            // routinely captures BOTH wrist detections (and both hand
+            // blocks). Two wrists on one physical hand pull both arms to
+            // the same point and twist the torso; keep the better-scored
+            // side and relax the other.
+            {
+                let (lw, rw) = (raw[9], raw[10]);
+                let close = {
+                    let dx = (lw.nx - rw.nx) * width as f32;
+                    let dy = (lw.ny - rw.ny) * height as f32;
+                    (dx * dx + dy * dy).sqrt() < 0.04 * width as f32
+                };
+                if close && lw.score > 0.0 && rw.score > 0.0 {
+                    let drop_left = lw.score < rw.score;
+                    let (wrist_i, base) = if drop_left { (9, 91) } else { (10, 112) };
+                    raw[wrist_i].score = 0.0;
+                    for k in raw.iter_mut().skip(base).take(21) {
+                        k.score = 0.0;
+                    }
                 }
             }
             // The dedicated hand crop supersedes the body detector's hand
@@ -422,7 +533,7 @@ impl PoseProvider for FusionProvider {
             // Depth-lifted joints: the absolute-depth anchor that resolves
             // the projective scale/distance ambiguity of the 2-D terms.
             if let Some(d) = depth.as_ref() {
-                if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize {
+                if d.points_m.len() == (d.width * d.height) as usize {
                     let z_ref = if self.est.last_t.is_some() {
                         Some(head_center_pred[2])
                     } else {
@@ -525,7 +636,7 @@ impl PoseProvider for FusionProvider {
 
         // ---- point cloud ------------------------------------------------------
         if let Some(d) = depth.as_ref() {
-            if d.crop.is_none() && d.points_m.len() == (d.width * d.height) as usize {
+            if d.points_m.len() == (d.width * d.height) as usize {
                 let cloud = cloud_near_model(
                     &d.points_m,
                     d.width,
@@ -660,7 +771,7 @@ impl PoseProvider for FusionProvider {
                     eprintln!("    surf ({:.3},{:.3},{:.3}) σ={:.3} → {name} d={:+.3}", pt[0], pt[1], pt[2], sg, best.1);
                 }
             }
-            eprintln!("  depth frame: {:?} valid@nose {:?}", depth.as_ref().map(|d| (d.width, d.height, d.points_m.len(), d.crop.is_some())),
+            eprintln!("  depth frame: {:?} valid@nose {:?}", depth.as_ref().map(|d| (d.width, d.height, d.points_m.len())),
                 obs.kp2d.first().and_then(|k| depth.as_ref().and_then(|d| window_point(&d.points_m, d.width, d.height, k.u, k.v, 3, 0.1, 10.0))));
             eprintln!("  diag {:?}", self.est.diag);
         }
@@ -677,6 +788,9 @@ impl PoseProvider for FusionProvider {
                 let z_ref = head_center[2];
                 let depth_at2 = |u: f64, v: f64| -> Option<V3> {
                     let d = depth.as_ref()?;
+                    if in_hand_rect(u, v) {
+                        return None;
+                    }
                     window_point(
                         &d.points_m,
                         d.width,

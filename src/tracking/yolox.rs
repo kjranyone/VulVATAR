@@ -114,18 +114,6 @@ pub struct PersonBbox {
     pub score: f32,
 }
 
-impl PersonBbox {
-    pub fn width(&self) -> f32 {
-        (self.x2 - self.x1).max(0.0)
-    }
-    pub fn height(&self) -> f32 {
-        (self.y2 - self.y1).max(0.0)
-    }
-    pub fn area(&self) -> f32 {
-        self.width() * self.height()
-    }
-}
-
 pub struct YoloxPersonDetector {
     session: Session,
     input_name: String,

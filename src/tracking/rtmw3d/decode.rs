@@ -13,14 +13,7 @@ pub(super) const SIMCC_Z_BINS: usize = 576;
 /// One decoded keypoint in normalised model space:
 /// `nx, ny ∈ [0, 1]` (image-relative, NY top-to-bottom),
 /// `nz ∈ [0, 1]` (model depth axis), `score` is the per-joint
-/// confidence after sigmoid.
-///
-/// `z_score` is the sigmoid of the **z heatmap's own peak** — the
-/// model's confidence in the depth estimate, independent of the x/y
-/// localisation quality carried by `score`. A joint can be firmly
-/// localised in the image (high `score`) while its depth heatmap is
-/// flat or bimodal (low `z_score`); consumers that trust `nz` should
-/// gate on this instead of assuming x/y confidence transfers to depth.
+/// confidence after sigmoid of the x/y heatmap peaks.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DecodedJoint {
     pub(in crate::tracking) nx: f32,
@@ -155,9 +148,7 @@ pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) ->
         // Per-joint score: take the smaller of x/y heatmap peaks
         // (z is depth — its peak does not localise the joint
         // detection, only its depth) and pass through sigmoid so
-        // values land in `[0, 1]` for the threshold. The z peak gets
-        // its own channel (`z_score`) so depth consumers can gate on
-        // the depth head's confidence separately.
+        // values land in `[0, 1]`.
         let score = sigmoid(xs.min(ys));
         out.push(DecodedJoint {
             nx: refine_peak(x_slice, xi) / SIMCC_X_BINS as f32,

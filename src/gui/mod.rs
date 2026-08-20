@@ -463,8 +463,8 @@ pub struct TrackingGuiState {
     pub hand_tracking_enabled: bool,
     pub face_tracking_enabled: bool,
     /// When true, hip/knee/ankle keypoints drive the leg humanoid
-    /// bones; when false the solver keeps the whole lower-body chain
-    /// at rest pose (see `SolverParams::lower_body_tracking_enabled`).
+    /// bones; when false the retarget keeps the whole lower-body chain
+    /// at rest pose (see `RetargetParams::lower_body_tracking_enabled`).
     pub lower_body_tracking_enabled: bool,
     /// When true, the avatar's `Hips` follows the subject's side-step /
     /// lean / crouch (translation, on top of body-yaw rotation). When
@@ -474,7 +474,7 @@ pub struct TrackingGuiState {
     /// lost (past the tracking hold window) and fades back in on re-detection.
     /// Passed through `FrameConfig::fade_on_tracking_loss`.
     pub fade_on_tracking_loss: bool,
-    /// Pose-solver smoothing / confidence thresholds, surfaced in the
+    /// Display smoothing / face-confidence thresholds, surfaced in the
     /// Tracking inspector's *Advanced smoothing* section and passed
     /// straight through `FrameConfig::smoothing` each frame. Defaults are
     /// tuned for the common case; see [`TrackingSmoothingParams`]. Only the

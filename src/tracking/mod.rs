@@ -46,24 +46,22 @@ pub use source_skeleton::{
 /// [`crate::avatar::retarget::apply_rig_pose`] via
 /// [`RetargetParams`](crate::avatar::retarget::RetargetParams).
 ///
-/// The [`Default`] values below are tuned to lean on the upstream 1€ filter
-/// and structural keypoint floors (see the `Default` impl), so most users
+/// The [`Default`] values below are tuned to lean on the fusion
+/// estimator's process noise (see the `Default` impl), so most users
 /// never need to touch these. They are now surfaced in the Tracking
 /// inspector's *Advanced smoothing* section for the per-camera cases the
-/// defaults don't cover (noisy confidence floors, jittery expression
-/// rigs): the GUI holds the live values on `TrackingGuiState::smoothing`
-/// and passes them through `FrameConfig::smoothing` each frame. The GUI
-/// does not expose `stale_timeout_nanos` — it is a hold-policy timing knob,
-/// not a smoothing control — so it always keeps its default.
+/// defaults don't cover (jittery expression rigs): the GUI holds the
+/// live values on `TrackingGuiState::smoothing` and passes them through
+/// `FrameConfig::smoothing` each frame. The GUI does not expose
+/// `stale_timeout_nanos` — it is a hold-policy timing knob, not a
+/// smoothing control — so it always keeps its default.
 #[derive(Clone, Debug)]
 pub struct TrackingSmoothingParams {
     /// Per-frame blend factor toward the new rotation. Maps directly to
-    /// `SolverParams::rotation_blend`.
+    /// `RetargetParams::rotation_blend`.
     pub rotation_blend: f32,
     /// Per-frame blend factor toward new expression weights.
     pub expression_blend: f32,
-    /// Minimum keypoint confidence for a joint to drive a bone.
-    pub joint_confidence_threshold: f32,
     /// Minimum face-pose confidence for the head to react.
     pub face_confidence_threshold: f32,
     pub stale_timeout_nanos: u64,
@@ -72,20 +70,16 @@ pub struct TrackingSmoothingParams {
 impl Default for TrackingSmoothingParams {
     fn default() -> Self {
         // `rotation_blend = 1.0` snaps each frame straight to the
-        // direction-matched output. The 1€ filter on joint positions
-        // (the fusion estimator's process noise) already smooths jitter
-        // adaptively, so a separate per-frame rotation LPF on top
-        // just adds blanket lag. `joint_confidence_threshold = 0.0`
-        // delegates noise gating to the structural floors that already
-        // run upstream (`KEYPOINT_VISIBILITY_FLOOR`, hip/shoulder
-        // origin choice, hand-MCP quorum, wrist anatomy check).
-        // `expression_blend` stays smoothed because there is no 1€ on
-        // expression weights — without this LPF, ARKit blendshapes
-        // chatter visibly.
+        // retarget output. The fusion estimator's process noise already
+        // smooths jitter adaptively, so a separate per-frame rotation
+        // LPF on top just adds blanket lag. Joint gating is the
+        // retarget's σ-rest (not a keypoint-confidence floor).
+        // `expression_blend` stays smoothed because there is no
+        // equivalent filter on expression weights — without this LPF,
+        // ARKit blendshapes chatter visibly.
         Self {
             rotation_blend: 1.0,
             expression_blend: 0.8,
-            joint_confidence_threshold: 0.0,
             face_confidence_threshold: 0.0,
             stale_timeout_nanos: 200_000_000,
         }
@@ -869,12 +863,6 @@ impl TrackingMailbox {
         v.latest_frame.clone()
     }
 
-    /// Read the latest 2D detection annotation.
-    pub fn latest_annotation(&self) -> Option<DetectionAnnotation> {
-        let v = self.preview.lock().unwrap_or_else(|e| e.into_inner());
-        v.latest_annotation.clone()
-    }
-
     pub fn sequence(&self) -> u64 {
         let p = self.pose.lock().unwrap_or_else(|e| e.into_inner());
         p.sequence
@@ -1095,29 +1083,6 @@ impl TrackingWorker {
             handle: None,
             running: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(false)),
-            mailbox,
-        }
-    }
-
-    /// Create a worker that reports `is_running()` / `is_ready()` as
-    /// `true` immediately, without spawning a capture thread — for
-    /// callers that drive the mailbox themselves (headless replay /
-    /// diagnostics that publish `PoseEstimate`s via
-    /// [`Self::mailbox`]`().publish_estimate(...)`, e.g.
-    /// `src/bin/diagnose_signal_quality.rs`).
-    ///
-    /// `Application::run_frame` only reads the mailbox when
-    /// `tracking_worker` is `Some` and running (`step_tracking`,
-    /// `src/app/render.rs`) — this gate exists so a freshly loaded
-    /// avatar doesn't fade out before tracking ever starts. Without
-    /// this constructor an external driver has no sanctioned way to
-    /// satisfy that gate short of spawning a real (and here,
-    /// redundant) capture thread via `start_with_params`.
-    pub fn new_external(mailbox: TrackingMailbox) -> Self {
-        Self {
-            handle: None,
-            running: Arc::new(AtomicBool::new(true)),
-            ready: Arc::new(AtomicBool::new(true)),
             mailbox,
         }
     }
@@ -1402,8 +1367,8 @@ impl TrackingWorker {
                 break;
             };
 
-            // Forward calibration / torso-capture / mode-hint transitions
-            // to the provider (edge-detected: forward only on change).
+            // Forward calibration updates to the provider (edge-detected:
+            // forward only on change).
             if let Some(ref mut provider) = pose_provider {
                 if let Some((cal, seq)) = mailbox.poll_calibration(last_calibration_seq) {
                     provider.set_calibration(cal);

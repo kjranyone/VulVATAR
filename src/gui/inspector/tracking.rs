@@ -84,12 +84,8 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             );
         });
 
-    // Pose-solver smoothing / confidence thresholds. These used to be
-    // hardcoded to `TrackingSmoothingParams::default()` at the FrameConfig
-    // build site, so the values existed but no control could reach them.
-    // They now live on `state.tracking.smoothing` and flow through
-    // `FrameConfig::smoothing` each frame. Collapsed by default — most
-    // users should never need to touch them.
+    // Display smoothing / face-confidence thresholds. Collapsed by
+    // default — most users should never need to touch them.
     collapsible_card(ui, "tracking.advanced_smoothing", t!("tracking.advanced_smoothing"), false, |ui| {
             ui.label(
                 egui::RichText::new(t!("tracking.advanced_smoothing_hint"))
@@ -106,14 +102,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .text(t!("tracking.expression_blend")),
             )
             .on_hover_text(t!("tracking.expression_blend_tooltip"));
-            ui.add(
-                egui::Slider::new(
-                    &mut state.tracking.smoothing.joint_confidence_threshold,
-                    0.0..=1.0,
-                )
-                .text(t!("tracking.joint_confidence")),
-            )
-            .on_hover_text(t!("tracking.joint_confidence_tooltip"));
             ui.add(
                 egui::Slider::new(
                     &mut state.tracking.smoothing.face_confidence_threshold,
@@ -135,8 +123,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let defaults = crate::tracking::TrackingSmoothingParams::default();
                 state.tracking.smoothing.rotation_blend = defaults.rotation_blend;
                 state.tracking.smoothing.expression_blend = defaults.expression_blend;
-                state.tracking.smoothing.joint_confidence_threshold =
-                    defaults.joint_confidence_threshold;
                 state.tracking.smoothing.face_confidence_threshold =
                     defaults.face_confidence_threshold;
             }

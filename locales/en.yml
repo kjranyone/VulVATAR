@@ -252,8 +252,6 @@ tracking:
   rotation_blend_tooltip: "Per-frame blend toward the newly tracked rotation. 1.0 snaps each frame (no extra lag); lower values add smoothing on top of the upstream 1€ filter."
   expression_blend: "Expression Blend"
   expression_blend_tooltip: "Per-frame blend toward new blendshape weights. Lower = smoother but laggier facial expressions."
-  joint_confidence: "Joint Confidence Floor"
-  joint_confidence_tooltip: "Minimum keypoint confidence for a joint to drive its bone. 0 delegates gating to the structural floors upstream."
   face_confidence: "Face Confidence Floor"
   face_confidence_tooltip: "Minimum face-pose confidence before the head reacts."
   smoothing_reset: "Reset smoothing"

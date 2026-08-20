@@ -58,7 +58,6 @@ pub struct ProjectState {
     // default.
     pub smoothing_rotation_blend: f32,
     pub smoothing_expression_blend: f32,
-    pub smoothing_joint_confidence: f32,
     pub smoothing_face_confidence: f32,
     /// Captured pose-calibration reference. Wired through `Application`'s
     /// `tracking_calibration.pose` on load; the GUI reads it back through
@@ -339,8 +338,6 @@ pub struct TrackingConfig {
     pub smoothing_rotation_blend: f32,
     #[serde(default = "default_expression_blend")]
     pub smoothing_expression_blend: f32,
-    #[serde(default)]
-    pub smoothing_joint_confidence: f32,
     #[serde(default)]
     pub smoothing_face_confidence: f32,
     /// **Legacy field — read-only for migration.** Pose calibration
@@ -877,7 +874,6 @@ impl ProjectFile {
                 show_detection_annotations: state.show_detection_annotations,
                 smoothing_rotation_blend: state.smoothing_rotation_blend,
                 smoothing_expression_blend: state.smoothing_expression_blend,
-                smoothing_joint_confidence: state.smoothing_joint_confidence,
                 smoothing_face_confidence: state.smoothing_face_confidence,
                 pose_calibration: state.pose_calibration.as_ref().map(pose_calibration_to_dto),
             },
@@ -972,7 +968,6 @@ impl ProjectFile {
             show_detection_annotations: self.tracking.show_detection_annotations,
             smoothing_rotation_blend: self.tracking.smoothing_rotation_blend,
             smoothing_expression_blend: self.tracking.smoothing_expression_blend,
-            smoothing_joint_confidence: self.tracking.smoothing_joint_confidence,
             smoothing_face_confidence: self.tracking.smoothing_face_confidence,
             pose_calibration: self.tracking.pose_calibration.as_ref().and_then(dto_to_pose_calibration),
 
@@ -2006,13 +2001,16 @@ mod tests {
 
     #[test]
     fn tracking_config_silently_drops_legacy_smoothing_fields() {
-        // `smoothing_strength` and `confidence_threshold` were removed
-        // when the GUI sliders went away. Older `.vvtproj` files still
-        // carry them; serde must accept the unknown fields and load
-        // the rest of the config rather than failing the load.
+        // `smoothing_strength`, `confidence_threshold`, and
+        // `smoothing_joint_confidence` were removed when the GUI
+        // sliders went away (the last after the v1 pose solver). Older
+        // `.vvtproj` files still carry them; serde must accept the
+        // unknown fields and load the rest of the config rather than
+        // failing the load.
         let legacy = json!({
             "smoothing_strength": 0.7,
             "confidence_threshold": 0.4,
+            "smoothing_joint_confidence": 0.3,
             "mirror": true,
         });
         let cfg: TrackingConfig =

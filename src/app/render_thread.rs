@@ -33,8 +33,6 @@ pub enum RenderCommand {
     /// Return its lease to the renderer-owned export pool so the slot may be
     /// reused by a future frame.
     ReleaseExportLease(u64),
-    #[allow(dead_code)]
-    Resize(u32, u32),
     Shutdown,
 }
 
@@ -260,9 +258,6 @@ impl RenderThreadInner {
                     }
                     let result = self.renderer.render_thumbnail(&request);
                     let _ = respond_to.send(result);
-                }
-                RenderCommand::Resize(w, h) => {
-                    let _ = self.renderer.resize([w, h]);
                 }
                 RenderCommand::EvictCaches => {
                     self.renderer.flush_pending();

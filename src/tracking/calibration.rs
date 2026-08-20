@@ -6,32 +6,28 @@
 //! depth window biases that anchor by 0.3–1.5 m. The bias propagates
 //! through every downstream consumer (body yaw, root translation).
 //! This module carries the explicit reference values the user
-//! captures via the `Calibrate Pose` modal so the solver and
-//! `skeleton_from_depth` can seed / gate against a known-good
+//! captures via the `Calibrate Pose` modal so the retarget and
+//! fusion estimator can seed / gate against a known-good
 //! baseline rather than the auto-EMA's first frame.
 //!
 //! [`super::TrackingCalibration`] carries an optional
 //! [`PoseCalibration`]; consumers fall back to the auto-EMA /
-//! default behaviour whenever it is absent or
-//! [`PoseCalibration::is_active`] returns false.
+//! default behaviour whenever it is absent.
 
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 /// Which pose the subject took during the calibration capture window.
-/// Drives both the on-screen instructions and the anchor-selection
-/// policy in [`super::skeleton_from_depth`].
+/// Drives both the on-screen instructions and the captured-anchor
+/// choice (hip vs shoulder).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalibrationMode {
     /// Subject visible from feet to head, T-pose. Hip pair midpoint
-    /// (COCO 11/12) is the captured anchor; `skeleton_from_depth`
-    /// continues to prefer hip with shoulder fallback.
+    /// (COCO 11/12) is the captured anchor.
     FullBody,
     /// Subject visible from chest / waist up, hands at sides. Shoulder
-    /// pair midpoint (COCO 5/6) is the captured anchor; once active,
-    /// `skeleton_from_depth` is *forced* onto the shoulder anchor even
-    /// when the hip pair clears the visibility floor — when the user
+    /// pair midpoint (COCO 5/6) is the captured anchor; when the user
     /// said "upper body only", an apparent hip detection is almost
     /// certainly the desk surface or chair seat.
     UpperBody,
@@ -366,13 +362,6 @@ mod body_yaw_tests {
 }
 
 impl PoseCalibration {
-    /// `true` once a capture has completed and at least one frame was
-    /// gathered. Used by consumers to decide between calibration-aware
-    /// and auto-EMA / hardcoded-clamp behaviour.
-    pub fn is_active(&self) -> bool {
-        self.frame_count > 0
-    }
-
     /// The neutral head pose measured for `source`, if the calibration
     /// hold gathered enough confident frames from that estimator.
     /// Subtraction must be keyed on the live pose's own source — see

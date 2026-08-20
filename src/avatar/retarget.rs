@@ -19,6 +19,7 @@ use crate::asset::{HumanoidBone, HumanoidMap, NodeId, SkeletonAsset, Transform};
 use crate::math_utils::{
     quat_conjugate, quat_mul, quat_normalize, quat_rotate_vec3, vec3_length, vec3_sub, Quat, Vec3,
 };
+use crate::asset::HumanoidBone as HB;
 use crate::tracking::fusion::output::RigPose;
 
 /// Persistent retarget state per avatar instance.
@@ -54,9 +55,6 @@ impl RetargetState {
         self.prev_hips_translation = None;
         self.rest_cache_len = 0;
     }
-    pub fn anchor(&self) -> Option<[f32; 3]> {
-        self.anchor_cam
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +71,11 @@ pub struct RetargetParams {
     pub min_quality: f32,
     /// Seconds of well-tracked data used to seed the root anchor.
     pub anchor_seed_s: f64,
+    /// Maximum whole-body lean (rad) the hips may carry; the rest of the
+    /// estimator's pelvis tilt is treated as pelvis/spine-split wander (or
+    /// camera mounting pitch) and absorbed. Body-internal articulation is
+    /// unaffected — bones are re-expressed relative to the hips.
+    pub max_root_tilt: f32,
 }
 
 impl Default for RetargetParams {
@@ -85,6 +88,7 @@ impl Default for RetargetParams {
             sigma_rest: 1.2,
             min_quality: 0.2,
             anchor_seed_s: 1.0,
+            max_root_tilt: 0.20,
         }
     }
 }
@@ -272,6 +276,18 @@ fn world_rot(skeleton: &SkeletonAsset, locals: &[Transform], mut i: usize) -> Qu
     quat_normalize(&q)
 }
 
+/// Shortest-arc rotation taking unit vector `a` onto unit vector `b`.
+fn quat_from_to(a: Vec3, b: Vec3) -> Quat {
+    let c = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let w = (1.0 + d).max(1e-6);
+    quat_normalize(&[c[0], c[1], c[2], w])
+}
+
 /// Apply the rig pose. `dt` = render-side seconds since the last call.
 pub fn apply_rig_pose(
     rig: &RigPose,
@@ -284,6 +300,38 @@ pub fn apply_rig_pose(
 ) {
     ensure_rest_cache(state, skeleton);
     let blend = dt_aware_blend(params.rotation_blend, dt);
+
+    // ---- upright root: yaw-only hips with a clamped lean ----------------------
+    // With the legs unobserved (the desk envelope) the estimator's
+    // pelvis-vs-spine pitch split is prior-determined and free to wander,
+    // and any camera mounting pitch lands on the whole body. A VTuber
+    // avatar must stay upright: split the hips world delta into
+    // tilt ∘ yaw, clamp the tilt to `max_root_tilt`, and re-express every
+    // other bone RELATIVE to the hips so body-internal articulation
+    // (head vs torso, arms vs chest) is preserved exactly.
+    let (hips_fix, hips_full): (Quat, Quat) = {
+        match rig.bones.get(&HB::Hips) {
+            Some(rb) if rig.quality >= params.min_quality => {
+                let dh = quat_normalize(&rb.delta_world);
+                let up = quat_rotate_vec3(&dh, &[0.0, 1.0, 0.0]);
+                let tilt = quat_from_to([0.0, 1.0, 0.0], up);
+                let yaw = quat_normalize(&quat_mul(&quat_conjugate(&tilt), &dh));
+                // Clamp the tilt angle.
+                let ang = 2.0 * tilt[3].clamp(-1.0, 1.0).acos();
+                let ang = if ang > std::f32::consts::PI { 2.0 * std::f32::consts::PI - ang } else { ang };
+                let clamped = if ang > params.max_root_tilt && ang > 1e-4 {
+                    let t = params.max_root_tilt / ang;
+                    slerp_short(&[0.0, 0.0, 0.0, 1.0], &tilt, t)
+                } else {
+                    tilt
+                };
+                (quat_normalize(&quat_mul(&clamped, &yaw)), dh)
+            }
+            _ => ([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]),
+        }
+    };
+    // Δ' = ΔH_clamped ∘ ΔH⁻¹ ∘ Δ_bone
+    let rebase = quat_mul(&hips_fix, &quat_conjugate(&hips_full));
 
     for bone in ORDER {
         let Some(NodeId(node)) = humanoid.bone_map.get(&bone).copied() else {
@@ -303,7 +351,8 @@ pub fn apply_rig_pose(
                     && (params.hand_tracking_enabled || !is_finger(bone))
                     && (params.lower_body_tracking_enabled || !is_leg(bone)) =>
             {
-                let desired_world = quat_mul(&rb.delta_world, &state.rest_world_rot[node]);
+                let corrected = quat_mul(&rebase, &rb.delta_world);
+                let desired_world = quat_mul(&corrected, &state.rest_world_rot[node]);
                 let parent_world = match skeleton.nodes[node].parent {
                     Some(NodeId(p)) => world_rot(skeleton, local_transforms, p as usize),
                     None => [0.0, 0.0, 0.0, 1.0],
@@ -356,11 +405,12 @@ pub fn apply_rig_pose(
                             }
                         })
                         .unwrap_or(1.0);
-                    let d = [
+                    let d_view = [
                         (rig.root_cam_m[0] - anchor[0]) * scale,
                         -(rig.root_cam_m[1] - anchor[1]) * scale,
                         -(rig.root_cam_m[2] - anchor[2]) * scale,
                     ];
+                    let d = d_view;
                     [rest_pos[0] + d[0], rest_pos[1] + d[1], rest_pos[2] + d[2]]
                 }
                 _ => rest_pos,
@@ -425,6 +475,35 @@ mod tests {
         bone_map.insert(HumanoidBone::Hips, NodeId(1));
         bone_map.insert(HumanoidBone::Spine, NodeId(2));
         (sk, HumanoidMap { bone_map })
+    }
+
+    #[test]
+    fn upright_rebase_clamps_whole_body_tilt_but_keeps_articulation() {
+        let (sk, hm) = skeleton();
+        let mut locals: Vec<Transform> = sk.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        // Estimator says: hips pitched forward 60° (pelvis/spine-split
+        // wander), spine pitched forward 80° in world (i.e. 20° relative
+        // flexion which is REAL).
+        let qx = |a: f32| [(a / 2.0).sin(), 0.0, 0.0, (a / 2.0).cos()];
+        let mut rig = RigPose {
+            quality: 1.0,
+            ..Default::default()
+        };
+        rig.bones.insert(HumanoidBone::Hips, RigBone { delta_world: qx(1.0), sigma: 0.05, data_sigma: 0.05 });
+        rig.bones.insert(HumanoidBone::Spine, RigBone { delta_world: qx(1.2), sigma: 0.05, data_sigma: 0.05 });
+        let mut st = RetargetState::default();
+        let params = RetargetParams { rotation_blend: 1.0, max_root_tilt: 0.2, ..Default::default() };
+        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params, &mut st, 1.0 / 30.0);
+        // Hips world tilt clamped to 0.2 rad.
+        let hips_w = world_rot(&sk, &locals, 1);
+        let up = quat_rotate_vec3(&hips_w, &[0.0, 1.0, 0.0]);
+        let tilt = up[1].clamp(-1.0, 1.0).acos();
+        assert!((tilt - 0.2).abs() < 1e-3, "hips tilt {tilt} (want 0.2)");
+        // Spine local flexion preserved at 0.2 rad relative to hips.
+        let q = locals[2].rotation;
+        let ang = 2.0 * q[3].clamp(-1.0, 1.0).acos();
+        let ang = if ang > std::f32::consts::PI { 2.0 * std::f32::consts::PI - ang } else { ang };
+        assert!((ang - 0.2).abs() < 1e-3, "spine relative flexion {ang} (want 0.2)");
     }
 
     #[test]

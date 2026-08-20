@@ -81,7 +81,7 @@ pub(super) fn tracked_z_gain(ch: f32, height: u32) -> f32 {
 /// `(x1, y1, x2, y2)` in source pixels, possibly negative or past `width`/
 /// `height`. The SEED bbox is clamped upstream (`derive_self_track_bbox`) so
 /// this beyond-frame crop cannot drive an unbounded zoom-out feedback loop.
-pub(in crate::tracking) fn pad_bbox_to_aspect(bbox: &PersonBbox, pad_ratio: f32) -> (f32, f32, f32, f32) {
+pub(super) fn pad_bbox_to_aspect(bbox: &PersonBbox, pad_ratio: f32) -> (f32, f32, f32, f32) {
     let mut bw = (bbox.x2 - bbox.x1).max(1.0) * (1.0 + pad_ratio);
     let mut bh = (bbox.y2 - bbox.y1).max(1.0) * (1.0 + pad_ratio);
     let cx = (bbox.x1 + bbox.x2) * 0.5;
@@ -101,7 +101,7 @@ pub(in crate::tracking) fn pad_bbox_to_aspect(bbox: &PersonBbox, pad_ratio: f32)
 /// pixels. `ox`/`oy` are the top-left in source pixels (may be negative). Black
 /// matches mmpose's `warpAffine` border and normalises to a constant the model
 /// learned to ignore. One `copy_from_slice` per row over the in-bounds x-span.
-pub(in crate::tracking) fn crop_rgb_padded(
+pub(super) fn crop_rgb_padded(
     rgb: &[u8],
     width: u32,
     height: u32,

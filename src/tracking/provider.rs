@@ -2,10 +2,9 @@
 //!
 //! `TrackingWorker` talks to this module instead of binding directly to
 //! a specific model. There is a single production pipeline: RTMW3D
-//! (body + hands + face). Metric depth is supplied externally by a
-//! RealSense D435 (`set_external_depth`, `realsense` feature); without
-//! it the provider runs RTMW3D-only and z falls back to RTMW3D's
-//! body-prior synthetic.
+//! perception feeding the fusion estimator. Metric depth is supplied
+//! externally by a RealSense D435 (`set_external_depth`); without it
+//! the estimator still runs on 2-D keypoints alone.
 
 use std::path::Path;
 
@@ -75,16 +74,16 @@ pub trait PoseProvider {
     /// jitter range.
     fn set_calibration(&mut self, _calibration: Option<crate::tracking::PoseCalibration>) {}
 
-    /// Reset per-session temporal state: wrist temporal holds,
-    /// smoothing EMAs, self-tracking crop. Called between *unrelated*
-    /// inputs — `validate_pipeline` calls this before every image so
-    /// image N's temporal holds can't contaminate image N+1's
-    /// skeleton. Live tracking never calls it mid-session.
+    /// Reset per-session temporal state (self-tracking crop, YOLOX
+    /// sticky result, fusion estimator). Called between *unrelated*
+    /// inputs — `validate_gt` calls this before every pose so pose N's
+    /// temporal state can't contaminate pose N+1. Live tracking never
+    /// calls it mid-session.
     fn reset_temporal_state(&mut self) {}
 
     /// Supply a metric depth frame captured by an external sensor (e.g. a
     /// RealSense D435) for the *next* [`Self::estimate_pose`] call,
-    /// replacing the internal DAv2 depth stage. The tracking worker calls
+    /// replacing any previous depth. The tracking worker calls
     /// this each frame with depth aligned to the color image it is about
     /// to hand to `estimate_pose`. Providers without a depth stage ignore
     /// it. Consumed once: the provider clears it after the next estimate.

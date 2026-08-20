@@ -6,6 +6,7 @@ mod gpu_wait;
 pub mod gpu_handle;
 pub mod material;
 pub mod mtoon;
+pub mod offline;
 pub mod output_export;
 mod background;
 pub mod pipeline;

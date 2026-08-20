@@ -314,8 +314,7 @@ impl SourceSkeleton {
     /// placeholders. Not for production use — the real path sets this in
     /// the metric depth path.
     pub fn stamp_synthetic_metric_frame(&mut self) {
-        // Mirrors `skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN` (the source
-        // normalisation target) when the shoulders are absent.
+        // Fallback when the shoulders are absent (~adult shoulder span).
         const FALLBACK_SPAN_M: f32 = 0.75;
         let reference_span_m = match (
             self.joints.get(&HumanoidBone::LeftUpperArm),
@@ -348,13 +347,6 @@ impl SourceSkeleton {
                 height: 480,
             },
         });
-    }
-
-    /// Insert a joint only if its confidence clears `min_conf`.
-    pub fn put_joint(&mut self, bone: HumanoidBone, joint: SourceJoint, min_conf: f32) {
-        if joint.confidence >= min_conf {
-            self.joints.insert(bone, joint);
-        }
     }
 
     /// Multiply every confidence channel by `scale`, clamped to

@@ -1,7 +1,5 @@
 //! Live debug channel — lets an external tool (`scratchpad/live_debug.py`)
-//! observe the running app's tracking pipeline AND tune the solver **without a
-//! rebuild**, so a fix can be A/B-toggled or a threshold swept against the live
-//! camera instead of re-launching for every experiment.
+//! observe the running app's tracking pipeline without stealing the camera.
 //!
 //! Off by default: every entry point is a no-op unless the flag file
 //! `%ProgramData%\VulVATAR\debug.on` exists (one `exists()` stat per frame).
@@ -10,13 +8,11 @@
 //!     RGBA behind the same 32-byte header the virtual-camera tap already
 //!     parses) and `debug_state.json` (2D keypoints + source arm joints), so the
 //!     external overlay can line up camera ↔ 2D ↔ avatar-output in one view.
-//!   * [`load_tuning`] reads `debug_tuning.json` (re-parsed only when its mtime
-//!     changes) into a [`Tuning`]; the app applies it each frame.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use super::latest_cell::LatestCell;
 use super::PoseEstimate;
@@ -32,7 +28,7 @@ fn base_dir() -> PathBuf {
 /// The master switch. The flag-file `stat` is cached and refreshed at
 /// most every [`ENABLED_REFRESH_MS`] — the previous stat-per-call design
 /// actually ran *several* filesystem stats per frame (`dump_observation`
-/// + the face/mesh stashes + `load_tuning` each check independently) on
+/// + the face/mesh stashes each check independently) on
 /// the tracking hot path. Toggling the flag file takes effect within the
 /// refresh interval.
 pub fn enabled() -> bool {
@@ -375,46 +371,4 @@ pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_avatar.json"), &bytes);
     }
-}
-
-/// Live solver overrides. `None` = keep the app's normal value. Toggling
-/// `arm_reach_ik` / `contact_ik` on the live app isolates which stage is
-/// responsible for an arm artefact (e.g. the hands-together cross) without a
-/// rebuild.
-#[derive(Clone, Copy, Default)]
-pub struct Tuning {
-    pub joint_confidence_threshold: Option<f32>,
-}
-
-static TUNING_CACHE: Mutex<(Option<SystemTime>, Tuning)> = Mutex::new((
-    None,
-    Tuning {
-        joint_confidence_threshold: None,
-    },
-));
-
-/// Read `debug_tuning.json`, re-parsing only when its mtime changes. Returns the
-/// default (all-`None`) tuning when the channel is off or the file is absent.
-pub fn load_tuning() -> Tuning {
-    if !enabled() {
-        return Tuning::default();
-    }
-    let path = base_dir().join("debug_tuning.json");
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let mut cache = TUNING_CACHE.lock().unwrap();
-    if mtime.is_some() && mtime == cache.0 {
-        return cache.1;
-    }
-    cache.0 = mtime;
-    cache.1 = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .map(|v| Tuning {
-            joint_confidence_threshold: v
-                .get("joint_confidence_threshold")
-                .and_then(|x| x.as_f64())
-                .map(|x| x as f32),
-        })
-        .unwrap_or_default();
-    cache.1
 }

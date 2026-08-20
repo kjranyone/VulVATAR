@@ -19,8 +19,8 @@
 //! detach-or-prompt flow.
 
 use crate::asset::{
-    AvatarAsset, ClothAsset, HumanoidBone, MeshAsset, MeshId, MeshPrimitiveAsset, MeshRef, NodeId,
-    NodeRef, PrimitiveId, PrimitiveRef, SkeletonNode,
+    AvatarAsset, ClothAsset, MeshAsset, MeshId, MeshPrimitiveAsset, MeshRef, NodeId, NodeRef,
+    PrimitiveId, PrimitiveRef, SkeletonNode,
 };
 use std::collections::HashMap;
 
@@ -124,8 +124,6 @@ impl RebindReport {
 /// loops are O(refs) rather than O(refs × avatar size).
 struct AvatarResolver<'a> {
     nodes_by_name: HashMap<&'a str, &'a SkeletonNode>,
-    nodes_by_humanoid: HashMap<HumanoidBone, &'a SkeletonNode>,
-    nodes_by_path: HashMap<String, &'a SkeletonNode>,
     meshes_by_name: HashMap<&'a str, &'a MeshAsset>,
     /// Primitives keyed by `(mesh_name, primitive_index_within_mesh)`.
     /// glTF doesn't name primitives, so this is the most stable
@@ -140,20 +138,6 @@ impl<'a> AvatarResolver<'a> {
             .nodes
             .iter()
             .map(|n| (n.name.as_str(), n))
-            .collect();
-        let nodes_by_humanoid: HashMap<HumanoidBone, &SkeletonNode> = avatar
-            .skeleton
-            .nodes
-            .iter()
-            .filter_map(|n| n.humanoid_bone.map(|hb| (hb, n)))
-            .collect();
-        let nodes_by_id: HashMap<NodeId, &SkeletonNode> =
-            avatar.skeleton.nodes.iter().map(|n| (n.id, n)).collect();
-        let nodes_by_path: HashMap<String, &SkeletonNode> = avatar
-            .skeleton
-            .nodes
-            .iter()
-            .map(|n| (path_signature(n, &nodes_by_id), n))
             .collect();
 
         let meshes_by_name: HashMap<&str, &MeshAsset> = avatar
@@ -170,8 +154,6 @@ impl<'a> AvatarResolver<'a> {
 
         Self {
             nodes_by_name,
-            nodes_by_humanoid,
-            nodes_by_path,
             meshes_by_name,
             primitives_by_position,
         }
@@ -183,20 +165,9 @@ impl<'a> AvatarResolver<'a> {
         if let Some(n) = self.nodes_by_name.get(old.name.as_str()) {
             return Some((n, RebindTier::Primary));
         }
-        // Secondary: humanoid bone slot of the *original* node, if we
-        // can recover that. The overlay only stored a name + id, so
-        // the only way to recover humanoid-bone identity for the
-        // original is to assume the name matched a current humanoid
-        // bone with that exact label. Unsupported here — fall through
-        // to tertiary.
-        // (When the avatar is actually re-imported with renamed bones,
-        //  the humanoid bone slot is the same; we'd need the overlay
-        //  to have stored `humanoid_bone` alongside name. Adding that
-        //  is a `format_version` bump and out of phase A.)
-        // Tertiary: parent-path signature stored elsewhere is also
-        // future work for the same reason.
-        let _ = self.nodes_by_humanoid; // silence unused warning until secondary lands
-        let _ = self.nodes_by_path;
+        // Secondary (humanoid-bone slot) and tertiary (parent-path
+        // signature) need the overlay to store those identities —
+        // a `format_version` bump, not implemented here.
         None
     }
 
@@ -222,32 +193,6 @@ impl<'a> AvatarResolver<'a> {
         }
         None
     }
-}
-
-fn path_signature(
-    node: &SkeletonNode,
-    by_id: &HashMap<NodeId, &SkeletonNode>,
-) -> String {
-    let mut parts: Vec<&str> = vec![node.name.as_str()];
-    let mut current = node.parent;
-    // Cap the walk so a cycle (shouldn't happen on valid skeletons)
-    // can't hang.
-    let mut hops = 0;
-    while let Some(parent_id) = current {
-        if hops > 64 {
-            break;
-        }
-        match by_id.get(&parent_id) {
-            Some(parent) => {
-                parts.push(parent.name.as_str());
-                current = parent.parent;
-            }
-            None => break,
-        }
-        hops += 1;
-    }
-    parts.reverse();
-    parts.join("/")
 }
 
 /// Parse the `"<mesh_name>#<index>"` convention used by `PrimitiveRef.name`.

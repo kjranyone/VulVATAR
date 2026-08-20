@@ -252,8 +252,6 @@ tracking:
   rotation_blend_tooltip: "朝新追踪旋转的逐帧混合系数。1.0 每帧即时对齐 (无额外延迟)；较低值在上游 1€ 滤波器之上叠加平滑。"
   expression_blend: "表情混合"
   expression_blend_tooltip: "朝新混合变形权重的逐帧混合系数。越低表情越平滑但延迟越大。"
-  joint_confidence: "关节置信度下限"
-  joint_confidence_tooltip: "关节驱动其骨骼所需的最小关键点置信度。0 表示将门控交给上游的结构性下限。"
   face_confidence: "面部置信度下限"
   face_confidence_tooltip: "头部作出反应所需的最小面部姿势置信度。"
   smoothing_reset: "重置平滑"

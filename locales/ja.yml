@@ -252,8 +252,6 @@ tracking:
   rotation_blend_tooltip: "新しく追跡された回転へのフレーム毎ブレンド係数。1.0 は毎フレーム即座に追従（追加遅延なし）、低い値は上流の 1€ フィルタに加えてスムージングします。"
   expression_blend: "表情ブレンド"
   expression_blend_tooltip: "新しいブレンドシェイプ重みへのフレーム毎ブレンド係数。低いほど滑らかですが表情の遅延が増えます。"
-  joint_confidence: "関節信頼度フロア"
-  joint_confidence_tooltip: "関節がボーンを駆動するための最小キーポイント信頼度。0 はゲーティングを上流の構造的フロアに委ねます。"
   face_confidence: "顔信頼度フロア"
   face_confidence_tooltip: "頭部が反応するための最小の顔ポーズ信頼度。"
   smoothing_reset: "スムージングをリセット"

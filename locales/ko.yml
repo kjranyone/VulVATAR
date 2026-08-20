@@ -252,8 +252,6 @@ tracking:
   rotation_blend_tooltip: "새로 추적된 회전으로의 프레임별 블렌드 계수. 1.0은 매 프레임 즉시 반영 (추가 지연 없음), 낮은 값은 상류의 1€ 필터에 더해 스무딩합니다."
   expression_blend: "표정 블렌드"
   expression_blend_tooltip: "새 블렌드셰이프 가중치로의 프레임별 블렌드 계수. 낮을수록 부드럽지만 표정 지연이 커집니다."
-  joint_confidence: "관절 신뢰도 하한"
-  joint_confidence_tooltip: "관절이 본을 구동하기 위한 최소 키포인트 신뢰도. 0은 게이팅을 상류의 구조적 하한에 위임합니다."
   face_confidence: "얼굴 신뢰도 하한"
   face_confidence_tooltip: "머리가 반응하기 위한 최소 얼굴 포즈 신뢰도."
   smoothing_reset: "스무딩 초기화"

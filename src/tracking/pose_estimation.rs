@@ -3,9 +3,8 @@
 //! Used only when the `inference` feature is disabled — a stand-in detector
 //! that locates a single skin-coloured region in the frame and produces a
 //! bare-minimum [`SourceSkeleton`] (no body joints, just a face pose
-//! derived from the centroid) so the downstream solver has something to
-//! work with. Proper pose estimation comes from
-//! [`super::mediapipe::MediaPipeInference`].
+//! derived from the centroid) so the GUI still has a heartbeat. Proper
+//! pose estimation comes from RTMW3D + the fusion estimator.
 
 use super::{DetectionAnnotation, FacePose, PoseEstimate, SourceSkeleton};
 

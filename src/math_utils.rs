@@ -91,27 +91,6 @@ pub fn quat_conjugate(q: &Quat) -> Quat {
     [-q[0], -q[1], -q[2], q[3]]
 }
 
-/// Decompose a rotation quaternion into a swing + twist around `axis`,
-/// such that `swing * twist == q`. Used to extract the "rotation around
-/// a bone's length axis" component from a full 3-DoF rotation so that
-/// twist can be redistributed between bones (e.g. the forearm
-/// pronation/supination component of a wrist rotation, which
-/// anatomically lives in the radius/ulna and not the wrist itself).
-///
-/// `axis` must be a unit vector. The "swing" component contains all
-/// rotation that is *not* around `axis`; the "twist" component contains
-/// only rotation around `axis`.
-pub fn swing_twist_decompose(q: &Quat, axis: &Vec3) -> (Quat, Quat) {
-    let dot = q[0] * axis[0] + q[1] * axis[1] + q[2] * axis[2];
-    let proj = [dot * axis[0], dot * axis[1], dot * axis[2]];
-    // The twist quaternion is the projection of q's vector part onto
-    // `axis`, paired with q's scalar part. Normalize because the
-    // projection loses unit length.
-    let twist = quat_normalize(&[proj[0], proj[1], proj[2], q[3]]);
-    let swing = quat_mul(q, &quat_conjugate(&twist));
-    (swing, twist)
-}
-
 /// Rotate a vector by a unit quaternion: `v' = q * v * q^*`.
 pub fn quat_rotate_vec3(q: &Quat, v: &Vec3) -> Vec3 {
     // Optimized form: v' = v + 2 * q.xyz × (q.xyz × v + q.w * v)
@@ -145,54 +124,6 @@ pub fn quat_from_vectors(from: &Vec3, to: &Vec3) -> Quat {
     let axis = vec3_cross(from, to);
     let w = 1.0 + dot;
     quat_normalize(&[axis[0], axis[1], axis[2], w])
-}
-
-/// Rotation that maps an orthonormal basis pair `(rest_fwd, rest_up)`
-/// onto a target pair `(src_fwd, src_up)`. Use this when a single
-/// `quat_from_vectors` would leave the bone's twist around its
-/// length axis ambiguous — e.g. the wrist, where finger orientation
-/// hinges on the palm plane and not just the wrist→fingers vector.
-///
-/// All four inputs should be unit-length. Inputs need not be exactly
-/// orthogonal: the function projects `up` onto the plane perpendicular
-/// to `fwd` internally, so a slightly off-axis `up` (typical of the
-/// noisy MCP-derived palm normal) still gives a well-defined result.
-pub fn quat_from_basis_pair(
-    rest_fwd: &Vec3,
-    rest_up: &Vec3,
-    src_fwd: &Vec3,
-    src_up: &Vec3,
-) -> Quat {
-    // Step 1: shortest-arc to align the forward vectors. After this
-    // rotation the rest frame's forward already points where we want;
-    // only the twist around `src_fwd` remains to be fixed.
-    let q1 = quat_from_vectors(rest_fwd, src_fwd);
-    let rest_up_after = quat_rotate_vec3(&q1, rest_up);
-
-    // Step 2: project both ups onto the plane perpendicular to
-    // src_fwd, then find the rotation around src_fwd that takes
-    // the rotated rest-up onto src_up. This second rotation has
-    // axis exactly along src_fwd so it preserves the alignment we
-    // achieved in step 1.
-    let dot_a = vec3_dot(&rest_up_after, src_fwd);
-    let proj_a = vec3_normalize(&[
-        rest_up_after[0] - src_fwd[0] * dot_a,
-        rest_up_after[1] - src_fwd[1] * dot_a,
-        rest_up_after[2] - src_fwd[2] * dot_a,
-    ]);
-    let dot_b = vec3_dot(src_up, src_fwd);
-    let proj_b = vec3_normalize(&[
-        src_up[0] - src_fwd[0] * dot_b,
-        src_up[1] - src_fwd[1] * dot_b,
-        src_up[2] - src_fwd[2] * dot_b,
-    ]);
-    if proj_a == [0.0, 0.0, 0.0] || proj_b == [0.0, 0.0, 0.0] {
-        // up is parallel to fwd on either side — twist undefined,
-        // fall back to forward-only alignment.
-        return q1;
-    }
-    let q2 = quat_from_vectors(&proj_a, &proj_b);
-    quat_normalize(&quat_mul(&q2, &q1))
 }
 
 /// Build a quaternion from Euler angles (radians) using Y-up graphics

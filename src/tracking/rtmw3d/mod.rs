@@ -17,23 +17,20 @@
 //! 3. **Infer** the model: one input, three SimCC heatmap outputs
 //!    (X: `(1, 133, 576)`, Y: `(1, 133, 768)`, Z: `(1, 133, 576)`).
 //! 4. **Decode** by argmax + sigmoid into normalised `(nx, ny, nz)`
-//!    triples in `[0, 1]³` with per-joint scores.
-//! 5. **Map** the 133 indices to `HumanoidBone` slots (selfie mirror)
-//!    and build a `SourceSkeleton` whose hip mid-point is the depth
-//!    origin, in source-space `[-aspect, +aspect] × [-1, 1] × z` coords
-//!    with `+z` toward the camera.
-//! 6. **Wrist resilience layer** validates the per-hand wrist position
-//!    against the upper-arm chain and synthesises a held / extended
-//!    fallback when the live track is implausible (see `wrist`).
-//! 7. **Face cascade**: head pose from body face landmarks 0..=4, then
+//!    triples in `[0, 1]³` with per-joint scores and localisation σ.
+//! 5. **Hand off** the 133 keypoints (via `take_aux`)
+//!    to the fusion estimator. This stage no longer builds a body
+//!    skeleton — it only fills face pose / expressions plus the 2-D
+//!    annotation for the GUI overlay.
+//! 6. **Face cascade**: head pose from body face landmarks 0..=4, then
 //!    optional MediaPipe FaceMesh + Blendshape on a face-68-derived
 //!    bbox for expression channels.
 //!
 //! ## Module layout
 //!
 //! Each pipeline stage lives in its own sibling module so this file
-//! only orchestrates. The sibling modules (`consts`, `math`, `decode`,
-//! `preprocess`, `skeleton`, `wrist`, `face`, `annotation`, `session`)
+//! only orchestrates. The sibling modules (`consts`, `decode`,
+//! `preprocess`, `face`, `annotation`, `session`, `yolox_worker`)
 //! are private to this directory; `session::build_session` is re-exported
 //! as `pub(in crate::tracking)` for the YOLOX + FaceMesh sessions to
 //! share the DirectML-fall-back-to-CPU EP-selection logic.
@@ -41,27 +38,20 @@
 #[cfg(feature = "inference")]
 mod annotation;
 #[cfg(feature = "inference")]
-#[cfg(feature = "inference")]
 mod consts;
 #[cfg(feature = "inference")]
 mod decode;
 #[cfg(feature = "inference")]
 mod face;
 #[cfg(feature = "inference")]
-#[cfg(feature = "inference")]
 mod preprocess;
 #[cfg(feature = "inference")]
 pub(in crate::tracking) mod session;
-#[cfg(feature = "inference")]
 #[cfg(feature = "inference")]
 mod yolox_worker;
 
 #[cfg(feature = "inference")]
 pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
-// Crop helpers shared with the rtmw3d_with_depth provider's DAv2
-// person-crop stage. The functions don't depend on RTMW3D internals;
-// they're here purely because that's where they were originally
-// written. Promotion-only re-export, no logic change.
 #[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
@@ -298,34 +288,15 @@ impl Rtmw3dInference {
         Self::from_models_dir_with_options(models_dir, Rtmw3dOptions::default())
     }
 
-    /// Same as [`Self::from_models_dir`] but with explicit FaceMesh
-    /// EP. Used by the depth-enabled pipeline to force FaceMesh onto
-    /// CPU, where it runs uncontended at ~7 ms instead of 13+ ms when
-    /// fighting DAv2 for the DirectML command queue.
-    #[cfg(feature = "inference")]
-    pub fn from_models_dir_with_face_ep(
-        models_dir: impl AsRef<Path>,
-        face_ep: super::face_mediapipe::FaceMeshEp,
-    ) -> Result<Self, String> {
-        Self::from_models_dir_with_options(
-            models_dir,
-            Rtmw3dOptions {
-                face_ep,
-                ..Rtmw3dOptions::default()
-            },
-        )
-    }
-
-    /// Reset cross-frame temporal state (the ray-IK held-wrist
-    /// continuity + torso-depth EMA; the self-tracking crop when
-    /// present). See `PoseProvider::reset_temporal_state`.
-    #[cfg(feature = "inference")]
     /// Drain the raw perception outputs of the last `estimate_pose`.
     #[cfg(feature = "inference")]
     pub(crate) fn take_aux(&mut self) -> Option<Rtmw3dAux> {
         self.last_aux.take()
     }
 
+    /// Reset cross-frame temporal state (self-tracking crop, YOLOX
+    /// sticky result, capture-clock dt). See `PoseProvider::reset_temporal_state`.
+    #[cfg(feature = "inference")]
     pub fn reset_temporal_state(&mut self) {
         self.self_track_bbox = None;
         self.last_self_track = None;
@@ -336,6 +307,9 @@ impl Rtmw3dInference {
             worker.clear_result();
         }
     }
+
+    #[cfg(not(feature = "inference"))]
+    pub fn reset_temporal_state(&mut self) {}
 
     /// Push the device capture timestamp (ms) of the frame about to be
     /// handed to [`Self::estimate_pose`]. Consumed once per estimate;
