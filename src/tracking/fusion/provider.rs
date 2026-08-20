@@ -57,6 +57,14 @@ pub struct FusionProvider {
     /// (it sees the whole person), so a lock that the body cannot back up
     /// for a few frames is dropped.
     hand_unsupported: [u8; 2],
+    /// This frame's crop result for each slot carries the OTHER hand's
+    /// handedness (see the veto note at the crop loop). Dropping such a
+    /// result outright makes the arm flicker between the data pose and
+    /// the prior (measured: left-wrist snaps 14 → 40 on a live clasped
+    /// hands session), so it is kept at inflated σ instead.
+    hand_suspect: [bool; 2],
+    /// Frames in which both crops locked onto one physical hand.
+    pub hand_dupes: u32,
     /// Last ACCEPTED head-orientation target (camera frame) and the run of
     /// consecutive rejections since. A real head turns ≲ 3 rad/s; the
     /// mesh's palm-lock failure mode is a STEP — yaw saturating 0 → −0.8
@@ -149,6 +157,8 @@ impl FusionProvider {
             face_fit_n: 0,
             ori_cooldown: 0,
             hand_unsupported: [0, 0],
+            hand_suspect: [false, false],
+            hand_dupes: 0,
             ori_last: None,
             ori_reject_run: 0,
             ori_depth_grace: 0,
@@ -238,6 +248,8 @@ impl PoseProvider for FusionProvider {
         self.face_fit_n = 0;
         self.ori_cooldown = 0;
         self.hand_unsupported = [0, 0];
+        self.hand_suspect = [false, false];
+        self.hand_dupes = 0;
         self.ori_last = None;
         self.ori_reject_run = 0;
         self.ori_depth_grace = 0;
@@ -539,6 +551,17 @@ impl PoseProvider for FusionProvider {
                         }
                     }
                 }
+                // Handedness veto: with the hands clasped or overlapping,
+                // a crop aimed at one wrist routinely locks onto the OTHER
+                // hand, and the landmarker says so — measured on a live
+                // clasped-hands session, 46% of the left slot's results
+                // carried right-hand handedness, and each flip moved the
+                // wrist 0.15–0.35 m (the two hands are that far apart).
+                // The convention is fixed by this pipeline's mirror: the
+                // left slot reads ≈0.15, the right ≈0.85 (measured on a
+                // clip with one raised, unambiguous hand). Scores inside
+                // the middle band are genuinely uncertain and pass.
+
                 // Body-detector corroboration (see `hand_unsupported`).
                 if let Some(res) = best.as_ref().filter(|r| r.presence >= 0.5) {
                     let (cx, cy, sz) = res.crop;
@@ -575,6 +598,39 @@ impl PoseProvider for FusionProvider {
                         self.last_hands[hand] = Some(res);
                     }
                     _ => self.prev_hands[hand] = None,
+                }
+            }
+            // Duplicate lock: with the hands clasped or crossing, both
+            // crops routinely land on the SAME physical hand, and the two
+            // slots then flip between the user's real hands frame to
+            // frame (measured: 0.15–0.35 m wrist steps on a live clasped
+            // hands session). When both results sit on top of each other,
+            // keep the one whose handedness matches its slot — this
+            // pipeline's mirror puts the left slot at ≈0.15 and the right
+            // at ≈0.85, measured on a clip with one unambiguous hand —
+            // and let the other arm ride its prior for the frame rather
+            // than be driven by its twin.
+            if std::env::var_os("VULVATAR_NO_HANDEDNESS").is_none() {
+                if let (Some(l), Some(r)) = (&self.last_hands[0], &self.last_hands[1]) {
+                    let d = ((l.px[0][0] - r.px[0][0]).powi(2) + (l.px[0][1] - r.px[0][1]).powi(2))
+                        .sqrt();
+                    if d < 0.06 * width as f32 {
+                        // Vote: distance of each result's handedness from
+                        // its slot's expected pole.
+                        let l_fit = 1.0 - l.handedness;
+                        let r_fit = r.handedness;
+                        self.hand_dupes += 1;
+                        // The loser is de-weighted, not dropped: removing
+                        // it outright makes that arm swing to its prior
+                        // and back as the duplicate comes and goes
+                        // (left-wrist snaps 13 → 36 on the live clasped
+                        // hands session).
+                        self.hand_suspect = if l_fit >= r_fit {
+                            [false, true]
+                        } else {
+                            [true, false]
+                        };
+                    }
                 }
             }
         }
@@ -991,6 +1047,7 @@ impl PoseProvider for FusionProvider {
                 None,
                 width,
                 height,
+                if self.hand_suspect[hand] { 4.0 } else { 1.0 },
                 &mut obs.kp2d,
                 &mut obs.kp3d,
             );

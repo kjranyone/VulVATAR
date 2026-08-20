@@ -268,12 +268,16 @@ pub fn hand_observations(
     wrist_abs: Option<V3>,
     width: u32,
     height: u32,
+    // `sigma_scale` > 1 when the result is suspect (e.g. its handedness
+    // contradicts the slot it was cropped for).
+    sigma_scale: f64,
     out2d: &mut Vec<Kp2d>,
     out3d: &mut Vec<Kp3d>,
 ) {
     let scale = res.crop.2 as f64 / INPUT as f64;
     // ~2 px in crop space, inflated by (1 − presence).
-    let sigma_px = (2.0 * scale).max(1.0) * (1.0 + 2.0 * (1.0 - res.presence as f64));
+    let sigma_px =
+        (2.0 * scale).max(1.0) * (1.0 + 2.0 * (1.0 - res.presence as f64)) * sigma_scale;
     let wrist = if hand == 0 { h.j.l_wrist } else { h.j.r_wrist };
     let mut points: [Option<ModelPoint>; HAND_KP] = [None; HAND_KP];
     points[0] = Some(ModelPoint::Joint(wrist));
