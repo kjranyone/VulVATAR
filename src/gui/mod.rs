@@ -1697,14 +1697,20 @@ impl eframe::App for GuiApp {
         let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             if let Some(path) = file.path {
-                let ext = path
+                let resolved_path = if path.is_dir() {
+                    crate::asset::find_avatar_file_in_dir(&path).unwrap_or(path.clone())
+                } else {
+                    path.clone()
+                };
+
+                let ext = resolved_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
                 match ext.as_str() {
                     "vrm" | "fbx" => {
-                        info!("gui: dropped avatar file: {:?}", path);
+                        info!("gui: dropped avatar file (original: {:?}): {:?}", path, resolved_path);
                         // Replacing a live avatar from a stray drag is
                         // the one accidental-destruction path — ask
                         // first. First load (no avatar yet) and a
@@ -1712,20 +1718,20 @@ impl eframe::App for GuiApp {
                         let replaces_other = self
                             .app
                             .active_avatar()
-                            .is_some_and(|a| a.asset.source_path != path);
+                            .is_some_and(|a| a.asset.source_path != resolved_path);
                         if replaces_other {
-                            self.pending_avatar_drop = Some(path);
+                            self.pending_avatar_drop = Some(resolved_path);
                         } else {
-                            top_bar::load_avatar_from_path(self, &path);
+                            top_bar::load_avatar_from_path(self, &resolved_path);
                         }
                     }
                     "vvtproj" => {
-                        info!("gui: dropped project file: {:?}", path);
-                        top_bar::open_project_from_path(self, &path);
+                        info!("gui: dropped project file: {:?}", resolved_path);
+                        top_bar::open_project_from_path(self, &resolved_path);
                     }
                     "vvtcloth" => {
-                        info!("gui: dropped cloth overlay: {:?}", path);
-                        top_bar::open_overlay_from_path(self, &path);
+                        info!("gui: dropped cloth overlay: {:?}", resolved_path);
+                        top_bar::open_overlay_from_path(self, &resolved_path);
                     }
                     _ => {
                         self.push_warning_notification(t!(

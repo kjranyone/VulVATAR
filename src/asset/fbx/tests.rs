@@ -10,8 +10,6 @@ fn test_load_yumeka_fbx() {
     let opts = ufbx::LoadOpts::default();
     let scene = ufbx::load_file(fbx_path, opts).unwrap();
 
-    // Check mesh instances / nodes
-    println!("Node 1 (Armature): name='{}' rot={:?} t={:?}", scene.nodes[1].element.name, scene.nodes[1].local_transform.rotation, scene.nodes[1].local_transform.translation);
     // Load avatar using FbxAssetLoader
     let loader = crate::asset::fbx::FbxAssetLoader::new();
     let asset = loader.load_with_progress(fbx_path, |_| {}).unwrap();
@@ -88,8 +86,46 @@ fn test_load_yumeka_fbx() {
     // Verify materials
     for mat in &asset.materials {
         assert!(mat.double_sided, "Material {} should be double_sided", mat.name);
-        assert_eq!(mat.alpha_mode, crate::asset::AlphaMode::Mask(0.5));
+        let lower = mat.name.to_lowercase();
+        if lower.contains("transparent")
+            || lower.contains("trans")
+            || lower.contains("alpha")
+            || lower.contains("blend")
+        {
+            assert_eq!(mat.alpha_mode, crate::asset::AlphaMode::Mask(0.05));
+        } else {
+            assert_eq!(mat.alpha_mode, crate::asset::AlphaMode::Opaque);
+        }
     }
+
+    // Verify wing material resolved its mask texture via token matching
+    let wing_mat = asset
+        .materials
+        .iter()
+        .find(|m| m.name.to_lowercase().contains("wing"))
+        .expect("Wing mat must exist");
+    assert!(
+        wing_mat.texture_bindings.base_color_texture.is_some(),
+        "Wing texture must be resolved"
+    );
+
+    // Verify triangulation generated proper 3-vertex polygons for all primitives
+    let mut total_indices = 0;
+    for mesh in &asset.meshes {
+        for prim in &mesh.primitives {
+            assert_eq!(
+                prim.index_count % 3,
+                0,
+                "Indices count must be multiple of 3"
+            );
+            total_indices += prim.index_count;
+        }
+    }
+    assert!(
+        total_indices > 20000,
+        "Indices count should be well populated (got {})",
+        total_indices
+    );
 
     // Verify humanoid mapping
     let humanoid = asset.humanoid.as_ref().expect("Humanoid map must exist");
@@ -115,9 +151,10 @@ fn test_load_yumeka_fbx() {
         .iter()
         .filter(|m| m.texture_bindings.base_color_texture.as_ref().is_some_and(|t| t.pixel_data.is_some()))
         .count();
-    assert!(
-        mats_with_textures > 0,
-        "At least one material must have resolved texture from Texture/PNG"
+    assert_eq!(
+        mats_with_textures,
+        asset.materials.len(),
+        "All materials should have resolved textures"
     );
 
     // Second load (must hit cache and rehydrate textures)
@@ -138,3 +175,21 @@ fn test_load_yumeka_fbx() {
         "Rehydrated textures count in cached load must match initial parse"
     );
 }
+
+#[test]
+fn test_find_avatar_file_in_dir() {
+    let dir = Path::new("sample_data/YUMEKA_v1.0.1");
+    if !dir.exists() {
+        return;
+    }
+
+    let found = crate::asset::find_avatar_file_in_dir(dir);
+    assert!(found.is_some(), "Should find an avatar file in sample_data/YUMEKA_v1.0.1");
+    let found_path = found.unwrap();
+    assert!(
+        found_path.ends_with("Yumeka_v1.0.fbx"),
+        "Should find Yumeka_v1.0.fbx, got: {:?}",
+        found_path
+    );
+}
+

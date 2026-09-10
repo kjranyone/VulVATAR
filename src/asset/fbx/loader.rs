@@ -202,7 +202,16 @@ impl FbxAssetLoader {
 
             let base_mode = MaterialMode::ToonLike;
             let base_color = [1.0, 1.0, 1.0, 1.0];
-            let alpha_mode = AlphaMode::Mask(0.5);
+            let lower_name = mat_name.to_lowercase();
+            let is_transparent = lower_name.contains("transparent")
+                || lower_name.contains("trans")
+                || lower_name.contains("alpha")
+                || lower_name.contains("blend");
+            let alpha_mode = if is_transparent {
+                AlphaMode::Mask(0.05)
+            } else {
+                AlphaMode::Opaque
+            };
             let double_sided = true;
 
             let toon_params = ToonMaterialParams {
@@ -362,8 +371,8 @@ impl FbxAssetLoader {
 
                 for &face_idx in &face_indices {
                     let face = mesh.faces[face_idx];
-                    let num_tri_verts = mesh.triangulate_face(&mut tri_buffer, face);
-                    let tri_indices = &tri_buffer[..num_tri_verts as usize];
+                    let num_triangles = mesh.triangulate_face(&mut tri_buffer, face);
+                    let tri_indices = &tri_buffer[..(num_triangles * 3) as usize];
 
                     for &corner in tri_indices {
                         let corner = corner as usize;

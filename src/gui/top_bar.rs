@@ -301,6 +301,10 @@ fn draw_avatar_menu(ui: &mut Ui, state: &mut GuiApp, label: &str) {
                 request_load_avatar_dialog(state);
                 ui.close_menu();
             }
+            if ui.button(format!("{}\u{2026}", t!("top_bar.open_avatar_folder"))).clicked() {
+                request_load_avatar_folder_dialog(state);
+                ui.close_menu();
+            }
 
             // Recent — MRU list, existing files only.
             let recent: Vec<PathBuf> = state
@@ -623,6 +627,12 @@ pub(super) fn request_load_avatar_dialog(state: &mut GuiApp) {
     });
 }
 
+pub(super) fn request_load_avatar_folder_dialog(state: &mut GuiApp) {
+    request_file_dialog(state, FileDialogPurpose::LoadAvatar, move || {
+        rfd::FileDialog::new().pick_folder()
+    });
+}
+
 impl GuiApp {
     /// Drain a finished file-dialog worker and dispatch its result.
     /// Called once per frame from `update()`.
@@ -646,7 +656,14 @@ impl GuiApp {
             FileDialogPurpose::OpenProject => open_project_from_path(self, &path),
             FileDialogPurpose::SaveProjectAs => save_project_to_path(self, &path),
             FileDialogPurpose::OpenOverlay => open_overlay_from_path(self, &path),
-            FileDialogPurpose::LoadAvatar => load_avatar_from_path(self, &path),
+            FileDialogPurpose::LoadAvatar => {
+                let resolved = if path.is_dir() {
+                    crate::asset::find_avatar_file_in_dir(&path).unwrap_or(path)
+                } else {
+                    path
+                };
+                load_avatar_from_path(self, &resolved);
+            }
         }
     }
 }

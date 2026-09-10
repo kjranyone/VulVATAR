@@ -167,6 +167,21 @@ impl TextureResolver {
             }
         }
 
+        // Token-based matching: strip common qualifiers like transparent, opaque, mask, mat, etc.
+        let tokens: Vec<&str> = norm_mat
+            .split('_')
+            .filter(|&t| !t.is_empty() && t != "transparent" && t != "trans" && t != "alpha" && t != "mat" && t != "material" && t != "mask")
+            .collect();
+        for &tok in tokens.iter().rev() {
+            if tok.len() >= 3 {
+                for (k, path) in &self.discovered_images {
+                    if k.contains(tok) {
+                        return Some(path.clone());
+                    }
+                }
+            }
+        }
+
         None
     }
 }

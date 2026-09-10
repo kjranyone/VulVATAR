@@ -35,6 +35,7 @@ top_bar:
   title: "VulVATAR"
   title_dirty: "VulVATAR *"
   open_avatar: "Open Avatar"
+  open_avatar_folder: "Open Avatar Folder"
   recent: "Recent"
   no_recent: "No recent avatars"
   open_project: "Open Project"

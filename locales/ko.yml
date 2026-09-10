@@ -35,6 +35,7 @@ top_bar:
   title: "VulVATAR"
   title_dirty: "VulVATAR *"
   open_avatar: "아바타 열기"
+  open_avatar_folder: "아바타 폴더 열기"
   recent: "최근"
   no_recent: "최근 아바타 없음"
   open_project: "프로젝트 열기"

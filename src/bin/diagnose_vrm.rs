@@ -49,15 +49,23 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| default_output_path(&input_path, &material_mode, &debug_view));
 
-    let loader = VrmAssetLoader::new();
-    eprintln!("gpu_vertex={:?}", GpuVertex::per_vertex());
-    let asset = loader
-        .load(
-            input_path
-                .to_str()
-                .ok_or_else(|| format!("invalid input path: {}", input_path.display()))?,
-        )
-        .map_err(|e| format!("failed to load VRM '{}': {}", input_path.display(), e))?;
+    let is_fbx = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("fbx"))
+        .unwrap_or(false);
+
+    let path_str = input_path
+        .to_str()
+        .ok_or_else(|| format!("invalid input path: {}", input_path.display()))?;
+
+    let asset = if is_fbx {
+        let loader = vulvatar_lib::asset::fbx::FbxAssetLoader::new();
+        loader.load(path_str).map_err(|e| format!("failed to load FBX '{}': {}", input_path.display(), e))?
+    } else {
+        let loader = VrmAssetLoader::new();
+        loader.load(path_str).map_err(|e| format!("failed to load VRM '{}': {}", input_path.display(), e))?
+    };
     print_uv_stats(&asset, material_filter.as_deref());
     if atlas_dump {
         dump_first_matching_texture(&asset, &output_path, material_filter.as_deref())?;
@@ -83,6 +91,9 @@ fn main() -> Result<(), String> {
 
     let mut renderer = VulkanRenderer::new();
     renderer.initialize();
+    let _warm = renderer
+        .render(&frame_input)
+        .map_err(|e| format!("failed to render warm frame: {e}"))?;
     let render_result = renderer
         .render(&frame_input)
         .map_err(|e| format!("failed to render frame: {e}"))?;

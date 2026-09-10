@@ -35,6 +35,7 @@ top_bar:
   title: "VulVATAR"
   title_dirty: "VulVATAR *"
   open_avatar: "アバターを開く"
+  open_avatar_folder: "アバターフォルダを開く"
   recent: "最近のファイル"
   no_recent: "最近のアバターはありません"
   open_project: "プロジェクトを開く"

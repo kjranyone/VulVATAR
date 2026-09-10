@@ -825,3 +825,86 @@ pub fn identity_matrix() -> Mat4 {
         [0.0, 0.0, 0.0, 1.0],
     ]
 }
+
+/// Search `dir` (up to depth 3) for an avatar file (`.vrm` or `.fbx`).
+///
+/// If multiple candidates exist, prioritises:
+/// 1. Files whose stem matches the root folder name.
+/// 2. Larger file sizes (main avatar bodies are typically several MBs, accessories are smaller).
+pub fn find_avatar_file_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+
+    while let Some((curr, depth)) = stack.pop() {
+        if depth > 3 {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&curr) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.starts_with('.')
+                    && !name.eq_ignore_ascii_case("target")
+                    && !name.eq_ignore_ascii_case("node_modules")
+                    && !name.eq_ignore_ascii_case(".git")
+                {
+                    stack.push((path, depth + 1));
+                }
+            } else if path.is_file() {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ext == "vrm" || ext == "fbx" {
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    candidates.push((path, size));
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let folder_stem = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    candidates.sort_by(|(path_a, size_a), (path_b, size_b)| {
+        let stem_a = path_a
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let stem_b = path_b
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let match_a = (!folder_stem.is_empty()
+            && (folder_stem.contains(&stem_a) || stem_a.contains(&folder_stem))) as i32;
+        let match_b = (!folder_stem.is_empty()
+            && (folder_stem.contains(&stem_b) || stem_b.contains(&folder_stem))) as i32;
+
+        match match_b.cmp(&match_a) {
+            std::cmp::Ordering::Equal => size_b.cmp(size_a),
+            ord => ord,
+        }
+    });
+
+    candidates.into_iter().next().map(|(p, _)| p)
+}
+
