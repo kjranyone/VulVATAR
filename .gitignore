@@ -19,7 +19,6 @@ Thumbs.db
 .DS_Store
 
 # ONNX models fetched by `dev.ps1` (not committed).
-# `models/viseme_nn.onnx.data` is the only committed model artifact.
 models/*.onnx
 
 # Retired PoC dumps — ignore if they reappear on disk.

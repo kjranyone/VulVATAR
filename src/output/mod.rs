@@ -3,8 +3,6 @@ pub mod frame_sink;
 pub mod mf_virtual_camera;
 #[cfg(target_os = "windows")]
 pub mod shmem_security;
-#[cfg(all(target_os = "windows", feature = "virtual-camera"))]
-pub mod virtual_camera_native;
 
 pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, OutputSinkWriter};
 
