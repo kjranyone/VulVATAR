@@ -20,9 +20,6 @@ use super::model::*;
 use super::observe::*;
 use super::output;
 
-/// Number of RTMW3D face-68 landmarks (COCO-Wholebody 23..=90).
-const FACE68: usize = 68;
-const FACE68_BASE: usize = 23;
 
 pub struct FusionProvider {
     rtmw3d: Rtmw3dInference,
@@ -74,9 +71,7 @@ pub struct FusionProvider {
     pub last_solve_ms: f32,
     /// Estimator-only time (ms) of the last frame (excludes inference).
     pub last_est_ms: f32,
-    /// Diagnostics: the cloud handed to the estimator this frame (subsampled
-    /// exactly as the estimator saw it) and the sparse surface points.
-    pub last_cloud: Vec<[f32; 3]>,
+    /// Diagnostics: sparse surface points.
     pub last_surface: Vec<[f32; 3]>,
     /// Diagnostics: metric joint observations `(joint index, point, σ)`.
     pub last_kp3d: Vec<(usize, V3, f64)>,
@@ -111,11 +106,7 @@ impl FusionProvider {
         };
         info!("Fusion provider ready (RTMW3D {})", rtmw3d.backend().label());
         let h = Humanoid::new();
-        let mut params = Params::default();
-        // Bench override: dense-cloud information budget (0 = off).
-        if let Some(b) = std::env::var("VULVATAR_FUSION_CLOUD_BUDGET").ok().and_then(|v| v.parse::<f64>().ok()) {
-            params.cloud_budget = b;
-        }
+        let params = Params::default();
         let est = Estimator::new(&h.model, params);
         let body_map = BodyMap::new(&h);
         Ok(Self {
@@ -140,7 +131,6 @@ impl FusionProvider {
             hand_kp_start: 0,
             last_solve_ms: 0.0,
             last_est_ms: 0.0,
-            last_cloud: Vec::new(),
             last_surface: Vec::new(),
             last_kp3d: Vec::new(),
         })
@@ -151,9 +141,6 @@ impl FusionProvider {
     }
     pub fn estimator(&self) -> &Estimator {
         &self.est
-    }
-    pub fn face68_learned(&self) -> usize {
-        0
     }
     pub fn mesh_learned(&self) -> usize {
         self.face_fit.n as usize
@@ -262,7 +249,6 @@ impl PoseProvider for FusionProvider {
             intr: Some(intr),
             kp2d: Vec::with_capacity(700),
             kp3d: Vec::with_capacity(600),
-            cloud: None,
             ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
@@ -576,8 +562,7 @@ impl PoseProvider for FusionProvider {
             arm_inflate(self.h.j.r_wrist, self.h.j.r_elbow),
         ];
 
-        // ---- body keypoints -------------------------------------------------
-        let mut face68_px: Vec<[f32; 3]> = Vec::new();
+
         if let Some(aux) = aux.as_ref() {
             let mut raw: Vec<RawKp> = aux
                 .joints
@@ -806,17 +791,7 @@ impl PoseProvider for FusionProvider {
                     }
                 }
             }
-            // Face-68 block in frame pixels (learned shape).
-            for k in 0..FACE68 {
-                let j = &aux.joints[FACE68_BASE + k];
-                if j.score >= 0.3 {
-                    face68_px.push([j.nx * width as f32, j.ny * height as f32, 0.0]);
-                } else {
-                    face68_px.push([f32::NAN, f32::NAN, 0.0]);
-                }
-            }
         }
-        let face68_valid: Vec<[f32; 3]> = face68_px.clone();
         let mesh_px: Option<&Vec<[f32; 3]>> = aux
             .as_ref()
             .and_then(|a| a.face_mesh.as_ref())
@@ -827,7 +802,6 @@ impl PoseProvider for FusionProvider {
         {
             let head_sigma_pred = self.est.joint_sigma(&self.h.model, head_j);
             let sigma_scale = if head_sigma_pred < 0.2 { 1.0 } else { 2.0 };
-            let _ = &face68_valid;
             if let Some(lm) = mesh_px.filter(|_| !face_occluded) {
                 // Canonical-face observations: every FaceMesh landmark is a
                 // point rigidly attached to the head at
@@ -1009,31 +983,7 @@ impl PoseProvider for FusionProvider {
             obs.ori.push(ori);
         }
 
-        // ---- point cloud ------------------------------------------------------
-        if let Some(d) = depth.as_ref() {
-            if d.points_m.len() == (d.width * d.height) as usize {
-                let cloud = cloud_near_model(
-                    &d.points_m,
-                    d.width,
-                    d.height,
-                    &self.h.model,
-                    &fk_pred,
-                    &pred,
-                    &intr,
-                    0.12,
-                    0.35,
-                    self.est.params.cloud_max_points,
-                );
-                if cloud.points.len() >= 50 {
-                    obs.cloud = Some(cloud);
-                }
-            }
-        }
-
         // Ablation switches for the replay bench.
-        if std::env::var_os("VULVATAR_FUSION_NO_CLOUD").is_some() {
-            obs.cloud = None;
-        }
         if std::env::var_os("VULVATAR_FUSION_NO_SURF").is_some() {
             obs.surface.clear();
         }
@@ -1041,7 +991,6 @@ impl PoseProvider for FusionProvider {
             obs.kp3d.clear();
         }
         if std::env::var_os("VULVATAR_FUSION_KEEP_CLOUD").is_some() {
-            self.last_cloud = obs.cloud.as_ref().map(|c| c.points.clone()).unwrap_or_default();
             self.last_surface = obs.surface.iter().map(|(p, _)| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
             self.last_kp3d = obs
                 .kp3d

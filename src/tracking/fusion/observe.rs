@@ -4,7 +4,7 @@
 //! "is this measurement physically usable" (in frame, finite, inside the
 //! person's depth band); everything else is the estimator's job.
 
-use super::estimator::{closest_on_segment, Cloud, Intrinsics, Kp2d, Kp3d, ModelPoint};
+use super::estimator::{closest_on_segment, Kp2d, Kp3d, ModelPoint};
 use super::math::*;
 use super::model::*;
 
@@ -351,35 +351,6 @@ pub fn body_torso_leg_depth(
     }
 }
 
-/// Surface points under the torso / leg keypoints (shoulders, hips, knees,
-/// ankles): the depth there is *some* body surface — the joint's own skin,
-/// or an occluding limb — so it is fed as a point→nearest-capsule term.
-pub fn body_surface_points(
-    kps: &[RawKp],
-    points: &[[f32; 3]],
-    width: u32,
-    height: u32,
-    z_ref: Option<f64>,
-    min_score: f32,
-    out: &mut Vec<(V3, f64)>,
-) {
-    let (zlo, zhi) = match z_ref {
-        Some(z) => ((z - 0.7) as f32, (z + 0.7) as f32),
-        None => (0.15, 6.0),
-    };
-    for i in [5usize, 6, 11, 12, 13, 14, 15, 16] {
-        let Some(kp) = kps.get(i) else { continue };
-        if !(kp.score >= min_score) || kp.nx <= 0.0 || kp.nx >= 1.0 || kp.ny <= 0.0 || kp.ny >= 1.0 {
-            continue;
-        }
-        let u = kp.nx as f64 * width as f64;
-        let v = kp.ny as f64 * height as f64;
-        // A small window (radius 2 → 5×5) so the median stays on one surface.
-        let Some(p) = window_point(points, width, height, u, v, 2, zlo, zhi) else { continue };
-        let sigma = 0.015 * (1.0 + (1.0 - kp.score as f64));
-        out.push((p, sigma));
-    }
-}
 
 /// Torso yaw from the chest's depth slope, in camera x/z (radians),
 /// with the number of surviving columns.
@@ -672,82 +643,6 @@ pub fn shoulder_depth_ref(
     Some(zs[zs.len() / 2])
 }
 
-// ---------------------------------------------------------------------------
-// Point cloud
-// ---------------------------------------------------------------------------
-
-/// Extract the person's neighbourhood from a full-frame point cloud
-/// (`points[y*width+x]`, camera metres, NaN = invalid), using the
-/// predicted model to define the region: image-space bounding box of the
-/// projected capsules with a metric margin, and a depth band around the
-/// model. Subsampled by stride to at most `max_points`.
-#[allow(clippy::too_many_arguments)]
-pub fn cloud_near_model(
-    points: &[[f32; 3]],
-    width: u32,
-    height: u32,
-    model: &Model,
-    fk: &Fk,
-    st: &State,
-    intr: &Intrinsics,
-    margin_m: f64,
-    z_band_m: f64,
-    max_points: usize,
-) -> Cloud {
-    let mut umin = f64::INFINITY;
-    let mut umax = f64::NEG_INFINITY;
-    let mut vmin = f64::INFINITY;
-    let mut vmax = f64::NEG_INFINITY;
-    let mut zmin = f64::INFINITY;
-    let mut zmax = f64::NEG_INFINITY;
-    for c in &model.capsules {
-        let r = model.capsule_radius(st, c);
-        for p in [fk.point(c.a), fk.point(c.b)] {
-            zmin = zmin.min(p[2] - r);
-            zmax = zmax.max(p[2] + r);
-            if let Some(uv) = intr.project(p) {
-                let pad = intr.fx * (r + margin_m) / p[2].max(0.2);
-                umin = umin.min(uv[0] - pad);
-                umax = umax.max(uv[0] + pad);
-                vmin = vmin.min(uv[1] - pad);
-                vmax = vmax.max(uv[1] + pad);
-            }
-        }
-    }
-    if !umin.is_finite() || !zmin.is_finite() {
-        return Cloud::default();
-    }
-    let x0 = umin.floor().clamp(0.0, width as f64) as usize;
-    let x1 = umax.ceil().clamp(0.0, width as f64) as usize;
-    let y0 = vmin.floor().clamp(0.0, height as f64) as usize;
-    let y1 = vmax.ceil().clamp(0.0, height as f64) as usize;
-    if x1 <= x0 || y1 <= y0 {
-        return Cloud::default();
-    }
-    let zlo = (zmin - z_band_m) as f32;
-    let zhi = (zmax + z_band_m) as f32;
-    let area = (x1 - x0) * (y1 - y0);
-    // Choose a stride so the ROI yields ≈ max_points before validity culls.
-    let stride = ((area as f64 / max_points.max(1) as f64).sqrt().floor() as usize).max(1);
-    let mut out = Vec::with_capacity(max_points + 64);
-    let w = width as usize;
-    let mut y = y0;
-    while y < y1 {
-        let mut x = x0;
-        while x < x1 {
-            let p = points[y * w + x];
-            if p[2].is_finite() && p[2] > zlo && p[2] < zhi && p[0].is_finite() && p[1].is_finite() {
-                out.push(p);
-            }
-            x += stride;
-        }
-        y += stride;
-    }
-    Cloud {
-        points: out,
-        sigma: Vec::new(),
-    }
-}
 
 /// Median metric point in a small window of a full-frame point cloud,
 /// restricted to a depth band. Returns `None` when fewer than 3 valid

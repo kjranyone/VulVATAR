@@ -389,7 +389,7 @@ fn main() -> Result<(), String> {
             sig(h.j.l_shoulder), sig(h.j.l_elbow), sig(h.j.l_wrist),
             sig(h.j.r_shoulder), sig(h.j.r_elbow), sig(h.j.r_wrist),
             est.state.scale,
-            provider.face68_learned(), provider.mesh_learned(),
+            0, provider.mesh_learned(),
         ));
         {
             let l = &est.state.len;
@@ -751,35 +751,10 @@ fn main() -> Result<(), String> {
                 width: cw as f64,
                 height: ch as f64,
             };
-            // cloud points: associated (by part colour) vs not (grey)
-            {
-                let cloud = &provider.last_cloud;
-                let stride = ((cloud.len() + est.params.cloud_max_points - 1) / est.params.cloud_max_points).max(1);
-                let sub: Vec<[f32; 3]> = cloud.iter().enumerate().filter(|(i, _)| i % stride == 0).map(|(_, p)| *p).collect();
-                let mut assoc_of = vec![usize::MAX; sub.len()];
-                for &(pi, ci) in est.cloud_assoc() {
-                    if pi < assoc_of.len() {
-                        assoc_of[pi] = ci;
-                    }
-                }
-                for (i, p) in sub.iter().enumerate() {
-                    if let Some(uv) = intr.project([p[0] as f64, p[1] as f64, p[2] as f64]) {
-                        let c = if assoc_of[i] == usize::MAX {
-                            [90, 90, 90]
-                        } else {
-                            match m.capsules[assoc_of[i]].part {
-                                Part::Torso => [40, 90, 255],
-                                Part::Head => [0, 220, 220],
-                                _ => [200, 0, 200],
-                            }
-                        };
-                        draw_dot(&mut img, uv, 1, c);
-                    }
-                }
-                for p in &provider.last_surface {
-                    if let Some(uv) = intr.project([p[0] as f64, p[1] as f64, p[2] as f64]) {
-                        draw_dot(&mut img, uv, 4, [255, 200, 0]);
-                    }
+            // surface points
+            for p in &provider.last_surface {
+                if let Some(uv) = intr.project([p[0] as f64, p[1] as f64, p[2] as f64]) {
+                    draw_dot(&mut img, uv, 4, [255, 200, 0]);
                 }
             }
             // capsules

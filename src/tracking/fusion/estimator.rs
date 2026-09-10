@@ -114,16 +114,6 @@ pub struct ShoulderYawObs {
     pub sigma: f64,
 }
 
-/// A depth point cloud in the colour camera frame (metres). Points should
-/// already be pre-filtered to the person's neighbourhood; the estimator
-/// caps the count and associates every point to the nearest capsule.
-#[derive(Clone, Debug, Default)]
-pub struct Cloud {
-    pub points: Vec<[f32; 3]>,
-    /// σ per point (metres); empty ⇒ derived from depth (`0.0015 · z²`).
-    pub sigma: Vec<f32>,
-}
-
 /// Everything observed at one capture time.
 #[derive(Clone, Debug, Default)]
 pub struct FrameObs {
@@ -132,7 +122,6 @@ pub struct FrameObs {
     pub intr: Option<Intrinsics>,
     pub kp2d: Vec<Kp2d>,
     pub kp3d: Vec<Kp3d>,
-    pub cloud: Option<Cloud>,
     /// Direct world-orientation observations (see [`OriObs`]).
     pub ori: Vec<OriObs>,
     /// Torso yaw from the chest depth slope (see [`ShoulderYawObs`]).
@@ -155,20 +144,8 @@ pub struct Params {
     /// Robust kernel scale (whitened units) for 2-D / 3-D / cloud terms.
     pub c_2d: f64,
     pub c_3d: f64,
-    pub c_cloud: f64,
-    /// Total information budget of the cloud term, expressed as an
-    /// equivalent number of unit-σ keypoints; per-point weight is this over
-    /// the associated count.
-    pub cloud_budget: f64,
-    /// Points farther than this from every capsule surface are ignored.
-    pub cloud_gate_m: f64,
-    /// Max cloud points used per frame (uniform subsampling beyond).
-    pub cloud_max_points: usize,
-    /// Model-discrepancy σ (m) added in quadrature to every cloud point.
-    pub cloud_model_sigma: f64,
-    /// Graduated non-convexity: the cloud kernel scale starts at
-    /// `c_cloud · gnc_start` on the first LM iteration and decays by
-    /// `gnc_decay` per iteration toward `c_cloud`.
+    /// Model-discrepancy σ (m) added in quadrature to surface points.
+    pub surf_model_sigma: f64,
     pub gnc_start: f64,
     pub gnc_decay: f64,
     /// GNC start multiplier on tracked (warm-started) frames.
@@ -230,16 +207,8 @@ pub struct Params {
     pub seed_win_ratio: f64,
     /// Median 2-D residual (px) above which the track counts as lost.
     pub lost_rms_px: f64,
-    /// Restrict the point-cloud term to torso / neck / head capsules (the
-    /// parts whose surface the capsule model represents faithfully and that
-    /// have no other dense evidence). Limbs are constrained by 2-D + depth-
-    /// lifted keypoints.
-    pub cloud_torso_only: bool,
     /// Use the heavy-tailed Cauchy kernel (vs Geman–McClure) on 2-D terms.
     pub cauchy_2d: bool,
-    /// Associate dense cloud points by the first capsule their camera ray
-    /// hits (model z-buffer) instead of the nearest surface in 3-D.
-    pub cloud_zbuffer: bool,
     /// Kernel scale / gate for the sparse keypoint-lifted surface points.
     pub c_surf: f64,
     pub surf_gate_m: f64,
@@ -251,11 +220,7 @@ impl Default for Params {
             max_iters: 8,
             c_2d: 4.0,
             c_3d: 5.0,
-            c_cloud: 2.5,
-            cloud_budget: 0.0,
-            cloud_gate_m: 0.10,
-            cloud_max_points: 6000,
-            cloud_model_sigma: 0.012,
+            surf_model_sigma: 0.012,
             gnc_start: 16.0,
             gnc_decay: 0.5,
             gnc_tracked: 3.0,
@@ -276,8 +241,6 @@ impl Default for Params {
             upright_sigma: 0.12,
             seed_win_ratio: 0.95,
             lost_rms_px: 40.0,
-            cloud_torso_only: true,
-            cloud_zbuffer: true,
             cauchy_2d: true,
             c_surf: 4.0,
             surf_gate_m: 0.20,
@@ -304,11 +267,9 @@ pub struct Estimator {
     jac2: Vec<(usize, V3)>,
     /// Predicted state used as the temporal-prior mean this frame.
     pred: State,
-    /// Cloud association scratch: (point index, capsule index).
-    assoc: Vec<(usize, usize)>,
     /// Last solve diagnostics.
     pub diag: SolveDiag,
-    /// Current GNC multiplier on the cloud kernel scale.
+    /// Current GNC multiplier on the robust kernel scales.
     gnc: f64,
     /// Sparse-row scratch: dense accumulator + touched index list.
     row_acc: Vec<f64>,
@@ -401,7 +362,6 @@ impl Estimator {
             delta: vec![0.0; n],
             jac: Vec::with_capacity(64),
             jac2: Vec::with_capacity(64),
-            assoc: Vec::new(),
             diag: SolveDiag::default(),
             gnc: 1.0,
             row_acc: vec![0.0; n],
@@ -461,13 +421,6 @@ impl Estimator {
             st.apply_delta(model, &d);
         }
         st
-    }
-
-    /// Cloud association of the last accumulate: `(point index, capsule)`.
-    /// Point indices refer to the estimator's subsampled cloud (stride
-    /// `ceil(n / cloud_max_points)`).
-    pub fn cloud_assoc(&self) -> &[(usize, usize)] {
-        &self.assoc
     }
 
     /// Marginal σ (rad or m) of a joint (max over its components).
@@ -625,39 +578,10 @@ impl Estimator {
             .surface
             .iter()
             .map(|(p, s)| {
-                let s2 = (s * s + self.params.cloud_model_sigma * self.params.cloud_model_sigma).sqrt();
+                let s2 = (s * s + self.params.surf_model_sigma * self.params.surf_model_sigma).sqrt();
                 (*p, s2)
             })
             .collect();
-
-        // ---- prepare cloud --------------------------------------------------
-        let cloud_pts: Vec<([f64; 3], f64)> = match &obs.cloud {
-            Some(c) if !c.points.is_empty() => {
-                let stride = (c.points.len() + self.params.cloud_max_points - 1)
-                    / self.params.cloud_max_points;
-                let stride = stride.max(1);
-                c.points
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % stride == 0)
-                    .map(|(i, p)| {
-                        let z = p[2] as f64;
-                        let s_sensor = if c.sigma.len() == c.points.len() {
-                            c.sigma[i] as f64
-                        } else {
-                            (0.0015 * z * z).max(0.002)
-                        };
-                        // Capsules are a coarse surface model: fold the model
-                        // discrepancy into the per-point σ.
-                        let s = (s_sensor * s_sensor
-                            + self.params.cloud_model_sigma * self.params.cloud_model_sigma)
-                            .sqrt();
-                        ([p[0] as f64, p[1] as f64, z], s)
-                    })
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
 
         // ---- bootstrap: no temporal prior yet → seed the root from the torso
         // hint and fit the sparse terms with a wide (near-L2) kernel first, so
@@ -674,21 +598,21 @@ impl Estimator {
             let saved = (self.params.gnc_start, self.params.gnc_decay);
             self.params.gnc_start = 50.0;
             self.params.gnc_decay = 0.5;
-            self.lm_loop(model, obs, &[], &prior_var, dt);
+            self.lm_loop(model, obs, &prior_var, dt);
             self.params.gnc_start = saved.0;
             self.params.gnc_decay = saved.1;
             }
         }
         // ---- LM loop --------------------------------------------------------
         let start = self.state.clone();
-        let mut cost = self.lm_loop(model, obs, &cloud_pts, &prior_var, dt);
+        let mut cost = self.lm_loop(model, obs, &prior_var, dt);
         let mut best_state = self.state.clone();
         let mut best_diag = self.diag;
         let mut best_gnc_final = true;
         for seed in seeds {
             let Some(cand) = seed(&start) else { continue };
             self.state = cand;
-            let c = self.lm_loop(model, obs, &cloud_pts, &prior_var, dt);
+            let c = self.lm_loop(model, obs, &prior_var, dt);
             if std::env::var_os("VULVATAR_SEED_DUMP").is_some() {
                 eprintln!("SEEDCAND cost {cost:.1} cand {c:.1} ratio {:.3}", c / cost.max(1e-6));
             }
@@ -708,7 +632,7 @@ impl Estimator {
             let seed_wins = self.diag.seed_wins;
             self.diag = best_diag;
             self.diag.seed_wins = seed_wins;
-            cost = self.accumulate(model, obs, &fk, &cloud_pts, &prior_var, dt, true);
+            cost = self.accumulate(model, obs, &fk, &prior_var, dt, true);
         }
         self.diag.cost_final = cost;
         self.finish(model, &prev, dt, obs.t);
@@ -782,7 +706,6 @@ impl Estimator {
         &mut self,
         model: &Model,
         obs: &FrameObs,
-        cloud_pts: &[([f64; 3], f64)],
         prior_var: &[f64],
         dt: f64,
     ) -> f64 {
@@ -797,14 +720,14 @@ impl Estimator {
             self.params.gnc_tracked.max(1.0)
         };
         let mut fk = model.fk(&self.state);
-        let mut cost = self.accumulate(model, obs, &fk, cloud_pts, prior_var, dt, true);
+        let mut cost = self.accumulate(model, obs, &fk, prior_var, dt, true);
         self.diag = SolveDiag {
             iters: 0,
             cost_initial: cost,
             cost_final: cost,
             n_kp2d: obs.kp2d.len(),
             n_kp3d: obs.kp3d.len(),
-            n_cloud: self.assoc.len(),
+            n_cloud: 0,
             dt,
             ..self.diag
         };
@@ -824,7 +747,7 @@ impl Estimator {
                 trial.apply_delta(model, &self.delta);
                 let fk_trial = model.fk(&trial);
                 let cost_trial =
-                    self.eval_cost(model, obs, &fk_trial, &trial, cloud_pts, prior_var, dt);
+                    self.eval_cost(model, obs, &fk_trial, &trial, prior_var, dt);
                 if cost_trial.is_finite() && cost_trial <= cost {
                     self.state = trial;
                     fk = fk_trial;
@@ -835,7 +758,7 @@ impl Estimator {
                     self.diag.iters = it + 1;
                     if improvement < 1e-4 && self.gnc <= 1.0 {
                         // converged
-                        return self.accumulate(model, obs, &fk, cloud_pts, prior_var, dt, true);
+                        return self.accumulate(model, obs, &fk, prior_var, dt, true);
                     }
                     break;
                 } else {
@@ -848,11 +771,11 @@ impl Estimator {
             // Anneal the cloud kernel; the cost is re-evaluated under the new
             // scale so the acceptance test stays consistent.
             self.gnc = (self.gnc * self.params.gnc_decay).max(1.0);
-            cost = self.accumulate(model, obs, &fk, cloud_pts, prior_var, dt, true);
+            cost = self.accumulate(model, obs, &fk, prior_var, dt, true);
         }
         let _ = cost;
         self.gnc = 1.0;
-        self.accumulate(model, obs, &fk, cloud_pts, prior_var, dt, true)
+        self.accumulate(model, obs, &fk, prior_var, dt, true)
     }
 
     /// Posterior bookkeeping after the LM loop: covariance from the final
@@ -928,37 +851,33 @@ impl Estimator {
 
     /// Accumulate normal equations (if `build`) and return the total robust
     /// cost at `fk`/`self.state`.
-    #[allow(clippy::too_many_arguments)]
     fn accumulate(
         &mut self,
         model: &Model,
         obs: &FrameObs,
         fk: &Fk,
-        cloud: &[([f64; 3], f64)],
         prior_var: &[f64],
         dt: f64,
         build: bool,
     ) -> f64 {
         let st = self.state.clone();
         let surf = std::mem::take(&mut self.surf_pts);
-        let c = self.accumulate_at(model, obs, fk, &st, cloud, &surf, prior_var, dt, build);
+        let c = self.accumulate_at(model, obs, fk, &st, &surf, prior_var, dt, build);
         self.surf_pts = surf;
         c
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn eval_cost(
         &mut self,
         model: &Model,
         obs: &FrameObs,
         fk: &Fk,
         st: &State,
-        cloud: &[([f64; 3], f64)],
         prior_var: &[f64],
         dt: f64,
     ) -> f64 {
         let surf = std::mem::take(&mut self.surf_pts);
-        let c = self.accumulate_at(model, obs, fk, st, cloud, &surf, prior_var, dt, false);
+        let c = self.accumulate_at(model, obs, fk, st, &surf, prior_var, dt, false);
         self.surf_pts = surf;
         c
     }
@@ -970,7 +889,6 @@ impl Estimator {
         obs: &FrameObs,
         fk: &Fk,
         st: &State,
-        cloud: &[([f64; 3], f64)],
         surf: &[([f64; 3], f64)],
         prior_var: &[f64],
         _dt: f64,
@@ -1073,8 +991,8 @@ impl Estimator {
             }
         }
 
-        // ---- capsule-end Jacobians (shared by both surface terms) --------------
-        if build && (!cloud.is_empty() || !surf.is_empty()) {
+        // ---- capsule-end Jacobians (surface term) -------------------------------
+        if build && !surf.is_empty() {
             let nc = model.capsules.len();
             if self.cap_jac.len() != 2 * nc {
                 self.cap_jac = vec![Vec::with_capacity(48); 2 * nc];
@@ -1088,36 +1006,9 @@ impl Estimator {
                 self.cap_jac[2 * ci + 1] = jb;
             }
         }
-        // ---- dense cloud → torso/head capsules -----------------------------------
-        self.assoc.clear();
-        {
-            let spec = SurfaceSpec {
-                kernel: Kernel::GemanMcClure(self.params.c_cloud * self.gnc),
-                budget: self.params.cloud_budget,
-                max_weight: 1.0,
-                gate_m: self.params.cloud_gate_m,
-                torso_only: self.params.cloud_torso_only,
-                record_assoc: true,
-                zbuffer: self.params.cloud_zbuffer,
-            };
-            let (c, n, md) = self.surface_term(model, fk, st, cloud, spec, build);
-            cost += c;
-            ccl += c;
-            sumcl += md * n as f64;
-            ncl += n;
-        }
         // ---- sparse surface points (depth under body keypoints) -----------------
         {
-            let spec = SurfaceSpec {
-                kernel: Kernel::Cauchy(self.params.c_surf * self.gnc),
-                budget: 1e9,
-                max_weight: 1.0,
-                gate_m: self.params.surf_gate_m,
-                torso_only: false,
-                record_assoc: false,
-                zbuffer: false,
-            };
-            let (c, n, md) = self.surface_term(model, fk, st, surf, spec, build);
+            let (c, n, md) = self.surface_term(model, fk, st, surf, build);
             cost += c;
             ccl += c;
             sumcl += md * n as f64;
@@ -1441,83 +1332,44 @@ impl Estimator {
 }
 
 impl Estimator {
-    /// Point → capsule-surface term shared by the dense cloud and the sparse
-    /// keypoint-lifted surface points. Returns `(cost, n_assoc, mean_d)`.
+    /// Sparse point → capsule-surface term (lifted depth under keypoints).
+    /// Returns `(cost, n_assoc, mean_d)`.
     fn surface_term(
         &mut self,
         model: &Model,
         fk: &Fk,
         st: &State,
-        cloud: &[([f64; 3], f64)],
-        spec: SurfaceSpec,
+        points: &[([f64; 3], f64)],
         build: bool,
     ) -> (f64, usize, f64) {
         let mut cost = 0.0;
         let mut sumcl = 0.0;
         let mut ncl = 0usize;
-        if !cloud.is_empty() && spec.budget > 0.0 {
-            let kern = spec.kernel;
+        if !points.is_empty() {
+            let kern = Kernel::Cauchy(self.params.c_surf * self.gnc);
+            let gate_m = self.params.surf_gate_m * self.gnc;
             // Association: nearest capsule surface within the gate.
             let caps: Vec<(V3, V3, f64)> = model
                 .capsules
                 .iter()
                 .map(|c| (fk.point(c.a), fk.point(c.b), model.capsule_radius(st, c)))
                 .collect();
-            let mut items: Vec<(usize, usize, f64, V3, f64)> = Vec::with_capacity(cloud.len());
-            for (pi, (pt, _sig)) in cloud.iter().enumerate() {
+            let mut items: Vec<(usize, usize, f64, V3, f64)> = Vec::with_capacity(points.len());
+            for (pi, (pt, _sig)) in points.iter().enumerate() {
                 let mut best = (usize::MAX, f64::INFINITY, [0.0; 3], 0.0);
-                if spec.zbuffer {
-                    // Visibility association: the capsule the camera ray
-                    // through this point hits FIRST owns it (the model as its
-                    // own z-buffer). A point well in front of that surface is
-                    // an un-modelled occluder (desk, other person) and a point
-                    // well behind it cannot be seen — both are skipped. The
-                    // residual is then the distance to that capsule's surface.
-                    let t_obs = norm(*pt);
-                    if t_obs < 1e-6 {
-                        continue;
-                    }
-                    let dir = scale(*pt, 1.0 / t_obs);
-                    let mut first = (usize::MAX, f64::INFINITY);
-                    for (ci, (a, b, r)) in caps.iter().enumerate() {
-                        if let Some(t_hit) = ray_capsule_entry(dir, *a, *b, *r) {
-                            if t_hit < first.1 {
-                                first = (ci, t_hit);
-                            }
-                        }
-                    }
-                    if first.0 == usize::MAX || (t_obs - first.1).abs() > spec.gate_m * self.gnc {
-                        continue;
-                    }
-                    let (a, b, r) = caps[first.0];
-                    let (q, u) = closest_on_segment(a, b, *pt);
+                for (ci, (a, b, r)) in caps.iter().enumerate() {
+                    let (q, u) = closest_on_segment(*a, *b, *pt);
                     let d = norm(sub(*pt, q)) - r;
-                    best = (first.0, d, q, u);
-                } else {
-                    // Nearest surface among ALL capsules (so a limb in front of
-                    // the torso claims its own points); with `torso_only` the
-                    // point then only contributes if the winner is a torso/head
-                    // capsule.
-                    for (ci, (a, b, r)) in caps.iter().enumerate() {
-                        let (q, u) = closest_on_segment(*a, *b, *pt);
-                        let d = norm(sub(*pt, q)) - r;
-                        if d.abs() < best.1.abs() {
-                            best = (ci, d, q, u);
-                        }
+                    if d.abs() < best.1.abs() {
+                        best = (ci, d, q, u);
                     }
                 }
-                if best.0 != usize::MAX && best.1.abs() < spec.gate_m * self.gnc {
-                    if spec.torso_only
-                        && !matches!(model.capsules[best.0].part, Part::Torso | Part::Head)
-                    {
-                        continue;
-                    }
+                if best.0 != usize::MAX && best.1.abs() < gate_m {
                     items.push((pi, best.0, best.1, best.2, best.3));
                 }
             }
             let n_assoc = items.len();
             if n_assoc > 0 {
-                let w_scale = (spec.budget / n_assoc as f64).min(spec.max_weight);
                 // Per-capsule compressed normal equations: every point's
                 // residual row is α·[Ja; Jb; radius] with a point-specific
                 // 7-vector α, so Σ w αᵀα (7×7) and Σ w α r (7) per capsule
@@ -1528,14 +1380,11 @@ impl Estimator {
                 let mut mv = vec![[0.0f64; 7]; nc];
                 let mut used = vec![false; nc];
                 for (pi, ci, d, q, u) in items {
-                    if spec.record_assoc {
-                        self.assoc.push((pi, ci));
-                    }
-                    let (pt, sig) = cloud[pi];
+                    let (pt, sig) = points[pi];
                     let inv_s = 1.0 / sig.max(1e-4);
                     let r = d * inv_s;
                     let (rho, w) = kern.eval(r * r);
-                    cost += rho * w_scale;
+                    cost += rho;
                     sumcl += d;
                     ncl += 1;
                     if !build {
@@ -1553,10 +1402,9 @@ impl Estimator {
                         -u * nhat[2] * inv_s,
                         -rad * inv_s,
                     ];
-                    let ww = w * w_scale;
                     let m = &mut mm[ci];
                     for k in 0..7 {
-                        let ak = alpha[k] * ww;
+                        let ak = alpha[k] * w;
                         mv[ci][k] += ak * r;
                         for l in 0..7 {
                             m[k][l] += ak * alpha[l];
@@ -1655,7 +1503,6 @@ impl Estimator {
 
         (cost, ncl, if ncl > 0 { sumcl / ncl as f64 } else { 0.0 })
     }
-
 }
 
 /// Locked parameters: the pelvis joint (redundant with the root rotation).
@@ -1707,21 +1554,6 @@ fn trunk_params(model: &Model) -> Vec<bool> {
         }
     }
     v
-}
-
-/// Parameters of one point→surface term.
-#[derive(Clone, Copy, Debug)]
-pub struct SurfaceSpec {
-    pub kernel: Kernel,
-    /// Total information budget (unit-σ residual equivalents) spread over
-    /// the associated points; per-point weight = min(budget/N, max_weight).
-    pub budget: f64,
-    pub max_weight: f64,
-    pub gate_m: f64,
-    pub torso_only: bool,
-    pub record_assoc: bool,
-    /// Visibility (first-hit) association instead of nearest-surface.
-    pub zbuffer: bool,
 }
 
 /// Parameter-space difference `a ⊖ b` (left perturbation for rotations).
@@ -1862,7 +1694,7 @@ mod tests {
         v
     }
 
-    fn cloud_from_capsules(model: &Model, st: &State, n_per: usize) -> Cloud {
+    pub(super) fn surface_from_capsules(model: &Model, st: &State, n_per: usize) -> Vec<(V3, f64)> {
         let fk = model.fk(st);
         let mut pts = Vec::new();
         for c in &model.capsules {
@@ -1872,20 +1704,15 @@ mod tests {
             for i in 0..n_per {
                 let u = i as f64 / (n_per.max(2) - 1) as f64;
                 let q = add(a, scale(sub(b, a), u));
-                // surface point toward the camera (−z of the world), i.e. the
-                // visible front surface.
                 let axis = normalize(sub(b, a));
                 let mut nrm = [0.0, 0.0, -1.0];
                 nrm = sub(nrm, scale(axis, dot(nrm, axis)));
                 let nrm = normalize(nrm);
                 let p = add(q, scale(nrm, r));
-                pts.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+                pts.push((p, 0.015));
             }
         }
-        Cloud {
-            points: pts,
-            sigma: Vec::new(),
-        }
+        pts
     }
 
     fn gt_state(h: &Humanoid) -> State {
@@ -1924,20 +1751,12 @@ mod tests {
             intr: Some(intr),
             kp2d: observe(m, &gt, intr, 1.0),
             kp3d,
-            cloud: Some(cloud_from_capsules(m, &gt, 12)),
             ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
-            surface: Vec::new(),
+            surface: surface_from_capsules(m, &gt, 12),
         };
-        let mut est = Estimator::new(
-            m,
-            Params {
-                cloud_budget: 250.0,
-                cloud_torso_only: false,
-                ..Params::default()
-            },
-        );
+        let mut est = Estimator::new(m, Params::default());
         // Warm start: relaxed pose facing camera at roughly the right place.
         est.state.root_t = [0.0, 0.3, 1.5];
         for i in 0..20 {
@@ -1985,7 +1804,6 @@ mod tests {
                     intr: Some(intr),
                     kp2d: full.clone(),
                     kp3d: Vec::new(),
-                    cloud: None,
                     ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
@@ -2020,7 +1838,6 @@ mod tests {
                     intr: Some(intr),
                     kp2d: partial.clone(),
                     kp3d: Vec::new(),
-                    cloud: None,
                     ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
@@ -2071,7 +1888,6 @@ mod tests {
                     intr: Some(intr),
                     kp2d: observe(m, &s, intr, 1.0),
                     kp3d: Vec::new(),
-                    cloud: None,
                     ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
@@ -2086,24 +1902,10 @@ mod tests {
 }
 
 #[cfg(test)]
-pub mod tests_helpers {
-    use super::*;
-    pub fn cloud(model:&Model, st:&State)->Cloud{
-        let fk = model.fk(st);
-        let mut pts = Vec::new();
-        for c in &model.capsules {
-            let a = fk.point(c.a); let b = fk.point(c.b); let r = model.capsule_radius(st, c);
-            for i in 0..12 { let u = i as f64/11.0; let q = add(a, scale(sub(b,a),u));
-                let axis = normalize(sub(b,a)); let mut nrm=[0.0,0.0,-1.0]; nrm = sub(nrm, scale(axis, dot(nrm,axis))); let nrm=normalize(nrm);
-                let p = add(q, scale(nrm, r)); pts.push([p[0] as f32,p[1] as f32,p[2] as f32]); } }
-        Cloud{points:pts, sigma:Vec::new()}
-    }
-}
-#[cfg(test)]
 mod gradient_tests {
     use super::*;
     #[test]
-    fn cloud_gradient_matches_finite_difference() {
+    fn surface_gradient_matches_finite_difference() {
         let h = Humanoid::new();
         let m = &h.model;
         let mut gt = State::rest(m);
@@ -2111,106 +1913,33 @@ mod gradient_tests {
         gt.root_r = FACING_CAMERA;
         gt.root_t = [0.1, 0.35, 1.6];
         gt.set_hinge(m, h.j.l_elbow, 1.1);
-        let cloud = super::tests_helpers::cloud(m, &gt);
-        let pts: Vec<([f64;3], f64)> = cloud.points.iter().map(|p| ([p[0] as f64,p[1] as f64,p[2] as f64], 0.004)).collect();
+        let pts = super::tests::surface_from_capsules(m, &gt, 12);
         // Perturb slightly
         let mut st = gt.clone();
         let mut d = vec![0.0; m.num_params];
         d[ROOT_T] = 0.01; d[m.joint_param[h.j.l_elbow]] = 0.05; d[m.beta_scale] = 0.02;
         st.apply_delta(m, &d);
-        let mut est = Estimator::new(m, Params { cloud_budget: 1.0, ..Params::default() });
+        let mut est = Estimator::new(m, Params::default());
         est.state = st.clone();
-        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], cloud: None, ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: Vec::new() };
+        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: pts.clone() };
         let prior_var = vec![1e9; m.num_params];
-        // Build with only cloud terms: temporarily disable priors by huge sigma? Priors are always on; compare gradient of total instead.
+        est.surf_pts = pts;
         let fk = m.fk(&st);
-        let c0 = est.accumulate(m, &obs, &fk, &pts, &prior_var, 0.033, true);
+        let c0 = est.accumulate(m, &obs, &fk, &prior_var, 0.033, true);
         let g: Vec<f64> = est.dense.g.clone();
         // finite difference of cost
         for k in [ROOT_T, ROOT_T+1, ROOT_T+2, m.joint_param[h.j.l_elbow], m.beta_scale, m.beta_rad, m.joint_param[h.j.spine2]] {
             let eps = 1e-6;
             let mut sp = st.clone(); let mut dd = vec![0.0; m.num_params]; dd[k]=eps; sp.apply_delta(m,&dd);
             let fkp = m.fk(&sp);
-            let cp = est.eval_cost(m, &obs, &fkp, &sp, &pts, &prior_var, 0.033);
+            let cp = est.eval_cost(m, &obs, &fkp, &sp, &prior_var, 0.033);
             let mut sm = st.clone(); dd[k]=-eps; sm.apply_delta(m,&dd);
             let fkm = m.fk(&sm);
-            let cm = est.eval_cost(m, &obs, &fkm, &sm, &pts, &prior_var, 0.033);
+            let cm = est.eval_cost(m, &obs, &fkm, &sm, &prior_var, 0.033);
             let num = (cp-cm)/(2.0*eps);
             // ∂cost/∂x = 2 g (cost = Σ ρ, g = Σ w Jᵀ r)
             assert!((num - 2.0 * g[k]).abs() < 1e-3 * (1.0 + num.abs()), "param {k}: analytic 2g {} vs numeric {}", 2.0 * g[k], num);
         }
         assert!(c0.is_finite());
-    }
-}
-#[cfg(test)]
-mod timing_tests {
-    use super::*;
-    #[test]
-    #[ignore = "perf probe: cargo test --lib timing_tests -- --ignored --nocapture"]
-    fn timing_dense_cloud() {
-        let h = Humanoid::new();
-        let m = &h.model;
-        let intr = Intrinsics { fx: 600.0, fy: 600.0, cx: 320.0, cy: 240.0, width: 640.0, height: 480.0 };
-        let mut gt = State::rest(m);
-        gt.set_relaxed(m);
-        gt.root_r = FACING_CAMERA;
-        gt.root_t = [0.1, 0.35, 1.6];
-        let fkg = m.fk(&gt);
-        let mut kp = Vec::new();
-        for j in 0..m.joints.len() { if let Some(uv)=intr.project(fkg.t[j]) { kp.push(Kp2d{point:ModelPoint::Joint(j),u:uv[0],v:uv[1],sigma:2.0}); } }
-        for s in 0..m.sites.len() { if let Some(uv)=intr.project(fkg.site[s]) { kp.push(Kp2d{point:ModelPoint::Site(s),u:uv[0],v:uv[1],sigma:2.0}); } }
-        // dense cloud: 200 per capsule
-        let fk = m.fk(&gt);
-        let mut pts = Vec::new();
-        for c in &m.capsules { let a=fk.point(c.a); let b=fk.point(c.b); let r=m.capsule_radius(&gt,c);
-            for i in 0..150 { let u=(i%50) as f64/49.0; let ang = (i/50) as f64 * 0.5 - 0.5; let q=add(a,scale(sub(b,a),u));
-                let axis=normalize(sub(b,a)); let mut nrm=[ang.sin(),0.0,-ang.cos()]; nrm=sub(nrm,scale(axis,dot(nrm,axis))); let nrm=normalize(nrm);
-                let p=add(q,scale(nrm,r)); pts.push([p[0] as f32,p[1] as f32,p[2] as f32]); } }
-        eprintln!("params {} cloud {}", m.num_params, pts.len());
-        let mut est = Estimator::new(m, Params::default());
-        est.state.root_t=[0.0,0.3,1.5];
-        let t0 = std::time::Instant::now();
-        for i in 0..30 {
-            let obs = FrameObs{ t:i as f64/30.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:Some(Cloud{points:pts.clone(),sigma:vec![]}), ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: Vec::new() };
-            est.update(m,&obs);
-        }
-        eprintln!("30 frames: {:.1} ms/frame, last iters {} n_cloud {}", t0.elapsed().as_secs_f64()*1000.0/30.0, est.diag.iters, est.diag.n_cloud);
-    }
-}
-#[cfg(test)]
-mod timing_tests2 {
-    use super::*;
-    #[test]
-    #[ignore = "perf probe: cargo test --lib timing_tests2 -- --ignored --nocapture"]
-    fn timing_parts() {
-        let h = Humanoid::new();
-        let m = &h.model;
-        let intr = Intrinsics { fx: 600.0, fy: 600.0, cx: 320.0, cy: 240.0, width: 640.0, height: 480.0 };
-        let mut gt = State::rest(m);
-        gt.set_relaxed(m);
-        gt.root_r = FACING_CAMERA;
-        gt.root_t = [0.1, 0.35, 1.6];
-        let fkg = m.fk(&gt);
-        let mut kp = Vec::new();
-        for j in 0..m.joints.len() { if let Some(uv)=intr.project(fkg.t[j]) { kp.push(Kp2d{point:ModelPoint::Joint(j),u:uv[0],v:uv[1],sigma:2.0}); } }
-        let fk = m.fk(&gt);
-        let mut pts = Vec::new();
-        for c in &m.capsules { let a=fk.point(c.a); let b=fk.point(c.b); let r=m.capsule_radius(&gt,c);
-            for i in 0..150 { let u=(i%50) as f64/49.0; let ang = (i/50) as f64 * 0.5 - 0.5; let q=add(a,scale(sub(b,a),u));
-                let axis=normalize(sub(b,a)); let mut nrm=[ang.sin(),0.0,-ang.cos()]; nrm=sub(nrm,scale(axis,dot(nrm,axis))); let nrm=normalize(nrm);
-                let p=add(q,scale(nrm,r)); pts.push([p[0] as f32,p[1] as f32,p[2] as f32]); } }
-        let cl: Vec<([f64;3],f64)> = pts.iter().map(|p| ([p[0] as f64,p[1] as f64,p[2] as f64],0.012)).collect();
-        let mut est = Estimator::new(m, Params::default());
-        est.state = gt.clone();
-        let obs = FrameObs{ t:0.0, intr:Some(intr), kp2d:kp.clone(), kp3d:vec![], cloud:None, ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: Vec::new() };
-        let pv = vec![1.0; m.num_params];
-        let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&cl,&pv,0.03,true);} eprintln!("accumulate build: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
-        let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&cl,&pv,0.03,false);} eprintln!("accumulate eval: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
-        let t=std::time::Instant::now(); for _ in 0..10 { est.accumulate(m,&obs,&fk,&[],&pv,0.03,true);} eprintln!("accumulate build nocloud: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
-        let mut d = vec![0.0; m.num_params];
-        let t=std::time::Instant::now(); for _ in 0..10 { est.dense.solve_damped(1e-3,1e-9,&mut d);} eprintln!("solve: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
-        let mut v = vec![0.0; m.num_params];
-        let t=std::time::Instant::now(); for _ in 0..10 { est.dense.marginal_variances(1e-9,&mut v);} eprintln!("marginals: {:.2} ms", t.elapsed().as_secs_f64()*100.0);
-        let t=std::time::Instant::now(); for _ in 0..10 { let _=m.fk(&gt);} eprintln!("fk: {:.3} ms", t.elapsed().as_secs_f64()*100.0);
     }
 }
