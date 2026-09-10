@@ -203,6 +203,7 @@ pub fn filter_arm_coherence(
         let sh_i = 5 + side;
         let el_i = 7 + side;
         let wr_i = 9 + side;
+        let base = if side == 0 { 91 } else { 112 };
         if raw[sh_i].score <= 0.0 {
             // An uncorroborated border-clamped arm when shoulder is not visible is a phantom.
             for &idx in &[el_i, wr_i] {
@@ -211,6 +212,14 @@ pub fn filter_arm_coherence(
                         || !(0.02..0.98).contains(&raw[idx].ny);
                     if clamped {
                         raw[idx].score = 0.0;
+                    }
+                }
+            }
+            let has_wrist = raw[wr_i].score > 0.0 || (base < raw.len() && raw[base].score > 0.0);
+            if !has_wrist {
+                for i in base..base + 21 {
+                    if i < raw.len() {
+                        raw[i].score = 0.0;
                     }
                 }
             }
@@ -233,28 +242,64 @@ pub fn filter_arm_coherence(
             }
         }
 
-        if raw[wr_i].score > 0.0 {
-            let wr_z = z_at(raw[wr_i].nx as f64, raw[wr_i].ny as f64);
+        let validate_wrist = |idx: usize, raw: &[RawKp]| -> bool {
+            if raw[idx].score <= 0.0 {
+                return false;
+            }
+            let wr_z = z_at(raw[idx].nx as f64, raw[idx].ny as f64);
             let foreign = wr_z.map(|zv| !in_band(zv)).unwrap_or(false);
             let z = wr_z.unwrap_or(el_z);
             let wr_clamped =
-                !(0.02..0.98).contains(&raw[wr_i].nx) || !(0.02..0.98).contains(&raw[wr_i].ny);
-            let mut wr_ok = !foreign && (!wr_clamped || wr_z.is_some());
-            if wr_ok {
-                if el_ok {
-                    let fore_m = bone_m(&raw[wr_i], &raw[el_i], z.max(el_z));
-                    if fore_m > FOREARM_REACH_M {
-                        wr_ok = false;
-                    }
-                } else {
-                    let full_m = bone_m(&raw[wr_i], &raw[sh_i], z.max(sh_z));
-                    if full_m > FULL_ARM_REACH_M {
-                        wr_ok = false;
+                !(0.02..0.98).contains(&raw[idx].nx) || !(0.02..0.98).contains(&raw[idx].ny);
+            if foreign || (wr_clamped && wr_z.is_none()) {
+                return false;
+            }
+            if el_ok {
+                let fore_m = bone_m(&raw[idx], &raw[el_i], z.max(el_z));
+                if fore_m > FOREARM_REACH_M {
+                    return false;
+                }
+            } else {
+                let full_m = bone_m(&raw[idx], &raw[sh_i], z.max(sh_z));
+                if full_m > FULL_ARM_REACH_M {
+                    return false;
+                }
+            }
+            let opp_side = 1 - side;
+            let sh_opp_i = 5 + opp_side;
+            if raw[sh_opp_i].score > 0.0 {
+                let dx_sh = raw[sh_opp_i].nx - raw[sh_i].nx;
+                let dy_sh = raw[sh_opp_i].ny - raw[sh_i].ny;
+                let len_sq = dx_sh * dx_sh + dy_sh * dy_sh;
+                if len_sq > 1e-4 {
+                    let dx_wr = raw[idx].nx - raw[sh_i].nx;
+                    let dy_wr = raw[idx].ny - raw[sh_i].ny;
+                    let proj = (dx_wr * dx_sh + dy_wr * dy_sh) / len_sq;
+                    if proj > 1.05 || (!el_ok && proj > 0.65) {
+                        return false;
                     }
                 }
             }
-            if !wr_ok {
-                zero_arm_chain(raw, side);
+            true
+        };
+
+        if raw[wr_i].score > 0.0 && !validate_wrist(wr_i, raw) {
+            raw[wr_i].score = 0.0;
+        }
+        if base < raw.len() && raw[base].score > 0.0 && !validate_wrist(base, raw) {
+            raw[base].score = 0.0;
+        }
+
+        // Hand fingers validation: fingers require at least one valid wrist detection
+        // (body wrist or hand-block wrist) to anchor them.
+        let has_any_wrist = raw[wr_i].score > 0.0 || (base < raw.len() && raw[base].score > 0.0);
+        if !has_any_wrist {
+            // Completely unanchored fingers: without any wrist detection,
+            // wholebody hand keypoints are phantom hallucinations.
+            for i in base..base + 21 {
+                if i < raw.len() {
+                    raw[i].score = 0.0;
+                }
             }
         }
     }
