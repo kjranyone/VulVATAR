@@ -78,18 +78,29 @@ impl FbxAssetLoader {
             .map_err(|e| FbxLoadError::Ufbx(format!("{}: {}", e.description, e.info())))?;
 
         on_progress(LoadStage::Skeleton);
+        // Build mapping from FBX element_id to array index (NodeId)
+        let mut elem_to_node_idx: HashMap<u32, usize> = HashMap::with_capacity(scene.nodes.len());
+        for (idx, node) in scene.nodes.iter().enumerate() {
+            elem_to_node_idx.insert(node.element.element_id, idx);
+        }
+
         // Build skeleton nodes
         let mut nodes = Vec::with_capacity(scene.nodes.len());
         let mut humanoid_bone_map = HashMap::new();
 
-        for node in &scene.nodes {
-            let id = NodeId(node.element.element_id as u64);
+        for (idx, node) in scene.nodes.iter().enumerate() {
+            let id = NodeId(idx as u64);
             let name = node.element.name.to_string();
-            let parent = node.parent.as_ref().map(|p| NodeId(p.element.element_id as u64));
+            let parent = node
+                .parent
+                .as_ref()
+                .and_then(|p| elem_to_node_idx.get(&p.element.element_id))
+                .map(|&p_idx| NodeId(p_idx as u64));
             let children: Vec<NodeId> = node
                 .children
                 .iter()
-                .map(|c| NodeId(c.element.element_id as u64))
+                .filter_map(|c| elem_to_node_idx.get(&c.element.element_id))
+                .map(|&c_idx| NodeId(c_idx as u64))
                 .collect();
 
             let t = [
@@ -191,8 +202,8 @@ impl FbxAssetLoader {
 
             let base_mode = MaterialMode::ToonLike;
             let base_color = [1.0, 1.0, 1.0, 1.0];
-            let alpha_mode = AlphaMode::Opaque;
-            let double_sided = false;
+            let alpha_mode = AlphaMode::Mask(0.5);
+            let double_sided = true;
 
             let toon_params = ToonMaterialParams {
                 ramp_threshold: 0.5,
@@ -251,14 +262,17 @@ impl FbxAssetLoader {
             if let Some(skin_def) = skin {
                 for cluster in &skin_def.clusters {
                     if let Some(ref bone_node) = cluster.bone_node {
-                        let joint_node_id = NodeId(bone_node.element.element_id as u64);
+                        let node_idx = elem_to_node_idx
+                            .get(&bone_node.element.element_id)
+                            .copied()
+                            .unwrap_or(0);
+                        let joint_node_id = NodeId(node_idx as u64);
                         skin_joint_nodes.push(joint_node_id);
 
                         // Convert ufbx::Matrix to Mat4 column-major
                         let m = matrix_to_mat4(&cluster.geometry_to_bone);
                         skin_ibm.push(m);
 
-                        let node_idx = bone_node.element.element_id as usize;
                         if node_idx < inverse_bind_matrices.len() && !ibm_set[node_idx] {
                             inverse_bind_matrices[node_idx] = m;
                             ibm_set[node_idx] = true;
@@ -401,7 +415,13 @@ impl FbxAssetLoader {
                                 let num_w = (sv.num_weights as usize).min(4);
                                 for w_idx in 0..num_w {
                                     let w = &skin_def.weights[sv.weight_begin as usize + w_idx];
-                                    j_indices[w_idx] = w.cluster_index as u16;
+                                    let cluster = &skin_def.clusters[w.cluster_index as usize];
+                                    let node_idx = cluster
+                                        .bone_node
+                                        .as_ref()
+                                        .and_then(|b| elem_to_node_idx.get(&b.element.element_id).copied())
+                                        .unwrap_or(0);
+                                    j_indices[w_idx] = node_idx as u16;
                                     j_weights[w_idx] = w.weight as f32;
                                     total_w += w.weight as f32;
                                 }
@@ -474,7 +494,10 @@ impl FbxAssetLoader {
             for node in &scene.nodes {
                 if let Some(ref m) = node.mesh {
                     if m.element.element_id == mesh.element.element_id {
-                        let node_idx = node.element.element_id as usize;
+                        let node_idx = elem_to_node_idx
+                            .get(&node.element.element_id)
+                            .copied()
+                            .unwrap_or(0);
                         let meshes_idx = meshes.len();
                         node_to_mesh.insert(node_idx, meshes_idx);
 
