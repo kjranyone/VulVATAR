@@ -7,8 +7,46 @@
 //! alternative starting point; the LM run from each seed is compared by
 //! total cost and the better basin wins.
 
+use super::estimator::{Estimator, FrameObs, ModelPoint};
 use super::math::*;
 use super::model::*;
+
+/// Find 3D joints and run the estimator update with analytic arm re-seeds.
+pub fn update_with_arm_seeds(
+    h: &Humanoid,
+    est: &mut Estimator,
+    obs: &FrameObs,
+) {
+    let find3d = |j: usize| -> Option<V3> {
+        obs.kp3d
+            .iter()
+            .find(|k| matches!(k.point, ModelPoint::Joint(jj) if jj == j))
+            .map(|k| k.p)
+    };
+    let l = (find3d(h.j.l_elbow), find3d(h.j.l_wrist));
+    let r = (find3d(h.j.r_elbow), find3d(h.j.r_wrist));
+    let seed_l = |st: &State| -> Option<State> {
+        seed_arm(h, st, true, l.0, l.1?)
+    };
+    let seed_r = |st: &State| -> Option<State> {
+        seed_arm(h, st, false, r.0, r.1?)
+    };
+    let seed_both = |st: &State| -> Option<State> {
+        let a = seed_arm(h, st, true, l.0, l.1?)?;
+        seed_arm(h, &a, false, r.0, r.1?)
+    };
+    let mut seeds: Vec<&dyn Fn(&State) -> Option<State>> = Vec::new();
+    if l.1.is_some() {
+        seeds.push(&seed_l);
+    }
+    if r.1.is_some() {
+        seeds.push(&seed_r);
+    }
+    if l.1.is_some() && r.1.is_some() {
+        seeds.push(&seed_both);
+    }
+    est.update_with_seeds(&h.model, obs, &seeds);
+}
 
 /// Rotation taking the orthonormal pair `(a1, a2)` onto `(b1, b2)`
 /// (`a2 ⟂ a1`, `b2 ⟂ b1` assumed after re-orthogonalisation).

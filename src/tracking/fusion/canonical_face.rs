@@ -492,3 +492,109 @@ pub const FACE_OVAL: [usize; 36] = [
     10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152,
     148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
 ];
+
+use super::math::*;
+use super::observe::window_point;
+use crate::tracking::metric_frame::MetricDepthFrame;
+
+/// Per-user canonical-face fit: uniform scale over the canonical template
+/// and its offset from the head joint, learned by EMA from depth-lifted
+/// mesh landmarks.
+#[derive(Clone, Debug)]
+pub struct FaceFit {
+    pub scale: f64,
+    pub offset: V3,
+    pub n: u32,
+}
+
+impl Default for FaceFit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FaceFit {
+    pub fn new() -> Self {
+        Self {
+            scale: 1.0,
+            offset: [0.0, 0.045, 0.02],
+            n: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.scale = 1.0;
+        self.offset = [0.0, 0.045, 0.02];
+        self.n = 0;
+    }
+
+    /// Update canonical-face fit from depth-lifted mesh landmarks.
+    pub fn update(
+        &mut self,
+        lm: &[[f32; 3]],
+        head_t: V3,
+        head_r: &M3,
+        z_ref: f64,
+        depth: &MetricDepthFrame,
+        in_hand_rect: impl Fn(f64, f64) -> bool,
+    ) {
+        let depth_at = |u: f64, v: f64| -> Option<V3> {
+            if in_hand_rect(u, v) {
+                return None;
+            }
+            window_point(
+                &depth.points_m,
+                depth.width,
+                depth.height,
+                u,
+                v,
+                1,
+                (z_ref - 0.25) as f32,
+                (z_ref + 0.25) as f32,
+            )
+        };
+
+        let rt = transpose(head_r);
+        let mut pts: Vec<(V3, V3)> = Vec::new();
+        for (i, l) in lm.iter().enumerate().take(468) {
+            if i % 3 != 0 || !l[0].is_finite() {
+                continue;
+            }
+            if let Some(p) = depth_at(l[0] as f64, l[1] as f64) {
+                if (p[2] - z_ref).abs() < 0.15 {
+                    let local = mat_vec(&rt, sub(p, head_t));
+                    let c = CANONICAL_FACE_468[i];
+                    pts.push((local, [c[0] as f64, c[1] as f64, c[2] as f64]));
+                }
+            }
+        }
+        if pts.len() >= 20 {
+            let n = pts.len() as f64;
+            let mean_l = scale(
+                pts.iter().fold([0.0; 3], |a, (l, _)| add(a, *l)),
+                1.0 / n,
+            );
+            let mean_c = scale(
+                pts.iter().fold([0.0; 3], |a, (_, c)| add(a, *c)),
+                1.0 / n,
+            );
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for (l, c) in &pts {
+                let dc = sub(*c, mean_c);
+                let dl = sub(*l, mean_l);
+                num += dot(dc, dl);
+                den += dot(dc, dc);
+            }
+            if den > 1e-9 {
+                let s_new = (num / den).clamp(0.7, 1.4);
+                let t_new = sub(mean_l, scale(mean_c, s_new));
+                let alpha = if self.n == 0 { 1.0 } else { 0.05 };
+                self.scale += alpha * (s_new - self.scale);
+                self.offset = add(self.offset, scale(sub(t_new, self.offset), alpha));
+                self.n = self.n.saturating_add(1);
+            }
+        }
+    }
+}
+

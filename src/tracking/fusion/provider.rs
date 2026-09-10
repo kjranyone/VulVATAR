@@ -37,16 +37,9 @@ pub struct FusionProvider {
     body_map: BodyMap,
     /// Per-user canonical-face fit: uniform scale over the canonical
     /// template and its offset from the head joint, learned by EMA from
-    /// depth-lifted mesh landmarks. Rotation is fixed anatomy (see
-    /// `canonical_face`).
-    face_fit_scale: f64,
-    face_fit_offset: V3,
-    face_fit_n: u32,
-    /// Frames remaining in which head-orientation observations stay
-    /// suppressed after a hand-over-face episode: the hand-rect signal
-    /// drops out for a frame or two mid-occlusion (crop tracking loss)
-    /// exactly while the mesh pose is still poisoned.
-    ori_cooldown: u8,
+    /// depth-lifted mesh landmarks.
+    face_fit: super::canonical_face::FaceFit,
+    head_ori: super::head_ori::HeadOriTracker,
     /// Consecutive frames each locked hand crop has gone WITHOUT
     /// corroboration from the body detector (wrist / hand-block keypoints
     /// near the crop). The dedicated hand landmarker happily reports
@@ -65,25 +58,6 @@ pub struct FusionProvider {
     hand_suspect: [bool; 2],
     /// Frames in which both crops locked onto one physical hand.
     pub hand_dupes: u32,
-    /// Last ACCEPTED head-orientation target (camera frame) and the run of
-    /// consecutive rejections since. A real head turns ≲ 3 rad/s; the
-    /// mesh's palm-lock failure mode is a STEP — yaw saturating 0 → −0.8
-    /// within a frame or two while a palm slides over the face — so a
-    /// target that jumps faster than physics is rejected. To re-lock after
-    /// a genuinely lost stretch, a rejected target that AGREES with the
-    /// solver's current head orientation (±0.4 rad, which palm-garbage
-    /// never does because the rest of the evidence keeps the head sane)
-    /// is accepted immediately.
-    ori_last: Option<M3>,
-    ori_reject_run: u8,
-    /// Frames since the depth cheek-profile last CONFIRMED a large-yaw
-    /// pose (saturating count-down). The profile signal flickers frame to
-    /// frame (sparse depth columns, headphones, hair), so a confirmed
-    /// large-yaw episode stays trusted for a short window as long as the
-    /// target stays temporally continuous. A palm-locked mesh never earns
-    /// the confirmation in the first place, so the window never opens for
-    /// it.
-    ori_depth_grace: u8,
     external_depth: Option<MetricDepthFrame>,
     load_warnings: Vec<String>,
     /// Last capture time (s) handed to the estimator.
@@ -152,16 +126,11 @@ impl FusionProvider {
             h,
             est,
             body_map,
-            face_fit_scale: 1.0,
-            face_fit_offset: [0.0, 0.045, 0.02],
-            face_fit_n: 0,
-            ori_cooldown: 0,
+            face_fit: super::canonical_face::FaceFit::new(),
+            head_ori: super::head_ori::HeadOriTracker::new(),
             hand_unsupported: [0, 0],
             hand_suspect: [false, false],
             hand_dupes: 0,
-            ori_last: None,
-            ori_reject_run: 0,
-            ori_depth_grace: 0,
             external_depth: None,
             load_warnings: warnings,
             last_t: None,
@@ -187,7 +156,7 @@ impl FusionProvider {
         0
     }
     pub fn mesh_learned(&self) -> usize {
-        self.face_fit_n as usize
+        self.face_fit.n as usize
     }
 
     /// Which arm (0 = left, 1 = right) a model point belongs to, if any
@@ -243,16 +212,11 @@ impl PoseProvider for FusionProvider {
         self.rtmw3d.reset_temporal_state();
         self.est.reset(&self.h.model);
         self.prev_hands = [None, None];
-        self.face_fit_scale = 1.0;
-        self.face_fit_offset = [0.0, 0.045, 0.02];
-        self.face_fit_n = 0;
-        self.ori_cooldown = 0;
+        self.face_fit.reset();
+        self.head_ori.reset();
         self.hand_unsupported = [0, 0];
         self.hand_suspect = [false, false];
         self.hand_dupes = 0;
-        self.ori_last = None;
-        self.ori_reject_run = 0;
-        self.ori_depth_grace = 0;
         self.last_t = None;
         self.frames = 0;
     }
@@ -361,67 +325,14 @@ impl PoseProvider for FusionProvider {
                 u >= x0 as f64 && u <= x1 as f64 && v >= y0 as f64 && v <= y1 as f64
             })
         };
-        let nose_in_hand_obs = {
-            let n = base.annotation.keypoints.first().copied().unwrap_or((0.5, 0.5, 0.0));
-            in_hand_rect(n.0 as f64 * width as f64, n.1 as f64 * height as f64)
-        };
-        // Face-box × hand-box overlap: a palm anywhere over the face makes
-        // the FaceMesh pose (and its confidence) untrustworthy well before
-        // the nose itself is covered — the mesh happily locks onto a
-        // saturated yaw while half the face is occluded. Face box from the
-        // annotation's eye/ear keypoints, padded to cover the jaw.
-        let face_overlaps_hand = {
-            let kps = &base.annotation.keypoints;
-            let mut x0 = f32::MAX;
-            let mut y0 = f32::MAX;
-            let mut x1 = f32::MIN;
-            let mut y1 = f32::MIN;
-            let mut n = 0;
-            for k in kps.iter().take(5) {
-                if k.2 < 0.3 {
-                    continue;
-                }
-                let (u, v) = (k.0 * width as f32, k.1 * height as f32);
-                x0 = x0.min(u);
-                y0 = y0.min(v);
-                x1 = x1.max(u);
-                y1 = y1.max(v);
-                n += 1;
-            }
-            if n >= 3 {
-                let pad = 0.6 * (x1 - x0).max(24.0);
-                let (fx0, fy0, fx1, fy1) = (x0 - pad, y0 - pad, x1 + pad, y1 + pad * 1.6);
-                // Only hands the landmarker actually believes in — the
-                // crop tracker also carries speculative rects (detector /
-                // predicted candidates) that routinely hover near the face
-                // in desk framing where no hand is visible at all.
-                self.last_hands
-                    .iter()
-                    .flatten()
-                    .filter(|hr| hr.presence >= 0.5)
-                    .map(|hr| {
-                        let (x, y, sz) = hr.crop;
-                        (x, y, x + sz, y + sz)
-                    })
-                    .any(|(hx0, hy0, hx1, hy1)| fx0 < hx1 && hx0 < fx1 && fy0 < hy1 && hy0 < fy1)
-            } else {
-                false
-            }
-        };
-        // Occlusion policy: a hand RESTING at the chin/cheek is a
-        // persistent, legitimate desk posture (chin-on-hand) during which
-        // the head must keep tracking — merely overlapping the face box
-        // cannot suppress the mesh. Only a palm actually covering the
-        // face centre (the NOSE inside a hand rect) marks the mesh as
-        // fabricated, and a short cooldown bridges the crop-tracking
-        // dropouts that happen mid-cover. `face_overlaps_hand` stays as a
-        // milder trust reducer via σ, not a gate.
-        if nose_in_hand_obs {
-            self.ori_cooldown = 5;
-        } else {
-            self.ori_cooldown = self.ori_cooldown.saturating_sub(1);
-        }
-        let face_occluded = self.ori_cooldown > 0;
+        let occl = self.head_ori.check_occlusion(
+            &base.annotation.keypoints,
+            width,
+            height,
+            &hand_rects,
+            &self.last_hands,
+        );
+        let face_occluded = occl.face_occluded;
         let depth_at = |u: f64, v: f64| -> Option<V3> {
             let d = depth.as_ref()?;
             if in_hand_rect(u, v) {
@@ -728,27 +639,43 @@ impl PoseProvider for FusionProvider {
                     }
                 }
             }
-            // Duplicate-wrist degeneracy: a single palm thrust at the camera
-            // routinely captures BOTH wrist detections (and both hand
-            // blocks). Two wrists on one physical hand pull both arms to
-            // the same point and twist the torso; keep the better-scored
-            // side and relax the other.
-            {
-                let (lw, rw) = (raw[9], raw[10]);
-                let close = {
-                    let dx = (lw.nx - rw.nx) * width as f32;
-                    let dy = (lw.ny - rw.ny) * height as f32;
-                    (dx * dx + dy * dy).sqrt() < 0.04 * width as f32
-                };
-                if close && lw.score > 0.0 && rw.score > 0.0 {
-                    let drop_left = lw.score < rw.score;
-                    let (wrist_i, base) = if drop_left { (9, 91) } else { (10, 112) };
-                    raw[wrist_i].score = 0.0;
-                    for k in raw.iter_mut().skip(base).take(21) {
-                        k.score = 0.0;
-                    }
+            // Leg-chain coherence: a hip that passes the gate can still be
+            // a bottom-edge clamp while the detector paints its knee /
+            // ankle / toe on the background or on the user's own raised
+            // arms — measured on a chest-up session: l_hip in the last
+            // frame rows (ny 0.97), l_knee at head height, a projective
+            // 0.7–0.9 m "thigh" no human has, driving 11 knee snaps of
+            // 0.15–0.5 m. The arms have `reach_filter` for exactly this;
+            // Anthropometric & kinematic coherence sanity filters (see `super::coherence`):
+            // Physical perspective projection cannot exceed true bone length. Detections
+            // violating reach, pelvis width, height order, or edge borders are culled.
+            if let Some(d) = depth.as_ref() {
+                if d.points_m.len() == (d.width * d.height) as usize {
+                    let z_person = head_center_pred[2];
+                    let model_pelvis_w = norm(sub(
+                        fk_pred.t[self.h.j.l_hip],
+                        fk_pred.t[self.h.j.r_hip],
+                    ));
+                    super::coherence::filter_leg_coherence(
+                        &mut raw,
+                        &d.points_m,
+                        d.width,
+                        d.height,
+                        intr.fx,
+                        z_person,
+                        model_pelvis_w,
+                    );
+                    super::coherence::filter_arm_coherence(
+                        &mut raw,
+                        &d.points_m,
+                        d.width,
+                        d.height,
+                        intr.fx,
+                        z_person,
+                    );
                 }
             }
+            super::coherence::filter_duplicate_wrists(&mut raw, width, height);
             // The dedicated hand crop supersedes the body detector's hand
             // block for that hand (keep the wrist: it anchors the crop).
             for hand in 0..2 {
@@ -906,8 +833,8 @@ impl PoseProvider for FusionProvider {
                 // point rigidly attached to the head at
                 // `scale · canonical + offset` — full-strength orientation
                 // evidence with zero rotational gauge freedom.
-                let s_fit = self.face_fit_scale;
-                let t_fit = self.face_fit_offset;
+                let s_fit = self.face_fit.scale;
+                let t_fit = self.face_fit.offset;
                 // Head POSITION anchor: ONE observation at the landmark
                 // centroid. Individual landmark positions systematically
                 // frontalize under yaw (the dense mesh compresses toward a
@@ -1063,229 +990,23 @@ impl PoseProvider for FusionProvider {
         // absolute orientation), so landmark terms alone under-rotate the
         // head. FaceMesh's dense-landmark pose derivation tracks yaw
         // to ~±60° with high confidence — feed it as a direct world-
-        // orientation observation on the head joint.
-        let nose_in_hand = nose_in_hand_obs;
-        if let (Some(f), Some(c)) = (base.skeleton.face, base.skeleton.face_mesh_confidence) {
-            // Gates: high mesh confidence, not the ±63° atan saturation
-            // (garbage at extremes), and the face not covered by a hand —
-            // a palm over the face intermittently reads as a confident
-            // "face" with a saturated yaw and would twist head + torso.
-            if matches!(f.source, crate::tracking::FaceSource::Mesh)
-                && std::env::var_os("VULVATAR_FUSION_NO_ORI").is_none()
-                && c >= 0.2
-                && f.yaw.abs() < 1.05
-                && self.ori_cooldown == 0
-            {
-                // Source-frame angles → camera-frame head rotation:
-                // R_head_cam = Rx(180) · R_view, with the view-frame head
-                // delta composed yaw (about +Y, sign-flipped by the selfie
-                // mirror), then pitch (about +X), then roll (about +Z).
-                let (yw, pt, rl) = (-f.yaw as f64, f.pitch as f64, -f.roll as f64);
-                let r_view = mat_mul(
-                    &so3_exp([0.0, yw, 0.0]),
-                    &mat_mul(&so3_exp([pt, 0.0, 0.0]), &so3_exp([0.0, 0.0, rl])),
-                );
-                let target = mat_mul(&FACING_CAMERA, &r_view);
-                let dt_s = self
-                    .last_t
-                    .map(|lt| (t - lt).clamp(0.02, 0.25))
-                    .unwrap_or(0.033);
-                let step_ok = match &self.ori_last {
-                    Some(prev) => norm(so3_log(&mat_mul(&target, &transpose(prev))))
-                        <= 3.0 * dt_s + 0.05,
-                    // No standing lock (start of session, or dropped after
-                    // a rejection streak): continuity is undefined, so the
-                    // target must earn acceptance through agreement below.
-                    None => false,
-                };
-                let agrees_pred = norm(so3_log(&mat_mul(
-                    &target,
-                    &transpose(&fk_pred.r[self.h.j.head]),
-                ))) <= 0.4;
-                // Depth corroboration for LARGE yaw claims: a real 3/4
-                // turn puts one cheek ~10 cm nearer the camera than the
-                // other; a palm-poisoned mesh (frontal face, saturated
-                // yaw, conf 0.97) shows a flat profile. Sample the depth
-                // under the mesh's own cheek landmarks and require the
-                // z-asymmetry to back the claim.
-                let depth_supports = if f.yaw.abs() <= 0.35 {
-                    Some(true)
-                } else {
-                    // Face box from the annotation head keypoints, split
-                    // into image-left / image-right halves at eye level;
-                    // median raw depth of each half (hand rects excluded,
-                    // head z-band applied by depth_at). A real 3/4 turn
-                    // tips this by ≥ 3 cm; a palm-poisoned frontal face
-                    // stays flat.
-                    let kps = &base.annotation.keypoints;
-                    let mut x0 = f32::MAX;
-                    let mut y0 = f32::MAX;
-                    let mut x1 = f32::MIN;
-                    let mut y1 = f32::MIN;
-                    let mut nk = 0;
-                    for k in kps.iter().take(5) {
-                        if k.2 < 0.3 {
-                            continue;
-                        }
-                        x0 = x0.min(k.0 * width as f32);
-                        y0 = y0.min(k.1 * height as f32);
-                        x1 = x1.max(k.0 * width as f32);
-                        y1 = y1.max(k.1 * height as f32);
-                        nk += 1;
-                    }
-                    if nk >= 3 && x1 - x0 > 30.0 {
-                        let cx = 0.5 * (x0 + x1);
-                        let cy = 0.5 * (y0 + y1);
-                        let half_h = 0.6 * (x1 - x0);
-                        // Per-column median depth, then the LS slope of
-                        // z(u) across the face — total Δz over the box
-                        // width. Half-medians blunt the gradient ~4×; the
-                        // slope keeps the full 2·sin(yaw)·r_face signal
-                        // (≈ 10 cm at 45°) clear of the frontal noise
-                        // floor (≈ 2 cm from nose/cheek shape).
-                        let mut cols: Vec<(f64, f64)> = Vec::new();
-                        for iu in 0..14 {
-                            let u = x0 as f64 + (x1 - x0) as f64 * (iu as f64 + 0.5) / 14.0;
-                            let mut zs: Vec<f64> = Vec::new();
-                            for iv in 0..7 {
-                                let v = (cy - half_h) as f64
-                                    + 2.0 * half_h as f64 * (iv as f64 + 0.5) / 7.0;
-                                if let Some(p) = depth_at(u, v) {
-                                    zs.push(p[2]);
-                                }
-                            }
-                            if zs.len() >= 3 {
-                                zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                                cols.push((u, zs[zs.len() / 2]));
-                            }
-                        }
-                        if cols.len() >= 8 {
-                            let n = cols.len() as f64;
-                            let mu = cols.iter().map(|c| c.0).sum::<f64>() / n;
-                            let mz = cols.iter().map(|c| c.1).sum::<f64>() / n;
-                            let (mut num, mut den) = (0.0, 0.0);
-                            for (u, z) in &cols {
-                                num += (u - mu) * (z - mz);
-                                den += (u - mu) * (u - mu);
-                            }
-                            let dz_full = num / den.max(1e-9) * (x1 - x0) as f64;
-                            if std::env::var_os("VULVATAR_ORI_CAL").is_some() {
-                                // Calibration dump: measured slope vs the
-                                // slope a flat face plane at this yaw would
-                                // give over the sampled width.
-                                let w_m = (x1 - x0) as f64 * head_center_pred[2]
-                                    / intr.fx.max(1.0) as f64;
-                                eprintln!(
-                                    "ORICAL yaw {:.3} dz {:+.4} w_m {:.3} expect {:+.4} ncol {}",
-                                    f.yaw,
-                                    dz_full,
-                                    w_m,
-                                    -w_m * (f.yaw as f64).tan(),
-                                    cols.len()
-                                );
-                            }
-                            if std::env::var_os("VULVATAR_ORI_DUMP").is_some() {
-                                let nose = kps[0];
-                                let no = if nose.2 >= 0.3 && x1 - x0 > 1.0 {
-                                    (nose.0 * width as f32 - cx) / (0.5 * (x1 - x0))
-                                } else {
-                                    f32::NAN
-                                };
-                                eprintln!("ORI dz {:+.3} ncol {} yaw {:.2} nose_off {:+.2}", dz_full, cols.len(), f.yaw, no);
-                            }
-                            // Sign must match the claim, and the slope
-                            // must clear a threshold calibrated on real
-                            // data: across a 400-frame desk session with
-                            // no hands in frame the measured Δz SATURATES
-                            // at 0.034–0.045 m regardless of how far the
-                            // head is turned (a head is round — the
-                            // visible face narrows as it rotates, so the
-                            // slope stops growing past ~30°), with a 5th
-                            // percentile of 0.026. Palm-locked frames — a
-                            // frontal face claiming 45°+ — sit at 0.018.
-                            // Normalising by the claimed angle was tried
-                            // and is strictly worse: it re-injects the
-                            // very number under test and cost 4–10° of
-                            // head amplitude.
-                            // The bar rises when a hand is near the face:
-                            // that is the only situation in which the
-                            // mesh fabricates a turn, so it is the only
-                            // one that has to pay for the doubt. With no
-                            // hand in the picture the mesh cannot be
-                            // palm-locked and the honest-turn threshold
-                            // applies.
-                            let need = if face_overlaps_hand { 0.040 } else { 0.025 };
-                            Some(dz_full.abs() >= need && (dz_full < 0.0) == (f.yaw < 0.0))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                if std::env::var_os("VULVATAR_ORI_DUMP").is_some() && f.yaw.abs() > 0.35 {
-                    eprintln!("ORI depth_support {:?} yaw {:.2}", depth_supports, f.yaw);
-                }
-                // A large-yaw pose claim ALWAYS needs the depth cheek
-                // profile to concur — the mesh fabricates saturated yaws
-                // with conf 0.9+ whenever a hand gets near the face, and
-                // the hand-rect proxies miss a fair share of those frames.
-                // Small-yaw claims are harmless (they cannot destabilize
-                // the torso) and stay depth-free.
-                if depth_supports == Some(true) {
-                    self.ori_depth_grace = 20;
-                } else {
-                    self.ori_depth_grace = self.ori_depth_grace.saturating_sub(1);
-                }
-                let depth_ok = depth_supports == Some(true)
-                    || (self.ori_depth_grace > 0 && step_ok);
-                let accept =
-                    (step_ok || agrees_pred) && (f.yaw.abs() <= 0.35 || depth_ok);
-                if !accept {
-                    self.ori_reject_run = self.ori_reject_run.saturating_add(1);
-                    if self.ori_reject_run >= 15 {
-                        // The lock itself is stale — drop it so only
-                        // agreement (never blind continuity) can re-arm.
-                        self.ori_last = None;
-                    }
-                }
-                // Tight σ: the transformation-matrix pose is the only
-                // orientation evidence immune to landmark frontalization
-                // (dense mesh x/y compress toward a frontal arrangement at
-                // 3/4+ turns), so it must out-vote the 468 σ2px points.
-                if accept {
-                self.ori_last = Some(target);
-                self.ori_reject_run = 0;
-                let sigma = std::env::var("VULVATAR_ORI_SIGMA")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or_else(|| 0.03 + 0.10 * (1.0 - c as f64))
-                    * if face_overlaps_hand { 2.0 } else { 1.0 };
-                obs.ori.push(super::estimator::OriObs {
-                    joint: self.h.j.head,
-                    target,
-                    sigma,
-                    // Full chain: truncating the Jacobian at the neck makes
-                    // the LM linearization inconsistent with the true cost
-                    // and the solve spins out — torso protection is done by
-                    // gating bad targets (hand-over-face), not by cutting
-                    // the chain.
-                    chain_depth: usize::MAX,
-                });
-                if std::env::var_os("VULVATAR_ORI_DUMP").is_some() {
-                    let ann = &base.annotation.keypoints;
-                    let fc: f32 = ann.iter().take(5).map(|k| k.2).sum::<f32>() / 5.0;
-                    eprintln!(
-                        "ORI fired t{:.3} yaw {:.2} c {:.2} depth {:?} ann_face_c {:.2}",
-                        t, f.yaw, c, depth_supports, fc
-                    );
-                }
-                }
-            } else if std::env::var_os("VULVATAR_ORI_DUMP").is_some() {
-                let ann = &base.annotation.keypoints;
-                let fc: f32 = ann.iter().take(5).map(|k| k.2).sum::<f32>() / 5.0;
-                eprintln!("ORI gated t{:.3} src {:?} c {:.2} yaw {:.2} nose_in_hand {} overlap {} ann_face_c {:.2}", t, f.source, c, f.yaw, nose_in_hand, face_overlaps_hand, fc);
-            }
+        if let Some(ori) = self.head_ori.estimate_orientation(
+            &base,
+            &occl,
+            depth.as_ref(),
+            head_center_pred,
+            head_depth_pred,
+            &fk_pred.r[self.h.j.head],
+            self.h.j.head,
+            t,
+            self.last_t,
+            width,
+            height,
+            &intr,
+            &arm_capsules,
+            &hand_rects,
+        ) {
+            obs.ori.push(ori);
         }
 
         // ---- point cloud ------------------------------------------------------
@@ -1345,90 +1066,11 @@ impl PoseProvider for FusionProvider {
         }
 
         // ---- solve (with analytic arm re-seeds from metric joints) ------------
-        {
-            use super::estimator::ModelPoint;
-            let find3d = |j: usize| -> Option<V3> {
-                obs.kp3d
-                    .iter()
-                    .find(|k| matches!(k.point, ModelPoint::Joint(jj) if jj == j))
-                    .map(|k| k.p)
-            };
-            let l = (find3d(self.h.j.l_elbow), find3d(self.h.j.l_wrist));
-            let r = (find3d(self.h.j.r_elbow), find3d(self.h.j.r_wrist));
-            let h = &self.h;
-            let seed_l = |st: &State| -> Option<State> {
-                super::seed::seed_arm(h, st, true, l.0, l.1?)
-            };
-            let seed_r = |st: &State| -> Option<State> {
-                super::seed::seed_arm(h, st, false, r.0, r.1?)
-            };
-            let seed_both = |st: &State| -> Option<State> {
-                let a = super::seed::seed_arm(h, st, true, l.0, l.1?)?;
-                super::seed::seed_arm(h, &a, false, r.0, r.1?)
-            };
-            let mut seeds: Vec<&dyn Fn(&State) -> Option<State>> = Vec::new();
-            if l.1.is_some() {
-                seeds.push(&seed_l);
-            }
-            if r.1.is_some() {
-                seeds.push(&seed_r);
-            }
-            if l.1.is_some() && r.1.is_some() {
-                seeds.push(&seed_both);
-            }
-            let t_est = std::time::Instant::now();
-            self.est.update_with_seeds(&self.h.model, &obs, &seeds);
-            self.last_est_ms = t_est.elapsed().as_secs_f32() * 1000.0;
-        }
-        let dump_frame = std::env::var("VULVATAR_FUSION_OBSDUMP").ok().and_then(|v| v.parse::<u64>().ok());
-        if dump_frame == Some(frame_index) || (dump_frame == Some(999_999) && frame_index < 3) {
-            let fk = self.h.model.fk(&self.est.state);
-            eprintln!("--- frame {frame_index} t={t:.3} obs dump (post-solve) root_t={:?} lost={} ---", self.est.state.root_t, self.est.lost_events);
-            for k in &obs.kp2d {
-                let (j, pw) = super::estimator::resolve_point(&self.h.model, &fk, k.point);
-                let name = match k.point {
-                    super::estimator::ModelPoint::Joint(j) => self.h.model.joints[j].name.to_string(),
-                    super::estimator::ModelPoint::Site(s) => format!("site:{}", self.h.model.sites[s].name),
-                    super::estimator::ModelPoint::Attached { .. } => "attached".to_string(),
-                };
-                let _ = j;
-                let proj = intr.project(pw).unwrap_or([f64::NAN, f64::NAN]);
-                eprintln!("  2d {name:>14} obs=({:.0},{:.0}) σ={:.1}  model=({:.0},{:.0}) z={:.2}", k.u, k.v, k.sigma, proj[0], proj[1], pw[2]);
-            }
-            for k in &obs.kp3d {
-                let (_, pw) = super::estimator::resolve_point(&self.h.model, &fk, k.point);
-                let name = match k.point {
-                    super::estimator::ModelPoint::Joint(j) => self.h.model.joints[j].name.to_string(),
-                    super::estimator::ModelPoint::Site(s) => format!("site:{}", self.h.model.sites[s].name),
-                    super::estimator::ModelPoint::Attached { .. } => "attached".to_string(),
-                };
-                eprintln!("  3d {name:>14} obs=({:.3},{:.3},{:.3}) σ={:.3} model=({:.3},{:.3},{:.3})", k.p[0], k.p[1], k.p[2], k.sigma, pw[0], pw[1], pw[2]);
-            }
-            eprintln!("  surface pts {}", obs.surface.len());
-            {
-                let m = &self.h.model;
-                let fk = m.fk(&self.est.state);
-                for (pt, sg) in &obs.surface {
-                    let mut best = (usize::MAX, f64::INFINITY);
-                    for (ci, c) in m.capsules.iter().enumerate() {
-                        let (q, _u) = super::estimator::closest_on_segment(fk.point(c.a), fk.point(c.b), *pt);
-                        let d = norm(sub(*pt, q)) - m.capsule_radius(&self.est.state, c);
-                        if d.abs() < best.1.abs() {
-                            best = (ci, d);
-                        }
-                    }
-                    let name = if best.0 == usize::MAX { "none".to_string() } else {
-                        let c = &m.capsules[best.0];
-                        let pa = |p: PointRef| match p { PointRef::Joint(j) => m.joints[j].name.to_string(), PointRef::Site(s) => m.sites[s].name.to_string() };
-                        format!("{:?}:{}-{}", c.part, pa(c.a), pa(c.b))
-                    };
-                    eprintln!("    surf ({:.3},{:.3},{:.3}) σ={:.3} → {name} d={:+.3}", pt[0], pt[1], pt[2], sg, best.1);
-                }
-            }
-            eprintln!("  depth frame: {:?} valid@nose {:?}", depth.as_ref().map(|d| (d.width, d.height, d.points_m.len())),
-                obs.kp2d.first().and_then(|k| depth.as_ref().and_then(|d| window_point(&d.points_m, d.width, d.height, k.u, k.v, 3, 0.1, 10.0))));
-            eprintln!("  diag {:?}", self.est.diag);
-        }
+        let t_est = std::time::Instant::now();
+        super::seed::update_with_arm_seeds(&self.h, &mut self.est, &obs);
+        self.last_est_ms = t_est.elapsed().as_secs_f32() * 1000.0;
+
+        dump_obs_post_solve(&self.h, &self.est, frame_index, t, &obs, &intr, depth.as_ref());
         self.last_t = Some(t);
         self.frames += 1;
 
@@ -1437,74 +1079,17 @@ impl PoseProvider for FusionProvider {
             let fk = self.h.model.fk(&self.est.state);
             let head_sigma = self.est.joint_sigma(&self.h.model, head_j);
             let neck_sigma = self.est.joint_sigma(&self.h.model, self.h.j.neck);
-            if head_sigma < 0.35 && neck_sigma < 0.4 && depth.is_some() {
-                let head_center = fk.site[self.h.s.head_center];
-                let z_ref = head_center[2];
-                let depth_at2 = |u: f64, v: f64| -> Option<V3> {
-                    let d = depth.as_ref()?;
-                    if in_hand_rect(u, v) {
-                        return None;
-                    }
-                    window_point(
-                        &d.points_m,
-                        d.width,
-                        d.height,
-                        u,
-                        v,
-                        1,
-                        (z_ref - 0.25) as f32,
-                        (z_ref + 0.25) as f32,
-                    )
-                };
-                if let Some(lm) = mesh_px {
-                    // Canonical-face fit update: express depth-lifted mesh
-                    // landmarks in the head frame and solve the closed-form
-                    // 1-D scale + 3-D offset least squares against the
-                    // canonical template (rotation fixed). EMA'd across
-                    // frames; head-pose errors leak into the offset
-                    // (harmless) but cannot rotate the template.
-                    let rt = transpose(&fk.r[head_j]);
-                    let mut pts: Vec<(V3, V3)> = Vec::new();
-                    for (i, l) in lm.iter().enumerate().take(468) {
-                        if i % 3 != 0 || !l[0].is_finite() {
-                            continue;
-                        }
-                        if let Some(p) = depth_at2(l[0] as f64, l[1] as f64) {
-                            if (p[2] - z_ref).abs() < 0.15 {
-                                let local = mat_vec(&rt, sub(p, fk.t[head_j]));
-                                let c = super::canonical_face::CANONICAL_FACE_468[i];
-                                pts.push((local, [c[0] as f64, c[1] as f64, c[2] as f64]));
-                            }
-                        }
-                    }
-                    if pts.len() >= 20 {
-                        let n = pts.len() as f64;
-                        let mean_l = scale(
-                            pts.iter().fold([0.0; 3], |a, (l, _)| add(a, *l)),
-                            1.0 / n,
-                        );
-                        let mean_c = scale(
-                            pts.iter().fold([0.0; 3], |a, (_, c)| add(a, *c)),
-                            1.0 / n,
-                        );
-                        let mut num = 0.0;
-                        let mut den = 0.0;
-                        for (l, c) in &pts {
-                            let dc = sub(*c, mean_c);
-                            let dl = sub(*l, mean_l);
-                            num += dot(dc, dl);
-                            den += dot(dc, dc);
-                        }
-                        if den > 1e-9 {
-                            let s_new = (num / den).clamp(0.7, 1.4);
-                            let t_new = sub(mean_l, scale(mean_c, s_new));
-                            let alpha = if self.face_fit_n == 0 { 1.0 } else { 0.05 };
-                            self.face_fit_scale += alpha * (s_new - self.face_fit_scale);
-                            self.face_fit_offset =
-                                add(self.face_fit_offset, scale(sub(t_new, self.face_fit_offset), alpha));
-                            self.face_fit_n = self.face_fit_n.saturating_add(1);
-                        }
-                    }
+            if head_sigma < 0.35 && neck_sigma < 0.4 {
+                if let (Some(d), Some(lm)) = (depth.as_ref(), mesh_px) {
+                    let z_ref = fk.site[self.h.s.head_center][2];
+                    self.face_fit.update(
+                        lm,
+                        fk.t[head_j],
+                        &fk.r[head_j],
+                        z_ref,
+                        d,
+                        &in_hand_rect,
+                    );
                 }
             }
         }
@@ -1547,7 +1132,7 @@ impl PoseProvider for FusionProvider {
                 "cov_failures": d.cov_failures,
                 "hand_crops": [self.last_hands[0].is_some(), self.last_hands[1].is_some()],
                 "face68_learned": 0,
-                "mesh_learned": self.face_fit_n,
+                "mesh_learned": self.face_fit.n,
                 "shape_frozen": self.est.shape_frozen,
             }));
         }
@@ -1556,5 +1141,107 @@ impl PoseProvider for FusionProvider {
             skeleton,
             annotation: base.annotation,
         }
+    }
+}
+
+fn dump_obs_post_solve(
+    h: &Humanoid,
+    est: &Estimator,
+    frame_index: u64,
+    t: f64,
+    obs: &super::estimator::FrameObs,
+    intr: &Intrinsics,
+    depth: Option<&MetricDepthFrame>,
+) {
+    let dump_frame = std::env::var("VULVATAR_FUSION_OBSDUMP")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    if dump_frame == Some(frame_index) || (dump_frame == Some(999_999) && frame_index < 3) {
+        let fk = h.model.fk(&est.state);
+        eprintln!(
+            "--- frame {frame_index} t={t:.3} obs dump (post-solve) root_t={:?} lost={} ---",
+            est.state.root_t, est.lost_events
+        );
+        for k in &obs.kp2d {
+            let (_j, pw) = super::estimator::resolve_point(&h.model, &fk, k.point);
+            let name = match k.point {
+                super::estimator::ModelPoint::Joint(j) => {
+                    h.model.joints[j].name.to_string()
+                }
+                super::estimator::ModelPoint::Site(s) => {
+                    format!("site:{}", h.model.sites[s].name)
+                }
+                super::estimator::ModelPoint::Attached { .. } => "attached".to_string(),
+            };
+            let proj = intr.project(pw).unwrap_or([f64::NAN, f64::NAN]);
+            eprintln!(
+                "  2d {name:>14} obs=({:.0},{:.0}) σ={:.1}  model=({:.0},{:.0}) z={:.2}",
+                k.u, k.v, k.sigma, proj[0], proj[1], pw[2]
+            );
+        }
+        for k in &obs.kp3d {
+            let (_, pw) = super::estimator::resolve_point(&h.model, &fk, k.point);
+            let name = match k.point {
+                super::estimator::ModelPoint::Joint(j) => {
+                    h.model.joints[j].name.to_string()
+                }
+                super::estimator::ModelPoint::Site(s) => {
+                    format!("site:{}", h.model.sites[s].name)
+                }
+                super::estimator::ModelPoint::Attached { .. } => "attached".to_string(),
+            };
+            eprintln!(
+                "  3d {name:>14} obs=({:.3},{:.3},{:.3}) σ={:.3} model=({:.3},{:.3},{:.3})",
+                k.p[0], k.p[1], k.p[2], k.sigma, pw[0], pw[1], pw[2]
+            );
+        }
+        eprintln!("  surface pts {}", obs.surface.len());
+        {
+            let m = &h.model;
+            let fk = m.fk(&est.state);
+            for (pt, sg) in &obs.surface {
+                let mut best = (usize::MAX, f64::INFINITY);
+                for (ci, c) in m.capsules.iter().enumerate() {
+                    let (q, _u) = super::estimator::closest_on_segment(
+                        fk.point(c.a),
+                        fk.point(c.b),
+                        *pt,
+                    );
+                    let d = norm(sub(*pt, q)) - m.capsule_radius(&est.state, c);
+                    if d.abs() < best.1.abs() {
+                        best = (ci, d);
+                    }
+                }
+                let name = if best.0 == usize::MAX {
+                    "none".to_string()
+                } else {
+                    let c = &m.capsules[best.0];
+                    let pa = |p: PointRef| match p {
+                        PointRef::Joint(j) => m.joints[j].name.to_string(),
+                        PointRef::Site(s) => m.sites[s].name.to_string(),
+                    };
+                    format!("{:?}:{}-{}", c.part, pa(c.a), pa(c.b))
+                };
+                eprintln!(
+                    "    surf ({:.3},{:.3},{:.3}) σ={:.3} → {name} d={:+.3}",
+                    pt[0], pt[1], pt[2], sg, best.1
+                );
+            }
+        }
+        eprintln!(
+            "  depth frame: {:?} valid@nose {:?}",
+            depth.as_ref().map(|d| (d.width, d.height, d.points_m.len())),
+            obs.kp2d.first().and_then(|k| depth.as_ref().and_then(|d| window_point(
+                &d.points_m,
+                d.width,
+                d.height,
+                k.u,
+                k.v,
+                3,
+                0.1,
+                10.0
+            )))
+        );
+        eprintln!("  diag {:?}", est.diag);
     }
 }

@@ -371,6 +371,8 @@ pub struct SolveDiag {
     pub rms_2d_px: f64,
     /// Median |residual| of the 2-D terms (px) — robust track-health signal.
     pub med_2d_px: f64,
+    /// Median |residual| of sparse body/face terms (excluding hand crops / fingers).
+    pub med_sparse_2d_px: f64,
     pub mean_3d_m: f64,
     pub mean_cloud_m: f64,
     /// Cumulative count of frames where an alternative seed won.
@@ -712,8 +714,19 @@ impl Estimator {
         self.finish(model, &prev, dt, obs.t);
         // ---- track health: a fit whose sparse residuals stay far off is a
         // lost track (association collapse); re-acquire next frame ---------------
+        // Track health is determined by sparse body/face sites. Finger residuals
+        // from fast hand crops must not trigger a whole-body track collapse.
+        // Furthermore, if metric 3D anchors (nose/shoulders) are closely tracking,
+        // the body is undeniably in-track.
+        let sparse_unhealthy = if self.diag.med_sparse_2d_px > 0.0 {
+            self.diag.med_sparse_2d_px > self.params.lost_rms_px
+        } else {
+            self.diag.med_2d_px > self.params.lost_rms_px
+        };
+        let has_solid_3d = self.diag.n_kp3d >= 4 && self.diag.mean_3d_m < 0.12;
         let unhealthy = self.diag.n_kp2d >= 8
-            && (self.diag.med_2d_px > self.params.lost_rms_px
+            && !has_solid_3d
+            && (sparse_unhealthy
                 // Collapsed state: plenty of detections, almost nothing
                 // projects — near-zero cost that must not read as healthy.
                 || self.diag.n_2d_proj * 4 < self.diag.n_kp2d);
@@ -750,10 +763,11 @@ impl Estimator {
     /// it can never recover without this hard reset.
     pub fn mark_lost(&mut self, model: &Model) {
         let n = model.num_params;
+        let prev_z = self.state.root_t[2].clamp(0.4, 2.5);
         self.state = State::rest(model);
         self.state.set_relaxed(model);
         self.state.root_r = FACING_CAMERA;
-        self.state.root_t = [0.0, 0.3, 1.2];
+        self.state.root_t = [0.0, 0.3, prev_z];
         self.pred = self.state.clone();
         self.var = vec![1.0; n];
         self.vel = vec![0.0; n];
@@ -977,6 +991,7 @@ impl Estimator {
         let mut sum2d = 0.0;
         let mut n2d = 0usize;
         let mut res2d: Vec<f64> = Vec::with_capacity(obs.kp2d.len());
+        let mut res2d_sparse: Vec<f64> = Vec::with_capacity(obs.kp2d.len());
         let mut sum3d = 0.0;
         let mut n3d = 0usize;
         let mut sumcl = 0.0;
@@ -1002,8 +1017,12 @@ impl Estimator {
                 let (rho, w) = kern.eval(s);
                 cost += rho;
                 c2d += rho;
-                sum2d += s.sqrt() * kp.sigma.max(0.25);
-                res2d.push(s.sqrt() * kp.sigma.max(0.25));
+                let err_px = s.sqrt() * kp.sigma.max(0.25);
+                sum2d += err_px;
+                res2d.push(err_px);
+                if matches!(kp.point, ModelPoint::Joint(_) | ModelPoint::Site(_)) {
+                    res2d_sparse.push(err_px);
+                }
                 n2d += 1;
                 if !build {
                     continue;
@@ -1407,6 +1426,12 @@ impl Estimator {
                 res2d[res2d.len() / 2]
             } else {
                 0.0
+            };
+            self.diag.med_sparse_2d_px = if !res2d_sparse.is_empty() {
+                res2d_sparse.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                res2d_sparse[res2d_sparse.len() / 2]
+            } else {
+                self.diag.med_2d_px
             };
             self.diag.mean_3d_m = if n3d > 0 { sum3d / n3d as f64 } else { 0.0 };
             self.diag.mean_cloud_m = if ncl > 0 { sumcl / ncl as f64 } else { 0.0 };

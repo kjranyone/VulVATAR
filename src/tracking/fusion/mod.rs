@@ -7,6 +7,7 @@
 //! angles + root pose + per-joint σ.
 
 pub mod canonical_face;
+pub mod coherence;
 pub mod estimator;
 pub mod math;
 pub mod model;
@@ -15,5 +16,7 @@ pub mod output;
 pub mod seed;
 #[cfg(feature = "inference")]
 pub mod hands;
+#[cfg(feature = "inference")]
+pub mod head_ori;
 #[cfg(feature = "inference")]
 pub mod provider;
