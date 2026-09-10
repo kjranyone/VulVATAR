@@ -43,6 +43,7 @@ fn test_load_yumeka_fbx() {
     println!("Max transform diff between compute_global_transforms and ufbx: {}", max_diff);
     assert!(max_diff < 1e-4, "Global transforms diverge from ufbx: {}", max_diff);
 
+
     // Verify inverse bind matrices
     let hips_node_idx = asset.skeleton.nodes.iter().position(|n| n.name == "Hips").unwrap();
     let ibm_hips = &asset.skeleton.inverse_bind_matrices[hips_node_idx];
@@ -174,6 +175,49 @@ fn test_load_yumeka_fbx() {
         cached_mats_with_textures, mats_with_textures,
         "Rehydrated textures count in cached load must match initial parse"
     );
+
+    // Verify spring bones & colliders were extracted and cached
+    assert!(
+        !asset.spring_bones.is_empty(),
+        "Expected spring bones to be populated from unitypackage/heuristic"
+    );
+    assert_eq!(
+        cached_asset.spring_bones.len(),
+        asset.spring_bones.len(),
+        "Cached spring_bones count must match initial parse"
+    );
+    assert_eq!(
+        cached_asset.colliders.len(),
+        asset.colliders.len(),
+        "Cached colliders count must match initial parse"
+    );
+
+    // Verify spring bone simulation step runs without panic or NaN
+    let mut instance = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
+    );
+    assert_eq!(
+        instance.secondary_motion.spring_states.len(),
+        asset.spring_bones.len()
+    );
+    let tuning = crate::simulation::spring::SpringTuning::default();
+    for _ in 0..10 {
+        crate::simulation::spring::step_spring_bones(
+            1.0 / 60.0,
+            &mut instance,
+            &[],
+            &tuning,
+            [0.0, -1.0, 0.0],
+            1.0,
+        );
+    }
+    // Verify positions are finite (no NaN / Inf)
+    for state in &instance.secondary_motion.spring_states {
+        for pos in &state.positions {
+            assert!(pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite());
+        }
+    }
 }
 
 #[test]
@@ -192,4 +236,23 @@ fn test_find_avatar_file_in_dir() {
         found_path
     );
 }
+
+#[test]
+fn test_parse_yumeka_unitypackage() {
+    let pkg_path = Path::new("sample_data/YUMEKA_v1.0.1/Yumeka_v1.0.1.unitypackage");
+    if !pkg_path.exists() {
+        return;
+    }
+
+    let parsed = crate::asset::vrc::parse_unitypackage(pkg_path).expect("Failed to parse unitypackage");
+    assert!(!parsed.phys_bones.is_empty(), "Should parse VRCPhysBones from prefab");
+    assert!(!parsed.colliders.is_empty(), "Should parse VRCPhysBoneColliders from prefab");
+    println!(
+        "Parsed unitypackage: {} PhysBones, {} Colliders",
+        parsed.phys_bones.len(),
+        parsed.colliders.len()
+    );
+}
+
+
 

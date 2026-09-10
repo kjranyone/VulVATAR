@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::asset::vrm::LoadStage;
 use crate::asset::*;
@@ -62,6 +62,21 @@ impl FbxAssetLoader {
         if let Ok(Some(mut cached)) = crate::asset::cache::try_load(&source_path) {
             info!("fbx avatar cache hit for {}", source_path.display());
             rehydrate_textures(&mut cached, &source_path);
+            if cached.spring_bones.is_empty() {
+                let base_dir = source_path.parent().unwrap_or(Path::new("."));
+                let vrc_data = if let Some(package_path) = crate::asset::vrc::find_unitypackage_in_dir(base_dir) {
+                    crate::asset::vrc::parse_unitypackage(&package_path).unwrap_or_default()
+                } else {
+                    crate::asset::vrc::ParsedVrcData::default()
+                };
+                let (sb, col) = crate::asset::vrc::build_spring_bones_and_colliders(&cached.skeleton, &vrc_data);
+                if !sb.is_empty() {
+                    info!("fbx: populated {} spring bones and {} colliders for cached asset", sb.len(), col.len());
+                    cached.spring_bones = sb;
+                    cached.colliders = col;
+                    let _ = crate::asset::cache::save(&source_path, &cached);
+                }
+            }
             cached.id = AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed));
             cached.set_loaded_from_cache(true);
             return Ok(Arc::new(cached));
@@ -567,20 +582,50 @@ impl FbxAssetLoader {
             thumbnail: None,
         };
 
+        let skeleton = SkeletonAsset {
+            nodes,
+            root_nodes,
+            inverse_bind_matrices,
+        };
+
+        // SpringBones & Colliders (VRC PhysBone via unitypackage or heuristic fallback)
+        on_progress(LoadStage::SpringBones);
+        let (spring_bones, colliders) = {
+            let base_dir = source_path.parent().unwrap_or(Path::new("."));
+            let vrc_data = if let Some(package_path) = crate::asset::vrc::find_unitypackage_in_dir(base_dir) {
+                match crate::asset::vrc::parse_unitypackage(&package_path) {
+                    Ok(data) => {
+                        info!("fbx: successfully extracted VRC PhysBone settings from {:?}", package_path);
+                        data
+                    }
+                    Err(e) => {
+                        warn!("fbx: failed to parse unitypackage {:?}: {e}; falling back to default heuristic", package_path);
+                        crate::asset::vrc::ParsedVrcData::default()
+                    }
+                }
+            } else {
+                debug!("fbx: no unitypackage found in {:?}; using default spring bone heuristic", base_dir);
+                crate::asset::vrc::ParsedVrcData::default()
+            };
+
+            crate::asset::vrc::build_spring_bones_and_colliders(&skeleton, &vrc_data)
+        };
+        info!(
+            "fbx: generated {} spring bone chains and {} colliders",
+            spring_bones.len(),
+            colliders.len()
+        );
+
         let asset = AvatarAsset {
             id: AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed)),
             source_path: source_path.clone(),
             source_hash,
-            skeleton: SkeletonAsset {
-                nodes,
-                root_nodes,
-                inverse_bind_matrices,
-            },
+            skeleton,
             meshes,
             materials,
             humanoid,
-            spring_bones: Vec::new(),
-            colliders: Vec::new(),
+            spring_bones,
+            colliders,
             default_expressions,
             animation_clips: Vec::new(),
             node_to_mesh,
