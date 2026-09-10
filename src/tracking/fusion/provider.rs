@@ -437,6 +437,17 @@ impl PoseProvider for FusionProvider {
                 let mut best: Option<super::hands::HandResult> = None;
                 for crop in candidates {
                     if let Some(res) = hl.estimate(rgb_data, width, height, crop) {
+                        // Handedness veto: a slot must never lock onto the opposing hand
+                        // when the classifier is decisive (left ≈0.15, right ≈0.85).
+                        // Middle band [0.30, 0.70] is genuinely uncertain and passes.
+                        let wrong_hand = if hand == 0 {
+                            res.handedness > 0.70
+                        } else {
+                            res.handedness < 0.30
+                        };
+                        if wrong_hand {
+                            continue;
+                        }
                         let better =
                             best.as_ref().map(|b| res.presence > b.presence).unwrap_or(true);
                         if better {
@@ -517,16 +528,14 @@ impl PoseProvider for FusionProvider {
                         let l_fit = 1.0 - l.handedness;
                         let r_fit = r.handedness;
                         self.hand_dupes += 1;
-                        // The loser is de-weighted, not dropped: removing
-                        // it outright makes that arm swing to its prior
-                        // and back as the duplicate comes and goes
-                        // (left-wrist snaps 13 → 36 on the live clasped
-                        // hands session).
-                        self.hand_suspect = if l_fit >= r_fit {
+                        let loser = if l_fit >= r_fit { 1 } else { 0 };
+                        self.hand_suspect = if loser == 1 {
                             [false, true]
                         } else {
                             [true, false]
                         };
+                        // Clear prev_hands for the loser so it stops cropping the twin's position
+                        self.prev_hands[loser] = None;
                     }
                 }
             }

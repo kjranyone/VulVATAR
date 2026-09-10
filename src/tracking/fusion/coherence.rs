@@ -204,6 +204,16 @@ pub fn filter_arm_coherence(
         let el_i = 7 + side;
         let wr_i = 9 + side;
         if raw[sh_i].score <= 0.0 {
+            // An uncorroborated border-clamped arm when shoulder is not visible is a phantom.
+            for &idx in &[el_i, wr_i] {
+                if raw[idx].score > 0.0 {
+                    let clamped = !(0.02..0.98).contains(&raw[idx].nx)
+                        || !(0.02..0.98).contains(&raw[idx].ny);
+                    if clamped {
+                        raw[idx].score = 0.0;
+                    }
+                }
+            }
             continue;
         }
         let sh_z = z_at(raw[sh_i].nx as f64, raw[sh_i].ny as f64).unwrap_or(z_person);

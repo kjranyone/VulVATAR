@@ -217,7 +217,9 @@ pub fn body_kp3d(
         if !(kp.score >= min_score) || !kp.nx.is_finite() || !kp.ny.is_finite() {
             continue;
         }
-        if kp.nx <= 0.0 || kp.nx >= 1.0 || kp.ny <= 0.0 || kp.ny >= 1.0 {
+        // Reject keypoints clamped at the frame border (within 1% margin): detector emits
+        // limbs exiting the frame clamped to the border, and depth underneath is unrelated.
+        if kp.nx <= 0.01 || kp.nx >= 0.99 || kp.ny <= 0.01 || kp.ny >= 0.99 {
             continue;
         }
         let u = kp.nx as f64 * width as f64;
