@@ -76,12 +76,16 @@ Type: files; Name: "{app}\VirtualCamera\vulvatar_mf_camera_*.dll"
 [Files]
 Source: "..\target\release\{#MyAppExeName}";    DestDir: "{app}";                Flags: ignoreversion
 Source: "..\target\release\DirectML.dll";       DestDir: "{app}";                Flags: ignoreversion
+Source: "..\target\release\realsense2.dll";     DestDir: "{app}";                Flags: ignoreversion
 Source: "..\target\release\{#MfCameraDllName}"; DestDir: "{app}\VirtualCamera";  Flags: ignoreversion restartreplace uninsrestartdelete
 Source: "..\LICENSE";                           DestDir: "{app}";                Flags: ignoreversion
 Source: "..\README.md";                         DestDir: "{app}";                Flags: ignoreversion
+Source: "..\THIRD_PARTY_LICENSES.md";           DestDir: "{app}";                Flags: ignoreversion
+Source: "..\docs\USER_GUIDE_JA.md";             DestDir: "{app}\docs";           Flags: ignoreversion
 Source: "..\assets\NotoSansJP-Regular.otf";     DestDir: "{app}\assets";         Flags: ignoreversion
 Source: "..\assets\NotoSansKR-Regular.otf";     DestDir: "{app}\assets";         Flags: ignoreversion
 Source: "..\assets\NotoSansSC-Regular.otf";     DestDir: "{app}\assets";         Flags: ignoreversion
+Source: "..\assets\MaterialSymbolsRounded.ttf"; DestDir: "{app}\assets";         Flags: ignoreversion
 Source: "..\models\rtmw3d.onnx";                DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\yolox.onnx";                 DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\face_landmark.onnx";         DestDir: "{app}\models";         Flags: ignoreversion

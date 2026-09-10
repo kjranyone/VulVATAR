@@ -601,16 +601,19 @@ function Test-DistributionPrereqs {
         "assets\NotoSansJP-Regular.otf",
         "assets\NotoSansKR-Regular.otf",
         "assets\NotoSansSC-Regular.otf",
+        "assets\MaterialSymbolsRounded.ttf",
         "models\rtmw3d.onnx",
         "models\yolox.onnx",
         "models\face_landmark.onnx",
-        "models\face_blendshapes.onnx"
+        "models\face_blendshapes.onnx",
+        "THIRD_PARTY_LICENSES.md",
+        "docs\USER_GUIDE_JA.md"
     )
     $missing = $required | Where-Object { -not (Test-Path $_) }
     if ($missing) {
         Write-Host "Missing files required for installer build:" -ForegroundColor Red
         $missing | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-        throw "Run the 'setup' menu entry first to download fonts + ONNX models."
+        throw "Run the 'setup' menu entry first to download fonts + ONNX models, and ensure docs/licenses are present."
     }
 }
 
@@ -717,12 +720,23 @@ function Build-Distribution {
         $cert     = Wait-ForCodeSigningCertificate
     }
 
-    # 1. Main app — default CRT linkage. ORT's prebuilt onnxruntime.lib
-    #    expects /MD; forcing /MT here would hit CRT symbol conflicts at
-    #    link time.
-    Write-Host "[1/5] cargo build --release..." -ForegroundColor Cyan
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit $LASTEXITCODE)" }
+    # 1. Main app — default CRT linkage with RealSense toolchain.
+    #    ORT's prebuilt onnxruntime.lib expects /MD; forcing /MT here
+    #    would hit CRT symbol conflicts at link time.
+    Write-Host "[1/5] Building release with RealSense toolchain..." -ForegroundColor Cyan
+    Invoke-CargoRealsense -CargoArgs @('build', '--release')
+
+    # Copy realsense2.dll from the RealSense SDK to target\release\ so the
+    # installer can bundle it alongside vulvatar.exe.
+    $sdkRoot = if ($env:VULVATAR_REALSENSE_SDK) { $env:VULVATAR_REALSENSE_SDK }
+               else { Join-Path $env:USERPROFILE "Documents\RealSense SDK 2.0" }
+    $rsDll = Join-Path $sdkRoot "bin\x64\realsense2.dll"
+    if (Test-Path $rsDll) {
+        Copy-Item $rsDll "target\release\realsense2.dll" -Force
+        Write-Host "  Staged realsense2.dll into target\release\" -ForegroundColor Green
+    } else {
+        throw "realsense2.dll not found at $rsDll"
+    }
 
     # 2. Camera DLL — static CRT. svchost loads this in Session 0 with
     #    its own DLL search rules; static CRT removes any VC runtime

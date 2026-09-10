@@ -50,6 +50,7 @@ RealSense SDK のパスや `PKG_CONFIG_PATH` / `LIBCLANG_PATH` の設定、`dev.
 
 ## 関連ドキュメント
 
+- [docs/USER_GUIDE_JA.md](docs/USER_GUIDE_JA.md) — ユーザーガイド & セットアップマニュアル
 - [docs/architecture.md](docs/architecture.md) — システム設計
 - [docs/realsense-build.md](docs/realsense-build.md) — RealSense ネイティブビルド手順
 - [docs/mf-virtual-camera.md](docs/mf-virtual-camera.md) — Media Foundation 仮想カメラ
@@ -66,8 +67,9 @@ for that binary as required by GPL-3.0.
 
 ## Third-party components
 
-VulVATAR uses third-party libraries and model assets under their own
-licenses. In particular:
+VulVATAR uses third-party libraries, model assets, and fonts under their own
+licenses. Detailed license terms, copyright notices, and full texts are provided in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). In particular:
 
 - RTMW3D-x whole-body 3D pose estimation model (Apache-2.0), trained
   by OpenMMLab / mmpose and re-distributed as ONNX by Soykaf:
