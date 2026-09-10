@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crate::asset::{
+    fbx::FbxAssetLoader,
     vrm::{LoadStage, VrmAssetLoader},
     AvatarAsset,
 };
@@ -75,17 +76,34 @@ impl AvatarLoadJob {
         let (tx, rx) = mpsc::channel();
         let path_for_worker = path.clone();
         let worker = thread::spawn(move || {
-            let loader = VrmAssetLoader::new();
+            let path_str = path_for_worker.to_string_lossy();
+            let is_fbx = path_for_worker
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("fbx"))
+                .unwrap_or(false);
+
             let tx_progress = tx.clone();
-            let result = loader.load_with_progress(
-                path_for_worker.to_string_lossy().as_ref(),
-                move |stage| {
-                    let _ = tx_progress.send(LoadMessage::Progress(stage));
-                },
-            );
+            let result = if is_fbx {
+                let loader = FbxAssetLoader::new();
+                loader.load_with_progress(
+                    path_str.as_ref(),
+                    move |stage| {
+                        let _ = tx_progress.send(LoadMessage::Progress(stage));
+                    },
+                ).map_err(|e| e.to_string())
+            } else {
+                let loader = VrmAssetLoader::new();
+                loader.load_with_progress(
+                    path_str.as_ref(),
+                    move |stage| {
+                        let _ = tx_progress.send(LoadMessage::Progress(stage));
+                    },
+                ).map_err(|e| e.to_string())
+            };
             let final_msg = match result {
                 Ok(asset) => LoadMessage::Done(asset),
-                Err(e) => LoadMessage::Error(e.to_string()),
+                Err(e) => LoadMessage::Error(e),
             };
             let _ = tx.send(final_msg);
         });

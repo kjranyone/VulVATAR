@@ -163,7 +163,7 @@ impl FolderWatcher {
                 e.paths.iter().any(|p| {
                     p.extension()
                         .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.eq_ignore_ascii_case("vrm"))
+                        .map(|ext| ext.eq_ignore_ascii_case("vrm") || ext.eq_ignore_ascii_case("fbx"))
                         .unwrap_or(false)
                 })
             })

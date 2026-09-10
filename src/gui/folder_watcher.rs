@@ -102,12 +102,12 @@ impl GuiApp {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_vrm = path
+                let is_supported = path
                     .extension()
                     .and_then(|s| s.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("vrm"))
+                    .map(|ext| ext.eq_ignore_ascii_case("vrm") || ext.eq_ignore_ascii_case("fbx"))
                     .unwrap_or(false);
-                if !is_vrm {
+                if !is_supported {
                     continue;
                 }
                 if self.import_vrm_into_library_if_missing(&path) {
@@ -143,7 +143,25 @@ impl GuiApp {
         }
         let mut entry =
             crate::app::avatar_library::AvatarLibraryEntry::from_path(vrm_path);
-        if let Ok(loader) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+
+        let is_fbx = vrm_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("fbx"))
+            .unwrap_or(false);
+
+        if is_fbx {
+            if let Ok(loader) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::asset::fbx::FbxAssetLoader::new()
+            })) {
+                if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {
+                    entry.update_from_asset_with_thumbnail_dir(
+                        &asset,
+                        self.library.thumbnail_gen.output_dir(),
+                    );
+                }
+            }
+        } else if let Ok(loader) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::asset::vrm::VrmAssetLoader::new()
         })) {
             if let Ok(asset) = loader.load(&vrm_path.to_string_lossy()) {

@@ -641,7 +641,9 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             if add_resp.clicked()
             {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("VRM 1.0", &["vrm"])
+                    .add_filter("3D Avatar (*.vrm, *.fbx)", &["vrm", "fbx"])
+                    .add_filter("VRM (*.vrm)", &["vrm"])
+                    .add_filter("FBX (*.fbx)", &["fbx"])
                     .pick_file()
                 {
                     let mut entry =

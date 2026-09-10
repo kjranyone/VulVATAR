@@ -1703,8 +1703,8 @@ impl eframe::App for GuiApp {
                     .unwrap_or("")
                     .to_lowercase();
                 match ext.as_str() {
-                    "vrm" => {
-                        info!("gui: dropped VRM file: {:?}", path);
+                    "vrm" | "fbx" => {
+                        info!("gui: dropped avatar file: {:?}", path);
                         // Replacing a live avatar from a stray drag is
                         // the one accidental-destruction path — ask
                         // first. First load (no avatar yet) and a

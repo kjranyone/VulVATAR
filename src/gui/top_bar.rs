@@ -616,7 +616,9 @@ pub(super) fn request_load_avatar_dialog(state: &mut GuiApp) {
     let filter_label = t!("top_bar.filter_vrm");
     request_file_dialog(state, FileDialogPurpose::LoadAvatar, move || {
         rfd::FileDialog::new()
-            .add_filter(filter_label, &["vrm"])
+            .add_filter(filter_label, &["vrm", "fbx"])
+            .add_filter("VRM (*.vrm)", &["vrm"])
+            .add_filter("FBX (*.fbx)", &["fbx"])
             .pick_file()
     });
 }

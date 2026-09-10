@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cloth_rebind;
+pub mod fbx;
 pub mod vrm;
 
 use serde::{Deserialize, Serialize};
