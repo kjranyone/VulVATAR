@@ -372,3 +372,44 @@ pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(
         atomic_write(&base_dir().join("debug_avatar.json"), &bytes);
     }
 }
+
+/// GUI-thread heartbeat: the handful of raw flags that decide whether the
+/// per-frame pipeline runs at all. Written from `GuiApp::update` *outside*
+/// every gate, so its `seq` advances whenever the GUI is alive regardless
+/// of what is switched off downstream.
+///
+/// Exists because "the avatar is frozen while tracking still runs" has at
+/// least two indistinguishable causes from the outside — the frame loop
+/// being paused, and there being no avatar to pose — and both leave the
+/// same fingerprint on every other artefact the app writes. Reporting the
+/// flags directly removes the guesswork: read `debug_gui.json` and the
+/// answer is a value, not an inference.
+///
+/// No-op unless the debug flag file exists.
+pub fn dump_gui_heartbeat(
+    paused: bool,
+    avatars_loaded: usize,
+    tracking_enabled: bool,
+    frame_count: u64,
+) {
+    if !enabled() {
+        return;
+    }
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let state = serde_json::json!({
+        "seq": SEQ.fetch_add(1, Ordering::Relaxed),
+        // `false` here and a stalled `debug_avatar.json` means the frame
+        // loop is running but produced no avatar — look at `avatars_loaded`.
+        "paused": paused,
+        // Zero means nothing is posed however healthy tracking looks.
+        "avatars_loaded": avatars_loaded,
+        "tracking_enabled": tracking_enabled,
+        // Only advances on unpaused frames — the direct counterpart to
+        // `seq`, which advances on every frame. seq climbing while
+        // frame_count holds still IS the paused signature.
+        "frame_count": frame_count,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        atomic_write(&base_dir().join("debug_gui.json"), &bytes);
+    }
+}

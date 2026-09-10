@@ -29,13 +29,15 @@ pub mod debug_channel;
 pub mod face_mediapipe;
 pub mod fusion;
 pub mod rtmw3d;
+pub mod session_record;
 pub mod source_skeleton;
 #[cfg(feature = "inference")]
 pub mod yolox;
 
 pub use calibration::{
-    rotate_xz, shoulder_line_yaw, CalibrationMode, PoseCalibration,
+    rotate_xz, shoulder_line_yaw, shoulder_span_plausible, CalibrationMode, PoseCalibration,
     BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD,
+    SHOULDER_SPAN_MAX_M, SHOULDER_SPAN_MIN_M,
 };
 pub use source_skeleton::{
     CameraIntrinsics, FacePose, FaceSource, MetricFrameInfo, SourceExpression, SourceJoint,
@@ -1418,12 +1420,40 @@ impl TrackingWorker {
                 );
             }
 
+            // Session recording: append this capture frame to the offline
+            // time series (no-op unless VULVATAR_RECORD is set). Placed
+            // beside the debug channel because both need the estimate
+            // before it is moved into the mailbox — but unlike that
+            // latest-only channel this one keeps every frame, so a
+            // misbehaviour that lasted three frames is still there
+            // afterwards. The raw colour/depth are passed by reference and
+            // only cloned for frames that trip the jump trigger.
+            session_record::record(
+                frame_index,
+                &estimate.skeleton,
+                &rs_frame.rgb,
+                width,
+                height,
+                &rs_frame.depth_raw,
+                rs_frame.depth_units,
+                CameraIntrinsics {
+                    fx: rs_frame.intrinsics.fx,
+                    fy: rs_frame.intrinsics.fy,
+                    cx: rs_frame.intrinsics.cx,
+                    cy: rs_frame.intrinsics.cy,
+                    width: rs_frame.intrinsics.width,
+                    height: rs_frame.intrinsics.height,
+                },
+                rs_frame.timestamp_ms,
+            );
+
             let frame = Some(downscale_for_gui(&rs_frame.rgb, width, height, 320));
             mailbox.publish_estimate(estimate, frame);
             stagelog::mark(frame_index, "publish");
         }
 
         let _ = capture_handle.join();
+        session_record::finish();
         info!("tracking-worker: stopped");
     }
 }

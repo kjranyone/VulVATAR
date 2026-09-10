@@ -117,15 +117,29 @@ pub struct PoseCalibration {
     /// captures.
     pub anchor_depth_jitter_m: Option<f32>,
     /// Median per-subject 3D shoulder span (LeftShoulder ↔
-    /// RightShoulder distance) in metres, gathered across the
-    /// calibration window. The depth-aware skeleton builder uses it
-    /// as `reference_span_m` — the subject's true body scale — which
-    /// feeds both the isotropic `mpsu` source-frame normalisation and
-    /// the solver's metres→avatar-units factor for 1:1 root
-    /// placement. `None` when fewer than 3 frames produced a finite
-    /// reading or for older saves that predate the field (the builder
-    /// then falls back to the frame's measured span / anatomical
-    /// mean).
+    /// RightShoulder distance) in **real camera metres**, gathered
+    /// across the calibration window. The depth-aware skeleton builder
+    /// uses it as `reference_span_m` — the subject's true body scale —
+    /// which feeds both the isotropic `mpsu` source-frame normalisation
+    /// and the solver's metres→avatar-units factor for 1:1 root
+    /// placement, and drives bone-length-aware Z reconstruction in
+    /// `skeleton_from_depth` so the avatar's arm pose becomes
+    /// outfit-independent. `None` when fewer than 3 frames produced a
+    /// finite reading, when the capture ran on a non-metric provider,
+    /// or for older saves that predate the field (the builder then
+    /// falls back to the frame's measured span / anatomical mean).
+    ///
+    /// **Metres, not source units.** The published `SourceSkeleton` is
+    /// already normalised so its shoulder span equals
+    /// `skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN`, so
+    /// measuring it directly yields that constant for *every* subject;
+    /// feeding it back as `reference_span_m` then inflates every
+    /// anthropometric bone length by ~1.8× and shrinks the published
+    /// skeleton out of the solver's tuned range. The capture path
+    /// converts back with `MetricFrameInfo::mpsu`, and both the
+    /// aggregate and the loader gate on
+    /// [`shoulder_span_plausible`] so a pre-fix profile can't poison a
+    /// live session.
     #[serde(default)]
     pub shoulder_span_m: Option<f32>,
     /// Optional per-axis peak-to-peak movement range captured by the
@@ -209,6 +223,31 @@ pub struct PoseCalibration {
     /// today (no rotation applied).
     #[serde(default)]
     pub neutral_body_yaw: Option<f32>,
+}
+
+/// Lower bound on a stored [`PoseCalibration::shoulder_span_m`], in
+/// real metres. Below this the reading is not a torso — a collapsed
+/// shoulder pair, a mis-scaled depth frame, or a value recorded in
+/// some other unit.
+pub const SHOULDER_SPAN_MIN_M: f32 = 0.20;
+
+/// Upper bound on a stored [`PoseCalibration::shoulder_span_m`], in
+/// real metres. A 0.60 m acromion-to-acromion span is already beyond
+/// the human range; the specific number this guards against is a
+/// *source-unit* span (≈ `skeleton_from_depth::TARGET_SRC_SHOULDER_SPAN`
+/// = 0.75) written by the pre-fix capture path, which
+/// `skeleton_from_depth::anthropometric_bones` would turn into
+/// ~1.8×-too-long limbs.
+pub const SHOULDER_SPAN_MAX_M: f32 = 0.60;
+
+/// `true` when `span` is a physically plausible human shoulder span
+/// in metres. Every producer and consumer of
+/// [`PoseCalibration::shoulder_span_m`] gates on this — the field is
+/// multiplied into bone lengths and into the whole-skeleton
+/// normalisation, so an out-of-band value doesn't degrade the pose,
+/// it destroys it.
+pub fn shoulder_span_plausible(span: f32) -> bool {
+    span.is_finite() && (SHOULDER_SPAN_MIN_M..=SHOULDER_SPAN_MAX_M).contains(&span)
 }
 
 /// Minimum per-frame yaw readings for a capture to publish a

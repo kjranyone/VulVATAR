@@ -245,7 +245,30 @@ fn dto_to_pose_calibration(
         anchor_depth_m: dto.anchor_depth_m.map(|d| d.abs()),
         confidence: dto.confidence,
         anchor_depth_jitter_m: dto.anchor_depth_jitter_m,
-        shoulder_span_m: dto.shoulder_span_m,
+        // Migration: pre-fix captures measured the shoulder span on the
+        // *published* skeleton, which `skeleton_from_depth` has already
+        // normalised to `TARGET_SRC_SHOULDER_SPAN` — so the stored value
+        // is a source-unit constant (≈0.75), not the subject's metres.
+        // Consumed as metres it makes every anthropometric bone ~1.8×
+        // too long (depth-hole joints fly off along their ray) and
+        // shrinks the published skeleton to ~58% of the range the
+        // solver's dead-zones / 1€ cutoffs are tuned for. Drop an
+        // out-of-band value on load so the session falls back to the
+        // provider's stabilised auto-span; the inspector then shows the
+        // span as not captured, prompting a (now-correct) recapture.
+        shoulder_span_m: dto.shoulder_span_m.filter(|s| {
+            let ok = crate::tracking::shoulder_span_plausible(*s);
+            if !ok {
+                log::warn!(
+                    "dropping implausible stored shoulder_span_m {s:.3} m (outside \
+                     {:.2}–{:.2} m) — pre-fix calibration recorded in source units; \
+                     re-run Calibrate Pose to restore it",
+                    crate::tracking::SHOULDER_SPAN_MIN_M,
+                    crate::tracking::SHOULDER_SPAN_MAX_M,
+                );
+            }
+            ok
+        }),
         x_range_observed: dto.x_range_observed,
         z_range_observed: dto.z_range_observed,
         neutral_expressions: dto.neutral_expressions.clone(),
@@ -1875,6 +1898,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create tempdir");
         dir
+    }
+
+    /// A DTO carrying only the fields these tests care about.
+    fn calibration_dto(shoulder_span_m: Option<f32>) -> PoseCalibrationDto {
+        PoseCalibrationDto {
+            mode: "full_body".to_string(),
+            captured_at: "2026-05-08T09:33:48Z".to_string(),
+            captured_at_unix: 1_778_232_828,
+            frame_count: 41,
+            anchor_x: 0.033_656_113,
+            anchor_y: -0.072_242_945,
+            anchor_depth_m: Some(0.788_906_34),
+            confidence: 0.673_795_76,
+            anchor_depth_jitter_m: Some(0.027_591_532),
+            shoulder_span_m,
+            x_range_observed: None,
+            z_range_observed: None,
+            neutral_expressions: Vec::new(),
+            neutral_face_ypr: [0.0; 3],
+            neutral_face_ypr_mesh: None,
+            neutral_face_ypr_body: None,
+            neutral_body_yaw: None,
+        }
+    }
+
+    #[test]
+    fn load_drops_a_source_unit_shoulder_span() {
+        // Value taken verbatim from a real pre-fix profiles.json: the
+        // capture path measured the already-normalised published
+        // skeleton, so it recorded the source-space target constant
+        // instead of the subject's metres. Consumed as metres it makes
+        // every anthropometric bone ~1.8× too long.
+        let loaded = dto_to_pose_calibration(&calibration_dto(Some(0.691_979_17)))
+            .expect("mode parses");
+        assert_eq!(
+            loaded.shoulder_span_m, None,
+            "an implausible span must not reach the solver — the auto-measured \
+             span is strictly better than a 1.8×-inflated one"
+        );
+        // The rest of the record still loads: dropping the span must
+        // not throw away a good anchor.
+        assert_eq!(loaded.frame_count, 41);
+        assert_eq!(loaded.anchor_depth_m, Some(0.788_906_34));
+    }
+
+    #[test]
+    fn load_keeps_a_plausible_shoulder_span() {
+        let loaded =
+            dto_to_pose_calibration(&calibration_dto(Some(0.41))).expect("mode parses");
+        assert_eq!(loaded.shoulder_span_m, Some(0.41));
     }
 
     #[test]
