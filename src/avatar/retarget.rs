@@ -39,6 +39,10 @@ pub struct RetargetState {
     rest_world_rot: Vec<Quat>,
     rest_world_pos: Vec<Vec3>,
     rest_cache_len: usize,
+    /// 1€ adaptive filter state per bone rotation.
+    one_euro_bones: HashMap<HumanoidBone, OneEuroQuat>,
+    /// 1€ adaptive filter state for hips root translation.
+    one_euro_hips_t: OneEuroVec3,
 }
 
 impl RetargetState {
@@ -48,12 +52,16 @@ impl RetargetState {
         self.anchor_cam = None;
         self.anchor_seed.clear();
         self.anchor_seed_start = None;
+        self.one_euro_bones.clear();
+        self.one_euro_hips_t.reset();
     }
     /// Forget only the display-smoothing state (avatar swap).
     pub fn reset_smoothing(&mut self) {
         self.prev_local.clear();
         self.prev_hips_translation = None;
         self.rest_cache_len = 0;
+        self.one_euro_bones.clear();
+        self.one_euro_hips_t.reset();
     }
 }
 
@@ -80,6 +88,14 @@ pub struct RetargetParams {
     pub hand_cross_prevention: bool,
     /// Minimum lateral distance (m) between left and right hand centers when touching.
     pub min_hand_distance: f32,
+    /// Enable 1€ (One Euro) adaptive smoothing filter for rotation and root translation.
+    pub one_euro_enabled: bool,
+    /// Minimum cutoff frequency in Hz for 1€ filter (stillness jitter suppression). Default: 1.0
+    pub one_euro_min_cutoff: f32,
+    /// Speed sensitivity coefficient β for 1€ filter (higher = less lag during fast motion). Default: 1.0
+    pub one_euro_beta: f32,
+    /// Cutoff frequency in Hz for derivative filtering in 1€ filter. Default: 1.0
+    pub one_euro_d_cutoff: f32,
 }
 
 impl Default for RetargetParams {
@@ -95,6 +111,10 @@ impl Default for RetargetParams {
             max_root_tilt: 0.35,
             hand_cross_prevention: true,
             min_hand_distance: 0.08,
+            one_euro_enabled: true,
+            one_euro_min_cutoff: 1.0,
+            one_euro_beta: 1.0,
+            one_euro_d_cutoff: 1.0,
         }
     }
 }
@@ -141,6 +161,143 @@ fn slerp_short(a: &Quat, b: &Quat, t: f32) -> Quat {
         s0 * a[2] + s1 * b2[2],
         s0 * a[3] + s1 * b2[3],
     ])
+}
+
+fn compute_alpha(fc: f32, dt: f32) -> f32 {
+    let r = 2.0 * std::f32::consts::PI * fc * dt;
+    (r / (1.0 + r)).clamp(0.0, 1.0)
+}
+
+/// 1D Low-Pass Filter for derivative estimation in 1€ filter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LowPassFilter1D {
+    hat: Option<f32>,
+}
+
+impl LowPassFilter1D {
+    pub fn reset(&mut self) {
+        self.hat = None;
+    }
+
+    pub fn filter(&mut self, val: f32, alpha: f32) -> f32 {
+        let next = match self.hat {
+            Some(prev) => prev + alpha * (val - prev),
+            None => val,
+        };
+        self.hat = Some(next);
+        next
+    }
+}
+
+/// 1€ adaptive filter for 3D position vectors (e.g. Hips root translation).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OneEuroVec3 {
+    prev_filtered: Option<Vec3>,
+    d_hat: LowPassFilter1D,
+}
+
+impl OneEuroVec3 {
+    pub fn reset(&mut self) {
+        self.prev_filtered = None;
+        self.d_hat.reset();
+    }
+
+    pub fn set_filtered(&mut self, p: Vec3) {
+        self.prev_filtered = Some(p);
+    }
+
+    pub fn filter(
+        &mut self,
+        target: Vec3,
+        dt: f32,
+        min_cutoff: f32,
+        beta: f32,
+        d_cutoff: f32,
+    ) -> Vec3 {
+        let prev = match self.prev_filtered {
+            Some(p) => p,
+            None => {
+                self.prev_filtered = Some(target);
+                return target;
+            }
+        };
+
+        if dt <= 1e-5 {
+            return prev;
+        }
+
+        let speed = vec3_length(&vec3_sub(&target, &prev)) / dt;
+        let alpha_d = compute_alpha(d_cutoff, dt);
+        let speed_hat = self.d_hat.filter(speed, alpha_d);
+
+        let fc = (min_cutoff + beta * speed_hat).max(1e-3);
+        let alpha = compute_alpha(fc, dt);
+
+        let filtered = [
+            prev[0] + alpha * (target[0] - prev[0]),
+            prev[1] + alpha * (target[1] - prev[1]),
+            prev[2] + alpha * (target[2] - prev[2]),
+        ];
+        self.prev_filtered = Some(filtered);
+        filtered
+    }
+}
+
+/// 1€ adaptive filter for Unit Quaternions (SO(3) rotations).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OneEuroQuat {
+    prev_filtered: Option<Quat>,
+    d_hat: LowPassFilter1D,
+}
+
+impl OneEuroQuat {
+    pub fn reset(&mut self) {
+        self.prev_filtered = None;
+        self.d_hat.reset();
+    }
+
+    pub fn set_filtered(&mut self, q: Quat) {
+        self.prev_filtered = Some(q);
+    }
+
+    pub fn filter(
+        &mut self,
+        target: Quat,
+        dt: f32,
+        min_cutoff: f32,
+        beta: f32,
+        d_cutoff: f32,
+    ) -> Quat {
+        let prev = match self.prev_filtered {
+            Some(q) => q,
+            None => {
+                let norm = quat_normalize(&target);
+                self.prev_filtered = Some(norm);
+                return norm;
+            }
+        };
+
+        if dt <= 1e-5 {
+            return prev;
+        }
+
+        // Angular distance theta = 2 * acos(|prev · target|)
+        let dot = (prev[0] * target[0] + prev[1] * target[1] + prev[2] * target[2] + prev[3] * target[3])
+            .abs()
+            .clamp(0.0, 1.0);
+        let theta = 2.0 * dot.acos();
+        let omega = theta / dt; // rad/s
+
+        let alpha_d = compute_alpha(d_cutoff, dt);
+        let omega_hat = self.d_hat.filter(omega, alpha_d);
+
+        let fc = (min_cutoff + beta * omega_hat).max(1e-3);
+        let alpha = compute_alpha(fc, dt);
+
+        let filtered = slerp_short(&prev, &target, alpha);
+        self.prev_filtered = Some(filtered);
+        filtered
+    }
 }
 
 /// Hierarchical driving order (parents before children).
@@ -348,30 +505,53 @@ pub fn apply_rig_pose(
             continue;
         }
         let rest_local_rot = skeleton.nodes[node].rest_local.rotation;
+        let is_tracked = rig.quality >= params.min_quality
+            && (params.hand_tracking_enabled || !is_finger(bone))
+            && (params.lower_body_tracking_enabled || !is_leg(bone));
+
         // Target local rotation. A low-quality rig (subject lost / tiny)
         // drives nothing: every bone relaxes to rest.
-        let target = match rig.bones.get(&bone) {
-            Some(rb)
-                if rig.quality >= params.min_quality
-                    && rb.sigma <= params.sigma_rest
-                    && (params.hand_tracking_enabled || !is_finger(bone))
-                    && (params.lower_body_tracking_enabled || !is_leg(bone)) =>
-            {
+        let (target, tracking_valid) = match rig.bones.get(&bone) {
+            Some(rb) if is_tracked && rb.sigma <= params.sigma_rest => {
                 let corrected = quat_mul(&rebase, &rb.delta_world);
                 let desired_world = quat_mul(&corrected, &state.rest_world_rot[node]);
                 let parent_world = match skeleton.nodes[node].parent {
                     Some(NodeId(p)) => world_rot(skeleton, local_transforms, p as usize),
                     None => [0.0, 0.0, 0.0, 1.0],
                 };
-                quat_normalize(&quat_mul(&quat_conjugate(&parent_world), &desired_world))
+                (
+                    quat_normalize(&quat_mul(&quat_conjugate(&parent_world), &desired_world)),
+                    true,
+                )
             }
-            _ => rest_local_rot,
+            _ => (rest_local_rot, false),
         };
+
+        // 1€ filter smooths tracking jitter adaptively when tracked;
+        // when tracking is lost or gated by σ, reset filter state so
+        // re-acquisition never drags from past positions.
+        let filtered_target = if tracking_valid && params.one_euro_enabled {
+            state
+                .one_euro_bones
+                .entry(bone)
+                .or_default()
+                .filter(
+                    target,
+                    dt,
+                    params.one_euro_min_cutoff,
+                    params.one_euro_beta,
+                    params.one_euro_d_cutoff,
+                )
+        } else {
+            state.one_euro_bones.remove(&bone);
+            target
+        };
+
         let prev = state.prev_local.get(&bone).copied().unwrap_or(rest_local_rot);
         let out = if blend >= 1.0 {
-            target
+            filtered_target
         } else {
-            slerp_short(&prev, &target, blend)
+            slerp_short(&prev, &filtered_target, blend)
         };
         state.prev_local.insert(bone, out);
         local_transforms[node].rotation = out;
@@ -397,7 +577,8 @@ pub fn apply_rig_pose(
                     state.anchor_seed.clear();
                 }
             }
-            let target = match (state.anchor_cam, params.root_translation_enabled && rig.quality >= params.min_quality) {
+            let hips_tracked = params.root_translation_enabled && rig.quality >= params.min_quality;
+            let (target, tracking_valid) = match (state.anchor_cam, hips_tracked) {
                 (Some(anchor), true) => {
                     // camera → viewer: Rx(180°) = (x, −y, −z); scaled to the
                     // avatar's size so a 10 cm real step is a proportional
@@ -417,15 +598,29 @@ pub fn apply_rig_pose(
                         -(rig.root_cam_m[2] - anchor[2]) * scale,
                     ];
                     let d = d_view;
-                    [rest_pos[0] + d[0], rest_pos[1] + d[1], rest_pos[2] + d[2]]
+                    ([rest_pos[0] + d[0], rest_pos[1] + d[1], rest_pos[2] + d[2]], true)
                 }
-                _ => rest_pos,
+                _ => (rest_pos, false),
             };
+
+            let filtered_target = if tracking_valid && params.one_euro_enabled {
+                state.one_euro_hips_t.filter(
+                    target,
+                    dt,
+                    params.one_euro_min_cutoff,
+                    params.one_euro_beta,
+                    params.one_euro_d_cutoff,
+                )
+            } else {
+                state.one_euro_hips_t.reset();
+                target
+            };
+
             let prev = state.prev_hips_translation.unwrap_or(rest_pos);
             let out = [
-                prev[0] + blend * (target[0] - prev[0]),
-                prev[1] + blend * (target[1] - prev[1]),
-                prev[2] + blend * (target[2] - prev[2]),
+                prev[0] + blend * (filtered_target[0] - prev[0]),
+                prev[1] + blend * (filtered_target[1] - prev[1]),
+                prev[2] + blend * (filtered_target[2] - prev[2]),
             ];
             state.prev_hips_translation = Some(out);
             local_transforms[hips].translation = out;
@@ -711,6 +906,14 @@ fn prevent_hand_crossing(
         state.prev_local.insert(HB::RightUpperArm, ru_new);
         state.prev_local.insert(HB::RightLowerArm, rl_new);
         state.prev_local.insert(HB::RightHand, rh_new);
+
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftUpperArm) { f.set_filtered(lu_new); }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftLowerArm) { f.set_filtered(ll_new); }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftHand) { f.set_filtered(lh_new); }
+
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightUpperArm) { f.set_filtered(ru_new); }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightLowerArm) { f.set_filtered(rl_new); }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightHand) { f.set_filtered(rh_new); }
     }
 }
 
@@ -930,5 +1133,112 @@ mod tests {
         let l2 = vec3_length(&vec3_sub(&w_l, &e_l));
         assert!((l1 - 0.25).abs() < 1e-4, "Upper arm length must be 0.25 (got {l1})");
         assert!((l2 - 0.25).abs() < 1e-4, "Forearm length must be 0.25 (got {l2})");
+    }
+
+    #[test]
+    fn test_one_euro_filter_reduces_jitter_when_still_and_tracks_fast_movement() {
+        let (sk, hm) = skeleton();
+        let qy = |a: f32| [0.0, (a / 2.0).sin(), 0.0, (a / 2.0).cos()];
+
+        // 1. Stillness jitter test:
+        // Input oscillates at 30Hz: base angle 0.5 rad with noise +-0.05 rad (peak-to-peak 0.1 rad).
+        let mut st_filter = RetargetState::default();
+        let params_filter = RetargetParams {
+            rotation_blend: 1.0, // pure 1€ filter behavior
+            one_euro_enabled: true,
+            one_euro_min_cutoff: 1.0,
+            one_euro_beta: 1.0,
+            one_euro_d_cutoff: 1.0,
+            ..Default::default()
+        };
+
+        let mut spine_angles = Vec::new();
+        let mut locals: Vec<Transform> = sk.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        let dt = 1.0 / 30.0;
+
+        for frame in 0..60 {
+            let noise = if frame % 2 == 0 { 0.05 } else { -0.05 };
+            let raw_angle = 0.5 + noise;
+            let mut rig = RigPose {
+                quality: 1.0,
+                ..Default::default()
+            };
+            rig.bones.insert(
+                HumanoidBone::Hips,
+                RigBone {
+                    delta_world: [0.0, 0.0, 0.0, 1.0],
+                    sigma: 0.05,
+                    data_sigma: 0.05,
+                },
+            );
+            rig.bones.insert(
+                HumanoidBone::Spine,
+                RigBone {
+                    delta_world: qy(raw_angle),
+                    sigma: 0.05,
+                    data_sigma: 0.05,
+                },
+            );
+            apply_rig_pose(&rig, &sk, &hm, &mut locals, &params_filter, &mut st_filter, dt);
+            let q = locals[2].rotation;
+            let ang = 2.0 * q[3].clamp(-1.0, 1.0).acos();
+            if frame >= 10 {
+                spine_angles.push(ang);
+            }
+        }
+
+        let max_ang = spine_angles.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_ang = spine_angles.iter().copied().fold(f32::INFINITY, f32::min);
+        let jitter_range = max_ang - min_ang;
+        println!("Jitter range with 1€ filter: {:.4} rad (raw: 0.1000 rad)", jitter_range);
+        assert!(
+            jitter_range < 0.025,
+            "1€ filter failed to suppress stillness jitter: got range {:.4}, expected < 0.025",
+            jitter_range
+        );
+
+        // 2. Fast movement tracking test:
+        // Sudden jump to 1.5 rad. High angular velocity -> dynamic cutoff rises -> responds rapidly.
+        let mut rig = RigPose {
+            quality: 1.0,
+            ..Default::default()
+        };
+        rig.bones.insert(
+            HumanoidBone::Hips,
+            RigBone {
+                delta_world: [0.0, 0.0, 0.0, 1.0],
+                sigma: 0.05,
+                data_sigma: 0.05,
+            },
+        );
+        rig.bones.insert(
+            HumanoidBone::Spine,
+            RigBone {
+                delta_world: qy(1.5),
+                sigma: 0.05,
+                data_sigma: 0.05,
+            },
+        );
+        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params_filter, &mut st_filter, dt);
+        let q_fast = locals[2].rotation;
+        let ang_fast = 2.0 * q_fast[3].clamp(-1.0, 1.0).acos();
+        println!("Angle after sudden fast motion: {:.4} rad (target: 1.5 rad)", ang_fast);
+        assert!(
+            ang_fast > 1.1,
+            "1€ filter responded too sluggishly to fast motion: got {:.4}, expected > 1.1",
+            ang_fast
+        );
+
+        // 3. Test disabling 1€ filter:
+        let params_disabled = RetargetParams {
+            rotation_blend: 1.0,
+            one_euro_enabled: false,
+            ..Default::default()
+        };
+        let mut st_disabled = RetargetState::default();
+        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params_disabled, &mut st_disabled, dt);
+        let q_raw = locals[2].rotation;
+        let ang_raw = 2.0 * q_raw[3].clamp(-1.0, 1.0).acos();
+        assert!((ang_raw - 1.5).abs() < 1e-4, "With 1€ disabled, angle should match target exactly");
     }
 }
