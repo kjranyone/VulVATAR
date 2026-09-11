@@ -492,7 +492,7 @@ flags, fade-on-loss, mouth source, material mode.
 - Use this for values that only the frame step (retargeting / expressions,
   simulation, material selection) reads.
 
-### Path 3: Requested (Phase D, `Application::set_requested_*`)
+### Path 3: Requested (`Application::set_requested_*`)
 
 Stateful runtime resources that can fail to start or stop: output sink,
 lipsync capture (and, structurally, the tracking worker).
@@ -517,11 +517,10 @@ cloth attachments, `avatar.cloth_enabled`.
 
 ### Anti-patterns
 
-- A GUI-side shadow copy of a Path 3 value (drifts on runtime failure —
-  the exact bug Phase C/D removed).
+- A GUI-side shadow copy of a Path 3 value (it silently drifts from
+  the active state when a runtime transition fails).
 - Gating a persisted Path 2 toggle on non-persisted session state
-  (the pre-refactor `toggle_cloth && sim_playing` bug: cloth silently
-  froze after every restart).
+  (the toggle's meaning silently changes across restarts).
 - Syncing a value into an `Application` field *and* passing it through
   `FrameConfig` — one consumer model per setting.
 
@@ -550,8 +549,7 @@ cloth attachments, `avatar.cloth_enabled`.
 - `src/tracking/`: RealSense D435 depth tracking, fusion estimator, and retargeting inputs
 - `src/output/`: OBS-facing and external frame sink integration
 
-The implementations the original baseline anticipated are all in
-place; large modules have since grown into directory modules with
+Modules are organized as directory modules with
 per-concern sibling files:
 
 - `src/avatar/{animation, expressions, instance, pose, retarget}.rs`

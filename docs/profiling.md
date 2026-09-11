@@ -3,7 +3,7 @@
 ## Purpose
 
 This document describes how to measure per-frame performance in VulVATAR
-and identifies the known bottlenecks discovered during initial tuning.
+and lists the known bottlenecks and their mitigations.
 
 Related documents:
 
@@ -26,7 +26,7 @@ Related documents:
 
 For GPU-runtime regression checks, also grep for `GPU_RUNTIME`. The renderer
 logs cumulative steady-state counters every 60 frames; the field names
-reflect the compute-prepass migration (single `TransformGpuData` slot per
+follow the transform prepass layout (single `TransformGpuData` slot per
 primitive, fused skinning + morph + cloth dispatch):
 
 ```text
@@ -179,7 +179,7 @@ copy drops it to 0.1 ms.
 targeting a `PREFER_HOST | HOST_RANDOM_ACCESS` buffer triggers a slow DMA
 transfer path in the driver (~30 ms for 1920x1080 RGBA).
 
-**Solution** (implemented): Two-stage readback.
+**Solution**: Two-stage readback.
 
 1. `copy_image_to_buffer` → device-local + host-visible (resizable BAR) staging
    buffer.  This stays on-chip and completes in < 1 ms.
@@ -199,16 +199,16 @@ perform 8 MB copies in unoptimised (opt-level 0) code.  The egui/epaint
 crates have tight inner loops that benefit enormously from compiler
 optimisation.
 
-**Solution** (implemented): Per-crate `opt-level = 2` in `Cargo.toml` for
+**Solution**: Per-crate `opt-level = 2` in `Cargo.toml` for
 egui, epaint, eframe, emath, egui-winit, egui_glow, and glow.  This brings
 `vp_upload` down to ~2 ms without requiring a full release build.
 
-### 3. Synchronous GPU readback blocking the render thread (historical)
+### 3. Synchronous GPU readback blocking the render thread
 
 **Symptom**: `fence.wait(None)` called in the same frame as the GPU
 submission, blocking the render thread for the full GPU render time.
 
-**Solution** (implemented): Async readback with `PendingReadbackState`.
+**Solution**: Async readback with `PendingReadbackState`.
 The GPU fence from frame N is waited on at the start of frame N+1.  By that
 point the GPU work has already completed, so the wait returns instantly.
 

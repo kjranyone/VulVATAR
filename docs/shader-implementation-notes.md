@@ -38,20 +38,17 @@ Avoid giant feature-flag shaders as the default architecture.
 
 ## Vertex Shader Responsibilities
 
-After the compute prepass migration (landed on
-`feature/compute-prepass-migration`, 2026-05-19), the main avatar
-vertex shader is intentionally tiny:
+The main avatar vertex shader is intentionally tiny:
 
 - clip-space projection (`view * proj` applied to the world-space input)
 - passing normalized material inputs (UV, world position, world normal) to
   the fragment stage
 
-Everything that used to live in the vertex stage — vertex skinning, morph
-blending, cloth deformation, normal/tangent transformation — has moved to
-the per-primitive **transform compute prepass** (`pipeline::transform_cs`)
-that runs ahead of the graphics passes each frame. The prepass writes
-world-space vertices into a persistent SSBO bound as the graphics vertex
-buffer.
+Vertex skinning, morph blending, cloth deformation, and normal/tangent
+transformation live in the per-primitive **transform compute prepass**
+(`pipeline::transform_cs`) that runs ahead of the graphics passes each
+frame. The prepass writes world-space vertices into a persistent SSBO
+bound as the graphics vertex buffer.
 
 The vertex shader should not contain:
 
@@ -135,8 +132,7 @@ the attached `ClothAsset::render_bindings[0]` at `init_cloth_sim` /
 `init_cloth_overlay` time. A cloth that has been authored but not yet
 bound to a render target (no `render_bindings`) simulates but does
 not contribute to any draw — that's a deliberate "well-defined no
-cloth" state instead of the old "broadcasts to every primitive in
-the instance" footgun.
+cloth" state.
 
 ## Toon-Like Lighting Notes
 

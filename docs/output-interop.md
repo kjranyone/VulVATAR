@@ -24,15 +24,15 @@ The preferred output path is GPU-resident handoff with explicit synchronization.
 
 CPU readback is a fallback path, not the architectural center.
 
-Current bridge note: `SharedTextureFileStub` now preserves that distinction at
-the last hop. It writes metadata-only `VGTK` records when a valid
+At the last hop, `SharedTextureFileStub` preserves that distinction:
+it writes metadata-only `VGTK` records when a valid
 `GpuFrameToken` arrives and legacy `VSTX` records when the frame is on the CPU
-fallback path. The downstream consumer is still a stub; this is the first
+fallback path. The downstream consumer is still a stub; this is a
 token-capable sink boundary, not yet the finished live interop path.
 
-P2-05 phase 2 extends this contract to the live `VirtualCamera` and
-`SharedMemory` sinks on Windows. Both sinks are backed by
-`Win32FileBackedSharedMemorySink`, which now emits the same `VGTK` record
+The live `VirtualCamera` and `SharedMemory` sinks on Windows extend
+this contract. Both sinks are backed by
+`Win32FileBackedSharedMemorySink`, which emits the same `VGTK` record
 into a sidecar file alongside the existing byte buffer when the renderer
 publishes a valid GPU token, and leaves the byte buffer to the existing
 CPU-fallback path. See [`Win32 GPU-handle sidecar`](#win32-gpu-handle-sidecar).
@@ -40,7 +40,7 @@ CPU-fallback path. See [`Win32 GPU-handle sidecar`](#win32-gpu-handle-sidecar).
 ## Win32 GPU-handle sidecar
 
 `Win32FileBackedSharedMemorySink` (used by `FrameSink::VirtualCamera` and
-`FrameSink::SharedMemory` on Windows) now supports two on-disk shapes that
+`FrameSink::SharedMemory` on Windows) supports two on-disk shapes that
 the consumer (MF virtual camera DLL) must distinguish:
 
 | Path | File | Contents | When |
@@ -181,7 +181,7 @@ Examples:
 
 Do not assume "submission finished" implies safe external consumption without explicit sync.
 
-Current implementation note: the first token path uses
+The current token path uses
 `OutputSyncToken::ProducerWaitComplete`, meaning the producer waits for render
 completion before publishing the token. That is an honest readiness contract
 for the present code, but it is not yet an exported cross-process wait object.

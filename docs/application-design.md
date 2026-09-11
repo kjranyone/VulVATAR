@@ -59,8 +59,6 @@ The application exposes 6 explicit modes on the navigation rail (`AppMode::ALL`)
 5. `Cloth Authoring`
 6. `Settings`
 
-(`Preview` was an earlier prototype mode that has been retired; its features were redistributed to `Avatar`, `Rendering`, and `Cloth Authoring`.)
-
 ### `Avatar`
 
 Purpose:
@@ -147,7 +145,6 @@ Switches between the 6 modes:
 - Output (F4)
 - Cloth Authoring (F6)
 - Settings (F7)
-(F5 folds into Rendering for legacy muscle-memory compatibility)
 
 Switching modes preserves loaded assets and current session state.
 
@@ -479,7 +476,7 @@ the chord (`mode_nav.rs`, `top_bar.rs`, `inspector/library.rs`).
 | `F2`           | Switch to Tracking Setup mode                                       |
 | `F3`           | Switch to Rendering (Scene) mode                                    |
 | `F4`           | Switch to Output mode                                               |
-| `F5`           | Switch to Rendering (Scene) mode (legacy Preview key)                |
+| `F5`           | Switch to Rendering (Scene) mode                                     |
 | `F6`           | Switch to Cloth Authoring mode                                      |
 | `F7`           | Switch to Settings mode                                             |
 

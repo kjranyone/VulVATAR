@@ -122,6 +122,6 @@ docstring estimate.
 
 - Drag-and-drop import
 - Import metadata from VRM extension data (title, author, version,
-  thumbnail) — partially landed; tags and category remain manual.
+  thumbnail) — partially implemented; tags and category remain manual.
 - Library categories or folders
 - Export/import of library catalogs

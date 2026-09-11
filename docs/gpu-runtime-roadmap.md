@@ -3,10 +3,9 @@
 ## Purpose
 
 The GPU runtime architecture: residency rules, the GPU-first output
-path, and the central `RuntimeGpuBudget` pressure policy. The original
-three-phase roadmap (stabilize baseline → GPU-first output → GPU
-simulation + pacing) has fully landed; this document now records the
-landed contracts and the remaining extension slices.
+path, and the central `RuntimeGpuBudget` pressure policy. This
+document records the current contracts and the remaining extension
+slices.
 
 Related documents:
 
@@ -67,7 +66,7 @@ exportable GPU image
 4. **Synchronization is part of the API** — a frame is ready only when
    its fence/semaphore/token says so.
 
-## Landed Milestones
+## Core Mechanisms
 
 - **Compute prepass** — skinning + morph + cloth fused into
   `pipeline::transform_cs`; per-frame host writes bounded to the
@@ -93,7 +92,7 @@ exportable GPU image
   `EmergencyCpu`, which forces `RenderExportMode::CpuReadback` until
   the clean-streak recovery clears.
 
-## RuntimeGpuBudget — Landed State Machine
+## RuntimeGpuBudget — State Machine
 
 `src/app/runtime_gpu_budget.rs` is the single place that decides
 system-level cadence; consumers read its outputs and never hard-code
@@ -145,13 +144,11 @@ upward; everything else needs the 5 s dwell.
 
 ### Why centralise
 
-Before this landed, render cadence lived on `OutputRouter`, YOLOX skip
-period was a `const` in `tracking::rtmw3d`, depth refresh was a
-separate const, and facemesh EP was chosen at startup with no runtime
-adjustment. None of them could see the others. Under sustained load
-the system would either (a) drop frames in one subsystem while another
-remained at full cost, or (b) require manual re-tuning. The budget
-makes degraded modes intentional and visible in one place.
+Render cadence, YOLOX skip period, depth refresh, and FaceMesh EP are
+system-level policy: no single subsystem can see the others' load.
+Kept per-subsystem, they degrade independently — one drops frames
+while another stays at full cost, and the remedy is manual re-tuning.
+The budget makes degraded modes intentional and visible in one place.
 
 ## Remaining Extension Slices
 

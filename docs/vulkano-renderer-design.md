@@ -4,9 +4,6 @@
 
 The renderer reference: design, module layout, API boundary, material
 strategy, MToon compatibility status, and validation checklist.
-(Absorbed the former `renderer-module-design.md`,
-`renderer-api-contract.md`, `rendering-materials.md`,
-`mtoon-compatibility.md`, and `mtoon-test-matrix.md`.)
 
 Related documents:
 
@@ -230,10 +227,8 @@ Three layers, normalized strictly in this order:
 The renderer never decodes raw VRM extension schema while drawing.
 
 Normalized modes: `Unlit`, `SimpleLit`, `ToonLike` (the importer
-chooses; the GUI exposes a debugging override). The staged roadmap
-(Unlit → SimpleLit → ToonLike → Outline → broader compatibility) is
-fully landed; new material work extends the normalized contract rather
-than adding modes ad hoc.
+chooses; the GUI exposes a debugging override). New material work
+extends the normalized contract rather than adding modes ad hoc.
 
 Alpha policy is explicit per material: `Opaque`, `Cutout` (alpha
 test), `Blend`. Culling intent (`Back`, `None`, `Front`) is surfaced
@@ -262,8 +257,7 @@ are the primary compatibility checks, not edge cases.
 - alpha modes (opaque, mask, blend), double-sided rendering
 - outline width / color (stencil-masked)
 - ToonLike ambient floor (`ambient_avg` added into the lit term —
-  see `pipeline.rs` fragment source; the early "toon path lacks
-  ambient" issue is fixed)
+  see `pipeline.rs` fragment source)
 
 ### Disabled / partial
 

@@ -179,7 +179,8 @@ joints fly off along their ray) while shrinking the published skeleton
 to ~58% of the range the solver's dead-zones are tuned for. The capture
 path converts back with `MetricFrameInfo::mpsu`, and the aggregate,
 loader and consumer all gate on `tracking::shoulder_span_plausible`
-(0.20–0.60 m), so a pre-fix profile loads as "not captured" instead of
+(0.20–0.60 m), so a profile with an implausible stored span loads as
+"not captured" instead of
 poisoning the session.
 
 ## UI status line
