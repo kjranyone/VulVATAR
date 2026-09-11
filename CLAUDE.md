@@ -93,7 +93,6 @@ cargo build --features realsense --bin diagnose_fusion_replay
 | `debug_state.json` | トラッキングワーカー | 2D キーポイント + source 関節 (位置・信頼度) + face pose |
 | `debug_avatar.json` | `run_frame` 内 | ソルブ後のアバター world 関節 + head 軸 |
 | `debug_camera.bin` | トラッキングワーカー | カメラ RGBA (32 byte ヘッダ `VDBG`) |
-| `debug_tuning.json` | **読み込み** | `arm_reach_ik` / `contact_ik` / `idle_arm_apose` / `joint_confidence_threshold` をリビルドなしで A/B |
 
 「アバターが動かない」の切り分けは `debug_gui.json` の 2 値で決まる。`seq` は毎 GUI フレーム、`frame_count` は**非 pause フレームのみ**進む:
 
@@ -121,7 +120,7 @@ cargo run                       # 再現させてトラッキング停止 (生�
 以降はカメラ不要:
 
 ```powershell
-cargo run --release --bin diagnose_video_replay -- diagnostics\session_<unix>   # 温度状態を継続して本番プロバイダに流す
+cargo run --release --bin diagnose_fusion_replay -- diagnostics\session_<unix>   # 温度状態を継続して本番プロバイダに流す
 cargo run --bin analyze_session -- diagnostics\session_<unix>                   # summary.md に判定
 ```
 
@@ -139,7 +138,7 @@ cargo run --bin analyze_session -- diagnostics\session_<unix>                   
 
 - GUI thread: eframe/egui — `src/gui/mod.rs` (`GuiApp::update`)
 - Render thread: Vulkan via vulkano — `src/renderer/mod.rs` (`VulkanRenderer::render`)
-- Communication: `sync_channel(2)` in `src/app/render_thread.rs`
+- Communication: command queue `sync_channel(2)` + result mailbox (`ResultMailbox`) in `src/app/render_thread.rs`
 - Output: shared-memory writer on a worker thread — `src/output/`
 
 See `docs/architecture.md` and `docs/threading-model.md`.

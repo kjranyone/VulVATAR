@@ -534,7 +534,7 @@ change.
 - Unit: median/stability/plausibility gates of the yaw aggregate, and
   fold-of-rotated-samples ≠ rotate-the-folded-box —
   `gui::calibration::finalize::tests`.
-- Live: `diagnose_video_replay` (CPU inference, non-competing) on
+- Live: `diagnose_fusion_replay` (offline replay) on
   oblique footage; live-debug protocol to read the measured θ and
   the post-de-rotation residual shoulder yaw on the user's actual
   setup.

@@ -50,93 +50,106 @@ The application should support these core scenarios:
 
 ## Application Modes
 
-The application should expose explicit modes rather than mixing all tools into one overloaded screen.
+The application exposes 6 explicit modes on the navigation rail (`AppMode::ALL`):
 
-Recommended first modes:
-
-1. `Preview`
+1. `Avatar`
 2. `Tracking Setup`
-3. `Rendering`
+3. `Rendering` (Scene)
 4. `Output`
 5. `Cloth Authoring`
+6. `Settings`
 
-### `Preview`
+(`Preview` was an earlier prototype mode that has been retired; its features were redistributed to `Avatar`, `Rendering`, and `Cloth Authoring`.)
+
+### `Avatar`
 
 Purpose:
 
-- load an avatar
-- inspect the current scene
-- position the avatar
-- toggle runtime features on or off
+- inspect loaded avatar identity and statistics
+- browse and manage the Model Library
+- test and inspect facial expressions and blendshapes
+- manage avatar attachment and reload
 
 ### `Tracking Setup`
 
 Purpose:
 
-- choose the RealSense D435 depth device
-- inspect tracking confidence
-- tune retargeting behavior
-- validate latency and stability
+- start or stop the RealSense D435 capture
+- calibrate pose reference and anchors
+- configure driven body parts (head, face, lower body, root translation, hands)
+- inspect tracking latency, confidence, and solver diagnostics
+- adjust smoothing parameters and safety fallbacks
 
-### `Rendering`
+### `Rendering` (Scene)
 
 Purpose:
 
-- adjust material and shading controls
-- inspect lighting and background composition
-- validate alpha and scene framing
+- adjust avatar world transform (position, rotation, scale)
+- configure material modes (Unlit, SimpleLit, ToonLike) and toon ramp parameters
+- tune scene lighting, ambient floor, and background
+- configure post-processing effects (Bloom downsample/upsample/composite)
 
 ### `Output`
 
 Purpose:
 
-- configure frame sink selection
-- inspect output state
-- validate OBS-facing behavior
+- select frame sink (Virtual Camera, Shared Memory, Shared Texture)
+- configure resolution, target frame rate, color space, alpha mode, MSAA
+- monitor queue latency, dropped frames, and GPU handoff lease tokens
 
 ### `Cloth Authoring`
 
 Purpose:
 
-- create and edit `ClothAsset` overlays
-- preview cloth simulation
-- save overlay data
+- create and edit `ClothAsset` overlay slots
+- select garment regions with viewport ray picking or material filters
+- generate simulation meshes and configure pin sets / collision proxies
+- tune XPBD solver parameters in interactive preview
 
-Detailed flow is defined in [editor-cloth-authoring.md](editor-cloth-authoring.md).
+### `Settings`
+
+Purpose:
+
+- choose UI language (English, Japanese, Simplified Chinese, Korean)
+- adjust viewport navigation sensitivities (orbit, pan, zoom)
+- toggle session diagnostics
+- inspect keyboard shortcuts
 
 ## Top-Level Layout
 
-The application should have a stable shell with:
+The application has a stable shell with:
 
 - top bar
 - left mode navigation
 - central viewport
-- right inspector
-- bottom status and diagnostics strip
+- left inspector (docked beside mode navigation)
+- bottom status strip
 
 ### Top Bar
 
-The top bar should provide global actions:
+The top bar provides global session actions:
 
-- open avatar
-- recent avatars
-- save project
-- save project as
-- open cloth overlay
-- save cloth overlay
-- runtime play or pause if needed later
+- inspector toggle
+- project title & dirty status
+- avatar picker / quick switch
+- camera start / stop
+- pose calibration launcher
+- runtime pause toggle
+- File dropdown menu (New / Open / Save project, import avatar, load/save overlay)
 
 ### Left Mode Navigation
 
-This should switch between:
+Switches between the 6 modes:
 
-- Preview
-- Tracking Setup
-- Rendering
-- Output
-- Cloth Authoring
+- Avatar (F1)
+- Tracking Setup (F2)
+- Rendering / Scene (F3)
+- Output (F4)
+- Cloth Authoring (F6)
+- Settings (F7)
+(F5 folds into Rendering for legacy muscle-memory compatibility)
 
-Switching modes should preserve loaded assets and current session state.
+Switching modes preserves loaded assets and current session state.
 
 ### Central Viewport
 
@@ -168,63 +181,48 @@ The status area should show:
 - frame timing
 - warnings and validation messages
 
-## Preview Mode
+## Avatar Mode
 
-This is the default mode after loading an avatar.
+This mode manages the active avatar asset, model catalog, and facial blendshapes.
 
 Recommended inspector sections:
 
-- avatar asset
-- transform
-- cloth attachment
-- scene background
-- runtime toggles
+- avatar asset info
+- model library
+- expression testing
+- camera transform / autoframe
 
-### Avatar Asset
+### Avatar Asset Info
 
 Controls:
 
-- loaded avatar identity
+- loaded avatar identity, source format (.vrm, .fbx), hash, and mesh/material statistics
 - reload avatar
 - detach avatar
-- active cloth overlay
 
-### Transform
-
-Controls:
-
-- position
-- rotation
-- scale
-- reset transform
-- ground alignment helper if added later
-
-### Cloth Attachment
+### Model Library
 
 Controls:
 
-- attach overlay
-- detach overlay
-- enable cloth
-- disable cloth
+- persistent catalog of imported VRM/FBX models (`avatar_library.vvtlib`)
+- search by name, path, or tags
+- sorting (name, recent, favorites)
+- add file / purge missing files
+- watched folders for auto-import
 
-### Scene Background
-
-Controls:
-
-- transparent background
-- solid color background
-- image background if added later
-
-### Runtime Toggles
+### Expression Testing
 
 Controls:
 
-- tracking enabled
-- spring enabled
-- cloth enabled
-- collision debug
-- skeleton debug
+- test sliders for facial blendshape weights (vowels, eyes, brows, emotions)
+- reset expressions
+
+### Camera Transform / Autoframe
+
+Controls:
+
+- auto-frame camera to avatar bounding box
+- orbit, pan, zoom controls and reset view
 
 ## Tracking Setup Mode
 
@@ -391,7 +389,18 @@ Its detailed structure is defined in [editor-cloth-authoring.md](editor-cloth-au
 At the application level, the important rule is:
 
 - entering cloth authoring should keep the current avatar and session context
-- leaving cloth authoring should return to preview with the saved overlay available
+- leaving cloth authoring should return to the active avatar with the saved overlay available
+
+## Settings Mode
+
+This mode manages application-level preferences persisted to `%APPDATA%\VulVATAR\settings.json`.
+
+Recommended inspector sections:
+
+- language selection (English, Japanese, Simplified Chinese, Korean)
+- viewport sensitivities (orbit, pan, zoom with logarithmic slider)
+- session-only diagnostics toggle (status-bar debug telemetry)
+- keyboard shortcuts (read-only list generated from live bindings)
 
 ## Project Model
 
@@ -457,16 +466,22 @@ Default bindings live in `src/gui/hotkey.rs::HotkeyMap::set_defaults`
 — that's the source of truth. Tooltips on the relevant buttons surface
 the chord (`mode_nav.rs`, `top_bar.rs`, `inspector/library.rs`).
 
-| Chord       | Action                        |
-|-------------|-------------------------------|
-| `Space`     | Toggle pause                  |
-| `Ctrl+T`    | Toggle tracking enabled       |
-| `Ctrl+C`    | Toggle cloth simulation       |
-| `Ctrl+Shift+R` | Reset pose                 |
-| `Home`      | Reset camera                  |
-| `Ctrl+S`    | Save project                  |
-| `Ctrl+O`    | Load avatar                   |
-| `F1`–`F7`   | Switch to mode 1..7 in `AppMode::ALL` order (Avatar / Tracking / Rendering / Output / Preview / Authoring / Settings) |
+| Chord          | Action                                                              |
+|----------------|---------------------------------------------------------------------|
+| `Space`        | Toggle pause                                                        |
+| `Ctrl+T`       | Toggle tracking enabled                                             |
+| `Ctrl+Shift+C` | Toggle cloth simulation                                             |
+| `Ctrl+Shift+R` | Reset pose                                                          |
+| `Home`         | Reset camera                                                        |
+| `Ctrl+S`       | Save project                                                        |
+| `Ctrl+O`       | Load avatar                                                         |
+| `F1`           | Switch to Avatar mode                                               |
+| `F2`           | Switch to Tracking Setup mode                                       |
+| `F3`           | Switch to Rendering (Scene) mode                                    |
+| `F4`           | Switch to Output mode                                               |
+| `F5`           | Switch to Rendering (Scene) mode (legacy Preview key)                |
+| `F6`           | Switch to Cloth Authoring mode                                      |
+| `F7`           | Switch to Settings mode                                             |
 
 Hotkeys are suppressed while a text input owns keyboard focus —
 typing "Save the day" in a rename field doesn't trigger save.

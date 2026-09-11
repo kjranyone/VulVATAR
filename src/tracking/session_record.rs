@@ -6,8 +6,8 @@
 //! frame so an external overlay can draw the current pose. That is the right
 //! shape for watching, and the wrong shape for diagnosis — when the avatar
 //! throws a limb across the room for three frames, the evidence is gone
-//! before anyone can look at it. The offline replay bins
-//! (`diagnose_depth_replay`, `diagnose_video_replay`) want
+//! before anyone can look at it. The offline replay tool
+//! (`diagnose_fusion_replay`) wants
 //! `<stem>_color.png` + `<stem>_depth_mm.npy`, and nothing in the app has
 //! ever written that pair — the checked-in fixtures were made by hand. So a
 //! live misbehaviour report has, until now, had no data behind it.
@@ -260,8 +260,8 @@ pub fn active() -> bool {
 }
 
 /// Colour image + `u16` little-endian depth `.npy`, named so
-/// `diagnose_depth_replay <stem>_color.<ext>` finds its depth sibling by the
-/// `_color.*` → `_depth_mm.npy` rule those bins already implement.
+/// `diagnose_fusion_replay` finds its depth sibling by the
+/// `_color.*` → `_depth_mm.npy` rule.
 ///
 /// **BMP, not PNG.** Measured on 640×480: PNG costs ~91 ms/frame at the dev
 /// profile (dependencies build at opt-level 0, so deflate is unoptimised)

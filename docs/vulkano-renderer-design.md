@@ -33,15 +33,21 @@ frame snapshots and turns them into images.
   normalization of imported materials into renderer-ready payloads
 - `pipeline.rs` — pipeline families, variant selection, cache keys,
   shader sources (including `transform_cs`)
+- `post_effects.rs` — HDR scene target (`R16G16B16A16_SFLOAT`), bloom downsample
+  chain (Karis firefly suppression), bloom upsample chain (tent filter),
+  and composite/encode pass to final 8-bit SDR target
+- `pipeline_targets.rs` — offscreen color and depth targets, MSAA allocation,
+  target format and sizing management
+- `background.rs` — background quad pass (solid color, transparent, or image)
 - `output_export.rs` — export boundary (`OutputFrame` /
   `GpuFrameToken` production)
-- later extractions: `cloth_cache.rs`, `transform_cache.rs`,
+- helper/support modules: `cloth_cache.rs`, `transform_cache.rs`,
   `readback.rs`, `texture_cache.rs`, `thumbnail.rs`, `debug.rs`,
-  `frame_pool.rs`, `gpu_handle.rs`
+  `frame_pool.rs`, `gpu_handle.rs`, `gpu_wait.rs`, `offline.rs`
 
 Dependency direction inside the domain:
 
-- `mod.rs -> frame_input, material, pipeline, output_export`
+- `mod.rs -> frame_input, material, pipeline, post_effects, output_export`
 - `material -> asset` is allowed (normalization input)
 - avoid `frame_input -> output_export`, `pipeline -> app`,
   `output_export -> avatar`
@@ -76,10 +82,16 @@ the authoritative reference.
 
 ## Pass Structure
 
-1. transform compute prepass
-2. main forward avatar pass
-3. outline pass
-4. output resolve / export step
+1. transform compute prepass (`pipeline::transform_cs`)
+2. main scene pass (HDR `R16G16B16A16_SFLOAT` target):
+   - background pass (`background.rs`)
+   - forward avatar pass (opaque + alpha cutout + alpha blend)
+   - outline pass (stencil-masked)
+3. post-effects passes (`post_effects.rs`):
+   - bloom downsample chain (half-res per level, luminance threshold + Karis average)
+   - bloom upsample chain (tent filter with additive blend)
+   - composite / encode pass (HDR scene + bloom -> SDR target with color space transfer curve)
+4. output resolve / export step (`output_export.rs` / `readback.rs`)
 
 ### Transform Compute Prepass
 
@@ -91,28 +103,33 @@ vertex buffer.
 
 The graphics vertex shaders are reduced to view × projection; they
 never see the source `GpuVertexBase` or the morph / cloth buffers. See
-`pipeline::transform_cs` for the shader contract (landed on
-`feature/compute-prepass-migration`, 2026-05-19).
+`pipeline::transform_cs` for the shader contract.
 
-### Main Forward Avatar Pass
+### Main Scene Pass
 
-Draws opaque and alpha-tested avatar surfaces from the prepass output,
-evaluating the selected material mode.
+Renders into an HDR target (`R16G16B16A16_SFLOAT`) using a `D32_SFLOAT_S8_UINT`
+depth-stencil buffer:
+- draws background quad if enabled
+- draws opaque, cutout, and alpha-blended avatar surfaces from prepass output
+- draws material-driven outlines with stencil masking
 
-### Outline Pass
+### Post-Effects Chain
 
-Renders material-driven outlines with its own raster state; stays
-separate from generic material shading logic. See "Implementation
-Lessons" and the stencil-masking section of
-shader-implementation-notes.md.
+Runs downstream of the HDR scene target:
+- **Bloom Downsample**: downsamples HDR scene into a chain of half-resolution
+  16F images with soft-knee luminance threshold and Karis firefly suppression.
+- **Bloom Upsample**: tent-filters each level and additively blends it back into
+  the level above to accumulate glow.
+- **Composite/Encode**: combines HDR scene and bloom level 0, then applies tone-mapping
+  and the selected color space transfer curve (`R8G8B8A8_SRGB` or `R8G8B8A8_UNORM`).
+  Preserves fractional alpha for downstream compositing.
 
 ### Output Resolve / Export Step
 
-Prepares the final color target, preserves the alpha contract, and
-exports the image when the selected output path needs it. The
-renderer produces an `OutputFrame` / `GpuFrameToken` only after all
-rendering work for the frame is complete; the export boundary defines
-the image, format, alpha mode, synchronization primitive, and when the
+Exports the final resolved color target when the active output sink requires it.
+The renderer produces an `OutputFrame` / `GpuFrameToken` only after all
+rendering and post-effect work is complete; the export boundary defines
+the image handle, format, alpha mode, synchronization primitive, and when the
 image may be reused.
 
 ## Descriptor Layout

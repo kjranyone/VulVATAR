@@ -228,14 +228,16 @@ Fields:
 
 - `id: AvatarInstanceId`
 - `asset_id: AvatarAssetId`
+- `asset: Arc<AvatarAsset>`
 - `world_transform: Transform`
 - `pose: AvatarPose`
 - `animation_state: AnimationState`
 - `secondary_motion: SecondaryMotionState`
-- `tracking_input: Option<TrackingRigPose>`
-- `attached_cloth: Option<ClothOverlayId>`
-- `cloth_enabled: bool`
-- `cloth_state: Option<ClothState>`
+- `expression_weights: Vec<ResolvedExpressionWeight>`
+- `expression_state: ExpressionState`
+- `retarget_state: RetargetState`
+- `cloth_overlays: Vec<ClothOverlaySlot>`
+- `collider_enabled: Vec<bool>`
 
 ### `AvatarPose`
 
@@ -285,36 +287,38 @@ Fields:
 
 ## Tracking Types
 
-### `TrackingFrame`
+### `SourceSkeleton`
 
 Purpose:
 
-- raw or near-raw input sample from a tracking source
+- published frame sample holding 2D/3D joints, face pose candidates, ARKit expressions, and metric camera intrinsics (`src/tracking/source_skeleton.rs`)
 
 Fields:
 
-- `source_id: TrackingSourceId`
-- `capture_timestamp: TimeStamp`
-- `frame_size: UVec2`
-- `image_format: TrackingImageFormat`
+- `timestamp: f64`
+- `joints: HashMap<HumanoidBone, SourceJoint>`
+- `face: Option<FacePose>`
+- `expressions: Vec<SourceExpression>`
+- `intrinsics: Option<CameraIntrinsics>`
+- `metric: Option<MetricFrameInfo>`
+- `rig: Option<RigPose>`
 
-### `TrackingRigPose`
+### `RigPose`
 
 Purpose:
 
-- normalized performer-driving data for avatar retargeting
+- normalized performer-driving data produced by the tracking-v2 fusion estimator and consumed by `avatar::retarget::apply_rig_pose` (`src/tracking/fusion/output.rs`)
 
 Fields:
 
-- `source_timestamp: TimeStamp`
-- `head: Option<RigTarget>`
-- `neck: Option<RigTarget>`
-- `spine: Option<RigTarget>`
-- `shoulders: RigShoulderTargets`
-- `arms: RigArmTargets`
-- `hands: Option<RigHandTargets>`
-- `expressions: ExpressionWeightSet`
-- `confidence: TrackingConfidenceMap`
+- `t: f64` (device capture timestamp)
+- `bones: HashMap<HumanoidBone, RigBone>` (world deltas `delta_world` and marginal uncertainty `sigma`)
+- `root_cam_m: [f32; 3]` (pelvis camera-space position in metres)
+- `root_sigma_m: f32`
+- `quality: f32`
+- `shape_confidence: f32`
+- `hand_confidence: [f32; 2]`
+- `shoulder_span_m: f32`
 
 ## Output Types
 
@@ -328,10 +332,13 @@ Fields:
 
 - `frame_id: OutputFrameId`
 - `timestamp: FrameTimestamp`
-- `extent: UVec2`
+- `extent: [u32; 2]`
 - `color_space: OutputColorSpace`
 - `alpha_mode: AlphaMode`
-- `gpu_token: GpuFrameToken`
+- `gpu_token: Option<GpuFrameToken>`
+- `handoff_path: HandoffPath`
+- `fallback_reason: Option<FallbackReason>`
+- `pixel_data: Option<Arc<Vec<u8>>>`
 
 ### `GpuFrameToken`
 
@@ -343,8 +350,9 @@ Fields:
 
 - `resource_id: ExportedResourceId`
 - `handle_type: ExternalHandleType`
-- `sync: GpuSyncToken`
-- `lifetime: FrameLifetimeContract`
+- `external_handle: Option<u64>`
+- `sync: OutputSyncToken`
+- `lease: FrameLease`
 
 Rule:
 
@@ -356,12 +364,13 @@ Rule:
 
 Purpose:
 
-- lock-bounded or lock-free latest-sample exchange between tracking worker and app loop
+- lock-bounded latest-sample exchange between tracking worker and app loop (`src/tracking/mod.rs`)
 
 Fields:
 
-- `latest_pose: Option<TrackingRigPose>`
-- `sequence: u64`
+- `pose`: `Arc<Mutex<PoseMailboxInner>>` (carries latest `RigPose`)
+- `preview`: `Arc<Mutex<PreviewMailboxInner>>` (carries latest `SourceSkeleton` and detection annotation)
+- `diagnostics`: `Arc<Mutex<DiagnosticsMailboxInner>>`
 
 ### `FrameSinkQueuePolicy`
 
@@ -379,17 +388,17 @@ Variants:
 ## Implemented Shapes
 
 The types above are all implemented; the code is the authoritative
-field-level reference (the implementations carry more fields than the
-contracts here — animation clips, caches, per-overlay slots, GPU
-buffers):
+field-level reference:
 
-- `AvatarAsset`, `ClothAsset`, identifier types — `src/asset/mod.rs`
+- `AvatarAsset`, `ClothAsset`, identifier types — `src/asset/mod.rs` (VRM via `src/asset/vrm/`, FBX via `src/asset/fbx/`, VRChat PhysBones via `src/asset/vrc/`)
 - `AvatarInstance`, `AvatarPose` — `src/avatar/instance.rs`,
   `src/avatar/pose.rs` (pose stores local TRS, global matrices, and
   skinning matrices)
 - `ClothState`, `ClothDeformOutput` (dual-path: CPU solver output,
   GPU-consumed SSBO) — `src/avatar/instance.rs`,
   `src/simulation/cloth.rs`
-- `TrackingRigPose` / mailbox — `src/tracking/mod.rs`
+- `RigPose`, `SourceSkeleton`, `TrackingMailbox` — `src/tracking/fusion/output.rs`,
+  `src/tracking/source_skeleton.rs`, `src/tracking/mod.rs`
 - `OutputFrame`, `GpuFrameToken` — `src/output/mod.rs`,
   `src/frame_handoff.rs`
+

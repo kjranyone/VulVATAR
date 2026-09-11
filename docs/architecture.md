@@ -2,18 +2,18 @@
 
 ## Scope
 
-This project targets `VRM 1.0 only`. The implemented scope:
+This project targets `VRM 1.0` and `FBX` avatar rendering and motion tracking. The implemented scope:
 
-- VRM 1.0 asset loading
+- VRM 1.0 and FBX asset loading
+- VRChat `.unitypackage` secondary motion extraction (`VRCPhysBone`, `VRCPhysBoneCollider`)
 - skinned rendering on `Vulkano`
 - `MToon-like` shading
-- secondary motion with spring bones
+- secondary motion with spring bones and VRC PhysBones
 - cloth simulation for selected garments or accessories
-- RealSense D435 depth-camera motion tracking
+- RealSense D435 depth-camera motion tracking via fusion estimator
 - video output routable into OBS Studio
 
-`VRM 0.x` compatibility is intentionally out of scope (a best-effort
-loader shim exists, but no compatibility guarantees).
+`VRM 0.x` compatibility is supported on a best-effort basis via a loader shim.
 
 ## Core Design Decision
 
@@ -46,9 +46,10 @@ Editor tools should author optional overlay assets, not rewrite the imported VRM
 
 Responsibilities:
 
-- read `.vrm` files
+- read `.vrm` and `.fbx` files
+- read optional `.unitypackage` files for VRCPhysBone / VRCPhysBoneCollider extraction
 - read optional project-local overlay data for authored features such as cloth
-- parse glTF buffers, meshes, skins, nodes, animations, materials
+- parse glTF / FBX buffers, meshes, skins, nodes, animations, materials
 - parse VRM 1.0 extensions
 - convert source data into engine-native immutable assets
 
@@ -108,6 +109,8 @@ Key runtime types:
 - `AnimationState`
 - `SecondaryMotionState`
 - `ClothState`
+- `RetargetState`
+- `ExpressionState`
 
 This is the center of the architecture. Renderer and simulation read or write through explicit interfaces, but neither should become the source of truth for the skeleton.
 
@@ -173,9 +176,9 @@ Responsibilities:
 
 Outputs:
 
-- `TrackingFrame`
-- `TrackingRigPose`
-- optional blendshape or expression weights
+- `SourceSkeleton`
+- `RigPose`
+- `ExpressionWeights`
 
 Rules:
 
@@ -261,13 +264,13 @@ not as raw final bone transforms.
 
 ### Tracking abstraction
 
-Suggested types:
+Implemented live types:
 
-- `TrackingSource`
-- `TrackingFrame`
-- `TrackingConfidenceMap`
-- `RetargetingProfile`
-- `TrackingRigPose`
+- `FusionProvider`
+- `SourceSkeleton`
+- `RigPose`
+- `RetargetProfile`
+- `Rtmw3dRunner`
 
 ### Recommended first tracking scope
 
@@ -413,7 +416,7 @@ If you want compositing in OBS, alpha support becomes an architectural requireme
 The core type split — immutable assets (`AvatarAsset`, `ClothAsset`)
 vs. mutable runtime state (`AvatarInstance`, `AvatarPose`,
 `SecondaryMotionState`, `ClothState`) vs. handoff values
-(`TrackingRigPose`, `OutputFrame`) — is specified field-by-field in
+(`RigPose`, `OutputFrame`) — is specified field-by-field in
 [data-model.md](data-model.md);
 the implemented structs in `src/asset/mod.rs`, `src/avatar/instance.rs`,
 and `src/output/mod.rs` are the authoritative shapes.
@@ -486,7 +489,7 @@ flags, fade-on-loss, mouth source, material mode.
 
 - The GUI struct owns the value; it rides a `FrameConfig` value struct
   into `run_frame` and never needs an `Application` field.
-- Use this for values that only the frame step (pose solver,
+- Use this for values that only the frame step (retargeting / expressions,
   simulation, material selection) reads.
 
 ### Path 3: Requested (Phase D, `Application::set_requested_*`)
@@ -539,26 +542,29 @@ cloth attachments, `avatar.cloth_enabled`.
 ## Repository Mapping
 
 - `src/app/`: orchestration and frame update order
-- `src/asset/`: VRM 1.0 loading and immutable asset conversion
+- `src/asset/`: VRM 1.0 & FBX loading, VRC secondary motion extraction, immutable asset conversion
 - `src/editor/`: cloth authoring tools and overlay persistence
-- `src/avatar/`: runtime avatar state and pose ownership
+- `src/avatar/`: runtime avatar state, retargeting, expressions, and pose ownership
 - `src/simulation/`: spring, cloth, collider, and future world-physics logic
-- `src/renderer/`: Vulkano rendering and material pipelines
-- `src/tracking/`: RealSense D435 depth tracking and retargeting inputs
+- `src/renderer/`: Vulkano rendering, post-effects (bloom/tone-mapping), and material pipelines
+- `src/tracking/`: RealSense D435 depth tracking, fusion estimator, and retargeting inputs
 - `src/output/`: OBS-facing and external frame sink integration
 
 The implementations the original baseline anticipated are all in
 place; large modules have since grown into directory modules with
 per-concern sibling files:
 
-- `src/avatar/animation.rs`, `src/avatar/instance.rs`, `src/avatar/pose.rs`
+- `src/avatar/{animation, expressions, instance, pose, retarget}.rs`
 - `src/editor/cloth_authoring.rs`
-- `src/renderer/material.rs`, `src/renderer/mtoon.rs`
+- `src/renderer/{material, mtoon, pipeline, pipeline_targets, post_effects, background, gpu_wait, offline, output_export, frame_pool}.rs`
 - `src/simulation/spring.rs`
 - `src/simulation/cloth_solver/{mod,integrator,constraints,collision,output,tests}.rs`
 - `src/asset/vrm/{mod,extensions,gltf_decode,mtoon,v0,v1,metadata_tests}.rs`
+- `src/asset/fbx/{mod,loader,tests}.rs`
+- `src/asset/vrc/{mod,unitypackage,physbone,tests}.rs`
 - `src/tracking/fusion/{mod,estimator,observe,output,provider,model,math,hands,seed}.rs`
 - `src/tracking/rtmw3d/{mod,consts,decode,preprocess,face,annotation,session,yolox_worker}.rs`
+- `src/tracking/{calibration, debug_channel, face_mediapipe, realsense, source_skeleton, yolox}.rs`
 - `src/gui/inspector/{mod,avatar,tracking,rendering,output,cloth,library,settings}.rs`
 
 Directory discipline: split by responsibility inside each top-level

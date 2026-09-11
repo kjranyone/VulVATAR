@@ -1,12 +1,12 @@
 # VulVATAR
 
-Windows 専用の VRM 1.0 アバター モーションキャプチャ・アプリケーション。
+Windows 専用の VRM 1.0 / FBX アバター モーションキャプチャ・アプリケーション。
 **Intel RealSense D435** デプスカメラを唯一のキャプチャバックエンドとして演奏者の全身（顔・手・体）をトラッキングし、`Vulkano` (Vulkan) でレンダリングしたアバターを Windows 11 Media Foundation 仮想カメラ経由で OBS Studio / Meet / Teams / Zoom 等へ送出します。
 
 実装されている主な機能:
 
-- VRM 1.0 アセット読み込みと `MToon-like` スキンドレンダリング
-- スプリングボーンによるセカンダリモーション
+- VRM 1.0 / FBX アセット読み込み（VRChat `.unitypackage` 二次物理 `VRCPhysBone` 抽出対応）と `MToon-like` スキンドレンダリング
+- スプリングボーンおよび VRC PhysBone によるセカンダリモーション
 - 布シミュレーション（CPU XPBD / GPU 計算パス）
 - **RealSense D435** によるデプス付き全身ポーズトラッキング（RTMW3D + YOLOX + MediaPipe FaceMesh/Blendshapes, ONNX Runtime / DirectML）
 - リップシンク（マイク入力）
@@ -28,7 +28,7 @@ RealSense SDK のパスや `PKG_CONFIG_PATH` / `LIBCLANG_PATH` の設定、`dev.
 
 ## Current Direction
 
-- target `VRM 1.0 only`（`VRM 0.x` はベストエフォートのローダ shim のみ、互換性保証なし）
+- target `VRM 1.0` および `FBX`（`VRM 0.x` はベストエフォートのローダ shim のみ、互換性保証なし）
 - キャプチャは **D435 専用**。デプスをトラッキングへのメトリック入力として扱い、ボーンを直接支配させない
 - アセット / シミュレーション / レンダラの各層を分離し、アバターポーズをレイヤー間の主契約にする
 - トラッキングと出力を独立したサブシステムとして扱う

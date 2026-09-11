@@ -454,14 +454,9 @@ fn analyze(dir: &Path, frames: &[Frame]) -> String {
         } else {
             let _ = writeln!(
                 r,
-                "Replayable frames captured ({}). Re-run one through the real provider with:\n\n\
-                 ```\ncargo run --features realsense --bin diagnose_depth_replay -- \\\n  \
-                 {}/{}_color.bmp\n```\n\n\
-                 For the whole session (continuous temporal state, the live pipeline minus \
-                 the camera):\n\n```\ncargo run --release --bin diagnose_video_replay -- {}\n```\n",
+                "Replayable frames captured ({}). Re-run through the live fusion pipeline with:\n\n\
+                 ```\ncargo run --features realsense --bin diagnose_fusion_replay -- {}\n```\n",
                 dumps.len(),
-                dir.display(),
-                dumps[0],
                 dir.display()
             );
         }

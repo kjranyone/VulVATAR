@@ -236,19 +236,16 @@ between sections and live code is deliberate — we want the spec to
 read as a coherent target even when half of it is still scaffolding.
 For a quick orientation:
 
-| Area                                | State (as of mid-2026)                                       |
+| Area                                | State                                                        |
 |-------------------------------------|--------------------------------------------------------------|
 | Overlay create / duplicate / rename / delete | live (`crate::editor::Editor`)                       |
-| Overlay project-local persistence   | live (cloth_overlay_paths in ProjectState round-trip)        |
+| Overlay project-local persistence   | live (`cloth_overlay_paths` in `ProjectState` round-trip)    |
 | Project-local overlay file format   | live (`.vvtcloth`, `crate::persistence::ClothOverlayFile`)   |
-| Stable references / rebind on reimport | partial — geometry-shape detection lives in `gui::inspector::library`; pin/proxy resolver still index-based |
-| Region selection in viewport        | not yet — first-pass authoring is JSON-edit + reload         |
-| Pin / constraint / collision proxy editing UI | not yet — payloads can be authored, no inspector yet |
-| Simulation mesh generation          | not yet — overlays carry an externally-supplied sim mesh     |
-| Wind / gravity / step controls      | partial — gravity scale + cloth toggle live; preset library was removed (was unused dead code) |
-| Validation surfacing in editor      | partial — unresolved-reference / version-mismatch toasts only |
+| Multiple overlay slots per avatar   | live (`AvatarInstance.cloth_overlays: Vec<ClothOverlaySlot>`)|
+| Stable references / rebind on reimport | live (`crate::asset::cloth_rebind::rebind_overlay`)        |
+| Region selection in viewport        | live (`crate::gui::mesh_picking`, material select, grow/shrink) |
+| Pin / constraint / collision proxy UI | live (`crate::gui::inspector::cloth`, pin creation & node binding) |
+| Simulation mesh generation          | live (`crate::editor::cloth_authoring::generate_sim_mesh`)   |
+| Wind / gravity / step controls      | live — gravity scale, manual step, and cloth toggles live    |
+| Validation surfacing in editor      | live — unresolved-reference, version mismatch, rebind notifications |
 
-When extending the editor, prefer landing the data shape (in
-`ClothAsset`) and persistence first, then the inspector UI — that
-keeps overlays authored in one session readable in the next even if
-the editing UI has shifted underneath.

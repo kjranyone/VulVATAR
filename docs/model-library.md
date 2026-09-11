@@ -2,23 +2,23 @@
 
 ## Purpose
 
-This document describes the avatar model library feature, which provides persistent cataloging of VRM 1.0 files for quick access, switching, and metadata management.
+This document describes the avatar model library feature, which provides persistent cataloging of avatar files (`.vrm`, `.fbx`) for quick access, switching, and metadata management.
 
 ## Data Model
 
 ### `AvatarLibraryEntry`
 
-One entry per known VRM file:
+One entry per known avatar file:
 
 - `path`: source file path
 - `name`: display name (defaults to file stem, editable)
-- `source_hash`: SHA-256 hash of the VRM file at import time
+- `source_hash`: SHA-256 hash of the avatar file at import time
 - `last_loaded`: timestamp of last load (epoch seconds)
 - `tags`: user-defined tags for filtering
 - `notes`: free-form notes
 - `favorite`: boolean flag for favorites sorting
 - `mesh_count`, `material_count`, `spring_chain_count`, `collider_count`: cached asset stats
-- `has_humanoid`: whether the VRM includes a humanoid rig
+- `has_humanoid`: whether the avatar includes a humanoid rig
 
 ### `AvatarLibrary`
 
@@ -47,7 +47,7 @@ The library is:
 
 ## GUI
 
-The library browser appears as a collapsible section ("Model Library") in the Preview mode inspector panel.
+The library browser appears as a collapsible section ("Model Library") in the Avatar mode inspector panel (`AppMode::Avatar`).
 
 ### Features
 
@@ -69,7 +69,7 @@ The library browser appears as a collapsible section ("Model Library") in the Pr
   - Save button
 - **Bulk actions**:
   - Purge Missing: remove all entries with missing source files
-  - Add File: file picker to add a VRM to the library
+  - Add File: file picker to add an avatar (`.vrm`, `.fbx`) to the library
 
 ## Integration Points
 
@@ -81,7 +81,7 @@ The library browser appears as a collapsible section ("Model Library") in the Pr
 ## Folder Watching
 
 Every directory added via *Watched folders* is registered with a
-`notify`-backed watcher in the avatar library inspector; new `.vrm`
+`notify`-backed watcher in the avatar library inspector; new `.vrm` or `.fbx`
 files appearing under a watched directory get auto-imported with a
 notification toast. The watcher's debounce is fixed at 100 ms and
 only handles flat directories (recursion is off).
@@ -96,7 +96,7 @@ only handles flat directories (recursion is off).
 - **OneDrive / Google Drive / Dropbox** — cloud-sync clients land
   files in stages (placeholder → real bytes) and the events
   collapse under the debounce as `Modified` rather than `Created`,
-  so the VRM-Created filter rejects them.
+  so the file-Created filter rejects them.
 - **Symlinks / NTFS junctions** — propagation across the link is
   platform-dependent.
 
