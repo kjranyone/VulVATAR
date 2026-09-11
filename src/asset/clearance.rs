@@ -347,27 +347,65 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                 .map(|m| m.name.to_lowercase())
                 .unwrap_or_default();
 
-            // Check if this primitive is clothing, skirt, dress, or costume
-            let is_clothing = m_name.contains("cloth")
-                || m_name.contains("skirt")
-                || m_name.contains("dress")
-                || m_name.contains("costume")
+            // Target bottom clothing: skirts, pants, dresses (lower portion) that
+            // collide with thighs and legs.
+            // Strictly exclude upper-body clothing (shirt, blouse, jacket, sleeve, collar, ribbon, tie, etc.)
+            let is_upper_body = m_name.contains("shirt")
+                || m_name.contains("blouse")
+                || m_name.contains("jacket")
+                || m_name.contains("sleeve")
+                || m_name.contains("arm")
+                || m_name.contains("cuff")
+                || m_name.contains("collar")
+                || m_name.contains("ribbon")
+                || m_name.contains("tie")
+                || m_name.contains("wing")
+                || m_name.contains("acc")
+                || m_name.contains("hair")
+                || m_name.contains("shoe")
+                || m_name.contains("boot")
+                || m_name.contains("sock")
+                || mat_name.contains("ribbon")
+                || mat_name.contains("tie")
+                || mat_name.contains("wing")
+                || mat_name.contains("shoe");
+
+            if is_upper_body {
+                continue;
+            }
+
+            let has_skirt_name = m_name.contains("skirt")
                 || m_name.contains("bottom")
                 || m_name.contains("pants")
-                || m_name.contains("wear")
-                || m_name.contains("uniform")
-                || m_name.contains("jacket")
-                || m_name.contains("shirt")
-                || m_name.contains("onepiece")
-                || mat_name.contains("cloth")
                 || mat_name.contains("skirt")
-                || mat_name.contains("dress")
-                || mat_name.contains("costume")
                 || mat_name.contains("bottom")
-                || mat_name.contains("pants")
-                || mat_name.contains("wear");
+                || mat_name.contains("pants");
 
-            if !is_clothing {
+            // Check how many vertices are weighted to skirt bones
+            let skirt_bone_weighted_ratio = prim_arc.vertices.as_ref().map_or(0.0f32, |vd| {
+                if vd.positions.is_empty() {
+                    return 0.0;
+                }
+                let mut skirt_vert_count = 0usize;
+                for (vi, indices) in vd.joint_indices.iter().enumerate() {
+                    let is_skirt_vert = indices.iter().enumerate().any(|(slot, &ji)| {
+                        if (ji as usize) < asset.skeleton.nodes.len() {
+                            let node_name = asset.skeleton.nodes[ji as usize].name.to_lowercase();
+                            node_name.contains("skirt") && vd.joint_weights.get(vi).map_or(false, |w| w[slot] > 0.1)
+                        } else {
+                            false
+                        }
+                    });
+                    if is_skirt_vert {
+                        skirt_vert_count += 1;
+                    }
+                }
+                skirt_vert_count as f32 / vd.positions.len() as f32
+            });
+
+            // Must either have explicit skirt name, or >= 40% of vertices weighted to skirt bones
+            let is_skirt = has_skirt_name || skirt_bone_weighted_ratio >= 0.4;
+            if !is_skirt {
                 continue;
             }
 

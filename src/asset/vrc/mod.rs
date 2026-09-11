@@ -931,12 +931,12 @@ pub fn build_spring_bones_and_colliders(
         go_file_id: 0,
         root_transform_id: 0,
         pull: 0.15,
-        spring: 0.2,
+        spring: 0.4,
         stiffness: 0.2,
-        gravity: 0.08,
+        gravity: 0.8,
         gravity_falloff: 0.0,
-        radius: 0.05,
-        immobile: 0.7,
+        radius: 0.02,
+        immobile: 0.8,
         collider_refs: Vec::new(),
     };
 
@@ -1003,13 +1003,11 @@ pub fn build_spring_bones_and_colliders(
 
         // Category-specific collider guards
         if chain.category == ChainCategory::Skirt {
-            // Skirt chains must strictly collide with legs/thighs and never upper-body colliders
-            col_refs.retain(|r| leg_collider_refs.iter().any(|lr| lr.id == r.id));
-            for lr in &leg_collider_refs {
-                if !col_refs.iter().any(|r| r.id == lr.id) {
-                    col_refs.push(lr.clone());
-                }
-            }
+            // Skirt anti-penetration against thighs is handled purely by the GPU
+            // Compute Shader Skin-Anchor Clearance Field. We eliminate rigid leg/thigh
+            // capsule colliders from skirt spring chains entirely, avoiding skirt flip
+            // or pointing upward at rest.
+            col_refs.clear();
         } else if matches!(
             chain.category,
             ChainCategory::HairBack

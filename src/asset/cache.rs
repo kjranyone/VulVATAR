@@ -35,7 +35,7 @@ use std::time::SystemTime;
 /// File magic — `VVTCACHE` little-endian.
 const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// Bump on incompatible header / wire-format changes.
-const VVT_CACHE_VERSION: u32 = 5;
+const VVT_CACHE_VERSION: u32 = 7;
 /// Default cap on the number of `.vvtcache` files retained under
 /// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
 /// drops the oldest-mtime entries on next startup.

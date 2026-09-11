@@ -509,47 +509,20 @@ fn test_inspect_thigh_colliders_and_skirt() {
                 i, root_name, sb.radius, sb.gravity_power, col_names
             );
 
-            // Assert: Every skirt chain must have UpperLeg colliders assigned
+            // Assert: Skirt chains do NOT carry rigid thigh colliders (anti-penetration is handled by GPU Skin-Anchor clearance field)
             assert!(
-                sb.collider_refs.iter().any(|r| {
-                    let c = asset.colliders.iter().find(|c| c.id == r.id).unwrap();
-                    let n = &asset.skeleton.nodes[c.node.0 as usize].name;
-                    n.contains("Leg") || n.contains("Thigh")
-                }),
-                "Skirt chain '{}' must have leg/thigh colliders assigned",
+                sb.collider_refs.is_empty(),
+                "Skirt chain '{}' should not have rigid capsule colliders attached",
                 root_name
-            );
-            // Assert: No upper-body colliders (Chest, UpperArm) on skirt
-            assert!(
-                !sb.collider_refs.iter().any(|r| {
-                    let c = asset.colliders.iter().find(|c| c.id == r.id).unwrap();
-                    let n = &asset.skeleton.nodes[c.node.0 as usize].name;
-                    n.contains("Chest") || n.contains("Arm") || n.contains("Head")
-                }),
-                "Skirt chain '{}' must NOT have chest/arm colliders assigned",
-                root_name
-            );
-            // Assert: Skirt radius must be reasonable (authored ~0.057, not tiny 0.016)
-            assert!(
-                sb.radius >= 0.03,
-                "Skirt chain '{}' radius ({}) must be >= 0.03 for adequate thigh standoff",
-                root_name, sb.radius
             );
         }
     }
     assert!(skirt_chain_count >= 10, "Expected at least 10 skirt chains in Yumeka");
 
-    // 4. Test dynamic leg movement: rotate LeftUpperLeg forward by 45 degrees
-    // (simulating walking / sitting step).
-    let l_leg_idx = asset.skeleton.nodes.iter().position(|n| n.name == "UpperLeg_L").unwrap();
-    // Rotate 45 deg around local X (forward leg lift):
-    let angle_rad = 45.0f32.to_radians();
-    let sin_half = (angle_rad * 0.5).sin();
-    let cos_half = (angle_rad * 0.5).cos();
-    let rot_x = [sin_half, 0.0, 0.0, cos_half];
-    avatar.pose.local_transforms[l_leg_idx].rotation = crate::math_utils::quat_mul(
-        &rot_x,
-        &asset.skeleton.nodes[l_leg_idx].rest_local.rotation,
+    // 4. Test natural skirt hanging under downward gravity
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
     );
     avatar.compute_global_pose();
 
@@ -566,17 +539,17 @@ fn test_inspect_thigh_colliders_and_skirt() {
         );
     }
 
-    // Verify left front skirt chains are pushed forward by the raised thigh collider
+    // Verify skirt chains hang naturally downward, not flipping or pointing upward
     for (i, sb) in asset.spring_bones.iter().enumerate() {
         let root_name = &asset.skeleton.nodes[sb.chain_root.0 as usize].name;
         if root_name == "Skirt_2_L" || root_name == "Skirt_1" {
             let last_pos = avatar.secondary_motion.spring_states[i].positions.last().copied().unwrap();
-            println!("  After 45 deg leg lift, {} tip pos: [{:.4}, {:.4}, {:.4}]", root_name, last_pos[0], last_pos[1], last_pos[2]);
-            // Z must be pushed forward (Z > 0.08) by the forward-tilted thigh capsule
+            println!("  Natural hang, {} tip pos: [{:.4}, {:.4}, {:.4}]", root_name, last_pos[0], last_pos[1], last_pos[2]);
+            // Tip Y must be lower than root (hangs downward, Y < 0.70)
             assert!(
-                last_pos[2] > 0.08,
-                "Skirt chain '{}' tip Z ({}) should be pushed forward by raised thigh",
-                root_name, last_pos[2]
+                last_pos[1] < 0.70,
+                "Skirt chain '{}' tip Y ({}) should hang naturally downward, not pointing upward",
+                root_name, last_pos[1]
             );
         }
     }
@@ -624,6 +597,17 @@ fn test_yumeka_skin_anchors_generation() {
         body_prim.vertex_count, 79116,
         "Yumeka body primitive has 79116 vertices"
     );
+
+    for m in &asset.meshes {
+        for p in &m.primitives {
+            if let Some(ref anc) = p.skin_anchors {
+                let bound = anc.iter().filter(|a| a.body_vertex_idx != u32::MAX).count();
+                println!("Mesh '{}' prim {:?} verts={}: bound skin anchors = {} / {}", m.name, p.id, p.vertex_count, bound, anc.len());
+            } else {
+                println!("Mesh '{}' prim {:?} verts={}: NO skin anchors", m.name, p.id, p.vertex_count);
+            }
+        }
+    }
 
     // Find skirt mesh (Circle.056)
     let skirt_mesh = asset
