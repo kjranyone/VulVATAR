@@ -1047,15 +1047,17 @@ void main() {
         nrm += w * morph_deltas.data[i + 1u].xyz;
     }
 
-    // Cloth override: the CPU physics solver wrote per-frame world-relative
-    // positions into `cloth_pos` and (optionally) normals into `cloth_norm`.
-    // Skinning still applies on top so cloth-bearing primitives can ride
-    // along with the avatar's root transform.
+    // Cloth override: the physics solver writes per-frame world-space
+    // positions into `cloth_pos` and normals into `cloth_norm`. Pinned
+    // particles are already attached to skeletal bones by the solver,
+    // so skinning must NOT be applied on top of simulated cloth vertices.
     if (ctrl.has_cloth > 0u) {
-        pos = cloth_pos.p[vid].xyz;
-        if (ctrl.has_cloth_normals > 0u) {
-            nrm = cloth_norm.n[vid].xyz;
-        }
+        vec3 cloth_nrm = (ctrl.has_cloth_normals > 0u) ? cloth_norm.n[vid].xyz : nrm;
+        out_v.v[vid].position = vec4(cloth_pos.p[vid].xyz, 0.0);
+        out_v.v[vid].normal   = vec4(cloth_nrm, 0.0);
+        out_v.v[vid].uv       = b.uv;
+        out_v.v[vid]._pad     = uvec2(0u, 0u);
+        return;
     }
 
     // Unified weight threshold. Weights below this are treated as

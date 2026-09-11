@@ -275,5 +275,70 @@ fn test_inspect_mouth() {
     assert_eq!(aa_expr.morph_binds[0].morph_target_index, 0, "Preset 'aa' should prioritize vrc.v_aa");
 }
 
+#[test]
+fn test_inspect_skirt_meshes() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).unwrap();
+
+    let skirt_nodes: Vec<(usize, &str)> = asset.skeleton.nodes.iter().enumerate()
+        .filter(|(_, n)| n.name.to_lowercase().contains("skirt"))
+        .map(|(i, n)| (i, n.name.as_str()))
+        .collect();
+    println!("=== SKIRT BONES IN SKELETON (total: {}) ===", skirt_nodes.len());
+    for &(idx, name) in &skirt_nodes {
+        println!("  Node {}: '{}'", idx, name);
+    }
+
+    println!("=== MESHES WEIGHTED TO SKIRT BONES ===");
+    for mesh in &asset.meshes {
+        for (pi, prim) in mesh.primitives.iter().enumerate() {
+            let mut skirt_vert_count = 0usize;
+            let mut total_vert_count = 0usize;
+            if let Some(ref vd) = prim.vertices {
+                total_vert_count = vd.positions.len();
+                for (ji, jw) in vd.joint_indices.iter().zip(&vd.joint_weights) {
+                    let mut is_skirt = false;
+                    for (&slot, &w) in ji.iter().zip(jw) {
+                        if w > 0.05 && skirt_nodes.iter().any(|&(s_idx, _)| slot as usize == s_idx) {
+                            is_skirt = true;
+                            break;
+                        }
+                    }
+                    if is_skirt {
+                        skirt_vert_count += 1;
+                    }
+                }
+            }
+            if skirt_vert_count > 0 {
+                let mat_name = asset.materials.iter()
+                    .find(|m| m.id == prim.material_id)
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("unknown");
+                let raw_y_min = prim.vertices.as_ref().map(|v| v.positions.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min)).unwrap_or(0.0);
+                let raw_y_max = prim.vertices.as_ref().map(|v| v.positions.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max)).unwrap_or(0.0);
+                println!(
+                    "  Mesh '{}' (id={:?}) prim {} (id={:?}): {} / {} vertices weighted to skirt (mat='{}', bounds={:?}..{:?}, raw_y={:.4}..{:.4})",
+                    mesh.name, mesh.id, pi, prim.id, skirt_vert_count, total_vert_count, mat_name, prim.bounds.min, prim.bounds.max, raw_y_min, raw_y_max
+                );
+            }
+        }
+    }
+
+    let circle_056 = asset.meshes.iter().find(|m| m.name == "Circle.056");
+    assert!(circle_056.is_some(), "Yumeka should have Circle.056 mesh for skirt");
+    let circle_056 = circle_056.unwrap();
+    assert_eq!(circle_056.primitives.len(), 1);
+    let prim = &circle_056.primitives[0];
+    assert_eq!(prim.vertex_count, 2460);
+    assert!(prim.bounds.min[1] > 0.55 && prim.bounds.max[1] < 0.85, "Skirt bounds must be around hips/thighs");
+}
+
+
+
 
 
