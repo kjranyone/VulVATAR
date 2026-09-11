@@ -1153,27 +1153,60 @@ impl VulkanRenderer {
 
             // Topological dependency ordering for hierarchical surface clearances:
             // If primitive B specifies body_primitive_id = Some(A), A must be dispatched before B.
-            let mut ordered_mesh_instances: Vec<&frame_input::RenderMeshInstance> =
-                instance.mesh_instances.iter().collect();
+            // Using Kahn's algorithm with cycle detection to guarantee a valid dispatch order.
+            let n = instance.mesh_instances.len();
+            let mut in_degree = vec![0usize; n];
+            let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let prim_id_to_idx: HashMap<PrimitiveId, usize> = instance
+                .mesh_instances
+                .iter()
+                .enumerate()
+                .map(|(idx, mi)| (mi.primitive_id, idx))
+                .collect();
 
-            ordered_mesh_instances.sort_by(|a, b| {
-                let a_parent = a.primitive_data.as_ref().and_then(|p| p.body_primitive_id);
-                let b_parent = b.primitive_data.as_ref().and_then(|p| p.body_primitive_id);
-                match (a_parent, b_parent) {
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (Some(ap), Some(bp)) => {
-                        if ap == b.primitive_id {
-                            std::cmp::Ordering::Greater
-                        } else if bp == a.primitive_id {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Equal
+            for (idx, mi) in instance.mesh_instances.iter().enumerate() {
+                if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
+                    if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
+                        if parent_idx != idx {
+                            adj[parent_idx].push(idx);
+                            in_degree[idx] += 1;
                         }
                     }
-                    (None, None) => std::cmp::Ordering::Equal,
                 }
-            });
+            }
+
+            let mut queue: std::collections::VecDeque<usize> = in_degree
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &deg)| if deg == 0 { Some(idx) } else { None })
+                .collect();
+
+            let mut ordered_mesh_instances = Vec::with_capacity(n);
+            let mut visited = vec![false; n];
+
+            while let Some(u) = queue.pop_front() {
+                visited[u] = true;
+                ordered_mesh_instances.push(&instance.mesh_instances[u]);
+                for &v in &adj[u] {
+                    in_degree[v] -= 1;
+                    if in_degree[v] == 0 {
+                        queue.push_back(v);
+                    }
+                }
+            }
+
+            // Fallback for cyclic dependencies or unvisited nodes: append remaining in original order
+            if ordered_mesh_instances.len() < n {
+                warn!(
+                    "render: cycle or unresolved dependency detected in mesh primitive clearance graph ({} of {} resolved)",
+                    ordered_mesh_instances.len(), n
+                );
+                for (idx, mi) in instance.mesh_instances.iter().enumerate() {
+                    if !visited[idx] {
+                        ordered_mesh_instances.push(mi);
+                    }
+                }
+            }
 
             for &mesh_inst in &ordered_mesh_instances {
                 let prim_asset = match mesh_inst.primitive_data.as_ref() {
