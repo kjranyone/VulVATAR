@@ -455,7 +455,345 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
     }
 
     info!(
-        "clearance: total {} skin anchors established across avatar",
+        "clearance: total {} skin anchors established across avatar (Phase 1)",
         anchors_generated_count
     );
+
+    // Phase 2: Hierarchical Layered Clothing Clearance (inner -> outer pairings)
+    generate_layered_clothing_anchors(asset, &globals, &skinning);
+}
+
+/// Helper: computes cosine similarity between two vertex 4-bone weight sets.
+fn compute_bone_weight_similarity(
+    indices_a: &[u16; 4], weights_a: &[f32; 4],
+    indices_b: &[u16; 4], weights_b: &[f32; 4],
+) -> f32 {
+    let mut dot = 0.0f32;
+    let mut len_a2 = 0.0f32;
+    let mut len_b2 = 0.0f32;
+    for i in 0..4 {
+        let wa = weights_a[i];
+        len_a2 += wa * wa;
+        for j in 0..4 {
+            let wb = weights_b[j];
+            if indices_a[i] == indices_b[j] {
+                dot += wa * wb;
+            }
+        }
+    }
+    for j in 0..4 {
+        let wb = weights_b[j];
+        len_b2 += wb * wb;
+    }
+    if len_a2 > 1e-4 && len_b2 > 1e-4 {
+        dot / (len_a2.sqrt() * len_b2.sqrt())
+    } else {
+        0.0
+    }
+}
+
+/// Helper: checks whether two 3D Axis-Aligned Bounding Boxes intersect.
+fn aabb_intersects(min_a: [f32; 3], max_a: [f32; 3], min_b: [f32; 3], max_b: [f32; 3]) -> bool {
+    min_a[0] <= max_b[0] && max_a[0] >= min_b[0]
+        && min_a[1] <= max_b[1] && max_a[1] >= min_b[1]
+        && min_a[2] <= max_b[2] && max_a[2] >= min_b[2]
+}
+
+/// Phase 2: Hierarchical Layered Clothing Clearance.
+///
+/// Automatically discovers multi-layer clothing pairings (e.g. shirt -> blazer,
+/// inner blouse -> outer jacket, underwear -> outerwear) using rest-pose geometry
+/// and bone kinematics. Assigns GPU clearance anchors from the inner surface to the
+/// outer surface, guaranteeing that inner clothing never penetrates outer layers
+/// even during acute joint bending or cloth dynamics.
+pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat4], skinning: &[Mat4]) {
+    struct PrimCandidate {
+        mesh_idx: usize,
+        prim_idx: usize,
+        prim_id: PrimitiveId,
+        mesh_name: String,
+        world_verts: Vec<([f32; 3], [f32; 3])>,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+    }
+
+    let mut candidates = Vec::new();
+
+    for (m_idx, mesh) in asset.meshes.iter().enumerate() {
+        let m_name = mesh.name.to_lowercase();
+        if m_name.contains("hair") || m_name.contains("face") || m_name.contains("eye") || m_name.contains("brow") {
+            continue;
+        }
+
+        for (p_idx, prim) in mesh.primitives.iter().enumerate() {
+            if Some(prim.id) == asset.body_primitive_id || prim.body_primitive_id.is_some() {
+                continue;
+            }
+
+            let mat_name = asset
+                .materials
+                .iter()
+                .find(|m| m.id == prim.material_id)
+                .map(|m| m.name.to_lowercase())
+                .unwrap_or_default();
+
+            if mat_name.contains("hair") || mat_name.contains("face") || mat_name.contains("eye") {
+                continue;
+            }
+
+            let vert_count = prim.vertex_count as usize;
+            if vert_count < 100 {
+                continue;
+            }
+
+            let world_verts = compute_rest_world_vertices(prim, skinning);
+            if world_verts.is_empty() {
+                continue;
+            }
+
+            let mut aabb_min = [f32::MAX; 3];
+            let mut aabb_max = [f32::MIN; 3];
+            for &(p, _) in &world_verts {
+                for c in 0..3 {
+                    if p[c] < aabb_min[c] { aabb_min[c] = p[c]; }
+                    if p[c] > aabb_max[c] { aabb_max[c] = p[c]; }
+                }
+            }
+
+            candidates.push(PrimCandidate {
+                mesh_idx: m_idx,
+                prim_idx: p_idx,
+                prim_id: prim.id,
+                mesh_name: mesh.name.clone(),
+                world_verts,
+                aabb_min,
+                aabb_max,
+            });
+        }
+    }
+
+    if candidates.len() < 2 {
+        return;
+    }
+
+    // Pairwise geometric layer analysis: determine which primitive is inner vs outer.
+    // Map of outer_candidate_index -> (inner_candidate_index, avg_clearance, paired_count)
+    let mut best_inner_for_outer: HashMap<usize, (usize, f32, usize)> = HashMap::new();
+
+    let candidate_count = candidates.len();
+    for i in 0..candidate_count {
+        for j in (i + 1)..candidate_count {
+            if !aabb_intersects(
+                candidates[i].aabb_min, candidates[i].aabb_max,
+                candidates[j].aabb_min, candidates[j].aabb_max,
+            ) {
+                continue;
+            }
+
+            let prim_a = &candidates[i];
+            let prim_b = &candidates[j];
+
+            let a_vd = asset.meshes[prim_a.mesh_idx].primitives[prim_a.prim_idx].vertices.as_ref().unwrap();
+            let b_vd = asset.meshes[prim_b.mesh_idx].primitives[prim_b.prim_idx].vertices.as_ref().unwrap();
+
+            // Build spatial grid for candidate A
+            let cell_size = 0.04f32;
+            let inv_cell = 1.0 / cell_size;
+            let mut grid_a: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
+            for (idx, &(p, _)) in prim_a.world_verts.iter().enumerate() {
+                let k = ((p[0] * inv_cell).floor() as i32, (p[1] * inv_cell).floor() as i32, (p[2] * inv_cell).floor() as i32);
+                grid_a.entry(k).or_default().push(idx as u32);
+            }
+
+            // Query sample of vertices from B to A within 3.5 cm
+            let max_r2 = 0.035 * 0.035;
+            let mut overlap_pairs = Vec::new();
+
+            // Stride to keep import time under 15 ms
+            let step_b = (prim_b.world_verts.len() / 500).max(1);
+            for b_idx in (0..prim_b.world_verts.len()).step_by(step_b) {
+                let (bp, bn) = prim_b.world_verts[b_idx];
+                let ck = ((bp[0] * inv_cell).floor() as i32, (bp[1] * inv_cell).floor() as i32, (bp[2] * inv_cell).floor() as i32);
+                let mut best_a = None;
+                let mut best_d2 = max_r2;
+
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            if let Some(list) = grid_a.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz)) {
+                                for &a_idx in list {
+                                    let (ap, an) = prim_a.world_verts[a_idx as usize];
+                                    let dot_n = bn[0]*an[0] + bn[1]*an[1] + bn[2]*an[2];
+                                    if dot_n < 0.0 { continue; }
+
+                                    let sim = compute_bone_weight_similarity(
+                                        &b_vd.joint_indices[b_idx], &b_vd.joint_weights[b_idx],
+                                        &a_vd.joint_indices[a_idx as usize], &a_vd.joint_weights[a_idx as usize],
+                                    );
+                                    if sim < 0.2 { continue; }
+
+                                    let diff = [bp[0] - ap[0], bp[1] - ap[1], bp[2] - ap[2]];
+                                    let d2 = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2];
+                                    if d2 < best_d2 {
+                                        best_d2 = d2;
+                                        best_a = Some(a_idx as usize);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(a_idx) = best_a {
+                    let (ap, _an) = prim_a.world_verts[a_idx];
+                    let prim_bone_a = a_vd.joint_indices[a_idx][0] as usize;
+                    let bone_pos = if prim_bone_a < globals.len() {
+                        [globals[prim_bone_a][3][0], globals[prim_bone_a][3][1], globals[prim_bone_a][3][2]]
+                    } else {
+                        [0.0, 0.0, 0.0]
+                    };
+                    let dist_b = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&bp, &bone_pos));
+                    let dist_a = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&ap, &bone_pos));
+                    let radial_diff = dist_b - dist_a;
+                    overlap_pairs.push(radial_diff);
+                }
+            }
+
+            if overlap_pairs.len() >= 40 {
+                let outer_b_count = overlap_pairs.iter().filter(|&&r| r > 0.0).count();
+                let outer_b_ratio = outer_b_count as f32 / overlap_pairs.len() as f32;
+                let avg_r: f32 = overlap_pairs.iter().sum::<f32>() / overlap_pairs.len() as f32;
+
+                // If B is outer of A (B is further from bone than A)
+                if outer_b_ratio >= 0.65 && avg_r > 0.001 {
+                    let cur = best_inner_for_outer.get(&j);
+                    let should_replace = match cur {
+                        None => true,
+                        Some(&(_, cur_avg_r, cur_overlap)) => {
+                            // Prioritize major multi-layer clothing meshes (larger overlap count)
+                            if overlap_pairs.len() > cur_overlap * 2 {
+                                true
+                            } else if cur_overlap > overlap_pairs.len() * 2 {
+                                false
+                            } else {
+                                avg_r < cur_avg_r
+                            }
+                        }
+                    };
+                    if should_replace {
+                        best_inner_for_outer.insert(j, (i, avg_r, overlap_pairs.len()));
+                    }
+                }
+                // If A is outer of B (A is further from bone than B)
+                else if outer_b_ratio <= 0.35 && avg_r < -0.001 {
+                    let cur = best_inner_for_outer.get(&i);
+                    let inv_avg_r = -avg_r;
+                    let should_replace = match cur {
+                        None => true,
+                        Some(&(_, cur_avg_r, cur_overlap)) => {
+                            if overlap_pairs.len() > cur_overlap * 2 {
+                                true
+                            } else if cur_overlap > overlap_pairs.len() * 2 {
+                                false
+                            } else {
+                                inv_avg_r < cur_avg_r
+                            }
+                        }
+                    };
+                    if should_replace {
+                        best_inner_for_outer.insert(i, (j, inv_avg_r, overlap_pairs.len()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Now generate anchors for outer primitives
+    for (&outer_idx, &(inner_idx, avg_c, n_overlap)) in &best_inner_for_outer {
+        let outer_cand = &candidates[outer_idx];
+        let inner_cand = &candidates[inner_idx];
+
+        info!(
+            "clearance: paired layered clothing: outer='{}' (prim {:?}) -> inner='{}' (prim {:?}), avg clearance={:.2}mm, {} overlap samples",
+            outer_cand.mesh_name, outer_cand.prim_id,
+            inner_cand.mesh_name, inner_cand.prim_id,
+            avg_c * 1000.0, n_overlap
+        );
+
+        let cell_size = 0.03f32;
+        let inv_cell = 1.0 / cell_size;
+        let mut inner_grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
+        for (idx, &(p, _)) in inner_cand.world_verts.iter().enumerate() {
+            let k = ((p[0] * inv_cell).floor() as i32, (p[1] * inv_cell).floor() as i32, (p[2] * inv_cell).floor() as i32);
+            inner_grid.entry(k).or_default().push(idx as u32);
+        }
+
+        let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx].vertices.as_ref().unwrap();
+        let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx].vertices.as_ref().unwrap();
+
+        let max_radius = 0.04f32;
+        let max_r2 = max_radius * max_radius;
+        let mut anchors = Vec::with_capacity(outer_cand.world_verts.len());
+        let mut bound_count = 0usize;
+
+        for (oi, &(op, on)) in outer_cand.world_verts.iter().enumerate() {
+            let ck = ((op[0] * inv_cell).floor() as i32, (op[1] * inv_cell).floor() as i32, (op[2] * inv_cell).floor() as i32);
+            let mut best_i = None;
+            let mut best_score = max_r2;
+
+            for dx in -2..=2 {
+                for dy in -2..=2 {
+                    for dz in -2..=2 {
+                        if let Some(list) = inner_grid.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz)) {
+                            for &idx in list {
+                                let (ip, inrm) = inner_cand.world_verts[idx as usize];
+                                let dot_n = on[0]*inrm[0] + on[1]*inrm[1] + on[2]*inrm[2];
+                                if dot_n < 0.0 { continue; }
+
+                                let w_sim = compute_bone_weight_similarity(
+                                    &o_vd.joint_indices[oi], &o_vd.joint_weights[oi],
+                                    &i_vd.joint_indices[idx as usize], &i_vd.joint_weights[idx as usize],
+                                );
+                                if w_sim < 0.2 { continue; }
+
+                                let diff = [op[0] - ip[0], op[1] - ip[1], op[2] - ip[2]];
+                                let d2 = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2];
+                                let score = d2 + 0.0003 * (1.0 - w_sim);
+                                if score < best_score {
+                                    best_score = score;
+                                    best_i = Some(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(idx) = best_i {
+                let (ip, inrm) = inner_cand.world_verts[idx as usize];
+                let diff = [op[0] - ip[0], op[1] - ip[1], op[2] - ip[2]];
+                let raw_c = diff[0]*inrm[0] + diff[1]*inrm[1] + diff[2]*inrm[2];
+                let min_clearance = raw_c.max(0.006);
+                anchors.push(SkinAnchor {
+                    body_vertex_idx: idx,
+                    min_clearance,
+                    weight: 1.0,
+                    _pad: 0,
+                });
+                bound_count += 1;
+            } else {
+                anchors.push(SkinAnchor::default());
+            }
+        }
+
+        if bound_count > 0 {
+            info!(
+                "clearance: established {} layered anchors on outer '{}' (prim {:?})",
+                bound_count, outer_cand.mesh_name, outer_cand.prim_id
+            );
+            let prim_mut = Arc::make_mut(&mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]);
+            prim_mut.skin_anchors = Some(anchors);
+            prim_mut.body_primitive_id = Some(inner_cand.prim_id);
+        }
+    }
 }

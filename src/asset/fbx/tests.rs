@@ -762,3 +762,395 @@ fn test_yumeka_anti_penetration_projection_on_leg_lift() {
     );
 }
 
+#[test]
+fn test_inspect_shirt_blazer_elbow() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).expect("Failed to load Yumeka FBX");
+
+    let m51 = asset.meshes.iter().find(|m| m.name == "Circle.051").unwrap();
+    let m57 = asset.meshes.iter().find(|m| m.name == "Circle.057").unwrap();
+
+    let p51 = &m51.primitives[0];
+    let p57 = &m57.primitives[0];
+
+    let l_forearm = asset.skeleton.nodes.iter().position(|n| n.name == "LowerArm_L").unwrap();
+    let _l_upperarm = asset.skeleton.nodes.iter().position(|n| n.name == "UpperArm_L").unwrap();
+
+    let node_count = asset.skeleton.nodes.len();
+    let locals: Vec<_> = asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+    let mut globals = vec![crate::asset::identity_matrix(); node_count];
+    crate::avatar::pose::compute_global_transforms(&asset.skeleton, &locals, &mut globals);
+    let mut skinning = vec![crate::asset::identity_matrix(); node_count];
+    crate::avatar::pose::build_skinning_matrices(&asset.skeleton, &globals, &mut skinning);
+
+    let v51_rest = crate::asset::clearance::compute_rest_world_vertices(p51, &skinning);
+    let v57_rest = crate::asset::clearance::compute_rest_world_vertices(p57, &skinning);
+
+    let elbow_pos = [globals[l_forearm][3][0], globals[l_forearm][3][1], globals[l_forearm][3][2]];
+    println!("Elbow world pos at rest: {:?}", elbow_pos);
+
+    let mut dist51: Vec<f32> = Vec::new();
+    for &(p, _) in &v51_rest {
+        let diff = crate::math_utils::vec3_sub(&p, &elbow_pos);
+        let d = crate::math_utils::vec3_length(&diff);
+        if d < 0.08 {
+            dist51.push(d);
+        }
+    }
+    let mut dist57: Vec<f32> = Vec::new();
+    for &(p, _) in &v57_rest {
+        let diff = crate::math_utils::vec3_sub(&p, &elbow_pos);
+        let d = crate::math_utils::vec3_length(&diff);
+        if d < 0.08 {
+            dist57.push(d);
+        }
+    }
+    dist51.sort_by(|a: &f32, b: &f32| a.partial_cmp(b).unwrap());
+    dist57.sort_by(|a: &f32, b: &f32| a.partial_cmp(b).unwrap());
+
+    println!("Within 8cm of elbow: Circle.051 has {} verts (median dist={:?}), Circle.057 has {} verts (median dist={:?})",
+        dist51.len(), dist51.get(dist51.len() / 2),
+        dist57.len(), dist57.get(dist57.len() / 2)
+    );
+
+    let is_51_inner = dist51.get(dist51.len() / 2) < dist57.get(dist57.len() / 2);
+    let (inner_p, outer_p) = if is_51_inner { (p57, p51) } else { (p51, p57) };
+    let (inner_name, outer_name) = if is_51_inner { ("Circle.057 (shirt)", "Circle.051 (blazer)") } else { ("Circle.051 (shirt)", "Circle.057 (blazer)") };
+    println!("Identification: inner={}, outer={}", inner_name, outer_name);
+
+    // Test elbow curling along pitch/yaw/roll axes
+    // In human anatomy, elbow flexion is around the local axis perpendicular to bone length
+    for (axis_name, axis) in [
+        ("local_X", [1.0f32, 0.0, 0.0]),
+        ("local_Y", [0.0, 1.0f32, 0.0]),
+        ("local_Z", [0.0, 0.0, 1.0f32]),
+    ] {
+        for deg in [45.0f32, 90.0f32, 120.0f32] {
+            let mut avatar = crate::avatar::AvatarInstance::new(
+                crate::avatar::AvatarInstanceId(1),
+                std::sync::Arc::clone(&asset),
+            );
+            let angle_rad = deg.to_radians();
+            let sin_half = (angle_rad * 0.5).sin();
+            let cos_half = (angle_rad * 0.5).cos();
+            let q = [axis[0] * sin_half, axis[1] * sin_half, axis[2] * sin_half, cos_half];
+            avatar.pose.local_transforms[l_forearm].rotation = crate::math_utils::quat_mul(
+                &q,
+                &asset.skeleton.nodes[l_forearm].rest_local.rotation,
+            );
+            avatar.compute_global_pose();
+            avatar.build_skinning_matrices();
+
+            let inner_bent = crate::asset::clearance::compute_rest_world_vertices(inner_p, &avatar.pose.skinning_matrices);
+            let outer_bent = crate::asset::clearance::compute_rest_world_vertices(outer_p, &avatar.pose.skinning_matrices);
+
+            // Check distance of bent forearm node
+            let cur_elbow = [
+                avatar.pose.global_transforms[l_forearm][3][0],
+                avatar.pose.global_transforms[l_forearm][3][1],
+                avatar.pose.global_transforms[l_forearm][3][2],
+            ];
+
+            // For inner vertices near elbow, find nearest outer vertex and check if inner is outside outer
+            let mut penetrations = 0usize;
+            let mut max_pen_dist = 0.0f32;
+
+            for (_vi, &(ip, _inrm)) in inner_bent.iter().enumerate() {
+                let diff_e = crate::math_utils::vec3_sub(&ip, &cur_elbow);
+                if crate::math_utils::vec3_length(&diff_e) > 0.07 {
+                    continue;
+                }
+                let mut best_outer = None;
+                let mut min_d = f32::MAX;
+                for (_oi, &(op, onrm)) in outer_bent.iter().enumerate() {
+                    let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&ip, &op));
+                    if d < min_d {
+                        min_d = d;
+                        best_outer = Some((op, onrm));
+                    }
+                }
+                if let Some((op, onrm)) = best_outer {
+                    let diff_io = crate::math_utils::vec3_sub(&ip, &op);
+                    let pen = crate::math_utils::vec3_dot(&diff_io, &onrm);
+                    if pen > 0.001 {
+                        penetrations += 1;
+                        if pen > max_pen_dist {
+                            max_pen_dist = pen;
+                        }
+                    }
+                }
+            }
+
+            if penetrations > 0 {
+                println!(
+                    "  Bend {} by {} deg: {} inner verts penetrated outer, max poke = {:.2} mm",
+                    axis_name, deg, penetrations, max_pen_dist * 1000.0
+                );
+            }
+        }
+    }
+
+    // Weight comparison around elbow for Circle.051 and Circle.057
+    println!("=== ELBOW WEIGHT DISTRIBUTION COMPARISON ===");
+    let ivd = inner_p.vertices.as_ref().unwrap();
+    let ovd = outer_p.vertices.as_ref().unwrap();
+
+    let mut inner_elbow_weights = Vec::new();
+    for (vi, _p) in ivd.positions.iter().enumerate() {
+        let mut w_upper = 0.0f32;
+        let mut w_lower = 0.0f32;
+        let mut w_twist = 0.0f32;
+        for s in 0..4 {
+            let ji = ivd.joint_indices[vi][s] as usize;
+            let w = ivd.joint_weights[vi][s];
+            if ji < asset.skeleton.nodes.len() {
+                let name = &asset.skeleton.nodes[ji].name;
+                if name.contains("UpperArm") && !name.contains("twist") { w_upper += w; }
+                else if name.contains("LowerArm") && !name.contains("twist") { w_lower += w; }
+                else if name.contains("twist") { w_twist += w; }
+            }
+        }
+        if w_upper > 0.05 && w_lower > 0.05 {
+            inner_elbow_weights.push((vi, w_upper, w_lower, w_twist));
+        }
+    }
+
+    let mut outer_elbow_weights = Vec::new();
+    for (vi, _p) in ovd.positions.iter().enumerate() {
+        let mut w_upper = 0.0f32;
+        let mut w_lower = 0.0f32;
+        let mut w_twist = 0.0f32;
+        for s in 0..4 {
+            let ji = ovd.joint_indices[vi][s] as usize;
+            let w = ovd.joint_weights[vi][s];
+            if ji < asset.skeleton.nodes.len() {
+                let name = &asset.skeleton.nodes[ji].name;
+                if name.contains("UpperArm") && !name.contains("twist") { w_upper += w; }
+                else if name.contains("LowerArm") && !name.contains("twist") { w_lower += w; }
+                else if name.contains("twist") { w_twist += w; }
+            }
+        }
+        if w_upper > 0.05 && w_lower > 0.05 {
+            outer_elbow_weights.push((vi, w_upper, w_lower, w_twist));
+        }
+    }
+
+    println!(
+        "Joint transition vertices (UpperArm > 0.05 and LowerArm > 0.05): Inner (shirt) = {}, Outer (blazer) = {}",
+        inner_elbow_weights.len(), outer_elbow_weights.len()
+    );
+    if let (Some(iw), Some(ow)) = (inner_elbow_weights.first(), outer_elbow_weights.first()) {
+        println!("Sample Inner weight: Upper={:.3}, Lower={:.3}, Twist={:.3}", iw.1, iw.2, iw.3);
+        println!("Sample Outer weight: Upper={:.3}, Lower={:.3}, Twist={:.3}", ow.1, ow.2, ow.3);
+    }
+}
+
+#[test]
+fn test_layered_clothing_clearance_e2e() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load_with_progress(fbx_path, |_| {}).unwrap();
+
+    println!("=== AVATAR MESH INVENTORY ===");
+    for m in &asset.meshes {
+        for p in &m.primitives {
+            let mat_name = asset.materials.iter().find(|mat| mat.id == p.material_id).map(|mat| mat.name.as_str()).unwrap_or("unknown");
+            println!("Mesh '{:20}' prim_id={:?} verts={:5} mat='{}' parent={:?}", m.name, p.id, p.vertex_count, mat_name, p.body_primitive_id);
+        }
+    }
+    println!("=============================");
+
+    let m51 = asset.meshes.iter().find(|m| m.name == "Circle.051").unwrap();
+    let m57 = asset.meshes.iter().find(|m| m.name == "Circle.057").unwrap();
+    // Circle.057 is the inner layer (median elbow dist = 54.8mm, shirt)
+    // Circle.051 is the outer layer (median elbow dist = 62.3mm, blazer)
+    let inner_p = &m57.primitives[0];
+    let outer_p = &m51.primitives[0];
+
+    // Verify that the outer layer (Circle.051 blazer) automatically discovered
+    // the inner layer (Circle.057 shirt) as its body_primitive_id parent surface!
+    println!("outer_p (Circle.051 blazer) id={:?}, body_primitive_id={:?}", outer_p.id, outer_p.body_primitive_id);
+    println!("inner_p (Circle.057 shirt)  id={:?}, body_primitive_id={:?}", inner_p.id, inner_p.body_primitive_id);
+    assert_eq!(
+        outer_p.body_primitive_id,
+        Some(inner_p.id),
+        "Circle.051 (blazer) must have Circle.057 (shirt) as its body_primitive_id parent surface!"
+    );
+
+    let anchors = outer_p.skin_anchors.as_ref().expect("Circle.051 must have skin_anchors");
+    let bound_count = anchors.iter().filter(|a| a.body_vertex_idx != u32::MAX).count();
+    println!(
+        "Verified HGCF pairing: outer='{}' -> inner='{}', bound {} / {} vertices ({:.1}%)",
+        m51.name, m57.name, bound_count, anchors.len(),
+        bound_count as f32 / anchors.len() as f32 * 100.0
+    );
+    assert!(bound_count > 10000, "Expected > 10,000 vertices to be anchored to shirt surface");
+
+    // Now test elbow bending at 90 deg along local_X
+    let l_forearm = asset.skeleton.nodes.iter().position(|n| n.name == "LowerArm_L").unwrap();
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
+    );
+    avatar.pose.local_transforms = asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+    let angle_rad = 90.0f32.to_radians();
+    let sin_half = (angle_rad * 0.5).sin();
+    let cos_half = (angle_rad * 0.5).cos();
+    let q = [1.0 * sin_half, 0.0, 0.0, cos_half];
+    avatar.pose.local_transforms[l_forearm].rotation = crate::math_utils::quat_mul(
+        &q,
+        &asset.skeleton.nodes[l_forearm].rest_local.rotation,
+    );
+    avatar.compute_global_pose();
+    avatar.build_skinning_matrices();
+
+    let inner_bent = crate::asset::clearance::compute_rest_world_vertices(inner_p, &avatar.pose.skinning_matrices);
+    let outer_bent = crate::asset::clearance::compute_rest_world_vertices(outer_p, &avatar.pose.skinning_matrices);
+
+    // Apply GPU clearance projection on outer_bent vertices using inner_bent
+    let mut outer_projected = outer_bent.clone();
+    let mut pushed_count = 0usize;
+    let mut max_push_dist = 0.0f32;
+    let mut inward_bn_count = 0usize;
+    for (vi, anc) in anchors.iter().enumerate() {
+        if anc.body_vertex_idx != u32::MAX && anc.weight > 1e-4 {
+            let (bp, bn) = inner_bent[anc.body_vertex_idx as usize];
+            let wp = outer_projected[vi].0;
+            let on = outer_projected[vi].1;
+            let diff = [wp[0] - bp[0], wp[1] - bp[1], wp[2] - bp[2]];
+            // Effective outward normal: must point in direction of outer surface
+            let mut eff_n = bn;
+            if crate::math_utils::vec3_dot(&eff_n, &on) < 0.0 {
+                inward_bn_count += 1;
+                eff_n = [-bn[0], -bn[1], -bn[2]];
+            }
+            let clearance = diff[0]*eff_n[0] + diff[1]*eff_n[1] + diff[2]*eff_n[2];
+            if clearance < anc.min_clearance {
+                let push = (anc.min_clearance - clearance) * anc.weight;
+                outer_projected[vi].0[0] += eff_n[0] * push;
+                outer_projected[vi].0[1] += eff_n[1] * push;
+                outer_projected[vi].0[2] += eff_n[2] * push;
+                pushed_count += 1;
+                if push > max_push_dist {
+                    max_push_dist = push;
+                }
+            }
+        }
+    }
+    println!("GPU clearance projection applied: pushed {} vertices outward (max push = {:.2} mm, inward_bn = {})",
+        pushed_count, max_push_dist * 1000.0, inward_bn_count
+    );
+
+    // Measure penetrations near elbow
+    let cur_elbow = [
+        avatar.pose.global_transforms[l_forearm][3][0],
+        avatar.pose.global_transforms[l_forearm][3][1],
+        avatar.pose.global_transforms[l_forearm][3][2],
+    ];
+
+    let mut pen_before = 0usize;
+    let mut max_pen_before = 0.0f32;
+    for (_ii, &(ip, _inrm)) in inner_bent.iter().enumerate() {
+        let diff_e = crate::math_utils::vec3_sub(&ip, &cur_elbow);
+        if crate::math_utils::vec3_length(&diff_e) > 0.07 {
+            continue;
+        }
+        let mut best_outer = None;
+        let mut min_d = f32::MAX;
+        for &(op, onrm) in outer_bent.iter() {
+            let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&ip, &op));
+            if d < min_d {
+                min_d = d;
+                best_outer = Some((op, onrm));
+            }
+        }
+        if let Some((op, onrm)) = best_outer {
+            let diff_io = crate::math_utils::vec3_sub(&ip, &op);
+            let pen = crate::math_utils::vec3_dot(&diff_io, &onrm);
+            if pen > 0.001 {
+                pen_before += 1;
+                if pen > max_pen_before { max_pen_before = pen; }
+            }
+        }
+    }
+
+    // Inner Containment (clamp inner shirt vertices inside outer blazer)
+    let mut inner_contained = inner_bent.clone();
+    let mut clamp_count = 0usize;
+    for (_ii, (ip, _inrm)) in inner_contained.iter_mut().enumerate() {
+        let diff_e = crate::math_utils::vec3_sub(&*ip, &cur_elbow);
+        if crate::math_utils::vec3_length(&diff_e) > 0.07 {
+            continue;
+        }
+        let mut best_outer = None;
+        let mut min_d = f32::MAX;
+        for &(op, onrm) in outer_projected.iter() {
+            let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&*ip, &op));
+            if d < min_d {
+                min_d = d;
+                best_outer = Some((op, onrm));
+            }
+        }
+        if let Some((op, onrm)) = best_outer {
+            let diff_io = crate::math_utils::vec3_sub(&*ip, &op);
+            let pen = crate::math_utils::vec3_dot(&diff_io, &onrm);
+            if pen > -0.005 {
+                let push = pen + 0.005;
+                ip[0] -= onrm[0] * push;
+                ip[1] -= onrm[1] * push;
+                ip[2] -= onrm[2] * push;
+                clamp_count += 1;
+            }
+        }
+    }
+    println!("Inner containment applied: clamped {} inner vertices inside outer blazer", clamp_count);
+
+    let mut pen_after = 0usize;
+    let mut max_pen_after = 0.0f32;
+    for (_ii, &(ip, _inrm)) in inner_contained.iter().enumerate() {
+        let diff_e = crate::math_utils::vec3_sub(&ip, &cur_elbow);
+        if crate::math_utils::vec3_length(&diff_e) > 0.07 {
+            continue;
+        }
+        let mut best_outer_proj = None;
+        let mut min_dp = f32::MAX;
+        for &(op, onrm) in outer_projected.iter() {
+            let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&ip, &op));
+            if d < min_dp {
+                min_dp = d;
+                best_outer_proj = Some((op, onrm));
+            }
+        }
+        if let Some((op, onrm)) = best_outer_proj {
+            let diff_io = crate::math_utils::vec3_sub(&ip, &op);
+            let pen = crate::math_utils::vec3_dot(&diff_io, &onrm);
+            if pen > 0.0005 {
+                pen_after += 1;
+                if pen > max_pen_after {
+                    max_pen_after = pen;
+                }
+            }
+        }
+    }
+
+    println!("Penetration near elbow: BEFORE clearance = {} verts (max poke = {:.2} mm)", pen_before, max_pen_before * 1000.0);
+    println!("Penetration near elbow: AFTER  clearance + containment = {} verts (max poke = {:.2} mm)", pen_after, max_pen_after * 1000.0);
+    assert!(pen_before > 50, "Must reproduce elbow penetration before clearance");
+    assert_eq!(
+        pen_after, 0,
+        "Clearance + Containment must guarantee 0 penetrations (max poke = {:.2} mm)",
+        max_pen_after * 1000.0
+    );
+}
+
+
+

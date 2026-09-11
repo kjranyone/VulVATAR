@@ -1151,44 +1151,29 @@ impl VulkanRenderer {
                 )
                 .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
 
-            // Identify target body primitive for skin clearance anti-penetration
-            let target_body_prim_id = instance.mesh_instances.iter().find_map(|mi| {
-                mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id)
-            });
-
-            let body_transformed_vbo = if let Some(body_pid) = target_body_prim_id {
-                if let Some(body_mi) = instance.mesh_instances.iter().find(|mi| mi.primitive_id == body_pid) {
-                    if let Some(prim_asset) = body_mi.primitive_data.as_ref() {
-                        self.ensure_transform_data(
-                            body_mi.mesh_id,
-                            body_mi.primitive_id,
-                            prim_asset,
-                            false,
-                            false,
-                            None,
-                            &memory_allocator,
-                            &ds_allocator,
-                            &transform_pipeline,
-                        )?;
-                        self.transform_cache
-                            .get(&(body_mi.mesh_id, body_mi.primitive_id))
-                            .map(|slot| slot.transformed_vbo.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
+            // Topological dependency ordering for hierarchical surface clearances:
+            // If primitive B specifies body_primitive_id = Some(A), A must be dispatched before B.
             let mut ordered_mesh_instances: Vec<&frame_input::RenderMeshInstance> =
                 instance.mesh_instances.iter().collect();
-            if let Some(body_pid) = target_body_prim_id {
-                ordered_mesh_instances
-                    .sort_by_key(|mi| if mi.primitive_id == body_pid { 0 } else { 1 });
-            }
+
+            ordered_mesh_instances.sort_by(|a, b| {
+                let a_parent = a.primitive_data.as_ref().and_then(|p| p.body_primitive_id);
+                let b_parent = b.primitive_data.as_ref().and_then(|p| p.body_primitive_id);
+                match (a_parent, b_parent) {
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(ap), Some(bp)) => {
+                        if ap == b.primitive_id {
+                            std::cmp::Ordering::Greater
+                        } else if bp == a.primitive_id {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    }
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
 
             for &mesh_inst in &ordered_mesh_instances {
                 let prim_asset = match mesh_inst.primitive_data.as_ref() {
@@ -1228,8 +1213,27 @@ impl VulkanRenderer {
                     })
                     .unwrap_or(false);
 
-                let is_body_prim = Some(mesh_inst.primitive_id) == target_body_prim_id;
-                let prim_body_vbo = if is_body_prim { None } else { body_transformed_vbo.clone() };
+                // Look up parent surface transformed VBO if this primitive has skin/layer anchors
+                let prim_parent_vbo = prim_asset.body_primitive_id.and_then(|parent_pid| {
+                    instance.mesh_instances.iter().find(|mi| mi.primitive_id == parent_pid).and_then(|parent_mi| {
+                        if let Some(parent_asset) = parent_mi.primitive_data.as_ref() {
+                            let _ = self.ensure_transform_data(
+                                parent_mi.mesh_id,
+                                parent_mi.primitive_id,
+                                parent_asset,
+                                false,
+                                false,
+                                None,
+                                &memory_allocator,
+                                &ds_allocator,
+                                &transform_pipeline,
+                            );
+                        }
+                        self.transform_cache
+                            .get(&(parent_mi.mesh_id, parent_mi.primitive_id))
+                            .map(|slot| slot.transformed_vbo.clone())
+                    })
+                });
 
                 self.ensure_transform_data(
                     mesh_inst.mesh_id,
@@ -1237,7 +1241,7 @@ impl VulkanRenderer {
                     prim_asset,
                     has_cloth_prim,
                     has_cloth_normals_prim,
-                    prim_body_vbo.clone(),
+                    prim_parent_vbo.clone(),
                     &memory_allocator,
                     &ds_allocator,
                     &transform_pipeline,
@@ -1302,7 +1306,7 @@ impl VulkanRenderer {
                     guard.target_count = slot.target_count;
                     guard.has_cloth = if has_cloth_prim { 1 } else { 0 };
                     guard.has_cloth_normals = if has_cloth_normals_prim { 1 } else { 0 };
-                    guard.has_skin_anchors = if prim_asset.skin_anchors.is_some() && prim_body_vbo.is_some() { 1 } else { 0 };
+                    guard.has_skin_anchors = if prim_asset.skin_anchors.is_some() && prim_parent_vbo.is_some() { 1 } else { 0 };
                     guard._pad0 = [0; 3];
                     let copy_n = (slot.target_count as usize).min(MORPH_MAX_TARGETS);
                     for i in 0..copy_n {
