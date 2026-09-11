@@ -112,7 +112,7 @@ impl Default for KpSigma {
             simcc_gain: 1.0,
             min_score: 0.2,
             score_inflate: 3.0,
-            border_frac: 0.004,
+            border_frac: 0.02,
         }
     }
 }
@@ -217,9 +217,9 @@ pub fn body_kp3d(
         if !(kp.score >= min_score) || !kp.nx.is_finite() || !kp.ny.is_finite() {
             continue;
         }
-        // Reject keypoints clamped at the frame border (within 1% margin): detector emits
+        // Reject keypoints clamped at the frame border (within 2% margin): detector emits
         // limbs exiting the frame clamped to the border, and depth underneath is unrelated.
-        if kp.nx <= 0.01 || kp.nx >= 0.99 || kp.ny <= 0.01 || kp.ny >= 0.99 {
+        if kp.nx <= 0.02 || kp.nx >= 0.98 || kp.ny <= 0.02 || kp.ny >= 0.98 {
             continue;
         }
         let u = kp.nx as f64 * width as f64;

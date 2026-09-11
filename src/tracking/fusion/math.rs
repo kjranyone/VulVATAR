@@ -281,6 +281,9 @@ pub enum Kernel {
     Cauchy(f64),
     /// Geman–McClure: ρ = s / (1 + s/c²) — outliers saturate at c².
     GemanMcClure(f64),
+    /// Tukey's biweight: redescending M-estimator where outliers beyond c
+    /// receive exactly 0 weight and cost saturates at c²/3.
+    Tukey(f64),
 }
 
 impl Kernel {
@@ -297,6 +300,15 @@ impl Kernel {
                 let c2 = c * c;
                 let u = 1.0 + s / c2;
                 (s / u, 1.0 / (u * u))
+            }
+            Kernel::Tukey(c) => {
+                let c2 = c * c;
+                if s >= c2 {
+                    (c2 / 3.0, 0.0)
+                } else {
+                    let u = 1.0 - s / c2;
+                    (c2 / 3.0 * (1.0 - u * u * u), u * u)
+                }
             }
         }
     }
@@ -618,6 +630,29 @@ mod tests {
             d2.solve_damped(0.0, 0.0, &mut e).unwrap();
             assert!((e[c] - var[c]).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn test_tukey_kernel() {
+        let k = Kernel::Tukey(4.0);
+        // at s=0: rho=0, w=1
+        let (rho0, w0) = k.eval(0.0);
+        assert_eq!(rho0, 0.0);
+        assert_eq!(w0, 1.0);
+
+        // at s = c^2 = 16: rho = c^2/3 = 16/3, w = 0
+        let (rhoc, wc) = k.eval(16.0);
+        assert!((rhoc - 16.0 / 3.0).abs() < 1e-9);
+        assert_eq!(wc, 0.0);
+
+        // at s > 16: rho stays 16/3, w stays 0
+        let (rho_out, w_out) = k.eval(25.0);
+        assert!((rho_out - 16.0 / 3.0).abs() < 1e-9);
+        assert_eq!(w_out, 0.0);
+
+        // at s = 8: 0 < w < 1
+        let (_, w_mid) = k.eval(8.0);
+        assert!((w_mid - 0.25).abs() < 1e-9);
     }
 
     #[test]

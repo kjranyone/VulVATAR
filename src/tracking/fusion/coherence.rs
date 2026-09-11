@@ -133,7 +133,7 @@ pub fn filter_leg_coherence(
         }
         let hip_z = z_at(raw[11 + side].nx as f64, raw[11 + side].ny as f64);
         let hip_foreign = hip_z.map(|z| !in_band(z)).unwrap_or(false);
-        let hip_clamped = raw[11 + side].ny > 0.9;
+        let hip_clamped = raw[11 + side].ny > 0.82;
 
         if raw[13 + side].score > 0.0 {
             let knee_z = z_at(raw[13 + side].nx as f64, raw[13 + side].ny as f64);
@@ -234,9 +234,15 @@ pub fn filter_arm_coherence(
             let foreign = z.map(|zv| !in_band(zv)).unwrap_or(false);
             el_z = z.unwrap_or(sh_z);
             let upper_m = bone_m(&raw[el_i], &raw[sh_i], el_z.max(sh_z));
-            let el_clamped =
-                !(0.02..0.98).contains(&raw[el_i].nx) || !(0.02..0.98).contains(&raw[el_i].ny);
-            el_ok = !foreign && upper_m <= UPPER_ARM_REACH_M && (!el_clamped || z.is_some());
+            // A bottom-clamped elbow (ny >= 0.98) is exiting the frame (hands under desk).
+            // A desk in foreground easily provides an in-band depth, but that is the desk,
+            // not the elbow. Reject bottom-clamped elbows unconditionally.
+            let el_bottom_clamped = raw[el_i].ny >= 0.98;
+            let el_side_clamped = !(0.02..0.98).contains(&raw[el_i].nx) || raw[el_i].ny <= 0.02;
+            el_ok = !foreign
+                && upper_m <= UPPER_ARM_REACH_M
+                && !el_bottom_clamped
+                && (!el_side_clamped || z.is_some());
             if !el_ok {
                 raw[el_i].score = 0.0;
             }
@@ -249,9 +255,11 @@ pub fn filter_arm_coherence(
             let wr_z = z_at(raw[idx].nx as f64, raw[idx].ny as f64);
             let foreign = wr_z.map(|zv| !in_band(zv)).unwrap_or(false);
             let z = wr_z.unwrap_or(el_z);
-            let wr_clamped =
-                !(0.02..0.98).contains(&raw[idx].nx) || !(0.02..0.98).contains(&raw[idx].ny);
-            if foreign || (wr_clamped && wr_z.is_none()) {
+            // Bottom-clamped wrists (ny >= 0.98) are hands resting below the desk line;
+            // depth there belongs to the desk surface. Reject unconditionally.
+            let wr_bottom_clamped = raw[idx].ny >= 0.98;
+            let wr_side_clamped = !(0.02..0.98).contains(&raw[idx].nx) || raw[idx].ny <= 0.02;
+            if foreign || wr_bottom_clamped || (wr_side_clamped && wr_z.is_none()) {
                 return false;
             }
             if el_ok {

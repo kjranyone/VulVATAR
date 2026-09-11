@@ -331,8 +331,8 @@ impl PoseProvider for FusionProvider {
                 u,
                 v,
                 1,
-                (head_center_pred[2] - 0.12) as f32,
-                (head_center_pred[2] + 0.12) as f32,
+                (head_center_pred[2] - 0.20) as f32,
+                (head_center_pred[2] + 0.20) as f32,
             )?;
             // Occlusion: does an arm/hand capsule cut this ray in front of
             // the head?
@@ -615,11 +615,14 @@ impl PoseProvider for FusionProvider {
                 let torso_ref = (sh_y - nose_y).abs().max(0.05);
                 for side in 0..2 {
                     let hip = &raw[11 + side];
+                    // A hip is only in-frame when well clear of borders and anatomically below the shoulders.
+                    // If the hip is at or below ny 0.82, the thighs (≈0.4 m) physically extend beyond
+                    // the bottom frame border, making any in-frame knee detection a 100% hallucination.
                     let hip_ok = hip.score >= 0.5
-                        && hip.nx > 0.02
-                        && hip.nx < 0.98
-                        && hip.ny > 0.02
-                        && hip.ny < 0.98
+                        && hip.nx > 0.04
+                        && hip.nx < 0.96
+                        && hip.ny > 0.04
+                        && hip.ny < 0.82
                         && hip.ny > sh_y + 0.6 * torso_ref;
                     if !hip_ok {
                         raw[11 + side].score = 0.0;
@@ -684,13 +687,13 @@ impl PoseProvider for FusionProvider {
             // With a dense-mesh centroid anchoring head position, the
             // SimCC face keypoints only ADD their frontalization bias —
             // widen them so they stop binding head yaw (~4° measured).
-            let head_scale = if !face_occluded
-                && aux
-                    .face_mesh
-                    .as_ref()
-                    .is_some_and(|(_, c)| *c >= 0.5)
-            {
-                3.0
+            let mesh_conf = aux
+                .face_mesh
+                .as_ref()
+                .map(|(_, c)| *c)
+                .unwrap_or(0.0);
+            let head_scale = if !face_occluded && mesh_conf >= 0.35 {
+                1.0 + 2.0 * ((mesh_conf - 0.35) / 0.25).clamp(0.0, 1.0) as f64
             } else {
                 1.0
             };
@@ -801,10 +804,15 @@ impl PoseProvider for FusionProvider {
                 }
             }
         }
+        let mesh_conf = aux
+            .as_ref()
+            .and_then(|a| a.face_mesh.as_ref())
+            .map(|(_, conf)| *conf)
+            .unwrap_or(0.0);
         let mesh_px: Option<&Vec<[f32; 3]>> = aux
             .as_ref()
             .and_then(|a| a.face_mesh.as_ref())
-            .filter(|(_, conf)| *conf >= 0.5)
+            .filter(|(_, conf)| *conf >= 0.35)
             .map(|(lm, _)| lm);
 
         // Canonical-face observations.
@@ -878,13 +886,15 @@ impl PoseProvider for FusionProvider {
                     }
                     let point = super::estimator::ModelPoint::Attached { joint: head_j, local };
                     let oval = super::canonical_face::FACE_OVAL.contains(&i);
-                    if i % 4 == 0 && facing > 0.25 && !oval {
+                    if i % 4 == 0 && facing > 0.15 && !oval {
                         if let Some(p) = depth_at(l[0] as f64, l[1] as f64) {
                             if (p[2] - head_center_pred[2]).abs() < 0.15 {
+                                let sig = (0.015 / (mesh_conf as f64).clamp(0.35, 1.0))
+                                    / (facing as f64).clamp(0.2, 1.0);
                                 obs.kp3d.push(super::estimator::Kp3d {
                                     point,
                                     p,
-                                    sigma: 0.008,
+                                    sigma: sig,
                                     // Honest z, frontalized lateral (see
                                     // Kp3d::lat_scale).
                                     lat_scale: 6.0,

@@ -959,7 +959,23 @@ fn derive_self_track_bbox(
         .take(17)
         .filter(|j| j.score >= SELF_TRACK_CONF_FLOOR)
         .count();
-    if body_confident < SELF_TRACK_MIN_KEYPOINTS {
+
+    // Bust-up / desk framing: when hands are below the desk, only head (0..=4)
+    // and shoulders (5, 6) are visible (at most 7 keypoints). If both shoulders
+    // are confident and at least 3 face landmarks are confident (or 5+ core points),
+    // this is a valid upper-body track. Requiring both shoulders strictly prevents
+    // locking onto a detached hand region.
+    let shoulders_ok = joints.len() > 6
+        && joints[5].score >= SELF_TRACK_CONF_FLOOR
+        && joints[6].score >= SELF_TRACK_CONF_FLOOR;
+    let face_confident = joints
+        .iter()
+        .take(5)
+        .filter(|j| j.score >= SELF_TRACK_CONF_FLOOR)
+        .count();
+    let bust_ok = shoulders_ok && (face_confident >= 3 || body_confident >= 5);
+
+    if body_confident < SELF_TRACK_MIN_KEYPOINTS && !bust_ok {
         return None;
     }
 

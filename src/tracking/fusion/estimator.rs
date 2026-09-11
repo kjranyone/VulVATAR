@@ -223,12 +223,18 @@ impl Default for Params {
             surf_model_sigma: 0.012,
             gnc_start: 16.0,
             gnc_decay: 0.5,
-            gnc_tracked: 3.0,
+            gnc_tracked: std::env::var("VULVATAR_FUSION_GNC_TRACKED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0),
             limit_sigma: 0.02,
             q_joint: 2.0,   // rad²/s — a limb can swing ~250°/s
             q_trunk: 0.15,  // rad²/s — the trunk turns ~120°/s at most
             q_root_rot: 0.15,
-            q_root_t: 0.05, // m²/s — ~1.2 m/s root motion
+            q_root_t: std::env::var("VULVATAR_FUSION_Q_ROOT_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.005), // m²/s — ~0.35 m/s seated root motion
             q_shape: 1e-4,
             shape_sigma: 0.12,
             scale_sigma: 0.04,
@@ -917,13 +923,11 @@ impl Estimator {
 
         // ---- 2-D reprojection ------------------------------------------------
         if let Some(intr) = obs.intr {
-            // Cauchy rather than Geman–McClure: a keypoint the model currently
-            // misses by many σ (previous-frame basin, occlusion recovery) must
-            // keep a non-vanishing pull, or the warm start becomes a trap.
+            let c2 = p.c_2d * self.gnc;
             let kern = if p.cauchy_2d {
-                Kernel::Cauchy(p.c_2d * self.gnc)
+                Kernel::Cauchy(c2)
             } else {
-                Kernel::GemanMcClure(p.c_2d * self.gnc)
+                Kernel::GemanMcClure(c2)
             };
             for kp in &obs.kp2d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
@@ -963,15 +967,13 @@ impl Estimator {
 
         // ---- 3-D points -----------------------------------------------------
         {
-            // Heavy-tailed kernel: a metric point that disagrees by a lot is
-            // usually the model sitting in a mirrored-depth basin (2-D
-            // consistent, wrong z), and it must keep pulling.
-            let kern = Kernel::Cauchy(p.c_3d * self.gnc);
+            let c3 = p.c_3d * self.gnc;
+            let kern = Kernel::Cauchy(c3);
             for kp in &obs.kp3d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
+                let d = sub(pw, kp.p);
                 let inv_s = 1.0 / kp.sigma.max(1e-4);
                 let inv_lat = inv_s / kp.lat_scale.max(1.0);
-                let d = sub(pw, kp.p);
                 let r = [d[0] * inv_lat, d[1] * inv_lat, d[2] * inv_s];
                 let s = dot(r, r);
                 let (rho, w) = kern.eval(s);
@@ -1540,7 +1542,7 @@ fn trunk_params(model: &Model) -> Vec<bool> {
     for (j, jd) in model.joints.iter().enumerate() {
         let trunk = matches!(
             jd.name,
-            "pelvis" | "spine1" | "spine2" | "spine3" | "neck" | "l_clav" | "r_clav"
+            "pelvis" | "spine1" | "spine2" | "spine3" | "neck" | "head" | "l_clav" | "r_clav"
         );
         if trunk {
             let p = model.joint_param[j];

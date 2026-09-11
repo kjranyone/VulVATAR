@@ -199,8 +199,8 @@ impl HeadOriTracker {
                 u,
                 v,
                 1,
-                (head_center_pred[2] - 0.12) as f32,
-                (head_center_pred[2] + 0.12) as f32,
+                (head_center_pred[2] - 0.20) as f32,
+                (head_center_pred[2] + 0.20) as f32,
             )?;
             let t_obs = norm(p);
             if t_obs > 1e-6 {
@@ -361,6 +361,13 @@ fn face_depth_slope(
             no
         );
     }
+    let nose = kps[0];
+    let nose_turned = if nose.2 >= 0.3 && x1 - x0 > 1.0 {
+        let no = (nose.0 * width as f32 - cx) / (0.5 * (x1 - x0));
+        no.abs() > 0.40 && (no < 0.0) == (claimed_yaw < 0.0)
+    } else {
+        false
+    };
     let need = if face_overlaps_hand { 0.040 } else { 0.025 };
-    Some(dz_full.abs() >= need && (dz_full < 0.0) == (claimed_yaw < 0.0))
+    Some(nose_turned || (dz_full.abs() >= need && (dz_full < 0.0) == (claimed_yaw < 0.0)))
 }
