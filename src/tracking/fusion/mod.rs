@@ -14,6 +14,7 @@ pub mod model;
 pub mod observe;
 pub mod output;
 pub mod seed;
+pub mod visibility;
 #[cfg(feature = "inference")]
 pub mod hands;
 #[cfg(feature = "inference")]

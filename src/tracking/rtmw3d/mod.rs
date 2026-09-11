@@ -72,6 +72,8 @@ use yolox_worker::YoloxWorker;
 
 #[cfg(feature = "inference")]
 use decode::{NUM_JOINTS, SIMCC_X_BINS, SIMCC_Y_BINS, SIMCC_Z_BINS};
+#[cfg(feature = "inference")]
+pub use decode::DecodedJoint;
 
 /// Which ONNX Runtime execution provider the session ended up on.
 /// Surfaced to the GUI so users can tell whether the GPU path is active
@@ -938,49 +940,47 @@ impl Rtmw3dInference {
 /// than [`SELF_TRACK_MIN_KEYPOINTS`] body keypoints clear the
 /// confidence floor or the bbox degenerates.
 ///
-/// Confidence floor 0.3 (vs the global visibility floor of 0.05):
-/// a garbage crop produces sub-0.3 scores almost everywhere, so a
-/// bad track releases itself within one frame instead of locking on.
+/// Visibility comes from the calibrated SimCC peak shape
+/// (`fusion::visibility::VisPolicy`): a garbage crop produces broad /
+/// multi-modal peaks almost everywhere, so a bad track releases itself
+/// within one frame instead of locking on.
 #[cfg(feature = "inference")]
 fn derive_self_track_bbox(
     joints: &[decode::DecodedJoint],
     width: u32,
     height: u32,
 ) -> Option<crate::tracking::yolox::PersonBbox> {
-    const SELF_TRACK_CONF_FLOOR: f32 = 0.3;
-    /// COCO body keypoints (0..17) above the floor required to trust
+    /// COCO body keypoints (0..17) judged visible required to trust
     /// the track. Hands/face alone must not sustain it — a track
     /// locked onto a detached hand region would never recover.
     const SELF_TRACK_MIN_KEYPOINTS: usize = 8;
     const MIN_BBOX_PX: f32 = 48.0;
 
-    let body_confident = joints
-        .iter()
-        .take(17)
-        .filter(|j| j.score >= SELF_TRACK_CONF_FLOOR)
-        .count();
+    // Visibility from the SimCC peak shape (calibrated), not the raw peak
+    // height: the sigmoid score sits at 0.5–0.6 for hallucinated joints
+    // and 0.7 for observed ones, so a 0.3 floor on it never rejected
+    // anything (an empty chair sustained a full "person" track).
+    let pol = crate::tracking::fusion::visibility::VisPolicy::default();
+    let visible: Vec<bool> = joints.iter().map(|j| pol.p_vis(j) >= pol.min_p).collect();
 
-    // Bust-up / desk framing: when hands are below the desk, only head (0..=4)
-    // and shoulders (5, 6) are visible (at most 7 keypoints). If both shoulders
-    // are confident and at least 3 face landmarks are confident (or 5+ core points),
-    // this is a valid upper-body track. Requiring both shoulders strictly prevents
-    // locking onto a detached hand region.
-    let shoulders_ok = joints.len() > 6
-        && joints[5].score >= SELF_TRACK_CONF_FLOOR
-        && joints[6].score >= SELF_TRACK_CONF_FLOOR;
-    let face_confident = joints
-        .iter()
-        .take(5)
-        .filter(|j| j.score >= SELF_TRACK_CONF_FLOOR)
-        .count();
-    let bust_ok = shoulders_ok && (face_confident >= 3 || body_confident >= 5);
+    let body_confident = visible.iter().take(17).filter(|&&v| v).count();
+
+    // Bust-up / desk framing: when hands are below the desk, only the head
+    // (0..=4) and shoulders (5, 6) are visible (at most 7 keypoints), and
+    // with the camera off-axis one shoulder is routinely cut by the frame
+    // edge. A face (≥ 3 landmarks) plus at least one shoulder is a valid
+    // upper-body track; a detached hand region does not produce a
+    // sharp-peaked face.
+    let shoulders_visible = visible.iter().skip(5).take(2).filter(|&&v| v).count();
+    let face_visible = visible.iter().take(5).filter(|&&v| v).count();
+    let bust_ok = shoulders_visible >= 1 && (face_visible >= 3 || body_confident >= 5);
 
     if body_confident < SELF_TRACK_MIN_KEYPOINTS && !bust_ok {
         return None;
     }
 
     let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for j in joints.iter().filter(|j| j.score >= SELF_TRACK_CONF_FLOOR) {
+    for j in joints.iter().zip(visible.iter()).filter(|(_, &v)| v).map(|(j, _)| j) {
         let px = j.nx * width as f32;
         let py = j.ny * height as f32;
         x1 = x1.min(px);

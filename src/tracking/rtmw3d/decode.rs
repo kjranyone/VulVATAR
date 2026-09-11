@@ -15,18 +15,33 @@ pub(super) const SIMCC_Z_BINS: usize = 576;
 /// `nz ∈ [0, 1]` (model depth axis), `score` is the per-joint
 /// confidence after sigmoid of the x/y heatmap peaks.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct DecodedJoint {
-    pub(in crate::tracking) nx: f32,
-    pub(in crate::tracking) ny: f32,
-    pub(in crate::tracking) nz: f32,
-    pub(in crate::tracking) score: f32,
+pub struct DecodedJoint {
+    pub nx: f32,
+    pub ny: f32,
+    pub nz: f32,
+    pub score: f32,
     /// Localisation σ of the x / y peak in the same normalised units as
     /// `nx` / `ny` (posterior std of the softmax-normalised SimCC
     /// distribution in a window around the peak). A sharp peak yields
     /// ~1 bin; a flat or bimodal distribution yields tens of bins. This
     /// is the per-keypoint uncertainty the fusion estimator consumes.
-    pub(in crate::tracking) sx: f32,
-    pub(in crate::tracking) sy: f32,
+    pub sx: f32,
+    pub sy: f32,
+    /// Peak-shape statistics of the raw SimCC vectors, kept for the
+    /// visibility calibration (see `fusion::visibility`). All are
+    /// scale-invariant in the logit values.
+    ///
+    /// Ratio of the strongest response OUTSIDE the main peak's window
+    /// (±`NOMINAL_FWHM_BINS`) to the main peak: ≈0 for a unimodal
+    /// confident joint, →1 for a bimodal / flat one.
+    pub second_x: f32,
+    pub second_y: f32,
+    /// Fraction of bins at or above half of the peak value. A nominal
+    /// peak covers ≈ FWHM / bins; a flat response covers most of the axis.
+    pub half_x: f32,
+    pub half_y: f32,
+    /// Sigmoid of the z-axis peak (the depth head's own confidence).
+    pub zscore: f32,
 }
 
 /// SimCC argmax. Returns `(bin, max_value)`.
@@ -136,6 +151,34 @@ const NOMINAL_FWHM_BINS: f32 = 44.0;
 /// Localisation σ (bins) of a nominal peak after sub-bin refinement.
 const BASE_SIGMA_BINS: f32 = 2.5;
 
+/// Peak-shape statistics for one SimCC axis: `(second, half)` where
+/// `second` is the strongest response outside ±`NOMINAL_FWHM_BINS` of
+/// the argmax divided by the argmax value (0 when the peak is ≤ 0), and
+/// `half` is the fraction of all bins at or above half the peak value.
+#[inline]
+fn peak_shape(slice: &[f32], peak: usize) -> (f32, f32) {
+    let m = slice[peak];
+    if !(m > 0.0) {
+        return (1.0, 1.0);
+    }
+    let w = NOMINAL_FWHM_BINS as usize;
+    let lo = peak.saturating_sub(w);
+    let hi = (peak + w).min(slice.len() - 1);
+    let half = 0.5 * m;
+    let mut second = f32::NEG_INFINITY;
+    let mut n_half = 0usize;
+    for (i, &v) in slice.iter().enumerate() {
+        if v >= half {
+            n_half += 1;
+        }
+        if (i < lo || i > hi) && v > second {
+            second = v;
+        }
+    }
+    let second = if second.is_finite() { (second / m).clamp(0.0, 1.0) } else { 0.0 };
+    (second, n_half as f32 / slice.len() as f32)
+}
+
 pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) -> Vec<DecodedJoint> {
     let mut out = Vec::with_capacity(NUM_JOINTS);
     for j in 0..NUM_JOINTS {
@@ -144,12 +187,14 @@ pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) ->
         let z_slice = &simcc_z[j * SIMCC_Z_BINS..(j + 1) * SIMCC_Z_BINS];
         let (xi, xs) = argmax_with_score(x_slice);
         let (yi, ys) = argmax_with_score(y_slice);
-        let (zi, _zs) = argmax_with_score(z_slice);
+        let (zi, zs) = argmax_with_score(z_slice);
         // Per-joint score: take the smaller of x/y heatmap peaks
         // (z is depth — its peak does not localise the joint
         // detection, only its depth) and pass through sigmoid so
         // values land in `[0, 1]`.
         let score = sigmoid(xs.min(ys));
+        let (second_x, half_x) = peak_shape(x_slice, xi);
+        let (second_y, half_y) = peak_shape(y_slice, yi);
         out.push(DecodedJoint {
             nx: refine_peak(x_slice, xi) / SIMCC_X_BINS as f32,
             ny: refine_peak(y_slice, yi) / SIMCC_Y_BINS as f32,
@@ -157,6 +202,11 @@ pub(super) fn decode_simcc(simcc_x: &[f32], simcc_y: &[f32], simcc_z: &[f32]) ->
             score,
             sx: peak_sigma_bins(x_slice, xi) / SIMCC_X_BINS as f32,
             sy: peak_sigma_bins(y_slice, yi) / SIMCC_Y_BINS as f32,
+            second_x,
+            second_y,
+            half_x,
+            half_y,
+            zscore: sigmoid(zs),
         });
     }
     out

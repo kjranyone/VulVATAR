@@ -19,6 +19,7 @@ use super::math::*;
 use super::model::*;
 use super::observe::*;
 use super::output;
+use super::visibility::{build_silhouette, SilhouetteParams, VisPolicy};
 
 
 pub struct FusionProvider {
@@ -75,6 +76,23 @@ pub struct FusionProvider {
     pub last_surface: Vec<[f32; 3]>,
     /// Diagnostics: metric joint observations `(joint index, point, σ)`.
     pub last_kp3d: Vec<(usize, V3, f64)>,
+    /// Diagnostics: the detector's raw 133 keypoints of the last frame
+    /// (whole-frame normalised, before any gate) with SimCC peak stats.
+    pub last_raw_joints: Vec<crate::tracking::rtmw3d::DecodedJoint>,
+    /// Diagnostics: person crop `(x, y, w, h)` fed to the detector.
+    pub last_crop: Option<(f32, f32, f32, f32)>,
+    /// Diagnostics: per-gate score snapshots of the last frame —
+    /// `(gate name, 133 scores after that gate)` in pipeline order.
+    pub last_kp_stages: Vec<(&'static str, Vec<f32>)>,
+    /// Keypoint visibility calibration (SimCC peak shape → probability).
+    pub vis_policy: VisPolicy,
+    /// Depth silhouette parameters.
+    pub sil_params: SilhouetteParams,
+    /// Diagnostics: per keypoint `(p_vis, distance to silhouette m)` of
+    /// the last frame (distance NaN without a silhouette).
+    pub last_vis: Vec<(f32, f32)>,
+    /// Diagnostics: last silhouette `(z_ref m, touches bottom, area m²)`.
+    pub last_silhouette: Option<(f64, bool, f64)>,
 }
 
 impl FusionProvider {
@@ -133,6 +151,13 @@ impl FusionProvider {
             last_est_ms: 0.0,
             last_surface: Vec::new(),
             last_kp3d: Vec::new(),
+            last_raw_joints: Vec::new(),
+            last_crop: None,
+            last_kp_stages: Vec::new(),
+            vis_policy: VisPolicy::default(),
+            sil_params: SilhouetteParams::default(),
+            last_vis: Vec::new(),
+            last_silhouette: None,
         })
     }
 
@@ -228,8 +253,8 @@ impl PoseProvider for FusionProvider {
             None => frame_index as f64 / 30.0,
         };
         self.rtmw3d.set_frame_timestamp_ms(ts_ms);
-        let base = self.rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
-        let aux = self.rtmw3d.take_aux();
+        let mut base = self.rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
+        let mut aux = self.rtmw3d.take_aux();
 
         let intr_cam: Option<CameraIntrinsics> = depth.as_ref().and_then(|d| d.intrinsics);
         let intr = match intr_cam {
@@ -261,6 +286,68 @@ impl PoseProvider for FusionProvider {
         let fk_pred = self.h.model.fk(&pred);
         let head_j = self.h.j.head;
         let head_center_pred = fk_pred.site[self.h.s.head_center];
+
+        // ---- keypoint visibility ---------------------------------------------
+        // SimCC peak shape → p_vis, then the depth silhouette: a keypoint
+        // not on the person's surface is dropped whatever its peak looks
+        // like. The calibrated probability REPLACES the detector score from
+        // here on (every downstream consumer reads `score`).
+        self.last_vis.clear();
+        self.last_silhouette = None;
+        if let Some(aux) = aux.as_mut() {
+            if std::env::var_os("VULVATAR_FUSION_NO_VIS").is_none() && aux.joints.len() >= 133 {
+                let pol = self.vis_policy;
+                let sp = self.sil_params;
+                let mut vis: Vec<f32> = aux.joints.iter().map(|j| pol.p_vis(j)).collect();
+                let (dw, dh) = depth
+                    .as_ref()
+                    .map(|d| (d.width as f64, d.height as f64))
+                    .unwrap_or((width as f64, height as f64));
+                // Silhouette seeds: visible face / shoulder keypoints, else
+                // the predicted head while the track is alive.
+                let mut seeds: Vec<(f64, f64)> = (0..7)
+                    .filter(|&i| vis[i] >= pol.min_p)
+                    .map(|i| (aux.joints[i].nx as f64 * dw, aux.joints[i].ny as f64 * dh))
+                    .filter(|&(u, v)| u >= 0.0 && v >= 0.0 && u < dw && v < dh)
+                    .collect();
+                if seeds.is_empty() && self.est.last_t.is_some() {
+                    if let Some(p) = intr.project(head_center_pred) {
+                        seeds.push((p[0], p[1]));
+                    }
+                }
+                let sil = depth.as_ref().and_then(|d| {
+                    build_silhouette(&d.points_m, d.width, d.height, intr.fx, &seeds, &sp)
+                });
+                let mut dist = vec![f32::NAN; aux.joints.len()];
+                match sil.as_ref() {
+                    Some(s) => {
+                        for (i, j) in aux.joints.iter().enumerate() {
+                            let dm = s.dist_m(j.nx as f64 * dw, j.ny as f64 * dh);
+                            dist[i] = dm as f32;
+                            if dm > sp.max_dist_m {
+                                vis[i] = 0.0;
+                            }
+                        }
+                        self.last_silhouette = Some((s.z_ref, s.touches_bottom, s.area_m2));
+                    }
+                    None => {
+                        // Depth available but no person surface under any
+                        // confident face / shoulder keypoint: nobody to
+                        // track (empty chair) — nothing is observed.
+                        if depth.is_some() {
+                            vis.iter_mut().for_each(|v| *v = 0.0);
+                        }
+                    }
+                }
+                for (i, j) in aux.joints.iter_mut().enumerate() {
+                    j.score = if vis[i] >= pol.min_p { vis[i] } else { 0.0 };
+                }
+                for (k, j) in base.annotation.keypoints.iter_mut().zip(aux.joints.iter()) {
+                    k.2 = j.score;
+                }
+                self.last_vis = vis.iter().zip(dist.iter()).map(|(&p, &d)| (p, d)).collect();
+            }
+        }
 
         // Depth accessor over the aligned point cloud for FACE landmarks:
         // tight person band around the predicted head, plus a model
@@ -350,13 +437,20 @@ impl PoseProvider for FusionProvider {
             Some(p)
         };
 
+        // Legacy per-joint geometric gates (border clamp, reach, leg /
+        // arm coherence). Off by default now that the visibility layer
+        // decides what is on the person; `VULVATAR_FUSION_OLDGATES=1`
+        // re-enables them for the ablation bench.
+        let old_gates = std::env::var_os("VULVATAR_FUSION_OLDGATES").is_some()
+            || std::env::var_os("VULVATAR_FUSION_NO_VIS").is_some();
+
         // ---- hand-block L/R assignment --------------------------------------
         // The detector's left/right hand blocks can be transposed when the
         // hands cross or touch. Decide the assignment against the predicted
         // wrists (only when both wrists are currently tracked): keep the
         // labelling unless swapping is clearly better.
         let mut det_kps: Vec<(f32, f32, f32)> = base.annotation.keypoints.clone();
-        if let Some(d) = depth.as_ref() {
+        if let Some(d) = depth.as_ref().filter(|_| old_gates) {
             if d.points_m.len() == (d.width * d.height) as usize && det_kps.len() >= 133 {
                 let mut tmp: Vec<RawKp> = det_kps
                     .iter()
@@ -584,12 +678,20 @@ impl PoseProvider for FusionProvider {
                     sy: j.sy,
                 })
                 .collect();
-            if let Some(crop) = aux.crop {
+            self.last_raw_joints = aux.joints.clone();
+            self.last_crop = aux.crop;
+            self.last_kp_stages.clear();
+            let snap = |stages: &mut Vec<(&'static str, Vec<f32>)>, name: &'static str, raw: &[RawKp]| {
+                stages.push((name, raw.iter().map(|k| k.score).collect()));
+            };
+            snap(&mut self.last_kp_stages, "raw", &raw);
+            if let Some(crop) = aux.crop.filter(|_| old_gates) {
                 cull_crop_border(&mut raw, crop, width, height, 0.02);
             }
+            snap(&mut self.last_kp_stages, "border", &raw);
             // Arm reachability against the predicted shoulders (depth-valid
             // pixels only) — see `reach_filter`.
-            if let Some(d) = depth.as_ref() {
+            if let Some(d) = depth.as_ref().filter(|_| old_gates) {
                 if d.points_m.len() == (d.width * d.height) as usize {
                     let zs = [fk_pred.t[self.h.j.l_shoulder][2], fk_pred.t[self.h.j.r_shoulder][2]];
                     if std::env::var_os("VULVATAR_FUSION_NO_REACH").is_none() {
@@ -597,6 +699,7 @@ impl PoseProvider for FusionProvider {
                     }
                 }
             }
+            snap(&mut self.last_kp_stages, "reach", &raw);
             if hands_swapped {
                 for k in 0..21 {
                     raw.swap(91 + k, 112 + k);
@@ -609,7 +712,7 @@ impl PoseProvider for FusionProvider {
             // meaningful when its hip is confidently in frame AND sits
             // anatomically below the shoulder line (the hallucinations
             // cluster at shoulder height on whatever object is in front).
-            {
+            if old_gates {
                 let sh_y = 0.5 * (raw[5].ny + raw[6].ny);
                 let nose_y = raw[0].ny;
                 let torso_ref = (sh_y - nose_y).abs().max(0.05);
@@ -636,6 +739,7 @@ impl PoseProvider for FusionProvider {
                     }
                 }
             }
+            snap(&mut self.last_kp_stages, "leg", &raw);
             // Leg-chain coherence: a hip that passes the gate can still be
             // a bottom-edge clamp while the detector paints its knee /
             // ankle / toe on the background or on the user's own raised
@@ -646,7 +750,7 @@ impl PoseProvider for FusionProvider {
             // Anthropometric & kinematic coherence sanity filters (see `super::coherence`):
             // Physical perspective projection cannot exceed true bone length. Detections
             // violating reach, pelvis width, height order, or edge borders are culled.
-            if let Some(d) = depth.as_ref() {
+            if let Some(d) = depth.as_ref().filter(|_| old_gates) {
                 if d.points_m.len() == (d.width * d.height) as usize {
                     let z_person = head_center_pred[2];
                     let model_pelvis_w = norm(sub(
@@ -672,7 +776,9 @@ impl PoseProvider for FusionProvider {
                     );
                 }
             }
+            snap(&mut self.last_kp_stages, "coherence", &raw);
             super::coherence::filter_duplicate_wrists(&mut raw, width, height);
+            snap(&mut self.last_kp_stages, "dupwrist", &raw);
             // The dedicated hand crop supersedes the body detector's hand
             // block for that hand (keep the wrist: it anchors the crop).
             for hand in 0..2 {
@@ -683,6 +789,7 @@ impl PoseProvider for FusionProvider {
                     }
                 }
             }
+            snap(&mut self.last_kp_stages, "handcrop", &raw);
             let n_before = obs.kp2d.len();
             // With a dense-mesh centroid anchoring head position, the
             // SimCC face keypoints only ADD their frontalization bias —

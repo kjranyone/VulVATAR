@@ -219,7 +219,10 @@ mod tests {
             ny,
             nz,
             score: 0.9,
-        sx: 0.002, sy: 0.002, }
+            sx: 0.002,
+            sy: 0.002,
+            ..Default::default()
+        }
     }
 
     /// The same physical pose decoded from a small crop and from a

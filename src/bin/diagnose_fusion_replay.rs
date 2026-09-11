@@ -129,6 +129,28 @@ fn load_metric_frame(
     ))
 }
 
+/// Median depth (m) of the valid pixels in a 3×3 window; NaN if none.
+fn depth_median_3x3(pts: &[[f32; 3]], w: u32, h: u32, u: i64, v: i64) -> f32 {
+    let mut zs: Vec<f32> = Vec::with_capacity(9);
+    for dv in -1..=1 {
+        for du in -1..=1 {
+            let (x, y) = (u + du, v + dv);
+            if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                continue;
+            }
+            let z = pts[(y as u32 * w + x as u32) as usize][2];
+            if z.is_finite() && z > 0.0 {
+                zs.push(z);
+            }
+        }
+    }
+    if zs.is_empty() {
+        return f32::NAN;
+    }
+    zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    zs[zs.len() / 2]
+}
+
 fn draw_line(img: &mut image::RgbImage, a: [f64; 2], b: [f64; 2], c: [u8; 3]) {
     let (w, h) = (img.width() as i64, img.height() as i64);
     let (x0, y0, x1, y1) = (a[0] as i64, a[1] as i64, b[0] as i64, b[1] as i64);
@@ -304,6 +326,17 @@ fn main() -> Result<(), String> {
     };
     eprintln!("provider: {} — {} frames → {}", provider.label(), pairs.len(), out_dir.display());
 
+    // VULVATAR_REPLAY_VISDUMP=1: per-frame × per-keypoint dump of the
+    // detector's raw output (SimCC peak stats), the score after each
+    // gate of the provider, the crop and the raw depth under the pixel —
+    // the input for the visibility calibration (`diagnostics/visibility`).
+    let vis_dump = std::env::var_os("VULVATAR_REPLAY_VISDUMP").is_some();
+    let mut vis_csv = String::new();
+    if vis_dump {
+        vis_csv.push_str("frame,j,nx,ny,nz,score,sx,sy,second_x,second_y,half_x,half_y,zscore,crop_x,crop_y,crop_w,crop_h,depth_z,p_vis,sil_dist,sil_zref,sil_bottom,sil_area");
+    }
+    let mut vis_header_done = false;
+
     let mut csv = String::new();
     csv.push_str("idx,t,solve_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
 
@@ -349,6 +382,35 @@ fn main() -> Result<(), String> {
                 }
             }
             eprintln!();
+        }
+        if vis_dump {
+            if !vis_header_done {
+                for (name, _) in &provider.last_kp_stages {
+                    vis_csv.push_str(&format!(",s_{name}"));
+                }
+                vis_csv.push('\n');
+                vis_header_done = true;
+            }
+            let (cx, cy, cw_, ch_) = provider.last_crop.unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
+            for (j, kp) in provider.last_raw_joints.iter().enumerate() {
+                let u = (kp.nx * cw as f32).round() as i64;
+                let v = (kp.ny * ch as f32).round() as i64;
+                let dz = depth_median_3x3(&depth_pts, cw, ch, u, v);
+                let (pv, sd) = provider.last_vis.get(j).copied().unwrap_or((f32::NAN, f32::NAN));
+                let (sz, sb, sa) = provider
+                    .last_silhouette
+                    .map(|(z, b, a)| (z, b as u8, a))
+                    .unwrap_or((f64::NAN, 0, f64::NAN));
+                vis_csv.push_str(&format!(
+                    "{idx},{j},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4},{:.3},{},{:.4}",
+                    kp.nx, kp.ny, kp.nz, kp.score, kp.sx, kp.sy, kp.second_x, kp.second_y,
+                    kp.half_x, kp.half_y, kp.zscore, cx, cy, cw_, ch_, dz, pv, sd, sz, sb, sa
+                ));
+                for (_, scores) in &provider.last_kp_stages {
+                    vis_csv.push_str(&format!(",{:.4}", scores.get(j).copied().unwrap_or(f32::NAN)));
+                }
+                vis_csv.push('\n');
+            }
         }
         let h = provider.humanoid();
         let est = provider.estimator();
@@ -814,6 +876,10 @@ fn main() -> Result<(), String> {
         }
     }
     std::fs::write(out_dir.join("frames.csv"), csv).map_err(|e| e.to_string())?;
+    if vis_dump {
+        std::fs::write(out_dir.join("kps.csv"), vis_csv).map_err(|e| e.to_string())?;
+        println!("kps: {}", out_dir.join("kps.csv").display());
+    }
 
     let (ym, ys, ymin, ymax) = stats(&torso_yaws);
     let (hm, hs, hmin, hmax) = stats(&head_yaws);
