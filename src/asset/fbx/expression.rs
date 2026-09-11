@@ -42,6 +42,22 @@ pub fn map_preset_expression(raw_name: &str) -> Option<&'static str> {
     }
 }
 
+fn preset_priority_score(raw_name: &str) -> i32 {
+    let lower = raw_name.to_lowercase();
+    let norm = lower.strip_prefix("blendshape.").unwrap_or(&lower);
+    let norm = norm.strip_prefix("blendshape_").unwrap_or(norm);
+
+    if norm.starts_with("vrc.v_") || norm.starts_with("vrc.") {
+        100
+    } else if norm.starts_with("v_") || norm.starts_with("viseme_") {
+        90
+    } else if norm.starts_with("mouth_") || norm.starts_with("eye_") {
+        50
+    } else {
+        30
+    }
+}
+
 /// Helper to build `ExpressionAssetSet` from collected morph bindings.
 ///
 /// `morph_targets`: `(node_idx, morph_target_index, channel_name)`
@@ -49,6 +65,12 @@ pub fn build_expressions(
     all_morphs: &[(usize, usize, String)],
 ) -> ExpressionAssetSet {
     let mut expressions_map: HashMap<String, Vec<ExpressionMorphBind>> = HashMap::new();
+
+    // Map of: (preset_name, node_idx) -> (best_score, ExpressionMorphBind)
+    // Ensures a standard preset (e.g. "aa") only binds the single best matching
+    // morph target per mesh node, preventing duplicate application (e.g. vrc.v_aa + mouth_a).
+    let mut preset_candidates: HashMap<(String, usize), (i32, ExpressionMorphBind)> =
+        HashMap::new();
 
     for &(node_idx, morph_target_index, ref name) in all_morphs {
         let bind = ExpressionMorphBind {
@@ -63,13 +85,24 @@ pub fn build_expressions(
             .or_default()
             .push(bind.clone());
 
-        // 2. If it maps to a standard VRM preset, register under preset name as well
+        // 2. If it maps to a standard VRM preset, select the highest priority candidate per node
         if let Some(preset) = map_preset_expression(name) {
-            expressions_map
-                .entry(preset.to_string())
-                .or_default()
-                .push(bind);
+            let score = preset_priority_score(name);
+            let key = (preset.to_string(), node_idx);
+            match preset_candidates.get(&key) {
+                Some(&(best_score, _)) if best_score >= score => {
+                    // Already bound to a higher or equal priority morph target on this node
+                }
+                _ => {
+                    preset_candidates.insert(key, (score, bind));
+                }
+            }
         }
+    }
+
+    // Add selected best preset binds to expressions_map
+    for ((preset, _node_idx), (_score, bind)) in preset_candidates {
+        expressions_map.entry(preset).or_default().push(bind);
     }
 
     let mut expressions: Vec<ExpressionDef> = expressions_map

@@ -74,6 +74,14 @@ fn main() -> Result<(), String> {
     }
 
     let mut avatar = AvatarInstance::new(AvatarInstanceId(1), Arc::clone(&asset));
+    if let Ok(expr_name) = std::env::var("EXPR_NAME") {
+        let weight: f32 = std::env::var("EXPR_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        println!("Applying expression '{}' with weight {}", expr_name, weight);
+        avatar.expression_weights.push(vulvatar_lib::avatar::expressions::ResolvedExpressionWeight {
+            name: expr_name,
+            weight,
+        });
+    }
     avatar.build_base_pose();
     avatar.compute_global_pose();
     avatar.build_skinning_matrices();
@@ -226,10 +234,14 @@ fn build_frame_input(
 
                 if let Some(filter) = material_filter {
                     let material_name = material_asset.map(|m| m.name.as_str()).unwrap_or("");
-                    if !material_name
-                        .to_ascii_lowercase()
-                        .contains(&filter.to_ascii_lowercase())
-                    {
+                    let matched = if let Some(exact) = filter.strip_prefix("exact:") {
+                        material_name.eq_ignore_ascii_case(exact)
+                    } else {
+                        material_name
+                            .to_ascii_lowercase()
+                            .contains(&filter.to_ascii_lowercase())
+                    };
+                    if !matched {
                         return None;
                     }
                 }
@@ -240,8 +252,9 @@ fn build_frame_input(
                 material_binding.mode = material_mode.clone();
                 material_binding.debug_view = debug_view.clone();
 
+                let no_outline = std::env::var("NO_OUTLINE").is_ok();
                 let outline = vulvatar_lib::renderer::frame_input::OutlineSnapshot {
-                    enabled: material_binding.outline_width > 0.0,
+                    enabled: !no_outline && material_binding.outline_width > 0.0,
                     width: material_binding.outline_width,
                     color: material_binding.outline_color,
                 };
@@ -252,10 +265,45 @@ fn build_frame_input(
                     vulvatar_lib::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
                 };
 
-                let cull_mode = if material_binding.double_sided {
+                let force_backface = std::env::var("FORCE_BACKFACE").is_ok();
+                let cull_mode = if !force_backface && material_binding.double_sided {
                     RenderCullMode::DoubleSided
                 } else {
                     RenderCullMode::BackFace
+                };
+
+                let morph_weights = if prim.morph_targets.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut weights = vec![0.0f32; prim.morph_targets.len()];
+                    for ew in &avatar.expression_weights {
+                        if let Some(expr_def) = avatar
+                            .asset
+                            .default_expressions
+                            .expressions
+                            .iter()
+                            .find(|e| e.name == ew.name)
+                        {
+                            for bind in &expr_def.morph_binds {
+                                if let Some(&mesh_idx) =
+                                    avatar.asset.node_to_mesh.get(&bind.node_index)
+                                {
+                                    if let Some(m) = avatar.asset.meshes.get(mesh_idx) {
+                                        if m.primitives.iter().any(|p| p.id == prim.id)
+                                            && bind.morph_target_index < weights.len()
+                                        {
+                                            weights[bind.morph_target_index] +=
+                                                ew.weight * bind.weight;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for w in &mut weights {
+                        *w = w.clamp(0.0, 1.0);
+                    }
+                    weights
                 };
 
                 Some(RenderMeshInstance {
@@ -267,7 +315,7 @@ fn build_frame_input(
                     cull_mode,
                     outline,
                     primitive_data: Some(Arc::clone(prim)),
-                    morph_weights: Vec::new(),
+                    morph_weights,
                 })
             })
         })
@@ -277,14 +325,23 @@ fn build_frame_input(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5.0);
+    let cam_pan_x: f32 = std::env::var("CAM_PAN_X")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let cam_pan_y: f32 = std::env::var("CAM_PAN_Y")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let cam_pitch: f32 = std::env::var("CAM_PITCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
     let camera = ViewportCamera {
         yaw_deg,
+        pitch_deg: cam_pitch,
         distance: cam_distance,
-        pan: [0.0, cam_pan_y],
+        pan: [cam_pan_x, cam_pan_y],
         ..ViewportCamera::default()
     };
     let (view, eye_pos) = build_view_matrix(&camera);

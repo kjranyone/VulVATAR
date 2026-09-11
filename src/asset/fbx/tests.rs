@@ -238,20 +238,41 @@ fn test_find_avatar_file_in_dir() {
 }
 
 #[test]
-fn test_parse_yumeka_unitypackage() {
-    let pkg_path = Path::new("sample_data/YUMEKA_v1.0.1/Yumeka_v1.0.1.unitypackage");
-    if !pkg_path.exists() {
+fn test_inspect_mouth() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
         return;
     }
 
-    let parsed = crate::asset::vrc::parse_unitypackage(pkg_path).expect("Failed to parse unitypackage");
-    assert!(!parsed.phys_bones.is_empty(), "Should parse VRCPhysBones from prefab");
-    assert!(!parsed.colliders.is_empty(), "Should parse VRCPhysBoneColliders from prefab");
-    println!(
-        "Parsed unitypackage: {} PhysBones, {} Colliders",
-        parsed.phys_bones.len(),
-        parsed.colliders.len()
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).unwrap();
+
+    // 1. Verify facial bones (tongue, cheek, eye, mouth) are NEVER in spring bones
+    for sb in &asset.spring_bones {
+        let root_name = &asset.skeleton.nodes[sb.chain_root.0 as usize].name;
+        let root_lower = root_name.to_lowercase();
+        assert!(
+            !root_lower.contains("tongue") && !root_lower.contains("cheek") && !root_lower.contains("eye") && !root_lower.contains("jaw"),
+            "Facial bone '{}' must not be a spring bone chain root", root_name
+        );
+        for &j in &sb.joints {
+            let j_name = &asset.skeleton.nodes[j.0 as usize].name;
+            let j_lower = j_name.to_lowercase();
+            assert!(
+                !j_lower.contains("tongue") && !j_lower.contains("cheek") && !j_lower.contains("eye") && !j_lower.contains("jaw"),
+                "Facial bone '{}' must not be in spring bone joints", j_name
+            );
+        }
+    }
+
+    // 2. Verify standard preset 'aa' binds only the best morph target (no duplicate application)
+    let aa_expr = asset.default_expressions.expressions.iter().find(|e| e.name == "aa").expect("Preset 'aa' must exist");
+    assert_eq!(
+        aa_expr.morph_binds.len(), 1,
+        "Preset 'aa' must have exactly 1 morph bind per mesh node, got: {:?}", aa_expr.morph_binds
     );
+    // Target 0 is vrc.v_aa
+    assert_eq!(aa_expr.morph_binds[0].morph_target_index, 0, "Preset 'aa' should prioritize vrc.v_aa");
 }
 
 

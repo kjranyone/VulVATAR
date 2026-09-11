@@ -508,6 +508,53 @@ impl ChainCategory {
     }
 }
 
+/// Check if a bone name belongs to facial features, limbs, or utility nodes
+/// that should NEVER be simulated as dynamic spring bones (which cause tongue/cheek distortion).
+fn is_excluded_bone_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // Head & facial components (e.g. Tongue, Cheek, Eye)
+    lower.contains("tongue")
+        || lower.contains("cheek")
+        || lower.contains("eye")
+        || lower.contains("pupil")
+        || lower.contains("brow")
+        || lower.contains("lip")
+        || lower.contains("jaw")
+        || lower.contains("mouth")
+        || lower.contains("face")
+        || lower.contains("nose")
+        || lower.contains("ear")
+        || lower.contains("teeth")
+        || lower.contains("tooth")
+        // Limbs & skeletal twist / helper bones
+        || lower.contains("twist")
+        || lower.contains("finger")
+        || lower.contains("thumb")
+        || lower.contains("index")
+        || lower.contains("middle")
+        || lower.contains("ring")
+        || lower.contains("little")
+        || lower.contains("pinky")
+        || lower.contains("hand")
+        || lower.contains("foot")
+        || lower.contains("arm")
+        || lower.contains("leg")
+        || lower.contains("toe")
+        // Utility & helpers
+        || lower.contains("col")
+        || lower.contains("mesh")
+        || lower.contains("target")
+        || lower.contains("ik")
+        || lower.contains("pole")
+        || lower.contains("socket")
+        || lower.contains("anchor")
+        || lower.contains("armature")
+        || lower.contains("null")
+        || lower.contains("dummy")
+        || lower.contains("center")
+        || lower.contains("scale")
+}
+
 /// Discovered non-humanoid bone chain from the skeleton hierarchy.
 pub struct DiscoveredChain {
     pub root_node_idx: usize,
@@ -522,6 +569,11 @@ pub fn discover_bone_chains(skeleton: &SkeletonAsset) -> Vec<DiscoveredChain> {
 
     for (node_idx, node) in skeleton.nodes.iter().enumerate() {
         if node.humanoid_bone.is_some() || node.children.is_empty() {
+            continue;
+        }
+
+        // Never turn facial bones (tongue, cheek, eye) or extremities into spring chains
+        if is_excluded_bone_name(&node.name) {
             continue;
         }
 
@@ -547,17 +599,6 @@ pub fn discover_bone_chains(skeleton: &SkeletonAsset) -> Vec<DiscoveredChain> {
         }
 
         let cat = ChainCategory::classify(&node.name);
-        if cat == ChainCategory::Other {
-            // Ignore utility nodes
-            let lower = node.name.to_lowercase();
-            if lower.contains("col")
-                || lower.contains("mesh")
-                || lower.contains("target")
-                || lower.contains("ik")
-            {
-                continue;
-            }
-        }
 
         // Collect all joints down this chain (single child branch or first path)
         let mut joints = vec![node_idx];
@@ -571,6 +612,11 @@ pub fn discover_bone_chains(skeleton: &SkeletonAsset) -> Vec<DiscoveredChain> {
             } else {
                 break;
             }
+        }
+
+        // If any descendant joint in the chain is an excluded bone, skip the entire chain
+        if joints.iter().any(|&j_idx| is_excluded_bone_name(&skeleton.nodes[j_idx].name)) {
+            continue;
         }
 
         chains.push(DiscoveredChain {
