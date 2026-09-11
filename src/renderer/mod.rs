@@ -1157,19 +1157,34 @@ impl VulkanRenderer {
             let n = instance.mesh_instances.len();
             let mut in_degree = vec![0usize; n];
             let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-            let prim_id_to_idx: HashMap<PrimitiveId, usize> = instance
-                .mesh_instances
-                .iter()
-                .enumerate()
-                .map(|(idx, mi)| (mi.primitive_id, idx))
-                .collect();
 
+            // Build unique primitive_id mapping; detect duplicate primitive IDs if any.
+            let mut prim_id_to_idx = HashMap::new();
+            let mut has_duplicate_ids = false;
             for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-                if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
-                    if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
-                        if parent_idx != idx {
-                            adj[parent_idx].push(idx);
-                            in_degree[idx] += 1;
+                if prim_id_to_idx.insert(mi.primitive_id, idx).is_some() {
+                    has_duplicate_ids = true;
+                    warn!("render: duplicate primitive_id {:?} in mesh instances", mi.primitive_id);
+                }
+            }
+
+            // Track which primitives have a strictly validated parent dependency.
+            // Invalid dependencies (self-reference, missing parent, or duplicate IDs) are pruned immediately.
+            let mut validated_parent_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
+
+            if !has_duplicate_ids {
+                for (idx, mi) in instance.mesh_instances.iter().enumerate() {
+                    if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
+                        if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
+                            if parent_idx != idx {
+                                adj[parent_idx].push(idx);
+                                in_degree[idx] += 1;
+                                validated_parent_ids.insert(mi.primitive_id, parent_id);
+                            } else {
+                                warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
+                            }
+                        } else {
+                            warn!("render: missing parent body_primitive_id {:?} for primitive {:?}; fallback to unconstrained skinning", parent_id, mi.primitive_id);
                         }
                     }
                 }
@@ -1195,14 +1210,17 @@ impl VulkanRenderer {
                 }
             }
 
-            // Fallback for cyclic dependencies or unvisited nodes: append remaining in original order
+            // Fallback for cyclic dependencies or unvisited nodes:
+            // Prune their parent dependencies to completely disable clearance constraints,
+            // falling back safely to standard skinning, then append remaining instances.
             if ordered_mesh_instances.len() < n {
                 warn!(
-                    "render: cycle or unresolved dependency detected in mesh primitive clearance graph ({} of {} resolved)",
+                    "render: cycle detected in clearance graph ({} of {} resolved); disabling clearance on cyclic nodes and falling back to standard skinning",
                     ordered_mesh_instances.len(), n
                 );
                 for (idx, mi) in instance.mesh_instances.iter().enumerate() {
                     if !visited[idx] {
+                        validated_parent_ids.remove(&mi.primitive_id);
                         ordered_mesh_instances.push(mi);
                     }
                 }
@@ -1246,8 +1264,9 @@ impl VulkanRenderer {
                     })
                     .unwrap_or(false);
 
-                // Look up parent surface transformed VBO if this primitive has skin/layer anchors
-                let prim_parent_vbo = prim_asset.body_primitive_id.and_then(|parent_pid| {
+                // Look up parent surface transformed VBO ONLY if this primitive has a validated DAG parent
+                let validated_parent_pid = validated_parent_ids.get(&mesh_inst.primitive_id).copied();
+                let prim_parent_vbo = validated_parent_pid.and_then(|parent_pid| {
                     instance.mesh_instances.iter().find(|mi| mi.primitive_id == parent_pid).and_then(|parent_mi| {
                         if let Some(parent_asset) = parent_mi.primitive_data.as_ref() {
                             let _ = self.ensure_transform_data(

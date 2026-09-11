@@ -19,7 +19,7 @@ VTuber、メタバース、VRChat、ゲーム開発など、リアルタイム3D
 | 手法 | メリット | トレードオフ・制約 |
 |---|---|---|
 | **カプセルコライダーの配置** | 物理エンジン（Dynamic Bone, PhysBone等）と親和性が高い | 薄い布層間（数ミリ〜1センチ程度）ではトンネリング（すり抜け）や反発の振動（ジッター）が起きやすい。アバターごとに手動調整が必要。 |
-| **不可視メッシュの削除・マスク** | 隠れた部分の貫通が原理的に生じない | 衣装の着脱や袖口・襟元から覗くメッシュを残す必要がある場合、動的マスクテクスチャや専用シェーダー等の仕組みが必要。 |
+| **不可視メッシュの削除・マスク** | 隠した部分の貫通が画面に現れない | 衣装の着脱や袖口・襟元から覗くメッシュを残す必要がある場合、動的マスクテクスチャや専用シェーダー等の仕組みが必要。 |
 | **ボーンウェイトの同期・転写** | 共通ボーンに対する変形傾向が揃う | メッシュ固有のシワや布の厚み表現が制約される場合がある。また、服ごとに独立した二次揺れボーン（胸揺れ・裾揺れ等）が存在する場合、その物理挙動まで完全に同期させることは難しい。 |
 
 本稿では、手動コライダー調整を回避しつつ、スキニング後のGPUパイプラインにおいて内側メッシュを参照して外側メッシュの位置を押し出す**「階層アンカーによるクリアランス補正」** の実装例を報告します。
@@ -27,7 +27,7 @@ VTuber、メタバース、VRChat、ゲーム開発など、リアルタイム3D
 具体的には、
 1. レストポーズにおけるメッシュ間の**ボーン放射距離（Radial Distance）** を用いた内外順序の推定ヒューリスティック
 2. 空間距離とボーンウェイト類似度を組み合わせたアンカー対応点探索
-3. Vulkan コンピュートスキニングパイプラインにおける **Kahn のアルゴリズムを用いたトポロジカルディスパッチ**
+3. Vulkan コンピュートスキニングパイプラインにおける **Kahn のアルゴリズムを用いたトポロジカルディスパッチと異常依存時の安全フォールバック**
 4. GPU コンピュートシェーダーによる一方向のクリアランス押し出し補正
 
 の設計と実装、および商用アバター（Yumeka）でのテスト結果と本手法が持つ工学的な制約・限界について客観的に解説します。
@@ -44,7 +44,7 @@ VTuber、メタバース、VRChat、ゲーム開発など、リアルタイム3D
 - **シャツメッシュ** (`Circle.057`, 17,844 頂点)
 - **ブレザーメッシュ** (`Circle.051`, 17,172 頂点)
 
-レストポーズ（Tポーズ）における前腕ボーン軸からの放射距離中央値を計測すると：
+レストポーズ（Tポーズ）における前腕ボーン軸（Yumekaモデルのノード名: `LowerArm_L`、Humanoid共通呼称: `LeftForeArm`）からの放射距離中央値を計測すると：
 - シャツの肘ボーン距離中央値: **54.8 mm**
 - ブレザーの肘ボーン距離中央値: **62.3 mm**
 - （参考：中央値の差は **約 7.5 mm**）
@@ -59,12 +59,12 @@ $$\mathbf{v}' = \sum_{j} w_j \mathbf{M}_j \mathbf{v}_{\text{rest}}$$
 
 ```
 Outer（ブレザー頂点例）:
-  - LeftArm:         0.69
-  - LeftForeArm:      0.31
+  - UpperArm:         0.69
+  - LowerArm:         0.31
 
 Inner（シャツ頂点例）:
-  - LeftArm:         0.42
-  - LeftForeArm:      0.58
+  - UpperArm:         0.42
+  - LowerArm:         0.58
 ```
 
 前腕ボーンが90度回転した際、前腕ウェイトの比率が大きいシャツ頂点（0.58）は回転運動に強く追従する一方、ブレザー頂点（0.31）は上腕寄りに留まります。初期クリアランスの厚みや動作範囲によっては、この変形ベクトルの違いによって内側メッシュが外側メッシュの軌道を追い越し、局所的な交差（クリッピング）が発生しやすくなります。
@@ -73,10 +73,10 @@ Inner（シャツ頂点例）:
 
 ## 3. 先行研究との位置づけ
 
-衣服の多層貫通問題に関する先行研究としては、**Implicit Untangling (Müller et al., ACM TOG 2019)** が広く知られています。
+衣服の多層貫通・交差解消に関する代表的な先行研究として、**Buffetらの *Implicit Untangling: A Robust Solution for Modeling Layered Clothing* (ACM TOG 2019)** が知られています。
 
-- **Implicit Untangling**: 衣服の各レイヤーを暗黙的な符号付き距離場（SDF）として扱い、衝突応答を最適化問題として解くアプローチ。高品質な交差解消が可能ですが、層の順序（Inner $\to$ Outer）はユーザーによる事前指定が前提とされることが多いです。
-- **本手法のアプローチ**: メッシュ名やユーザー指定に頼らず、幾何学的なボーン放射距離から層の順序を自動推定し、リアルタイム描画パイプラインの頂点スキニングステージ直後で固定アンカーによる軽量な点-接平面押し出しを行う工学的な軽量解法です。
+- **Buffetら (2019) のアプローチ**: ユーザーが指定した層順序と厚みなどに基づいて陰関数表現（Implicit Surfaces）の合成演算子を定義し、その結果へ衣服メッシュを投影することで多層交差を解消する。
+- **本手法のアプローチ**: 層順序をメッシュの幾何学的ボーン放射距離からヒューリスティックに自動推定し、リアルタイム描画パイプラインの頂点スキニングステージ直後で固定アンカーによる軽量な点-接平面押し出しを行う工学的な軽量解法。
 
 ---
 
@@ -110,7 +110,7 @@ $$\Delta r_{BA} = r(\mathbf{p}_B) - r(\mathbf{p}_A)$$
 レストポーズでのユークリッド距離のみで最近傍を求めると、関節屈曲時に異なる運動をする頂点とペアリングされてしまうため、ボーンウェイトの類似度をペナルティとして目的関数に加えます。
 
 #### コサイン類似度 $S_{\text{bone}}(u, v)$ の定義
-4次元のボーンウェイトベクトル $\mathbf{W}(u), \mathbf{W}(v)$（ボーンインデックスを共通軸として揃えたベクトル）に対し、正規化されたコサイン類似度を算出します：
+ボーンIDを共通の座標軸とする疎なウェイトベクトル（各頂点の非ゼロ要素は最大4個） $\mathbf{W}(u), \mathbf{W}(v)$ に対し、正規化されたコサイン類似度を算出します：
 
 $$S_{\text{bone}}(u, v) = \frac{\sum_{k \in J(u) \cap J(v)} W_k(u) W_k(v)}{\sqrt{\sum_k W_k(u)^2} \sqrt{\sum_k W_k(v)^2}}$$
 
@@ -129,33 +129,47 @@ $$i^* = \arg\min_{i \in \text{Candidates}} \left( \|\mathbf{p}_o - \mathbf{p}_i\
 
 ---
 
-### 4.3 Vulkan レンダラーにおけるトポロジカル・ディスパッチ
+### 4.3 Vulkan レンダラーにおけるトポロジカル・ディスパッチと安全フォールバック
 
 衣服プリミティブ間の依存関係（例: 素体 $\to$ シャツ $\to$ ブレザー）が構築された場合、GPU 上で親サーフェスの変形後頂点バッファを先に生成し、それを子サーフェスのコンピュートスキニングで読み込む必要があります。
 
-#### Kahn のアルゴリズムによるトポロジカルソート
-直接の親子判定のみを行う単純な `sort_by` 比較関数は推移律を満たさず全順序にならないため、**Kahn のアルゴリズム（入次数カウントとキューによる DAG トポロジカルソート）** を採用しています：
+#### Kahn のアルゴリズムと不正依存時のフォールバック
+単純な `sort_by` 比較関数は推移律を満たさず全順序にならないため、**Kahn のアルゴリズム（入次数カウントとキューによる DAG トポロジカルソート）** を採用しています。
+さらに、実行時安全性を担保するため、**循環依存・存在しない親ID・自己参照・重複IDが検出されたノードは親依存関係（`validated_parent_ids`）から除外し、クリアランス補正を無効化して通常スキニング（unconstrained skinning）へ安全に復帰** させます：
 
 ```rust
 // Topological dependency ordering for hierarchical surface clearances:
 // If primitive B specifies body_primitive_id = Some(A), A must be dispatched before B.
-// Using Kahn's algorithm with cycle detection to guarantee a valid dispatch order.
+// Using Kahn's algorithm with cycle detection and safe runtime fallback.
 let n = instance.mesh_instances.len();
 let mut in_degree = vec![0usize; n];
 let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-let prim_id_to_idx: HashMap<PrimitiveId, usize> = instance
-    .mesh_instances
-    .iter()
-    .enumerate()
-    .map(|(idx, mi)| (mi.primitive_id, idx))
-    .collect();
 
+// 重複 ID の検出
+let mut prim_id_to_idx = HashMap::new();
+let mut has_duplicate_ids = false;
 for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-    if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
-        if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
-            if parent_idx != idx {
-                adj[parent_idx].push(idx);
-                in_degree[idx] += 1;
+    if prim_id_to_idx.insert(mi.primitive_id, idx).is_some() {
+        has_duplicate_ids = true;
+        warn!("render: duplicate primitive_id {:?} in mesh instances", mi.primitive_id);
+    }
+}
+
+let mut validated_parent_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
+
+if !has_duplicate_ids {
+    for (idx, mi) in instance.mesh_instances.iter().enumerate() {
+        if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
+            if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
+                if parent_idx != idx {
+                    adj[parent_idx].push(idx);
+                    in_degree[idx] += 1;
+                    validated_parent_ids.insert(mi.primitive_id, parent_id);
+                } else {
+                    warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
+                }
+            } else {
+                warn!("render: missing parent {:?}; fallback to unconstrained skinning", parent_id);
             }
         }
     }
@@ -181,17 +195,20 @@ while let Some(u) = queue.pop_front() {
     }
 }
 
-// 循環依存や未解決ノードが存在する場合のフォールバック
+// 循環依存ノードのフォールバック：親参照を削除して通常スキニングへ戻す
 if ordered_mesh_instances.len() < n {
-    warn!("render: cycle or unresolved dependency detected in mesh primitive clearance graph");
+    warn!("render: cycle detected; disabling clearance on cyclic nodes");
     for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-        if !visited[idx] { ordered_mesh_instances.push(mi); }
+        if !visited[idx] {
+            validated_parent_ids.remove(&mi.primitive_id);
+            ordered_mesh_instances.push(mi);
+        }
     }
 }
 ```
 
-#### GPU メモリの可視性と同期（Vulkano 0.35）
-CPU 側でディスパッチ順序をソートするだけでは GPU のメモリ可視性は保証されません。本実装（Vulkano 0.35 ベース）では、同一コマンドバッファ内で先行ディスパッチが `transformed_vbo` に書き込み、後続ディスパッチが同バッファを Binding 7（親サーフェス VBO）として読み込む際、**`AutoCommandBufferBuilder` のリソースアクセストラッキング機構** によって、適切なパイプラインバリア（`VkMemoryBarrier`）がバインド境界で自動挿入され、RAW（Read-After-Write）ハザードが回避されます。
+#### GPU メモリの同期
+同一コマンドバッファ内の追跡対象リソースへのアクセスについて、本パイプラインでは Vulkano 0.35 の `AutoCommandBufferBuilder` の自動同期を利用しています（先行ディスパッチの `transformed_vbo` 書き込みと、後続ディスパッチの Binding 7 での読み込みの依存関係追跡）。
 
 ---
 
@@ -205,7 +222,9 @@ if (push.has_skin_anchors != 0) {
     SkinAnchor anchor = skin_anchors[gl_GlobalInvocationID.x];
     if (anchor.weight > 0.0) {
         vec3 parent_p = parent_v[anchor.body_vertex_idx].pos;
-        vec3 parent_n = normalize(parent_v[anchor.body_vertex_idx].norm);
+        vec3 raw_n = parent_v[anchor.body_vertex_idx].norm;
+        float n_len = length(raw_n);
+        vec3 parent_n = (n_len > 1e-5) ? (raw_n / n_len) : vec3(0.0, 1.0, 0.0);
 
         vec3 delta = skinned_pos - parent_p;
         float current_clearance = dot(delta, parent_n);
@@ -220,10 +239,10 @@ if (push.has_skin_anchors != 0) {
 
 > [!IMPORTANT]
 > **幾何学的補正の性質と制限事項**
-> 1. **一方向補正**: 本処理は外側頂点を外側に押し出す「一方向の位置補正（Unilateral Projection）」です（内側頂点を押し戻す双方向処理ではありません）。
+> 1. **一方向補正**: 本処理は外側頂点を外側に押し出す「一方向の位置補正（Unilateral Projection）」です（内側頂点を押し戻す処理ではありません）。
 > 2. **重み $w < 1$ での未到達**: クリアランス現在値を $d$、必要値を $c$、重みを $w$ とすると補正後距離は $d' = d + w(c - d)$ となり、$w < 1$ の場合は設定クリアランスに届きません。完全なクリアランスを要求する場合は $w = 1.0$ が前提となります。
 > 3. **点-接平面拘束の限界**: この補正が保証するのは「選ばれた親頂点の接平面に対する点-平面距離」のみです。三角形同士のメッシュ交差、エッジ交差、補正によって新たに生じる二次的な自己交差は検出・防止できません。
-> 4. **法線の更新**: 親メッシュのスキニング変形後の法線はスキニング行列で回転されたものを正規化して使用しています。
+> 4. **法線の再計算未実施**: 補正による形状変化に対する法線の再計算は行っておらず、拘束にはスキニング法線による近似平面を使用しています。
 
 ---
 
@@ -238,8 +257,8 @@ if (push.has_skin_anchors != 0) {
 - **ポーズ設定**: 左前腕ボーン（`LowerArm_L`）をローカル X 軸に沿って **90度屈曲**
 - **検証環境**: CPU シミュレーションテスト（`compute_rest_world_vertices` による LBS 再現計算）
 
-#### 貫通判定の定義
-本テストにおける「貫通」は、三角形交差判定ではなく、**「肘中心から半径 70mm 以内にあるインナー頂点に対し、最も近いアウター頂点のアウター法線に対する符号付き距離 $(\mathbf{p}_{\text{inner}} - \mathbf{p}_{\text{outer}}) \cdot \mathbf{n}_{\text{outer}} > 1.0\,\text{mm}$ を満たす頂点」** として計測しています。
+#### 計測指標の定義
+本テストにおける計測は、メッシュ全体の三角形交差判定ではなく、**「肘中心から半径 70mm 以内にあるインナー頂点に対し、最も近いアウター頂点のアウター法線方向に対する符号付き距離 $(\mathbf{p}_{\text{inner}} - \mathbf{p}_{\text{outer}}) \cdot \mathbf{n}_{\text{outer}} > 1.0\,\text{mm}$（アウター接平面の外側へ1mm以上突出）を満たす頂点数」** を評価対象としています（意図する健全な配置はアウター接平面より内側）。
 
 ### 実測値
 
@@ -255,20 +274,20 @@ if (push.has_skin_anchors != 0) {
 
 【肘 90度 屈曲時の点-接平面距離計測】
   - 補正前 (Skinned Baseline):
-      貫通判定頂点数: 75 頂点
-      最大法線方向突出: 26.38 mm
+      法線方向突出が 1mm を超えた頂点数: 75 頂点
+      最大法線方向突出 (超過分):        26.38 mm
   - 補正後 (Clearance Projected):
-      貫通判定頂点数: 0 頂点
-      最大法線方向突出: 0.00 mm (接平面の外側に維持)
+      法線方向突出が 1mm を超えた頂点数: 0 頂点 (該当なし)
 ======================================================================
 ```
 
-未補正状態では、ボーンウェイト比率の差によってシャツの頂点がブレザーの接平面より最大 26.38 mm 外側に突出していましたが、アンカーに基づく法線押し出し補正を適用した結果、計測対象領域における接平面突出は 0 頂点となりました。
+補正前はウェイト差によりシャツ頂点がブレザーの接平面より最大 26.38 mm 外側に突出していましたが、アンカーに基づく押し出し補正を適用した結果、計測対象領域において突出が 1mm を超える頂点は 0 頂点となりました。
 
 > [!NOTE]
 > **ベンチマークに関する留意事項**
-> - 本テストは CPU 上で LBS 変形とクリアランス補正関数を実行したシミュレーション検証であり、実際の Vulkan レンダリングパスでの GPU 計測値（フレームタイム等）については、GPU の機種・解像度・測定誤差（数マイクロ秒〜数十マイクロ秒のジッター）を含むため、別途実機ベンチマークでの確認が必要です。
-> - 本結果は特定モデル（Yumeka）の肘屈曲ポーズにおける検証結果であり、任意の未知アバターや激しい動的アニメーションに対して破綻ゼロを一般的に証明するものではありません。
+> - **閾値超過なしと微小突出の可能性**: 補正後の「超過頂点数 0 頂点」は、1.0mm を超える突出が存在しなかったことを示しています。本テストの計測ロジック上、閾値超過頂点がない場合はループ内で最大値更新が行われないため、0.0mm〜1.0mm 未満の微小な突出が残存している可能性は排除していません。
+> - **CPU シミュレーション**: 本テストは CPU 上で LBS 変形とクリアランス補正関数を実行したシミュレーション検証であり、実際の Vulkan レンダリングパスにおける GPU フレームタイムの確定値やジッターを評価するものではありません。
+> - **一般化の制限**: 本結果は特定モデル（Yumeka）の肘屈曲ポーズにおける検証結果であり、任意の未知アバターや激しい動的アニメーションに対して破綻ゼロを一般的に証明するものではありません。
 
 ---
 
@@ -278,13 +297,13 @@ if (push.has_skin_anchors != 0) {
 
 ### 実装の成果
 1. **手動設定の削減**: メッシュ名や手動コライダー設定に依存せず、放射距離ヒューリスティックにより Inner $\to$ Outer の順序を自動推定可能とした。
-2. **有効なディスパッチ順序の保証**: Kahn のトポロジカルソートにより、任意の階層深さで安全に先行サーフェスを変形・参照するパイプラインを構築した。
-3. **局所突出の改善**: 単純な LBS で発生していた 26mm 超の局所突き破りを、接平面クリアランス拘束によって効果的に低減できることを確認した。
+2. **実行時フォールバック**: Kahn のトポロジカルソートに異常依存（循環・未解決ノード等）時の親参照解除を組み込み、安全に通常スキニングへ戻すパイプラインを構築した。
+3. **局所突出の低減**: 単純な LBS で発生していた 26mm 超の局所突き破りを、接平面クリアランス拘束によって効果的に低減できることを確認した。
 
 ### 残された課題
 - **三角形メッシュ交差の非保証**: 点-接平面拘束のみでは、エッジ同士の交差やシワの折り返しによる交差を完全に防ぐことはできません。
 - **未バインド頂点の扱い**: 1.1% の未バインド頂点に対するフォールバックや、複数親サーフェス接触への対応。
-- **陰関数・SDFアプローチとの統合**: より高品位な接触解消が求められるケースにおいては、Implicit Untangling 等の連続距離場手法との併用が今後の検討課題となります。
+- **陰関数・SDFアプローチとの統合**: より高品位な接触解消が求められるケースにおいては、Buffetら (2019) のような連続距離場手法との併用が今後の検討課題となります。
 
 ---
 
