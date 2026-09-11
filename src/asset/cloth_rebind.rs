@@ -434,6 +434,7 @@ mod tests {
             node_to_mesh: std::collections::HashMap::new(),
             vrm_meta: VrmMeta::default(),
             root_aabb: Aabb::empty(),
+            body_primitive_id: None,
             loaded_from_cache: false,
         }
     }
@@ -554,6 +555,8 @@ mod tests {
                     vertices: None,
                     indices: None,
                     morph_targets: vec![],
+                    skin_anchors: None,
+                    body_primitive_id: None,
                 }),
                 std::sync::Arc::new(MeshPrimitiveAsset {
                     id: PrimitiveId(21),
@@ -565,6 +568,8 @@ mod tests {
                     vertices: None,
                     indices: None,
                     morph_targets: vec![],
+                    skin_anchors: None,
+                    body_primitive_id: None,
                 }),
             ],
         };
@@ -604,6 +609,8 @@ mod tests {
                 vertices: None,
                 indices: None,
                 morph_targets: vec![],
+                skin_anchors: None,
+                body_primitive_id: None,
             })],
         };
         let avatar = make_avatar(vec![], vec![body_mesh]);

@@ -478,6 +478,14 @@ impl Application {
         self.viewport_extent = [w, h];
     }
 
+    /// Extent whose aspect the render projection is built from this frame:
+    /// the explicit output resolution when set, else the GUI viewport. The
+    /// GUI's debug overlays must project through this same aspect (and then
+    /// into the letterboxed image rect) to stay aligned with the character.
+    pub fn render_extent(&self) -> [u32; 2] {
+        self.output_extent.unwrap_or(self.viewport_extent)
+    }
+
     /// Returns the rendered RGBA pixel data and its extent, if available.
     pub fn rendered_pixels(&self) -> Option<(&[u8], [u32; 2])> {
         self.rendered_pixels
@@ -893,6 +901,8 @@ mod tests {
             vertices: Some(verts),
             indices: Some(vec![0, 1, 2]),
             morph_targets: Vec::new(),
+            skin_anchors: None,
+            body_primitive_id: None,
         };
 
         let mesh = MeshAsset {
@@ -918,6 +928,7 @@ mod tests {
             node_to_mesh: Default::default(),
             vrm_meta: Default::default(),
             root_aabb: crate::asset::Aabb::empty(),
+            body_primitive_id: None,
             loaded_from_cache: false,
         });
 

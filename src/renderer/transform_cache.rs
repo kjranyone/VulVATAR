@@ -53,12 +53,58 @@ impl VulkanRenderer {
         Ok(stub)
     }
 
+    pub(super) fn ensure_stub_skin_anchor_ssbo(
+        &mut self,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+    ) -> Result<Subbuffer<[crate::asset::SkinAnchor]>, String> {
+        if let Some(ref stub) = self.stub_skin_anchor_ssbo {
+            return Ok(stub.clone());
+        }
+        let stub = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            [crate::asset::SkinAnchor::default()].into_iter(),
+        )
+        .map_err(|e| format!("renderer: stub skin anchor SSBO alloc failed: {e}"))?;
+        self.stub_skin_anchor_ssbo = Some(stub.clone());
+        Ok(stub)
+    }
+
+    pub(super) fn ensure_stub_vertex_ssbo(
+        &mut self,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+    ) -> Result<Subbuffer<[GpuVertex]>, String> {
+        if let Some(ref stub) = self.stub_vertex_ssbo {
+            return Ok(stub.clone());
+        }
+        let stub = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            [GpuVertex::default()].into_iter(),
+        )
+        .map_err(|e| format!("renderer: stub vertex SSBO alloc failed: {e}"))?;
+        self.stub_vertex_ssbo = Some(stub.clone());
+        Ok(stub)
+    }
+
     /// Ensure a [`TransformGpuData`] slot exists for `(mesh_id, prim_id)`
-    /// with cloth allocation matching this frame's requirements. If the
-    /// existing slot's cloth allocation shape disagrees with `has_cloth` /
-    /// `has_cloth_normals` (rare — user toggled a cloth-bearing accessory
-    /// on / off at runtime), the slot is evicted and rebuilt so the
-    /// descriptor set's pinned bindings stay consistent.
+    /// with cloth and skin-anchor allocation matching this frame's requirements.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ensure_transform_data(
         &mut self,
@@ -67,19 +113,22 @@ impl VulkanRenderer {
         prim: &MeshPrimitiveAsset,
         has_cloth: bool,
         has_cloth_normals: bool,
+        body_transformed_vbo: Option<Subbuffer<[GpuVertex]>>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         transform_pipeline: &Arc<ComputePipeline>,
     ) -> Result<(), String> {
         let key = (mesh_id, prim_id);
+        let has_anchors = prim.skin_anchors.is_some() && body_transformed_vbo.is_some();
 
         if let Some(existing) = self.transform_cache.get(&key) {
             if existing.has_cloth_alloc == has_cloth
                 && existing.has_cloth_normals_alloc == has_cloth_normals
+                && existing.has_skin_anchors_alloc == has_anchors
             {
                 return Ok(());
             }
-            // Cloth allocation shape changed under us; drop the slot so
+            // Cloth or anchor allocation shape changed under us; drop the slot so
             // the fresh allocation lands below with the right SSBOs.
             self.transform_cache.remove(&key);
         }
@@ -228,9 +277,37 @@ impl VulkanRenderer {
             self.ensure_stub_ssbo(memory_allocator)?
         };
 
+        let skin_anchors_ssbo = if let Some(ref anchors) = prim.skin_anchors {
+            Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                anchors.iter().copied(),
+            )
+            .map_err(|e| format!("renderer: skin anchors SSBO alloc failed: {e}"))?
+        } else {
+            self.ensure_stub_skin_anchor_ssbo(memory_allocator)?
+        };
+
+        let body_vbo = if let Some(ref vbo) = body_transformed_vbo {
+            vbo.clone()
+        } else {
+            self.ensure_stub_vertex_ssbo(memory_allocator)?
+        };
+
         let mut ctrl = TransformControl::zeroed();
         ctrl.vertex_count = vertex_count as u32;
         ctrl.target_count = target_count as u32;
+        ctrl.has_cloth = if has_cloth { 1 } else { 0 };
+        ctrl.has_cloth_normals = if has_cloth_normals { 1 } else { 0 };
+        ctrl.has_skin_anchors = if has_anchors { 1 } else { 0 };
         let control_ubo = Buffer::from_data(
             memory_allocator.clone(),
             BufferCreateInfo {
@@ -262,6 +339,8 @@ impl VulkanRenderer {
                 WriteDescriptorSet::buffer(3, cloth_norm_ssbo.clone()),
                 WriteDescriptorSet::buffer(4, control_ubo.clone()),
                 WriteDescriptorSet::buffer(5, transformed_vbo.clone()),
+                WriteDescriptorSet::buffer(6, skin_anchors_ssbo.clone()),
+                WriteDescriptorSet::buffer(7, body_vbo),
             ],
             [],
         )
@@ -277,12 +356,14 @@ impl VulkanRenderer {
                 morph_deltas,
                 cloth_pos_ssbo,
                 cloth_norm_ssbo,
+                skin_anchors_ssbo,
                 transform_set,
                 index_count,
                 vertex_count: vertex_count as u32,
                 target_count: target_count as u32,
                 has_cloth_alloc: has_cloth,
                 has_cloth_normals_alloc: has_cloth_normals,
+                has_skin_anchors_alloc: has_anchors,
                 last_cloth_version: None,
                 cloth_gpu: None,
             },

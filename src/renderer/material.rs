@@ -356,7 +356,10 @@ impl MaterialUploader {
             )
         } else {
             (
-                [0.0, 0.0, 0.0, 0.0],
+                // Non-MToon (e.g. FBX) materials: pure-black shade color turned
+                // every unlit face pitch black; a neutral grey keeps the toon
+                // step visible instead of crushing to 0.
+                [0.55, 0.55, 0.6, 1.0],
                 [0.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 0.0],
                 1.0,

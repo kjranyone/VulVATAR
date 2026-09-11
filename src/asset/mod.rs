@@ -1,8 +1,11 @@
 pub mod cache;
+pub mod clearance;
 pub mod cloth_rebind;
 pub mod fbx;
 pub mod vrc;
 pub mod vrm;
+
+pub use clearance::SkinAnchor;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -292,6 +295,8 @@ pub struct AvatarAsset {
     /// Union of all primitive AABBs in model/rest-pose space. Used for camera
     /// framing and debug visualisation.
     pub root_aabb: Aabb,
+    /// Primary body primitive used for skin clearance collision avoidance.
+    pub body_primitive_id: Option<PrimitiveId>,
     /// Runtime-only flag set when the avatar was rehydrated from the
     /// `%APPDATA%\VulVATAR\cache\<hash>.vvtcache` file. Surfaced in the
     /// inspector as a `Cached` / `Fresh load` badge so users can see
@@ -370,6 +375,10 @@ pub struct MeshPrimitiveAsset {
     /// Morph targets parsed from glTF. Index corresponds to the glTF
     /// morph target index within this primitive.
     pub morph_targets: Vec<MorphTargetDelta>,
+    /// Skin anchor constraints preventing penetration into the avatar's body.
+    pub skin_anchors: Option<Vec<SkinAnchor>>,
+    /// ID of the target body primitive this primitive is anchored against.
+    pub body_primitive_id: Option<PrimitiveId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

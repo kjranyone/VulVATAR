@@ -582,8 +582,199 @@ fn test_inspect_thigh_colliders_and_skirt() {
     }
 }
 
+#[test]
+fn test_inspect_all_meshes_in_yumeka() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).unwrap();
+    println!("=== ALL MESHES IN YUMEKA ({}) ===", asset.meshes.len());
+    for (i, m) in asset.meshes.iter().enumerate() {
+        for (pi, p) in m.primitives.iter().enumerate() {
+            let mat_name = asset.materials.iter().find(|mat| mat.id == p.material_id).map(|mat| mat.name.as_str()).unwrap_or("?");
+            println!("  Mesh {} '{}' prim {} (id={:?}) verts={} mat='{}' bounds={:?}..{:?}", i, m.name, pi, p.id, p.vertex_count, mat_name, p.bounds.min, p.bounds.max);
+        }
+    }
+}
 
+#[test]
+fn test_yumeka_skin_anchors_generation() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).unwrap();
 
+    assert!(
+        asset.body_primitive_id.is_some(),
+        "Yumeka must have an identified body primitive"
+    );
+    let body_pid = asset.body_primitive_id.unwrap();
 
+    let body_prim = asset
+        .meshes
+        .iter()
+        .flat_map(|m| &m.primitives)
+        .find(|p| p.id == body_pid)
+        .expect("body primitive must exist");
+    assert_eq!(
+        body_prim.vertex_count, 79116,
+        "Yumeka body primitive has 79116 vertices"
+    );
 
+    // Find skirt mesh (Circle.056)
+    let skirt_mesh = asset
+        .meshes
+        .iter()
+        .find(|m| m.name == "Circle.056")
+        .expect("Yumeka has Circle.056 skirt mesh");
+    let skirt_prim = &skirt_mesh.primitives[0];
+
+    assert!(
+        skirt_prim.skin_anchors.is_some(),
+        "Skirt primitive must have generated skin anchors"
+    );
+    assert_eq!(
+        skirt_prim.body_primitive_id,
+        Some(body_pid),
+        "Skirt primitive must point to body primitive"
+    );
+
+    let anchors = skirt_prim.skin_anchors.as_ref().unwrap();
+    assert_eq!(anchors.len(), 2460);
+
+    let mut bound_count = 0usize;
+    for anc in anchors {
+        if anc.body_vertex_idx != u32::MAX {
+            bound_count += 1;
+            assert!(
+                anc.min_clearance >= 0.002,
+                "Min clearance must be at least 2mm (0.002m), got {}",
+                anc.min_clearance
+            );
+            assert!(
+                (anc.body_vertex_idx as usize) < body_prim.vertex_count as usize,
+                "Body vertex index must be within body primitive bounds"
+            );
+        }
+    }
+
+    println!(
+        "Yumeka skirt skin anchors: {} / 2460 bound to body (body_pid={:?})",
+        bound_count, body_pid
+    );
+    assert!(
+        bound_count >= 2000,
+        "Expected at least 2000 skirt vertices bound to body surface, got {}",
+        bound_count
+    );
+}
+
+#[test]
+fn test_yumeka_anti_penetration_projection_on_leg_lift() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).expect("Failed to load Yumeka FBX");
+
+    let body_pid = asset.body_primitive_id.expect("body_primitive_id must be identified");
+    let body_prim = asset
+        .meshes
+        .iter()
+        .flat_map(|m| &m.primitives)
+        .find(|p| p.id == body_pid)
+        .expect("body primitive must exist");
+
+    let skirt_mesh = asset
+        .meshes
+        .iter()
+        .find(|m| m.name == "Circle.056")
+        .expect("Circle.056 skirt mesh must exist");
+    let skirt_prim = &skirt_mesh.primitives[0];
+    let anchors = skirt_prim.skin_anchors.as_ref().expect("Skirt must have skin anchors");
+
+    // 1. Create avatar instance and pose: lift LeftUpperLeg forward by 45 degrees
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
+    );
+
+    let l_leg_idx = asset
+        .skeleton
+        .nodes
+        .iter()
+        .position(|n| n.name == "UpperLeg_L")
+        .expect("UpperLeg_L must exist");
+
+    let angle_rad = 45.0f32.to_radians();
+    let sin_half = (angle_rad * 0.5).sin();
+    let cos_half = (angle_rad * 0.5).cos();
+    let rot_x = [sin_half, 0.0, 0.0, cos_half];
+    avatar.pose.local_transforms[l_leg_idx].rotation = crate::math_utils::quat_mul(
+        &rot_x,
+        &asset.skeleton.nodes[l_leg_idx].rest_local.rotation,
+    );
+    avatar.compute_global_pose();
+    avatar.build_skinning_matrices();
+
+    // 2. Compute skinned world vertices for both body and skirt under this lifted pose
+    let body_world = crate::asset::clearance::compute_rest_world_vertices(body_prim, &avatar.pose.skinning_matrices);
+    let skirt_world = crate::asset::clearance::compute_rest_world_vertices(skirt_prim, &avatar.pose.skinning_matrices);
+
+    assert_eq!(body_world.len(), body_prim.vertex_count as usize);
+    assert_eq!(skirt_world.len(), skirt_prim.vertex_count as usize);
+
+    // 3. Simulate GPU Compute Shader transform_cs clearance projection logic
+    let mut penetration_threat_count = 0usize;
+    let mut max_push_distance = 0.0f32;
+
+    for (vid, &(mut skirt_p, _skirt_n)) in skirt_world.iter().enumerate() {
+        let anc = anchors[vid];
+        if anc.body_vertex_idx != u32::MAX && anc.weight > 1e-4 {
+            let (bp, bn) = body_world[anc.body_vertex_idx as usize];
+            let nlen = (bn[0] * bn[0] + bn[1] * bn[1] + bn[2] * bn[2]).sqrt();
+            if nlen > 1e-4 {
+                let unit_bn = [bn[0] / nlen, bn[1] / nlen, bn[2] / nlen];
+                let diff = [skirt_p[0] - bp[0], skirt_p[1] - bp[1], skirt_p[2] - bp[2]];
+                let clearance = diff[0] * unit_bn[0] + diff[1] * unit_bn[1] + diff[2] * unit_bn[2];
+
+                if clearance < anc.min_clearance {
+                    penetration_threat_count += 1;
+                    let push = (anc.min_clearance - clearance) * anc.weight;
+                    max_push_distance = max_push_distance.max(push);
+                    skirt_p[0] += unit_bn[0] * push;
+                    skirt_p[1] += unit_bn[1] * push;
+                    skirt_p[2] += unit_bn[2] * push;
+
+                    // After projection, clearance must satisfy min_clearance
+                    let new_diff = [skirt_p[0] - bp[0], skirt_p[1] - bp[1], skirt_p[2] - bp[2]];
+                    let new_clearance = new_diff[0] * unit_bn[0] + new_diff[1] * unit_bn[1] + new_diff[2] * unit_bn[2];
+                    assert!(
+                        new_clearance >= anc.min_clearance - 1e-4,
+                        "After projection, clearance ({}) must be >= min_clearance ({})",
+                        new_clearance,
+                        anc.min_clearance
+                    );
+                }
+            }
+        }
+    }
+
+    println!(
+        "Yumeka leg-lift anti-penetration: {} vertices guarded from body penetration, max push = {:.2} mm",
+        penetration_threat_count,
+        max_push_distance * 1000.0
+    );
+
+    assert!(
+        penetration_threat_count > 0,
+        "Expected leg lift to trigger anti-penetration constraints on skirt vertices"
+    );
+}
 

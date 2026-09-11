@@ -721,6 +721,7 @@ fn make_minimal_avatar_asset() -> std::sync::Arc<crate::asset::AvatarAsset> {
         node_to_mesh: Default::default(),
         vrm_meta: Default::default(),
         root_aabb: crate::asset::Aabb::empty(),
+        body_primitive_id: None,
         loaded_from_cache: false,
     })
 }

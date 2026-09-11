@@ -163,6 +163,10 @@ impl VrmAssetLoader {
                     let blob = gltf_doc.blob.as_deref();
                     let source_path_clone = cached.source_path.clone();
                     gltf_decode::rehydrate_textures(&mut cached, &gltf_doc.document, blob, &source_path_clone);
+                    if cached.body_primitive_id.is_none() {
+                        crate::asset::clearance::generate_skin_anchors(&mut cached);
+                        let _ = crate::asset::cache::save(&source_path_clone, &cached);
+                    }
                     cached.id = AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed));
                     cached.set_loaded_from_cache(true);
                     return Ok(Arc::new(cached));
@@ -299,9 +303,9 @@ impl VrmAssetLoader {
             }
         }
 
-        let asset = AvatarAsset {
+        let mut asset = AvatarAsset {
             id: AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed)),
-            source_path,
+            source_path: source_path.clone(),
             source_hash,
             skeleton: SkeletonAsset {
                 nodes,
@@ -318,8 +322,17 @@ impl VrmAssetLoader {
             node_to_mesh,
             vrm_meta: parsed.meta,
             root_aabb,
+            body_primitive_id: None,
             loaded_from_cache: false,
         };
+
+        // Generate Skin-Anchor Clearance Field for anti-penetration
+        crate::asset::clearance::generate_skin_anchors(&mut asset);
+
+        // Cache save
+        if let Err(e) = crate::asset::cache::save(&source_path, &asset) {
+            log::warn!("avatar cache: save for '{}' failed: {}", source_path.display(), e);
+        }
 
         Ok(Arc::new(asset))
     }

@@ -298,6 +298,8 @@ pub(super) fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<Mes
                         vertices,
                         indices: idx_data,
                         morph_targets,
+                        skin_anchors: None,
+                        body_primitive_id: None,
                     })
                 })
                 .collect();

@@ -6,7 +6,6 @@ use image::ImageBuffer;
 use vulvatar_lib::app::ViewportCamera;
 use vulvatar_lib::asset::vrm::VrmAssetLoader;
 use vulvatar_lib::avatar::{AvatarInstance, AvatarInstanceId};
-use vulvatar_lib::renderer::pipeline::GpuVertex;
 use vulvatar_lib::renderer::frame_input::{
     CameraState, LightingState, OutputTargetRequest, RenderAlphaMode, RenderAvatarInstance,
     RenderCullMode, RenderDebugFlags, RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
@@ -15,7 +14,6 @@ use vulvatar_lib::renderer::material::{
     MaterialDebugView, MaterialShaderMode, MaterialUploadRequest,
 };
 use vulvatar_lib::renderer::VulkanRenderer;
-use vulkano::pipeline::graphics::vertex_input::Vertex;
 
 fn main() -> Result<(), String> {
     env_logger::init();
@@ -77,10 +75,19 @@ fn main() -> Result<(), String> {
     if let Ok(expr_name) = std::env::var("EXPR_NAME") {
         let weight: f32 = std::env::var("EXPR_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
         println!("Applying expression '{}' with weight {}", expr_name, weight);
-        avatar.expression_weights.push(vulvatar_lib::avatar::expressions::ResolvedExpressionWeight {
-            name: expr_name,
-            weight,
-        });
+        match avatar
+            .expression_weights
+            .iter_mut()
+            .find(|w| w.name == expr_name)
+        {
+            Some(ew) => ew.weight = weight,
+            None => avatar
+                .expression_weights
+                .push(vulvatar_lib::avatar::expressions::ResolvedExpressionWeight {
+                    name: expr_name,
+                    weight,
+                }),
+        }
     }
     avatar.build_base_pose();
     avatar.compute_global_pose();

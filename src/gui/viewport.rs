@@ -1,86 +1,114 @@
 use eframe::egui;
 
+use crate::app::Application;
+use crate::asset::Mat4;
 use crate::gui::theme::{color, viz};
 use crate::gui::GuiApp;
 use crate::t;
 use crate::renderer::debug::{self, DebugDrawList};
 
-/// Simple projection helper that maps a 3D world-space point to 2D viewport
-/// coordinates using the current camera state stored in `GuiApp`.
-///
-/// This is a CPU-side fallback for when the Vulkan renderer is not fully
-/// integrated.  It builds a basic perspective projection from the GUI camera
-/// parameters (position, rotation, FOV) and maps the result into the supplied
-/// egui `Rect`.
+/// Transform a world-space point into clip space through the frame's
+/// row-major view/projection pair — the exact transform chain the Vulkan
+/// vertex shader uses.
+fn world_to_clip(point: [f32; 3], view: &Mat4, proj: &Mat4) -> [f32; 4] {
+    let vx = view[0][0] * point[0] + view[0][1] * point[1] + view[0][2] * point[2] + view[0][3];
+    let vy = view[1][0] * point[0] + view[1][1] * point[1] + view[1][2] * point[2] + view[1][3];
+    let vz = view[2][0] * point[0] + view[2][1] * point[1] + view[2][2] * point[2] + view[2][3];
+    [
+        proj[0][0] * vx + proj[0][1] * vy + proj[0][2] * vz + proj[0][3],
+        proj[1][0] * vx + proj[1][1] * vy + proj[1][2] * vz + proj[1][3],
+        proj[2][0] * vx + proj[2][1] * vy + proj[2][2] * vz + proj[2][3],
+        proj[3][0] * vx + proj[3][1] * vy + proj[3][2] * vz + proj[3][3],
+    ]
+}
+
+/// Project a world-space point to 2D pixels through the frame's exact
+/// view/projection, mapped into `rect` — the rect the rendered image
+/// occupies on screen (letterboxed), not the whole pane. `mirror_x`
+/// reproduces the horizontal selfie-flip the display path applies to the
+/// texture so the overlay flips with the character.
 fn project_point(
     point: [f32; 3],
-    cam_pos: [f32; 3],
-    cam_rot: [f32; 3], // euler degrees [pitch, yaw, roll]
-    fov_deg: f32,
+    view: &Mat4,
+    proj: &Mat4,
     rect: &egui::Rect,
+    mirror_x: bool,
 ) -> Option<egui::Pos2> {
-    // Translate into camera-relative space.
-    let dx = point[0] - cam_pos[0];
-    let dy = point[1] - cam_pos[1];
-    let dz = point[2] - cam_pos[2];
-
-    // Apply inverse camera rotation (yaw then pitch, ignoring roll for
-    // simplicity).
-    let yaw = cam_rot[1].to_radians();
-    let pitch = cam_rot[0].to_radians();
-
-    let (sy, cy) = (yaw.sin(), yaw.cos());
-    let x1 = dx * cy - dz * sy;
-    let z1 = dx * sy + dz * cy;
-
-    let (sp, cp) = (pitch.sin(), pitch.cos());
-    let y2 = dy * cp - z1 * sp;
-    let z2 = -(dy * sp + z1 * cp);
-
-    if z2 < 0.001 {
+    let clip = world_to_clip(point, view, proj);
+    if clip[3] <= 0.001 {
         return None;
     }
+    let ndc_x = clip[0] / clip[3];
+    let ndc_y = clip[1] / clip[3];
 
-    let aspect = rect.width() / rect.height().max(1.0);
-    let half_fov_rad = (fov_deg * 0.5).to_radians();
-    let f = 1.0 / half_fov_rad.tan();
-
-    let ndc_x = (f * x1) / (z2 * aspect);
-    let ndc_y = (f * y2) / z2;
-
-    // NDC (-1..1) to viewport pixel coordinates.  Y is flipped (screen Y grows
-    // downward).
-    let px = rect.center().x + ndc_x * rect.width() * 0.5;
-    let py = rect.center().y - ndc_y * rect.height() * 0.5;
-
+    // Vulkan NDC: +x right, +y down, with the y flip already baked into the
+    // projection matrix — so ndc→pixels is the plain [0,1] remap into the
+    // image rect, matching the GPU's viewport transform.
+    let mut px = rect.left() + (ndc_x * 0.5 + 0.5) * rect.width();
+    let py = rect.top() + (ndc_y * 0.5 + 0.5) * rect.height();
+    if mirror_x {
+        px = rect.left() + rect.right() - px;
+    }
     Some(egui::pos2(px, py))
 }
 
-/// Project a world-space radius at a given depth into screen pixels.
-fn project_radius(radius: f32, depth: f32, fov_deg: f32, viewport_height: f32) -> f32 {
-    if depth < 0.001 {
+/// Project a world-space radius at clip depth `clip_w` into screen pixels
+/// via the projection's vertical scale (`|proj[1][1]|` — NDC per view unit).
+fn project_radius(radius: f32, clip_w: f32, proj_y_scale: f32, viewport_height: f32) -> f32 {
+    if clip_w < 0.001 {
         return 0.0;
     }
-    let half_fov_rad = (fov_deg * 0.5).to_radians();
-    let f = 1.0 / half_fov_rad.tan();
-    (f * radius / depth) * viewport_height * 0.5
+    (proj_y_scale.abs() * radius / clip_w) * viewport_height * 0.5
 }
 
-/// Approximate depth from camera to a point (simplified, uses the same
-/// transform as `project_point`).
-fn point_depth(point: [f32; 3], cam_pos: [f32; 3], cam_rot: [f32; 3]) -> f32 {
-    let dx = point[0] - cam_pos[0];
-    let dy = point[1] - cam_pos[1];
-    let dz = point[2] - cam_pos[2];
+/// View/projection pair for the CPU debug overlays: the same camera the
+/// Vulkan renderer used for the current frame. When the 1:1 sensor mirror is
+/// active the renderer swaps to the depth sensor's intrinsics + front view
+/// (`Application::render_frame`), so the overlay must swap too — projecting
+/// through the orbit camera there puts every debug line in the wrong place.
+fn overlay_camera(state: &GuiApp) -> (Mat4, Mat4) {
+    if state.mirror_view {
+        if let Some(sensor) = state
+            .app
+            .last_tracking_pose
+            .as_ref()
+            .and_then(|p| p.metric_frame_info.as_ref())
+        {
+            let target = state
+                .app
+                .avatars
+                .first()
+                .and_then(Application::avatar_upper_body_center)
+                .unwrap_or([0.0, 1.0, 0.0]);
+            let (view, _) =
+                Application::build_sensor_view_matrix(target, sensor.anchor_cam_m[2].abs());
+            let proj = Application::build_projection_from_intrinsics(&sensor.intrinsics, 0.1, 10.0);
+            return (view, proj);
+        }
+    }
+    let cam = &state.app.viewport_camera;
+    let extent = state.app.render_extent();
+    let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+    let (view, _) = Application::build_view_matrix(cam);
+    let proj = Application::build_projection_matrix(cam.fov_deg, aspect, 0.1, 1000.0);
+    (view, proj)
+}
 
-    let yaw = cam_rot[1].to_radians();
-    let pitch = cam_rot[0].to_radians();
-
-    let (sy, cy) = (yaw.sin(), yaw.cos());
-    let z1 = dx * sy + dz * cy;
-
-    let (sp, cp) = (pitch.sin(), pitch.cos());
-    -(dy * sp + z1 * cp)
+/// Fit a texture of `tex_size` inside `rect` while preserving aspect ratio
+/// (letterbox / pillarbox). Shared by the image display and the debug
+/// overlays — the overlays must project into this rect, not the pane rect,
+/// or they desync from the character whenever the output aspect differs.
+fn letterbox_rect(tex_size: egui::Vec2, rect: egui::Rect) -> egui::Rect {
+    let tex_aspect = tex_size.x / tex_size.y.max(1.0);
+    let vp_aspect = rect.width() / rect.height().max(1.0);
+    let (draw_w, draw_h) = if tex_aspect > vp_aspect {
+        // Wider than viewport: fit width.
+        (rect.width(), rect.width() / tex_aspect)
+    } else {
+        // Taller than viewport: fit height.
+        (rect.height() * tex_aspect, rect.height())
+    };
+    egui::Rect::from_center_size(rect.center(), egui::vec2(draw_w, draw_h))
 }
 
 /// Draw all debug primitives from a `DebugDrawList` using egui's `Painter`.
@@ -88,14 +116,14 @@ fn draw_debug_list(
     painter: &egui::Painter,
     rect: &egui::Rect,
     list: &DebugDrawList,
-    cam_pos: [f32; 3],
-    cam_rot: [f32; 3],
-    fov_deg: f32,
+    view: &Mat4,
+    proj: &Mat4,
+    mirror_x: bool,
 ) {
     // Lines.
     for line in &list.lines {
-        let p0 = project_point(line.start, cam_pos, cam_rot, fov_deg, rect);
-        let p1 = project_point(line.end, cam_pos, cam_rot, fov_deg, rect);
+        let p0 = project_point(line.start, view, proj, rect, mirror_x);
+        let p1 = project_point(line.end, view, proj, rect, mirror_x);
         if let (Some(a), Some(b)) = (p0, p1) {
             let color = color_f32_to_egui(&line.color);
             painter.line_segment([a, b], egui::Stroke::new(1.0, color));
@@ -104,10 +132,10 @@ fn draw_debug_list(
 
     // Spheres (drawn as circles).
     for sphere in &list.spheres {
-        let center_2d = project_point(sphere.center, cam_pos, cam_rot, fov_deg, rect);
+        let center_2d = project_point(sphere.center, view, proj, rect, mirror_x);
         if let Some(c) = center_2d {
-            let depth = point_depth(sphere.center, cam_pos, cam_rot);
-            let r = project_radius(sphere.radius, depth, fov_deg, rect.height());
+            let clip = world_to_clip(sphere.center, view, proj);
+            let r = project_radius(sphere.radius, clip[3], proj[1][1], rect.height());
             let r = r.max(2.0); // minimum visible size
             let color = color_f32_to_egui(&sphere.color);
             painter.circle_stroke(c, r, egui::Stroke::new(1.0, color));
@@ -173,24 +201,19 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 false
             };
 
+            // Rect the rendered frame occupies on screen (letterboxed to the
+            // render target's aspect). Computed once here so the debug
+            // overlays below can project into the same rect the character is
+            // drawn in.
+            let image_rect = state
+                .viewport
+                .texture
+                .as_ref()
+                .map(|tex| letterbox_rect(tex.size_vec2(), rect));
+
             if has_rendered_image {
                 if let Some(ref tex) = state.viewport.texture {
-                    // Scale the rendered image to fit the viewport while
-                    // preserving aspect ratio.
-                    let tex_size = tex.size_vec2();
-                    let tex_aspect = tex_size.x / tex_size.y.max(1.0);
-                    let vp_aspect = rect.width() / rect.height().max(1.0);
-
-                    let (draw_w, draw_h) = if tex_aspect > vp_aspect {
-                        // Wider than viewport: fit width.
-                        (rect.width(), rect.width() / tex_aspect)
-                    } else {
-                        // Taller than viewport: fit height.
-                        (rect.height() * tex_aspect, rect.height())
-                    };
-
-                    let draw_rect =
-                        egui::Rect::from_center_size(rect.center(), egui::vec2(draw_w, draw_h));
+                    let draw_rect = image_rect.expect("image_rect exists when texture does");
 
                     // Fill letterbox/pillarbox area with background.
                     painter.rect_filled(rect, 0.0, color::VIEWPORT_BG);
@@ -453,6 +476,15 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             }
 
             // ── Debug drawing (CPU-side fallback) ────────────────────────
+            // Project through the exact camera (and into the exact image
+            // rect + mirror state) the renderer used this frame, so the
+            // overlay lines up with the character instead of living in a
+            // different screen mapping.
+            let (overlay_view, overlay_proj) = overlay_camera(state);
+            let overlay_rect = image_rect.unwrap_or(rect);
+            let overlay_mirror = state.tracking.tracking_mirror;
+
+            // Orbit eye position, for the camera-info badge below.
             let yaw = state.camera_orbit.yaw_deg.to_radians();
             let pitch = state.camera_orbit.pitch_deg.to_radians();
             let (sy, cy) = (yaw.sin(), yaw.cos());
@@ -469,12 +501,6 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 state.camera_orbit.distance * sp + wy,
                 state.camera_orbit.distance * cp * cy + wz,
             ];
-            let cam_rot = [
-                state.camera_orbit.pitch_deg,
-                state.camera_orbit.yaw_deg,
-                0.0,
-            ];
-            let fov = state.rendering.camera_fov;
 
             if let Some(avatar) = state.app.active_avatar() {
                 // Skeleton debug.
@@ -489,7 +515,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                             vec![crate::asset::identity_matrix(); skel.nodes.len()]
                         };
                     let skel_list = debug::build_skeleton_debug(skel, &pose_matrices);
-                    draw_debug_list(&painter, &rect, &skel_list, cam_pos, cam_rot, fov);
+                    draw_debug_list(
+                        &painter,
+                        &overlay_rect,
+                        &skel_list,
+                        &overlay_view,
+                        &overlay_proj,
+                        overlay_mirror,
+                    );
                 }
 
                 // Collider debug.
@@ -503,7 +536,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         };
                     let col_list =
                         debug::build_collider_debug(&avatar.asset.colliders, skel, &pose_matrices);
-                    draw_debug_list(&painter, &rect, &col_list, cam_pos, cam_rot, fov);
+                    draw_debug_list(
+                        &painter,
+                        &overlay_rect,
+                        &col_list,
+                        &overlay_view,
+                        &overlay_proj,
+                        overlay_mirror,
+                    );
                 }
 
                 // Cloth mesh debug.
@@ -519,7 +559,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 &overlay.simulation_mesh,
                                 &cloth_state.sim_positions,
                             );
-                            draw_debug_list(&painter, &rect, &cloth_list, cam_pos, cam_rot, fov);
+                            draw_debug_list(
+                                &painter,
+                                &overlay_rect,
+                                &cloth_list,
+                                &overlay_view,
+                                &overlay_proj,
+                                overlay_mirror,
+                            );
 
                             if !cloth_state.sim_normals.is_empty() {
                                 let positions = if !cloth_state.sim_positions.is_empty() {
@@ -534,11 +581,11 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     );
                                     draw_debug_list(
                                         &painter,
-                                        &rect,
+                                        &overlay_rect,
                                         &normal_list,
-                                        cam_pos,
-                                        cam_rot,
-                                        fov,
+                                        &overlay_view,
+                                        &overlay_proj,
+                                        overlay_mirror,
                                     );
                                 }
                             }

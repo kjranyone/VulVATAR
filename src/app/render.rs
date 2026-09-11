@@ -725,7 +725,7 @@ impl Application {
     /// renderer draws in), used to aim the sensor-mirror camera. Midpoint of
     /// the two upper-arm (shoulder) bones, falling back to the head, then the
     /// hips. `None` when the avatar carries no humanoid rig.
-    fn avatar_upper_body_center(avatar: &AvatarInstance) -> Option<[f32; 3]> {
+    pub(crate) fn avatar_upper_body_center(avatar: &AvatarInstance) -> Option<[f32; 3]> {
         use crate::asset::HumanoidBone::*;
         let humanoid = avatar.asset.humanoid.as_ref()?;
         let bone_pos = |bone: crate::asset::HumanoidBone| {

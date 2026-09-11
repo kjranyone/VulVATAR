@@ -82,10 +82,27 @@ pub fn solve_expressions(
         .expressions
         .iter()
         .filter_map(|expr_def| {
-            let tracking = source
+            let tracking = match source
                 .expressions
                 .iter()
-                .find(|e| e.name == expr_def.name)?;
+                .find(|e| e.name == expr_def.name)
+            {
+                Some(t) => t,
+                None => {
+                    // No tracking counterpart (e.g. an FBX body-size
+                    // shape key): carry the previous weight through so
+                    // manual slider edits survive the per-frame
+                    // overwrite instead of being dropped to zero.
+                    let weight = prev_map
+                        .get(expr_def.name.as_str())
+                        .copied()
+                        .unwrap_or(0.0);
+                    return Some(ResolvedExpressionWeight {
+                        name: expr_def.name.clone(),
+                        weight: weight.clamp(0.0, 1.0),
+                    });
+                }
+            };
             let raw = tracking.weight.clamp(0.0, 1.0);
             let prev_w = prev_map.get(expr_def.name.as_str()).copied().unwrap_or(raw);
             // Rest deadband (eye/brow path), soft-thresholded so crossing

@@ -142,12 +142,15 @@ struct TransformGpuData {
     morph_deltas: Subbuffer<[[f32; 4]]>,
     cloth_pos_ssbo: Subbuffer<[[f32; 4]]>,
     cloth_norm_ssbo: Subbuffer<[[f32; 4]]>,
+    #[allow(dead_code)]
+    skin_anchors_ssbo: Subbuffer<[crate::asset::SkinAnchor]>,
     transform_set: Arc<DescriptorSet>,
     index_count: u32,
     vertex_count: u32,
     target_count: u32,
     has_cloth_alloc: bool,
     has_cloth_normals_alloc: bool,
+    has_skin_anchors_alloc: bool,
     last_cloth_version: Option<u64>,
     /// GPU cloth solver state, populated lazily on the first frame this
     /// primitive's snapshot reports `ClothSolverBackend::Gpu`. `None`
@@ -279,6 +282,8 @@ pub struct VulkanRenderer {
     /// index 0 because the corresponding `has_cloth` / `target_count`
     /// flag in the control UBO is 0.
     stub_storage_ssbo: Option<Subbuffer<[[f32; 4]]>>,
+    stub_skin_anchor_ssbo: Option<Subbuffer<[crate::asset::SkinAnchor]>>,
+    stub_vertex_ssbo: Option<Subbuffer<[pipeline::GpuVertex]>>,
     /// Compute pipeline that fuses skinning, morph-target blending, and
     /// cloth deformation into a single dispatch per (instance, primitive).
     /// Output lands in [`TransformGpuData::transformed_vbo`] which the
@@ -403,6 +408,8 @@ impl VulkanRenderer {
             mtoon_status: mtoon::MtoonCompatibilityStatus::initial_poc(),
             transform_cache: HashMap::new(),
             stub_storage_ssbo: None,
+            stub_skin_anchor_ssbo: None,
+            stub_vertex_ssbo: None,
             transform_compute_pipeline: None,
             cloth_verlet_pipeline: None,
             cloth_constraint_lambda_update_pipeline: None,
@@ -1144,7 +1151,46 @@ impl VulkanRenderer {
                 )
                 .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
 
-            for mesh_inst in &instance.mesh_instances {
+            // Identify target body primitive for skin clearance anti-penetration
+            let target_body_prim_id = instance.mesh_instances.iter().find_map(|mi| {
+                mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id)
+            });
+
+            let body_transformed_vbo = if let Some(body_pid) = target_body_prim_id {
+                if let Some(body_mi) = instance.mesh_instances.iter().find(|mi| mi.primitive_id == body_pid) {
+                    if let Some(prim_asset) = body_mi.primitive_data.as_ref() {
+                        self.ensure_transform_data(
+                            body_mi.mesh_id,
+                            body_mi.primitive_id,
+                            prim_asset,
+                            false,
+                            false,
+                            None,
+                            &memory_allocator,
+                            &ds_allocator,
+                            &transform_pipeline,
+                        )?;
+                        self.transform_cache
+                            .get(&(body_mi.mesh_id, body_mi.primitive_id))
+                            .map(|slot| slot.transformed_vbo.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut ordered_mesh_instances: Vec<&frame_input::RenderMeshInstance> =
+                instance.mesh_instances.iter().collect();
+            if let Some(body_pid) = target_body_prim_id {
+                ordered_mesh_instances
+                    .sort_by_key(|mi| if mi.primitive_id == body_pid { 0 } else { 1 });
+            }
+
+            for &mesh_inst in &ordered_mesh_instances {
                 let prim_asset = match mesh_inst.primitive_data.as_ref() {
                     Some(p) => p.as_ref(),
                     None => continue,
@@ -1182,12 +1228,16 @@ impl VulkanRenderer {
                     })
                     .unwrap_or(false);
 
+                let is_body_prim = Some(mesh_inst.primitive_id) == target_body_prim_id;
+                let prim_body_vbo = if is_body_prim { None } else { body_transformed_vbo.clone() };
+
                 self.ensure_transform_data(
                     mesh_inst.mesh_id,
                     mesh_inst.primitive_id,
                     prim_asset,
                     has_cloth_prim,
                     has_cloth_normals_prim,
+                    prim_body_vbo.clone(),
                     &memory_allocator,
                     &ds_allocator,
                     &transform_pipeline,
@@ -1252,6 +1302,8 @@ impl VulkanRenderer {
                     guard.target_count = slot.target_count;
                     guard.has_cloth = if has_cloth_prim { 1 } else { 0 };
                     guard.has_cloth_normals = if has_cloth_normals_prim { 1 } else { 0 };
+                    guard.has_skin_anchors = if prim_asset.skin_anchors.is_some() && prim_body_vbo.is_some() { 1 } else { 0 };
+                    guard._pad0 = [0; 3];
                     let copy_n = (slot.target_count as usize).min(MORPH_MAX_TARGETS);
                     for i in 0..copy_n {
                         let w = mesh_inst.morph_weights.get(i).copied().unwrap_or(0.0);

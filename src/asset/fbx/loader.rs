@@ -77,6 +77,10 @@ impl FbxAssetLoader {
                     let _ = crate::asset::cache::save(&source_path, &cached);
                 }
             }
+            if cached.body_primitive_id.is_none() {
+                crate::asset::clearance::generate_skin_anchors(&mut cached);
+                let _ = crate::asset::cache::save(&source_path, &cached);
+            }
             cached.id = AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed));
             cached.set_loaded_from_cache(true);
             return Ok(Arc::new(cached));
@@ -511,6 +515,8 @@ impl FbxAssetLoader {
                     },
                     indices: if index_count > 0 { Some(indices) } else { None },
                     morph_targets,
+                    skin_anchors: None,
+                    body_primitive_id: None,
                 }));
             }
 
@@ -616,7 +622,7 @@ impl FbxAssetLoader {
             colliders.len()
         );
 
-        let asset = AvatarAsset {
+        let mut asset = AvatarAsset {
             id: AvatarAssetId(NEXT_AVATAR_ID.fetch_add(1, Ordering::Relaxed)),
             source_path: source_path.clone(),
             source_hash,
@@ -631,8 +637,12 @@ impl FbxAssetLoader {
             node_to_mesh,
             vrm_meta,
             root_aabb,
+            body_primitive_id: None,
             loaded_from_cache: false,
         };
+
+        // Generate Skin-Anchor Clearance Field for anti-penetration
+        crate::asset::clearance::generate_skin_anchors(&mut asset);
 
         // Cache save
         if let Err(e) = crate::asset::cache::save(&source_path, &asset) {

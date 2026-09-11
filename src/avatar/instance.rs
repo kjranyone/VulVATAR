@@ -136,6 +136,20 @@ impl AvatarInstance {
         let node_count = asset.skeleton.nodes.len();
         let collider_count = asset.colliders.len();
         let asset_id = asset.id;
+        // Seed one zero-weight slot per named expression (VRM expressions
+        // and FBX blend shapes alike) so the avatar-tab sliders exist from
+        // load time — without this the list stayed empty until face
+        // tracking ran, and FBX-only shape keys (body-size morphs) never
+        // appeared because tracking has no counterpart for them.
+        let expression_weights = asset
+            .default_expressions
+            .expressions
+            .iter()
+            .map(|e| ResolvedExpressionWeight {
+                name: e.name.clone(),
+                weight: 0.0,
+            })
+            .collect();
 
         let spring_states = asset
             .spring_bones
@@ -169,7 +183,7 @@ impl AvatarInstance {
             cloth_sim_buffers: None,
             cloth_overlays: Vec::new(),
             collider_enabled: vec![true; collider_count],
-            expression_weights: Vec::new(),
+            expression_weights,
             expression_state: ExpressionState::default(),
             retarget_state: Default::default(),
         }

@@ -80,6 +80,8 @@ pub struct TransformControl {
     pub target_count: u32,
     pub has_cloth: u32,
     pub has_cloth_normals: u32,
+    pub has_skin_anchors: u32,
+    pub _pad0: [u32; 3],
     pub weights: [[f32; 4]; 64],
 }
 
@@ -90,6 +92,8 @@ impl TransformControl {
             target_count: 0,
             has_cloth: 0,
             has_cloth_normals: 0,
+            has_skin_anchors: 0,
+            _pad0: [0; 3],
             weights: [[0.0; 4]; 64],
         }
     }
@@ -305,7 +309,12 @@ void main() {
         // so shade_col = shade_color * base_texture_color.
         vec3 shade_col = material.shade_color.rgb * shade_texture_term * tex_color.rgb;
         vec3 toon_col = mix(shade_col, base_color_term, shading);
-        color.rgb = toon_col * (camera.light_color * max(camera.light_intensity, 0.0));
+        vec3 direct_light = camera.light_color * max(camera.light_intensity, 0.0);
+        // Ambient fill only on the shaded side: keeps the lit face identical
+        // to before while unlit faces receive the ambient color instead of
+        // collapsing to shade_color * light alone.
+        color.rgb = toon_col * direct_light
+                  + camera.ambient_term * base_color_term * (1.0 - shading);
     } else {
         // SimpleLit: standard diffuse
         float diffuse = max(ndotl, 0.0);
@@ -957,12 +966,29 @@ layout(set = 0, binding = 4) uniform TransformControl {
     uint target_count;
     uint has_cloth;
     uint has_cloth_normals;
+    uint has_skin_anchors;
+    uvec3 _pad0;
     vec4 weights[64];
 } ctrl;
 
 layout(set = 0, binding = 5) writeonly buffer OutVertices {
     OutVertex v[];
 } out_v;
+
+struct SkinAnchor {
+    uint body_vertex_idx;
+    float min_clearance;
+    float weight;
+    uint _pad;
+};
+
+layout(set = 0, binding = 6) readonly buffer SkinAnchors {
+    SkinAnchor a[];
+} skin_anchors;
+
+layout(set = 0, binding = 7) readonly buffer BodyVertices {
+    OutVertex v[];
+} body_v;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
     mat4 matrices[];
@@ -1047,112 +1073,87 @@ void main() {
         nrm += w * morph_deltas.data[i + 1u].xyz;
     }
 
+    const float WEIGHT_EPS = 1.0e-4;
+    vec3 world_pos;
+    vec3 world_nrm;
+
     // Cloth override: the physics solver writes per-frame world-space
     // positions into `cloth_pos` and normals into `cloth_norm`. Pinned
     // particles are already attached to skeletal bones by the solver,
     // so skinning must NOT be applied on top of simulated cloth vertices.
     if (ctrl.has_cloth > 0u) {
-        vec3 cloth_nrm = (ctrl.has_cloth_normals > 0u) ? cloth_norm.n[vid].xyz : nrm;
-        out_v.v[vid].position = vec4(cloth_pos.p[vid].xyz, 0.0);
-        out_v.v[vid].normal   = vec4(cloth_nrm, 0.0);
-        out_v.v[vid].uv       = b.uv;
-        out_v.v[vid]._pad     = uvec2(0u, 0u);
-        return;
-    }
-
-    // Unified weight threshold. Weights below this are treated as
-    // not-contributing across every check (total-weight gate, antipodal
-    // reference pick, accumulator skip). Asymmetric thresholds caused a
-    // pathology where total_w squeaked past 0.001 but the per-element
-    // `> 0.0` gate stayed strict, mixing contributing-joint selection
-    // with float-noise weights.
-    const float WEIGHT_EPS = 1.0e-4;
-
-    float total_w = b.joint_weights.x + b.joint_weights.y +
-                    b.joint_weights.z + b.joint_weights.w;
-    if (total_w < WEIGHT_EPS) {
-        // No skinning weights — emit the morph/cloth-blended position
-        // as-is (used for accessories that aren't bone-bound).
-        out_v.v[vid].position = vec4(pos, 0.0);
-        out_v.v[vid].normal   = vec4(nrm, 0.0);
-        out_v.v[vid].uv       = b.uv;
-        out_v.v[vid]._pad     = uvec2(0u, 0u);
-        return;
-    }
-
-    // ----- Dual Quaternion Skinning (Kavan 2007) -----
-    // The previous implementation blended the rotation in quaternion
-    // space (QLERP) but accumulated the translation linearly from
-    // each joint's `mi[3]`. That hybrid is consistent only when the
-    // joint rotations are similar; for wildly-differing rotations
-    // (e.g. solver-driven 180°-class finger bones whose `mi[3]`
-    // grows to 2–3 m) the QLERP rotation and the LBS-style
-    // translation describe geometrically inconsistent frames, and
-    // skinned vertices end up at rotated-rest + averaged-translation
-    // positions that don't correspond to any per-bone skinning
-    // result. `validate_gui_render` makes the failure reproducible
-    // across `validation_images/`.
-    //
-    // Full DQS packs each joint's transform into a unit dual
-    // quaternion (q_real, q_dual) where q_real is the rotation and
-    // q_dual encodes the translation via
-    //   q_dual = 0.5 * (0, t) * q_real
-    // The blend stays a valid rigid transform — both the rotation
-    // *and* translation are interpolated together in the same dual-
-    // quaternion space, preserving the rigidity that LBS-style
-    // translation accumulation breaks.
-    vec4 ref_real = vec4(0.0, 0.0, 0.0, 1.0);
-    for (uint i = 0u; i < 4u; i++) {
-        if (b.joint_weights[i] > WEIGHT_EPS) {
-            ref_real = mat3_to_quat(mat3(skinning.matrices[b.joint_indices[i]]));
-            break;
+        world_pos = cloth_pos.p[vid].xyz;
+        world_nrm = (ctrl.has_cloth_normals > 0u) ? cloth_norm.n[vid].xyz : nrm;
+    } else {
+        float total_w = b.joint_weights.x + b.joint_weights.y +
+                        b.joint_weights.z + b.joint_weights.w;
+        if (total_w < WEIGHT_EPS) {
+            // No skinning weights — emit the morph/cloth-blended position
+            // as-is (used for accessories that aren't bone-bound).
+            world_pos = pos;
+            world_nrm = nrm;
+        } else {
+            // ----- Dual Quaternion Skinning (Kavan 2007) -----
+            vec4 ref_real = vec4(0.0, 0.0, 0.0, 1.0);
+            for (uint i = 0u; i < 4u; i++) {
+                if (b.joint_weights[i] > WEIGHT_EPS) {
+                    ref_real = mat3_to_quat(mat3(skinning.matrices[b.joint_indices[i]]));
+                    break;
+                }
+            }
+            vec4 acc_real = vec4(0.0);
+            vec4 acc_dual = vec4(0.0);
+            for (uint i = 0u; i < 4u; i++) {
+                float wi = b.joint_weights[i];
+                if (wi <= WEIGHT_EPS) continue;
+                mat4 mi = skinning.matrices[b.joint_indices[i]];
+                vec4 qr = mat3_to_quat(mat3(mi));
+                float s = (dot(qr, ref_real) >= 0.0) ? 1.0 : -1.0;
+                qr = s * qr;
+                vec3 ti = mi[3].xyz;
+                vec3 qrxyz = qr.xyz;
+                float qrw = qr.w;
+                vec3 dxyz = 0.5 * (qrw * ti + cross(ti, qrxyz));
+                float dw = -0.5 * dot(ti, qrxyz);
+                vec4 qd = vec4(dxyz, dw);
+                acc_real += wi * qr;
+                acc_dual += wi * qd;
+            }
+            float acc_len = length(acc_real);
+            if (acc_len < 1.0e-6) {
+                world_pos = pos;
+                world_nrm = nrm;
+            } else {
+                float inv_len = 1.0 / acc_len;
+                vec4 q_real = acc_real * inv_len;
+                vec4 q_dual = acc_dual * inv_len;
+                vec3 rqxyz = -q_real.xyz;
+                float rqw = q_real.w;
+                vec3 t_recovered = 2.0 * (q_dual.w * rqxyz
+                                          + rqw * q_dual.xyz
+                                          + cross(q_dual.xyz, rqxyz));
+                world_pos = quat_rotate(q_real, pos) + t_recovered;
+                world_nrm = quat_rotate(q_real, nrm);
+            }
         }
     }
-    vec4 acc_real = vec4(0.0);
-    vec4 acc_dual = vec4(0.0);
-    for (uint i = 0u; i < 4u; i++) {
-        float wi = b.joint_weights[i];
-        if (wi <= WEIGHT_EPS) continue;
-        mat4 mi = skinning.matrices[b.joint_indices[i]];
-        vec4 qr = mat3_to_quat(mat3(mi));
-        float s = (dot(qr, ref_real) >= 0.0) ? 1.0 : -1.0;
-        qr = s * qr;
-        vec3 ti = mi[3].xyz;
-        // q_dual = 0.5 * (0, t) ⊗ q_real, quaternion product (xyz, w).
-        // (0, t) ⊗ (qx, qy, qz, qw) =
-        //   xyz = qw * t + cross(t, q_real.xyz)
-        //   w   = -dot(t, q_real.xyz)
-        vec3 qrxyz = qr.xyz;
-        float qrw = qr.w;
-        vec3 dxyz = 0.5 * (qrw * ti + cross(ti, qrxyz));
-        float dw = -0.5 * dot(ti, qrxyz);
-        vec4 qd = vec4(dxyz, dw);
-        acc_real += wi * qr;
-        acc_dual += wi * qd;
+
+    // Skin anchor clearance projection (anti-penetration)
+    if (ctrl.has_skin_anchors > 0u) {
+        SkinAnchor anc = skin_anchors.a[vid];
+        if (anc.body_vertex_idx != 0xFFFFFFFFu && anc.weight > 1e-4) {
+            vec3 bp = body_v.v[anc.body_vertex_idx].position.xyz;
+            vec3 bn = body_v.v[anc.body_vertex_idx].normal.xyz;
+            float nlen = length(bn);
+            if (nlen > 1e-4) {
+                bn /= nlen;
+                float clearance = dot(world_pos - bp, bn);
+                if (clearance < anc.min_clearance) {
+                    world_pos += bn * ((anc.min_clearance - clearance) * anc.weight);
+                }
+            }
+        }
     }
-    float acc_len = length(acc_real);
-    if (acc_len < 1.0e-6) {
-        out_v.v[vid].position = vec4(pos, 0.0);
-        out_v.v[vid].normal   = vec4(nrm, 0.0);
-        out_v.v[vid].uv       = b.uv;
-        out_v.v[vid]._pad     = uvec2(0u, 0u);
-        return;
-    }
-    float inv_len = 1.0 / acc_len;
-    vec4 q_real = acc_real * inv_len;
-    vec4 q_dual = acc_dual * inv_len;
-    // Translation recovered from the dual quaternion:
-    //   t = 2 * q_dual * conj(q_real)  (taking only the vector part).
-    // With q_real unit and the relation above, this reduces to:
-    //   t = 2 * (q_dual.w * (-q_real.xyz) + q_real.w * q_dual.xyz
-    //           + cross(q_dual.xyz, -q_real.xyz))
-    vec3 rqxyz = -q_real.xyz;
-    float rqw = q_real.w;
-    vec3 t_recovered = 2.0 * (q_dual.w * rqxyz
-                              + rqw * q_dual.xyz
-                              + cross(q_dual.xyz, rqxyz));
-    vec3 world_pos = quat_rotate(q_real, pos) + t_recovered;
-    vec3 world_nrm = quat_rotate(q_real, nrm);
 
     out_v.v[vid].position = vec4(world_pos, 0.0);
     out_v.v[vid].normal   = vec4(world_nrm, 0.0);
@@ -1788,6 +1789,28 @@ mod tests {
         assert_eq!(offset_of!(ClothConstraintControl, constraint_count), 4);
         assert_eq!(offset_of!(ClothConstraintControl, dt), 8);
         assert_eq!(offset_of!(ClothConstraintControl, _pad), 12);
+    }
+
+    // GLSL std140 layout for `TransformControl` UBO in transform_cs:
+    //   uint vertex_count;     // offset 0,  size 4
+    //   uint target_count;     // offset 4,  size 4
+    //   uint has_cloth;        // offset 8,  size 4
+    //   uint has_cloth_normals;// offset 12, size 4
+    //   uint has_skin_anchors; // offset 16, size 4
+    //   uvec3 _pad0;           // offset 20, size 12
+    //   vec4 weights[64];      // offset 32, size 1024
+    //   total                  // 1056 bytes
+    #[test]
+    fn transform_control_matches_std140_layout() {
+        use super::TransformControl;
+        assert_eq!(size_of::<TransformControl>(), 1056);
+        assert_eq!(offset_of!(TransformControl, vertex_count), 0);
+        assert_eq!(offset_of!(TransformControl, target_count), 4);
+        assert_eq!(offset_of!(TransformControl, has_cloth), 8);
+        assert_eq!(offset_of!(TransformControl, has_cloth_normals), 12);
+        assert_eq!(offset_of!(TransformControl, has_skin_anchors), 16);
+        assert_eq!(offset_of!(TransformControl, _pad0), 20);
+        assert_eq!(offset_of!(TransformControl, weights), 32);
     }
 }
 

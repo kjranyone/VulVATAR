@@ -59,6 +59,7 @@ fn make_avatar_with_node(node_id: u64, node_name: &str) -> Arc<AvatarAsset> {
         node_to_mesh: std::collections::HashMap::new(),
         vrm_meta: VrmMeta::default(),
         root_aabb: Aabb::empty(),
+        body_primitive_id: None,
         loaded_from_cache: false,
     })
 }
