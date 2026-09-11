@@ -179,6 +179,19 @@ fn main() -> Result<(), String> {
             avatar.compute_global_pose();
             avatar.build_skinning_matrices();
 
+            // Step secondary motion (hair, accessories) with newly attached body colliders
+            let spring_tuning = vulvatar_lib::simulation::spring::SpringTuning::default();
+            vulvatar_lib::simulation::spring::step_spring_bones(
+                dt,
+                &mut avatar,
+                &[],
+                &spring_tuning,
+                [0.0, -1.0, 0.0],
+                1.0,
+            );
+            avatar.compute_global_pose();
+            avatar.build_skinning_matrices();
+
             // Apply gentle fluctuating breeze
             if let Some(ref mut sim) = avatar.cloth_sim {
                 let gust = (t * 2.2).sin() * 0.4 + 0.6;

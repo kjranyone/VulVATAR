@@ -228,10 +228,10 @@ pub fn step_spring_bones(
         let gravity_dir = quat_rotate_vec3(&gravity_delta, &spring_asset.gravity_dir);
         let chain_gravity_power = spring_asset.gravity_power;
         let bone_radius = spring_asset.radius;
-        let collider_refs: Vec<usize> = spring_asset
+        let colliders: Vec<&crate::asset::ColliderAsset> = spring_asset
             .collider_refs
             .iter()
-            .map(|c| c.id.0 as usize)
+            .filter_map(|r| avatar.asset.colliders.iter().find(|c| c.id == r.id))
             .collect();
 
         let joints = avatar.secondary_motion.spring_states[chain_idx]
@@ -322,12 +322,11 @@ pub fn step_spring_bones(
             next = enforce_bone_length(&next, &parent_world_pos, bone_length);
 
             // 3. Collider resolution
-            for &collider_idx in &collider_refs {
-                if collider_idx >= avatar.asset.colliders.len() {
+            for collider in &colliders {
+                let collider_node = collider.node.0 as usize;
+                if collider_node >= avatar.pose.global_transforms.len() {
                     continue;
                 }
-                let collider = &avatar.asset.colliders[collider_idx];
-                let collider_node = collider.node.0 as usize;
                 let collider_world_pos =
                     mat4_translation(&avatar.pose.global_transforms[collider_node]);
                 let rotated_offset = mat4_transform_direction(

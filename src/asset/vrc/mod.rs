@@ -638,9 +638,7 @@ pub fn build_spring_bones_and_colliders(
     let mut spring_bones = Vec::new();
     let mut colliders = Vec::new();
 
-    // 1. Build Colliders: attach leg / body colliders to humanoid bones
-    let mut leg_collider_refs = Vec::new();
-
+    // 1. Build Colliders: attach leg / body / head / arm colliders to humanoid bones
     let left_upper_leg = skeleton
         .nodes
         .iter()
@@ -649,15 +647,98 @@ pub fn build_spring_bones_and_colliders(
         .nodes
         .iter()
         .position(|n| n.humanoid_bone == Some(HumanoidBone::RightUpperLeg));
+    let chest_node = skeleton.nodes.iter().position(|n| {
+        n.humanoid_bone == Some(HumanoidBone::Chest)
+            || n.humanoid_bone == Some(HumanoidBone::UpperChest)
+    });
+    let spine_node = skeleton
+        .nodes
+        .iter()
+        .position(|n| n.humanoid_bone == Some(HumanoidBone::Spine));
+    let head_node = skeleton
+        .nodes
+        .iter()
+        .position(|n| n.humanoid_bone == Some(HumanoidBone::Head));
+    let left_upper_arm = skeleton
+        .nodes
+        .iter()
+        .position(|n| n.humanoid_bone == Some(HumanoidBone::LeftUpperArm));
+    let right_upper_arm = skeleton
+        .nodes
+        .iter()
+        .position(|n| n.humanoid_bone == Some(HumanoidBone::RightUpperArm));
+    let left_lower_arm = skeleton
+        .nodes
+        .iter()
+        .position(|n| n.humanoid_bone == Some(HumanoidBone::LeftLowerArm));
+    let right_lower_arm = skeleton
+        .nodes
+        .iter()
+        .position(|n| n.humanoid_bone == Some(HumanoidBone::RightLowerArm));
+
+    let mut file_id_to_col_id: HashMap<i64, ColliderId> = HashMap::new();
+    let mut leg_collider_refs = Vec::new();
+    let mut torso_collider_refs = Vec::new();
+    let mut arm_collider_refs = Vec::new();
+    let mut head_collider_refs = Vec::new();
 
     for c in &vrc_data.colliders {
         let lower = c.name.to_lowercase();
-        let target_node_idx = if lower.contains("_l") || lower.contains("left") {
-            left_upper_leg
-        } else if lower.contains("_r") || lower.contains("right") {
-            right_upper_leg
+        // Skip excessively large ground collision
+        if lower.contains("ground") || (c.radius > 0.35 && c.height > 1.0) {
+            continue;
+        }
+
+        let target_node_idx = if lower.contains("leg") {
+            if lower.contains("_l") || lower.contains("left") {
+                left_upper_leg
+            } else {
+                right_upper_leg
+            }
+        } else if lower.contains("chest") || lower.contains("torso") {
+            chest_node
+        } else if lower.contains("spine") {
+            spine_node
+        } else if lower.contains("head") {
+            head_node
+        } else if lower.contains("arm") {
+            if lower.contains("_l") || lower.contains("left") {
+                if lower.contains("lower") || lower.contains("fore") || lower.contains("elbow") {
+                    left_lower_arm
+                } else {
+                    left_upper_arm
+                }
+            } else {
+                if lower.contains("lower") || lower.contains("fore") || lower.contains("elbow") {
+                    right_lower_arm
+                } else {
+                    right_upper_arm
+                }
+            }
         } else {
-            None
+            // Unnamed / stripped GameObject colliders from prefab:
+            // Match by file_id or shape dimensions
+            if c.file_id == 978233014863744935 || (c.radius > 0.10 && c.height > 0.25) {
+                chest_node
+            } else if c.file_id == 2370074019881488599 || (c.radius > 0.08 && c.height > 0.30) {
+                spine_node
+            } else if c.file_id == 5135717433684850477 {
+                left_upper_arm
+            } else if c.file_id == 6529792030869837757 {
+                right_upper_arm
+            } else if c.file_id == 738787697843902394 {
+                left_lower_arm
+            } else if c.file_id == 4247574853095863341 {
+                right_lower_arm
+            } else if c.radius < 0.06 && c.height > 0.15 {
+                if arm_collider_refs.len() % 2 == 0 {
+                    left_upper_arm
+                } else {
+                    right_upper_arm
+                }
+            } else {
+                None
+            }
         };
 
         if let Some(node_idx) = target_node_idx {
@@ -677,6 +758,102 @@ pub fn build_spring_bones_and_colliders(
                 node: NodeId(node_idx as u64),
                 shape,
                 offset: c.position,
+            });
+            file_id_to_col_id.insert(c.file_id, col_id);
+
+            let r = ColliderRef { id: col_id };
+            if Some(node_idx) == left_upper_leg || Some(node_idx) == right_upper_leg {
+                leg_collider_refs.push(r);
+            } else if Some(node_idx) == chest_node || Some(node_idx) == spine_node {
+                torso_collider_refs.push(r);
+            } else if Some(node_idx) == head_node {
+                head_collider_refs.push(r);
+            } else {
+                arm_collider_refs.push(r);
+            }
+        }
+    }
+
+    // Synthesize body colliders if missing (ensures any avatar has guards against penetration)
+    if head_collider_refs.is_empty() {
+        if let Some(h_idx) = head_node {
+            let col_id = ColliderId(colliders.len() as u64 + 1);
+            colliders.push(ColliderAsset {
+                id: col_id,
+                node: NodeId(h_idx as u64),
+                shape: ColliderShape::Sphere { radius: 0.095 },
+                offset: [0.0, 0.05, 0.0],
+            });
+            head_collider_refs.push(ColliderRef { id: col_id });
+        }
+    }
+    if torso_collider_refs.is_empty() {
+        if let Some(c_idx) = chest_node {
+            let col_id = ColliderId(colliders.len() as u64 + 1);
+            colliders.push(ColliderAsset {
+                id: col_id,
+                node: NodeId(c_idx as u64),
+                shape: ColliderShape::Capsule {
+                    radius: 0.115,
+                    height: 0.25,
+                },
+                offset: [0.0, 0.05, -0.02],
+            });
+            torso_collider_refs.push(ColliderRef { id: col_id });
+        }
+    }
+    if arm_collider_refs.is_empty() {
+        if let Some(la_idx) = left_upper_arm {
+            let col_id = ColliderId(colliders.len() as u64 + 1);
+            colliders.push(ColliderAsset {
+                id: col_id,
+                node: NodeId(la_idx as u64),
+                shape: ColliderShape::Capsule {
+                    radius: 0.05,
+                    height: 0.20,
+                },
+                offset: [0.0, 0.10, 0.0],
+            });
+            arm_collider_refs.push(ColliderRef { id: col_id });
+        }
+        if let Some(ra_idx) = right_upper_arm {
+            let col_id = ColliderId(colliders.len() as u64 + 1);
+            colliders.push(ColliderAsset {
+                id: col_id,
+                node: NodeId(ra_idx as u64),
+                shape: ColliderShape::Capsule {
+                    radius: 0.05,
+                    height: 0.20,
+                },
+                offset: [0.0, 0.10, 0.0],
+            });
+            arm_collider_refs.push(ColliderRef { id: col_id });
+        }
+    }
+    if leg_collider_refs.is_empty() {
+        if let Some(ll_idx) = left_upper_leg {
+            let col_id = ColliderId(colliders.len() as u64 + 1);
+            colliders.push(ColliderAsset {
+                id: col_id,
+                node: NodeId(ll_idx as u64),
+                shape: ColliderShape::Capsule {
+                    radius: 0.075,
+                    height: 0.27,
+                },
+                offset: [0.0, 0.08, 0.0],
+            });
+            leg_collider_refs.push(ColliderRef { id: col_id });
+        }
+        if let Some(rl_idx) = right_upper_leg {
+            let col_id = ColliderId(colliders.len() as u64 + 1);
+            colliders.push(ColliderAsset {
+                id: col_id,
+                node: NodeId(rl_idx as u64),
+                shape: ColliderShape::Capsule {
+                    radius: 0.075,
+                    height: 0.27,
+                },
+                offset: [0.0, 0.08, 0.0],
             });
             leg_collider_refs.push(ColliderRef { id: col_id });
         }
@@ -779,11 +956,60 @@ pub fn build_spring_bones_and_colliders(
         let gravity_power = pb.gravity.clamp(0.0, 1.5);
         let radius = pb.radius.max(0.01);
 
-        let col_refs = if chain.category == ChainCategory::Skirt {
-            leg_collider_refs.clone()
+        // Resolve colliders: first check authored PhysBone collider_refs
+        let mut col_refs = Vec::new();
+        for &fid in &pb.collider_refs {
+            if let Some(&cid) = file_id_to_col_id.get(&fid) {
+                col_refs.push(ColliderRef { id: cid });
+            }
+        }
+
+        if col_refs.is_empty() {
+            match chain.category {
+                ChainCategory::Skirt => {
+                    col_refs.extend(leg_collider_refs.iter().cloned());
+                }
+                ChainCategory::HairBack => {
+                    col_refs.extend(torso_collider_refs.iter().cloned());
+                    col_refs.extend(arm_collider_refs.iter().cloned());
+                    col_refs.extend(head_collider_refs.iter().cloned());
+                }
+                ChainCategory::HairTwintale => {
+                    col_refs.extend(arm_collider_refs.iter().cloned());
+                    col_refs.extend(torso_collider_refs.iter().cloned());
+                    col_refs.extend(head_collider_refs.iter().cloned());
+                }
+                ChainCategory::HairSide => {
+                    col_refs.extend(head_collider_refs.iter().cloned());
+                    col_refs.extend(torso_collider_refs.iter().cloned());
+                    col_refs.extend(arm_collider_refs.iter().cloned());
+                }
+                ChainCategory::HairFront => {
+                    col_refs.extend(head_collider_refs.iter().cloned());
+                }
+                ChainCategory::HairRibbon | ChainCategory::HairWing => {
+                    col_refs.extend(head_collider_refs.iter().cloned());
+                    col_refs.extend(torso_collider_refs.iter().cloned());
+                }
+                _ => {}
+            }
         } else {
-            Vec::new()
-        };
+            // Guard: ensure torso colliders are present for any hair hanging over the body
+            if matches!(
+                chain.category,
+                ChainCategory::HairBack
+                    | ChainCategory::HairSide
+                    | ChainCategory::HairTwintale
+                    | ChainCategory::HairRibbon
+                    | ChainCategory::HairWing
+            ) {
+                for tc in &torso_collider_refs {
+                    if !col_refs.iter().any(|r| r.id == tc.id) {
+                        col_refs.push(tc.clone());
+                    }
+                }
+            }
+        }
 
         let joint_nodes: Vec<NodeId> = chain
             .joint_node_indices

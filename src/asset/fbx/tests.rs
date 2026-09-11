@@ -338,6 +338,91 @@ fn test_inspect_skirt_meshes() {
     assert!(prim.bounds.min[1] > 0.55 && prim.bounds.max[1] < 0.85, "Skirt bounds must be around hips/thighs");
 }
 
+#[test]
+fn test_inspect_hair_and_colliders() {
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).unwrap();
+
+    println!("=== TOTAL COLLIDERS IN ASSET: {} ===", asset.colliders.len());
+    for (i, c) in asset.colliders.iter().enumerate() {
+        let node_name = &asset.skeleton.nodes[c.node.0 as usize].name;
+        println!("  Collider {}: node='{}' (id={:?}), shape={:?}, offset={:?}", i, node_name, c.node, c.shape, c.offset);
+    }
+
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
+    );
+    avatar.build_base_pose();
+    avatar.compute_global_pose();
+
+    println!("=== HUMANOID BONE WORLD POSITIONS ===");
+    for (i, node) in asset.skeleton.nodes.iter().enumerate() {
+        if let Some(hb) = node.humanoid_bone {
+            let pos = crate::math_utils::mat4_translation(&avatar.pose.global_transforms[i]);
+            println!("  Node {}: {:?} ('{}') -> world pos: [{:.4}, {:.4}, {:.4}]", i, hb, node.name, pos[0], pos[1], pos[2]);
+        }
+    }
+
+    println!("=== HAIR CHAIN REST POSITIONS ===");
+    for (i, sb) in asset.spring_bones.iter().enumerate() {
+        let root_name = &asset.skeleton.nodes[sb.chain_root.0 as usize].name;
+        if root_name.to_lowercase().contains("hair") {
+            let root_pos = crate::math_utils::mat4_translation(&avatar.pose.global_transforms[sb.chain_root.0 as usize]);
+            let last_joint = sb.joints.last().copied().unwrap_or(sb.chain_root).0 as usize;
+            let tip_pos = crate::math_utils::mat4_translation(&avatar.pose.global_transforms[last_joint]);
+            println!("  Hair Chain {}: '{}' root=[{:.4}, {:.4}, {:.4}] -> tip=[{:.4}, {:.4}, {:.4}] (joints={})",
+                i, root_name, root_pos[0], root_pos[1], root_pos[2], tip_pos[0], tip_pos[1], tip_pos[2], sb.joints.len()
+            );
+        }
+    }
+
+    assert!(
+        asset.colliders.len() >= 8,
+        "Expected at least 8 body colliders (Legs, Chest, Spine, Arms, Head), got {}",
+        asset.colliders.len()
+    );
+
+    // Verify hair chains have colliders assigned
+    let hair_springs: Vec<&crate::asset::SpringBoneAsset> = asset
+        .spring_bones
+        .iter()
+        .filter(|sb| asset.skeleton.nodes[sb.chain_root.0 as usize].name.to_lowercase().contains("hair"))
+        .collect();
+    assert!(!hair_springs.is_empty(), "Yumeka must have hair spring bones");
+    for sb in &hair_springs {
+        let name = &asset.skeleton.nodes[sb.chain_root.0 as usize].name;
+        assert!(
+            !sb.collider_refs.is_empty(),
+            "Hair chain '{}' must have colliders assigned to prevent costume penetration",
+            name
+        );
+    }
+
+    // Step spring bones with forward gravity and verify simulation stability
+    let tuning = crate::simulation::spring::SpringTuning::default();
+    for _ in 0..15 {
+        crate::simulation::spring::step_spring_bones(
+            1.0 / 60.0,
+            &mut avatar,
+            &[],
+            &tuning,
+            [0.0, -0.707, 0.707], // forward/downward gravity
+            1.0,
+        );
+    }
+    for state in &avatar.secondary_motion.spring_states {
+        for pos in &state.positions {
+            assert!(pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite());
+        }
+    }
+}
+
 
 
 
