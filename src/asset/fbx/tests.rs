@@ -423,6 +423,166 @@ fn test_inspect_hair_and_colliders() {
     }
 }
 
+#[test]
+fn test_inspect_thigh_colliders_and_skirt() {
+    fn mat4_dir(m: &[[f32; 4]; 4], d: &[f32; 3]) -> [f32; 3] {
+        [
+            m[0][0] * d[0] + m[1][0] * d[1] + m[2][0] * d[2],
+            m[0][1] * d[0] + m[1][1] * d[1] + m[2][1] * d[2],
+            m[0][2] * d[0] + m[1][2] * d[1] + m[2][2] * d[2],
+        ]
+    }
+    let fbx_path = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+    if !Path::new(fbx_path).exists() {
+        return;
+    }
+
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(fbx_path).unwrap();
+
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
+    );
+    avatar.build_base_pose();
+    avatar.compute_global_pose();
+
+    println!("=== SKELETON LEG NODES ===");
+    for (i, node) in asset.skeleton.nodes.iter().enumerate() {
+        if matches!(
+            node.humanoid_bone,
+            Some(crate::asset::HumanoidBone::Hips)
+                | Some(crate::asset::HumanoidBone::LeftUpperLeg)
+                | Some(crate::asset::HumanoidBone::LeftLowerLeg)
+                | Some(crate::asset::HumanoidBone::RightUpperLeg)
+                | Some(crate::asset::HumanoidBone::RightLowerLeg)
+        ) {
+            let pos = crate::math_utils::mat4_translation(&avatar.pose.global_transforms[i]);
+            let up = mat4_dir(&avatar.pose.global_transforms[i], &[0.0, 1.0, 0.0]);
+            println!(
+                "  Node {}: {:?} ('{}') -> world pos: [{:.4}, {:.4}, {:.4}], local Y up in world: [{:.4}, {:.4}, {:.4}]",
+                i, node.humanoid_bone, node.name, pos[0], pos[1], pos[2], up[0], up[1], up[2]
+            );
+        }
+    }
+
+    println!("=== THIGH COLLIDERS IN WORLD SPACE ===");
+    for (i, c) in asset.colliders.iter().enumerate() {
+        let node_idx = c.node.0 as usize;
+        let node = &asset.skeleton.nodes[node_idx];
+        if matches!(
+            node.humanoid_bone,
+            Some(crate::asset::HumanoidBone::LeftUpperLeg) | Some(crate::asset::HumanoidBone::RightUpperLeg)
+        ) {
+            let node_pos = crate::math_utils::mat4_translation(&avatar.pose.global_transforms[node_idx]);
+            let rotated_offset = mat4_dir(&avatar.pose.global_transforms[node_idx], &c.offset);
+            let center = crate::math_utils::vec3_add(&node_pos, &rotated_offset);
+            let up = mat4_dir(&avatar.pose.global_transforms[node_idx], &[0.0, 1.0, 0.0]);
+            let up_len = crate::math_utils::vec3_length(&up);
+            let up_norm = [up[0] / up_len, up[1] / up_len, up[2] / up_len];
+
+            if let crate::asset::ColliderShape::Capsule { radius, height } = c.shape {
+                let half_h = height * 0.5;
+                let seg_a = crate::math_utils::vec3_sub(&center, &crate::math_utils::vec3_scale(&up_norm, half_h));
+                let seg_b = crate::math_utils::vec3_add(&center, &crate::math_utils::vec3_scale(&up_norm, half_h));
+                println!(
+                    "  Thigh Collider {}: node='{}', radius={:.4}, height={:.4}\n    center=[{:.4}, {:.4}, {:.4}]\n    seg_a=[{:.4}, {:.4}, {:.4}]\n    seg_b=[{:.4}, {:.4}, {:.4}]",
+                    i, node.name, radius, height, center[0], center[1], center[2], seg_a[0], seg_a[1], seg_a[2], seg_b[0], seg_b[1], seg_b[2]
+                );
+            }
+        }
+    }
+
+    println!("=== SKIRT SPRING CHAINS ===");
+    let mut skirt_chain_count = 0;
+    for (i, sb) in asset.spring_bones.iter().enumerate() {
+        let root_name = &asset.skeleton.nodes[sb.chain_root.0 as usize].name;
+        if root_name.to_lowercase().contains("skirt") {
+            skirt_chain_count += 1;
+            let col_names: Vec<String> = sb.collider_refs.iter().map(|r| {
+                let c = asset.colliders.iter().find(|c| c.id == r.id).unwrap();
+                let n = &asset.skeleton.nodes[c.node.0 as usize].name;
+                format!("{}(id={})", n, r.id.0)
+            }).collect();
+            println!(
+                "  Skirt Chain {}: '{}' radius={:.4}, grav={:.4}, colliders={:?}",
+                i, root_name, sb.radius, sb.gravity_power, col_names
+            );
+
+            // Assert: Every skirt chain must have UpperLeg colliders assigned
+            assert!(
+                sb.collider_refs.iter().any(|r| {
+                    let c = asset.colliders.iter().find(|c| c.id == r.id).unwrap();
+                    let n = &asset.skeleton.nodes[c.node.0 as usize].name;
+                    n.contains("Leg") || n.contains("Thigh")
+                }),
+                "Skirt chain '{}' must have leg/thigh colliders assigned",
+                root_name
+            );
+            // Assert: No upper-body colliders (Chest, UpperArm) on skirt
+            assert!(
+                !sb.collider_refs.iter().any(|r| {
+                    let c = asset.colliders.iter().find(|c| c.id == r.id).unwrap();
+                    let n = &asset.skeleton.nodes[c.node.0 as usize].name;
+                    n.contains("Chest") || n.contains("Arm") || n.contains("Head")
+                }),
+                "Skirt chain '{}' must NOT have chest/arm colliders assigned",
+                root_name
+            );
+            // Assert: Skirt radius must be reasonable (authored ~0.057, not tiny 0.016)
+            assert!(
+                sb.radius >= 0.03,
+                "Skirt chain '{}' radius ({}) must be >= 0.03 for adequate thigh standoff",
+                root_name, sb.radius
+            );
+        }
+    }
+    assert!(skirt_chain_count >= 10, "Expected at least 10 skirt chains in Yumeka");
+
+    // 4. Test dynamic leg movement: rotate LeftUpperLeg forward by 45 degrees
+    // (simulating walking / sitting step).
+    let l_leg_idx = asset.skeleton.nodes.iter().position(|n| n.name == "UpperLeg_L").unwrap();
+    // Rotate 45 deg around local X (forward leg lift):
+    let angle_rad = 45.0f32.to_radians();
+    let sin_half = (angle_rad * 0.5).sin();
+    let cos_half = (angle_rad * 0.5).cos();
+    let rot_x = [sin_half, 0.0, 0.0, cos_half];
+    avatar.pose.local_transforms[l_leg_idx].rotation = crate::math_utils::quat_mul(
+        &rot_x,
+        &asset.skeleton.nodes[l_leg_idx].rest_local.rotation,
+    );
+    avatar.compute_global_pose();
+
+    // Step physics with downward gravity
+    let tuning = crate::simulation::spring::SpringTuning::default();
+    for _ in 0..20 {
+        crate::simulation::spring::step_spring_bones(
+            1.0 / 60.0,
+            &mut avatar,
+            &[],
+            &tuning,
+            [0.0, -1.0, 0.0],
+            1.0,
+        );
+    }
+
+    // Verify left front skirt chains are pushed forward by the raised thigh collider
+    for (i, sb) in asset.spring_bones.iter().enumerate() {
+        let root_name = &asset.skeleton.nodes[sb.chain_root.0 as usize].name;
+        if root_name == "Skirt_2_L" || root_name == "Skirt_1" {
+            let last_pos = avatar.secondary_motion.spring_states[i].positions.last().copied().unwrap();
+            println!("  After 45 deg leg lift, {} tip pos: [{:.4}, {:.4}, {:.4}]", root_name, last_pos[0], last_pos[1], last_pos[2]);
+            // Z must be pushed forward (Z > 0.08) by the forward-tilted thigh capsule
+            assert!(
+                last_pos[2] > 0.08,
+                "Skirt chain '{}' tip Z ({}) should be pushed forward by raised thigh",
+                root_name, last_pos[2]
+            );
+        }
+    }
+}
+
+
 
 
 

@@ -880,7 +880,13 @@ pub fn build_spring_bones_and_colliders(
     let mut other_pbs: Vec<&VrcPhysBoneData> = Vec::new();
 
     for pb in &vrc_data.phys_bones {
-        if pb.gravity >= 0.8 && !pb.collider_refs.is_empty() {
+        let references_leg = pb.collider_refs.iter().any(|fid| {
+            file_id_to_col_id.get(fid).map_or(false, |cid| {
+                leg_collider_refs.iter().any(|r| r.id == *cid)
+            })
+        });
+
+        if references_leg {
             skirt_pbs.push(pb);
         } else if (pb.gravity - 0.22).abs() < 0.05 && pb.collider_refs.len() == 1 {
             tail_pbs.push(pb);
@@ -925,12 +931,12 @@ pub fn build_spring_bones_and_colliders(
         go_file_id: 0,
         root_transform_id: 0,
         pull: 0.15,
-        spring: 0.4,
+        spring: 0.2,
         stiffness: 0.2,
-        gravity: 0.8,
+        gravity: 0.08,
         gravity_falloff: 0.0,
-        radius: 0.02,
-        immobile: 0.8,
+        radius: 0.05,
+        immobile: 0.7,
         collider_refs: Vec::new(),
     };
 
@@ -993,20 +999,28 @@ pub fn build_spring_bones_and_colliders(
                 }
                 _ => {}
             }
-        } else {
-            // Guard: ensure torso colliders are present for any hair hanging over the body
-            if matches!(
-                chain.category,
-                ChainCategory::HairBack
-                    | ChainCategory::HairSide
-                    | ChainCategory::HairTwintale
-                    | ChainCategory::HairRibbon
-                    | ChainCategory::HairWing
-            ) {
-                for tc in &torso_collider_refs {
-                    if !col_refs.iter().any(|r| r.id == tc.id) {
-                        col_refs.push(tc.clone());
-                    }
+        }
+
+        // Category-specific collider guards
+        if chain.category == ChainCategory::Skirt {
+            // Skirt chains must strictly collide with legs/thighs and never upper-body colliders
+            col_refs.retain(|r| leg_collider_refs.iter().any(|lr| lr.id == r.id));
+            for lr in &leg_collider_refs {
+                if !col_refs.iter().any(|r| r.id == lr.id) {
+                    col_refs.push(lr.clone());
+                }
+            }
+        } else if matches!(
+            chain.category,
+            ChainCategory::HairBack
+                | ChainCategory::HairSide
+                | ChainCategory::HairTwintale
+                | ChainCategory::HairRibbon
+                | ChainCategory::HairWing
+        ) {
+            for tc in &torso_collider_refs {
+                if !col_refs.iter().any(|r| r.id == tc.id) {
+                    col_refs.push(tc.clone());
                 }
             }
         }

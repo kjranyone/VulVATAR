@@ -118,7 +118,7 @@ fn main() -> Result<(), String> {
         let node_name = avatar.asset.skeleton.nodes.get(col.node.0 as usize)
             .map(|n| n.name.to_lowercase())
             .unwrap_or_default();
-        if node_name.contains("upperleg") || node_name.contains("hips") {
+        if node_name.contains("upperleg") || node_name.contains("leg") || node_name.contains("thigh") || node_name.contains("hips") {
             avatar.collider_enabled[i] = true;
             println!("Enabled collider #{}: {} on node '{}'", i, col.id.0, node_name);
         }

@@ -106,10 +106,26 @@ fn resolve_sphere_collision(
     let total_radius = collider_radius + bone_radius;
     let diff = vec3_sub(next, collider_center);
     let dist = vec3_length(&diff);
-    if dist < total_radius && dist > 1e-8 {
-        let push = vec3_scale(&diff, total_radius / dist);
-        let pushed = vec3_add(collider_center, &push);
-        enforce_bone_length(&pushed, parent_world_pos, bone_length)
+    if dist < total_radius {
+        let normal = if dist > 1e-8 {
+            vec3_scale(&diff, 1.0 / dist)
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let pushed = vec3_add(collider_center, &vec3_scale(&normal, total_radius));
+        let constrained = enforce_bone_length(&pushed, parent_world_pos, bone_length);
+        let diff_c = vec3_sub(&constrained, collider_center);
+        let dist_c = vec3_length(&diff_c);
+        if dist_c < total_radius {
+            let normal_c = if dist_c > 1e-8 {
+                vec3_scale(&diff_c, 1.0 / dist_c)
+            } else {
+                normal
+            };
+            vec3_add(collider_center, &vec3_scale(&normal_c, total_radius))
+        } else {
+            constrained
+        }
     } else {
         *next
     }
@@ -134,10 +150,27 @@ fn resolve_capsule_collision(
     let total_radius = collider_radius + bone_radius;
     let diff = vec3_sub(next, &closest);
     let dist = vec3_length(&diff);
-    if dist < total_radius && dist > 1e-8 {
-        let push = vec3_scale(&diff, total_radius / dist);
-        let pushed = vec3_add(&closest, &push);
-        enforce_bone_length(&pushed, parent_world_pos, bone_length)
+    if dist < total_radius {
+        let normal = if dist > 1e-8 {
+            vec3_scale(&diff, 1.0 / dist)
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let pushed = vec3_add(&closest, &vec3_scale(&normal, total_radius));
+        let constrained = enforce_bone_length(&pushed, parent_world_pos, bone_length);
+        let closest_c = closest_point_on_segment(&seg_a, &seg_b, &constrained);
+        let diff_c = vec3_sub(&constrained, &closest_c);
+        let dist_c = vec3_length(&diff_c);
+        if dist_c < total_radius {
+            let normal_c = if dist_c > 1e-8 {
+                vec3_scale(&diff_c, 1.0 / dist_c)
+            } else {
+                normal
+            };
+            vec3_add(&closest_c, &vec3_scale(&normal_c, total_radius))
+        } else {
+            constrained
+        }
     } else {
         *next
     }
