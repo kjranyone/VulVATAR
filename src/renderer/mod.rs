@@ -1160,32 +1160,44 @@ impl VulkanRenderer {
 
             // Build unique primitive_id mapping; detect duplicate primitive IDs if any.
             let mut prim_id_to_idx = HashMap::new();
-            let mut has_duplicate_ids = false;
+            let mut duplicate_ids = std::collections::HashSet::new();
             for (idx, mi) in instance.mesh_instances.iter().enumerate() {
                 if prim_id_to_idx.insert(mi.primitive_id, idx).is_some() {
-                    has_duplicate_ids = true;
+                    duplicate_ids.insert(mi.primitive_id);
                     warn!("render: duplicate primitive_id {:?} in mesh instances", mi.primitive_id);
                 }
             }
 
             // Track which primitives have a strictly validated parent dependency.
-            // Invalid dependencies (self-reference, missing parent, or duplicate IDs) are pruned immediately.
+            // Invalid dependencies (self-reference, missing parent, or duplicate/ambiguous IDs) are pruned immediately.
             let mut validated_parent_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
 
-            if !has_duplicate_ids {
-                for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-                    if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
-                        if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
-                            if parent_idx != idx {
-                                adj[parent_idx].push(idx);
-                                in_degree[idx] += 1;
-                                validated_parent_ids.insert(mi.primitive_id, parent_id);
-                            } else {
-                                warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
-                            }
+            for (idx, mi) in instance.mesh_instances.iter().enumerate() {
+                // If this primitive itself has a duplicate ID, it cannot be safely ordered; prune
+                if duplicate_ids.contains(&mi.primitive_id) {
+                    continue;
+                }
+
+                if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
+                    // If the parent ID is ambiguous due to duplicates, children cannot resolve it uniquely; prune
+                    if duplicate_ids.contains(&parent_id) {
+                        warn!(
+                            "render: parent primitive_id {:?} is ambiguous (duplicate IDs); pruning clearance on child {:?}",
+                            parent_id, mi.primitive_id
+                        );
+                        continue;
+                    }
+
+                    if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
+                        if parent_idx != idx {
+                            adj[parent_idx].push(idx);
+                            in_degree[idx] += 1;
+                            validated_parent_ids.insert(mi.primitive_id, parent_id);
                         } else {
-                            warn!("render: missing parent body_primitive_id {:?} for primitive {:?}; fallback to unconstrained skinning", parent_id, mi.primitive_id);
+                            warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
                         }
+                    } else {
+                        warn!("render: missing parent body_primitive_id {:?} for primitive {:?}; fallback to unconstrained skinning", parent_id, mi.primitive_id);
                     }
                 }
             }

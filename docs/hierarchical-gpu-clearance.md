@@ -133,9 +133,14 @@ $$i^* = \arg\min_{i \in \text{Candidates}} \left( \|\mathbf{p}_o - \mathbf{p}_i\
 
 衣服プリミティブ間の依存関係（例: 素体 $\to$ シャツ $\to$ ブレザー）が構築された場合、GPU 上で親サーフェスの変形後頂点バッファを先に生成し、それを子サーフェスのコンピュートスキニングで読み込む必要があります。
 
-#### Kahn のアルゴリズムと不正依存時のフォールバック
+#### Kahn のアルゴリズムと異常依存時のフォールバック
 単純な `sort_by` 比較関数は推移律を満たさず全順序にならないため、**Kahn のアルゴリズム（入次数カウントとキューによる DAG トポロジカルソート）** を採用しています。
-さらに、実行時安全性を担保するため、**循環依存・存在しない親ID・自己参照・重複IDが検出されたノードは親依存関係（`validated_parent_ids`）から除外し、クリアランス補正を無効化して通常スキニング（unconstrained skinning）へ安全に復帰** させます：
+さらに、実行時安全性を担保するため、以下の異常が検出されたノードは親依存関係（`validated_parent_ids`）から完全に除外されます：
+- **自己参照**（`parent_id == primitive_id`）
+- **存在しない親 ID**
+- **重複するプリミティブ ID を持つノード自身**
+- **重複する親 ID を参照している子ノード**（親が一意に定まらないため）
+- **循環依存**（Kahn 法のキューで未解決のまま残ったノード群）
 
 ```rust
 // Topological dependency ordering for hierarchical surface clearances:
@@ -147,30 +152,36 @@ let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
 
 // 重複 ID の検出
 let mut prim_id_to_idx = HashMap::new();
-let mut has_duplicate_ids = false;
+let mut duplicate_ids = std::collections::HashSet::new();
 for (idx, mi) in instance.mesh_instances.iter().enumerate() {
     if prim_id_to_idx.insert(mi.primitive_id, idx).is_some() {
-        has_duplicate_ids = true;
+        duplicate_ids.insert(mi.primitive_id);
         warn!("render: duplicate primitive_id {:?} in mesh instances", mi.primitive_id);
     }
 }
 
 let mut validated_parent_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
 
-if !has_duplicate_ids {
-    for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-        if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
-            if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
-                if parent_idx != idx {
-                    adj[parent_idx].push(idx);
-                    in_degree[idx] += 1;
-                    validated_parent_ids.insert(mi.primitive_id, parent_id);
-                } else {
-                    warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
-                }
+for (idx, mi) in instance.mesh_instances.iter().enumerate() {
+    if duplicate_ids.contains(&mi.primitive_id) { continue; }
+
+    if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
+        // 重複親を参照する子は一意に親を解決できないためプルーニング
+        if duplicate_ids.contains(&parent_id) {
+            warn!("render: parent {:?} is ambiguous (duplicates); pruning child {:?}", parent_id, mi.primitive_id);
+            continue;
+        }
+
+        if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
+            if parent_idx != idx {
+                adj[parent_idx].push(idx);
+                in_degree[idx] += 1;
+                validated_parent_ids.insert(mi.primitive_id, parent_id);
             } else {
-                warn!("render: missing parent {:?}; fallback to unconstrained skinning", parent_id);
+                warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
             }
+        } else {
+            warn!("render: missing parent {:?}; fallback to unconstrained skinning", parent_id);
         }
     }
 }
@@ -189,9 +200,7 @@ while let Some(u) = queue.pop_front() {
     ordered_mesh_instances.push(&instance.mesh_instances[u]);
     for &v in &adj[u] {
         in_degree[v] -= 1;
-        if in_degree[v] == 0 {
-            queue.push_back(v);
-        }
+        if in_degree[v] == 0 { queue.push_back(v); }
     }
 }
 
@@ -206,6 +215,12 @@ if ordered_mesh_instances.len() < n {
     }
 }
 ```
+
+#### フォールバックの実行時経路
+無効化された親マッピングは、ディスパッチの並び順だけでなく、以下の全実行経路に直結しています：
+1. **親バッファの参照**: `validated_parent_ids` に存在しないプリミティブは `prim_parent_vbo = None` となり、親バッファは取得されません。
+2. **シェーダー制御 UBO**: `guard.has_skin_anchors = if prim_parent_vbo.is_some() { 1 } else { 0 }` により、制御フラグが `0` となります。
+3. **GPU Compute Shader**: シェーダー内のクリアランス補正分岐（`if (push.has_skin_anchors != 0)`）が完全にスキップされ、**通常のスキニング（unconstrained skinning）へ安全に復帰**します。
 
 #### GPU メモリの同期
 同一コマンドバッファ内の追跡対象リソースへのアクセスについて、本パイプラインでは Vulkano 0.35 の `AutoCommandBufferBuilder` の自動同期を利用しています（先行ディスパッチの `transformed_vbo` 書き込みと、後続ディスパッチの Binding 7 での読み込みの依存関係追跡）。
@@ -258,7 +273,7 @@ if (push.has_skin_anchors != 0) {
 - **検証環境**: CPU シミュレーションテスト（`compute_rest_world_vertices` による LBS 再現計算）
 
 #### 計測指標の定義
-本テストにおける計測は、メッシュ全体の三角形交差判定ではなく、**「肘中心から半径 70mm 以内にあるインナー頂点に対し、最も近いアウター頂点のアウター法線方向に対する符号付き距離 $(\mathbf{p}_{\text{inner}} - \mathbf{p}_{\text{outer}}) \cdot \mathbf{n}_{\text{outer}} > 1.0\,\text{mm}$（アウター接平面の外側へ1mm以上突出）を満たす頂点数」** を評価対象としています（意図する健全な配置はアウター接平面より内側）。
+本テストにおける計測は、メッシュ全体の三角形交差判定ではなく、**「肘中心から半径 70mm 以内にあるインナー頂点に対し、最も近いアウター頂点のアウター法線方向に対する符号付き距離 $(\mathbf{p}_{\text{inner}} - \mathbf{p}_{\text{outer}}) \cdot \mathbf{n}_{\text{outer}} > 1.0\,\text{mm}$（アウター接平面の外側へ1mm超過で突出）を満たす頂点数」** を評価対象としています（意図する健全な配置はアウター接平面より内側）。
 
 ### 実測値
 
@@ -278,6 +293,7 @@ if (push.has_skin_anchors != 0) {
       最大法線方向突出 (超過分):        26.38 mm
   - 補正後 (Clearance Projected):
       法線方向突出が 1mm を超えた頂点数: 0 頂点 (該当なし)
+      最大突出値:                       未計測 (※1.0mm 以下の微小突出が残存し得る)
 ======================================================================
 ```
 
@@ -285,7 +301,7 @@ if (push.has_skin_anchors != 0) {
 
 > [!NOTE]
 > **ベンチマークに関する留意事項**
-> - **閾値超過なしと微小突出の可能性**: 補正後の「超過頂点数 0 頂点」は、1.0mm を超える突出が存在しなかったことを示しています。本テストの計測ロジック上、閾値超過頂点がない場合はループ内で最大値更新が行われないため、0.0mm〜1.0mm 未満の微小な突出が残存している可能性は排除していません。
+> - **閾値境界と微小突出の可能性**: 判定条件が `> 1.0mm` であるため、補正後の「超過頂点数 0 頂点」は 1.0mm を超える突出が検出されなかったことを意味します。本テストでは閾値超過頂点がない場合に最大値集計を行わないため、**1.0mm 以下の微小な突出が残存している可能性は排除しておらず、最大突出値自体は未計測** です。
 > - **CPU シミュレーション**: 本テストは CPU 上で LBS 変形とクリアランス補正関数を実行したシミュレーション検証であり、実際の Vulkan レンダリングパスにおける GPU フレームタイムの確定値やジッターを評価するものではありません。
 > - **一般化の制限**: 本結果は特定モデル（Yumeka）の肘屈曲ポーズにおける検証結果であり、任意の未知アバターや激しい動的アニメーションに対して破綻ゼロを一般的に証明するものではありません。
 
@@ -295,14 +311,13 @@ if (push.has_skin_anchors != 0) {
 
 本稿では、多層衣装のスキニング時クリッピングを軽減するための軽量なアプローチとして、ボーン放射距離に基づく内外順序推定と、Kahn のアルゴリズムを用いた Vulkan トポロジカルディスパッチによるクリアランス補正を実装・評価しました。
 
-### 実装の成果
-1. **手動設定の削減**: メッシュ名や手動コライダー設定に依存せず、放射距離ヒューリスティックにより Inner $\to$ Outer の順序を自動推定可能とした。
-2. **実行時フォールバック**: Kahn のトポロジカルソートに異常依存（循環・未解決ノード等）時の親参照解除を組み込み、安全に通常スキニングへ戻すパイプラインを構築した。
-3. **局所突出の低減**: 単純な LBS で発生していた 26mm 超の局所突き破りを、接平面クリアランス拘束によって効果的に低減できることを確認した。
+### 検証の結論
+**特定モデル・単一ポーズのCPU再現テストにおいて、定義した法線方向突出の閾値超過頂点数が75から0へ減少した。実GPU経路の動作・性能、三角形交差、他モデルや連続動作への一般化は未検証である。**
 
 ### 残された課題
 - **三角形メッシュ交差の非保証**: 点-接平面拘束のみでは、エッジ同士の交差やシワの折り返しによる交差を完全に防ぐことはできません。
 - **未バインド頂点の扱い**: 1.1% の未バインド頂点に対するフォールバックや、複数親サーフェス接触への対応。
+- **実GPU環境での計測**: 実機描画パイプラインにおけるフレームタイムや同期オーバーヘッドの厳密なプロファイリング。
 - **陰関数・SDFアプローチとの統合**: より高品位な接触解消が求められるケースにおいては、Buffetら (2019) のような連続距離場手法との併用が今後の検討課題となります。
 
 ---
