@@ -189,10 +189,7 @@ impl OutputRouter {
     /// Companion to [`Self::set_sink`] that accepts a caller-supplied
     /// writer. Used by tests that hot-swap to a custom-path writer.
     pub fn set_writer(&mut self, sink: FrameSink, writer: Box<dyn OutputSinkWriter>) {
-        info!(
-            "OutputRouter: swapping sink {:?} -> {:?}",
-            self.sink, sink
-        );
+        info!("OutputRouter: swapping sink {:?} -> {:?}", self.sink, sink);
 
         // Flush queue + pending — consumer is about to change. Frames in
         // the local queue never crossed the worker boundary, so their
@@ -488,9 +485,8 @@ impl OutputRouter {
                         if matches!(attempted_handoff_path, HandoffPath::GpuSharedFrame)
                             && !attempted_gpu_token_valid
                         {
-                            self.gpu_export_failure_count = self
-                                .gpu_export_failure_count
-                                .saturating_add(1);
+                            self.gpu_export_failure_count =
+                                self.gpu_export_failure_count.saturating_add(1);
                         }
                         self.last_publish_timestamp = attempted_timestamp;
                         self.last_handoff_path = Some(attempted_handoff_path);
@@ -516,7 +512,10 @@ impl OutputRouter {
                         if let WorkerMessage::Frame(dropped_frame) = dropped_message {
                             Self::complete_gpu_lease(&self.lease_completion_tx, &dropped_frame);
                         }
-                        debug!("output: worker channel full, dropping frame: {}", error_text);
+                        debug!(
+                            "output: worker channel full, dropping frame: {}",
+                            error_text
+                        );
                     }
                 }
             }
@@ -923,8 +922,7 @@ mod tests {
 
             let writer: Box<dyn OutputSinkWriter> =
                 Box::new(SharedMemoryFileSink::with_path(path.clone()));
-            let mut router =
-                OutputRouter::with_writer(FrameSink::SharedTextureFileStub, writer);
+            let mut router = OutputRouter::with_writer(FrameSink::SharedTextureFileStub, writer);
 
             router.publish(make_valid_gpu_frame(5_000));
             assert!(
@@ -971,7 +969,7 @@ mod tests {
             // Decode the PNG header to confirm dimensions match. The
             // sink's own unit tests cover round-trip integrity in
             // detail; here we just want the composed path to land at
-                // the right place with the right shape.
+            // the right place with the right shape.
             let bytes = std::fs::read(&png_path).expect("read png");
             assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
 
@@ -988,8 +986,7 @@ mod tests {
             let path_b = unique_temp_path("swap-b", "bin");
             let _ = std::fs::remove_file(&path_b);
 
-            let writer_a: Box<dyn OutputSinkWriter> =
-                Box::new(ImageSequenceSink::new(&dir_a));
+            let writer_a: Box<dyn OutputSinkWriter> = Box::new(ImageSequenceSink::new(&dir_a));
             let mut router = OutputRouter::with_writer(FrameSink::ImageSequence, writer_a);
 
             let mut cpu = OutputFrame::new(7_000, [2, 2], 1_000);

@@ -141,10 +141,7 @@ pub(super) fn resolve_self_collisions(sim: &mut ClothSimState) {
 
 /// Resolve pin targets to world-space positions from skeleton global
 /// transforms and write them to the pinned particles.
-pub(super) fn apply_pin_targets(
-    sim: &mut ClothSimState,
-    global_transforms: &[crate::asset::Mat4],
-) {
+pub(super) fn apply_pin_targets(sim: &mut ClothSimState, global_transforms: &[crate::asset::Mat4]) {
     for pin in &sim.pin_targets {
         let node_idx = pin.node_index;
         if node_idx >= global_transforms.len() {

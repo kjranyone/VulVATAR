@@ -21,9 +21,19 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
     let active_idx = state.app.output.active_sink().to_gui_index();
     let mut new_idx = requested_idx;
 
-    collapsible_card(ui, "inspector.output_sink", t!("inspector.output_sink"), true, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.output_sink",
+        t!("inspector.output_sink"),
+        true,
+        |ui| {
             egui::ComboBox::from_label(t!("inspector.output_sink_label"))
-                .selected_text(sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("Unknown"))
+                .selected_text(
+                    sink_names
+                        .get(requested_idx)
+                        .map(|s: &String| s.as_str())
+                        .unwrap_or("Unknown"),
+                )
                 .show_ui(ui, |ui| {
                     for (i, name) in sink_names.iter().enumerate() {
                         ui.selectable_value(&mut new_idx, i, name);
@@ -32,19 +42,30 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
             if active_idx != requested_idx {
                 ui.colored_label(
                     color::WARNING,
-                    t!("inspector.sink_mismatch",
-                        active = sink_names.get(active_idx).map(|s: &String| s.as_str()).unwrap_or("?"),
-                        requested = sink_names.get(requested_idx).map(|s: &String| s.as_str()).unwrap_or("?"),
+                    t!(
+                        "inspector.sink_mismatch",
+                        active = sink_names
+                            .get(active_idx)
+                            .map(|s: &String| s.as_str())
+                            .unwrap_or("?"),
+                        requested = sink_names
+                            .get(requested_idx)
+                            .map(|s: &String| s.as_str())
+                            .unwrap_or("?"),
                     ),
                 );
             }
-        });
+        },
+    );
 
     if new_idx != requested_idx {
         let want_sink = FrameSink::from_gui_index(new_idx);
         match state.app.set_requested_sink(want_sink) {
             Ok(()) => {
-                state.push_notification(t!("inspector.output_sink_changed", name = sink_names[new_idx].to_string()));
+                state.push_notification(t!(
+                    "inspector.output_sink_changed",
+                    name = sink_names[new_idx].to_string()
+                ));
             }
             Err(e) => {
                 state.push_notification(t!("inspector.output_sink_failed", error = e.to_string()));
@@ -52,8 +73,12 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
         }
     }
 
-
-    collapsible_card(ui, "inspector.frame_format", t!("inspector.frame_format"), true, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.frame_format",
+        t!("inspector.frame_format"),
+        true,
+        |ui| {
             egui::ComboBox::from_label(t!("tracking.resolution"))
                 .selected_text(
                     *["1920x1080", "1280x720", "640x480"]
@@ -75,7 +100,10 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ui.selectable_value(&mut state.output.output_framerate_index, 0, "60 fps");
                     ui.selectable_value(&mut state.output.output_framerate_index, 1, "30 fps");
                 });
-            ui.checkbox(&mut state.output.output_has_alpha, t!("inspector.rgba_alpha"));
+            ui.checkbox(
+                &mut state.output.output_has_alpha,
+                t!("inspector.rgba_alpha"),
+            );
             let cs_names: [String; 2] = [t!("inspector.srgb"), t!("inspector.linear_srgb")];
             egui::ComboBox::from_label(t!("inspector.color_space"))
                 .selected_text(
@@ -85,7 +113,11 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .unwrap_or("Unknown"),
                 )
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.output.output_color_space_index, 0, &*cs_names[0]);
+                    ui.selectable_value(
+                        &mut state.output.output_color_space_index,
+                        0,
+                        &*cs_names[0],
+                    );
                     ui.selectable_value(
                         &mut state.output.output_color_space_index,
                         1,
@@ -114,11 +146,17 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                         ui.selectable_value(&mut state.output.msaa_index, i, name);
                     }
                 });
-        });
+        },
+    );
 
     let diagnostics = state.app.output.diagnostics();
 
-    collapsible_card(ui, "inspector.synchronization", t!("inspector.synchronization"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.synchronization",
+        t!("inspector.synchronization"),
+        false,
+        |ui| {
             use crate::output::HandoffPath;
             // Reflect the most recently published frame's handoff_path
             // rather than guessing from the sink variant. Until any frame
@@ -129,18 +167,13 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 Some(HandoffPath::GpuSharedFrame) => {
                     ("inspector.handoff_active_gpu", color::SUCCESS)
                 }
-                Some(HandoffPath::CpuReadback) => (
-                    "inspector.handoff_active_cpu_readback",
-                    color::WARNING,
-                ),
-                Some(HandoffPath::SharedMemory) => (
-                    "inspector.handoff_active_shared_memory",
-                    color::WARNING,
-                ),
-                None => (
-                    "inspector.handoff_pending",
-                    color::ON_SURFACE_MUTED,
-                ),
+                Some(HandoffPath::CpuReadback) => {
+                    ("inspector.handoff_active_cpu_readback", color::WARNING)
+                }
+                Some(HandoffPath::SharedMemory) => {
+                    ("inspector.handoff_active_shared_memory", color::WARNING)
+                }
+                None => ("inspector.handoff_pending", color::ON_SURFACE_MUTED),
             };
             ui.label(egui::RichText::new(t!(label_key)).color(color));
             if diagnostics.fallback_active {
@@ -164,22 +197,22 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                             "inspector.handoff_fallback_reason_missing_handle"
                         }
                     };
-                    ui.label(
-                        egui::RichText::new(t!(reason_key))
-                            .color(color::WARNING),
-                    );
+                    ui.label(egui::RichText::new(t!(reason_key)).color(color::WARNING));
                 }
             }
-        });
+        },
+    );
 
-    collapsible_card(ui, "inspector.diagnostics", t!("inspector.diagnostics"), true, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.diagnostics",
+        t!("inspector.diagnostics"),
+        true,
+        |ui| {
             // "Connected" was unconditional green before — only consider the
             // pipeline connected once a frame has actually been published.
             let (label_key, color) = if diagnostics.last_publish_timestamp == 0 {
-                (
-                    "inspector.connection_pending",
-                    color::ON_SURFACE_MUTED,
-                )
+                ("inspector.connection_pending", color::ON_SURFACE_MUTED)
             } else {
                 ("inspector.connected", color::SUCCESS)
             };
@@ -198,9 +231,15 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 "inspector.dropped_frames",
                 count = diagnostics.dropped_frame_count
             ));
-        });
+        },
+    );
 
-    collapsible_card(ui, "inspector.runtime_budget", t!("inspector.runtime_budget"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.runtime_budget",
+        t!("inspector.runtime_budget"),
+        false,
+        |ui| {
             let budget = &state.app.runtime_gpu_budget;
             use crate::app::runtime_gpu_budget::DegradedMode;
             let mode_color = match budget.degraded_mode() {
@@ -240,5 +279,6 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 "inspector.runtime_budget_dropped_results",
                 count = state.app.render_results_dropped_count()
             ));
-        });
+        },
+    );
 }

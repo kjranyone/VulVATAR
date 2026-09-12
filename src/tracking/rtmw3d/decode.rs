@@ -3,12 +3,10 @@
 //! slices from RTMW3D and returns one [`DecodedJoint`] per
 //! COCO-Wholebody index.
 
-
 pub(in crate::tracking) const NUM_JOINTS: usize = 133;
 pub(super) const SIMCC_X_BINS: usize = 576;
 pub(super) const SIMCC_Y_BINS: usize = 768;
 pub(super) const SIMCC_Z_BINS: usize = 576;
-
 
 /// One decoded keypoint in normalised model space:
 /// `nx, ny ∈ [0, 1]` (image-relative, NY top-to-bottom),
@@ -112,7 +110,11 @@ fn peak_sigma_bins(slice: &[f32], peak: usize) -> f32 {
         let v = slice[peak - k];
         if v < half {
             let prev = slice[peak - k + 1];
-            let frac = if prev > v { (prev - half) / (prev - v) } else { 0.0 };
+            let frac = if prev > v {
+                (prev - half) / (prev - v)
+            } else {
+                0.0
+            };
             left = (k - 1) as f32 + frac.clamp(0.0, 1.0);
             break;
         }
@@ -129,7 +131,11 @@ fn peak_sigma_bins(slice: &[f32], peak: usize) -> f32 {
         let v = slice[peak + k];
         if v < half {
             let prev = slice[peak + k - 1];
-            let frac = if prev > v { (prev - half) / (prev - v) } else { 0.0 };
+            let frac = if prev > v {
+                (prev - half) / (prev - v)
+            } else {
+                0.0
+            };
             right = (k - 1) as f32 + frac.clamp(0.0, 1.0);
             break;
         }
@@ -175,7 +181,11 @@ fn peak_shape(slice: &[f32], peak: usize) -> (f32, f32) {
             second = v;
         }
     }
-    let second = if second.is_finite() { (second / m).clamp(0.0, 1.0) } else { 0.0 };
+    let second = if second.is_finite() {
+        (second / m).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     (second, n_half as f32 / slice.len() as f32)
 }
 
@@ -277,5 +287,4 @@ mod tests {
             "parabolic vertex must be recovered exactly, got {nx_bins} want {vertex}"
         );
     }
-
 }

@@ -82,21 +82,14 @@ pub fn solve_expressions(
         .expressions
         .iter()
         .filter_map(|expr_def| {
-            let tracking = match source
-                .expressions
-                .iter()
-                .find(|e| e.name == expr_def.name)
-            {
+            let tracking = match source.expressions.iter().find(|e| e.name == expr_def.name) {
                 Some(t) => t,
                 None => {
                     // No tracking counterpart (e.g. an FBX body-size
                     // shape key): carry the previous weight through so
                     // manual slider edits survive the per-frame
                     // overwrite instead of being dropped to zero.
-                    let weight = prev_map
-                        .get(expr_def.name.as_str())
-                        .copied()
-                        .unwrap_or(0.0);
+                    let weight = prev_map.get(expr_def.name.as_str()).copied().unwrap_or(0.0);
                     return Some(ResolvedExpressionWeight {
                         name: expr_def.name.clone(),
                         weight: weight.clamp(0.0, 1.0),

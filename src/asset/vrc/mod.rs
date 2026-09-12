@@ -615,7 +615,10 @@ pub fn discover_bone_chains(skeleton: &SkeletonAsset) -> Vec<DiscoveredChain> {
         }
 
         // If any descendant joint in the chain is an excluded bone, skip the entire chain
-        if joints.iter().any(|&j_idx| is_excluded_bone_name(&skeleton.nodes[j_idx].name)) {
+        if joints
+            .iter()
+            .any(|&j_idx| is_excluded_bone_name(&skeleton.nodes[j_idx].name))
+        {
             continue;
         }
 
@@ -881,9 +884,9 @@ pub fn build_spring_bones_and_colliders(
 
     for pb in &vrc_data.phys_bones {
         let references_leg = pb.collider_refs.iter().any(|fid| {
-            file_id_to_col_id.get(fid).map_or(false, |cid| {
-                leg_collider_refs.iter().any(|r| r.id == *cid)
-            })
+            file_id_to_col_id
+                .get(fid)
+                .map_or(false, |cid| leg_collider_refs.iter().any(|r| r.id == *cid))
         });
 
         if references_leg {

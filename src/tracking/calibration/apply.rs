@@ -88,11 +88,7 @@ impl TrackingCalibration {
                             -pose.anchor_depth_m.unwrap_or(0.0),
                         ];
                         let d = rotate_xz(
-                            [
-                                offset[0] - a0[0],
-                                offset[1] - a0[1],
-                                offset[2] - a0[2],
-                            ],
+                            [offset[0] - a0[0], offset[1] - a0[1], offset[2] - a0[2]],
                             theta,
                         );
                         *offset = [a0[0] + d[0], a0[1] + d[1], a0[2] + d[2]];
@@ -436,7 +432,11 @@ mod calibration_apply_tests {
         for (bone, j) in &frontal.joints {
             assert_vec3_eq(sk.joints[bone].position, j.position, "joint");
         }
-        assert_vec3_eq(sk.root_offset.unwrap(), frontal.root_offset.unwrap(), "offset");
+        assert_vec3_eq(
+            sk.root_offset.unwrap(),
+            frontal.root_offset.unwrap(),
+            "offset",
+        );
     }
 
     #[test]

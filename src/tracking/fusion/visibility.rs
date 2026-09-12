@@ -72,14 +72,7 @@ impl VisPolicy {
         let sxy = j.sx.max(j.sy).max(1e-5) as f64;
         let second = j.second_x.max(j.second_y) as f64;
         let half = j.half_x.max(j.half_y) as f64;
-        let x = [
-            j.score as f64,
-            sxy,
-            second,
-            half,
-            j.zscore as f64,
-            sxy.ln(),
-        ];
+        let x = [j.score as f64, sxy, second, half, j.zscore as f64, sxy.ln()];
         let z: f64 = self.w.iter().zip(x.iter()).map(|(w, x)| w * x).sum::<f64>() + self.bias;
         (1.0 / (1.0 + (-z).exp())) as f32
     }
@@ -245,7 +238,13 @@ impl Silhouette {
     /// `None` when there is no in-band depth there. The main silhouette
     /// reports its own area. Fills stop at `max_area_m2`: a larger blob
     /// reports `f64::INFINITY`.
-    pub fn blob_area_m2(&mut self, points: &[[f32; 3]], u: f64, v: f64, max_area_m2: f64) -> Option<f64> {
+    pub fn blob_area_m2(
+        &mut self,
+        points: &[[f32; 3]],
+        u: f64,
+        v: f64,
+        max_area_m2: f64,
+    ) -> Option<f64> {
         let (w, h) = (self.width as usize, self.height as usize);
         let s = self.scale as f64;
         let (cu, cv) = ((u / s).round() as i64, (v / s).round() as i64);
@@ -275,7 +274,11 @@ impl Silhouette {
         let max_px = (max_area_m2 * px2).ceil() as usize;
         if self.blob[start] != 0 {
             let n = self.blob_px[self.blob[start] as usize];
-            return Some(if n == usize::MAX { f64::INFINITY } else { n as f64 / px2 });
+            return Some(if n == usize::MAX {
+                f64::INFINITY
+            } else {
+                n as f64 / px2
+            });
         }
         let label = self.blob_px.len() as u32;
         let mut queue: Vec<usize> = vec![start];
@@ -322,7 +325,14 @@ impl Silhouette {
 
 /// Median of the valid depths in a `(2r+1)²` window; `None` if fewer than
 /// three valid pixels.
-pub fn window_median_z(points: &[[f32; 3]], w: usize, h: usize, u: i64, v: i64, r: i64) -> Option<f64> {
+pub fn window_median_z(
+    points: &[[f32; 3]],
+    w: usize,
+    h: usize,
+    u: i64,
+    v: i64,
+    r: i64,
+) -> Option<f64> {
     let mut zs: Vec<f32> = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
     for dy in -r..=r {
         let y = v + dy;
@@ -596,8 +606,15 @@ mod tests {
     #[test]
     fn silhouette_is_the_person_only() {
         let (pts, w, h) = scene();
-        let s = build_silhouette(&pts, w, h, 300.0, &[(70.0, 31.0), (66.0, 40.0)], &SilhouetteParams::default())
-            .expect("seeds have depth");
+        let s = build_silhouette(
+            &pts,
+            w,
+            h,
+            300.0,
+            &[(70.0, 31.0), (66.0, 40.0)],
+            &SilhouetteParams::default(),
+        )
+        .expect("seeds have depth");
         assert!((s.z_ref - 0.6).abs() < 1e-3);
         assert!(s.touches_bottom);
         // Inside the person.
@@ -636,15 +653,26 @@ mod tests {
         }
         // The synthetic scene is tiny (160×120 px): scale the limb range
         // so the 0.0027 m² hand passes and the 0.0175 m² desk overflows.
-        let p = SilhouetteParams { limb_blob_area_m2: (0.002, 0.01), ..Default::default() };
+        let p = SilhouetteParams {
+            limb_blob_area_m2: (0.002, 0.01),
+            ..Default::default()
+        };
         let mut s = build_silhouette(&pts, w, h, 300.0, &[(70.0, 40.0)], &p).unwrap();
         assert!(!s.contains(125.0, 60.0, 0.03));
-        let a = s.blob_area_m2(&pts, 125.0, 60.0, p.limb_blob_area_m2.1).unwrap();
+        let a = s
+            .blob_area_m2(&pts, 125.0, 60.0, p.limb_blob_area_m2.1)
+            .unwrap();
         assert!(a > 0.002 && a < 0.004, "hand blob {a}");
         // Same blob queried again: cached, same answer.
-        assert_eq!(s.blob_area_m2(&pts, 130.0, 70.0, p.limb_blob_area_m2.1).unwrap(), a);
+        assert_eq!(
+            s.blob_area_m2(&pts, 130.0, 70.0, p.limb_blob_area_m2.1)
+                .unwrap(),
+            a
+        );
         // Desk: overflows the limit.
-        let d = s.blob_area_m2(&pts, 20.0, 110.0, p.limb_blob_area_m2.1).unwrap();
+        let d = s
+            .blob_area_m2(&pts, 20.0, 110.0, p.limb_blob_area_m2.1)
+            .unwrap();
         assert!(d.is_infinite(), "desk {d}");
         // Main silhouette reports its own area.
         let m = s.blob_area_m2(&pts, 70.0, 80.0, 1.0).unwrap();
@@ -663,7 +691,15 @@ mod tests {
                 *p = [p[0] * s, p[1] * s, 0.9];
             }
         }
-        let s = build_silhouette(&pts, w, h, 300.0, &[(70.0, 40.0)], &SilhouetteParams::default()).unwrap();
+        let s = build_silhouette(
+            &pts,
+            w,
+            h,
+            300.0,
+            &[(70.0, 40.0)],
+            &SilhouetteParams::default(),
+        )
+        .unwrap();
         assert!(!s.contains(140.0, 60.0, 0.03));
         assert!(s.contains(70.0, 80.0, 0.0));
     }
@@ -671,12 +707,28 @@ mod tests {
     #[test]
     fn no_depth_under_seeds_gives_none() {
         let (pts, w, h) = scene();
-        assert!(build_silhouette(&pts, w, h, 300.0, &[(70.0, 31.0)], &SilhouetteParams::default()).is_some());
+        assert!(build_silhouette(
+            &pts,
+            w,
+            h,
+            300.0,
+            &[(70.0, 31.0)],
+            &SilhouetteParams::default()
+        )
+        .is_some());
         let mut holes = pts.clone();
         for p in holes.iter_mut() {
             *p = [f32::NAN; 3];
         }
-        assert!(build_silhouette(&holes, w, h, 300.0, &[(70.0, 40.0)], &SilhouetteParams::default()).is_none());
+        assert!(build_silhouette(
+            &holes,
+            w,
+            h,
+            300.0,
+            &[(70.0, 40.0)],
+            &SilhouetteParams::default()
+        )
+        .is_none());
     }
 
     #[test]

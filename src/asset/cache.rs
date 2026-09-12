@@ -193,17 +193,18 @@ pub fn save(source_path: &Path, asset: &AvatarAsset) -> Result<(), String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let header = VvtCacheHeader::for_source(asset.source_hash.0, source_size_bytes, source_mtime_unix);
+    let header =
+        VvtCacheHeader::for_source(asset.source_hash.0, source_size_bytes, source_mtime_unix);
 
     let cache_dir = crate::persistence::cache_dir();
     fs::create_dir_all(&cache_dir).map_err(|e| format!("cache save: mkdir: {}", e))?;
     let target_path = cache_path_for_hash(&asset.source_hash.0);
     let tmp_path = target_path.with_extension("vvtcache.tmp");
 
-    let header_bytes = bincode::serialize(&header)
-        .map_err(|e| format!("cache save: header serialize: {}", e))?;
-    let body_bytes = bincode::serialize(asset)
-        .map_err(|e| format!("cache save: body serialize: {}", e))?;
+    let header_bytes =
+        bincode::serialize(&header).map_err(|e| format!("cache save: header serialize: {}", e))?;
+    let body_bytes =
+        bincode::serialize(asset).map_err(|e| format!("cache save: body serialize: {}", e))?;
 
     {
         let mut f = fs::File::create(&tmp_path)
@@ -216,11 +217,9 @@ pub fn save(source_path: &Path, asset: &AvatarAsset) -> Result<(), String> {
             .map_err(|e| format!("cache save: write header: {}", e))?;
         f.write_all(&body_bytes)
             .map_err(|e| format!("cache save: write body: {}", e))?;
-        f.flush()
-            .map_err(|e| format!("cache save: flush: {}", e))?;
+        f.flush().map_err(|e| format!("cache save: flush: {}", e))?;
     }
-    fs::rename(&tmp_path, &target_path)
-        .map_err(|e| format!("cache save: rename: {}", e))?;
+    fs::rename(&tmp_path, &target_path).map_err(|e| format!("cache save: rename: {}", e))?;
 
     info!(
         "cache: saved '{}' ({} bytes header + {} bytes body)",
@@ -243,8 +242,8 @@ fn read_header(path: &Path) -> Result<(VvtCacheHeader, u64), String> {
     let mut header_bytes = vec![0u8; header_len];
     f.read_exact(&mut header_bytes)
         .map_err(|e| format!("read header: {}", e))?;
-    let header: VvtCacheHeader = bincode::deserialize(&header_bytes)
-        .map_err(|e| format!("deserialize header: {}", e))?;
+    let header: VvtCacheHeader =
+        bincode::deserialize(&header_bytes).map_err(|e| format!("deserialize header: {}", e))?;
     Ok((header, 4 + header_len as u64))
 }
 
@@ -504,7 +503,9 @@ mod tests {
             if sb.joints.len() < 2 {
                 continue;
             }
-            let name = inst.asset.skeleton.nodes[sb.chain_root.0 as usize].name.clone();
+            let name = inst.asset.skeleton.nodes[sb.chain_root.0 as usize]
+                .name
+                .clone();
             let mut angles = Vec::with_capacity(sb.joints.len() - 1);
             for w in sb.joints.windows(2) {
                 let a = crate::math_utils::mat4_translation(
@@ -521,10 +522,7 @@ mod tests {
                 "rest  {:>2} root={:<28} seg angles from down (deg): {:?}",
                 i,
                 name,
-                angles
-                    .iter()
-                    .map(|a| format!("{a:.0}"))
-                    .collect::<Vec<_>>()
+                angles.iter().map(|a| format!("{a:.0}")).collect::<Vec<_>>()
             );
         }
     }

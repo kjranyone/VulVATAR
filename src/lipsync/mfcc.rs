@@ -86,10 +86,7 @@ mod inner {
             self.fft.process(&mut fft_buf);
 
             // Power spectrum.
-            let power: Vec<f32> = fft_buf[..n_bins]
-                .iter()
-                .map(|c| c.norm_sqr())
-                .collect();
+            let power: Vec<f32> = fft_buf[..n_bins].iter().map(|c| c.norm_sqr()).collect();
 
             // Mel filterbank → dB.
             let mel_db: Vec<f32> = self

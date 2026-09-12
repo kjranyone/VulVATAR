@@ -37,13 +37,13 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::asset::HumanoidBone;
 use super::source_skeleton::SourceSkeleton;
+use crate::asset::HumanoidBone;
 
 /// Inter-frame displacement, in source units, above which a joint is
 /// treated as having *teleported* rather than moved.
@@ -288,9 +288,7 @@ fn write_assets(dir: &std::path::Path, stem: &str, rgb: &[u8], w: u32, h: u32, d
     // Minimal NPY v1.0 writer — the replay bins parse exactly this subset
     // (2-D, little-endian u16, C order), and pulling a numpy crate in for
     // one header would be a dependency for eleven lines of formatting.
-    let header = format!(
-        "{{'descr': '<u2', 'fortran_order': False, 'shape': ({h}, {w}), }}"
-    );
+    let header = format!("{{'descr': '<u2', 'fortran_order': False, 'shape': ({h}, {w}), }}");
     // The header (magic + version + len + text) must be a multiple of 64
     // bytes including the terminating newline.
     let unpadded = 10 + header.len() + 1;
@@ -387,9 +385,9 @@ pub fn record(
         })
     });
 
-    let face = sk.face.map(|f| {
-        serde_json::json!({ "y": f.yaw, "p": f.pitch, "r": f.roll, "c": f.confidence })
-    });
+    let face = sk
+        .face
+        .map(|f| serde_json::json!({ "y": f.yaw, "p": f.pitch, "r": f.roll, "c": f.confidence }));
 
     // --- frame capture -------------------------------------------------
     // Two reasons to write the colour+depth pair: continuous capture (turn
@@ -399,12 +397,10 @@ pub fn record(
     // write, and the `frame_` prefix keeps the directory in capture order
     // for the replay bin's `files.sort()`.
     let frame_ok = !rgb.is_empty() && depth_raw.len() == (width as usize * height as usize);
-    let raw_due = rec
-        .raw_every
-        .is_some_and(|n| frame_index.is_multiple_of(n))
+    let raw_due = rec.raw_every.is_some_and(|n| frame_index.is_multiple_of(n))
         && rec.raw_written.load(Ordering::Relaxed) < rec.raw_cap;
-    let jump_due = !jumps.is_empty()
-        && (rec.assets_dumped.load(Ordering::Relaxed) as usize) < MAX_ASSET_DUMPS;
+    let jump_due =
+        !jumps.is_empty() && (rec.assets_dumped.load(Ordering::Relaxed) as usize) < MAX_ASSET_DUMPS;
 
     let mut dump_stem = None;
     if frame_ok && (raw_due || jump_due) {
@@ -551,7 +547,11 @@ mod tests {
         let bytes = std::fs::read(dir.join("t_depth_mm.npy")).expect("npy written");
         assert_eq!(&bytes[0..6], b"\x93NUMPY");
         let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-        assert_eq!((10 + header_len) % 64, 0, "npy data must start 64-byte aligned");
+        assert_eq!(
+            (10 + header_len) % 64,
+            0,
+            "npy data must start 64-byte aligned"
+        );
         let header = std::str::from_utf8(&bytes[10..10 + header_len]).expect("utf8 header");
         assert!(header.contains("<u2"), "header: {header}");
         // (rows, cols) = (height, width).
@@ -623,7 +623,10 @@ mod tests {
             write_assets(&dir, &format!("b{i}"), &rgb, w, h, &depth);
         }
         let per = t0.elapsed().as_secs_f64() * 1000.0 / N as f64;
-        println!("write_assets {w}x{h}: {per:.1} ms/frame  ({:.1} fps ceiling)", 1000.0 / per);
+        println!(
+            "write_assets {w}x{h}: {per:.1} ms/frame  ({:.1} fps ceiling)",
+            1000.0 / per
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -643,6 +646,16 @@ mod tests {
             width: 640,
             height: 480,
         };
-        record(0, &SourceSkeleton::default(), &[], 0, 0, &[], 0.001, intr, 0.0);
+        record(
+            0,
+            &SourceSkeleton::default(),
+            &[],
+            0,
+            0,
+            &[],
+            0.001,
+            intr,
+            0.0,
+        );
     }
 }

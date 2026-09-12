@@ -18,4 +18,3 @@ pub(super) const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
 // COCO-Wholebody 133 layout (rtmlib / mmpose): 0..=16 body, 17..=22
 // foot, 23..=90 face-68, 91..=111 left hand, 112..=132 right hand.
-

@@ -32,13 +32,12 @@ fn main() -> Result<(), String> {
     let output_dir = args
         .next()
         .unwrap_or_else(|| "diagnostics/cloth".to_string());
-    let total_frames: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(90);
+    let total_frames: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
 
     if output_dir.contains("validation_images") {
-        return Err("Diagnostics outputs must not be written to validation_images/ (see CLAUDE.md)".into());
+        return Err(
+            "Diagnostics outputs must not be written to validation_images/ (see CLAUDE.md)".into(),
+        );
     }
 
     let output_dir_path = PathBuf::from(&output_dir);
@@ -55,10 +54,14 @@ fn main() -> Result<(), String> {
     println!("Loading avatar from: {}", input_path);
     let asset: Arc<AvatarAsset> = if is_fbx {
         let loader = FbxAssetLoader::new();
-        loader.load(&input_path).map_err(|e| format!("Failed to load FBX: {}", e))?
+        loader
+            .load(&input_path)
+            .map_err(|e| format!("Failed to load FBX: {}", e))?
     } else {
         let loader = VrmAssetLoader::new();
-        loader.load(&input_path).map_err(|e| format!("Failed to load VRM: {}", e))?
+        loader
+            .load(&input_path)
+            .map_err(|e| format!("Failed to load VRM: {}", e))?
     };
 
     println!(
@@ -101,7 +104,10 @@ fn main() -> Result<(), String> {
     };
     if let Ok(json) = serde_json::to_string_pretty(&overlay_file) {
         let _ = std::fs::write(&overlay_save_path, json);
-        println!("Saved cloth overlay asset to: {}", overlay_save_path.display());
+        println!(
+            "Saved cloth overlay asset to: {}",
+            overlay_save_path.display()
+        );
     }
 
     // 2. Attach Cloth to AvatarInstance
@@ -115,12 +121,23 @@ fn main() -> Result<(), String> {
 
     // Enable colliders for thighs (UpperLeg_L and UpperLeg_R)
     for (i, col) in avatar.asset.colliders.iter().enumerate() {
-        let node_name = avatar.asset.skeleton.nodes.get(col.node.0 as usize)
+        let node_name = avatar
+            .asset
+            .skeleton
+            .nodes
+            .get(col.node.0 as usize)
             .map(|n| n.name.to_lowercase())
             .unwrap_or_default();
-        if node_name.contains("upperleg") || node_name.contains("leg") || node_name.contains("thigh") || node_name.contains("hips") {
+        if node_name.contains("upperleg")
+            || node_name.contains("leg")
+            || node_name.contains("thigh")
+            || node_name.contains("hips")
+        {
             avatar.collider_enabled[i] = true;
-            println!("Enabled collider #{}: {} on node '{}'", i, col.id.0, node_name);
+            println!(
+                "Enabled collider #{}: {} on node '{}'",
+                i, col.id.0, node_name
+            );
         }
     }
 
@@ -137,11 +154,17 @@ fn main() -> Result<(), String> {
     // 3. Initialize Vulkan renderer
     let render_width = 1024u32;
     let render_height = 1024u32;
-    println!("Initializing Vulkan renderer ({}x{})...", render_width, render_height);
+    println!(
+        "Initializing Vulkan renderer ({}x{})...",
+        render_width, render_height
+    );
     let mut renderer = VulkanRenderer::new();
     renderer.initialize();
 
-    println!("Starting simulation and offline render across {} frames...", total_frames);
+    println!(
+        "Starting simulation and offline render across {} frames...",
+        total_frames
+    );
     let dt = 1.0 / 60.0;
     let mut recorded_snapshots = Vec::new();
 
@@ -153,7 +176,12 @@ fn main() -> Result<(), String> {
         .collect();
 
     // Record initial hips transform
-    let hips_node_idx = avatar.asset.skeleton.nodes.iter().enumerate()
+    let hips_node_idx = avatar
+        .asset
+        .skeleton
+        .nodes
+        .iter()
+        .enumerate()
         .find(|(_, n)| n.name.to_lowercase() == "hips")
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -173,7 +201,8 @@ fn main() -> Result<(), String> {
             // Roll rotation around Z axis: [0, 0, sin(roll/2), cos(roll/2)]
             let q_roll = [0.0, 0.0, (sway_roll * 0.5).sin(), (sway_roll * 0.5).cos()];
             // Multiply rotation
-            cur_t.rotation = vulvatar_lib::math_utils::quat_mul(&initial_hips_transform.rotation, &q_roll);
+            cur_t.rotation =
+                vulvatar_lib::math_utils::quat_mul(&initial_hips_transform.rotation, &q_roll);
 
             avatar.pose.local_transforms[hips_node_idx] = cur_t;
             avatar.compute_global_pose();
@@ -238,7 +267,8 @@ fn main() -> Result<(), String> {
             );
 
             // Double render invocation for pipelined CPU readback
-            let _ = renderer.render(&frame_input)
+            let _ = renderer
+                .render(&frame_input)
                 .map_err(|e| format!("Rendering warm-up failed at frame {}: {}", frame, e))?;
             let render_result = renderer
                 .render(&frame_input)
@@ -260,18 +290,34 @@ fn main() -> Result<(), String> {
     let mut report = String::new();
     report.push_str("# Yumeka Skirt Cloth Simulation Verification Report\n\n");
     report.push_str(&format!("- Target Avatar: `{}`\n", input_path));
-    report.push_str(&format!("- Target Skirt Mesh: Circle.056 (PrimitiveId({}))\n", skirt_prim_id.0));
-    report.push_str(&format!("- Vertices: {}\n", cloth_asset.simulation_mesh.vertices.len()));
-    report.push_str(&format!("- Distance Constraints: {}\n", cloth_asset.constraints.distance_constraints.len()));
+    report.push_str(&format!(
+        "- Target Skirt Mesh: Circle.056 (PrimitiveId({}))\n",
+        skirt_prim_id.0
+    ));
+    report.push_str(&format!(
+        "- Vertices: {}\n",
+        cloth_asset.simulation_mesh.vertices.len()
+    ));
+    report.push_str(&format!(
+        "- Distance Constraints: {}\n",
+        cloth_asset.constraints.distance_constraints.len()
+    ));
     report.push_str(&format!("- Pinned Particles: {}\n", cloth_asset.pins.len()));
-    report.push_str(&format!("- Total Simulated Frames: {} ({} s at 60 FPS)\n\n", total_frames, total_frames as f32 / 60.0));
+    report.push_str(&format!(
+        "- Total Simulated Frames: {} ({} s at 60 FPS)\n\n",
+        total_frames,
+        total_frames as f32 / 60.0
+    ));
     report.push_str("## Captured Keyframes\n\n");
     for (f, p) in &recorded_snapshots {
         report.push_str(&format!("### Frame {:03}\n\n", f));
-        report.push_str(&format!("![Frame {:03}]({})\n\n", f, p.file_name().unwrap().to_string_lossy()));
+        report.push_str(&format!(
+            "![Frame {:03}]({})\n\n",
+            f,
+            p.file_name().unwrap().to_string_lossy()
+        ));
     }
-    std::fs::write(&report_path, report)
-        .map_err(|e| format!("Failed to write report: {}", e))?;
+    std::fs::write(&report_path, report).map_err(|e| format!("Failed to write report: {}", e))?;
     println!("\nWrote verification summary to {}", report_path.display());
 
     println!("\n=== Cloth simulation diagnostic completed successfully! ===");
@@ -298,22 +344,31 @@ fn build_skirt_cloth_asset(
     }
 
     // Fallback search if name changed
-    let (prim_id, mesh_id, mesh_name, vert_count) = skirt_prim.or_else(|| {
-        for mesh in &asset.meshes {
-            for prim in &mesh.primitives {
-                if let Some(ref vd) = prim.vertices {
-                    let b_min_y = prim.bounds.min[1];
-                    let b_max_y = prim.bounds.max[1];
-                    if b_min_y > 0.55 && b_max_y < 0.85 && vd.positions.len() >= 2000 && vd.positions.len() <= 3000 {
-                        return Some((prim.id, mesh.id, mesh.name.clone(), vd.positions.len()));
+    let (prim_id, mesh_id, mesh_name, vert_count) = skirt_prim
+        .or_else(|| {
+            for mesh in &asset.meshes {
+                for prim in &mesh.primitives {
+                    if let Some(ref vd) = prim.vertices {
+                        let b_min_y = prim.bounds.min[1];
+                        let b_max_y = prim.bounds.max[1];
+                        if b_min_y > 0.55
+                            && b_max_y < 0.85
+                            && vd.positions.len() >= 2000
+                            && vd.positions.len() <= 3000
+                        {
+                            return Some((prim.id, mesh.id, mesh.name.clone(), vd.positions.len()));
+                        }
                     }
                 }
             }
-        }
-        None
-    }).ok_or_else(|| "Could not locate Circle.056 skirt mesh in avatar".to_string())?;
+            None
+        })
+        .ok_or_else(|| "Could not locate Circle.056 skirt mesh in avatar".to_string())?;
 
-    println!("Selected skirt primitive: {:?} on mesh '{}' ({} vertices)", prim_id, mesh_name, vert_count);
+    println!(
+        "Selected skirt primitive: {:?} on mesh '{}' ({} vertices)",
+        prim_id, mesh_name, vert_count
+    );
 
     let prim = asset
         .meshes
@@ -346,7 +401,10 @@ fn build_skirt_cloth_asset(
         .unwrap_or(0);
 
     let pin_node = &asset.skeleton.nodes[pin_node_idx];
-    println!("Binding pins to bone: '{}' (node idx {})", pin_node.name, pin_node_idx);
+    println!(
+        "Binding pins to bone: '{}' (node idx {})",
+        pin_node.name, pin_node_idx
+    );
 
     // Compute inverse of pin node's global transform for local pin offsets
     let m = &avatar.pose.global_transforms[pin_node_idx];
@@ -369,9 +427,12 @@ fn build_skirt_cloth_asset(
                     let j = vd.joint_indices[i][k] as usize;
                     if j < avatar.pose.skinning_matrices.len() {
                         let sm = &avatar.pose.skinning_matrices[j];
-                        let tx = sm[0][0] * pos[0] + sm[1][0] * pos[1] + sm[2][0] * pos[2] + sm[3][0];
-                        let ty = sm[0][1] * pos[0] + sm[1][1] * pos[1] + sm[2][1] * pos[2] + sm[3][1];
-                        let tz = sm[0][2] * pos[0] + sm[1][2] * pos[1] + sm[2][2] * pos[2] + sm[3][2];
+                        let tx =
+                            sm[0][0] * pos[0] + sm[1][0] * pos[1] + sm[2][0] * pos[2] + sm[3][0];
+                        let ty =
+                            sm[0][1] * pos[0] + sm[1][1] * pos[1] + sm[2][1] * pos[2] + sm[3][1];
+                        let tz =
+                            sm[0][2] * pos[0] + sm[1][2] * pos[1] + sm[2][2] * pos[2] + sm[3][2];
                         world_pos[0] += w * tx;
                         world_pos[1] += w * ty;
                         world_pos[2] += w * tz;
@@ -394,7 +455,11 @@ fn build_skirt_cloth_asset(
         let uv = vd.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
 
         if is_pin {
-            let d = [world_pos[0] - t[0], world_pos[1] - t[1], world_pos[2] - t[2]];
+            let d = [
+                world_pos[0] - t[0],
+                world_pos[1] - t[1],
+                world_pos[2] - t[2],
+            ];
             let ox = r0[0] * d[0] + r0[1] * d[1] + r0[2] * d[2];
             let oy = r1[0] * d[0] + r1[1] * d[1] + r1[2] * d[2];
             let oz = r2[0] * d[0] + r2[1] * d[1] + r2[2] * d[2];
@@ -539,7 +604,11 @@ fn build_render_frame_input(
 
     for mesh in &avatar.asset.meshes {
         for prim in &mesh.primitives {
-            let material_asset = avatar.asset.materials.iter().find(|m| m.id == prim.material_id);
+            let material_asset = avatar
+                .asset
+                .materials
+                .iter()
+                .find(|m| m.id == prim.material_id);
             let mut material_binding = material_asset
                 .map(MaterialUploadRequest::from_asset_material)
                 .unwrap_or_else(MaterialUploadRequest::default_material);
@@ -702,16 +771,36 @@ fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 
 
     (
         [
-            [r[0], r[1], r[2], -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z)],
-            [u[0], u[1], u[2], -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z)],
-            [-f[0], -f[1], -f[2], (f[0] * eye_x + f[1] * eye_y + f[2] * eye_z)],
+            [
+                r[0],
+                r[1],
+                r[2],
+                -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z),
+            ],
+            [
+                u[0],
+                u[1],
+                u[2],
+                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
+            ],
+            [
+                -f[0],
+                -f[1],
+                -f[2],
+                (f[0] * eye_x + f[1] * eye_y + f[2] * eye_z),
+            ],
             [0.0, 0.0, 0.0, 1.0],
         ],
         [eye_x, eye_y, eye_z],
     )
 }
 
-fn build_projection_matrix(fov_deg: f32, aspect: f32, near: f32, far: f32) -> vulvatar_lib::asset::Mat4 {
+fn build_projection_matrix(
+    fov_deg: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> vulvatar_lib::asset::Mat4 {
     let fov_rad = fov_deg.to_radians();
     let f = 1.0 / (fov_rad * 0.5).tan();
     let a = far / (near - far);

@@ -11,7 +11,12 @@ use crate::t;
 /// the Model Library card (a nested full card would double up the
 /// elevation chrome).
 pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_section(ui, "watched_folders.heading", t!("watched_folders.heading"), false, |ui| {
+    collapsible_section(
+        ui,
+        "watched_folders.heading",
+        t!("watched_folders.heading"),
+        false,
+        |ui| {
             let watched: Vec<std::path::PathBuf> = state.library.watched_avatar_dirs.clone();
 
             if watched.is_empty() {
@@ -105,13 +110,19 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                     ));
                 }
             }
-        });
+        },
+    );
 }
 
 /// Avatar Load Cache accordion — surfaces cache stats so users can
 /// see size and wipe without opening Explorer.
 pub(super) fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_section(ui, "avatar_cache.heading", t!("avatar_cache.heading"), false, |ui| {
+    collapsible_section(
+        ui,
+        "avatar_cache.heading",
+        t!("avatar_cache.heading"),
+        false,
+        |ui| {
             let stats = crate::asset::cache::stats();
             let dir = crate::persistence::cache_dir();
             ui.label(
@@ -158,7 +169,8 @@ pub(super) fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 }
             }
-        });
+        },
+    );
 }
 
 pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
@@ -211,7 +223,10 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
         ui.add_space(space::XS);
 
         // ── Show missing toggle ──────────────────────────────────
-        ui.checkbox(&mut state.library.show_missing, t!("inspector.show_missing"));
+        ui.checkbox(
+            &mut state.library.show_missing,
+            t!("inspector.show_missing"),
+        );
         ui.add_space(space::SM);
 
         // ── Sub-accordions ───────────────────────────────────────
@@ -239,19 +254,20 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
 
         let entries: Vec<LibraryRow> = {
             let lib = &state.app.avatar_library;
-            let to_row = |idx: usize, e: &crate::app::avatar_library::AvatarLibraryEntry| -> LibraryRow {
-                LibraryRow {
-                    idx,
-                    name: e.name.clone(),
-                    path: e.path.clone(),
-                    favorite: e.favorite,
-                    exists: e.exists(),
-                    mesh_count: e.mesh_count,
-                    material_count: e.material_count,
-                    vrm_author: e.vrm_author.clone(),
-                    thumbnail_path: e.thumbnail_path.clone(),
-                }
-            };
+            let to_row =
+                |idx: usize, e: &crate::app::avatar_library::AvatarLibraryEntry| -> LibraryRow {
+                    LibraryRow {
+                        idx,
+                        name: e.name.clone(),
+                        path: e.path.clone(),
+                        favorite: e.favorite,
+                        exists: e.exists(),
+                        mesh_count: e.mesh_count,
+                        material_count: e.material_count,
+                        vrm_author: e.vrm_author.clone(),
+                        thumbnail_path: e.thumbnail_path.clone(),
+                    }
+                };
             if state.library.search_query.is_empty() {
                 lib.entries
                     .iter()
@@ -292,9 +308,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = space::SM;
                 for row in &entries {
-                    let is_current = current_avatar_path
-                        .as_ref()
-                        .is_some_and(|p| *p == row.path);
+                    let is_current = current_avatar_path.as_ref().is_some_and(|p| *p == row.path);
 
                     // Row state is fill-only (selected = primary
                     // container, missing file = error container,
@@ -357,8 +371,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                 }
                             }
 
-                            let middle_width =
-                                (ui.available_width() - ACTION_COL_WIDTH).max(80.0);
+                            let middle_width = (ui.available_width() - ACTION_COL_WIDTH).max(80.0);
 
                             ui.allocate_ui_with_layout(
                                 egui::vec2(middle_width, 0.0),
@@ -435,21 +448,17 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                     // hosting Remove. The mockup shows
                                     // the dot trigger to keep the row
                                     // visually quiet.
-                                    let menu_resp = ui
-                                        .menu_button(
-                                            egui::RichText::new(ic::MORE_VERT.to_string())
-                                                .font(typography::icon(18.0))
-                                                .color(color::ON_SURFACE_VARIANT),
-                                            |ui| {
-                                                if ui
-                                                    .button(t!("inspector.remove"))
-                                                    .clicked()
-                                                {
-                                                    remove_idx = Some(row.idx);
-                                                    ui.close_menu();
-                                                }
-                                            },
-                                        );
+                                    let menu_resp = ui.menu_button(
+                                        egui::RichText::new(ic::MORE_VERT.to_string())
+                                            .font(typography::icon(18.0))
+                                            .color(color::ON_SURFACE_VARIANT),
+                                        |ui| {
+                                            if ui.button(t!("inspector.remove")).clicked() {
+                                                remove_idx = Some(row.idx);
+                                                ui.close_menu();
+                                            }
+                                        },
+                                    );
                                     let _ = menu_resp;
 
                                     if row.exists {
@@ -543,8 +552,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                 });
 
-                let tags_snapshot: Vec<String> =
-                    state.app.avatar_library.entries[idx].tags.clone();
+                let tags_snapshot: Vec<String> = state.app.avatar_library.entries[idx].tags.clone();
                 if !tags_snapshot.is_empty() {
                     ui.horizontal_wrapped(|ui| {
                         for tag_i in (0..tags_snapshot.len()).rev() {
@@ -629,7 +637,9 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
             let add_label_with_hotkey = format!(
                 "{} ({})",
                 t!("inspector.add_file"),
-                state.hotkeys.label_for(crate::gui::hotkey::HotkeyAction::LoadAvatar),
+                state
+                    .hotkeys
+                    .label_for(crate::gui::hotkey::HotkeyAction::LoadAvatar),
             );
             let add_resp = tonal_button(
                 ui,
@@ -638,8 +648,7 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                 ButtonTone::Primary,
                 true,
             );
-            if add_resp.clicked()
-            {
+            if add_resp.clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("3D Avatar (*.vrm, *.fbx)", &["vrm", "fbx"])
                     .add_filter("VRM (*.vrm)", &["vrm"])
@@ -650,7 +659,8 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         crate::app::avatar_library::AvatarLibraryEntry::from_path(&path);
                     if entry.thumbnail_path.as_ref().is_none_or(|p| !p.exists()) {
                         entry.thumbnail_path = state
-                            .library.thumbnail_gen
+                            .library
+                            .thumbnail_gen
                             .generate_and_save_placeholder(&entry.name);
                     }
                     state.app.avatar_library.add(entry);

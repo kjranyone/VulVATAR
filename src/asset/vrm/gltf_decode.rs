@@ -74,8 +74,7 @@ pub(super) fn bake_y_flip_on_roots(nodes: &mut [SkeletonNode], root_nodes: &[Nod
         }
         let node = &mut nodes[idx];
         // new_rot = Y180 * old_rot
-        node.rest_local.rotation =
-            crate::math_utils::quat_mul(&y_flip, &node.rest_local.rotation);
+        node.rest_local.rotation = crate::math_utils::quat_mul(&y_flip, &node.rest_local.rotation);
         // new_t = Y180 * old_t  →  flip X and Z, keep Y.
         node.rest_local.translation = [
             -node.rest_local.translation[0],
@@ -85,7 +84,9 @@ pub(super) fn bake_y_flip_on_roots(nodes: &mut [SkeletonNode], root_nodes: &[Nod
     }
 }
 
-pub(super) fn build_skeleton_nodes(doc: &gltf::Document) -> (Vec<SkeletonNode>, HashMap<u32, String>) {
+pub(super) fn build_skeleton_nodes(
+    doc: &gltf::Document,
+) -> (Vec<SkeletonNode>, HashMap<u32, String>) {
     let gltf_nodes: Vec<gltf::Node<'_>> = doc.nodes().collect();
     let node_count = gltf_nodes.len();
 
@@ -99,8 +100,7 @@ pub(super) fn build_skeleton_nodes(doc: &gltf::Document) -> (Vec<SkeletonNode>, 
 
         let (t, r, s) = gnode.transform().decomposed();
         let parent = find_parent(&gltf_nodes, idx);
-        let children: Vec<NodeId> =
-            gnode.children().map(|c| NodeId(c.index() as u64)).collect();
+        let children: Vec<NodeId> = gnode.children().map(|c| NodeId(c.index() as u64)).collect();
 
         nodes.push(SkeletonNode {
             id: NodeId(idx as u64),
@@ -228,8 +228,7 @@ pub(super) fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<Mes
                         .extras()
                         .as_ref()
                         .and_then(|raw| {
-                            let v: serde_json::Value =
-                                serde_json::from_str(raw.get()).ok()?;
+                            let v: serde_json::Value = serde_json::from_str(raw.get()).ok()?;
                             let arr = v.get("targetNames")?.as_array()?;
                             Some(
                                 arr.iter()
@@ -250,20 +249,16 @@ pub(super) fn build_meshes(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<Mes
                             let pos_d: Vec<[f32; 3]> = mt
                                 .positions()
                                 .and_then(|acc| {
-                                    let iter = gltf::accessor::Iter::<[f32; 3]>::new(
-                                        acc,
-                                        get_buf_data,
-                                    )?;
+                                    let iter =
+                                        gltf::accessor::Iter::<[f32; 3]>::new(acc, get_buf_data)?;
                                     Some(iter.collect())
                                 })
                                 .unwrap_or_default();
                             let norm_d: Vec<[f32; 3]> = mt
                                 .normals()
                                 .and_then(|acc| {
-                                    let iter = gltf::accessor::Iter::<[f32; 3]>::new(
-                                        acc,
-                                        get_buf_data,
-                                    )?;
+                                    let iter =
+                                        gltf::accessor::Iter::<[f32; 3]>::new(acc, get_buf_data)?;
                                     Some(iter.collect())
                                 })
                                 .unwrap_or_default();
@@ -361,13 +356,13 @@ pub(super) fn build_materials(
                 MaterialMode::SimpleLit
             };
 
-            let base_color_texture = pbr.base_color_texture().map(|info| {
-                texture_binding_from_info(&info.texture(), blob, source_path)
-            });
+            let base_color_texture = pbr
+                .base_color_texture()
+                .map(|info| texture_binding_from_info(&info.texture(), blob, source_path));
 
-            let normal_map_texture = gmat.normal_texture().map(|info| {
-                texture_binding_from_info(&info.texture(), blob, source_path)
-            });
+            let normal_map_texture = gmat
+                .normal_texture()
+                .map(|info| texture_binding_from_info(&info.texture(), blob, source_path));
 
             let mut shade_ramp_texture = None;
             let mut emissive_texture_binding = None;
@@ -540,7 +535,10 @@ pub(super) fn texture_binding_from_info(
     }
 }
 
-pub(super) fn build_skin_bindings(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<(usize, SkinBinding)> {
+pub(super) fn build_skin_bindings(
+    doc: &gltf::Document,
+    blob: Option<&[u8]>,
+) -> Vec<(usize, SkinBinding)> {
     let buffers: Vec<gltf::buffer::Data> = doc
         .buffers()
         .map(|buf| {
@@ -632,9 +630,7 @@ pub(super) fn assign_skins_to_meshes(
                         for ji in vd.joint_indices.iter_mut() {
                             for slot in ji.iter_mut() {
                                 let joint_idx = *slot as usize;
-                                if let Some(NodeId(node_id)) =
-                                    skin.joint_nodes.get(joint_idx)
-                                {
+                                if let Some(NodeId(node_id)) = skin.joint_nodes.get(joint_idx) {
                                     *slot = *node_id as u16;
                                 }
                             }
@@ -648,7 +644,10 @@ pub(super) fn assign_skins_to_meshes(
         .collect()
 }
 
-pub(super) fn build_animation_clips(doc: &gltf::Document, blob: Option<&[u8]>) -> Vec<AnimationClip> {
+pub(super) fn build_animation_clips(
+    doc: &gltf::Document,
+    blob: Option<&[u8]>,
+) -> Vec<AnimationClip> {
     let buffers: Vec<gltf::buffer::Data> = doc
         .buffers()
         .map(|buf| {

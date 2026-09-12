@@ -41,10 +41,7 @@ const UPPER_BODY_ARM_OUTWARD_DEGREES: f32 = 10.0;
 /// target pose. Pure function over the asset (no mutation, no shared
 /// state) so it's safe to call from the snapshot-request path
 /// without affecting the live render's avatar pose.
-pub fn target_pose_skinning_matrices(
-    asset: &AvatarAsset,
-    mode: CalibrationMode,
-) -> Vec<Mat4> {
+pub fn target_pose_skinning_matrices(asset: &AvatarAsset, mode: CalibrationMode) -> Vec<Mat4> {
     let skeleton = &asset.skeleton;
 
     let mut locals: Vec<Transform> = skeleton

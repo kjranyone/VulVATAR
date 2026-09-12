@@ -172,7 +172,9 @@ pub fn source_skeleton(
     for hand in 0..2 {
         for f in 0..5 {
             let dip = h.j.finger[hand][f][3];
-            let Some(bone) = m.joints[dip].bone else { continue };
+            let Some(bone) = m.joints[dip].bone else {
+                continue;
+            };
             let p = fk.site[h.s.tip[hand][f]];
             let sigma = est.joint_sigma(m, dip);
             sk.fingertips.insert(
@@ -190,7 +192,11 @@ pub fn source_skeleton(
         0.05,
         0.5,
     );
-    sk.root_offset = Some([-(anchor[0] as f32), -(anchor[1] as f32), -(anchor[2] as f32)]);
+    sk.root_offset = Some([
+        -(anchor[0] as f32),
+        -(anchor[1] as f32),
+        -(anchor[2] as f32),
+    ]);
     sk.root_anchor_is_hip = true;
     if let Some(intr) = intr {
         sk.metric_frame_info = Some(MetricFrameInfo {

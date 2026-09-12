@@ -53,10 +53,18 @@ pub(super) fn finalize_collection(
         } => (
             std::mem::take(samples),
             std::mem::take(expr_accum),
-            (std::mem::take(face_accum_mesh), std::mem::take(face_accum_body)),
+            (
+                std::mem::take(face_accum_mesh),
+                std::mem::take(face_accum_body),
+            ),
             std::mem::take(body_yaw_accum),
         ),
-        _ => (Vec::new(), ExprAccum::new(), (Vec::new(), Vec::new()), Vec::new()),
+        _ => (
+            Vec::new(),
+            ExprAccum::new(),
+            (Vec::new(), Vec::new()),
+            Vec::new(),
+        ),
     };
 
     if samples.len() < MIN_SAMPLES {
@@ -165,7 +173,6 @@ fn persist_calibration(state: &mut GuiApp, calibration: PoseCalibration) {
         }
     }
 }
-
 
 /// Finalize the *range* capture step. Reads the per-axis min/max out
 /// of the `RangeCollecting` variant, derives `x_range_observed` /
@@ -761,7 +768,11 @@ mod tests {
             [0.5, 0.0, 0.0],
         ];
         let n = neutral_from_accum(&accum).unwrap();
-        assert!((n[0] - 0.25).abs() < 1e-6, "expected mid-pair average, got {}", n[0]);
+        assert!(
+            (n[0] - 0.25).abs() < 1e-6,
+            "expected mid-pair average, got {}",
+            n[0]
+        );
     }
 
     #[test]

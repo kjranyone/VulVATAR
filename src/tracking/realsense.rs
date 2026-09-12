@@ -25,13 +25,11 @@ use realsense_rust::{
     config::Config,
     context::Context,
     frame::{ColorFrame, DepthFrame},
-    prelude::FrameEx,
     kind::{Rs2CameraInfo, Rs2Format, Rs2Option, Rs2ProductLine, Rs2StreamKind},
     pipeline::{ActivePipeline, InactivePipeline},
+    prelude::FrameEx,
     processing_blocks::{
-        align::Align,
-        options::TemporalFilterOptions,
-        temporal_filter::TemporalFilter,
+        align::Align, options::TemporalFilterOptions, temporal_filter::TemporalFilter,
     },
 };
 
@@ -407,9 +405,8 @@ impl RealSenseCapture {
         };
 
         // Align depth INTO the color image so color pixels index depth directly.
-        let align =
-            Align::new(Rs2StreamKind::Color, 10)
-                .map_err(|e| OpenFailure::Other(format!("realsense: align: {e}")))?;
+        let align = Align::new(Rs2StreamKind::Color, 10)
+            .map_err(|e| OpenFailure::Other(format!("realsense: align: {e}")))?;
 
         // Pin the color sensor to the requested frame rate. The D435 ships
         // with auto-exposure *priority* enabled, which silently halves the
@@ -494,13 +491,7 @@ impl RealSenseCapture {
 
         info!(
             "realsense: opened {} (serial {}) — color {}x{} @ {} fps, depth {}x{} aligned to color",
-            name,
-            serial,
-            width,
-            height,
-            fps,
-            DEPTH_W,
-            DEPTH_H,
+            name, serial, width, height, fps, DEPTH_W, DEPTH_H,
         );
 
         Ok(Self {
@@ -574,13 +565,12 @@ impl RealSenseCapture {
 
         let depth_frames: Vec<DepthFrame> = aligned.frames_of_type();
         let color_frames: Vec<ColorFrame> = aligned.frames_of_type();
-        let depth = depth_frames
-            .into_iter()
-            .next()
-            .ok_or_else(|| GrabError::Capture("realsense: aligned set has no depth frame".into()))?;
-        let color = color_frames
-            .first()
-            .ok_or_else(|| GrabError::Capture("realsense: aligned set has no color frame".into()))?;
+        let depth = depth_frames.into_iter().next().ok_or_else(|| {
+            GrabError::Capture("realsense: aligned set has no depth frame".into())
+        })?;
+        let color = color_frames.first().ok_or_else(|| {
+            GrabError::Capture("realsense: aligned set has no color frame".into())
+        })?;
 
         // Depth ↔ color capture-time consistency. librealsense's frameset
         // matcher is best-effort: when one stream drops a frame it happily

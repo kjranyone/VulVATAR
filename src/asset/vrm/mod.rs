@@ -15,7 +15,10 @@ pub enum LoadStage {
     Skeleton,
     Meshes,
     /// Per-material progress. `current` reaches `total` when done.
-    Materials { current: usize, total: usize },
+    Materials {
+        current: usize,
+        total: usize,
+    },
     SpringBones,
     Finalizing,
 }
@@ -162,7 +165,12 @@ impl VrmAssetLoader {
                 Ok(gltf_doc) => {
                     let blob = gltf_doc.blob.as_deref();
                     let source_path_clone = cached.source_path.clone();
-                    gltf_decode::rehydrate_textures(&mut cached, &gltf_doc.document, blob, &source_path_clone);
+                    gltf_decode::rehydrate_textures(
+                        &mut cached,
+                        &gltf_doc.document,
+                        blob,
+                        &source_path_clone,
+                    );
                     if cached.body_primitive_id.is_none() {
                         crate::asset::clearance::generate_skin_anchors(&mut cached);
                         let _ = crate::asset::cache::save(&source_path_clone, &cached);
@@ -180,7 +188,8 @@ impl VrmAssetLoader {
             }
         }
 
-        let asset = self.load_from_bytes_with_progress(&file_data, source_path.clone(), on_progress)?;
+        let asset =
+            self.load_from_bytes_with_progress(&file_data, source_path.clone(), on_progress)?;
         // Best-effort persist. If serialisation or write fails the user
         // still gets the freshly-parsed asset; the next load just misses
         // again.
@@ -193,7 +202,6 @@ impl VrmAssetLoader {
         }
         Ok(asset)
     }
-
 
     pub fn load_from_bytes(
         &self,
@@ -262,8 +270,7 @@ impl VrmAssetLoader {
         // Resolve the thumbnail hint to encoded image bytes while we still
         // hold `gltf_doc` and `blob`. The library code persists these to
         // disk later — we only want to do the glTF traversal once.
-        parsed.meta.thumbnail =
-            resolve_thumbnail(&gltf_doc.document, blob, &parsed.thumbnail_hint);
+        parsed.meta.thumbnail = resolve_thumbnail(&gltf_doc.document, blob, &parsed.thumbnail_hint);
 
         // VRM 0.x stores the model facing -Z; VRM 1.x (and the rest of this
         // engine) expects +Z. Bake a 180° Y rotation into each root node so
@@ -331,12 +338,15 @@ impl VrmAssetLoader {
 
         // Cache save
         if let Err(e) = crate::asset::cache::save(&source_path, &asset) {
-            log::warn!("avatar cache: save for '{}' failed: {}", source_path.display(), e);
+            log::warn!(
+                "avatar cache: save for '{}' failed: {}",
+                source_path.display(),
+                e
+            );
         }
 
         Ok(Arc::new(asset))
     }
-
 }
 
 fn compute_hash(data: &[u8]) -> AssetSourceHash {

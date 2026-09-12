@@ -169,17 +169,12 @@ impl HeadOriTracker {
             &mat_mul(&so3_exp([pt, 0.0, 0.0]), &so3_exp([0.0, 0.0, rl])),
         );
         let target = mat_mul(&FACING_CAMERA, &r_view);
-        let dt_s = last_t
-            .map(|lt| (t - lt).clamp(0.02, 0.25))
-            .unwrap_or(0.033);
+        let dt_s = last_t.map(|lt| (t - lt).clamp(0.02, 0.25)).unwrap_or(0.033);
         let step_ok = match &self.last {
-            Some(prev) => {
-                norm(so3_log(&mat_mul(&target, &transpose(prev)))) <= 3.0 * dt_s + 0.05
-            }
+            Some(prev) => norm(so3_log(&mat_mul(&target, &transpose(prev)))) <= 3.0 * dt_s + 0.05,
             None => false,
         };
-        let agrees_pred =
-            norm(so3_log(&mat_mul(&target, &transpose(fk_pred_head_r)))) <= 0.4;
+        let agrees_pred = norm(so3_log(&mat_mul(&target, &transpose(fk_pred_head_r)))) <= 0.4;
 
         let in_hand_rect = |u: f64, v: f64| -> bool {
             hand_rects.iter().any(|&(x0, y0, x1, y1)| {

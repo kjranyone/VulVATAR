@@ -30,9 +30,7 @@
 //! buffer and divided by touching-constraint count) is preserved from the
 //! prior PBD implementation so the Δx-application phase is unchanged.
 
-use crate::math_utils::{
-    vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_scale, vec3_sub,
-};
+use crate::math_utils::{vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_scale, vec3_sub};
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 
 /// `stiffness <= STIFFNESS_DISABLED_EPS` treats the constraint as **disabled**
@@ -144,10 +142,8 @@ pub(crate) fn project_distance_constraints(
         let corr_a = vec3_scale(&d, inv_mass_a * delta_lambda);
         let corr_b = vec3_scale(&d, -inv_mass_b * delta_lambda);
 
-        buffers.correction_accumulator[a] =
-            vec3_add(&buffers.correction_accumulator[a], &corr_a);
-        buffers.correction_accumulator[b] =
-            vec3_add(&buffers.correction_accumulator[b], &corr_b);
+        buffers.correction_accumulator[a] = vec3_add(&buffers.correction_accumulator[a], &corr_a);
+        buffers.correction_accumulator[b] = vec3_add(&buffers.correction_accumulator[b], &corr_b);
     }
 
     // Sum-of-corrections Δx application: every constraint that

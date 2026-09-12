@@ -106,7 +106,11 @@ pub fn collapsible_card<R>(
                         .strong(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let chevron = if open { icon::EXPAND_MORE } else { icon::CHEVRON_RIGHT };
+                    let chevron = if open {
+                        icon::EXPAND_MORE
+                    } else {
+                        icon::CHEVRON_RIGHT
+                    };
                     ui.label(
                         egui::RichText::new(chevron.to_string())
                             .font(typography::icon(18.0))
@@ -173,7 +177,11 @@ pub fn collapsible_section<R>(
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let chevron = if open { icon::EXPAND_MORE } else { icon::CHEVRON_RIGHT };
+            let chevron = if open {
+                icon::EXPAND_MORE
+            } else {
+                icon::CHEVRON_RIGHT
+            };
             ui.label(
                 egui::RichText::new(chevron.to_string())
                     .font(typography::icon(16.0))

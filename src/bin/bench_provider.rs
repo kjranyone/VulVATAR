@@ -22,18 +22,15 @@ fn main() -> Result<(), String> {
         args.next()
             .ok_or_else(|| "usage: bench_provider <image.png> [iters]".to_string())?,
     );
-    let iters: usize = args
-        .next()
-        .map(|s| s.parse().unwrap_or(10))
-        .unwrap_or(10);
+    let iters: usize = args.next().map(|s| s.parse().unwrap_or(10)).unwrap_or(10);
 
     let img = image::open(&image_path).map_err(|e| format!("open image: {e}"))?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     eprintln!("image: {}x{} from {}", w, h, image_path.display());
 
-    let mut provider =
-        create_pose_provider("models", Default::default()).map_err(|e| format!("provider load: {e}"))?;
+    let mut provider = create_pose_provider("models", Default::default())
+        .map_err(|e| format!("provider load: {e}"))?;
     eprintln!("label: {}", provider.label());
     let warnings = provider.take_load_warnings();
     for w in &warnings {

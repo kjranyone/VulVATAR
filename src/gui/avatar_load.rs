@@ -86,20 +86,18 @@ impl AvatarLoadJob {
             let tx_progress = tx.clone();
             let result = if is_fbx {
                 let loader = FbxAssetLoader::new();
-                loader.load_with_progress(
-                    path_str.as_ref(),
-                    move |stage| {
+                loader
+                    .load_with_progress(path_str.as_ref(), move |stage| {
                         let _ = tx_progress.send(LoadMessage::Progress(stage));
-                    },
-                ).map_err(|e| e.to_string())
+                    })
+                    .map_err(|e| e.to_string())
             } else {
                 let loader = VrmAssetLoader::new();
-                loader.load_with_progress(
-                    path_str.as_ref(),
-                    move |stage| {
+                loader
+                    .load_with_progress(path_str.as_ref(), move |stage| {
                         let _ = tx_progress.send(LoadMessage::Progress(stage));
-                    },
-                ).map_err(|e| e.to_string())
+                    })
+                    .map_err(|e| e.to_string())
             };
             let final_msg = match result {
                 Ok(asset) => LoadMessage::Done(asset),
@@ -151,7 +149,11 @@ impl GuiApp {
         };
 
         // Worker finished — take ownership so we can mutate other GuiApp fields.
-        let job = self.library.avatar_load_job.take().expect("job still present");
+        let job = self
+            .library
+            .avatar_load_job
+            .take()
+            .expect("job still present");
         if let Some(handle) = job.worker {
             let _ = handle.join();
         }
@@ -182,12 +184,19 @@ impl GuiApp {
                     }
                     if let Some(project_path) = project_path {
                         self.project_status.project_path = Some(project_path.clone());
-                        self.push_success_notification(t!("toast.opened_project", path = project_path.display().to_string()));
+                        self.push_success_notification(t!(
+                            "toast.opened_project",
+                            path = project_path.display().to_string()
+                        ));
                     }
                 }
             }
             LoadOutcome::Error(e) => {
-                self.push_error_notification(t!("toast.failed_load_avatar", path = job.path.display().to_string(), error = e.to_string()));
+                self.push_error_notification(t!(
+                    "toast.failed_load_avatar",
+                    path = job.path.display().to_string(),
+                    error = e.to_string()
+                ));
             }
         }
     }

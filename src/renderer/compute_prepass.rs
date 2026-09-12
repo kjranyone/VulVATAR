@@ -21,7 +21,7 @@ use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline, PipelineBin
 use crate::asset::PrimitiveId;
 use crate::renderer::frame_input::{self, RenderFrameInput};
 use crate::renderer::pipeline::{self, GpuVertex};
-use crate::renderer::{VulkanRenderer, TRANSFORM_LOCAL_SIZE, mat4_cols_identity};
+use crate::renderer::{mat4_cols_identity, VulkanRenderer, TRANSFORM_LOCAL_SIZE};
 
 // Per-primitive draw record built during the compute prepass and
 // consumed by the graphics passes that follow. `vertex_buffer` is
@@ -278,7 +278,9 @@ impl VulkanRenderer {
                 // previous-frame VBO.
                 let containment_parent_vbo = self.materialize_parent_vbo(
                     instance,
-                    validated_containment_ids.get(&mesh_inst.primitive_id).copied(),
+                    validated_containment_ids
+                        .get(&mesh_inst.primitive_id)
+                        .copied(),
                     &memory_allocator,
                     &ds_allocator,
                     &transform_pipeline,

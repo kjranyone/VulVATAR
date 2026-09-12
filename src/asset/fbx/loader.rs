@@ -1,14 +1,14 @@
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use log::{debug, info, warn};
 
-use crate::asset::vrm::LoadStage;
-use crate::asset::*;
 use super::expression::build_expressions;
 use super::humanoid::map_bone_name;
 use super::texture::TextureResolver;
+use crate::asset::vrm::LoadStage;
+use crate::asset::*;
 
 static NEXT_AVATAR_ID: AtomicU64 = AtomicU64::new(100_000);
 
@@ -64,14 +64,23 @@ impl FbxAssetLoader {
             rehydrate_textures(&mut cached, &source_path);
             if cached.spring_bones.is_empty() {
                 let base_dir = source_path.parent().unwrap_or(Path::new("."));
-                let vrc_data = if let Some(package_path) = crate::asset::vrc::find_unitypackage_in_dir(base_dir) {
+                let vrc_data = if let Some(package_path) =
+                    crate::asset::vrc::find_unitypackage_in_dir(base_dir)
+                {
                     crate::asset::vrc::parse_unitypackage(&package_path).unwrap_or_default()
                 } else {
                     crate::asset::vrc::ParsedVrcData::default()
                 };
-                let (sb, col) = crate::asset::vrc::build_spring_bones_and_colliders(&cached.skeleton, &vrc_data);
+                let (sb, col) = crate::asset::vrc::build_spring_bones_and_colliders(
+                    &cached.skeleton,
+                    &vrc_data,
+                );
                 if !sb.is_empty() {
-                    info!("fbx: populated {} spring bones and {} colliders for cached asset", sb.len(), col.len());
+                    info!(
+                        "fbx: populated {} spring bones and {} colliders for cached asset",
+                        sb.len(),
+                        col.len()
+                    );
                     cached.spring_bones = sb;
                     cached.colliders = col;
                     let _ = crate::asset::cache::save(&source_path, &cached);
@@ -188,7 +197,11 @@ impl FbxAssetLoader {
                     if let Ok(img) = image::load_from_memory(&prop.texture.content) {
                         use image::GenericImageView;
                         let (w, h) = img.dimensions();
-                        let uri = format!("{}#embedded_tex_{}", source_path.display(), prop.texture.element.element_id);
+                        let uri = format!(
+                            "{}#embedded_tex_{}",
+                            source_path.display(),
+                            prop.texture.element.element_id
+                        );
                         embedded_tex_binding = Some(TextureBinding {
                             uri,
                             pixel_data: Some(Arc::new(img.to_rgba8().into_raw())),
@@ -213,10 +226,7 @@ impl FbxAssetLoader {
             }
 
             let base_color_texture = embedded_tex_binding.or_else(|| {
-                tex_resolver.resolve_and_load(
-                    base_color_tex_path.as_deref(),
-                    &mat_name,
-                )
+                tex_resolver.resolve_and_load(base_color_tex_path.as_deref(), &mat_name)
             });
 
             let base_mode = MaterialMode::ToonLike;
@@ -412,7 +422,10 @@ impl FbxAssetLoader {
                         } else {
                             pos
                         };
-                        prim_bounds.expand(&Aabb { min: world_pos, max: world_pos });
+                        prim_bounds.expand(&Aabb {
+                            min: world_pos,
+                            max: world_pos,
+                        });
 
                         // Normal
                         let n = if mesh.vertex_normal.exists {
@@ -447,7 +460,9 @@ impl FbxAssetLoader {
                                     let node_idx = cluster
                                         .bone_node
                                         .as_ref()
-                                        .and_then(|b| elem_to_node_idx.get(&b.element.element_id).copied())
+                                        .and_then(|b| {
+                                            elem_to_node_idx.get(&b.element.element_id).copied()
+                                        })
                                         .unwrap_or(0);
                                     j_indices[w_idx] = node_idx as u16;
                                     j_weights[w_idx] = w.weight as f32;
@@ -465,7 +480,10 @@ impl FbxAssetLoader {
 
                         // Morph targets
                         for (c_idx, (_, ref offset_map)) in channel_data.iter().enumerate() {
-                            let offset = offset_map.get(&vert_idx).copied().unwrap_or([0.0, 0.0, 0.0]);
+                            let offset = offset_map
+                                .get(&vert_idx)
+                                .copied()
+                                .unwrap_or([0.0, 0.0, 0.0]);
                             morph_deltas[c_idx].1.push(offset);
                         }
 
@@ -489,9 +507,7 @@ impl FbxAssetLoader {
                 if prim_morph_count > 0 {
                     info!(
                         "[fbx] mesh '{}' prim {} has {} morph targets",
-                        mesh.element.name,
-                        prim_id.0,
-                        prim_morph_count
+                        mesh.element.name, prim_id.0, prim_morph_count
                     );
                 }
 
@@ -600,10 +616,15 @@ impl FbxAssetLoader {
         on_progress(LoadStage::SpringBones);
         let (spring_bones, colliders) = {
             let base_dir = source_path.parent().unwrap_or(Path::new("."));
-            let vrc_data = if let Some(package_path) = crate::asset::vrc::find_unitypackage_in_dir(base_dir) {
+            let vrc_data = if let Some(package_path) =
+                crate::asset::vrc::find_unitypackage_in_dir(base_dir)
+            {
                 match crate::asset::vrc::parse_unitypackage(&package_path) {
                     Ok(data) => {
-                        info!("fbx: successfully extracted VRC PhysBone settings from {:?}", package_path);
+                        info!(
+                            "fbx: successfully extracted VRC PhysBone settings from {:?}",
+                            package_path
+                        );
                         data
                     }
                     Err(e) => {
@@ -612,7 +633,10 @@ impl FbxAssetLoader {
                     }
                 }
             } else {
-                debug!("fbx: no unitypackage found in {:?}; using default spring bone heuristic", base_dir);
+                debug!(
+                    "fbx: no unitypackage found in {:?}; using default spring bone heuristic",
+                    base_dir
+                );
                 crate::asset::vrc::ParsedVrcData::default()
             };
 
@@ -648,7 +672,11 @@ impl FbxAssetLoader {
 
         // Cache save
         if let Err(e) = crate::asset::cache::save(&source_path, &asset) {
-            warn!("avatar cache: save for '{}' failed: {}", source_path.display(), e);
+            warn!(
+                "avatar cache: save for '{}' failed: {}",
+                source_path.display(),
+                e
+            );
         }
 
         Ok(Arc::new(asset))

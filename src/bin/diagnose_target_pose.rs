@@ -23,8 +23,8 @@ use vulvatar_lib::avatar::{AvatarInstance, AvatarInstanceId};
 use vulvatar_lib::gui::calibration::target_pose_skinning_matrices;
 use vulvatar_lib::renderer::frame_input::{
     CameraState, LightingState, OutlineSnapshot, OutputTargetRequest, RenderAvatarInstance,
-    RenderColorSpace, RenderDebugFlags, RenderExportMode, RenderFrameInput,
-    RenderMeshInstance, RenderOutputAlpha,
+    RenderColorSpace, RenderDebugFlags, RenderExportMode, RenderFrameInput, RenderMeshInstance,
+    RenderOutputAlpha,
 };
 use vulvatar_lib::renderer::material::MaterialShaderMode;
 use vulvatar_lib::renderer::pipeline::GpuVertex;
@@ -45,8 +45,12 @@ fn main() -> Result<(), String> {
         None => PathBuf::from("diagnostics/target_pose"),
     };
 
-    std::fs::create_dir_all(&output_dir)
-        .map_err(|e| format!("failed to create output dir '{}': {e}", output_dir.display()))?;
+    std::fs::create_dir_all(&output_dir).map_err(|e| {
+        format!(
+            "failed to create output dir '{}': {e}",
+            output_dir.display()
+        )
+    })?;
 
     let loader = VrmAssetLoader::new();
     eprintln!("loading {}", input_path.display());
@@ -225,9 +229,24 @@ fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 
 
     (
         [
-            [r[0], r[1], r[2], -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z)],
-            [u[0], u[1], u[2], -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z)],
-            [-f[0], -f[1], -f[2], (f[0] * eye_x + f[1] * eye_y + f[2] * eye_z)],
+            [
+                r[0],
+                r[1],
+                r[2],
+                -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z),
+            ],
+            [
+                u[0],
+                u[1],
+                u[2],
+                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
+            ],
+            [
+                -f[0],
+                -f[1],
+                -f[2],
+                (f[0] * eye_x + f[1] * eye_y + f[2] * eye_z),
+            ],
             [0.0, 0.0, 0.0, 1.0],
         ],
         [eye_x, eye_y, eye_z],

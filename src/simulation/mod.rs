@@ -66,7 +66,10 @@ impl SceneGravity {
     /// Avatar-local unit down direction for spring bones (the sim applies
     /// its own unitless power along this axis).
     pub fn local_dir(&self, world_rot: &Quat) -> Vec3 {
-        vec3_normalize(&quat_rotate_vec3(&quat_conjugate(world_rot), &self.dir_unit()))
+        vec3_normalize(&quat_rotate_vec3(
+            &quat_conjugate(world_rot),
+            &self.dir_unit(),
+        ))
     }
 
     /// Multiplier folded into each spring joint's authored `gravityPower`.

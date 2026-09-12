@@ -27,11 +27,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::{debug_channel, provider, session_record, stagelog};
-use super::{DetectionAnnotation, PreviewFrame, SourceSkeleton, TrackingMailbox};
 #[cfg(feature = "realsense")]
 use super::{latest_cell, realsense, sequence_recorder};
 #[cfg(feature = "realsense")]
 use super::{pose_estimation, CameraIntrinsics, TrackingErrorLevel};
+use super::{DetectionAnnotation, PreviewFrame, SourceSkeleton, TrackingMailbox};
 
 /// Combined output of a pose estimation pass: source skeleton + 2D annotation.
 pub struct PoseEstimate {
@@ -177,7 +177,16 @@ impl TrackingWorker {
         let handle = thread::Builder::new()
             .name("tracking-worker".into())
             .spawn(move || {
-                Self::worker_loop(mailbox, running, ready, width, height, fps, camera_serial, pipeline);
+                Self::worker_loop(
+                    mailbox,
+                    running,
+                    ready,
+                    width,
+                    height,
+                    fps,
+                    camera_serial,
+                    pipeline,
+                );
             })
             .expect("failed to spawn tracking-worker thread");
 
@@ -237,7 +246,16 @@ impl TrackingWorker {
         // camera to drive the pipeline, so the worker reports ready and
         // exits immediately — the app falls back to the avatar rest pose.
         #[cfg(feature = "realsense")]
-        Self::run_realsense(&mailbox, &running, &ready, width, height, fps, camera_serial, pipeline);
+        Self::run_realsense(
+            &mailbox,
+            &running,
+            &ready,
+            width,
+            height,
+            fps,
+            camera_serial,
+            pipeline,
+        );
         #[cfg(not(feature = "realsense"))]
         {
             let _ = (width, height, fps, camera_serial, pipeline);
@@ -306,7 +324,16 @@ impl TrackingWorker {
             thread::Builder::new()
                 .name("tracking-capture".into())
                 .spawn(move || {
-                    capture_loop(cell, running, mailbox, open_tx, width, height, fps, camera_serial);
+                    capture_loop(
+                        cell,
+                        running,
+                        mailbox,
+                        open_tx,
+                        width,
+                        height,
+                        fps,
+                        camera_serial,
+                    );
                 })
                 .expect("failed to spawn tracking-capture thread")
         };
@@ -420,8 +447,7 @@ impl TrackingWorker {
             let mut estimate = if let Some(ref mut provider) = pose_provider {
                 // Hand the D435's color-aligned metric depth to the
                 // provider for THIS frame.
-                let metric =
-                    crate::tracking::metric_frame::build_metric_frame_from_d435(&rs_frame);
+                let metric = crate::tracking::metric_frame::build_metric_frame_from_d435(&rs_frame);
                 provider.set_external_depth(metric);
                 provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
             } else {
@@ -514,17 +540,18 @@ fn capture_loop(
     fps: u32,
     camera_serial: Option<String>,
 ) {
-    let mut capture = match realsense::RealSenseCapture::open(width, height, fps, camera_serial.as_deref()) {
-        Ok(c) => {
-            let _ = open_tx.send(Ok((c.width(), c.height())));
-            Some(c)
-        }
-        Err(e) => {
-            let _ = open_tx.send(Err(e));
-            cell.close();
-            return;
-        }
-    };
+    let mut capture =
+        match realsense::RealSenseCapture::open(width, height, fps, camera_serial.as_deref()) {
+            Ok(c) => {
+                let _ = open_tx.send(Ok((c.width(), c.height())));
+                Some(c)
+            }
+            Err(e) => {
+                let _ = open_tx.send(Err(e));
+                cell.close();
+                return;
+            }
+        };
     drop(open_tx);
 
     let mut frame_index: u64 = 0;
@@ -554,7 +581,12 @@ fn capture_loop(
                     if !sleep_while_running(&running, backoff) {
                         break;
                     }
-                    match realsense::RealSenseCapture::open(width, height, fps, camera_serial.as_deref()) {
+                    match realsense::RealSenseCapture::open(
+                        width,
+                        height,
+                        fps,
+                        camera_serial.as_deref(),
+                    ) {
                         Ok(c) => {
                             info!("tracking-capture: camera reconnected");
                             capture = Some(c);

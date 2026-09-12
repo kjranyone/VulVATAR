@@ -51,8 +51,6 @@ pub(in crate::tracking) mod session;
 mod yolox_worker;
 
 #[cfg(feature = "inference")]
-pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
-#[cfg(feature = "inference")]
 use super::face_mediapipe::FaceMeshInference;
 #[cfg(feature = "inference")]
 use super::yolox::YoloxPersonDetector;
@@ -66,14 +64,16 @@ use ort::session::Session;
 #[cfg(feature = "inference")]
 use ort::value::TensorRef;
 #[cfg(feature = "inference")]
+pub(in crate::tracking) use session::{build_session, build_session_cpu_only};
+#[cfg(feature = "inference")]
 use std::path::Path;
 #[cfg(feature = "inference")]
 use yolox_worker::YoloxWorker;
 
 #[cfg(feature = "inference")]
-use decode::{NUM_JOINTS, SIMCC_X_BINS, SIMCC_Y_BINS, SIMCC_Z_BINS};
-#[cfg(feature = "inference")]
 pub use decode::DecodedJoint;
+#[cfg(feature = "inference")]
+use decode::{NUM_JOINTS, SIMCC_X_BINS, SIMCC_Y_BINS, SIMCC_Z_BINS};
 
 /// Which ONNX Runtime execution provider the session ended up on.
 /// Surfaced to the GUI so users can tell whether the GPU path is active
@@ -567,44 +567,58 @@ impl Rtmw3dInference {
             // 226 → 263) for a small gain in crop stability (36 → 22).
             if bbox_opt.is_none() {
                 bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
-                let cold_start = !worker.has_result();
-                // `.max(1)` is defence-in-depth: `RuntimeGpuBudget`'s
-                // mode arms only emit {4, 6, 8, 12}, asserted by the
-                // `all_modes_emit_nonzero_yolox_skip_period` unit
-                // test, but `is_multiple_of(0)` would panic so we
-                // guard against an accidental future regression.
-                let period = YOLOX_REFRESH_PERIOD
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(1);
-                let submitted = cold_start || frame_index.is_multiple_of(period);
-                if submitted {
-                    worker.submit(rgb_data, width, height, frame_index, frame_ts_ms, self.last_self_track);
-                }
-                let latest = worker.wait_latest();
-                // Age-gate the sticky result. While the self-track is
-                // live YOLOX receives no submissions, so when the track
-                // eventually drops the outbox may hold a bbox from
-                // minutes ago — cropping to it produces garbage frames
-                // that in turn prevent the self-track from re-forming.
-                // A stale sticky is treated as "no detection" (the
-                // letterboxed whole-frame path takes over) and a fresh
-                // detection is requested immediately instead of waiting
-                // for the next period boundary.
-                if latest.bbox.is_some()
-                    && sticky_is_stale(
-                        frame_ts_ms,
-                        latest.timestamp_ms,
-                        frame_index,
-                        latest.frame_index,
-                    )
-                {
-                    if !submitted {
-                        worker.submit(rgb_data, width, height, frame_index, frame_ts_ms, self.last_self_track);
+                    let cold_start = !worker.has_result();
+                    // `.max(1)` is defence-in-depth: `RuntimeGpuBudget`'s
+                    // mode arms only emit {4, 6, 8, 12}, asserted by the
+                    // `all_modes_emit_nonzero_yolox_skip_period` unit
+                    // test, but `is_multiple_of(0)` would panic so we
+                    // guard against an accidental future regression.
+                    let period = YOLOX_REFRESH_PERIOD
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .max(1);
+                    let submitted = cold_start || frame_index.is_multiple_of(period);
+                    if submitted {
+                        worker.submit(
+                            rgb_data,
+                            width,
+                            height,
+                            frame_index,
+                            frame_ts_ms,
+                            self.last_self_track,
+                        );
                     }
-                    None
-                } else {
-                    latest.bbox
-                }
+                    let latest = worker.wait_latest();
+                    // Age-gate the sticky result. While the self-track is
+                    // live YOLOX receives no submissions, so when the track
+                    // eventually drops the outbox may hold a bbox from
+                    // minutes ago — cropping to it produces garbage frames
+                    // that in turn prevent the self-track from re-forming.
+                    // A stale sticky is treated as "no detection" (the
+                    // letterboxed whole-frame path takes over) and a fresh
+                    // detection is requested immediately instead of waiting
+                    // for the next period boundary.
+                    if latest.bbox.is_some()
+                        && sticky_is_stale(
+                            frame_ts_ms,
+                            latest.timestamp_ms,
+                            frame_index,
+                            latest.frame_index,
+                        )
+                    {
+                        if !submitted {
+                            worker.submit(
+                                rgb_data,
+                                width,
+                                height,
+                                frame_index,
+                                frame_ts_ms,
+                                self.last_self_track,
+                            );
+                        }
+                        None
+                    } else {
+                        latest.bbox
+                    }
                 } else {
                     None
                 };
@@ -670,7 +684,8 @@ impl Rtmw3dInference {
                         // Bbox too small to crop usefully — fall through.
                         whole_frame_letterbox()
                     } else {
-                        let crop = preprocess::crop_rgb_padded(rgb_data, width, height, ox, oy, cw, ch);
+                        let crop =
+                            preprocess::crop_rgb_padded(rgb_data, width, height, ox, oy, cw, ch);
                         let ann = Some((
                             bbox.x1 / width as f32,
                             bbox.y1 / height as f32,
@@ -786,7 +801,8 @@ impl Rtmw3dInference {
                 }
                 g
             } else {
-                self.last_tracked_z_gain.unwrap_or_else(|| preprocess::tracked_z_gain(ch, height))
+                self.last_tracked_z_gain
+                    .unwrap_or_else(|| preprocess::tracked_z_gain(ch, height))
             };
             preprocess::remap_crop_joints(&mut joints, ox, oy, cw, ch, width, height, z_gain);
         }
@@ -1034,7 +1050,12 @@ fn derive_self_track_bbox(
     }
 
     let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for j in joints.iter().zip(visible.iter()).filter(|(_, &v)| v).map(|(j, _)| j) {
+    for j in joints
+        .iter()
+        .zip(visible.iter())
+        .filter(|(_, &v)| v)
+        .map(|(j, _)| j)
+    {
         let px = j.nx * width as f32;
         let py = j.ny * height as f32;
         x1 = x1.min(px);

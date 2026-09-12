@@ -2,8 +2,8 @@ use crate::asset::ColliderShape;
 use crate::avatar::AvatarInstance;
 use crate::math_utils::{
     closest_point_on_segment, mat4_rotation_to_quat, mat4_translation, quat_conjugate,
-    quat_from_vectors, quat_mul, quat_normalize, quat_rotate_vec3, vec3_add, vec3_cross,
-    vec3_dot, vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
+    quat_from_vectors, quat_mul, quat_normalize, quat_rotate_vec3, vec3_add, vec3_cross, vec3_dot,
+    vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
 };
 use crate::simulation::cloth::ResolvedCollider;
 use crate::simulation::SceneGravity;
@@ -292,9 +292,7 @@ pub fn step_spring_bones(
         let head_idx = joints[0].0 as usize;
         let mut anchor = mat4_translation(&avatar.pose.global_transforms[head_idx]);
         let mut head_parent_basis = match avatar.asset.skeleton.nodes[head_idx].parent {
-            Some(p) => {
-                mat4_rotation_to_quat(&avatar.pose.global_transforms[p.0 as usize])
-            }
+            Some(p) => mat4_rotation_to_quat(&avatar.pose.global_transforms[p.0 as usize]),
             None => [0.0, 0.0, 0.0, 1.0],
         };
 
@@ -333,10 +331,7 @@ pub fn step_spring_bones(
                 let frac = (gravity_param + tuning.gravity_offset)
                     .clamp(0.0, 1.5)
                     .max(spring_asset.gravity_floor);
-                (
-                    factor,
-                    frac * SceneGravity::EARTH_G * gravity_scale * dt2,
-                )
+                (factor, frac * SceneGravity::EARTH_G * gravity_scale * dt2)
             } else {
                 let stiffness = stiffness_param.min(max_stiffness);
                 let power = (gravity_param + tuning.gravity_offset).max(0.0) * gravity_scale;
@@ -521,10 +516,8 @@ pub fn step_spring_bones(
             let rest_dir_len = vec3_length(&rest_dir_local);
             let solved_dir_len = vec3_length(&solved_dir_world);
             if rest_dir_len > 1e-8 && solved_dir_len > 1e-8 {
-                let solved_dir_local = quat_rotate_vec3(
-                    &quat_conjugate(&head_parent_basis),
-                    &solved_dir_world,
-                );
+                let solved_dir_local =
+                    quat_rotate_vec3(&quat_conjugate(&head_parent_basis), &solved_dir_world);
                 let rot = quat_from_to(
                     &vec3_scale(&rest_dir_local, 1.0 / rest_dir_len),
                     &vec3_scale(&solved_dir_local, 1.0 / vec3_length(&solved_dir_local)),

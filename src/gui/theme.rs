@@ -92,7 +92,9 @@ pub mod color {
     /// Per-channel gamma-space blend of `b` over `a`.
     pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
         let ch = |x: u8, y: u8| -> u8 {
-            (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8
+            (x as f32 + (y as f32 - x as f32) * t)
+                .round()
+                .clamp(0.0, 255.0) as u8
         };
         Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
     }

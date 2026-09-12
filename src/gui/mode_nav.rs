@@ -98,10 +98,8 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
 /// the sidebar's content width. Active rows render with the primary
 /// container fill; hovered rows get a subtle surface fill.
 fn mode_nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), ROW_HEIGHT),
-        Sense::click(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
 
     let bg = if active {
         color::PRIMARY_CONTAINER
@@ -145,10 +143,8 @@ fn mode_nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Respons
 /// muted foreground, small rounding instead of the pill) so structural
 /// actions don't read as navigation destinations.
 fn utility_nav_item(ui: &mut Ui, glyph: char, label: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), 30.0),
-        Sense::click(),
-    );
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
 
     let bg = if resp.hovered() {
         color::with_alpha(color::PRIMARY, 14)

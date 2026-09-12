@@ -392,6 +392,7 @@ fn surface_gradient_matches_finite_difference() {
         m.joint_param[h.j.l_elbow],
         m.beta_scale,
         m.beta_rad,
+        m.beta_shear,
         sp2,
         sp2 + 1,
         sp2 + 2,

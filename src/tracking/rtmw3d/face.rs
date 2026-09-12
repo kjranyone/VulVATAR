@@ -4,7 +4,6 @@
 //! and produces source-space outputs (`FacePose`, `FaceBbox`) — no
 //! ONNX inference of its own.
 
-
 use super::super::face_mediapipe::{derive_face_bbox, FaceBbox};
 use super::super::{FacePose, FaceSource};
 use super::consts::{INPUT_H, INPUT_W, KEYPOINT_VISIBILITY_FLOOR};
@@ -52,7 +51,13 @@ pub(super) fn derive_face_pose_from_body(
     {
         let px = |j: &DecodedJoint| (j.nx * INPUT_W as f32, j.ny * INPUT_H as f32);
         let dist = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).hypot(a.1 - b.1);
-        let pts = [px(&joints[0]), px(&joints[1]), px(&joints[2]), px(&joints[3]), px(&joints[4])];
+        let pts = [
+            px(&joints[0]),
+            px(&joints[1]),
+            px(&joints[2]),
+            px(&joints[3]),
+            px(&joints[4]),
+        ];
         let mut head_size = 0.0_f32;
         for i in 0..pts.len() {
             for k in i + 1..pts.len() {
@@ -698,7 +703,12 @@ mod tests {
         // the avatar's head on every sideways turn).
         let mut sel = FaceSourceSelector::default();
         let out = sel
-            .select(Some(pose(-0.93, 0.66)), Some(mesh_pose(-0.2, 1.0)), 1.9e-8, DT)
+            .select(
+                Some(pose(-0.93, 0.66)),
+                Some(mesh_pose(-0.2, 1.0)),
+                1.9e-8,
+                DT,
+            )
             .unwrap();
         assert!((out.yaw - -0.93).abs() < 1e-6);
         assert!(out.confidence >= 0.66);
@@ -727,7 +737,12 @@ mod tests {
         // signals), so the healthy body confidence carries through.
         let mut sel = FaceSourceSelector::default();
         let out = sel
-            .select(Some(pose(-0.04, 0.7)), Some(mesh_pose(-1.07, 1.0)), 0.42, DT)
+            .select(
+                Some(pose(-0.04, 0.7)),
+                Some(mesh_pose(-1.07, 1.0)),
+                0.42,
+                DT,
+            )
             .unwrap();
         assert!((out.yaw - -1.07).abs() < 1e-6);
         assert!((out.confidence - 0.7).abs() < 1e-6);
@@ -739,7 +754,9 @@ mod tests {
         // No body pose at all: surface the mesh pose with its honest
         // (low) confidence so the solver's GUI threshold decides.
         let mut sel = FaceSourceSelector::default();
-        let out = sel.select(None, Some(mesh_pose(0.3, 1.0)), 0.1, DT).unwrap();
+        let out = sel
+            .select(None, Some(mesh_pose(0.3, 1.0)), 0.1, DT)
+            .unwrap();
         assert!((out.yaw - 0.3).abs() < 1e-6);
         assert!((out.confidence - 0.1).abs() < 1e-6);
     }
@@ -785,7 +802,11 @@ mod tests {
             sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
         }
         let out = sel.select(Some(body), Some(mesh), 0.05, DT).unwrap();
-        assert_eq!(out.source, FaceSource::Body, "sustained collapse must release the mesh");
+        assert_eq!(
+            out.source,
+            FaceSource::Body,
+            "sustained collapse must release the mesh"
+        );
     }
 
     #[test]
@@ -798,14 +819,21 @@ mod tests {
         let body = pose(0.0, 0.7); // body claims "facing forward" — the wrong pose
         let mut sel = FaceSourceSelector::default();
         let mut yaw = -0.80;
-        sel.select(Some(body), Some(mesh_pose(yaw, 1.0)), 1.0, DT).unwrap();
+        sel.select(Some(body), Some(mesh_pose(yaw, 1.0)), 1.0, DT)
+            .unwrap();
         for i in 0..20 {
             // Pose keeps drifting slightly (a real head mid-motion)
             // while the confidence flaps hard every other frame.
             yaw -= 0.01;
             let conf = if i % 2 == 0 { 0.005 } else { 0.95 };
-            let out = sel.select(Some(body), Some(mesh_pose(yaw, 1.0)), conf, DT).unwrap();
-            assert_eq!(out.source, FaceSource::Mesh, "frame {i}: dip must not flip to body");
+            let out = sel
+                .select(Some(body), Some(mesh_pose(yaw, 1.0)), conf, DT)
+                .unwrap();
+            assert_eq!(
+                out.source,
+                FaceSource::Mesh,
+                "frame {i}: dip must not flip to body"
+            );
             assert!(
                 (out.yaw - yaw).abs() < 1e-5,
                 "frame {i}: published yaw must follow the mesh, got {} want {yaw}",
@@ -821,8 +849,11 @@ mod tests {
         // instead of riding on nonsense.
         let body = pose(0.0, 0.7);
         let mut sel = FaceSourceSelector::default();
-        sel.select(Some(body), Some(mesh_pose(-0.8, 1.0)), 1.0, DT).unwrap();
-        let out = sel.select(Some(body), Some(mesh_pose(1.4, 1.0)), 0.01, DT).unwrap();
+        sel.select(Some(body), Some(mesh_pose(-0.8, 1.0)), 1.0, DT)
+            .unwrap();
+        let out = sel
+            .select(Some(body), Some(mesh_pose(1.4, 1.0)), 0.01, DT)
+            .unwrap();
         assert_eq!(
             out.source,
             FaceSource::Body,
@@ -866,7 +897,10 @@ mod tests {
                 break;
             }
         }
-        assert!(reached, "blend must converge to the mesh pose, ended at {prev_yaw}");
+        assert!(
+            reached,
+            "blend must converge to the mesh pose, ended at {prev_yaw}"
+        );
     }
 
     #[test]
@@ -959,11 +993,18 @@ mod tests {
         for frame in 0..(BLEND_STEPS_AT_30 - 1) {
             let out = sel.select(Some(body), Some(mesh), 0.9, DT).unwrap();
             let (from, t) = out.blend.expect("crossfade frame must be marked");
-            assert_eq!(from, FaceSource::Body, "frame {frame}: blend anchors on the from-source");
+            assert_eq!(
+                from,
+                FaceSource::Body,
+                "frame {frame}: blend anchors on the from-source"
+            );
             assert!(t > 0.0 && t < 1.0, "frame {frame}: t={t} out of (0,1)");
         }
         let out = sel.select(Some(body), Some(mesh), 0.9, DT).unwrap();
-        assert!(out.blend.is_none(), "post-blend steady mesh frame must clear the mark");
+        assert!(
+            out.blend.is_none(),
+            "post-blend steady mesh frame must clear the mark"
+        );
         assert_eq!(out.source, FaceSource::Mesh);
     }
 
@@ -989,8 +1030,14 @@ mod tests {
         };
         let at_30 = count_blend_frames(DT);
         let at_15 = count_blend_frames(2.0 * DT);
-        assert_eq!(at_30, 6, "30 fps keeps the calibrated 6-blended-frame schedule");
-        assert_eq!(at_15, 3, "15 fps covers the same wall time in half the frames");
+        assert_eq!(
+            at_30, 6,
+            "30 fps keeps the calibrated 6-blended-frame schedule"
+        );
+        assert_eq!(
+            at_15, 3,
+            "15 fps covers the same wall time in half the frames"
+        );
     }
 
     #[test]
@@ -1010,7 +1057,11 @@ mod tests {
         // eye-line→chin span decodes to ~0.
         let joints = with_face68(neutral_joints(190.0), VERTICAL_RATIO_NEUTRAL);
         let face = derive_face_pose_from_body(&joints, 1.0).unwrap();
-        assert!(face.pitch.abs() < 1e-5, "neutral must be 0, got {}", face.pitch);
+        assert!(
+            face.pitch.abs() < 1e-5,
+            "neutral must be 0, got {}",
+            face.pitch
+        );
     }
 
     #[test]
@@ -1029,7 +1080,10 @@ mod tests {
             (down - (0.20 * VERTICAL_RATIO_GAIN).atan()).abs() < 1e-5,
             "chin-down magnitude off: {down}"
         );
-        assert!((up + down).abs() < 1e-5, "must be antisymmetric: {up} vs {down}");
+        assert!(
+            (up + down).abs() < 1e-5,
+            "must be antisymmetric: {up} vs {down}"
+        );
         assert!(down > 0.5 && up < -0.5, "expected ±29°, got {down} / {up}");
     }
 
@@ -1140,7 +1194,11 @@ mod tests {
         // Fallback estimator. Nose dropped further below the eye line →
         // chin-down → +pitch.
         let face = derive_face_pose_from_body(&neutral_joints(214.0), 1.0).unwrap();
-        assert!(face.pitch > 0.3, "chin-down should be +pitch, got {}", face.pitch);
+        assert!(
+            face.pitch > 0.3,
+            "chin-down should be +pitch, got {}",
+            face.pitch
+        );
     }
 
     #[test]
@@ -1148,7 +1206,11 @@ mod tests {
         // Fallback estimator. Nose lifted toward the eye line → chin-up →
         // -pitch.
         let face = derive_face_pose_from_body(&neutral_joints(166.0), 1.0).unwrap();
-        assert!(face.pitch < -0.3, "chin-up should be -pitch, got {}", face.pitch);
+        assert!(
+            face.pitch < -0.3,
+            "chin-up should be -pitch, got {}",
+            face.pitch
+        );
     }
 
     #[test]

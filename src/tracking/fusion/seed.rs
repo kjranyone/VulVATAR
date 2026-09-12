@@ -12,11 +12,7 @@ use super::math::*;
 use super::model::*;
 
 /// Find 3D joints and run the estimator update with analytic arm re-seeds.
-pub fn update_with_arm_seeds(
-    h: &Humanoid,
-    est: &mut Estimator,
-    obs: &FrameObs,
-) {
+pub fn update_with_arm_seeds(h: &Humanoid, est: &mut Estimator, obs: &FrameObs) {
     let find3d = |j: usize| -> Option<V3> {
         obs.kp3d
             .iter()
@@ -25,12 +21,8 @@ pub fn update_with_arm_seeds(
     };
     let l = (find3d(h.j.l_elbow), find3d(h.j.l_wrist));
     let r = (find3d(h.j.r_elbow), find3d(h.j.r_wrist));
-    let seed_l = |st: &State| -> Option<State> {
-        seed_arm(h, st, true, l.0, l.1?)
-    };
-    let seed_r = |st: &State| -> Option<State> {
-        seed_arm(h, st, false, r.0, r.1?)
-    };
+    let seed_l = |st: &State| -> Option<State> { seed_arm(h, st, true, l.0, l.1?) };
+    let seed_r = |st: &State| -> Option<State> { seed_arm(h, st, false, r.0, r.1?) };
     let seed_both = |st: &State| -> Option<State> {
         let a = seed_arm(h, st, true, l.0, l.1?)?;
         seed_arm(h, &a, false, r.0, r.1?)
@@ -71,7 +63,13 @@ fn rotation_from_pairs(a1: V3, a2: V3, b1: V3, b2: V3) -> M3 {
 /// points. `elbow` may be `None` (out of frame): the elbow is then placed by
 /// two-bone IK with the current elbow as the swivel pole. Returns `None` if
 /// the observation is unusable (degenerate direction).
-pub fn seed_arm(h: &Humanoid, st: &State, left: bool, elbow: Option<V3>, wrist: V3) -> Option<State> {
+pub fn seed_arm(
+    h: &Humanoid,
+    st: &State,
+    left: bool,
+    elbow: Option<V3>,
+    wrist: V3,
+) -> Option<State> {
     let m = &h.model;
     let (j_sh, j_el, j_wr, j_clav) = if left {
         (h.j.l_shoulder, h.j.l_elbow, h.j.l_wrist, h.j.l_clav)
@@ -189,7 +187,11 @@ mod tests {
             // Wrist-only IK reaches the wrist too.
             let seeded = seed_arm(&h, &st, left, None, wr).unwrap();
             let fk = m.fk(&seeded);
-            let w3 = if left { fk.t[h.j.l_wrist] } else { fk.t[h.j.r_wrist] };
+            let w3 = if left {
+                fk.t[h.j.l_wrist]
+            } else {
+                fk.t[h.j.r_wrist]
+            };
             assert!(norm(sub(w3, wr)) < 1e-3, "IK wrist {w3:?} vs {wr:?}");
         }
     }

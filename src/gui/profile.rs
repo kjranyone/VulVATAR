@@ -308,7 +308,11 @@ mod profile_management_tests {
         let mut lib = library_with(&["Desk", "Sofa"], 0);
         assert_eq!(lib.rename_at(0, "   "), Err(RenameError::Empty));
         assert_eq!(lib.rename_at(0, "Sofa"), Err(RenameError::Duplicate));
-        assert_eq!(lib.rename_at(0, "Desk"), Ok(()), "self-rename is a no-op success");
+        assert_eq!(
+            lib.rename_at(0, "Desk"),
+            Ok(()),
+            "self-rename is a no-op success"
+        );
         assert_eq!(lib.rename_at(0, "  Studio "), Ok(()));
         assert_eq!(lib.profiles[0].name, "Studio", "rename trims whitespace");
         assert_eq!(lib.rename_at(9, "X"), Err(RenameError::OutOfBounds));
@@ -448,11 +452,7 @@ mod profile_roundtrip_tests {
         let restored = ProfileLibrary::import_from_file(&path).expect("import profiles");
 
         assert_eq!(restored.active_index, original.active_index);
-        assert_eq!(
-            restored.profiles.len(),
-            1,
-            "profile count must round-trip"
-        );
+        assert_eq!(restored.profiles.len(), 1, "profile count must round-trip");
 
         let r = &restored.profiles[0];
         let o = &original.profiles[0];
@@ -560,11 +560,7 @@ mod profile_roundtrip_tests {
         assert_eq!(restored.active_index, Some(1));
         assert_eq!(restored.profiles[0].name, "First");
         assert_eq!(restored.profiles[1].name, "Second");
-        approx_eq(
-            restored.profiles[1].camera_fov,
-            12.5,
-            "Second.camera_fov",
-        );
+        approx_eq(restored.profiles[1].camera_fov, 12.5, "Second.camera_fov");
         assert_eq!(restored.profiles[2].name, "Third");
         assert_eq!(restored.profiles[2].output_sink_index, 9);
 
@@ -585,8 +581,11 @@ mod profile_roundtrip_tests {
         let dir = make_tempdir("partial");
         let path = dir.join("partial.json");
         // Missing every field except `name`.
-        std::fs::write(&path, r#"{"profiles":[{"name":"only-name"}],"active_index":null}"#)
-            .expect("seed partial JSON");
+        std::fs::write(
+            &path,
+            r#"{"profiles":[{"name":"only-name"}],"active_index":null}"#,
+        )
+        .expect("seed partial JSON");
 
         let result = ProfileLibrary::import_from_file(&path);
         assert!(
@@ -600,4 +599,3 @@ mod profile_roundtrip_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

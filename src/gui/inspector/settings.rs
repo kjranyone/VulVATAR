@@ -24,35 +24,38 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
     let mut changed = false;
 
     collapsible_card(ui, "settings.heading", t!("settings.heading"), true, |ui| {
-            app_badge(ui);
-            let selected_name = crate::i18n::locale_display_name(&current_locale);
-            egui::ComboBox::from_label(t!("settings.language"))
-                .selected_text(selected_name)
-                .show_ui(ui, |ui| {
-                    for code in &locales {
-                        let name = crate::i18n::locale_display_name(code);
-                        if ui.selectable_label(current_locale == *code, name).clicked() {
-                            state.settings.locale = code.to_string();
-                            crate::i18n::set_locale(code);
-                            changed = true;
-                            // Reorder the CJK font fallback chain so the
-                            // newly-active locale's native shape wins per
-                            // glyph (e.g. 飞 vs 飛). No-op if the user
-                            // hasn't run dev.ps1 Install-Font yet — they
-                            // see the warn line at startup either way.
-                            if let Some(fonts) =
-                                crate::gui::build_font_definitions(code)
-                            {
-                                ui.ctx().set_fonts(fonts);
-                            }
+        app_badge(ui);
+        let selected_name = crate::i18n::locale_display_name(&current_locale);
+        egui::ComboBox::from_label(t!("settings.language"))
+            .selected_text(selected_name)
+            .show_ui(ui, |ui| {
+                for code in &locales {
+                    let name = crate::i18n::locale_display_name(code);
+                    if ui.selectable_label(current_locale == *code, name).clicked() {
+                        state.settings.locale = code.to_string();
+                        crate::i18n::set_locale(code);
+                        changed = true;
+                        // Reorder the CJK font fallback chain so the
+                        // newly-active locale's native shape wins per
+                        // glyph (e.g. 飞 vs 飛). No-op if the user
+                        // hasn't run dev.ps1 Install-Font yet — they
+                        // see the warn line at startup either way.
+                        if let Some(fonts) = crate::gui::build_font_definitions(code) {
+                            ui.ctx().set_fonts(fonts);
                         }
                     }
-                });
-        });
+                }
+            });
+    });
 
     ui.add_space(space::SM);
 
-    collapsible_card(ui, "settings.viewport_controls", t!("settings.viewport_controls"), true, |ui| {
+    collapsible_card(
+        ui,
+        "settings.viewport_controls",
+        t!("settings.viewport_controls"),
+        true,
+        |ui| {
             app_badge(ui);
             changed |= ui
                 .add(
@@ -76,7 +79,8 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .text(t!("settings.pan_sensitivity")),
                 )
                 .changed();
-        });
+        },
+    );
 
     if changed {
         state.project_status.app_settings_dirty = true;
@@ -94,13 +98,8 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, state: &mut GuiApp) {
         t!("settings.diagnostics"),
         false,
         |ui| {
-            ui.checkbox(
-                &mut state.debug_status_bar,
-                t!("settings.debug_status_bar"),
-            );
-            ui.label(
-                egui::RichText::new(t!("settings.debug_status_bar_hint")).small(),
-            );
+            ui.checkbox(&mut state.debug_status_bar, t!("settings.debug_status_bar"));
+            ui.label(egui::RichText::new(t!("settings.debug_status_bar_hint")).small());
         },
     );
 

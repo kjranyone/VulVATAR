@@ -63,7 +63,11 @@ impl HandLandmarker {
             .first()
             .map(|i| i.name().to_string())
             .unwrap_or_else(|| "input_1".to_string());
-        let output_names: Vec<String> = session.outputs().iter().map(|o| o.name().to_string()).collect();
+        let output_names: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
         if output_names.len() < 4 {
             return Err(format!(
                 "hand model declared {} outputs, expected 4",
@@ -117,7 +121,11 @@ impl HandLandmarker {
                         wsum += wgt;
                     }
                 }
-                let inv = if wsum > 0.0 { 1.0 / (255.0 * wsum) } else { 0.0 };
+                let inv = if wsum > 0.0 {
+                    1.0 / (255.0 * wsum)
+                } else {
+                    0.0
+                };
                 self.tensor[(0, ty, tx, 0)] = acc[0] * inv;
                 self.tensor[(0, ty, tx, 1)] = acc[1] * inv;
                 self.tensor[(0, ty, tx, 2)] = acc[2] * inv;
@@ -130,7 +138,10 @@ impl HandLandmarker {
                 return None;
             }
         };
-        let outputs = match self.session.run(ort::inputs![self.input_name.as_str() => input]) {
+        let outputs = match self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])
+        {
             Ok(o) => o,
             Err(e) => {
                 error!("hand: run failed: {e}");
@@ -147,8 +158,12 @@ impl HandLandmarker {
             }
         };
         let screen = extract(&self.output_names[0], 63)?;
-        let presence = extract(&self.output_names[1], 1).map(|v| v[0]).unwrap_or(0.0);
-        let handedness = extract(&self.output_names[2], 1).map(|v| v[0]).unwrap_or(0.0);
+        let presence = extract(&self.output_names[1], 1)
+            .map(|v| v[0])
+            .unwrap_or(0.0);
+        let handedness = extract(&self.output_names[2], 1)
+            .map(|v| v[0])
+            .unwrap_or(0.0);
         let world = extract(&self.output_names[3], 63)?;
         drop(outputs);
         // The converted checkpoint emits probabilities (an empty crop reads
@@ -210,7 +225,11 @@ pub fn predicted_hand_crop(
     {
         return None;
     }
-    Some(((cx - size * 0.5) as f32, (cy - size * 0.5) as f32, size as f32))
+    Some((
+        (cx - size * 0.5) as f32,
+        (cy - size * 0.5) as f32,
+        size as f32,
+    ))
 }
 
 /// Crop from the body detector's hand block (wrist + 20 landmarks, COCO
@@ -253,7 +272,11 @@ pub fn detector_hand_crop(
         return None;
     }
     let size = (span * 1.8).max(min_px);
-    Some(((cx - size * 0.5) as f32, (cy - size * 0.5) as f32, size as f32))
+    Some((
+        (cx - size * 0.5) as f32,
+        (cy - size * 0.5) as f32,
+        size as f32,
+    ))
 }
 
 /// Turn a hand result into estimator observations: 21 2-D keypoints
@@ -276,8 +299,7 @@ pub fn hand_observations(
 ) {
     let scale = res.crop.2 as f64 / INPUT as f64;
     // ~2 px in crop space, inflated by (1 − presence).
-    let sigma_px =
-        (2.0 * scale).max(1.0) * (1.0 + 2.0 * (1.0 - res.presence as f64)) * sigma_scale;
+    let sigma_px = (2.0 * scale).max(1.0) * (1.0 + 2.0 * (1.0 - res.presence as f64)) * sigma_scale;
     let wrist = if hand == 0 { h.j.l_wrist } else { h.j.r_wrist };
     let mut points: [Option<ModelPoint>; HAND_KP] = [None; HAND_KP];
     points[0] = Some(ModelPoint::Joint(wrist));
@@ -291,7 +313,13 @@ pub fn hand_observations(
     for i in 0..HAND_KP {
         let Some(pt) = points[i] else { continue };
         let (u, v) = (res.px[i][0] as f64, res.px[i][1] as f64);
-        if !u.is_finite() || !v.is_finite() || u < 0.0 || v < 0.0 || u >= width as f64 || v >= height as f64 {
+        if !u.is_finite()
+            || !v.is_finite()
+            || u < 0.0
+            || v < 0.0
+            || u >= width as f64
+            || v >= height as f64
+        {
             continue;
         }
         out2d.push(Kp2d {
@@ -302,12 +330,16 @@ pub fn hand_observations(
         });
         if let Some(w) = wrist_abs {
             if i > 0 {
-                let rel = [res.world[i][0] as f64, res.world[i][1] as f64, res.world[i][2] as f64];
+                let rel = [
+                    res.world[i][0] as f64,
+                    res.world[i][1] as f64,
+                    res.world[i][2] as f64,
+                ];
                 out3d.push(Kp3d {
                     point: pt,
                     p: add(w, rel),
                     sigma: 0.015 * (1.0 + 2.0 * (1.0 - res.presence as f64)),
-                lat_scale: 1.0,
+                    lat_scale: 1.0,
                 });
             }
         }

@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use log::info;
 
+use crate::tracking::metric_frame::MetricDepthFrame;
 use crate::tracking::provider::{PoseProvider, TrackingPipelineConfig};
 use crate::tracking::rtmw3d::{Rtmw3dInference, Rtmw3dOptions};
-use crate::tracking::metric_frame::MetricDepthFrame;
 use crate::tracking::source_skeleton::CameraIntrinsics;
 use crate::tracking::PoseEstimate;
 
@@ -20,7 +20,6 @@ use super::model::*;
 use super::observe::*;
 use super::output;
 use super::visibility::{build_silhouette, window_median_z, SilhouetteParams, VisPolicy};
-
 
 pub struct FusionProvider {
     rtmw3d: Rtmw3dInference,
@@ -154,7 +153,10 @@ impl FusionProvider {
                 None
             }
         };
-        info!("Fusion provider ready (RTMW3D {})", rtmw3d.backend().label());
+        info!(
+            "Fusion provider ready (RTMW3D {})",
+            rtmw3d.backend().label()
+        );
         let h = Humanoid::new();
         let params = Params::default();
         let est = Estimator::new(&h.model, params);
@@ -179,7 +181,11 @@ impl FusionProvider {
             // VULVATAR_FUSION_OLDSIGMA=1: the pre-visibility σ policy
             // (ablation bench only).
             kp_sigma: if std::env::var_os("VULVATAR_FUSION_OLDSIGMA").is_some() {
-                KpSigma { floor_px: 1.5, simcc_gain: 1.0, ..KpSigma::default() }
+                KpSigma {
+                    floor_px: 1.5,
+                    simcc_gain: 1.0,
+                    ..KpSigma::default()
+                }
             } else {
                 KpSigma::default()
             },
@@ -249,7 +255,12 @@ impl FusionProvider {
             y2 = y2.max(q[1]);
         }
         let (w, h) = (width as f64, height as f64);
-        let (x1, y1, x2, y2) = (x1.clamp(0.0, w), y1.clamp(0.0, h), x2.clamp(0.0, w), y2.clamp(0.0, h));
+        let (x1, y1, x2, y2) = (
+            x1.clamp(0.0, w),
+            y1.clamp(0.0, h),
+            x2.clamp(0.0, w),
+            y2.clamp(0.0, h),
+        );
         if x2 - x1 < 48.0 || y2 - y1 < 48.0 {
             return None;
         }
@@ -383,7 +394,9 @@ impl PoseProvider for FusionProvider {
         self.last_crop_hint = crop_hint.map(|b| (b.x1, b.y1, b.x2, b.y2));
         self.rtmw3d.set_crop_hint(crop_hint);
 
-        let mut base = self.rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
+        let mut base = self
+            .rtmw3d
+            .estimate_pose(rgb_data, width, height, frame_index);
         let mut aux = self.rtmw3d.take_aux();
 
         let mut obs = FrameObs {
@@ -515,12 +528,17 @@ impl PoseProvider for FusionProvider {
                             // shoulder's outline, in 11 % of frames). A real
                             // hand cut by the edge still seeds its crop from
                             // the hand-block points inside the frame.
-                            let at_edge = !(m..=1.0 - m).contains(&j.nx) || !(m..=1.0 - m).contains(&j.ny);
+                            let at_edge =
+                                !(m..=1.0 - m).contains(&j.nx) || !(m..=1.0 - m).contains(&j.ny);
                             if hole && at_edge {
                                 vis[i] = 0.0;
                                 continue;
                             }
-                            let tol = if hole { sp.max_dist_hole_m } else { sp.max_dist_m };
+                            let tol = if hole {
+                                sp.max_dist_hole_m
+                            } else {
+                                sp.max_dist_m
+                            };
                             if dm > tol && vis[i] >= pol.min_p_obs {
                                 // Not on the main surface. A hand / forearm
                                 // held in front of the chest or entering from
@@ -568,7 +586,11 @@ impl PoseProvider for FusionProvider {
                 for (k, j) in base.annotation.keypoints.iter_mut().zip(aux.joints.iter()) {
                     k.2 = j.score;
                 }
-                self.last_vis = p_simcc.iter().zip(dist.iter()).map(|(&p, &d)| (p, d)).collect();
+                self.last_vis = p_simcc
+                    .iter()
+                    .zip(dist.iter())
+                    .map(|(&p, &d)| (p, d))
+                    .collect();
             }
         }
 
@@ -677,9 +699,18 @@ impl PoseProvider for FusionProvider {
             if d.points_m.len() == (d.width * d.height) as usize && det_kps.len() >= 133 {
                 let mut tmp: Vec<RawKp> = det_kps
                     .iter()
-                    .map(|&(nx, ny, sc)| RawKp { nx, ny, score: sc, sx: 0.0, sy: 0.0 })
+                    .map(|&(nx, ny, sc)| RawKp {
+                        nx,
+                        ny,
+                        score: sc,
+                        sx: 0.0,
+                        sy: 0.0,
+                    })
                     .collect();
-                let zs = [fk_pred.t[self.h.j.l_shoulder][2], fk_pred.t[self.h.j.r_shoulder][2]];
+                let zs = [
+                    fk_pred.t[self.h.j.l_shoulder][2],
+                    fk_pred.t[self.h.j.r_shoulder][2],
+                ];
                 reach_filter(&mut tmp, &d.points_m, d.width, d.height, zs, 0.75);
                 for (k, t) in det_kps.iter_mut().zip(tmp.iter()) {
                     k.2 = t.score;
@@ -725,8 +756,7 @@ impl PoseProvider for FusionProvider {
                 // bimodal — a hit reads ~0.9+, a miss ~0).
                 let mut candidates: Vec<(f32, f32, f32)> = Vec::with_capacity(3);
                 if let Some(prev) = self.prev_hands[hand].as_ref() {
-                    let (mut x0, mut y0, mut x1, mut y1) =
-                        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                     for p in &prev.px {
                         x0 = x0.min(p[0]);
                         y0 = y0.min(p[1]);
@@ -765,8 +795,10 @@ impl PoseProvider for FusionProvider {
                         if wrong_hand {
                             continue;
                         }
-                        let better =
-                            best.as_ref().map(|b| res.presence > b.presence).unwrap_or(true);
+                        let better = best
+                            .as_ref()
+                            .map(|b| res.presence > b.presence)
+                            .unwrap_or(true);
                         if better {
                             let lock = res.presence >= 0.6;
                             best = Some(res);
@@ -888,7 +920,6 @@ impl PoseProvider for FusionProvider {
             arm_inflate(self.h.j.r_wrist, self.h.j.r_elbow),
         ];
 
-
         if let Some(aux) = aux.as_ref() {
             let mut raw: Vec<RawKp> = aux
                 .joints
@@ -904,9 +935,10 @@ impl PoseProvider for FusionProvider {
             self.last_raw_joints = aux.joints.clone();
             self.last_crop = aux.crop;
             self.last_kp_stages.clear();
-            let snap = |stages: &mut Vec<(&'static str, Vec<f32>)>, name: &'static str, raw: &[RawKp]| {
-                stages.push((name, raw.iter().map(|k| k.score).collect()));
-            };
+            let snap =
+                |stages: &mut Vec<(&'static str, Vec<f32>)>, name: &'static str, raw: &[RawKp]| {
+                    stages.push((name, raw.iter().map(|k| k.score).collect()));
+                };
             snap(&mut self.last_kp_stages, "raw", &raw);
             if let Some(crop) = aux.crop.filter(|_| old_gates) {
                 cull_crop_border(&mut raw, crop, width, height, 0.02);
@@ -916,7 +948,10 @@ impl PoseProvider for FusionProvider {
             // pixels only) — see `reach_filter`.
             if let Some(d) = depth.as_ref().filter(|_| old_gates) {
                 if d.points_m.len() == (d.width * d.height) as usize {
-                    let zs = [fk_pred.t[self.h.j.l_shoulder][2], fk_pred.t[self.h.j.r_shoulder][2]];
+                    let zs = [
+                        fk_pred.t[self.h.j.l_shoulder][2],
+                        fk_pred.t[self.h.j.r_shoulder][2],
+                    ];
                     if std::env::var_os("VULVATAR_FUSION_NO_REACH").is_none() {
                         reach_filter(&mut raw, &d.points_m, d.width, d.height, zs, 0.75);
                     }
@@ -952,9 +987,13 @@ impl PoseProvider for FusionProvider {
                         && hip.ny > sh_y + 0.6 * torso_ref;
                     if !hip_ok {
                         raw[11 + side].score = 0.0;
-                        for i in
-                            [13 + side, 15 + side, 17 + 3 * side, 18 + 3 * side, 19 + 3 * side]
-                        {
+                        for i in [
+                            13 + side,
+                            15 + side,
+                            17 + 3 * side,
+                            18 + 3 * side,
+                            19 + 3 * side,
+                        ] {
                             if i < raw.len() {
                                 raw[i].score = 0.0;
                             }
@@ -976,10 +1015,8 @@ impl PoseProvider for FusionProvider {
             if let Some(d) = depth.as_ref().filter(|_| old_gates) {
                 if d.points_m.len() == (d.width * d.height) as usize {
                     let z_person = head_center_pred[2];
-                    let model_pelvis_w = norm(sub(
-                        fk_pred.t[self.h.j.l_hip],
-                        fk_pred.t[self.h.j.r_hip],
-                    ));
+                    let model_pelvis_w =
+                        norm(sub(fk_pred.t[self.h.j.l_hip], fk_pred.t[self.h.j.r_hip]));
                     super::coherence::filter_leg_coherence(
                         &mut raw,
                         &d.points_m,
@@ -1017,11 +1054,7 @@ impl PoseProvider for FusionProvider {
             // With a dense-mesh centroid anchoring head position, the
             // SimCC face keypoints only ADD their frontalization bias —
             // widen them so they stop binding head yaw (~4° measured).
-            let mesh_conf = aux
-                .face_mesh
-                .as_ref()
-                .map(|(_, c)| *c)
-                .unwrap_or(0.0);
+            let mesh_conf = aux.face_mesh.as_ref().map(|(_, c)| *c).unwrap_or(0.0);
             let head_scale = if !face_occluded && mesh_conf >= 0.35 {
                 1.0 + 2.0 * ((mesh_conf - 0.35) / 0.25).clamp(0.0, 1.0) as f64
             } else {
@@ -1046,8 +1079,7 @@ impl PoseProvider for FusionProvider {
                         let (_, pw) =
                             super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
                         intr.project(pw).is_some_and(|pv| {
-                            ((k.u - pv[0]) * (k.u - pv[0]) + (k.v - pv[1]) * (k.v - pv[1]))
-                                .sqrt()
+                            ((k.u - pv[0]) * (k.u - pv[0]) + (k.v - pv[1]) * (k.v - pv[1])).sqrt()
                                 < 4.0 * k.sigma
                         })
                     };
@@ -1092,17 +1124,21 @@ impl PoseProvider for FusionProvider {
                         &mut obs.surface,
                     );
                     // ---- depth-confirmed wrist hold (see `wrist_hold`) ----
-                    if std::env::var("VULVATAR_WRIST_HOLD").map(|v| v == "1").unwrap_or(false) {
+                    if std::env::var("VULVATAR_WRIST_HOLD")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
                         let hold_max = std::env::var("VULVATAR_WRIST_HOLD_MAX")
                             .ok()
                             .and_then(|v| v.parse::<f64>().ok())
                             .unwrap_or(2.5);
                         for side in 0..2 {
-                            let j_wr =
-                                if side == 0 { self.h.j.l_wrist } else { self.h.j.r_wrist };
-                            let is_wr = |point: &super::estimator::ModelPoint| {
-                                matches!(point, super::estimator::ModelPoint::Joint(j) if *j == j_wr)
+                            let j_wr = if side == 0 {
+                                self.h.j.l_wrist
+                            } else {
+                                self.h.j.r_wrist
                             };
+                            let is_wr = |point: &super::estimator::ModelPoint| matches!(point, super::estimator::ModelPoint::Joint(j) if *j == j_wr);
                             let seen_3d = obs.kp3d.iter().rev().find(|k| is_wr(&k.point));
                             let seen_2d = obs.kp2d.iter().any(|k| is_wr(&k.point));
                             let trace = std::env::var_os("VULVATAR_WRIST_HOLD_TRACE").is_some();
@@ -1115,8 +1151,10 @@ impl PoseProvider for FusionProvider {
                                 );
                             }
                             if let Some(k) = seen_3d {
-                                self.wrist_hold[side] =
-                                    WristHold { last_t: Some(t), last_z: Some(k.p[2]) };
+                                self.wrist_hold[side] = WristHold {
+                                    last_t: Some(t),
+                                    last_z: Some(k.p[2]),
+                                };
                             } else if seen_2d {
                                 // Fresh bearing without a lifted 3-D point
                                 // (depth hole or hand-block-only frame): the
@@ -1161,10 +1199,11 @@ impl PoseProvider for FusionProvider {
                                     miss("project");
                                     continue;
                                 };
-                                let (mx, my) =
-                                    (0.02 * intr.width, 0.02 * intr.height);
-                                if uv[0] < mx || uv[0] > intr.width - mx
-                                    || uv[1] < my || uv[1] > intr.height - my
+                                let (mx, my) = (0.02 * intr.width, 0.02 * intr.height);
+                                if uv[0] < mx
+                                    || uv[0] > intr.width - mx
+                                    || uv[1] < my
+                                    || uv[1] > intr.height - my
                                 {
                                     miss(&format!("border uv {:.0},{:.0}", uv[0], uv[1]));
                                     continue;
@@ -1322,7 +1361,10 @@ impl PoseProvider for FusionProvider {
                     if n >= 100.0 {
                         let local = add(scale(scale(mc, 1.0 / n), s_fit), t_fit);
                         obs.kp2d.push(super::estimator::Kp2d {
-                            point: super::estimator::ModelPoint::Attached { joint: head_j, local },
+                            point: super::estimator::ModelPoint::Attached {
+                                joint: head_j,
+                                local,
+                            },
                             u: mu[0] / n,
                             v: mu[1] / n,
                             sigma: 1.5 * sigma_scale,
@@ -1342,10 +1384,7 @@ impl PoseProvider for FusionProvider {
                         continue;
                     }
                     let c = super::canonical_face::CANONICAL_FACE_468[i];
-                    let local = add(
-                        scale([c[0] as f64, c[1] as f64, c[2] as f64], s_fit),
-                        t_fit,
-                    );
+                    let local = add(scale([c[0] as f64, c[1] as f64, c[2] as f64], s_fit), t_fit);
                     let pw = add(head_t_pred, mat_vec(&head_r_pred, local));
                     let n_local = normalize([c[0] as f64, c[1] as f64, (c[2] as f64) - 0.02]);
                     let n_world = mat_vec(&head_r_pred, n_local);
@@ -1353,7 +1392,10 @@ impl PoseProvider for FusionProvider {
                     if facing < -0.1 {
                         continue;
                     }
-                    let point = super::estimator::ModelPoint::Attached { joint: head_j, local };
+                    let point = super::estimator::ModelPoint::Attached {
+                        joint: head_j,
+                        local,
+                    };
                     let oval = super::canonical_face::FACE_OVAL.contains(&i);
                     if i % 4 == 0 && facing > 0.15 && !oval {
                         if let Some(p) = depth_at(l[0] as f64, l[1] as f64) {
@@ -1386,7 +1428,12 @@ impl PoseProvider for FusionProvider {
         // is on the far side of the head and cannot be a real observation.
         if std::env::var_os("VULVATAR_ABL_NOCULL").is_none() {
             let head_c = fk_pred.site[self.h.s.head_center];
-            let head_sites = [self.h.s.l_eye, self.h.s.r_eye, self.h.s.l_ear, self.h.s.r_ear];
+            let head_sites = [
+                self.h.s.l_eye,
+                self.h.s.r_eye,
+                self.h.s.l_ear,
+                self.h.s.r_ear,
+            ];
             let facing_of = |pw: V3| -> f64 {
                 let n = normalize(sub(pw, head_c));
                 let to_cam = normalize(scale(pw, -1.0));
@@ -1428,8 +1475,14 @@ impl PoseProvider for FusionProvider {
         // ---- hand crop observations ---------------------------------------------
         self.hand_kp_start = obs.kp2d.len();
         for hand in 0..2 {
-            let Some(res) = self.last_hands[hand].as_ref() else { continue };
-            let wrist_j = if hand == 0 { self.h.j.l_wrist } else { self.h.j.r_wrist };
+            let Some(res) = self.last_hands[hand].as_ref() else {
+                continue;
+            };
+            let wrist_j = if hand == 0 {
+                self.h.j.l_wrist
+            } else {
+                self.h.j.r_wrist
+            };
             // The converted model's "world" output is not metric on this
             // checkpoint (index MCP reads ~3 cm from the wrist) — 2-D only.
             let _ = wrist_j;
@@ -1499,7 +1552,8 @@ impl PoseProvider for FusionProvider {
                         .capsules
                         .iter()
                         .map(|c| {
-                            let starts_at = |jj: usize| matches!(c.a, PointRef::Joint(x) if x == jj);
+                            let starts_at =
+                                |jj: usize| matches!(c.a, PointRef::Joint(x) if x == jj);
                             let no_head = std::env::var_os("VULVATAR_DENSE_NOHEAD").is_some();
                             let no_neck = std::env::var_os("VULVATAR_DENSE_NONECK").is_some();
                             match c.part {
@@ -1520,10 +1574,18 @@ impl PoseProvider for FusionProvider {
                                     false
                                 }
                                 Part::LeftArm => {
-                                    if starts_at(j.l_shoulder) { tracked(j.l_elbow) } else { tracked(j.l_wrist) }
+                                    if starts_at(j.l_shoulder) {
+                                        tracked(j.l_elbow)
+                                    } else {
+                                        tracked(j.l_wrist)
+                                    }
                                 }
                                 Part::RightArm => {
-                                    if starts_at(j.r_shoulder) { tracked(j.r_elbow) } else { tracked(j.r_wrist) }
+                                    if starts_at(j.r_shoulder) {
+                                        tracked(j.r_elbow)
+                                    } else {
+                                        tracked(j.r_wrist)
+                                    }
                                 }
                                 Part::LeftLeg => legs_in_frame && tracked(j.l_knee),
                                 Part::RightLeg => legs_in_frame && tracked(j.r_knee),
@@ -1542,7 +1604,11 @@ impl PoseProvider for FusionProvider {
             obs.kp3d.clear();
         }
         if std::env::var_os("VULVATAR_FUSION_KEEP_CLOUD").is_some() {
-            self.last_surface = obs.surface.iter().map(|(p, _)| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
+            self.last_surface = obs
+                .surface
+                .iter()
+                .map(|(p, _)| [p[0] as f32, p[1] as f32, p[2] as f32])
+                .collect();
             self.last_kp3d = obs
                 .kp3d
                 .iter()
@@ -1565,8 +1631,7 @@ impl PoseProvider for FusionProvider {
         for k in obs.kp3d.iter_mut() {
             if let Some(side) = self.arm_side_of(k.point) {
                 let agrees = corrob && {
-                    let (_, pw) =
-                        super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
+                    let (_, pw) = super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
                     norm(sub(k.p, pw)) < 0.10
                 };
                 if !agrees {
@@ -1578,8 +1643,7 @@ impl PoseProvider for FusionProvider {
         for k in obs.kp2d[n_hand_start..].iter_mut() {
             if let Some(side) = self.arm_side_of(k.point) {
                 let agrees = corrob && {
-                    let (_, pw) =
-                        super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
+                    let (_, pw) = super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
                     intr.project(pw).is_some_and(|pv| {
                         ((k.u - pv[0]) * (k.u - pv[0]) + (k.v - pv[1]) * (k.v - pv[1])).sqrt()
                             < 4.0 * k.sigma
@@ -1596,7 +1660,15 @@ impl PoseProvider for FusionProvider {
         super::seed::update_with_arm_seeds(&self.h, &mut self.est, &obs);
         self.last_est_ms = t_est.elapsed().as_secs_f32() * 1000.0;
 
-        dump_obs_post_solve(&self.h, &self.est, frame_index, t, &obs, &intr, depth.as_ref());
+        dump_obs_post_solve(
+            &self.h,
+            &self.est,
+            frame_index,
+            t,
+            &obs,
+            &intr,
+            depth.as_ref(),
+        );
         self.last_t = Some(t);
         self.frames += 1;
 
@@ -1608,14 +1680,8 @@ impl PoseProvider for FusionProvider {
             if head_sigma < 0.35 && neck_sigma < 0.4 {
                 if let (Some(d), Some(lm)) = (depth.as_ref(), mesh_px) {
                     let z_ref = fk.site[self.h.s.head_center][2];
-                    self.face_fit.update(
-                        lm,
-                        fk.t[head_j],
-                        &fk.r[head_j],
-                        z_ref,
-                        d,
-                        &in_hand_rect,
-                    );
+                    self.face_fit
+                        .update(lm, fk.t[head_j], &fk.r[head_j], z_ref, d, &in_hand_rect);
                 }
             }
         }
@@ -1623,7 +1689,10 @@ impl PoseProvider for FusionProvider {
         // ---- output ----------------------------------------------------------------
         let span_px = {
             let fk = self.h.model.fk(&self.est.state);
-            match (intr.project(fk.t[self.h.j.l_shoulder]), intr.project(fk.t[self.h.j.r_shoulder])) {
+            match (
+                intr.project(fk.t[self.h.j.l_shoulder]),
+                intr.project(fk.t[self.h.j.r_shoulder]),
+            ) {
                 (Some(a), Some(b)) => Some(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()),
                 _ => None,
             }
@@ -1633,7 +1702,8 @@ impl PoseProvider for FusionProvider {
             let fk = self.h.model.fk(&self.est.state);
             norm(sub(fk.t[self.h.j.l_shoulder], fk.t[self.h.j.r_shoulder])) as f32
         };
-        let mut skeleton = output::source_skeleton(&self.h, &self.est, frame_index, intr_cam, ref_span);
+        let mut skeleton =
+            output::source_skeleton(&self.h, &self.est, frame_index, intr_cam, ref_span);
         // Carry the perception-side channels the expression solver and GUI
         // still read from the base pipeline.
         skeleton.expressions = base.skeleton.expressions;
@@ -1691,9 +1761,7 @@ fn dump_obs_post_solve(
         for k in &obs.kp2d {
             let (_j, pw) = super::estimator::resolve_point(&h.model, &fk, k.point);
             let name = match k.point {
-                super::estimator::ModelPoint::Joint(j) => {
-                    h.model.joints[j].name.to_string()
-                }
+                super::estimator::ModelPoint::Joint(j) => h.model.joints[j].name.to_string(),
                 super::estimator::ModelPoint::Site(s) => {
                     format!("site:{}", h.model.sites[s].name)
                 }
@@ -1708,9 +1776,7 @@ fn dump_obs_post_solve(
         for k in &obs.kp3d {
             let (_, pw) = super::estimator::resolve_point(&h.model, &fk, k.point);
             let name = match k.point {
-                super::estimator::ModelPoint::Joint(j) => {
-                    h.model.joints[j].name.to_string()
-                }
+                super::estimator::ModelPoint::Joint(j) => h.model.joints[j].name.to_string(),
                 super::estimator::ModelPoint::Site(s) => {
                     format!("site:{}", h.model.sites[s].name)
                 }
@@ -1743,11 +1809,8 @@ fn dump_obs_post_solve(
                 let chosen = assoc.get(pi).copied().unwrap_or(-2);
                 let mut best = (usize::MAX, f64::INFINITY);
                 for (ci, c) in m.capsules.iter().enumerate() {
-                    let (q, _u) = super::estimator::closest_on_segment(
-                        fk.point(c.a),
-                        fk.point(c.b),
-                        *pt,
-                    );
+                    let (q, _u) =
+                        super::estimator::closest_on_segment(fk.point(c.a), fk.point(c.b), *pt);
                     let d = norm(sub(*pt, q)) - m.capsule_radius(&est.state, c);
                     if d.abs() < best.1.abs() {
                         best = (ci, d);
@@ -1771,17 +1834,21 @@ fn dump_obs_post_solve(
         }
         eprintln!(
             "  depth frame: {:?} valid@nose {:?}",
-            depth.as_ref().map(|d| (d.width, d.height, d.points_m.len())),
-            obs.kp2d.first().and_then(|k| depth.as_ref().and_then(|d| window_point(
-                &d.points_m,
-                d.width,
-                d.height,
-                k.u,
-                k.v,
-                3,
-                0.1,
-                10.0
-            )))
+            depth
+                .as_ref()
+                .map(|d| (d.width, d.height, d.points_m.len())),
+            obs.kp2d
+                .first()
+                .and_then(|k| depth.as_ref().and_then(|d| window_point(
+                    &d.points_m,
+                    d.width,
+                    d.height,
+                    k.u,
+                    k.v,
+                    3,
+                    0.1,
+                    10.0
+                )))
         );
         eprintln!("  diag {:?}", est.diag);
     }

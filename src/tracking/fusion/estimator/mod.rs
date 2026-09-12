@@ -53,7 +53,10 @@ pub enum ModelPoint {
     Site(usize),
     /// A point rigidly attached to `joint` at `local` (metres, joint frame,
     /// already scaled — used for learned face landmarks).
-    Attached { joint: usize, local: V3 },
+    Attached {
+        joint: usize,
+        local: V3,
+    },
 }
 
 /// One 2-D keypoint observation.
@@ -196,6 +199,18 @@ pub struct Params {
     /// Prior σ of the capsule radii (tight: a radius is only weakly
     /// observable from surface points and inflates to swallow outliers).
     pub radius_sigma: f64,
+    /// Prior σ (m) of the trunk front-surface shear (`State::shear`).
+    /// Identifiability: the visible front-surface depth slope measures
+    /// only `axis_tilt − taper` (one equation, two unknowns); the taper is
+    /// anatomical (session-constant) while posture fluctuates, so holding
+    /// it in the slow shape state separates the pair over a session.
+    /// Without it the solver books the whole chest slope (measured ≈ 11°
+    /// on the s1789219959 desk replay) as trunk tilt and swings the
+    /// out-of-frame pelvis to the desk plane. 0.04 m covers the
+    /// chest-to-belly front offset spread of real torsos.
+    /// `VULVATAR_TRUNK_SHEAR_SIGMA` overrides; a tiny value pins the
+    /// shear at 0, reproducing the pre-shear behaviour for ablation.
+    pub shear_sigma: f64,
     /// Velocity damping time constant (s) — the constant-velocity
     /// prediction decays toward zero over this horizon.
     pub velocity_tau: f64,
@@ -273,18 +288,26 @@ impl Default for Params {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2.0),
             limit_sigma: 0.02,
-            q_joint: 2.0,   // rad²/s — a limb can swing ~250°/s
+            q_joint: 2.0, // rad²/s — a limb can swing ~250°/s
             // Measured worse at 0.25 (torso yaw std 6 → 21 on a gesturing
             // session: a held arm fights its returning observation and the
             // trunk pays); kept as an ablation knob.
-            q_hold_floor: std::env::var("VULVATAR_HOLD_Q").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            q_hold_floor: std::env::var("VULVATAR_HOLD_Q")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
             q_hold_info_ref: 50.0,
             trunk_axis_sigma: if std::env::var_os("VULVATAR_NO_UPRIGHT").is_some() {
                 None
             } else {
-                Some(std::env::var("VULVATAR_TRUNK_AXIS_SIGMA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15))
+                Some(
+                    std::env::var("VULVATAR_TRUNK_AXIS_SIGMA")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0.15),
+                )
             },
-            q_trunk: 0.15,  // rad²/s — the trunk turns ~120°/s at most
+            q_trunk: 0.15, // rad²/s — the trunk turns ~120°/s at most
             q_root_rot: 0.15,
             q_root_t: std::env::var("VULVATAR_FUSION_Q_ROOT_T")
                 .ok()
@@ -294,6 +317,11 @@ impl Default for Params {
             shape_sigma: 0.12,
             scale_sigma: 0.04,
             radius_sigma: 0.05,
+            shear_sigma: std::env::var("VULVATAR_TRUNK_SHEAR_SIGMA")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(0.04),
             velocity_tau: 0.25,
             pose_prior_scale: 1.0,
             var_min: 1e-8,
@@ -303,10 +331,19 @@ impl Default for Params {
             seed_win_ratio: 0.95,
             lost_rms_px: 40.0,
             cauchy_2d: true,
-            surf_n_eff: std::env::var("VULVATAR_DENSE_NEFF").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0),
-            surf_n_eff_head: std::env::var("VULVATAR_DENSE_NEFF_HEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0),
+            surf_n_eff: std::env::var("VULVATAR_DENSE_NEFF")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30.0),
+            surf_n_eff_head: std::env::var("VULVATAR_DENSE_NEFF_HEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8.0),
             surf_n_eff_limb: 15.0,
-            surf_front_gate_m: std::env::var("VULVATAR_DENSE_FRONT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03),
+            surf_front_gate_m: std::env::var("VULVATAR_DENSE_FRONT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.03),
             c_surf: 4.0,
             surf_gate_m: 0.20,
         }
@@ -454,10 +491,26 @@ impl Estimator {
             lost_frames: 0,
             lost_events: 0,
             surf_pts: Vec::new(),
-            idx_l_shoulder: model.joints.iter().position(|j| j.name == "l_shoulder").unwrap_or(0),
-            idx_r_shoulder: model.joints.iter().position(|j| j.name == "r_shoulder").unwrap_or(0),
-            idx_l_elbow: model.joints.iter().position(|j| j.name == "l_elbow").unwrap_or(0),
-            idx_r_elbow: model.joints.iter().position(|j| j.name == "r_elbow").unwrap_or(0),
+            idx_l_shoulder: model
+                .joints
+                .iter()
+                .position(|j| j.name == "l_shoulder")
+                .unwrap_or(0),
+            idx_r_shoulder: model
+                .joints
+                .iter()
+                .position(|j| j.name == "r_shoulder")
+                .unwrap_or(0),
+            idx_l_elbow: model
+                .joints
+                .iter()
+                .position(|j| j.name == "l_elbow")
+                .unwrap_or(0),
+            idx_r_elbow: model
+                .joints
+                .iter()
+                .position(|j| j.name == "r_elbow")
+                .unwrap_or(0),
             trunk_param: trunk_params(model),
             locked_param: locked_params(model),
             data_info: vec![0.0; n],
@@ -606,7 +659,10 @@ impl Estimator {
 
     /// σ of the root translation (max component, metres).
     pub fn root_sigma_m(&self) -> f64 {
-        (0..3).map(|k| self.var[ROOT_T + k]).fold(0.0, f64::max).sqrt()
+        (0..3)
+            .map(|k| self.var[ROOT_T + k])
+            .fold(0.0, f64::max)
+            .sqrt()
     }
 
     /// Ingest one frame's observations and update the posterior.
@@ -654,7 +710,8 @@ impl Estimator {
                     // so an arm under the desk keeps its last pose instead
                     // of wandering toward every stray observation.
                     let info = self.data_info_ema.get(k).copied().unwrap_or(0.0);
-                    let f = (info / self.params.q_hold_info_ref).clamp(self.params.q_hold_floor, 1.0);
+                    let f =
+                        (info / self.params.q_hold_info_ref).clamp(self.params.q_hold_floor, 1.0);
                     self.params.q_joint * f
                 }
             } else {
@@ -669,7 +726,8 @@ impl Estimator {
             .surface
             .iter()
             .map(|(p, s)| {
-                let s2 = (s * s + self.params.surf_model_sigma * self.params.surf_model_sigma).sqrt();
+                let s2 =
+                    (s * s + self.params.surf_model_sigma * self.params.surf_model_sigma).sqrt();
                 (*p, s2)
             })
             .collect();
@@ -686,12 +744,12 @@ impl Estimator {
                 self.state.set_relaxed(model);
             }
             {
-            let saved = (self.params.gnc_start, self.params.gnc_decay);
-            self.params.gnc_start = 50.0;
-            self.params.gnc_decay = 0.5;
-            self.lm_loop(model, obs, &prior_var, dt);
-            self.params.gnc_start = saved.0;
-            self.params.gnc_decay = saved.1;
+                let saved = (self.params.gnc_start, self.params.gnc_decay);
+                self.params.gnc_start = 50.0;
+                self.params.gnc_decay = 0.5;
+                self.lm_loop(model, obs, &prior_var, dt);
+                self.params.gnc_start = saved.0;
+                self.params.gnc_decay = saved.1;
             }
         }
         // ---- LM loop --------------------------------------------------------
@@ -705,7 +763,10 @@ impl Estimator {
             self.state = cand;
             let c = self.lm_loop(model, obs, &prior_var, dt);
             if std::env::var_os("VULVATAR_SEED_DUMP").is_some() {
-                eprintln!("SEEDCAND cost {cost:.1} cand {c:.1} ratio {:.3}", c / cost.max(1e-6));
+                eprintln!(
+                    "SEEDCAND cost {cost:.1} cand {c:.1} ratio {:.3}",
+                    c / cost.max(1e-6)
+                );
             }
             if c < cost * self.params.seed_win_ratio {
                 cost = c;
@@ -800,13 +861,7 @@ impl Estimator {
 
     /// Run the damped Gauss–Newton loop on the current state and leave the
     /// normal equations accumulated at the final state (GNC scale 1).
-    fn lm_loop(
-        &mut self,
-        model: &Model,
-        obs: &FrameObs,
-        prior_var: &[f64],
-        dt: f64,
-    ) -> f64 {
+    fn lm_loop(&mut self, model: &Model, obs: &FrameObs, prior_var: &[f64], dt: f64) -> f64 {
         let mut lambda = 1e-3;
         // Graduated non-convexity only when there is no temporal prior to
         // warm-start from (bootstrap / re-acquisition); a tracked frame
@@ -844,8 +899,7 @@ impl Estimator {
                 let mut trial = self.state.clone();
                 trial.apply_delta(model, &self.delta);
                 let fk_trial = model.fk(&trial);
-                let cost_trial =
-                    self.eval_cost(model, obs, &fk_trial, &trial, prior_var, dt);
+                let cost_trial = self.eval_cost(model, obs, &fk_trial, &trial, prior_var, dt);
                 if cost_trial.is_finite() && cost_trial <= cost {
                     self.state = trial;
                     fk = fk_trial;
@@ -896,7 +950,11 @@ impl Estimator {
         let mut var = vec![0.0; n];
         let mut ok = false;
         for eps in [1e-9, 1e-6, 1e-3] {
-            if self.dense.full_inverse(eps, &mut var, &mut self.cov).is_some() {
+            if self
+                .dense
+                .full_inverse(eps, &mut var, &mut self.cov)
+                .is_some()
+            {
                 ok = true;
                 break;
             }
@@ -1082,7 +1140,8 @@ impl Estimator {
                 point_jac(model, st, fk, kp.point, joint, &mut self.jac);
                 self.jac2.clear();
                 for &(i, v) in &self.jac {
-                    self.jac2.push((i, [v[0] * inv_lat, v[1] * inv_lat, v[2] * inv_s]));
+                    self.jac2
+                        .push((i, [v[0] * inv_lat, v[1] * inv_lat, v[2] * inv_s]));
                 }
                 self.dense.add_residual3(&self.jac2, r, w);
             }
@@ -1215,10 +1274,24 @@ impl Estimator {
                         // dθ/dv = (−v_z, 0, v_x) / (v_x² + v_z²)
                         let dth = [-v[2] / d2, 0.0, v[0] / d2];
                         self.jac.clear();
-                        point_jac(model, st, fk, ModelPoint::Joint(o.left), o.left, &mut self.jac);
+                        point_jac(
+                            model,
+                            st,
+                            fk,
+                            ModelPoint::Joint(o.left),
+                            o.left,
+                            &mut self.jac,
+                        );
                         let jl = std::mem::take(&mut self.jac);
                         self.jac.clear();
-                        point_jac(model, st, fk, ModelPoint::Joint(o.right), o.right, &mut self.jac);
+                        point_jac(
+                            model,
+                            st,
+                            fk,
+                            ModelPoint::Joint(o.right),
+                            o.right,
+                            &mut self.jac,
+                        );
                         let jr = std::mem::take(&mut self.jac);
                         self.row_out.clear();
                         for &(i, g) in &jl {
@@ -1367,28 +1440,52 @@ impl Estimator {
 
         // ---- shape prior ---------------------------------------------------------
         {
-            let sig = if self.shape_frozen { 0.005 } else { p.shape_sigma };
+            let sig = if self.shape_frozen {
+                0.005
+            } else {
+                p.shape_sigma
+            };
             let inv = 1.0 / sig;
-            let inv_scale = 1.0 / if self.shape_frozen { 0.005 } else { p.scale_sigma };
+            let inv_scale = 1.0
+                / if self.shape_frozen {
+                    0.005
+                } else {
+                    p.scale_sigma
+                };
             let r = st.scale * inv_scale;
             cost += r * r;
             if build {
-                self.dense.add_residual(&[(model.beta_scale, inv_scale)], r, 1.0);
+                self.dense
+                    .add_residual(&[(model.beta_scale, inv_scale)], r, 1.0);
             }
             for g in 0..NUM_LEN_GROUPS {
                 let r = st.len[g] * inv;
                 cost += r * r;
                 if build {
-                    self.dense.add_residual(&[(model.beta_len + g, inv)], r, 1.0);
+                    self.dense
+                        .add_residual(&[(model.beta_len + g, inv)], r, 1.0);
                 }
             }
-            let inv_r = 1.0 / if self.shape_frozen { 0.005 } else { p.radius_sigma };
+            let inv_r = 1.0
+                / if self.shape_frozen {
+                    0.005
+                } else {
+                    p.radius_sigma
+                };
             for g in 0..NUM_RAD_GROUPS {
                 let r = st.rad[g] * inv_r;
                 cost += r * r;
                 if build {
-                    self.dense.add_residual(&[(model.beta_rad + g, inv_r)], r, 1.0);
+                    self.dense
+                        .add_residual(&[(model.beta_rad + g, inv_r)], r, 1.0);
                 }
+            }
+            let inv_sh = 1.0 / if self.shape_frozen { 0.005 } else { p.shear_sigma };
+            let r = st.shear * inv_sh;
+            cost += r * r;
+            if build {
+                self.dense
+                    .add_residual(&[(model.beta_shear, inv_sh)], r, 1.0);
             }
         }
 
@@ -1498,7 +1595,12 @@ impl Estimator {
             let assoc_ok: Vec<bool> = model
                 .capsules
                 .iter()
-                .map(|c| !matches!(c.part, super::model::Part::LeftHand | super::model::Part::RightHand))
+                .map(|c| {
+                    !matches!(
+                        c.part,
+                        super::model::Part::LeftHand | super::model::Part::RightHand
+                    )
+                })
                 .collect();
             let allow = &self.surf_allow;
             let is_core: Vec<bool> = model
@@ -1532,7 +1634,13 @@ impl Estimator {
                 let mut best_hand = f64::INFINITY;
                 for (ci, g) in caps.iter().enumerate() {
                     let (lo, hi) = boxes[ci];
-                    if pt[0] < lo[0] || pt[0] > hi[0] || pt[1] < lo[1] || pt[1] > hi[1] || pt[2] < lo[2] || pt[2] > hi[2] {
+                    if pt[0] < lo[0]
+                        || pt[0] > hi[0]
+                        || pt[1] < lo[1]
+                        || pt[1] > hi[1]
+                        || pt[2] < lo[2]
+                        || pt[2] > hi[2]
+                    {
                         continue;
                     }
                     let (d, q, u, _rho) = g.dist(*pt);
@@ -1543,7 +1651,11 @@ impl Estimator {
                         best_hand = best_hand.min(d.abs());
                         continue;
                     }
-                    let slot = if is_core[ci] { &mut best_core } else { &mut best_limb };
+                    let slot = if is_core[ci] {
+                        &mut best_core
+                    } else {
+                        &mut best_limb
+                    };
                     if d.abs() < slot.1.abs() {
                         *slot = (ci, d, q, u);
                     }
@@ -1558,12 +1670,11 @@ impl Estimator {
                 // Behind / inside (d < 0, the model too fat or misplaced)
                 // keeps the full gate so the fit can still converge.
                 let front_m = self.params.surf_front_gate_m * self.gnc;
-                let core_ok = best_core.0 != usize::MAX
-                    && best_core.1 > -gate_m
-                    && best_core.1 < front_m;
+                let core_ok =
+                    best_core.0 != usize::MAX && best_core.1 > -gate_m && best_core.1 < front_m;
                 let limb_ok = best_limb.0 != usize::MAX && best_limb.1.abs() < gate_m;
-                let limb_allowed =
-                    limb_ok && (allow.is_empty() || allow.get(best_limb.0).copied().unwrap_or(true));
+                let limb_allowed = limb_ok
+                    && (allow.is_empty() || allow.get(best_limb.0).copied().unwrap_or(true));
                 // An OBSERVED limb competes fairly (nearest surface wins —
                 // an arm held in front of the chest keeps its own points).
                 // An unobserved limb never claims, but a point nearest to
@@ -1658,7 +1769,11 @@ impl Estimator {
                         // Forward differences (one extra distance per entry;
                         // the distance is smooth and the LM step tolerates
                         // O(ε) Jacobian error).
-                        const EPS: f64 = 1e-4;
+                        // 1e-5: the forward-difference bias is O(ε) and at
+                        // 1e-4 it pushed the estimator's own gradient-vs-FD
+                        // test past its 1e-3 tolerance on sheared-top
+                        // operating points (measured 0.2–0.3 % mismatch).
+                        const EPS: f64 = 1e-5;
                         let d0 = d;
                         for (blk, which) in [(0usize, 0usize), (3, 1), (6, 2)] {
                             for k in 0..3 {
@@ -1702,22 +1817,23 @@ impl Estimator {
                         self.row_idx.clear();
                         // row_acc doubles as "position in local list + 1".
                         let mut bloc: Vec<[f64; NA]> = Vec::with_capacity(64);
-                        let touch = |i: usize,
-                                         k: usize,
-                                         v: f64,
-                                         row_acc: &mut Vec<f64>,
-                                         row_idx: &mut Vec<usize>,
-                                         bloc: &mut Vec<[f64; NA]>| {
-                            let pos = if row_acc[i] == 0.0 {
-                                row_idx.push(i);
-                                bloc.push([0.0; NA]);
-                                row_acc[i] = bloc.len() as f64;
-                                bloc.len() - 1
-                            } else {
-                                row_acc[i] as usize - 1
+                        let touch =
+                            |i: usize,
+                             k: usize,
+                             v: f64,
+                             row_acc: &mut Vec<f64>,
+                             row_idx: &mut Vec<usize>,
+                             bloc: &mut Vec<[f64; NA]>| {
+                                let pos = if row_acc[i] == 0.0 {
+                                    row_idx.push(i);
+                                    bloc.push([0.0; NA]);
+                                    row_acc[i] = bloc.len() as f64;
+                                    bloc.len() - 1
+                                } else {
+                                    row_acc[i] as usize - 1
+                                };
+                                bloc[pos][k] += v;
                             };
-                            bloc[pos][k] += v;
-                        };
                         for &(i, v) in &self.cap_jac[3 * ci] {
                             for k in 0..3 {
                                 touch(i, k, v[k], &mut self.row_acc, &mut self.row_idx, &mut bloc);
@@ -1725,12 +1841,26 @@ impl Estimator {
                         }
                         for &(i, v) in &self.cap_jac[3 * ci + 1] {
                             for k in 0..3 {
-                                touch(i, 3 + k, v[k], &mut self.row_acc, &mut self.row_idx, &mut bloc);
+                                touch(
+                                    i,
+                                    3 + k,
+                                    v[k],
+                                    &mut self.row_acc,
+                                    &mut self.row_idx,
+                                    &mut bloc,
+                                );
                             }
                         }
                         for &(i, v) in &self.cap_jac[3 * ci + 2] {
                             for k in 0..3 {
-                                touch(i, 6 + k, v[k], &mut self.row_acc, &mut self.row_idx, &mut bloc);
+                                touch(
+                                    i,
+                                    6 + k,
+                                    v[k],
+                                    &mut self.row_acc,
+                                    &mut self.row_idx,
+                                    &mut bloc,
+                                );
                             }
                         }
                         touch(
@@ -1807,7 +1937,14 @@ fn locked_params(model: &Model) -> Vec<bool> {
 }
 
 /// Append `sign ×` the point Jacobian of joint `j` to `out`.
-fn point_y_jac(model: &Model, st: &State, fk: &Fk, j: usize, sign: f64, out: &mut Vec<(usize, V3)>) {
+fn point_y_jac(
+    model: &Model,
+    st: &State,
+    fk: &Fk,
+    j: usize,
+    sign: f64,
+    out: &mut Vec<(usize, V3)>,
+) {
     let mut tmp = Vec::with_capacity(48);
     model.point_jacobian(st, fk, PointRef::Joint(j), &mut tmp);
     for (i, v) in tmp {
@@ -1864,6 +2001,7 @@ pub fn param_difference(model: &Model, a: &State, b: &State) -> Vec<f64> {
     for g in 0..NUM_RAD_GROUPS {
         d[model.beta_rad + g] = a.rad[g] - b.rad[g];
     }
+    d[model.beta_shear] = a.shear - b.shear;
     d
 }
 
@@ -1881,7 +2019,14 @@ pub fn resolve_point(model: &Model, fk: &Fk, mp: ModelPoint) -> (usize, V3) {
 
 /// Jacobian of a model point (dispatches attached points, which move with
 /// their joint's rotation but carry no shape dependence of their own).
-fn point_jac(model: &Model, st: &State, fk: &Fk, mp: ModelPoint, joint: usize, out: &mut Vec<(usize, V3)>) {
+fn point_jac(
+    model: &Model,
+    st: &State,
+    fk: &Fk,
+    mp: ModelPoint,
+    joint: usize,
+    out: &mut Vec<(usize, V3)>,
+) {
     match mp {
         ModelPoint::Joint(j) => model.point_jacobian(st, fk, PointRef::Joint(j), out),
         ModelPoint::Site(s) => model.point_jacobian(st, fk, PointRef::Site(s), out),

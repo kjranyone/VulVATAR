@@ -439,7 +439,10 @@ mod tests {
     fn first_pressure_signal_triggers_light_pressure() {
         let t0 = Instant::now();
         let mut budget = RuntimeGpuBudget::new(t0);
-        budget.update(&render_overrun_measurements(), t0 + Duration::from_millis(16));
+        budget.update(
+            &render_overrun_measurements(),
+            t0 + Duration::from_millis(16),
+        );
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
         assert_eq!(
             budget.render_fps_target(),
@@ -452,7 +455,10 @@ mod tests {
     fn export_pool_saturation_is_a_pressure_signal() {
         let t0 = Instant::now();
         let mut budget = RuntimeGpuBudget::new(t0);
-        budget.update(&pool_saturated_measurements(), t0 + Duration::from_millis(16));
+        budget.update(
+            &pool_saturated_measurements(),
+            t0 + Duration::from_millis(16),
+        );
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
         assert_eq!(
             budget.last_transition_reason(),
@@ -489,7 +495,10 @@ mod tests {
         // Immediately spike drops above the heavy threshold — no dwell needed.
         budget.update(&heavy_drop_measurements(), t0 + Duration::from_millis(16));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
-        assert_eq!(budget.last_transition_reason(), TransitionReason::OutputDrops);
+        assert_eq!(
+            budget.last_transition_reason(),
+            TransitionReason::OutputDrops
+        );
     }
 
     #[test]
@@ -728,20 +737,11 @@ mod tests {
         let mut budget = RuntimeGpuBudget::new(t0);
         budget.update(&render_overrun_measurements(), t0);
         // Halfway through recovery, pressure returns.
-        budget.update(
-            &healthy_measurements(),
-            t0 + Duration::from_secs(15),
-        );
-        budget.update(
-            &render_overrun_measurements(),
-            t0 + Duration::from_secs(20),
-        );
+        budget.update(&healthy_measurements(), t0 + Duration::from_secs(15));
+        budget.update(&render_overrun_measurements(), t0 + Duration::from_secs(20));
         // Another 30s pass — but the clean streak restarted at t+20s so
         // recovery hasn't fully completed yet.
-        budget.update(
-            &healthy_measurements(),
-            t0 + Duration::from_secs(30),
-        );
+        budget.update(&healthy_measurements(), t0 + Duration::from_secs(30));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
     }
 
@@ -799,7 +799,10 @@ mod tests {
         let mut budget = RuntimeGpuBudget::new(t0);
         // Move into PressureLight and arm pressure_since at t0+5s.
         budget.update(&render_overrun_measurements(), t0);
-        budget.update(&render_overrun_measurements(), t0 + LIGHT_TO_HEAVY_DWELL / 2);
+        budget.update(
+            &render_overrun_measurements(),
+            t0 + LIGHT_TO_HEAVY_DWELL / 2,
+        );
         // Now travel "backward" by calling update with `now = t0` again
         // (simulates a clock adjustment). pressure_since was in the
         // future; the guard must reset it to `now` so dwell can advance.

@@ -518,7 +518,9 @@ pub enum ClothLoDLevel {
     Full,
     Half,
     Quarter,
-    Custom { particle_ratio: f32 },
+    Custom {
+        particle_ratio: f32,
+    },
 }
 
 impl ClothLoDLevel {

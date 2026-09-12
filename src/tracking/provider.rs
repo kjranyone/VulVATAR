@@ -94,11 +94,7 @@ pub trait PoseProvider {
     /// the native realsense toolchain. Only the live D435 *source*
     /// (`build_metric_frame_from_d435`) needs the `realsense` feature.
     #[cfg(feature = "inference")]
-    fn set_external_depth(
-        &mut self,
-        _depth: crate::tracking::metric_frame::MetricDepthFrame,
-    ) {
-    }
+    fn set_external_depth(&mut self, _depth: crate::tracking::metric_frame::MetricDepthFrame) {}
 }
 
 /// Build the production pose provider: RTMW3D, shaped by the user's

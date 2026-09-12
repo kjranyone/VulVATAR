@@ -70,9 +70,7 @@ impl PermissiveSharedMemorySecurity {
             )
         };
         if ok == 0 || descriptor.is_null() {
-            return Err(
-                "ConvertStringSecurityDescriptorToSecurityDescriptorW failed".into(),
-            );
+            return Err("ConvertStringSecurityDescriptorToSecurityDescriptorW failed".into());
         }
 
         let attributes = RawSecurityAttributes {
@@ -119,8 +117,7 @@ impl Drop for PermissiveSharedMemorySecurity {
 const _: () = {
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     assert!(
-        std::mem::size_of::<RawSecurityAttributes>()
-            == std::mem::size_of::<SECURITY_ATTRIBUTES>()
+        std::mem::size_of::<RawSecurityAttributes>() == std::mem::size_of::<SECURITY_ATTRIBUTES>()
     );
     assert!(
         std::mem::align_of::<RawSecurityAttributes>()

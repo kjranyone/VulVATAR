@@ -30,9 +30,7 @@ use std::sync::Arc;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
-use crate::asset::{
-    AvatarAsset, Mat4, MeshId, MeshPrimitiveAsset, PrimitiveId,
-};
+use crate::asset::{AvatarAsset, Mat4, MeshId, MeshPrimitiveAsset, PrimitiveId};
 
 /// Anchor mode: push this vertex OUTWARD off the parent surface until it
 /// is at least `min_clearance` along the parent vertex's outward normal.
@@ -50,7 +48,9 @@ pub const SKIN_ANCHOR_CONTAINMENT: u32 = 1;
 /// Per-vertex skin anchor constraint.
 ///
 /// std430 alignment: 16 bytes (`uvec4`-aligned).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Serialize, Deserialize, bytemuck::Pod, bytemuck::Zeroable,
+)]
 #[repr(C)]
 pub struct SkinAnchor {
     /// Index of the nearest body vertex in the body primitive's vertex buffer.
@@ -192,9 +192,12 @@ pub fn compute_rest_world_vertices(
                     let j = vd.joint_indices[i][k] as usize;
                     if j < skinning.len() {
                         let sm = &skinning[j];
-                        let tx = sm[0][0] * pos[0] + sm[1][0] * pos[1] + sm[2][0] * pos[2] + sm[3][0];
-                        let ty = sm[0][1] * pos[0] + sm[1][1] * pos[1] + sm[2][1] * pos[2] + sm[3][1];
-                        let tz = sm[0][2] * pos[0] + sm[1][2] * pos[1] + sm[2][2] * pos[2] + sm[3][2];
+                        let tx =
+                            sm[0][0] * pos[0] + sm[1][0] * pos[1] + sm[2][0] * pos[2] + sm[3][0];
+                        let ty =
+                            sm[0][1] * pos[0] + sm[1][1] * pos[1] + sm[2][1] * pos[2] + sm[3][1];
+                        let tz =
+                            sm[0][2] * pos[0] + sm[1][2] * pos[1] + sm[2][2] * pos[2] + sm[3][2];
                         wp[0] += w * tx;
                         wp[1] += w * ty;
                         wp[2] += w * tz;
@@ -216,7 +219,7 @@ pub fn compute_rest_world_vertices(
             wp[0] /= total_w;
             wp[1] /= total_w;
             wp[2] /= total_w;
-            let nlen = (wn[0]*wn[0] + wn[1]*wn[1] + wn[2]*wn[2]).sqrt();
+            let nlen = (wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2]).sqrt();
             if nlen > 1e-4 {
                 wn[0] /= nlen;
                 wn[1] /= nlen;
@@ -283,13 +286,13 @@ impl SpatialGrid {
                         for &b_idx in indices {
                             let (bp, bn) = body_verts[b_idx as usize];
                             // Normal compatibility: clothing normal and body normal should point outward together
-                            let dot_n = normal[0]*bn[0] + normal[1]*bn[1] + normal[2]*bn[2];
+                            let dot_n = normal[0] * bn[0] + normal[1] * bn[1] + normal[2] * bn[2];
                             if dot_n < 0.1 {
                                 continue;
                             }
 
                             let diff = [p[0] - bp[0], p[1] - bp[1], p[2] - bp[2]];
-                            let d2 = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2];
+                            let d2 = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
                             if d2 < best_d2 {
                                 best_d2 = d2;
                                 best_idx = Some(b_idx);
@@ -317,7 +320,12 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
 
     // Compute rest-pose skinning matrices across skeleton nodes
     let node_count = asset.skeleton.nodes.len();
-    let locals: Vec<_> = asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+    let locals: Vec<_> = asset
+        .skeleton
+        .nodes
+        .iter()
+        .map(|n| n.rest_local.clone())
+        .collect();
     let mut globals = vec![crate::asset::identity_matrix(); node_count];
     crate::avatar::pose::compute_global_transforms(&asset.skeleton, &locals, &mut globals);
 
@@ -416,7 +424,8 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                     let is_skirt_vert = indices.iter().enumerate().any(|(slot, &ji)| {
                         if (ji as usize) < asset.skeleton.nodes.len() {
                             let node_name = asset.skeleton.nodes[ji as usize].name.to_lowercase();
-                            node_name.contains("skirt") && vd.joint_weights.get(vi).map_or(false, |w| w[slot] > 0.1)
+                            node_name.contains("skirt")
+                                && vd.joint_weights.get(vi).map_or(false, |w| w[slot] > 0.1)
                         } else {
                             false
                         }
@@ -490,8 +499,10 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
 
 /// Helper: computes cosine similarity between two vertex 4-bone weight sets.
 pub fn compute_bone_weight_similarity(
-    indices_a: &[u16; 4], weights_a: &[f32; 4],
-    indices_b: &[u16; 4], weights_b: &[f32; 4],
+    indices_a: &[u16; 4],
+    weights_a: &[f32; 4],
+    indices_b: &[u16; 4],
+    weights_b: &[f32; 4],
 ) -> f32 {
     let mut dot = 0.0f32;
     let mut len_a2 = 0.0f32;
@@ -519,9 +530,12 @@ pub fn compute_bone_weight_similarity(
 
 /// Helper: checks whether two 3D Axis-Aligned Bounding Boxes intersect.
 fn aabb_intersects(min_a: [f32; 3], max_a: [f32; 3], min_b: [f32; 3], max_b: [f32; 3]) -> bool {
-    min_a[0] <= max_b[0] && max_a[0] >= min_b[0]
-        && min_a[1] <= max_b[1] && max_a[1] >= min_b[1]
-        && min_a[2] <= max_b[2] && max_a[2] >= min_b[2]
+    min_a[0] <= max_b[0]
+        && max_a[0] >= min_b[0]
+        && min_a[1] <= max_b[1]
+        && max_a[1] >= min_b[1]
+        && min_a[2] <= max_b[2]
+        && max_a[2] >= min_b[2]
 }
 
 /// Spatial grid over a layer's rest-pose world vertices for the layered
@@ -582,7 +596,8 @@ fn query_layered_nearest(
                         let (tp, tn) = target_verts[idx as usize];
                         // Normal compatibility: the two surfaces must
                         // face the same way at the pairing point.
-                        let dot_n = query_nrm[0] * tn[0] + query_nrm[1] * tn[1] + query_nrm[2] * tn[2];
+                        let dot_n =
+                            query_nrm[0] * tn[0] + query_nrm[1] * tn[1] + query_nrm[2] * tn[2];
                         if dot_n < 0.0 {
                             continue;
                         }
@@ -597,7 +612,11 @@ fn query_layered_nearest(
                             continue;
                         }
 
-                        let diff = [query_pos[0] - tp[0], query_pos[1] - tp[1], query_pos[2] - tp[2]];
+                        let diff = [
+                            query_pos[0] - tp[0],
+                            query_pos[1] - tp[1],
+                            query_pos[2] - tp[2],
+                        ];
                         let d2 = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
                         let score = d2 + 0.0003 * (1.0 - w_sim);
                         if score < best_score {
@@ -628,7 +647,11 @@ fn query_layered_nearest(
 /// The two directions live in separate slots (`skin_anchors` /
 /// `body_primitive_id` vs `containment_anchors` / `containment_primitive_id`),
 /// so the middle layer of a 3+ layer stack carries both at once.
-pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat4], skinning: &[Mat4]) {
+pub fn generate_layered_clothing_anchors(
+    asset: &mut AvatarAsset,
+    globals: &[Mat4],
+    skinning: &[Mat4],
+) {
     struct PrimCandidate {
         mesh_idx: usize,
         prim_idx: usize,
@@ -643,7 +666,11 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
 
     for (m_idx, mesh) in asset.meshes.iter().enumerate() {
         let m_name = mesh.name.to_lowercase();
-        if m_name.contains("hair") || m_name.contains("face") || m_name.contains("eye") || m_name.contains("brow") {
+        if m_name.contains("hair")
+            || m_name.contains("face")
+            || m_name.contains("eye")
+            || m_name.contains("brow")
+        {
             continue;
         }
 
@@ -677,8 +704,12 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
             let mut aabb_max = [f32::MIN; 3];
             for &(p, _) in &world_verts {
                 for c in 0..3 {
-                    if p[c] < aabb_min[c] { aabb_min[c] = p[c]; }
-                    if p[c] > aabb_max[c] { aabb_max[c] = p[c]; }
+                    if p[c] < aabb_min[c] {
+                        aabb_min[c] = p[c];
+                    }
+                    if p[c] > aabb_max[c] {
+                        aabb_max[c] = p[c];
+                    }
                 }
             }
 
@@ -706,8 +737,10 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
     for i in 0..candidate_count {
         for j in (i + 1)..candidate_count {
             if !aabb_intersects(
-                candidates[i].aabb_min, candidates[i].aabb_max,
-                candidates[j].aabb_min, candidates[j].aabb_max,
+                candidates[i].aabb_min,
+                candidates[i].aabb_max,
+                candidates[j].aabb_min,
+                candidates[j].aabb_max,
             ) {
                 continue;
             }
@@ -715,15 +748,25 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
             let prim_a = &candidates[i];
             let prim_b = &candidates[j];
 
-            let a_vd = asset.meshes[prim_a.mesh_idx].primitives[prim_a.prim_idx].vertices.as_ref().unwrap();
-            let b_vd = asset.meshes[prim_b.mesh_idx].primitives[prim_b.prim_idx].vertices.as_ref().unwrap();
+            let a_vd = asset.meshes[prim_a.mesh_idx].primitives[prim_a.prim_idx]
+                .vertices
+                .as_ref()
+                .unwrap();
+            let b_vd = asset.meshes[prim_b.mesh_idx].primitives[prim_b.prim_idx]
+                .vertices
+                .as_ref()
+                .unwrap();
 
             // Build spatial grid for candidate A
             let cell_size = 0.04f32;
             let inv_cell = 1.0 / cell_size;
             let mut grid_a: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
             for (idx, &(p, _)) in prim_a.world_verts.iter().enumerate() {
-                let k = ((p[0] * inv_cell).floor() as i32, (p[1] * inv_cell).floor() as i32, (p[2] * inv_cell).floor() as i32);
+                let k = (
+                    (p[0] * inv_cell).floor() as i32,
+                    (p[1] * inv_cell).floor() as i32,
+                    (p[2] * inv_cell).floor() as i32,
+                );
                 grid_a.entry(k).or_default().push(idx as u32);
             }
 
@@ -735,7 +778,11 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
             let step_b = (prim_b.world_verts.len() / 500).max(1);
             for b_idx in (0..prim_b.world_verts.len()).step_by(step_b) {
                 let (bp, bn) = prim_b.world_verts[b_idx];
-                let ck = ((bp[0] * inv_cell).floor() as i32, (bp[1] * inv_cell).floor() as i32, (bp[2] * inv_cell).floor() as i32);
+                let ck = (
+                    (bp[0] * inv_cell).floor() as i32,
+                    (bp[1] * inv_cell).floor() as i32,
+                    (bp[2] * inv_cell).floor() as i32,
+                );
                 let mut best_a = None;
                 let mut best_d2 = max_r2;
 
@@ -745,17 +792,24 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
                             if let Some(list) = grid_a.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz)) {
                                 for &a_idx in list {
                                     let (ap, an) = prim_a.world_verts[a_idx as usize];
-                                    let dot_n = bn[0]*an[0] + bn[1]*an[1] + bn[2]*an[2];
-                                    if dot_n < 0.0 { continue; }
+                                    let dot_n = bn[0] * an[0] + bn[1] * an[1] + bn[2] * an[2];
+                                    if dot_n < 0.0 {
+                                        continue;
+                                    }
 
                                     let sim = compute_bone_weight_similarity(
-                                        &b_vd.joint_indices[b_idx], &b_vd.joint_weights[b_idx],
-                                        &a_vd.joint_indices[a_idx as usize], &a_vd.joint_weights[a_idx as usize],
+                                        &b_vd.joint_indices[b_idx],
+                                        &b_vd.joint_weights[b_idx],
+                                        &a_vd.joint_indices[a_idx as usize],
+                                        &a_vd.joint_weights[a_idx as usize],
                                     );
-                                    if sim < 0.2 { continue; }
+                                    if sim < 0.2 {
+                                        continue;
+                                    }
 
                                     let diff = [bp[0] - ap[0], bp[1] - ap[1], bp[2] - ap[2]];
-                                    let d2 = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2];
+                                    let d2 =
+                                        diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
                                     if d2 < best_d2 {
                                         best_d2 = d2;
                                         best_a = Some(a_idx as usize);
@@ -770,12 +824,20 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
                     let (ap, _an) = prim_a.world_verts[a_idx];
                     let prim_bone_a = a_vd.joint_indices[a_idx][0] as usize;
                     let bone_pos = if prim_bone_a < globals.len() {
-                        [globals[prim_bone_a][3][0], globals[prim_bone_a][3][1], globals[prim_bone_a][3][2]]
+                        [
+                            globals[prim_bone_a][3][0],
+                            globals[prim_bone_a][3][1],
+                            globals[prim_bone_a][3][2],
+                        ]
                     } else {
                         [0.0, 0.0, 0.0]
                     };
-                    let dist_b = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&bp, &bone_pos));
-                    let dist_a = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&ap, &bone_pos));
+                    let dist_b = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(
+                        &bp, &bone_pos,
+                    ));
+                    let dist_a = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(
+                        &ap, &bone_pos,
+                    ));
                     let radial_diff = dist_b - dist_a;
                     overlap_pairs.push(radial_diff);
                 }
@@ -846,8 +908,14 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
         let inv_cell = 1.0 / cell_size;
         let inner_grid = build_layer_grid(&inner_cand.world_verts, cell_size);
 
-        let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx].vertices.as_ref().unwrap();
-        let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx].vertices.as_ref().unwrap();
+        let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]
+            .vertices
+            .as_ref()
+            .unwrap();
+        let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx]
+            .vertices
+            .as_ref()
+            .unwrap();
 
         let mut anchors = Vec::with_capacity(outer_cand.world_verts.len());
         let mut bound_count = 0usize;
@@ -870,7 +938,7 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
             if let Some(idx) = best_i {
                 let (ip, inrm) = inner_cand.world_verts[idx as usize];
                 let diff = [op[0] - ip[0], op[1] - ip[1], op[2] - ip[2]];
-                let raw_c = diff[0]*inrm[0] + diff[1]*inrm[1] + diff[2]*inrm[2];
+                let raw_c = diff[0] * inrm[0] + diff[1] * inrm[1] + diff[2] * inrm[2];
                 let min_clearance = raw_c.max(0.006);
                 anchors.push(SkinAnchor {
                     body_vertex_idx: idx,
@@ -889,7 +957,9 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
                 "clearance: established {} layered anchors on outer '{}' (prim {:?})",
                 bound_count, outer_cand.mesh_name, outer_cand.prim_id
             );
-            let prim_mut = Arc::make_mut(&mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]);
+            let prim_mut = Arc::make_mut(
+                &mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx],
+            );
             prim_mut.skin_anchors = Some(anchors);
             prim_mut.body_primitive_id = Some(inner_cand.prim_id);
         }
@@ -904,9 +974,11 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
     // inner layer therefore also gets containment anchors referencing
     // the outer surface: the transform shader clamps those vertices
     // back inside when their clearance along the outer normal exceeds
-    // the rest-derived target (`rest_clearance - CONTAINMENT_SLACK`),
-    // so the constraint never fires on the rest pose itself, however
-    // tight the layer gap.
+    // the rest-derived target (`rest_clearance + CONTAINMENT_SLACK`).
+    // The target sits ABOVE the rest clearance so the constraint never
+    // fires on the rest pose (however tight the layer gap) and only
+    // pulls a vertex back once it drifts more than the slack beyond
+    // its rest offset — preserving the authored layer separation.
     //
     // Containment anchors live in their own `containment_anchors` /
     // `containment_primitive_id` slots, so the middle layer of a 3+
@@ -925,8 +997,8 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
 
     for &(outer_idx, inner_idx, _n_overlap) in &pairs {
         {
-            let inner_check =
-                &asset.meshes[candidates[inner_idx].mesh_idx].primitives[candidates[inner_idx].prim_idx];
+            let inner_check = &asset.meshes[candidates[inner_idx].mesh_idx].primitives
+                [candidates[inner_idx].prim_idx];
             if inner_check.containment_anchors.is_some()
                 || inner_check.containment_primitive_id.is_some()
             {
@@ -974,7 +1046,7 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
                 let rest_c = diff[0] * on[0] + diff[1] * on[1] + diff[2] * on[2];
                 anchors.push(SkinAnchor {
                     body_vertex_idx: idx,
-                    min_clearance: rest_c - CONTAINMENT_SLACK,
+                    min_clearance: rest_c + CONTAINMENT_SLACK,
                     weight: 1.0,
                     mode: SKIN_ANCHOR_CONTAINMENT,
                 });
@@ -990,7 +1062,8 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
                 bound_count, inner_cand.mesh_name, inner_cand.prim_id, outer_cand.mesh_name
             );
             let prim_mut = Arc::make_mut(
-                &mut asset.meshes[candidates[inner_idx].mesh_idx].primitives[candidates[inner_idx].prim_idx],
+                &mut asset.meshes[candidates[inner_idx].mesh_idx].primitives
+                    [candidates[inner_idx].prim_idx],
             );
             prim_mut.containment_anchors = Some(anchors);
             prim_mut.containment_primitive_id = Some(outer_cand.prim_id);

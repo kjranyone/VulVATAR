@@ -413,8 +413,7 @@ fn v0_synthetic_extension_parses_humanoid_and_blendshapes() {
     nodes[4].children = vec![NodeId(5)];
     nodes[5].children = vec![NodeId(6)];
 
-    let mesh_to_node: HashMap<usize, usize> =
-        [(0usize, 2usize)].into_iter().collect();
+    let mesh_to_node: HashMap<usize, usize> = [(0usize, 2usize)].into_iter().collect();
 
     let parsed =
         super::extensions::parse_v0_extensions(&raw, &nodes, &mesh_to_node).expect("v0 parse");
@@ -547,8 +546,14 @@ fn v1_synthetic_extension_parses_preset_expressions() {
         .map(|e| e.name.as_str())
         .collect();
     assert!(names.contains("aa"));
-    assert!(names.contains("blinkLeft"), "blinkLeft preset key preserved");
-    assert!(names.contains("MyCustom"), "custom expression keyed by map key");
+    assert!(
+        names.contains("blinkLeft"),
+        "blinkLeft preset key preserved"
+    );
+    assert!(
+        names.contains("MyCustom"),
+        "custom expression keyed by map key"
+    );
 
     assert_eq!(parsed.springs.len(), 1);
     assert_eq!(parsed.springs[0].joints.len(), 2);

@@ -252,8 +252,7 @@ impl GuiApp {
         // skeleton + bind pose without mutating the live avatar
         // instance — the live render keeps using the tracked pose
         // while the snapshot captures the reference pose.
-        let skinning_matrices =
-            calibration::target_pose_skinning_matrices(&avatar.asset, mode);
+        let skinning_matrices = calibration::target_pose_skinning_matrices(&avatar.asset, mode);
 
         let aspect = extent[0] as f32 / extent[1].max(1) as f32;
         let fov_deg: f32 = 30.0;
@@ -364,10 +363,8 @@ impl GuiApp {
                 let w = thumb.width as usize;
                 let h = thumb.height as usize;
                 if w > 0 && h > 0 && thumb.rgba_pixels.len() == w * h * 4 {
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [w, h],
-                        &thumb.rgba_pixels,
-                    );
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied([w, h], &thumb.rgba_pixels);
                     let options = egui::TextureOptions {
                         magnification: egui::TextureFilter::Linear,
                         minification: egui::TextureFilter::Linear,
@@ -376,11 +373,8 @@ impl GuiApp {
                     if let Some(ref mut handle) = self.calibration.target_pose_texture {
                         handle.set(color_image, options);
                     } else {
-                        let handle = ctx.load_texture(
-                            "calibration_target_pose",
-                            color_image,
-                            options,
-                        );
+                        let handle =
+                            ctx.load_texture("calibration_target_pose", color_image, options);
                         self.calibration.target_pose_texture = Some(handle);
                     }
                 }

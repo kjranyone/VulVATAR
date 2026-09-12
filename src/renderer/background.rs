@@ -50,8 +50,8 @@ use crate::renderer::frame_input::RenderFrameInput;
 /// lookup); tune those first if the background shows up in frame profiles.
 mod background_fs {
     vulkano_shaders::shader! {
-                ty: "fragment",
-                src: r"
+                    ty: "fragment",
+                    src: r"
 #version 450
 
 layout(location = 0) in vec2 frag_uv;
@@ -184,7 +184,7 @@ void main() {
     out_color = vec4(col * pc.intensity, 1.0);
 }
 "
-            }
+                }
 }
 
 /// Push-constant mirror of the shader's `Push` block (96 bytes, under the

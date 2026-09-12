@@ -16,8 +16,8 @@ use vulvatar_lib::tracking::fusion::estimator::Intrinsics;
 use vulvatar_lib::tracking::fusion::math::*;
 use vulvatar_lib::tracking::fusion::model::*;
 use vulvatar_lib::tracking::fusion::provider::FusionProvider;
-use vulvatar_lib::tracking::provider::{PoseProvider, TrackingPipelineConfig};
 use vulvatar_lib::tracking::metric_frame::MetricDepthFrame;
+use vulvatar_lib::tracking::provider::{PoseProvider, TrackingPipelineConfig};
 use vulvatar_lib::tracking::CameraIntrinsics;
 
 use vulvatar_lib::asset::Transform;
@@ -47,7 +47,9 @@ fn parse_npy_u16(bytes: &[u8]) -> Result<(usize, usize, Vec<u16>), String> {
     let header = std::str::from_utf8(&bytes[10.min(data_start)..data_start])
         .map_err(|e| format!("npy header utf8: {e}"))?;
     if !header.contains("<u2") && !header.contains("|u2") {
-        return Err(format!("expected little-endian u16 (<u2), header: {header}"));
+        return Err(format!(
+            "expected little-endian u16 (<u2), header: {header}"
+        ));
     }
     let shape = header
         .split("'shape':")
@@ -268,13 +270,13 @@ fn main() -> Result<(), String> {
             render_every = 5;
         }
     }
-    let dir = PathBuf::from(args.first().ok_or("usage: diagnose_fusion_replay <dir> [out_dir] [--render N]")?);
-    let out_dir = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("diagnostics/fusion").join(dir.file_name().unwrap_or_default())
-        });
+    let dir = PathBuf::from(
+        args.first()
+            .ok_or("usage: diagnose_fusion_replay <dir> [out_dir] [--render N]")?,
+    );
+    let out_dir = args.get(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("diagnostics/fusion").join(dir.file_name().unwrap_or_default())
+    });
     if out_dir.starts_with("validation_images") {
         return Err("refusing to write under validation_images/".into());
     }
@@ -283,7 +285,11 @@ fn main() -> Result<(), String> {
     let mut pairs: Vec<(u64, PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| format!("read_dir: {e}"))? {
         let p = entry.map_err(|e| e.to_string())?.path();
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         if let Some(stem) = name.strip_suffix("_color.png") {
             let depth = p.with_file_name(format!("{stem}_depth_mm.npy"));
             if depth.exists() {
@@ -299,7 +305,10 @@ fn main() -> Result<(), String> {
     }
     pairs.sort_by_key(|(i, _, _)| *i);
     if pairs.is_empty() {
-        return Err(format!("no *_color.png + *_depth_mm.npy pairs in {}", dir.display()));
+        return Err(format!(
+            "no *_color.png + *_depth_mm.npy pairs in {}",
+            dir.display()
+        ));
     }
 
     let mut cfg = TrackingPipelineConfig::default();
@@ -318,13 +327,22 @@ fn main() -> Result<(), String> {
             .map_err(|e| format!("load VRM: {e:?}"))?;
         let mut renderer = VulkanRenderer::new();
         renderer.initialize();
-        let rest_locals: Vec<Transform> =
-            asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        let rest_locals: Vec<Transform> = asset
+            .skeleton
+            .nodes
+            .iter()
+            .map(|n| n.rest_local.clone())
+            .collect();
         Some((asset, renderer, rest_locals, RetargetState::default()))
     } else {
         None
     };
-    eprintln!("provider: {} — {} frames → {}", provider.label(), pairs.len(), out_dir.display());
+    eprintln!(
+        "provider: {} — {} frames → {}",
+        provider.label(),
+        pairs.len(),
+        out_dir.display()
+    );
 
     // VULVATAR_REPLAY_VISDUMP=1: per-frame × per-keypoint dump of the
     // detector's raw output (SimCC peak stats), the score after each
@@ -338,7 +356,7 @@ fn main() -> Result<(), String> {
     let mut vis_header_done = false;
 
     let mut csv = String::new();
-    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
+    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,shear,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
 
     let mut torso_yaws = Vec::new();
     let mut torso_pitches = Vec::new();
@@ -380,7 +398,12 @@ fn main() -> Result<(), String> {
             eprint!("frame {idx} kps:");
             for i in [0usize, 5, 6, 7, 8, 9, 10, 11, 12] {
                 if let Some((nx, ny, sc)) = k.get(i) {
-                    eprint!(" {i}:({:.0},{:.0},{:.2})", nx * cw as f32, ny * ch as f32, sc);
+                    eprint!(
+                        " {i}:({:.0},{:.0},{:.2})",
+                        nx * cw as f32,
+                        ny * ch as f32,
+                        sc
+                    );
                 }
             }
             eprintln!();
@@ -393,26 +416,37 @@ fn main() -> Result<(), String> {
                 vis_csv.push('\n');
                 vis_header_done = true;
             }
-            let (cx, cy, cw_, ch_) = provider.last_crop.unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
+            let (cx, cy, cw_, ch_) =
+                provider
+                    .last_crop
+                    .unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
             for (j, kp) in provider.last_raw_joints.iter().enumerate() {
                 let u = (kp.nx * cw as f32).round() as i64;
                 let v = (kp.ny * ch as f32).round() as i64;
                 let dz = depth_median_3x3(&depth_pts, cw, ch, u, v);
-                let (pv, sd) = provider.last_vis.get(j).copied().unwrap_or((f32::NAN, f32::NAN));
+                let (pv, sd) = provider
+                    .last_vis
+                    .get(j)
+                    .copied()
+                    .unwrap_or((f32::NAN, f32::NAN));
                 let (sz, sb, sa) = provider
                     .last_silhouette
                     .map(|(z, b, a)| (z, b as u8, a))
                     .unwrap_or((f64::NAN, 0, f64::NAN));
-                let (hx1, hy1, hx2, hy2) = provider
-                    .last_crop_hint
-                    .unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
+                let (hx1, hy1, hx2, hy2) =
+                    provider
+                        .last_crop_hint
+                        .unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
                 vis_csv.push_str(&format!(
                     "{idx},{j},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4},{:.3},{},{:.4},{:.1},{:.1},{:.1},{:.1}",
                     kp.nx, kp.ny, kp.nz, kp.score, kp.sx, kp.sy, kp.second_x, kp.second_y,
                     kp.half_x, kp.half_y, kp.zscore, cx, cy, cw_, ch_, dz, pv, sd, sz, sb, sa, hx1, hy1, hx2, hy2
                 ));
                 for (_, scores) in &provider.last_kp_stages {
-                    vis_csv.push_str(&format!(",{:.4}", scores.get(j).copied().unwrap_or(f32::NAN)));
+                    vis_csv.push_str(&format!(
+                        ",{:.4}",
+                        scores.get(j).copied().unwrap_or(f32::NAN)
+                    ));
                 }
                 vis_csv.push('\n');
             }
@@ -464,13 +498,14 @@ fn main() -> Result<(), String> {
             let r = &est.state.rad;
             csv.pop();
             csv.push_str(&format!(
-                ",{l0:.3},{l1:.3},{l2:.3},{l3:.3},{l4:.3},{l5:.3},{l6:.3},{l7:.3},{r0:.3},{r1:.3},{r2:.3},\
+                ",{l0:.3},{l1:.3},{l2:.3},{l3:.3},{l4:.3},{l5:.3},{l6:.3},{l7:.3},{r0:.3},{r1:.3},{r2:.3},{shr:.3},\
 {c2d:.1},{c3d:.1},{ccl:.1},{cpr:.1},{cte:.1},{m2d:.2},{m3d:.4},{mcl:.4},\
 {ds0:.3},{ds1:.3},{ds2:.3},{ds3:.3},{ds4:.3},{ds5:.3},\
 {lkx:.3},{lky:.3},{lkz:.3},{rkx:.3},{rky:.3},{rkz:.3},\
 {lax:.3},{lay:.3},{laz:.3},{rax:.3},{ray:.3},{raz:.3}\n",
                 l0 = l[0], l1 = l[1], l2 = l[2], l3 = l[3], l4 = l[4], l5 = l[5], l6 = l[6], l7 = l[7],
                 r0 = r[0], r1 = r[1], r2 = r[2],
+                shr = est.state.shear,
                 c2d = d.cost_2d, c3d = d.cost_3d, ccl = d.cost_cloud, cpr = d.cost_prior, cte = d.cost_temporal,
                 m2d = d.med_2d_px, m3d = d.mean_3d_m, mcl = d.mean_cloud_m,
                 ds0 = est.joint_data_sigma(m, h.j.l_hip), ds1 = est.joint_data_sigma(m, h.j.l_knee), ds2 = est.joint_data_sigma(m, h.j.l_ankle),
@@ -483,9 +518,13 @@ fn main() -> Result<(), String> {
             let lsh = fk.t[h.j.l_shoulder];
             let rsh = fk.t[h.j.r_shoulder];
             let near = |p: V3| -> Option<f32> {
-                provider.last_surface.iter().map(|q| ([q[0] as f64, q[1] as f64, q[2] as f64], q[2]))
-                    .filter(|(q, _)| ((q[0]-p[0]).powi(2)+(q[1]-p[1]).powi(2)).sqrt() < 0.12)
-                    .map(|(_, z)| z).next()
+                provider
+                    .last_surface
+                    .iter()
+                    .map(|q| ([q[0] as f64, q[1] as f64, q[2] as f64], q[2]))
+                    .filter(|(q, _)| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() < 0.12)
+                    .map(|(_, z)| z)
+                    .next()
             };
             eprintln!("idx {idx} yaw {ty:+.1} Lsh z {:.3} (surf {:?}) Rsh z {:.3} (surf {:?}) sig L/R {:.2}/{:.2} scale {:.3} len_sh {:.3}",
                 lsh[2], near(lsh), rsh[2], near(rsh), sig(h.j.l_shoulder), sig(h.j.r_shoulder), est.state.scale, est.state.len[0]);
@@ -553,10 +592,7 @@ fn main() -> Result<(), String> {
                             .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
                             .collect();
                         let n = pts.len() as f64;
-                        let xspan = pts
-                            .iter()
-                            .map(|p| p.0)
-                            .fold(f64::NEG_INFINITY, f64::max)
+                        let xspan = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max)
                             - pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
                         if pts.len() < 8 || xspan < 0.12 {
                             None
@@ -587,22 +623,30 @@ fn main() -> Result<(), String> {
             let k = &est_out.annotation.keypoints;
             let sh_px = |i: usize| -> Option<(f64, f64)> {
                 let (nx, ny, sc) = *k.get(i)?;
-                if sc < 0.5 { return None; }
+                if sc < 0.5 {
+                    return None;
+                }
                 Some((nx as f64 * cw as f64, ny as f64 * ch as f64))
             };
             if let (Some(lp), Some(rp)) = (sh_px(5), sh_px(6)) {
                 let mid = (0.5 * (lp.0 + rp.0), 0.5 * (lp.1 + rp.1));
-                let inset = |p: (f64, f64)| (p.0 + 0.15 * (mid.0 - p.0), p.1 + 0.15 * (mid.1 - p.1));
+                let inset =
+                    |p: (f64, f64)| (p.0 + 0.15 * (mid.0 - p.0), p.1 + 0.15 * (mid.1 - p.1));
                 let med_z = |p: (f64, f64)| -> Option<f64> {
                     let mut zs: Vec<f64> = Vec::new();
                     for du in -4i32..=4 {
                         for dv in -4i32..=4 {
                             let (u, v) = (p.0 + du as f64 * 2.0, p.1 + dv as f64 * 2.0);
                             if let Some(q) = vulvatar_lib::tracking::fusion::observe::window_point(
-                                &depth_pts, cw, ch, u, v, 1, 0.2, 3.0) { zs.push(q[2]); }
+                                &depth_pts, cw, ch, u, v, 1, 0.2, 3.0,
+                            ) {
+                                zs.push(q[2]);
+                            }
                         }
                     }
-                    if zs.len() < 12 { return None; }
+                    if zs.len() < 12 {
+                        return None;
+                    }
                     zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     Some(zs[zs.len() / 2])
                 };
@@ -626,13 +670,26 @@ fn main() -> Result<(), String> {
         if std::env::var_os("VULVATAR_REPLAY_VARDUMP").is_some() && n % 10 == 5 {
             let pj = m.joint_param[h.j.head];
             let pn = m.joint_param[h.j.neck];
-            eprintln!("idx {idx} var head {:?} neck {:?} data_info head {:?} root_t var {:?}",
-                &est.var[pj..pj + 3], &est.var[pn..pn + 3], &est.data_info_ema[pj..pj + 3], &est.var[3..6]);
+            eprintln!(
+                "idx {idx} var head {:?} neck {:?} data_info head {:?} root_t var {:?}",
+                &est.var[pj..pj + 3],
+                &est.var[pn..pn + 3],
+                &est.data_info_ema[pj..pj + 3],
+                &est.var[3..6]
+            );
         }
         // Metric-joint residuals for the key joints (model vs depth-lifted obs).
         for &(j, pobs, _) in &provider.last_kp3d {
             let e = norm(sub(fk.t[j], pobs));
-            let slot = if j == h.j.l_shoulder || j == h.j.r_shoulder { 0 } else if j == h.j.l_elbow || j == h.j.r_elbow { 1 } else if j == h.j.l_wrist || j == h.j.r_wrist { 2 } else { 3 };
+            let slot = if j == h.j.l_shoulder || j == h.j.r_shoulder {
+                0
+            } else if j == h.j.l_elbow || j == h.j.r_elbow {
+                1
+            } else if j == h.j.l_wrist || j == h.j.r_wrist {
+                2
+            } else {
+                3
+            };
             kp3d_err[slot].push(e);
         }
         if std::env::var_os("VULVATAR_REPLAY_POSTURE").is_some() {
@@ -653,10 +710,9 @@ fn main() -> Result<(), String> {
         if std::env::var_os("VULVATAR_REPLAY_HEADREF").is_some() {
             // Estimator head yaw vs the FaceMesh-selected face channel
             // (dense 478-landmark pose, trustworthy to ~±45°).
-            if let (Some(f), Some(c)) = (
-                est_out.skeleton.face,
-                est_out.skeleton.face_mesh_confidence,
-            ) {
+            if let (Some(f), Some(c)) =
+                (est_out.skeleton.face, est_out.skeleton.face_mesh_confidence)
+            {
                 if c > 0.6 {
                     eprintln!("HEADREF idx {idx} est_yaw {hy:.1} est_pitch {hp:.1} sel_yaw {:.1} sel_pitch {:.1} mesh_c {c:.2}", f.yaw.to_degrees(), f.pitch.to_degrees());
                 }
@@ -777,10 +833,15 @@ fn main() -> Result<(), String> {
                         let fwd = vulvatar_lib::math_utils::quat_rotate_vec3(&q, &[0.0, 0.0, 1.0]);
                         let pitch_av = (-fwd[1]).asin().to_degrees();
                         let yaw_av = fwd[0].atan2(fwd[2]).to_degrees();
-                        let rig_head = est_out.skeleton.rig.as_ref().and_then(|r| r.bones.get(&vulvatar_lib::asset::HumanoidBone::Head));
+                        let rig_head =
+                            est_out.skeleton.rig.as_ref().and_then(|r| {
+                                r.bones.get(&vulvatar_lib::asset::HumanoidBone::Head)
+                            });
                         let (ry, rp) = rig_head
                             .map(|b| {
-                                let m3 = vulvatar_lib::tracking::fusion::math::quat_to_mat(b.delta_world);
+                                let m3 = vulvatar_lib::tracking::fusion::math::quat_to_mat(
+                                    b.delta_world,
+                                );
                                 ypr_deg(&m3)
                             })
                             .map(|(y, p, _)| (y, p))
@@ -792,10 +853,13 @@ fn main() -> Result<(), String> {
             if render_every > 0 && n % render_every == 0 {
                 let inst = offline::make_instance(asset, locals);
                 let side = ch.min(720);
-                let rgba =
-                    offline::render_avatar(renderer, &inst, [side, side], &offline::bench_camera())?;
-                let av = image::RgbaImage::from_raw(side, side, rgba)
-                    .ok_or("avatar pixels")?;
+                let rgba = offline::render_avatar(
+                    renderer,
+                    &inst,
+                    [side, side],
+                    &offline::bench_camera(),
+                )?;
+                let av = image::RgbaImage::from_raw(side, side, rgba).ok_or("avatar pixels")?;
                 let mut comp = image::RgbImage::new(cw + side, ch);
                 for (x, y, p) in rgb.enumerate_pixels() {
                     comp.put_pixel(x, y, *p);
@@ -877,7 +941,12 @@ fn main() -> Result<(), String> {
                 } else {
                     [160, 160, 160]
                 };
-                draw_dot(&mut img, [nx as f64 * cw as f64, ny as f64 * ch as f64], 2, c);
+                draw_dot(
+                    &mut img,
+                    [nx as f64 * cw as f64, ny as f64 * ch as f64],
+                    2,
+                    c,
+                );
             }
             let out = out_dir.join(format!("overlay_{idx:05}.png"));
             img.save(&out).map_err(|e| e.to_string())?;
@@ -909,8 +978,7 @@ fn main() -> Result<(), String> {
         .map(|k| {
             (
                 k,
-                leg_sig.iter().filter(|s| s[k] < 0.4).count() as f64
-                    / leg_sig.len().max(1) as f64,
+                leg_sig.iter().filter(|s| s[k] < 0.4).count() as f64 / leg_sig.len().max(1) as f64,
             )
         })
         .collect();
@@ -947,20 +1015,41 @@ fn main() -> Result<(), String> {
     }
     println!("head yaw (deg) : mean {hm:+.1} std {hs:.1} range [{hmin:+.1}, {hmax:+.1}]");
     println!("head pitch(deg): mean {pm:+.1} std {ps:.1} range [{pmin:+.1}, {pmax:+.1}]");
-    println!("L wrist: max jump {lwmax:.3} m, snaps>0.15m {lw_snaps}, data-σ<0.4 duty {lw_duty:.2}");
-    println!("R wrist: max jump {rwmax:.3} m, snaps>0.15m {rw_snaps}, data-σ<0.4 duty {rw_duty:.2}");
+    println!(
+        "L wrist: max jump {lwmax:.3} m, snaps>0.15m {lw_snaps}, data-σ<0.4 duty {lw_duty:.2}"
+    );
+    println!(
+        "R wrist: max jump {rwmax:.3} m, snaps>0.15m {rw_snaps}, data-σ<0.4 duty {rw_duty:.2}"
+    );
     println!("root: max jump {rjmax:.3} m");
     println!("L knee : max jump {lkmax:.3} m, snaps>0.15m {lk_snaps}");
     println!("R knee : max jump {rkmax:.3} m, snaps>0.15m {rk_snaps}");
     println!("leg data-σ<0.4 duty: {leg_duty_s}");
-    for (name, v) in ["shoulders", "elbows", "wrists", "other"].iter().zip(kp3d_err.iter()) {
-        if v.is_empty() { continue; }
+    for (name, v) in ["shoulders", "elbows", "wrists", "other"]
+        .iter()
+        .zip(kp3d_err.iter())
+    {
+        if v.is_empty() {
+            continue;
+        }
         let mut s = v.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let (m, _, _, mx) = stats(v);
-        println!("metric-joint residual {name:>9}: n {} mean {:.3} med {:.3} p90 {:.3} max {:.3} m", v.len(), m, s[s.len()/2], s[(s.len()*9/10).min(s.len()-1)], mx);
+        println!(
+            "metric-joint residual {name:>9}: n {} mean {:.3} med {:.3} p90 {:.3} max {:.3} m",
+            v.len(),
+            m,
+            s[s.len() / 2],
+            s[(s.len() * 9 / 10).min(s.len() - 1)],
+            mx
+        );
     }
-    println!("estimator: seed wins {}  re-acquisitions {}  cov failures {}", provider.estimator().diag.seed_wins, provider.estimator().lost_events, provider.estimator().diag.cov_failures);
+    println!(
+        "estimator: seed wins {}  re-acquisitions {}  cov failures {}",
+        provider.estimator().diag.seed_wins,
+        provider.estimator().lost_events,
+        provider.estimator().diag.cov_failures
+    );
     println!("hand crops: L {} R {} frames with presence≥0.5 (of {}); hand-block L/R re-labels {}; duplicate locks {}", hand_frames[0], hand_frames[1], pairs.len(), provider.hand_swaps, provider.hand_dupes);
     println!("csv: {}", out_dir.join("frames.csv").display());
     Ok(())

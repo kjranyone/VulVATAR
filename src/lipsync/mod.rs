@@ -105,17 +105,13 @@ impl LipSyncProcessor {
         }
 
         // SmoothDamp (matches Unity's Mathf.SmoothDamp).
-        for ((smoothed, raw_val), velocity) in self.smoothed.iter_mut()
+        for ((smoothed, raw_val), velocity) in self
+            .smoothed
+            .iter_mut()
             .zip(raw.iter())
             .zip(self.smooth_velocity.iter_mut())
         {
-            *smoothed = smooth_damp(
-                *smoothed,
-                *raw_val,
-                velocity,
-                smoothing.max(0.001),
-                dt,
-            );
+            *smoothed = smooth_damp(*smoothed, *raw_val, velocity, smoothing.max(0.001), dt);
         }
 
         let volume = self.smoothed.iter().sum();

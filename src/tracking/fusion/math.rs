@@ -124,11 +124,7 @@ pub fn so3_log(r: &M3) -> V3 {
     let tr = (r[0][0] + r[1][1] + r[2][2]).clamp(-1.0, 3.0);
     let cos_th = ((tr - 1.0) * 0.5).clamp(-1.0, 1.0);
     let th = cos_th.acos();
-    let v = [
-        r[2][1] - r[1][2],
-        r[0][2] - r[2][0],
-        r[1][0] - r[0][1],
-    ];
+    let v = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
     if th < 1e-6 {
         return scale(v, 0.5);
     }
@@ -454,7 +450,12 @@ impl Dense {
         self.inverse_impl(eps, out, Some(full))
     }
 
-    fn inverse_impl(&mut self, eps: f64, out: &mut [f64], mut full: Option<&mut Vec<f64>>) -> Option<()> {
+    fn inverse_impl(
+        &mut self,
+        eps: f64,
+        out: &mut [f64],
+        mut full: Option<&mut Vec<f64>>,
+    ) -> Option<()> {
         let n = self.n;
         // Factor once (λ = 0).
         for i in 0..n {
@@ -559,7 +560,12 @@ mod tests {
             let dr = so3_log(&mat_mul(&r1, &transpose(&r0)));
             let jd = mat_vec(&jl, d);
             for i in 0..3 {
-                assert!((dr[i] - jd[i]).abs() < 1e-8, "k={k} i={i}: {} vs {}", dr[i], jd[i]);
+                assert!(
+                    (dr[i] - jd[i]).abs() < 1e-8,
+                    "k={k} i={i}: {} vs {}",
+                    dr[i],
+                    jd[i]
+                );
             }
         }
         // inverse consistency

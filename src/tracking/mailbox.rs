@@ -247,10 +247,7 @@ impl TrackingMailbox {
     /// Worker-side poll: returns `Some((calibration, seq))` only when
     /// `seq` has advanced past `last_seen_seq`, so the worker
     /// processes a calibration update at most once per write.
-    pub fn poll_calibration(
-        &self,
-        last_seen_seq: u64,
-    ) -> Option<(Option<PoseCalibration>, u64)> {
+    pub fn poll_calibration(&self, last_seen_seq: u64) -> Option<(Option<PoseCalibration>, u64)> {
         let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
         if c.calibration_seq != last_seen_seq {
             Some((c.calibration.clone(), c.calibration_seq))
@@ -258,7 +255,6 @@ impl TrackingMailbox {
             None
         }
     }
-
 
     /// Set the inference-backend label. Called once by the worker after
     /// `Rtmw3dInference` finishes loading its model. `None` resets it
@@ -376,9 +372,15 @@ mod mailbox_tests {
         );
 
         // Calibration mailbox uses its own seqs for edge detection.
-        assert!(mb.poll_calibration(0).is_some(), "first poll sees the write");
+        assert!(
+            mb.poll_calibration(0).is_some(),
+            "first poll sees the write"
+        );
         let observed_seq = mb.poll_calibration(0).map(|(_, s)| s).unwrap();
-        assert!(mb.poll_calibration(observed_seq).is_none(), "no advance, no work");
+        assert!(
+            mb.poll_calibration(observed_seq).is_none(),
+            "no advance, no work"
+        );
     }
 
     #[test]
@@ -399,10 +401,7 @@ mod mailbox_tests {
         mb.report_error("test failure", TrackingErrorLevel::Warning);
         let drained = mb.drain_error();
         assert!(drained.is_some());
-        assert!(
-            mb.drain_error().is_none(),
-            "errors drain exactly once"
-        );
+        assert!(mb.drain_error().is_none(), "errors drain exactly once");
         mb.set_inference_backend_label(Some("CPU".to_string()));
         assert_eq!(mb.inference_backend_label(), Some("CPU".to_string()));
         mb.set_inference_backend_label(None);

@@ -95,8 +95,7 @@ pub fn save_watched_folders(paths: &[std::path::PathBuf]) -> Result<(), String> 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    atomic_write(&path, &data)
-        .map_err(|e| format!("write watched folders: {}", e))
+    atomic_write(&path, &data).map_err(|e| format!("write watched folders: {}", e))
 }
 
 fn recent_avatars_path() -> std::path::PathBuf {
@@ -157,12 +156,10 @@ pub fn load_profiles() -> Option<crate::gui::profile::ProfileLibrary> {
 /// triggered by `Calibrate Pose ▼` writing into the active profile,
 /// by future profile-edit UI, etc. Atomic write via `atomic_write`
 /// so a mid-write crash never leaves a half-truncated file behind.
-pub fn save_profiles(
-    library: &crate::gui::profile::ProfileLibrary,
-) -> Result<(), String> {
+pub fn save_profiles(library: &crate::gui::profile::ProfileLibrary) -> Result<(), String> {
     let path = profiles_path();
-    let data = serde_json::to_string_pretty(library)
-        .map_err(|e| format!("serialise profiles: {}", e))?;
+    let data =
+        serde_json::to_string_pretty(library).map_err(|e| format!("serialise profiles: {}", e))?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

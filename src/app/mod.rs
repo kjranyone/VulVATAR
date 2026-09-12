@@ -20,7 +20,9 @@ use crate::output::{FrameSink, OutputRouter};
 use crate::renderer::frame_input::LightingState;
 use crate::renderer::VulkanRenderer;
 use crate::simulation::{PhysicsWorld, SimulationClock};
-use crate::tracking::{TrackingCalibration, TrackingSmoothingParams, TrackingSource, TrackingWorker};
+use crate::tracking::{
+    TrackingCalibration, TrackingSmoothingParams, TrackingSource, TrackingWorker,
+};
 
 /// All per-frame parameters passed from the GUI to `run_frame()`.
 #[derive(Clone, Debug)]

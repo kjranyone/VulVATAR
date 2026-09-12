@@ -37,7 +37,9 @@ fn main() -> Result<(), eframe::Error> {
             );
             rfd::MessageDialog::new()
                 .set_title("VulVATAR — Startup Error")
-                .set_description("Could not acquire the single-instance lock. Another process may hold it.")
+                .set_description(
+                    "Could not acquire the single-instance lock. Another process may hold it.",
+                )
                 .set_level(rfd::MessageLevel::Error)
                 .show();
             return Ok(());

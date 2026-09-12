@@ -37,13 +37,13 @@ use vulvatar_lib::math_utils::{
 };
 use vulvatar_lib::renderer::frame_input::{
     CameraState, LightingState, OutlineSnapshot, OutputTargetRequest, RenderAvatarInstance,
-    RenderColorSpace, RenderDebugFlags, RenderExportMode, RenderFrameInput,
-    RenderMeshInstance, RenderOutputAlpha,
+    RenderColorSpace, RenderDebugFlags, RenderExportMode, RenderFrameInput, RenderMeshInstance,
+    RenderOutputAlpha,
 };
 use vulvatar_lib::renderer::material::MaterialShaderMode;
 use vulvatar_lib::renderer::VulkanRenderer;
-use vulvatar_lib::tracking::provider::create_pose_provider;
 use vulvatar_lib::tracking::metric_frame::MetricDepthFrame;
+use vulvatar_lib::tracking::provider::create_pose_provider;
 
 const RENDER_EXTENT: [u32; 2] = [1024, 1024];
 /// AliciaSolid, NOT AvatarSample_A: the tracker reads Alicia's
@@ -87,10 +87,26 @@ fn base_ops() -> Vec<PoseOp> {
     use HumanoidBone::*;
     use PoseOp::*;
     vec![
-        AimAt { bone: LeftUpperArm, tip: LeftLowerArm, target_rel: [0.45, -0.5, 0.05] },
-        AimAt { bone: LeftLowerArm, tip: LeftHand, target_rel: [0.55, -1.0, 0.1] },
-        AimAt { bone: RightUpperArm, tip: RightLowerArm, target_rel: [-0.45, -0.5, 0.05] },
-        AimAt { bone: RightLowerArm, tip: RightHand, target_rel: [-0.55, -1.0, 0.1] },
+        AimAt {
+            bone: LeftUpperArm,
+            tip: LeftLowerArm,
+            target_rel: [0.45, -0.5, 0.05],
+        },
+        AimAt {
+            bone: LeftLowerArm,
+            tip: LeftHand,
+            target_rel: [0.55, -1.0, 0.1],
+        },
+        AimAt {
+            bone: RightUpperArm,
+            tip: RightLowerArm,
+            target_rel: [-0.45, -0.5, 0.05],
+        },
+        AimAt {
+            bone: RightLowerArm,
+            tip: RightHand,
+            target_rel: [-0.55, -1.0, 0.1],
+        },
     ]
 }
 
@@ -106,26 +122,67 @@ fn pose_suite() -> Vec<(&'static str, Vec<PoseOp>)> {
     };
     vec![
         ("neutral", with_base(vec![])),
-        ("twist_left_30", with_base(vec![RotateWorld(UpperChest, y, 30.0)])),
-        ("twist_right_30", with_base(vec![RotateWorld(UpperChest, y, -30.0)])),
+        (
+            "twist_left_30",
+            with_base(vec![RotateWorld(UpperChest, y, 30.0)]),
+        ),
+        (
+            "twist_right_30",
+            with_base(vec![RotateWorld(UpperChest, y, -30.0)]),
+        ),
         ("head_yaw_30", with_base(vec![RotateWorld(Head, y, 30.0)])),
-        ("shrug_left_20", with_base(vec![RotateWorld(LeftShoulder, z, 20.0)])),
+        (
+            "shrug_left_20",
+            with_base(vec![RotateWorld(LeftShoulder, z, 20.0)]),
+        ),
         (
             "arms_forward",
             with_base(vec![
-                AimAt { bone: LeftUpperArm, tip: LeftLowerArm, target_rel: [0.15, -0.1, 0.6] },
-                AimAt { bone: LeftLowerArm, tip: LeftHand, target_rel: [0.15, -0.1, 1.2] },
-                AimAt { bone: RightUpperArm, tip: RightLowerArm, target_rel: [-0.15, -0.1, 0.6] },
-                AimAt { bone: RightLowerArm, tip: RightHand, target_rel: [-0.15, -0.1, 1.2] },
+                AimAt {
+                    bone: LeftUpperArm,
+                    tip: LeftLowerArm,
+                    target_rel: [0.15, -0.1, 0.6],
+                },
+                AimAt {
+                    bone: LeftLowerArm,
+                    tip: LeftHand,
+                    target_rel: [0.15, -0.1, 1.2],
+                },
+                AimAt {
+                    bone: RightUpperArm,
+                    tip: RightLowerArm,
+                    target_rel: [-0.15, -0.1, 0.6],
+                },
+                AimAt {
+                    bone: RightLowerArm,
+                    tip: RightHand,
+                    target_rel: [-0.15, -0.1, 1.2],
+                },
             ]),
         ),
         (
             "palms_meet",
             with_base(vec![
-                AimAt { bone: LeftUpperArm, tip: LeftLowerArm, target_rel: [0.0, -0.25, 0.55] },
-                AimAt { bone: LeftLowerArm, tip: LeftHand, target_rel: [0.0, -0.15, 0.7] },
-                AimAt { bone: RightUpperArm, tip: RightLowerArm, target_rel: [0.0, -0.25, 0.55] },
-                AimAt { bone: RightLowerArm, tip: RightHand, target_rel: [0.0, -0.15, 0.7] },
+                AimAt {
+                    bone: LeftUpperArm,
+                    tip: LeftLowerArm,
+                    target_rel: [0.0, -0.25, 0.55],
+                },
+                AimAt {
+                    bone: LeftLowerArm,
+                    tip: LeftHand,
+                    target_rel: [0.0, -0.15, 0.7],
+                },
+                AimAt {
+                    bone: RightUpperArm,
+                    tip: RightLowerArm,
+                    target_rel: [0.0, -0.25, 0.55],
+                },
+                AimAt {
+                    bone: RightLowerArm,
+                    tip: RightHand,
+                    target_rel: [0.0, -0.15, 0.7],
+                },
             ]),
         ),
         (
@@ -135,10 +192,26 @@ fn pose_suite() -> Vec<(&'static str, Vec<PoseOp>)> {
             // L/R-swap-at-the-midline crossing repro.
             "fingertips_touch",
             with_base(vec![
-                AimAt { bone: LeftUpperArm, tip: LeftLowerArm, target_rel: [0.28, -0.35, 0.30] },
-                AimAt { bone: LeftLowerArm, tip: LeftHand, target_rel: [0.0, -0.35, 0.55] },
-                AimAt { bone: RightUpperArm, tip: RightLowerArm, target_rel: [-0.28, -0.35, 0.30] },
-                AimAt { bone: RightLowerArm, tip: RightHand, target_rel: [0.0, -0.35, 0.55] },
+                AimAt {
+                    bone: LeftUpperArm,
+                    tip: LeftLowerArm,
+                    target_rel: [0.28, -0.35, 0.30],
+                },
+                AimAt {
+                    bone: LeftLowerArm,
+                    tip: LeftHand,
+                    target_rel: [0.0, -0.35, 0.55],
+                },
+                AimAt {
+                    bone: RightUpperArm,
+                    tip: RightLowerArm,
+                    target_rel: [-0.28, -0.35, 0.30],
+                },
+                AimAt {
+                    bone: RightLowerArm,
+                    tip: RightHand,
+                    target_rel: [0.0, -0.35, 0.55],
+                },
             ]),
         ),
     ]
@@ -225,13 +298,16 @@ fn apply_world_delta(
 fn build_gt_pose(asset: &AvatarAsset, ops: &[PoseOp]) -> Vec<Transform> {
     let skeleton = &asset.skeleton;
     let humanoid = &asset.humanoid.as_ref().expect("humanoid map").bone_map;
-    let mut locals: Vec<Transform> = skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+    let mut locals: Vec<Transform> = skeleton
+        .nodes
+        .iter()
+        .map(|n| n.rest_local.clone())
+        .collect();
 
     // Rig-agnostic frame: shoulder midpoint + arm length from rest FK.
     let rest = fk(skeleton, &locals);
-    let pos_of = |b: HumanoidBone| -> Option<Vec3> {
-        humanoid.get(&b).map(|NodeId(i)| rest[*i as usize].1)
-    };
+    let pos_of =
+        |b: HumanoidBone| -> Option<Vec3> { humanoid.get(&b).map(|NodeId(i)| rest[*i as usize].1) };
     let (sl, sr) = (
         pos_of(HumanoidBone::LeftUpperArm).expect("L shoulder"),
         pos_of(HumanoidBone::RightUpperArm).expect("R shoulder"),
@@ -246,9 +322,19 @@ fn build_gt_pose(asset: &AvatarAsset, ops: &[PoseOp]) -> Vec<Transform> {
     for op in ops {
         match op {
             PoseOp::RotateWorld(bone, axis, deg) => {
-                apply_world_delta(skeleton, humanoid, &mut locals, *bone, axis_angle(axis, *deg));
+                apply_world_delta(
+                    skeleton,
+                    humanoid,
+                    &mut locals,
+                    *bone,
+                    axis_angle(axis, *deg),
+                );
             }
-            PoseOp::AimAt { bone, tip, target_rel } => {
+            PoseOp::AimAt {
+                bone,
+                tip,
+                target_rel,
+            } => {
                 let world = fk(skeleton, &locals);
                 let (Some(NodeId(bi)), Some(NodeId(ti))) =
                     (humanoid.get(bone).copied(), humanoid.get(tip).copied())
@@ -298,7 +384,9 @@ struct PoseMetrics {
 
 /// Metrics computed directly from the DETECTED source skeleton —
 /// isolates tracking error (GT→SRC) from solver error (SRC→REC).
-fn metrics_source(sk: &vulvatar_lib::tracking::source_skeleton::SourceSkeleton) -> Option<PoseMetrics> {
+fn metrics_source(
+    sk: &vulvatar_lib::tracking::source_skeleton::SourceSkeleton,
+) -> Option<PoseMetrics> {
     let p = |b: HumanoidBone| sk.joints.get(&b).map(|j| j.position);
     let sl = p(HumanoidBone::LeftUpperArm)?;
     let sr = p(HumanoidBone::RightUpperArm)?;
@@ -341,7 +429,11 @@ fn metrics(asset: &AvatarAsset, locals: &[Transform], rest_head: &Quat) -> PoseM
         .unwrap_or([0.0, 0.0, 0.0, 1.0]);
     let d = quat_mul(&head_rot, &quat_conjugate(rest_head));
     let head_rot_deg = 2.0 * d[3].clamp(-1.0, 1.0).acos().to_degrees().min(360.0);
-    let head_rot_deg = if head_rot_deg > 180.0 { 360.0 - head_rot_deg } else { head_rot_deg };
+    let head_rot_deg = if head_rot_deg > 180.0 {
+        360.0 - head_rot_deg
+    } else {
+        head_rot_deg
+    };
 
     PoseMetrics {
         shoulder_yaw_deg: line[2].atan2(line[0]).to_degrees(),
@@ -537,7 +629,9 @@ fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 
     let eye_z = cam.distance * cp * cy + wz;
     let target = [wx, wy, wz];
     let fwd = [target[0] - eye_x, target[1] - eye_y, target[2] - eye_z];
-    let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt().max(1e-6);
+    let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2])
+        .sqrt()
+        .max(1e-6);
     let f = [fwd[0] / len, fwd[1] / len, fwd[2] / len];
     let world_up = [0.0f32, 1.0, 0.0];
     let r = [
@@ -554,16 +648,36 @@ fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 
     ];
     (
         [
-            [r[0], r[1], r[2], -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z)],
-            [u[0], u[1], u[2], -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z)],
-            [-f[0], -f[1], -f[2], f[0] * eye_x + f[1] * eye_y + f[2] * eye_z],
+            [
+                r[0],
+                r[1],
+                r[2],
+                -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z),
+            ],
+            [
+                u[0],
+                u[1],
+                u[2],
+                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
+            ],
+            [
+                -f[0],
+                -f[1],
+                -f[2],
+                f[0] * eye_x + f[1] * eye_y + f[2] * eye_z,
+            ],
             [0.0, 0.0, 0.0, 1.0],
         ],
         [eye_x, eye_y, eye_z],
     )
 }
 
-fn build_projection_matrix(fov_deg: f32, aspect: f32, near: f32, far: f32) -> vulvatar_lib::asset::Mat4 {
+fn build_projection_matrix(
+    fov_deg: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> vulvatar_lib::asset::Mat4 {
     let f = 1.0 / (fov_deg.to_radians() * 0.5).tan();
     let a = far / (near - far);
     let b = far * near / (near - far);
@@ -602,8 +716,7 @@ fn main() -> Result<(), String> {
 
     eprintln!("loading pose provider…");
     let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
-    let mut infer =
-        create_pose_provider("models", config).map_err(|e| format!("provider: {e}"))?;
+    let mut infer = create_pose_provider("models", config).map_err(|e| format!("provider: {e}"))?;
     for w in infer.take_load_warnings() {
         eprintln!("  warning: {w}");
     }
@@ -621,8 +734,12 @@ fn main() -> Result<(), String> {
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir: {e}"))?;
 
     // Rest head rotation for the head metric baseline.
-    let rest_locals: Vec<Transform> =
-        asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+    let rest_locals: Vec<Transform> = asset
+        .skeleton
+        .nodes
+        .iter()
+        .map(|n| n.rest_local.clone())
+        .collect();
     let rest_world = fk(&asset.skeleton, &rest_locals);
     let rest_head = asset
         .humanoid
@@ -647,7 +764,8 @@ fn main() -> Result<(), String> {
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     let neutral_metric = build_metric_frame_from_depth(
-        &neutral_depth.ok_or_else(|| "validate_gt: neutral render produced no depth".to_string())?,
+        &neutral_depth
+            .ok_or_else(|| "validate_gt: neutral render produced no depth".to_string())?,
         RENDER_EXTENT,
         cam_fov,
     );
@@ -666,7 +784,10 @@ fn main() -> Result<(), String> {
         let (rgba, gt_depth) = render_avatar(&mut renderer, &gt_avatar, RENDER_EXTENT)?;
 
         // RGBA → RGB for the tracker.
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
         // Aligned metric depth for THIS pose's render, fed before each
         // estimate_pose so the provider fuses the 2-D keypoints against
         // the same metric cloud the live D435 path uses.
@@ -705,7 +826,10 @@ fn main() -> Result<(), String> {
                 .rig
                 .as_ref()
                 .expect("fusion provider always publishes a rig pose");
-            let hm = asset.humanoid.as_ref().expect("sample VRM has a humanoid map");
+            let hm = asset
+                .humanoid
+                .as_ref()
+                .expect("sample VRM has a humanoid map");
             let mut rstate = vulvatar_lib::avatar::retarget::RetargetState::default();
             let rp = vulvatar_lib::avatar::retarget::RetargetParams {
                 rotation_blend: 1.0,
@@ -815,7 +939,11 @@ fn save_composite(path: &std::path::Path, left: &[u8], right: &[u8]) -> Result<(
         for x in 0..w {
             let i = ((y * w + x) * 4) as usize;
             out.put_pixel(x, y, image::Rgba([left[i], left[i + 1], left[i + 2], 255]));
-            out.put_pixel(w + x, y, image::Rgba([right[i], right[i + 1], right[i + 2], 255]));
+            out.put_pixel(
+                w + x,
+                y,
+                image::Rgba([right[i], right[i + 1], right[i + 2], 255]),
+            );
         }
     }
     out.save(path).map_err(|e| format!("save composite: {e}"))
@@ -892,7 +1020,11 @@ fn write_summary(
                     rec.wrist_forward - rec0.wrist_forward,
                     ""
                 ),
-                cell(gt.wrist_gap - gt0.wrist_gap, rec.wrist_gap - rec0.wrist_gap, ""),
+                cell(
+                    gt.wrist_gap - gt0.wrist_gap,
+                    rec.wrist_gap - rec0.wrist_gap,
+                    ""
+                ),
             ));
         }
     }

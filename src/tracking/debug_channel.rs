@@ -108,7 +108,9 @@ pub fn dump_depth_snapshot(frame_index: u64, depth_raw: &[u16], w: u32, h: u32, 
     out[12..16].copy_from_slice(&1u32.to_le_bytes());
     out[16..24].copy_from_slice(&frame_index.to_le_bytes());
     for (i, &raw) in depth_raw.iter().enumerate() {
-        let mm = (raw as f32 * mm_per_unit).round().clamp(0.0, u16::MAX as f32) as u16;
+        let mm = (raw as f32 * mm_per_unit)
+            .round()
+            .clamp(0.0, u16::MAX as f32) as u16;
         out[32 + i * 2..32 + i * 2 + 2].copy_from_slice(&mm.to_le_bytes());
     }
     atomic_write(&base_dir().join("debug_depth.bin"), &out);

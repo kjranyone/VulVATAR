@@ -18,9 +18,7 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .strong()
                     .color(ui.visuals().warn_fg_color),
             );
-            ui.label(
-                egui::RichText::new(t!("tracking.unclean_exit_body", log = log_path)).small(),
-            );
+            ui.label(egui::RichText::new(t!("tracking.unclean_exit_body", log = log_path)).small());
             ui.horizontal(|ui| {
                 if ui.button(t!("tracking.unclean_exit_safe_mode")).clicked() {
                     state.tracking.safe_mode_armed = true;
@@ -68,7 +66,12 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     // concepts finally side by side and explained.
     draw_display_options(ui, state);
 
-    collapsible_card(ui, "tracking.pipeline", t!("tracking.pipeline"), false, |ui| {
+    collapsible_card(
+        ui,
+        "tracking.pipeline",
+        t!("tracking.pipeline"),
+        false,
+        |ui| {
             ui.checkbox(
                 &mut state.tracking.yolox_enabled,
                 t!("tracking.pipeline_yolox"),
@@ -82,11 +85,17 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .small()
                     .weak(),
             );
-        });
+        },
+    );
 
     // Display smoothing / face-confidence thresholds. Collapsed by
     // default — most users should never need to touch them.
-    collapsible_card(ui, "tracking.advanced_smoothing", t!("tracking.advanced_smoothing"), false, |ui| {
+    collapsible_card(
+        ui,
+        "tracking.advanced_smoothing",
+        t!("tracking.advanced_smoothing"),
+        false,
+        |ui| {
             ui.label(
                 egui::RichText::new(t!("tracking.advanced_smoothing_hint"))
                     .color(color::ON_SURFACE_VARIANT),
@@ -126,12 +135,18 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 state.tracking.smoothing.face_confidence_threshold =
                     defaults.face_confidence_threshold;
             }
-        });
+        },
+    );
 
     // Detailed diagnostics — backend labels, raw timestamp, per-joint
     // confidence. Collapsed: the one-line status in ① is the everyday
     // read; this is for debugging sessions.
-    collapsible_card(ui, "tracking.inference_status", t!("tracking.inference_status"), false, |ui| {
+    collapsible_card(
+        ui,
+        "tracking.inference_status",
+        t!("tracking.inference_status"),
+        false,
+        |ui| {
             if state.is_tracking_active() {
                 ui.label(t!(
                     "tracking.camera_label",
@@ -166,22 +181,41 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                 let joint_conf = |b: HumanoidBone| -> f32 {
                     tracking.joints.get(&b).map(|j| j.confidence).unwrap_or(0.0)
                 };
-                draw_confidence_bar(ui, &t!("tracking.confidence_left_shoulder"), joint_conf(HumanoidBone::LeftShoulder));
+                draw_confidence_bar(
+                    ui,
+                    &t!("tracking.confidence_left_shoulder"),
+                    joint_conf(HumanoidBone::LeftShoulder),
+                );
                 draw_confidence_bar(
                     ui,
                     &t!("tracking.confidence_right_shoulder"),
                     joint_conf(HumanoidBone::RightShoulder),
                 );
-                draw_confidence_bar(ui, &t!("tracking.confidence_left_hand"), joint_conf(HumanoidBone::LeftHand));
-                draw_confidence_bar(ui, &t!("tracking.confidence_right_hand"), joint_conf(HumanoidBone::RightHand));
+                draw_confidence_bar(
+                    ui,
+                    &t!("tracking.confidence_left_hand"),
+                    joint_conf(HumanoidBone::LeftHand),
+                );
+                draw_confidence_bar(
+                    ui,
+                    &t!("tracking.confidence_right_hand"),
+                    joint_conf(HumanoidBone::RightHand),
+                );
             } else {
                 ui.label(t!("tracking.no_tracking_data"));
             }
-        });
+        },
+    );
 
-    collapsible_card(ui, "tracking.lip_sync", t!("tracking.lip_sync"), false, |ui| {
-        draw_lipsync(ui, state);
-    });
+    collapsible_card(
+        ui,
+        "tracking.lip_sync",
+        t!("tracking.lip_sync"),
+        false,
+        |ui| {
+            draw_lipsync(ui, state);
+        },
+    );
 }
 
 /// Capture format after the safe-mode clamp. Single source for every
@@ -308,7 +342,10 @@ fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
         } else if active && tracking_on {
             (color::SUCCESS, t!("tracking.running").to_string())
         } else if active {
-            (color::WARNING, t!("tracking.camera_active_paused").to_string())
+            (
+                color::WARNING,
+                t!("tracking.camera_active_paused").to_string(),
+            )
         } else {
             (color::ON_SURFACE_MUTED, t!("tracking.stopped").to_string())
         };
@@ -318,9 +355,16 @@ fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
 
         // Camera on but solve paused (pause hotkey) — offer the way back
         // right where the amber status is shown.
-        if active && !tracking_on
-            && tonal_button(ui, Some(ic::PLAY), &t!("tracking.resume_tracking"), ButtonTone::Primary, true)
-                .clicked()
+        if active
+            && !tracking_on
+            && tonal_button(
+                ui,
+                Some(ic::PLAY),
+                &t!("tracking.resume_tracking"),
+                ButtonTone::Primary,
+                true,
+            )
+            .clicked()
         {
             state.tracking.toggle_tracking = true;
         }
@@ -365,7 +409,9 @@ fn draw_camera_devices(ui: &mut egui::Ui, state: &mut GuiApp) {
                 .map(|c| c.serial.clone());
             let usable_count = cameras
                 .iter()
-                .filter(|c| c.supported && !crate::tracking::usb_link_too_slow(c.usb_type.as_deref()))
+                .filter(|c| {
+                    c.supported && !crate::tracking::usb_link_too_slow(c.usb_type.as_deref())
+                })
                 .count();
 
             for cam in cameras {
@@ -398,10 +444,8 @@ fn draw_camera_devices(ui: &mut egui::Ui, state: &mut GuiApp) {
                         Some(s) => s == cam.serial,
                         None => first_usable.as_deref() == Some(cam.serial.as_str()),
                     };
-                    let response = ui.add_enabled(
-                        usable,
-                        egui::RadioButton::new(checked, &caption),
-                    );
+                    let response =
+                        ui.add_enabled(usable, egui::RadioButton::new(checked, &caption));
                     if usable && response.clicked() {
                         state.tracking.camera_serial = Some(cam.serial.clone());
                         state.project_status.app_settings_dirty = true;
@@ -461,149 +505,177 @@ fn draw_calibration_card(ui: &mut egui::Ui, state: &mut GuiApp) {
 
 /// ③ Which body parts drive the avatar.
 fn draw_body_parts(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_card(ui, "tracking.body_parts", t!("tracking.body_parts"), true, |ui| {
-        ui
-            .checkbox(&mut state.tracking.hand_tracking_enabled, t!("tracking.hand_tracking"))
+    collapsible_card(
+        ui,
+        "tracking.body_parts",
+        t!("tracking.body_parts"),
+        true,
+        |ui| {
+            ui.checkbox(
+                &mut state.tracking.hand_tracking_enabled,
+                t!("tracking.hand_tracking"),
+            )
             .changed();
-        ui
-            .checkbox(&mut state.tracking.face_tracking_enabled, t!("tracking.face_tracking"))
+            ui.checkbox(
+                &mut state.tracking.face_tracking_enabled,
+                t!("tracking.face_tracking"),
+            )
             .changed();
-        ui
-            .checkbox(
+            ui.checkbox(
                 &mut state.tracking.lower_body_tracking_enabled,
                 t!("tracking.lower_body"),
             )
             .on_hover_text(t!("tracking.lower_body_tooltip"))
             .changed();
-        ui
-            .checkbox(
+            ui.checkbox(
                 &mut state.tracking.root_translation_enabled,
                 t!("tracking.root_translation"),
             )
             .on_hover_text(t!("tracking.root_translation_tooltip"))
             .changed();
-        ui
-            .checkbox(
+            ui.checkbox(
                 &mut state.tracking.fade_on_tracking_loss,
                 t!("tracking.fade_on_loss"),
             )
             .on_hover_text(t!("tracking.fade_on_loss_tooltip"))
             .changed();
-    });
+        },
+    );
 }
 
 /// ④ Capture format — combo edits are staged and only take effect on
 /// Apply (or the next Start), never by restarting mid-click-through.
 fn draw_input_device(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_card(ui, "tracking.input_device", t!("tracking.input_device"), false, |ui| {
-        #[cfg(feature = "realsense")]
-        {
-            // D435-exclusive capture: the sole input is the Intel
-            // RealSense D435. It self-selects the first D400 device and
-            // supplies its own color-aligned metric depth to the pose
-            // pipeline — there is no device / backend to choose.
-            ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
-            ui.add_space(4.0);
-        }
-        let unknown = t!("tracking.option_unknown");
-        egui::ComboBox::from_label(t!("tracking.resolution"))
-            .selected_text(
-                ["640x480", "1280x720", "1920x1080"]
-                    .get(state.tracking.camera_resolution_index)
-                    .map(|s| s.to_string())
-                    .unwrap_or(unknown),
-            )
-            .show_ui(ui, |ui| {
-                // Highest-first, matching the Output panel's ordering.
-                // Display order only — the GUI keeps combo positions
-                // 0=640, 1=1280, 2=1920; projects persist the real
-                // width/height values, not these indices.
-                ui.selectable_value(&mut state.tracking.camera_resolution_index, 2, "1920x1080");
-                ui.selectable_value(&mut state.tracking.camera_resolution_index, 1, "1280x720");
-                ui.selectable_value(&mut state.tracking.camera_resolution_index, 0, "640x480");
-            });
-        let unknown = t!("tracking.option_unknown");
-        egui::ComboBox::from_label(t!("tracking.frame_rate"))
-            .selected_text(
-                ["30 fps", "60 fps"]
-                    .get(state.tracking.camera_framerate_index)
-                    .map(|s| s.to_string())
-                    .unwrap_or(unknown),
-            )
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.tracking.camera_framerate_index, 0, "30 fps");
-                ui.selectable_value(&mut state.tracking.camera_framerate_index, 1, "60 fps");
-            });
+    collapsible_card(
+        ui,
+        "tracking.input_device",
+        t!("tracking.input_device"),
+        false,
+        |ui| {
+            #[cfg(feature = "realsense")]
+            {
+                // D435-exclusive capture: the sole input is the Intel
+                // RealSense D435. It self-selects the first D400 device and
+                // supplies its own color-aligned metric depth to the pose
+                // pipeline — there is no device / backend to choose.
+                ui.label(egui::RichText::new(t!("tracking.backend_realsense_hint")).small());
+                ui.add_space(4.0);
+            }
+            let unknown = t!("tracking.option_unknown");
+            egui::ComboBox::from_label(t!("tracking.resolution"))
+                .selected_text(
+                    ["640x480", "1280x720", "1920x1080"]
+                        .get(state.tracking.camera_resolution_index)
+                        .map(|s| s.to_string())
+                        .unwrap_or(unknown),
+                )
+                .show_ui(ui, |ui| {
+                    // Highest-first, matching the Output panel's ordering.
+                    // Display order only — the GUI keeps combo positions
+                    // 0=640, 1=1280, 2=1920; projects persist the real
+                    // width/height values, not these indices.
+                    ui.selectable_value(
+                        &mut state.tracking.camera_resolution_index,
+                        2,
+                        "1920x1080",
+                    );
+                    ui.selectable_value(&mut state.tracking.camera_resolution_index, 1, "1280x720");
+                    ui.selectable_value(&mut state.tracking.camera_resolution_index, 0, "640x480");
+                });
+            let unknown = t!("tracking.option_unknown");
+            egui::ComboBox::from_label(t!("tracking.frame_rate"))
+                .selected_text(
+                    ["30 fps", "60 fps"]
+                        .get(state.tracking.camera_framerate_index)
+                        .map(|s| s.to_string())
+                        .unwrap_or(unknown),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut state.tracking.camera_framerate_index, 0, "30 fps");
+                    ui.selectable_value(&mut state.tracking.camera_framerate_index, 1, "60 fps");
+                });
 
-        // While running, combo edits are *pending* until Apply — the
-        // camera restart takes seconds, so crossing two entries must
-        // not restart twice. The format the camera actually started
-        // with lives in egui temp memory (seeded on Start; if absent —
-        // e.g. after an egui memory reset — the current selection is
-        // treated as applied, which errs on not offering a stale Apply).
-        if state.app.is_tracking_running() {
-            let current = (
-                state.tracking.camera_resolution_index,
-                state.tracking.camera_framerate_index,
-            );
-            let applied = ui
-                .ctx()
-                .data_mut(|d| *d.get_temp_mut_or(applied_format_id(), current));
-            if applied != current {
-                ui.label(
-                    egui::RichText::new(t!("tracking.format_pending_hint"))
-                        .small()
-                        .color(color::ON_SURFACE_VARIANT),
+            // While running, combo edits are *pending* until Apply — the
+            // camera restart takes seconds, so crossing two entries must
+            // not restart twice. The format the camera actually started
+            // with lives in egui temp memory (seeded on Start; if absent —
+            // e.g. after an egui memory reset — the current selection is
+            // treated as applied, which errs on not offering a stale Apply).
+            if state.app.is_tracking_running() {
+                let current = (
+                    state.tracking.camera_resolution_index,
+                    state.tracking.camera_framerate_index,
                 );
-                if filled_button(ui, Some(ic::REFRESH), &t!("tracking.apply_format"), true)
-                    .clicked()
-                {
-                    let (w, h, fps) = effective_capture_params(state);
-                    let pipeline = state.tracking.pipeline_config();
-                    let camera_serial = state.tracking.camera_serial.clone();
-                    state
-                        .app
-                        .start_tracking_with_params(w, h, fps, camera_serial, pipeline);
-                    ui.ctx()
-                        .data_mut(|d| d.insert_temp(applied_format_id(), current));
-                    state.push_notification(t!(
-                        "tracking.camera_restarted",
-                        w = w,
-                        h = h,
-                        fps = fps
-                    ));
+                let applied = ui
+                    .ctx()
+                    .data_mut(|d| *d.get_temp_mut_or(applied_format_id(), current));
+                if applied != current {
+                    ui.label(
+                        egui::RichText::new(t!("tracking.format_pending_hint"))
+                            .small()
+                            .color(color::ON_SURFACE_VARIANT),
+                    );
+                    if filled_button(ui, Some(ic::REFRESH), &t!("tracking.apply_format"), true)
+                        .clicked()
+                    {
+                        let (w, h, fps) = effective_capture_params(state);
+                        let pipeline = state.tracking.pipeline_config();
+                        let camera_serial = state.tracking.camera_serial.clone();
+                        state
+                            .app
+                            .start_tracking_with_params(w, h, fps, camera_serial, pipeline);
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(applied_format_id(), current));
+                        state.push_notification(t!(
+                            "tracking.camera_restarted",
+                            w = w,
+                            h = h,
+                            fps = fps
+                        ));
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// ⑤ Display options — both mirror concepts in one place, each with a
 /// caption spelling out what it flips (they used to live in different
 /// sections with no explanation of the difference).
 fn draw_display_options(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_card(ui, "tracking.display_options", t!("tracking.display_options"), false, |ui| {
-        #[cfg(feature = "realsense")]
-        {
-            // 1:1 sensor-matched mirror render (needs the D435
-            // intrinsics, so it is realsense-only).
-            ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
-            ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
-            ui.add_space(4.0);
-        }
-        ui
-            .checkbox(&mut state.tracking.tracking_mirror, t!("tracking.mirror_preview"))
-            .changed();
-        ui.label(egui::RichText::new(t!("tracking.mirror_preview_hint")).small());
-        ui.add_space(4.0);
-        ui.checkbox(&mut state.viewport.show_camera_wipe, t!("tracking.camera_wipe"));
-        if state.viewport.show_camera_wipe {
+    collapsible_card(
+        ui,
+        "tracking.display_options",
+        t!("tracking.display_options"),
+        false,
+        |ui| {
+            #[cfg(feature = "realsense")]
+            {
+                // 1:1 sensor-matched mirror render (needs the D435
+                // intrinsics, so it is realsense-only).
+                ui.checkbox(&mut state.mirror_view, t!("tracking.mirror_view"));
+                ui.label(egui::RichText::new(t!("tracking.mirror_view_hint")).small());
+                ui.add_space(4.0);
+            }
             ui.checkbox(
-                &mut state.viewport.show_detection_annotations,
-                t!("tracking.show_annotations"),
+                &mut state.tracking.tracking_mirror,
+                t!("tracking.mirror_preview"),
+            )
+            .changed();
+            ui.label(egui::RichText::new(t!("tracking.mirror_preview_hint")).small());
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut state.viewport.show_camera_wipe,
+                t!("tracking.camera_wipe"),
             );
-        }
-    });
+            if state.viewport.show_camera_wipe {
+                ui.checkbox(
+                    &mut state.viewport.show_detection_annotations,
+                    t!("tracking.show_annotations"),
+                );
+            }
+        },
+    );
 }
 
 fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
@@ -655,8 +727,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
 
     if new_mic != active_mic {
         match state.app.set_requested_lipsync(requested_enabled, new_mic) {
-            Ok(()) => {
-            }
+            Ok(()) => {}
             Err(e) => {
                 // Mic device init failed — surface the error but
                 // do *not* mark the project dirty; nothing in
@@ -669,7 +740,10 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.add_space(4.0);
 
     let mut new_enabled = requested_enabled;
-    if ui.checkbox(&mut new_enabled, t!("tracking.enable_lip_sync")).changed() {
+    if ui
+        .checkbox(&mut new_enabled, t!("tracking.enable_lip_sync"))
+        .changed()
+    {
         match state.app.set_requested_lipsync(new_enabled, active_mic) {
             Ok(()) => {
                 if new_enabled {
@@ -701,9 +775,7 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
             // Without the feature, set_requested_lipsync is a no-op stub
             // that returns Ok, so just call it to reset App state.
             let _ = state.app.set_requested_lipsync(false, active_mic);
-            state.push_notification(
-                t!("tracking.lip_sync_unavailable").to_string(),
-            );
+            state.push_notification(t!("tracking.lip_sync_unavailable").to_string());
         }
     }
 
@@ -730,16 +802,16 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
     ui.label(t!("tracking.volume", vol = format!("{:.3}", vol)));
 
     ui.add_space(4.0);
-    ui
-        .add(
-            egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
-                .text(t!("tracking.threshold"))
-                .logarithmic(true),
-        )
-        .changed();
-    ui
-        .add(egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text(t!("tracking.smoothing")))
-        .changed();
+    ui.add(
+        egui::Slider::new(&mut state.lipsync.volume_threshold, 0.001..=0.1)
+            .text(t!("tracking.threshold"))
+            .logarithmic(true),
+    )
+    .changed();
+    ui.add(
+        egui::Slider::new(&mut state.lipsync.smoothing, 0.0..=1.0).text(t!("tracking.smoothing")),
+    )
+    .changed();
 
     // Mouth source: how the audio lip-sync and the camera (FaceMesh) mouth
     // visemes combine. Both = whichever is stronger, so the mouth opens for

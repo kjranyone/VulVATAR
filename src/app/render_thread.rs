@@ -308,10 +308,10 @@ mod tests {
     use crate::frame_handoff::{
         ExternalHandleType, FrameLease, FrameLifetimeContract, GpuFrameToken, OutputSyncToken,
     };
+    use crate::output::{FallbackReason, HandoffPath};
     use crate::renderer::frame_input::RenderColorSpace;
     use crate::renderer::output_export::{ExportMetadata, ExportedFrame};
     use crate::renderer::RenderStats;
-    use crate::output::{FallbackReason, HandoffPath};
     use std::sync::Arc;
 
     fn empty_result() -> RenderResult {

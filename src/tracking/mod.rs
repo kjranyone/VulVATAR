@@ -6,11 +6,11 @@ pub mod realsense;
 pub mod sequence_recorder;
 
 pub(crate) mod latest_cell;
+#[cfg(feature = "inference")]
+pub mod metric_frame;
 mod pose_estimation;
 pub mod provider;
 pub mod stagelog;
-#[cfg(feature = "inference")]
-pub mod metric_frame;
 
 pub mod calibration;
 pub mod debug_channel;
@@ -123,7 +123,6 @@ impl MouthSource {
         }
     }
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TrackingErrorLevel {

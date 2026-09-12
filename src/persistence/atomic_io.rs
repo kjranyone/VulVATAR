@@ -18,12 +18,16 @@ pub(super) fn backup_path_for(path: &std::path::Path) -> std::path::PathBuf {
     )
 }
 
-pub(super) fn load_with_fallback<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, String> {
+pub(super) fn load_with_fallback<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, String> {
     let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_json::from_str(&data).map_err(|e| e.to_string())
 }
 
-pub(super) fn load_or_backup<T: serde::de::DeserializeOwned>(primary: &std::path::Path) -> Result<T, String> {
+pub(super) fn load_or_backup<T: serde::de::DeserializeOwned>(
+    primary: &std::path::Path,
+) -> Result<T, String> {
     let backup = backup_path_for(primary);
     match load_with_fallback::<T>(primary) {
         Ok(v) => Ok(v),

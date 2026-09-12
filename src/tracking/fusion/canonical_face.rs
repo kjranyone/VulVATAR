@@ -570,14 +570,8 @@ impl FaceFit {
         }
         if pts.len() >= 20 {
             let n = pts.len() as f64;
-            let mean_l = scale(
-                pts.iter().fold([0.0; 3], |a, (l, _)| add(a, *l)),
-                1.0 / n,
-            );
-            let mean_c = scale(
-                pts.iter().fold([0.0; 3], |a, (_, c)| add(a, *c)),
-                1.0 / n,
-            );
+            let mean_l = scale(pts.iter().fold([0.0; 3], |a, (l, _)| add(a, *l)), 1.0 / n);
+            let mean_c = scale(pts.iter().fold([0.0; 3], |a, (_, c)| add(a, *c)), 1.0 / n);
             let mut num = 0.0;
             let mut den = 0.0;
             for (l, c) in &pts {
@@ -597,4 +591,3 @@ impl FaceFit {
         }
     }
 }
-

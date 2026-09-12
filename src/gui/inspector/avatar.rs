@@ -30,18 +30,15 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
                 // version badge reads at a glance, like the
                 // "musette" title in the mockup.
                 let (chip_bg, chip_fg) = match meta.spec_version {
-                    crate::asset::VrmSpecVersion::V1 => (
-                        color::SUCCESS_CONTAINER,
-                        color::ON_SUCCESS_CONTAINER,
-                    ),
-                    crate::asset::VrmSpecVersion::V0 => (
-                        color::WARNING_CONTAINER,
-                        color::ON_WARNING_CONTAINER,
-                    ),
-                    crate::asset::VrmSpecVersion::Unknown => (
-                        color::ERROR_CONTAINER,
-                        color::ON_ERROR_CONTAINER,
-                    ),
+                    crate::asset::VrmSpecVersion::V1 => {
+                        (color::SUCCESS_CONTAINER, color::ON_SUCCESS_CONTAINER)
+                    }
+                    crate::asset::VrmSpecVersion::V0 => {
+                        (color::WARNING_CONTAINER, color::ON_WARNING_CONTAINER)
+                    }
+                    crate::asset::VrmSpecVersion::Unknown => {
+                        (color::ERROR_CONTAINER, color::ON_ERROR_CONTAINER)
+                    }
                 };
                 ui.horizontal(|ui| {
                     let label_text = match &meta.spec_version_raw {
@@ -223,16 +220,22 @@ fn draw_model_information_card(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// gate per-avatar runtime behaviour, so they belong with the avatar,
 /// not with scene composition.
 fn draw_runtime_toggles(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_card(ui, "inspector.runtime_toggles", t!("inspector.runtime_toggles"), false, |ui| {
-        ui
-            .checkbox(&mut state.rendering.toggle_spring, t!("inspector.spring_enabled"))
+    collapsible_card(
+        ui,
+        "inspector.runtime_toggles",
+        t!("inspector.runtime_toggles"),
+        false,
+        |ui| {
+            ui.checkbox(
+                &mut state.rendering.toggle_spring,
+                t!("inspector.spring_enabled"),
+            )
             .changed();
-        ui.add_enabled_ui(state.rendering.toggle_spring, |ui| {
-            use crate::simulation::spring::SpringTuning;
-            ui.horizontal(|ui| {
-                ui.label(t!("inspector.spring_sway"));
-                ui
-                    .add(
+            ui.add_enabled_ui(state.rendering.toggle_spring, |ui| {
+                use crate::simulation::spring::SpringTuning;
+                ui.horizontal(|ui| {
+                    ui.label(t!("inspector.spring_sway"));
+                    ui.add(
                         egui::Slider::new(
                             &mut state.rendering.spring_tuning.sway_scale,
                             SpringTuning::SWAY_RANGE,
@@ -240,11 +243,10 @@ fn draw_runtime_toggles(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .fixed_decimals(2),
                     )
                     .changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label(t!("inspector.spring_gravity"));
-                ui
-                    .add(
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t!("inspector.spring_gravity"));
+                    ui.add(
                         egui::Slider::new(
                             &mut state.rendering.spring_tuning.gravity_offset,
                             SpringTuning::GRAVITY_RANGE,
@@ -252,29 +254,30 @@ fn draw_runtime_toggles(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .fixed_decimals(2),
                     )
                     .changed();
+                });
+                ui.checkbox(
+                    &mut state.rendering.spring_tuning.natural_gravity,
+                    t!("inspector.spring_natural_gravity"),
+                )
+                .changed();
             });
             ui.checkbox(
-                &mut state.rendering.spring_tuning.natural_gravity,
-                t!("inspector.spring_natural_gravity"),
+                &mut state.rendering.toggle_cloth,
+                t!("inspector.cloth_enabled"),
             )
             .changed();
-        });
-        ui
-            .checkbox(&mut state.rendering.toggle_cloth, t!("inspector.cloth_enabled"))
-            .changed();
-        ui
-            .checkbox(
+            ui.checkbox(
                 &mut state.rendering.toggle_collision_debug,
                 t!("inspector.collision_debug"),
             )
             .changed();
-        ui
-            .checkbox(
+            ui.checkbox(
                 &mut state.rendering.toggle_skeleton_debug,
                 t!("inspector.skeleton_debug"),
             )
             .changed();
-    });
+        },
+    );
 }
 
 /// Expression weight sliders. Bind directly to
@@ -291,173 +294,190 @@ fn draw_expression_control(ui: &mut egui::Ui, state: &mut GuiApp) {
         return;
     }
 
-    collapsible_card(ui, "inspector.expression_control", t!("inspector.expression_control"), false, |ui| {
-        ui.horizontal(|ui| {
-            if tonal_button(
-                ui,
-                None,
-                &t!("inspector.reset_all"),
-                ButtonTone::Primary,
-                true,
-            )
-            .clicked()
-            {
-                for ew in avatar.expression_weights.iter_mut() {
-                    ew.weight = 0.0;
-                }
-            }
-            if tonal_button(
-                ui,
-                None,
-                &t!("inspector.set_all_50"),
-                ButtonTone::Primary,
-                true,
-            )
-            .clicked()
-            {
-                for ew in avatar.expression_weights.iter_mut() {
-                    ew.weight = 0.5;
-                }
-            }
-        });
-
-        ui.separator();
-
-        for ew in avatar.expression_weights.iter_mut() {
+    collapsible_card(
+        ui,
+        "inspector.expression_control",
+        t!("inspector.expression_control"),
+        false,
+        |ui| {
             ui.horizontal(|ui| {
-                ui.label(&ew.name);
-                ui.add(
-                    egui::Slider::new(&mut ew.weight, 0.0..=1.0)
-                        .text("")
-                        .custom_formatter(|n, _| format!("{:.0}%", n * 100.0))
-                        .custom_parser(|s| {
-                            s.trim_end_matches('%')
-                                .parse::<f64>()
-                                .ok()
-                                .map(|v| v / 100.0)
-                        }),
-                );
+                if tonal_button(
+                    ui,
+                    None,
+                    &t!("inspector.reset_all"),
+                    ButtonTone::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    for ew in avatar.expression_weights.iter_mut() {
+                        ew.weight = 0.0;
+                    }
+                }
+                if tonal_button(
+                    ui,
+                    None,
+                    &t!("inspector.set_all_50"),
+                    ButtonTone::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    for ew in avatar.expression_weights.iter_mut() {
+                        ew.weight = 0.5;
+                    }
+                }
             });
-        }
 
-        ui.separator();
-        ui.label(t!(
-            "inspector.expressions_loaded",
-            count = avatar.expression_weights.len()
-        ));
-    });
+            ui.separator();
+
+            for ew in avatar.expression_weights.iter_mut() {
+                ui.horizontal(|ui| {
+                    ui.label(&ew.name);
+                    ui.add(
+                        egui::Slider::new(&mut ew.weight, 0.0..=1.0)
+                            .text("")
+                            .custom_formatter(|n, _| format!("{:.0}%", n * 100.0))
+                            .custom_parser(|s| {
+                                s.trim_end_matches('%')
+                                    .parse::<f64>()
+                                    .ok()
+                                    .map(|v| v / 100.0)
+                            }),
+                    );
+                });
+            }
+
+            ui.separator();
+            ui.label(t!(
+                "inspector.expressions_loaded",
+                count = avatar.expression_weights.len()
+            ));
+        },
+    );
 }
 
 /// Camera orbit rig editor — drawn by the Scene panel
 /// (`rendering::draw_scene`); defined here historically and re-used
 /// via `pub(super)` so the move stayed a one-line call-site change.
 pub(super) fn draw_camera_transform_card(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_card(ui, "inspector.camera_transform", t!("inspector.camera_transform"), true, |ui| {
-        kv_grid(
-            ui,
-            &[
-                (
-                    t!("inspector.yaw").as_str(),
-                    format!("{:.3}", state.camera_orbit.yaw_deg),
-                ),
-                (
-                    t!("inspector.pitch").as_str(),
-                    format!("{:.3}", state.camera_orbit.pitch_deg),
-                ),
-                (
-                    t!("inspector.distance").as_str(),
-                    format!("{:.4}", state.camera_orbit.distance),
-                ),
-            ],
-        );
-        ui.add_space(space::SM);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
-                    .speed(0.5)
-                    .prefix(format!("{}: ", t!("inspector.yaw"))),
+    collapsible_card(
+        ui,
+        "inspector.camera_transform",
+        t!("inspector.camera_transform"),
+        true,
+        |ui| {
+            kv_grid(
+                ui,
+                &[
+                    (
+                        t!("inspector.yaw").as_str(),
+                        format!("{:.3}", state.camera_orbit.yaw_deg),
+                    ),
+                    (
+                        t!("inspector.pitch").as_str(),
+                        format!("{:.3}", state.camera_orbit.pitch_deg),
+                    ),
+                    (
+                        t!("inspector.distance").as_str(),
+                        format!("{:.4}", state.camera_orbit.distance),
+                    ),
+                ],
             );
-            ui.add(
-                egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
-                    .speed(0.5)
-                    .prefix(format!("{}: ", t!("inspector.pitch"))),
-            );
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.camera_orbit.distance)
-                        .speed(0.05)
-                        .range(0.1..=100.0)
-                        .prefix(format!("{}: ", t!("inspector.distance"))),
-                )
-                .changed()
+            ui.add_space(space::SM);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut state.camera_orbit.yaw_deg)
+                        .speed(0.5)
+                        .prefix(format!("{}: ", t!("inspector.yaw"))),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut state.camera_orbit.pitch_deg)
+                        .speed(0.5)
+                        .prefix(format!("{}: ", t!("inspector.pitch"))),
+                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.camera_orbit.distance)
+                            .speed(0.05)
+                            .range(0.1..=100.0)
+                            .prefix(format!("{}: ", t!("inspector.distance"))),
+                    )
+                    .changed()
+                {
+                    state.camera_orbit.target_distance = state.camera_orbit.distance;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut state.camera_orbit.pan[0])
+                        .speed(0.01)
+                        .prefix(format!("{}: ", t!("inspector.pan_x"))),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut state.camera_orbit.pan[1])
+                        .speed(0.01)
+                        .prefix(format!("{}: ", t!("inspector.pan_y"))),
+                );
+            });
+            ui.add_space(space::SM);
+            // World-space eye position. The camera is an orbit rig, so X/Y/Z is a
+            // derived quantity (eye = orbit of yaw/pitch/distance around the pan
+            // target). Editing it repositions the eye about the world origin —
+            // pan is cleared and yaw/pitch/distance re-derived, which is the only
+            // *exact* inverse this rig supports. When not being edited the fields
+            // track the live eye, matching the viewport overlay.
+            let (sy, cy) = state.camera_orbit.yaw_deg.to_radians().sin_cos();
+            let (sp, cp) = state.camera_orbit.pitch_deg.to_radians().sin_cos();
+            let right = [cy, 0.0, -sy];
+            let up = [-sy * sp, cp, -cy * sp];
+            let pan = state.camera_orbit.pan;
+            let dist = state.camera_orbit.distance;
+            let mut eye = [
+                dist * cp * sy + pan[0] * right[0] + pan[1] * up[0],
+                dist * sp + pan[0] * right[1] + pan[1] * up[1],
+                dist * cp * cy + pan[0] * right[2] + pan[1] * up[2],
+            ];
+            ui.label(t!("inspector.camera_world_pos"));
+            ui.horizontal(|ui| {
+                let mut changed = false;
+                for (axis, prefix) in [(0usize, "X: "), (1, "Y: "), (2, "Z: ")] {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut eye[axis])
+                                .speed(0.05)
+                                .prefix(prefix),
+                        )
+                        .changed();
+                }
+                if changed {
+                    let d = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2])
+                        .sqrt()
+                        .max(0.1);
+                    state.camera_orbit.distance = d;
+                    state.camera_orbit.target_distance = d;
+                    state.camera_orbit.pitch_deg =
+                        (eye[1] / d).clamp(-1.0, 1.0).asin().to_degrees();
+                    state.camera_orbit.yaw_deg = eye[0].atan2(eye[2]).to_degrees();
+                    state.camera_orbit.pan = [0.0, 0.0];
+                }
+            });
+            ui.add_space(space::SM);
+            if tonal_button(
+                ui,
+                Some(ic::HISTORY),
+                &t!("inspector.reset_camera"),
+                ButtonTone::Primary,
+                true,
+            )
+            .clicked()
             {
-                state.camera_orbit.target_distance = state.camera_orbit.distance;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut state.camera_orbit.pan[0])
-                    .speed(0.01)
-                    .prefix(format!("{}: ", t!("inspector.pan_x"))),
-            );
-            ui.add(
-                egui::DragValue::new(&mut state.camera_orbit.pan[1])
-                    .speed(0.01)
-                    .prefix(format!("{}: ", t!("inspector.pan_y"))),
-            );
-        });
-        ui.add_space(space::SM);
-        // World-space eye position. The camera is an orbit rig, so X/Y/Z is a
-        // derived quantity (eye = orbit of yaw/pitch/distance around the pan
-        // target). Editing it repositions the eye about the world origin —
-        // pan is cleared and yaw/pitch/distance re-derived, which is the only
-        // *exact* inverse this rig supports. When not being edited the fields
-        // track the live eye, matching the viewport overlay.
-        let (sy, cy) = state.camera_orbit.yaw_deg.to_radians().sin_cos();
-        let (sp, cp) = state.camera_orbit.pitch_deg.to_radians().sin_cos();
-        let right = [cy, 0.0, -sy];
-        let up = [-sy * sp, cp, -cy * sp];
-        let pan = state.camera_orbit.pan;
-        let dist = state.camera_orbit.distance;
-        let mut eye = [
-            dist * cp * sy + pan[0] * right[0] + pan[1] * up[0],
-            dist * sp + pan[0] * right[1] + pan[1] * up[1],
-            dist * cp * cy + pan[0] * right[2] + pan[1] * up[2],
-        ];
-        ui.label(t!("inspector.camera_world_pos"));
-        ui.horizontal(|ui| {
-            let mut changed = false;
-            for (axis, prefix) in [(0usize, "X: "), (1, "Y: "), (2, "Z: ")] {
-                changed |= ui
-                    .add(egui::DragValue::new(&mut eye[axis]).speed(0.05).prefix(prefix))
-                    .changed();
-            }
-            if changed {
-                let d = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2])
-                    .sqrt()
-                    .max(0.1);
-                state.camera_orbit.distance = d;
-                state.camera_orbit.target_distance = d;
-                state.camera_orbit.pitch_deg = (eye[1] / d).clamp(-1.0, 1.0).asin().to_degrees();
-                state.camera_orbit.yaw_deg = eye[0].atan2(eye[2]).to_degrees();
+                state.camera_orbit.yaw_deg = 0.0;
+                state.camera_orbit.pitch_deg = 0.0;
+                state.camera_orbit.distance = 5.0;
+                state.camera_orbit.target_distance = 5.0;
                 state.camera_orbit.pan = [0.0, 0.0];
             }
-        });
-        ui.add_space(space::SM);
-        if tonal_button(
-            ui,
-            Some(ic::HISTORY),
-            &t!("inspector.reset_camera"),
-            ButtonTone::Primary,
-            true,
-        )
-        .clicked()
-        {
-            state.camera_orbit.yaw_deg = 0.0;
-            state.camera_orbit.pitch_deg = 0.0;
-            state.camera_orbit.distance = 5.0;
-            state.camera_orbit.target_distance = 5.0;
-            state.camera_orbit.pan = [0.0, 0.0];
-        }
-    });
+        },
+    );
 }

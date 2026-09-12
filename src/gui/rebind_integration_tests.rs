@@ -54,7 +54,9 @@ fn make_avatar_with_node(node_id: u64, node_name: &str) -> Arc<AvatarAsset> {
         humanoid: None,
         spring_bones: vec![],
         colliders: vec![],
-        default_expressions: ExpressionAssetSet { expressions: vec![] },
+        default_expressions: ExpressionAssetSet {
+            expressions: vec![],
+        },
         animation_clips: vec![],
         node_to_mesh: std::collections::HashMap::new(),
         vrm_meta: VrmMeta::default(),
@@ -71,8 +73,11 @@ fn install_avatar(harness: &mut GuiApp, asset: Arc<AvatarAsset>) {
 }
 
 fn make_overlay_pinning_to(name: &str, old_id: u64) -> ClothAsset {
-    let mut overlay =
-        ClothAsset::new_empty(ClothOverlayId(0), AvatarAssetId(1), AssetSourceHash([0u8; 32]));
+    let mut overlay = ClothAsset::new_empty(
+        ClothOverlayId(0),
+        AvatarAssetId(1),
+        AssetSourceHash([0u8; 32]),
+    );
     overlay.pins.push(ClothPin {
         sim_vertex_indices: vec![0],
         binding_node: NodeRef {

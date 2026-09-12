@@ -35,9 +35,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         .map(|p| {
             use crate::asset::HumanoidBone;
             match relevant_mode(&state.calibration.modal) {
-                Some(CalibrationMode::FullBody) => {
-                    p.joints.contains_key(&HumanoidBone::Hips)
-                }
+                Some(CalibrationMode::FullBody) => p.joints.contains_key(&HumanoidBone::Hips),
                 Some(CalibrationMode::UpperBody) => {
                     p.joints.contains_key(&HumanoidBone::LeftShoulder)
                         && p.joints.contains_key(&HumanoidBone::RightShoulder)

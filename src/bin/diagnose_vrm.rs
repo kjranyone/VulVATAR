@@ -1,6 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::collections::HashSet;
 
 use image::ImageBuffer;
 use vulvatar_lib::app::ViewportCamera;
@@ -17,9 +17,9 @@ fn main() -> Result<(), String> {
     env_logger::init();
 
     let mut args = std::env::args().skip(1);
-    let input_path = args
-        .next()
-        .ok_or_else(|| "usage: diagnose_vrm <input.vrm> [output.png] [toon|simple|unlit]".to_string())?;
+    let input_path = args.next().ok_or_else(|| {
+        "usage: diagnose_vrm <input.vrm> [output.png] [toon|simple|unlit]".to_string()
+    })?;
     let output_path = args.next();
     let mode_arg = args.next();
     let atlas_dump = matches!(mode_arg.as_deref(), Some("atlas"));
@@ -57,10 +57,14 @@ fn main() -> Result<(), String> {
 
     let asset = if is_fbx {
         let loader = vulvatar_lib::asset::fbx::FbxAssetLoader::new();
-        loader.load(path_str).map_err(|e| format!("failed to load FBX '{}': {}", input_path.display(), e))?
+        loader
+            .load(path_str)
+            .map_err(|e| format!("failed to load FBX '{}': {}", input_path.display(), e))?
     } else {
         let loader = VrmAssetLoader::new();
-        loader.load(path_str).map_err(|e| format!("failed to load VRM '{}': {}", input_path.display(), e))?
+        loader
+            .load(path_str)
+            .map_err(|e| format!("failed to load VRM '{}': {}", input_path.display(), e))?
     };
     print_uv_stats(&asset, material_filter.as_deref());
     if atlas_dump {
@@ -71,7 +75,10 @@ fn main() -> Result<(), String> {
 
     let mut avatar = AvatarInstance::new(AvatarInstanceId(1), Arc::clone(&asset));
     if let Ok(expr_name) = std::env::var("EXPR_NAME") {
-        let weight: f32 = std::env::var("EXPR_WEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let weight: f32 = std::env::var("EXPR_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         println!("Applying expression '{}' with weight {}", expr_name, weight);
         match avatar
             .expression_weights
@@ -79,12 +86,12 @@ fn main() -> Result<(), String> {
             .find(|w| w.name == expr_name)
         {
             Some(ew) => ew.weight = weight,
-            None => avatar
-                .expression_weights
-                .push(vulvatar_lib::avatar::expressions::ResolvedExpressionWeight {
+            None => avatar.expression_weights.push(
+                vulvatar_lib::avatar::expressions::ResolvedExpressionWeight {
                     name: expr_name,
                     weight,
-                }),
+                },
+            ),
         }
     }
     avatar.build_base_pose();
@@ -145,9 +152,9 @@ fn parse_mode(mode: Option<&str>) -> Result<(MaterialShaderMode, MaterialDebugVi
         "uv" => Ok((MaterialShaderMode::Unlit, MaterialDebugView::Uv)),
         "tex" | "texture" => Ok((MaterialShaderMode::Unlit, MaterialDebugView::BaseTexture)),
         other => Err(format!(
-        "unsupported mode '{}', expected one of: toon, simple, unlit, uv, tex, atlas",
-        other
-    )),
+            "unsupported mode '{}', expected one of: toon, simple, unlit, uv, tex, atlas",
+            other
+        )),
     }
 }
 
@@ -164,9 +171,9 @@ fn default_output_path(
         MaterialDebugView::Uv => "uv",
         MaterialDebugView::BaseTexture => "tex",
         MaterialDebugView::None => match material_mode {
-        MaterialShaderMode::Unlit => "unlit",
-        MaterialShaderMode::SimpleLit => "simple",
-        MaterialShaderMode::ToonLike => "toon",
+            MaterialShaderMode::Unlit => "unlit",
+            MaterialShaderMode::SimpleLit => "simple",
+            MaterialShaderMode::ToonLike => "toon",
         },
     };
     PathBuf::from("diagnostics").join(format!("{stem}_{mode}.png"))
@@ -194,11 +201,17 @@ fn dump_first_matching_texture(
         .base_color_texture
         .as_ref()
         .ok_or_else(|| format!("material '{}' has no base color texture", material.name))?;
-    let pixels = texture
-        .pixel_data
-        .as_ref()
-        .ok_or_else(|| format!("material '{}' texture has no embedded pixel data", material.name))?;
-    save_png(output_path, [texture.dimensions.0, texture.dimensions.1], pixels.as_slice())
+    let pixels = texture.pixel_data.as_ref().ok_or_else(|| {
+        format!(
+            "material '{}' texture has no embedded pixel data",
+            material.name
+        )
+    })?;
+    save_png(
+        output_path,
+        [texture.dimensions.0, texture.dimensions.1],
+        pixels.as_slice(),
+    )
 }
 
 fn save_png(path: &Path, extent: [u32; 2], pixels: &[u8]) -> Result<(), String> {
@@ -314,7 +327,10 @@ fn build_frame_input(
             world_transform: avatar.world_transform.clone(),
             mesh_instances,
             skinning_matrices: if disable_skinning {
-                vec![vulvatar_lib::asset::identity_matrix(); avatar.pose.skinning_matrices.len().max(1)]
+                vec![
+                    vulvatar_lib::asset::identity_matrix();
+                    avatar.pose.skinning_matrices.len().max(1)
+                ]
             } else {
                 avatar.pose.skinning_matrices.clone()
             },

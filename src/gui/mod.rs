@@ -60,10 +60,9 @@ pub(crate) fn build_font_definitions(locale: &str) -> Option<egui::FontDefinitio
         }
         match std::fs::read(&path) {
             Ok(data) => {
-                fonts.font_data.insert(
-                    (*name).into(),
-                    Arc::new(egui::FontData::from_owned(data)),
-                );
+                fonts
+                    .font_data
+                    .insert((*name).into(), Arc::new(egui::FontData::from_owned(data)));
                 available_cjk.push(name);
                 info!("loaded CJK font: {}", path.display());
             }
@@ -122,11 +121,7 @@ pub(crate) fn build_font_definitions(locale: &str) -> Option<egui::FontDefinitio
 
     for name in chain {
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push(name.into());
+            fonts.families.entry(family).or_default().push(name.into());
         }
     }
 
@@ -281,8 +276,10 @@ pub struct LibraryUiState {
     /// finished its synchronous thumbnail render. `update` drains them
     /// once per frame, writes the PNG, and tells egui to forget the
     /// cached texture for that file:// URI so the new pixels show up.
-    pub pending_thumbnail_jobs:
-        Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>)>,
+    pub pending_thumbnail_jobs: Vec<(
+        std::path::PathBuf,
+        std::sync::mpsc::Receiver<Result<crate::renderer::ThumbnailRenderResult, String>>,
+    )>,
     /// Background avatar load in progress, if any. Set by `top_bar::load_*`
     /// helpers, polled and cleared by `update`.
     pub avatar_load_job: Option<avatar_load::AvatarLoadJob>,
@@ -996,8 +993,7 @@ impl GuiApp {
         // override. Installs that predate `settings.json` migrate the
         // values out of the legacy last-session slot exactly once.
         let app_settings = crate::persistence::load_app_settings().unwrap_or_else(|| {
-            let migrated =
-                crate::persistence::migrate_legacy_app_settings().unwrap_or_default();
+            let migrated = crate::persistence::migrate_legacy_app_settings().unwrap_or_default();
             if let Err(e) = crate::persistence::save_app_settings(&migrated) {
                 warn!("persistence: could not write initial settings.json: {e}");
             }
@@ -1245,8 +1241,8 @@ impl GuiApp {
         };
         match (startup_avatar_path, restored) {
             (Some(avatar), Some((ps, warnings, project_path))) => {
-                state.library.avatar_load_job = Some(
-                    crate::gui::avatar_load::AvatarLoadJob::spawn(
+                state.library.avatar_load_job =
+                    Some(crate::gui::avatar_load::AvatarLoadJob::spawn(
                         avatar,
                         crate::gui::avatar_load::AfterLoad::ApplyProject {
                             project_state: Box::new(ps),
@@ -1254,8 +1250,7 @@ impl GuiApp {
                             warnings,
                             restore_unsaved,
                         },
-                    ),
-                );
+                    ));
             }
             (Some(avatar), None) => {
                 top_bar::load_avatar_from_path(&mut state, &avatar);
@@ -1297,13 +1292,11 @@ impl GuiApp {
         // entry. Only writes new files.
         let mut library_dirty = false;
         for entry in state.app.avatar_library.entries.iter_mut() {
-            let needs = entry
-                .thumbnail_path
-                .as_ref()
-                .is_none_or(|p| !p.exists());
+            let needs = entry.thumbnail_path.as_ref().is_none_or(|p| !p.exists());
             if needs {
                 if let Some(path) = state
-                    .library.thumbnail_gen
+                    .library
+                    .thumbnail_gen
                     .generate_and_save_placeholder(&entry.name)
                 {
                     entry.thumbnail_path = Some(path);
@@ -1322,11 +1315,18 @@ impl GuiApp {
         // afterwards so a missing folder doesn't keep coming back.
         for path in crate::persistence::load_watched_folders() {
             if !path.exists() {
-                state.push_notification(t!("toast.watched_folder_missing", path = path.display().to_string()));
+                state.push_notification(t!(
+                    "toast.watched_folder_missing",
+                    path = path.display().to_string()
+                ));
                 continue;
             }
             if let Err(e) = state.start_watching_folder(path.clone()) {
-                state.push_notification(t!("toast.failed_restore_watch", path = path.display().to_string(), error = e.to_string()));
+                state.push_notification(t!(
+                    "toast.failed_restore_watch",
+                    path = path.display().to_string(),
+                    error = e.to_string()
+                ));
             }
         }
         let _ = crate::persistence::save_watched_folders(&state.library.watched_avatar_dirs);
@@ -1461,11 +1461,7 @@ impl GuiApp {
     /// rescans while the camera is streaming, where it would contend
     /// with the capture thread. Returns the error toast text on a
     /// failed enumeration (context/driver trouble the user must see).
-    pub fn rescan_cameras(
-        &mut self,
-        force: bool,
-        interval: std::time::Duration,
-    ) -> Option<String> {
+    pub fn rescan_cameras(&mut self, force: bool, interval: std::time::Duration) -> Option<String> {
         if self.is_tracking_active() {
             return None;
         }
@@ -1586,8 +1582,7 @@ impl GuiApp {
         self.project_status.recent_avatars.retain(|p| p != &path);
         self.project_status.recent_avatars.insert(0, path);
         self.project_status.recent_avatars.truncate(10);
-        if let Err(e) =
-            crate::persistence::save_recent_avatars(&self.project_status.recent_avatars)
+        if let Err(e) = crate::persistence::save_recent_avatars(&self.project_status.recent_avatars)
         {
             warn!("persistence: save_recent_avatars failed: {}", e);
         }
@@ -1752,7 +1747,6 @@ impl GuiApp {
             frame_dt,
         }
     }
-
 }
 
 /// Localised label for an avatar-load progress stage. The asset-layer
@@ -1794,7 +1788,10 @@ impl eframe::App for GuiApp {
                     .to_lowercase();
                 match ext.as_str() {
                     "vrm" | "fbx" => {
-                        info!("gui: dropped avatar file (original: {:?}): {:?}", path, resolved_path);
+                        info!(
+                            "gui: dropped avatar file (original: {:?}): {:?}",
+                            path, resolved_path
+                        );
                         // Replacing a live avatar from a stray drag is
                         // the one accidental-destruction path — ask
                         // first. First load (no avatar yet) and a
@@ -1879,7 +1876,8 @@ impl eframe::App for GuiApp {
         self.runtime_status.last_frame_instant = now;
         let dt_secs = elapsed.as_secs_f64();
         // Exponential moving average for smoothing.
-        self.runtime_status.frame_time_ms = self.runtime_status.frame_time_ms * 0.9 + (dt_secs * 1000.0) * 0.1;
+        self.runtime_status.frame_time_ms =
+            self.runtime_status.frame_time_ms * 0.9 + (dt_secs * 1000.0) * 0.1;
         if dt_secs > 0.0 {
             self.runtime_status.fps = self.runtime_status.fps * 0.9 + (1.0 / dt_secs) * 0.1;
         }
@@ -1958,35 +1956,35 @@ impl eframe::App for GuiApp {
         self.write_recovery_snapshot_if_due();
 
         // Cloth overlay autosave consent dialog
-        if self.app.editor.overlay_asset.is_some() && self.cloth_authoring.autosave_consent.is_none() {
-        egui::Window::new(t!("dialog.cloth_autosave_title"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.label(
-                    t!("dialog.cloth_autosave_body"),
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if components::filled_button(ui, None, &t!("dialog.yes"), true).clicked() {
-                        self.cloth_authoring.autosave_consent = Some(true);
-                        self.project_status.app_settings_dirty = true;
-                    }
-                    if components::tonal_button(
-                        ui,
-                        None,
-                        &t!("dialog.no"),
-                        components::ButtonTone::Primary,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.cloth_authoring.autosave_consent = Some(false);
-                        self.project_status.app_settings_dirty = true;
-                    }
+        if self.app.editor.overlay_asset.is_some()
+            && self.cloth_authoring.autosave_consent.is_none()
+        {
+            egui::Window::new(t!("dialog.cloth_autosave_title"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(t!("dialog.cloth_autosave_body"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if components::filled_button(ui, None, &t!("dialog.yes"), true).clicked() {
+                            self.cloth_authoring.autosave_consent = Some(true);
+                            self.project_status.app_settings_dirty = true;
+                        }
+                        if components::tonal_button(
+                            ui,
+                            None,
+                            &t!("dialog.no"),
+                            components::ButtonTone::Primary,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            self.cloth_authoring.autosave_consent = Some(false);
+                            self.project_status.app_settings_dirty = true;
+                        }
+                    });
                 });
-            });
         }
 
         top_bar::draw(ctx, self);

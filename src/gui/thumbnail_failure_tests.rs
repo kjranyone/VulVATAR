@@ -67,10 +67,8 @@ fn render_failure_preserves_existing_placeholder() {
     let placeholder_bytes: &[u8] = b"placeholder-bytes";
     std::fs::write(&path, placeholder_bytes).expect("seed placeholder");
 
-    let outcome = handle_thumbnail_response(
-        &path,
-        Err("simulated render thread panic".to_string()),
-    );
+    let outcome =
+        handle_thumbnail_response(&path, Err("simulated render thread panic".to_string()));
     assert!(outcome.is_err());
 
     let after = std::fs::read(&path).expect("placeholder still readable");

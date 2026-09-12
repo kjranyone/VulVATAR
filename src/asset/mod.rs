@@ -925,9 +925,11 @@ pub fn find_avatar_file_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
             .to_lowercase();
 
         let match_a = (!folder_stem.is_empty()
-            && (folder_stem.contains(&stem_a) || stem_a.contains(&folder_stem))) as i32;
+            && (folder_stem.contains(&stem_a) || stem_a.contains(&folder_stem)))
+            as i32;
         let match_b = (!folder_stem.is_empty()
-            && (folder_stem.contains(&stem_b) || stem_b.contains(&folder_stem))) as i32;
+            && (folder_stem.contains(&stem_b) || stem_b.contains(&folder_stem)))
+            as i32;
 
         match match_b.cmp(&match_a) {
             std::cmp::Ordering::Equal => size_b.cmp(size_a),
@@ -937,4 +939,3 @@ pub fn find_avatar_file_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
 
     candidates.into_iter().next().map(|(p, _)| p)
 }
-

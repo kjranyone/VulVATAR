@@ -619,8 +619,7 @@ pub(super) fn derive_face_pose_from_landmarks(landmarks: &[[f32; 3]]) -> Option<
     // before the subtraction. 0.5 floor: past ~60° the mesh confidence
     // collapses anyway; don't let cos over-shrink a noisy ratio.
     let yaw_foreshorten = yaw.cos().clamp(0.5, 1.0);
-    let pitch_signal =
-        (nose[1] - eye_mid_y) / face_width * yaw_foreshorten - PITCH_NEUTRAL_SIGNAL;
+    let pitch_signal = (nose[1] - eye_mid_y) / face_width * yaw_foreshorten - PITCH_NEUTRAL_SIGNAL;
     let pitch = pitch_signal.clamp(-2.0, 2.0).atan();
 
     // ROLL from eye-line Y-X. Image y-down: when subject tilts head

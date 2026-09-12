@@ -73,7 +73,13 @@ pub struct RawKp {
 /// joints it cannot see to the crop edge with a plausible-looking score,
 /// so those carry no information (they are not "at the edge", they are
 /// "somewhere outside"). `margin_frac` is relative to the crop size.
-pub fn cull_crop_border(kps: &mut [RawKp], crop: (f32, f32, f32, f32), width: u32, height: u32, margin_frac: f32) {
+pub fn cull_crop_border(
+    kps: &mut [RawKp],
+    crop: (f32, f32, f32, f32),
+    width: u32,
+    height: u32,
+    margin_frac: f32,
+) {
     let (cx, cy, cw, ch) = crop;
     if cw <= 0.0 || ch <= 0.0 {
         return;
@@ -166,7 +172,9 @@ pub fn body_kp2d(
         if abl_no_headkp && i < 5 {
             continue;
         }
-        let Some(Some(point)) = map.points.get(i) else { continue };
+        let Some(Some(point)) = map.points.get(i) else {
+            continue;
+        };
         if !(kp.score >= pol.min_score) || !kp.nx.is_finite() || !kp.ny.is_finite() {
             continue;
         }
@@ -241,7 +249,9 @@ pub fn body_kp3d(
         None => (0.15, 6.0),
     };
     for &(i, off, sigma) in &TABLE {
-        let Some(Some(point)) = map.points.get(i) else { continue };
+        let Some(Some(point)) = map.points.get(i) else {
+            continue;
+        };
         let Some(kp) = kps.get(i) else { continue };
         if !(kp.score >= min_score) || !kp.nx.is_finite() || !kp.ny.is_finite() {
             continue;
@@ -271,7 +281,9 @@ pub fn body_kp3d(
         } else {
             sigma
         };
-        let Some(p) = window_point(points, width, height, u, v, 3, zlo, zhi) else { continue };
+        let Some(p) = window_point(points, width, height, u, v, 3, zlo, zhi) else {
+            continue;
+        };
         let n = norm(p);
         if n < 0.1 {
             continue;
@@ -283,7 +295,7 @@ pub fn body_kp3d(
             point: *point,
             p: p_joint,
             sigma: s,
-                lat_scale: 1.0,
+            lat_scale: 1.0,
         });
     }
 }
@@ -326,14 +338,19 @@ pub fn body_torso_leg_depth(
         None => (0.15, 6.0),
     };
     for &(i, off, sigma) in &TABLE {
-        let Some(Some(point)) = map.points.get(i) else { continue };
+        let Some(Some(point)) = map.points.get(i) else {
+            continue;
+        };
         let Some(kp) = kps.get(i) else { continue };
-        if !(kp.score >= min_score) || kp.nx <= 0.0 || kp.nx >= 1.0 || kp.ny <= 0.0 || kp.ny >= 1.0 {
+        if !(kp.score >= min_score) || kp.nx <= 0.0 || kp.nx >= 1.0 || kp.ny <= 0.0 || kp.ny >= 1.0
+        {
             continue;
         }
         let u = kp.nx as f64 * width as f64;
         let v = kp.ny as f64 * height as f64;
-        let Some(p) = window_point(points, width, height, u, v, 2, zlo, zhi) else { continue };
+        let Some(p) = window_point(points, width, height, u, v, 2, zlo, zhi) else {
+            continue;
+        };
         let n = norm(p);
         if n < 0.1 {
             continue;
@@ -358,7 +375,11 @@ pub fn body_torso_leg_depth(
             if own || matches!(c.part, Part::Torso) {
                 continue;
             }
-            let (q, _u) = closest_on_segment(pred_fk.point(c.a), pred_fk.point(c.b), scale(dir, joint_depth));
+            let (q, _u) = closest_on_segment(
+                pred_fk.point(c.a),
+                pred_fk.point(c.b),
+                scale(dir, joint_depth),
+            );
             // Distance from the ray to the capsule axis, evaluated at the
             // segment point closest to the joint-depth sample.
             let along = dot(q, dir);
@@ -370,7 +391,10 @@ pub fn body_torso_leg_depth(
             }
         }
         if occluded || (p[2] as f64) < joint_depth - 0.20 {
-            out_surface.push((p, 0.015 * SCORE_INFLATE_BASE_3D() * (1.0 + (1.0 - kp.score as f64))));
+            out_surface.push((
+                p,
+                0.015 * SCORE_INFLATE_BASE_3D() * (1.0 + (1.0 - kp.score as f64)),
+            ));
         } else {
             let p_joint = scale(p, (n + off) / n);
             out3d.push(Kp3d {
@@ -382,7 +406,6 @@ pub fn body_torso_leg_depth(
         }
     }
 }
-
 
 /// Torso yaw from the chest's depth slope, in camera x/z (radians),
 /// with the number of surviving columns.
@@ -433,76 +456,82 @@ pub fn chest_yaw_from_depth(
     // neck and chin sit there, not the trunk.
     let bands: [(f64, f64, bool); 2] = [(0.02, 0.18, false), (-0.16, -0.03, true)];
     for &(row_lo, row_hi, skip_middle) in &bands {
-    let mut med: Vec<(f64, f64)> = Vec::with_capacity(COLS);
-    for c in 0..COLS {
-        // Inset 12% at each end: a column on the silhouette mixes the
-        // background into its median.
-        let t = 0.12 + 0.76 * (c as f64 + 0.5) / COLS as f64;
-        if skip_middle && (0.33..0.67).contains(&t) {
-            continue;
-        }
-        let bu = rp.0 + (lp.0 - rp.0) * t;
-        let bv = rp.1 + (lp.1 - rp.1) * t;
-        let (mut xs, mut zs): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
-        for row in 0..7 {
-            let v = bv + span * (row_lo + (row_hi - row_lo) * row as f64 / 6.0);
-            if occluded(bu, v) {
-                n_occl += 1;
+        let mut med: Vec<(f64, f64)> = Vec::with_capacity(COLS);
+        for c in 0..COLS {
+            // Inset 12% at each end: a column on the silhouette mixes the
+            // background into its median.
+            let t = 0.12 + 0.76 * (c as f64 + 0.5) / COLS as f64;
+            if skip_middle && (0.33..0.67).contains(&t) {
                 continue;
             }
-            if let Some(q) = window_point(points, width, height, bu, v, 1, zlo, zhi) {
-                xs.push(q[0]);
-                zs.push(q[2]);
-            } else {
-                n_nodepth += 1;
+            let bu = rp.0 + (lp.0 - rp.0) * t;
+            let bv = rp.1 + (lp.1 - rp.1) * t;
+            let (mut xs, mut zs): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+            for row in 0..7 {
+                let v = bv + span * (row_lo + (row_hi - row_lo) * row as f64 / 6.0);
+                if occluded(bu, v) {
+                    n_occl += 1;
+                    continue;
+                }
+                if let Some(q) = window_point(points, width, height, bu, v, 1, zlo, zhi) {
+                    xs.push(q[0]);
+                    zs.push(q[2]);
+                } else {
+                    n_nodepth += 1;
+                }
             }
+            if zs.len() < 4 {
+                continue;
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            med.push((xs[xs.len() / 2], zs[zs.len() / 2]));
         }
-        if zs.len() < 4 {
+        // A band needs enough columns to fit a line; the shoulder-top band
+        // has at most 10 (its middle third is skipped).
+        if med.len() < if skip_middle { 6 } else { 8 } {
+            if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+                eprintln!(
+                    "CHESTFAIL cols {} of {} occl {} nodepth {}",
+                    med.len(),
+                    COLS,
+                    n_occl,
+                    n_nodepth
+                );
+            }
             continue;
         }
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        med.push((xs[xs.len() / 2], zs[zs.len() / 2]));
-    }
-    // A band needs enough columns to fit a line; the shoulder-top band
-    // has at most 10 (its middle third is skipped).
-    if med.len() < if skip_middle { 6 } else { 8 } {
-        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
-            eprintln!("CHESTFAIL cols {} of {} occl {} nodepth {}", med.len(), COLS, n_occl, n_nodepth);
+        let mut zz: Vec<f64> = med.iter().map(|c| c.1).collect();
+        zz.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mid = zz[zz.len() / 2];
+        let pts: Vec<(f64, f64)> = med
+            .iter()
+            .copied()
+            .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
+            .collect();
+        if pts.len() < if skip_middle { 6 } else { 8 } {
+            if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+                eprintln!("CHESTFAIL zfilter {} of {}", pts.len(), med.len());
+            }
+            continue;
         }
-        continue;
-    }
-    let mut zz: Vec<f64> = med.iter().map(|c| c.1).collect();
-    zz.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = zz[zz.len() / 2];
-    let pts: Vec<(f64, f64)> = med
-        .iter()
-        .copied()
-        .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
-        .collect();
-    if pts.len() < if skip_middle { 6 } else { 8 } {
-        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
-            eprintln!("CHESTFAIL zfilter {} of {}", pts.len(), med.len());
+        let xmin = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let xmax = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        if xmax - xmin < 0.12 {
+            if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
+                eprintln!("CHESTFAIL span {:.3}", xmax - xmin);
+            }
+            continue;
         }
-        continue;
-    }
-    let xmin = pts.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-    let xmax = pts.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-    if xmax - xmin < 0.12 {
-        if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
-            eprintln!("CHESTFAIL span {:.3}", xmax - xmin);
+        let n = pts.len() as f64;
+        let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        let mz = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        let (mut num, mut den) = (0.0, 0.0);
+        for (x, z) in &pts {
+            num += (x - mx) * (z - mz);
+            den += (x - mx) * (x - mx);
         }
-        continue;
-    }
-    let n = pts.len() as f64;
-    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
-    let mz = pts.iter().map(|p| p.1).sum::<f64>() / n;
-    let (mut num, mut den) = (0.0, 0.0);
-    for (x, z) in &pts {
-        num += (x - mx) * (z - mz);
-        den += (x - mx) * (x - mx);
-    }
-    return Some(((num / den.max(1e-9)).atan(), pts.len()));
+        return Some(((num / den.max(1e-9)).atan(), pts.len()));
     }
     None
 }
@@ -533,24 +562,23 @@ pub fn reach_filter(
         (112, 133, 1), // right hand block
     ];
     // Does this side's elbow have depth support? (Same window as below.)
-    let elbow_has_depth: [bool; 2] = [7usize, 8]
-        .map(|i| {
-            kps.get(i)
-                .filter(|kp| kp.score > 0.2 && (0.0..=1.0).contains(&kp.nx))
-                .and_then(|kp| {
-                    window_point(
-                        points,
-                        width,
-                        height,
-                        kp.nx as f64 * width as f64,
-                        kp.ny as f64 * height as f64,
-                        2,
-                        0.15,
-                        8.0,
-                    )
-                })
-                .is_some()
-        });
+    let elbow_has_depth: [bool; 2] = [7usize, 8].map(|i| {
+        kps.get(i)
+            .filter(|kp| kp.score > 0.2 && (0.0..=1.0).contains(&kp.nx))
+            .and_then(|kp| {
+                window_point(
+                    points,
+                    width,
+                    height,
+                    kp.nx as f64 * width as f64,
+                    kp.ny as f64 * height as f64,
+                    2,
+                    0.15,
+                    8.0,
+                )
+            })
+            .is_some()
+    });
     for &(lo, hi, side) in &groups {
         let zs = shoulder_z[side];
         if !zs.is_finite() || zs <= 0.0 {
@@ -596,8 +624,7 @@ pub fn reach_filter(
                     // 5% of the frame. Swept: at 2% and 1% the phantom
                     // comes back (the bystander sat at 0.995 but the
                     // detector's estimate of it wanders inward).
-                    let border =
-                        !(0.05..0.95).contains(&kp.nx) || !(0.05..0.95).contains(&kp.ny);
+                    let border = !(0.05..0.95).contains(&kp.nx) || !(0.05..0.95).contains(&kp.ny);
                     if border && !elbow_has_depth[side] {
                         kp.score = 0.0;
                     }
@@ -675,7 +702,6 @@ pub fn shoulder_depth_ref(
     Some(zs[zs.len() / 2])
 }
 
-
 /// Median metric point in a small window of a full-frame point cloud,
 /// restricted to a depth band. Returns `None` when fewer than 3 valid
 /// samples exist.
@@ -720,5 +746,9 @@ pub fn window_point(
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    Some([med(&mut xs) as f64, med(&mut ys) as f64, med(&mut zs) as f64])
+    Some([
+        med(&mut xs) as f64,
+        med(&mut ys) as f64,
+        med(&mut zs) as f64,
+    ])
 }

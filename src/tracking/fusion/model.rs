@@ -90,6 +90,19 @@ pub struct SiteDef {
     pub offset: V3,
     /// Multiplied by `exp(β_scale + β_len[group])`.
     pub len_group: LenGroup,
+    /// If set, the offset additionally translates by `State::shear` metres
+    /// along the joint frame's +Z (positive = toward the body's front):
+    /// the trunk front-surface taper, as a shape parameter. The visible
+    /// chest surface recedes toward the shoulders by anatomy, and a
+    /// straight constant-section capsule can only explain that depth
+    /// slope by tilting its axis — which drags the out-of-frame pelvis
+    /// toward the camera (measured on the s1789219959 desk replay:
+    /// torso pitch −11° ≈ the chest-surface slope, pelvis 0.46 m vs
+    /// 0.75 m honest). The slope `axis_tilt − taper` is one equation in
+    /// two unknowns per frame; the taper is anatomical (session-constant)
+    /// while posture fluctuates, so placing it in the slow shape state
+    /// separates the pair. See `Params::shear_sigma`.
+    pub shear: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +159,12 @@ pub struct Model {
     pub beta_scale: usize,
     pub beta_len: usize,
     pub beta_rad: usize,
+    /// Trunk front-surface shear (metres, additive along the sheared sites'
+    /// local +Z) — the taper shape parameter. Always the LAST parameter, so
+    /// `beta_scale..num_params` ranges (predict's no-extrapolation, the
+    /// shape-freeze variance check, process-noise classing) pick it up
+    /// automatically.
+    pub beta_shear: usize,
     /// Depth of each joint (root children = 1).
     pub depth: Vec<usize>,
 }
@@ -298,8 +317,22 @@ impl Builder {
             joint,
             offset,
             len_group,
+            shear: false,
         });
         self.sites.len() - 1
+    }
+    /// Like [`Self::site`], but the offset rides the trunk shear parameter
+    /// (see `SiteDef::shear`).
+    fn site_sheared(
+        &mut self,
+        name: &'static str,
+        joint: usize,
+        offset: V3,
+        len_group: LenGroup,
+    ) -> usize {
+        let i = self.site(name, joint, offset, len_group);
+        self.sites[i].shear = true;
+        i
     }
     fn capsule(&mut self, a: PointRef, b: PointRef, r: f64, g: RadGroup, part: Part) {
         self.capsules.push(CapsuleDef {
@@ -429,10 +462,10 @@ impl Humanoid {
         // 2:1 elliptical section instead of a round tube)
         s.torso_l_lo = b.site("torso_l_lo", j.pelvis, [0.06, 0.02, 0.0], L::Hips);
         s.torso_r_lo = b.site("torso_r_lo", j.pelvis, [-0.06, 0.02, 0.0], L::Hips);
-        s.torso_l_hi = b.site("torso_l_hi", j.spine3, [0.07, 0.10, 0.0], L::Shoulder);
+        s.torso_l_hi = b.site_sheared("torso_l_hi", j.spine3, [0.07, 0.10, 0.0], L::Shoulder);
         s.torso_r_hi = b.site("torso_r_hi", j.spine3, [-0.07, 0.10, 0.0], L::Shoulder);
         s.torso_lo = b.site("torso_lo", j.pelvis, [0.0, 0.02, 0.0], L::Hips);
-        s.torso_hi = b.site("torso_hi", j.spine3, [0.0, 0.10, 0.0], L::Shoulder);
+        s.torso_hi = b.site_sheared("torso_hi", j.spine3, [0.0, 0.10, 0.0], L::Shoulder);
         // One elliptic trunk (lateral semi-axis 0.17 m, depth 0.105 m):
         // the same 2:1 section the former capsule pair approximated, as a
         // single surface whose flat front carries yaw.
@@ -477,222 +510,284 @@ impl Humanoid {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
             .unwrap_or(0.15);
-        let l_arm = |b: &mut Builder, s: &mut SiteIdx, mirror: bool| -> ([usize; 5], [[usize; 4]; 5]) {
-            let m = |v: V3| if mirror { mirror_v(v) } else { v };
-            let mk = |k: JointKind| if mirror { mirror_kind(k) } else { k };
-            let mr = |w: V3| if mirror { mirror_rotvec(w) } else { w };
-            let hand = if mirror { 1 } else { 0 };
-            let (b_clav, b_up, b_lo, b_hand) = if mirror {
-                (B::RightShoulder, B::RightUpperArm, B::RightLowerArm, B::RightHand)
-            } else {
-                (B::LeftShoulder, B::LeftUpperArm, B::LeftLowerArm, B::LeftHand)
-            };
-            let clav = b.joint(
-                if mirror { "r_clav" } else { "l_clav" },
-                Some(3), // spine3
-                m([0.25, 1.0, 0.0]),
-                0.10,
-                L::Shoulder,
-                mk(ball([-0.4, -0.5, -0.4], [0.4, 0.5, 0.6])),
-                Some(b_clav),
-                z3,
-                sig(clav_sigma),
-            );
-            let sh = b.joint(
-                if mirror { "r_shoulder" } else { "l_shoulder" },
-                Some(clav),
-                m([1.0, 0.05, 0.0]),
-                0.16,
-                L::Shoulder,
-                mk(BALL_WIDE),
-                Some(b_up),
-                // relaxed: arm hanging down ≈ rotate −80° about +Z for the
-                // left arm (T-pose +X → down)
-                mr([0.0, 0.0, -1.4]),
-                sig(0.9),
-            );
-            let el = b.joint(
-                if mirror { "r_elbow" } else { "l_elbow" },
-                Some(sh),
-                m([1.0, 0.0, 0.0]),
-                0.28,
-                L::UpperArm,
-                // flexion brings the forearm forward (+Z) from +X: rotate
-                // about −Y for the left arm.
-                mk(hinge([0.0, -1.0, 0.0], -0.05, 2.6)),
-                None,
-                [0.3, 0.0, 0.0],
-                sig(0.7),
-            );
-            let tw = b.joint(
-                if mirror { "r_elbow_twist" } else { "l_elbow_twist" },
-                Some(el),
-                z3,
-                0.0,
-                L::Forearm,
-                // pronation/supination about the forearm axis (+X left)
-                mk(hinge([1.0, 0.0, 0.0], -1.6, 1.6)),
-                Some(b_lo),
-                z3,
-                sig(0.6),
-            );
-            let wr = b.joint(
-                if mirror { "r_wrist" } else { "l_wrist" },
-                Some(tw),
-                m([1.0, 0.0, 0.0]),
-                0.26,
-                L::Forearm,
-                mk(ball([-0.5, -0.6, -1.2], [0.5, 0.6, 1.2])),
-                Some(b_hand),
-                z3,
-                sig(0.35),
-            );
-            b.capsule(
-                PointRef::Joint(sh),
-                PointRef::Joint(el),
-                0.045,
-                R::UpperArm,
-                if mirror { Part::RightArm } else { Part::LeftArm },
-            );
-            b.capsule(
-                PointRef::Joint(el),
-                PointRef::Joint(wr),
-                0.040,
-                R::Forearm,
-                if mirror { Part::RightArm } else { Part::LeftArm },
-            );
-            // Hand: MCPs as joints (children of wrist), fingers as chains.
-            // Palm-down T-pose: fingers along +X (left), thumb toward +Z.
-            let mut mcp_pos = [
-                ("thumb", [0.030, -0.010, 0.030], 0.045),
-                ("index", [0.090, 0.0, 0.028], 0.040),
-                ("middle", [0.095, 0.0, 0.008], 0.045),
-                ("ring", [0.090, 0.0, -0.012], 0.040),
-                ("little", [0.082, 0.0, -0.030], 0.033),
-            ];
-            let seg_len = [
-                [0.045, 0.030, 0.025], // thumb: MCP→IP, IP→tip after CMC→MCP (prox len above)
-                [0.040, 0.025, 0.020],
-                [0.045, 0.028, 0.022],
-                [0.040, 0.026, 0.020],
-                [0.033, 0.020, 0.018],
-            ];
-            let bones: [[B; 3]; 5] = if mirror {
-                [
-                    [B::RightThumbProximal, B::RightThumbIntermediate, B::RightThumbDistal],
-                    [B::RightIndexProximal, B::RightIndexIntermediate, B::RightIndexDistal],
-                    [B::RightMiddleProximal, B::RightMiddleIntermediate, B::RightMiddleDistal],
-                    [B::RightRingProximal, B::RightRingIntermediate, B::RightRingDistal],
-                    [B::RightLittleProximal, B::RightLittleIntermediate, B::RightLittleDistal],
-                ]
-            } else {
-                [
-                    [B::LeftThumbProximal, B::LeftThumbIntermediate, B::LeftThumbDistal],
-                    [B::LeftIndexProximal, B::LeftIndexIntermediate, B::LeftIndexDistal],
-                    [B::LeftMiddleProximal, B::LeftMiddleIntermediate, B::LeftMiddleDistal],
-                    [B::LeftRingProximal, B::LeftRingIntermediate, B::LeftRingDistal],
-                    [B::LeftLittleProximal, B::LeftLittleIntermediate, B::LeftLittleDistal],
-                ]
-            };
-            let hand_part = if mirror { Part::RightHand } else { Part::LeftHand };
-            let mut finger_idx = [[0usize; 4]; 5];
-            for (f, (_name, pos, prox_len)) in mcp_pos.iter_mut().enumerate() {
-                let is_thumb = f == 0;
-                // Finger direction in the hand frame at rest.
-                let dir: V3 = if is_thumb {
-                    normalize([0.7, -0.15, 0.7])
+        let l_arm =
+            |b: &mut Builder, s: &mut SiteIdx, mirror: bool| -> ([usize; 5], [[usize; 4]; 5]) {
+                let m = |v: V3| if mirror { mirror_v(v) } else { v };
+                let mk = |k: JointKind| if mirror { mirror_kind(k) } else { k };
+                let mr = |w: V3| if mirror { mirror_rotvec(w) } else { w };
+                let hand = if mirror { 1 } else { 0 };
+                let (b_clav, b_up, b_lo, b_hand) = if mirror {
+                    (
+                        B::RightShoulder,
+                        B::RightUpperArm,
+                        B::RightLowerArm,
+                        B::RightHand,
+                    )
                 } else {
-                    [1.0, 0.0, 0.0]
+                    (
+                        B::LeftShoulder,
+                        B::LeftUpperArm,
+                        B::LeftLowerArm,
+                        B::LeftHand,
+                    )
                 };
-                // Flexion axis: curl toward the palm (−Y). For a finger
-                // along +X that is rotation about −Z. Thumb curls across
-                // the palm: about an axis ⟂ to its dir and to the palm
-                // normal.
-                let flex_axis: V3 = if is_thumb {
-                    normalize(cross(dir, [0.0, -1.0, 0.0]))
-                } else {
-                    [0.0, 0.0, -1.0]
-                };
-                let abd_axis: V3 = if is_thumb {
-                    [0.0, -1.0, 0.0]
-                } else {
-                    [0.0, 1.0, 0.0]
-                };
-                // Metacarpal head as an offset joint (MCP flex hinge), with
-                // the abduction hinge stacked at zero offset.
-                let mcp_len = norm(*pos);
-                let mcp_flex = b.joint(
-                    "mcp_flex",
-                    Some(wr),
-                    m(*pos),
-                    mcp_len,
-                    L::Hand,
-                    mk(hinge(flex_axis, if is_thumb { -0.6 } else { -0.3 }, 1.6)),
-                    Some(bones[f][0]),
-                    [0.1, 0.0, 0.0],
-                    sig(0.5),
+                let clav = b.joint(
+                    if mirror { "r_clav" } else { "l_clav" },
+                    Some(3), // spine3
+                    m([0.25, 1.0, 0.0]),
+                    0.10,
+                    L::Shoulder,
+                    mk(ball([-0.4, -0.5, -0.4], [0.4, 0.5, 0.6])),
+                    Some(b_clav),
+                    z3,
+                    sig(clav_sigma),
                 );
-                let mcp_abd = b.joint(
-                    "mcp_abd",
-                    Some(mcp_flex),
+                let sh = b.joint(
+                    if mirror { "r_shoulder" } else { "l_shoulder" },
+                    Some(clav),
+                    m([1.0, 0.05, 0.0]),
+                    0.16,
+                    L::Shoulder,
+                    mk(BALL_WIDE),
+                    Some(b_up),
+                    // relaxed: arm hanging down ≈ rotate −80° about +Z for the
+                    // left arm (T-pose +X → down)
+                    mr([0.0, 0.0, -1.4]),
+                    sig(0.9),
+                );
+                let el = b.joint(
+                    if mirror { "r_elbow" } else { "l_elbow" },
+                    Some(sh),
+                    m([1.0, 0.0, 0.0]),
+                    0.28,
+                    L::UpperArm,
+                    // flexion brings the forearm forward (+Z) from +X: rotate
+                    // about −Y for the left arm.
+                    mk(hinge([0.0, -1.0, 0.0], -0.05, 2.6)),
+                    None,
+                    [0.3, 0.0, 0.0],
+                    sig(0.7),
+                );
+                let tw = b.joint(
+                    if mirror {
+                        "r_elbow_twist"
+                    } else {
+                        "l_elbow_twist"
+                    },
+                    Some(el),
                     z3,
                     0.0,
-                    L::Hand,
-                    mk(hinge(abd_axis, -0.5, 0.5)),
-                    None,
+                    L::Forearm,
+                    // pronation/supination about the forearm axis (+X left)
+                    mk(hinge([1.0, 0.0, 0.0], -1.6, 1.6)),
+                    Some(b_lo),
                     z3,
-                    sig(0.25),
-                );
-                let pip = b.joint(
-                    "pip",
-                    Some(mcp_abd),
-                    m(dir),
-                    *prox_len,
-                    L::Hand,
-                    mk(hinge(flex_axis, -0.1, 1.9)),
-                    Some(bones[f][1]),
-                    [0.15, 0.0, 0.0],
                     sig(0.6),
                 );
-                let dip = b.joint(
-                    "dip",
-                    Some(pip),
-                    m(dir),
-                    seg_len[f][1],
-                    L::Hand,
-                    mk(hinge(flex_axis, -0.1, 1.6)),
-                    Some(bones[f][2]),
-                    [0.1, 0.0, 0.0],
-                    sig(0.6),
+                let wr = b.joint(
+                    if mirror { "r_wrist" } else { "l_wrist" },
+                    Some(tw),
+                    m([1.0, 0.0, 0.0]),
+                    0.26,
+                    L::Forearm,
+                    mk(ball([-0.5, -0.6, -1.2], [0.5, 0.6, 1.2])),
+                    Some(b_hand),
+                    z3,
+                    sig(0.35),
                 );
-                let tip = b.site(
-                    "tip",
-                    dip,
-                    scale(m(dir), seg_len[f][2]),
-                    L::Hand,
-                );
-                s.tip[hand][f] = tip;
-                finger_idx[f] = [mcp_flex, mcp_abd, pip, dip];
                 b.capsule(
-                    PointRef::Joint(mcp_flex),
-                    PointRef::Site(tip),
-                    0.009,
-                    R::Hand,
-                    hand_part,
+                    PointRef::Joint(sh),
+                    PointRef::Joint(el),
+                    0.045,
+                    R::UpperArm,
+                    if mirror {
+                        Part::RightArm
+                    } else {
+                        Part::LeftArm
+                    },
                 );
-                if f == 2 {
-                    // palm capsule wrist → middle MCP
+                b.capsule(
+                    PointRef::Joint(el),
+                    PointRef::Joint(wr),
+                    0.040,
+                    R::Forearm,
+                    if mirror {
+                        Part::RightArm
+                    } else {
+                        Part::LeftArm
+                    },
+                );
+                // Hand: MCPs as joints (children of wrist), fingers as chains.
+                // Palm-down T-pose: fingers along +X (left), thumb toward +Z.
+                let mut mcp_pos = [
+                    ("thumb", [0.030, -0.010, 0.030], 0.045),
+                    ("index", [0.090, 0.0, 0.028], 0.040),
+                    ("middle", [0.095, 0.0, 0.008], 0.045),
+                    ("ring", [0.090, 0.0, -0.012], 0.040),
+                    ("little", [0.082, 0.0, -0.030], 0.033),
+                ];
+                let seg_len = [
+                    [0.045, 0.030, 0.025], // thumb: MCP→IP, IP→tip after CMC→MCP (prox len above)
+                    [0.040, 0.025, 0.020],
+                    [0.045, 0.028, 0.022],
+                    [0.040, 0.026, 0.020],
+                    [0.033, 0.020, 0.018],
+                ];
+                let bones: [[B; 3]; 5] = if mirror {
+                    [
+                        [
+                            B::RightThumbProximal,
+                            B::RightThumbIntermediate,
+                            B::RightThumbDistal,
+                        ],
+                        [
+                            B::RightIndexProximal,
+                            B::RightIndexIntermediate,
+                            B::RightIndexDistal,
+                        ],
+                        [
+                            B::RightMiddleProximal,
+                            B::RightMiddleIntermediate,
+                            B::RightMiddleDistal,
+                        ],
+                        [
+                            B::RightRingProximal,
+                            B::RightRingIntermediate,
+                            B::RightRingDistal,
+                        ],
+                        [
+                            B::RightLittleProximal,
+                            B::RightLittleIntermediate,
+                            B::RightLittleDistal,
+                        ],
+                    ]
+                } else {
+                    [
+                        [
+                            B::LeftThumbProximal,
+                            B::LeftThumbIntermediate,
+                            B::LeftThumbDistal,
+                        ],
+                        [
+                            B::LeftIndexProximal,
+                            B::LeftIndexIntermediate,
+                            B::LeftIndexDistal,
+                        ],
+                        [
+                            B::LeftMiddleProximal,
+                            B::LeftMiddleIntermediate,
+                            B::LeftMiddleDistal,
+                        ],
+                        [
+                            B::LeftRingProximal,
+                            B::LeftRingIntermediate,
+                            B::LeftRingDistal,
+                        ],
+                        [
+                            B::LeftLittleProximal,
+                            B::LeftLittleIntermediate,
+                            B::LeftLittleDistal,
+                        ],
+                    ]
+                };
+                let hand_part = if mirror {
+                    Part::RightHand
+                } else {
+                    Part::LeftHand
+                };
+                let mut finger_idx = [[0usize; 4]; 5];
+                for (f, (_name, pos, prox_len)) in mcp_pos.iter_mut().enumerate() {
+                    let is_thumb = f == 0;
+                    // Finger direction in the hand frame at rest.
+                    let dir: V3 = if is_thumb {
+                        normalize([0.7, -0.15, 0.7])
+                    } else {
+                        [1.0, 0.0, 0.0]
+                    };
+                    // Flexion axis: curl toward the palm (−Y). For a finger
+                    // along +X that is rotation about −Z. Thumb curls across
+                    // the palm: about an axis ⟂ to its dir and to the palm
+                    // normal.
+                    let flex_axis: V3 = if is_thumb {
+                        normalize(cross(dir, [0.0, -1.0, 0.0]))
+                    } else {
+                        [0.0, 0.0, -1.0]
+                    };
+                    let abd_axis: V3 = if is_thumb {
+                        [0.0, -1.0, 0.0]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    };
+                    // Metacarpal head as an offset joint (MCP flex hinge), with
+                    // the abduction hinge stacked at zero offset.
+                    let mcp_len = norm(*pos);
+                    let mcp_flex = b.joint(
+                        "mcp_flex",
+                        Some(wr),
+                        m(*pos),
+                        mcp_len,
+                        L::Hand,
+                        mk(hinge(flex_axis, if is_thumb { -0.6 } else { -0.3 }, 1.6)),
+                        Some(bones[f][0]),
+                        [0.1, 0.0, 0.0],
+                        sig(0.5),
+                    );
+                    let mcp_abd = b.joint(
+                        "mcp_abd",
+                        Some(mcp_flex),
+                        z3,
+                        0.0,
+                        L::Hand,
+                        mk(hinge(abd_axis, -0.5, 0.5)),
+                        None,
+                        z3,
+                        sig(0.25),
+                    );
+                    let pip = b.joint(
+                        "pip",
+                        Some(mcp_abd),
+                        m(dir),
+                        *prox_len,
+                        L::Hand,
+                        mk(hinge(flex_axis, -0.1, 1.9)),
+                        Some(bones[f][1]),
+                        [0.15, 0.0, 0.0],
+                        sig(0.6),
+                    );
+                    let dip = b.joint(
+                        "dip",
+                        Some(pip),
+                        m(dir),
+                        seg_len[f][1],
+                        L::Hand,
+                        mk(hinge(flex_axis, -0.1, 1.6)),
+                        Some(bones[f][2]),
+                        [0.1, 0.0, 0.0],
+                        sig(0.6),
+                    );
+                    let tip = b.site("tip", dip, scale(m(dir), seg_len[f][2]), L::Hand);
+                    s.tip[hand][f] = tip;
+                    finger_idx[f] = [mcp_flex, mcp_abd, pip, dip];
                     b.capsule(
-                        PointRef::Joint(wr),
                         PointRef::Joint(mcp_flex),
-                        0.028,
+                        PointRef::Site(tip),
+                        0.009,
                         R::Hand,
                         hand_part,
                     );
+                    if f == 2 {
+                        // palm capsule wrist → middle MCP
+                        b.capsule(
+                            PointRef::Joint(wr),
+                            PointRef::Joint(mcp_flex),
+                            0.028,
+                            R::Hand,
+                            hand_part,
+                        );
+                    }
                 }
-            }
-            ([clav, sh, el, tw, wr], finger_idx)
-        };
+                ([clav, sh, el, tw, wr], finger_idx)
+            };
         let (l, lf) = l_arm(&mut b, &mut s, false);
         j.finger[0] = lf;
         j.l_clav = l[0];
@@ -753,10 +848,32 @@ impl Humanoid {
             );
             let toe = b.site("toe", ankle, [0.0, -0.06, 0.18], L::Foot);
             s.toe[if mirror { 1 } else { 0 }] = toe;
-            let part = if mirror { Part::RightLeg } else { Part::LeftLeg };
-            b.capsule(PointRef::Joint(hip), PointRef::Joint(knee), 0.075, R::Thigh, part);
-            b.capsule(PointRef::Joint(knee), PointRef::Joint(ankle), 0.055, R::Shin, part);
-            b.capsule(PointRef::Joint(ankle), PointRef::Site(toe), 0.035, R::Shin, part);
+            let part = if mirror {
+                Part::RightLeg
+            } else {
+                Part::LeftLeg
+            };
+            b.capsule(
+                PointRef::Joint(hip),
+                PointRef::Joint(knee),
+                0.075,
+                R::Thigh,
+                part,
+            );
+            b.capsule(
+                PointRef::Joint(knee),
+                PointRef::Joint(ankle),
+                0.055,
+                R::Shin,
+                part,
+            );
+            b.capsule(
+                PointRef::Joint(ankle),
+                PointRef::Site(toe),
+                0.035,
+                R::Shin,
+                part,
+            );
             [hip, knee, ankle]
         };
         let ll = leg(&mut b, &mut s, false);
@@ -781,7 +898,8 @@ impl Humanoid {
         let beta_scale = off;
         let beta_len = off + 1;
         let beta_rad = beta_len + NUM_LEN_GROUPS;
-        let num_params = beta_rad + NUM_RAD_GROUPS;
+        let beta_shear = beta_rad + NUM_RAD_GROUPS;
+        let num_params = beta_shear + 1;
         let mut depth = vec![0usize; b.joints.len()];
         for (i, jd) in b.joints.iter().enumerate() {
             depth[i] = jd.parent.map(|p| depth[p] + 1).unwrap_or(0);
@@ -796,6 +914,7 @@ impl Humanoid {
                 beta_scale,
                 beta_len,
                 beta_rad,
+                beta_shear,
                 depth,
             },
             j,
@@ -829,6 +948,9 @@ pub struct State {
     pub scale: f64,
     pub len: [f64; NUM_LEN_GROUPS],
     pub rad: [f64; NUM_RAD_GROUPS],
+    /// Trunk front-surface shear (m, positive = sheared sites move toward
+    /// the body's front). See `SiteDef::shear`.
+    pub shear: f64,
 }
 
 impl State {
@@ -841,6 +963,7 @@ impl State {
             scale: 0.0,
             len: [0.0; NUM_LEN_GROUPS],
             rad: [0.0; NUM_RAD_GROUPS],
+            shear: 0.0,
         }
     }
 
@@ -896,6 +1019,7 @@ impl State {
         for g in 0..NUM_RAD_GROUPS {
             self.rad[g] += delta[model.beta_rad + g];
         }
+        self.shear += delta[model.beta_shear];
     }
 
     /// Set a hinge angle (keeps the matrix in sync).
@@ -968,9 +1092,13 @@ impl Model {
         let mut site = Vec::with_capacity(self.sites.len());
         let mut site_off = Vec::with_capacity(self.sites.len());
         for sd in &self.sites {
-            let o = mat_vec(&r[sd.joint], scale(sd.offset, st.len_mul(sd.len_group)));
-            site_off.push(o);
-            site.push(add(t[sd.joint], o));
+            let mut o = scale(sd.offset, st.len_mul(sd.len_group));
+            if sd.shear {
+                o[2] += st.shear;
+            }
+            let ow = mat_vec(&r[sd.joint], o);
+            site_off.push(ow);
+            site.push(add(t[sd.joint], ow));
         }
         Fk {
             r,
@@ -988,15 +1116,28 @@ impl Model {
             PointRef::Joint(j) => self.jac_chain(st, fk, j, fk.t[j], false, None, out),
             PointRef::Site(s) => {
                 let sd = &self.sites[s];
+                // `site_off` includes the shear displacement; the length /
+                // scale derivatives must see only the β-scaled part (the
+                // shear is additive and un-scaled), so strip it back out.
+                let (own, sheared) = if sd.shear {
+                    let sw = mat_vec(&fk.r[sd.joint], [0.0, 0.0, st.shear]);
+                    (sub(fk.site_off[s], sw), true)
+                } else {
+                    (fk.site_off[s], false)
+                };
                 self.jac_chain(
                     st,
                     fk,
                     sd.joint,
                     fk.site[s],
                     true,
-                    Some((fk.site_off[s], sd.len_group)),
+                    Some((own, sd.len_group)),
                     out,
-                )
+                );
+                if sheared {
+                    // ∂site/∂shear = the joint frame's +Z axis.
+                    out.push((self.beta_shear, mat_vec(&fk.r[sd.joint], [0.0, 0.0, 1.0])));
+                }
             }
         }
     }
@@ -1242,8 +1383,16 @@ mod tests {
         st.set_hinge(m, h.j.l_elbow, 1.2);
         st.set_hinge(m, h.j.r_elbow, 1.2);
         let fk = m.fk(&st);
-        assert!(fk.t[h.j.l_wrist][2] > 0.15, "left wrist z {}", fk.t[h.j.l_wrist][2]);
-        assert!(fk.t[h.j.r_wrist][2] > 0.15, "right wrist z {}", fk.t[h.j.r_wrist][2]);
+        assert!(
+            fk.t[h.j.l_wrist][2] > 0.15,
+            "left wrist z {}",
+            fk.t[h.j.l_wrist][2]
+        );
+        assert!(
+            fk.t[h.j.r_wrist][2] > 0.15,
+            "right wrist z {}",
+            fk.t[h.j.r_wrist][2]
+        );
         // Knee flexion sends the ankles backward (−Z).
         let mut st = State::rest(m);
         st.set_hinge(m, h.j.l_knee, 1.0);
@@ -1263,7 +1412,12 @@ mod tests {
         for hand in 0..2 {
             let wr = if hand == 0 { h.j.l_wrist } else { h.j.r_wrist };
             let tip = fk.site[h.s.tip[hand][1]];
-            assert!(tip[1] < fk.t[wr][1] - 0.03, "hand {hand} tip y {} wrist y {}", tip[1], fk.t[wr][1]);
+            assert!(
+                tip[1] < fk.t[wr][1] - 0.03,
+                "hand {hand} tip y {} wrist y {}",
+                tip[1],
+                fk.t[wr][1]
+            );
         }
         // Relaxed pose hangs the arms down.
         let mut st = State::rest(m);

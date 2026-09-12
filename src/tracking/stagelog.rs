@@ -70,11 +70,7 @@ pub fn begin_session(session_label: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let log_path = dir.join(format!("tracking_{unix_secs}.log"));
-    let mut file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(f) => f,
         Err(e) => {
             warn!("stagelog: cannot open {}: {e}", log_path.display());
@@ -216,10 +212,7 @@ mod tests {
         assert!(stale_sentinel().is_some(), "sentinel exists while active");
         mark(0, "unit_test_stage");
         end_session();
-        assert!(
-            stale_sentinel().is_none(),
-            "clean end removes the sentinel"
-        );
+        assert!(stale_sentinel().is_none(), "clean end removes the sentinel");
     }
 
     #[test]

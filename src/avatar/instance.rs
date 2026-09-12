@@ -4,10 +4,8 @@ use crate::asset::{
     AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, NodeId, Transform, Vec3,
 };
 use crate::avatar::animation::{self, AnimationState};
-use crate::avatar::pose::{
-    self as pose_helpers, AvatarPose,
-};
 use crate::avatar::expressions::{ExpressionState, ResolvedExpressionWeight};
+use crate::avatar::pose::{self as pose_helpers, AvatarPose};
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -233,8 +231,7 @@ impl AvatarInstance {
             target_mesh_id: None,
             target_vertex_offset: 0,
             target_vertex_count: 0,
-            solver_backend:
-                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+            solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
         });
     }
 
@@ -290,8 +287,7 @@ impl AvatarInstance {
             target_mesh_id: None,
             target_vertex_offset: 0,
             target_vertex_count: 0,
-            solver_backend:
-                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+            solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
         };
         let sim = ClothSimState::default();
         let n = sim.particle_count();
@@ -532,11 +528,13 @@ mod morph_weight_tests {
             weight: 0.0,
             morph_binds: binds
                 .into_iter()
-                .map(|(node_index, morph_target_index, weight)| ExpressionMorphBind {
-                    node_index,
-                    morph_target_index,
-                    weight,
-                })
+                .map(
+                    |(node_index, morph_target_index, weight)| ExpressionMorphBind {
+                        node_index,
+                        morph_target_index,
+                        weight,
+                    },
+                )
                 .collect(),
         }
     }

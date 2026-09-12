@@ -20,8 +20,7 @@ use super::pose_match::REQUIRED_STABLE_FRAMES;
 use super::refresh::refresh_anchor_telemetry;
 use super::state::{relevant_mode, CalibrationModalState, DoneOutcome};
 use super::transitions::{
-    advance_state, begin_capture, begin_range_capture, finish_capture, retry_capture,
-    skip_range,
+    advance_state, begin_capture, begin_range_capture, finish_capture, retry_capture, skip_range,
 };
 use super::{
     COLLECTION_SECONDS, MIN_SAMPLES, NO_ANCHOR_HINT_SECONDS, RANGE_COLLECTION_SECONDS,
@@ -232,9 +231,9 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
                 if let Some(ref mut handle) = state.calibration.preview_texture {
                     handle.set(color_image, options);
                 } else {
-                    let handle =
-                        ui.ctx()
-                            .load_texture("calibration_preview", color_image, options);
+                    let handle = ui
+                        .ctx()
+                        .load_texture("calibration_preview", color_image, options);
                     state.calibration.preview_texture = Some(handle);
                 }
             }
@@ -321,7 +320,6 @@ fn draw_preview_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             }
         }
     }
-
 }
 
 /// Status pane (right side of the modal). Branches on the
@@ -338,9 +336,7 @@ fn draw_status_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             CalibrationModalState::WaitingForPose { .. }
             | CalibrationModalState::Collecting { .. }
             | CalibrationModalState::RangeHoldStill { .. }
-            | CalibrationModalState::RangeCollecting { .. } => {
-                draw_capturing_pane(ui, state)
-            }
+            | CalibrationModalState::RangeCollecting { .. } => draw_capturing_pane(ui, state),
             CalibrationModalState::AnchorDone { .. } => draw_anchor_done_pane(ui, state),
             CalibrationModalState::Done { .. } => draw_done_pane(ui, state),
             CalibrationModalState::Closed => {}
@@ -379,7 +375,11 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.label(
+        egui::RichText::new(step_label)
+            .font(typography::body())
+            .strong(),
+    );
     ui.add_space(space::XS);
     ui.label(egui::RichText::new(instructions).font(typography::label()));
     ui.add_space(space::MD);
@@ -410,7 +410,11 @@ fn draw_idle_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// without cancelling.
 fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.label(
+        egui::RichText::new(step_label)
+            .font(typography::body())
+            .strong(),
+    );
     ui.add_space(space::XS);
     ui.label(egui::RichText::new(instructions).font(typography::label()));
     ui.add_space(space::MD);
@@ -488,9 +492,7 @@ fn draw_capturing_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// visible. `None` otherwise. Pure-read on the modal state so the
 /// hint rendering can decide whether to draw the row without mutating
 /// anything.
-fn mode_mismatch_hint(
-    state: &CalibrationModalState,
-) -> Option<(&'static str, CalibrationMode)> {
+fn mode_mismatch_hint(state: &CalibrationModalState) -> Option<(&'static str, CalibrationMode)> {
     let CalibrationModalState::WaitingForPose {
         mode,
         no_anchor_since,
@@ -554,7 +556,11 @@ fn framing_hint(state: &CalibrationModalState) -> Option<&'static str> {
 /// the aggregated calibration on the variant.
 fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.label(
+        egui::RichText::new(step_label)
+            .font(typography::body())
+            .strong(),
+    );
     ui.add_space(space::XS);
     ui.label(egui::RichText::new(instructions).font(typography::label()));
     ui.add_space(space::MD);
@@ -582,7 +588,11 @@ fn draw_anchor_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// and mislabelled "dismiss a finished calibration" as a cancel.
 fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
     let (step_label, instructions) = step_text(&state.calibration.modal);
-    ui.label(egui::RichText::new(step_label).font(typography::body()).strong());
+    ui.label(
+        egui::RichText::new(step_label)
+            .font(typography::body())
+            .strong(),
+    );
     ui.add_space(space::XS);
     ui.label(egui::RichText::new(instructions).font(typography::label()));
     ui.add_space(space::SM);
@@ -596,7 +606,12 @@ fn draw_done_pane(ui: &mut egui::Ui, state: &mut GuiApp) {
             Some(s) => t!("calibration.summary_span_value", span = format!("{:.2}", s)),
             None => t!("calibration.summary_not_captured"),
         };
-        summary_row(ui, &t!("calibration.summary_span"), &span_text, calibration.shoulder_span_m.is_some());
+        summary_row(
+            ui,
+            &t!("calibration.summary_span"),
+            &span_text,
+            calibration.shoulder_span_m.is_some(),
+        );
 
         let has_range =
             calibration.x_range_observed.is_some() || calibration.z_range_observed.is_some();
@@ -636,7 +651,11 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str, captured: bool) {
                 .font(typography::caption())
                 .color(color::ON_SURFACE_VARIANT),
         );
-        let dot = if captured { color::SUCCESS } else { color::ON_SURFACE_MUTED };
+        let dot = if captured {
+            color::SUCCESS
+        } else {
+            color::ON_SURFACE_MUTED
+        };
         status_dot_label(ui, dot, value);
     });
 }
@@ -646,7 +665,11 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str, captured: bool) {
 /// show yet); `true` for the active-capture states.
 fn draw_live_telemetry(ui: &mut egui::Ui, state: &CalibrationModalState, show_samples: bool) {
     let (anchor_seen, conf, samples) = telemetry(state);
-    let conf_color = if conf >= 0.5 { color::SUCCESS } else { color::ERROR };
+    let conf_color = if conf >= 0.5 {
+        color::SUCCESS
+    } else {
+        color::ERROR
+    };
     ui.horizontal(|ui| {
         ui.label(t!("calibration.confidence"));
         ui.colored_label(conf_color, format!("{:.2}", conf));
@@ -849,9 +872,7 @@ fn progress_for(state: &CalibrationModalState) -> (f32, String) {
         // AnchorDone is user-input gated rather than time-gated, so
         // the progress bar is fully filled and the label tells the
         // user we're awaiting their choice.
-        CalibrationModalState::AnchorDone { .. } => {
-            (1.0, t!("calibration.awaiting_choice"))
-        }
+        CalibrationModalState::AnchorDone { .. } => (1.0, t!("calibration.awaiting_choice")),
         CalibrationModalState::RangeHoldStill { started_at, .. } => {
             let elapsed = started_at.elapsed().as_secs_f32();
             let remaining = (RANGE_HOLD_STILL_SECONDS - elapsed).max(0.0);

@@ -18,8 +18,8 @@ use std::collections::HashMap;
 
 use log::warn;
 
-use super::{v0, v1};
 use super::VrmLoadError;
+use super::{v0, v1};
 use crate::asset::*;
 
 // ---------------------------------------------------------------------------
@@ -74,9 +74,7 @@ pub(super) fn parse_vrm_extensions(
         match parse_v1_extensions(raw, ext_map.get("VRMC_springBone")) {
             Ok(parsed) => return Ok(parsed),
             Err(e) => {
-                warn!(
-                    "VRM 1.x extension parse failed ({e}); falling back to VRM 0.x if available"
-                );
+                warn!("VRM 1.x extension parse failed ({e}); falling back to VRM 0.x if available");
             }
         }
     }
@@ -96,11 +94,10 @@ pub(super) fn parse_v1_extensions(
     vrmc_vrm_raw: &serde_json::Value,
     vrmc_spring_bone_raw: Option<&serde_json::Value>,
 ) -> Result<ParsedVrm, VrmLoadError> {
-    let vrmc_vrm: v1::VrmExtension = serde_json::from_value(vrmc_vrm_raw.clone())
-        .map_err(|e| {
-            warn!("VRMC_vrm deserialisation failed: {e}");
-            VrmLoadError::JsonParse(e)
-        })?;
+    let vrmc_vrm: v1::VrmExtension = serde_json::from_value(vrmc_vrm_raw.clone()).map_err(|e| {
+        warn!("VRMC_vrm deserialisation failed: {e}");
+        VrmLoadError::JsonParse(e)
+    })?;
 
     let (meta, thumbnail_hint) = build_v1_meta(&vrmc_vrm);
     let humanoid = Some(build_v1_humanoid(&vrmc_vrm.humanoid)?);
@@ -374,7 +371,9 @@ fn build_v1_springs(ext: &v1::SpringBoneExtension) -> (Vec<SpringBoneAsset>, Vec
             let first = spring.joints.first();
             let stiffness = first.map(|j| j.stiffness).unwrap_or(1.0);
             let drag_force = first.and_then(|j| j.drag_force).unwrap_or(0.5);
-            let gravity_dir = first.and_then(|j| j.gravity_dir).unwrap_or([0.0, -1.0, 0.0]);
+            let gravity_dir = first
+                .and_then(|j| j.gravity_dir)
+                .unwrap_or([0.0, -1.0, 0.0]);
             let gravity_power = first.map(|j| j.gravity_power).unwrap_or(0.0);
             let radius = first.and_then(|j| j.hit_radius).unwrap_or(0.05);
 
@@ -462,10 +461,7 @@ fn build_v0_meta(root: &v0::VrmRoot) -> (VrmMeta, ThumbnailHint) {
         .unwrap_or_default();
     let references = meta.reference.into_iter().collect();
     // Some VRM 0.x exporters emit `-1` for "no thumbnail"; guard against that.
-    let texture_index = meta
-        .texture
-        .filter(|i| *i >= 0)
-        .map(|i| i as usize);
+    let texture_index = meta.texture.filter(|i| *i >= 0).map(|i| i as usize);
     let hint = ThumbnailHint {
         image_index: None,
         texture_index,

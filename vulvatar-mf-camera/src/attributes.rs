@@ -48,24 +48,15 @@ macro_rules! forward_imfattributes {
                 }
             }
 
-            fn GetUINT32(
-                &self,
-                guidkey: *const windows::core::GUID,
-            ) -> windows::core::Result<u32> {
+            fn GetUINT32(&self, guidkey: *const windows::core::GUID) -> windows::core::Result<u32> {
                 unsafe { self.attributes.GetUINT32(guidkey) }
             }
 
-            fn GetUINT64(
-                &self,
-                guidkey: *const windows::core::GUID,
-            ) -> windows::core::Result<u64> {
+            fn GetUINT64(&self, guidkey: *const windows::core::GUID) -> windows::core::Result<u64> {
                 unsafe { self.attributes.GetUINT64(guidkey) }
             }
 
-            fn GetDouble(
-                &self,
-                guidkey: *const windows::core::GUID,
-            ) -> windows::core::Result<f64> {
+            fn GetDouble(&self, guidkey: *const windows::core::GUID) -> windows::core::Result<f64> {
                 unsafe { self.attributes.GetDouble(guidkey) }
             }
 
@@ -167,10 +158,7 @@ macro_rules! forward_imfattributes {
                 unsafe { self.attributes.SetItem(guidkey, value) }
             }
 
-            fn DeleteItem(
-                &self,
-                guidkey: *const windows::core::GUID,
-            ) -> windows::core::Result<()> {
+            fn DeleteItem(&self, guidkey: *const windows::core::GUID) -> windows::core::Result<()> {
                 unsafe { self.attributes.DeleteItem(guidkey) }
             }
 

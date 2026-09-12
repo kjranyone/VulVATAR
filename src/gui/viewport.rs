@@ -4,8 +4,8 @@ use crate::app::Application;
 use crate::asset::Mat4;
 use crate::gui::theme::{color, viz};
 use crate::gui::GuiApp;
-use crate::t;
 use crate::renderer::debug::{self, DebugDrawList};
+use crate::t;
 
 /// Transform a world-space point into clip space through the frame's
 /// row-major view/projection pair — the exact transform chain the Vulkan
@@ -395,13 +395,8 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 use crate::gui::components::{
                                     filled_button, tonal_button, ButtonTone,
                                 };
-                                if filled_button(
-                                    ui,
-                                    None,
-                                    &t!("viewport.empty_open_file"),
-                                    true,
-                                )
-                                .clicked()
+                                if filled_button(ui, None, &t!("viewport.empty_open_file"), true)
+                                    .clicked()
                                 {
                                     crate::gui::top_bar::request_load_avatar_dialog(state);
                                 }
@@ -468,7 +463,8 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 state.camera_orbit.pitch_deg += delta.y * state.settings.orbit_sensitivity;
             }
             if drag_pan {
-                let scale = 0.002 * state.camera_orbit.distance * 0.2 * state.settings.pan_sensitivity;
+                let scale =
+                    0.002 * state.camera_orbit.distance * 0.2 * state.settings.pan_sensitivity;
                 state.camera_orbit.pan[0] += delta.x * scale;
                 state.camera_orbit.pan[1] -= delta.y * scale;
             }
@@ -621,8 +617,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 // snapshot" races to advance `camera_wipe_seq` while
                 // still uploading the old frame, leaving the newer
                 // frame permanently un-uploaded until the next publish.
-                if state.app.tracking.mailbox().preview_sequence()
-                    != state.viewport.camera_wipe_seq
+                if state.app.tracking.mailbox().preview_sequence() != state.viewport.camera_wipe_seq
                 {
                     let snap = state.app.tracking.mailbox().snapshot();
                     if let Some(ref frame) = snap.frame {
@@ -754,15 +749,19 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             // with a bright foreground so it stays legible over both light and
             // dark rendered content — the old flat dim-grey text was nearly
             // invisible against the viewport background.
-            let info = t!("viewport.camera_info", x = format!("{:.2}", cam_pos[0]), y = format!("{:.2}", cam_pos[1]), z = format!("{:.2}", cam_pos[2]), yaw = format!("{:.1}", state.camera_orbit.yaw_deg), pitch = format!("{:.1}", state.camera_orbit.pitch_deg), dist = format!("{:.2}", state.camera_orbit.distance));
-            let info_color = viz::OVERLAY_TEXT;
-            let galley =
-                painter.layout_no_wrap(info, egui::FontId::monospace(11.0), info_color);
-            let pad = egui::vec2(6.0, 4.0);
-            let text_tl = egui::pos2(
-                rect.left() + 10.0,
-                rect.bottom() - 10.0 - galley.size().y,
+            let info = t!(
+                "viewport.camera_info",
+                x = format!("{:.2}", cam_pos[0]),
+                y = format!("{:.2}", cam_pos[1]),
+                z = format!("{:.2}", cam_pos[2]),
+                yaw = format!("{:.1}", state.camera_orbit.yaw_deg),
+                pitch = format!("{:.1}", state.camera_orbit.pitch_deg),
+                dist = format!("{:.2}", state.camera_orbit.distance)
             );
+            let info_color = viz::OVERLAY_TEXT;
+            let galley = painter.layout_no_wrap(info, egui::FontId::monospace(11.0), info_color);
+            let pad = egui::vec2(6.0, 4.0);
+            let text_tl = egui::pos2(rect.left() + 10.0, rect.bottom() - 10.0 - galley.size().y);
             painter.rect_filled(
                 egui::Rect::from_min_size(text_tl - pad, galley.size() + pad * 2.0),
                 4.0,
@@ -783,13 +782,19 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 .flat_map(|m| m.primitives.iter())
                                 .find(|p| p.id == sel.target_primitive)
                                 .map(|p| t!("viewport.primitive", id = p.id.0))
-                                .unwrap_or_else(|| t!("viewport.primitive", id = sel.target_primitive.0));
+                                .unwrap_or_else(|| {
+                                    t!("viewport.primitive", id = sel.target_primitive.0)
+                                });
 
                             let vert_count = sel.selected_vertices.len();
                             let lines = [
                                 t!("viewport.selected", count = vert_count),
                                 t!("viewport.target", label = prim_label),
-                                t!("viewport.range", start = sel.selected_vertex_range.0, end = sel.selected_vertex_range.1),
+                                t!(
+                                    "viewport.range",
+                                    start = sel.selected_vertex_range.0,
+                                    end = sel.selected_vertex_range.1
+                                ),
                             ];
 
                             let mut y = rect.top() + 6.0;

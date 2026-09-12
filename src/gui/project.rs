@@ -59,8 +59,7 @@ impl GuiApp {
     /// `force` skips the 250 ms probe throttle — used by `on_exit`,
     /// where the final flush must not race the throttle window.
     pub(super) fn refresh_project_dirty(&mut self, now: Instant, force: bool) {
-        if !force
-            && now.duration_since(self.project_status.last_dirty_probe) < DIRTY_PROBE_INTERVAL
+        if !force && now.duration_since(self.project_status.last_dirty_probe) < DIRTY_PROBE_INTERVAL
         {
             return;
         }
@@ -260,7 +259,10 @@ impl GuiApp {
         use crate::output::FrameSink;
         let want_sink = FrameSink::from_gui_index(sink_index);
         if let Err(e) = self.app.set_requested_sink(want_sink) {
-            self.push_warning_notification(t!("toast.virtual_camera_unavailable", error = e.to_string()));
+            self.push_warning_notification(t!(
+                "toast.virtual_camera_unavailable",
+                error = e.to_string()
+            ));
         }
         if let Err(e) = self.app.set_requested_lipsync(lipsync_enabled, lipsync_mic) {
             warn!("lipsync apply failed: {e}");
@@ -446,19 +448,29 @@ impl GuiApp {
             .filter_map(|p| {
                 let path = std::path::PathBuf::from(p);
                 if !path.exists() {
-                    self.push_warning_notification(t!("toast.cloth_overlay_not_found", path = path.display().to_string()));
+                    self.push_warning_notification(t!(
+                        "toast.cloth_overlay_not_found",
+                        path = path.display().to_string()
+                    ));
                     return None;
                 }
                 match crate::persistence::load_cloth_overlay(&path) {
                     Ok(file) => match file.cloth_asset {
                         Some(asset) => Some((path, asset)),
                         None => {
-                            self.push_warning_notification(t!("toast.cloth_overlay_no_payload", path = path.display().to_string()));
+                            self.push_warning_notification(t!(
+                                "toast.cloth_overlay_no_payload",
+                                path = path.display().to_string()
+                            ));
                             None
                         }
                     },
                     Err(e) => {
-                        self.push_error_notification(t!("toast.failed_load_cloth_overlay", path = path.display().to_string(), error = e.to_string()));
+                        self.push_error_notification(t!(
+                            "toast.failed_load_cloth_overlay",
+                            path = path.display().to_string(),
+                            error = e.to_string()
+                        ));
                         None
                     }
                 }
@@ -474,9 +486,8 @@ impl GuiApp {
                 continue; // rebind reported Failed; skip attach
             }
             if let Some(avatar) = self.app.active_avatar_mut() {
-                let overlay_id = crate::asset::ClothOverlayId(
-                    (avatar.cloth_overlay_count() as u64) + 2,
-                );
+                let overlay_id =
+                    crate::asset::ClothOverlayId((avatar.cloth_overlay_count() as u64) + 2);
                 let idx = avatar.attach_cloth_overlay(overlay_id);
                 avatar.init_cloth_overlay(idx, &cloth_asset);
                 if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
@@ -514,7 +525,12 @@ impl GuiApp {
                 true
             }
             RebindStatus::Partial => {
-                self.push_notification(t!("toast.rebound_overlay", path = path.display().to_string(), nodes = report.node_remappings.len(), primitives = report.primitive_remappings.len()));
+                self.push_notification(t!(
+                    "toast.rebound_overlay",
+                    path = path.display().to_string(),
+                    nodes = report.node_remappings.len(),
+                    primitives = report.primitive_remappings.len()
+                ));
                 if let Err(e) = save_rebound_overlay(path, cloth_asset) {
                     warn!(
                         "rebind: failed to write back rebound overlay '{}': {}",
@@ -525,7 +541,12 @@ impl GuiApp {
                 true
             }
             RebindStatus::Failed => {
-                self.push_error_notification(t!("toast.could_not_rebind", path = path.display().to_string(), unresolved = report.unresolved.len(), geometry = report.fatal_geometry_changes.len()));
+                self.push_error_notification(t!(
+                    "toast.could_not_rebind",
+                    path = path.display().to_string(),
+                    unresolved = report.unresolved.len(),
+                    geometry = report.fatal_geometry_changes.len()
+                ));
                 false
             }
         }
@@ -621,9 +642,7 @@ impl GuiApp {
         // sensitivities / consents. The sensitivity sliders re-set the
         // flag every frame of a drag; the retry's base delay doubles as
         // the 250 ms write throttle.
-        if self.project_status.app_settings_dirty
-            && self.project_status.settings_save_retry.due()
-        {
+        if self.project_status.app_settings_dirty && self.project_status.settings_save_retry.due() {
             self.project_status.settings_save_retry.record_attempt();
             match crate::persistence::save_app_settings(&self.collect_app_settings()) {
                 Ok(()) => {
@@ -665,30 +684,31 @@ impl GuiApp {
         let project_state = Some(self.to_project_state());
 
         let has_overlay = self.app.editor.overlay_asset.is_some();
-        let overlay_for_snapshot = if has_overlay && self.cloth_authoring.autosave_consent == Some(true) {
-            let overlay_name = self
-                .app
-                .editor
-                .overlay_asset
-                .as_ref()
-                .map(|a| a.metadata.name.clone())
-                .unwrap_or_else(|| "Untitled".to_string());
-            let target_avatar_path = self
-                .app
-                .active_avatar()
-                .map(|a| a.asset.source_path.to_string_lossy().into_owned());
-            Some(crate::persistence::ClothOverlayFile {
-                format_version: crate::persistence::OVERLAY_FORMAT_VERSION,
-                created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
-                last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
-                overlay_name,
-                target_avatar_path,
-                cloth_asset: self.app.editor.overlay_asset.clone(),
-                last_rebound_with: None,
-            })
-        } else {
-            None
-        };
+        let overlay_for_snapshot =
+            if has_overlay && self.cloth_authoring.autosave_consent == Some(true) {
+                let overlay_name = self
+                    .app
+                    .editor
+                    .overlay_asset
+                    .as_ref()
+                    .map(|a| a.metadata.name.clone())
+                    .unwrap_or_else(|| "Untitled".to_string());
+                let target_avatar_path = self
+                    .app
+                    .active_avatar()
+                    .map(|a| a.asset.source_path.to_string_lossy().into_owned());
+                Some(crate::persistence::ClothOverlayFile {
+                    format_version: crate::persistence::OVERLAY_FORMAT_VERSION,
+                    created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+                    last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+                    overlay_name,
+                    target_avatar_path,
+                    cloth_asset: self.app.editor.overlay_asset.clone(),
+                    last_rebound_with: None,
+                })
+            } else {
+                None
+            };
 
         if let Err(e) = self.project_status.recovery_manager.write_snapshot(
             project_state.as_ref(),
@@ -948,11 +968,17 @@ mod save_policy_tests {
         // The autosaved state is the new baseline: an unchanged app
         // stays clean on the next probe...
         app.refresh_project_dirty(Instant::now(), true);
-        assert!(!app.project_status.project_dirty, "baseline tracks the write");
+        assert!(
+            !app.project_status.project_dirty,
+            "baseline tracks the write"
+        );
         // ...and a further edit re-flags.
         app.transform.position[1] += 0.5;
         app.refresh_project_dirty(Instant::now(), true);
-        assert!(app.project_status.project_dirty, "post-save edits re-derive dirty");
+        assert!(
+            app.project_status.project_dirty,
+            "post-save edits re-derive dirty"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -966,7 +992,10 @@ mod save_policy_tests {
         let mut app = crate::gui::GuiApp::for_test();
         app.mark_project_baseline();
         app.refresh_project_dirty(Instant::now(), true);
-        assert!(!app.project_status.project_dirty, "untouched state is clean");
+        assert!(
+            !app.project_status.project_dirty,
+            "untouched state is clean"
+        );
 
         // A sample across unrelated subsystems — transform, tracking
         // toggle, rendering value — all detected by the same probe.
@@ -982,7 +1011,10 @@ mod save_policy_tests {
 
         app.rendering.bloom_intensity += 0.25;
         app.refresh_project_dirty(Instant::now(), true);
-        assert!(app.project_status.project_dirty, "rendering change detected");
+        assert!(
+            app.project_status.project_dirty,
+            "rendering change detected"
+        );
     }
 
     /// The capture format persists as VALUES; combo positions are
@@ -1082,11 +1114,8 @@ mod startup_avatar_tests {
 
     #[test]
     fn env_override_wins_over_project_avatar() {
-        let (choice, issues) = resolve_startup_avatar(
-            Some(PathBuf::from("env.vrm")),
-            Some("project.vrm"),
-            &always,
-        );
+        let (choice, issues) =
+            resolve_startup_avatar(Some(PathBuf::from("env.vrm")), Some("project.vrm"), &always);
         assert_eq!(choice, StartupAvatar::Env(PathBuf::from("env.vrm")));
         assert!(issues.is_empty());
     }
@@ -1094,11 +1123,8 @@ mod startup_avatar_tests {
     #[test]
     fn missing_env_falls_back_to_project_avatar_with_issue() {
         let exists = |p: &Path| p == Path::new("project.vrm");
-        let (choice, issues) = resolve_startup_avatar(
-            Some(PathBuf::from("env.vrm")),
-            Some("project.vrm"),
-            &exists,
-        );
+        let (choice, issues) =
+            resolve_startup_avatar(Some(PathBuf::from("env.vrm")), Some("project.vrm"), &exists);
         assert_eq!(choice, StartupAvatar::Project(PathBuf::from("project.vrm")));
         assert_eq!(
             issues,
@@ -1115,11 +1141,8 @@ mod startup_avatar_tests {
 
     #[test]
     fn all_sources_missing_reports_every_issue() {
-        let (choice, issues) = resolve_startup_avatar(
-            Some(PathBuf::from("env.vrm")),
-            Some("project.vrm"),
-            &never,
-        );
+        let (choice, issues) =
+            resolve_startup_avatar(Some(PathBuf::from("env.vrm")), Some("project.vrm"), &never);
         assert_eq!(choice, StartupAvatar::None);
         assert_eq!(
             issues,

@@ -140,11 +140,8 @@ impl<'a> AvatarResolver<'a> {
             .map(|n| (n.name.as_str(), n))
             .collect();
 
-        let meshes_by_name: HashMap<&str, &MeshAsset> = avatar
-            .meshes
-            .iter()
-            .map(|m| (m.name.as_str(), m))
-            .collect();
+        let meshes_by_name: HashMap<&str, &MeshAsset> =
+            avatar.meshes.iter().map(|m| (m.name.as_str(), m)).collect();
         let mut primitives_by_position = HashMap::new();
         for mesh in &avatar.meshes {
             for (idx, prim) in mesh.primitives.iter().enumerate() {
@@ -179,10 +176,7 @@ impl<'a> AvatarResolver<'a> {
     /// `"<mesh_name>#<index>"` (per the schema convention agreed in
     /// the rebind design); we parse that to look up the new primitive
     /// at the same `(mesh, index)` slot.
-    fn resolve_primitive(
-        &self,
-        old: &PrimitiveRef,
-    ) -> Option<(&MeshPrimitiveAsset, RebindTier)> {
+    fn resolve_primitive(&self, old: &PrimitiveRef) -> Option<(&MeshPrimitiveAsset, RebindTier)> {
         if let Some((mesh_name, idx)) = parse_primitive_name(&old.name) {
             if let Some(prim) = self
                 .primitives_by_position
@@ -226,17 +220,17 @@ pub fn rebind_overlay(overlay: &mut ClothAsset, new_avatar: &AvatarAsset) -> Reb
 
     // ---- Pins ----
     for pin in &mut overlay.pins {
-        rebind_node_ref(&mut pin.binding_node, &resolver, &mut report, &mut node_seen);
-    }
-
-    // ---- Collision proxy bindings ----
-    for cb in &mut overlay.collision_bindings {
         rebind_node_ref(
-            &mut cb.binding_node,
+            &mut pin.binding_node,
             &resolver,
             &mut report,
             &mut node_seen,
         );
+    }
+
+    // ---- Collision proxy bindings ----
+    for cb in &mut overlay.collision_bindings {
+        rebind_node_ref(&mut cb.binding_node, &resolver, &mut report, &mut node_seen);
     }
 
     // ---- Render region bindings (primitive refs) ----
@@ -429,7 +423,9 @@ mod tests {
             humanoid: None,
             spring_bones: vec![],
             colliders: vec![],
-            default_expressions: ExpressionAssetSet { expressions: vec![] },
+            default_expressions: ExpressionAssetSet {
+                expressions: vec![],
+            },
             animation_clips: vec![],
             node_to_mesh: std::collections::HashMap::new(),
             vrm_meta: VrmMeta::default(),
@@ -440,11 +436,7 @@ mod tests {
     }
 
     fn empty_overlay(target_avatar: AvatarAssetId) -> ClothAsset {
-        ClothAsset::new_empty(
-            ClothOverlayId(0),
-            target_avatar,
-            AssetSourceHash([0u8; 32]),
-        )
+        ClothAsset::new_empty(ClothOverlayId(0), target_avatar, AssetSourceHash([0u8; 32]))
     }
 
     #[test]

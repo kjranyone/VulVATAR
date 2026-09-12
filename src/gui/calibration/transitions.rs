@@ -25,20 +25,18 @@ use super::{COLLECTION_SECONDS, RANGE_COLLECTION_SECONDS, RANGE_HOLD_STILL_SECON
 pub(super) fn begin_capture(state: &mut GuiApp) {
     let _now = Instant::now();
     let next = match &state.calibration.modal {
-        CalibrationModalState::Idle { mode, .. } => {
-            Some(CalibrationModalState::WaitingForPose {
-                mode: *mode,
-                last_score: 0.0,
-                frames_at_match: 0,
-                last_anchor_seen: false,
-                last_confidence: 0.0,
-                no_anchor_since: None,
-                no_lower_arms_since: None,
-                stillness_fallback: false,
-                last_anchor_pos: None,
-                last_seq_consumed: 0,
-            })
-        }
+        CalibrationModalState::Idle { mode, .. } => Some(CalibrationModalState::WaitingForPose {
+            mode: *mode,
+            last_score: 0.0,
+            frames_at_match: 0,
+            last_anchor_seen: false,
+            last_confidence: 0.0,
+            no_anchor_since: None,
+            no_lower_arms_since: None,
+            stillness_fallback: false,
+            last_anchor_pos: None,
+            last_seq_consumed: 0,
+        }),
         _ => None,
     };
     if let Some(s) = next {
@@ -214,21 +212,19 @@ pub(super) fn finish_capture(state: &mut GuiApp) {
             mode,
             stillness_fallback,
             ..
-        } => {
-            Some(CalibrationModalState::Collecting {
-                mode: *mode,
-                started_at: now,
-                stillness_fallback: *stillness_fallback,
-                samples: Vec::with_capacity(64),
-                expr_accum: std::collections::HashMap::new(),
-                face_accum_mesh: Vec::new(),
-                face_accum_body: Vec::new(),
-                body_yaw_accum: Vec::new(),
-                last_seq_consumed: 0,
-                last_anchor_seen: false,
-                last_confidence: 0.0,
-            })
-        }
+        } => Some(CalibrationModalState::Collecting {
+            mode: *mode,
+            started_at: now,
+            stillness_fallback: *stillness_fallback,
+            samples: Vec::with_capacity(64),
+            expr_accum: std::collections::HashMap::new(),
+            face_accum_mesh: Vec::new(),
+            face_accum_body: Vec::new(),
+            body_yaw_accum: Vec::new(),
+            last_seq_consumed: 0,
+            last_anchor_seen: false,
+            last_confidence: 0.0,
+        }),
         CalibrationModalState::Collecting { mode, .. } => {
             Some(finalize_collection(state, *mode, now))
         }
@@ -264,4 +260,3 @@ pub(super) fn transition_to_done_success(
         },
     }
 }
-

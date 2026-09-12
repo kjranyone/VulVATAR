@@ -49,8 +49,7 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
     // constraint projection / normal recomputation compute pipelines;
     // running the CPU XPBD path on top would waste CPU cycles and the
     // resulting deform_output would just be ignored by the renderer.
-    if cloth_state.solver_backend
-        == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+    if cloth_state.solver_backend == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
     {
         return;
     }

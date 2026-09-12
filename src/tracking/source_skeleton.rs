@@ -411,9 +411,7 @@ mod tests {
         assert!((s.overall_confidence - 0.4).abs() < 1e-6);
         assert!((s.face_mesh_confidence.unwrap() - 0.45).abs() < 1e-6);
         assert!((s.joints[&HumanoidBone::Hips].confidence - 0.3).abs() < 1e-6);
-        assert!(
-            (s.fingertips[&HumanoidBone::LeftIndexDistal].confidence - 0.25).abs() < 1e-6,
-        );
+        assert!((s.fingertips[&HumanoidBone::LeftIndexDistal].confidence - 0.25).abs() < 1e-6,);
         assert!((s.face.unwrap().confidence - 0.35).abs() < 1e-6);
         assert_eq!(
             s.joints[&HumanoidBone::Hips].position,

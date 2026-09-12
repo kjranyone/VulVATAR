@@ -269,30 +269,32 @@ impl VulkanRenderer {
             }
         };
 
-        let containment_anchors_ssbo =
-            match previous.as_ref().map(|p| p.containment_anchors_ssbo.clone()) {
-                Some(b) => b,
-                None => {
-                    if let Some(ref anchors) = prim.containment_anchors {
-                        gpu_alloc::host_buffer(
-                            memory_allocator,
-                            BufferUsage::STORAGE_BUFFER,
-                            anchors.iter().copied(),
-                            "containment anchors SSBO",
-                        )?
-                    } else {
-                        // Same 1-element stub content as the clearance
-                        // anchors, so the shared slot serves both.
-                        gpu_alloc::get_or_init_stub(
-                            &mut self.stub_skin_anchor_ssbo,
-                            memory_allocator,
-                            BufferUsage::STORAGE_BUFFER,
-                            crate::asset::SkinAnchor::default(),
-                            "stub skin anchor SSBO",
-                        )?
-                    }
+        let containment_anchors_ssbo = match previous
+            .as_ref()
+            .map(|p| p.containment_anchors_ssbo.clone())
+        {
+            Some(b) => b,
+            None => {
+                if let Some(ref anchors) = prim.containment_anchors {
+                    gpu_alloc::host_buffer(
+                        memory_allocator,
+                        BufferUsage::STORAGE_BUFFER,
+                        anchors.iter().copied(),
+                        "containment anchors SSBO",
+                    )?
+                } else {
+                    // Same 1-element stub content as the clearance
+                    // anchors, so the shared slot serves both.
+                    gpu_alloc::get_or_init_stub(
+                        &mut self.stub_skin_anchor_ssbo,
+                        memory_allocator,
+                        BufferUsage::STORAGE_BUFFER,
+                        crate::asset::SkinAnchor::default(),
+                        "stub skin anchor SSBO",
+                    )?
                 }
-            };
+            }
+        };
 
         let body_vbo = if let Some(ref vbo) = body_transformed_vbo {
             vbo.clone()

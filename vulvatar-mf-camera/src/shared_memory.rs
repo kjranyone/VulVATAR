@@ -313,9 +313,7 @@ fn ensure_mapping(state: &mut Inner) -> bool {
     // Re-borrow the file just to grab its raw handle. The HANDLE we
     // build here doesn't extend the borrow past this statement — it's
     // an opaque pointer-sized value that the kernel resolves independently.
-    let file_handle = HANDLE(
-        state.file.as_ref().unwrap().as_raw_handle(),
-    );
+    let file_handle = HANDLE(state.file.as_ref().unwrap().as_raw_handle());
     let mapping = unsafe {
         // dwMaximumSizeHigh=0, dwMaximumSizeLow=0 → kernel uses current
         // file size, which is exactly what we want.

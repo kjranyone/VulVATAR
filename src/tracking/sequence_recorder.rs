@@ -191,7 +191,9 @@ fn try_start() -> Option<PathBuf> {
         "sequence_recorder: ARMED, up to {} frames / {} MB -> {}",
         MAX_FRAMES.load(Ordering::Relaxed),
         MEMORY_BUDGET_BYTES / 1_000_000,
-        std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone()).display()
+        std::fs::canonicalize(&dir)
+            .unwrap_or_else(|_| dir.clone())
+            .display()
     );
     Some(dir)
 }
@@ -353,7 +355,10 @@ mod tests {
         let due = |last: u64, now: u64| last == 0 || now.saturating_sub(last) >= FLAG_POLL_MS;
         assert!(due(0, 0), "first frame must check");
         assert!(!due(1000, 1500), "throttled between polls");
-        assert!(due(1000, 1000 + FLAG_POLL_MS), "checks again after the interval");
+        assert!(
+            due(1000, 1000 + FLAG_POLL_MS),
+            "checks again after the interval"
+        );
     }
 
     /// The memory ceiling must end a session before the app pages itself

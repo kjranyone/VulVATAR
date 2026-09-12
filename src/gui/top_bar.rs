@@ -33,7 +33,10 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
         state.push_notification(t!("top_bar.avatar_load_blocked_by_calibration"));
         return;
     }
-    state.push_notification(t!("top_bar.loading_avatar", path = path.display().to_string()));
+    state.push_notification(t!(
+        "top_bar.loading_avatar",
+        path = path.display().to_string()
+    ));
     state.library.avatar_load_job = Some(AvatarLoadJob::spawn(path.to_path_buf(), AfterLoad::None));
 }
 
@@ -47,12 +50,11 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
 
     let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(path);
     entry.update_from_asset_with_thumbnail_dir(&asset, state.library.thumbnail_gen.output_dir());
-    if entry
-        .thumbnail_path
-        .as_ref()
-        .is_none_or(|p| !p.exists())
-    {
-        entry.thumbnail_path = state.library.thumbnail_gen.generate_and_save_placeholder(&entry.name);
+    if entry.thumbnail_path.as_ref().is_none_or(|p| !p.exists()) {
+        entry.thumbnail_path = state
+            .library
+            .thumbnail_gen
+            .generate_and_save_placeholder(&entry.name);
     }
     state.app.avatar_library.add(entry);
     state.save_avatar_library_with_toast();
@@ -81,7 +83,10 @@ pub fn finalize_avatar_load(state: &mut GuiApp, path: &Path, asset: Arc<AvatarAs
     // project-restore path (`AfterLoad::ApplyProject`) clears the flag
     // again right after applying, so restores don't loop a rewrite.
     info!("avatar loaded: {}", path.display());
-    state.push_success_notification(t!("top_bar.loaded_avatar", path = path.display().to_string()));
+    state.push_success_notification(t!(
+        "top_bar.loaded_avatar",
+        path = path.display().to_string()
+    ));
 
     let avatar_name = path
         .file_stem()
@@ -122,8 +127,7 @@ fn draw_left(ui: &mut Ui, state: &mut GuiApp) {
     // Title = the document, not the mode: "Tracking Setup •" read as
     // "this mode is unsaved". The mode identity lives on the nav rail;
     // what the dot qualifies is the project file.
-    let unsaved =
-        state.project_status.project_dirty || state.project_status.explicit_file_stale;
+    let unsaved = state.project_status.project_dirty || state.project_status.explicit_file_stale;
     let file_label = state
         .project_status
         .project_path
@@ -237,7 +241,11 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
 
     // ── Pause ────────────────────────────────────────────────────
     if visible[ACTION_PAUSE] {
-        let pause_glyph = if state.runtime_status.paused { ic::PLAY } else { ic::PAUSE };
+        let pause_glyph = if state.runtime_status.paused {
+            ic::PLAY
+        } else {
+            ic::PAUSE
+        };
         if topbar_action(ui, pause_glyph, &pause_label).clicked() {
             state.runtime_status.paused = !state.runtime_status.paused;
         }
@@ -297,11 +305,17 @@ fn draw_avatar_menu(ui: &mut Ui, state: &mut GuiApp, label: &str) {
         egui::RichText::new(label.to_string()).font(typography::body()),
         |ui| {
             ui.set_min_width(220.0);
-            if ui.button(format!("{}\u{2026}", t!("top_bar.open_avatar"))).clicked() {
+            if ui
+                .button(format!("{}\u{2026}", t!("top_bar.open_avatar")))
+                .clicked()
+            {
                 request_load_avatar_dialog(state);
                 ui.close_menu();
             }
-            if ui.button(format!("{}\u{2026}", t!("top_bar.open_avatar_folder"))).clicked() {
+            if ui
+                .button(format!("{}\u{2026}", t!("top_bar.open_avatar_folder")))
+                .clicked()
+            {
                 request_load_avatar_folder_dialog(state);
                 ui.close_menu();
             }
@@ -329,7 +343,11 @@ fn draw_avatar_menu(ui: &mut Ui, state: &mut GuiApp, label: &str) {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
+                if ui
+                    .button(name)
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
                     chosen = Some(path);
                     ui.close_menu();
                 }
@@ -500,10 +518,7 @@ fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
                 ui.close_menu();
             }
             let can_remove = state.profiles.can_remove();
-            let del = ui.add_enabled(
-                can_remove,
-                egui::Button::new(t!("top_bar.profile_delete")),
-            );
+            let del = ui.add_enabled(can_remove, egui::Button::new(t!("top_bar.profile_delete")));
             let del = if can_remove {
                 del
             } else {
@@ -693,12 +708,11 @@ pub(super) fn open_project_from_path(state: &mut GuiApp, path: &Path) {
     // project file — the previous session ended without an explicit
     // Save and its autosaved state would otherwise silently vanish.
     let sidecar = crate::gui::project::unsaved_sidecar_path(path);
-    let (load_path, restore_unsaved) =
-        if crate::gui::project::sidecar_is_newer(path, &sidecar) {
-            (sidecar, true)
-        } else {
-            (path.to_path_buf(), false)
-        };
+    let (load_path, restore_unsaved) = if crate::gui::project::sidecar_is_newer(path, &sidecar) {
+        (sidecar, true)
+    } else {
+        (path.to_path_buf(), false)
+    };
     match persistence::load_project(&load_path) {
         Ok((project_state, load_warnings)) => {
             if let Some(ref overlay_path_str) = project_state.active_overlay_path {
@@ -708,8 +722,7 @@ pub(super) fn open_project_from_path(state: &mut GuiApp, path: &Path) {
                         Ok(overlay_file_data) => {
                             if let Some(cloth_asset) = overlay_file_data.cloth_asset {
                                 state.app.editor.overlay_asset = Some(cloth_asset);
-                                state.app.editor.overlay_path =
-                                    Some(overlay_file.to_path_buf());
+                                state.app.editor.overlay_path = Some(overlay_file.to_path_buf());
                             }
                         }
                         Err(e) => {
@@ -849,10 +862,9 @@ pub(super) fn open_overlay_from_path(state: &mut GuiApp, path: &Path) {
 fn save_overlay(state: &mut GuiApp) {
     match state.app.editor.save_overlay(None) {
         Ok(()) => state.push_success_notification(t!("top_bar.overlay_saved")),
-        Err(e) => state.push_error_notification(t!(
-            "top_bar.save_overlay_failed",
-            error = e.to_string()
-        )),
+        Err(e) => {
+            state.push_error_notification(t!("top_bar.save_overlay_failed", error = e.to_string()))
+        }
     }
 }
 
@@ -1035,8 +1047,7 @@ pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
                             )
                             .clicked()
                         {
-                            let was_active =
-                                state.profiles.active_index == Some(index);
+                            let was_active = state.profiles.active_index == Some(index);
                             state.profiles.remove(index);
                             state.project_status.profiles_dirty = true;
                             state.push_notification(t!(
@@ -1136,11 +1147,9 @@ fn topbar_icon_button(ui: &mut Ui, glyph: char, hover_text: &str) -> Response {
 
 fn topbar_action(ui: &mut Ui, glyph: char, label: &str) -> Response {
     let icon_size = 16.0;
-    let label_galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        typography::body(),
-        color::ON_SURFACE,
-    );
+    let label_galley =
+        ui.painter()
+            .layout_no_wrap(label.to_string(), typography::body(), color::ON_SURFACE);
     let label_w = label_galley.size().x;
     let h = 32.0;
     let pad_x = space::MD;

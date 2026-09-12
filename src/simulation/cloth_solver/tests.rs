@@ -14,9 +14,7 @@ use std::collections::HashSet;
 
 fn make_simple_sim(particle_count: usize) -> ClothSimState {
     let particles = (0..particle_count)
-        .map(|i| {
-            ClothParticle::new([i as f32, 0.0, 0.0], false)
-        })
+        .map(|i| ClothParticle::new([i as f32, 0.0, 0.0], false))
         .collect();
     ClothSimState {
         particles,
@@ -612,8 +610,7 @@ fn write_back_copies_positions_and_normals() {
         target_mesh_id: None,
         target_vertex_offset: 0,
         target_vertex_count: 0,
-        solver_backend:
-            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+        solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
     };
 
     write_back(&sim, &mut cloth_state);
@@ -650,8 +647,7 @@ fn write_back_increments_version() {
         target_mesh_id: None,
         target_vertex_offset: 0,
         target_vertex_count: 0,
-        solver_backend:
-            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+        solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
     };
 
     write_back(&sim, &mut cloth_state);
@@ -849,11 +845,8 @@ fn resolve_colliders_skips_disabled_entries() {
     let transforms = [identity];
 
     // Middle collider disabled → only two survive.
-    let resolved = crate::simulation::cloth::resolve_colliders(
-        &colliders,
-        &transforms,
-        &[true, false, true],
-    );
+    let resolved =
+        crate::simulation::cloth::resolve_colliders(&colliders, &transforms, &[true, false, true]);
     assert_eq!(resolved.len(), 2);
 
     // A short/empty mask defaults every collider to enabled (back-compat).

@@ -9,9 +9,16 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
     // Copied up front (it is `Copy`) so the manual Step handler can pass it
     // without conflicting with the `&mut` avatar borrow taken from `state`.
     let scene_gravity = state.rendering.scene_gravity;
-    collapsible_card(ui, "inspector.cloth_overlay", t!("inspector.cloth_overlay"), true, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.cloth_overlay",
+        t!("inspector.cloth_overlay"),
+        true,
+        |ui| {
             if state.app.editor.is_dirty() {
-                ui.label(egui::RichText::new(t!("inspector.unsaved_changes")).color(color::WARNING));
+                ui.label(
+                    egui::RichText::new(t!("inspector.unsaved_changes")).color(color::WARNING),
+                );
             } else {
                 ui.label(t!("inspector.no_unsaved"));
             }
@@ -34,7 +41,8 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         state.app.editor.create_overlay(avatar_id, avatar_hash);
                     }
                 }
-                if filled_button(ui, Some(ic::SAVE), &t!("inspector.save_overlay"), true).clicked() {
+                if filled_button(ui, Some(ic::SAVE), &t!("inspector.save_overlay"), true).clicked()
+                {
                     match state.app.editor.save_overlay(None) {
                         Ok(()) => {
                             state.push_success_notification(t!("top_bar.overlay_saved"));
@@ -54,11 +62,17 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             {
                 state.cloth_authoring.autosave_consent = Some(autosave_enabled);
             }
-        });
+        },
+    );
 
     draw_cloth_attachment(ui, state);
 
-    collapsible_card(ui, "inspector.sim_mesh", t!("inspector.sim_mesh"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.sim_mesh",
+        t!("inspector.sim_mesh"),
+        false,
+        |ui| {
             if let Some(avatar) = state.app.active_avatar() {
                 ui.label(t!("inspector.select_garment"));
 
@@ -77,7 +91,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
                             for (i, name) in mat_names.iter().enumerate() {
-                                ui.selectable_value(&mut state.cloth_authoring.material_pick_index, i, name);
+                                ui.selectable_value(
+                                    &mut state.cloth_authoring.material_pick_index,
+                                    i,
+                                    name,
+                                );
                             }
                         });
                     if tonal_button(
@@ -89,8 +107,10 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .clicked()
                     {
-                        if let Some(mat) =
-                            avatar.asset.materials.get(state.cloth_authoring.material_pick_index)
+                        if let Some(mat) = avatar
+                            .asset
+                            .materials
+                            .get(state.cloth_authoring.material_pick_index)
                         {
                             state.cloth_authoring.region_selection =
                                 crate::editor::cloth_authoring::RegionSelection::select_by_material(
@@ -147,7 +167,10 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
 
                 if let Some(ref sel) = state.cloth_authoring.region_selection {
                     ui.label(
-                        egui::RichText::new(t!("inspector.selected_vertices", count = sel.selected_vertices.len()))
+                        egui::RichText::new(t!(
+                            "inspector.selected_vertices",
+                            count = sel.selected_vertices.len()
+                        ))
                         .color(color::WARNING),
                     );
                     ui.label(t!("inspector.primitive", id = sel.target_primitive.0));
@@ -168,7 +191,9 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                             if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                                 overlay.simulation_mesh = sim_mesh;
                                 state.app.editor.set_dirty();
-                                state.push_notification(t!("inspector.sim_mesh_generated").to_string());
+                                state.push_notification(
+                                    t!("inspector.sim_mesh_generated").to_string(),
+                                );
                             }
                         }
                     }
@@ -176,9 +201,15 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             } else {
                 super::draw_no_avatar_state(ui);
             }
-        });
+        },
+    );
 
-    collapsible_card(ui, "inspector.pin_binding", t!("inspector.pin_binding"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.pin_binding",
+        t!("inspector.pin_binding"),
+        false,
+        |ui| {
             if let Some(avatar) = state.app.active_avatar() {
                 let nodes = &avatar.asset.skeleton.nodes;
                 if nodes.is_empty() {
@@ -199,7 +230,11 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                         .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
                             for (i, name) in node_names.iter().enumerate() {
-                                ui.selectable_value(&mut state.cloth_authoring.pin_node_index, i, name);
+                                ui.selectable_value(
+                                    &mut state.cloth_authoring.pin_node_index,
+                                    i,
+                                    name,
+                                );
                             }
                         });
 
@@ -234,7 +269,9 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                             };
                                             overlay.pins.push(pin);
                                             state.app.editor.set_dirty();
-                                            state.push_notification(t!("inspector.pin_set_created").to_string());
+                                            state.push_notification(
+                                                t!("inspector.pin_set_created").to_string(),
+                                            );
                                         } else {
                                             state.push_notification(
                                                 t!("inspector.no_pinned_verts").to_string(),
@@ -243,7 +280,9 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                     }
                                 }
                             } else {
-                                state.push_notification(t!("inspector.select_region_first").to_string());
+                                state.push_notification(
+                                    t!("inspector.select_region_first").to_string(),
+                                );
                             }
                         }
                     });
@@ -278,9 +317,15 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             } else {
                 super::draw_no_avatar_state(ui);
             }
-        });
+        },
+    );
 
-    collapsible_card(ui, "inspector.constraints", t!("inspector.constraints"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.constraints",
+        t!("inspector.constraints"),
+        false,
+        |ui| {
             // Seed the sliders from the active overlay's actual constraint
             // stiffness whenever the overlay changes, so the displayed value
             // matches the asset instead of the GUI default. Without this, a
@@ -303,7 +348,10 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                 egui::Slider::new(&mut state.cloth_authoring.distance_stiffness, 0.0..=1.0)
                     .text(t!("inspector.distance_stiffness")),
             );
-            ui.checkbox(&mut state.cloth_authoring.bend_enabled, t!("inspector.bend_constraints"));
+            ui.checkbox(
+                &mut state.cloth_authoring.bend_enabled,
+                t!("inspector.bend_constraints"),
+            );
             if state.cloth_authoring.bend_enabled {
                 ui.add(
                     egui::Slider::new(&mut state.cloth_authoring.bend_stiffness, 0.0..=1.0)
@@ -313,8 +361,14 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
 
             if let Some(ref mut overlay) = state.app.editor.overlay_asset {
                 ui.add_space(4.0);
-                ui.label(t!("inspector.distance_constraints", count = overlay.constraints.distance_constraints.len()));
-                ui.label(t!("inspector.bend_constraints_count", count = overlay.constraints.bend_constraints.len()));
+                ui.label(t!(
+                    "inspector.distance_constraints",
+                    count = overlay.constraints.distance_constraints.len()
+                ));
+                ui.label(t!(
+                    "inspector.bend_constraints_count",
+                    count = overlay.constraints.bend_constraints.len()
+                ));
                 if filled_button(ui, None, &t!("inspector.apply_constraints"), true).clicked() {
                     for dc in &mut overlay.constraints.distance_constraints {
                         dc.stiffness = state.cloth_authoring.distance_stiffness;
@@ -331,9 +385,15 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             } else {
                 ui.label(t!("inspector.no_overlay_active"));
             }
-        });
+        },
+    );
 
-    collapsible_card(ui, "inspector.collision_proxies", t!("inspector.collision_proxies"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.collision_proxies",
+        t!("inspector.collision_proxies"),
+        false,
+        |ui| {
             if let Some(avatar) = state.app.active_avatar_mut() {
                 let collider_count = avatar.asset.colliders.len();
                 // Keep the runtime enable mask sized to the collider list.
@@ -379,9 +439,15 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             } else {
                 super::draw_no_avatar_state(ui);
             }
-        });
+        },
+    );
 
-    collapsible_card(ui, "inspector.solver_params", t!("inspector.solver_params"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.solver_params",
+        t!("inspector.solver_params"),
+        false,
+        |ui| {
             if let Some(avatar) = state.app.active_avatar_mut() {
                 if let Some(ref mut sim) = avatar.cloth_sim {
                     ui.horizontal(|ui| {
@@ -438,8 +504,14 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                     }
                     ui.add_space(4.0);
                     ui.label(t!("inspector.particles", count = sim.particle_count()));
-                    ui.label(t!("inspector.distance_constraints", count = sim.distance_constraints.len()));
-                    ui.label(t!("inspector.bend_constraints_count", count = sim.bend_constraints.len()));
+                    ui.label(t!(
+                        "inspector.distance_constraints",
+                        count = sim.distance_constraints.len()
+                    ));
+                    ui.label(t!(
+                        "inspector.bend_constraints_count",
+                        count = sim.bend_constraints.len()
+                    ));
                     ui.label(t!("inspector.pin_targets", count = sim.pin_targets.len()));
                 } else {
                     ui.label(t!("inspector.no_cloth_sim"));
@@ -462,7 +534,8 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
             } else {
                 super::draw_no_avatar_state(ui);
             }
-        });
+        },
+    );
 
     draw_cloth_preview(ui, state, scene_gravity);
 }
@@ -471,152 +544,166 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// Moved from the retired Preview mode: attaching lives next to
 /// authoring so the "make it → wear it" loop is a single panel.
 fn draw_cloth_attachment(ui: &mut egui::Ui, state: &mut GuiApp) {
-    collapsible_card(ui, "inspector.cloth_attachment", t!("inspector.cloth_attachment"), false, |ui| {
-        ui.horizontal(|ui| {
-            if tonal_button(
-                ui,
-                None,
-                &t!("inspector.attach_primary"),
-                ButtonTone::Primary,
-                true,
-            )
-            .clicked()
-            {
-                let overlay_id = state
-                    .app
-                    .editor
-                    .active_overlay()
-                    .unwrap_or(crate::asset::ClothOverlayId(1));
-                if let Some(avatar) = state.app.active_avatar_mut() {
-                    avatar.attach_cloth(overlay_id);
-                }
-            }
-            if tonal_button(
-                ui,
-                None,
-                &t!("inspector.detach_primary"),
-                ButtonTone::Error,
-                true,
-            )
-            .clicked()
-            {
-                if let Some(avatar) = state.app.active_avatar_mut() {
-                    avatar.detach_cloth();
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            if tonal_button(
-                ui,
-                Some(ic::ADD),
-                &t!("inspector.add_overlay_slot"),
-                ButtonTone::Primary,
-                true,
-            )
-            .clicked()
-            {
-                let sim_mesh = state
-                    .app
-                    .editor
-                    .overlay_asset
-                    .as_ref()
-                    .map(|o| o.simulation_mesh.clone());
-                if let Some(avatar) = state.app.active_avatar_mut() {
-                    let overlay_id =
-                        crate::asset::ClothOverlayId((avatar.cloth_overlay_count() as u64) + 2);
-                    let idx = avatar.attach_cloth_overlay(overlay_id);
-                    if let Some(sim_mesh) = sim_mesh {
-                        let mut cloth_asset = crate::asset::ClothAsset::new_empty(
-                            crate::asset::ClothOverlayId(0),
-                            avatar.asset.id,
-                            avatar.asset.source_hash.clone(),
-                        );
-                        cloth_asset.simulation_mesh = sim_mesh;
-                        avatar.init_cloth_overlay(idx, &cloth_asset);
-                    }
-                }
-            }
-            if tonal_button(
-                ui,
-                Some(ic::FOLDER_OPEN),
-                &t!("inspector.load_overlay_file"),
-                ButtonTone::Primary,
-                true,
-            )
-            .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(t!("top_bar.filter_cloth"), &["vvtcloth"])
-                    .set_title("Load cloth overlay into a new slot")
-                    .pick_file()
+    collapsible_card(
+        ui,
+        "inspector.cloth_attachment",
+        t!("inspector.cloth_attachment"),
+        false,
+        |ui| {
+            ui.horizontal(|ui| {
+                if tonal_button(
+                    ui,
+                    None,
+                    &t!("inspector.attach_primary"),
+                    ButtonTone::Primary,
+                    true,
+                )
+                .clicked()
                 {
-                    let load_result = crate::persistence::load_cloth_overlay(&path);
-                    let asset_opt = match load_result {
-                        Ok(file) => file.cloth_asset,
-                        Err(e) => {
-                            state.push_error_notification(t!("inspector.failed_load_overlay", path = path.display().to_string(), error = e.to_string()));
-                            None
-                        }
-                    };
-                    if let Some(mut cloth_asset) = asset_opt {
-                        // Resolve the overlay's stored IDs against the
-                        // currently-loaded avatar. If the avatar was
-                        // re-exported and the IDs drifted, the rebinder
-                        // rewrites them by name. A Failed status (refs
-                        // we can't resolve at any tier) skips the attach.
-                        if !state.attempt_overlay_rebind(&path, &mut cloth_asset) {
-                            state.push_error_notification(t!("inspector.overlay_rebind_failed", path = path.display().to_string()));
-                        } else if let Some(avatar) = state.app.active_avatar_mut() {
-                            let overlay_id = crate::asset::ClothOverlayId(
-                                (avatar.cloth_overlay_count() as u64) + 2,
-                            );
-                            let idx = avatar.attach_cloth_overlay(overlay_id);
-                            avatar.init_cloth_overlay(idx, &cloth_asset);
-                            if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
-                                slot.source_path = Some(path.clone());
-                            }
-                            state.push_notification(t!("inspector.overlay_attached", path = path.display().to_string(), index = idx));
-                        }
-                    } else {
-                        state.push_notification(t!("inspector.overlay_no_payload", path = path.display().to_string()));
+                    let overlay_id = state
+                        .app
+                        .editor
+                        .active_overlay()
+                        .unwrap_or(crate::asset::ClothOverlayId(1));
+                    if let Some(avatar) = state.app.active_avatar_mut() {
+                        avatar.attach_cloth(overlay_id);
                     }
                 }
-            }
-        });
-        if let Some(avatar) = state.app.active_avatar_mut() {
-            ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.enable_cloth"));
-            // Defer removal until after the iter_mut borrow ends —
-            // can't mutate the Vec we're iterating.
-            let mut remove_slot: Option<usize> = None;
-            for (i, slot) in avatar.cloth_overlays.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut slot.enabled,
-                        format!(
-                            "#{} (id={}, {} particles)",
-                            i,
-                            slot.overlay_id.0,
-                            slot.sim.particle_count()
-                        ),
-                    );
-                    if tonal_button(
-                        ui,
-                        None,
-                        &t!("inspector.remove"),
-                        ButtonTone::Error,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        remove_slot = Some(i);
+                if tonal_button(
+                    ui,
+                    None,
+                    &t!("inspector.detach_primary"),
+                    ButtonTone::Error,
+                    true,
+                )
+                .clicked()
+                {
+                    if let Some(avatar) = state.app.active_avatar_mut() {
+                        avatar.detach_cloth();
                     }
-                });
+                }
+            });
+            ui.horizontal(|ui| {
+                if tonal_button(
+                    ui,
+                    Some(ic::ADD),
+                    &t!("inspector.add_overlay_slot"),
+                    ButtonTone::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    let sim_mesh = state
+                        .app
+                        .editor
+                        .overlay_asset
+                        .as_ref()
+                        .map(|o| o.simulation_mesh.clone());
+                    if let Some(avatar) = state.app.active_avatar_mut() {
+                        let overlay_id =
+                            crate::asset::ClothOverlayId((avatar.cloth_overlay_count() as u64) + 2);
+                        let idx = avatar.attach_cloth_overlay(overlay_id);
+                        if let Some(sim_mesh) = sim_mesh {
+                            let mut cloth_asset = crate::asset::ClothAsset::new_empty(
+                                crate::asset::ClothOverlayId(0),
+                                avatar.asset.id,
+                                avatar.asset.source_hash.clone(),
+                            );
+                            cloth_asset.simulation_mesh = sim_mesh;
+                            avatar.init_cloth_overlay(idx, &cloth_asset);
+                        }
+                    }
+                }
+                if tonal_button(
+                    ui,
+                    Some(ic::FOLDER_OPEN),
+                    &t!("inspector.load_overlay_file"),
+                    ButtonTone::Primary,
+                    true,
+                )
+                .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter(t!("top_bar.filter_cloth"), &["vvtcloth"])
+                        .set_title("Load cloth overlay into a new slot")
+                        .pick_file()
+                    {
+                        let load_result = crate::persistence::load_cloth_overlay(&path);
+                        let asset_opt = match load_result {
+                            Ok(file) => file.cloth_asset,
+                            Err(e) => {
+                                state.push_error_notification(t!(
+                                    "inspector.failed_load_overlay",
+                                    path = path.display().to_string(),
+                                    error = e.to_string()
+                                ));
+                                None
+                            }
+                        };
+                        if let Some(mut cloth_asset) = asset_opt {
+                            // Resolve the overlay's stored IDs against the
+                            // currently-loaded avatar. If the avatar was
+                            // re-exported and the IDs drifted, the rebinder
+                            // rewrites them by name. A Failed status (refs
+                            // we can't resolve at any tier) skips the attach.
+                            if !state.attempt_overlay_rebind(&path, &mut cloth_asset) {
+                                state.push_error_notification(t!(
+                                    "inspector.overlay_rebind_failed",
+                                    path = path.display().to_string()
+                                ));
+                            } else if let Some(avatar) = state.app.active_avatar_mut() {
+                                let overlay_id = crate::asset::ClothOverlayId(
+                                    (avatar.cloth_overlay_count() as u64) + 2,
+                                );
+                                let idx = avatar.attach_cloth_overlay(overlay_id);
+                                avatar.init_cloth_overlay(idx, &cloth_asset);
+                                if let Some(slot) = avatar.cloth_overlays.get_mut(idx) {
+                                    slot.source_path = Some(path.clone());
+                                }
+                                state.push_notification(t!(
+                                    "inspector.overlay_attached",
+                                    path = path.display().to_string(),
+                                    index = idx
+                                ));
+                            }
+                        } else {
+                            state.push_notification(t!(
+                                "inspector.overlay_no_payload",
+                                path = path.display().to_string()
+                            ));
+                        }
+                    }
+                }
+            });
+            if let Some(avatar) = state.app.active_avatar_mut() {
+                ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.enable_cloth"));
+                // Defer removal until after the iter_mut borrow ends —
+                // can't mutate the Vec we're iterating.
+                let mut remove_slot: Option<usize> = None;
+                for (i, slot) in avatar.cloth_overlays.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut slot.enabled,
+                            format!(
+                                "#{} (id={}, {} particles)",
+                                i,
+                                slot.overlay_id.0,
+                                slot.sim.particle_count()
+                            ),
+                        );
+                        if tonal_button(ui, None, &t!("inspector.remove"), ButtonTone::Error, true)
+                            .clicked()
+                        {
+                            remove_slot = Some(i);
+                        }
+                    });
+                }
+                if let Some(idx) = remove_slot {
+                    avatar.remove_cloth_overlay(idx);
+                }
             }
-            if let Some(idx) = remove_slot {
-                avatar.remove_cloth_overlay(idx);
-            }
-        }
-    });
+        },
+    );
 }
 
 fn draw_cloth_preview(
@@ -624,14 +711,18 @@ fn draw_cloth_preview(
     state: &mut GuiApp,
     scene_gravity: crate::simulation::SceneGravity,
 ) {
-    collapsible_card(ui, "inspector.preview", t!("inspector.preview"), false, |ui| {
+    collapsible_card(
+        ui,
+        "inspector.preview",
+        t!("inspector.preview"),
+        false,
+        |ui| {
             if let Some(avatar) = state.app.active_avatar_mut() {
                 ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.cloth_simulation"));
 
                 ui.horizontal(|ui| {
                     if state.cloth_authoring.sim_paused {
-                        if filled_button(ui, Some(ic::PLAY), &t!("inspector.play"), true)
-                            .clicked()
+                        if filled_button(ui, Some(ic::PLAY), &t!("inspector.play"), true).clicked()
                         {
                             state.cloth_authoring.sim_paused = false;
                         }
@@ -668,8 +759,14 @@ fn draw_cloth_preview(
                 ui.add_space(4.0);
 
                 if let Some(ref cs) = avatar.cloth_state {
-                    ui.label(t!("inspector.primary_sim_positions", count = cs.sim_positions.len()));
-                    ui.label(t!("inspector.primary_deform", version = cs.deform_output.version));
+                    ui.label(t!(
+                        "inspector.primary_sim_positions",
+                        count = cs.sim_positions.len()
+                    ));
+                    ui.label(t!(
+                        "inspector.primary_deform",
+                        version = cs.deform_output.version
+                    ));
                 } else if !avatar.cloth_overlays.is_empty() {
                     ui.label(t!("inspector.primary_state_none"));
                 } else {
@@ -687,5 +784,6 @@ fn draw_cloth_preview(
             } else {
                 super::draw_no_avatar_state(ui);
             }
-        });
+        },
+    );
 }

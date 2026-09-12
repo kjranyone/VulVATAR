@@ -26,7 +26,9 @@ fn import_skips_path_already_in_library() {
     harness
         .app
         .avatar_library
-        .add(crate::app::avatar_library::AvatarLibraryEntry::from_path(&vrm_path));
+        .add(crate::app::avatar_library::AvatarLibraryEntry::from_path(
+            &vrm_path,
+        ));
     let before = harness.app.avatar_library.entries.len();
 
     let added = harness.import_vrm_into_library_if_missing(&vrm_path);

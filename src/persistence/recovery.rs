@@ -6,8 +6,8 @@ use log::{error, info};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    app_data_dir, app_tag, atomic_write, ClothOverlayFile, OVERLAY_FORMAT_VERSION, ProjectFile,
-    PROJECT_FORMAT_VERSION, ProjectState, RECOVERY_FORMAT_VERSION,
+    app_data_dir, app_tag, atomic_write, ClothOverlayFile, ProjectFile, ProjectState,
+    OVERLAY_FORMAT_VERSION, PROJECT_FORMAT_VERSION, RECOVERY_FORMAT_VERSION,
 };
 
 #[derive(Serialize, Deserialize, Debug)]

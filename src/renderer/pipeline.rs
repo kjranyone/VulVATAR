@@ -164,8 +164,8 @@ pub fn vertex_data_to_base(vd: &crate::asset::VertexData) -> Vec<GpuVertexBase> 
 
 pub mod vs {
     vulkano_shaders::shader! {
-                ty: "vertex",
-                src: r"
+                    ty: "vertex",
+                    src: r"
 #version 450
 
 layout(location = 0) in vec4 position;
@@ -197,13 +197,13 @@ void main() {
     gl_Position = camera.proj * camera.view * vec4(position.xyz, 1.0);
 }
 "
-            }
+                }
 }
 
 pub mod fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                                ty: "fragment",
-                                                                                                                                                                                                                                                                                src: r"
+                                                                                                                                                                                                                                                                                    ty: "fragment",
+                                                                                                                                                                                                                                                                                    src: r"
 #version 450
 
 layout(location = 0) in vec3 frag_normal;
@@ -350,7 +350,7 @@ void main() {
     out_color = vec4(color.rgb, color.a * camera.fade_opacity);
 }
 "
-                                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,8 +359,8 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-                ty: "vertex",
-                src: r"
+                    ty: "vertex",
+                    src: r"
 #version 450
 
 layout(location = 0) in vec4 position;
@@ -400,13 +400,13 @@ void main() {
     gl_Position = clip_pos;
 }
 "
-            }
+                }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-                ty: "fragment",
-                src: r"
+                    ty: "fragment",
+                    src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -423,7 +423,7 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-            }
+                }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,8 +455,8 @@ void main() {
 // `simulation::cloth_gpu_boundary::ClothGpuSimulationState`.
 pub mod cloth_verlet_cs {
     vulkano_shaders::shader! {
-                ty: "compute",
-                src: r"
+                    ty: "compute",
+                    src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -516,7 +516,7 @@ void main() {
     prev_positions.p[idx] = vec4(pos, pinned);
 }
 "
-            }
+                }
 }
 
 // =========================================================================
@@ -555,8 +555,8 @@ void main() {
 // disabled" exactly like the CPU path.
 pub mod cloth_constraint_lambda_update_cs {
     vulkano_shaders::shader! {
-                ty: "compute",
-                src: r"
+                    ty: "compute",
+                    src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -649,13 +649,13 @@ void main() {
     dlambda.l[cidx] = delta_lambda;
 }
 "
-            }
+                }
 }
 
 pub mod cloth_constraint_accumulate_cs {
     vulkano_shaders::shader! {
-                ty: "compute",
-                src: r"
+                    ty: "compute",
+                    src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -745,7 +745,7 @@ void main() {
     deltas.d[pid] = vec4(delta, 0.0);
 }
 "
-            }
+                }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,8 +753,8 @@ void main() {
 // ---------------------------------------------------------------------------
 pub mod cloth_constraint_apply_cs {
     vulkano_shaders::shader! {
-                ty: "compute",
-                src: r"
+                    ty: "compute",
+                    src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -790,7 +790,7 @@ void main() {
     deltas.d[pid] = vec4(0.0);
 }
 "
-            }
+                }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,8 +815,8 @@ void main() {
 // `(0, 1, 0)`; CPU path uses the same fallback.
 pub mod cloth_normal_cs {
     vulkano_shaders::shader! {
-                ty: "compute",
-                src: r"
+                    ty: "compute",
+                    src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -909,7 +909,7 @@ void main() {
     normals.n[vid] = vec4(nrm, 0.0);
 }
 "
-            }
+                }
 }
 
 pub mod transform_cs {
@@ -930,8 +930,8 @@ pub mod transform_cs {
     // 16-byte alignment, so we pad to `vec4` on both ends — see the Rust
     // struct comments for byte-for-byte breakdown.
     vulkano_shaders::shader! {
-                ty: "compute",
-                src: r"
+                    ty: "compute",
+                    src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -1267,7 +1267,7 @@ void main() {
     out_v.v[vid]._pad     = uvec2(0u, 0u);
 }
 "
-            }
+                }
 }
 
 // ---------------------------------------------------------------------------

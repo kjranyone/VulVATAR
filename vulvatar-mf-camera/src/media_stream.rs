@@ -17,11 +17,11 @@ use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaBuffer, IMFMediaEvent,
     IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2,
     IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFSample, IMFStreamDescriptor,
-    IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample, MFGetSystemTime,
-    MFVideoFormat_NV12, MFVideoPrimaries_BT709, MFVideoTransFunc_10, MFVideoTransFunc_sRGB,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_E_SHUTDOWN, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES, MF_STREAM_STATE,
-    MF_STREAM_STATE_RUNNING,
+    IMFVideoSampleAllocatorEx, MEMediaSample, MFCreateMemoryBuffer, MFCreateSample,
+    MFGetSystemTime, MFVideoFormat_NV12, MFVideoPrimaries_BT709, MFVideoTransFunc_10,
+    MFVideoTransFunc_sRGB, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MF_E_SHUTDOWN, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES,
+    MF_STREAM_STATE, MF_STREAM_STATE_RUNNING,
 };
 
 use crate::media_source::{AllocatorHandle, DEFAULT_FPS};
@@ -235,12 +235,8 @@ impl IMFMediaStream_Impl for VulvatarMediaStream_Impl {
         // while we still hold the Mutex, so the lock is released before
         // the (potentially blocking) AllocateSample / fill_allocated_sample
         // path runs.
-        let allocator_opt: Option<IMFVideoSampleAllocatorEx> = self
-            .allocator
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|h| h.0.clone());
+        let allocator_opt: Option<IMFVideoSampleAllocatorEx> =
+            self.allocator.lock().unwrap().as_ref().map(|h| h.0.clone());
 
         let sample: IMFSample = if let Some(allocator) = allocator_opt {
             if !self.allocator_initialized.load(Ordering::Acquire) {
@@ -579,11 +575,7 @@ unsafe fn write_nv12_strided(scanline: *mut u8, pitch: usize, writer: &PixelWrit
         while col + 1 < w {
             let p = |dx: usize, dy: usize| -> (u32, u32, u32) {
                 let off = (row + dy) * src_stride + (col + dx) * 4;
-                (
-                    rgba[off] as u32,
-                    rgba[off + 1] as u32,
-                    rgba[off + 2] as u32,
-                )
+                (rgba[off] as u32, rgba[off + 1] as u32, rgba[off + 2] as u32)
             };
             let (r0, g0, b0) = p(0, 0);
             let (r1, g1, b1) = p(1, 0);
@@ -632,11 +624,14 @@ unsafe fn write_rgb32_strided(scanline: *mut u8, pitch: usize, writer: &PixelWri
             *d = *s.add(2); // B (BGRA's first byte ← RGBA's third byte)
             *d.add(1) = *s.add(1); // G
             *d.add(2) = *s; // R
-            *d.add(3) = if writer.preserve_alpha { *s.add(3) } else { 0xFF };
+            *d.add(3) = if writer.preserve_alpha {
+                *s.add(3)
+            } else {
+                0xFF
+            };
         }
     }
 }
-
 
 impl VulvatarMediaStream {
     /// Resolve the negotiated subtype + frame size + frame rate. Cached

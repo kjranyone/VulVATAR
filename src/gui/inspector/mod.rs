@@ -67,9 +67,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         // Preview is retired; `normalized()` folds it
                         // onto Rendering (Scene) so this arm is
                         // unreachable — kept for match exhaustiveness.
-                        AppMode::Preview | AppMode::Rendering => {
-                            rendering::draw_scene(ui, state)
-                        }
+                        AppMode::Preview | AppMode::Rendering => rendering::draw_scene(ui, state),
                         AppMode::TrackingSetup => tracking::draw_tracking(ui, state),
                         AppMode::Output => output::draw_output(ui, state),
                         AppMode::ClothAuthoring => cloth::draw_cloth_authoring(ui, state),

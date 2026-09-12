@@ -113,11 +113,7 @@ impl ClothGpuSimulationState {
     /// Vulkan SSBO handles land when stage 1 of P3-02 ships; the counts
     /// alone are enough for the renderer to dispatch the right number of
     /// workgroups even with a no-op solver.
-    pub fn from_authoring(
-        particle_count: u32,
-        constraint_count: u32,
-        iterations: u32,
-    ) -> Self {
+    pub fn from_authoring(particle_count: u32, constraint_count: u32, iterations: u32) -> Self {
         Self {
             version: 0,
             iterations,
@@ -456,8 +452,7 @@ mod tests {
         let cpu_final: Vec<[f32; 3]> = sim.particles.iter().map(|p| p.position).collect();
 
         // ----- GLSL formula mirror -----
-        let mut positions: Vec<[f32; 3]> =
-            (0..4).map(|i| [i as f32, 1.0, 0.0]).collect();
+        let mut positions: Vec<[f32; 3]> = (0..4).map(|i| [i as f32, 1.0, 0.0]).collect();
         let mut prev_positions: Vec<[f32; 3]> = positions.clone();
         let pinned: Vec<bool> = vec![false; 4];
         // wind_force baked the same way collect_cloth_deforms does it:
@@ -539,7 +534,7 @@ mod tests {
     /// matching the renderer's `cmd.fill_buffer(lambda_ssbo, 0)` reset
     /// in `mod.rs`.
     fn cpu_mirror_of_cloth_constraint_iter(
-        positions: &mut [[f32; 4]], // xyz = pos, w = inv_mass
+        positions: &mut [[f32; 4]],           // xyz = pos, w = inv_mass
         constraints: &[(u32, u32, f32, f32)], // (a, b, rest_length, stiffness)
         adj: &VertexTriangleAdjacency,
         lambda: &mut [f32],
@@ -875,10 +870,8 @@ mod tests {
                     e1[2] * e2[0] - e1[0] * e2[2],
                     e1[0] * e2[1] - e1[1] * e2[0],
                 ];
-                let face_area2 = (cross[0] * cross[0]
-                    + cross[1] * cross[1]
-                    + cross[2] * cross[2])
-                    .sqrt();
+                let face_area2 =
+                    (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
                 if face_area2 < 1e-12 {
                     continue;
                 }
@@ -915,9 +908,7 @@ mod tests {
     /// degenerate vertices fall back to `(0, 1, 0)` on both sides.
     #[test]
     fn cloth_normal_cs_formula_matches_cpu_pbd() {
-        use crate::simulation::cloth::{
-            ClothParticle, ClothSimState, SpatialHashGrid,
-        };
+        use crate::simulation::cloth::{ClothParticle, ClothSimState, SpatialHashGrid};
         use crate::simulation::cloth_solver::output::compute_normals;
         use std::collections::HashSet;
 
@@ -981,7 +972,10 @@ mod tests {
                 assert!(
                     diff < 1e-4,
                     "normal {} axis {} mismatch: CPU = {:?}, GLSL = {:?}",
-                    i, k, cpu_normals[i], gpu_normals[i]
+                    i,
+                    k,
+                    cpu_normals[i],
+                    gpu_normals[i]
                 );
             }
         }

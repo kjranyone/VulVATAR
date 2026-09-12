@@ -34,11 +34,7 @@ impl AvatarPose {
 /// This is the pure-function form of [`AvatarInstance::compute_global_pose`];
 /// the snapshot path (`gui::calibration::target_pose`) uses it
 /// without needing a `&mut AvatarInstance`.
-pub fn compute_global_transforms(
-    skeleton: &SkeletonAsset,
-    locals: &[Transform],
-    out: &mut [Mat4],
-) {
+pub fn compute_global_transforms(skeleton: &SkeletonAsset, locals: &[Transform], out: &mut [Mat4]) {
     let mut stack: Vec<(usize, Option<usize>)> = Vec::new();
     for root in skeleton.root_nodes.iter().rev() {
         stack.push((root.0 as usize, None));

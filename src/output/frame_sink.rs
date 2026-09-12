@@ -1002,9 +1002,7 @@ pub fn create_sink_writer(sink: &FrameSink) -> Box<dyn OutputSinkWriter> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame_handoff::{
-        FrameLease, FrameLifetimeContract, HandoffPath, OutputFrameId,
-    };
+    use crate::frame_handoff::{FrameLease, FrameLifetimeContract, HandoffPath, OutputFrameId};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 

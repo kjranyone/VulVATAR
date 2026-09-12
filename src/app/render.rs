@@ -13,8 +13,8 @@ use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
 use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
-    CameraState, ClothDeformSnapshot, OutputTargetRequest, RenderAvatarInstance,
-    RenderExportMode, RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
+    CameraState, ClothDeformSnapshot, OutputTargetRequest, RenderAvatarInstance, RenderExportMode,
+    RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
 };
 use crate::renderer::material::MaterialShaderMode;
 use crate::simulation::SimulationStepOptions;
@@ -127,8 +127,9 @@ impl Application {
         // persisted project). Applies to the compat source skeleton's
         // face channels only — the rig pose from the fusion estimator is
         // already metric and needs no calibration.
-        let effective_calibration =
-            crate::tracking::TrackingCalibration { pose: self.tracking_calibration.pose.clone() };
+        let effective_calibration = crate::tracking::TrackingCalibration {
+            pose: self.tracking_calibration.pose.clone(),
+        };
 
         // Global avatar fade-out when person detection is lost. Target is full
         // opacity while a person is present (fresh sample or within the hold
@@ -297,7 +298,8 @@ impl Application {
                 }
                 if step_options.cloth_enabled {
                     for _ in 0..substeps {
-                        self.physics.step_cloth(fixed_dt, avatar, &config.scene_gravity);
+                        self.physics
+                            .step_cloth(fixed_dt, avatar, &config.scene_gravity);
                     }
                     avatar.compute_global_pose();
                 }
@@ -317,13 +319,12 @@ impl Application {
             // mode back to Healthy and GpuExport resumes naturally.
             let force_cpu_export = self.runtime_gpu_budget.degraded_mode()
                 == crate::app::runtime_gpu_budget::DegradedMode::EmergencyCpu;
-            let export_mode = if !force_cpu_export
-                && self.output.active_sink().supports_gpu_tokens()
-            {
-                RenderExportMode::GpuExport
-            } else {
-                RenderExportMode::CpuReadback
-            };
+            let export_mode =
+                if !force_cpu_export && self.output.active_sink().supports_gpu_tokens() {
+                    RenderExportMode::GpuExport
+                } else {
+                    RenderExportMode::CpuReadback
+                };
             let fi_config = FrameInputConfig {
                 camera: self.viewport_camera.clone(),
                 lighting: self.viewport_lighting.clone(),
@@ -486,8 +487,7 @@ impl Application {
             // gate would pin to full rate forever after even one stall.
             let dropped = rt.take_dropped_results();
             if dropped > 0 {
-                self.render_results_dropped =
-                    self.render_results_dropped.saturating_add(dropped);
+                self.render_results_dropped = self.render_results_dropped.saturating_add(dropped);
                 let dropped_u32 = u32::try_from(dropped).unwrap_or(u32::MAX);
                 self.render_results_pending =
                     self.render_results_pending.saturating_sub(dropped_u32);
@@ -792,12 +792,11 @@ impl Application {
                             // mode.
                             let mut mesh_instance =
                                 RenderMeshInstance::from_primitive(avatar, mesh.id, prim);
-                            mesh_instance.material_binding.mode =
-                                match material_mode_index {
-                                    0 => MaterialShaderMode::Unlit,
-                                    1 => MaterialShaderMode::SimpleLit,
-                                    _ => MaterialShaderMode::ToonLike,
-                                };
+                            mesh_instance.material_binding.mode = match material_mode_index {
+                                0 => MaterialShaderMode::Unlit,
+                                1 => MaterialShaderMode::SimpleLit,
+                                _ => MaterialShaderMode::ToonLike,
+                            };
                             mesh_instance
                         })
                     })
@@ -994,9 +993,9 @@ fn collect_cloth_deforms<'a>(
     fixed_dt: f32,
     substeps: u32,
 ) -> Vec<ClothDeformSnapshot> {
+    use crate::math_utils::vec3_scale;
     use crate::renderer::frame_input::{ClothGpuAttachData, ClothGpuDispatchControl};
     use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
-    use crate::math_utils::vec3_scale;
 
     let mut seen_targets: std::collections::HashSet<crate::asset::PrimitiveId> =
         std::collections::HashSet::new();
@@ -1007,48 +1006,35 @@ fn collect_cloth_deforms<'a>(
             if !seen_targets.insert(target_primitive_id) {
                 return None;
             }
-            let (gpu_control, gpu_attach) =
-                if cs.solver_backend == ClothSolverBackend::Gpu {
-                    match sim_opt {
-                        Some(sim) => {
-                            let wind_force =
-                                vec3_scale(&sim.wind_direction, sim.wind_response);
-                            let ctrl = ClothGpuDispatchControl {
-                                dt: fixed_dt,
-                                substeps,
-                                damping: sim.damping,
-                                gravity: sim.gravity,
-                                wind_force,
-                                solver_iterations: sim.solver_iterations as u32,
-                            };
-                            let attach = ClothGpuAttachData {
-                                constraints: sim
-                                    .distance_constraints
-                                    .iter()
-                                    .map(|c| {
-                                        (
-                                            c.a as u32,
-                                            c.b as u32,
-                                            c.rest_length,
-                                            c.stiffness,
-                                        )
-                                    })
-                                    .collect(),
-                                triangle_indices: sim.triangle_indices.clone(),
-                                inv_masses: sim
-                                    .particles
-                                    .iter()
-                                    .map(|p| p.inv_mass)
-                                    .collect(),
-                                pinned: sim.particles.iter().map(|p| p.pinned).collect(),
-                            };
-                            (Some(ctrl), Some(attach))
-                        }
-                        None => (None, None),
+            let (gpu_control, gpu_attach) = if cs.solver_backend == ClothSolverBackend::Gpu {
+                match sim_opt {
+                    Some(sim) => {
+                        let wind_force = vec3_scale(&sim.wind_direction, sim.wind_response);
+                        let ctrl = ClothGpuDispatchControl {
+                            dt: fixed_dt,
+                            substeps,
+                            damping: sim.damping,
+                            gravity: sim.gravity,
+                            wind_force,
+                            solver_iterations: sim.solver_iterations as u32,
+                        };
+                        let attach = ClothGpuAttachData {
+                            constraints: sim
+                                .distance_constraints
+                                .iter()
+                                .map(|c| (c.a as u32, c.b as u32, c.rest_length, c.stiffness))
+                                .collect(),
+                            triangle_indices: sim.triangle_indices.clone(),
+                            inv_masses: sim.particles.iter().map(|p| p.inv_mass).collect(),
+                            pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                        };
+                        (Some(ctrl), Some(attach))
                     }
-                } else {
-                    (None, None)
-                };
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
             Some(ClothDeformSnapshot {
                 target_primitive_id,
                 target_mesh_id: cs.target_mesh_id,
@@ -1079,7 +1065,14 @@ mod sensor_camera_tests {
     }
 
     fn intrinsics(cx: f32, cy: f32) -> crate::tracking::CameraIntrinsics {
-        crate::tracking::CameraIntrinsics { fx: 600.0, fy: 600.0, cx, cy, width: 1280, height: 720 }
+        crate::tracking::CameraIntrinsics {
+            fx: 600.0,
+            fy: 600.0,
+            cx,
+            cy,
+            width: 1280,
+            height: 720,
+        }
     }
 
     /// Centred principal point: a view-space point straight down the optical
@@ -1089,7 +1082,10 @@ mod sensor_camera_tests {
         let p = Application::build_projection_from_intrinsics(&intrinsics(640.0, 360.0), 0.1, 10.0);
         let clip = mul(&p, &[0.0, 0.0, -1.0, 1.0]);
         let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
-        assert!(ndc[0].abs() < 1e-5 && ndc[1].abs() < 1e-5, "axis → centre, got {ndc:?}");
+        assert!(
+            ndc[0].abs() < 1e-5 && ndc[1].abs() < 1e-5,
+            "axis → centre, got {ndc:?}"
+        );
     }
 
     /// A pixel offset maps to the matching NDC offset. A point at x=+0.5,
@@ -1099,7 +1095,10 @@ mod sensor_camera_tests {
         let p = Application::build_projection_from_intrinsics(&intrinsics(640.0, 360.0), 0.1, 10.0);
         let clip = mul(&p, &[0.5, 0.0, -1.0, 1.0]);
         let ndc_x = clip[0] / clip[3];
-        assert!((ndc_x - 0.46875).abs() < 1e-4, "expected 0.46875, got {ndc_x}");
+        assert!(
+            (ndc_x - 0.46875).abs() < 1e-4,
+            "expected 0.46875, got {ndc_x}"
+        );
     }
 
     /// A principal point right-of-centre (cx > w/2) shifts the on-axis point
@@ -1110,7 +1109,10 @@ mod sensor_camera_tests {
         let clip = mul(&p, &[0.0, 0.0, -1.0, 1.0]);
         let ndc_x = clip[0] / clip[3];
         // ndc_x = 2·700/1280 − 1 = 0.09375.
-        assert!((ndc_x - 0.09375).abs() < 1e-4, "principal offset → 0.09375, got {ndc_x}");
+        assert!(
+            (ndc_x - 0.09375).abs() < 1e-4,
+            "principal offset → 0.09375, got {ndc_x}"
+        );
     }
 
     /// Near plane → NDC z 0, far plane → NDC z 1 (Vulkan depth range), same
@@ -1143,7 +1145,11 @@ mod sensor_camera_tests {
     #[test]
     fn sensor_view_clamps_zero_depth() {
         let (_v, eye) = Application::build_sensor_view_matrix([0.0, 1.0, 0.0], 0.0);
-        assert!(eye[2] >= 0.2, "zero depth must clamp to a positive standoff, got {}", eye[2]);
+        assert!(
+            eye[2] >= 0.2,
+            "zero depth must clamp to a positive standoff, got {}",
+            eye[2]
+        );
     }
 }
 
@@ -1182,8 +1188,7 @@ mod cloth_collection_tests {
             target_mesh_id: target_primitive_id.map(|p| MeshId(p.0)),
             target_vertex_offset: 0,
             target_vertex_count: vertex_count,
-            solver_backend:
-                crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+            solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
         }
     }
 
@@ -1193,12 +1198,18 @@ mod cloth_collection_tests {
         let skirt = make_cloth_state(2, Some(PrimitiveId(20)), 64, 1);
         let scarf = make_cloth_state(3, Some(PrimitiveId(30)), 16, 1);
 
-        let result =
-            collect_cloth_deforms([(&body, None), (&skirt, None), (&scarf, None)], 1.0 / 60.0, 1);
+        let result = collect_cloth_deforms(
+            [(&body, None), (&skirt, None), (&scarf, None)],
+            1.0 / 60.0,
+            1,
+        );
 
-        assert_eq!(result.len(), 3, "all three distinct-target cloths must be kept");
-        let target_ids: Vec<u64> =
-            result.iter().map(|c| c.target_primitive_id.0).collect();
+        assert_eq!(
+            result.len(),
+            3,
+            "all three distinct-target cloths must be kept"
+        );
+        let target_ids: Vec<u64> = result.iter().map(|c| c.target_primitive_id.0).collect();
         assert_eq!(target_ids, vec![10, 20, 30]);
         let vertex_counts: Vec<u32> = result.iter().map(|c| c.vertex_count).collect();
         assert_eq!(vertex_counts, vec![32, 64, 16]);
@@ -1209,8 +1220,11 @@ mod cloth_collection_tests {
         let authoritative = make_cloth_state(1, Some(PrimitiveId(10)), 32, 5);
         let overlay_duplicate = make_cloth_state(2, Some(PrimitiveId(10)), 64, 99);
 
-        let result =
-            collect_cloth_deforms([(&authoritative, None), (&overlay_duplicate, None)], 1.0 / 60.0, 1);
+        let result = collect_cloth_deforms(
+            [(&authoritative, None), (&overlay_duplicate, None)],
+            1.0 / 60.0,
+            1,
+        );
 
         assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
         assert_eq!(result[0].version, 5, "first (authoritative) cloth wins");
@@ -1222,8 +1236,7 @@ mod cloth_collection_tests {
         let bound = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
         let unbound = make_cloth_state(2, None, 64, 1);
 
-        let result =
-            collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1);
+        let result = collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1);
 
         assert_eq!(result.len(), 1, "cloth with no render target is dropped");
         assert_eq!(result[0].target_primitive_id.0, 10);

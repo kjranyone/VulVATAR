@@ -236,10 +236,28 @@ mod tests {
 
         // Near subject: crop is most of the frame.
         let mut near = base;
-        remap_crop_joints(&mut near, 100.0, 0.0, 540.0, 720.0, w, h, tracked_z_gain(720.0, h));
+        remap_crop_joints(
+            &mut near,
+            100.0,
+            0.0,
+            540.0,
+            720.0,
+            w,
+            h,
+            tracked_z_gain(720.0, h),
+        );
         // Far subject: same pose, crop four times smaller.
         let mut far = base;
-        remap_crop_joints(&mut far, 500.0, 200.0, 135.0, 180.0, w, h, tracked_z_gain(180.0, h));
+        remap_crop_joints(
+            &mut far,
+            500.0,
+            200.0,
+            135.0,
+            180.0,
+            w,
+            h,
+            tracked_z_gain(180.0, h),
+        );
 
         let ratios = |pair: &[DecodedJoint; 2]| {
             let dx = pair[1].nx - pair[0].nx;
@@ -265,7 +283,16 @@ mod tests {
     fn remap_identity_crop_is_a_noop() {
         let (w, h) = (640u32, 480u32);
         let mut joints = [dj(0.25, 0.75, 0.5)];
-        remap_crop_joints(&mut joints, 0.0, 0.0, 640.0, 480.0, w, h, tracked_z_gain(480.0, h));
+        remap_crop_joints(
+            &mut joints,
+            0.0,
+            0.0,
+            640.0,
+            480.0,
+            w,
+            h,
+            tracked_z_gain(480.0, h),
+        );
         assert!((joints[0].nx - 0.25).abs() < 1e-6);
         assert!((joints[0].ny - 0.75).abs() < 1e-6);
         assert!((joints[0].nz - 0.5).abs() < 1e-6);

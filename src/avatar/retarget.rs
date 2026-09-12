@@ -15,11 +15,11 @@
 
 use std::collections::HashMap;
 
+use crate::asset::HumanoidBone as HB;
 use crate::asset::{HumanoidBone, HumanoidMap, NodeId, SkeletonAsset, Transform};
 use crate::math_utils::{
     quat_conjugate, quat_mul, quat_normalize, quat_rotate_vec3, vec3_length, vec3_sub, Quat, Vec3,
 };
-use crate::asset::HumanoidBone as HB;
 use crate::tracking::fusion::output::RigPose;
 
 /// Persistent retarget state per avatar instance.
@@ -282,9 +282,10 @@ impl OneEuroQuat {
         }
 
         // Angular distance theta = 2 * acos(|prev · target|)
-        let dot = (prev[0] * target[0] + prev[1] * target[1] + prev[2] * target[2] + prev[3] * target[3])
-            .abs()
-            .clamp(0.0, 1.0);
+        let dot =
+            (prev[0] * target[0] + prev[1] * target[1] + prev[2] * target[2] + prev[3] * target[3])
+                .abs()
+                .clamp(0.0, 1.0);
         let theta = 2.0 * dot.acos();
         let omega = theta / dt; // rad/s
 
@@ -481,7 +482,11 @@ pub fn apply_rig_pose(
                 let yaw = quat_normalize(&quat_mul(&quat_conjugate(&tilt), &dh));
                 // Clamp the tilt angle.
                 let ang = 2.0 * tilt[3].clamp(-1.0, 1.0).acos();
-                let ang = if ang > std::f32::consts::PI { 2.0 * std::f32::consts::PI - ang } else { ang };
+                let ang = if ang > std::f32::consts::PI {
+                    2.0 * std::f32::consts::PI - ang
+                } else {
+                    ang
+                };
                 let clamped = if ang > params.max_root_tilt && ang > 1e-4 {
                     let t = params.max_root_tilt / ang;
                     slerp_short(&[0.0, 0.0, 0.0, 1.0], &tilt, t)
@@ -531,23 +536,23 @@ pub fn apply_rig_pose(
         // when tracking is lost or gated by σ, reset filter state so
         // re-acquisition never drags from past positions.
         let filtered_target = if tracking_valid && params.one_euro_enabled {
-            state
-                .one_euro_bones
-                .entry(bone)
-                .or_default()
-                .filter(
-                    target,
-                    dt,
-                    params.one_euro_min_cutoff,
-                    params.one_euro_beta,
-                    params.one_euro_d_cutoff,
-                )
+            state.one_euro_bones.entry(bone).or_default().filter(
+                target,
+                dt,
+                params.one_euro_min_cutoff,
+                params.one_euro_beta,
+                params.one_euro_d_cutoff,
+            )
         } else {
             state.one_euro_bones.remove(&bone);
             target
         };
 
-        let prev = state.prev_local.get(&bone).copied().unwrap_or(rest_local_rot);
+        let prev = state
+            .prev_local
+            .get(&bone)
+            .copied()
+            .unwrap_or(rest_local_rot);
         let out = if blend >= 1.0 {
             filtered_target
         } else {
@@ -598,7 +603,10 @@ pub fn apply_rig_pose(
                         -(rig.root_cam_m[2] - anchor[2]) * scale,
                     ];
                     let d = d_view;
-                    ([rest_pos[0] + d[0], rest_pos[1] + d[1], rest_pos[2] + d[2]], true)
+                    (
+                        [rest_pos[0] + d[0], rest_pos[1] + d[1], rest_pos[2] + d[2]],
+                        true,
+                    )
                 }
                 _ => (rest_pos, false),
             };
@@ -628,13 +636,7 @@ pub fn apply_rig_pose(
     }
 
     // ---- hand cross prevention (Two-Bone IK) ---------------------------------
-    prevent_hand_crossing(
-        skeleton,
-        humanoid,
-        local_transforms,
-        state,
-        params,
-    );
+    prevent_hand_crossing(skeleton, humanoid, local_transforms, state, params);
 }
 
 /// Compute world position and world rotation of node `node` given `locals`.
@@ -685,9 +687,18 @@ fn solve_two_bone_ik(
     let l1 = vec3_length(&v_se);
     let l2 = vec3_length(&v_ew);
     if l1 < 1e-3 || l2 < 1e-3 {
-        let u_loc = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &upper_world_rot));
-        let l_loc = quat_normalize(&quat_mul(&quat_conjugate(&upper_world_rot), &lower_world_rot));
-        let h_loc = quat_normalize(&quat_mul(&quat_conjugate(&lower_world_rot), &hand_world_rot));
+        let u_loc = quat_normalize(&quat_mul(
+            &quat_conjugate(&parent_world_rot),
+            &upper_world_rot,
+        ));
+        let l_loc = quat_normalize(&quat_mul(
+            &quat_conjugate(&upper_world_rot),
+            &lower_world_rot,
+        ));
+        let h_loc = quat_normalize(&quat_mul(
+            &quat_conjugate(&lower_world_rot),
+            &hand_world_rot,
+        ));
         return (u_loc, l_loc, h_loc);
     }
 
@@ -704,7 +715,8 @@ fn solve_two_bone_ik(
     };
 
     // Law of cosines: angle at shoulder
-    let cos_alpha = ((l1 * l1 + d_clamped * d_clamped - l2 * l2) / (2.0 * l1 * d_clamped)).clamp(-1.0, 1.0);
+    let cos_alpha =
+        ((l1 * l1 + d_clamped * d_clamped - l2 * l2) / (2.0 * l1 * d_clamped)).clamp(-1.0, 1.0);
     let sin_alpha = (1.0 - cos_alpha * cos_alpha).max(0.0).sqrt();
 
     // Pole vector from current elbow
@@ -745,7 +757,10 @@ fn solve_two_bone_ik(
     let delta_upper = quat_from_to(v_se_norm, v_se_new_norm);
 
     let upper_world_new = quat_normalize(&quat_mul(&delta_upper, &upper_world_rot));
-    let upper_local_new = quat_normalize(&quat_mul(&quat_conjugate(&parent_world_rot), &upper_world_new));
+    let upper_local_new = quat_normalize(&quat_mul(
+        &quat_conjugate(&parent_world_rot),
+        &upper_world_new,
+    ));
 
     // Lower arm rotation delta: rotates v_ew carried by delta_upper onto (target_pos - e_new)
     let v_ew_norm = [v_ew[0] / l2, v_ew[1] / l2, v_ew[2] / l2];
@@ -753,14 +768,27 @@ fn solve_two_bone_ik(
 
     let v_target = vec3_sub(&target_pos, &e_new);
     let target_dist = vec3_length(&v_target).max(1e-6);
-    let v_target_norm = [v_target[0] / target_dist, v_target[1] / target_dist, v_target[2] / target_dist];
+    let v_target_norm = [
+        v_target[0] / target_dist,
+        v_target[1] / target_dist,
+        v_target[2] / target_dist,
+    ];
     let delta_lower = quat_from_to(v_ew_carried, v_target_norm);
 
-    let lower_world_new = quat_normalize(&quat_mul(&delta_lower, &quat_mul(&delta_upper, &lower_world_rot)));
-    let lower_local_new = quat_normalize(&quat_mul(&quat_conjugate(&upper_world_new), &lower_world_new));
+    let lower_world_new = quat_normalize(&quat_mul(
+        &delta_lower,
+        &quat_mul(&delta_upper, &lower_world_rot),
+    ));
+    let lower_local_new = quat_normalize(&quat_mul(
+        &quat_conjugate(&upper_world_new),
+        &lower_world_new,
+    ));
 
     // Preserve hand world rotation
-    let hand_local_new = quat_normalize(&quat_mul(&quat_conjugate(&lower_world_new), &hand_world_rot));
+    let hand_local_new = quat_normalize(&quat_mul(
+        &quat_conjugate(&lower_world_new),
+        &hand_world_rot,
+    ));
 
     (upper_local_new, lower_local_new, hand_local_new)
 }
@@ -777,16 +805,33 @@ fn prevent_hand_crossing(
         return;
     }
 
-    let l_upper_node = humanoid.bone_map.get(&HB::LeftUpperArm).map(|n| n.0 as usize);
-    let l_lower_node = humanoid.bone_map.get(&HB::LeftLowerArm).map(|n| n.0 as usize);
-    let l_hand_node  = humanoid.bone_map.get(&HB::LeftHand).map(|n| n.0 as usize);
-    let r_upper_node = humanoid.bone_map.get(&HB::RightUpperArm).map(|n| n.0 as usize);
-    let r_lower_node = humanoid.bone_map.get(&HB::RightLowerArm).map(|n| n.0 as usize);
-    let r_hand_node  = humanoid.bone_map.get(&HB::RightHand).map(|n| n.0 as usize);
+    let l_upper_node = humanoid
+        .bone_map
+        .get(&HB::LeftUpperArm)
+        .map(|n| n.0 as usize);
+    let l_lower_node = humanoid
+        .bone_map
+        .get(&HB::LeftLowerArm)
+        .map(|n| n.0 as usize);
+    let l_hand_node = humanoid.bone_map.get(&HB::LeftHand).map(|n| n.0 as usize);
+    let r_upper_node = humanoid
+        .bone_map
+        .get(&HB::RightUpperArm)
+        .map(|n| n.0 as usize);
+    let r_lower_node = humanoid
+        .bone_map
+        .get(&HB::RightLowerArm)
+        .map(|n| n.0 as usize);
+    let r_hand_node = humanoid.bone_map.get(&HB::RightHand).map(|n| n.0 as usize);
 
-    let (Some(lu), Some(ll), Some(lh), Some(ru), Some(rl), Some(rh)) =
-        (l_upper_node, l_lower_node, l_hand_node, r_upper_node, r_lower_node, r_hand_node)
-    else {
+    let (Some(lu), Some(ll), Some(lh), Some(ru), Some(rl), Some(rh)) = (
+        l_upper_node,
+        l_lower_node,
+        l_hand_node,
+        r_upper_node,
+        r_lower_node,
+        r_hand_node,
+    ) else {
         return;
     };
 
@@ -858,7 +903,11 @@ fn prevent_hand_crossing(
         let target_dist = vec3_length(&v_target);
         if target_dist < min_dist {
             let scale = min_dist / target_dist.max(1e-6);
-            v_target = [v_target[0] * scale, v_target[1] * scale, v_target[2] * scale];
+            v_target = [
+                v_target[0] * scale,
+                v_target[1] * scale,
+                v_target[2] * scale,
+            ];
         }
 
         let w_l_target = [
@@ -883,12 +932,24 @@ fn prevent_hand_crossing(
         };
 
         let (lu_new, ll_new, lh_new) = solve_two_bone_ik(
-            s_l_pos, e_l_pos, w_l_pos, w_l_target,
-            s_l_rot, e_l_rot, w_l_rot, parent_l_rot,
+            s_l_pos,
+            e_l_pos,
+            w_l_pos,
+            w_l_target,
+            s_l_rot,
+            e_l_rot,
+            w_l_rot,
+            parent_l_rot,
         );
         let (ru_new, rl_new, rh_new) = solve_two_bone_ik(
-            s_r_pos, e_r_pos, w_r_pos, w_r_target,
-            s_r_rot, e_r_rot, w_r_rot, parent_r_rot,
+            s_r_pos,
+            e_r_pos,
+            w_r_pos,
+            w_r_target,
+            s_r_rot,
+            e_r_rot,
+            w_r_rot,
+            parent_r_rot,
         );
 
         local_transforms[lu].rotation = lu_new;
@@ -907,13 +968,25 @@ fn prevent_hand_crossing(
         state.prev_local.insert(HB::RightLowerArm, rl_new);
         state.prev_local.insert(HB::RightHand, rh_new);
 
-        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftUpperArm) { f.set_filtered(lu_new); }
-        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftLowerArm) { f.set_filtered(ll_new); }
-        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftHand) { f.set_filtered(lh_new); }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftUpperArm) {
+            f.set_filtered(lu_new);
+        }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftLowerArm) {
+            f.set_filtered(ll_new);
+        }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::LeftHand) {
+            f.set_filtered(lh_new);
+        }
 
-        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightUpperArm) { f.set_filtered(ru_new); }
-        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightLowerArm) { f.set_filtered(rl_new); }
-        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightHand) { f.set_filtered(rh_new); }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightUpperArm) {
+            f.set_filtered(ru_new);
+        }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightLowerArm) {
+            f.set_filtered(rl_new);
+        }
+        if let Some(f) = state.one_euro_bones.get_mut(&HB::RightHand) {
+            f.set_filtered(rh_new);
+        }
     }
 }
 
@@ -927,7 +1000,10 @@ fn avatar_shoulder_span(
     if l >= skeleton.nodes.len() || r >= skeleton.nodes.len() {
         return None;
     }
-    let d = vec3_length(&vec3_sub(&state.rest_world_pos[l], &state.rest_world_pos[r]));
+    let d = vec3_length(&vec3_sub(
+        &state.rest_world_pos[l],
+        &state.rest_world_pos[r],
+    ));
     (d > 0.05).then_some(d)
 }
 
@@ -939,18 +1015,19 @@ mod tests {
 
     /// Minimal 3-node chain: root → Hips → Spine, identity rest.
     fn skeleton() -> (SkeletonAsset, HumanoidMap) {
-        let mk = |id: u64, name: &str, parent: Option<u64>, children: Vec<u64>, bone| SkeletonNode {
-            id: NodeId(id),
-            name: name.to_string(),
-            parent: parent.map(NodeId),
-            children: children.into_iter().map(NodeId).collect(),
-            rest_local: Transform {
-                translation: [0.0, 0.5, 0.0],
-                rotation: [0.0, 0.0, 0.0, 1.0],
-                scale: [1.0, 1.0, 1.0],
-            },
-            humanoid_bone: bone,
-        };
+        let mk =
+            |id: u64, name: &str, parent: Option<u64>, children: Vec<u64>, bone| SkeletonNode {
+                id: NodeId(id),
+                name: name.to_string(),
+                parent: parent.map(NodeId),
+                children: children.into_iter().map(NodeId).collect(),
+                rest_local: Transform {
+                    translation: [0.0, 0.5, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: bone,
+            };
         let nodes = vec![
             mk(0, "root", None, vec![1], None),
             mk(1, "hips", Some(0), vec![2], Some(HumanoidBone::Hips)),
@@ -979,10 +1056,28 @@ mod tests {
             quality: 1.0,
             ..Default::default()
         };
-        rig.bones.insert(HumanoidBone::Hips, RigBone { delta_world: qx(1.0), sigma: 0.05, data_sigma: 0.05 });
-        rig.bones.insert(HumanoidBone::Spine, RigBone { delta_world: qx(1.2), sigma: 0.05, data_sigma: 0.05 });
+        rig.bones.insert(
+            HumanoidBone::Hips,
+            RigBone {
+                delta_world: qx(1.0),
+                sigma: 0.05,
+                data_sigma: 0.05,
+            },
+        );
+        rig.bones.insert(
+            HumanoidBone::Spine,
+            RigBone {
+                delta_world: qx(1.2),
+                sigma: 0.05,
+                data_sigma: 0.05,
+            },
+        );
         let mut st = RetargetState::default();
-        let params = RetargetParams { rotation_blend: 1.0, max_root_tilt: 0.2, ..Default::default() };
+        let params = RetargetParams {
+            rotation_blend: 1.0,
+            max_root_tilt: 0.2,
+            ..Default::default()
+        };
         apply_rig_pose(&rig, &sk, &hm, &mut locals, &params, &mut st, 1.0 / 30.0);
         // Hips world tilt clamped to 0.2 rad.
         let hips_w = world_rot(&sk, &locals, 1);
@@ -992,8 +1087,15 @@ mod tests {
         // Spine local flexion preserved at 0.2 rad relative to hips.
         let q = locals[2].rotation;
         let ang = 2.0 * q[3].clamp(-1.0, 1.0).acos();
-        let ang = if ang > std::f32::consts::PI { 2.0 * std::f32::consts::PI - ang } else { ang };
-        assert!((ang - 0.2).abs() < 1e-3, "spine relative flexion {ang} (want 0.2)");
+        let ang = if ang > std::f32::consts::PI {
+            2.0 * std::f32::consts::PI - ang
+        } else {
+            ang
+        };
+        assert!(
+            (ang - 0.2).abs() < 1e-3,
+            "spine relative flexion {ang} (want 0.2)"
+        );
     }
 
     #[test]
@@ -1041,18 +1143,21 @@ mod tests {
 
     #[test]
     fn test_hand_cross_prevention() {
-        let mk = |id: u64, name: &str, parent: Option<u64>, children: Vec<u64>, t: [f32; 3], bone| SkeletonNode {
-            id: NodeId(id),
-            name: name.to_string(),
-            parent: parent.map(NodeId),
-            children: children.into_iter().map(NodeId).collect(),
-            rest_local: Transform {
-                translation: t,
-                rotation: [0.0, 0.0, 0.0, 1.0],
-                scale: [1.0, 1.0, 1.0],
-            },
-            humanoid_bone: bone,
-        };
+        let mk =
+            |id: u64, name: &str, parent: Option<u64>, children: Vec<u64>, t: [f32; 3], bone| {
+                SkeletonNode {
+                    id: NodeId(id),
+                    name: name.to_string(),
+                    parent: parent.map(NodeId),
+                    children: children.into_iter().map(NodeId).collect(),
+                    rest_local: Transform {
+                        translation: t,
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                        scale: [1.0, 1.0, 1.0],
+                    },
+                    humanoid_bone: bone,
+                }
+            };
 
         // Rigs: Hips -> Spine -> Chest
         // Chest has LeftUpperArm (+0.2m) and RightUpperArm (-0.2m)
@@ -1061,15 +1166,78 @@ mod tests {
         // RightUpperArm -> RightLowerArm (-0.25m) -> RightHand (-0.25m)
         let nodes = vec![
             mk(0, "root", None, vec![1], [0.0, 0.0, 0.0], None),
-            mk(1, "hips", Some(0), vec![2], [0.0, 1.0, 0.0], Some(HumanoidBone::Hips)),
-            mk(2, "spine", Some(1), vec![3], [0.0, 0.2, 0.0], Some(HumanoidBone::Spine)),
-            mk(3, "chest", Some(2), vec![4, 7], [0.0, 0.2, 0.0], Some(HumanoidBone::Chest)),
-            mk(4, "l_upper", Some(3), vec![5], [0.2, 0.0, 0.0], Some(HumanoidBone::LeftUpperArm)),
-            mk(5, "l_lower", Some(4), vec![6], [0.25, 0.0, 0.0], Some(HumanoidBone::LeftLowerArm)),
-            mk(6, "l_hand", Some(5), vec![], [0.25, 0.0, 0.0], Some(HumanoidBone::LeftHand)),
-            mk(7, "r_upper", Some(3), vec![8], [-0.2, 0.0, 0.0], Some(HumanoidBone::RightUpperArm)),
-            mk(8, "r_lower", Some(7), vec![9], [-0.25, 0.0, 0.0], Some(HumanoidBone::RightLowerArm)),
-            mk(9, "r_hand", Some(8), vec![], [-0.25, 0.0, 0.0], Some(HumanoidBone::RightHand)),
+            mk(
+                1,
+                "hips",
+                Some(0),
+                vec![2],
+                [0.0, 1.0, 0.0],
+                Some(HumanoidBone::Hips),
+            ),
+            mk(
+                2,
+                "spine",
+                Some(1),
+                vec![3],
+                [0.0, 0.2, 0.0],
+                Some(HumanoidBone::Spine),
+            ),
+            mk(
+                3,
+                "chest",
+                Some(2),
+                vec![4, 7],
+                [0.0, 0.2, 0.0],
+                Some(HumanoidBone::Chest),
+            ),
+            mk(
+                4,
+                "l_upper",
+                Some(3),
+                vec![5],
+                [0.2, 0.0, 0.0],
+                Some(HumanoidBone::LeftUpperArm),
+            ),
+            mk(
+                5,
+                "l_lower",
+                Some(4),
+                vec![6],
+                [0.25, 0.0, 0.0],
+                Some(HumanoidBone::LeftLowerArm),
+            ),
+            mk(
+                6,
+                "l_hand",
+                Some(5),
+                vec![],
+                [0.25, 0.0, 0.0],
+                Some(HumanoidBone::LeftHand),
+            ),
+            mk(
+                7,
+                "r_upper",
+                Some(3),
+                vec![8],
+                [-0.2, 0.0, 0.0],
+                Some(HumanoidBone::RightUpperArm),
+            ),
+            mk(
+                8,
+                "r_lower",
+                Some(7),
+                vec![9],
+                [-0.25, 0.0, 0.0],
+                Some(HumanoidBone::RightLowerArm),
+            ),
+            mk(
+                9,
+                "r_hand",
+                Some(8),
+                vec![],
+                [-0.25, 0.0, 0.0],
+                Some(HumanoidBone::RightHand),
+            ),
         ];
         let sk = SkeletonAsset {
             nodes,
@@ -1102,9 +1270,15 @@ mod tests {
 
         let (w_l_before, _) = node_world_transform(&sk, &locals, 6);
         let (w_r_before, _) = node_world_transform(&sk, &locals, 9);
-        println!("Before IK: Left wrist X = {:.4}, Right wrist X = {:.4}", w_l_before[0], w_r_before[0]);
+        println!(
+            "Before IK: Left wrist X = {:.4}, Right wrist X = {:.4}",
+            w_l_before[0], w_r_before[0]
+        );
         // Confirm that without anti-cross, Left wrist is to the right of Right wrist (crossed!)
-        assert!(w_l_before[0] < w_r_before[0], "Hands must be crossed initially for this test");
+        assert!(
+            w_l_before[0] < w_r_before[0],
+            "Hands must be crossed initially for this test"
+        );
 
         let params = RetargetParams {
             hand_cross_prevention: true,
@@ -1116,10 +1290,18 @@ mod tests {
 
         let (w_l_after, _) = node_world_transform(&sk, &locals, 6);
         let (w_r_after, _) = node_world_transform(&sk, &locals, 9);
-        println!("After IK: Left wrist X = {:.4}, Right wrist X = {:.4}", w_l_after[0], w_r_after[0]);
+        println!(
+            "After IK: Left wrist X = {:.4}, Right wrist X = {:.4}",
+            w_l_after[0], w_r_after[0]
+        );
 
         // 1. Left wrist must now be on the left side of Right wrist (no crossing!)
-        assert!(w_l_after[0] > w_r_after[0], "Left wrist ({}) must be to the left of Right wrist ({})", w_l_after[0], w_r_after[0]);
+        assert!(
+            w_l_after[0] > w_r_after[0],
+            "Left wrist ({}) must be to the left of Right wrist ({})",
+            w_l_after[0],
+            w_r_after[0]
+        );
 
         // 2. Separation must be at least min_hand_distance
         let sep = w_l_after[0] - w_r_after[0];
@@ -1131,8 +1313,14 @@ mod tests {
         let (w_l, _) = node_world_transform(&sk, &locals, 6);
         let l1 = vec3_length(&vec3_sub(&e_l, &s_l));
         let l2 = vec3_length(&vec3_sub(&w_l, &e_l));
-        assert!((l1 - 0.25).abs() < 1e-4, "Upper arm length must be 0.25 (got {l1})");
-        assert!((l2 - 0.25).abs() < 1e-4, "Forearm length must be 0.25 (got {l2})");
+        assert!(
+            (l1 - 0.25).abs() < 1e-4,
+            "Upper arm length must be 0.25 (got {l1})"
+        );
+        assert!(
+            (l2 - 0.25).abs() < 1e-4,
+            "Forearm length must be 0.25 (got {l2})"
+        );
     }
 
     #[test]
@@ -1179,7 +1367,15 @@ mod tests {
                     data_sigma: 0.05,
                 },
             );
-            apply_rig_pose(&rig, &sk, &hm, &mut locals, &params_filter, &mut st_filter, dt);
+            apply_rig_pose(
+                &rig,
+                &sk,
+                &hm,
+                &mut locals,
+                &params_filter,
+                &mut st_filter,
+                dt,
+            );
             let q = locals[2].rotation;
             let ang = 2.0 * q[3].clamp(-1.0, 1.0).acos();
             if frame >= 10 {
@@ -1187,10 +1383,16 @@ mod tests {
             }
         }
 
-        let max_ang = spine_angles.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_ang = spine_angles
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
         let min_ang = spine_angles.iter().copied().fold(f32::INFINITY, f32::min);
         let jitter_range = max_ang - min_ang;
-        println!("Jitter range with 1€ filter: {:.4} rad (raw: 0.1000 rad)", jitter_range);
+        println!(
+            "Jitter range with 1€ filter: {:.4} rad (raw: 0.1000 rad)",
+            jitter_range
+        );
         assert!(
             jitter_range < 0.025,
             "1€ filter failed to suppress stillness jitter: got range {:.4}, expected < 0.025",
@@ -1219,10 +1421,21 @@ mod tests {
                 data_sigma: 0.05,
             },
         );
-        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params_filter, &mut st_filter, dt);
+        apply_rig_pose(
+            &rig,
+            &sk,
+            &hm,
+            &mut locals,
+            &params_filter,
+            &mut st_filter,
+            dt,
+        );
         let q_fast = locals[2].rotation;
         let ang_fast = 2.0 * q_fast[3].clamp(-1.0, 1.0).acos();
-        println!("Angle after sudden fast motion: {:.4} rad (target: 1.5 rad)", ang_fast);
+        println!(
+            "Angle after sudden fast motion: {:.4} rad (target: 1.5 rad)",
+            ang_fast
+        );
         assert!(
             ang_fast > 1.1,
             "1€ filter responded too sluggishly to fast motion: got {:.4}, expected > 1.1",
@@ -1236,9 +1449,20 @@ mod tests {
             ..Default::default()
         };
         let mut st_disabled = RetargetState::default();
-        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params_disabled, &mut st_disabled, dt);
+        apply_rig_pose(
+            &rig,
+            &sk,
+            &hm,
+            &mut locals,
+            &params_disabled,
+            &mut st_disabled,
+            dt,
+        );
         let q_raw = locals[2].rotation;
         let ang_raw = 2.0 * q_raw[3].clamp(-1.0, 1.0).acos();
-        assert!((ang_raw - 1.5).abs() < 1e-4, "With 1€ disabled, angle should match target exactly");
+        assert!(
+            (ang_raw - 1.5).abs() < 1e-4,
+            "With 1€ disabled, angle should match target exactly"
+        );
     }
 }

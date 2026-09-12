@@ -61,9 +61,7 @@ fn preset_priority_score(raw_name: &str) -> i32 {
 /// Helper to build `ExpressionAssetSet` from collected morph bindings.
 ///
 /// `morph_targets`: `(node_idx, morph_target_index, channel_name)`
-pub fn build_expressions(
-    all_morphs: &[(usize, usize, String)],
-) -> ExpressionAssetSet {
+pub fn build_expressions(all_morphs: &[(usize, usize, String)]) -> ExpressionAssetSet {
     let mut expressions_map: HashMap<String, Vec<ExpressionMorphBind>> = HashMap::new();
 
     // Map of: (preset_name, node_idx) -> (best_score, ExpressionMorphBind)

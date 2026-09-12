@@ -51,9 +51,7 @@ impl IClassFactory_Impl for VulvatarClassFactory_Impl {
             // COM identity. Frame Server writes attributes through the
             // activate view before calling ActivateObject, then reads them
             // through the source view during FsProxy setup.
-            let source_unk: IUnknown = VulvatarMediaSource::new()
-                ?
-                .into();
+            let source_unk: IUnknown = VulvatarMediaSource::new()?.into();
             let hr = source_unk.query(iid, ppv);
             crate::t!("ClassFactory::CreateInstance: source.query -> {:?}", hr);
             if hr.is_err() {

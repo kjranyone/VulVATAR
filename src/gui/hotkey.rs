@@ -330,10 +330,7 @@ impl GuiApp {
         // Every state-changing hotkey below announces itself with a
         // toast: an invisible global shortcut that silently flips
         // tracking or cloth physics reads as "the app broke".
-        if self
-            .hotkeys
-            .check(HotkeyAction::ToggleTrackingEnabled, ctx)
-        {
+        if self.hotkeys.check(HotkeyAction::ToggleTrackingEnabled, ctx) {
             self.tracking.toggle_tracking = !self.tracking.toggle_tracking;
             self.push_notification(if self.tracking.toggle_tracking {
                 t!("toast.tracking_on")
@@ -341,10 +338,7 @@ impl GuiApp {
                 t!("toast.tracking_off")
             });
         }
-        if self
-            .hotkeys
-            .check(HotkeyAction::ToggleClothSimulation, ctx)
-        {
+        if self.hotkeys.check(HotkeyAction::ToggleClothSimulation, ctx) {
             self.rendering.toggle_cloth = !self.rendering.toggle_cloth;
             self.push_notification(if self.rendering.toggle_cloth {
                 t!("toast.cloth_sim_on")

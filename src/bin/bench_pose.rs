@@ -21,10 +21,7 @@ fn main() -> Result<(), String> {
         args.next()
             .ok_or_else(|| "usage: bench_pose <image.png> [iters]".to_string())?,
     );
-    let iters: usize = args
-        .next()
-        .map(|s| s.parse().unwrap_or(10))
-        .unwrap_or(10);
+    let iters: usize = args.next().map(|s| s.parse().unwrap_or(10)).unwrap_or(10);
 
     let img = image::open(&image_path).map_err(|e| format!("open image: {e}"))?;
     let rgb = img.to_rgb8();

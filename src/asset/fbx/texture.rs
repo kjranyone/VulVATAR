@@ -1,8 +1,8 @@
+use image::GenericImageView;
+use log::{info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use image::GenericImageView;
-use log::{info, warn};
 
 use crate::asset::TextureBinding;
 
@@ -170,7 +170,15 @@ impl TextureResolver {
         // Token-based matching: strip common qualifiers like transparent, opaque, mask, mat, etc.
         let tokens: Vec<&str> = norm_mat
             .split('_')
-            .filter(|&t| !t.is_empty() && t != "transparent" && t != "trans" && t != "alpha" && t != "mat" && t != "material" && t != "mask")
+            .filter(|&t| {
+                !t.is_empty()
+                    && t != "transparent"
+                    && t != "trans"
+                    && t != "alpha"
+                    && t != "mat"
+                    && t != "material"
+                    && t != "mask"
+            })
             .collect();
         for &tok in tokens.iter().rev() {
             if tok.len() >= 3 {

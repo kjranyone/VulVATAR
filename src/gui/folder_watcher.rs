@@ -25,7 +25,10 @@ impl GuiApp {
         if let Some(ref mut fw) = self.library.folder_watcher {
             fw.watch(&path, true)?;
             self.library.watched_avatar_dirs.push(path.clone());
-            self.push_notification(t!("toast.watched_folder", path = path.display().to_string()));
+            self.push_notification(t!(
+                "toast.watched_folder",
+                path = path.display().to_string()
+            ));
             if let Err(e) =
                 crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs)
             {
@@ -39,7 +42,10 @@ impl GuiApp {
         if let Some(ref mut fw) = self.library.folder_watcher {
             fw.unwatch(path)?;
             self.library.watched_avatar_dirs.retain(|p| p != path);
-            self.push_notification(t!("toast.stopped_watching", path = path.display().to_string()));
+            self.push_notification(t!(
+                "toast.stopped_watching",
+                path = path.display().to_string()
+            ));
             if let Err(e) =
                 crate::persistence::save_watched_folders(&self.library.watched_avatar_dirs)
             {
@@ -70,7 +76,10 @@ impl GuiApp {
             }
         }
         for vrm_path in &newly_added {
-            self.push_notification(t!("toast.new_vrm_detected", path = vrm_path.display().to_string()));
+            self.push_notification(t!(
+                "toast.new_vrm_detected",
+                path = vrm_path.display().to_string()
+            ));
         }
         if !newly_added.is_empty() && !self.test_no_persist {
             self.save_avatar_library_with_toast();
@@ -141,8 +150,7 @@ impl GuiApp {
         if self.app.avatar_library.find_by_path(vrm_path).is_some() {
             return false;
         }
-        let mut entry =
-            crate::app::avatar_library::AvatarLibraryEntry::from_path(vrm_path);
+        let mut entry = crate::app::avatar_library::AvatarLibraryEntry::from_path(vrm_path);
 
         let is_fbx = vrm_path
             .extension()
@@ -171,13 +179,10 @@ impl GuiApp {
                 );
             }
         }
-        if entry
-            .thumbnail_path
-            .as_ref()
-            .is_none_or(|p| !p.exists())
-        {
+        if entry.thumbnail_path.as_ref().is_none_or(|p| !p.exists()) {
             entry.thumbnail_path = self
-                .library.thumbnail_gen
+                .library
+                .thumbnail_gen
                 .generate_and_save_placeholder(&entry.name);
         }
         self.app.avatar_library.add(entry);

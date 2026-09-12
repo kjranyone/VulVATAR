@@ -74,7 +74,11 @@ struct Frame {
 
 fn f3(v: &serde_json::Value) -> Option<[f64; 3]> {
     let a = v.as_array()?;
-    Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])
+    Some([
+        a.first()?.as_f64()?,
+        a.get(1)?.as_f64()?,
+        a.get(2)?.as_f64()?,
+    ])
 }
 
 fn parse(line: &str) -> Option<Frame> {
@@ -195,7 +199,10 @@ fn analyze(dir: &Path, frames: &[Frame]) -> String {
     let _ = writeln!(r, "# Session analysis — `{}`\n", dir.display());
 
     // --- coverage ----------------------------------------------------
-    let span_ms = match (frames.first().and_then(|f| f.t_ms), frames.last().and_then(|f| f.t_ms)) {
+    let span_ms = match (
+        frames.first().and_then(|f| f.t_ms),
+        frames.last().and_then(|f| f.t_ms),
+    ) {
         (Some(a), Some(b)) if b > a => Some(b - a),
         _ => None,
     };
