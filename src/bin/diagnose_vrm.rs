@@ -55,7 +55,7 @@ fn main() -> Result<(), String> {
         .to_str()
         .ok_or_else(|| format!("invalid input path: {}", input_path.display()))?;
 
-    let asset = if is_fbx {
+    let mut asset = if is_fbx {
         let loader = vulvatar_lib::asset::fbx::FbxAssetLoader::new();
         loader
             .load(path_str)
@@ -71,6 +71,30 @@ fn main() -> Result<(), String> {
         dump_first_matching_texture(&asset, &output_path, material_filter.as_deref())?;
         println!("saved_atlas={}", output_path.display());
         return Ok(());
+    }
+
+    // Hierarchical-clearance verification knobs (env-gated so the CLI
+    // signature stays stable). `VULVATAR_DIAG_NO_ANCHORS=1` strips every
+    // clearance / containment anchor from the asset — done here while
+    // `asset` still holds the only Arc reference so `make_mut` mutates
+    // in place instead of deep-copying — so the same pose can be
+    // rendered with and without the anti-penetration constraints and
+    // the two PNGs diffed. `VULVATAR_DIAG_BEND_ELBOW=<deg>` (below)
+    // bends both lower arms to reproduce the layered-clothing poke.
+    if std::env::var("VULVATAR_DIAG_NO_ANCHORS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        for mesh in &mut Arc::make_mut(&mut asset).meshes {
+            for prim in &mut mesh.primitives {
+                let prim_mut = Arc::make_mut(prim);
+                prim_mut.skin_anchors = None;
+                prim_mut.body_primitive_id = None;
+                prim_mut.containment_anchors = None;
+                prim_mut.containment_primitive_id = None;
+            }
+        }
+        println!("stripped all skin/containment anchors (VULVATAR_DIAG_NO_ANCHORS=1)");
     }
 
     let mut avatar = AvatarInstance::new(AvatarInstanceId(1), Arc::clone(&asset));
@@ -95,6 +119,38 @@ fn main() -> Result<(), String> {
         }
     }
     avatar.build_base_pose();
+
+    let bend_elbow_deg = std::env::var("VULVATAR_DIAG_BEND_ELBOW")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    if bend_elbow_deg != 0.0 {
+        let angle = bend_elbow_deg.to_radians();
+        let (s, c) = ((angle * 0.5).sin(), (angle * 0.5).cos());
+        for (bone, suffix) in [
+            (vulvatar_lib::asset::HumanoidBone::LeftLowerArm, "LowerArm_L"),
+            (vulvatar_lib::asset::HumanoidBone::RightLowerArm, "LowerArm_R"),
+        ] {
+            let node = avatar
+                .pose
+                .local_transforms
+                .iter()
+                .enumerate()
+                .find(|(i, _)| {
+                    asset.skeleton.nodes[*i].humanoid_bone == Some(bone)
+                        || asset.skeleton.nodes[*i].name.ends_with(suffix)
+                })
+                .map(|(i, _)| i);
+            if let Some(i) = node {
+                let q = [s, 0.0, 0.0, c];
+                avatar.pose.local_transforms[i].rotation = vulvatar_lib::math_utils::quat_mul(
+                    &q,
+                    &asset.skeleton.nodes[i].rest_local.rotation,
+                );
+            }
+        }
+        println!("bent elbows by {} deg", bend_elbow_deg);
+    }
     avatar.compute_global_pose();
     avatar.build_skinning_matrices();
 

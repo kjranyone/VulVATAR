@@ -466,6 +466,11 @@ impl Humanoid {
         s.torso_r_hi = b.site("torso_r_hi", j.spine3, [-0.07, 0.10, 0.0], L::Shoulder);
         s.torso_lo = b.site("torso_lo", j.pelvis, [0.0, 0.02, 0.0], L::Hips);
         s.torso_hi = b.site_sheared("torso_hi", j.spine3, [0.0, 0.10, 0.0], L::Shoulder);
+        // Unsheared copies of the capsule ends for the trunk-axis prior:
+        // the prior holds the SKELETON axis, not the (shape-sheared)
+        // capsule axis. Same offsets, no shear flag.
+        b.site("axis_lo", j.pelvis, [0.0, 0.02, 0.0], L::Hips);
+        b.site("axis_hi", j.spine3, [0.0, 0.10, 0.0], L::Shoulder);
         // One elliptic trunk (lateral semi-axis 0.17 m, depth 0.105 m):
         // the same 2:1 section the former capsule pair approximated, as a
         // single surface whose flat front carries yaw.

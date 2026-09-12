@@ -356,7 +356,7 @@ fn main() -> Result<(), String> {
     let mut vis_header_done = false;
 
     let mut csv = String::new();
-    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,shear,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
+    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,shear,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,cost_whold,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
 
     let mut torso_yaws = Vec::new();
     let mut torso_pitches = Vec::new();
@@ -499,7 +499,7 @@ fn main() -> Result<(), String> {
             csv.pop();
             csv.push_str(&format!(
                 ",{l0:.3},{l1:.3},{l2:.3},{l3:.3},{l4:.3},{l5:.3},{l6:.3},{l7:.3},{r0:.3},{r1:.3},{r2:.3},{shr:.3},\
-{c2d:.1},{c3d:.1},{ccl:.1},{cpr:.1},{cte:.1},{m2d:.2},{m3d:.4},{mcl:.4},\
+{c2d:.1},{c3d:.1},{ccl:.1},{cpr:.1},{cte:.1},{cwh:.2},{m2d:.2},{m3d:.4},{mcl:.4},\
 {ds0:.3},{ds1:.3},{ds2:.3},{ds3:.3},{ds4:.3},{ds5:.3},\
 {lkx:.3},{lky:.3},{lkz:.3},{rkx:.3},{rky:.3},{rkz:.3},\
 {lax:.3},{lay:.3},{laz:.3},{rax:.3},{ray:.3},{raz:.3}\n",
@@ -507,6 +507,7 @@ fn main() -> Result<(), String> {
                 r0 = r[0], r1 = r[1], r2 = r[2],
                 shr = est.state.shear,
                 c2d = d.cost_2d, c3d = d.cost_3d, ccl = d.cost_cloud, cpr = d.cost_prior, cte = d.cost_temporal,
+                cwh = d.cost_whold,
                 m2d = d.med_2d_px, m3d = d.mean_3d_m, mcl = d.mean_cloud_m,
                 ds0 = est.joint_data_sigma(m, h.j.l_hip), ds1 = est.joint_data_sigma(m, h.j.l_knee), ds2 = est.joint_data_sigma(m, h.j.l_ankle),
                 ds3 = est.joint_data_sigma(m, h.j.r_hip), ds4 = est.joint_data_sigma(m, h.j.r_knee), ds5 = est.joint_data_sigma(m, h.j.r_ankle),

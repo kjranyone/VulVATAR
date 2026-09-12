@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::asset::{AvatarAsset, Mat4, MeshId, MeshPrimitiveAsset, PrimitiveId};
@@ -730,8 +730,13 @@ pub fn generate_layered_clothing_anchors(
     }
 
     // Pairwise geometric layer analysis: determine which primitive is inner vs outer.
-    // Map of outer_candidate_index -> (inner_candidate_index, avg_clearance, paired_count)
-    let mut best_inner_for_outer: HashMap<usize, (usize, f32, usize)> = HashMap::new();
+    // Map of outer_candidate_index -> every accepted inner candidate
+    // (inner_candidate_index, avg_clearance, paired_count). All
+    // candidates are kept — the forward pass ranks them and falls
+    // through to the next when one fails to bind enough anchors, so a
+    // stray accessory that wins the radial analysis by tightness cannot
+    // silently leave the outer layer unconstrained.
+    let mut inner_candidates: HashMap<usize, Vec<(usize, f32, usize)>> = HashMap::new();
 
     let candidate_count = candidates.len();
     for i in 0..candidate_count {
@@ -850,118 +855,128 @@ pub fn generate_layered_clothing_anchors(
 
                 // If B is outer of A (B is further from bone than A)
                 if outer_b_ratio >= 0.65 && avg_r > 0.001 {
-                    let cur = best_inner_for_outer.get(&j);
-                    let should_replace = match cur {
-                        None => true,
-                        Some(&(_, cur_avg_r, cur_overlap)) => {
-                            // Prioritize major multi-layer clothing meshes (larger overlap count)
-                            if overlap_pairs.len() > cur_overlap * 2 {
-                                true
-                            } else if cur_overlap > overlap_pairs.len() * 2 {
-                                false
-                            } else {
-                                avg_r < cur_avg_r
-                            }
-                        }
-                    };
-                    if should_replace {
-                        best_inner_for_outer.insert(j, (i, avg_r, overlap_pairs.len()));
-                    }
+                    inner_candidates
+                        .entry(j)
+                        .or_default()
+                        .push((i, avg_r, overlap_pairs.len()));
                 }
                 // If A is outer of B (A is further from bone than B)
                 else if outer_b_ratio <= 0.35 && avg_r < -0.001 {
-                    let cur = best_inner_for_outer.get(&i);
-                    let inv_avg_r = -avg_r;
-                    let should_replace = match cur {
-                        None => true,
-                        Some(&(_, cur_avg_r, cur_overlap)) => {
-                            if overlap_pairs.len() > cur_overlap * 2 {
-                                true
-                            } else if cur_overlap > overlap_pairs.len() * 2 {
-                                false
-                            } else {
-                                inv_avg_r < cur_avg_r
-                            }
-                        }
-                    };
-                    if should_replace {
-                        best_inner_for_outer.insert(i, (j, inv_avg_r, overlap_pairs.len()));
-                    }
+                    inner_candidates
+                        .entry(i)
+                        .or_default()
+                        .push((j, -avg_r, overlap_pairs.len()));
                 }
             }
         }
     }
 
-    // Forward pass: clearance anchors on the outer primitives
-    for (&outer_idx, &(inner_idx, avg_c, n_overlap)) in &best_inner_for_outer {
+    // Forward pass: clearance anchors on the outer primitives. Inner
+    // candidates are ranked — major overlap first (the "bigger mesh is
+    // the real garment" heuristic), tightest average clearance second —
+    // and tried in order. A candidate must bind at least 2% of the
+    // outer surface (floor of 32 verts) to be accepted; a stray
+    // accessory that won the radial analysis by tightness binds almost
+    // nothing and falls through to the next candidate instead of
+    // silently leaving the outer layer unconstrained.
+    let mut accepted_pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for (&outer_idx, cands) in &inner_candidates {
         let outer_cand = &candidates[outer_idx];
-        let inner_cand = &candidates[inner_idx];
+        let min_bound = (outer_cand.world_verts.len() / 50).max(32);
+        let mut ranked = cands.clone();
+        ranked.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.partial_cmp(&b.1).unwrap()));
 
-        info!(
-            "clearance: paired layered clothing: outer='{}' (prim {:?}) -> inner='{}' (prim {:?}), avg clearance={:.2}mm, {} overlap samples",
-            outer_cand.mesh_name, outer_cand.prim_id,
-            inner_cand.mesh_name, inner_cand.prim_id,
-            avg_c * 1000.0, n_overlap
-        );
+        let mut accepted: Option<(usize, Vec<SkinAnchor>)> = None;
+        for &(inner_idx, avg_c, n_overlap) in &ranked {
+            let inner_cand = &candidates[inner_idx];
 
-        let cell_size = 0.03f32;
-        let inv_cell = 1.0 / cell_size;
-        let inner_grid = build_layer_grid(&inner_cand.world_verts, cell_size);
+            let cell_size = 0.03f32;
+            let inv_cell = 1.0 / cell_size;
+            let inner_grid = build_layer_grid(&inner_cand.world_verts, cell_size);
 
-        let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]
-            .vertices
-            .as_ref()
-            .unwrap();
-        let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx]
-            .vertices
-            .as_ref()
-            .unwrap();
+            let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]
+                .vertices
+                .as_ref()
+                .unwrap();
+            let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx]
+                .vertices
+                .as_ref()
+                .unwrap();
 
-        let mut anchors = Vec::with_capacity(outer_cand.world_verts.len());
-        let mut bound_count = 0usize;
+            let mut anchors = Vec::with_capacity(outer_cand.world_verts.len());
+            let mut bound_count = 0usize;
 
-        for (oi, &(op, on)) in outer_cand.world_verts.iter().enumerate() {
-            let best_i = query_layered_nearest(
-                op,
-                on,
-                &o_vd.joint_indices[oi],
-                &o_vd.joint_weights[oi],
-                &inner_grid,
-                &inner_cand.world_verts,
-                &i_vd.joint_indices,
-                &i_vd.joint_weights,
-                inv_cell,
-                0.04,
-                0.2,
-            );
+            for (oi, &(op, on)) in outer_cand.world_verts.iter().enumerate() {
+                let best_i = query_layered_nearest(
+                    op,
+                    on,
+                    &o_vd.joint_indices[oi],
+                    &o_vd.joint_weights[oi],
+                    &inner_grid,
+                    &inner_cand.world_verts,
+                    &i_vd.joint_indices,
+                    &i_vd.joint_weights,
+                    inv_cell,
+                    0.04,
+                    0.2,
+                );
 
-            if let Some(idx) = best_i {
-                let (ip, inrm) = inner_cand.world_verts[idx as usize];
-                let diff = [op[0] - ip[0], op[1] - ip[1], op[2] - ip[2]];
-                let raw_c = diff[0] * inrm[0] + diff[1] * inrm[1] + diff[2] * inrm[2];
-                let min_clearance = raw_c.max(0.006);
-                anchors.push(SkinAnchor {
-                    body_vertex_idx: idx,
-                    min_clearance,
-                    weight: 1.0,
-                    mode: SKIN_ANCHOR_CLEARANCE,
-                });
-                bound_count += 1;
+                if let Some(idx) = best_i {
+                    let (ip, inrm) = inner_cand.world_verts[idx as usize];
+                    let diff = [op[0] - ip[0], op[1] - ip[1], op[2] - ip[2]];
+                    let raw_c = diff[0] * inrm[0] + diff[1] * inrm[1] + diff[2] * inrm[2];
+                    let min_clearance = raw_c.max(0.006);
+                    anchors.push(SkinAnchor {
+                        body_vertex_idx: idx,
+                        min_clearance,
+                        weight: 1.0,
+                        mode: SKIN_ANCHOR_CLEARANCE,
+                    });
+                    bound_count += 1;
+                } else {
+                    anchors.push(SkinAnchor::default());
+                }
+            }
+
+            if bound_count >= min_bound {
+                info!(
+                    "clearance: paired layered clothing: outer='{}' (prim {:?}) -> inner='{}' (prim {:?}), avg clearance={:.2}mm, {} overlap samples, {}/{} verts bound",
+                    outer_cand.mesh_name,
+                    outer_cand.prim_id,
+                    inner_cand.mesh_name,
+                    inner_cand.prim_id,
+                    avg_c * 1000.0,
+                    n_overlap,
+                    bound_count,
+                    outer_cand.world_verts.len()
+                );
+                accepted = Some((inner_idx, anchors));
+                accepted_pairs.push((outer_idx, inner_idx, n_overlap));
+                break;
             } else {
-                anchors.push(SkinAnchor::default());
+                info!(
+                    "clearance: inner candidate '{}' bound only {}/{} verts on outer '{}' (min {}); trying next candidate",
+                    inner_cand.mesh_name,
+                    bound_count,
+                    outer_cand.world_verts.len(),
+                    outer_cand.mesh_name,
+                    min_bound
+                );
             }
         }
 
-        if bound_count > 0 {
-            info!(
-                "clearance: established {} layered anchors on outer '{}' (prim {:?})",
-                bound_count, outer_cand.mesh_name, outer_cand.prim_id
-            );
+        if let Some((inner_idx, anchors)) = accepted {
+            let inner_cand = &candidates[inner_idx];
             let prim_mut = Arc::make_mut(
                 &mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx],
             );
             prim_mut.skin_anchors = Some(anchors);
             prim_mut.body_primitive_id = Some(inner_cand.prim_id);
+        } else if !ranked.is_empty() {
+            warn!(
+                "clearance: no inner candidate produced usable anchors for outer '{}' (prim {:?}); layer left unconstrained",
+                outer_cand.mesh_name, outer_cand.prim_id
+            );
         }
     }
 
@@ -989,10 +1004,7 @@ pub fn generate_layered_clothing_anchors(
     // with the larger overlap count wins (sorted for determinism).
     const CONTAINMENT_SLACK: f32 = 0.002;
 
-    let mut pairs: Vec<(usize, usize, usize)> = best_inner_for_outer
-        .iter()
-        .map(|(&outer_idx, &(inner_idx, _, n_overlap))| (outer_idx, inner_idx, n_overlap))
-        .collect();
+    let mut pairs: Vec<(usize, usize, usize)> = accepted_pairs.clone();
     pairs.sort_by(|a, b| b.2.cmp(&a.2));
 
     for &(outer_idx, inner_idx, _n_overlap) in &pairs {

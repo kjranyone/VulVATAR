@@ -42,8 +42,10 @@ const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// `containment_anchors` / `containment_primitive_id` slots so middle
 /// layers can carry clearance and containment simultaneously — a v11
 /// cache stores containment data in the clearance slot and must not be
-/// reused.
-const VVT_CACHE_VERSION: u32 = 12;
+/// reused. v13: the layered pairing keeps every inner candidate ranked
+/// and falls through to the next when one binds too few anchors, so a
+/// stolen pairing no longer drops an outer layer's clearance silently.
+const VVT_CACHE_VERSION: u32 = 13;
 /// Default cap on the number of `.vvtcache` files retained under
 /// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
 /// drops the oldest-mtime entries on next startup.

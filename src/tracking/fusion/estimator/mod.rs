@@ -9,7 +9,9 @@
 //! * 3-D point observations of model points (depth-lifted landmarks);
 //! * point cloud → capsule surface (dense torso / head / limb evidence);
 //! * joint limits (soft hinge), pose prior (relaxed pose), shape prior;
-//! * temporal prior `x ~ N(x̂, P + Q·dt)` from the previous posterior.
+//! * temporal prior `x ~ N(x̂, P + Q·dt)` from the previous posterior;
+//! * wrist hold: a plain pseudo-observation pinning an unobserved wrist's
+//!   root-frame position to the prediction (arm-twist null direction).
 //!
 //! Nothing here decides "is this joint visible": an unobserved joint simply
 //! has no data terms, its variance grows by `Q·dt` per frame and the pose
@@ -206,15 +208,18 @@ pub struct Params {
     /// it in the slow shape state separates the pair over a session.
     /// Without it the solver books the whole chest slope (measured ≈ 11°
     /// on the s1789219959 desk replay) as trunk tilt and swings the
-    /// out-of-frame pelvis to the desk plane. 0.03 m is the anatomical
-    /// spread of the chest-to-belly front offset difference — tighter
-    /// than 0.04 because with a STATIC pose (no posture excitation) the
-    /// φ/taper split is decided by the prior price ratio alone, and at
-    /// 0.04 the solver preferred booking a real 5.7° root tilt as shear
-    /// (measured: recovery-test ankle error 5.6 cm; at 0.03 the tilt
-    /// priors win and the pose recovers within tolerance).
-    /// `VULVATAR_TRUNK_SHEAR_SIGMA` overrides; a tiny value pins the
-    /// shear at 0, reproducing the pre-shear behaviour for ablation.
+    /// out-of-frame pelvis to the desk plane.
+    ///
+    /// DEFAULT DISABLED (1e-9 pins the shear at 0 = the pre-shear
+    /// behaviour). Benched on s1789219959, a FREE shear (0.03) made the
+    /// equilibrium WORSE on the very lean it was meant to fix (torso
+    /// pitch −11° → −23/−24°, pelvis still 0.46 m) while roughly halving
+    /// wrist snaps — the recording's slope signal is not anatomy-dominated
+    /// the way the confound model assumed, and separating "the subject is
+    /// genuinely reclined" from "the fit is" needs independent ground
+    /// truth (a deliberately-upright recording, or a synthetic slope
+    /// fixture through `validate_gt`) before this can be enabled with a
+    /// calibrated σ. `VULVATAR_TRUNK_SHEAR_SIGMA=0.03` re-enables.
     pub shear_sigma: f64,
     /// Velocity damping time constant (s) — the constant-velocity
     /// prediction decays toward zero over this horizon.
@@ -231,6 +236,28 @@ pub struct Params {
     /// otherwise parks it wherever the basin left it — humans rest
     /// elbows low. Real elbows-up poses out-pull this through the data.
     pub elbow_low_sigma: f64,
+    /// σ (m) of the wrist hold: when a wrist carries NO observation in
+    /// the current frame, its root-frame position is pinned to the
+    /// prediction by a plain (non-robust) pseudo-observation. With the
+    /// elbow typically observed but the hand under the desk, the
+    /// forearm's direction (flexion + twist, 2 DOF) is a null direction
+    /// of every data term — only priors decide it, and the solver flips
+    /// between their shallow basins frame to frame (measured on the
+    /// s1789219959 desk replay: 29 of 31 wrist snaps > 8 cm with σ ≈ 0.6,
+    /// no observation change, temporal cost 11.5× its median). Holding
+    /// the wrist position (root-frame, so leaning root motion does not
+    /// fight it) eliminates the snaps (replay: R wrist snaps > 15 cm
+    /// 15 → 0, max jump 0.58 → 0.13 m, head yaw sd 16.1 → 15.1) at a
+    /// small torso cost (yaw sd 2.8 → 3.5). Narrower holds were measured
+    /// worse: the swivel angle alone (1 of the 2 DOF) leaves the snaps
+    /// (13 of 15 remain); a shoulder-anchored position hold drags the
+    /// torso (yaw err sd 2.7 → 4.5). The parameter-space hold
+    /// (`q_hold_floor`) cannot treat this either: it was measured worse
+    /// at 0.25 because a held arm fights its *returning* observation —
+    /// hence this hold is gated off per frame whenever the wrist has any
+    /// 2-D/3-D observation, so a real observation (or a re-seed, which
+    /// needs one) always wins. 0 disables.
+    pub wrist_hold_sigma: f64,
     /// σ (rad) of the upright-root prior: the pelvis "up" direction in the
     /// camera frame is pulled toward straight up (camera −y). Without it
     /// the pelvis/spine pitch split is unobservable in an upper-body
@@ -326,12 +353,22 @@ impl Default for Params {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| *v > 0.0)
-                .unwrap_or(0.03),
+                // 1e-9 = pinned (disabled by default; see the field doc).
+                .unwrap_or(1e-9),
             velocity_tau: 0.25,
             pose_prior_scale: 1.0,
             var_min: 1e-8,
             var_max: 25.0,
             elbow_low_sigma: 0.10,
+            wrist_hold_sigma: if std::env::var_os("VULVATAR_FUSION_NO_WHOLD").is_some() {
+                0.0
+            } else {
+                std::env::var("VULVATAR_FUSION_WHOLD_SIGMA")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(0.02)
+            },
             upright_sigma: 0.12,
             seed_win_ratio: 0.95,
             lost_rms_px: 40.0,
@@ -420,6 +457,14 @@ pub struct Estimator {
     /// Leaky-integrated data information per parameter (tau ~ 0.3 s), so a
     /// joint that was measured a few frames ago still reads as observed.
     pub data_info_ema: Vec<f64>,
+    /// Wrist joint indices (`l_wrist`, `r_wrist`; `(0, false)` if the
+    /// model has none — holds disabled).
+    wrist_joints: [(usize, bool); 2],
+    /// Per-wrist hold target for THIS frame: `(active, wrist − root_t)`
+    /// in the camera frame, taken from the prediction. `active` is false
+    /// on bootstrap frames and on any frame where the wrist carries an
+    /// observation (see `Params::wrist_hold_sigma`).
+    hold_targets: [(bool, V3); 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -437,6 +482,10 @@ pub struct SolveDiag {
     pub cost_cloud: f64,
     pub cost_prior: f64,
     pub cost_temporal: f64,
+    /// Cost of the wrist-hold pseudo-observations (active term only;
+    /// 0 on frames where both wrists were observed). See
+    /// `Params::wrist_hold_sigma`.
+    pub cost_whold: f64,
     /// Number of 2-D observations that actually projected (model point in
     /// front of the camera). A collapsed state (body at/behind the camera
     /// plane) produces near-zero cost with zero projectable points — the
@@ -487,8 +536,14 @@ impl Estimator {
             surf_allow: Vec::new(),
             last_surf_assoc: Vec::new(),
             trunk_sites: {
+                // The prior must span the SKELETON axis (`axis_lo`/`axis_hi`,
+                // unsheared). Spans that ride the trunk-shear sites would
+                // constrain the capsule's shape-tilt instead of the pose,
+                // freeing the skeleton to recline (measured on the
+                // s1789219959 replay: pitch −11° → −23° once the shear was
+                // introduced with the prior still on `torso_hi`).
                 let find = |n: &str| model.sites.iter().position(|s| s.name == n);
-                match (find("torso_lo"), find("torso_hi")) {
+                match (find("axis_lo"), find("axis_hi")) {
                     (Some(a), Some(b)) => Some((a, b)),
                     _ => None,
                 }
@@ -520,6 +575,25 @@ impl Estimator {
             locked_param: locked_params(model),
             data_info: vec![0.0; n],
             data_info_ema: vec![0.0; n],
+            wrist_joints: [
+                (
+                    model
+                        .joints
+                        .iter()
+                        .position(|j| j.name == "l_wrist")
+                        .unwrap_or(0),
+                    model.joints.iter().any(|j| j.name == "l_wrist"),
+                ),
+                (
+                    model
+                        .joints
+                        .iter()
+                        .position(|j| j.name == "r_wrist")
+                        .unwrap_or(0),
+                    model.joints.iter().any(|j| j.name == "r_wrist"),
+                ),
+            ],
+            hold_targets: [(false, [0.0; 3]), (false, [0.0; 3])],
             cov: Vec::new(),
             world_sigma: vec![1.0; model.joints.len()],
         }
@@ -696,6 +770,30 @@ impl Estimator {
         self.pred = self.predict(model, obs.t.max(self.last_t.unwrap_or(obs.t)));
         if self.last_t.is_none() {
             self.pred = self.state.clone();
+        }
+        // ---- wrist hold targets ---------------------------------------------
+        // Root-frame wrist position from the prediction, active only when
+        // the wrist carries no observation this frame (a returning
+        // observation — including one a seed candidate relies on — must be
+        // free to move the wrist; see `Params::wrist_hold_sigma`).
+        {
+            let joint_of = |mp: &ModelPoint| match mp {
+                ModelPoint::Joint(j) => Some(*j),
+                ModelPoint::Site(s) => model.sites.get(*s).map(|s| s.joint),
+                ModelPoint::Attached { joint, .. } => Some(*joint),
+            };
+            let wrist_observed = [
+                obs.kp2d.iter().any(|k| joint_of(&k.point) == Some(self.wrist_joints[0].0))
+                    || obs.kp3d.iter().any(|k| joint_of(&k.point) == Some(self.wrist_joints[0].0)),
+                obs.kp2d.iter().any(|k| joint_of(&k.point) == Some(self.wrist_joints[1].0))
+                    || obs.kp3d.iter().any(|k| joint_of(&k.point) == Some(self.wrist_joints[1].0)),
+            ];
+            let pred_fk = model.fk(&self.pred);
+            for k in 0..2 {
+                let (wj, ok) = self.wrist_joints[k];
+                let active = ok && self.last_t.is_some() && !wrist_observed[k];
+                self.hold_targets[k] = (active, sub(pred_fk.t[wj], self.pred.root_t));
+            }
         }
         // Prior variance for this frame: P + Q dt (per parameter class).
         let mut prior_var = vec![0.0; n];
@@ -1068,6 +1166,7 @@ impl Estimator {
         let mut c2d = 0.0;
         let mut c3d = 0.0;
         let mut ccl = 0.0;
+        let mut cwh = 0.0;
         let cpr;
         let ctm;
         let mut sum2d = 0.0;
@@ -1485,7 +1584,14 @@ impl Estimator {
                         .add_residual(&[(model.beta_rad + g, inv_r)], r, 1.0);
                 }
             }
-            let inv_sh = 1.0 / if self.shape_frozen { 0.005 } else { p.shear_sigma };
+            // Freezing tightens toward 0.005 — but never LOOSENS a pin
+            // (the disabled default 1e-9 must survive the freeze).
+            let inv_sh = 1.0
+                / if self.shape_frozen {
+                    p.shear_sigma.min(0.005)
+                } else {
+                    p.shear_sigma
+                };
             let r = st.shear * inv_sh;
             cost += r * r;
             if build {
@@ -1537,12 +1643,63 @@ impl Estimator {
             }
         }
         ctm = cost - cost_before_temporal;
+        // ---- wrist hold (unobserved end-effector) ----------------------------
+        // Plain quadratic pseudo-observation of the wrist's root-frame
+        // position toward the prediction — no robust kernel: the hold must
+        // keep pulling exactly when the deviation is large. Gated per frame
+        // in `update_with_seeds` (active only with zero wrist observations).
+        let sig_wh = p.wrist_hold_sigma;
+        if sig_wh > 1e-6 {
+            let inv_s = 1.0 / sig_wh;
+            for k in 0..2 {
+                let (active, tgt) = self.hold_targets[k];
+                if !active {
+                    continue;
+                }
+                let wj = self.wrist_joints[k].0;
+                let rel = sub(fk.t[wj], st.root_t);
+                let r = [
+                    (rel[0] - tgt[0]) * inv_s,
+                    (rel[1] - tgt[1]) * inv_s,
+                    (rel[2] - tgt[2]) * inv_s,
+                ];
+                let s = dot(r, r);
+                cost += s;
+                cwh += s;
+                if build {
+                    point_jac(model, st, fk, ModelPoint::Joint(wj), wj, &mut self.jac);
+                    self.jac2.clear();
+                    // ∂(wrist − root_t)/∂θ: the root-translation columns
+                    // translate the wrist AND the anchor — subtract the
+                    // identity from those three columns.
+                    let mut root_seen = [false; 3];
+                    for &(i, v) in &self.jac {
+                        let mut v = v;
+                        if i >= ROOT_T && i < ROOT_T + 3 {
+                            let a = i - ROOT_T;
+                            root_seen[a] = true;
+                            v[a] -= 1.0;
+                        }
+                        self.jac2.push((i, [v[0] * inv_s, v[1] * inv_s, v[2] * inv_s]));
+                    }
+                    for a in 0..3 {
+                        if !root_seen[a] {
+                            let mut v = [0.0; 3];
+                            v[a] = -inv_s;
+                            self.jac2.push((ROOT_T + a, v));
+                        }
+                    }
+                    self.dense.add_residual3(&self.jac2, r, 1.0);
+                }
+            }
+        }
         if build {
             self.diag.cost_2d = c2d;
             self.diag.cost_3d = c3d;
             self.diag.cost_cloud = ccl;
             self.diag.cost_prior = cpr;
             self.diag.cost_temporal = ctm;
+            self.diag.cost_whold = cwh;
             self.diag.n_2d_proj = n2d;
             self.diag.rms_2d_px = if n2d > 0 { sum2d / n2d as f64 } else { 0.0 };
             self.diag.med_2d_px = if n2d > 0 {
@@ -2040,6 +2197,40 @@ fn point_jac(
             model.attached_point_jacobian(st, fk, joint, pw, out);
         }
     }
+}
+
+/// Signed swivel angle of the forearm about the shoulder→elbow axis,
+/// measured from the gravity meridian (world down projected ⊥ the axis).
+/// Retained for diagnostics / future forearm-frame holds: measured on the
+/// s1789219959 desk replay, pinning this angle alone does NOT stop the
+/// unobserved-wrist snaps (13 of 15 remain — the flexion DOF of the
+/// forearm direction carries them too), see `Params::wrist_hold_sigma`.
+/// `None` when the geometry is degenerate (zero-length segment, or the
+/// arm axis within ~3° of gravity so the meridian is undefined).
+#[allow(dead_code)]
+fn swivel_angle(s: V3, e: V3, w: V3) -> Option<f64> {
+    let u = sub(e, s);
+    let lu = norm(u);
+    if lu < 1e-6 {
+        return None;
+    }
+    let a = scale(u, 1.0 / lu);
+    let v = sub(w, e);
+    let lv = norm(v);
+    if lv < 1e-6 {
+        return None;
+    }
+    let vhat = scale(v, 1.0 / lv);
+    // World down (camera y is down), projected ⊥ the arm axis.
+    let d: V3 = [0.0, 1.0, 0.0];
+    if norm(cross(a, d)) < 0.05 {
+        return None;
+    }
+    let r = sub(d, scale(a, dot(d, a)));
+    let rhat = scale(r, 1.0 / norm(r));
+    let x = dot(rhat, vhat);
+    let y = dot(cross(rhat, vhat), a);
+    Some(y.atan2(x))
 }
 
 /// Entry depth `t` (along the unit ray `dir` from the origin) of a capsule

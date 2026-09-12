@@ -123,6 +123,15 @@ crop は **状態の関数** であり、フレーム毎の検出結果がフィ
 - 追跡健全性: 対応点 ≥ 150 かつ平均符号付き距離 < 3 cm なら、2D 顔点の残差が跳んでも lost にしない (掌で顔を覆うと検出器は鼻・目を手の上に描き、旧判定はそこへ再捕捉していた)。
 - 無効化: `VULVATAR_FUSION_NO_DENSE=1`。
 
+### 3.8 未観測手首のホールド (`Estimator::accumulate_at` の wrist-hold 項)
+
+そのフレームに手首観測 (2D/3D いずれか) が**ゼロ**の手首は、root 並進相対の予測位置へ σ 0.02 m の非ロバスト疑似観測でピン止めする。肘は観測され手は机下、のデスク構図では前腕方向 (屈曲+捻り 2-DoF) は全データ項の零方向であり、事前の浅い盆地間をソルバがフレーム単位で跳ぶ (s1789219959 で snap 29/31 は観測変化ゼロ・temporal コスト 11.5×)。
+
+- ゲートはフレーム毎: 手首に観測があれば直ちに無効 → 復帰観測や再 seed とは競合しない (`q_hold_floor` を下げる方式は復帰観測と闘って劣化測定済み)。
+- 実測 (s1789219959): R 手首 snap >15 cm 12→0、最大 jump 0.41→0.13 m、頭 yaw sd 23.8→15.1。代償は胴 yaw sd +0.2〜0.4°。
+- 狭い拘束は効かない測定済み: swivel 角のみ (snap 13/15 残存 — 屈曲側が主因)、肩アンカー位置 (胴 yaw err sd 2.7→4.5 と干渉)。
+- 無効化/調整: `VULVATAR_FUSION_NO_WHOLD=1` / `VULVATAR_FUSION_WHOLD_SIGMA=<m>`。
+
 ---
 
 ## 4. 関節体モデル (`fusion/model.rs`)
@@ -187,6 +196,7 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_FUSION_NO_HINT` | crop ヒントを渡さない |
 | `VULVATAR_FUSION_OLDSIGMA` | σ 再表現前の gain/floor/base (1.0 / 1.5 px / 1.0) |
 | `VULVATAR_FUSION_NO_{SURF,3D,BURNIN,REACH,CHESTYAW}` | 各項の無効化 |
+| `VULVATAR_FUSION_NO_WHOLD` / `VULVATAR_FUSION_WHOLD_SIGMA` | 未観測手首ホールドの無効化 / σ (m) (§3.8) |
 | `VULVATAR_FUSION_NO_DENSE` / `VULVATAR_DENSE_ARMS` / `VULVATAR_DENSE_NOHEAD` / `VULVATAR_DENSE_NONECK` | 密表面項の無効化 / 腕カプセル許可 / 頭・首の除外 |
 | `VULVATAR_DENSE_NEFF` / `VULVATAR_DENSE_NEFF_HEAD` / `VULVATAR_DENSE_FRONT` / `VULVATAR_DENSE_FREEZE` | 実効点数・前方ゲート・形状凍結の上書き |
 | `VULVATAR_HOLD_Q` / `VULVATAR_NO_UPRIGHT` / `VULVATAR_TRUNK_AXIS_SIGMA` | 未観測肢ホールド係数 / 胴軸事前の無効化・σ |

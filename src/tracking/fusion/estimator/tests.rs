@@ -435,3 +435,111 @@ fn surface_gradient_matches_finite_difference() {
     }
     assert!(c0.is_finite());
 }
+
+#[test]
+fn wrist_hold_gates_on_wrist_observations() {
+    let h = Humanoid::new();
+    let m = &h.model;
+    let intr = intr();
+    let mut gt = gt_state(&h);
+    // Lift the right arm out of the hanging pose — an arm axis parallel
+    // to gravity has no defined swivel meridian, which would (correctly)
+    // keep the hold inactive for a different reason than the gate.
+    gt.set_ball(h.j.r_shoulder, [0.3, -0.5, -0.9]);
+    let mut est = Estimator::new(m, Params::default());
+    let frame = |t: f64, kp2d: Vec<Kp2d>| FrameObs {
+        t,
+        intr: Some(intr),
+        kp2d,
+        kp3d: Vec::new(),
+        ori: Vec::new(),
+        shoulder_yaw: None,
+        torso_hint: None,
+        surface: Vec::new(),
+        surf_allow: Vec::new(),
+    };
+    // Bootstrap + one tracked frame with every joint observed.
+    est.update(m, &frame(0.0, observe(m, &gt, intr, 1.0)));
+    est.update(m, &frame(1.0 / 30.0, observe(m, &gt, intr, 1.0)));
+    assert!(
+        !est.hold_targets[0].0 && !est.hold_targets[1].0,
+        "wrists observed -> hold inactive"
+    );
+    // Drop the right-wrist observation: exactly that hold activates.
+    let no_rw: Vec<Kp2d> = observe(m, &gt, intr, 1.0)
+        .into_iter()
+        .filter(|k| !matches!(k.point, ModelPoint::Joint(j) if j == h.j.r_wrist))
+        .collect();
+    est.update(m, &frame(2.0 / 30.0, no_rw));
+    assert!(est.hold_targets[1].0, "unobserved wrist -> hold active");
+    assert!(!est.hold_targets[0].0, "observed wrist stays free");
+    assert!(est.diag.cost_whold.is_finite());
+}
+
+/// The hold's hand-built Jacobian (wrist-point Jacobian minus the
+/// identity on the root-translation columns) must match the numeric
+/// derivative of the cost — checked on the root columns, where the
+/// subtraction lives, and along the wrist's kinematic chain.
+#[test]
+fn wrist_hold_jacobian_matches_finite_difference() {
+    let h = Humanoid::new();
+    let m = &h.model;
+    let mut st = State::rest(m);
+    st.set_relaxed(m);
+    st.root_r = FACING_CAMERA;
+    st.root_t = [0.1, 0.35, 1.6];
+    st.set_hinge(m, h.j.r_elbow, 0.9);
+    // Lift the arm and bend the elbow so the wrist is well away from the
+    // root and the residual gradient is non-degenerate.
+    st.set_ball(h.j.r_shoulder, [0.3, -0.5, -0.9]);
+    let mut est = Estimator::new(m, Params::default());
+    est.state = st.clone();
+    // Deliberately offset root-frame target so the residual/gradient are live.
+    est.hold_targets[1] = (true, [0.15, -0.05, 0.55]);
+    let obs = FrameObs {
+        t: 0.0,
+        intr: None,
+        kp2d: vec![],
+        kp3d: vec![],
+        ori: Vec::new(),
+        shoulder_yaw: None,
+        torso_hint: None,
+        surface: Vec::new(),
+        surf_allow: Vec::new(),
+    };
+    let prior_var = vec![1e9; m.num_params];
+    let fk = m.fk(&st);
+    let _c0 = est.accumulate(m, &obs, &fk, &prior_var, 0.033, true);
+    let g = est.dense.g.clone();
+    let eps = 1e-5;
+    let rs = m.joint_param[h.j.r_shoulder];
+    for k in [
+        ROOT_T,
+        ROOT_T + 1,
+        ROOT_T + 2,
+        rs,
+        rs + 1,
+        rs + 2,
+        m.joint_param[h.j.r_elbow],
+        m.joint_param[h.j.spine2],
+    ] {
+        let mut dd = vec![0.0; m.num_params];
+        let mut sp = st.clone();
+        dd[k] = eps;
+        sp.apply_delta(m, &dd);
+        let cp = est.eval_cost(m, &obs, &m.fk(&sp), &sp, &prior_var, 0.033);
+        let mut sm = st.clone();
+        dd[k] = -eps;
+        sm.apply_delta(m, &dd);
+        let cm = est.eval_cost(m, &obs, &m.fk(&sm), &sm, &prior_var, 0.033);
+        let num = (cp - cm) / (2.0 * eps);
+        assert!(
+            (num - 2.0 * g[k]).abs() < 1e-3 * (1.0 + num.abs()),
+            "param {k}: analytic 2g {} vs numeric {}",
+            2.0 * g[k],
+            num
+        );
+    }
+}
+
+
