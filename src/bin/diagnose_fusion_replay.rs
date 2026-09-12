@@ -333,12 +333,12 @@ fn main() -> Result<(), String> {
     let vis_dump = std::env::var_os("VULVATAR_REPLAY_VISDUMP").is_some();
     let mut vis_csv = String::new();
     if vis_dump {
-        vis_csv.push_str("frame,j,nx,ny,nz,score,sx,sy,second_x,second_y,half_x,half_y,zscore,crop_x,crop_y,crop_w,crop_h,depth_z,p_vis,sil_dist,sil_zref,sil_bottom,sil_area");
+        vis_csv.push_str("frame,j,nx,ny,nz,score,sx,sy,second_x,second_y,half_x,half_y,zscore,crop_x,crop_y,crop_w,crop_h,depth_z,p_vis,sil_dist,sil_zref,sil_bottom,sil_height,hint_x1,hint_y1,hint_x2,hint_y2");
     }
     let mut vis_header_done = false;
 
     let mut csv = String::new();
-    csv.push_str("idx,t,solve_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
+    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
 
     let mut torso_yaws = Vec::new();
     let mut yaw_ref_pairs: Vec<(f64, f64)> = Vec::new();
@@ -401,10 +401,13 @@ fn main() -> Result<(), String> {
                     .last_silhouette
                     .map(|(z, b, a)| (z, b as u8, a))
                     .unwrap_or((f64::NAN, 0, f64::NAN));
+                let (hx1, hy1, hx2, hy2) = provider
+                    .last_crop_hint
+                    .unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
                 vis_csv.push_str(&format!(
-                    "{idx},{j},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4},{:.3},{},{:.4}",
+                    "{idx},{j},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4},{:.3},{},{:.4},{:.1},{:.1},{:.1},{:.1}",
                     kp.nx, kp.ny, kp.nz, kp.score, kp.sx, kp.sy, kp.second_x, kp.second_y,
-                    kp.half_x, kp.half_y, kp.zscore, cx, cy, cw_, ch_, dz, pv, sd, sz, sb, sa
+                    kp.half_x, kp.half_y, kp.zscore, cx, cy, cw_, ch_, dz, pv, sd, sz, sb, sa, hx1, hy1, hx2, hy2
                 ));
                 for (_, scores) in &provider.last_kp_stages {
                     vis_csv.push_str(&format!(",{:.4}", scores.get(j).copied().unwrap_or(f32::NAN)));
@@ -431,9 +434,10 @@ fn main() -> Result<(), String> {
         let d = est.diag;
         let q = rig.as_ref().map(|r| r.quality).unwrap_or(0.0);
         csv.push_str(&format!(
-            "{idx},{:.3},{:.2},{:.1},{:.1},{},{},{},{},{:.2},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}\n",
+            "{idx},{:.3},{:.2},{:.2},{:.1},{:.1},{},{},{},{},{:.2},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}\n",
             *idx as f64 / 30.0,
             provider.last_solve_ms,
+            provider.last_est_ms,
             d.cost_initial,
             d.cost_final,
             d.iters,

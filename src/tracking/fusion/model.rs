@@ -102,8 +102,19 @@ pub enum PointRef {
 pub struct CapsuleDef {
     pub a: PointRef,
     pub b: PointRef,
+    /// Lateral radius (the only radius for a round capsule).
     pub base_radius: f64,
     pub rad_group: RadGroup,
+    /// Elliptic cross-section: `lateral` is a reference point whose
+    /// direction from the axis defines the wide semi-axis (`base_radius`);
+    /// the perpendicular (depth) semi-axis is `base_radius × aspect`.
+    /// `None` / 1.0 for a round capsule. The trunk uses this: a chest is a
+    /// flat slab (width 0.34 m, depth 0.21 m), and a flat surface patch
+    /// pins its yaw where any arrangement of round tubes cannot
+    /// (measured: two round trunk capsules fitted the chest plane equally
+    /// well 30° off).
+    pub lateral: Option<PointRef>,
+    pub aspect: f64,
     /// Which limb this capsule belongs to (for association bookkeeping and
     /// visibility duty accounting).
     pub part: Part,
@@ -189,6 +200,9 @@ pub struct SiteIdx {
     /// `[leg]` toe tip.
     pub toe: [usize; 2],
     pub torso_l_lo: usize,
+    /// Trunk axis ends (pelvis / upper chest centre line).
+    pub torso_lo: usize,
+    pub torso_hi: usize,
     pub torso_r_lo: usize,
     pub torso_l_hi: usize,
     pub torso_r_hi: usize,
@@ -294,6 +308,29 @@ impl Builder {
             base_radius: r,
             rad_group: g,
             part,
+            lateral: None,
+            aspect: 1.0,
+        });
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn capsule_ellipse(
+        &mut self,
+        a: PointRef,
+        b: PointRef,
+        lateral: PointRef,
+        r_lat: f64,
+        aspect: f64,
+        g: RadGroup,
+        part: Part,
+    ) {
+        self.capsules.push(CapsuleDef {
+            a,
+            b,
+            base_radius: r_lat,
+            rad_group: g,
+            part,
+            lateral: Some(lateral),
+            aspect,
         });
     }
 }
@@ -394,17 +431,17 @@ impl Humanoid {
         s.torso_r_lo = b.site("torso_r_lo", j.pelvis, [-0.06, 0.02, 0.0], L::Hips);
         s.torso_l_hi = b.site("torso_l_hi", j.spine3, [0.07, 0.10, 0.0], L::Shoulder);
         s.torso_r_hi = b.site("torso_r_hi", j.spine3, [-0.07, 0.10, 0.0], L::Shoulder);
-        b.capsule(
-            PointRef::Site(s.torso_l_lo),
+        s.torso_lo = b.site("torso_lo", j.pelvis, [0.0, 0.02, 0.0], L::Hips);
+        s.torso_hi = b.site("torso_hi", j.spine3, [0.0, 0.10, 0.0], L::Shoulder);
+        // One elliptic trunk (lateral semi-axis 0.17 m, depth 0.105 m):
+        // the same 2:1 section the former capsule pair approximated, as a
+        // single surface whose flat front carries yaw.
+        b.capsule_ellipse(
+            PointRef::Site(s.torso_lo),
+            PointRef::Site(s.torso_hi),
             PointRef::Site(s.torso_l_hi),
-            0.105,
-            R::Torso,
-            Part::Torso,
-        );
-        b.capsule(
-            PointRef::Site(s.torso_r_lo),
-            PointRef::Site(s.torso_r_hi),
-            0.105,
+            0.17,
+            0.105 / 0.17,
             R::Torso,
             Part::Torso,
         );
@@ -799,8 +836,13 @@ impl State {
         (self.scale + self.len[g as usize]).exp()
     }
     #[inline]
+    /// Capsule radius multiplier. Deliberately NOT tied to the global
+    /// length scale: a person's girth is not proportional to their height,
+    /// and with the dense surface term the radii are measured directly —
+    /// coupling them to `scale` let the surface inflate every bone length
+    /// by 13 % to widen the chest (measured).
     pub fn rad_mul(&self, g: RadGroup) -> f64 {
-        (self.scale + self.rad[g as usize]).exp()
+        self.rad[g as usize].exp()
     }
 
     /// Rotation vector of a joint's local rotation (ball) or its hinge
@@ -1035,6 +1077,13 @@ impl Model {
     #[inline]
     pub fn capsule_radius(&self, st: &State, c: &CapsuleDef) -> f64 {
         c.base_radius * st.rad_mul(c.rad_group)
+    }
+
+    /// Depth (camera-facing) semi-axis: the lateral radius for a round
+    /// capsule, `radius × aspect` for an elliptic one. Occlusion tests use
+    /// this — the conservative extent toward the camera.
+    pub fn capsule_depth_radius(&self, st: &State, c: &CapsuleDef) -> f64 {
+        self.capsule_radius(st, c) * c.aspect
     }
 
     /// Joint index whose `bone` equals `b`, if any.

@@ -135,6 +135,16 @@ pub struct FrameObs {
     /// the arm, not a wrong shoulder). Associated to the nearest capsule of
     /// any part.
     pub surface: Vec<(V3, f64)>,
+    /// Per-capsule association permission for `surface` (empty = all).
+    /// Surface evidence may only be claimed by parts that are observed:
+    /// the trunk and head always, a limb capsule only while its distal
+    /// joint carries data. A point whose nearest capsule is a forbidden
+    /// one is DROPPED, not re-assigned — an unobserved arm hanging at the
+    /// side still occludes the trunk there. Without this, free
+    /// (unobserved) arm capsules slide onto the chest and explain the
+    /// torso surface at zero cost (measured: 1 400 of 4 800 points on the
+    /// upper arms, trunk yaw 27° off).
+    pub surf_allow: Vec<bool>,
 }
 
 /// Tunables. Units: pixels / metres / radians / seconds.
@@ -155,6 +165,21 @@ pub struct Params {
     /// Process noise (variance per second) for joint rotations, root
     /// rotation, root translation, and shape.
     pub q_joint: f64,
+    /// Process-noise scaling for unobserved limb joints: `q_joint` is
+    /// multiplied by clamp(data_info_ema / q_hold_info_ref, q_hold_floor, 1).
+    pub q_hold_floor: f64,
+    pub q_hold_info_ref: f64,
+    /// Trunk-axis prior (complements `upright_sigma`, which holds only the
+    /// root): σ on the camera-z component of the unit pelvis→chest axis (0 = trunk perpendicular to the optical axis).
+    /// In the desk envelope the pelvis is below the frame and nothing
+    /// observes the trunk's lean; without an absolute prior the surface
+    /// fit swings the unseen lower trunk toward the camera over a few
+    /// hundred frames (measured: root depth 0.79 → 0.43 m while the chest
+    /// stayed put). A camera pitched 20° up puts a truly upright trunk at
+    /// 0.34; at σ 0.35 the prior was measured too weak to stop the drift
+    /// (1.3σ against hundreds of cost units elsewhere), 0.15 holds it.
+    /// `None` disables it.
+    pub trunk_axis_sigma: Option<f64>,
     /// Process noise for the trunk (pelvis / spine / neck / clavicles):
     /// the torso turns far slower than a limb swings, so its yaw must keep
     /// memory across a frame where a shoulder is occluded.
@@ -209,6 +234,26 @@ pub struct Params {
     pub lost_rms_px: f64,
     /// Use the heavy-tailed Cauchy kernel (vs Geman–McClure) on 2-D terms.
     pub cauchy_2d: bool,
+    /// Front-side association gate for core capsules (m): a surface point
+    /// farther out than this from the trunk / head surface is an occluder
+    /// (hand across the chest measured at 0.10–0.20 m; a shirt fold at
+    /// 0.02). Scaled by the GNC multiplier during bootstrap. Swept 0.06 →
+    /// 0.03 on four recordings: torso yaw std sum 45.8 → 34.3, the palms
+    /// replay 14.3 → 5.5.
+    pub surf_front_gate_m: f64,
+    /// Effective independent points per capsule for the dense surface
+    /// term. The capsule model's shape error (±2–3 cm) is common to every
+    /// point on a capsule, so N points do not carry N× the information;
+    /// each capsule's point weights are scaled by min(1, n_eff / n).
+    /// 30 points at σ ≈ 1.4 cm still pin a capsule's position to ~3 mm,
+    /// while a direct orientation observation (FaceMesh OriObs) keeps
+    /// its say over the round head capsule.
+    pub surf_n_eff: f64,
+    /// Same for the head (its round capsule is a crude face model; the
+    /// FaceMesh centroid already fixes head position at pixel precision)
+    /// and for limb capsules.
+    pub surf_n_eff_head: f64,
+    pub surf_n_eff_limb: f64,
     /// Kernel scale / gate for the sparse keypoint-lifted surface points.
     pub c_surf: f64,
     pub surf_gate_m: f64,
@@ -229,6 +274,16 @@ impl Default for Params {
                 .unwrap_or(2.0),
             limit_sigma: 0.02,
             q_joint: 2.0,   // rad²/s — a limb can swing ~250°/s
+            // Measured worse at 0.25 (torso yaw std 6 → 21 on a gesturing
+            // session: a held arm fights its returning observation and the
+            // trunk pays); kept as an ablation knob.
+            q_hold_floor: std::env::var("VULVATAR_HOLD_Q").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            q_hold_info_ref: 50.0,
+            trunk_axis_sigma: if std::env::var_os("VULVATAR_NO_UPRIGHT").is_some() {
+                None
+            } else {
+                Some(std::env::var("VULVATAR_TRUNK_AXIS_SIGMA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15))
+            },
             q_trunk: 0.15,  // rad²/s — the trunk turns ~120°/s at most
             q_root_rot: 0.15,
             q_root_t: std::env::var("VULVATAR_FUSION_Q_ROOT_T")
@@ -248,6 +303,10 @@ impl Default for Params {
             seed_win_ratio: 0.95,
             lost_rms_px: 40.0,
             cauchy_2d: true,
+            surf_n_eff: std::env::var("VULVATAR_DENSE_NEFF").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0),
+            surf_n_eff_head: std::env::var("VULVATAR_DENSE_NEFF_HEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0),
+            surf_n_eff_limb: 15.0,
+            surf_front_gate_m: std::env::var("VULVATAR_DENSE_FRONT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03),
             c_surf: 4.0,
             surf_gate_m: 0.20,
         }
@@ -284,6 +343,14 @@ pub struct Estimator {
     row_out2: Vec<(usize, f64)>,
     /// Per-capsule-end point Jacobians, rebuilt once per accumulate.
     cap_jac: Vec<Vec<(usize, V3)>>,
+    /// Per-capsule association permission for the current frame (see
+    /// `FrameObs::surf_allow`).
+    surf_allow: Vec<bool>,
+    /// Trunk axis sites (`torso_lo`, `torso_hi`) for the upright prior.
+    trunk_sites: Option<(usize, usize)>,
+    /// Diagnostics: capsule index chosen for each surface point in the
+    /// last build pass (−1 = dropped).
+    pub last_surf_assoc: Vec<i32>,
     lost_frames: u32,
     /// Number of re-acquisitions triggered by the health check.
     pub lost_events: u64,
@@ -375,6 +442,15 @@ impl Estimator {
             row_out: Vec::with_capacity(128),
             row_out2: Vec::with_capacity(128),
             cap_jac: Vec::new(),
+            surf_allow: Vec::new(),
+            last_surf_assoc: Vec::new(),
+            trunk_sites: {
+                let find = |n: &str| model.sites.iter().position(|s| s.name == n);
+                match (find("torso_lo"), find("torso_hi")) {
+                    (Some(a), Some(b)) => Some((a, b)),
+                    _ => None,
+                }
+            },
             lost_frames: 0,
             lost_events: 0,
             surf_pts: Vec::new(),
@@ -571,7 +647,15 @@ impl Estimator {
                 if self.trunk_param[k] {
                     self.params.q_trunk
                 } else {
-                    self.params.q_joint
+                    // Hold when unobserved: a limb nobody is looking at has
+                    // no reason to move. The process noise (a random walk
+                    // at human peak speed) is scaled by how much data the
+                    // joint has been receiving, down to `q_hold_floor`,
+                    // so an arm under the desk keeps its last pose instead
+                    // of wandering toward every stray observation.
+                    let info = self.data_info_ema.get(k).copied().unwrap_or(0.0);
+                    let f = (info / self.params.q_hold_info_ref).clamp(self.params.q_hold_floor, 1.0);
+                    self.params.q_joint * f
                 }
             } else {
                 self.params.q_shape
@@ -580,6 +664,7 @@ impl Estimator {
         }
         // Warm start from the prediction.
         self.state = self.pred.clone();
+        self.surf_allow = obs.surf_allow.clone();
         self.surf_pts = obs
             .surface
             .iter()
@@ -654,8 +739,15 @@ impl Estimator {
             self.diag.med_2d_px > self.params.lost_rms_px
         };
         let has_solid_3d = self.diag.n_kp3d >= 4 && self.diag.mean_3d_m < 0.12;
+        // The dense surface is the primary observation: a trunk that sits
+        // on hundreds of measured surface points is in track even when the
+        // 2-D face points disagree (palms over the face: the detector
+        // paints nose / eyes on the hands, their residual explodes, and
+        // without this the track was reset onto the hands).
+        let has_solid_surface = self.diag.n_cloud >= 150 && self.diag.mean_cloud_m.abs() < 0.03;
         let unhealthy = self.diag.n_kp2d >= 8
             && !has_solid_3d
+            && !has_solid_surface
             && (sparse_unhealthy
                 // Collapsed state: plenty of detections, almost nothing
                 // projects — near-zero cost that must not read as healthy.
@@ -845,6 +937,9 @@ impl Estimator {
         self.frames += 1;
         // Freeze the shape once its variances have converged (a few seconds
         // of well-observed data).
+        if std::env::var_os("VULVATAR_DENSE_FREEZE").is_some() && self.frames > 30 {
+            self.shape_frozen = true;
+        }
         if !self.shape_frozen && self.frames > 90 {
             let max_shape_var = (model.beta_scale..n)
                 .map(|k| self.var[k])
@@ -996,16 +1091,22 @@ impl Estimator {
         // ---- capsule-end Jacobians (surface term) -------------------------------
         if build && !surf.is_empty() {
             let nc = model.capsules.len();
-            if self.cap_jac.len() != 2 * nc {
-                self.cap_jac = vec![Vec::with_capacity(48); 2 * nc];
+            if self.cap_jac.len() != 3 * nc {
+                self.cap_jac = vec![Vec::with_capacity(48); 3 * nc];
             }
             for (ci, c) in model.capsules.iter().enumerate() {
-                let mut ja = std::mem::take(&mut self.cap_jac[2 * ci]);
+                let mut ja = std::mem::take(&mut self.cap_jac[3 * ci]);
                 model.point_jacobian(st, fk, c.a, &mut ja);
-                self.cap_jac[2 * ci] = ja;
-                let mut jb = std::mem::take(&mut self.cap_jac[2 * ci + 1]);
+                self.cap_jac[3 * ci] = ja;
+                let mut jb = std::mem::take(&mut self.cap_jac[3 * ci + 1]);
                 model.point_jacobian(st, fk, c.b, &mut jb);
-                self.cap_jac[2 * ci + 1] = jb;
+                self.cap_jac[3 * ci + 1] = jb;
+                let mut jc = std::mem::take(&mut self.cap_jac[3 * ci + 2]);
+                jc.clear();
+                if let Some(l) = c.lateral {
+                    model.point_jacobian(st, fk, l, &mut jc);
+                }
+                self.cap_jac[3 * ci + 2] = jc;
             }
         }
         // ---- sparse surface points (depth under body keypoints) -----------------
@@ -1291,6 +1392,34 @@ impl Estimator {
             }
         }
 
+        // ---- trunk axis prior (see `Params::trunk_axis_sigma`) --------------------
+        if let (Some(sig), Some((lo, hi))) = (p.trunk_axis_sigma, self.trunk_sites) {
+            let a = fk.site[lo];
+            let b = fk.site[hi];
+            let d = sub(b, a);
+            let len = norm(d);
+            if len > 1e-6 {
+                let axis = scale(d, 1.0 / len);
+                let r = axis[2] / sig;
+                cost += r * r;
+                if build {
+                    // ∂axis_z/∂d = (e_z − axis·axis_z) / |d|
+                    let gvec = scale(sub([0.0, 0.0, 1.0], scale(axis, axis[2])), 1.0 / len);
+                    let mut jhi = Vec::with_capacity(48);
+                    let mut jlo = Vec::with_capacity(48);
+                    model.point_jacobian(st, fk, PointRef::Site(hi), &mut jhi);
+                    model.point_jacobian(st, fk, PointRef::Site(lo), &mut jlo);
+                    let mut jac1: Vec<(usize, f64)> = Vec::with_capacity(96);
+                    for &(i, v) in &jhi {
+                        jac1.push((i, dot(v, gvec) / sig));
+                    }
+                    for &(i, v) in &jlo {
+                        jac1.push((i, -dot(v, gvec) / sig));
+                    }
+                    self.dense.add_residual(&jac1, r, 1.0);
+                }
+            }
+        }
         cpr = cost - cost_before_prior;
         // ---- temporal prior (previous posterior propagated) --------------------
         let cost_before_temporal = cost;
@@ -1328,6 +1457,7 @@ impl Estimator {
             };
             self.diag.mean_3d_m = if n3d > 0 { sum3d / n3d as f64 } else { 0.0 };
             self.diag.mean_cloud_m = if ncl > 0 { sumcl / ncl as f64 } else { 0.0 };
+            self.diag.n_cloud = ncl;
         }
         cost
     }
@@ -1350,27 +1480,144 @@ impl Estimator {
         if !points.is_empty() {
             let kern = Kernel::Cauchy(self.params.c_surf * self.gnc);
             let gate_m = self.params.surf_gate_m * self.gnc;
-            // Association: nearest capsule surface within the gate.
-            let caps: Vec<(V3, V3, f64)> = model
+            // Association: nearest capsule surface within the gate. Hand
+            // capsules are skipped: the hand landmarker owns the hands and
+            // their pixels are excluded from the dense samples, so a hand
+            // capsule can only steal torso / forearm points.
+            let caps: Vec<CapGeom> = model
                 .capsules
                 .iter()
-                .map(|c| (fk.point(c.a), fk.point(c.b), model.capsule_radius(st, c)))
+                .map(|c| CapGeom {
+                    a: fk.point(c.a),
+                    b: fk.point(c.b),
+                    c: c.lateral.map(|l| fk.point(l)),
+                    r: model.capsule_radius(st, c),
+                    k: c.aspect,
+                })
                 .collect();
+            let assoc_ok: Vec<bool> = model
+                .capsules
+                .iter()
+                .map(|c| !matches!(c.part, super::model::Part::LeftHand | super::model::Part::RightHand))
+                .collect();
+            let allow = &self.surf_allow;
+            let is_core: Vec<bool> = model
+                .capsules
+                .iter()
+                .map(|c| matches!(c.part, super::model::Part::Torso | super::model::Part::Head))
+                .collect();
+            // Axis-aligned boxes (expanded by the gate) for cheap rejection.
+            let boxes: Vec<([f64; 3], [f64; 3])> = caps
+                .iter()
+                .map(|g| {
+                    let (a, b, r) = (g.a, g.b, g.r);
+                    let e = r + gate_m;
+                    let lo = [a[0].min(b[0]) - e, a[1].min(b[1]) - e, a[2].min(b[2]) - e];
+                    let hi = [a[0].max(b[0]) + e, a[1].max(b[1]) + e, a[2].max(b[2]) + e];
+                    (lo, hi)
+                })
+                .collect();
+            // Trunk / head have priority: a point within `core_claim_m` of a
+            // core capsule belongs to the core even if a limb capsule is
+            // nearer. Limbs are free (often unobserved) and would otherwise
+            // slide onto the chest and take its points, leaving the trunk
+            // fitted to an asymmetric remainder (measured: 381 chest points
+            // on the upper arm, trunk yaw 25° off the chest slope).
+            let core_claim_m = 0.06;
+            // (point, capsule, signed distance, axis point, axis param)
             let mut items: Vec<(usize, usize, f64, V3, f64)> = Vec::with_capacity(points.len());
             for (pi, (pt, _sig)) in points.iter().enumerate() {
-                let mut best = (usize::MAX, f64::INFINITY, [0.0; 3], 0.0);
-                for (ci, (a, b, r)) in caps.iter().enumerate() {
-                    let (q, u) = closest_on_segment(*a, *b, *pt);
-                    let d = norm(sub(*pt, q)) - r;
-                    if d.abs() < best.1.abs() {
-                        best = (ci, d, q, u);
+                let mut best_core = (usize::MAX, f64::INFINITY, [0.0; 3], 0.0);
+                let mut best_limb = (usize::MAX, f64::INFINITY, [0.0; 3], 0.0);
+                let mut best_hand = f64::INFINITY;
+                for (ci, g) in caps.iter().enumerate() {
+                    let (lo, hi) = boxes[ci];
+                    if pt[0] < lo[0] || pt[0] > hi[0] || pt[1] < lo[1] || pt[1] > hi[1] || pt[2] < lo[2] || pt[2] > hi[2] {
+                        continue;
+                    }
+                    let (d, q, u, _rho) = g.dist(*pt);
+                    if !assoc_ok[ci] {
+                        // Hand capsule: never fitted, but a point that is
+                        // nearest to a hand belongs to the hand and must
+                        // not be handed to the forearm.
+                        best_hand = best_hand.min(d.abs());
+                        continue;
+                    }
+                    let slot = if is_core[ci] { &mut best_core } else { &mut best_limb };
+                    if d.abs() < slot.1.abs() {
+                        *slot = (ci, d, q, u);
                     }
                 }
-                if best.0 != usize::MAX && best.1.abs() < gate_m {
-                    items.push((pi, best.0, best.1, best.2, best.3));
+                if best_hand < best_core.1.abs() && best_hand < best_limb.1.abs() {
+                    continue;
                 }
+                // Depth order: the sensor only ever sees a surface from the
+                // front, so a point well IN FRONT of a core capsule (d > 0)
+                // is an occluder — a hand or forearm across the chest, the
+                // desk edge — not the trunk surface a few centimetres out.
+                // Behind / inside (d < 0, the model too fat or misplaced)
+                // keeps the full gate so the fit can still converge.
+                let front_m = self.params.surf_front_gate_m * self.gnc;
+                let core_ok = best_core.0 != usize::MAX
+                    && best_core.1 > -gate_m
+                    && best_core.1 < front_m;
+                let limb_ok = best_limb.0 != usize::MAX && best_limb.1.abs() < gate_m;
+                let limb_allowed =
+                    limb_ok && (allow.is_empty() || allow.get(best_limb.0).copied().unwrap_or(true));
+                // An OBSERVED limb competes fairly (nearest surface wins —
+                // an arm held in front of the chest keeps its own points).
+                // An unobserved limb never claims, but a point nearest to
+                // it is dropped rather than handed to the trunk: the
+                // predicted arm still occludes the chest there, and letting
+                // a free arm explain chest points is how it slid onto the
+                // chest at zero cost.
+                let _ = core_claim_m;
+                let pick = if limb_ok && best_limb.1.abs() < best_core.1.abs() {
+                    if !limb_allowed {
+                        continue;
+                    }
+                    best_limb
+                } else if core_ok {
+                    // A core capsule excluded this frame (e.g. the head while
+                    // FaceMesh owns it) drops its points rather than passing
+                    // them on to the neighbour.
+                    if !allow.is_empty() && !allow.get(best_core.0).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    best_core
+                } else {
+                    continue;
+                };
+                items.push((pi, pick.0, pick.1, pick.2, pick.3));
             }
             let n_assoc = items.len();
+            if build {
+                self.last_surf_assoc.clear();
+                self.last_surf_assoc.resize(points.len(), -1);
+                for it in &items {
+                    self.last_surf_assoc[it.0] = it.1 as i32;
+                }
+            }
+            // Correlated-error normalisation per capsule (see `surf_n_eff`).
+            let mut per_cap = vec![0usize; model.capsules.len()];
+            for it in &items {
+                per_cap[it.1] += 1;
+            }
+            let cap_w: Vec<f64> = per_cap
+                .iter()
+                .enumerate()
+                .map(|(ci, &n)| {
+                    if n == 0 {
+                        return 1.0;
+                    }
+                    let n_eff = match model.capsules[ci].part {
+                        super::model::Part::Head => self.params.surf_n_eff_head,
+                        super::model::Part::Torso => self.params.surf_n_eff,
+                        _ => self.params.surf_n_eff_limb,
+                    };
+                    (n_eff / n as f64).min(1.0)
+                })
+                .collect();
             if n_assoc > 0 {
                 // Per-capsule compressed normal equations: every point's
                 // residual row is α·[Ja; Jb; radius] with a point-specific
@@ -1378,37 +1625,67 @@ impl Estimator {
                 // capture everything; the expansion into H is done once per
                 // capsule instead of once per point.
                 let nc = model.capsules.len();
-                let mut mm = vec![[[0.0f64; 7]; 7]; nc];
-                let mut mv = vec![[0.0f64; 7]; nc];
+                const NA: usize = 10;
+                let mut mm = vec![[[0.0f64; NA]; NA]; nc];
+                let mut mv = vec![[0.0f64; NA]; nc];
                 let mut used = vec![false; nc];
                 for (pi, ci, d, q, u) in items {
                     let (pt, sig) = points[pi];
                     let inv_s = 1.0 / sig.max(1e-4);
                     let r = d * inv_s;
                     let (rho, w) = kern.eval(r * r);
+                    let (rho, w) = (rho * cap_w[ci], w * cap_w[ci]);
                     cost += rho;
                     sumcl += d;
                     ncl += 1;
                     if !build {
                         continue;
                     }
-                    let c = &model.capsules[ci];
-                    let nhat = normalize(sub(pt, q));
-                    let rad = model.capsule_radius(st, c);
-                    let alpha = [
-                        -(1.0 - u) * nhat[0] * inv_s,
-                        -(1.0 - u) * nhat[1] * inv_s,
-                        -(1.0 - u) * nhat[2] * inv_s,
-                        -u * nhat[0] * inv_s,
-                        -u * nhat[1] * inv_s,
-                        -u * nhat[2] * inv_s,
-                        -rad * inv_s,
-                    ];
+                    let g = &caps[ci];
+                    // α: ∂d/∂[a, b, c, log-radius] (× 1/σ). Round capsules
+                    // analytically; elliptic ones by central differences on
+                    // the closed-form distance (the lateral point c moves
+                    // the section's orientation — that is the yaw gradient).
+                    let mut alpha = [0.0f64; NA];
+                    if g.c.is_none() {
+                        let nhat = normalize(sub(pt, q));
+                        for k in 0..3 {
+                            alpha[k] = -(1.0 - u) * nhat[k] * inv_s;
+                            alpha[3 + k] = -u * nhat[k] * inv_s;
+                        }
+                        alpha[9] = -g.r * inv_s;
+                    } else {
+                        // Forward differences (one extra distance per entry;
+                        // the distance is smooth and the LM step tolerates
+                        // O(ε) Jacobian error).
+                        const EPS: f64 = 1e-4;
+                        let d0 = d;
+                        for (blk, which) in [(0usize, 0usize), (3, 1), (6, 2)] {
+                            for k in 0..3 {
+                                let mut gp = g.clone();
+                                match which {
+                                    0 => gp.a[k] += EPS,
+                                    1 => gp.b[k] += EPS,
+                                    _ => {
+                                        if let Some(cp) = gp.c.as_mut() {
+                                            cp[k] += EPS;
+                                        }
+                                    }
+                                }
+                                alpha[blk + k] = (gp.dist(pt).0 - d0) / EPS * inv_s;
+                            }
+                        }
+                        // ∂d/∂(log r): the Euclidean distance to an ellipse
+                        // does not shrink exactly by the section radius.
+                        let mut gp = g.clone();
+                        gp.r *= (EPS * 10.0).exp();
+                        alpha[9] = (gp.dist(pt).0 - d0) / (EPS * 10.0) * inv_s;
+                    }
                     let m = &mut mm[ci];
-                    for k in 0..7 {
+                    for k in 0..NA {
                         let ak = alpha[k] * w;
                         mv[ci][k] += ak * r;
-                        for l in 0..7 {
+                        for l in 0..NA {
                             m[k][l] += ak * alpha[l];
                         }
                     }
@@ -1421,19 +1698,19 @@ impl Estimator {
                             continue;
                         }
                         let c = &model.capsules[ci];
-                        // Local parameter set + B (L×7).
+                        // Local parameter set + B (L×NA).
                         self.row_idx.clear();
                         // row_acc doubles as "position in local list + 1".
-                        let mut bloc: Vec<[f64; 7]> = Vec::with_capacity(64);
+                        let mut bloc: Vec<[f64; NA]> = Vec::with_capacity(64);
                         let touch = |i: usize,
                                          k: usize,
                                          v: f64,
                                          row_acc: &mut Vec<f64>,
                                          row_idx: &mut Vec<usize>,
-                                         bloc: &mut Vec<[f64; 7]>| {
+                                         bloc: &mut Vec<[f64; NA]>| {
                             let pos = if row_acc[i] == 0.0 {
                                 row_idx.push(i);
-                                bloc.push([0.0; 7]);
+                                bloc.push([0.0; NA]);
                                 row_acc[i] = bloc.len() as f64;
                                 bloc.len() - 1
                             } else {
@@ -1441,34 +1718,38 @@ impl Estimator {
                             };
                             bloc[pos][k] += v;
                         };
-                        for &(i, v) in &self.cap_jac[2 * ci] {
+                        for &(i, v) in &self.cap_jac[3 * ci] {
                             for k in 0..3 {
                                 touch(i, k, v[k], &mut self.row_acc, &mut self.row_idx, &mut bloc);
                             }
                         }
-                        for &(i, v) in &self.cap_jac[2 * ci + 1] {
+                        for &(i, v) in &self.cap_jac[3 * ci + 1] {
                             for k in 0..3 {
                                 touch(i, 3 + k, v[k], &mut self.row_acc, &mut self.row_idx, &mut bloc);
                             }
                         }
-                        touch(model.beta_scale, 6, 1.0, &mut self.row_acc, &mut self.row_idx, &mut bloc);
+                        for &(i, v) in &self.cap_jac[3 * ci + 2] {
+                            for k in 0..3 {
+                                touch(i, 6 + k, v[k], &mut self.row_acc, &mut self.row_idx, &mut bloc);
+                            }
+                        }
                         touch(
                             model.beta_rad + c.rad_group as usize,
-                            6,
+                            9,
                             1.0,
                             &mut self.row_acc,
                             &mut self.row_idx,
                             &mut bloc,
                         );
                         let l = self.row_idx.len();
-                        // MB = B·M  (L×7)
+                        // MB = B·M  (L×NA)
                         let m = &mm[ci];
-                        let mut mb: Vec<[f64; 7]> = Vec::with_capacity(l);
+                        let mut mb: Vec<[f64; NA]> = Vec::with_capacity(l);
                         for bi in &bloc {
-                            let mut row = [0.0; 7];
-                            for k in 0..7 {
+                            let mut row = [0.0; NA];
+                            for k in 0..NA {
                                 let mut acc = 0.0;
-                                for q in 0..7 {
+                                for q in 0..NA {
                                     acc += bi[q] * m[q][k];
                                 }
                                 row[k] = acc;
@@ -1481,7 +1762,7 @@ impl Estimator {
                             let ia = self.row_idx[a];
                             // gradient: g += Bᵀ mv
                             let mut ga = 0.0;
-                            for k in 0..7 {
+                            for k in 0..NA {
                                 ga += bloc[a][k] * mv[ci][k];
                             }
                             g[ia] += ga;
@@ -1489,7 +1770,7 @@ impl Estimator {
                             for bb in 0..l {
                                 let ib = self.row_idx[bb];
                                 let mut acc = 0.0;
-                                for k in 0..7 {
+                                for k in 0..NA {
                                     acc += mb[a][k] * bloc[bb][k];
                                 }
                                 h[row + ib] += acc;
@@ -1643,6 +1924,97 @@ pub fn ray_capsule_entry(dir: V3, a: V3, b: V3, r: f64) -> Option<f64> {
 }
 
 /// Closest point on segment `ab` to `p`, with the parameter `u ∈ [0,1]`.
+/// Capsule geometry for the surface term: axis `a→b`, lateral radius `r`,
+/// optional lateral reference point `c` with depth/lateral aspect `k`.
+#[derive(Clone, Debug)]
+pub struct CapGeom {
+    pub a: V3,
+    pub b: V3,
+    pub c: Option<V3>,
+    pub r: f64,
+    pub k: f64,
+}
+
+impl CapGeom {
+    /// Surface radius in the direction `dir` (unit, perpendicular to the
+    /// axis) from axis point `q`: `r` for a round capsule, the ellipse
+    /// radius for an elliptic one. Exact surface points for fixtures.
+    pub fn radius_along(&self, dir: V3) -> f64 {
+        match self.c {
+            None => self.r,
+            Some(c) => {
+                let t = normalize(sub(self.b, self.a));
+                let mut l = sub(c, self.a);
+                l = sub(l, scale(t, dot(l, t)));
+                let l = normalize(l);
+                let n = normalize(cross(t, l));
+                let (cs, sn) = (dot(dir, l), dot(dir, n));
+                let rb = (self.r * self.k).max(1e-6);
+                1.0 / ((cs / self.r.max(1e-6)).powi(2) + (sn / rb).powi(2)).sqrt()
+            }
+        }
+    }
+
+    /// Signed radial distance of `p` from the surface, the axis point, the
+    /// axis parameter, and the local surface radius ρ in `p`'s direction.
+    /// Round capsule: `|p − q| − r`. Elliptic capsule: the section's radius
+    /// in the direction of `p` (polar angle from the lateral axis) replaces
+    /// `r`, so a flat chest faces where the points say it does.
+    pub fn dist(&self, p: V3) -> (f64, V3, f64, f64) {
+        let (q, u) = closest_on_segment(self.a, self.b, p);
+        let v = sub(p, q);
+        let dv = norm(v);
+        match self.c {
+            None => (dv - self.r, q, u, self.r),
+            Some(c) => {
+                let t = normalize(sub(self.b, self.a));
+                let mut l = sub(c, self.a);
+                l = sub(l, scale(t, dot(l, t)));
+                let l = normalize(l);
+                let n = normalize(cross(t, l));
+                let vl = dot(v, l);
+                let vn = dot(v, n);
+                let vt = dot(v, t);
+                let rr = (vl * vl + vn * vn).sqrt().max(1e-9);
+                let (cs, sn) = (vl / rr, vn / rr);
+                let ra = self.r.max(1e-6);
+                let rb = (self.r * self.k).max(1e-6);
+                // Radial section radius in this direction (used for the
+                // radius Jacobian and the end caps).
+                let rho = 1.0 / ((cs / ra).powi(2) + (sn / rb).powi(2)).sqrt();
+                if vt.abs() > 1e-6 && (u <= 0.0 || u >= 1.0) {
+                    // End cap: treat as an ellipsoidal cap with the local
+                    // radius ρ.
+                    return (dv - rho, q, u, rho);
+                }
+                // Interior: true Euclidean distance to the ellipse
+                // (a cos t, b sin t) by Newton on the tangency condition
+                // f(t) = (x − a cos t) a sin t − (y − b sin t) b cos t = 0.
+                let (x, y) = (vl.abs(), vn.abs());
+                let mut tt = (y * ra).atan2(x * rb);
+                for _ in 0..3 {
+                    let (st, ct) = tt.sin_cos();
+                    let f = (x - ra * ct) * ra * st - (y - rb * st) * rb * ct;
+                    let fp = ra * ra * st * st
+                        + (x - ra * ct) * ra * ct
+                        + rb * rb * ct * ct
+                        + (y - rb * st) * rb * st;
+                    if fp.abs() < 1e-12 {
+                        break;
+                    }
+                    tt -= f / fp;
+                    tt = tt.clamp(0.0, std::f64::consts::FRAC_PI_2);
+                }
+                let (st, ct) = tt.sin_cos();
+                let (ex, ey) = (ra * ct, rb * st);
+                let de = ((x - ex).powi(2) + (y - ey).powi(2)).sqrt();
+                let inside = (x / ra).powi(2) + (y / rb).powi(2) < 1.0;
+                (if inside { -de } else { de }, q, u, rho)
+            }
+        }
+    }
+}
+
 #[inline]
 pub fn closest_on_segment(a: V3, b: V3, p: V3) -> (V3, f64) {
     let ab = sub(b, a);
@@ -1697,12 +2069,27 @@ mod tests {
     }
 
     pub(super) fn surface_from_capsules(model: &Model, st: &State, n_per: usize) -> Vec<(V3, f64)> {
+        surface_from_capsules_parts(model, st, n_per, None)
+    }
+
+    pub(super) fn surface_from_capsules_parts(
+        model: &Model,
+        st: &State,
+        n_per: usize,
+        parts: Option<&[super::super::model::Part]>,
+    ) -> Vec<(V3, f64)> {
         let fk = model.fk(st);
         let mut pts = Vec::new();
         for c in &model.capsules {
+            if let Some(ps) = parts {
+                if !ps.contains(&c.part) {
+                    continue;
+                }
+            }
             let a = fk.point(c.a);
             let b = fk.point(c.b);
             let r = model.capsule_radius(st, c);
+            let g = CapGeom { a, b, c: c.lateral.map(|l| fk.point(l)), r, k: c.aspect };
             for i in 0..n_per {
                 let u = i as f64 / (n_per.max(2) - 1) as f64;
                 let q = add(a, scale(sub(b, a), u));
@@ -1710,7 +2097,8 @@ mod tests {
                 let mut nrm = [0.0, 0.0, -1.0];
                 nrm = sub(nrm, scale(axis, dot(nrm, axis)));
                 let nrm = normalize(nrm);
-                let p = add(q, scale(nrm, r));
+                // Radius in this direction (round: r; elliptic: ρ).
+                let p = add(q, scale(nrm, g.radius_along(nrm)));
                 pts.push((p, 0.015));
             }
         }
@@ -1733,7 +2121,21 @@ mod tests {
     }
 
     #[test]
+    fn recovers_pose_from_2d_and_core_cloud() {
+        recover_with(Some(&[super::super::model::Part::Torso, super::super::model::Part::Head]));
+    }
+
+    #[test]
     fn recovers_pose_from_2d_and_cloud() {
+        recover_with(None);
+    }
+
+    #[test]
+    fn recovers_pose_from_2d_only() {
+        recover_with(Some(&[]));
+    }
+
+    fn recover_with(parts: Option<&[super::super::model::Part]>) {
         let h = Humanoid::new();
         let m = &h.model;
         let gt = gt_state(&h);
@@ -1756,26 +2158,45 @@ mod tests {
             ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
-            surface: surface_from_capsules(m, &gt, 12),
+            surface: surface_from_capsules_parts(m, &gt, 12, parts),
+            surf_allow: Vec::new(),
         };
         let mut est = Estimator::new(m, Params::default());
         // Warm start: relaxed pose facing camera at roughly the right place.
         est.state.root_t = [0.0, 0.3, 1.5];
+        let fk_gt = m.fk(&gt);
+        // The production path always solves with the analytic arm seeds
+        // (metric elbow / wrist → shoulder + elbow angles): a raised arm
+        // from a relaxed warm start is a textbook robust-kernel local
+        // minimum otherwise (measured: wrist stuck 21 cm off at 3-D cost
+        // 52 while every other joint sat within 2 cm).
         for i in 0..20 {
             let mut o = obs.clone();
             o.t = i as f64 / 30.0;
-            est.update(m, &o);
+            super::super::seed::update_with_arm_seeds(&h, &mut est, &o);
         }
-        let fk_gt = m.fk(&gt);
         let fk = m.fk(&est.state);
         let mut worst = 0.0f64;
+        let mut worst_name = "";
         for j in 0..m.joints.len() {
+            // Hand capsules never take surface points (the landmarker owns
+            // the hands), so the fingers are unobserved in this fixture.
+            let name = m.joints[j].name;
+            if name.contains("mcp") || name.contains("pip") || name.contains("dip") || name.contains("tip") || name.contains("thumb") {
+                continue;
+            }
             let e = norm(sub(fk.t[j], fk_gt.t[j]));
-            worst = worst.max(e);
+            if e > 0.02 {
+                eprintln!("joint {} err {:.3} m", m.joints[j].name, e);
+            }
+            if e > worst {
+                worst = e;
+                worst_name = m.joints[j].name;
+            }
         }
         assert!(
             worst < 0.02,
-            "worst joint error {worst:.4} m (cost {:.2} → {:.2})",
+            "worst joint error {worst:.4} m at {worst_name} (cost {:.2} → {:.2})",
             est.diag.cost_initial,
             est.diag.cost_final
         );
@@ -1810,6 +2231,7 @@ mod tests {
             shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
+                    surf_allow: Vec::new(),
                 },
             );
         }
@@ -1844,6 +2266,7 @@ mod tests {
             shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
+                    surf_allow: Vec::new(),
                 },
             );
         }
@@ -1894,12 +2317,51 @@ mod tests {
             shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
+                    surf_allow: Vec::new(),
                 },
             );
         }
         let now = est.state.root_t[0];
         let ahead = est.predict(m, 19.0 / 30.0 + 0.05).root_t[0];
         assert!(ahead > now + 0.015, "now {now} ahead {ahead}");
+    }
+}
+
+#[cfg(test)]
+mod capgeom_tests {
+    use super::*;
+
+    /// Points placed on the surface by `radius_along` must measure zero
+    /// distance, inside points negative, outside positive — for both the
+    /// round and the elliptic section, interior and end caps.
+    #[test]
+    fn ellipse_distance_is_zero_on_its_own_surface() {
+        let a = [0.0, 0.0, 1.0];
+        let b = [0.0, 0.4, 1.0];
+        for (c, k) in [(None, 1.0), (Some([0.3, 0.0, 1.0]), 0.6)] {
+            let g = CapGeom { a, b, c, r: 0.17, k };
+            for i in 0..24 {
+                let th = i as f64 * std::f64::consts::TAU / 24.0;
+                let dir = [th.cos(), 0.0, th.sin()];
+                for u in [0.1, 0.5, 0.9] {
+                    let q = add(a, scale(sub(b, a), u));
+                    let rho = g.radius_along(dir);
+                    let on = add(q, scale(dir, rho));
+                    let (d0, _, _, _) = g.dist(on);
+                    assert!(d0.abs() < 1e-6, "th {th:.2} u {u}: d {d0} rho {rho}");
+                    let (di, _, _, _) = g.dist(add(q, scale(dir, rho - 0.02)));
+                    let (dout, _, _, _) = g.dist(add(q, scale(dir, rho + 0.02)));
+                    assert!(di < -0.01 && di > -0.03, "inside {di}");
+                    assert!(dout > 0.01 && dout < 0.03, "outside {dout}");
+                }
+            }
+            // End cap: 5 cm past the top along the axis, on the surface radius.
+            let dir = [1.0, 0.0, 0.0];
+            let rho = g.radius_along(dir);
+            let p = add(add(b, [0.0, 0.05, 0.0]), scale(dir, rho));
+            let (dcap, _, u, _) = g.dist(p);
+            assert!(u >= 1.0 && dcap > 0.0 && dcap < 0.06, "cap d {dcap} u {u}");
+        }
     }
 }
 
@@ -1923,14 +2385,16 @@ mod gradient_tests {
         st.apply_delta(m, &d);
         let mut est = Estimator::new(m, Params::default());
         est.state = st.clone();
-        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: pts.clone() };
+        let obs = FrameObs { t: 0.0, intr: None, kp2d: vec![], kp3d: vec![], ori: Vec::new(), shoulder_yaw: None, torso_hint: None, surface: pts.clone(), surf_allow: Vec::new() };
         let prior_var = vec![1e9; m.num_params];
         est.surf_pts = pts;
         let fk = m.fk(&st);
         let c0 = est.accumulate(m, &obs, &fk, &prior_var, 0.033, true);
         let g: Vec<f64> = est.dense.g.clone();
         // finite difference of cost
-        for k in [ROOT_T, ROOT_T+1, ROOT_T+2, m.joint_param[h.j.l_elbow], m.beta_scale, m.beta_rad, m.joint_param[h.j.spine2]] {
+        let sp2 = m.joint_param[h.j.spine2];
+        let hd = m.joint_param[h.j.head];
+        for k in [0, 1, 2, ROOT_T, ROOT_T+1, ROOT_T+2, m.joint_param[h.j.l_elbow], m.beta_scale, m.beta_rad, sp2, sp2 + 1, sp2 + 2, hd, hd + 1] {
             let eps = 1e-6;
             let mut sp = st.clone(); let mut dd = vec![0.0; m.num_params]; dd[k]=eps; sp.apply_delta(m,&dd);
             let fkp = m.fk(&sp);

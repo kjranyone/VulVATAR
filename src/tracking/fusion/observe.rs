@@ -107,14 +107,43 @@ pub struct KpSigma {
 
 impl Default for KpSigma {
     fn default() -> Self {
+        // `score` is the calibrated visibility probability (≈ 0.99 for a
+        // sharp peak) since the visibility layer landed. Under the old
+        // sigmoid peak height (≈ 0.71 for the same joints) the inflation
+        // term contributed a constant ×1.87 that the whole 2-D/3-D/prior
+        // balance was tuned against; that gain now lives in `simcc_gain`
+        // and `floor_px` so a confident joint keeps the same σ, while
+        // `score_inflate` acts on genuine uncertainty (p_vis 0.5–0.9).
         Self {
-            floor_px: 1.5,
-            simcc_gain: 1.0,
+            floor_px: 2.8,
+            simcc_gain: 1.9,
             min_score: 0.2,
             score_inflate: 3.0,
             border_frac: 0.02,
         }
     }
+}
+
+/// Constant part of the old score-driven σ inflation `1 + (1 − score)`
+/// under the detector's sigmoid peak height (≈ 0.71 for a sharp peak):
+/// the depth-lift and surface terms were tuned against ×1.3. `score` is
+/// now the calibrated visibility probability (≈ 0.99 for the same joints),
+/// so the constant is applied explicitly and the score term only acts on
+/// genuine uncertainty. See `KpSigma::default` for the 2-D counterpart.
+pub const SCORE_INFLATE_BASE_3D_DEFAULT: f64 = 1.3;
+
+/// `SCORE_INFLATE_BASE_3D_DEFAULT`, or 1.0 under `VULVATAR_FUSION_OLDSIGMA`
+/// (ablation bench only; read once).
+#[allow(non_snake_case)]
+pub fn SCORE_INFLATE_BASE_3D() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if std::env::var_os("VULVATAR_FUSION_OLDSIGMA").is_some() {
+            1.0
+        } else {
+            SCORE_INFLATE_BASE_3D_DEFAULT
+        }
+    })
 }
 
 /// Body 2-D observations from the 133 keypoints. `hand_scale` inflates
@@ -249,7 +278,7 @@ pub fn body_kp3d(
         }
         let p_joint = scale(p, (n + off) / n);
         // Low detector score → the pixel may not be on the joint at all.
-        let s = sigma * (1.0 + 1.0 * (1.0 - kp.score as f64));
+        let s = sigma * SCORE_INFLATE_BASE_3D() * (1.0 + 1.0 * (1.0 - kp.score as f64));
         out.push(Kp3d {
             point: *point,
             p: p_joint,
@@ -320,6 +349,7 @@ pub fn body_torso_leg_depth(
         let mut occluded = false;
         for c in &model.capsules {
             // Skip the joint's own limb capsules (their surface IS the skin).
+            // (Elliptic trunk: the depth semi-axis is the relevant extent.)
             let own = match (c.a, c.b) {
                 (PointRef::Joint(a), _) if a == jw => true,
                 (_, PointRef::Joint(b)) if b == jw => true,
@@ -340,13 +370,13 @@ pub fn body_torso_leg_depth(
             }
         }
         if occluded || (p[2] as f64) < joint_depth - 0.20 {
-            out_surface.push((p, 0.015 * (1.0 + (1.0 - kp.score as f64))));
+            out_surface.push((p, 0.015 * SCORE_INFLATE_BASE_3D() * (1.0 + (1.0 - kp.score as f64))));
         } else {
             let p_joint = scale(p, (n + off) / n);
             out3d.push(Kp3d {
                 point: *point,
                 p: p_joint,
-                sigma: sigma * (1.0 + (1.0 - kp.score as f64)),
+                sigma: sigma * SCORE_INFLATE_BASE_3D() * (1.0 + (1.0 - kp.score as f64)),
                 lat_scale: 1.0,
             });
         }

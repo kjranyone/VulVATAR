@@ -36,17 +36,29 @@ use crate::tracking::rtmw3d::DecodedJoint;
 pub struct VisPolicy {
     pub w: [f64; 6],
     pub bias: f64,
-    /// Below this probability the keypoint is dropped outright.
+    /// Presence threshold: below this the keypoint does not count as
+    /// evidence that a body part is there (self-track bbox, silhouette
+    /// seeds, hand-crop seeding).
     pub min_p: f32,
+    /// Observation threshold: below this the keypoint is not used as a
+    /// residual at all. Kept separate from `min_p` so a softer policy
+    /// (uncertain keypoints entering at inflated σ) can be benched;
+    /// 0.15 was measured worse than 0.5 over 23 recordings (torso yaw
+    /// std sum 128 vs 114, wrist snaps 152 vs 134), so both are 0.5.
+    pub min_p_obs: f32,
 }
 
 impl Default for VisPolicy {
     fn default() -> Self {
         Self {
-            // Placeholder until the calibration run lands (see analyze_vis.py).
-            w: [6.2, 0.0, -13.0, -0.56, 0.57, -3.7],
-            bias: -17.3,
+            // Full fit 2026-09-11 (analyze_vis.py): 125 984 labelled
+            // keypoints, 23 recordings. Session-split validation AUC 0.985
+            // (peak height alone 0.928); at 0.5: face / shoulder positives
+            // kept 99.9 %, out-of-frame legs rejected 98.8 %.
+            w: [49.8919, 9.6979, -11.0647, -3.5774, -26.6312, 3.5178],
+            bias: 5.5525,
             min_p: 0.5,
+            min_p_obs: 0.5,
         }
     }
 }
@@ -89,6 +101,24 @@ pub struct SilhouetteParams {
     /// as on the person (joint centres sit inside the body; the detector
     /// jitters a few pixels).
     pub max_dist_m: f64,
+    /// Same tolerance for a keypoint whose pixel has NO depth (a hole):
+    /// a hole is absence of information, not evidence of absence — near
+    /// hands lose depth constantly and cut holes into the shoulder they
+    /// cover (measured: a shoulder 0.09–0.10 m from the outline, on a
+    /// hole, dropped in 6 % of frames → one-shoulder torso yaw flips).
+    pub max_dist_hole_m: f64,
+    /// Minimum visible silhouette height (m, crown to lowest visible row)
+    /// for the hips to be inside the frame at all. Adult crown-to-hip is
+    /// ≈ 0.8 m; below this the whole leg chain is out of frame by
+    /// construction (desk sessions measure 0.25–0.53 m).
+    pub min_height_for_legs_m: f64,
+    /// Area range (m²) of a depth-continuous blob inside the person band
+    /// that is NOT connected to the main silhouette but still counts as
+    /// the person's limb: a hand or hand + forearm entering from outside
+    /// the frame, or held in front of the chest (the depth step to the
+    /// torso breaks continuity). A hand is ≈ 0.01–0.02 m², hand + forearm
+    /// ≈ 0.04; a desk plane or chair back is ≫ 0.1.
+    pub limb_blob_area_m2: (f64, f64),
 }
 
 impl Default for SilhouetteParams {
@@ -98,20 +128,41 @@ impl Default for SilhouetteParams {
             z_back: 0.45,
             grad_per_m: 0.03,
             max_dist_m: 0.06,
+            max_dist_hole_m: 0.20,
+            min_height_for_legs_m: 0.65,
+            limb_blob_area_m2: (0.003, 0.08),
         }
     }
 }
 
 /// The person's outline in the depth frame plus a chamfer distance field.
+/// Built on a `scale`-times decimated grid (2 at 640x480): the outline
+/// needs centimetre, not pixel, precision and the flood fill + distance
+/// transform on the full 307 k pixels cost ~20 ms in the dev build.
 #[derive(Clone, Debug)]
 pub struct Silhouette {
+    /// Decimation factor between the depth frame and the mask grid.
+    pub scale: u32,
+    /// Mask grid size (depth size / `scale`).
     pub width: u32,
     pub height: u32,
+    /// Depth frame size.
+    pub src_width: u32,
+    pub src_height: u32,
     /// 1 where the pixel belongs to the person surface.
     pub mask: Vec<u8>,
     /// Chamfer (3-4) distance to the nearest mask pixel, in thirds of a
     /// pixel; 0 inside the mask.
     dist3: Vec<u32>,
+    /// Candidate pixels (in band, depth-continuous) — the flood-fill
+    /// domain, kept for the limb-blob query.
+    cand: Vec<u8>,
+    /// Lazily assigned blob label per candidate pixel (0 = unlabelled,
+    /// 1 = main silhouette, ≥ 2 = detached blobs) and their pixel counts
+    /// (`usize::MAX` = overflowed the query's area limit).
+    blob: Vec<u32>,
+    blob_px: Vec<usize>,
+    fx: f64,
     /// Face reference depth (m).
     pub z_ref: f64,
     /// Pixels per metre at `z_ref`.
@@ -121,26 +172,157 @@ pub struct Silhouette {
     pub touches_bottom: bool,
     /// Approximate surface area (m²) at `z_ref`.
     pub area_m2: f64,
+    /// Visible height (m) of the surface: lowest minus highest mask row
+    /// at `z_ref`.
+    pub height_m: f64,
 }
 
 impl Silhouette {
     /// Metric distance (m) from pixel `(u, v)` to the outline (0 inside).
     /// Pixels outside the frame are clamped to the border.
     pub fn dist_m(&self, u: f64, v: f64) -> f64 {
-        let x = (u.round() as i64).clamp(0, self.width as i64 - 1) as usize;
-        let y = (v.round() as i64).clamp(0, self.height as i64 - 1) as usize;
+        let s = self.scale as f64;
+        let x = ((u / s).round() as i64).clamp(0, self.width as i64 - 1) as usize;
+        let y = ((v / s).round() as i64).clamp(0, self.height as i64 - 1) as usize;
         self.dist3[y * self.width as usize + x] as f64 / 3.0 / self.px_per_m
+    }
+
+    /// Mask grid index -> source-frame pixel index (top-left of the cell).
+    fn src_index(&self, i: usize) -> usize {
+        let (w, s) = (self.width as usize, self.scale as usize);
+        let (x, y) = (i % w, i / w);
+        (y * s) * self.src_width as usize + x * s
     }
 
     /// Whether pixel `(u, v)` is on the person (within `max_dist_m`).
     pub fn contains(&self, u: f64, v: f64, max_dist_m: f64) -> bool {
         self.dist_m(u, v) <= max_dist_m
     }
+
+    /// Dense surface samples of the person: every `stride`-th pixel of the
+    /// main silhouette (camera-space metres) with a D435-style range σ
+    /// (`0.004 + 0.001·z²` m). Pixels for which `skip(u, v)` is true (hand
+    /// crops) are left out. This is the primary metric observation of the
+    /// visible body: tens of thousands of surface points pin the trunk,
+    /// head and upper arms every frame, where a handful of 2-D keypoints
+    /// could not.
+    pub fn sample_points(
+        &self,
+        points: &[[f32; 3]],
+        stride: usize,
+        skip: &dyn Fn(f64, f64) -> bool,
+    ) -> Vec<([f64; 3], f64)> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let s = self.scale as usize;
+        // `stride` is in source pixels; walk the mask grid accordingly.
+        let stride = (stride / s).max(1);
+        let mut out = Vec::with_capacity(w * h / (stride * stride) / 3);
+        // Offset the grid by half a stride so the samples are not biased
+        // to the mask's top-left.
+        let off = stride / 2;
+        let mut y = off;
+        while y < h {
+            let mut x = off;
+            while x < w {
+                let i = y * w + x;
+                if self.mask[i] == 1 && !skip((x * s) as f64, (y * s) as f64) {
+                    let p = points[self.src_index(i)];
+                    let z = p[2] as f64;
+                    if z.is_finite() && z > 0.0 {
+                        let sigma = 0.004 + 0.001 * z * z;
+                        out.push(([p[0] as f64, p[1] as f64, z], sigma));
+                    }
+                }
+                x += stride;
+            }
+            y += stride;
+        }
+        out
+    }
+
+    /// Area (m², at the blob's own depth) of the in-band depth-continuous
+    /// blob under pixel `(u, v)` (nearest candidate pixel within 4 px), or
+    /// `None` when there is no in-band depth there. The main silhouette
+    /// reports its own area. Fills stop at `max_area_m2`: a larger blob
+    /// reports `f64::INFINITY`.
+    pub fn blob_area_m2(&mut self, points: &[[f32; 3]], u: f64, v: f64, max_area_m2: f64) -> Option<f64> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let s = self.scale as f64;
+        let (cu, cv) = ((u / s).round() as i64, (v / s).round() as i64);
+        let mut start = None;
+        'outer: for r in 0..=2i64 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
+                    let (x, y) = (cu + dx, cv + dy);
+                    if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                        continue;
+                    }
+                    let i = y as usize * w + x as usize;
+                    if self.cand[i] == 1 {
+                        start = Some(i);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let start = start?;
+        let z_blob = points[self.src_index(start)][2] as f64;
+        let px_per_m = self.fx / z_blob.max(0.1) / self.scale as f64;
+        let px2 = px_per_m * px_per_m;
+        let max_px = (max_area_m2 * px2).ceil() as usize;
+        if self.blob[start] != 0 {
+            let n = self.blob_px[self.blob[start] as usize];
+            return Some(if n == usize::MAX { f64::INFINITY } else { n as f64 / px2 });
+        }
+        let label = self.blob_px.len() as u32;
+        let mut queue: Vec<usize> = vec![start];
+        self.blob[start] = label;
+        let mut head = 0;
+        let mut overflow = false;
+        while head < queue.len() {
+            if queue.len() > max_px {
+                overflow = true;
+                break;
+            }
+            let i = queue[head];
+            head += 1;
+            let (x, y) = (i % w, i / w);
+            let mut nb = [usize::MAX; 4];
+            if x > 0 {
+                nb[0] = i - 1;
+            }
+            if x + 1 < w {
+                nb[1] = i + 1;
+            }
+            if y > 0 {
+                nb[2] = i - w;
+            }
+            if y + 1 < h {
+                nb[3] = i + w;
+            }
+            for j in nb {
+                if j != usize::MAX && self.cand[j] == 1 && self.blob[j] == 0 {
+                    self.blob[j] = label;
+                    queue.push(j);
+                }
+            }
+        }
+        if overflow {
+            self.blob_px.push(usize::MAX);
+            Some(f64::INFINITY)
+        } else {
+            self.blob_px.push(queue.len());
+            Some(queue.len() as f64 / px2)
+        }
+    }
 }
 
 /// Median of the valid depths in a `(2r+1)²` window; `None` if fewer than
 /// three valid pixels.
-fn window_median_z(points: &[[f32; 3]], w: usize, h: usize, u: i64, v: i64, r: i64) -> Option<f64> {
+pub fn window_median_z(points: &[[f32; 3]], w: usize, h: usize, u: i64, v: i64, r: i64) -> Option<f64> {
     let mut zs: Vec<f32> = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
     for dy in -r..=r {
         let y = v + dy;
@@ -176,23 +358,32 @@ pub fn build_silhouette(
     seeds: &[(f64, f64)],
     p: &SilhouetteParams,
 ) -> Option<Silhouette> {
-    let (w, h) = (width as usize, height as usize);
-    if points.len() != w * h || w == 0 || h == 0 {
+    let (sw, sh) = (width as usize, height as usize);
+    if points.len() != sw * sh || sw == 0 || sh == 0 {
         return None;
     }
-    // Reference depth: median over the seeds' local medians.
+    let scale: usize = if sw >= 1000 { 3 } else { 2 };
+    let (w, h) = (sw / scale, sh / scale);
+    // Reference depth: median over the seeds' local medians (source res).
     let mut refs: Vec<f64> = Vec::with_capacity(seeds.len());
     let mut seed_px: Vec<(usize, usize)> = Vec::with_capacity(seeds.len());
     for &(u, v) in seeds {
         let (ui, vi) = (u.round() as i64, v.round() as i64);
-        if ui < 0 || vi < 0 || ui >= w as i64 || vi >= h as i64 {
+        if ui < 0 || vi < 0 || ui >= sw as i64 || vi >= sh as i64 {
             continue;
         }
-        if let Some(z) = window_median_z(points, w, h, ui, vi, 2) {
+        if let Some(z) = window_median_z(points, sw, sh, ui, vi, 2) {
             refs.push(z);
-            seed_px.push((ui as usize, vi as usize));
+            seed_px.push((ui as usize / scale, vi as usize / scale));
         }
     }
+    // Decimated depth: one sample per cell (top-left pixel).
+    let zs: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            points[(y * scale) * sw + x * scale][2]
+        })
+        .collect();
     if refs.is_empty() {
         return None;
     }
@@ -202,24 +393,26 @@ pub fn build_silhouette(
     let z_hi = (z_ref + p.z_back) as f32;
     let step = (p.grad_per_m * z_ref.max(0.3)) as f32;
 
-    // Candidate pixels: in band and depth-continuous with left / up.
+    // Candidate cells: in band and depth-continuous with left / up. The
+    // step is per source pixel; across a `scale`-cell it scales up.
+    let step = step * scale as f32;
     let mut cand = vec![0u8; w * h];
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
-            let z = points[i][2];
+            let z = zs[i];
             if !(z.is_finite() && z > z_lo && z < z_hi) {
                 continue;
             }
             let mut ok = true;
             if x > 0 {
-                let zl = points[i - 1][2];
+                let zl = zs[i - 1];
                 if zl.is_finite() && zl > 0.0 && (z - zl).abs() >= step {
                     ok = false;
                 }
             }
             if ok && y > 0 {
-                let zu = points[i - w][2];
+                let zu = zs[i - w];
                 if zu.is_finite() && zu > 0.0 && (z - zu).abs() >= step {
                     ok = false;
                 }
@@ -284,9 +477,17 @@ pub fn build_silhouette(
         }
     }
     let n_mask = queue.len();
-    let touches_bottom = mask[(h - 3) * w..].iter().any(|&m| m == 1);
-    let px_per_m = fx / z_ref;
+    let touches_bottom = mask[(h - 2) * w..].iter().any(|&m| m == 1);
+    // Pixels per metre on the MASK grid.
+    let px_per_m = fx / z_ref / scale as f64;
     let area_m2 = n_mask as f64 / (px_per_m * px_per_m);
+    let (mut top, mut bottom) = (usize::MAX, 0usize);
+    for &i in &queue {
+        let y = i / w;
+        top = top.min(y);
+        bottom = bottom.max(y);
+    }
+    let height_m = (bottom - top) as f64 / px_per_m;
 
     // Chamfer 3-4 distance transform (two passes).
     const INF: u32 = u32::MAX / 4;
@@ -335,15 +536,28 @@ pub fn build_silhouette(
             d[i] = best;
         }
     }
+    // Blob labels: the main silhouette is label 1 (already filled).
+    let mut blob = vec![0u32; w * h];
+    for &i in &queue {
+        blob[i] = 1;
+    }
     Some(Silhouette {
-        width,
-        height,
+        scale: scale as u32,
+        width: w as u32,
+        height: h as u32,
+        src_width: width,
+        src_height: height,
         mask,
         dist3: d,
+        cand,
+        blob,
+        blob_px: vec![0, n_mask],
+        fx,
         z_ref,
         px_per_m,
         touches_bottom,
         area_m2,
+        height_m,
     })
 }
 
@@ -396,6 +610,47 @@ mod tests {
         assert!(!s.contains(10.0, 110.0, 0.06));
         // Area: 60×100 px at 500 px/m → 0.024 m² (minus the hole strip).
         assert!((s.area_m2 - 0.024).abs() < 0.002, "area {}", s.area_m2);
+        // 100 px tall at 500 px/m.
+        assert!((s.height_m - 0.2).abs() < 0.01, "height {}", s.height_m);
+    }
+
+    #[test]
+    fn detached_hand_blob_is_accepted_but_a_desk_plane_is_not() {
+        let (mut pts, w, h) = scene();
+        let fx = 300.0f32;
+        let wu = w as usize;
+        // A "hand" at 0.45 m (in band, in front of the chest) detached
+        // from the person: 30×40 px at 667 px/m → 0.0027 m².
+        for y in 40..80 {
+            for x in 110..140 {
+                let z = 0.45f32;
+                pts[y * wu + x] = [(x as f32 - 80.0) / fx * z, (y as f32 - 60.0) / fx * z, z];
+            }
+        }
+        // A "desk" plane at 0.7 m across the whole bottom: y 100..120.
+        for y in 100..120 {
+            for x in 0..wu {
+                let z = 0.7f32;
+                pts[y * wu + x] = [(x as f32 - 80.0) / fx * z, (y as f32 - 60.0) / fx * z, z];
+            }
+        }
+        // The synthetic scene is tiny (160×120 px): scale the limb range
+        // so the 0.0027 m² hand passes and the 0.0175 m² desk overflows.
+        let p = SilhouetteParams { limb_blob_area_m2: (0.002, 0.01), ..Default::default() };
+        let mut s = build_silhouette(&pts, w, h, 300.0, &[(70.0, 40.0)], &p).unwrap();
+        assert!(!s.contains(125.0, 60.0, 0.03));
+        let a = s.blob_area_m2(&pts, 125.0, 60.0, p.limb_blob_area_m2.1).unwrap();
+        assert!(a > 0.002 && a < 0.004, "hand blob {a}");
+        // Same blob queried again: cached, same answer.
+        assert_eq!(s.blob_area_m2(&pts, 130.0, 70.0, p.limb_blob_area_m2.1).unwrap(), a);
+        // Desk: overflows the limit.
+        let d = s.blob_area_m2(&pts, 20.0, 110.0, p.limb_blob_area_m2.1).unwrap();
+        assert!(d.is_infinite(), "desk {d}");
+        // Main silhouette reports its own area.
+        let m = s.blob_area_m2(&pts, 70.0, 80.0, 1.0).unwrap();
+        assert!((m - s.area_m2).abs() < 1e-6);
+        // Wall (out of band): no blob.
+        assert!(s.blob_area_m2(&pts, 20.0, 30.0, 1.0).is_none());
     }
 
     #[test]

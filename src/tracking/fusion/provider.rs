@@ -19,7 +19,7 @@ use super::math::*;
 use super::model::*;
 use super::observe::*;
 use super::output;
-use super::visibility::{build_silhouette, SilhouetteParams, VisPolicy};
+use super::visibility::{build_silhouette, window_median_z, SilhouetteParams, VisPolicy};
 
 
 pub struct FusionProvider {
@@ -88,11 +88,21 @@ pub struct FusionProvider {
     pub vis_policy: VisPolicy,
     /// Depth silhouette parameters.
     pub sil_params: SilhouetteParams,
-    /// Diagnostics: per keypoint `(p_vis, distance to silhouette m)` of
-    /// the last frame (distance NaN without a silhouette).
+    /// Diagnostics: per keypoint `(SimCC p_vis before the silhouette test,
+    /// distance to silhouette m)` of the last frame (distance NaN without
+    /// a silhouette). The final verdict is the keypoint's `score`.
     pub last_vis: Vec<(f32, f32)>,
-    /// Diagnostics: last silhouette `(z_ref m, touches bottom, area m²)`.
+    /// Diagnostics: last silhouette `(z_ref m, touches bottom, visible height m)`.
     pub last_silhouette: Option<(f64, bool, f64)>,
+    /// Frames since the detector last showed ≥ 2 visible face keypoints
+    /// (`u32::MAX` before the first).
+    frames_since_face: u32,
+    /// Diagnostics: crop hint pushed to the detector this frame (px).
+    pub last_crop_hint: Option<(f32, f32, f32, f32)>,
+    /// This frame's person silhouette (dense surface source, GUI overlay).
+    pub last_sil: Option<super::visibility::Silhouette>,
+    /// Dense surface points fed to the estimator this frame.
+    pub last_dense_n: usize,
 }
 
 impl FusionProvider {
@@ -144,7 +154,13 @@ impl FusionProvider {
             load_warnings: warnings,
             last_t: None,
             frames: 0,
-            kp_sigma: KpSigma::default(),
+            // VULVATAR_FUSION_OLDSIGMA=1: the pre-visibility σ policy
+            // (ablation bench only).
+            kp_sigma: if std::env::var_os("VULVATAR_FUSION_OLDSIGMA").is_some() {
+                KpSigma { floor_px: 1.5, simcc_gain: 1.0, ..KpSigma::default() }
+            } else {
+                KpSigma::default()
+            },
             hand_swaps: 0,
             hand_kp_start: 0,
             last_solve_ms: 0.0,
@@ -158,6 +174,68 @@ impl FusionProvider {
             sil_params: SilhouetteParams::default(),
             last_vis: Vec::new(),
             last_silhouette: None,
+            frames_since_face: u32::MAX,
+            last_crop_hint: None,
+            last_sil: None,
+            last_dense_n: 0,
+        })
+    }
+
+    /// Predicted upper-body bbox (frame px) for the detector crop, or
+    /// `None` when the head is not currently tracked.
+    fn crop_hint_from_state(
+        &self,
+        t: f64,
+        intr: &Intrinsics,
+        width: u32,
+        height: u32,
+    ) -> Option<crate::tracking::yolox::PersonBbox> {
+        self.est.last_t?;
+        let m = &self.h.model;
+        if self.est.joint_data_sigma(m, self.h.j.head) >= 0.5 {
+            return None;
+        }
+        let pred = self.est.predict(m, t);
+        let fk = m.fk(&pred);
+        let ls = fk.t[self.h.j.l_shoulder];
+        let rs = fk.t[self.h.j.r_shoulder];
+        let mid = scale(add(ls, rs), 0.5);
+        // Camera space: +y is image-down. Cover head top → chest and a
+        // hand's width outside each shoulder.
+        let pts = [
+            fk.site[self.h.s.head_top],
+            fk.site[self.h.s.head_center],
+            add(ls, [-0.12, 0.0, 0.0]),
+            add(rs, [0.12, 0.0, 0.0]),
+            add(ls, [0.12, 0.0, 0.0]),
+            add(rs, [-0.12, 0.0, 0.0]),
+            add(mid, [0.0, 0.30, 0.0]),
+        ];
+        // The predicted arms are deliberately NOT part of the hint: the
+        // self-track bbox (visible keypoints, unioned at the crop site)
+        // already covers a hand that is actually seen, and extending the
+        // hint with the predicted arms was measured worse (torso yaw std
+        // sum 114 → 128 over 23 recordings — the crop follows a wrist
+        // prediction that is itself uncertain).
+        let (mut x1, mut y1, mut x2, mut y2) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for p in pts {
+            let q = intr.project(p)?;
+            x1 = x1.min(q[0]);
+            y1 = y1.min(q[1]);
+            x2 = x2.max(q[0]);
+            y2 = y2.max(q[1]);
+        }
+        let (w, h) = (width as f64, height as f64);
+        let (x1, y1, x2, y2) = (x1.clamp(0.0, w), y1.clamp(0.0, h), x2.clamp(0.0, w), y2.clamp(0.0, h));
+        if x2 - x1 < 48.0 || y2 - y1 < 48.0 {
+            return None;
+        }
+        Some(crate::tracking::yolox::PersonBbox {
+            x1: x1 as f32,
+            y1: y1 as f32,
+            x2: x2 as f32,
+            y2: y2 as f32,
+            score: 1.0,
         })
     }
 
@@ -253,8 +331,6 @@ impl PoseProvider for FusionProvider {
             None => frame_index as f64 / 30.0,
         };
         self.rtmw3d.set_frame_timestamp_ms(ts_ms);
-        let mut base = self.rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
-        let mut aux = self.rtmw3d.take_aux();
 
         let intr_cam: Option<CameraIntrinsics> = depth.as_ref().and_then(|d| d.intrinsics);
         let intr = match intr_cam {
@@ -269,6 +345,23 @@ impl PoseProvider for FusionProvider {
             None => Self::nominal_intrinsics(width, height),
         };
 
+        // ---- state-driven crop hint -----------------------------------------
+        // While the head is tracked, the detector's person crop follows the
+        // ESTIMATED upper body (head top → chest, shoulders ± a hand), not
+        // the subset of keypoints that happened to be sharp last frame.
+        // Same principle as the hand crops: the crop is a function of the
+        // state, so per-frame visibility cannot feed back into it.
+        let crop_hint = if std::env::var_os("VULVATAR_FUSION_NO_HINT").is_some() {
+            None
+        } else {
+            self.crop_hint_from_state(t, &intr, width, height)
+        };
+        self.last_crop_hint = crop_hint.map(|b| (b.x1, b.y1, b.x2, b.y2));
+        self.rtmw3d.set_crop_hint(crop_hint);
+
+        let mut base = self.rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
+        let mut aux = self.rtmw3d.take_aux();
+
         let mut obs = FrameObs {
             t,
             intr: Some(intr),
@@ -278,6 +371,7 @@ impl PoseProvider for FusionProvider {
             shoulder_yaw: None,
             torso_hint: None,
             surface: Vec::new(),
+            surf_allow: Vec::new(),
         };
 
         // Prediction for this frame (drives ROI extraction + face-shape
@@ -294,58 +388,163 @@ impl PoseProvider for FusionProvider {
         // here on (every downstream consumer reads `score`).
         self.last_vis.clear();
         self.last_silhouette = None;
+        self.last_sil = None;
+        self.last_dense_n = 0;
         if let Some(aux) = aux.as_mut() {
             if std::env::var_os("VULVATAR_FUSION_NO_VIS").is_none() && aux.joints.len() >= 133 {
                 let pol = self.vis_policy;
                 let sp = self.sil_params;
                 let mut vis: Vec<f32> = aux.joints.iter().map(|j| pol.p_vis(j)).collect();
+                // A keypoint outside the image is not an observation. The
+                // person crop is zero-padded past the frame, and the
+                // detector extrapolates arms into that black region with
+                // SHARP peaks (measured: elbows / wrists at nx 1.12,
+                // ny 1.29 with p_vis 0.98 on a hidden-hands desk session).
+                // Likewise a keypoint pinned to the crop border is a joint
+                // the crop cut off, not one at the border. A keypoint just
+                // inside the FRAME edge stays: the 2-D / depth-lift terms
+                // already skip the outer 2 % (`KpSigma::border_frac`), but
+                // the hand-crop seeding needs it — a hand half cut by the
+                // right edge (wrist at nx 0.98) still crops fine, and
+                // without that crop the arm floated and the torso yawed
+                // 30° to reach it (measured on a gesturing desk session).
+                // Tolerance for a keypoint slightly past the edge: a face cut
+                // by the frame has its nose tip 1–2 % outside with a sharp
+                // peak (the visible face continues there) and dropping it
+                // cost the FaceMesh crop its anchor (head yaw std 19 → 29°
+                // on a profile session); the hallucinated arms sat 12–29 %
+                // outside.
+                const OUTSIDE_TOL: f32 = 0.05;
+                let m = self.kp_sigma.border_frac;
+                for (i, j) in aux.joints.iter().enumerate() {
+                    let outside = !(-OUTSIDE_TOL..=1.0 + OUTSIDE_TOL).contains(&j.nx)
+                        || !(-OUTSIDE_TOL..=1.0 + OUTSIDE_TOL).contains(&j.ny);
+                    let on_crop_edge = aux.crop.is_some_and(|(cx, cy, cw, ch)| {
+                        let (u, v) = (j.nx * width as f32, j.ny * height as f32);
+                        let (mx, my) = (cw * m, ch * m);
+                        u <= cx + mx || u >= cx + cw - mx || v <= cy + my || v >= cy + ch - my
+                    });
+                    if outside || on_crop_edge {
+                        vis[i] = 0.0;
+                    }
+                }
+                let p_simcc = vis.clone();
                 let (dw, dh) = depth
                     .as_ref()
                     .map(|d| (d.width as f64, d.height as f64))
                     .unwrap_or((width as f64, height as f64));
-                // Silhouette seeds: visible face / shoulder keypoints, else
-                // the predicted head while the track is alive.
-                let mut seeds: Vec<(f64, f64)> = (0..7)
+                // Silhouette seeds: the visible face keypoints. At least two
+                // are required — measured: every one of 7 359 frames with a
+                // person had ≥ 3, the empty chair never had 2 (38 of 76
+                // frames had exactly one). No fallback to the predicted
+                // head: after the user leaves, the prediction would seed the
+                // chair and keep a phantom track alive.
+                let mut seeds: Vec<(f64, f64)> = (0..5)
                     .filter(|&i| vis[i] >= pol.min_p)
                     .map(|i| (aux.joints[i].nx as f64 * dw, aux.joints[i].ny as f64 * dh))
                     .filter(|&(u, v)| u >= 0.0 && v >= 0.0 && u < dw && v < dh)
                     .collect();
-                if seeds.is_empty() && self.est.last_t.is_some() {
-                    if let Some(p) = intr.project(head_center_pred) {
-                        seeds.push((p[0], p[1]));
+                if seeds.len() >= 2 {
+                    self.frames_since_face = 0;
+                } else {
+                    seeds.clear();
+                    self.frames_since_face = self.frames_since_face.saturating_add(1);
+                    // Short bridge over a face-less frame (a hand sweep,
+                    // a hard turn): seed from the predicted head while
+                    // the face was seen within the last second. Longer
+                    // than that the person may have left — a stale
+                    // prediction would seed the empty chair.
+                    if self.frames_since_face <= 30
+                        && self.est.joint_data_sigma(&self.h.model, self.h.j.head) < 0.5
+                    {
+                        if let Some(p) = intr.project(head_center_pred) {
+                            if p[0] >= 0.0 && p[1] >= 0.0 && p[0] < dw && p[1] < dh {
+                                seeds.push((p[0], p[1]));
+                            }
+                        }
                     }
                 }
-                let sil = depth.as_ref().and_then(|d| {
+                let mut sil = depth.as_ref().and_then(|d| {
                     build_silhouette(&d.points_m, d.width, d.height, intr.fx, &seeds, &sp)
                 });
                 let mut dist = vec![f32::NAN; aux.joints.len()];
-                match sil.as_ref() {
+                match sil.as_mut() {
                     Some(s) => {
+                        let pts = &depth.as_ref().unwrap().points_m;
                         for (i, j) in aux.joints.iter().enumerate() {
-                            let dm = s.dist_m(j.nx as f64 * dw, j.ny as f64 * dh);
+                            let (u, v) = (j.nx as f64 * dw, j.ny as f64 * dh);
+                            let dm = s.dist_m(u, v);
                             dist[i] = dm as f32;
-                            if dm > sp.max_dist_m {
+                            let hole = window_median_z(
+                                pts,
+                                s.src_width as usize,
+                                s.src_height as usize,
+                                u.round() as i64,
+                                v.round() as i64,
+                                2,
+                            )
+                            .is_none();
+                            // A hole AT the frame edge is unverifiable: the
+                            // detector parks extrapolated arms there (a
+                            // hidden-hands session had the wrist at nx
+                            // 0.995–1.0 over a hole, 0.03 m from the
+                            // shoulder's outline, in 11 % of frames). A real
+                            // hand cut by the edge still seeds its crop from
+                            // the hand-block points inside the frame.
+                            let at_edge = !(m..=1.0 - m).contains(&j.nx) || !(m..=1.0 - m).contains(&j.ny);
+                            if hole && at_edge {
                                 vis[i] = 0.0;
+                                continue;
+                            }
+                            let tol = if hole { sp.max_dist_hole_m } else { sp.max_dist_m };
+                            if dm > tol && vis[i] >= pol.min_p_obs {
+                                // Not on the main surface. A hand / forearm
+                                // held in front of the chest or entering from
+                                // outside the frame is a small detached blob
+                                // at the person's depth; the desk or a
+                                // bystander is not.
+                                let (lo, hi) = sp.limb_blob_area_m2;
+                                let limb = s
+                                    .blob_area_m2(pts, u, v, hi)
+                                    .map(|a| a >= lo && a <= hi)
+                                    .unwrap_or(false);
+                                if limb {
+                                    dist[i] = 0.0;
+                                } else {
+                                    vis[i] = 0.0;
+                                }
                             }
                         }
-                        self.last_silhouette = Some((s.z_ref, s.touches_bottom, s.area_m2));
+                        // Truncated trunk: with less than a crown-to-hip
+                        // height visible, the hips and everything below
+                        // are outside the frame; a leg keypoint that still
+                        // passes the peak test is painted on the torso /
+                        // face (measured: knees at chest height, 31 snaps
+                        // in one desk session).
+                        if s.height_m < sp.min_height_for_legs_m {
+                            for v in vis.iter_mut().take(23).skip(11) {
+                                *v = 0.0;
+                            }
+                        }
+                        self.last_silhouette = Some((s.z_ref, s.touches_bottom, s.height_m));
                     }
                     None => {
-                        // Depth available but no person surface under any
-                        // confident face / shoulder keypoint: nobody to
-                        // track (empty chair) — nothing is observed.
+                        // Depth available but no person surface under a
+                        // visible face: nobody to track (empty chair) —
+                        // nothing is observed.
                         if depth.is_some() {
                             vis.iter_mut().for_each(|v| *v = 0.0);
                         }
                     }
                 }
                 for (i, j) in aux.joints.iter_mut().enumerate() {
-                    j.score = if vis[i] >= pol.min_p { vis[i] } else { 0.0 };
+                    j.score = if vis[i] >= pol.min_p_obs { vis[i] } else { 0.0 };
                 }
+                self.last_sil = sil.take();
                 for (k, j) in base.annotation.keypoints.iter_mut().zip(aux.joints.iter()) {
                     k.2 = j.score;
                 }
-                self.last_vis = vis.iter().zip(dist.iter()).map(|(&p, &d)| (p, d)).collect();
+                self.last_vis = p_simcc.iter().zip(dist.iter()).map(|(&p, &d)| (p, d)).collect();
             }
         }
 
@@ -1109,6 +1308,69 @@ impl PoseProvider for FusionProvider {
             obs.ori.push(ori);
         }
 
+        // ---- dense surface (primary metric observation) ----------------------
+        // Every visible pixel of the person's silhouette is a measured point
+        // on the body surface. Fitted against the capsule surfaces it fixes
+        // root depth and trunk orientation frame by frame; the sparse 2-D
+        // keypoints then only resolve what a surface cannot (left/right,
+        // position along the surface, hands). Hand crops are excluded (the
+        // landmarker owns them) and the estimator skips hand capsules in the
+        // association.
+        // `VULVATAR_FUSION_NO_DENSE=1` disables (ablation bench).
+        if std::env::var_os("VULVATAR_FUSION_NO_DENSE").is_none() {
+            if let (Some(sil), Some(d)) = (self.last_sil.as_ref(), depth.as_ref()) {
+                if d.points_m.len() == (d.width * d.height) as usize {
+                    // ~1 300 points at 640×480: the per-capsule count
+                    // normalisation (`surf_n_eff`) makes denser sampling
+                    // pure cost.
+                    let stride = if d.width >= 1000 { 12 } else { 8 };
+                    let dense = sil.sample_points(&d.points_m, stride, &in_hand_rect);
+                    self.last_dense_n = dense.len();
+                    obs.surface.extend(dense);
+                    // Which capsules may claim surface points this frame.
+                    let m = &self.h.model;
+                    let tracked = |j: usize| self.est.joint_data_sigma(m, j) < 0.5;
+                    let legs_in_frame = sil.height_m >= self.sil_params.min_height_for_legs_m;
+                    let j = &self.h.j;
+                    obs.surf_allow = m
+                        .capsules
+                        .iter()
+                        .map(|c| {
+                            let starts_at = |jj: usize| matches!(c.a, PointRef::Joint(x) if x == jj);
+                            let no_head = std::env::var_os("VULVATAR_DENSE_NOHEAD").is_some();
+                            let no_neck = std::env::var_os("VULVATAR_DENSE_NONECK").is_some();
+                            match c.part {
+                                Part::Head => !no_head,
+                                Part::Torso => !(no_neck && starts_at(j.spine3)),
+                                Part::LeftHand | Part::RightHand => false,
+                                // Arms never claim surface points (they still
+                                // occlude: points nearest an arm are dropped).
+                                // Letting a tracked arm compete for points was
+                                // measured to couple the surface into the arm
+                                // seed contest (seed wins 3 → 15, wrist jumps
+                                // 0.5–0.8 m on the wave replay); the arms stay
+                                // on 2-D + depth-lift + hand crops.
+                                // `VULVATAR_DENSE_ARMS=1` re-enables for benches.
+                                Part::LeftArm | Part::RightArm
+                                    if std::env::var_os("VULVATAR_DENSE_ARMS").is_none() =>
+                                {
+                                    false
+                                }
+                                Part::LeftArm => {
+                                    if starts_at(j.l_shoulder) { tracked(j.l_elbow) } else { tracked(j.l_wrist) }
+                                }
+                                Part::RightArm => {
+                                    if starts_at(j.r_shoulder) { tracked(j.r_elbow) } else { tracked(j.r_wrist) }
+                                }
+                                Part::LeftLeg => legs_in_frame && tracked(j.l_knee),
+                                Part::RightLeg => legs_in_frame && tracked(j.r_knee),
+                            }
+                        })
+                        .collect();
+                }
+            }
+        }
+
         // Ablation switches for the replay bench.
         if std::env::var_os("VULVATAR_FUSION_NO_SURF").is_some() {
             obs.surface.clear();
@@ -1274,7 +1536,22 @@ fn dump_obs_post_solve(
         {
             let m = &h.model;
             let fk = m.fk(&est.state);
-            for (pt, sg) in &obs.surface {
+            for (ci, c) in m.capsules.iter().enumerate() {
+                let pa = |p: PointRef| match p {
+                    PointRef::Joint(j) => m.joints[j].name.to_string(),
+                    PointRef::Site(s) => m.sites[s].name.to_string(),
+                };
+                let (a, b) = (fk.point(c.a), fk.point(c.b));
+                eprintln!(
+                    "  cap{ci:2} {:?}:{}-{} a=({:.3},{:.3},{:.3}) b=({:.3},{:.3},{:.3}) r={:.3} allow={}",
+                    c.part, pa(c.a), pa(c.b), a[0], a[1], a[2], b[0], b[1], b[2],
+                    m.capsule_radius(&est.state, c),
+                    obs.surf_allow.get(ci).copied().unwrap_or(true)
+                );
+            }
+            let assoc = &est.last_surf_assoc;
+            for (pi, (pt, sg)) in obs.surface.iter().enumerate() {
+                let chosen = assoc.get(pi).copied().unwrap_or(-2);
                 let mut best = (usize::MAX, f64::INFINITY);
                 for (ci, c) in m.capsules.iter().enumerate() {
                     let (q, _u) = super::estimator::closest_on_segment(
@@ -1298,7 +1575,7 @@ fn dump_obs_post_solve(
                     format!("{:?}:{}-{}", c.part, pa(c.a), pa(c.b))
                 };
                 eprintln!(
-                    "    surf ({:.3},{:.3},{:.3}) σ={:.3} → {name} d={:+.3}",
+                    "    surf ({:.3},{:.3},{:.3}) σ={:.3} → {name} d={:+.3} est={chosen}",
                     pt[0], pt[1], pt[2], sg, best.1
                 );
             }

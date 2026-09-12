@@ -30,7 +30,8 @@ D435 color 640×480 + aligned depth
   │
   ├─ 顔: FaceMesh 478 (state-driven crop) → 重心アンカー + 方位観測 OriObs (§3.4)
   ├─ 手: hand landmarker ×2 (state-driven crop、検出器/予測駆動) (§3.5)
-  ├─ 深度リフト / 肩 yaw 観測 / 表面点 (§3.6)
+  ├─ 深度リフト / 肩 yaw 観測 (§3.6)
+  ├─ 密表面点 = 主観測 (§3.7): シルエット画素 → 胴・頭カプセル表面へ
   ▼
 推定器 (§5): sparse LM、ロバスト核、共分散、predict(t)
   ▼
@@ -106,15 +107,29 @@ crop は **状態の関数** であり、フレーム毎の検出結果がフィ
 - body 17 点 + 手首は、キーポイント直下 (3 px 窓) の深度中央値を人物帯でゲートし、皮膚→関節オフセットで視線方向へ押し込んで 3D 観測にする。手矩形内の画素は顔の深度に使わない。予測腕カプセルがレイを遮る場合は表面点に格下げ。
 - σ: 2D は `KpSigma { floor 2.8 px, simcc_gain 1.9, score_inflate 3.0 }`、3D は `SCORE_INFLATE_BASE_3D = 1.3` × (1 + (1 − p_vis))。gain/floor/base は較正済み p_vis (鋭いピークで ≈ 0.99) 前提の値。
 - `ShoulderYawObs`: 胸部ストリップの列中央値深度の LS 勾配 (手クロップ画素のみ除外、胸が塞がる姿勢では肩上面バンド) を 1-DoF の胴 yaw 観測として注入。胴カプセルは自軸対称なので表面項は yaw 情報を持たない。
-- 密点群項は実装済みだが `cloud_budget = 0` で無効 (z-buffer 可視性付き対応付けに作り直すまで)。
+
+### 3.7 密表面点 (主観測、`Silhouette::sample_points` → `Estimator::surface_term`)
+
+深度が見ている体表面そのものを主観測にする。2D キーポイントは面が決められない自由度 (左右、面に沿った関節位置、手) だけを担当する。
+
+- サンプル: シルエット (§3.3、2 倍間引きグリッド) の主成分画素を 8 px 間隔 (1280 幅では 12 px) で採り、手クロップ矩形内は除外。640×480 のデスク framing で約 1,300 点。σ = 0.004 + 0.001·z² m (D435 レンジノイズ) に推定器側で形状誤差 σ 0.012 m を二乗和。
+- 対応付け (毎 LM 反復、`CapGeom::dist`、AABB で早期棄却):
+  - 手カプセルは対象外。ただし最近傍が手なら点は棄却 (前腕へ渡さない)。
+  - 胴 (楕円柱)・首・頭 = コア。**前方ゲート 0.03 m**: コア表面より手前に 3 cm 超離れた点は遮蔽物 (胸前の手・前腕・机縁) として却下。後方/内側は 0.20 m (×GNC) まで許容。
+  - 腕・脚カプセルは `FrameObs::surf_allow` で許可された時だけ点を取り、許可されていない肢が最近傍なら点は棄却 (未観測の腕は依然として胸を遮る)。既定で腕は不許可 (`VULVATAR_DENSE_ARMS=1` で「肘/手首が追跡中なら許可」)、脚はシルエット可視高さ ≥ 0.65 m かつ膝追跡中のみ。
+  - 許可された肢は最近傍で公平に競合する (胸前で構えた腕は自分の点を持つ)。
+- 重み: カプセルごとの実効点数 `n_eff` (胴 30、頭 8、肢 15) で各点の重みを min(1, n_eff/n) 倍。形状誤差はカプセル内で相関するので N 点は N 倍の情報を持たない。頭は FaceMesh 重心が既に画素精度で位置を決めるため小さい。
+- ヤコビアン: 圧縮正規方程式 (カプセルごとに端点 a・b・側方点 c・log 半径 の 10 列)。円断面は解析、楕円断面は前進差分。
+- 追跡健全性: 対応点 ≥ 150 かつ平均符号付き距離 < 3 cm なら、2D 顔点の残差が跳んでも lost にしない (掌で顔を覆うと検出器は鼻・目を手の上に描き、旧判定はそこへ再捕捉していた)。
+- 無効化: `VULVATAR_FUSION_NO_DENSE=1`。
 
 ---
 
 ## 4. 関節体モデル (`fusion/model.rs`)
 
 - VRM T-pose 基準、約 120 DoF: root 6DoF、脊椎 3・首・頭・鎖骨 2・肩 2・肘 2 (屈曲 + 回内)・手首 2・指 15×2・股 2・膝 2・足首 2。
-- 形状 β = 骨長 + 分節カプセル半径。セッション内で推定し収束後は強い事前で固定 (`shape_frozen`)。
-- 各分節はカプセル、頭は楕円体。サイト (`head_top`, `head_center` など) は関節に固定したオフセット点。解析ヤコビアン。
+- 形状 β = 骨長 + 分節カプセル半径。セッション内で推定し収束後は強い事前で固定 (`shape_frozen`)。**半径は骨長スケールと独立** (`rad_mul = exp(rad[g])`): 身長と胴回りは比例しないし、密表面点が半径を直接測る (連動させると胸を広げるために全骨長が 13% 伸びた)。
+- 各分節はカプセル。**胴は 1 本の楕円柱** (`capsule_ellipse`: 軸 `torso_lo`→`torso_hi`、側方基準点 `torso_l_hi`、側方半径 0.17 m・奥行 0.105 m)。平らな胸面の向きが yaw を決める (円柱 2 本では平面パッチにどの yaw でも同じ精度で当たり、30° 外れた解に落ちた)。頭・首・四肢は円柱カプセル。サイト (`head_top`, `head_center` など) は関節に固定したオフセット点。解析ヤコビアン。
 - 関節限界はソフト境界 (hinge)、姿勢事前は neutral 周りの弱いガウス。
 
 ---
@@ -127,13 +142,16 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
   + Σ ρ_C(d(p, surface)²/σ²)       表面点 (gate 0.20 m × GNC)
   + OriObs / ShoulderYawObs         SO(3) / 1-DoF 方位観測
   + hinge(q) + ‖q − q_neutral‖²    関節限界・姿勢事前
+  + (root up · x, z)²/σ²           root 直立事前 (σ 0.12)
+  + (trunk axis · z)²/σ²           胴軸事前 (σ 0.15): 骨盤が画面外のとき面項が下部胴をカメラ側へ振る (root 深度 0.79→0.43 m) のを止める
   + ‖x_t − f(x_{t−1})‖²_Q          時間事前 (q_joint 2.0 rad²/s、頭は trunk に含め q 0.15)
   + ‖β − β̂‖²                       形状定常
 ```
 
 - sparse LM、warm start = `predict(t)`、GNC ブートストラップ。共分散は H⁻¹ の対角ブロック → 関節ごとの周辺 σ (`joint_world_sigma`) と観測到達度 (`joint_data_sigma`、< 0.5 で「追跡中」)。
 - `predict(t)` は任意時刻の状態 + 共分散 (レンダースレッドが 60 Hz で呼ぶ)。1€ フィルタは持たない。
-- 健全性: スパース主要関節の 2D 残差中央値 (`med_sparse_2d_px`) が `lost_rms_px` (40 px) を 2 フレーム連続で超えたら lost。頭/肩の 3D アンカーが追従中 (`n_kp3d ≥ 4` かつ `mean_3d_m < 0.12`) なら lost にしない。lost 時も直前深度を引き継ぐ。
+- 健全性: スパース主要関節の 2D 残差中央値 (`med_sparse_2d_px`) が `lost_rms_px` (40 px) を 2 フレーム連続で超えたら lost。頭/肩の 3D アンカーが追従中 (`n_kp3d ≥ 4` かつ `mean_3d_m < 0.12`) か、密表面が当たっている (§3.7) なら lost にしない。lost 時も直前深度を引き継ぐ。
+- 未観測肢のプロセスノイズ縮小 (`q_hold_floor`) は 0.25 で悪化 (保持された腕が戻ってきた観測と喧嘩し胴が代償を払う) を実測し、既定 1.0 (無効)。
 - 再シード: 解析的アームシード候補 (`update_with_arm_seeds`) は現解のコストの 0.95 倍未満で勝った時だけ採用 (僅差採用は手首瞬間移動になる)。
 - root は 1:1 metric、recenter 無し (`root_recenter_horizon_s = None`)。
 
@@ -153,7 +171,8 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 |---|---|
 | `diagnose_fusion_replay <dir> [out] [--render N] [--avatar]` | 録画を本番プロバイダで無人リプレイ。`frames.csv` (毎フレームのコスト内訳・σ・関節位置)、summary (胴 yaw std / 肩深度参照との誤差 / 手首・膝ジャンプと snap / data-σ duty / root jump / seed wins / 再捕捉)。GPU なら 400 フレーム約 24 秒 |
 | `VULVATAR_REPLAY_VISDUMP=1` | `kps.csv`: 133 関節 × 全フレームの SimCC 統計、p_vis、シルエット距離、crop、crop ヒント、各段階のスコア |
-| `diagnostics/visibility/` | `analyze_vis.py` (較正・混同行列)、`bench_compare.py <runsA> <runsB>` (セッション別 + 合計、crop 遷移数、顔可視率)、`overlay_vis.py` (判定オーバーレイ)、`ablate.ps1` (1 セッションのアブレーション行列) |
+| `diagnostics/visibility/` | `analyze_vis.py` (較正・混同行列)、`bench_compare.py <runsA> <runsB>` (セッション別 + 合計、crop 遷移数、顔可視率)、`overlay_vis.py` (判定オーバーレイ)、`ablate.ps1` / `dense_ablate.ps1` / `dense_multi.ps1` / `dense_sweep.ps1` (アブレーション行列、密表面項の off/on 比較) |
+| `VULVATAR_FUSION_OBSDUMP=<frame>` | 観測とモデルの対応ダンプ。カプセル幾何 (`cap N ... allow=`) と各表面点の推定器側対応 (`est=<capsule>`, −1 = 棄却) を含む |
 | `validate_gt` | 合成 GT (既知ポーズをレンダ → 追跡 → 復元) |
 | ライブ debug チャネル | `CLAUDE.md` 参照 (`debug_state.json` / `debug_avatar.json` / `debug_depth.bin`) |
 
@@ -168,6 +187,9 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_FUSION_NO_HINT` | crop ヒントを渡さない |
 | `VULVATAR_FUSION_OLDSIGMA` | σ 再表現前の gain/floor/base (1.0 / 1.5 px / 1.0) |
 | `VULVATAR_FUSION_NO_{SURF,3D,BURNIN,REACH,CHESTYAW}` | 各項の無効化 |
+| `VULVATAR_FUSION_NO_DENSE` / `VULVATAR_DENSE_ARMS` / `VULVATAR_DENSE_NOHEAD` / `VULVATAR_DENSE_NONECK` | 密表面項の無効化 / 腕カプセル許可 / 頭・首の除外 |
+| `VULVATAR_DENSE_NEFF` / `VULVATAR_DENSE_NEFF_HEAD` / `VULVATAR_DENSE_FRONT` / `VULVATAR_DENSE_FREEZE` | 実効点数・前方ゲート・形状凍結の上書き |
+| `VULVATAR_HOLD_Q` / `VULVATAR_NO_UPRIGHT` / `VULVATAR_TRUNK_AXIS_SIGMA` | 未観測肢ホールド係数 / 胴軸事前の無効化・σ |
 | `VULVATAR_FUSION_OBSDUMP=<frame>` | 観測とモデルの対応ダンプ |
 | `VULVATAR_REPLAY_CPU` / `VULVATAR_REPLAY_NO_YOLOX` | リプレイの EP / YOLOX 無効化 (CPU と DirectML の SimCC 統計は小数 4 桁で一致) |
 
@@ -179,17 +201,19 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 |---|---|
 | 関節体モデル・推定器・共分散・predict | ✅ |
 | 可視性層 (p_vis + 深度シルエット + 脚高さ規則 + state-driven crop) | ✅ |
+| 密表面点を主観測に (楕円柱胴、部位別対応付け、前方ゲート、胴軸事前) | ✅ 胴・頭のみ。腕は未接続 |
 | 顔 (canonical テンプレート、OriObs、深度裏付け) | ✅ |
 | 手 (state-driven crop、handedness、裏付け、重複ロック) | ✅ 2D のみ |
 | リターゲット・アプリ配線 | ✅ (v1 経路は削除済み) |
-| 密点群項 | ⚠️ 既定 OFF |
 | align-to-color 廃止 (native 深度 + extrinsics) | ❌ 未着手 |
 | AprilTag GT リグ / 実データ mm-deg ベンチ | ❌ 未着手 |
 | 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床/事前なし |
 
 既知の課題:
 
-- 推定器の崩壊モード (手上げ時に 2D 項が root をカメラ側へ引く): 可視性層では解けない。観測可能性の問題として推定器側で扱う。
+- 腕は密表面に接続していない (2D + 深度リフト + 手クロップのみ)。接続すると腕シードのコスト比較に面項が混ざり、手を振る録画で手首が 0.5〜0.8 m 跳ぶ (seed wins 3 → 15)。腕モデル (円柱 1 本) と対応付けの改良が前提。
+- 手を素早く顔前で振る録画 (wave、5 フレーム間引き) では密表面項ありで胴 yaw std 3.6 → 13°。胸前を横切る手が前方ゲート内 (< 3 cm) で胴の点を奪う/隠すため。デスク配信では起きない。
+- 推定器の崩壊モード (手上げ時に 2D 項が root をカメラ側へ引く) は密表面項で大きく減った (s1787219804: 胴 yaw std 24 → 13) が消えてはいない。
 - 頭 yaw 振幅: mesh conf < 0.2 の区間は方位ソースが無い。
 - namaste 持続カバー中の偽お辞儀: 手に覆われた SimCC 鼻/目が手の表面に捏造される。per-kp ゲートでは解けず据置、次の一手は耳ベース頭アンカー。
 - 未観測腕のプロセスノイズ (q_joint 2.0) が緩く、腕の観測が消えた/戻った時の往復が残る。

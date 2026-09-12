@@ -30,7 +30,7 @@ will invalidate that cache and trigger a rebuild.
 ## Tracking v2 (fusion estimator) — 2026-08-19 以降の本番経路
 
 - 本番プロバイダは `src/tracking/fusion/provider.rs` (`FusionProvider`) の一本のみ
-  (v1 位置ベース経路は 2026-08-20 に全削除)。設計と実装状況は `docs/tracking-v2-design.md` (§13)。
+  (v1 位置ベース経路は 2026-08-20 に全削除)。現行仕様は `docs/tracking-v2-design.md` (As-Is のみ、経緯は書かない)。
 - オフライン検証: `cargo run --features realsense --bin diagnose_fusion_replay -- <dir> [out_dir] [--render N]`
   (`diagnostics/depth/{wave,palms_front,namaste}_replay`, `diagnostics/sessions/<id>` を食う)。
   summary に 胴 yaw std / 肩深度参照との差 / メトリック関節残差 / 手首ジャンプ / 再捕捉回数、

@@ -190,6 +190,17 @@ pub struct Rtmw3dInference {
     /// as the (re)acquisition path.
     #[cfg(feature = "inference")]
     self_track_bbox: Option<crate::tracking::yolox::PersonBbox>,
+    /// State-driven crop hint for the NEXT frame, pushed by the fusion
+    /// provider from its predicted upper body (head + shoulders + chest
+    /// projected through the camera). Consumed once per estimate. While
+    /// present it is unioned with the self-track bbox, so the crop can
+    /// never shrink below the body the estimator knows is there — the
+    /// visible-keypoint-only seed used to contract onto whichever half
+    /// (face or shoulders) had sharp peaks, push the other half to the
+    /// crop edge, and release the track (measured live: 9 Hz crop
+    /// flapping, 85 % of frames without a self-track).
+    #[cfg(feature = "inference")]
+    crop_hint: Option<crate::tracking::yolox::PersonBbox>,
     /// Last bbox the self-track produced before it (possibly) released.
     /// Survives a self-track drop and is passed to YOLOX as the
     /// identity hint: re-acquisition prefers the candidate overlapping
@@ -302,6 +313,7 @@ impl Rtmw3dInference {
     pub fn reset_temporal_state(&mut self) {
         self.self_track_bbox = None;
         self.last_self_track = None;
+        self.crop_hint = None;
         self.last_tracked_z_gain = None;
         self.frame_timestamp_ms = None;
         self.frame_dt.reset();
@@ -312,6 +324,16 @@ impl Rtmw3dInference {
 
     #[cfg(not(feature = "inference"))]
     pub fn reset_temporal_state(&mut self) {}
+
+    /// Push the crop hint for the next [`Self::estimate_pose`] call
+    /// (frame pixels). See the `crop_hint` field.
+    #[cfg(feature = "inference")]
+    pub fn set_crop_hint(&mut self, hint: Option<crate::tracking::yolox::PersonBbox>) {
+        self.crop_hint = hint;
+    }
+
+    #[cfg(not(feature = "inference"))]
+    pub fn set_crop_hint(&mut self, _hint: Option<crate::tracking::yolox::PersonBbox>) {}
 
     /// Push the device capture timestamp (ms) of the frame about to be
     /// handed to [`Self::estimate_pose`]. Consumed once per estimate;
@@ -430,6 +452,7 @@ impl Rtmw3dInference {
             yolox_worker,
             self_track_bbox: None,
             last_self_track: None,
+            crop_hint: None,
             last_tracked_z_gain: None,
             face_selector: face::FaceSourceSelector::default(),
             frame_timestamp_ms: None,
@@ -525,9 +548,25 @@ impl Rtmw3dInference {
             // self-track is live, YOLOX receives no submissions at
             // all — no CPU spent on a detector whose result would be
             // ignored.
-            let bbox_opt = if let Some(track) = self.self_track_bbox {
-                Some(track)
-            } else if let Some(worker) = self.yolox_worker.as_ref() {
+            let hint = self.crop_hint.take();
+            let mut bbox_opt = match (self.self_track_bbox, hint) {
+                (Some(t), Some(h)) => Some(crate::tracking::yolox::PersonBbox {
+                    x1: t.x1.min(h.x1),
+                    y1: t.y1.min(h.y1),
+                    x2: t.x2.max(h.x2),
+                    y2: t.y2.max(h.y2),
+                    score: 1.0,
+                }),
+                (Some(t), None) => Some(t),
+                (None, Some(h)) => Some(h),
+                (None, None) => None,
+            };
+            // No hysteresis on the union: the hint is already a smooth
+            // function of the state, and damping it was measured worse
+            // (23 recordings: torso yaw std sum 114 → 120, wrist snaps
+            // 226 → 263) for a small gain in crop stability (36 → 22).
+            if bbox_opt.is_none() {
+                bbox_opt = if let Some(worker) = self.yolox_worker.as_ref() {
                 let cold_start = !worker.has_result();
                 // `.max(1)` is defence-in-depth: `RuntimeGpuBudget`'s
                 // mode arms only emit {4, 6, 8, 12}, asserted by the
@@ -566,9 +605,10 @@ impl Rtmw3dInference {
                 } else {
                     latest.bbox
                 }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
+            }
             // Whole-frame fallback: run the frame through the SAME
             // aspect-preserving virtual-crop path a person bbox takes
             // (full-frame bbox, zero pad ratio) instead of feeding the
@@ -961,7 +1001,21 @@ fn derive_self_track_bbox(
     // and 0.7 for observed ones, so a 0.3 floor on it never rejected
     // anything (an empty chair sustained a full "person" track).
     let pol = crate::tracking::fusion::visibility::VisPolicy::default();
-    let visible: Vec<bool> = joints.iter().map(|j| pol.p_vis(j) >= pol.min_p).collect();
+    // Observable = visible AND clear of the outer 2 % frame band. The 2-D
+    // and depth-lift terms already skip that band, and the crop's 25 %
+    // pad covers a real hand resting at the frame edge anyway; what the
+    // band contributes to the seed is the detector's guess for an unseen
+    // wrist parked in the bottom corner (measured live: the crop jumped
+    // 25 % of the frame at 1.3 Hz as that phantom flickered in and out).
+    let band = crate::tracking::fusion::observe::KpSigma::default().border_frac;
+    let visible: Vec<bool> = joints
+        .iter()
+        .map(|j| {
+            pol.p_vis(j) >= pol.min_p
+                && (band..=1.0 - band).contains(&j.nx)
+                && (band..=1.0 - band).contains(&j.ny)
+        })
+        .collect();
 
     let body_confident = visible.iter().take(17).filter(|&&v| v).count();
 
