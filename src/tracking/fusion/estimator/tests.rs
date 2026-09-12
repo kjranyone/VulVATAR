@@ -140,7 +140,20 @@ fn recover_with(parts: Option<&[super::super::model::Part]>) {
         surface: surface_from_capsules_parts(m, &gt, 12, parts),
         surf_allow: Vec::new(),
     };
-    let mut est = Estimator::new(m, Params::default());
+    // Pin the trunk shear: a single STATIC pose cannot separate root tilt
+    // from front-surface taper (the depth slope measures `tilt − taper`
+    // only — see `Params::shear_sigma`); production separates them by
+    // posture excitation over time, which a repeated-identical-obs fixture
+    // cannot provide. With the taper pinned, this fixture verifies that
+    // the tilt itself is still recovered. (Unpinned, the solver books the
+    // gt's real 5.7° root tilt as shear and the ankles land 5.6 cm off.)
+    let mut est = Estimator::new(
+        m,
+        Params {
+            shear_sigma: 1e-9,
+            ..Params::default()
+        },
+    );
     // Warm start: relaxed pose facing camera at roughly the right place.
     est.state.root_t = [0.0, 0.3, 1.5];
     let fk_gt = m.fk(&gt);
