@@ -7,11 +7,10 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::{
-    app_data_dir, atomic_write, default_orbit_sensitivity, default_pan_sensitivity,
-    default_zoom_sensitivity, last_session_path, ProjectFile,
+use super::project_dto::{
+    default_orbit_sensitivity, default_pan_sensitivity, default_zoom_sensitivity,
 };
-
+use super::{app_data_dir, atomic_write, last_session_path, ProjectFile};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct SettingsConfig {
