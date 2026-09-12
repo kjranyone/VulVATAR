@@ -136,15 +136,15 @@ impl GuiApp {
 
             tracking_enabled: self.tracking.toggle_tracking,
             tracking_mirror: self.tracking.tracking_mirror,
-            camera_capture_width: super::camera_resolution_for_index(
+            camera_capture_width: crate::tracking::camera_resolution_for_index(
                 self.tracking.camera_resolution_index,
             )
             .0,
-            camera_capture_height: super::camera_resolution_for_index(
+            camera_capture_height: crate::tracking::camera_resolution_for_index(
                 self.tracking.camera_resolution_index,
             )
             .1,
-            camera_capture_fps: super::camera_fps_for_index(self.tracking.camera_framerate_index),
+            camera_capture_fps: crate::tracking::camera_fps_for_index(self.tracking.camera_framerate_index),
             hand_tracking_enabled: self.tracking.hand_tracking_enabled,
             face_tracking_enabled: self.tracking.face_tracking_enabled,
             lower_body_tracking_enabled: self.tracking.lower_body_tracking_enabled,
@@ -320,12 +320,12 @@ impl GuiApp {
 
         self.tracking.toggle_tracking = state.tracking_enabled;
         self.tracking.tracking_mirror = state.tracking_mirror;
-        self.tracking.camera_resolution_index = super::camera_resolution_index_for(
+        self.tracking.camera_resolution_index = crate::tracking::camera_resolution_index_for(
             state.camera_capture_width,
             state.camera_capture_height,
         );
         self.tracking.camera_framerate_index =
-            super::camera_fps_index_for(state.camera_capture_fps);
+            crate::tracking::camera_fps_index_for(state.camera_capture_fps);
         self.tracking.hand_tracking_enabled = state.hand_tracking_enabled;
         self.tracking.face_tracking_enabled = state.face_tracking_enabled;
         self.tracking.lower_body_tracking_enabled = state.lower_body_tracking_enabled;
@@ -1077,11 +1077,11 @@ mod save_policy_tests {
     /// panicking or silently landing on slot 0.
     #[test]
     fn unknown_capture_values_snap_to_nearest_combo_entry() {
-        assert_eq!(crate::gui::camera_resolution_index_for(3840, 2160), 2);
-        assert_eq!(crate::gui::camera_resolution_index_for(1280, 720), 1);
-        assert_eq!(crate::gui::camera_resolution_index_for(320, 240), 0);
-        assert_eq!(crate::gui::camera_fps_index_for(90), 1);
-        assert_eq!(crate::gui::camera_fps_index_for(24), 0);
+        assert_eq!(crate::tracking::camera_resolution_index_for(3840, 2160), 2);
+        assert_eq!(crate::tracking::camera_resolution_index_for(1280, 720), 1);
+        assert_eq!(crate::tracking::camera_resolution_index_for(320, 240), 0);
+        assert_eq!(crate::tracking::camera_fps_index_for(90), 1);
+        assert_eq!(crate::tracking::camera_fps_index_for(24), 0);
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 // ── Camera capture rate (configured) ─────────────
                 if tracking_active {
                     let fps =
-                        crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+                        crate::tracking::camera_fps_for_index(state.tracking.camera_framerate_index);
                     ui.label(
                         egui::RichText::new(t!("status.camera_fps", fps = fps))
                             .font(typography::caption())

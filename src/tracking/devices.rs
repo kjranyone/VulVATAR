@@ -126,3 +126,54 @@ mod camera_enum_tests {
         assert!(!usable_capture_device(&[]));
     }
 }
+
+/// Map a `tracking.camera_resolution_index` (combo box position) to actual
+/// width/height. Kept as a free function so both the inspector (combo
+/// onchange and Start Camera button) and the GUI reconciliation path resolve
+/// indices identically.
+pub fn camera_resolution_for_index(index: usize) -> (u32, u32) {
+    match index {
+        1 => (1280, 720),
+        2 => (1920, 1080),
+        _ => (640, 480),
+    }
+}
+
+/// Map a `tracking.camera_framerate_index` to the actual fps value.
+pub fn camera_fps_for_index(index: usize) -> u32 {
+    if index == 1 {
+        60
+    } else {
+        30
+    }
+}
+
+/// Inverse of [`camera_resolution_for_index`]: find the combo position
+/// whose real value matches, falling back to the nearest pixel count.
+/// Projects persist VALUES (width/height/fps), so growing or
+/// reordering the combo can never silently retarget a saved format —
+/// this is the only place a value re-becomes a UI position.
+pub fn camera_resolution_index_for(width: u32, height: u32) -> usize {
+    const OPTIONS: [(u32, u32); 3] = [(640, 480), (1280, 720), (1920, 1080)];
+    if let Some(i) = OPTIONS.iter().position(|&(w, h)| (w, h) == (width, height)) {
+        return i;
+    }
+    let target = width as u64 * height as u64;
+    OPTIONS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &(w, h))| (w as u64 * h as u64).abs_diff(target))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Inverse of [`camera_fps_for_index`] — nearest supported rate.
+pub fn camera_fps_index_for(fps: u32) -> usize {
+    const OPTIONS: [u32; 2] = [30, 60];
+    OPTIONS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &f)| f.abs_diff(fps))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}

@@ -34,8 +34,9 @@ pub(crate) use calibration::{
     SHOULDER_SPAN_MAX_M, SHOULDER_SPAN_MIN_M,
 };
 pub use devices::{
-    d400_product_name, enumerate_cameras, usable_capture_device, usb_link_too_slow,
-    CameraDeviceInfo,
+    camera_fps_for_index, camera_fps_index_for, camera_resolution_for_index,
+    camera_resolution_index_for, d400_product_name, enumerate_cameras, usable_capture_device,
+    usb_link_too_slow, CameraDeviceInfo,
 };
 pub use mailbox::{DetectionAnnotation, MailboxSnapshot, PreviewFrame, TrackingMailbox};
 pub use source_skeleton::{

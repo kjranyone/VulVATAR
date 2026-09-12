@@ -501,7 +501,7 @@ impl ProjectFile {
 /// were when projects persisted raw indices (0 = 640×480, 1 = 1280×720,
 /// 2 = 1920×1080). Only for migrating old files and for writing the
 /// best-effort legacy index alongside the value fields — the live GUI
-/// combo mapping lives in `gui::camera_resolution_for_index` and may
+/// combo mapping lives in `tracking::camera_resolution_for_index` and may
 /// grow entries freely without touching this table.
 fn legacy_camera_resolution(index: usize) -> (u32, u32) {
     match index {

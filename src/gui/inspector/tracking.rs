@@ -223,8 +223,8 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
 /// Start button and the change-while-running restart and had already
 /// begun to drift risk.
 fn effective_capture_params(state: &GuiApp) -> (u32, u32, u32) {
-    let (w, h) = crate::gui::camera_resolution_for_index(state.tracking.camera_resolution_index);
-    let fps = crate::gui::camera_fps_for_index(state.tracking.camera_framerate_index);
+    let (w, h) = crate::tracking::camera_resolution_for_index(state.tracking.camera_resolution_index);
+    let fps = crate::tracking::camera_fps_for_index(state.tracking.camera_framerate_index);
     clamp_for_safe_mode(w, h, fps, state.tracking.safe_mode_armed)
 }
 
