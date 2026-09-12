@@ -14,6 +14,10 @@
 //! [`PoseCalibration`]; consumers fall back to the auto-EMA /
 //! default behaviour whenever it is absent.
 
+mod apply;
+
+pub(crate) use apply::TrackingCalibration;
+
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -22,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// Drives both the on-screen instructions and the captured-anchor
 /// choice (hip vs shoulder).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CalibrationMode {
+pub(crate) enum CalibrationMode {
     /// Subject visible from feet to head, T-pose. Hip pair midpoint
     /// (COCO 11/12) is the captured anchor.
     FullBody,
@@ -37,7 +41,7 @@ impl CalibrationMode {
     /// Stable string for serialization. Decoupled from the enum's
     /// `Debug` impl so the on-disk schema is independent of Rust
     /// formatting choices.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             CalibrationMode::FullBody => "full_body",
             CalibrationMode::UpperBody => "upper_body",
@@ -51,7 +55,7 @@ impl CalibrationMode {
 /// log a warning" rather than fail-loud, so the existing project
 /// file isn't lost on a future schema change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnknownCalibrationMode;
+pub(crate) struct UnknownCalibrationMode;
 
 impl FromStr for CalibrationMode {
     type Err = UnknownCalibrationMode;
@@ -80,7 +84,7 @@ impl FromStr for CalibrationMode {
 /// source units. `anchor_depth_m` is always the positive camera-space
 /// forward distance (source z negated).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PoseCalibration {
+pub(crate) struct PoseCalibration {
     pub mode: CalibrationMode,
     /// ISO-8601 capture timestamp. `String` rather than `SystemTime`
     /// because the on-disk schema needs a stable, human-readable
@@ -229,7 +233,7 @@ pub struct PoseCalibration {
 /// real metres. Below this the reading is not a torso — a collapsed
 /// shoulder pair, a mis-scaled depth frame, or a value recorded in
 /// some other unit.
-pub const SHOULDER_SPAN_MIN_M: f32 = 0.20;
+pub(crate) const SHOULDER_SPAN_MIN_M: f32 = 0.20;
 
 /// Upper bound on a stored [`PoseCalibration::shoulder_span_m`], in
 /// real metres. A 0.60 m acromion-to-acromion span is already beyond
@@ -238,7 +242,7 @@ pub const SHOULDER_SPAN_MIN_M: f32 = 0.20;
 /// = 0.75) written by the pre-fix capture path, which
 /// `skeleton_from_depth::anthropometric_bones` would turn into
 /// ~1.8×-too-long limbs.
-pub const SHOULDER_SPAN_MAX_M: f32 = 0.60;
+pub(crate) const SHOULDER_SPAN_MAX_M: f32 = 0.60;
 
 /// `true` when `span` is a physically plausible human shoulder span
 /// in metres. Every producer and consumer of
@@ -246,7 +250,7 @@ pub const SHOULDER_SPAN_MAX_M: f32 = 0.60;
 /// multiplied into bone lengths and into the whole-skeleton
 /// normalisation, so an out-of-band value doesn't degrade the pose,
 /// it destroys it.
-pub fn shoulder_span_plausible(span: f32) -> bool {
+pub(crate) fn shoulder_span_plausible(span: f32) -> bool {
     span.is_finite() && (SHOULDER_SPAN_MIN_M..=SHOULDER_SPAN_MAX_M).contains(&span)
 }
 
@@ -254,20 +258,20 @@ pub fn shoulder_span_plausible(span: f32) -> bool {
 /// [`PoseCalibration::neutral_body_yaw`]. Matches the face-neutral
 /// floor: below this the estimate is one noisy reading, and baking it
 /// into every subsequent frame is worse than the uncorrected constant.
-pub const BODY_YAW_MIN_SAMPLES: usize = 5;
+pub(crate) const BODY_YAW_MIN_SAMPLES: usize = 5;
 
 /// Hard cap on a stored neutral body yaw. Beyond ~60° the far
 /// shoulder is occlusion-shadowed in the depth map and L/R-swap risk
 /// dominates: a larger reading is more likely detector garbage than
 /// camera geometry. The GUI additionally warns (without clamping)
 /// above [`BODY_YAW_WARN_RAD`].
-pub const BODY_YAW_MAX_RAD: f32 = std::f32::consts::PI / 3.0;
+pub(crate) const BODY_YAW_MAX_RAD: f32 = std::f32::consts::PI / 3.0;
 
 /// Inspector-warning threshold (45°): tracking still runs but depth
 /// shadowing measurably degrades the far arm; the user should know
 /// their camera is very oblique rather than silently getting worse
 /// output.
-pub const BODY_YAW_WARN_RAD: f32 = std::f32::consts::PI / 4.0;
+pub(crate) const BODY_YAW_WARN_RAD: f32 = std::f32::consts::PI / 4.0;
 
 /// Minimum horizontal (x, z) shoulder-line length, in isotropic
 /// source units, for its yaw to be well-defined. Same floor as the
@@ -287,7 +291,7 @@ const YAW_MIN_HORIZ_SPAN: f32 = 0.20;
 /// trustworthy enough to measure a constant we then subtract forever),
 /// either shoulder is missing or below the keypoint floor, or the
 /// horizontal span is degenerate.
-pub fn shoulder_line_yaw(sample: &super::SourceSkeleton) -> Option<f32> {
+pub(crate) fn shoulder_line_yaw(sample: &super::SourceSkeleton) -> Option<f32> {
     use crate::asset::HumanoidBone;
     sample.metric_frame_info.as_ref()?;
     let l = sample.joints.get(&HumanoidBone::LeftUpperArm)?;
@@ -310,7 +314,7 @@ pub fn shoulder_line_yaw(sample: &super::SourceSkeleton) -> Option<f32> {
 /// `rotate_xz(shoulder_line, shoulder_line_yaw(...))` maps the
 /// shoulder line back to frontal (+x, z = 0) — the de-rotation
 /// direction. Y passes through untouched.
-pub fn rotate_xz(v: [f32; 3], theta: f32) -> [f32; 3] {
+pub(crate) fn rotate_xz(v: [f32; 3], theta: f32) -> [f32; 3] {
     let (s, c) = theta.sin_cos();
     [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]
 }
@@ -405,7 +409,7 @@ impl PoseCalibration {
     /// hold gathered enough confident frames from that estimator.
     /// Subtraction must be keyed on the live pose's own source — see
     /// [`Self::neutral_face_ypr_mesh`].
-    pub fn neutral_face_ypr_for(
+    pub(crate) fn neutral_face_ypr_for(
         &self,
         source: super::source_skeleton::FaceSource,
     ) -> Option<[f32; 3]> {
