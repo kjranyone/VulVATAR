@@ -32,6 +32,9 @@ models/vitpose-h-wholebody_onnx/
 # Gemini / Antigravity CLI workspace symlink
 /.antigravitycli/
 
+# ZCode CLI session workspace
+/.zcode/
+
 # Sample data (keep directory)
 /sample_data/*
 !/sample_data/.gitkeep
@@ -59,3 +62,8 @@ __pycache__/
 # Misc
 nul
 /logs/
+
+# Machine-local pkg-config shim for the RealSense SDK. Regenerated per
+# machine from `realsense2.pc.example` (see docs/realsense-build.md) —
+# the SDK install path differs on every developer box.
+/build-support/pkgconfig/realsense2.pc

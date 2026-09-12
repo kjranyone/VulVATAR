@@ -1,0 +1,16 @@
+# Copy to `realsense2.pc` and point `prefix` at YOUR Intel RealSense SDK
+# 2.0 install (use the 8.3 short path when the real path contains spaces).
+# Two non-negotiables (docs/realsense-build.md):
+#   - `Cflags` must define DLL_FOLDER: realsense-sys's build.rs indexes
+#     `library.defines["DLL_FOLDER"]` to locate realsense2.dll.
+#   - `Version` should match the installed SDK so bindgen regenerates
+#     against the right headers.
+prefix=C:/PROGRA~1/RealSenseSDK
+includedir=${prefix}/include
+libdir=${prefix}/lib/x64
+
+Name: realsense2
+Description: Intel RealSense SDK 2.0
+Version: 2.58.2
+Cflags: -I${includedir} -DDLL_FOLDER=${prefix}/bin/x64
+Libs: -L${libdir} -lrealsense2

@@ -23,7 +23,9 @@ version bump on the SDK is fine.
 ## The hand-written `realsense2.pc`
 
 The SDK ships no `.pc` file, so `build-support/pkgconfig/realsense2.pc`
-supplies one. Two non-obvious details:
+supplies one. **That file is machine-local and gitignored** — copy
+`realsense2.pc.example` next to it and fill in your SDK path. Two
+non-obvious details:
 
 1. **Use the 8.3 short path** for `prefix`
    (`C:/Users/kojiro/DOCUME~1/REALSE~1.0`) — the real path contains a
@@ -35,12 +37,15 @@ supplies one. Two non-obvious details:
    `no entry found for key` without it. It uses that folder to copy
    `realsense2.dll` into `target/<profile>/deps/`.
 
-Regenerate it (short path is machine-specific) with:
+Generate it (short path is machine-specific) with:
 
 ```powershell
 $fso = New-Object -ComObject Scripting.FileSystemObject
 $prefix = ($fso.GetFolder("C:\Users\kojiro\Documents\RealSense SDK 2.0").ShortPath) -replace '\\','/'
-# write build-support/pkgconfig/realsense2.pc with that $prefix (see git history)
+Copy-Item build-support\pkgconfig\realsense2.pc.example build-support\pkgconfig\realsense2.pc
+(Get-Content build-support\pkgconfig\realsense2.pc) `
+    -replace 'prefix=.*', "prefix=$prefix" |
+    Set-Content build-support\pkgconfig\realsense2.pc
 ```
 
 ## Build & run
