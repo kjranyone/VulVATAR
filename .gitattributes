@@ -1,0 +1,22 @@
+# Normalize all text files to LF in the repository and on checkout.
+# Ends the CRLF churn that polluted whole-file diffs (editor saves and
+# MSYS sed both flipped endings on and off — see the persistence
+# refactor slices, 2026-09-12). Binary detection stays automatic.
+* text=auto eol=lf
+
+# Belt-and-braces for the binary assets that live next to the sources.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.bmp binary
+*.ico binary
+*.ttf binary
+*.onnx binary
+*.npy binary
+*.dll binary
+*.glb binary
+*.vrm binary
+*.fbx binary
+*.exr binary
+*.hdr binary
+*.spv binary
