@@ -77,6 +77,12 @@ pub(super) struct PlannedCloth {
     pub(super) constraint_iters: u32,
     pub(super) constraints: Option<PlannedClothConstraints>,
     pub(super) normal: Option<PlannedClothNormal>,
+    pub(super) collide: Option<PlannedClothCollide>,
+}
+
+pub(super) struct PlannedClothCollide {
+    pub(super) set: Arc<DescriptorSet>,
+    pub(super) collider_count: u32,
 }
 
 pub(super) struct PlannedClothConstraints {

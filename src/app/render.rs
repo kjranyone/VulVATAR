@@ -825,6 +825,10 @@ impl Application {
                 // loop. The renderer's substep loop runs verlet +
                 // constraint iters that many times per frame.
                 let cloth_substep_dt = fixed_dt.max(1.0 / 1000.0);
+                // Avatar-node collision capsules in world space, resolved
+                // once per frame and shared by every cloth snapshot. Scene
+                // colliders are CPU-solver-only (see ClothGpuDispatchControl).
+                let gpu_colliders = gpu_colliders_for(avatar);
                 let cloth_deforms = collect_cloth_deforms(
                     avatar
                         .cloth_state
@@ -841,6 +845,7 @@ impl Application {
                     cloth_substep_dt,
                     substeps,
                     &avatar.pose.global_transforms,
+                    &gpu_colliders,
                 );
 
                 RenderAvatarInstance {
@@ -990,6 +995,46 @@ impl Application {
     }
 }
 
+/// World-space avatar collision capsules for the GPU cloth stage —
+/// the sibling of the CPU solver's `resolve_colliders` output, with
+/// spheres encoded as degenerate capsules. Enabled mask and node-index
+/// bounds follow `simulation::cloth::resolve_colliders` exactly.
+fn gpu_colliders_for(
+    avatar: &crate::avatar::AvatarInstance,
+) -> Vec<crate::renderer::frame_input::ClothGpuCollider> {
+    crate::simulation::cloth::resolve_colliders(
+        &avatar.asset.colliders,
+        &avatar.pose.global_transforms,
+        &avatar.collider_enabled,
+    )
+    .into_iter()
+    .map(|c| {
+        let (p0, p1, radius) = match c {
+            crate::simulation::cloth::ResolvedCollider::Sphere { center, radius } => {
+                (center, center, radius)
+            }
+            crate::simulation::cloth::ResolvedCollider::Capsule {
+                center,
+                radius,
+                half_height,
+                axis,
+            } => {
+                let a = crate::math_utils::vec3_sub(
+                    &center,
+                    &crate::math_utils::vec3_scale(&axis, half_height),
+                );
+                let b = crate::math_utils::vec3_add(
+                    &center,
+                    &crate::math_utils::vec3_scale(&axis, half_height),
+                );
+                (a, b, radius)
+            }
+        };
+        crate::renderer::frame_input::ClothGpuCollider { p0, p1, radius }
+    })
+    .collect()
+}
+
 /// Per-particle pin world targets for the GPU solver, mirroring CPU
 /// `cloth_solver::collision::apply_pin_targets`: `T(node) · offset`
 /// per pin binding, expanded to particle index space. Entries for
@@ -1031,6 +1076,10 @@ fn gpu_pin_targets(
 /// when the cloth's `solver_backend` is `Gpu`. The renderer uses it as the
 /// `dt` input to the Verlet integration shader; for CPU-backed cloths it
 /// is ignored.
+///
+/// `colliders` carries the frame's world-space collision capsules for the
+/// GPU stage — the caller resolves the avatar-node colliders once per
+/// frame (all cloths on one avatar collide against the same body).
 fn collect_cloth_deforms<'a>(
     sources: impl IntoIterator<
         Item = (
@@ -1041,6 +1090,7 @@ fn collect_cloth_deforms<'a>(
     fixed_dt: f32,
     substeps: u32,
     global_transforms: &[crate::asset::Mat4],
+    colliders: &[crate::renderer::frame_input::ClothGpuCollider],
 ) -> Vec<ClothDeformSnapshot> {
     use crate::math_utils::vec3_scale;
     use crate::renderer::frame_input::{ClothGpuAttachData, ClothGpuDispatchControl};
@@ -1067,6 +1117,8 @@ fn collect_cloth_deforms<'a>(
                             wind_force,
                             solver_iterations: sim.solver_iterations as u32,
                             pin_positions: gpu_pin_targets(sim, global_transforms),
+                            collision_margin: sim.collision_margin,
+                            colliders: colliders.to_vec(),
                         };
                         let attach = ClothGpuAttachData {
                             constraints: sim
@@ -1299,6 +1351,7 @@ mod cloth_collection_tests {
             1.0 / 60.0,
             1,
             &[],
+            &[],
         );
 
         assert_eq!(
@@ -1322,6 +1375,7 @@ mod cloth_collection_tests {
             1.0 / 60.0,
             1,
             &[],
+            &[],
         );
 
         assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
@@ -1334,7 +1388,7 @@ mod cloth_collection_tests {
         let bound = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
         let unbound = make_cloth_state(2, None, 64, 1);
 
-        let result = collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1, &[]);
+        let result = collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1, &[], &[]);
 
         assert_eq!(result.len(), 1, "cloth with no render target is dropped");
         assert_eq!(result[0].target_primitive_id.0, 10);

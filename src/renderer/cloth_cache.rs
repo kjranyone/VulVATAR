@@ -18,7 +18,8 @@ use vulkano::pipeline::{ComputePipeline, Pipeline};
 use crate::asset::{MeshId, PrimitiveId};
 use crate::renderer::gpu_alloc;
 use crate::renderer::{
-    pipeline, ClothGpuConstraintResources, ClothGpuNormalResources, ClothGpuSlot, VulkanRenderer,
+    pipeline, ClothGpuCollideResources, ClothGpuConstraintResources, ClothGpuNormalResources,
+    ClothGpuSlot, VulkanRenderer,
 };
 
 impl VulkanRenderer {
@@ -214,6 +215,7 @@ impl VulkanRenderer {
                 verlet_set,
                 constraints,
                 normals,
+                collide: None,
             });
         }
         Ok(())
@@ -480,4 +482,102 @@ fn allocate_cloth_normal_resources(
         control_ubo,
         normal_set,
     })
+}
+
+/// Build / refresh the per-slot GPU collision resources for this
+/// frame's capsule list. The SSBO is rewritten every frame (capsules
+/// follow the bones) and reallocated only when the count changes; the
+/// control UBO carries the (slot-static) particle count plus the
+/// frame's collider count and margin.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ensure_cloth_gpu_collide_resources(
+    renderer_slot: &mut crate::renderer::TransformGpuData,
+    colliders: &[crate::renderer::frame_input::ClothGpuCollider],
+    particle_count: u32,
+    margin: f32,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+    cloth_collide_pipeline: &Arc<ComputePipeline>,
+) -> Result<(), String> {
+    let count = colliders.len() as u32;
+    let cloth_pos_ssbo = renderer_slot.cloth_pos_ssbo.clone();
+    let gpu = renderer_slot
+        .cloth_gpu
+        .as_mut()
+        .ok_or("renderer: collide resources require an allocated cloth slot")?;
+    let needs_rebuild = gpu
+        .collide
+        .as_ref()
+        .map(|c| c.collider_count != count)
+        .unwrap_or(true);
+    if needs_rebuild {
+        let collider_ssbo = gpu_alloc::host_buffer(
+            memory_allocator,
+            BufferUsage::STORAGE_BUFFER,
+            colliders.iter().map(|c| pipeline::ClothGpuColliderGpu {
+                a: [c.p0[0], c.p0[1], c.p0[2], c.radius],
+                b: [c.p1[0], c.p1[1], c.p1[2], 0.0],
+            }),
+            "cloth collider SSBO",
+        )?;
+        let control_ubo = gpu_alloc::host_ubo(
+            memory_allocator,
+            pipeline::ClothCollideControl {
+                particle_count,
+                collider_count: count,
+                margin,
+                _pad: 0,
+            },
+            "cloth collide control UBO",
+        )?;
+        let set_layout = cloth_collide_pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .ok_or("renderer: cloth collide pipeline missing set 0 layout")?
+            .clone();
+        let collide_set = DescriptorSet::new(
+            ds_allocator.clone(),
+            set_layout,
+            [
+                // The positions buffer is the transform slot's
+                // cloth_pos_ssbo, passed in by the caller through the
+                // renderer slot below.
+                WriteDescriptorSet::buffer(0, cloth_pos_ssbo),
+                WriteDescriptorSet::buffer(1, collider_ssbo.clone()),
+                WriteDescriptorSet::buffer(2, control_ubo.clone()),
+            ],
+            [],
+        )
+        .map_err(|e| format!("renderer: cloth collide descriptor set: {e}"))?;
+        gpu.collide = Some(ClothGpuCollideResources {
+            collider_ssbo,
+            control_ubo,
+            collide_set,
+            collider_count: count,
+        });
+    } else if let Some(res) = gpu.collide.as_mut() {
+        // Refresh the capsule rows in place (same live-write pattern as
+        // the verlet control UBO).
+        let mut guard = res
+            .collider_ssbo
+            .write()
+            .map_err(|e| format!("renderer: collider SSBO write: {e}"))?;
+        for (dst, c) in guard.iter_mut().zip(colliders.iter()) {
+            *dst = pipeline::ClothGpuColliderGpu {
+                a: [c.p0[0], c.p0[1], c.p0[2], c.radius],
+                b: [c.p1[0], c.p1[1], c.p1[2], 0.0],
+            };
+        }
+    }
+    if let Some(res) = gpu.collide.as_mut() {
+        let mut g = res
+            .control_ubo
+            .write()
+            .map_err(|e| format!("renderer: collide control UBO write: {e}"))?;
+        g.collider_count = count;
+        g.margin = margin;
+        g.particle_count = particle_count;
+    }
+    Ok(())
 }

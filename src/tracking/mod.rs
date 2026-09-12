@@ -31,7 +31,7 @@ pub mod yolox;
 // `private_interfaces` at every one of those sites. The remaining
 // calibration items are crate-visible only (visibility-tightening
 // pass), and a `pub use` cannot re-export them outward.
-pub use calibration::{CalibrationMode, PoseCalibration};
+pub use calibration::{median_joint_state, CalibrationMode, PoseCalibration};
 pub(crate) use calibration::{
     rotate_xz, shoulder_line_yaw, shoulder_span_plausible, TrackingCalibration,
     BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD, SHOULDER_SPAN_MAX_M,

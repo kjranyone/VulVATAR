@@ -219,6 +219,7 @@ struct ClothGpuSlot {
     /// Vertex normal recomputation resources. `None` when the cloth has
     /// no triangle index data.
     normals: Option<ClothGpuNormalResources>,
+    collide: Option<ClothGpuCollideResources>,
 }
 
 /// Per-primitive constraint-projection resources for the Jacobi
@@ -265,6 +266,18 @@ struct ClothGpuConstraintResources {
 /// Per-primitive normal-recomputation resources. The output normal SSBO
 /// is the parent slot's `cloth_norm_ssbo` — reused so `transform_cs`
 /// sees the GPU-written normals without an extra binding.
+/// Per-slot resources for the GPU collision stage (`cloth_collide_cs`).
+/// The collider SSBO is world-space and moves with the bones, so the
+/// prepare half rewrites it every frame and reallocates only when the
+/// capsule count changes.
+struct ClothGpuCollideResources {
+    #[allow(dead_code)]
+    collider_ssbo: Subbuffer<[pipeline::ClothGpuColliderGpu]>,
+    control_ubo: Subbuffer<pipeline::ClothCollideControl>,
+    collide_set: Arc<DescriptorSet>,
+    collider_count: u32,
+}
+
 struct ClothGpuNormalResources {
     #[allow(dead_code)]
     triangle_idx_ssbo: Subbuffer<[u32]>,
@@ -337,6 +350,7 @@ pub struct VulkanRenderer {
     cloth_constraint_apply_pipeline: Option<Arc<ComputePipeline>>,
     /// Cloth vertex normal recomputation compute pipeline (S3.1).
     cloth_normal_pipeline: Option<Arc<ComputePipeline>>,
+    cloth_collide_pipeline: Option<Arc<ComputePipeline>>,
     gpu_runtime_counters: GpuRuntimeCounters,
     texture_cache: HashMap<String, Arc<ImageView>>,
     device: Option<Arc<Device>>,
@@ -463,6 +477,7 @@ impl VulkanRenderer {
             cloth_constraint_accumulate_pipeline: None,
             cloth_constraint_apply_pipeline: None,
             cloth_normal_pipeline: None,
+            cloth_collide_pipeline: None,
             gpu_runtime_counters: GpuRuntimeCounters::default(),
             texture_cache: HashMap::new(),
             device: None,
@@ -840,6 +855,11 @@ impl VulkanRenderer {
         )
         .expect("failed to create cloth normal compute pipeline");
         self.cloth_normal_pipeline = Some(cloth_normal_pipeline);
+        let cloth_collide_pipeline = pipeline::create_cloth_collide_compute_pipeline(
+            self.device.as_ref().expect("device set above").clone(),
+        )
+        .expect("failed to create cloth collide compute pipeline");
+        self.cloth_collide_pipeline = Some(cloth_collide_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
         self.post_sampler = Some(post_sampler);
@@ -1249,6 +1269,11 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no cloth normal pipeline")?
             .clone();
+        let cloth_collide_pipeline = self
+            .cloth_collide_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth collide pipeline")?
+            .clone();
 
         let mut builder = AutoCommandBufferBuilder::primary(
             cb_allocator,
@@ -1266,6 +1291,7 @@ impl VulkanRenderer {
             &cloth_accumulate_pipeline,
             &cloth_apply_pipeline,
             &cloth_normal_pipeline,
+            &cloth_collide_pipeline,
             &plan.instances,
         )?;
 

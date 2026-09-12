@@ -1045,4 +1045,107 @@ mod tests {
         assert_eq!(positions[0], [1.0, 0.0, 0.0]);
         assert_eq!(prev[0], [1.0, 0.0, 0.0]);
     }
+
+    /// Rust mirror of `cloth_collide_cs`'s per-particle body: sequential
+    /// capsule loop with the position mutating across iterations, exactly
+    /// as the shader does (closest-point degenerate-segment handling,
+    /// radius+margin projection, 1e-12 guards).
+    fn collide_cs_project(mut pos: [f32; 3], capsules: &[[f32; 7]], margin: f32) -> [f32; 3] {
+        for cap in capsules {
+            let (a, b) = ([cap[0], cap[1], cap[2]], [cap[3], cap[4], cap[5]]);
+            let radius = cap[6] + margin;
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ap = [pos[0] - a[0], pos[1] - a[1], pos[2] - a[2]];
+            let ab_len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let closest = if ab_len_sq >= 1.0e-12 {
+                let t = ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab_len_sq)
+                    .clamp(0.0, 1.0);
+                [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t]
+            } else {
+                a
+            };
+            let diff = [pos[0] - closest[0], pos[1] - closest[1], pos[2] - closest[2]];
+            let dist = (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]).sqrt();
+            if dist < radius && dist > 1.0e-12 {
+                let n = [diff[0] / dist, diff[1] / dist, diff[2] / dist];
+                pos = [
+                    closest[0] + n[0] * radius,
+                    closest[1] + n[1] * radius,
+                    closest[2] + n[2] * radius,
+                ];
+            }
+        }
+        pos
+    }
+
+    /// CPU reference: transcription of `cloth_solver::collision::collide`
+    /// for one particle (sphere + capsule variants, same guards), using
+    /// the shared closest-point helper.
+    fn cpu_collide_particle(
+        mut pos: [f32; 3],
+        capsules: &[[f32; 7]],
+        margin: f32,
+    ) -> [f32; 3] {
+        use crate::math_utils::{closest_point_on_segment, vec3_add, vec3_scale, vec3_sub};
+        for cap in capsules {
+            let a = [cap[0], cap[1], cap[2]];
+            let b = [cap[3], cap[4], cap[5]];
+            let radius = cap[6] + margin;
+            let closest = closest_point_on_segment(&a, &b, &pos);
+            let diff = vec3_sub(&pos, &closest);
+            let dist = crate::math_utils::vec3_length(&diff);
+            if dist < radius && dist > 1e-12 {
+                let normal = vec3_scale(&diff, 1.0 / dist);
+                pos = vec3_add(&closest, &vec3_scale(&normal, radius));
+            }
+        }
+        pos
+    }
+
+    /// Deterministic LCG so failures reproduce without a seed dependency.
+    fn lcg(state: &mut u64) -> f32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
+    }
+
+    #[test]
+    fn cloth_collide_cs_formula_matches_cpu_collision() {
+        let mut rng = 789_101_112u64;
+        for case in 0..200 {
+            let n_caps = 1 + (case % 4);
+            let mut capsules = Vec::new();
+            for _ in 0..n_caps {
+                let degenerate = lcg(&mut rng) > 0.5; // sphere ⇔ p0 == p1
+                let p0 = [lcg(&mut rng), lcg(&mut rng), lcg(&mut rng)];
+                let p1 = if degenerate {
+                    p0
+                } else {
+                    [lcg(&mut rng), lcg(&mut rng), lcg(&mut rng)]
+                };
+                let radius = 0.05 + lcg(&mut rng).abs() * 0.3;
+                capsules.push([p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], radius]);
+            }
+            let margin = (lcg(&mut rng).abs() * 0.05).max(0.0);
+            // Half the particles start inside a capsule so the projection
+            // path (not just the miss path) is exercised.
+            let base = if case % 2 == 0 {
+                [capsules[0][0], capsules[0][1], capsules[0][2]]
+            } else {
+                [lcg(&mut rng), lcg(&mut rng), lcg(&mut rng)]
+            };
+            let pos = [
+                base[0] + lcg(&mut rng) * 0.1,
+                base[1] + lcg(&mut rng) * 0.1,
+                base[2] + lcg(&mut rng) * 0.1,
+            ];
+            let gpu = collide_cs_project(pos, &capsules, margin);
+            let cpu = cpu_collide_particle(pos, &capsules, margin);
+            for k in 0..3 {
+                assert!(
+                    (gpu[k] - cpu[k]).abs() < 1e-5,
+                    "case {case} axis {k}: gpu {gpu:?} vs cpu {cpu:?}"
+                );
+            }
+        }
+    }
 }

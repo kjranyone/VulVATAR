@@ -794,6 +794,82 @@ void main() {
 }
 
 // ---------------------------------------------------------------------------
+// Cloth collision projection compute shader (P3-02 S2.2)
+// ---------------------------------------------------------------------------
+//
+// Per-particle projection out of world-space capsule colliders — the GPU
+// twin of `cloth_solver::collision::collide` (external collision only;
+// self-collision stays CPU-side). Runs once per substep after the XPBD
+// constraint iterations, matching the CPU step order. Pinned particles
+// (inv_mass == 0) are skipped, so the pin rows authored by the prepare
+// half survive untouched.
+pub mod cloth_collide_cs {
+    vulkano_shaders::shader! {
+                    ty: "compute",
+                    src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// xyz = position, w = inv_mass (0.0 = effectively pinned / immobile).
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+
+// Capsule: a.xyz / b.xyz = segment endpoints, a.w = radius.
+struct Capsule {
+    vec4 a;
+    vec4 b;
+};
+layout(set = 0, binding = 1) readonly buffer Colliders {
+    Capsule c[];
+} colliders;
+
+// Rust mirror: `ClothCollideControl`.
+layout(set = 0, binding = 2) uniform Control {
+    uint  particle_count;
+    uint  collider_count;
+    float margin;
+    uint  _pad;
+} ctrl;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 pp = positions.p[pid];
+    // Matches the CPU `if p.pinned { continue }` skip.
+    if (pp.w <= 0.0) return;
+
+    vec3 pos = pp.xyz;
+    for (uint k = 0; k < ctrl.collider_count; ++k) {
+        vec3 a = colliders.c[k].a.xyz;
+        vec3 b = colliders.c[k].b.xyz;
+        float radius = colliders.c[k].a.w + ctrl.margin;
+        // Closest point on the segment — degenerate segment (sphere)
+        // collapses to its endpoint, same as the CPU helper.
+        vec3 ab = b - a;
+        vec3 ap = pos - a;
+        float ab_len_sq = dot(ab, ab);
+        vec3 closest = a;
+        if (ab_len_sq >= 1.0e-12) {
+            float t = clamp(dot(ap, ab) / ab_len_sq, 0.0, 1.0);
+            closest = a + ab * t;
+        }
+        vec3 diff = pos - closest;
+        float dist = length(diff);
+        if (dist < radius && dist > 1.0e-12) {
+            vec3 n = diff / dist;
+            pos = closest + n * radius;
+        }
+    }
+    positions.p[pid] = vec4(pos, pp.w);
+}
+"
+                }
+}
+
+// ---------------------------------------------------------------------------
 // Cloth vertex normal recomputation compute shader (P3-02 S3.1)
 // ---------------------------------------------------------------------------
 //
@@ -1778,6 +1854,53 @@ pub fn create_cloth_normal_compute_pipeline(
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .map_err(|e| format!("failed to create cloth normal compute pipeline: {e}"))
+}
+
+
+/// Control block for `cloth_collide_cs`. Rust mirror of the GLSL
+/// `Control` uniform.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothCollideControl {
+    pub particle_count: u32,
+    pub collider_count: u32,
+    pub margin: f32,
+    pub _pad: u32,
+}
+
+/// SSBO row for one collision capsule: `a.xyz`/`b.xyz` = segment
+/// endpoints, `a.w` = radius, `b.w` unused (padding).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothGpuColliderGpu {
+    pub a: [f32; 4],
+    pub b: [f32; 4],
+}
+
+/// Build the cloth collision projection compute pipeline (P3-02 S2.2).
+pub fn create_cloth_collide_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_collide_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth collide compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth collide compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth collide pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth collide pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth collide compute pipeline: {e}"))
 }
 
 /// Build the compute pipeline that fuses skinning, morph-target blend, and

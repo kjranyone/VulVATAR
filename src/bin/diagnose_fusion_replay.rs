@@ -270,9 +270,27 @@ fn main() -> Result<(), String> {
             render_every = 5;
         }
     }
+    // --qneutral-hold [N]: emulate a calibration hold on the first N
+    // frames — median the solved joint state over them, build a
+    // PoseCalibration carrying only q_neutral, and inject it via
+    // set_calibration at frame N. The rest of the run then tracks
+    // WITH the calibrated posture prior (the estimator replaces each
+    // joint's relaxed-pose prior mean; sigma unchanged). A/B against
+    // a run without the flag to measure the prior's effect. N
+    // defaults to 90 (3 s at the nominal replay clock).
+    let mut qneutral_hold: Option<usize> = None;
+    if let Some(i) = args.iter().position(|a| a == "--qneutral-hold") {
+        qneutral_hold = Some(
+            args.get(i + 1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(90),
+        );
+        args.drain(i..(i + 2).min(args.len()));
+    }
+
     let dir = PathBuf::from(
         args.first()
-            .ok_or("usage: diagnose_fusion_replay <dir> [out_dir] [--render N]")?,
+            .ok_or("usage: diagnose_fusion_replay <dir> [out_dir] [--render N] [--qneutral-hold N]")?,
     );
     let out_dir = args.get(1).map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from("diagnostics/fusion").join(dir.file_name().unwrap_or_default())
@@ -391,6 +409,9 @@ fn main() -> Result<(), String> {
     let mut lwr_sig = Vec::new();
     let mut rwr_sig = Vec::new();
 
+    // --qneutral-hold accumulator (solved joint states of the hold window).
+    let mut qneutral_accum: Vec<Vec<[f32; 3]>> = Vec::new();
+
     for (n, (idx, cp, dp)) in pairs.iter().enumerate() {
         let (rgb, mut metric) = load_metric_frame(cp, dp)?;
         let (cw, ch) = (rgb.width(), rgb.height());
@@ -399,6 +420,50 @@ fn main() -> Result<(), String> {
         let depth_pts = metric.points_m.clone();
         provider.set_external_depth(metric);
         let est_out = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64);
+        if let Some(hold_n) = qneutral_hold {
+            if let Some(q) = est_out.skeleton.estimator_joint_state.clone() {
+                qneutral_accum.push(q);
+            }
+            if qneutral_accum.len() >= hold_n {
+                match vulvatar_lib::tracking::median_joint_state(&qneutral_accum) {
+                    Some(qn) => {
+                        let cal = vulvatar_lib::tracking::PoseCalibration {
+                            mode: vulvatar_lib::tracking::CalibrationMode::UpperBody,
+                            captured_at: String::new(),
+                            captured_at_unix: 0,
+                            frame_count: qneutral_accum.len(),
+                            anchor_x: 0.0,
+                            anchor_y: 0.0,
+                            anchor_depth_m: None,
+                            confidence: 1.0,
+                            anchor_depth_jitter_m: None,
+                            shoulder_span_m: None,
+                            x_range_observed: None,
+                            z_range_observed: None,
+                            neutral_expressions: Vec::new(),
+                            neutral_face_ypr_mesh: None,
+                            neutral_face_ypr_body: None,
+                            neutral_body_yaw: None,
+                            q_neutral: Some(qn.clone()),
+                        };
+                        provider.set_calibration(Some(cal));
+                        eprintln!(
+                            "q_neutral: injected median of {} frames ({} joints) at frame {}",
+                            qneutral_accum.len(),
+                            qn.len(),
+                            n
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "q_neutral: hold produced no usable median ({} frames) — run continues without the prior",
+                            qneutral_accum.len()
+                        );
+                    }
+                }
+                qneutral_hold = None;
+            }
+        }
         let rig = est_out.skeleton.rig.clone();
         if std::env::var_os("VULVATAR_REPLAY_KPDUMP").is_some() {
             let k = &est_out.annotation.keypoints;
@@ -936,6 +1001,80 @@ fn main() -> Result<(), String> {
                             tilt.to_degrees(),
                             rebase.to_degrees()
                         );
+                    }
+                    // Spine-chain lean audit: avatar segment lean from world
+                    // positions + the rig deltas that produced it. A recline
+                    // the person isn't doing shows here as Chest→Neck lean
+                    // far beyond the asset's rest profile.
+                    {
+                        let pos_of = |bone: HB| -> Option<[f32; 3]> {
+                            let node = hm.bone_map.get(&bone)?;
+                            let mut chain = vec![];
+                            let mut i = node.0 as usize;
+                            loop {
+                                chain.push(i);
+                                match asset.skeleton.nodes[i].parent {
+                                    Some(p) => i = p.0 as usize,
+                                    None => break,
+                                }
+                            }
+                            let mut p = [0.0f32; 3];
+                            let mut rot = [0.0f32, 0.0, 0.0, 1.0];
+                            for &k in chain.iter().rev() {
+                                let lt = locals[k].translation;
+                                let off = quat_rotate_vec3(&rot, &lt);
+                                for q in 0..3 {
+                                    p[q] += off[q];
+                                }
+                                rot = quat_mul(&rot, &locals[k].rotation);
+                            }
+                            Some(p)
+                        };
+                        let hb_short = |b: HB| -> String {
+                            let s = format!("{b:?}");
+                            s.strip_prefix("Left")
+                                .map(|x| format!("L{x}"))
+                                .or_else(|| s.strip_prefix("Right").map(|x| format!("R{x}")))
+                                .unwrap_or(s)
+                        };
+                        let mut line = String::new();
+                        for (a, b) in [
+                            (HB::Hips, HB::Spine),
+                            (HB::Spine, HB::Chest),
+                            (HB::Chest, HB::UpperChest),
+                            (HB::UpperChest, HB::Neck),
+                            (HB::Chest, HB::Neck),
+                            (HB::Neck, HB::Head),
+                        ] {
+                            if let (Some(pa), Some(pb)) = (pos_of(a), pos_of(b)) {
+                                let (dy, dz) = (pb[1] - pa[1], pb[2] - pa[2]);
+                                // viewer z is toward the camera: a node
+                                // displaced to negative z leans BACK, so
+                                // atan2(−dz, dy) > 0 = recline.
+                                let lean = (-dz).atan2(dy).to_degrees();
+                                line.push_str(&format!(
+                                    " {}→{} {:+.0}°",
+                                    hb_short(a),
+                                    hb_short(b),
+                                    lean
+                                ));
+                            }
+                        }
+                        let deltas = [HB::Hips, HB::Spine, HB::Chest, HB::UpperChest]
+                            .iter()
+                            .filter_map(|b| {
+                                rig.and_then(|r| r.bones.get(b)).map(|rb| {
+                                    let m3 =
+                                        vulvatar_lib::tracking::fusion::math::quat_to_mat(
+                                            rb.delta_world,
+                                        );
+                                    let (y, p, _) = ypr_deg(&m3);
+                                    format!("{} y{:+.0} p{:+.0}", hb_short(*b), y, p)
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        eprintln!("SPINECMP idx {idx} lean:{line} | rig: {deltas}");
                     }
                 }
             }

@@ -596,6 +596,71 @@ fn build_skirt_cloth_asset(
     Ok((cloth_asset, prim_id))
 }
 
+/// Per-particle pin world targets — diagnostic twin of the app-side
+/// `gpu_pin_targets` (same math as the CPU solver's
+/// `cloth_solver::collision::apply_pin_targets`), so the GPU backend
+/// smoke can drive pins from the bin without reaching into private
+/// app internals.
+/// World-space avatar collision capsules for the GPU stage —
+/// diagnostic twin of the app-side `gpu_colliders_for`.
+fn gpu_colliders(avatar: &AvatarInstance) -> Vec<vulvatar_lib::renderer::frame_input::ClothGpuCollider> {
+    vulvatar_lib::simulation::cloth::resolve_colliders(
+        &avatar.asset.colliders,
+        &avatar.pose.global_transforms,
+        &avatar.collider_enabled,
+    )
+    .into_iter()
+    .map(|c| {
+        let (p0, p1, radius) = match c {
+            vulvatar_lib::simulation::cloth::ResolvedCollider::Sphere { center, radius } => {
+                (center, center, radius)
+            }
+            vulvatar_lib::simulation::cloth::ResolvedCollider::Capsule {
+                center,
+                radius,
+                half_height,
+                axis,
+            } => {
+                let a = vulvatar_lib::math_utils::vec3_sub(
+                    &center,
+                    &vulvatar_lib::math_utils::vec3_scale(&axis, half_height),
+                );
+                let b = vulvatar_lib::math_utils::vec3_add(
+                    &center,
+                    &vulvatar_lib::math_utils::vec3_scale(&axis, half_height),
+                );
+                (a, b, radius)
+            }
+        };
+        vulvatar_lib::renderer::frame_input::ClothGpuCollider { p0, p1, radius }
+    })
+    .collect()
+}
+
+fn gpu_pin_targets(
+    sim: &vulvatar_lib::simulation::cloth::ClothSimState,
+    global_transforms: &[vulvatar_lib::asset::Mat4],
+) -> Vec<[f32; 3]> {
+    let mut out = vec![[0.0f32; 3]; sim.particles.len()];
+    for pin in &sim.pin_targets {
+        let Some(mat) = global_transforms.get(pin.node_index) else {
+            continue;
+        };
+        let [ox, oy, oz] = pin.offset;
+        let world = [
+            mat[0][0] * ox + mat[1][0] * oy + mat[2][0] * oz + mat[3][0],
+            mat[0][1] * ox + mat[1][1] * oy + mat[2][1] * oz + mat[3][1],
+            mat[0][2] * ox + mat[1][2] * oy + mat[2][2] * oz + mat[3][2],
+        ];
+        for &pi in &pin.particle_indices {
+            if pi < out.len() {
+                out[pi] = world;
+            }
+        }
+    }
+    out
+}
+
 fn build_render_frame_input(
     avatar: &AvatarInstance,
     skirt_prim_id: PrimitiveId,
@@ -643,20 +708,89 @@ fn build_render_frame_input(
         }
     }
 
-    // Collect cloth deforms
+    // Collect cloth deforms from the primary ClothState and the
+    // overlay slots (first-wins per primitive, matching the app's
+    // `collect_cloth_deforms`). This bin attaches via
+    // `attach_cloth_overlay`, so the overlay path is the live one —
+    // until this collected both, the render never received any cloth
+    // snapshot at all. The snapshot honors each ClothState's backend:
+    // with `VULVATAR_CLOTH_GPU=1` the CPU solver early-returns
+    // (frozen `deform_output`) and the renderer dispatches the cloth
+    // compute pipelines — the rendered PNGs then show the GPU result,
+    // which is exactly what this bin exists to verify.
     let mut cloth_deforms = Vec::new();
-    if let Some(ref cs) = avatar.cloth_state {
+    let mut seen_targets: HashSet<vulvatar_lib::asset::PrimitiveId> = HashSet::new();
+    let primary_iter = avatar
+        .cloth_state
+        .as_ref()
+        .map(|cs| (cs, avatar.cloth_sim.as_ref()))
+        .into_iter();
+    let overlay_iter = avatar
+        .cloth_overlays
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| (&s.state, Some(&s.sim)));
+    for (cs, sim_opt) in primary_iter.chain(overlay_iter) {
+        let Some(target_primitive_id) = cs.target_primitive_id else {
+            continue;
+        };
+        if !seen_targets.insert(target_primitive_id) {
+            continue;
+        }
+        let (gpu_control, gpu_attach) = if cs.solver_backend == ClothSolverBackend::Gpu {
+            sim_opt
+                .map(|sim| {
+                    use vulvatar_lib::renderer::frame_input::{
+                        ClothGpuAttachData, ClothGpuDispatchControl,
+                    };
+                    let wind = vulvatar_lib::math_utils::vec3_scale(
+                        &sim.wind_direction,
+                        sim.wind_response,
+                    );
+                    (
+                        Some(ClothGpuDispatchControl {
+                            dt,
+                            substeps: 1,
+                            damping: sim.damping,
+                            gravity: sim.gravity,
+                            wind_force: wind,
+                            solver_iterations: sim.solver_iterations as u32,
+                            pin_positions: gpu_pin_targets(
+                                sim,
+                                &avatar.pose.global_transforms,
+                            ),
+                            collision_margin: sim.collision_margin,
+                            colliders: gpu_colliders(avatar),
+                        }),
+                        Some(ClothGpuAttachData {
+                            constraints: sim
+                                .distance_constraints
+                                .iter()
+                                .map(|c| {
+                                    (c.a as u32, c.b as u32, c.rest_length, c.stiffness)
+                                })
+                                .collect(),
+                            triangle_indices: sim.triangle_indices.clone(),
+                            inv_masses: sim.particles.iter().map(|p| p.inv_mass).collect(),
+                            pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                        }),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         cloth_deforms.push(ClothDeformSnapshot {
-            target_primitive_id: skirt_prim_id,
+            target_primitive_id,
             target_mesh_id: cs.target_mesh_id,
             vertex_offset: cs.target_vertex_offset,
             vertex_count: cs.target_vertex_count,
             deformed_positions: cs.deform_output.deformed_positions.clone(),
             deformed_normals: cs.deform_output.deformed_normals.clone(),
             version: cs.deform_output.version,
-            solver_backend: ClothSolverBackend::Cpu,
-            gpu_control: None,
-            gpu_attach: None,
+            solver_backend: cs.solver_backend,
+            gpu_control,
+            gpu_attach,
         });
     }
 

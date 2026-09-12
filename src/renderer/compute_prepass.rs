@@ -26,8 +26,8 @@ use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline, PipelineBin
 use crate::asset::PrimitiveId;
 use crate::renderer::frame_input::{self, RenderFrameInput};
 use crate::renderer::frame_plan::{
-    DrawInfo, PlannedCloth, PlannedClothConstraints, PlannedClothNormal, PlannedInstance,
-    PlannedPrim,
+    DrawInfo, PlannedCloth, PlannedClothCollide, PlannedClothConstraints, PlannedClothNormal,
+    PlannedInstance, PlannedPrim,
 };
 use crate::renderer::pipeline::{self, GpuVertex};
 use crate::renderer::{mat4_cols_identity, VulkanRenderer, TRANSFORM_LOCAL_SIZE};
@@ -673,6 +673,49 @@ impl VulkanRenderer {
                                 None
                             };
 
+                        // S2.2 — collision projection resources. Built
+                        // only when the frame actually carries capsules
+                        // (avatar-node colliders resolved by the
+                        // snapshot collector); rewritten every frame.
+                        let collide_plan = if !ctrl.colliders.is_empty() {
+                            match self.cloth_collide_pipeline.as_ref() {
+                                Some(collide_pipeline) => {
+                                    let slot = self
+                                        .transform_cache
+                                        .get_mut(&key)
+                                        .expect("transform slot present");
+                                    match super::cloth_cache::ensure_cloth_gpu_collide_resources(
+                                        slot,
+                                        &ctrl.colliders,
+                                        particle_count,
+                                        ctrl.collision_margin,
+                                        memory_allocator,
+                                        ds_allocator,
+                                        collide_pipeline,
+                                    ) {
+                                        Ok(()) => slot
+                                            .cloth_gpu
+                                            .as_ref()
+                                            .and_then(|g| g.collide.as_ref())
+                                            .map(|c| PlannedClothCollide {
+                                                set: c.collide_set.clone(),
+                                                collider_count: c.collider_count,
+                                            }),
+                                        Err(e) => {
+                                            warn!(
+                                                "render: cloth collide resources failed for primitive {:?}: {}",
+                                                mesh_inst.primitive_id, e
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         cloth_plan = Some(PlannedCloth {
                             verlet_set,
                             groups: [groups, 1, 1],
@@ -680,6 +723,7 @@ impl VulkanRenderer {
                             constraint_iters,
                             constraints: constraints_plan,
                             normal: normal_plan,
+                            collide: collide_plan,
                         });
                     }
                 }
@@ -829,6 +873,7 @@ impl VulkanRenderer {
         cloth_constraint_accumulate_pipeline: &Arc<ComputePipeline>,
         cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
         cloth_normal_pipeline: &Arc<ComputePipeline>,
+        cloth_collide_pipeline: &Arc<ComputePipeline>,
         instances: &[PlannedInstance],
     ) -> Result<(), String> {
         builder
@@ -959,6 +1004,36 @@ impl VulkanRenderer {
                         }
                     }
 
+                    // S2.2 — collision projection: push particles out of
+                    // the world-space capsules, once per substep after
+                    // the constraint iterations (CPU step order: XPBD →
+                    // self-collision → colliders; self-collision stays
+                    // CPU-side). Pinned rows are skipped in-shader, so
+                    // the pin targets authored in prepare survive. The
+                    // verlet pipeline is re-bound afterwards because the
+                    // next substep iteration starts from it.
+                    if let Some(collide) = &cloth.collide {
+                        builder
+                            .bind_pipeline_compute(cloth_collide_pipeline.clone())
+                            .map_err(|e| format!("render: bind cloth collide pipeline: {e}"))?;
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Compute,
+                                cloth_collide_pipeline.layout().clone(),
+                                0,
+                                collide.set.clone(),
+                            )
+                            .map_err(|e| format!("render: bind cloth collide set: {e}"))?;
+                        unsafe {
+                            builder.dispatch(cloth.groups).map_err(|e| {
+                                format!("render: cloth collide dispatch: {e}")
+                            })?;
+                        }
+                        builder
+                            .bind_pipeline_compute(cloth_verlet_pipeline.clone())
+                            .map_err(|e| format!("render: rebind cloth verlet pipeline: {e}"))?;
+                    }
+
                     // S3.1 — vertex normal recomputation.
                     if let Some(normal) = &cloth.normal {
                         builder
@@ -981,12 +1056,29 @@ impl VulkanRenderer {
 
                     // Switch the bound compute pipeline back to the
                     // transform pipeline so the dispatch below uses the
-                    // right shader. (The descriptor set bound
-                    // afterwards targets a different layout, so an
-                    // explicit re-bind here is required.)
+                    // right shader. Two things must be re-bound, not
+                    // just the pipeline: the cloth passes bound set 0
+                    // under their own (incompatible) layouts, which
+                    // drops the transform layout's set-1 skinning set
+                    // from the command buffer's tracked bindings —
+                    // without this re-bind the transform dispatch
+                    // fails validation ("pipeline accesses descriptor
+                    // set 1, but no descriptor set was previously
+                    // bound"). First exercised by the GPU-cloth smoke
+                    // in diagnose_cloth; the CPU path never dispatches
+                    // cloth, so the transform set-1 binding from the
+                    // instance loop above stayed live.
                     builder
                         .bind_pipeline_compute(transform_pipeline.clone())
                         .map_err(|e| format!("render: rebind transform pipeline: {e}"))?;
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Compute,
+                            transform_pipeline.layout().clone(),
+                            1,
+                            inst.skinning_set.clone(),
+                        )
+                        .map_err(|e| format!("render: rebind skinning set: {e}"))?;
                 }
 
                 // Bind set 0 + dispatch.

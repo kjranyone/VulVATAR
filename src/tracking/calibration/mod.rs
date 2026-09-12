@@ -240,6 +240,46 @@ pub struct PoseCalibration {
     pub q_neutral: Option<Vec<[f32; 3]>>,
 }
 
+/// Median solved joint state over a calibration hold — the posture
+/// prior's `q_neutral`. Frames ride at the provider model's joint
+/// count; if that count changed mid-hold (provider restart against a
+/// different model version) the majority count wins and the minority
+/// frames are dropped, so the median is never ragged. Below
+/// `Q_NEUTRAL_MIN_SAMPLES` consistent frames the estimate is too thin
+/// — `None` (the finalizer then carries the previous calibration's
+/// value forward). Shared by the GUI finalizer and the replay bench
+/// (`diagnose_fusion_replay --qneutral-hold`).
+pub fn median_joint_state(accum: &[Vec<[f32; 3]>]) -> Option<Vec<[f32; 3]>> {
+    const Q_NEUTRAL_MIN_SAMPLES: usize = 5;
+    if accum.is_empty() {
+        return None;
+    }
+    let mut counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for q in accum {
+        *counts.entry(q.len()).or_default() += 1;
+    }
+    let (&n, _) = counts.iter().max_by_key(|(_, &c)| c)?;
+    if n == 0 {
+        return None;
+    }
+    let frames: Vec<&Vec<[f32; 3]>> = accum.iter().filter(|q| q.len() == n).collect();
+    if frames.len() < Q_NEUTRAL_MIN_SAMPLES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for j in 0..n {
+        let mut joint = [0.0f32; 3];
+        for (k, comp) in joint.iter_mut().enumerate() {
+            let mut vals: Vec<f32> = frames.iter().map(|q| q[j][k]).collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            *comp = vals[vals.len() / 2];
+        }
+        out.push(joint);
+    }
+    Some(out)
+}
+
 /// Lower bound on a stored [`PoseCalibration::shoulder_span_m`], in
 /// real metres. Below this the reading is not a torso — a collapsed
 /// shoulder pair, a mis-scaled depth frame, or a value recorded in

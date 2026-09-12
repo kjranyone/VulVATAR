@@ -184,9 +184,13 @@ slices:
   shrinking the CPU snapshot vector to a metadata-only descriptor.
   Opt-in today via `VULVATAR_CLOTH_GPU=1` (attach-time selection;
   dynamic pin targets that follow the avatar's bones are wired through
-  `ClothGpuDispatchControl::pin_positions`). Blocked on a GPU collider
-  stage (capsules still live only in the CPU solver) and, for CPU-side
-  consumers, a GPU→CPU readback path.
+  `ClothGpuDispatchControl::pin_positions`, and avatar-node capsule
+  colliders project through `cloth_collide_cs` once per substep —
+  formula parity locked by `cloth_gpu_boundary::tests`). Blocked on
+  scene colliders / self-collision (still CPU-solver-only) and, for
+  CPU-side consumers, a GPU→CPU readback path. Verified end-to-end by
+  `diagnose_cloth` (which now renders from overlay snapshots and
+  honors the backend, exercising the real dispatch path headlessly).
 - **GPU-local preview** — egui still consumes CPU pixels for the
   viewport; that is a distinct preview fallback path and must not
   define the output architecture.

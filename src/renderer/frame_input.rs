@@ -282,6 +282,14 @@ pub struct ClothGpuDispatchControl {
     /// times *within each substep*. Normal recomputation runs once
     /// per frame, after all substeps complete.
     pub solver_iterations: u32,
+    /// Collision margin added to every capsule radius, mirroring
+    /// `ClothSimState::collision_margin` on the CPU path.
+    pub collision_margin: f32,
+    /// World-space collision capsules for THIS frame (avatar-node
+    /// colliders resolved from the current pose; spheres encoded as
+    /// degenerate capsules with `p0 == p1`). Scene colliders and
+    /// self-collision remain CPU-solver-only.
+    pub colliders: Vec<ClothGpuCollider>,
     /// Per-particle pin world targets for THIS frame — the GPU twin
     /// of the CPU solver's `apply_pin_targets` (`T(node) · offset`
     /// per pin binding, expanded to particle index space). The
@@ -291,6 +299,19 @@ pub struct ClothGpuDispatchControl {
     /// particles are zero and skipped via `gpu_attach.pinned`.
     /// Empty when the cloth has no pins.
     pub pin_positions: Vec<[f32; 3]>,
+}
+
+/// One world-space collision capsule for the GPU cloth stage. Spheres
+/// are encoded as degenerate capsules (`p0 == p1`); the closest-point-
+/// on-segment math handles that case identically to a sphere.
+#[derive(Clone, Copy, Debug)]
+pub struct ClothGpuCollider {
+    /// First segment endpoint.
+    pub p0: [f32; 3],
+    /// Second segment endpoint (equal to `p0` for spheres).
+    pub p1: [f32; 3],
+    /// Capsule radius, before the per-cloth collision margin.
+    pub radius: f32,
 }
 
 /// One-shot data uploaded to the GPU at cloth-attach time: constraint
