@@ -164,8 +164,8 @@ pub fn vertex_data_to_base(vd: &crate::asset::VertexData) -> Vec<GpuVertexBase> 
 
 pub mod vs {
     vulkano_shaders::shader! {
-                    ty: "vertex",
-                    src: r"
+                        ty: "vertex",
+                        src: r"
 #version 450
 
 layout(location = 0) in vec4 position;
@@ -197,13 +197,13 @@ void main() {
     gl_Position = camera.proj * camera.view * vec4(position.xyz, 1.0);
 }
 "
-                }
+                    }
 }
 
 pub mod fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                                    ty: "fragment",
-                                                                                                                                                                                                                                                                                    src: r"
+                                                                                                                                                                                                                                                                                        ty: "fragment",
+                                                                                                                                                                                                                                                                                        src: r"
 #version 450
 
 layout(location = 0) in vec3 frag_normal;
@@ -350,7 +350,7 @@ void main() {
     out_color = vec4(color.rgb, color.a * camera.fade_opacity);
 }
 "
-                                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                                                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,8 +359,8 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-                    ty: "vertex",
-                    src: r"
+                        ty: "vertex",
+                        src: r"
 #version 450
 
 layout(location = 0) in vec4 position;
@@ -400,13 +400,13 @@ void main() {
     gl_Position = clip_pos;
 }
 "
-                }
+                    }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
+                        ty: "fragment",
+                        src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -423,7 +423,7 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-                }
+                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,16 +447,16 @@ void main() {
 // bit-for-bit so the CPU PBD tests double as parity oracles for the eventual
 // GPU side-by-side test (P3-02 S1.3).
 //
-// **Status**: shader + pipeline factory only. Not yet wired into the render
-// loop; that lands when `ClothGpuSimulationState` grows actual Vulkano
-// buffer handles (P3-02 S1.1 Vulkan side).
+// **Status**: wired. Dispatched from `record_compute_prepass` for cloths
+// whose `ClothDeformSnapshot::solver_backend == Gpu` (opt-in at attach
+// time via `VULVATAR_CLOTH_GPU=1`).
 //
 // SSBO + UBO layout matches the slot table documented in
 // `simulation::cloth_gpu_boundary::ClothGpuSimulationState`.
 pub mod cloth_verlet_cs {
     vulkano_shaders::shader! {
-                    ty: "compute",
-                    src: r"
+                        ty: "compute",
+                        src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -516,7 +516,7 @@ void main() {
     prev_positions.p[idx] = vec4(pos, pinned);
 }
 "
-                }
+                    }
 }
 
 // =========================================================================
@@ -555,8 +555,8 @@ void main() {
 // disabled" exactly like the CPU path.
 pub mod cloth_constraint_lambda_update_cs {
     vulkano_shaders::shader! {
-                    ty: "compute",
-                    src: r"
+                        ty: "compute",
+                        src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -649,13 +649,13 @@ void main() {
     dlambda.l[cidx] = delta_lambda;
 }
 "
-                }
+                    }
 }
 
 pub mod cloth_constraint_accumulate_cs {
     vulkano_shaders::shader! {
-                    ty: "compute",
-                    src: r"
+                        ty: "compute",
+                        src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -745,7 +745,7 @@ void main() {
     deltas.d[pid] = vec4(delta, 0.0);
 }
 "
-                }
+                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,8 +753,8 @@ void main() {
 // ---------------------------------------------------------------------------
 pub mod cloth_constraint_apply_cs {
     vulkano_shaders::shader! {
-                    ty: "compute",
-                    src: r"
+                        ty: "compute",
+                        src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -790,7 +790,7 @@ void main() {
     deltas.d[pid] = vec4(0.0);
 }
 "
-                }
+                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,8 +815,8 @@ void main() {
 // `(0, 1, 0)`; CPU path uses the same fallback.
 pub mod cloth_normal_cs {
     vulkano_shaders::shader! {
-                    ty: "compute",
-                    src: r"
+                        ty: "compute",
+                        src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -909,7 +909,7 @@ void main() {
     normals.n[vid] = vec4(nrm, 0.0);
 }
 "
-                }
+                    }
 }
 
 pub mod transform_cs {
@@ -930,8 +930,8 @@ pub mod transform_cs {
     // 16-byte alignment, so we pad to `vec4` on both ends — see the Rust
     // struct comments for byte-for-byte breakdown.
     vulkano_shaders::shader! {
-                    ty: "compute",
-                    src: r"
+                        ty: "compute",
+                        src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -1197,21 +1197,18 @@ void main() {
     // Clearance (binding 6, `body_v` = the INNER surface): this vertex
     //   must stay at least `min_clearance` OUTSIDE the parent surface,
     //   measured along the parent vertex's outward normal — pushes the
-    //   outer garment off the inner one. At joints where the two
-    //   surfaces fold against each other the anchored parent normal can
-    //   end up opposing this vertex's own normal; the push direction
-    //   then flips to follow this vertex's facing so the fold opens
-    //   instead of crushing the outer layer inward. The flip is only
-    //   decided from a world-space normal — cloth vertices without
-    //   GPU-computed normals still carry a rest-space normal, so they
-    //   keep the unflipped behaviour.
+    //   outer surface away from the inner one (garment off garment, or
+    //   garment off the body). The push direction is NEVER flipped to
+    //   follow this vertex's own normal: for body parents the outward
+    //   skin normal is the only valid away direction, and fold-region
+    //   flips were measured pushing garments 200mm+ INTO the body.
     //
     // Containment (binding 10, `containment_parent_v` = the OUTER
     //   surface): this vertex must stay at most `min_clearance`
-    //   (negative, rest-derived) outside the parent surface — clamps
-    //   the inner garment back inside the outer one when it pokes
-    //   through at bent joints. The two sets are separate so a middle
-    //   layer can carry both at once.
+    //   (rest-derived) outside the parent surface — clamps the inner
+    //   garment back inside the outer one when it pokes through at
+    //   bent joints. The two sets are separate so a middle layer can
+    //   carry both at once.
     //
     // Both read the parent through a sanity band on the parent position
     // (avatar-local coords live well inside it) plus NaN-rejecting
@@ -1228,16 +1225,9 @@ void main() {
             float nlen = length(bn);
             if (plen > 1e-3 && plen < 10.0 && nlen > 1e-4) {
                 bn /= nlen;
-                // Clearance: push out, flipping along the vertex's
-                // own facing at fold regions.
-                vec3 eff_n = bn;
-                bool nrm_world_valid = (ctrl.has_cloth == 0u) || (ctrl.has_cloth_normals > 0u);
-                if (nrm_world_valid && dot(bn, world_nrm) < 0.0) {
-                    eff_n = -bn;
-                }
-                float clearance = dot(world_pos - bp, eff_n);
+                float clearance = dot(world_pos - bp, bn);
                 if (clearance < anc.min_clearance) {
-                    world_pos += eff_n * ((anc.min_clearance - clearance) * anc.weight);
+                    world_pos += bn * ((anc.min_clearance - clearance) * anc.weight);
                 }
             }
         }
@@ -1267,7 +1257,7 @@ void main() {
     out_v.v[vid]._pad     = uvec2(0u, 0u);
 }
 "
-                }
+                    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,9 +1590,8 @@ pub struct ClothVerletControl {
 
 /// Build the cloth Verlet integration compute pipeline (P3-02 S1.2).
 ///
-/// Not yet called at runtime: the per-primitive cloth particle SSBOs
-/// (`pos_ssbo`, `prev_pos_ssbo`) land in P3-02 S1.1 Vulkan side. The
-/// factory exists so that landing is a wiring change, not a new design.
+/// Dispatched from `record_compute_prepass` inside the GPU cloth
+/// substep loop (verlet first, then the constraint passes).
 pub fn create_cloth_verlet_compute_pipeline(
     device: Arc<Device>,
 ) -> Result<Arc<ComputePipeline>, String> {
@@ -1764,9 +1753,8 @@ pub struct ClothNormalControl {
 
 /// Build the cloth vertex normal recomputation compute pipeline (P3-02 S3.1).
 ///
-/// Not yet called at runtime. Lands with the rest of the GPU cloth dispatch
-/// path once `ClothGpuSimulationState` carries actual Vulkano buffer
-/// handles.
+/// Dispatched once per frame at the end of the GPU cloth substep loop,
+/// before `transform_cs` reads the cloth normal SSBO.
 pub fn create_cloth_normal_compute_pipeline(
     device: Arc<Device>,
 ) -> Result<Arc<ComputePipeline>, String> {

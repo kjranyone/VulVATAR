@@ -37,11 +37,15 @@ pub(super) fn draw_watched_folders(ui: &mut egui::Ui, state: &mut GuiApp) {
                     } else {
                         color::ON_ERROR_CONTAINER
                     };
-                    ui.label(
-                        egui::RichText::new(label)
-                            .font(typography::caption())
-                            .color(label_color),
-                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&label)
+                                .font(typography::caption())
+                                .color(label_color),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(label.as_str());
                     if !exists {
                         ui.label(
                             egui::RichText::new(t!("watched_folders.missing"))
@@ -125,14 +129,18 @@ pub(super) fn draw_avatar_cache(ui: &mut egui::Ui, state: &mut GuiApp) {
         |ui| {
             let stats = crate::asset::cache::stats();
             let dir = crate::persistence::cache_dir();
-            ui.label(
-                egui::RichText::new(t!(
-                    "avatar_cache.location",
-                    path = dir.display().to_string()
-                ))
-                .font(typography::caption())
-                .color(color::ON_SURFACE_VARIANT),
-            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!(
+                        "avatar_cache.location",
+                        path = dir.display().to_string()
+                    ))
+                    .font(typography::caption())
+                    .color(color::ON_SURFACE_VARIANT),
+                )
+                .truncate(),
+            )
+            .on_hover_text(dir.display().to_string());
             ui.label(
                 egui::RichText::new(t!(
                     "avatar_cache.entries",
@@ -420,22 +428,36 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                                     }
 
                                     if !row.exists {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "\u{26a0} {}",
-                                                row.path.to_string_lossy()
-                                            ))
-                                            .font(typography::caption())
-                                            .color(color::ERROR),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new(
-                                                row.path.to_string_lossy().as_ref(),
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!(
+                                                    "\u{26a0} {}",
+                                                    row.path.to_string_lossy()
+                                                ))
+                                                .font(typography::caption())
+                                                .color(color::ERROR),
                                             )
-                                            .font(typography::caption())
-                                            .color(color::ON_SURFACE_MUTED),
-                                        );
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(row.path.to_string_lossy().as_ref());
+                                    } else {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(
+                                                    row.path.to_string_lossy().as_ref(),
+                                                )
+                                                .font(typography::caption())
+                                                .color(color::ON_SURFACE_MUTED),
+                                            )
+                                            // An unbounded path label inflates the
+                                            // row → card → ScrollArea min width, and
+                                            // from there the inspector SidePanel's
+                                            // claimed width; the surplus panel area
+                                            // is unpainted and reads as a black
+                                            // band. Truncate to the row width.
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(row.path.to_string_lossy().as_ref());
                                     }
                                 },
                             );

@@ -184,6 +184,16 @@ pub enum FaceMeshEp {
     ForceCpu,
 }
 
+/// Cross-thread FaceMesh EP preference published by
+/// `RuntimeGpuBudget` (PressureHeavy and above force CPU so the small
+/// face cascade stops contending with RTMW3D on DirectML). Consulted
+/// where ONNX sessions are built (`rtmw3d::from_models_dir_with_options`),
+/// so a flip takes effect on the next tracking start — the same
+/// latency class as the existing user-facing `force_cpu` toggle.
+/// `false` (default) keeps the caller's `FaceMeshEp` choice intact.
+pub static FACEMESH_EP_CPU: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub struct FaceMeshInference {
     /// Full-frame pixel landmarks (+ z in frame-pixel scale) and the
     /// mesh confidence of the most recent [`Self::estimate`] call.

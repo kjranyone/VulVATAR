@@ -81,6 +81,13 @@ impl EditorSession {
             .as_ref()
             .map(|a| a.source_path.to_string_lossy().into_owned());
 
+        // Stamp tier-2/3 identity (humanoid slot, parent path) onto
+        // every NodeRef while the authoring avatar is still at hand —
+        // a later rebind can only fall back to it if it was recorded.
+        if let (Some(asset), Some(avatar)) = (&mut self.overlay_asset, &self.target_avatar) {
+            crate::asset::cloth_rebind::enrich_node_identities(asset, avatar);
+        }
+
         let file = ClothOverlayFile {
             format_version: crate::persistence::OVERLAY_FORMAT_VERSION,
             created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),

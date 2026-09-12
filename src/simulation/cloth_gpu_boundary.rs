@@ -138,11 +138,14 @@ impl ClothGpuSimulationState {
 pub enum ClothSolverBackend {
     #[default]
     Cpu,
-    /// GPU compute path. Until P3-02 stage 1 lands the renderer falls
-    /// back to CPU silently (the snapshot pipeline does not yet honour
-    /// this flag); the variant exists so attach-time code can already
-    /// record intent and the upcoming compute landing has a stable
-    /// switch to flip behaviour on.
+    /// GPU compute path. Opt-in at attach time via
+    /// [`solver_backend_from_env`] (`VULVATAR_CLOTH_GPU=1`); the
+    /// renderer dispatches verlet + XPBD + normals on the GPU and the
+    /// CPU solver skips its XPBD pass. Known gaps vs `Cpu`: no GPU
+    /// collider stage (cloth can pass through the body), and
+    /// CPU-side consumers (`ClothState::deform_output`, the cloth
+    /// inspector's live particle view, the manual Step button) see
+    /// the attach-time rest pose because nothing reads positions back.
     Gpu,
 }
 
@@ -153,6 +156,23 @@ impl ClothSolverBackend {
             ClothSolverBackend::Gpu => "GPU compute",
         }
     }
+}
+
+/// One-shot backend selection for freshly attached cloth
+/// (`VULVATAR_CLOTH_GPU=1` → `Gpu`, anything else / unset → `Cpu`).
+/// Cached in a `OnceLock` because the selection is per-attach anyway
+/// and a mid-session env flip must not produce mixed backends on
+/// overlay slots. Promoting `Gpu` to the default (or driving it from
+/// `RuntimeGpuBudget`) is deliberately not done yet: see the collider
+/// / readback gaps on [`ClothSolverBackend::Gpu`].
+pub fn solver_backend_from_env() -> ClothSolverBackend {
+    static CACHE: std::sync::OnceLock<ClothSolverBackend> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match std::env::var_os("VULVATAR_CLOTH_GPU") {
+            Some(v) if v != "0" => ClothSolverBackend::Gpu,
+            _ => ClothSolverBackend::Cpu,
+        }
+    })
 }
 
 /// CSR (compressed sparse row) adjacency listing the triangles incident to

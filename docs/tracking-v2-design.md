@@ -161,7 +161,7 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 - `predict(t)` は任意時刻の状態 + 共分散 (レンダースレッドが 60 Hz で呼ぶ)。1€ フィルタは持たない。
 - 健全性: スパース主要関節の 2D 残差中央値 (`med_sparse_2d_px`) が `lost_rms_px` (40 px) を 2 フレーム連続で超えたら lost。頭/肩の 3D アンカーが追従中 (`n_kp3d ≥ 4` かつ `mean_3d_m < 0.12`) か、密表面が当たっている (§3.7) なら lost にしない。lost 時も直前深度を引き継ぐ。
 - 未観測肢のプロセスノイズ縮小 (`q_hold_floor`) は 0.25 で悪化 (保持された腕が戻ってきた観測と喧嘩し胴が代償を払う) を実測し、既定 1.0 (無効)。
-- 再シード: 解析的アームシード候補 (`update_with_arm_seeds`) は現解のコストの 0.95 倍未満で勝った時だけ採用 (僅差採用は手首瞬間移動になる)。
+- 再シード: 解析的アームシード候補 (`update_with_arm_seeds`) は現解のコストの 0.95 倍未満で勝った時だけ採用 (僅差採用は手首瞬間移動になる)。**定常ゲート**: 手首 data-σ が追跡閾値 (0.5) 以下の腕はシード候補をスキップする — 左手首常時観測のデスク構図では seed_l + seed_both が毎フレーム走って推定器時間の ~2/3 を占め、勝率 1/600 だった (s1789219959: seed評価 612→3、estimator 68.7→26.3 ms、品質指標は全桁同一。勝った 1 フレームは右手首の復帰直後で data-σ EMA がまだ高く、ゲートは自然に開く)。ブートストラップは σ=10 で常時シード。`VULVATAR_FUSION_SEEDGATE_SIGMA` で閾値変更、0 で無効化 (常時シード = 旧動作)。
 - root は 1:1 metric、recenter 無し (`root_recenter_horizon_s = None`)。
 
 ---
@@ -197,11 +197,13 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_FUSION_OLDSIGMA` | σ 再表現前の gain/floor/base (1.0 / 1.5 px / 1.0) |
 | `VULVATAR_FUSION_NO_{SURF,3D,BURNIN,REACH,CHESTYAW}` | 各項の無効化 |
 | `VULVATAR_FUSION_NO_WHOLD` / `VULVATAR_FUSION_WHOLD_SIGMA` | 未観測手首ホールドの無効化 / σ (m) (§3.8) |
+| `VULVATAR_FUSION_SEEDGATE_SIGMA` | アームシードの定常ゲート閾値 (data-σ)。0 = 常時シード (旧動作) |
 | `VULVATAR_FUSION_NO_DENSE` / `VULVATAR_DENSE_ARMS` / `VULVATAR_DENSE_NOHEAD` / `VULVATAR_DENSE_NONECK` | 密表面項の無効化 / 腕カプセル許可 / 頭・首の除外 |
 | `VULVATAR_DENSE_NEFF` / `VULVATAR_DENSE_NEFF_HEAD` / `VULVATAR_DENSE_FRONT` / `VULVATAR_DENSE_FREEZE` | 実効点数・前方ゲート・形状凍結の上書き |
 | `VULVATAR_HOLD_Q` / `VULVATAR_NO_UPRIGHT` / `VULVATAR_TRUNK_AXIS_SIGMA` | 未観測肢ホールド係数 / 胴軸事前の無効化・σ |
 | `VULVATAR_FUSION_OBSDUMP=<frame>` | 観測とモデルの対応ダンプ |
 | `VULVATAR_REPLAY_CPU` / `VULVATAR_REPLAY_NO_YOLOX` | リプレイの EP / YOLOX 無効化 (CPU と DirectML の SimCC 統計は小数 4 桁で一致) |
+| `VULVATAR_FUSION_NO_QNEUTRAL` | キャリブレーションの q_neutral 姿勢事前を無効化 (モデル既定の relaxed-pose 事前に戻す) |
 
 ---
 
@@ -217,7 +219,7 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | リターゲット・アプリ配線 | ✅ (v1 経路は削除済み) |
 | align-to-color 廃止 (native 深度 + extrinsics) | ❌ 未着手 |
 | AprilTag GT リグ / 実データ mm-deg ベンチ | ❌ 未着手 |
-| 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床/事前なし |
+| 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床なし。姿勢事前のみ q_neutral 実装済み (キャリブレーションホールドの関節角中央値が各関節の prior mean を差し替え、σ は不変。効果検証は `VULVATAR_FUSION_NO_QNEUTRAL` で A/B) |
 
 既知の課題:
 
@@ -229,3 +231,5 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 - 未観測腕のプロセスノイズ (q_joint 2.0) が緩く、腕の観測が消えた/戻った時の往復が残る。
 - 肘の深度リフトに約 14 cm の系統誤差 (Cauchy で無視されている)。
 - 参照 (胸部深度勾配) と `ShoulderYawObs` は同じ物理信号なので、参照だけでは姿勢の正しさを証明できない。独立指標は 2D 再投影誤差と合成目視。
+- q_neutral の効果は未計測 (実装は通ったが、デスク系 + 正面系録画での `VULVATAR_FUSION_NO_QNEUTRAL` A/B がまだ無い。効果が出る前に σ 側を弄らないこと)。
+- align-to-color 廃止の初手として「リプレイが meta.jsonl の実 intrinsics を読む」改善が有効 (現在は名目 D435 値で固定、AGENTS.md の前提)。ただし bench 数値の連続性が切れるので opt-in フラグ (`--real-intrinsics`) で。

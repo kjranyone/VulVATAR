@@ -1,10 +1,14 @@
-//! Compute prepass — slice 6 of the #12 renderer split. Records the
-//! per-instance skinning + sparse-morph + cloth compute dispatches and
-//! assembles the per-primitive [`DrawInfo`] list the scene pass
-//! consumes. All state lives on `VulkanRenderer`
-//! (`transform_cache`, `skinning_cache`, `material_uploader`,
-//! texture caches, GPU runtime counters); `render` stays the
-//! orchestrator that owns the command buffer.
+//! Compute prepass — slice 6 of the #12 renderer split. Split into a
+//! prepare half ([`VulkanRenderer::prepare_compute_prepass`]) that performs
+//! the per-primitive CPU writes (control UBOs, compacted morph weights,
+//! cloth snapshot copies, cloth controls + pin targets, material
+//! uniforms) and captures the dispatch structure, and a recording half
+//! ([`VulkanRenderer::record_compute_prepass_planned`]) that replays that
+//! structure into a command buffer. The split is what lets `render` reuse
+//! a cached command buffer on unchanged frame shapes (see `frame_plan.rs`).
+//! All state lives on `VulkanRenderer` (`transform_cache`,
+//! `skinning_cache`, `material_uploader`, texture caches, GPU runtime
+//! counters).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,28 +18,19 @@ use log::warn;
 use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::DescriptorSet;
+use vulkano::image::sampler::Sampler;
+use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint};
 
 use crate::asset::PrimitiveId;
 use crate::renderer::frame_input::{self, RenderFrameInput};
+use crate::renderer::frame_plan::{
+    DrawInfo, PlannedCloth, PlannedClothConstraints, PlannedClothNormal, PlannedInstance,
+    PlannedPrim,
+};
 use crate::renderer::pipeline::{self, GpuVertex};
 use crate::renderer::{mat4_cols_identity, VulkanRenderer, TRANSFORM_LOCAL_SIZE};
-
-// Per-primitive draw record built during the compute prepass and
-// consumed by the graphics passes that follow. `vertex_buffer` is
-// the compute shader's output, so the graphics passes never see
-// base / morph / cloth data — only the world-space vertices.
-pub(super) struct DrawInfo {
-    pub(super) pipeline: Arc<GraphicsPipeline>,
-    pub(super) alpha_mode: frame_input::RenderAlphaMode,
-    pub(super) vertex_buffer: Subbuffer<[GpuVertex]>,
-    pub(super) index_buffer: Subbuffer<[u32]>,
-    pub(super) index_count: u32,
-    pub(super) material_set: Arc<DescriptorSet>,
-    pub(super) outline: Option<(f32, [f32; 3])>,
-}
 
 impl VulkanRenderer {
     /// Fuse skinning + morph + cloth into one dispatch per primitive
@@ -47,23 +42,24 @@ impl VulkanRenderer {
     /// instead — their parent's own clearance dispatch runs later in
     /// the same order, so same-frame input is impossible without a
     /// second pass.
+    ///
+    /// This is the prepare half: every GPU-bound value reaches the GPU
+    /// through a persistent buffer written here, and the dispatch
+    /// structure is captured into [`PlannedInstance`]s for
+    /// [`Self::record_compute_prepass_planned`].
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_compute_prepass(
+    pub(super) fn prepare_compute_prepass(
         &mut self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         input: &RenderFrameInput,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         transform_pipeline: &Arc<ComputePipeline>,
         gfx_pipeline: &Arc<GraphicsPipeline>,
-        default_tex: &Arc<vulkano::image::view::ImageView>,
-        sampler: &Arc<vulkano::image::sampler::Sampler>,
-    ) -> Result<Vec<DrawInfo>, String> {
+        default_tex: &Arc<ImageView>,
+        sampler: &Arc<Sampler>,
+    ) -> Result<(Vec<PlannedInstance>, Vec<DrawInfo>), String> {
+        let mut planned_instances: Vec<PlannedInstance> = Vec::new();
         let mut draws: Vec<DrawInfo> = Vec::new();
-        // ── Compute prepass: fuse skinning + morph + cloth per primitive
-        builder
-            .bind_pipeline_compute(transform_pipeline.clone())
-            .map_err(|e| format!("render: bind_pipeline_compute failed: {e}"))?;
 
         for (inst_idx, instance) in input.instances.iter().enumerate() {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
@@ -81,15 +77,6 @@ impl VulkanRenderer {
                 ds_allocator.clone(),
                 &transform_pipeline,
             )?;
-
-            builder
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    transform_pipeline.layout().clone(),
-                    1,
-                    skinning_set,
-                )
-                .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
 
             // Topological dependency ordering for hierarchical surface clearances:
             // If primitive B specifies body_primitive_id = Some(A) (clearance
@@ -221,6 +208,7 @@ impl VulkanRenderer {
                 }
             }
 
+            let mut planned_prims: Vec<PlannedPrim> = Vec::new();
             for &mesh_inst in &ordered_mesh_instances {
                 let prim_asset = match mesh_inst.primitive_data.as_ref() {
                     Some(p) => p.as_ref(),
@@ -267,8 +255,8 @@ impl VulkanRenderer {
                 let prim_parent_vbo = self.materialize_parent_vbo(
                     instance,
                     validated_parent_ids.get(&mesh_inst.primitive_id).copied(),
-                    &memory_allocator,
-                    &ds_allocator,
+                    memory_allocator,
+                    ds_allocator,
                     &transform_pipeline,
                 );
 
@@ -281,8 +269,8 @@ impl VulkanRenderer {
                     validated_containment_ids
                         .get(&mesh_inst.primitive_id)
                         .copied(),
-                    &memory_allocator,
-                    &ds_allocator,
+                    memory_allocator,
+                    ds_allocator,
                     &transform_pipeline,
                 );
 
@@ -294,8 +282,8 @@ impl VulkanRenderer {
                     has_cloth_normals_prim,
                     prim_parent_vbo.clone(),
                     containment_parent_vbo.clone(),
-                    &memory_allocator,
-                    &ds_allocator,
+                    memory_allocator,
+                    ds_allocator,
                     &transform_pipeline,
                 )?;
 
@@ -330,8 +318,8 @@ impl VulkanRenderer {
                             (mesh_inst.mesh_id, mesh_inst.primitive_id),
                             &cloth_snap.deformed_positions,
                             attach,
-                            &memory_allocator,
-                            &ds_allocator,
+                            memory_allocator,
+                            ds_allocator,
                             &cloth_verlet_pipeline,
                             &cloth_constraint_lambda_update_pipeline,
                             &cloth_constraint_accumulate_pipeline,
@@ -345,18 +333,55 @@ impl VulkanRenderer {
                 // this frame's data. Live-write is safe because the
                 // previous frame's fence has already been waited on at
                 // the top of `render` (via `harvest_pending_readback`).
+                //
+                // The morph gather is COMPACTED to the active targets:
+                // the shader's per-vertex loop bound is `target_count`,
+                // and driving it at the full authored count (446 on
+                // Yumeka's face) costs ~1.4 ms of GPU for iterations
+                // that only load a zero weight and continue. The
+                // entries buffer stays untouched — the per-target info
+                // rows are absolute indices into it, so writing the
+                // active rows into the head of `morph_infos` and the
+                // matching weights into the head of `morph_weights`
+                // gives the shader the same binary searches over a
+                // shorter loop.
+                let mut active_target_count = 0u32;
                 {
                     let slot = self
                         .transform_cache
                         .get(&key)
                         .expect("ensure_transform_data populated the slot");
+                    if slot.target_count > 0 {
+                        let mut infos = slot
+                            .morph_infos
+                            .write()
+                            .map_err(|e| format!("render: morph infos write failed: {e}"))?;
+                        let mut weights = slot
+                            .morph_weights_buf
+                            .write()
+                            .map_err(|e| format!("render: morph weights write failed: {e}"))?;
+                        for (t, &w) in mesh_inst.morph_weights.iter().enumerate() {
+                            if w.abs() <= 1e-6 {
+                                continue;
+                            }
+                            let (Some(info_dst), Some(weight_dst)) = (
+                                infos.get_mut(active_target_count as usize),
+                                weights.get_mut(active_target_count as usize),
+                            ) else {
+                                break;
+                            };
+                            *info_dst = slot.morph_infos_full[t];
+                            *weight_dst = w;
+                            active_target_count += 1;
+                        }
+                    }
                     {
                         let mut guard = slot
                             .control_ubo
                             .write()
                             .map_err(|e| format!("render: control UBO write failed: {e}"))?;
                         guard.vertex_count = slot.vertex_count;
-                        guard.target_count = slot.target_count;
+                        guard.target_count = active_target_count;
                         guard.has_cloth = if has_cloth_prim { 1 } else { 0 };
                         guard.has_cloth_normals = if has_cloth_normals_prim { 1 } else { 0 };
                         guard.has_skin_anchors =
@@ -373,15 +398,6 @@ impl VulkanRenderer {
                             0
                         };
                         guard._pad0 = [0; 2];
-                    }
-                    if slot.target_count > 0 {
-                        let mut weights = slot
-                            .morph_weights_buf
-                            .write()
-                            .map_err(|e| format!("render: morph weights write failed: {e}"))?;
-                        for (i, w) in weights.iter_mut().enumerate() {
-                            *w = mesh_inst.morph_weights.get(i).copied().unwrap_or(0.0);
-                        }
                     }
                 }
                 self.gpu_runtime_counters.morph_weight_writes += 1;
@@ -449,9 +465,9 @@ impl VulkanRenderer {
                     self.gpu_runtime_counters.cloth_vbo_writes += 1;
                 }
 
-                // GPU cloth Verlet integration dispatch. Runs before
-                // `transform_cs` reads `cloth_pos_ssbo`. Inter-dispatch
-                // synchronisation here relies on Vulkano 0.35's
+                // GPU cloth Verlet integration structure + per-frame
+                // control writes. Inter-dispatch synchronisation in the
+                // recorded command buffer relies on Vulkano 0.35's
                 // `AutoCommandBufferBuilder` resource-access tracking:
                 // when two dispatches in the same command buffer share
                 // a buffer with conflicting access (write→read or
@@ -461,9 +477,10 @@ impl VulkanRenderer {
                 // apply → normal → transform_cs because each pair
                 // shares `cloth_pos_ssbo` and/or `delta_ssbo` /
                 // `cloth_norm_ssbo`. If the Vulkano version is bumped
-                // and auto-sync semantics change, this code needs to
-                // gain explicit `synchronization_pipeline_barrier`
+                // and auto-sync semantics change, the recording half
+                // needs to gain explicit `synchronization_pipeline_barrier`
                 // calls.
+                let mut cloth_plan: Option<PlannedCloth> = None;
                 if let (true, Some(cloth)) = (cloth_is_gpu, cloth_snap_opt) {
                     if cloth.gpu_control.is_none() {
                         // Silent skip → renderer reads stale positions.
@@ -478,10 +495,7 @@ impl VulkanRenderer {
                             mesh_inst.primitive_id
                         );
                     }
-                    if let (Some(ctrl), Some(cloth_verlet_pipeline)) = (
-                        cloth.gpu_control.as_ref(),
-                        self.cloth_verlet_pipeline.clone(),
-                    ) {
+                    if let Some(ctrl) = cloth.gpu_control.as_ref() {
                         let (verlet_set, particle_count) = {
                             let slot = self
                                 .transform_cache
@@ -519,6 +533,45 @@ impl VulkanRenderer {
                                 ],
                             };
                             gpu.state.bump_version();
+                        }
+                        // Dynamic pins: overwrite pinned particles'
+                        // positions AND previous positions with this
+                        // frame's bone-following targets — the GPU
+                        // twin of the CPU solver's `apply_pin_targets`.
+                        // prev_pos is written too so verlet derives no
+                        // velocity from the pin move. Host-visible
+                        // SSBO write from the render thread, the same
+                        // live-write pattern as the control UBO
+                        // rewrite above; the verlet shader skips
+                        // pinned/immobile particles entirely, and the
+                        // constraint passes treat inv_mass == 0 as
+                        // immovable, so the pin rows are only ever
+                        // authored here.
+                        if let Some(attach) = cloth.gpu_attach.as_ref() {
+                            if !ctrl.pin_positions.is_empty() {
+                                let (pos_buf, prev_buf) = {
+                                    let slot = self
+                                        .transform_cache
+                                        .get(&key)
+                                        .expect("transform slot present");
+                                    let gpu = slot
+                                        .cloth_gpu
+                                        .as_ref()
+                                        .expect("cloth_gpu present (dispatch branch)");
+                                    (slot.cloth_pos_ssbo.clone(), gpu.prev_pos_ssbo.clone())
+                                };
+                                if let Err(e) = write_cloth_pin_targets(
+                                    &pos_buf,
+                                    &prev_buf,
+                                    &attach.pinned,
+                                    &ctrl.pin_positions,
+                                ) {
+                                    warn!(
+                                        "render: cloth pin target write failed for primitive {:?}: {}",
+                                        mesh_inst.primitive_id, e
+                                    );
+                                }
+                            }
                         }
                         let groups = particle_count.div_ceil(TRANSFORM_LOCAL_SIZE);
                         // S2.1 — XPBD constraint projection resources.
@@ -560,25 +613,17 @@ impl VulkanRenderer {
                         // particle_count + constraint_count are slot-
                         // static, dt is the per-substep duration, and
                         // we run every substep with the same value.
-                        // λ is reset per-substep via fill_buffer below.
-                        let constraint_pack = if let (
-                            Some((
-                                lambda_update_set,
-                                accumulate_set,
-                                apply_set,
-                                constraint_ctrl_ubo,
-                                lambda_ssbo,
-                                constraint_count,
-                            )),
-                            Some(lambda_update_pipeline),
-                            Some(accumulate_pipeline),
-                            Some(apply_pipeline),
-                        ) = (
-                            constraint_resources,
-                            self.cloth_constraint_lambda_update_pipeline.clone(),
-                            self.cloth_constraint_accumulate_pipeline.clone(),
-                            self.cloth_constraint_apply_pipeline.clone(),
-                        ) {
+                        // λ is reset per-substep via fill_buffer in the
+                        // recording half.
+                        let constraints_plan = if let Some((
+                            lambda_update_set,
+                            accumulate_set,
+                            apply_set,
+                            constraint_ctrl_ubo,
+                            lambda_ssbo,
+                            constraint_count,
+                        )) = constraint_resources
+                        {
                             {
                                 let mut g = constraint_ctrl_ubo
                                     .write()
@@ -590,200 +635,56 @@ impl VulkanRenderer {
                                     _pad: 0,
                                 };
                             }
-                            Some((
+                            let constraint_groups = constraint_count.div_ceil(64).max(1);
+                            Some(PlannedClothConstraints {
                                 lambda_update_set,
                                 accumulate_set,
                                 apply_set,
                                 lambda_ssbo,
                                 constraint_count,
-                                lambda_update_pipeline,
-                                accumulate_pipeline,
-                                apply_pipeline,
-                            ))
+                                constraint_groups,
+                            })
                         } else {
                             None
                         };
 
-                        // Substep loop: each substep advances Verlet
-                        // integration by `ctrl.dt` (fixed_dt), then
-                        // runs `constraint_iters` XPBD constraint
-                        // iterations. Matches the CPU path's
-                        // `for _ in 0..substeps { step_cloth(fixed_dt) }`
-                        // loop in `simulation::step_cloth_overlays`.
-                        // Before this loop the GPU dispatched the
-                        // whole thing once at frame_dt, integrating
-                        // gravity·dt² with `substeps²` more energy and
-                        // making α̃ = α/dt² `substeps²` smaller — CPU
-                        // and GPU produced qualitatively different
-                        // cloth physics.
-                        for _ in 0..substeps {
-                            builder
-                                .bind_pipeline_compute(cloth_verlet_pipeline.clone())
-                                .map_err(|e| format!("render: bind cloth verlet pipeline: {e}"))?;
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Compute,
-                                    cloth_verlet_pipeline.layout().clone(),
-                                    0,
-                                    verlet_set.clone(),
-                                )
-                                .map_err(|e| format!("render: bind cloth verlet set: {e}"))?;
-                            unsafe {
-                                builder
-                                    .dispatch([groups, 1, 1])
-                                    .map_err(|e| format!("render: cloth verlet dispatch: {e}"))?;
-                            }
-
-                            if let Some((
-                                lambda_update_set,
-                                accumulate_set,
-                                apply_set,
-                                lambda_ssbo,
-                                constraint_count,
-                                lambda_update_pipeline,
-                                accumulate_pipeline,
-                                apply_pipeline,
-                            )) = constraint_pack.as_ref()
-                            {
-                                // Reset λ for this substep. XPBD's λ
-                                // accumulates across the projection
-                                // iterations *within* one substep,
-                                // then starts fresh at the next
-                                // substep — same lifecycle as
-                                // `ClothSimTempBuffers::reset_lambda`
-                                // on the CPU side.
-                                builder
-                                    .fill_buffer(lambda_ssbo.clone().reinterpret::<[u32]>(), 0u32)
-                                    .map_err(|e| format!("render: lambda fill_buffer: {e}"))?;
-                                let constraint_groups = constraint_count.div_ceil(64).max(1);
-                                for _ in 0..constraint_iters {
-                                    // Pass 1: per-constraint XPBD λ
-                                    // update writes Δλ_j to
-                                    // dlambda_ssbo and accumulates
-                                    // into lambda_ssbo.
-                                    builder
-                                        .bind_pipeline_compute(lambda_update_pipeline.clone())
-                                        .map_err(|e| {
-                                            format!("render: bind constraint lambda update: {e}")
-                                        })?;
-                                    builder
-                                        .bind_descriptor_sets(
-                                            PipelineBindPoint::Compute,
-                                            lambda_update_pipeline.layout().clone(),
-                                            0,
-                                            lambda_update_set.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!(
-                                                "render: bind constraint lambda update set: {e}"
-                                            )
-                                        })?;
-                                    unsafe {
-                                        builder.dispatch([constraint_groups, 1, 1]).map_err(
-                                    |e| {
-                                        format!("render: constraint lambda update dispatch: {e}")
-                                    },
-                                )?;
-                                    }
-                                    // Pass 2: per-particle Δx
-                                    // accumulate reads Δλ_j.
-                                    builder
-                                        .bind_pipeline_compute(accumulate_pipeline.clone())
-                                        .map_err(|e| {
-                                            format!("render: bind constraint accumulate: {e}")
-                                        })?;
-                                    builder
-                                        .bind_descriptor_sets(
-                                            PipelineBindPoint::Compute,
-                                            accumulate_pipeline.layout().clone(),
-                                            0,
-                                            accumulate_set.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint accumulate set: {e}")
-                                        })?;
-                                    unsafe {
-                                        builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                            format!("render: constraint accumulate dispatch: {e}")
-                                        })?;
-                                    }
-                                    // Pass 3: apply Δx to positions,
-                                    // zero deltas for next iter.
-                                    builder
-                                        .bind_pipeline_compute(apply_pipeline.clone())
-                                        .map_err(|e| {
-                                            format!("render: bind constraint apply: {e}")
-                                        })?;
-                                    builder
-                                        .bind_descriptor_sets(
-                                            PipelineBindPoint::Compute,
-                                            apply_pipeline.layout().clone(),
-                                            0,
-                                            apply_set.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint apply set: {e}")
-                                        })?;
-                                    unsafe {
-                                        builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                            format!("render: constraint apply dispatch: {e}")
-                                        })?;
-                                    }
-                                }
-                            }
-                        }
-
-                        // S3.1 — vertex normal recomputation.
+                        // S3.1 — vertex normal recomputation control.
                         let normal_resources = self
                             .transform_cache
                             .get(&key)
                             .and_then(|s| s.cloth_gpu.as_ref())
                             .and_then(|g| g.normals.as_ref())
                             .map(|n| (n.normal_set.clone(), n.control_ubo.clone()));
-                        if let (Some((normal_set, normal_ctrl_ubo)), Some(normal_pipeline)) =
-                            (normal_resources, self.cloth_normal_pipeline.clone())
-                        {
-                            {
-                                let mut g = normal_ctrl_ubo
-                                    .write()
-                                    .map_err(|e| format!("render: normal UBO write: {e}"))?;
-                                *g = pipeline::ClothNormalControl {
-                                    vertex_count: particle_count,
-                                    _pad0: 0,
-                                    _pad1: 0,
-                                    _pad2: 0,
-                                };
-                            }
-                            builder
-                                .bind_pipeline_compute(normal_pipeline.clone())
-                                .map_err(|e| format!("render: bind cloth normal pipeline: {e}"))?;
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Compute,
-                                    normal_pipeline.layout().clone(),
-                                    0,
-                                    normal_set,
-                                )
-                                .map_err(|e| format!("render: bind cloth normal set: {e}"))?;
-                            unsafe {
-                                builder
-                                    .dispatch([groups, 1, 1])
-                                    .map_err(|e| format!("render: cloth normal dispatch: {e}"))?;
-                            }
-                        }
+                        let normal_plan =
+                            if let Some((normal_set, normal_ctrl_ubo)) = normal_resources {
+                                {
+                                    let mut g = normal_ctrl_ubo
+                                        .write()
+                                        .map_err(|e| format!("render: normal UBO write: {e}"))?;
+                                    *g = pipeline::ClothNormalControl {
+                                        vertex_count: particle_count,
+                                        _pad0: 0,
+                                        _pad1: 0,
+                                        _pad2: 0,
+                                    };
+                                }
+                                Some(PlannedClothNormal { set: normal_set })
+                            } else {
+                                None
+                            };
 
-                        // Switch the bound compute pipeline back to the
-                        // transform pipeline so the dispatch below uses
-                        // the right shader. (The descriptor set bound
-                        // afterwards targets a different layout, so an
-                        // explicit re-bind here is required.)
-                        builder
-                            .bind_pipeline_compute(transform_pipeline.clone())
-                            .map_err(|e| format!("render: rebind transform pipeline: {e}"))?;
+                        cloth_plan = Some(PlannedCloth {
+                            verlet_set,
+                            groups: [groups, 1, 1],
+                            substeps,
+                            constraint_iters,
+                            constraints: constraints_plan,
+                            normal: normal_plan,
+                        });
                     }
                 }
 
-                // Bind set 0 + dispatch.
+                // Transform dispatch inputs.
                 let (transform_set, vertex_count, vbo, ibo, idx_count) = {
                     let slot = self.transform_cache.get(&key).expect("slot present");
                     (
@@ -794,20 +695,7 @@ impl VulkanRenderer {
                         slot.index_count,
                     )
                 };
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        transform_pipeline.layout().clone(),
-                        0,
-                        transform_set,
-                    )
-                    .map_err(|e| format!("render: bind transform set 0 failed: {e}"))?;
-                let groups = vertex_count.div_ceil(TRANSFORM_LOCAL_SIZE);
-                unsafe {
-                    builder
-                        .dispatch([groups, 1, 1])
-                        .map_err(|e| format!("render: dispatch failed: {e}"))?;
-                }
+                let transform_groups = vertex_count.div_ceil(TRANSFORM_LOCAL_SIZE);
 
                 // Pick the graphics variant for the eventual draw.
                 let is_blend = matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
@@ -904,6 +792,11 @@ impl VulkanRenderer {
                     None
                 };
 
+                planned_prims.push(PlannedPrim {
+                    transform_set,
+                    groups: [transform_groups, 1, 1],
+                    cloth: cloth_plan,
+                });
                 draws.push(DrawInfo {
                     pipeline: active_pipeline,
                     alpha_mode: mesh_inst.alpha_mode.clone(),
@@ -914,8 +807,205 @@ impl VulkanRenderer {
                     outline: outline_info,
                 });
             }
+            planned_instances.push(PlannedInstance {
+                skinning_set,
+                prims: planned_prims,
+            });
         }
-        Ok(draws)
+        Ok((planned_instances, draws))
+    }
+
+    /// Recording half of the compute prepass: replay a prepared dispatch
+    /// structure into `builder`. Pure mechanical translation of the
+    /// [`PlannedInstance`]s — no renderer state is touched, which is what
+    /// makes the output identical between a fresh recording and the
+    /// structure a cached command buffer was built from.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_compute_prepass_planned(
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        transform_pipeline: &Arc<ComputePipeline>,
+        cloth_verlet_pipeline: &Arc<ComputePipeline>,
+        cloth_constraint_lambda_update_pipeline: &Arc<ComputePipeline>,
+        cloth_constraint_accumulate_pipeline: &Arc<ComputePipeline>,
+        cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
+        cloth_normal_pipeline: &Arc<ComputePipeline>,
+        instances: &[PlannedInstance],
+    ) -> Result<(), String> {
+        builder
+            .bind_pipeline_compute(transform_pipeline.clone())
+            .map_err(|e| format!("render: bind_pipeline_compute failed: {e}"))?;
+
+        for inst in instances {
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    transform_pipeline.layout().clone(),
+                    1,
+                    inst.skinning_set.clone(),
+                )
+                .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
+
+            for prim in &inst.prims {
+                if let Some(cloth) = &prim.cloth {
+                    // Substep loop: each substep advances Verlet
+                    // integration by the fixed `ctrl.dt`, then runs
+                    // `constraint_iters` XPBD constraint iterations.
+                    // Matches the CPU path's
+                    // `for _ in 0..substeps { step_cloth(fixed_dt) }`
+                    // loop in `simulation::step_cloth_overlays`.
+                    for _ in 0..cloth.substeps {
+                        builder
+                            .bind_pipeline_compute(cloth_verlet_pipeline.clone())
+                            .map_err(|e| format!("render: bind cloth verlet pipeline: {e}"))?;
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Compute,
+                                cloth_verlet_pipeline.layout().clone(),
+                                0,
+                                cloth.verlet_set.clone(),
+                            )
+                            .map_err(|e| format!("render: bind cloth verlet set: {e}"))?;
+                        unsafe {
+                            builder
+                                .dispatch(cloth.groups)
+                                .map_err(|e| format!("render: cloth verlet dispatch: {e}"))?;
+                        }
+
+                        if let Some(cs) = &cloth.constraints {
+                            // Reset λ for this substep. XPBD's λ
+                            // accumulates across the projection
+                            // iterations *within* one substep, then
+                            // starts fresh at the next substep — same
+                            // lifecycle as `ClothSimTempBuffers::reset_lambda`
+                            // on the CPU side.
+                            builder
+                                .fill_buffer(cs.lambda_ssbo.clone().reinterpret::<[u32]>(), 0u32)
+                                .map_err(|e| format!("render: lambda fill_buffer: {e}"))?;
+                            for _ in 0..cloth.constraint_iters {
+                                // Pass 1: per-constraint XPBD λ
+                                // update writes Δλ_j to dlambda_ssbo
+                                // and accumulates into lambda_ssbo.
+                                builder
+                                    .bind_pipeline_compute(
+                                        cloth_constraint_lambda_update_pipeline.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint lambda update: {e}")
+                                    })?;
+                                builder
+                                    .bind_descriptor_sets(
+                                        PipelineBindPoint::Compute,
+                                        cloth_constraint_lambda_update_pipeline.layout().clone(),
+                                        0,
+                                        cs.lambda_update_set.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint lambda update set: {e}")
+                                    })?;
+                                unsafe {
+                                    builder.dispatch([cs.constraint_groups, 1, 1]).map_err(
+                                        |e| {
+                                            format!(
+                                                "render: constraint lambda update dispatch: {e}"
+                                            )
+                                        },
+                                    )?;
+                                }
+                                // Pass 2: per-particle Δx accumulate
+                                // reads Δλ_j.
+                                builder
+                                    .bind_pipeline_compute(
+                                        cloth_constraint_accumulate_pipeline.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint accumulate: {e}")
+                                    })?;
+                                builder
+                                    .bind_descriptor_sets(
+                                        PipelineBindPoint::Compute,
+                                        cloth_constraint_accumulate_pipeline.layout().clone(),
+                                        0,
+                                        cs.accumulate_set.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint accumulate set: {e}")
+                                    })?;
+                                unsafe {
+                                    builder.dispatch(cloth.groups).map_err(|e| {
+                                        format!("render: constraint accumulate dispatch: {e}")
+                                    })?;
+                                }
+                                // Pass 3: apply Δx to positions, zero
+                                // deltas for next iter.
+                                builder
+                                    .bind_pipeline_compute(cloth_constraint_apply_pipeline.clone())
+                                    .map_err(|e| format!("render: bind constraint apply: {e}"))?;
+                                builder
+                                    .bind_descriptor_sets(
+                                        PipelineBindPoint::Compute,
+                                        cloth_constraint_apply_pipeline.layout().clone(),
+                                        0,
+                                        cs.apply_set.clone(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("render: bind constraint apply set: {e}")
+                                    })?;
+                                unsafe {
+                                    builder.dispatch(cloth.groups).map_err(|e| {
+                                        format!("render: constraint apply dispatch: {e}")
+                                    })?;
+                                }
+                            }
+                        }
+                    }
+
+                    // S3.1 — vertex normal recomputation.
+                    if let Some(normal) = &cloth.normal {
+                        builder
+                            .bind_pipeline_compute(cloth_normal_pipeline.clone())
+                            .map_err(|e| format!("render: bind cloth normal pipeline: {e}"))?;
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Compute,
+                                cloth_normal_pipeline.layout().clone(),
+                                0,
+                                normal.set.clone(),
+                            )
+                            .map_err(|e| format!("render: bind cloth normal set: {e}"))?;
+                        unsafe {
+                            builder
+                                .dispatch(cloth.groups)
+                                .map_err(|e| format!("render: cloth normal dispatch: {e}"))?;
+                        }
+                    }
+
+                    // Switch the bound compute pipeline back to the
+                    // transform pipeline so the dispatch below uses the
+                    // right shader. (The descriptor set bound
+                    // afterwards targets a different layout, so an
+                    // explicit re-bind here is required.)
+                    builder
+                        .bind_pipeline_compute(transform_pipeline.clone())
+                        .map_err(|e| format!("render: rebind transform pipeline: {e}"))?;
+                }
+
+                // Bind set 0 + dispatch.
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        transform_pipeline.layout().clone(),
+                        0,
+                        prim.transform_set.clone(),
+                    )
+                    .map_err(|e| format!("render: bind transform set 0 failed: {e}"))?;
+                unsafe {
+                    builder
+                        .dispatch(prim.groups)
+                        .map_err(|e| format!("render: dispatch failed: {e}"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the transformed-VBO handle of a primitive's hierarchical
@@ -923,7 +1013,7 @@ impl VulkanRenderer {
     /// missing it is materialised WITHOUT anchors just to obtain a
     /// stable handle; an existing slot is left untouched — re-ensuring
     /// it with a `None` parent VBO would downgrade its own anchor
-    /// binding every frame (the parent's iteration below would then
+    /// binding every frame (the parent's own iteration below would then
     /// have to rebuild it right back).
     #[allow(clippy::too_many_arguments)]
     fn materialize_parent_vbo(
@@ -962,4 +1052,29 @@ impl VulkanRenderer {
                     .map(|slot| slot.transformed_vbo.clone())
             })
     }
+}
+
+/// Write this frame's pin world targets into the pinned particles'
+/// rows of `cloth_pos_ssbo` / `prev_pos_ssbo` — see the call site for
+/// why both rows are written. Separate function so both write guards
+/// live in one scope with a single error path.
+fn write_cloth_pin_targets(
+    pos_buf: &vulkano::buffer::Subbuffer<[[f32; 4]]>,
+    prev_buf: &vulkano::buffer::Subbuffer<[[f32; 4]]>,
+    pinned: &[bool],
+    targets: &[[f32; 3]],
+) -> Result<(), String> {
+    let mut pos_guard = pos_buf.write().map_err(|e| e.to_string())?;
+    let mut prev_guard = prev_buf.write().map_err(|e| e.to_string())?;
+    for ((dst_pos, dst_prev), (&is_pinned, target)) in pos_guard
+        .iter_mut()
+        .zip(prev_guard.iter_mut())
+        .zip(pinned.iter().zip(targets.iter()))
+    {
+        if is_pinned {
+            *dst_pos = [target[0], target[1], target[2], dst_pos[3]];
+            *dst_prev = [target[0], target[1], target[2], dst_prev[3]];
+        }
+    }
+    Ok(())
 }

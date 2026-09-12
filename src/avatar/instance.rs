@@ -106,7 +106,10 @@ pub struct ClothState {
     /// into the renderer's cloth SSBO each frame. `Gpu` skips the CPU
     /// integration / constraint loop and lets the renderer dispatch
     /// the cloth compute pipelines, which write the SSBO in place.
-    /// Set at attach time (e.g. by a future `RuntimeGpuBudget` consumer).
+    /// Set once per attach from
+    /// [`cloth_gpu_boundary::solver_backend_from_env`]
+    /// (`VULVATAR_CLOTH_GPU=1`); a `RuntimeGpuBudget`-driven default
+    /// flip is future work (needs a GPU collider stage first).
     ///
     /// **Known limitation — mid-session flips**: Switching from `Gpu`
     /// back to `Cpu` after the GPU solver has run for any frames will
@@ -231,7 +234,8 @@ impl AvatarInstance {
             target_mesh_id: None,
             target_vertex_offset: 0,
             target_vertex_count: 0,
-            solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+            solver_backend:
+                crate::simulation::cloth_gpu_boundary::solver_backend_from_env(),
         });
     }
 
@@ -287,7 +291,8 @@ impl AvatarInstance {
             target_mesh_id: None,
             target_vertex_offset: 0,
             target_vertex_count: 0,
-            solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+            solver_backend:
+                crate::simulation::cloth_gpu_boundary::solver_backend_from_env(),
         };
         let sim = ClothSimState::default();
         let n = sim.particle_count();

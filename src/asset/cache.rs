@@ -45,7 +45,9 @@ const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// reused. v13: the layered pairing keeps every inner candidate ranked
 /// and falls through to the next when one binds too few anchors, so a
 /// stolen pairing no longer drops an outer layer's clearance silently.
-const VVT_CACHE_VERSION: u32 = 13;
+/// v14: middle and innermost layered garments anchor their clearance
+/// against the body surface (sleeve coverage), not the garment-inner.
+const VVT_CACHE_VERSION: u32 = 14;
 /// Default cap on the number of `.vvtcache` files retained under
 /// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
 /// drops the oldest-mtime entries on next startup.

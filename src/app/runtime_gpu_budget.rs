@@ -13,14 +13,22 @@
 //!   `Application::set_user_render_fps`
 //! - `yolox_skip_period` → `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`
 //!   (`pub static AtomicU64`)
+//! - `pose_hz_target` → `tracking::worker::POSE_HZ_TARGET` (read in
+//!   the worker's estimate loop; frames that fail the pacing check
+//!   are dropped before inference)
+//! - `depth_refresh_period` → `tracking::worker::DEPTH_REFRESH_PERIOD`
+//!   (metric-cloud rebuild cadence; skipped frames clone the last
+//!   cloud)
+//! - `facemesh_cpu_ep` → `tracking::face_mediapipe::FACEMESH_EP_CPU`
+//!   (consulted at ONNX session build — takes effect on the next
+//!   tracking start)
 //! - `degraded_mode == EmergencyCpu` → forces `RenderExportMode::CpuReadback`
 //!   in `app/render.rs`, breaking the GPU-export → failure loop
 //!
 //! Not yet wired (would be follow-up work, with a real consumer in the
 //! same commit so the budget doesn't accumulate dead policy outputs):
-//! - pose worker Hz throttle
-//! - FaceMesh ONNX EP preference (today the EP is hard-coded per
-//!   provider)
+//! none. Future candidates live in docs/gpu-runtime-roadmap.md
+//! ("Remaining Extension Slices").
 //!
 //! See `docs/gpu-runtime-roadmap.md` for the design and threshold rationale.
 
@@ -111,6 +119,16 @@ pub struct RuntimeGpuBudget {
 
     render_fps_target: u32,
     yolox_skip_period: u32,
+    /// Pose estimate cadence (Hz) the tracking worker should honour.
+    /// Camera-rate at Healthy; stepwise lower under pressure.
+    pose_hz_target: u32,
+    /// Metric-depth cloud rebuild cadence: rebuild every Nth frame,
+    /// reuse (clone) the previous cloud in between. 1 at Healthy =
+    /// the pre-budget per-frame behaviour.
+    depth_refresh_period: u32,
+    /// Whether FaceMesh should stay off DirectML. Read at ONNX session
+    /// build, so a flip takes effect on the next tracking start.
+    facemesh_cpu_ep: bool,
     degraded_mode: DegradedMode,
 
     pressure_since: Option<Instant>,
@@ -175,6 +193,9 @@ impl RuntimeGpuBudget {
             user_render_fps: 60,
             render_fps_target: 60,
             yolox_skip_period: 4,
+            pose_hz_target: 30,
+            depth_refresh_period: 1,
+            facemesh_cpu_ep: false,
             degraded_mode: DegradedMode::Healthy,
             pressure_since: None,
             clean_streak_started: Some(now),
@@ -201,6 +222,15 @@ impl RuntimeGpuBudget {
     }
     pub fn yolox_skip_period(&self) -> u32 {
         self.yolox_skip_period
+    }
+    pub fn pose_hz_target(&self) -> u32 {
+        self.pose_hz_target
+    }
+    pub fn depth_refresh_period(&self) -> u32 {
+        self.depth_refresh_period
+    }
+    pub fn facemesh_prefers_cpu_ep(&self) -> bool {
+        self.facemesh_cpu_ep
     }
     pub fn degraded_mode(&self) -> DegradedMode {
         self.degraded_mode
@@ -383,18 +413,30 @@ impl RuntimeGpuBudget {
             DegradedMode::Healthy => {
                 self.render_fps_target = self.user_render_fps;
                 self.yolox_skip_period = 4;
+                self.pose_hz_target = 30;
+                self.depth_refresh_period = 1;
+                self.facemesh_cpu_ep = false;
             }
             DegradedMode::PressureLight => {
                 self.render_fps_target = self.user_render_fps.min(45);
                 self.yolox_skip_period = 6;
+                self.pose_hz_target = 25;
+                self.depth_refresh_period = 2;
+                self.facemesh_cpu_ep = false;
             }
             DegradedMode::PressureHeavy => {
                 self.render_fps_target = self.user_render_fps.min(30);
                 self.yolox_skip_period = 8;
+                self.pose_hz_target = 20;
+                self.depth_refresh_period = 3;
+                self.facemesh_cpu_ep = true;
             }
             DegradedMode::EmergencyCpu => {
                 self.render_fps_target = self.user_render_fps.min(30);
                 self.yolox_skip_period = 12;
+                self.pose_hz_target = 15;
+                self.depth_refresh_period = 4;
+                self.facemesh_cpu_ep = true;
             }
         }
     }
@@ -787,6 +829,52 @@ mod tests {
                 mode
             );
         }
+    }
+
+    /// Defence-in-depth twin of the YOLOX invariant for the two new
+    /// cadence knobs: a zero pose Hz / depth period must never be
+    /// emitted (`is_multiple_of(0)` panics; a 0 Hz pose gate would
+    /// starve tracking). `.max(1)`/`hz == 0` guards on the read sites
+    /// back this, but the invariant should hold at the source too.
+    #[test]
+    fn all_modes_emit_sane_pose_hz_and_depth_period() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        for mode in [
+            DegradedMode::Healthy,
+            DegradedMode::PressureLight,
+            DegradedMode::PressureHeavy,
+            DegradedMode::EmergencyCpu,
+        ] {
+            budget.degraded_mode = mode;
+            budget.recompute_targets();
+            assert!(
+                budget.pose_hz_target() >= 1,
+                "mode {:?} emitted pose_hz_target = 0",
+                mode
+            );
+            assert!(
+                budget.depth_refresh_period() >= 1,
+                "mode {:?} emitted depth_refresh_period = 0",
+                mode
+            );
+        }
+        // Explicit per-mode expectations: cadence tightens
+        // monotonically with degradation, depth staleness only grows
+        // under pressure (Healthy must stay per-frame = pre-budget
+        // behaviour), FaceMesh goes CPU from PressureHeavy up.
+        budget.degraded_mode = DegradedMode::Healthy;
+        budget.recompute_targets();
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (30, 1, false));
+        budget.degraded_mode = DegradedMode::PressureLight;
+        budget.recompute_targets();
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (25, 2, false));
+        budget.degraded_mode = DegradedMode::PressureHeavy;
+        budget.recompute_targets();
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (20, 3, true));
+        budget.degraded_mode = DegradedMode::EmergencyCpu;
+        budget.recompute_targets();
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (15, 4, true));
     }
 
     /// Defence: if the dwell timer's anchor is in the future relative

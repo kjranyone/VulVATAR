@@ -167,6 +167,124 @@ For A/B testing, you can gate code behind `std::env::var()`:
 These are **not** checked in — add them temporarily in `render()` / `run_frame()`
 when needed, then remove before committing.
 
+## Render Benchmark (`bench_render`)
+
+`src/bin/bench_render.rs` renders an avatar N times through the full
+`VulkanRenderer` path with animated expression weights and head motion,
+reporting per-frame wall time (the loop times `render()` only, and the
+async fence means the wall approximates max(CPU submit, GPU exec)):
+
+```powershell
+cargo run --bin bench_render -- sample_data\YUMEKA_v1.0.3\FBX\Yumeka_v1.0.3.fbx 300 1920 1080
+```
+
+`VULVATAR_BENCH_EXPRS=N` sets how many expressions animate (morph cost
+scales with the ACTIVE count only — see the compacted gather below).
+`VULVATAR_BENCH_BG=1` enables the generative background (exercises the
+uniform ring + its interaction with the CB cache). With
+`VULVATAR_BENCH_DUMP=<dir>` every harvested frame's pixels are written as
+raw RGBA; because the animation is deterministic in the frame index, two
+runs differing only in a renderer knob must produce byte-identical dumps —
+that is the equivalence gate used for the CB cache / pixel pool.
+
+### Measured attribution (Yumeka v1.0.3, 23 prims / 252,789 verts, Arc B580, 1080p)
+
+```text
+full frame (2026-09, before CB cache / pixel pool)
+                        ~5.2-5.9 ms median
+  harvest (fence+8MB)    ~1.5-2.5 ms   <- to_vec alloc+copy dominated
+  cb_build (CPU)         ~2.5-3.5 ms   <- dominated by vulkano builder.build() (~2 ms)
+    prepass recording    ~0.3-0.5 ms
+    scene+post record    ~0.2-0.35 ms
+  submit                 ~0.35 ms
+compute prepass (GPU)    ~1.4-1.7 ms   <- was ~1.7 ms before the compacted morph gather
+draw pass                ~0.2 ms
+
+full frame (2026-09, CB cache + pixel pool ON)
+                        ~3.7 ms median / ~1.0 ms min
+```
+
+After the two CPU-side optimizations below, the 1080p median sits at the
+GPU-execution floor (~3.7 ms ≈ max(CPU ~1 ms, GPU exec)); further CPU work
+would not move the median. The two A/B knobs (default on) exist so a live
+regression can be bisected without a rebuild:
+
+| Knob | Off-switch | What it isolates |
+|---|---|---|
+| Command-buffer cache | `VULVATAR_CB_CACHE=0` | prepare/record split + shape-key reuse of built CBs |
+| Pixel-Vec pool | `VULVATAR_PIXEL_POOL=0` | zero-allocation harvest of the readback ring |
+
+Both were verified pixel-identical byte-for-byte across a 149-frame
+animated `bench_render` run (`VULVATAR_BENCH_DUMP` A/B compare, including
+generative-background frames and cache-hit steady state).
+
+### Command-buffer cache (prepare/record split)
+
+`render()` used to interleave CPU writes (camera, control UBOs, morph
+weights, cloth controls, material uniforms) with Vulkan recording and pay
+`AutoCommandBufferBuilder::build()`'s dependency resolution (~2 ms) every
+frame. The loop is now split: `prepare_frame` (`src/renderer/frame_plan.rs`)
+performs every CPU write and captures the dispatch structure + a shape key
+hashing every command-buffer-visible identity (descriptor-set/pipeline Arc
+pointers, dispatch counts, push-constant bits, clear colour, ring slots);
+`get_or_build_frame_cb` returns the previously built command buffer when
+the key matches. Cached buffers are recorded with
+`CommandBufferUsage::SimultaneousUse` and pin their resources, so pointer
+keys cannot go stale through allocator reuse; every site that swaps a
+CB-visible resource clears the cache (resize, format/MSAA change, avatar
+swap, transform-slot rebuild, skinning realloc, cloth-slot (re)build,
+readback/depth buffer realloc).
+
+Prerequisite: the generative background's push constants (which animate
+via `time` + tracking anchors every frame) moved to a 2-slot uniform ring
+(`background.rs`), so an animated background no longer changes the command
+buffer — steady state hits ~113/120 frames (7 misses = the ring-shape
+warm-up). Ring shapes multiply: camera 3 × readback 2 × bg 2; the LRU cap
+is 16.
+
+### Zero-allocation pixel harvest
+
+`harvest_pending_readback` used to `read().to_vec()` a fresh full-frame
+Vec every frame (8.3 MB at 1080p — large-block virtual alloc + first-touch
+faults). The readback ring now keeps one owned Arc per slot; at harvest,
+`Arc::try_unwrap` reclaims the previous frame's allocation when consumers
+have dropped it (the common case — counters show ~117 reuses vs 2 allocs
+per 120 frames) and the GPU bytes are copied into the warm pages. When a
+consumer still holds the old Arc the unwrap fails and a fresh Vec is
+allocated — correct, just slower. The depth-aspect readback buffer
+(`validate_gt` benches) is likewise cached per extent instead of
+reallocated every frame.
+
+The remaining harvest cost is the single 8 MB memcpy out of the mapped
+ring buffer (~0.4 ms) — the price of the `Arc<Vec<u8>>` handoff API
+shared by the preview / output worker / sinks. A genuinely zero-copy
+lease (consumers borrowing the mapped memory) would require widening
+`ExportedPixelData::CpuReadback` past `Arc<Vec<u8>>` through every
+consumer plus a tear-free lifetime contract (consumers currently may hold
+a frame past one ring rotation); revisit only if the 0.4 ms matters.
+
+### GPU cloth dispatch note
+
+The cloth Verlet/XPBD/normal dispatch recording was mechanically mirrored
+into the plan path and is exercised by `diagnose_cloth` on the CPU-solver
+backend; the GPU-solver dispatch structure (`VULVATAR_CLOTH_GPU=1`) is
+trace-verified but not yet runtime-benched — eyeball the first live GPU
+cloth session after this change.
+
+### Compacted morph gather
+
+`transform_cs`'s per-vertex morph loop is bounded by the control
+block's `target_count`, which used to be the FULL authored target count
+(446 on Yumeka's face — 26,880 verts × 446 = ~12 M loop iterations per
+frame that only load a zero weight and continue). The render loop now
+compacts the gather to the active targets each frame: the active
+targets' info rows are written into the head of `morph_infos` and the
+matching weights into the head of `morph_weights`, and `target_count`
+is set to the active count. The entries buffer is untouched (info rows
+are absolute indices into it), so the shader performs the same binary
+searches over a shorter loop. Verified pixel-identical (max diff 0 on
+an expression-weighted render).
+
 ## Known Bottlenecks and Solutions
 
 ### 1. Intel Arc: slow `copy_image_to_buffer` to host memory (30 ms)

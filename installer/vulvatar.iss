@@ -90,6 +90,7 @@ Source: "..\models\rtmw3d.onnx";                DestDir: "{app}\models";        
 Source: "..\models\yolox.onnx";                 DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\face_landmark.onnx";         DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\face_blendshapes.onnx";      DestDir: "{app}\models";         Flags: ignoreversion
+Source: "..\models\mediapipe_hand_landmark.onnx"; DestDir: "{app}\models";       Flags: ignoreversion
 
 [Registry]
 ; HKLM CLSID registration — mirrors what dev.ps1 Register-MfCameraSystem

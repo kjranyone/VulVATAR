@@ -32,6 +32,7 @@ fn calibration_dto(shoulder_span_m: Option<f32>) -> PoseCalibrationDto {
         neutral_face_ypr_mesh: None,
         neutral_face_ypr_body: None,
         neutral_body_yaw: None,
+        q_neutral: None,
     }
 }
 

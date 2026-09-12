@@ -923,6 +923,7 @@ mod tests {
                 captured_at: String::new(),
                 captured_at_unix: 0,
                 frame_count: 1,
+                q_neutral: None,
                 anchor_x: 0.0,
                 anchor_y: 0.0,
                 anchor_depth_m: None,

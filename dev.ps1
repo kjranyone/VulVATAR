@@ -85,6 +85,7 @@ function Install-Models {
     #   * RTMW3D-x   — Soykaf/RTMW3D-x              (370 MB, 133 3D landmarks)
     #   * FaceMesh   — PINTO 410 FaceMeshV2         (4.8 MB, 478 face landmarks)
     #   * Blendshape — PINTO 390 BlendshapeV2       (1.8 MB, 52 ARKit weights)
+    #   * HandLandmk — opencv_zoo 2023feb           (4.1 MB, 21 hand landmarks)
     #   * YOLOX-m    — mmpose rtmposev1 onnx_sdk    (94 MB,  human-art bbox)
     #
     # YOLOX-m is optional — without it, RTMW3D runs on the whole frame
@@ -123,6 +124,17 @@ function Install-Models {
     Install-PintoArchive -Name "MediaPipe BlendshapeV2 (52 ARKit blendshapes)" `
         -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/390_BlendShapeV2/resources.tar.gz" `
         -KeepGlobs @("face_blendshapes.onnx")
+
+    # MediaPipe hand landmarker (21 keypoints + wrist-relative world layout)
+    # from opencv_zoo — fusion/hands.rs crops around the *predicted* hand, so
+    # the landmark model alone suffices (no palm detector needed). Raw URL is
+    # a Git LFS pointer target; curl -L follows the redirect to the blob.
+    # Without this file the tracker warns and fingers fall back to the coarse
+    # body-detector block (~20 px σ).
+    Install-DirectFiles -Name "MediaPipe hand landmarker (21 keypoints)" -Files @(
+        @{ Url = "https://github.com/opencv/opencv_zoo/raw/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx";
+           OutName = "mediapipe_hand_landmark.onnx" }
+    )
 
     # Rename to the canonical filename the loader expects.
     if ((Test-Path "models\face_landmarks_detector_1x3x256x256.onnx") -and
@@ -606,6 +618,7 @@ function Test-DistributionPrereqs {
         "models\yolox.onnx",
         "models\face_landmark.onnx",
         "models\face_blendshapes.onnx",
+        "models\mediapipe_hand_landmark.onnx",
         "THIRD_PARTY_LICENSES.md",
         "docs\USER_GUIDE_JA.md"
     )

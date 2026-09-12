@@ -25,13 +25,17 @@ pub mod worker;
 #[cfg(feature = "inference")]
 pub mod yolox;
 
-// `pub(crate)`, not `pub`: the calibration items themselves are
-// crate-visible only (visibility-tightening pass), and a `pub use`
-// cannot re-export them outward.
+// `CalibrationMode` / `PoseCalibration` are `pub`: they are embedded in
+// pub API across the crate (GUI state, `PoseProvider` trait methods,
+// persisted `ProjectState`), so a crate-only visibility would trip
+// `private_interfaces` at every one of those sites. The remaining
+// calibration items are crate-visible only (visibility-tightening
+// pass), and a `pub use` cannot re-export them outward.
+pub use calibration::{CalibrationMode, PoseCalibration};
 pub(crate) use calibration::{
-    rotate_xz, shoulder_line_yaw, shoulder_span_plausible, CalibrationMode, PoseCalibration,
-    TrackingCalibration, BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD,
-    SHOULDER_SPAN_MAX_M, SHOULDER_SPAN_MIN_M,
+    rotate_xz, shoulder_line_yaw, shoulder_span_plausible, TrackingCalibration,
+    BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD, SHOULDER_SPAN_MAX_M,
+    SHOULDER_SPAN_MIN_M,
 };
 pub use devices::{
     camera_fps_for_index, camera_fps_index_for, camera_resolution_for_index,

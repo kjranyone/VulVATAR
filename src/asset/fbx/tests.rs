@@ -1027,10 +1027,9 @@ fn test_yumeka_anti_penetration_projection_on_leg_lift() {
     // the fold-region normal flip and the parent-position sanity band the
     // shader applies (pipeline.rs transform_cs skin-anchor block).
     let mut penetration_threat_count = 0usize;
-    let mut flipped_count = 0usize;
     let mut max_push_distance = 0.0f32;
 
-    for (vid, &(mut skirt_p, skirt_n)) in skirt_world.iter().enumerate() {
+    for (vid, &(mut skirt_p, _skirt_n)) in skirt_world.iter().enumerate() {
         let anc = anchors[vid];
         if anc.body_vertex_idx != u32::MAX && anc.weight > 1e-4 {
             let (bp, bn_raw) = body_world[anc.body_vertex_idx as usize];
@@ -1041,27 +1040,20 @@ fn test_yumeka_anti_penetration_projection_on_leg_lift() {
                 continue;
             }
             let bn = [bn_raw[0] / bn_len, bn_raw[1] / bn_len, bn_raw[2] / bn_len];
-            // Fold-region flip: follow the skirt vertex's own facing when
-            // the body normal opposes it (shader's eff_n).
-            let mut eff_n = bn;
-            if crate::math_utils::vec3_dot(&bn, &skirt_n) < 0.0 {
-                eff_n = [-bn[0], -bn[1], -bn[2]];
-                flipped_count += 1;
-            }
             let diff = [skirt_p[0] - bp[0], skirt_p[1] - bp[1], skirt_p[2] - bp[2]];
-            let clearance = crate::math_utils::vec3_dot(&diff, &eff_n);
+            let clearance = crate::math_utils::vec3_dot(&diff, &bn);
 
             if clearance < anc.min_clearance {
                 penetration_threat_count += 1;
                 let push = (anc.min_clearance - clearance) * anc.weight;
                 max_push_distance = max_push_distance.max(push);
-                skirt_p[0] += eff_n[0] * push;
-                skirt_p[1] += eff_n[1] * push;
-                skirt_p[2] += eff_n[2] * push;
+                skirt_p[0] += bn[0] * push;
+                skirt_p[1] += bn[1] * push;
+                skirt_p[2] += bn[2] * push;
 
                 // After projection, clearance must satisfy min_clearance
                 let new_diff = [skirt_p[0] - bp[0], skirt_p[1] - bp[1], skirt_p[2] - bp[2]];
-                let new_clearance = crate::math_utils::vec3_dot(&new_diff, &eff_n);
+                let new_clearance = crate::math_utils::vec3_dot(&new_diff, &bn);
                 assert!(
                     new_clearance >= anc.min_clearance - 1e-4,
                     "After projection, clearance ({}) must be >= min_clearance ({})",
@@ -1073,10 +1065,9 @@ fn test_yumeka_anti_penetration_projection_on_leg_lift() {
     }
 
     println!(
-        "Yumeka leg-lift anti-penetration: {} vertices guarded from body penetration, max push = {:.2} mm, flipped normals = {}",
+        "Yumeka leg-lift anti-penetration: {} vertices guarded from body penetration, max push = {:.2} mm",
         penetration_threat_count,
-        max_push_distance * 1000.0,
-        flipped_count
+        max_push_distance * 1000.0
     );
 
     assert!(
@@ -1489,32 +1480,23 @@ fn test_layered_clothing_clearance_e2e() {
     let mut outer_projected = outer_bent.clone();
     let mut pushed_count = 0usize;
     let mut max_push_dist = 0.0f32;
-    let mut inward_bn_count = 0usize;
     for (vi, anc) in outer_anchors.iter().enumerate() {
         if anc.body_vertex_idx != u32::MAX && anc.weight > 1e-4 {
             let (bp, bn_raw) = inner_bent[anc.body_vertex_idx as usize];
             let wp = outer_projected[vi].0;
-            let on = outer_projected[vi].1;
             let bn_len = crate::math_utils::vec3_length(&bn_raw);
             let bp_len = crate::math_utils::vec3_length(&bp);
             if bn_len <= 1e-4 || bp_len <= 1e-3 || bp_len >= 10.0 {
                 continue;
             }
             let bn = [bn_raw[0] / bn_len, bn_raw[1] / bn_len, bn_raw[2] / bn_len];
-            // Effective outward normal: follow the outer vertex's own
-            // facing at fold regions (shader's eff_n).
-            let mut eff_n = bn;
-            if crate::math_utils::vec3_dot(&eff_n, &on) < 0.0 {
-                inward_bn_count += 1;
-                eff_n = [-bn[0], -bn[1], -bn[2]];
-            }
             let diff = [wp[0] - bp[0], wp[1] - bp[1], wp[2] - bp[2]];
-            let c = crate::math_utils::vec3_dot(&diff, &eff_n);
+            let c = crate::math_utils::vec3_dot(&diff, &bn);
             if c < anc.min_clearance {
                 let push = (anc.min_clearance - c) * anc.weight;
-                outer_projected[vi].0[0] += eff_n[0] * push;
-                outer_projected[vi].0[1] += eff_n[1] * push;
-                outer_projected[vi].0[2] += eff_n[2] * push;
+                outer_projected[vi].0[0] += bn[0] * push;
+                outer_projected[vi].0[1] += bn[1] * push;
+                outer_projected[vi].0[2] += bn[2] * push;
                 pushed_count += 1;
                 if push > max_push_dist {
                     max_push_dist = push;
@@ -1523,10 +1505,9 @@ fn test_layered_clothing_clearance_e2e() {
         }
     }
     println!(
-        "GPU clearance projection: pushed {} outer vertices outward (max push = {:.2} mm, flipped normals = {})",
+        "GPU clearance projection: pushed {} outer vertices outward (max push = {:.2} mm)",
         pushed_count,
-        max_push_dist * 1000.0,
-        inward_bn_count
+        max_push_dist * 1000.0
     );
 
     // ---- GPU mirror pass B: inner containment clamp (transform_cs
@@ -1759,4 +1740,330 @@ fn test_layered_clothing_clearance_e2e() {
         residual_violations, 0,
         "every anchored vertex must satisfy its containment plane after clamping"
     );
+}
+#[test]
+fn test_skin_through_sleeve_at_elbow_bend() {
+    let Some(fbx_path) = yumeka_fbx_path() else {
+        return;
+    };
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(&fbx_path).unwrap();
+
+    let body_pid = asset.body_primitive_id.expect("body primitive");
+    let body_prim = asset
+        .meshes
+        .iter()
+        .flat_map(|m| &m.primitives)
+        .find(|p| p.id == body_pid)
+        .unwrap();
+
+    // The layered stack (reuse the e2e discovery): outermost garment and
+    // its inner (the middle layer).
+    let prim_of = |pid: crate::asset::PrimitiveId| {
+        asset
+            .meshes
+            .iter()
+            .flat_map(|m| &m.primitives)
+            .find(|p| p.id == pid)
+    };
+    let mid_prim = asset
+        .meshes
+        .iter()
+        .flat_map(|m| &m.primitives)
+        .find(|p| {
+            p.containment_anchors.is_some()
+                && p.containment_primitive_id
+                    .and_then(|o| prim_of(o).map(|op| op.containment_anchors.is_none()))
+                    .unwrap_or(false)
+        })
+        .expect("layered stack present");
+    let outer_pid = mid_prim.containment_primitive_id.unwrap();
+    let outer_prim = prim_of(outer_pid).unwrap();
+    let outer_anchors = outer_prim.skin_anchors.as_ref().unwrap();
+    let mid_anchors = mid_prim.containment_anchors.as_ref().unwrap();
+    println!(
+        "stack: body <- mid({}) <- outer({})",
+        prim_name(&asset, mid_prim.id),
+        prim_name(&asset, outer_pid)
+    );
+
+    // Bend BOTH elbows.
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(1),
+        std::sync::Arc::clone(&asset),
+    );
+    avatar.pose.local_transforms = asset.skeleton.nodes.iter().map(|n| n.rest_local.clone()).collect();
+    let angle = 90.0f32.to_radians();
+    let (s, c) = ((angle * 0.5).sin(), (angle * 0.5).cos());
+    let mut elbows = Vec::new();
+    for (bone, suffix) in [
+        (crate::asset::HumanoidBone::LeftLowerArm, "LowerArm_L"),
+        (crate::asset::HumanoidBone::RightLowerArm, "LowerArm_R"),
+    ] {
+        let idx = find_humanoid_node(&asset, bone, suffix).expect("forearm node");
+        let q = [s, 0.0, 0.0, c];
+        avatar.pose.local_transforms[idx].rotation = crate::math_utils::quat_mul(
+            &q,
+            &asset.skeleton.nodes[idx].rest_local.rotation,
+        );
+    }
+    avatar.compute_global_pose();
+    avatar.build_skinning_matrices();
+
+    let skin = crate::asset::clearance::compute_rest_world_vertices(body_prim, &avatar.pose.skinning_matrices);
+    let mid_bent = crate::asset::clearance::compute_rest_world_vertices(mid_prim, &avatar.pose.skinning_matrices);
+    let outer_bent = crate::asset::clearance::compute_rest_world_vertices(outer_prim, &avatar.pose.skinning_matrices);
+
+    for bone in [crate::asset::HumanoidBone::LeftLowerArm, crate::asset::HumanoidBone::RightLowerArm] {
+        let idx = find_humanoid_node(&asset, bone, "").expect("forearm node");
+        elbows.push([
+            avatar.pose.global_transforms[idx][3][0],
+            avatar.pose.global_transforms[idx][3][1],
+            avatar.pose.global_transforms[idx][3][2],
+        ]);
+    }
+
+    // GPU mirror, matching transform_cs's sequential application:
+    //   mid:   clearance vs BODY (skin) first, then containment vs outer
+    //   outer: clearance vs the final mid
+    let mid_clear_anchors = mid_prim.skin_anchors.as_ref();
+    let mut mid_clearanced = mid_bent.clone();
+    if let Some(anchors) = mid_clear_anchors {
+        for (vi, anc) in anchors.iter().enumerate() {
+            if anc.body_vertex_idx == u32::MAX || anc.weight <= 1e-4 {
+                continue;
+            }
+            let (bp, bn_raw) = skin[anc.body_vertex_idx as usize];
+            let bn_len = crate::math_utils::vec3_length(&bn_raw);
+            let bp_len = crate::math_utils::vec3_length(&bp);
+            if bn_len <= 1e-4 || bp_len <= 1e-3 || bp_len >= 10.0 {
+                continue;
+            }
+            let bn = [bn_raw[0] / bn_len, bn_raw[1] / bn_len, bn_raw[2] / bn_len];
+            let diff = crate::math_utils::vec3_sub(&mid_clearanced[vi].0, &bp);
+            let clr = crate::math_utils::vec3_dot(&diff, &bn);
+            if clr < anc.min_clearance {
+                let push = (anc.min_clearance - clr) * anc.weight;
+                for k in 0..3 {
+                    mid_clearanced[vi].0[k] += bn[k] * push;
+                }
+            }
+        }
+    }
+
+    // outer clearance off mid_bent, then mid containment vs
+    // projected outer (converged same-frame stand-in).
+    let mut outer_proj = outer_bent.clone();
+    for (vi, anc) in outer_anchors.iter().enumerate() {
+        if anc.body_vertex_idx == u32::MAX || anc.weight <= 1e-4 {
+            continue;
+        }
+        let (bp, bn_raw) = mid_bent[anc.body_vertex_idx as usize];
+        let bn_len = crate::math_utils::vec3_length(&bn_raw);
+        let bp_len = crate::math_utils::vec3_length(&bp);
+        if bn_len <= 1e-4 || bp_len <= 1e-3 || bp_len >= 10.0 {
+            continue;
+        }
+        let bn = [bn_raw[0] / bn_len, bn_raw[1] / bn_len, bn_raw[2] / bn_len];
+        let diff = crate::math_utils::vec3_sub(&outer_proj[vi].0, &bp);
+        let clr = crate::math_utils::vec3_dot(&diff, &bn);
+        if clr < anc.min_clearance {
+            let push = (anc.min_clearance - clr) * anc.weight;
+            for k in 0..3 {
+                outer_proj[vi].0[k] += bn[k] * push;
+            }
+        }
+    }
+    let mut mid_contained = mid_clearanced.clone();
+    for (vi, anc) in mid_anchors.iter().enumerate() {
+        if anc.body_vertex_idx == u32::MAX || anc.weight <= 1e-4 {
+            continue;
+        }
+        let (op, on_raw) = outer_proj[anc.body_vertex_idx as usize];
+        let on_len = crate::math_utils::vec3_length(&on_raw);
+        let op_len = crate::math_utils::vec3_length(&op);
+        if on_len <= 1e-4 || op_len <= 1e-3 || op_len >= 10.0 {
+            continue;
+        }
+        let on = [on_raw[0] / on_len, on_raw[1] / on_len, on_raw[2] / on_len];
+        let diff = crate::math_utils::vec3_sub(&mid_contained[vi].0, &op);
+        let c2 = crate::math_utils::vec3_dot(&diff, &on);
+        if c2 > anc.min_clearance {
+            let push = (c2 - anc.min_clearance) * anc.weight;
+            for k in 0..3 {
+                mid_contained[vi].0[k] -= on[k] * push;
+            }
+        }
+    }
+
+    // Skin-through measurement: skin verts near an elbow vs the nearest
+    // garment vertex tangent plane.
+    fn skin_through(
+        skin: &[([f32; 3], [f32; 3])],
+        garment: &[([f32; 3], [f32; 3])],
+        elbows: &[[f32; 3]],
+        radius: f32,
+    ) -> (usize, f32) {
+        skin_through_banded(skin, garment, elbows, radius, 0.0)
+    }
+
+    // `inner_band` restricts the count to skin verts whose distance to
+    // the nearest elbow node is within [inner_band, radius) — the elbow
+    // core vs the armhole/cuff periphery.
+    #[allow(clippy::too_many_arguments)]
+    fn skin_through_banded(
+        skin: &[([f32; 3], [f32; 3])],
+        garment: &[([f32; 3], [f32; 3])],
+        elbows: &[[f32; 3]],
+        radius: f32,
+        inner_band: f32,
+    ) -> (usize, f32) {
+        let mut count = 0usize;
+        let mut max_pen = 0.0f32;
+        for &(sp, _) in skin {
+            let ed = elbows
+                .iter()
+                .map(|e| crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&sp, e)))
+                .fold(f32::MAX, f32::min);
+            if ed >= radius || ed < inner_band {
+                continue;
+            }
+            let mut best: Option<([f32; 3], [f32; 3])> = None;
+            let mut min_d = f32::MAX;
+            for &(gp, gn) in garment {
+                let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&sp, &gp));
+                if d < min_d {
+                    min_d = d;
+                    best = Some((gp, gn));
+                }
+            }
+            if let Some((gp, gn)) = best {
+                let pen = crate::math_utils::vec3_dot(&crate::math_utils::vec3_sub(&sp, &gp), &gn);
+                if pen > 0.0005 {
+                    count += 1;
+                    max_pen = max_pen.max(pen);
+                }
+            }
+        }
+        (count, max_pen)
+    }
+
+    // Diagnose: worst pokes AFTER body clearance — where are they and
+    // what does their anchor look like?
+    {
+        let anchors = mid_prim.skin_anchors.as_ref().unwrap();
+        let bound = anchors.iter().filter(|a| a.body_vertex_idx != u32::MAX).count();
+        println!("mid body-anchors bound: {} / {}", bound, anchors.len());
+        let mut worst: Vec<(f32, [f32; 3], usize)> = Vec::new();
+        for &(sp, _) in &skin {
+            if !elbows.iter().any(|e| crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&sp, e)) < 0.07) {
+                continue;
+            }
+            let mut best: Option<([f32; 3], [f32; 3])> = None;
+            let mut min_d = f32::MAX;
+            for &(gp, gn) in &mid_clearanced {
+                let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&sp, &gp));
+                if d < min_d {
+                    min_d = d;
+                    best = Some((gp, gn));
+                }
+            }
+            if let Some((gp, gn)) = best {
+                let pen = crate::math_utils::vec3_dot(&crate::math_utils::vec3_sub(&sp, &gp), &gn);
+                if pen > 0.005 {
+                    worst.push((pen, sp, 0));
+                }
+            }
+        }
+        worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        println!("worst skin-through pokes after body-clr (skin side): {}", worst.len());
+        for &(pen, sp, _) in worst.iter().take(5) {
+            // nearest mid vert -> its anchor
+            let mut best_vi = 0usize;
+            let mut min_d = f32::MAX;
+            for (vi, &(mp, _)) in mid_clearanced.iter().enumerate() {
+                let d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&sp, &mp));
+                if d < min_d {
+                    min_d = d;
+                    best_vi = vi;
+                }
+            }
+            let anc = &anchors[best_vi];
+            let elbow_d = elbows
+                .iter()
+                .map(|e| crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&sp, e)))
+                .fold(f32::MAX, f32::min);
+            if anc.body_vertex_idx == u32::MAX {
+                println!("  skin poke pen={:.1}mm at [{:.2} {:.2} {:.2}] (elbow_d={:.0}mm): nearest mid vert UNBOUND", pen * 1000.0, sp[0], sp[1], sp[2], elbow_d * 1000.0);
+            } else {
+                let (bp, _) = skin[anc.body_vertex_idx as usize];
+                let anchor_d = crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(&mid_clearanced[best_vi].0, &bp));
+                println!(
+                    "  skin poke pen={:.1}mm at [{:.2} {:.2} {:.2}] (elbow_d={:.0}mm): nearest mid vert {} anchor dist={:.0}mm min_clr={:.1}mm",
+                    pen * 1000.0, sp[0], sp[1], sp[2], elbow_d * 1000.0, best_vi, anchor_d * 1000.0, anc.min_clearance * 1000.0
+                );
+            }
+        }
+    }
+
+    // The assertion targets the ELBOW CORE (within 35mm of the joint)
+    // — the reported symptom. The 35-70mm band is the armhole /
+    // upper-arm periphery where the shirt carries no sensible coverage
+    // and tangent-plane violations reshuffle with any sleeve
+    // displacement; those are printed as reference values only.
+    let (core_pure, _) = skin_through_banded(&skin, &mid_bent, &elbows, 0.035, 0.0);
+    let (core_fixed, _) = skin_through_banded(&skin, &mid_clearanced, &elbows, 0.035, 0.0);
+    let (core_contained, _) = skin_through_banded(&skin, &mid_contained, &elbows, 0.035, 0.0);
+    println!(
+        "elbow core (<35mm): pure={} +body-clr={} +containment={}",
+        core_pure, core_fixed, core_contained
+    );
+    assert!(
+        core_pure > 20,
+        "90-degree bend must reproduce skin-through-sleeve at the elbow core (got {})",
+        core_pure
+    );
+    assert_eq!(
+        core_fixed, 0,
+        "body clearance must eliminate elbow-core skin-through (got {})",
+        core_fixed
+    );
+    for radius in [0.07_f32, 0.12] {
+        let (a_cnt, a_max) = skin_through(&skin, &mid_bent, &elbows, radius);
+        let (b_cnt, b_max) = skin_through(&skin, &mid_clearanced, &elbows, radius);
+        let (c_cnt, c_max) = skin_through(&skin, &mid_contained, &elbows, radius);
+        let (ob_cnt, ob_max) = skin_through(&skin, &outer_bent, &elbows, radius);
+        let (op_cnt, op_max) = skin_through(&skin, &outer_proj, &elbows, radius);
+        println!(
+            "radius {:.0}mm: skin-through-mid: pure={} (max {:.1}mm) +body-clr={} (max {:.1}mm) +containment={} (max {:.1}mm) | skin-through-outer: pure={} (max {:.1}mm) cleared={} (max {:.1}mm)",
+            radius * 1000.0,
+            a_cnt, a_max * 1000.0,
+            b_cnt, b_max * 1000.0,
+            c_cnt, c_max * 1000.0,
+            ob_cnt, ob_max * 1000.0,
+            op_cnt, op_max * 1000.0
+        );
+        for band in [0.0_f32, 0.035] {
+            let (ba, _) = skin_through_banded(&skin, &mid_bent, &elbows, radius, band);
+            let (bb, _) = skin_through_banded(&skin, &mid_clearanced, &elbows, radius, band);
+            let (bc, _) = skin_through_banded(&skin, &mid_contained, &elbows, radius, band);
+            println!(
+                "  band {:.0}-{:.0}mm: pure={} +body-clr={} +containment={}",
+                band * 1000.0,
+                radius * 1000.0,
+                ba,
+                bb,
+                bc
+            );
+        }
+    }
+}
+
+fn prim_name(asset: &crate::asset::AvatarAsset, pid: crate::asset::PrimitiveId) -> String {
+    asset
+        .meshes
+        .iter()
+        .find(|m| m.primitives.iter().any(|p| p.id == pid))
+        .map(|m| m.name.clone())
+        .unwrap_or_default()
 }

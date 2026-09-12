@@ -360,7 +360,14 @@ impl Rtmw3dInference {
             ));
         }
 
-        let face_ep = if opts.force_cpu {
+        // `force_cpu` (user toggle) and the RuntimeGpuBudget's EP
+        // preference (PressureHeavy+) both push FaceMesh off DirectML.
+        // The budget static is read here — session-build time — so the
+        // flip lands on the next tracking start, never mid-session.
+        let face_ep = if opts.force_cpu
+            || super::face_mediapipe::FACEMESH_EP_CPU
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             super::face_mediapipe::FaceMeshEp::ForceCpu
         } else {
             opts.face_ep

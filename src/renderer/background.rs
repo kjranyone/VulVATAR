@@ -11,8 +11,11 @@
 //!   pre-scaled on the CPU by `avatar_opacity` (tracking-loss fade) and
 //!   zeroed when no avatar is loaded.
 //!
-//! Everything per-frame reaches the shader as push constants — changing any
-//! setting never rebuilds the pipeline. The pipeline itself is rebuilt with
+//! Everything per-frame reaches the shader through a small ring of uniform
+//! buffers (set 0) — changing any setting never rebuilds the pipeline, and
+//! the animated fields (`time`, tracking anchors) staying out of the command
+//! buffer is what lets `render`'s command-buffer cache reuse a recording
+//! while the background animates. The pipeline itself is rebuilt with
 //! the scene pipelines (same render pass, baked viewport and MSAA sample
 //! count). Depth test/write and stencil stay disabled: painter's order
 //! alone puts the background behind the avatar, and the cleared depth
@@ -25,6 +28,7 @@
 
 use std::sync::Arc;
 
+use bytemuck::Zeroable;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::device::Device;
 use vulkano::image::SampleCount;
@@ -50,14 +54,14 @@ use crate::renderer::frame_input::RenderFrameInput;
 /// lookup); tune those first if the background shows up in frame profiles.
 mod background_fs {
     vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
+                            ty: "fragment",
+                            src: r"
 #version 450
 
 layout(location = 0) in vec2 frag_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(push_constant) uniform Push {
+layout(set = 0, binding = 0, std140) uniform BgData {
     vec4 color_a;      // rgb used, w ignored
     vec4 color_b;      // rgb used, w ignored
     vec2 head_uv;
@@ -184,11 +188,11 @@ void main() {
     out_color = vec4(col * pc.intensity, 1.0);
 }
 "
-                }
+                        }
 }
 
-/// Push-constant mirror of the shader's `Push` block (96 bytes, under the
-/// 128-byte guaranteed minimum).
+/// UBO payload mirror of the shader's `BgData` block (std140; the member
+/// sequence needs no implicit padding, so offsets match `#[repr(C)]`).
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(super) struct BackgroundPushConstants {
@@ -207,7 +211,7 @@ pub(super) struct BackgroundPushConstants {
     pub _pad: [f32; 2],
 }
 
-/// Assemble the per-frame push constants: project the tracking anchors to
+/// Assemble the per-frame uniform payload: project the tracking anchors to
 /// screen UV and gate the reactive terms.
 ///
 /// `reactivity` is scaled by `avatar_opacity` so a tracking loss fades the
@@ -331,22 +335,95 @@ pub(super) fn create_background_pipeline(
 }
 
 /// Record the background draw. Must be called inside the scene render pass,
-/// before any avatar draw. The caller computes the push constants (UV
-/// projection + reactivity scaling happen in `render()`).
+/// before any avatar draw. The caller has already written this frame's
+/// uniform into the ring slot behind `bg_set` (UV projection + reactivity
+/// scaling happen in `render()`).
 pub(super) fn record_background(
     builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
     pipeline: &Arc<GraphicsPipeline>,
-    push: BackgroundPushConstants,
+    bg_set: Arc<vulkano::descriptor_set::DescriptorSet>,
 ) -> Result<(), String> {
     builder
         .bind_pipeline_graphics(pipeline.clone())
         .map_err(|e| format!("background: bind_pipeline failed: {e}"))?
-        .push_constants(pipeline.layout().clone(), 0, push)
-        .map_err(|e| format!("background: push_constants failed: {e}"))?;
+        .bind_descriptor_sets(
+            vulkano::pipeline::PipelineBindPoint::Graphics,
+            pipeline.layout().clone(),
+            0,
+            bg_set,
+        )
+        .map_err(|e| format!("background: bind uniform set failed: {e}"))?;
     unsafe {
         builder
             .draw(3, 1, 0, 0)
             .map_err(|e| format!("background: draw failed: {e}"))?;
     }
     Ok(())
+}
+
+/// Depth of the per-frame uniform ring. Two slots match the readback ring's
+/// in-flight depth: `render` writes slot `frame % 2` only after the previous
+/// frame's fence was waited on, so a slot is never rewritten while the GPU
+/// still reads it.
+pub(super) const BG_UNIFORM_RING_SIZE: usize = 2;
+
+/// Per-frame uniform buffers + descriptor sets for the background shader
+/// (the UBO replacement for the former push constants). Owned by
+/// `VulkanRenderer` and rebuilt whenever the background pipeline is.
+pub(super) struct BgUniformRing {
+    buffers: Vec<vulkano::buffer::Subbuffer<BackgroundPushConstants>>,
+    sets: Vec<Arc<vulkano::descriptor_set::DescriptorSet>>,
+}
+
+impl BgUniformRing {
+    pub(super) fn new(
+        memory_allocator: &Arc<vulkano::memory::allocator::StandardMemoryAllocator>,
+        ds_allocator: &Arc<vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator>,
+        pipeline: &Arc<GraphicsPipeline>,
+    ) -> Self {
+        let layout = pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .expect("background pipeline has no set 0")
+            .clone();
+
+        let initial = BackgroundPushConstants::zeroed();
+        let mut buffers = Vec::with_capacity(BG_UNIFORM_RING_SIZE);
+        let mut sets = Vec::with_capacity(BG_UNIFORM_RING_SIZE);
+        for _ in 0..BG_UNIFORM_RING_SIZE {
+            let buffer = super::gpu_alloc::host_ubo(
+                memory_allocator,
+                initial,
+                "background uniform ring alloc",
+            )
+            .expect("background uniform ring alloc failed");
+            let set = vulkano::descriptor_set::DescriptorSet::new(
+                ds_allocator.clone(),
+                layout.clone(),
+                [vulkano::descriptor_set::WriteDescriptorSet::buffer(
+                    0,
+                    buffer.clone(),
+                )],
+                [],
+            )
+            .expect("background uniform desc set alloc failed");
+            buffers.push(buffer);
+            sets.push(set);
+        }
+        BgUniformRing { buffers, sets }
+    }
+
+    /// Write `data` into ring slot `slot` and return its descriptor set.
+    pub(super) fn write_slot(
+        &self,
+        slot: usize,
+        data: BackgroundPushConstants,
+    ) -> Result<Arc<vulkano::descriptor_set::DescriptorSet>, String> {
+        let mut guard = self.buffers[slot]
+            .write()
+            .map_err(|e| format!("background: uniform write failed: {e}"))?;
+        *guard = data;
+        Ok(self.sets[slot].clone())
+    }
 }

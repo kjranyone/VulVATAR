@@ -1,6 +1,6 @@
 //! Scene pass — slice 7 of the #12 renderer split. Records the offscreen
 //! render pass that draws the generative background, the opaque/blend
-//! avatar draws (consuming the compute prepass's [`DrawInfo`] list),
+//! avatar draws (consuming the frame plan's [`DrawInfo`] list),
 //! and the outline pass. Camera / material descriptor sets are bound
 //! here; the HDR scene target then feeds the post-effect layer.
 
@@ -10,13 +10,11 @@ use vulkano::command_buffer::{
     AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
     SubpassContents, SubpassEndInfo,
 };
-use vulkano::descriptor_set::DescriptorSet;
 use vulkano::pipeline::{GraphicsPipeline, Pipeline, PipelineBindPoint};
 use vulkano::render_pass::Framebuffer;
 
 use crate::renderer::background;
-use crate::renderer::compute_prepass::DrawInfo;
-use crate::renderer::frame_input::{self, RenderFrameInput};
+use crate::renderer::frame_plan::FramePlan;
 use crate::renderer::VulkanRenderer;
 
 /// Push constant layout for the outline pipeline (matches shader).
@@ -32,42 +30,34 @@ struct OutlinePushConstants {
 
 impl VulkanRenderer {
     /// Record the offscreen scene render pass: generative background,
-    /// opaque-then-blend avatar draws, outline pass.
-    #[allow(clippy::too_many_arguments)]
+    /// opaque-then-blend avatar draws, outline pass. All values come from
+    /// the prepared [`FramePlan`] so a cached command buffer is
+    /// byte-equivalent to a fresh recording of the same plan.
     pub(super) fn record_scene_pass(
         &mut self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        input: &RenderFrameInput,
-        draws: &[DrawInfo],
+        plan: &FramePlan,
         framebuffer: &Arc<Framebuffer>,
         gfx_pipeline: &Arc<GraphicsPipeline>,
         outline_pipeline: &Arc<GraphicsPipeline>,
-        camera_set: Arc<DescriptorSet>,
-        outline_camera_set: Arc<DescriptorSet>,
     ) -> Result<(), String> {
         // ── Graphics pass: forward draws then outlines ──────────────────
         // Vulkano inserts the compute-write → vertex-input-read barrier on
         // each `transformed_vbo` automatically because the dispatch and the
         // draw share this single command buffer.
-        let bg_clear = if input.transparent_background {
-            [0.0_f32, 0.0, 0.0, 0.0]
-        } else {
-            let [r, g, b] = input.background_color;
-            [r, g, b, 1.0]
-        };
         // Clear values must line up with the render pass attachment order
         // built in `build_render_pass`:
         //   1×:   [color (Clear), depth (Clear)]
         //   MSAA: [msaa_color (Clear), color/resolve (DontCare → None), depth (Clear)]
         let clear_values = if self.current_sample_count > 1 {
             vec![
-                Some(bg_clear.into()),
+                Some(plan.clear.into()),
                 None,
                 Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
             ]
         } else {
             vec![
-                Some(bg_clear.into()),
+                Some(plan.clear.into()),
                 Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
             ]
         };
@@ -88,13 +78,8 @@ impl VulkanRenderer {
         // order alone keeps it behind the avatar (its pipeline neither tests
         // nor writes depth), and being inside the HDR scene pass means the
         // bloom chain picks up its highlights like any other scene content.
-        if input.generative_background.enabled {
-            let bg_pipeline = self
-                .background_pipeline
-                .as_ref()
-                .ok_or("render: no background pipeline")?;
-            let push = background::build_push_constants(input);
-            background::record_background(builder, bg_pipeline, push)?;
+        if let (Some(bg_pipeline), Some(bg_set)) = (&plan.bg_pipeline, &plan.bg_set) {
+            background::record_background(builder, bg_pipeline, bg_set.clone())?;
         }
 
         builder
@@ -104,7 +89,7 @@ impl VulkanRenderer {
                 PipelineBindPoint::Graphics,
                 gfx_pipeline.layout().clone(),
                 0,
-                camera_set,
+                plan.camera_set.clone(),
             )
             .map_err(|e| format!("render: bind camera descriptor set failed: {e}"))?;
 
@@ -112,8 +97,11 @@ impl VulkanRenderer {
         // across all graphics variants, so it stays bound when we swap
         // variant pipelines (Vulkan layout compatibility for set 0).
         for blend_pass in [false, true] {
-            for draw in draws {
-                let is_blend = matches!(draw.alpha_mode, frame_input::RenderAlphaMode::Blend);
+            for draw in &plan.draws {
+                let is_blend = matches!(
+                    draw.alpha_mode,
+                    crate::renderer::frame_input::RenderAlphaMode::Blend
+                );
                 if is_blend != blend_pass {
                     continue;
                 }
@@ -140,7 +128,7 @@ impl VulkanRenderer {
         }
 
         // ── Outline pass ────────────────────────────────────────────────
-        let outline_count = draws.iter().filter(|d| d.outline.is_some()).count();
+        let outline_count = plan.draws.iter().filter(|d| d.outline.is_some()).count();
         if outline_count > 0 {
             builder
                 .bind_pipeline_graphics(outline_pipeline.clone())
@@ -149,11 +137,11 @@ impl VulkanRenderer {
                     PipelineBindPoint::Graphics,
                     outline_pipeline.layout().clone(),
                     0,
-                    outline_camera_set,
+                    plan.outline_camera_set.clone(),
                 )
                 .map_err(|e| format!("render: bind outline camera set failed: {e}"))?;
 
-            for draw in draws {
+            for draw in &plan.draws {
                 let Some((width, color)) = draw.outline else {
                     continue;
                 };

@@ -347,6 +347,12 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
     if body_world.is_empty() {
         return;
     }
+    // Cloned out of `asset` so the reference doesn't outlive the
+    // Phase-1 mutable mesh loop below (~4 MB for a 79k-vert body).
+    let (body_joint_indices, body_joint_weights) = {
+        let vd = body_prim.vertices.as_ref().unwrap();
+        (vd.joint_indices.clone(), vd.joint_weights.clone())
+    };
 
     info!(
         "clearance: indexed body primitive {:?} ({} vertices) for skin anchors",
@@ -494,7 +500,15 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
     );
 
     // Phase 2: Hierarchical Layered Clothing Clearance (inner -> outer pairings)
-    generate_layered_clothing_anchors(asset, &globals, &skinning);
+    generate_layered_clothing_anchors(
+        asset,
+        &globals,
+        &skinning,
+        body_prim_id,
+        &body_world,
+        &body_joint_indices,
+        &body_joint_weights,
+    );
 }
 
 /// Helper: computes cosine similarity between two vertex 4-bone weight sets.
@@ -631,6 +645,66 @@ fn query_layered_nearest(
     best_i
 }
 
+/// Generate body-surface clearance anchors for one garment's rest world
+/// vertices — the Phase-2 body-parenting rules: middle layers of a
+/// layered stack and innermost layers with a free clearance slot anchor
+/// against the BODY so sleeves stay off the skin at bent joints (a
+/// garment-garment clearance parent never covers sleeves — the inner
+/// garment has none).
+///
+/// The pairing is BONE-WEIGHT-AWARE (unlike the Phase-1 skirt query):
+/// near joints the garment and the skin are often weighted differently
+/// across the joint boundary, and a pure nearest-neighbour pairing
+/// matches vertices that do not co-move under bending — the anchored
+/// plane then describes a different part of the arm than the vertex
+/// pressing through it (measured: the elbow bulge poked 19.8mm past a
+/// sleeve held 16.8mm off a skin vertex 17mm away). Weight-similar
+/// pairings co-move and the rest-derived clearance stays meaningful.
+#[allow(clippy::too_many_arguments)]
+fn anchor_prim_against_body(
+    world_verts: &[([f32; 3], [f32; 3])],
+    own_joint_indices: &[[u16; 4]],
+    own_joint_weights: &[[f32; 4]],
+    body_world: &[([f32; 3], [f32; 3])],
+    body_joint_indices: &[[u16; 4]],
+    body_joint_weights: &[[f32; 4]],
+    body_grid_3cm: &HashMap<(i32, i32, i32), Vec<u32>>,
+) -> (Vec<SkinAnchor>, usize) {
+    let inv_cell = 1.0 / 0.03f32;
+    let mut anchors = Vec::with_capacity(world_verts.len());
+    let mut bound_count = 0usize;
+    for (vi, &(cp, cn)) in world_verts.iter().enumerate() {
+        let b_idx = query_layered_nearest(
+            cp,
+            cn,
+            &own_joint_indices[vi],
+            &own_joint_weights[vi],
+            body_grid_3cm,
+            body_world,
+            body_joint_indices,
+            body_joint_weights,
+            inv_cell,
+            0.12,
+            0.25,
+        );
+        if let Some(b_idx) = b_idx {
+            let (bp, bn) = body_world[b_idx as usize];
+            let diff = [cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]];
+            let raw_clearance = diff[0] * bn[0] + diff[1] * bn[1] + diff[2] * bn[2];
+            anchors.push(SkinAnchor {
+                body_vertex_idx: b_idx,
+                min_clearance: raw_clearance.max(0.002),
+                weight: 1.0,
+                mode: SKIN_ANCHOR_CLEARANCE,
+            });
+            bound_count += 1;
+        } else {
+            anchors.push(SkinAnchor::default());
+        }
+    }
+    (anchors, bound_count)
+}
+
 /// Phase 2: Hierarchical Layered Clothing Clearance.
 ///
 /// Automatically discovers multi-layer clothing pairings (e.g. shirt -> blazer,
@@ -651,6 +725,10 @@ pub fn generate_layered_clothing_anchors(
     asset: &mut AvatarAsset,
     globals: &[Mat4],
     skinning: &[Mat4],
+    body_pid: PrimitiveId,
+    body_world: &[([f32; 3], [f32; 3])],
+    body_joint_indices: &[[u16; 4]],
+    body_joint_weights: &[[f32; 4]],
 ) {
     struct PrimCandidate {
         mesh_idx: usize,
@@ -728,6 +806,8 @@ pub fn generate_layered_clothing_anchors(
     if candidates.len() < 2 {
         return;
     }
+
+    let body_grid_3cm = build_layer_grid(body_world, 0.03);
 
     // Pairwise geometric layer analysis: determine which primitive is inner vs outer.
     // Map of outer_candidate_index -> every accepted inner candidate
@@ -879,14 +959,14 @@ pub fn generate_layered_clothing_anchors(
     // accessory that won the radial analysis by tightness binds almost
     // nothing and falls through to the next candidate instead of
     // silently leaving the outer layer unconstrained.
-    let mut accepted_pairs: Vec<(usize, usize, usize)> = Vec::new();
+    let mut chosen: Vec<(usize, usize, usize, Vec<SkinAnchor>)> = Vec::new();
     for (&outer_idx, cands) in &inner_candidates {
         let outer_cand = &candidates[outer_idx];
         let min_bound = (outer_cand.world_verts.len() / 50).max(32);
         let mut ranked = cands.clone();
         ranked.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.partial_cmp(&b.1).unwrap()));
 
-        let mut accepted: Option<(usize, Vec<SkinAnchor>)> = None;
+        let mut accepted: Option<(usize, usize, Vec<SkinAnchor>)> = None;
         for &(inner_idx, avg_c, n_overlap) in &ranked {
             let inner_cand = &candidates[inner_idx];
 
@@ -950,8 +1030,7 @@ pub fn generate_layered_clothing_anchors(
                     bound_count,
                     outer_cand.world_verts.len()
                 );
-                accepted = Some((inner_idx, anchors));
-                accepted_pairs.push((outer_idx, inner_idx, n_overlap));
+                accepted = Some((inner_idx, n_overlap, anchors));
                 break;
             } else {
                 info!(
@@ -965,19 +1044,68 @@ pub fn generate_layered_clothing_anchors(
             }
         }
 
-        if let Some((inner_idx, anchors)) = accepted {
-            let inner_cand = &candidates[inner_idx];
-            let prim_mut = Arc::make_mut(
-                &mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx],
-            );
-            prim_mut.skin_anchors = Some(anchors);
-            prim_mut.body_primitive_id = Some(inner_cand.prim_id);
+        if let Some((inner_idx, n_overlap, anchors)) = accepted {
+            chosen.push((outer_idx, inner_idx, n_overlap, anchors));
         } else if !ranked.is_empty() {
             warn!(
                 "clearance: no inner candidate produced usable anchors for outer '{}' (prim {:?}); layer left unconstrained",
                 outer_cand.mesh_name, outer_cand.prim_id
             );
         }
+    }
+
+    // Parent selection + write. A garment that is itself the inner of
+    // another accepted pair (a MIDDLE layer of the stack) anchors its
+    // clearance against the BODY instead of its garment-inner: the
+    // garment-inner is sleeveless or differently-cut, so its anchors
+    // only cover the torso and leave the sleeve region unconstrained —
+    // exactly where the arm presses through at bent joints. Body
+    // anchoring uses the Phase-1 semantics (12 cm radius, 2 mm floor).
+    // Outermost layers keep the garment pairing (their clearance
+    // follows the inner garment surface, which itself now follows the
+    // body — a transitive chain body -> middle -> outer).
+    let middles: std::collections::HashSet<usize> =
+        chosen.iter().map(|(_, inner, _, _)| *inner).collect();
+    let mut accepted_pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for (outer_idx, inner_idx, n_overlap, garment_anchors) in chosen {
+        let outer_cand = &candidates[outer_idx];
+        let inner_cand = &candidates[inner_idx];
+        let use_body = middles.contains(&outer_idx);
+        let (anchors, parent_pid) = if use_body {
+            let (own_idx, own_w) = {
+                let vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]
+                    .vertices
+                    .as_ref()
+                    .unwrap();
+                (&vd.joint_indices, &vd.joint_weights)
+            };
+            let (body_anchors, body_bound) = anchor_prim_against_body(
+                &outer_cand.world_verts,
+                own_idx,
+                own_w,
+                body_world,
+                body_joint_indices,
+                body_joint_weights,
+                &body_grid_3cm,
+            );
+            if body_bound > 0 {
+                info!(
+                    "clearance: middle layer '{}' (prim {:?}) anchors against the body ({} bound) — garment-inner '{}' has no sleeve coverage",
+                    outer_cand.mesh_name, outer_cand.prim_id, body_bound, inner_cand.mesh_name
+                );
+                (body_anchors, body_pid)
+            } else {
+                (garment_anchors, inner_cand.prim_id)
+            }
+        } else {
+            (garment_anchors, inner_cand.prim_id)
+        };
+        let prim_mut = Arc::make_mut(
+            &mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx],
+        );
+        prim_mut.skin_anchors = Some(anchors);
+        prim_mut.body_primitive_id = Some(parent_pid);
+        accepted_pairs.push((outer_idx, inner_idx, n_overlap));
     }
 
     // Reverse pass: containment anchors on the inner layers.
@@ -1079,6 +1207,47 @@ pub fn generate_layered_clothing_anchors(
             );
             prim_mut.containment_anchors = Some(anchors);
             prim_mut.containment_primitive_id = Some(outer_cand.prim_id);
+        }
+    }
+
+    // Phase 1b: innermost layers — containment-carrying prims whose
+    // clearance slot is still free — get body-surface clearance as
+    // well. The vest under the shirt hugs the skin, and nothing else
+    // would otherwise keep it (or the skin beneath it) separated from
+    // the body at bent joints.
+    for cand in &candidates {
+        let needs_body = {
+            let prim = &asset.meshes[cand.mesh_idx].primitives[cand.prim_idx];
+            prim.containment_anchors.is_some() && prim.skin_anchors.is_none()
+        };
+        if !needs_body {
+            continue;
+        }
+        let (own_idx, own_w) = {
+            let vd = asset.meshes[cand.mesh_idx].primitives[cand.prim_idx]
+                .vertices
+                .as_ref()
+                .unwrap();
+            (&vd.joint_indices, &vd.joint_weights)
+        };
+        let (anchors, bound_count) = anchor_prim_against_body(
+            &cand.world_verts,
+            own_idx,
+            own_w,
+            body_world,
+            body_joint_indices,
+            body_joint_weights,
+            &body_grid_3cm,
+        );
+        if bound_count > 0 {
+            info!(
+                "clearance: generated {} body anchors for innermost layer '{}' (prim {:?})",
+                bound_count, cand.mesh_name, cand.prim_id
+            );
+            let prim_mut =
+                Arc::make_mut(&mut asset.meshes[cand.mesh_idx].primitives[cand.prim_idx]);
+            prim_mut.skin_anchors = Some(anchors);
+            prim_mut.body_primitive_id = Some(body_pid);
         }
     }
 }

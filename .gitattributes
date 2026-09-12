@@ -20,3 +20,10 @@
 *.exr binary
 *.hdr binary
 *.spv binary
+
+# Vendored crates are snapshots of upstream releases plus the documented
+# local patch (docs/realsense-build.md). EOL normalization would make
+# the vendored copy diverge from upstream byte-for-byte and break the
+# "keep the diff minimal to ease rebasing" contract — including the
+# upstream-shipped prebuilt bindings, which use CRLF.
+vendor/** -text

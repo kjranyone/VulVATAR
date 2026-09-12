@@ -48,6 +48,38 @@ Copy-Item build-support\pkgconfig\realsense2.pc.example build-support\pkgconfig\
     Set-Content build-support\pkgconfig\realsense2.pc
 ```
 
+## The vendored `realsense-sys` patch (`vendor/realsense-sys`)
+
+`realsense-sys` 2.56.5 (from crates.io) is replaced by a local copy via
+`[patch.crates-io]` in the root `Cargo.toml`, because its `build.rs` has a
+self-sustaining rerun loop:
+
+- it writes the bindgen output to `<package>/bindings/bindings.rs` —
+  *inside its own package directory* — on every run, and
+- it emits no `cargo:rerun-if-changed` directive, so cargo's default
+  "rerun the build script if any file in the package changed" stays
+  active. The bindings rewrite trips that on **every** build.
+
+The result was that every `cargo build` recompiled
+`realsense-sys` → `realsense-rust` → the `vulvatar` lib and relinked all
+bins (~90 s with zero source changes). The vendored copy differs from
+upstream in three points:
+
+1. bindings are written to `OUT_DIR` instead of the package directory
+   (`src/lib.rs` includes from `OUT_DIR` under `buildtime-bindgen`,
+   falling back to the shipped prebuilt bindings otherwise),
+2. `build.rs` emits `cargo:rerun-if-changed` for itself, the SDK include
+   dirs, and the SDK `realsense2.dll` (so SDK upgrades still regenerate
+   bindings / refresh the deps copy),
+3. the deps-DLL refresh copy tolerates a sharing violation when a
+   running process (the app, a test binary) already loaded
+   `target/<profile>/deps/realsense2.dll` — it keeps the existing copy
+   and warns instead of failing the build, since
+   `rerun-if-changed` on the SDK DLL retries on later builds,
+4. nothing else — keep the diff minimal to ease rebasing onto a future
+   upstream release. When upstream fixes this, delete `vendor/` and the
+   `[patch.crates-io]` block.
+
 ## Build & run
 
 Set three env vars, then build with the feature:

@@ -126,6 +126,15 @@ struct WristHold {
     last_z: Option<f64>,
 }
 
+/// `VULVATAR_FUSION_NO_QNEUTRAL` ablation for the calibrated posture
+/// prior (docs/tracking-v2-design.md §7 convention): keeps
+/// `set_calibration` wiring honest in benches by forcing the estimator
+/// back to the model's relaxed-pose prior.
+fn q_neutral_ablated() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("VULVATAR_FUSION_NO_QNEUTRAL").is_some())
+}
+
 impl FusionProvider {
     pub fn from_models_dir_with_config(
         models_dir: impl AsRef<Path>,
@@ -348,6 +357,25 @@ impl PoseProvider for FusionProvider {
 
     fn set_external_depth(&mut self, depth: MetricDepthFrame) {
         self.external_depth = Some(depth);
+    }
+
+    fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
+        // Forward the calibrated neutral joint pose into the estimator's
+        // posture prior (‖q − q_neutral‖² — mean replacement only, the
+        // joint's own sigma stays). Length is validated against the
+        // model inside `accumulate_at`, so a capture taken against a
+        // different model version degrades to the relaxed-pose prior
+        // rather than mis-indexing. `VULVATAR_FUSION_NO_QNEUTRAL`
+        // ablates for benches (same convention as the other NO_* gates
+        // in docs/tracking-v2-design.md §7).
+        self.est.q_neutral = match calibration.as_ref().and_then(|c| c.q_neutral.as_ref()) {
+            Some(_) if q_neutral_ablated() => None,
+            qn => qn.map(|v| {
+                v.iter()
+                    .map(|r| [r[0] as f64, r[1] as f64, r[2] as f64])
+                    .collect()
+            }),
+        };
     }
 
     fn estimate_pose(
@@ -1711,6 +1739,18 @@ impl PoseProvider for FusionProvider {
         skeleton.face = base.skeleton.face;
         skeleton.face_body_raw = base.skeleton.face_body_raw;
         skeleton.capture_timestamp_ms = ts_ms;
+        // Solved joint state for the calibration modal's q_neutral hold.
+        // Published unconditionally: the modal gates admission on frame
+        // quality itself, and debug tooling finds a always-present field
+        // easier to reason about than a confidence-conditional one.
+        skeleton.estimator_joint_state = Some(
+            (0..self.h.model.joints.len())
+                .map(|j| {
+                    let v = self.est.state.joint_rotvec(&self.h.model, j);
+                    [v[0] as f32, v[1] as f32, v[2] as f32]
+                })
+                .collect(),
+        );
         skeleton.rig = Some(Arc::new(rig));
         self.last_solve_ms = t0.elapsed().as_secs_f32() * 1000.0;
         if crate::tracking::debug_channel::enabled() {

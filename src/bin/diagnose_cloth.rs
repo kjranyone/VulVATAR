@@ -469,6 +469,8 @@ fn build_skirt_cloth_asset(
                 binding_node: NodeRef {
                     id: pin_node.id,
                     name: pin_node.name.clone(),
+                    humanoid_bone: None,
+                    parent_path: None,
                 },
                 offset: [ox, oy, oz],
             });
@@ -541,6 +543,8 @@ fn build_skirt_cloth_asset(
             node_refs: vec![NodeRef {
                 id: pin_node.id,
                 name: pin_node.name.clone(),
+                humanoid_bone: None,
+                parent_path: None,
             }],
             mesh_refs: vec![MeshRef {
                 id: mesh_id,

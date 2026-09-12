@@ -19,8 +19,8 @@
 //! detach-or-prompt flow.
 
 use crate::asset::{
-    AvatarAsset, ClothAsset, MeshAsset, MeshId, MeshPrimitiveAsset, MeshRef, NodeId, NodeRef,
-    PrimitiveId, PrimitiveRef, SkeletonNode,
+    AvatarAsset, ClothAsset, HumanoidBone, MeshAsset, MeshId, MeshPrimitiveAsset, MeshRef, NodeId,
+    NodeRef, PrimitiveId, PrimitiveRef, SkeletonNode,
 };
 use std::collections::HashMap;
 
@@ -129,6 +129,86 @@ struct AvatarResolver<'a> {
     /// glTF doesn't name primitives, so this is the most stable
     /// identity we can synthesise.
     primitives_by_position: HashMap<(String, usize), &'a MeshPrimitiveAsset>,
+    /// Secondary-tier lookup: humanoid bone slot -> nodes claiming it.
+    /// A slot claimed by more than one node is ambiguous and never
+    /// resolves at that tier.
+    nodes_by_slot: HashMap<HumanoidBone, Vec<&'a SkeletonNode>>,
+    /// Tertiary-tier lookup: ancestor chain (root-to-parent, the
+    /// node's own name excluded) -> nodes hanging off it. Same
+    /// ambiguity rule as `nodes_by_slot`.
+    nodes_by_parent_path: HashMap<String, Vec<&'a SkeletonNode>>,
+}
+
+/// NodeId -> node index over an avatar's skeleton.
+fn nodes_by_id<'a>(avatar: &'a AvatarAsset) -> HashMap<NodeId, &'a SkeletonNode> {
+    avatar
+        .skeleton
+        .nodes
+        .iter()
+        .map(|n| (n.id, n))
+        .collect()
+}
+
+/// NodeId -> humanoid bone slot, merging both sources in the asset:
+/// the per-node `SkeletonNode::humanoid_bone` field (populated by the
+/// FBX loader) and `AvatarAsset::humanoid.bone_map` (populated by the
+/// VRM loaders). When both name a node, the map wins — it is the
+/// spec-authoritative source.
+fn slot_by_node_id(avatar: &AvatarAsset) -> HashMap<NodeId, HumanoidBone> {
+    let mut map: HashMap<NodeId, HumanoidBone> = avatar
+        .skeleton
+        .nodes
+        .iter()
+        .filter_map(|n| n.humanoid_bone.map(|slot| (n.id, slot)))
+        .collect();
+    if let Some(humanoid) = &avatar.humanoid {
+        for (slot, id) in &humanoid.bone_map {
+            map.insert(*id, *slot);
+        }
+    }
+    map
+}
+
+/// Root-to-node path of bone names joined with `/`, or `None` when the
+/// parent chain is broken or cyclic (loader bug; the node then simply
+/// has no tertiary identity).
+fn parent_path_of(
+    nodes: &HashMap<NodeId, &SkeletonNode>,
+    id: NodeId,
+) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut cursor = id;
+    let mut hops = 0usize;
+    loop {
+        let node = *nodes.get(&cursor)?;
+        names.push(node.name.as_str());
+        match node.parent {
+            Some(parent) => {
+                cursor = parent;
+                hops += 1;
+                if hops > nodes.len() {
+                    return None; // cyclic parent chain
+                }
+            }
+            None => break,
+        }
+    }
+    names.reverse();
+    Some(names.join("/"))
+}
+
+/// Ancestor chain of `id` (root-to-parent, excluding the node's own
+/// name) joined with `/`, or `None` for root nodes / broken chains.
+/// This is the tertiary-tier signature: by the time it is consulted
+/// the node's own name has already failed to match (primary tier), so
+/// only the names of its ancestors carry signal. A node whose sibling
+/// shares the chain is ambiguous and never resolves at that tier.
+fn ancestor_path_of(
+    nodes: &HashMap<NodeId, &SkeletonNode>,
+    id: NodeId,
+) -> Option<String> {
+    let parent = (*nodes.get(&id)?).parent?;
+    parent_path_of(nodes, parent)
 }
 
 impl<'a> AvatarResolver<'a> {
@@ -140,7 +220,7 @@ impl<'a> AvatarResolver<'a> {
             .map(|n| (n.name.as_str(), n))
             .collect();
 
-        let meshes_by_name: HashMap<&str, &MeshAsset> =
+        let meshes_by_name: HashMap<&'a str, &'a MeshAsset> =
             avatar.meshes.iter().map(|m| (m.name.as_str(), m)).collect();
         let mut primitives_by_position = HashMap::new();
         for mesh in &avatar.meshes {
@@ -149,10 +229,25 @@ impl<'a> AvatarResolver<'a> {
             }
         }
 
+        let by_id = nodes_by_id(avatar);
+        let slots = slot_by_node_id(avatar);
+        let mut nodes_by_slot: HashMap<HumanoidBone, Vec<&SkeletonNode>> = HashMap::new();
+        let mut nodes_by_parent_path: HashMap<String, Vec<&SkeletonNode>> = HashMap::new();
+        for n in &avatar.skeleton.nodes {
+            if let Some(slot) = slots.get(&n.id) {
+                nodes_by_slot.entry(*slot).or_default().push(n);
+            }
+            if let Some(path) = ancestor_path_of(&by_id, n.id) {
+                nodes_by_parent_path.entry(path).or_default().push(n);
+            }
+        }
+
         Self {
             nodes_by_name,
             meshes_by_name,
             primitives_by_position,
+            nodes_by_slot,
+            nodes_by_parent_path,
         }
     }
 
@@ -162,9 +257,30 @@ impl<'a> AvatarResolver<'a> {
         if let Some(n) = self.nodes_by_name.get(old.name.as_str()) {
             return Some((n, RebindTier::Primary));
         }
-        // Secondary (humanoid-bone slot) and tertiary (parent-path
-        // signature) need the overlay to store those identities —
-        // a `format_version` bump, not implemented here.
+        // Secondary: humanoid bone slot. The overlay recorded the slot
+        // the node occupied in the authoring avatar; a re-export that
+        // renamed bones keeps the slot, so the new avatar's slot
+        // occupant is the same logical bone. A slot claimed by several
+        // nodes is ambiguous and never resolves here.
+        if let Some(slot) = old.humanoid_bone {
+            if let Some(candidates) = self.nodes_by_slot.get(&slot) {
+                if candidates.len() == 1 {
+                    return Some((candidates[0], RebindTier::Secondary));
+                }
+            }
+        }
+        // Tertiary: ancestor-chain signature (the node's own name
+        // excluded — it already failed to match at the primary tier).
+        // Survives a rename of the node itself, not of its ancestors;
+        // a chain shared by several nodes is ambiguous and never
+        // resolves here.
+        if let Some(path) = old.parent_path.as_deref() {
+            if let Some(candidates) = self.nodes_by_parent_path.get(path) {
+                if candidates.len() == 1 {
+                    return Some((candidates[0], RebindTier::Tertiary));
+                }
+            }
+        }
         None
     }
 
@@ -350,6 +466,32 @@ pub fn rebind_overlay(overlay: &mut ClothAsset, new_avatar: &AvatarAsset) -> Reb
     report
 }
 
+/// Record the humanoid-bone slot and root-to-node path of every
+/// `NodeRef` in the overlay, resolved against `avatar` by id. Called at
+/// overlay save time so the *next* rebind can fall back to tier-2/3
+/// identity when names have drifted. Refs whose id no longer exists in
+/// the avatar keep whatever identity they already carried — enrichment
+/// never discards information on a miss.
+pub fn enrich_node_identities(overlay: &mut ClothAsset, avatar: &AvatarAsset) {
+    let by_id = nodes_by_id(avatar);
+    let slots = slot_by_node_id(avatar);
+    let enrich = |r: &mut NodeRef| {
+        if by_id.contains_key(&r.id) {
+            r.humanoid_bone = slots.get(&r.id).copied();
+            r.parent_path = ancestor_path_of(&by_id, r.id);
+        }
+    };
+    for pin in &mut overlay.pins {
+        enrich(&mut pin.binding_node);
+    }
+    for cb in &mut overlay.collision_bindings {
+        enrich(&mut cb.binding_node);
+    }
+    for node_ref in &mut overlay.stable_refs.node_refs {
+        enrich(node_ref);
+    }
+}
+
 fn rebind_node_ref(
     target: &mut NodeRef,
     resolver: &AvatarResolver,
@@ -404,6 +546,15 @@ mod tests {
         }
     }
 
+    fn node_ref(id: u64, name: &str) -> NodeRef {
+        NodeRef {
+            id: NodeId(id),
+            name: name.to_string(),
+            humanoid_bone: None,
+            parent_path: None,
+        }
+    }
+
     fn make_avatar(nodes: Vec<SkeletonNode>, meshes: Vec<MeshAsset>) -> AvatarAsset {
         AvatarAsset {
             id: AvatarAssetId(1),
@@ -444,10 +595,7 @@ mod tests {
         let mut overlay = empty_overlay(AvatarAssetId(1));
         overlay.pins.push(ClothPin {
             sim_vertex_indices: vec![0],
-            binding_node: NodeRef {
-                id: NodeId(99),
-                name: "Hips".to_string(),
-            },
+            binding_node: node_ref(99, "Hips"),
             offset: [0.0, 0.0, 0.0],
         });
 
@@ -467,10 +615,7 @@ mod tests {
         let mut overlay = empty_overlay(AvatarAssetId(1));
         overlay.pins.push(ClothPin {
             sim_vertex_indices: vec![0],
-            binding_node: NodeRef {
-                id: NodeId(99),
-                name: "MissingBone".to_string(),
-            },
+            binding_node: node_ref(99, "MissingBone"),
             offset: [0.0, 0.0, 0.0],
         });
 
@@ -489,18 +634,12 @@ mod tests {
         // Two pins both binding to the same node.
         overlay.pins.push(ClothPin {
             sim_vertex_indices: vec![0],
-            binding_node: NodeRef {
-                id: NodeId(99),
-                name: "Hips".to_string(),
-            },
+            binding_node: node_ref(99, "Hips"),
             offset: [0.0, 0.0, 0.0],
         });
         overlay.pins.push(ClothPin {
             sim_vertex_indices: vec![1],
-            binding_node: NodeRef {
-                id: NodeId(99),
-                name: "Hips".to_string(),
-            },
+            binding_node: node_ref(99, "Hips"),
             offset: [0.0, 0.0, 0.0],
         });
 
@@ -648,5 +787,242 @@ mod tests {
         let report = rebind_overlay(&mut overlay, &avatar);
         assert_eq!(report.status, RebindStatus::Clean);
         assert!(!report.has_changes());
+    }
+
+    #[test]
+    fn secondary_node_rebind_by_humanoid_slot_after_rename() {
+        let mut overlay = empty_overlay(AvatarAssetId(1));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: NodeRef {
+                id: NodeId(99),
+                name: "J_Bip_L_UpperArm".to_string(),
+                humanoid_bone: Some(HumanoidBone::LeftUpperArm),
+                parent_path: None,
+            },
+            offset: [0.0, 0.0, 0.0],
+        });
+
+        // Re-export renamed the bone; the humanoid slot survived
+        // (FBX-style: slot lives on the node itself).
+        let mut arm = make_skeleton_node(7, "arm_L", Some(1));
+        arm.humanoid_bone = Some(HumanoidBone::LeftUpperArm);
+        let avatar = make_avatar(
+            vec![make_skeleton_node(1, "Hips", None), arm],
+            vec![],
+        );
+
+        let report = rebind_overlay(&mut overlay, &avatar);
+
+        assert_eq!(report.status, RebindStatus::Partial);
+        assert_eq!(overlay.pins[0].binding_node.id, NodeId(7));
+        assert_eq!(report.node_remappings.len(), 1);
+        assert_eq!(report.node_remappings[0].tier, RebindTier::Secondary);
+    }
+
+    #[test]
+    fn secondary_node_rebind_uses_vrm_humanoid_map() {
+        let mut overlay = empty_overlay(AvatarAssetId(1));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: NodeRef {
+                id: NodeId(99),
+                name: "OldUpperArm".to_string(),
+                humanoid_bone: Some(HumanoidBone::RightUpperArm),
+                parent_path: None,
+            },
+            offset: [0.0, 0.0, 0.0],
+        });
+
+        // VRM-style: nodes carry no per-node slot, the map on
+        // `avatar.humanoid` is the only source.
+        let mut avatar = make_avatar(
+            vec![
+                make_skeleton_node(1, "Hips", None),
+                make_skeleton_node(7, "肩.R", Some(1)),
+            ],
+            vec![],
+        );
+        avatar.humanoid = Some(HumanoidMap {
+            bone_map: [(HumanoidBone::RightUpperArm, NodeId(7))]
+                .into_iter()
+                .collect(),
+        });
+
+        let report = rebind_overlay(&mut overlay, &avatar);
+
+        assert_eq!(report.status, RebindStatus::Partial);
+        assert_eq!(overlay.pins[0].binding_node.id, NodeId(7));
+        assert_eq!(report.node_remappings[0].tier, RebindTier::Secondary);
+    }
+
+    #[test]
+    fn ambiguous_humanoid_slot_does_not_resolve() {
+        let mut overlay = empty_overlay(AvatarAssetId(1));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: NodeRef {
+                id: NodeId(99),
+                name: "OldChest".to_string(),
+                humanoid_bone: Some(HumanoidBone::Chest),
+                parent_path: None,
+            },
+            offset: [0.0, 0.0, 0.0],
+        });
+
+        // Two nodes claim the same slot — the loader produced a
+        // malformed rig; secondary must refuse rather than guess.
+        let mut a = make_skeleton_node(7, "chest_A", None);
+        a.humanoid_bone = Some(HumanoidBone::Chest);
+        let mut b = make_skeleton_node(8, "chest_B", None);
+        b.humanoid_bone = Some(HumanoidBone::Chest);
+        let avatar = make_avatar(vec![a, b], vec![]);
+
+        let report = rebind_overlay(&mut overlay, &avatar);
+
+        assert_eq!(report.status, RebindStatus::Failed);
+        assert_eq!(report.unresolved.len(), 1);
+    }
+
+    #[test]
+    fn tertiary_node_rebind_by_parent_path_after_rename() {
+        let mut overlay = empty_overlay(AvatarAssetId(1));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: NodeRef {
+                id: NodeId(99),
+                name: "J_Bip_C_Chest".to_string(),
+                humanoid_bone: None,
+                // Ancestor chain of the renamed bone (its own name is
+                // excluded — that is what failed to match).
+                parent_path: Some("Hips/Spine".to_string()),
+            },
+            offset: [0.0, 0.0, 0.0],
+        });
+
+        // The bone itself was renamed, its ancestors kept their names
+        // and no humanoid slot exists (non-humanoid accessory bone).
+        let avatar = make_avatar(
+            vec![
+                make_skeleton_node(1, "Hips", None),
+                make_skeleton_node(2, "Spine", Some(1)),
+                make_skeleton_node(3, "NewChest", Some(2)),
+            ],
+            vec![],
+        );
+
+        let report = rebind_overlay(&mut overlay, &avatar);
+
+        assert_eq!(report.status, RebindStatus::Partial);
+        assert_eq!(overlay.pins[0].binding_node.id, NodeId(3));
+        assert_eq!(report.node_remappings[0].tier, RebindTier::Tertiary);
+    }
+
+    #[test]
+    fn ambiguous_parent_path_does_not_resolve() {
+        let mut overlay = empty_overlay(AvatarAssetId(1));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: NodeRef {
+                id: NodeId(99),
+                name: "OldChest".to_string(),
+                humanoid_bone: None,
+                parent_path: Some("Hips".to_string()),
+            },
+            offset: [0.0, 0.0, 0.0],
+        });
+
+        // Two identical root-to-node paths (duplicate sibling names in
+        // a re-export) — tertiary must refuse rather than guess.
+        let avatar = make_avatar(
+            vec![
+                make_skeleton_node(1, "Hips", None),
+                make_skeleton_node(2, "Chest", Some(1)),
+                make_skeleton_node(3, "Hips", None),
+                make_skeleton_node(4, "Chest", Some(3)),
+            ],
+            vec![],
+        );
+
+        let report = rebind_overlay(&mut overlay, &avatar);
+
+        assert_eq!(report.status, RebindStatus::Failed);
+        assert_eq!(report.unresolved.len(), 1);
+    }
+
+    #[test]
+    fn enrich_node_identities_populates_slot_and_path() {
+        let mut avatar = make_avatar(
+            vec![
+                make_skeleton_node(1, "Hips", None),
+                make_skeleton_node(2, "Spine", Some(1)),
+                make_skeleton_node(3, "Chest", Some(2)),
+            ],
+            vec![],
+        );
+        avatar.humanoid = Some(HumanoidMap {
+            bone_map: [(HumanoidBone::Chest, NodeId(3))].into_iter().collect(),
+        });
+
+        let mut overlay = empty_overlay(AvatarAssetId(1));
+        overlay.pins.push(ClothPin {
+            sim_vertex_indices: vec![0],
+            binding_node: node_ref(3, "Chest"),
+            offset: [0.0, 0.0, 0.0],
+        });
+        overlay.collision_bindings.push(ClothCollisionBinding {
+            proxy_shape: ColliderShape::Sphere { radius: 0.1 },
+            binding_node: node_ref(999, "Gone"), // id no longer in avatar
+        });
+
+        enrich_node_identities(&mut overlay, &avatar);
+
+        assert_eq!(
+            overlay.pins[0].binding_node.humanoid_bone,
+            Some(HumanoidBone::Chest)
+        );
+        assert_eq!(
+            overlay.pins[0].binding_node.parent_path.as_deref(),
+            Some("Hips/Spine")
+        );
+        // Miss keeps whatever was there (nothing) — enrichment never
+        // discards on a miss.
+        assert_eq!(overlay.collision_bindings[0].binding_node.humanoid_bone, None);
+        assert_eq!(
+            overlay.collision_bindings[0].binding_node.parent_path,
+            None
+        );
+    }
+
+    #[test]
+    fn cyclic_parent_chain_yields_no_path() {
+        let mut avatar = make_avatar(
+            vec![
+                make_skeleton_node(1, "A", Some(2)),
+                make_skeleton_node(2, "B", Some(1)),
+            ],
+            vec![],
+        );
+        // Both nodes are parented to each other; `root_nodes` (parents
+        // = None) ends up empty, which is consistent with the broken
+        // chain. Path computation must terminate without panicking.
+        avatar.skeleton.root_nodes.clear();
+
+        let by_id = nodes_by_id(&avatar);
+        assert_eq!(parent_path_of(&by_id, NodeId(1)), None);
+        assert_eq!(parent_path_of(&by_id, NodeId(2)), None);
+    }
+
+    #[test]
+    fn legacy_node_ref_json_without_identity_fields_deserialises() {
+        // Overlays saved before the identity fields existed serialise
+        // plain `{ id, name }`; they must load with the fallbacks as
+        // None rather than being rejected.
+        let json = r#"[{"id":5,"name":"Hips"}]"#;
+        let refs: Vec<NodeRef> = serde_json::from_str(json).expect("legacy NodeRef deserialises");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, NodeId(5));
+        assert_eq!(refs[0].humanoid_bone, None);
+        assert_eq!(refs[0].parent_path, None);
     }
 }

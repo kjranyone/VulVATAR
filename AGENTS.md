@@ -63,9 +63,14 @@ channel で計測する。アプリがカメラを掴んでいる間は pyrealse
   (`frame`/`seq` でデデュープ)、jsonl に貯めて統計 (中央値・sd・フレーム間ジャンプ)。
   ユーザーに「20秒ポーズをキープ」と依頼してから回す。スクリプトは `scratchpad/` に書く。
 
-アプリ稼働中は本 target の `cargo build --features realsense` が **必ず失敗する**
-(realsense-sys の build.rs が `target\debug\deps\realsense2.dll` へコピーを試み、
-稼働プロセスがロック中)。診断バイナリは別 target でビルドする:
+アプリ稼働中の本 target の `cargo build --features realsense` は **通常は成功する**。
+かつては realsense-sys の build.rs が毎ビルド再実行され、`target\debug\deps\realsense2.dll`
+へのコピーが稼働プロセスのロックで失敗してビルドが落ちていたが、vendor patch
+(docs/realsense-build.md「The vendored realsense-sys patch」参照) で build.rs の再実行は
+「build.rs 変更・SDK ヘッダ/DLL 更新・pkg-config 環境変数変更」時に限られ、DLL コピーも
+そのときしか走らない。2026-09 実測では、稼働プロセスは `deps\realsense2.dll` をロック
+していなかった (exe と同じディレクトリに DLL はなく、PATH 上の SDK コピーをロードすると
+推定)。診断バイナリを本 target と完全に分離して回したいときは別 target でビルドする:
 
 ```powershell
 $env:CARGO_TARGET_DIR = "$PWD\target-test"
@@ -74,7 +79,9 @@ $env:SHADERC_LIB_DIR  = "$PWD\target\debug\build\shaderc-sys-<hash>\out\lib"  # 
 cargo build --features realsense --bin diagnose_fusion_replay
 ```
 
-アプリ本体の再ビルドだけはユーザーにアプリを閉じてもらう必要がある。
+アプリ本体の exe リンクも稼働中に通る (cargo が rename 置換するため稼働プロセスは
+旧イメージのまま実行継続)。ただし新バイナリが反映されるのは次回起動からなので、
+稼働中のアプリに変更を反映したいときは再起動してもらう。
 
 ## 実機不具合の調べ方 (最優先)
 

@@ -264,6 +264,8 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
                                                 binding_node: crate::asset::NodeRef {
                                                     id: pin_node_id,
                                                     name: pin_node_name,
+                                                    humanoid_bone: None,
+                                                    parent_path: None,
                                                 },
                                                 offset: [0.0, 0.0, 0.0],
                                             };
@@ -766,6 +768,10 @@ fn draw_cloth_preview(
                     ui.label(t!(
                         "inspector.primary_deform",
                         version = cs.deform_output.version
+                    ));
+                    ui.label(t!(
+                        "inspector.cloth_solver_backend",
+                        backend = cs.solver_backend.label()
                     ));
                 } else if !avatar.cloth_overlays.is_empty() {
                     ui.label(t!("inspector.primary_state_none"));

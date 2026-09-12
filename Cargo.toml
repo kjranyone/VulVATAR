@@ -1,5 +1,17 @@
 [workspace]
 members = [".", "vulvatar-mf-camera"]
+# Vendored crates are patched-in dependencies, not workspace targets:
+# keep fmt / clippy / test from touching them.
+exclude = ["vendor"]
+
+# Local patch of realsense-sys: upstream's build.rs writes bindgen output
+# into the package directory and emits no rerun-if-changed, so cargo's
+# default "rerun if any package file changed" re-runs the build script on
+# EVERY build — recompiling realsense-sys -> realsense-rust -> this crate
+# and relinking all bins even with zero source changes (measured ~90s).
+# The vendored copy writes bindings to OUT_DIR and pins rerun conditions.
+[patch.crates-io]
+realsense-sys = { path = "vendor/realsense-sys" }
 
 [package]
 name = "vulvatar"

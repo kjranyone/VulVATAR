@@ -256,10 +256,10 @@ pub struct ClothDeformSnapshot {
     pub gpu_attach: Option<ClothGpuAttachData>,
 }
 
-/// Per-frame control data uploaded to `cloth_verlet_cs`'s `Control`
-/// UBO. Populated by `collect_cloth_deforms` for GPU-backed cloths
-/// from the avatar's `ClothSimState`.
-#[derive(Clone, Copy, Debug)]
+/// Per-frame control data for the GPU cloth dispatch. Populated by
+/// `collect_cloth_deforms` for GPU-backed cloths from the avatar's
+/// `ClothSimState`.
+#[derive(Clone, Debug)]
 pub struct ClothGpuDispatchControl {
     /// Substep dt. The renderer dispatches the verlet + constraint
     /// pipeline `substeps` times per frame with this dt, matching the
@@ -282,6 +282,15 @@ pub struct ClothGpuDispatchControl {
     /// times *within each substep*. Normal recomputation runs once
     /// per frame, after all substeps complete.
     pub solver_iterations: u32,
+    /// Per-particle pin world targets for THIS frame — the GPU twin
+    /// of the CPU solver's `apply_pin_targets` (`T(node) · offset`
+    /// per pin binding, expanded to particle index space). The
+    /// renderer writes pinned particles' `pos`/`prev_pos` SSBO rows
+    /// to these targets before the substep dispatches so pinned
+    /// cloth follows the avatar's bones. Entries for unpinned
+    /// particles are zero and skipped via `gpu_attach.pinned`.
+    /// Empty when the cloth has no pins.
+    pub pin_positions: Vec<[f32; 3]>,
 }
 
 /// One-shot data uploaded to the GPU at cloth-attach time: constraint

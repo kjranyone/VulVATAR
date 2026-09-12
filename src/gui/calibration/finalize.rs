@@ -37,11 +37,12 @@ pub(super) fn finalize_collection(
     // collected) yields an empty vec.
     type ExprAccum = std::collections::HashMap<String, (f32, usize)>;
     type FaceAccums = (Vec<[f32; 3]>, Vec<[f32; 3]>);
-    let (samples, expr_accum, (face_accum_mesh, face_accum_body), body_yaw_accum): (
+    let (samples, expr_accum, (face_accum_mesh, face_accum_body), body_yaw_accum, q_accum): (
         Vec<AnchorSample>,
         ExprAccum,
         FaceAccums,
         Vec<f32>,
+        Vec<Vec<[f32; 3]>>,
     ) = match &mut state.calibration.modal {
         CalibrationModalState::Collecting {
             samples,
@@ -49,6 +50,7 @@ pub(super) fn finalize_collection(
             face_accum_mesh,
             face_accum_body,
             body_yaw_accum,
+            q_accum,
             ..
         } => (
             std::mem::take(samples),
@@ -58,11 +60,13 @@ pub(super) fn finalize_collection(
                 std::mem::take(face_accum_body),
             ),
             std::mem::take(body_yaw_accum),
+            std::mem::take(q_accum),
         ),
         _ => (
             Vec::new(),
             ExprAccum::new(),
             (Vec::new(), Vec::new()),
+            Vec::new(),
             Vec::new(),
         ),
     };
@@ -124,6 +128,14 @@ pub(super) fn finalize_collection(
     // instead of silently discarding a good one.
     calibration.neutral_body_yaw = neutral_body_yaw_from_accum(&body_yaw_accum)
         .or(previous.as_ref().and_then(|p| p.neutral_body_yaw));
+
+    // Median solved joint state over the hold → the estimator posture
+    // prior's q_neutral (‖q − q_neutral‖²). Same carry-forward contract
+    // as the other neutrals: a recapture without a running fusion
+    // provider (2D-only path) keeps the previous value instead of
+    // silently discarding it.
+    calibration.q_neutral = q_neutral_from_accum(&q_accum)
+        .or_else(|| previous.as_ref().and_then(|p| p.q_neutral.clone()));
 
     // Write into Application so the solver / project file see the
     // new value next frame. Also push to the tracking mailbox so the
@@ -375,6 +387,7 @@ fn aggregate(samples: &[AnchorSample], mode: CalibrationMode) -> PoseCalibration
         // Set by the caller from the medianed shoulder-line yaw
         // accumulator (metric captures only).
         neutral_body_yaw: None,
+        q_neutral: None,
     }
 }
 
@@ -432,6 +445,44 @@ const FACE_NEUTRAL_MAX_MAD_RAD: f32 = 0.15;
 /// pitch). Returns `None` when the source didn't gather enough
 /// confident frames or the head visibly wandered during the hold —
 /// callers then keep the previous calibration's value for that source.
+/// Median solved joint state over the calibration hold — the posture
+/// prior's `q_neutral`. Frames ride at the provider model's joint
+/// count; if that count changed mid-hold (provider restart against a
+/// different model version) the majority count wins and the minority
+/// frames are dropped, so the median is never ragged. Below
+/// `Q_NEUTRAL_MIN_SAMPLES` consistent frames the estimate is too thin
+/// — `None` (the finalizer then carries the previous calibration's
+/// value forward).
+fn q_neutral_from_accum(accum: &[Vec<[f32; 3]>]) -> Option<Vec<[f32; 3]>> {
+    const Q_NEUTRAL_MIN_SAMPLES: usize = 5;
+    if accum.is_empty() {
+        return None;
+    }
+    let mut counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for q in accum {
+        *counts.entry(q.len()).or_default() += 1;
+    }
+    let (&n, _) = counts.iter().max_by_key(|(_, &c)| c)?;
+    if n == 0 {
+        return None;
+    }
+    let frames: Vec<&Vec<[f32; 3]>> = accum.iter().filter(|q| q.len() == n).collect();
+    if frames.len() < Q_NEUTRAL_MIN_SAMPLES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for j in 0..n {
+        let mut joint = [0.0f32; 3];
+        for (k, comp) in joint.iter_mut().enumerate() {
+            let mut vals: Vec<f32> = frames.iter().map(|q| q[j][k]).collect();
+            *comp = median_inplace(&mut vals);
+        }
+        out.push(joint);
+    }
+    Some(out)
+}
+
 fn neutral_from_accum(accum: &[[f32; 3]]) -> Option<[f32; 3]> {
     if accum.len() < FACE_NEUTRAL_MIN_SAMPLES {
         return None;
@@ -673,6 +724,39 @@ mod tests {
             assert!(shoulder_span_plausible(s), "{s} m should be accepted");
         }
         assert!(!shoulder_span_plausible(f32::NAN));
+    }
+
+    #[test]
+    fn q_neutral_medians_a_steady_hold() {
+        let frame = vec![[0.1, 0.2, 0.3], [-0.4, 0.0, 0.5]];
+        let accum: Vec<Vec<[f32; 3]>> = (0..6).map(|_| frame.clone()).collect();
+        assert_eq!(q_neutral_from_accum(&accum), Some(frame));
+    }
+
+    #[test]
+    fn q_neutral_needs_minimum_samples() {
+        let frame = vec![[0.1, 0.2, 0.3]];
+        let accum: Vec<Vec<[f32; 3]>> = (0..4).map(|_| frame.clone()).collect();
+        assert_eq!(q_neutral_from_accum(&accum), None);
+    }
+
+    #[test]
+    fn q_neutral_drops_minority_joint_counts() {
+        // 6 frames at 2 joints, 2 frames at 3 joints (provider restart
+        // mid-hold): the majority count wins, minority frames are
+        // excluded from the median rather than ragged-indexed.
+        let majority = vec![[0.1, 0.2, 0.3], [-0.4, 0.0, 0.5]];
+        let minority = vec![[9.0; 3], [9.0; 3], [9.0; 3]];
+        let accum: Vec<Vec<[f32; 3]>> = (0..6)
+            .map(|_| majority.clone())
+            .chain((0..2).map(|_| minority.clone()))
+            .collect();
+        assert_eq!(q_neutral_from_accum(&accum), Some(majority));
+    }
+
+    #[test]
+    fn q_neutral_rejects_empty_hold() {
+        assert_eq!(q_neutral_from_accum(&[]), None);
     }
 
     #[test]

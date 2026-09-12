@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// Drives both the on-screen instructions and the captured-anchor
 /// choice (hip vs shoulder).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum CalibrationMode {
+pub enum CalibrationMode {
     /// Subject visible from feet to head, T-pose. Hip pair midpoint
     /// (COCO 11/12) is the captured anchor.
     FullBody,
@@ -55,7 +55,7 @@ impl CalibrationMode {
 /// log a warning" rather than fail-loud, so the existing project
 /// file isn't lost on a future schema change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UnknownCalibrationMode;
+pub struct UnknownCalibrationMode;
 
 impl FromStr for CalibrationMode {
     type Err = UnknownCalibrationMode;
@@ -84,7 +84,7 @@ impl FromStr for CalibrationMode {
 /// source units. `anchor_depth_m` is always the positive camera-space
 /// forward distance (source z negated).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PoseCalibration {
+pub struct PoseCalibration {
     pub mode: CalibrationMode,
     /// ISO-8601 capture timestamp. `String` rather than `SystemTime`
     /// because the on-disk schema needs a stable, human-readable
@@ -227,6 +227,17 @@ pub(crate) struct PoseCalibration {
     /// today (no rotation applied).
     #[serde(default)]
     pub neutral_body_yaw: Option<f32>,
+    /// Calibrated neutral joint pose (rotation vector per fusion-model
+    /// joint) from the calibration hold — the `q_neutral` of the
+    /// estimator's posture prior ‖q − q_neutral‖². Median of the
+    /// solved joint state over the hold; consumed by `FusionProvider`
+    /// to replace each joint's relaxed-pose prior *mean* (sigma
+    /// unchanged), validated against the consuming model's joint
+    /// count. `None` on captures before this field existed and on
+    /// holds with too few solved frames — both behave exactly like
+    /// today (model relaxed-pose prior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_neutral: Option<Vec<[f32; 3]>>,
 }
 
 /// Lower bound on a stored [`PoseCalibration::shoulder_span_m`], in

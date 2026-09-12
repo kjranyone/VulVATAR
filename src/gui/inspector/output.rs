@@ -268,6 +268,22 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 period = budget.yolox_skip_period()
             ));
             ui.label(t!(
+                "inspector.runtime_budget_pose_hz",
+                hz = budget.pose_hz_target()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_depth_refresh",
+                period = budget.depth_refresh_period()
+            ));
+            ui.label(t!(
+                "inspector.runtime_budget_face_ep",
+                ep = if budget.facemesh_prefers_cpu_ep() {
+                    "CPU (budget)"
+                } else {
+                    "Auto"
+                }
+            ));
+            ui.label(t!(
                 "inspector.runtime_budget_reason",
                 reason = budget.last_transition_reason().label().to_string()
             ));

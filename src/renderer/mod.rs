@@ -4,6 +4,7 @@ pub mod compute_prepass;
 pub mod debug;
 mod draw_pass;
 pub mod frame_input;
+mod frame_plan;
 pub mod frame_pool;
 mod gpu_alloc;
 pub mod gpu_handle;
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo, PrimaryAutoCommandBuffer,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -45,7 +46,7 @@ use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreate
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, SampleCounts};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::viewport::Viewport;
 use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline};
 use vulkano::render_pass::{Framebuffer, RenderPass};
@@ -95,7 +96,25 @@ struct GpuRuntimeCounters {
     morph_weight_writes: u64,
     cloth_cache_creations: u64,
     cloth_vbo_writes: u64,
+    cb_cache_hits: u64,
+    cb_cache_misses: u64,
+    pixel_pool_reuses: u64,
+    pixel_pool_allocs: u64,
 }
+
+/// One cached command buffer plus its LRU stamp. See `frame_plan.rs` for
+/// the key-safety argument (identities hashed; cached buffers pin their
+/// resources so pointer keys cannot go stale through allocator reuse).
+struct CachedFrameCb {
+    cb: Arc<PrimaryAutoCommandBuffer>,
+    last_used: u64,
+}
+
+/// LRU cap for the command-buffer cache. The steady-state frame cycle
+/// needs at most (camera ring 3) × (readback ring 2) × (bg ring 2)
+/// distinct shapes; the cap only bites on user-driven churn (slider
+/// drags, toggles), which is exactly what should expire.
+const CB_CACHE_CAP: usize = 16;
 
 /// Workgroup size of `pipeline::transform_cs` (`local_size_x = 64`).
 /// Used to compute the dispatch count `ceil(vertex_count / 64)`.
@@ -128,8 +147,14 @@ struct TransformGpuData {
     #[allow(dead_code)]
     morph_entries: Subbuffer<[[f32; 4]]>,
     /// `(begin, count, stride, _)` per morph target into `morph_entries`.
+    /// Rewritten in-place each frame with the ACTIVE targets' rows
+    /// (compacted morph gather).
     #[allow(dead_code)]
     morph_infos: Subbuffer<[[u32; 4]]>,
+    /// Full per-target info rows (all authored targets) — the CPU-side
+    /// source the per-frame compaction copies from.
+    #[allow(dead_code)]
+    morph_infos_full: Vec<[u32; 4]>,
     /// Per-frame morph weights, one float per target. Rewritten in-place
     /// by the render loop each frame (same live-write safety as
     /// `control_ubo`).
@@ -373,16 +398,33 @@ pub struct VulkanRenderer {
     msaa_color: Option<Arc<Image>>,
     msaa_color_view: Option<Arc<ImageView>>,
     camera_ring: Option<CameraRing>,
+    /// Per-frame uniform ring for the generative background (the UBO
+    /// replacement for its former push constants — `time` and the
+    /// tracking anchors animate every frame and must stay out of the
+    /// command buffer for the CB cache to hit). Rebuilt with the
+    /// background pipeline.
+    bg_uniform_ring: Option<background::BgUniformRing>,
+    /// Built command buffers keyed by frame shape (see `frame_plan.rs`).
+    /// Cleared at every site that swaps a command-buffer-visible
+    /// resource; LRU-capped at [`CB_CACHE_CAP`].
+    cb_cache: HashMap<u64, CachedFrameCb>,
 
     // Async readback ring: two-stage (staging + readback) buffers and pending fence.
     staging_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
     readback_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
+    /// One owned `Arc` per ring slot for the zero-allocation pixel
+    /// harvest (see `readback.rs`). `Arc::try_unwrap` at harvest time
+    /// reclaims the allocation once consumers dropped the frame's Arc.
+    readback_cpu_pool: [Option<Arc<Vec<u8>>>; READBACK_RING_SIZE],
     readback_slot: usize,
     pending_readback: Option<PendingReadbackState>,
     // When set, the 1× render path copies the depth aspect to a CPU buffer and
     // surfaces it as `RenderResult::depth_ndc`. Off on the live path; enabled
     // only by the metric-depth benches (`validate_gt`) via `set_depth_readback`.
     depth_readback_enabled: bool,
+    /// Cached depth-aspect readback buffer for the benches (recreated only
+    // when the extent changes; was a fresh full-resolution alloc per frame).
+    depth_readback_buffer: Option<Subbuffer<[u8]>>,
     // Cached skinning buffer + descriptor set per avatar instance slot.
     skinning_cache: Vec<SkinningCacheEntry>,
 }
@@ -456,22 +498,26 @@ impl VulkanRenderer {
             msaa_color: None,
             msaa_color_view: None,
             camera_ring: None,
+            bg_uniform_ring: None,
+            cb_cache: HashMap::new(),
 
             staging_buffers: [None, None],
             readback_buffers: [None, None],
+            readback_cpu_pool: [None, None],
             readback_slot: 0,
             pending_readback: None,
             depth_readback_enabled: false,
+            depth_readback_buffer: None,
             skinning_cache: Vec::new(),
         }
     }
 
     // Readback helpers (`harvest_pending`, `harvest_pending_readback`,
-    // `ensure_readback_buffers`) live in `src/renderer/readback.rs` as
-    // part of the #12 module split. The render() function on this
-    // struct still enqueues `PendingReadbackState` directly because it
-    // is intertwined with command-buffer construction; only the
-    // off-render-thread harvest + allocator helpers were moved.
+    // `ensure_readback_buffers`, `ensure_depth_readback_buffer`) live in
+    // `src/renderer/readback.rs` as part of the #12 module split. The
+    // render() function enqueues `PendingReadbackState` directly from the
+    // prepared frame plan; only the off-render-thread harvest + allocator
+    // helpers were moved.
 
     /// Flush any in-flight readback (used during shutdown).
     pub fn flush_pending(&mut self) {
@@ -821,6 +867,12 @@ impl VulkanRenderer {
             &outline_pipeline,
         ));
 
+        self.bg_uniform_ring = Some(background::BgUniformRing::new(
+            &memory_allocator,
+            &descriptor_set_allocator,
+            &self.background_pipeline.as_ref().expect("set above"),
+        ));
+
         self.initialized = true;
         info!("renderer: initialized with Vulkano");
     }
@@ -845,9 +897,13 @@ impl VulkanRenderer {
         self.rebuild_pipelines_and_targets(render_pass, new_extent, self.current_sample_count)
             .map_err(|e| format!("resize: {e}"))?;
 
-        // Invalidate pre-allocated readback buffers (extent changed).
+        // Invalidate pre-allocated readback buffers (extent changed), the
+        // CPU pixel pool (sized to the old extent), and any cached command
+        // buffers (they reference the old pipelines / targets / buffers).
         self.staging_buffers = [None, None];
         self.readback_buffers = [None, None];
+        self.readback_cpu_pool = [None, None];
+        self.cb_cache.clear();
 
         info!("renderer: resized to {}x{}", new_extent[0], new_extent[1]);
         Ok(())
@@ -941,6 +997,9 @@ impl VulkanRenderer {
     pub fn clear_caches(&mut self) {
         self.texture_cache.clear();
         self.transform_cache.clear();
+        // Cached command buffers reference the old per-primitive /
+        // skinning resources — they must not survive an avatar swap.
+        self.cb_cache.clear();
         // `stub_storage_ssbo` is intentionally retained — it is a tiny
         // 1-element zero buffer with no per-avatar state, and reallocating
         // would burn one needless VRAM round-trip on every avatar swap.
@@ -997,61 +1056,6 @@ impl VulkanRenderer {
         // ── Phase 1: Harvest the previous frame's readback ──────────────
         let harvested = self.harvest_pending_readback()?;
 
-        // ── Phase 2: Build and submit the current frame ─────────────────
-
-        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
-        let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
-        let memory_allocator = self
-            .memory_allocator
-            .as_ref()
-            .ok_or("renderer: no memory allocator")?
-            .clone();
-        let cb_allocator = self
-            .command_buffer_allocator
-            .as_ref()
-            .ok_or("renderer: no command buffer allocator")?
-            .clone();
-        let ds_allocator = self
-            .descriptor_set_allocator
-            .as_ref()
-            .ok_or("renderer: no descriptor set allocator")?
-            .clone();
-        let gfx_pipeline = self
-            .graphics_pipeline
-            .as_ref()
-            .ok_or("renderer: no graphics pipeline")?
-            .clone();
-        let outline_pipeline = self
-            .outline_pipeline
-            .as_ref()
-            .ok_or("renderer: no outline pipeline")?
-            .clone();
-        let transform_pipeline = self
-            .transform_compute_pipeline
-            .as_ref()
-            .ok_or("renderer: no transform compute pipeline")?
-            .clone();
-        let framebuffer = self
-            .offscreen_framebuffer
-            .as_ref()
-            .ok_or("renderer: no framebuffer")?
-            .clone();
-        // Readback / export source: the post-effect layer's final 8-bit
-        // image, written by the composite pass recorded after the scene
-        // render pass below.
-        let final_color_image = self
-            .post_effects
-            .as_ref()
-            .ok_or("renderer: no post-effect resources")?
-            .final_color
-            .clone();
-        let sampler = self.sampler.as_ref().ok_or("renderer: no sampler")?.clone();
-        let default_tex = self
-            .default_texture_view
-            .as_ref()
-            .ok_or("renderer: no default texture")?
-            .clone();
-
         let total_meshes: u32 = input
             .instances
             .iter()
@@ -1068,169 +1072,19 @@ impl VulkanRenderer {
             .filter(|i| !i.cloth_deforms.is_empty())
             .count() as u32;
 
-        let mut builder = AutoCommandBufferBuilder::primary(
-            cb_allocator.clone(),
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .map_err(|e| format!("render: failed to create command buffer: {e}"))?;
+        // ── Phase 2: Prepare the frame ───────────────────────────────────
+        // Every per-frame CPU write (camera, background uniform, skinning,
+        // control UBOs, morph weights, cloth controls + pins, material
+        // uniforms) plus the dispatch structure / shape key. See
+        // `frame_plan.rs`.
+        let plan = self.prepare_frame(input)?;
 
-        // ── Camera UBO update (ring slot for this frame) ────────────────
-        let ld = input.lighting.main_light_dir_ws;
-        let ld_len = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2])
-            .sqrt()
-            .max(1e-6);
-        let light_dir = [ld[0] / ld_len, ld[1] / ld_len, ld[2] / ld_len];
-
-        let camera_data = CameraUniform {
-            view: mat4_to_cols(input.camera.view),
-            proj: mat4_to_cols(input.camera.projection),
-            camera_pos: input.camera.position_ws,
-            _pad0: 0.0,
-            light_dir,
-            light_intensity: input.lighting.main_light_intensity,
-            light_color: input.lighting.main_light_color,
-            _pad1: 0.0,
-            ambient_term: input.lighting.ambient_term,
-            fade_opacity: input.avatar_opacity,
-        };
-        let ring_slot = (self.frame_counter % FRAME_LAG as u64) as usize;
-        let (camera_set, outline_camera_set) = {
-            let ring = self.camera_ring.as_ref().ok_or("render: no camera ring")?;
-            {
-                let mut guard = ring.buffers[ring_slot]
-                    .write()
-                    .map_err(|e| format!("render: camera buffer write failed: {e}"))?;
-                *guard = camera_data;
-            }
-            (
-                ring.main_sets[ring_slot].clone(),
-                ring.outline_sets[ring_slot].clone(),
-            )
-        };
-
-        // ── Phase 2a: compute prepass (skinning + morph + cloth) ──────
-        let draws = self.record_compute_prepass(
-            &mut builder,
-            input,
-            &memory_allocator,
-            &ds_allocator,
-            &transform_pipeline,
-            &gfx_pipeline,
-            &default_tex,
-            &sampler,
-        )?;
-
-        // ── Phase 2b: scene pass (forward draws + outlines) ─────────────
-        self.record_scene_pass(
-            &mut builder,
-            input,
-            &draws,
-            &framebuffer,
-            &gfx_pipeline,
-            &outline_pipeline,
-            camera_set,
-            outline_camera_set,
-        )?;
-
-        // ── Post effects: bloom chain + composite/encode ────────────────
-        // The composite always runs — it is the HDR→8-bit encode stage that
-        // produces the readback / export image. The bloom chain only runs
-        // when enabled; otherwise the composite samples the 1x1 transparent
-        // black fallback with zero intensity (a passthrough).
-        {
-            let post = self
-                .post_effects
-                .as_ref()
-                .ok_or("renderer: no post-effect resources")?;
-            let use_bloom = input.bloom.enabled && post.has_bloom_chain();
-            if use_bloom {
-                Self::record_bloom_chain(&mut builder, post, &input.bloom)?;
-            }
-            let intensity = if use_bloom {
-                input.bloom.intensity
-            } else {
-                0.0
-            };
-            Self::record_composite(&mut builder, post, intensity, use_bloom)?;
-        }
-
-        // ── Readback: two-stage copy to avoid slow Intel DMA path ───────
-        let (staging_buffer, readback_buffer) =
-            self.ensure_readback_buffers(self.current_extent)?;
-
-        builder
-            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
-                final_color_image,
-                staging_buffer.clone(),
-            ))
-            .map_err(|e| format!("render: copy_image_to_buffer failed: {e}"))?;
-
-        builder
-            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-                staging_buffer,
-                readback_buffer.clone(),
-            ))
-            .map_err(|e| format!("render: copy_buffer staging→readback failed: {e}"))?;
-
-        // Optional depth-aspect readback (metric-depth benches only). 1× only
-        // — the MSAA depth attachment is multisampled + `DontCare`. The depth
-        // image carries `TRANSFER_SRC` and is `Store`d (see `pipeline_targets`);
-        // we copy only the DEPTH aspect of the combined D32S8 format to a
-        // host-visible buffer harvested next frame alongside the colour.
-        let depth_buffer = if self.depth_readback_enabled && self.current_sample_count == 1 {
-            match self.offscreen_depth.clone() {
-                Some(depth_image) => {
-                    let ext = self.current_extent;
-                    // vulkano validates the buffer against the combined
-                    // D32_SFLOAT_S8_UINT block size (8 B), even though a DEPTH-
-                    // aspect copy writes the depth tightly packed at 4 B/texel
-                    // (Vulkan spec) into the leading `w*h*4` bytes. Size for the
-                    // 8 B block so validation passes; the harvest reads the
-                    // tightly-packed depth prefix.
-                    let bytes = (ext[0] as u64) * (ext[1] as u64) * 8;
-                    let buf = vulkano::buffer::Buffer::new_slice::<u8>(
-                        memory_allocator.clone(),
-                        vulkano::buffer::BufferCreateInfo {
-                            usage: vulkano::buffer::BufferUsage::TRANSFER_DST,
-                            ..Default::default()
-                        },
-                        AllocationCreateInfo {
-                            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                            ..Default::default()
-                        },
-                        bytes,
-                    )
-                    .map_err(|e| format!("render: depth readback buffer alloc failed: {e}"))?;
-                    let region = vulkano::command_buffer::BufferImageCopy {
-                        image_subresource: vulkano::image::ImageSubresourceLayers {
-                            aspects: vulkano::image::ImageAspects::DEPTH,
-                            mip_level: 0,
-                            array_layers: 0..1,
-                        },
-                        image_extent: [ext[0], ext[1], 1],
-                        ..Default::default()
-                    };
-                    builder
-                        .copy_image_to_buffer(CopyImageToBufferInfo {
-                            regions: [region].into_iter().collect(),
-                            ..CopyImageToBufferInfo::image_buffer(depth_image, buf.clone())
-                        })
-                        .map_err(|e| format!("render: depth copy_image_to_buffer failed: {e}"))?;
-                    Some(buf)
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-
-        let command_buffer = builder
-            .build()
-            .map_err(|e| format!("render: failed to build command buffer: {e}"))?;
+        // ── Phase 3: Get or build the frame command buffer ──────────────
+        let command_buffer = self.get_or_build_frame_cb(&plan)?;
 
         crate::tracking::stagelog::mark(self.frame_counter, "render_submit");
+        let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
+        let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
         let fence_future = vulkano::sync::now(device.clone())
             .then_execute(queue.clone(), command_buffer)
             .map_err(|e| format!("render: then_execute failed: {e}"))?
@@ -1245,7 +1099,8 @@ impl VulkanRenderer {
             let counters = &self.gpu_runtime_counters;
             info!(
                 "GPU_RUNTIME frame={} transform_resources={} weight_writes={} \
-                 cloth_writes={} cloth_creations={} cache_slots={} readback_bytes={}",
+                 cloth_writes={} cloth_creations={} cache_slots={} readback_bytes={} \
+                 cb_hits={} cb_misses={} pix_reuse={} pix_alloc={}",
                 self.frame_counter,
                 counters.morph_gpu_resource_creations,
                 counters.morph_weight_writes,
@@ -1253,6 +1108,10 @@ impl VulkanRenderer {
                 counters.cloth_cache_creations,
                 self.transform_cache.len(),
                 (extent[0] as u64) * (extent[1] as u64) * 4,
+                counters.cb_cache_hits,
+                counters.cb_cache_misses,
+                counters.pixel_pool_reuses,
+                counters.pixel_pool_allocs,
             );
         }
 
@@ -1266,8 +1125,9 @@ impl VulkanRenderer {
 
         self.pending_readback = Some(PendingReadbackState {
             wait_fn: Box::new(move || gpu_wait::wait_fence_bounded(fence_future, "frame_readback")),
-            readback_buffer,
-            depth_buffer,
+            readback_buffer: plan.readback_buffer.clone(),
+            pool_slot: plan.readback_slot,
+            depth_buffer: plan.depth_buffer.clone(),
             extent,
             timestamp_nanos,
             stats: stats.clone(),
@@ -1282,6 +1142,200 @@ impl VulkanRenderer {
             exported_frame: None,
             depth_ndc: None,
         }))
+    }
+
+    /// A/B knob for the command-buffer cache (`VULVATAR_CB_CACHE=0`
+    /// re-records + rebuilds every frame). Evaluated once per process.
+    fn cb_cache_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_CACHE").map_or(true, |v| v != "0"))
+    }
+
+    /// Fetch the cached command buffer for `plan.shape_key`, or record +
+    /// build + store one.
+    fn get_or_build_frame_cb(
+        &mut self,
+        plan: &frame_plan::FramePlan,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>, String> {
+        if Self::cb_cache_enabled() {
+            if let Some(entry) = self.cb_cache.get_mut(&plan.shape_key) {
+                entry.last_used = self.frame_counter;
+                self.gpu_runtime_counters.cb_cache_hits += 1;
+                return Ok(entry.cb.clone());
+            }
+        }
+        self.gpu_runtime_counters.cb_cache_misses += 1;
+        let cb = self.build_frame_cb(plan)?;
+        if Self::cb_cache_enabled() {
+            if self.cb_cache.len() >= CB_CACHE_CAP {
+                let evict = self
+                    .cb_cache
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(k, _)| *k);
+                if let Some(k) = evict {
+                    self.cb_cache.remove(&k);
+                }
+            }
+            self.cb_cache.insert(
+                plan.shape_key,
+                CachedFrameCb {
+                    cb: cb.clone(),
+                    last_used: self.frame_counter,
+                },
+            );
+        }
+        Ok(cb)
+    }
+
+    /// Record + build the frame command buffer from a prepared plan.
+    /// Mirrors the historical per-frame recording; the only intentional
+    /// difference is `CommandBufferUsage::SimultaneousUse`, which is what
+    /// makes the built buffer resubmittable from the cache. (Only one
+    /// frame is ever in flight — `render` harvests the previous fence
+    /// before submitting — so even simultaneous use is conservative.)
+    fn build_frame_cb(
+        &mut self,
+        plan: &frame_plan::FramePlan,
+    ) -> Result<Arc<PrimaryAutoCommandBuffer>, String> {
+        let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
+        let cb_allocator = self
+            .command_buffer_allocator
+            .as_ref()
+            .ok_or("renderer: no command buffer allocator")?
+            .clone();
+        let framebuffer = self
+            .offscreen_framebuffer
+            .as_ref()
+            .ok_or("renderer: no framebuffer")?
+            .clone();
+        let gfx_pipeline = self
+            .graphics_pipeline
+            .as_ref()
+            .ok_or("renderer: no graphics pipeline")?
+            .clone();
+        let outline_pipeline = self
+            .outline_pipeline
+            .as_ref()
+            .ok_or("renderer: no outline pipeline")?
+            .clone();
+        let transform_pipeline = self
+            .transform_compute_pipeline
+            .as_ref()
+            .ok_or("renderer: no transform compute pipeline")?
+            .clone();
+        let cloth_verlet_pipeline = self
+            .cloth_verlet_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth verlet pipeline")?
+            .clone();
+        let cloth_lambda_pipeline = self
+            .cloth_constraint_lambda_update_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth lambda pipeline")?
+            .clone();
+        let cloth_accumulate_pipeline = self
+            .cloth_constraint_accumulate_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth accumulate pipeline")?
+            .clone();
+        let cloth_apply_pipeline = self
+            .cloth_constraint_apply_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth apply pipeline")?
+            .clone();
+        let cloth_normal_pipeline = self
+            .cloth_normal_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth normal pipeline")?
+            .clone();
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            cb_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::SimultaneousUse,
+        )
+        .map_err(|e| format!("render: failed to create command buffer: {e}"))?;
+
+        // ── Compute prepass: fuse skinning + morph + cloth per primitive
+        Self::record_compute_prepass_planned(
+            &mut builder,
+            &transform_pipeline,
+            &cloth_verlet_pipeline,
+            &cloth_lambda_pipeline,
+            &cloth_accumulate_pipeline,
+            &cloth_apply_pipeline,
+            &cloth_normal_pipeline,
+            &plan.instances,
+        )?;
+
+        // ── Scene pass: forward draws + outlines ────────────────────────
+        self.record_scene_pass(
+            &mut builder,
+            plan,
+            &framebuffer,
+            &gfx_pipeline,
+            &outline_pipeline,
+        )?;
+
+        // ── Post effects: bloom chain + composite/encode ────────────────
+        // The composite always runs — it is the HDR→8-bit encode stage that
+        // produces the readback / export image. The bloom chain only runs
+        // when enabled; otherwise the composite samples the 1x1 transparent
+        // black fallback with zero intensity (a passthrough).
+        {
+            let post = self
+                .post_effects
+                .as_ref()
+                .ok_or("renderer: no post-effect resources")?;
+            if plan.use_bloom {
+                Self::record_bloom_chain(&mut builder, post, &plan.bloom)?;
+            }
+            Self::record_composite(&mut builder, post, plan.composite_intensity, plan.use_bloom)?;
+        }
+
+        // ── Readback: two-stage copy to avoid slow Intel DMA path ───────
+        builder
+            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                plan.final_color_image.clone(),
+                plan.staging_buffer.clone(),
+            ))
+            .map_err(|e| format!("render: copy_image_to_buffer failed: {e}"))?;
+
+        builder
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                plan.staging_buffer.clone(),
+                plan.readback_buffer.clone(),
+            ))
+            .map_err(|e| format!("render: copy_buffer staging→readback failed: {e}"))?;
+
+        // Optional depth-aspect readback (metric-depth benches only). 1× only
+        // — the MSAA depth attachment is multisampled + `DontCare`. The depth
+        // image carries `TRANSFER_SRC` and is `Store`d (see `pipeline_targets`);
+        // we copy only the DEPTH aspect of the combined D32S8 format to a
+        // host-visible buffer harvested next frame alongside the colour.
+        if let (Some(depth_image), Some(depth_buffer)) = (&plan.depth_image, &plan.depth_buffer) {
+            let ext = self.current_extent;
+            let region = vulkano::command_buffer::BufferImageCopy {
+                image_subresource: vulkano::image::ImageSubresourceLayers {
+                    aspects: vulkano::image::ImageAspects::DEPTH,
+                    mip_level: 0,
+                    array_layers: 0..1,
+                },
+                image_extent: [ext[0], ext[1], 1],
+                ..Default::default()
+            };
+            builder
+                .copy_image_to_buffer(CopyImageToBufferInfo {
+                    regions: [region].into_iter().collect(),
+                    ..CopyImageToBufferInfo::image_buffer(depth_image.clone(), depth_buffer.clone())
+                })
+                .map_err(|e| format!("render: depth copy_image_to_buffer failed: {e}"))?;
+        }
+
+        builder
+            .build()
+            .map_err(|e| format!("render: failed to build command buffer: {e}"))
     }
 
     /// Render a single offscreen frame at thumbnail resolution and

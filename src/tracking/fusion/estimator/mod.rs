@@ -42,6 +42,13 @@ pub struct Estimator {
     pub frames: u64,
     /// Whether the shape has been frozen (β prior tightened).
     pub shape_frozen: bool,
+    /// Calibrated neutral joint pose (rotation vector per joint,
+    /// `State::joint_rotvec` order) from `PoseCalibration::q_neutral`.
+    /// When set (and length-matched to the model), each joint's
+    /// posture-prior *mean* comes from here instead of the model's
+    /// built-in relaxed pose; `prior_sigma` is unchanged so the prior
+    /// keeps its original strength. `None` = today's behaviour.
+    pub q_neutral: Option<Vec<V3>>,
     dense: Dense,
     delta: Vec<f64>,
     jac: Vec<(usize, V3)>,
@@ -159,6 +166,7 @@ impl Estimator {
             last_t: None,
             frames: 0,
             shape_frozen: false,
+            q_neutral: None,
             dense: Dense::new(n),
             delta: vec![0.0; n],
             jac: Vec::with_capacity(64),
@@ -954,9 +962,18 @@ impl Estimator {
                                 self.dense.add_residual(&[(pidx, inv_lim)], r, 1.0);
                             }
                         }
-                        // prior
+                        // prior — mean from the calibrated neutral when
+                        // available (q_neutral), else the model's
+                        // relaxed pose.
+                        let mean0 = self
+                            .q_neutral
+                            .as_ref()
+                            .filter(|qn| qn.len() == model.joints.len())
+                            .and_then(|qn| qn.get(j))
+                            .map(|v| v[0])
+                            .unwrap_or(jd.prior_mean[0]);
                         let sp = (jd.prior_sigma[0] * p.pose_prior_scale).max(1e-4);
-                        let r = (a - jd.prior_mean[0]) / sp;
+                        let r = (a - mean0) / sp;
                         cost += r * r;
                         if build {
                             self.dense.add_residual(&[(pidx, 1.0 / sp)], r, 1.0);
@@ -973,8 +990,15 @@ impl Estimator {
                             } else {
                                 0.0
                             };
+                            let mean_k = self
+                                .q_neutral
+                                .as_ref()
+                                .filter(|qn| qn.len() == model.joints.len())
+                                .and_then(|qn| qn.get(j))
+                                .map(|v| v[k])
+                                .unwrap_or(jd.prior_mean[k]);
                             let sp = (jd.prior_sigma[k] * p.pose_prior_scale).max(1e-4);
-                            let rp = (w[k] - jd.prior_mean[k]) / sp;
+                            let rp = (w[k] - mean_k) / sp;
                             cost += rp * rp;
                             let rl = viol * inv_lim;
                             cost += rl * rl;

@@ -470,6 +470,24 @@ impl Application {
                 self.runtime_gpu_budget.yolox_skip_period() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            crate::tracking::face_mediapipe::FACEMESH_EP_CPU.store(
+                self.runtime_gpu_budget.facemesh_prefers_cpu_ep(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        // Pose Hz + depth refresh are consumed by the realsense
+        // worker's estimate loop (worker::POSE_HZ_TARGET /
+        // worker::DEPTH_REFRESH_PERIOD). Same Relaxed rationale.
+        #[cfg(feature = "realsense")]
+        {
+            crate::tracking::worker::POSE_HZ_TARGET.store(
+                self.runtime_gpu_budget.pose_hz_target(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            crate::tracking::worker::DEPTH_REFRESH_PERIOD.store(
+                self.runtime_gpu_budget.depth_refresh_period() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -822,6 +840,7 @@ impl Application {
                         ),
                     cloth_substep_dt,
                     substeps,
+                    &avatar.pose.global_transforms,
                 );
 
                 RenderAvatarInstance {
@@ -971,6 +990,35 @@ impl Application {
     }
 }
 
+/// Per-particle pin world targets for the GPU solver, mirroring CPU
+/// `cloth_solver::collision::apply_pin_targets`: `T(node) · offset`
+/// per pin binding, expanded to particle index space. Entries for
+/// unpinned particles are zero; the renderer skips them via
+/// `gpu_attach.pinned`. Empty when the cloth has no pins.
+fn gpu_pin_targets(
+    sim: &crate::simulation::cloth::ClothSimState,
+    global_transforms: &[crate::asset::Mat4],
+) -> Vec<[f32; 3]> {
+    let mut out = vec![[0.0f32; 3]; sim.particles.len()];
+    for pin in &sim.pin_targets {
+        let Some(mat) = global_transforms.get(pin.node_index) else {
+            continue;
+        };
+        let [ox, oy, oz] = pin.offset;
+        let world = [
+            mat[0][0] * ox + mat[1][0] * oy + mat[2][0] * oz + mat[3][0],
+            mat[0][1] * ox + mat[1][1] * oy + mat[2][1] * oz + mat[3][1],
+            mat[0][2] * ox + mat[1][2] * oy + mat[2][2] * oz + mat[3][2],
+        ];
+        for &pi in &pin.particle_indices {
+            if pi < out.len() {
+                out[pi] = world;
+            }
+        }
+    }
+    out
+}
+
 /// Collect per-primitive cloth snapshots from `(ClothState, Option<ClothSimState>)` pairs.
 ///
 /// Cloth is scoped per primitive (`target_primitive_id`), so multiple cloths
@@ -992,6 +1040,7 @@ fn collect_cloth_deforms<'a>(
     >,
     fixed_dt: f32,
     substeps: u32,
+    global_transforms: &[crate::asset::Mat4],
 ) -> Vec<ClothDeformSnapshot> {
     use crate::math_utils::vec3_scale;
     use crate::renderer::frame_input::{ClothGpuAttachData, ClothGpuDispatchControl};
@@ -1017,6 +1066,7 @@ fn collect_cloth_deforms<'a>(
                             gravity: sim.gravity,
                             wind_force,
                             solver_iterations: sim.solver_iterations as u32,
+                            pin_positions: gpu_pin_targets(sim, global_transforms),
                         };
                         let attach = ClothGpuAttachData {
                             constraints: sim
@@ -1193,6 +1243,52 @@ mod cloth_collection_tests {
     }
 
     #[test]
+    fn gpu_pin_targets_follow_bound_node_transform() {
+        use crate::simulation::cloth::{ClothParticle, ClothSimState, PinTarget};
+
+        let mut sim = ClothSimState::default();
+        sim.particles = vec![
+            ClothParticle::new([0.0, 0.0, 0.0], true),
+            ClothParticle::new([1.0, 0.0, 0.0], false),
+        ];
+        sim.pin_targets.push(PinTarget {
+            node_index: 1,
+            offset: [0.5, 0.0, 0.0],
+            particle_indices: vec![0],
+        });
+
+        // Node 0 identity, node 1 translated by (10, 20, 30) with a
+        // +90° rotation about Y so the local +X offset maps to world
+        // +Z (column-major Mat4, same convention as the CPU solver's
+        // `apply_pin_targets`).
+        let mut t = [[0.0f32; 4]; 4];
+        t[0][2] = 1.0; // column 0 = (0,0,1)
+        t[1][1] = 1.0;
+        t[2][0] = -1.0; // column 2 = (-1,0,0)
+        t[3][0] = 10.0;
+        t[3][1] = 20.0;
+        t[3][2] = 30.0;
+        t[3][3] = 1.0;
+        let mut identity = [[0.0f32; 4]; 4];
+        identity[0][0] = 1.0;
+        identity[1][1] = 1.0;
+        identity[2][2] = 1.0;
+        identity[3][3] = 1.0;
+        let targets = gpu_pin_targets(&sim, &[identity, t]);
+
+        assert_eq!(targets.len(), 2);
+        // T * (0.5,0,0) = translate + R*(0.5,0,0) = (10, 20, 30.5).
+        assert_eq!(targets[0], [10.0, 20.0, 30.5]);
+        // Unpinned particle keeps the zero placeholder.
+        assert_eq!(targets[1], [0.0, 0.0, 0.0]);
+
+        // Out-of-range node index is skipped, not fatal.
+        sim.pin_targets[0].node_index = 9;
+        let targets = gpu_pin_targets(&sim, &[]);
+        assert_eq!(targets[0], [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn multi_cloth_targeting_distinct_primitives_all_survive() {
         let body = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
         let skirt = make_cloth_state(2, Some(PrimitiveId(20)), 64, 1);
@@ -1202,6 +1298,7 @@ mod cloth_collection_tests {
             [(&body, None), (&skirt, None), (&scarf, None)],
             1.0 / 60.0,
             1,
+            &[],
         );
 
         assert_eq!(
@@ -1224,6 +1321,7 @@ mod cloth_collection_tests {
             [(&authoritative, None), (&overlay_duplicate, None)],
             1.0 / 60.0,
             1,
+            &[],
         );
 
         assert_eq!(result.len(), 1, "duplicate target_primitive_id must dedup");
@@ -1236,7 +1334,7 @@ mod cloth_collection_tests {
         let bound = make_cloth_state(1, Some(PrimitiveId(10)), 32, 1);
         let unbound = make_cloth_state(2, None, 64, 1);
 
-        let result = collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1);
+        let result = collect_cloth_deforms([(&bound, None), (&unbound, None)], 1.0 / 60.0, 1, &[]);
 
         assert_eq!(result.len(), 1, "cloth with no render target is dropped");
         assert_eq!(result[0].target_primitive_id.0, 10);

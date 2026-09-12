@@ -5,6 +5,23 @@
 //! `RenderResult::CpuReadback`. The render-side enqueue still lives
 //! in `mod.rs` next to the rest of the per-frame command-buffer
 //! construction.
+//!
+//! ## Zero-allocation pixel harvest
+//!
+//! `harvest` used to do `readback_buffer.read().to_vec()` — a fresh
+//! full-frame allocation every frame (8.3 MB at 1080p) that the Windows
+//! heap services through large-block virtual allocs plus first-touch
+//! page faults, only for the bytes to be handed to consumers as an
+//! `Arc<Vec<u8>>` that dies one or two frames later. The ring now keeps
+//! one owned `Arc` clone per slot: on harvest, `Arc::try_unwrap` reclaims
+//! the previous frame's allocation when every consumer has already
+//! dropped theirs (the common case — the preview replaces its reference
+//! each frame and the output worker copies out within its queue depth)
+//! and the GPU bytes are copied into the warm, pre-faulted pages. If a
+//! consumer still holds the old Arc, the unwrap fails and we fall back
+//! to a fresh allocation — correct, just slower. Ring safety is
+//! unchanged: the slot's GPU buffer was fenced-complete before the CPU
+//! looked at it.
 
 use std::sync::Arc;
 
@@ -18,6 +35,9 @@ use crate::renderer::{frame_input, output_export, RenderResult, RenderStats, Vul
 pub(super) struct PendingReadbackState {
     pub(super) wait_fn: Box<dyn FnOnce() -> Result<(), String> + Send>,
     pub(super) readback_buffer: Subbuffer<[u8]>,
+    /// Readback ring slot the buffer belongs to — identifies the CPU
+    /// pixel-Vec pool entry the harvest refills.
+    pub(super) pool_slot: usize,
     /// Host buffer holding the frame's depth aspect (D32_SFLOAT NDC) when the
     /// caller enabled depth readback; `None` on the live path.
     pub(super) depth_buffer: Option<Subbuffer<[u8]>>,
@@ -47,11 +67,35 @@ impl VulkanRenderer {
 
         (pending.wait_fn)()?;
 
-        let pixel_data = pending
+        let guard = pending
             .readback_buffer
             .read()
-            .map_err(|e| format!("render: readback buffer read failed: {e}"))?
-            .to_vec();
+            .map_err(|e| format!("render: readback buffer read failed: {e}"))?;
+        let pixel_data = {
+            let reuse = if Self::pixel_pool_enabled() {
+                self.readback_cpu_pool[pending.pool_slot]
+                    .take()
+                    .and_then(|arc| Arc::try_unwrap(arc).ok())
+            } else {
+                None
+            };
+            match reuse {
+                Some(mut v) => {
+                    v.clear();
+                    v.extend_from_slice(&guard[..]);
+                    self.gpu_runtime_counters.pixel_pool_reuses += 1;
+                    Arc::new(v)
+                }
+                None => {
+                    self.gpu_runtime_counters.pixel_pool_allocs += 1;
+                    Arc::new(guard.to_vec())
+                }
+            }
+        };
+        if Self::pixel_pool_enabled() {
+            self.readback_cpu_pool[pending.pool_slot] = Some(Arc::clone(&pixel_data));
+        }
+        drop(guard);
 
         // Depth aspect (D32_SFLOAT NDC), when the caller enabled depth readback.
         // The buffer is oversized to the D32S8 block (see `render`); the depth
@@ -73,7 +117,7 @@ impl VulkanRenderer {
         };
 
         let exported_frame = output_export::ExportedFrame {
-            pixel_data: output_export::ExportedPixelData::CpuReadback(Arc::new(pixel_data)),
+            pixel_data: output_export::ExportedPixelData::CpuReadback(pixel_data),
             extent: pending.extent,
             timestamp_nanos: pending.timestamp_nanos,
             gpu_token_id: self.frame_counter.saturating_sub(1),
@@ -100,11 +144,20 @@ impl VulkanRenderer {
         }))
     }
 
+    /// A/B knob for the pixel-Vec pool benchmark (`VULVATAR_PIXEL_POOL=0`
+    /// restores the per-frame allocation). Evaluated once per process.
+    pub(super) fn pixel_pool_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_PIXEL_POOL").map_or(true, |v| v != "0"))
+    }
+
     /// Ensure pre-allocated readback buffers exist for the given extent.
     ///
-    /// Returns `(staging, readback)` where:
+    /// Returns `(slot, staging, readback)` where:
+    /// - `slot` is the ring index the pair belongs to (identifies the CPU
+    ///   pixel-Vec pool entry refilled at harvest),
     /// - `staging` is a device-local + host-visible (BAR) buffer used as the
-    ///   target for `copy_image_to_buffer` (fast GPU copy).
+    ///   target for `copy_image_to_buffer` (fast GPU copy),
     /// - `readback` is a host-cached buffer for fast CPU reads; the render
     ///   command buffer also contains a `copy_buffer` from staging→readback
     ///   so that the CPU never reads uncached VRAM.
@@ -112,7 +165,7 @@ impl VulkanRenderer {
     pub(super) fn ensure_readback_buffers(
         &mut self,
         extent: [u32; 2],
-    ) -> Result<(Subbuffer<[u8]>, Subbuffer<[u8]>), String> {
+    ) -> Result<(usize, Subbuffer<[u8]>, Subbuffer<[u8]>), String> {
         let slot = self.readback_slot;
         let pixel_count = (extent[0] as u64) * (extent[1] as u64);
         let needed = pixel_count * 4;
@@ -179,14 +232,66 @@ impl VulkanRenderer {
 
             self.staging_buffers[slot] = Some(staging);
             self.readback_buffers[slot] = Some(readback);
+            // The GPU-side ring buffers were swapped: a cached command
+            // buffer from the old extent would copy into dead buffers.
+            self.readback_cpu_pool[slot] = None;
+            self.cb_cache.clear();
         }
 
         // Advance slot for next frame.
         self.readback_slot = (slot + 1) % READBACK_RING_SIZE;
 
         Ok((
+            slot,
             self.staging_buffers[slot].as_ref().unwrap().clone(),
             self.readback_buffers[slot].as_ref().unwrap().clone(),
         ))
+    }
+
+    /// Ensure the depth-aspect readback buffer exists for the given
+    /// extent, reusing the previous allocation when the size still
+    /// matches. (The live path never enables depth readback; this
+    /// serves the metric-depth benches, which used to allocate a fresh
+    /// full-resolution buffer every frame.)
+    pub(super) fn ensure_depth_readback_buffer(
+        &mut self,
+        extent: [u32; 2],
+    ) -> Result<Subbuffer<[u8]>, String> {
+        // vulkano validates the buffer against the combined D32_SFLOAT_S8_UINT
+        // block size (8 B), even though a DEPTH-aspect copy writes the depth
+        // tightly packed at 4 B/texel (Vulkan spec) into the leading `w*h*4`
+        // bytes. Size for the 8 B block so validation passes; the harvest
+        // reads the tightly-packed depth prefix.
+        let bytes = (extent[0] as u64) * (extent[1] as u64) * 8;
+        let needs_recreate = match &self.depth_readback_buffer {
+            Some(buf) => buf.len() as u64 != bytes,
+            None => true,
+        };
+        if needs_recreate {
+            let ma = self
+                .memory_allocator
+                .as_ref()
+                .ok_or("renderer: no memory allocator")?
+                .clone();
+            let buf = Buffer::new_slice::<u8>(
+                ma,
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                    ..Default::default()
+                },
+                bytes,
+            )
+            .map_err(|e| format!("render: depth readback buffer alloc failed: {e}"))?;
+            self.depth_readback_buffer = Some(buf);
+            // The buffer handle a cached command buffer would copy into
+            // changed — drop the cache.
+            self.cb_cache.clear();
+        }
+        Ok(self.depth_readback_buffer.clone().unwrap())
     }
 }

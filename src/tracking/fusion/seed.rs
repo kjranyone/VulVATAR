@@ -27,14 +27,39 @@ pub fn update_with_arm_seeds(h: &Humanoid, est: &mut Estimator, obs: &FrameObs) 
         let a = seed_arm(h, st, true, l.0, l.1?)?;
         seed_arm(h, &a, false, r.0, r.1?)
     };
+    // Steady-state gating: an arm whose wrist has been under continuous
+    // observation (wrist data-σ below the tracked threshold) does not
+    // need an analytic re-seed — the solver is already in the right
+    // basin and each seed candidate costs a full extra LM loop.
+    // Measured on the s1789219959 desk replay: with the left wrist
+    // observed ~every frame, seed_l + seed_both ran on every frame for a
+    // 1-in-600 win rate while carrying ~2/3 of the estimator's total
+    // time. The gate opens itself exactly when seeding matters: after an
+    // unobserved stretch or a re-acquisition the data-σ EMA (τ = 0.3 s)
+    // is still elevated, so returning-observation frames keep their
+    // seeds (the 1 win in 600 was such a frame). Bootstrap reads σ = 10
+    // and always seeds.
+    // `VULVATAR_FUSION_SEEDGATE_SIGMA` overrides the threshold; 0
+    // disables the gate (always seed — the previous behaviour).
+    static GATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let gate = *GATE.get_or_init(|| {
+        std::env::var("VULVATAR_FUSION_SEEDGATE_SIGMA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(0.5)
+    });
+    let wanted = |j: usize| gate <= 0.0 || est.joint_data_sigma(&h.model, j) > gate;
+    let l_wanted = wanted(h.j.l_wrist);
+    let r_wanted = wanted(h.j.r_wrist);
     let mut seeds: Vec<&dyn Fn(&State) -> Option<State>> = Vec::new();
-    if l.1.is_some() {
+    if l.1.is_some() && l_wanted {
         seeds.push(&seed_l);
     }
-    if r.1.is_some() {
+    if r.1.is_some() && r_wanted {
         seeds.push(&seed_r);
     }
-    if l.1.is_some() && r.1.is_some() {
+    if l.1.is_some() && r.1.is_some() && l_wanted && r_wanted {
         seeds.push(&seed_both);
     }
     est.update_with_seeds(&h.model, obs, &seeds);

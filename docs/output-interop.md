@@ -27,8 +27,14 @@ CPU readback is a fallback path, not the architectural center.
 At the last hop, `SharedTextureFileStub` preserves that distinction:
 it writes metadata-only `VGTK` records when a valid
 `GpuFrameToken` arrives and legacy `VSTX` records when the frame is on the CPU
-fallback path. The downstream consumer is still a stub; this is a
-token-capable sink boundary, not yet the finished live interop path.
+fallback path. `src/bin/consume_shared_texture.rs` is the reference
+read side: it validates/decodes both record shapes, can watch a live
+bridge file and report update cadence, dumps VSTX payloads as PNG, and
+carries a `--self-test` that round-trips both records through the real
+sink writer. It stops at the record boundary — importing the texture
+behind a `Win32Kmt` handle (D3D `OpenSharedResource1` / Vulkan
+`OPAQUE_WIN32_KMT`) is still future work, so the live zero-copy
+interop path remains unfinished.
 
 The live `VirtualCamera` and `SharedMemory` sinks on Windows extend
 this contract. Both sinks are backed by

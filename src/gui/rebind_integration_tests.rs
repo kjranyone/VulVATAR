@@ -12,17 +12,19 @@
 //! * **Failed** (unresolved name) — overlay is *not* attached,
 //!   "Could not auto-bind" notification fires, on-disk file
 //!   untouched.
-//! * **Partial** (secondary/tertiary tier resolution) — currently
-//!   unreachable through the resolver (name match is the only
-//!   implemented tier). The persistence leg (`save_rebound_overlay`
-//!   writing `last_rebound_with`) is covered by a focused IO test
-//!   below; once tier-2/3 resolution lands, replace that with a true
-//!   E2E Partial test.
+//! * **Partial** (secondary/tertiary tier resolution) — the overlay
+//!   carries tier-2/3 identity (`humanoid_bone` / `parent_path`
+//!   recorded at save time); a re-export that renamed bones but kept
+//!   the humanoid slot resolves at the secondary tier. Covered E2E via
+//!   `partial_rebind_via_humanoid_slot_attaches_notifies_and_writes_back`
+//!   below; the persistence leg (`save_rebound_overlay` writing
+//!   `last_rebound_with`) additionally has a focused IO test.
 use super::project::save_rebound_overlay;
 use super::*;
 use crate::asset::{
     Aabb, AssetSourceHash, AvatarAsset, AvatarAssetId, ClothAsset, ClothOverlayId, ClothPin,
-    ExpressionAssetSet, NodeId, NodeRef, SkeletonAsset, SkeletonNode, Transform, VrmMeta,
+    ExpressionAssetSet, HumanoidBone, NodeId, NodeRef, SkeletonAsset, SkeletonNode, Transform,
+    VrmMeta,
 };
 use crate::avatar::{AvatarInstance, AvatarInstanceId};
 use std::sync::Arc;
@@ -66,6 +68,21 @@ fn make_avatar_with_node(node_id: u64, node_name: &str) -> Arc<AvatarAsset> {
     })
 }
 
+/// Avatar whose single node occupies a humanoid slot under a name the
+/// overlay has never seen (FBX-style: the slot lives on the node).
+fn make_avatar_with_renamed_slotted_node(
+    node_id: u64,
+    node_name: &str,
+    slot: HumanoidBone,
+) -> Arc<AvatarAsset> {
+    let mut avatar = match Arc::try_unwrap(make_avatar_with_node(node_id, node_name)) {
+        Ok(a) => a,
+        Err(_) => unreachable!("freshly-created Arc has exactly one reference"),
+    };
+    avatar.skeleton.nodes[0].humanoid_bone = Some(slot);
+    Arc::new(avatar)
+}
+
 fn install_avatar(harness: &mut GuiApp, asset: Arc<AvatarAsset>) {
     harness
         .app
@@ -83,6 +100,8 @@ fn make_overlay_pinning_to(name: &str, old_id: u64) -> ClothAsset {
         binding_node: NodeRef {
             id: NodeId(old_id),
             name: name.to_string(),
+            humanoid_bone: None,
+            parent_path: None,
         },
         offset: [0.0, 0.0, 0.0],
     });
@@ -208,13 +227,68 @@ fn failed_rebind_skips_attach_and_pushes_notification() {
 }
 
 #[test]
+fn partial_rebind_via_humanoid_slot_attaches_notifies_and_writes_back() {
+    // The overlay was authored against a bone named "J_Bip_L_UpperArm"
+    // and saved with its humanoid identity recorded. The re-export
+    // renamed that bone to "arm_L" — primary (name) tier fails, but
+    // the secondary humanoid-slot tier resolves it. Expected dispatch:
+    // overlay attaches, "Rebound overlay" notification fires, and the
+    // rebound IDs + `last_rebound_with` stamp land on disk.
+    let mut harness = GuiApp::for_test();
+    install_avatar(
+        &mut harness,
+        make_avatar_with_renamed_slotted_node(10, "arm_L", HumanoidBone::LeftUpperArm),
+    );
+
+    let dir = make_tempdir("partial");
+    let overlay_path = dir.join("partial.vvtcloth");
+    let mut overlay_asset = make_overlay_pinning_to("J_Bip_L_UpperArm", 99);
+    overlay_asset.pins[0].binding_node.humanoid_bone = Some(HumanoidBone::LeftUpperArm);
+    write_overlay_file(&overlay_path, &overlay_asset);
+
+    let paths = vec![overlay_path.to_string_lossy().to_string()];
+    harness.restore_cloth_overlay_paths(&paths);
+
+    // Attached on the active avatar — Partial applies automatically.
+    let avatar = harness.app.active_avatar().expect("active avatar");
+    assert_eq!(
+        avatar.cloth_overlay_count(),
+        1,
+        "Partial rebind should attach the overlay"
+    );
+
+    // Notification fired with the Partial-path message.
+    assert_eq!(harness.notifications.len(), 1);
+    let msg = &harness.notifications[0].message;
+    assert!(
+        msg.contains("Rebound overlay"),
+        "expected 'Rebound overlay' in notification, got: {}",
+        msg
+    );
+
+    // Disk file was stamped and carries the rebound IDs.
+    let on_disk = crate::persistence::load_cloth_overlay(&overlay_path)
+        .expect("reload overlay after Partial rebind");
+    assert!(
+        on_disk.last_rebound_with.is_some(),
+        "Partial must stamp last_rebound_with via save_rebound_overlay"
+    );
+    let saved_asset = on_disk
+        .cloth_asset
+        .expect("cloth_asset preserved through save");
+    assert_eq!(saved_asset.pins[0].binding_node.id, NodeId(10));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn save_rebound_overlay_stamps_last_rebound_with_on_disk() {
-    // Persistence-leg coverage for the (currently unreachable) Partial
-    // dispatch path: when the dispatcher *would* call this on Partial,
-    // it must produce a file whose last_rebound_with is set and whose
-    // cloth_asset payload is the rebound (not the original) one. We
-    // exercise the IO directly because the algorithm cannot yet
-    // produce a Partial report — see the module docstring.
+    // Persistence-leg coverage for the Partial dispatch path in
+    // isolation from the resolver: when the dispatcher calls this on
+    // Partial, it must produce a file whose last_rebound_with is set
+    // and whose cloth_asset payload is the rebound (not the original)
+    // one. The E2E Partial path is covered above; this pins the IO
+    // contract directly.
     let dir = make_tempdir("save");
     let overlay_path = dir.join("partial.vvtcloth");
     let original_asset = make_overlay_pinning_to("Hips", 99);

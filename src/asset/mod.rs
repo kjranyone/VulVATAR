@@ -623,6 +623,22 @@ pub struct ClothStableRefSet {
 pub struct NodeRef {
     pub id: NodeId,
     pub name: String,
+    /// Humanoid bone slot this node occupied in the authoring avatar
+    /// (reverse-lookup through `AvatarAsset::humanoid`, or the node's
+    /// own `SkeletonNode::humanoid_bone` for FBX sources). Consumed by
+    /// `cloth_rebind`'s secondary tier when the node name no longer
+    /// matches after a re-export. Populated at overlay save time by
+    /// `cloth_rebind::enrich_node_identities`.
+    #[serde(default)]
+    pub humanoid_bone: Option<HumanoidBone>,
+    /// Ancestor chain of the node (root-to-parent, the node's own
+    /// name excluded), joined with `/` — recorded at save time for
+    /// `cloth_rebind`'s tertiary tier. It survives a rename of the
+    /// node itself as long as the ancestors keep their names and no
+    /// sibling shares the chain. `None` on overlays saved before this
+    /// field existed and for root nodes (no ancestors).
+    #[serde(default)]
+    pub parent_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

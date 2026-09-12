@@ -208,6 +208,7 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
         ref mut face_accum_mesh,
         ref mut face_accum_body,
         ref mut body_yaw_accum,
+        ref mut q_accum,
         ref mut last_seq_consumed,
         ..
     } = state.calibration.modal
@@ -236,6 +237,13 @@ pub(super) fn refresh_anchor_telemetry(state: &mut GuiApp, snap: &MailboxSnapsho
                     // recapture measures the true camera angle.
                     if let Some(yaw) = crate::tracking::shoulder_line_yaw(pose) {
                         body_yaw_accum.push(yaw);
+                    }
+                    // Solved joint state for `q_neutral` — admitted under
+                    // the same anchor/quality gate as the other neutral
+                    // accumulators so a mid-hold tracking glitch doesn't
+                    // contribute a collapsed solve to the median.
+                    if let Some(q) = pose.estimator_joint_state.clone() {
+                        q_accum.push(q);
                     }
                     // Fold the resting expression weights into the running
                     // mean (independent of `root_offset` — a desk-distance

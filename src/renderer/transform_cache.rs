@@ -66,6 +66,10 @@ impl VulkanRenderer {
             {
                 return Ok(());
             }
+            // The slot's descriptor set (and possibly its cloth SSBOs) is
+            // about to be swapped — cached command buffers referencing the
+            // old set must not survive.
+            self.cb_cache.clear();
             self.transform_cache.remove(&key)
         } else {
             None
@@ -136,11 +140,14 @@ impl VulkanRenderer {
         // cap on the target count.
         let raw_target_count = prim.morph_targets.len();
         let target_count = raw_target_count as u32;
-        let (morph_entries, morph_infos) = match previous
-            .as_ref()
-            .map(|p| (p.morph_entries.clone(), p.morph_infos.clone()))
-        {
-            Some((e, i)) => (e, i),
+        let (morph_entries, morph_infos, morph_infos_full) = match previous.as_ref().map(|p| {
+            (
+                p.morph_entries.clone(),
+                p.morph_infos.clone(),
+                p.morph_infos_full.clone(),
+            )
+        }) {
+            Some((e, i, f)) => (e, i, f),
             None => {
                 let (entries, infos) = pack_sparse_morphs(&prim.morph_targets);
                 if raw_target_count == 0 {
@@ -159,6 +166,7 @@ impl VulkanRenderer {
                             [0u32; 4],
                             "stub uvec4 SSBO",
                         )?,
+                        Vec::new(),
                     )
                 } else {
                     (
@@ -171,9 +179,10 @@ impl VulkanRenderer {
                         gpu_alloc::host_buffer(
                             memory_allocator,
                             BufferUsage::STORAGE_BUFFER,
-                            infos,
+                            infos.clone(),
                             "morph infos",
                         )?,
+                        infos,
                     )
                 }
             }
@@ -370,6 +379,7 @@ impl VulkanRenderer {
                 control_ubo,
                 morph_entries,
                 morph_infos,
+                morph_infos_full,
                 morph_weights_buf,
                 cloth_pos_ssbo,
                 cloth_norm_ssbo,
@@ -437,6 +447,9 @@ impl VulkanRenderer {
 
         // If the buffer is too small, reallocate.
         if mat_count > entry.capacity {
+            // The skinning descriptor set is about to be swapped — cached
+            // command buffers binding the old set must not survive.
+            self.cb_cache.clear();
             let buf = gpu_alloc::host_buffer(
                 &memory_allocator,
                 BufferUsage::STORAGE_BUFFER,

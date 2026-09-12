@@ -100,12 +100,21 @@ their own thresholds.
 
 ### State machine
 
-| Mode | Trigger to enter | Trigger to leave | Render FPS clamp | Pose Hz | YOLOX skip | Depth skip | FaceMesh EP |
+| Mode | Trigger to enter | Trigger to leave | Render FPS clamp | Pose Hz | YOLOX skip | Depth refresh | FaceMesh EP |
 |---|---|---|---|---|---|---|---|
-| `Healthy` | initial / recovered | render dt > 1.2× target dt **or** drops/sec ≥ 5 (5 s sustained) | user choice | 30 | every 4 | every 4 | Auto |
-| `PressureLight` | sustained light pressure for 5 s | clean 30 s **or** light→heavy escalation | min(user, 45) | 25 | every 6 | every 6 | Auto |
-| `PressureHeavy` | sustained light pressure another 5 s **or** drops/sec ≥ 20 (bypass) | clean 30 s | min(user, 30) | 20 | every 8 | every 8 | Cpu |
-| `EmergencyCpu` | 2 GPU export failures in the recent window | clean 30 s | min(user, 30) | 15 | every 12 | every 12 | Cpu |
+| `Healthy` | initial / recovered | render dt > 1.2× target dt **or** drops/sec ≥ 5 (5 s sustained) | user choice | 30 | every 4 | every 1 | Auto |
+| `PressureLight` | sustained light pressure for 5 s | clean 30 s **or** light→heavy escalation | min(user, 45) | 25 | every 6 | every 2 | Auto |
+| `PressureHeavy` | sustained light pressure another 5 s **or** drops/sec ≥ 20 (bypass) | clean 30 s | min(user, 30) | 20 | every 8 | every 3 | Cpu |
+| `EmergencyCpu` | 2 GPU export failures in the recent window | clean 30 s | min(user, 30) | 15 | every 12 | every 4 | Cpu |
+
+Depth refresh: the metric cloud rebuild runs every Nth *estimated* frame;
+skipped frames hand the provider a clone of the last cloud (stale by at
+most one refresh interval). Healthy stays at 1 (= the pre-budget
+per-frame rebuild) so the budget never changes nominal tracking
+behaviour — staleness only grows once the system is already degrading.
+The original design table sketched 4/6/8/12 including Healthy; that
+would have silently degraded nominal tracking without bench backing and
+was changed when the wiring landed.
 
 Hysteresis is the point. Recovery requires a 30-second clean streak per
 step — a one-frame stutter does not immediately bounce you up a level,
@@ -125,10 +134,22 @@ upward; everything else needs the 5 s dwell.
   submit guard. A single shared atomic is used in preference to an
   `Arc<AtomicU64>` plumbing path because the value is conceptually
   global — one Application + one Rtmw3dInference per session.
-- **Pose Hz / Depth skip / FaceMesh EP**: budget fields are populated
-  and surfaced in the inspector; the consumer wiring lands when each
-  subsystem starts honouring the budget. The YOLOX skip period is the
-  reference pattern (`pub static AtomicU64` read in the submit guard).
+- **Pose Hz**: published to `tracking::worker::POSE_HZ_TARGET` and read
+  in the worker's estimate loop. Frames that fail the pacing check
+  (`pose_throttle_allows`, a device-clock accumulator so the effective
+  rate converges to the target from any camera rate) are dropped before
+  the inference pass; the mailbox keeps the last published estimate.
+  The throttle is disabled while the session recorder is active so
+  `pose.jsonl` stays gap-free.
+- **Depth refresh period**: published to
+  `tracking::worker::DEPTH_REFRESH_PERIOD`; the metric-cloud rebuild
+  runs on every Nth estimated frame and skipped frames clone the last
+  cloud into the provider.
+- **FaceMesh ONNX EP**: published to
+  `tracking::face_mediapipe::FACEMESH_EP_CPU`, consulted at
+  `rtmw3d::from_models_dir_with_options` session-build time — a flip
+  takes effect on the next tracking start, the same latency class as
+  the user-facing `force_cpu` toggle.
 
 ### Inputs the budget reads
 
@@ -152,21 +173,20 @@ The budget makes degraded modes intentional and visible in one place.
 
 ## Remaining Extension Slices
 
-Each is a small wiring change that must land with a real consumer in
-the same commit, so the budget doesn't accumulate dead policy outputs:
+Every wiring change must land with a real consumer in the same
+commit, so the budget doesn't accumulate dead policy outputs. Wired so
+far: render FPS, YOLOX skip period, pose Hz, depth refresh period,
+FaceMesh EP preference (see "Consumer plumbing" above). Remaining
+slices:
 
-- **Pose worker Hz throttle** — `pub static AtomicU32` next to the pose
-  worker's loop tick, written from
-  `Application::update_runtime_gpu_budget`.
-- **Depth refresh period** — same pattern beside the depth provider's
-  per-frame guard.
-- **FaceMesh ONNX EP preference** — currently hard-coded per provider
-  (`Auto` for standalone rtmw3d, `ForceCpu` for the depth-colocated
-  paths). Plumbing the preference means re-init on change OR an
-  `AtomicU8` consulted at next session build.
 - **GPU cloth as default** — promote the GPU cloth backend from
   parity-tested option to production default (potentially budget-driven),
   shrinking the CPU snapshot vector to a metadata-only descriptor.
+  Opt-in today via `VULVATAR_CLOTH_GPU=1` (attach-time selection;
+  dynamic pin targets that follow the avatar's bones are wired through
+  `ClothGpuDispatchControl::pin_positions`). Blocked on a GPU collider
+  stage (capsules still live only in the CPU solver) and, for CPU-side
+  consumers, a GPU→CPU readback path.
 - **GPU-local preview** — egui still consumes CPU pixels for the
   viewport; that is a distinct preview fallback path and must not
   define the output architecture.

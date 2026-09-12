@@ -14,7 +14,10 @@ const LABEL_COLUMN_WIDTH: f32 = 100.0;
 
 /// Single-row label/value pair. Renders the label in
 /// `ON_SURFACE_VARIANT` at fixed width on the left, then the value
-/// in `ON_SURFACE` filling the rest of the row.
+/// in `ON_SURFACE` filling the rest of the row. The value truncates
+/// with an ellipsis instead of expanding the row — values are often
+/// file paths or URLs whose unbounded width would otherwise stretch
+/// the parent card and panel.
 pub fn kv_row(ui: &mut Ui, label: impl Into<String>, value: impl Into<egui::WidgetText>) {
     ui.horizontal(|ui| {
         ui.add_sized(
@@ -25,7 +28,7 @@ pub fn kv_row(ui: &mut Ui, label: impl Into<String>, value: impl Into<egui::Widg
                     .color(color::ON_SURFACE_VARIANT),
             ),
         );
-        ui.label(value);
+        ui.add(egui::Label::new(value).truncate());
     });
 }
 

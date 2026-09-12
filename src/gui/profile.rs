@@ -294,6 +294,7 @@ mod profile_management_tests {
             neutral_face_ypr_mesh: None,
             neutral_face_ypr_body: None,
             neutral_body_yaw: None,
+            q_neutral: None,
         });
         let idx = lib.duplicate_at(0).expect("duplicate");
         assert!(
@@ -430,6 +431,7 @@ mod profile_roundtrip_tests {
                 neutral_face_ypr_mesh: Some([-0.61, 0.14, 0.02]),
                 neutral_face_ypr_body: Some([-0.55, 0.31, 0.01]),
                 neutral_body_yaw: Some(-0.42),
+            q_neutral: None,
             }),
         }
     }

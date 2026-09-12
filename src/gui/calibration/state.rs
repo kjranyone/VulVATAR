@@ -207,6 +207,12 @@ pub enum CalibrationModalState {
         /// the finalizer then carries the previous calibration's
         /// value forward, same as the face neutrals.
         body_yaw_accum: Vec<f32>,
+        /// Solved fusion-model joint states (`estimator_joint_state`)
+        /// admitted during the window. Medianed in `finalize_collection`
+        /// into `PoseCalibration::q_neutral` — the estimator's posture
+        /// prior target. Empty unless the FusionProvider is running
+        /// (2D-only producers never populate the field).
+        q_accum: Vec<Vec<[f32; 3]>>,
         /// Tracks the last mailbox sequence we admitted a sample for,
         /// so we don't double-count when the GUI repaints faster than
         /// the tracking thread emits new frames.

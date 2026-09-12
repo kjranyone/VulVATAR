@@ -39,6 +39,7 @@ pub(super) fn pose_calibration_to_dto(
         neutral_face_ypr_mesh: cal.neutral_face_ypr_mesh,
         neutral_face_ypr_body: cal.neutral_face_ypr_body,
         neutral_body_yaw: cal.neutral_body_yaw,
+        q_neutral: cal.q_neutral.clone(),
     }
 }
 
@@ -124,6 +125,7 @@ pub(super) fn dto_to_pose_calibration(
                 crate::tracking::BODY_YAW_MAX_RAD,
             )
         }),
+        q_neutral: dto.q_neutral.clone(),
     })
 }
 
@@ -270,6 +272,11 @@ pub struct PoseCalibrationDto {
     /// load).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub neutral_body_yaw: Option<f32>,
+    /// Calibrated neutral joint pose (rotation vector per fusion-model
+    /// joint) — see `crate::tracking::PoseCalibration::q_neutral`.
+    /// `None` for older saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_neutral: Option<Vec<[f32; 3]>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

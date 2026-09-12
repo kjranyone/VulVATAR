@@ -73,6 +73,9 @@ impl VulkanRenderer {
         if needs_rebuild {
             if let Some(slot) = self.transform_cache.get_mut(&key) {
                 slot.cloth_gpu = None;
+                // Cloth descriptor sets are about to be reallocated —
+                // cached command buffers binding the old sets must go.
+                self.cb_cache.clear();
             }
         }
 
@@ -84,6 +87,9 @@ impl VulkanRenderer {
         if already_alloc || initial_positions.is_empty() {
             return Ok(());
         }
+        // First allocation of this slot's cloth descriptor sets — same
+        // invalidation rule as the rebuild branch above.
+        self.cb_cache.clear();
         let inv_mass_at = |i: usize| attach.inv_masses.get(i).copied().unwrap_or(1.0);
         let pinned_at = |i: usize| {
             if attach.pinned.get(i).copied().unwrap_or(false) {

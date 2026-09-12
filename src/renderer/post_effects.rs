@@ -82,8 +82,8 @@ const BLOOM_MIN_DIM: u32 = 8;
 /// Source and target share the same image-space orientation, so no Y flip.
 pub mod post_fullscreen_vs {
     vulkano_shaders::shader! {
-                    ty: "vertex",
-                    src: r"
+                            ty: "vertex",
+                            src: r"
 #version 450
 
 layout(location = 0) out vec2 frag_uv;
@@ -94,7 +94,7 @@ void main() {
     gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 "
-                }
+                        }
 }
 
 /// 13-tap Jimenez downsample (5 overlapping bilinear 4-tap boxes: centre
@@ -104,8 +104,8 @@ void main() {
 /// contribution (premultiplied content scales coherently).
 pub mod bloom_downsample_fs {
     vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
+                            ty: "fragment",
+                            src: r"
 #version 450
 
 layout(location = 0) in vec2 frag_uv;
@@ -156,7 +156,7 @@ void main() {
     }
 }
 "
-                }
+                        }
 }
 
 /// 3x3 tent upsample. The shader only filters the lower-resolution level;
@@ -164,8 +164,8 @@ void main() {
 /// (`One`/`One`) hardware blend.
 pub mod bloom_upsample_fs {
     vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
+                            ty: "fragment",
+                            src: r"
 #version 450
 
 layout(location = 0) in vec2 frag_uv;
@@ -191,7 +191,7 @@ void main() {
     out_color = sum / 16.0;
 }
 "
-                }
+                        }
 }
 
 /// Final composite/encode: HDR scene + bloom → 8-bit output. Writes linear
@@ -201,8 +201,8 @@ void main() {
 /// live camera footage downstream and must not carry a baked-in look).
 pub mod post_composite_fs {
     vulkano_shaders::shader! {
-                    ty: "fragment",
-                    src: r"
+                            ty: "fragment",
+                            src: r"
 #version 450
 
 layout(location = 0) in vec2 frag_uv;
@@ -222,7 +222,7 @@ void main() {
                      clamp(scene.a + pc.intensity * bloom.a, 0.0, 1.0));
 }
 "
-                }
+                        }
 }
 
 /// Push constant layout for `bloom_downsample_fs` (matches shader).
@@ -270,9 +270,9 @@ pub(super) struct BloomLevel {
 /// image are colour-space-dependent). Bloom *parameters* are push constants
 /// and never trigger a rebuild.
 pub(super) struct PostEffectResources {
-    pipe_down: Arc<GraphicsPipeline>,
-    pipe_up: Arc<GraphicsPipeline>,
-    pipe_composite: Arc<GraphicsPipeline>,
+    pub(super) pipe_down: Arc<GraphicsPipeline>,
+    pub(super) pipe_up: Arc<GraphicsPipeline>,
+    pub(super) pipe_composite: Arc<GraphicsPipeline>,
     bloom_levels: Vec<BloomLevel>,
     /// Final 8-bit output image — the readback / export source. Carries the
     /// external-memory (OPAQUE_WIN32_KMT) allocation when supported so the

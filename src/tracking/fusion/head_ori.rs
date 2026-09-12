@@ -145,7 +145,20 @@ impl HeadOriTracker {
         if !matches!(f.source, crate::tracking::FaceSource::Mesh)
             || std::env::var_os("VULVATAR_FUSION_NO_ORI").is_some()
             || c < 0.2
-            || f.yaw.abs() >= 1.05
+            // Hard envelope 1.35 rad (~77°), NOT 1.05: the user's habitual
+            // desk pose (oblique camera) sits at |yaw| 0.96-1.13 rad, and at
+            // the old 1.05 cut-off the whole orientation channel went dark
+            // exactly there — measured live (2026-09-13): with the head
+            // held at a constant −13° roll the avatar head roll tracked the
+            // face channel while |yaw| < ~1.0 rad and collapsed to 0-3°
+            // beyond it ("neck tilt dead while face direction still works"
+            // — yaw survives via keypoints). The channel itself is
+            // faithful end-to-end when it fires (replay: face→rig→avatar
+            // all ≈ 1:1 on the three axes), so the envelope, not the
+            // estimator, was the killer. 1.35 keeps a margin short of the
+            // ±90° region where yaw/roll alias; landmark quality beyond it
+            // is still guarded by step_ok / agrees_pred / depth_support.
+            || f.yaw.abs() >= 1.35
             || self.cooldown != 0
         {
             if std::env::var_os("VULVATAR_ORI_DUMP").is_some() {
@@ -359,7 +372,19 @@ fn face_depth_slope(
     let nose = kps[0];
     let nose_turned = if nose.2 >= 0.3 && x1 - x0 > 1.0 {
         let no = (nose.0 * width as f32 - cx) / (0.5 * (x1 - x0));
-        no.abs() > 0.40 && (no < 0.0) == (claimed_yaw < 0.0)
+        // `claimed_yaw` is the MIRRORED source-frame yaw (the camera-frame
+        // yaw is −claimed_yaw, see the composition in
+        // `estimate_orientation`), while `no` is in unmirrored image
+        // space: a genuine turn puts the nose on the side OPPOSITE the
+        // source-frame yaw sign. Comparing them for EQUALITY (the old
+        // check) passed only inconsistent geometries, so at large real
+        // yaws this escape hatch never fired and the cheek-slope
+        // magnitude path (damped to 0.011–0.025 m by hair/holes vs the
+        // 0.025 m threshold) rejected the honest FaceMesh orientation —
+        // measured on the s1789219959 desk replay: nose_off +0.75..+0.86
+        // with yaw −0.8..−0.9 rejected for 214 frames while the estimator
+        // parked the head 140° off the mesh channel.
+        no.abs() > 0.40 && (no < 0.0) != (claimed_yaw < 0.0)
     } else {
         false
     };

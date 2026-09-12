@@ -321,10 +321,17 @@ fn main() -> Result<(), String> {
     let mut provider = FusionProvider::from_models_dir_with_config("models", cfg)?;
     // Optional avatar rendering rig.
     let mut avatar_rig = if let Some(vrm) = avatar_vrm.as_ref() {
-        eprintln!("loading VRM {vrm} + Vulkan renderer for composites…");
-        let asset = vulvatar_lib::asset::vrm::VrmAssetLoader::new()
-            .load(vrm)
-            .map_err(|e| format!("load VRM: {e:?}"))?;
+        let asset = if vrm.to_ascii_lowercase().ends_with(".fbx") {
+            eprintln!("loading FBX {vrm} + Vulkan renderer for composites…");
+            vulvatar_lib::asset::fbx::FbxAssetLoader::new()
+                .load(vrm)
+                .map_err(|e| format!("load FBX: {e:?}"))?
+        } else {
+            eprintln!("loading VRM {vrm} + Vulkan renderer for composites…");
+            vulvatar_lib::asset::vrm::VrmAssetLoader::new()
+                .load(vrm)
+                .map_err(|e| format!("load VRM: {e:?}"))?
+        };
         let mut renderer = VulkanRenderer::new();
         renderer.initialize();
         let rest_locals: Vec<Transform> = asset
@@ -814,11 +821,22 @@ fn main() -> Result<(), String> {
                 );
             }
             if std::env::var_os("VULVATAR_REPLAY_HEADCMP").is_some() && n % 8 == 0 {
-                // Avatar head world orientation actually applied vs the rig delta.
+                // Neck-tilt transfer audit: for Neck and Head separately,
+                // compare the rig's delta rotation (yaw/pitch/roll) against
+                // what the retarget actually applied — both the avatar
+                // world orientation and the avatar's own delta from its
+                // rest (= world · rest⁻¹, the apples-to-apples transfer
+                // number). Also report the σ gate inputs and the
+                // upright-root rebase magnitude, the two structural
+                // suspects when a tilt axis goes missing between rig and
+                // avatar.
                 if let Some(hm) = asset.humanoid.as_ref() {
-                    if let Some(node) = hm.bone_map.get(&vulvatar_lib::asset::HumanoidBone::Head) {
-                        // world rot of head node under `locals`
-                        let mut q = [0.0f32, 0.0, 0.0, 1.0];
+                    use vulvatar_lib::asset::HumanoidBone as HB;
+                    use vulvatar_lib::math_utils::{
+                        quat_conjugate, quat_mul, quat_normalize, quat_rotate_vec3,
+                    };
+                    let world_and_rest = |bone: HB| -> Option<([f32; 4], [f32; 4])> {
+                        let node = hm.bone_map.get(&bone)?;
                         let mut chain = vec![];
                         let mut i = node.0 as usize;
                         loop {
@@ -828,26 +846,96 @@ fn main() -> Result<(), String> {
                                 None => break,
                             }
                         }
+                        let (mut q, mut qr) = ([0.0f32, 0.0, 0.0, 1.0], [0.0f32, 0.0, 0.0, 1.0]);
                         for &k in chain.iter().rev() {
-                            q = vulvatar_lib::math_utils::quat_mul(&q, &locals[k].rotation);
+                            q = quat_mul(&q, &locals[k].rotation);
+                            qr = quat_mul(&qr, &rest_locals[k].rotation);
                         }
-                        let fwd = vulvatar_lib::math_utils::quat_rotate_vec3(&q, &[0.0, 0.0, 1.0]);
-                        let pitch_av = (-fwd[1]).asin().to_degrees();
-                        let yaw_av = fwd[0].atan2(fwd[2]).to_degrees();
-                        let rig_head =
-                            est_out.skeleton.rig.as_ref().and_then(|r| {
-                                r.bones.get(&vulvatar_lib::asset::HumanoidBone::Head)
-                            });
-                        let (ry, rp) = rig_head
+                        Some((q, qr))
+                    };
+                    // Same ZXY-ish decomposition as `ypr_deg`, on a quat.
+                    let ypr_of = |q: [f32; 4]| -> (f64, f64, f64) {
+                        let f = quat_rotate_vec3(&q, &[0.0, 0.0, 1.0]);
+                        let u = quat_rotate_vec3(&q, &[0.0, 1.0, 0.0]);
+                        let yaw = (f[0] as f64).atan2(f[2] as f64).to_degrees();
+                        let pitch = (-(f[1] as f64)).asin().to_degrees();
+                        let right = [
+                            u[1] * f[2] - u[2] * f[1],
+                            u[2] * f[0] - u[0] * f[2],
+                            u[0] * f[1] - u[1] * f[0],
+                        ];
+                        let roll =
+                            (right[1] as f64).atan2((u[1] as f64).abs().max(1e-6)).to_degrees();
+                        (yaw, pitch, roll)
+                    };
+                    let rig = est_out.skeleton.rig.as_ref();
+                    // Face channel (the OriObs target source) for the Head
+                    // line: the estimator-side transfer is rig vs
+                    // (-yaw, pitch, -roll) of this.
+                    let face_ypr = est_out
+                        .skeleton
+                        .face
+                        .as_ref()
+                        .map(|f| {
+                            (
+                                -f.yaw as f64,
+                                f.pitch as f64,
+                                -f.roll as f64,
+                            )
+                        })
+                        .map(|(y, p, r)| {
+                            (y.to_degrees(), p.to_degrees(), r.to_degrees())
+                        });
+                    for bone in [HB::Neck, HB::Head] {
+                        let Some((qw, qr)) = world_and_rest(bone) else {
+                            continue;
+                        };
+                        let (wy, wp, wr) = ypr_of(qw);
+                        // Avatar delta from its OWN rest = the number the
+                        // rig delta should have landed on.
+                        let (dy, dp, dr) = ypr_of(quat_normalize(&quat_mul(
+                            &qw,
+                            &quat_conjugate(&qr),
+                        )));
+                        let rig_line = rig
+                            .and_then(|r| r.bones.get(&bone))
                             .map(|b| {
-                                let m3 = vulvatar_lib::tracking::fusion::math::quat_to_mat(
-                                    b.delta_world,
-                                );
-                                ypr_deg(&m3)
+                                let m3 =
+                                    vulvatar_lib::tracking::fusion::math::quat_to_mat(b.delta_world);
+                                let (ry, rp, rr) = ypr_deg(&m3);
+                                format!(
+                                    "rig {ry:+.1}/{rp:+.1}/{rr:+.1} sig {:+.2}/{:+.2}",
+                                    b.sigma, b.data_sigma
+                                )
                             })
-                            .map(|(y, p, _)| (y, p))
-                            .unwrap_or((0.0, 0.0));
-                        eprintln!("HEADCMP idx {idx} rig yaw/pitch {ry:.0}/{rp:.0} avatar yaw/pitch {yaw_av:.0}/{pitch_av:.0}");
+                            .unwrap_or_else(|| "rig ---".to_string());
+                        let name = if bone == HB::Neck { "Neck" } else { "Head" };
+                        let face_str = if bone == HB::Head {
+                            match face_ypr {
+                                Some((y, p, r)) => {
+                                    format!(" face(cam) {y:+.1}/{p:+.1}/{r:+.1}")
+                                }
+                                None => " face(cam) ---".to_string(),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        eprintln!(
+                            "HEADCMP idx {idx} {name} {rig_line} avW {wy:+.1}/{wp:+.1}/{wr:+.1} avD {dy:+.1}/{dp:+.1}/{dr:+.1}{face_str}"
+                        );
+                    }
+                    // Hips tilt the rebase removed (max_root_tilt = 0.35 rad
+                    // in RetargetParams::default): how much world-frame
+                    // pre-rotation every driven bone got scaled by.
+                    if let Some(b) = rig.and_then(|r| r.bones.get(&HB::Hips)) {
+                        let up = quat_rotate_vec3(&b.delta_world, &[0.0, 1.0, 0.0]);
+                        let tilt = up[1].clamp(-1.0, 1.0).acos();
+                        let rebase = (tilt - 0.35f32).max(0.0);
+                        eprintln!(
+                            "HEADCMP idx {idx} Hips tilt {:.1}° rebase -{:.1}°",
+                            tilt.to_degrees(),
+                            rebase.to_degrees()
+                        );
                     }
                 }
             }

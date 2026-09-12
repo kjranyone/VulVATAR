@@ -3,7 +3,10 @@
 > The captured `PoseCalibration` is applied at solve time via
 > `TrackingCalibration::apply_calibration` (neutral face / expression /
 > body-yaw). Wiring the same capture into the fusion estimator's
-> `q_neutral` is future work ([tracking-v2-design.md](tracking-v2-design.md) §6).
+> `q_neutral` posture prior is wired: the hold's median solved joint state
+becomes `PoseCalibration::q_neutral`, which `FusionProvider` feeds to the
+estimator to replace each joint's relaxed-pose prior *mean* (sigma unchanged;
+ablate with `VULVATAR_FUSION_NO_QNEUTRAL`) — [tracking-v2-design.md](tracking-v2-design.md).
 > The code is the source of truth for exact thresholds and field sets
 > (`src/tracking/calibration.rs`, `src/gui/calibration/`); this
 > document carries the UX flow, the data contract, and the design
@@ -106,8 +109,9 @@ Applied to a clone of the sample just before retarget each frame
 (the mailbox always carries the RAW sample — the recapture-invariant
 that prevents double subtraction): the neutral-body-yaw scene
 de-rotation, the per-source neutral face-pose subtraction, and the
-neutral-expression rescale. The fusion estimator does not yet consume
-the capture (`q_neutral` is future work). D435 depth is measured, not
+neutral-expression rescale. The fusion estimator consumes the capture's
+joint-state median as the posture prior's `q_neutral` (mean replacement
+only; effect not yet A/B-benched — see tracking-v2-design.md §8). D435 depth is measured, not
 estimated — there is no scale-calibration step. `anchor_depth_jitter_m`
 is a capture-quality diagnostic only (inspector status detail).
 

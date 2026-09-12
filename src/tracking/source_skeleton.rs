@@ -70,10 +70,11 @@ pub enum FaceSource {
 ///   head moves toward +Z (i.e. the chin drops — "looking down").
 /// * **`roll`** — positive rolls around +Z so the head leans toward +X.
 ///
-/// The face track is currently empty — RTMW3D emits 68 face landmarks
-/// (indices 23-90) but they are not yet decoded into yaw/pitch/roll;
-/// the head bone falls back to spine direction. Phase C (SMIRK) will
-/// drive this field along with ARKit blendshape weights.
+/// The face track is filled by two producers: the body-derived
+/// fallback (`derive_face_pose_from_body`) and the RTMW3D 68-landmark
+/// decoder (`derive_face_pose_from_landmarks`, FaceMesh path), with
+/// the producing source stamped on [`FacePose::source`]. Phase C
+/// (SMIRK) will additionally drive ARKit blendshape weights.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FacePose {
     pub yaw: f32,
@@ -201,6 +202,15 @@ pub struct SourceSkeleton {
     /// the solver — calibration capture only. `None` when the body
     /// face keypoints were below the visibility floor.
     pub face_body_raw: Option<FacePose>,
+    /// Solved fusion-model joint state (rotation vector per model
+    /// joint, `State::joint_rotvec` order) as of this frame. Populated
+    /// only by `FusionProvider`; the calibration modal accumulates it
+    /// during the neutral hold into `PoseCalibration::q_neutral`. The
+    /// joint indexing is the estimator model's, not a humanoid-bone
+    /// map — consumers must validate the length against the model
+    /// they hold. `None` on frames from other producers or when the
+    /// estimator did not run.
+    pub estimator_joint_state: Option<Vec<[f32; 3]>>,
     /// Auxiliary positions for finger *tips* (the keypoint beyond the
     /// `*Distal` bone). Keyed by the distal bone whose tip it represents —
     /// e.g. `fingertips[LeftIndexDistal]` is the 3D position of the left
@@ -271,6 +281,7 @@ impl SourceSkeleton {
             source_timestamp,
             capture_timestamp_ms: None,
             joints: HashMap::new(),
+            estimator_joint_state: None,
             face_body_raw: None,
             fingertips: HashMap::new(),
             face: None,

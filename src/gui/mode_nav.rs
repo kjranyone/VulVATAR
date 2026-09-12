@@ -24,6 +24,11 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             ..Default::default()
         })
         .show(ctx, |ui| {
+            // Same rationale as the inspector panel: egui 0.30 SidePanel
+            // doesn't guarantee the frame fill covers the full panel
+            // width, so claim it explicitly to avoid an unpainted
+            // (window-clear-colour) strip when a row label overflows.
+            ui.set_min_width(ui.max_rect().width());
             // ── Brand header ──────────────────────────────────────
             ui.horizontal(|ui| {
                 ui.add_space(space::XS);

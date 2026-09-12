@@ -21,7 +21,7 @@ use log::{error, warn};
 // no-capture-backend build doesn't warn on it being unused.
 #[cfg(feature = "realsense")]
 use log::info;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -32,6 +32,61 @@ use super::{latest_cell, realsense, sequence_recorder};
 #[cfg(feature = "realsense")]
 use super::{pose_estimation, CameraIntrinsics, TrackingErrorLevel};
 use super::{DetectionAnnotation, PreviewFrame, SourceSkeleton, TrackingMailbox};
+
+// ---------------------------------------------------------------------------
+// RuntimeGpuBudget cadence knobs (P3-03)
+// ---------------------------------------------------------------------------
+// Same shape as `rtmw3d::YOLOX_REFRESH_PERIOD`: one Application writes,
+// the tracking-worker loop reads, so a plain static beats `Arc<Atomic>`
+// plumbing (see that static's doc for the full rationale).
+
+/// Pose estimate cadence target in Hz, published by
+/// `Application::update_runtime_gpu_budget`. The estimate loop drops
+/// frames that fail the pacing check (see [`pose_throttle_allows`]);
+/// the mailbox keeps the last published estimate, so the app sees a
+/// slower pose rate rather than a stall. Healthy default 30 = the
+/// camera rate, i.e. no throttling in practice.
+pub static POSE_HZ_TARGET: AtomicU32 = AtomicU32::new(30);
+
+/// Metric-depth cloud rebuild period, published by
+/// `Application::update_runtime_gpu_budget`: rebuild the full-frame
+/// cloud every Nth frame and hand the provider a clone of the last
+/// cloud in between. 1 (Healthy default) = the pre-budget per-frame
+/// rebuild.
+pub static DEPTH_REFRESH_PERIOD: AtomicU64 = AtomicU64::new(1);
+
+/// Pacing decision for the pose-Hz throttle: publish this frame or
+/// skip it. `next_pub_ms` / `published_once` form a device-clock
+/// pacing state owned by the caller. The accumulator advances by a
+/// fixed interval per publish (a virtual clock), so the long-run
+/// publish rate converges to `hz` from any camera rate ≥ `hz` —
+/// e.g. a 30 fps camera at hz=25 settles into a 5-publish-1-skip
+/// pattern. Two simpler gates fail that case: a min-interval gate
+/// collapses to 15 Hz (every 33 ms frame misses a 40 ms threshold),
+/// and anchoring the next deadline at the publish timestamp (`ts +
+/// interval`) never accrues credit and also collapses to 15 Hz. If
+/// the loop stalls and falls behind, the deadline clamps to the
+/// current timestamp so catch-up never bursts. `hz == 0` disables
+/// throttling (defensive; the budget never emits 0).
+pub fn pose_throttle_allows(
+    frame_ts_ms: f64,
+    next_pub_ms: &mut f64,
+    published_once: &mut bool,
+    hz: u32,
+) -> bool {
+    if hz == 0 {
+        return true;
+    }
+    const EPS_MS: f64 = 1e-3;
+    let interval_ms = 1000.0 / hz as f64;
+    if !*published_once || frame_ts_ms + EPS_MS >= *next_pub_ms {
+        *published_once = true;
+        *next_pub_ms = (*next_pub_ms + interval_ms).max(frame_ts_ms);
+        true
+    } else {
+        false
+    }
+}
 
 /// Combined output of a pose estimation pass: source skeleton + 2D annotation.
 pub struct PoseEstimate {
@@ -412,6 +467,12 @@ impl TrackingWorker {
         stagelog::mark(0, "provider_load_end");
         ready.store(true, Ordering::SeqCst);
         let mut last_calibration_seq: u64 = 0;
+        // P3-03 pose-Hz pacing state (device-clock accumulator).
+        let mut pose_next_pub_ms: f64 = 0.0;
+        let mut pose_published_once = false;
+        // P3-03 depth-refresh cache: the last full-frame metric cloud,
+        // cloned to the provider on frames between rebuilds.
+        let mut cached_metric: Option<crate::tracking::metric_frame::MetricDepthFrame> = None;
 
         while running.load(Ordering::SeqCst) {
             // Blocks until the freshest capture is available; wakes with
@@ -440,14 +501,53 @@ impl TrackingWorker {
             // Raw-input recorder (off unless the flag file exists). Placed
             // BEFORE any processing on purpose: the whole point is to keep a
             // record that no estimator has touched, so a replacement can be
-            // scored on the same sensor data as the incumbent.
+            // scored on the same sensor data as the incumbent. Runs even on
+            // pose-throttled frames — the capture stream must stay gapless.
             sequence_recorder::record(frame_index, &rs_frame);
+
+            // P3-03 pose-Hz throttle: under GPU pressure the budget lowers
+            // the estimate cadence below the camera rate. Frames that fail
+            // the pacing check are dropped before the expensive inference
+            // pass (mailbox keeps the last published estimate). Disabled
+            // while the session recorder is active — its pose.jsonl must
+            // stay gap-free relative to the raw captures, and diagnostics
+            // sessions run with the budget effectively Healthy anyway.
+            let pose_hz = POSE_HZ_TARGET.load(Ordering::Relaxed);
+            if !session_record::active()
+                && !pose_throttle_allows(
+                    rs_frame.timestamp_ms,
+                    &mut pose_next_pub_ms,
+                    &mut pose_published_once,
+                    pose_hz,
+                )
+            {
+                continue;
+            }
 
             stagelog::mark(frame_index, "estimate_begin");
             let mut estimate = if let Some(ref mut provider) = pose_provider {
                 // Hand the D435's color-aligned metric depth to the
-                // provider for THIS frame.
-                let metric = crate::tracking::metric_frame::build_metric_frame_from_d435(&rs_frame);
+                // provider for THIS frame. Under pressure the budget
+                // stretches the rebuild cadence (`DEPTH_REFRESH_PERIOD`)
+                // and skipped frames reuse a clone of the last cloud —
+                // stale by at most one refresh interval. Period 1
+                // (Healthy) rebuilds every frame = pre-budget behaviour.
+                let period = DEPTH_REFRESH_PERIOD.load(Ordering::Relaxed).max(1);
+                let metric =
+                    if period <= 1 || frame_index.is_multiple_of(period) || cached_metric.is_none()
+                    {
+                        let m = crate::tracking::metric_frame::build_metric_frame_from_d435(
+                            &rs_frame,
+                        );
+                        if period > 1 {
+                            cached_metric = Some(m.clone());
+                        }
+                        m
+                    } else {
+                        // Unwrap is infallible: the `cached_metric.is_none()`
+                        // arm above populates it before we can get here.
+                        cached_metric.clone().unwrap()
+                    };
                 provider.set_external_depth(metric);
                 provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
             } else {
@@ -811,5 +911,74 @@ fn downscale_for_gui(rgb_data: &[u8], src_w: u32, src_h: u32, max_w: u32) -> Pre
         rgb_data: out,
         width: dst_w,
         height: dst_h,
+    }
+}
+
+#[cfg(test)]
+mod pose_throttle_tests {
+    use super::pose_throttle_allows;
+
+    /// Camera-rate device timestamps for `fps` over `frames` frames.
+    fn stamps(fps: f64, frames: u32) -> impl Iterator<Item = f64> {
+        let dt = 1000.0 / fps;
+        (0..frames).map(move |i| i as f64 * dt)
+    }
+
+    #[test]
+    fn hz_zero_disables_throttling() {
+        let (mut next, mut once) = (0.0, false);
+        for ts in stamps(30.0, 100) {
+            assert!(pose_throttle_allows(ts, &mut next, &mut once, 0));
+        }
+    }
+
+    #[test]
+    fn hz_at_camera_rate_publishes_every_frame() {
+        let (mut next, mut once) = (0.0, false);
+        for ts in stamps(30.0, 300) {
+            assert!(pose_throttle_allows(ts, &mut next, &mut once, 30));
+        }
+    }
+
+    #[test]
+    fn camera_rate_converges_to_off_target_hz() {
+        // 30 fps camera throttled to 25 Hz over 10 s: the accumulator
+        // must land near 25 Hz — a naive min-interval gate collapses
+        // this case to 15 Hz.
+        let (mut next, mut once) = (0.0, false);
+        let published = stamps(30.0, 300)
+            .filter(|&ts| pose_throttle_allows(ts, &mut next, &mut once, 25))
+            .count();
+        assert!(
+            (235..=265).contains(&published),
+            "expected ~250 publishes over 300 frames, got {}",
+            published
+        );
+    }
+
+    #[test]
+    fn half_rate_never_bursts() {
+        // 30 fps camera throttled to 15 Hz: exactly every other frame,
+        // and never two publishes on consecutive frames.
+        let (mut next, mut once) = (0.0, false);
+        let mut prev_published = false;
+        let mut published = 0;
+        for ts in stamps(30.0, 300) {
+            let allow = pose_throttle_allows(ts, &mut next, &mut once, 15);
+            if allow {
+                published += 1;
+                assert!(!prev_published, "two consecutive publishes at hz=15");
+            }
+            prev_published = allow;
+        }
+        assert_eq!(published, 150);
+    }
+
+    #[test]
+    fn first_frame_always_publishes() {
+        let (mut next, mut once) = (0.0, false);
+        assert!(pose_throttle_allows(12_345.0, &mut next, &mut once, 20));
+        // First publish anchors the virtual clock at the frame itself.
+        assert_eq!(next, 12_345.0);
     }
 }

@@ -270,7 +270,16 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
             "root_sigma_m": r.root_sigma_m,
             "hand_confidence": r.hand_confidence,
             "shoulder_span_m": r.shoulder_span_m,
-            "head": b(HumanoidBone::Head),
+            "head": r.bones.get(&HumanoidBone::Head).map(|x| {
+                serde_json::json!({
+                    "sigma": x.sigma,
+                    "data_sigma": x.data_sigma,
+                    // World-delta quaternion [x,y,z,w] the retarget applies
+                    // (viewer frame): live rig↔avatar transfer audits read
+                    // this against debug_avatar.json's head_axes.
+                    "delta_world": x.delta_world,
+                })
+            }),
             "upper_chest": b(HumanoidBone::UpperChest),
             "l_upper_arm": b(HumanoidBone::LeftUpperArm),
             "r_upper_arm": b(HumanoidBone::RightUpperArm),

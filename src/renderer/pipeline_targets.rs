@@ -439,13 +439,22 @@ impl VulkanRenderer {
         self.pipeline_no_cull_cutout = Some(no_cull_pipeline_cutout);
         self.pipeline_front_cull_cutout = Some(front_cull_pipeline_cutout);
         self.outline_pipeline = Some(outline_pipeline.clone());
-        self.background_pipeline = Some(background_pipeline);
+        self.background_pipeline = Some(background_pipeline.clone());
         self.current_extent = extent;
         self.current_sample_count = sample_count;
 
         if let (Some(ma), Some(dsa)) = (&self.memory_allocator, &self.descriptor_set_allocator) {
             self.camera_ring = Some(CameraRing::new(ma, dsa, &gfx_pipeline, &outline_pipeline));
+            self.bg_uniform_ring = Some(super::background::BgUniformRing::new(
+                ma,
+                dsa,
+                &background_pipeline,
+            ));
         }
+
+        // Every scene/post pipeline, target image, and ring set a cached
+        // command buffer referenced was swapped above.
+        self.cb_cache.clear();
 
         if let Some(ref mut ps) = self.active_pipeline {
             ps.graphics_pipeline = Some(gfx_pipeline);
