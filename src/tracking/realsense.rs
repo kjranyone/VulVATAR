@@ -276,21 +276,81 @@ impl From<OpenFailure> for String {
     }
 }
 
+/// Enumerate every connected RealSense device (all product lines) for the
+/// Tracking panel's device list — see [`crate::tracking::CameraDeviceInfo`].
+/// Unlike the D400-filtered query inside [`RealSenseCapture::open`], this
+/// deliberately uses an empty product mask (= any product line) so a
+/// plugged-in but unsupported device (e.g. an L515) still shows up as
+/// "connected, not usable" instead of vanishing.
+pub(crate) fn enumerate_devices() -> Result<Vec<crate::tracking::CameraDeviceInfo>, String> {
+    let context = Context::new().map_err(|e| format!("realsense: context: {e}"))?;
+    Ok(context
+        .query_devices(HashSet::new())
+        .iter()
+        .map(|device| {
+            let name = device
+                .info(Rs2CameraInfo::Name)
+                .map(|s| s.to_string_lossy().trim().to_string())
+                .unwrap_or_else(|| "RealSense".to_string());
+            let serial = device
+                .info(Rs2CameraInfo::SerialNumber)
+                .map(|s| s.to_string_lossy().trim().to_string())
+                .unwrap_or_default();
+            let usb_type = device
+                .info(Rs2CameraInfo::UsbTypeDescriptor)
+                .map(|s| s.to_string_lossy().trim().to_string());
+            crate::tracking::CameraDeviceInfo {
+                supported: crate::tracking::d400_product_name(&name),
+                name,
+                serial,
+                usb_type,
+            }
+        })
+        .collect())
+}
+
 impl RealSenseCapture {
-    /// Open the first connected D400-series device and start streaming color
+    /// Open a connected D400-series device and start streaming color
     /// (`width`x`height` @ `fps`) plus depth, with depth aligned to color.
-    pub fn open(width: u32, height: u32, fps: u32) -> Result<Self, OpenFailure> {
+    ///
+    /// `preferred_serial` picks WHICH device when several are connected
+    /// (the Tracking panel's radio selection, persisted in
+    /// `settings.json`): the device with that serial is used when
+    /// present, otherwise the first enumerated D400 — a saved selection
+    /// outliving the camera it named must not brick capture.
+    pub fn open(
+        width: u32,
+        height: u32,
+        fps: u32,
+        preferred_serial: Option<&str>,
+    ) -> Result<Self, OpenFailure> {
         let context =
             Context::new().map_err(|e| OpenFailure::Other(format!("realsense: context: {e}")))?;
 
         let mut product = HashSet::new();
         product.insert(Rs2ProductLine::D400);
         let devices = context.query_devices(product);
-        let device = devices.first().ok_or(OpenFailure::NoDevice)?;
-
-        let serial = device.info(Rs2CameraInfo::SerialNumber).ok_or_else(|| {
-            OpenFailure::Other("realsense: device reports no serial number".to_string())
-        })?;
+        let device = preferred_serial
+            .and_then(|want| {
+                devices.iter().find(|d| {
+                    d.info(Rs2CameraInfo::SerialNumber)
+                        .is_some_and(|s| s.to_string_lossy() == want)
+                })
+            })
+            .or_else(|| devices.first())
+            .ok_or(OpenFailure::NoDevice)?;
+        let serial = device
+            .info(Rs2CameraInfo::SerialNumber)
+            .map(|s| s.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                OpenFailure::Other("realsense: device reports no serial number".to_string())
+            })?;
+        if let Some(want) = preferred_serial {
+            if want != serial {
+                warn!("realsense: preferred serial {want} not connected — using {serial} instead");
+            }
+        }
+        info!("realsense: using D400 device S/N {serial}");
         let name = device
             .info(Rs2CameraInfo::Name)
             .map(|s| s.to_string_lossy().into_owned())
@@ -300,8 +360,12 @@ impl RealSenseCapture {
             .map_err(|e| OpenFailure::Other(format!("realsense: create pipeline: {e}")))?;
 
         let mut config = Config::new();
+        // `enable_device_from_serial` takes a CStr; serials are plain
+        // ASCII so the CString rebuild can't realistically fail.
+        let serial_c = std::ffi::CString::new(serial.clone())
+            .map_err(|e| OpenFailure::Other(format!("realsense: serial contains NUL: {e}")))?;
         config
-            .enable_device_from_serial(serial)
+            .enable_device_from_serial(&serial_c)
             .map_err(|e| OpenFailure::Other(format!("realsense: enable device: {e}")))?
             .disable_all_streams()
             .map_err(|e| OpenFailure::Other(format!("realsense: disable all streams: {e}")))?
@@ -431,7 +495,7 @@ impl RealSenseCapture {
         info!(
             "realsense: opened {} (serial {}) — color {}x{} @ {} fps, depth {}x{} aligned to color",
             name,
-            serial.to_string_lossy(),
+            serial,
             width,
             height,
             fps,

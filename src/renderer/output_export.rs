@@ -154,8 +154,7 @@ impl ExportImagePool {
             .slots
             .iter()
             .position(|slot| {
-                slot.image_id == image_id
-                    && matches!(slot.state, ExportImageSlotState::Available)
+                slot.image_id == image_id && matches!(slot.state, ExportImageSlotState::Available)
             })
             .or_else(|| {
                 self.slots
@@ -812,8 +811,7 @@ impl OutputExporter {
                     timestamp_nanos,
                 },
                 handoff_path: HandoffPath::CpuReadback,
-                fallback_reason: fallback_reason
-                    .or(Some(FallbackReason::RequestedCpuReadback)),
+                fallback_reason: fallback_reason.or(Some(FallbackReason::RequestedCpuReadback)),
                 // CpuReadback `pixel_data` already feeds the preview.
                 preview_pixels: None,
             }),

@@ -6,7 +6,11 @@
 //! This exercises the whole streaming module end-to-end (stream -> align ->
 //! deproject) against the live device.
 //!
-//!   cargo run --bin diagnose_realsense --features realsense
+//!   cargo run --bin diagnose_realsense --features realsense [-- SERIAL]
+//!
+//! The optional SERIAL argument opens that specific D400 (same pick
+//! semantics as the GUI's radio selection); without it the first
+//! enumerated device is used.
 //!
 //! Build env (see docs/realsense-build.md): PKG_CONFIG_PATH -> the hand-written
 //! realsense2.pc, LIBCLANG_PATH -> LLVM\bin. Runtime: the SDK's bin\x64
@@ -17,7 +21,30 @@ use vulvatar_lib::tracking::realsense::RealSenseCapture;
 fn main() -> Result<(), String> {
     env_logger::init();
 
-    let mut cap = RealSenseCapture::open(1280, 720, 30)?;
+    // Device list first: when `open` fails this is the part that says
+    // whether the driver sees ANY camera (and at what USB link speed),
+    // separating "not enumerated" (driver/cable/port) from "enumerated
+    // but won't stream" (link speed / occupied / permissions).
+    match vulvatar_lib::tracking::enumerate_cameras() {
+        Ok(devices) if devices.is_empty() => {
+            println!("no RealSense devices enumerated — check the driver in Device Manager and the USB connection.");
+        }
+        Ok(devices) => {
+            for d in &devices {
+                println!(
+                    "found: {}  S/N {}  USB {}  supported={}",
+                    d.name,
+                    d.serial,
+                    d.usb_type.as_deref().unwrap_or("?"),
+                    d.supported
+                );
+            }
+        }
+        Err(e) => println!("enumeration failed: {e}"),
+    }
+
+    let preferred_serial = std::env::args().nth(1);
+    let mut cap = RealSenseCapture::open(1280, 720, 30, preferred_serial.as_deref())?;
     println!("opened D435 — streaming (first few frames warm up auto-exposure)...");
 
     for i in 0..30 {

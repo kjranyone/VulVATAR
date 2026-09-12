@@ -437,4 +437,88 @@ mod tests {
         assert!(p.to_string_lossy().contains("0000000000"));
         assert!(p.extension().and_then(|s| s.to_str()) == Some("vvtcache"));
     }
+
+    /// Diagnostic (measurement, not an assertion — run with `--ignored
+    /// --nocapture`): dump the spring-chain parameters a cached avatar
+    /// actually loaded with, e.g. when live hair gravity looks wrong and
+    /// the VRC PhysBone → chain heuristic is the suspect. Usage:
+    /// `VULVATAR_DUMP_SPRINGS=<path\to\model.fbx> cargo test -- --ignored
+    /// dump_cached_spring_parameters --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_cached_spring_parameters() {
+        let path = match std::env::var("VULVATAR_DUMP_SPRINGS") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => return,
+        };
+        let asset = try_load(&path)
+            .expect("cache load")
+            .expect("no cache entry for source");
+        println!(
+            "springs for {:?}: {} chains, {} colliders",
+            path,
+            asset.spring_bones.len(),
+            asset.colliders.len()
+        );
+        for (i, sb) in asset.spring_bones.iter().enumerate() {
+            let name = asset
+                .skeleton
+                .nodes
+                .get(sb.chain_root.0 as usize)
+                .map(|n| n.name.as_str())
+                .unwrap_or("?");
+            println!(
+                "chain {:>2} root={:<28} joints={:<2} stiff={:.3} drag={:.3} \
+                 grav_dir={:?} grav_pow={:.3} radius={:.3} cols={}",
+                i,
+                name,
+                sb.joints.len(),
+                sb.stiffness,
+                sb.drag_force,
+                sb.gravity_dir,
+                sb.gravity_power,
+                sb.radius,
+                sb.collider_refs.len()
+            );
+        }
+
+        // Rest-pose geometry: how far each chain's segments sit from
+        // straight down. Gravity only produces visible droop on the
+        // tangential component — a near-vertical rest segment cancels it
+        // via the bone-length constraint, whatever gravityPower says.
+        let mut inst = crate::avatar::AvatarInstance::new(
+            crate::avatar::AvatarInstanceId(0),
+            std::sync::Arc::new(asset.clone()),
+        );
+        inst.build_base_pose();
+        inst.compute_global_pose();
+        let down = [0.0f32, -1.0, 0.0];
+        for (i, sb) in asset.spring_bones.iter().enumerate() {
+            if sb.joints.len() < 2 {
+                continue;
+            }
+            let name = inst.asset.skeleton.nodes[sb.chain_root.0 as usize].name.clone();
+            let mut angles = Vec::with_capacity(sb.joints.len() - 1);
+            for w in sb.joints.windows(2) {
+                let a = crate::math_utils::mat4_translation(
+                    &inst.pose.global_transforms[w[0].0 as usize],
+                );
+                let b = crate::math_utils::mat4_translation(
+                    &inst.pose.global_transforms[w[1].0 as usize],
+                );
+                let d = crate::math_utils::vec3_normalize(&crate::math_utils::vec3_sub(&b, &a));
+                let dot = -(d[0] * down[0] + d[1] * down[1] + d[2] * down[2]);
+                angles.push(dot.acos().to_degrees());
+            }
+            println!(
+                "rest  {:>2} root={:<28} seg angles from down (deg): {:?}",
+                i,
+                name,
+                angles
+                    .iter()
+                    .map(|a| format!("{a:.0}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

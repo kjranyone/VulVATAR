@@ -499,6 +499,20 @@ pub struct TrackingGuiState {
     /// shows the unclean-exit banner; cleared when the user picks
     /// safe mode or dismisses. Never persisted.
     pub unclean_exit_log: Option<String>,
+    /// Cameras enumerated for the Tracking panel's device list. Pure UI
+    /// artifact (like `LipSyncGuiState::available_mics`) — refreshed on
+    /// panel draw / Rescan, never persisted. `None` = never scanned yet.
+    pub available_cameras: Option<Vec<crate::tracking::CameraDeviceInfo>>,
+    /// Instant of the last automatic rescan, pacing the every-few-seconds
+    /// retry while the list is empty (so plugging the camera in flips the
+    /// list — and the Start button — without a manual Rescan).
+    pub camera_scan_at: Option<std::time::Instant>,
+    /// Serial of the D400 the user selected with the device-list radio.
+    /// `None` = first enumerated device. Persisted in `settings.json`
+    /// (a machine-level choice, not scene state) and read at every
+    /// camera start; while the camera runs, changing it stages for the
+    /// next start (same policy as the capture-format combos).
+    pub camera_serial: Option<String>,
 }
 
 impl TrackingGuiState {
@@ -682,6 +696,9 @@ impl Default for TrackingGuiState {
             yolox_enabled: true,
             safe_mode_armed: false,
             unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
+            available_cameras: None,
+            camera_scan_at: None,
+            camera_serial: None,
         }
     }
 }
@@ -1055,7 +1072,11 @@ impl GuiApp {
 
             transform: TransformState::default(),
             camera_orbit: CameraOrbitState::default(),
-            tracking: TrackingGuiState::default(),
+            tracking: TrackingGuiState {
+                // Device pick rides settings.json (machine-level).
+                camera_serial: app_settings.camera_serial.clone(),
+                ..TrackingGuiState::default()
+            },
             rendering: RenderingGuiState::default(),
             output: OutputGuiState::default(),
 
@@ -1420,6 +1441,68 @@ impl GuiApp {
             .is_some_and(|w| w.is_ready())
     }
 
+    /// Whether Start Camera can do anything right now: the last
+    /// enumeration found a D400-series camera on a fast-enough USB link.
+    /// While the camera is running this is moot (stop governs), and an
+    /// exhausted scan reads as false so the button still works when the
+    /// backend is a non-realsense build.
+    pub fn camera_startable(&self) -> bool {
+        self.tracking
+            .available_cameras
+            .as_ref()
+            .is_some_and(|cams| crate::tracking::usable_capture_device(cams))
+    }
+
+    /// (Re-)enumerate connected RealSense cameras into
+    /// [`TrackingGuiState::available_cameras`], pacing automatic rescans
+    /// with `camera_scan_at`. `force` is the explicit Rescan button;
+    /// otherwise an empty/never-scanned list rescans at most every
+    /// `interval` so plugging the camera in self-heals without spamming
+    /// librealsense (a scan loads/queries the context) — and never
+    /// rescans while the camera is streaming, where it would contend
+    /// with the capture thread. Returns the error toast text on a
+    /// failed enumeration (context/driver trouble the user must see).
+    pub fn rescan_cameras(
+        &mut self,
+        force: bool,
+        interval: std::time::Duration,
+    ) -> Option<String> {
+        if self.is_tracking_active() {
+            return None;
+        }
+        let due = self
+            .tracking
+            .camera_scan_at
+            .is_none_or(|at| at.elapsed() >= interval);
+        let list_empty = self
+            .tracking
+            .available_cameras
+            .as_ref()
+            .is_none_or(|cams| cams.is_empty());
+        if !force && !due {
+            return None;
+        }
+        // Only an empty (or never-scanned) list auto-retries; a
+        // populated list stays put until an explicit Rescan so a camera
+        // unplugged mid-session doesn't get silently re-added while the
+        // user reads it.
+        if !force && !list_empty {
+            return None;
+        }
+        self.tracking.camera_scan_at = Some(std::time::Instant::now());
+        match crate::tracking::enumerate_cameras() {
+            Ok(cams) => {
+                self.tracking.available_cameras = Some(cams);
+                None
+            }
+            Err(e) => {
+                // Keep whatever the last good scan produced; the error
+                // is the actionable signal.
+                Some(t!("tracking.camera_scan_failed", error = e))
+            }
+        }
+    }
+
     /// Start the camera with the panel-configured resolution / fps /
     /// pipeline, applying the safe-mode clamp. Single entry point for
     /// the top-bar toggle; the Tracking panel's Start button and its
@@ -1438,7 +1521,9 @@ impl GuiApp {
             (w, h, fps)
         };
         let pipeline = self.tracking.pipeline_config();
-        self.app.start_tracking_with_params(w, h, fps, pipeline);
+        let camera_serial = self.tracking.camera_serial.clone();
+        self.app
+            .start_tracking_with_params(w, h, fps, camera_serial, pipeline);
     }
 
     /// Open the pose-calibration modal at the active profile's last
@@ -1836,6 +1921,7 @@ impl eframe::App for GuiApp {
             self.app.avatars.len(),
             self.tracking.toggle_tracking,
             self.runtime_status.frame_count,
+            self.app.last_sim_substeps,
         );
 
         if !self.runtime_status.paused {

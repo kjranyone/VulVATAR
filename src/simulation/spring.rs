@@ -1,9 +1,9 @@
 use crate::asset::ColliderShape;
 use crate::avatar::AvatarInstance;
 use crate::math_utils::{
-    closest_point_on_segment, mat4_translation, quat_from_vectors, quat_mul, quat_normalize,
-    quat_rotate_vec3, vec3_add, vec3_cross, vec3_dot, vec3_length, vec3_length_sq, vec3_scale,
-    vec3_sub, Vec3,
+    closest_point_on_segment, mat4_rotation_to_quat, mat4_translation, quat_conjugate,
+    quat_from_vectors, quat_mul, quat_normalize, quat_rotate_vec3, vec3_add, vec3_cross,
+    vec3_dot, vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
 };
 use crate::simulation::cloth::ResolvedCollider;
 
@@ -176,38 +176,6 @@ fn resolve_capsule_collision(
     }
 }
 
-/// Compute the local rotation that maps the rest-pose direction to the
-/// solved world direction and write it back into the avatar's local
-/// transforms.  Returns `true` if the rotation was successfully written.
-fn compute_rotation_writeback(
-    next: &Vec3,
-    parent_world_pos: &Vec3,
-    rest_local_translation: &Vec3,
-    parent_global_transform: &[[f32; 4]; 4],
-    rest_rotation: &[f32; 4],
-    local_rotation_out: &mut [f32; 4],
-) -> bool {
-    let solved_dir_world = vec3_sub(next, parent_world_pos);
-    let rest_dir_len = vec3_length(rest_local_translation);
-    if rest_dir_len < 1e-8 {
-        return false;
-    }
-    let rest_dir_norm = vec3_scale(rest_local_translation, 1.0 / rest_dir_len);
-
-    let solved_dir_local =
-        mat4_inverse_transform_direction(parent_global_transform, &solved_dir_world);
-    let solved_dir_local_len = vec3_length(&solved_dir_local);
-    if solved_dir_local_len < 1e-8 {
-        return false;
-    }
-    let solved_dir_local_norm = vec3_scale(&solved_dir_local, 1.0 / solved_dir_local_len);
-
-    let rot = quat_from_to(&rest_dir_norm, &solved_dir_local_norm);
-    let final_rot = quat_mul(&rot, rest_rotation);
-    *local_rotation_out = quat_normalize(&final_rot);
-    true
-}
-
 pub fn step_spring_bones(
     dt: f32,
     avatar: &mut AvatarInstance,
@@ -275,6 +243,33 @@ pub fn step_spring_bones(
             continue;
         }
 
+        // Carried frame for the joint loop. Iteration `j` solves the
+        // segment (joints[j-1] → joints[j]): its anchor is the origin of
+        // `joints[j-1]` and the solved rotation is written into
+        // `joints[j-1]` — the segment's *head*. Under the engine's T·R
+        // local compose order (`Transform::to_matrix` puts translation
+        // outside the rotation block) a node's rotation aims the segment
+        // to its child, not the node's own offset, so writing the tail
+        // node instead left the first segment of every chain frozen at
+        // rest and displaced each swing one segment down.
+        //
+        // For `j == 1` the head is the chain root, whose pose global is
+        // fresh this frame (tracking). For `j >= 2` the head was solved
+        // earlier in this loop, so we carry its solved origin
+        // (`positions[j-1]`, == `next` of the previous iteration) and its
+        // post-solve basis (parent basis ∘ written rotation). The pose
+        // globals are only recomputed after the whole solver, so reading
+        // them here would anchor bent chains to rest-derived transforms
+        // and make the solved chain diverge from the rendered one.
+        let head_idx = joints[0].0 as usize;
+        let mut anchor = mat4_translation(&avatar.pose.global_transforms[head_idx]);
+        let mut head_parent_basis = match avatar.asset.skeleton.nodes[head_idx].parent {
+            Some(p) => {
+                mat4_rotation_to_quat(&avatar.pose.global_transforms[p.0 as usize])
+            }
+            None => [0.0, 0.0, 0.0, 1.0],
+        };
+
         for j in 1..joints.len() {
             let stiffness = (spring_asset
                 .joint_stiffness
@@ -301,7 +296,7 @@ pub fn step_spring_bones(
                 * gravity_scale)
                 .max(0.0);
             let node_idx = joints[j].0 as usize;
-            let parent_idx = joints[j - 1].0 as usize;
+            let head_idx = joints[j - 1].0 as usize;
 
             // Retrieve current / previous positions from per-joint state.
             let current = avatar.secondary_motion.spring_states[chain_idx]
@@ -327,15 +322,21 @@ pub fn step_spring_bones(
                 previous
             };
 
-            let parent_world_pos = mat4_translation(&avatar.pose.global_transforms[parent_idx]);
+            // Anchor from the carried frame (see the comment above the
+            // loop): the head joint's solved origin, not its rest-derived
+            // pose global.
+            let parent_world_pos = anchor;
             let rest_local_translation =
                 avatar.asset.skeleton.nodes[node_idx].rest_local.translation;
             let bone_length = vec3_length(&rest_local_translation).max(0.001);
 
-            let rest_world_dir = mat4_transform_direction(
-                &avatar.pose.global_transforms[parent_idx],
-                &rest_local_translation,
-            );
+            // Segment rest direction in the head node's local frame
+            // (head rest rotation applied to the bone axis), and the
+            // stiffness pull target following the solved bend of the
+            // parent segment.
+            let head_rest_rot = avatar.asset.skeleton.nodes[head_idx].rest_local.rotation;
+            let rest_dir_local = quat_rotate_vec3(&head_rest_rot, &rest_local_translation);
+            let rest_world_dir = quat_rotate_vec3(&head_parent_basis, &rest_dir_local);
             let rest_world_target = vec3_add(&parent_world_pos, &rest_world_dir);
 
             // 1. Verlet integration
@@ -354,7 +355,10 @@ pub fn step_spring_bones(
             // 2. Enforce bone length
             next = enforce_bone_length(&next, &parent_world_pos, bone_length);
 
-            // 3. Collider resolution
+            // 3. Collider resolution. Snapshot the pre-collision position
+            // so the total projection can be subtracted from the implicit
+            // velocity in step 4.
+            let pre_collision = next;
             for collider in &colliders {
                 let collider_node = collider.node.0 as usize;
                 if collider_node >= avatar.pose.global_transforms.len() {
@@ -437,7 +441,15 @@ pub fn step_spring_bones(
                 }
             }
 
-            // 4. Update per-joint state
+            // 4. Update per-joint state. Verlet stores velocity
+            // implicitly as (current - previous); a collider projection
+            // that moves only `current` converts this step's penetration
+            // depth into an outward kick next step — the hair bouncing
+            // off a shoulder instead of draping on it. Shifting
+            // `previous` by the same correction makes the contact
+            // inelastic: the chain keeps its tangential slide, loses the
+            // normal restitution.
+            let correction = vec3_sub(&next, &pre_collision);
             if let Some(pos) = avatar.secondary_motion.spring_states[chain_idx]
                 .positions
                 .get_mut(j)
@@ -448,19 +460,44 @@ pub fn step_spring_bones(
                 .previous_positions
                 .get_mut(j)
             {
-                *prev = current;
+                *prev = vec3_add(&current, &correction);
             }
 
-            // 5. Rotation writeback
-            let rest_rot = avatar.asset.skeleton.nodes[node_idx].rest_local.rotation;
-            compute_rotation_writeback(
-                &next,
-                &parent_world_pos,
-                &rest_local_translation,
-                &avatar.pose.global_transforms[parent_idx],
-                &rest_rot,
-                &mut avatar.pose.local_transforms[node_idx].rotation,
-            );
+            // 5. Rotation writeback into the segment's HEAD node
+            // (joints[j-1]): its rotation must aim the segment at the
+            // solved tail. `rest_dir_local` is the segment's rest
+            // direction in the head's local frame, so the delta rotation
+            // maps rest → solved in the head's parent frame, composed
+            // before the head's own rest rotation. Also stored in the
+            // chain state so frames that skip the solver (zero
+            // substeps) can re-apply it over the per-frame rest reset in
+            // `build_base_pose`.
+            let solved_dir_world = vec3_sub(&next, &parent_world_pos);
+            let rest_dir_len = vec3_length(&rest_dir_local);
+            let solved_dir_len = vec3_length(&solved_dir_world);
+            if rest_dir_len > 1e-8 && solved_dir_len > 1e-8 {
+                let solved_dir_local = quat_rotate_vec3(
+                    &quat_conjugate(&head_parent_basis),
+                    &solved_dir_world,
+                );
+                let rot = quat_from_to(
+                    &vec3_scale(&rest_dir_local, 1.0 / rest_dir_len),
+                    &vec3_scale(&solved_dir_local, 1.0 / vec3_length(&solved_dir_local)),
+                );
+                let written = quat_normalize(&quat_mul(&rot, &head_rest_rot));
+                avatar.pose.local_transforms[head_idx].rotation = written;
+                if let Some(slot) = avatar.secondary_motion.spring_states[chain_idx]
+                    .solved_rotations
+                    .get_mut(j - 1)
+                {
+                    *slot = written;
+                }
+                // Carry the head's post-solve basis (parent basis ∘
+                // written rotation) and the solved tail as the next
+                // segment's anchor.
+                head_parent_basis = quat_mul(&head_parent_basis, &written);
+            }
+            anchor = next;
         }
     }
 
@@ -480,19 +517,6 @@ fn mat4_transform_direction(m: &[[f32; 4]; 4], d: &Vec3) -> Vec3 {
         m[0][0] * d[0] + m[1][0] * d[1] + m[2][0] * d[2],
         m[0][1] * d[0] + m[1][1] * d[1] + m[2][1] * d[2],
         m[0][2] * d[0] + m[1][2] * d[1] + m[2][2] * d[2],
-    ]
-}
-
-/// Inverse-transform a direction by the upper-left 3x3 of a column-major 4x4
-/// matrix. Assumes the 3x3 is orthonormal (rotation only or uniform scale),
-/// so the inverse is the transpose.
-#[inline]
-fn mat4_inverse_transform_direction(m: &[[f32; 4]; 4], d: &Vec3) -> Vec3 {
-    // Transpose of the 3x3 block: rows become columns.
-    [
-        m[0][0] * d[0] + m[0][1] * d[1] + m[0][2] * d[2],
-        m[1][0] * d[0] + m[1][1] * d[1] + m[1][2] * d[2],
-        m[2][0] * d[0] + m[2][1] * d[1] + m[2][2] * d[2],
     ]
 }
 

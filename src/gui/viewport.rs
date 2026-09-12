@@ -215,8 +215,17 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 if let Some(ref tex) = state.viewport.texture {
                     let draw_rect = image_rect.expect("image_rect exists when texture does");
 
-                    // Fill letterbox/pillarbox area with background.
-                    painter.rect_filled(rect, 0.0, color::VIEWPORT_BG);
+                    // Fill letterbox/pillarbox margins. The preview always
+                    // renders at the OUTPUT resolution (WYSIWYG framing for
+                    // the virtual camera), so whenever the pane's aspect
+                    // differs there are margins — e.g. opening the inspector
+                    // narrows the pane and a band appears beside it. Those
+                    // margins are chrome around the output picture, not a
+                    // rendering void: fill them with the panel surface and
+                    // (below) stroke the frame edge, so the boundary reads
+                    // as a deliberate mat instead of an unexplained black
+                    // gap.
+                    painter.rect_filled(rect, 0.0, color::SURFACE_DIM);
 
                     // When alpha preview is on, draw a checkerboard behind the
                     // rendered image so transparent areas are visible.
@@ -254,6 +263,14 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
                     };
                     painter.image(tex.id(), draw_rect, uv, egui::Color32::WHITE);
+
+                    // Frame edge on top of the image so the output picture
+                    // is explicitly bounded against the margin fill above.
+                    painter.rect_stroke(
+                        draw_rect,
+                        0.0,
+                        egui::Stroke::new(1.0, color::OUTLINE_VARIANT),
+                    );
                 }
             } else {
                 // ── Placeholder (no rendered image yet) ────────────────

@@ -222,7 +222,10 @@ fn start_camera(state: &mut GuiApp, ctx: &egui::Context) {
     }
     let (w, h, fps) = effective_capture_params(state);
     let pipeline = state.tracking.pipeline_config();
-    state.app.start_tracking_with_params(w, h, fps, pipeline);
+    let camera_serial = state.tracking.camera_serial.clone();
+    state
+        .app
+        .start_tracking_with_params(w, h, fps, camera_serial, pipeline);
     ctx.data_mut(|d| {
         d.insert_temp(
             applied_format_id(),
@@ -240,6 +243,15 @@ fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
         let active = state.is_tracking_active();
         let ready = state.is_tracking_ready();
         let tracking_on = state.tracking.toggle_tracking;
+        let startable = state.camera_startable();
+
+        // Keep the device list below fresh: scans once on first draw,
+        // then every few seconds while it's empty (so plugging the
+        // camera in flips the list — and Start — without a manual
+        // Rescan), and never while the camera is streaming.
+        if let Some(err) = state.rescan_cameras(false, std::time::Duration::from_secs(3)) {
+            state.push_warning_notification(err);
+        }
 
         ui.horizontal(|ui| {
             if active && ready {
@@ -259,11 +271,34 @@ fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
                 // the filled-button silhouette so the layout doesn't
                 // jump when it flips to Stop.
                 let _ = filled_button(ui, None, &t!("tracking.preparing"), false);
-            } else if filled_button(ui, Some(ic::PLAY), &t!("tracking.start_camera"), true)
+            } else {
+                let start =
+                    filled_button(ui, Some(ic::PLAY), &t!("tracking.start_camera"), startable);
+                if startable {
+                    if start.clicked() {
+                        let ctx = ui.ctx().clone();
+                        start_camera(state, &ctx);
+                    }
+                } else {
+                    // Empty/unsupported device list — say why instead
+                    // of letting a dead button read as a hang.
+                    start.on_hover_text(t!("tracking.start_camera_no_device"));
+                }
+            }
+
+            if !active
+                && tonal_button(
+                    ui,
+                    Some(ic::REFRESH),
+                    &t!("tracking.refresh"),
+                    ButtonTone::Primary,
+                    true,
+                )
                 .clicked()
             {
-                let ctx = ui.ctx().clone();
-                start_camera(state, &ctx);
+                if let Some(err) = state.rescan_cameras(true, std::time::Duration::from_secs(3)) {
+                    state.push_warning_notification(err);
+                }
             }
         });
 
@@ -278,6 +313,8 @@ fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
             (color::ON_SURFACE_MUTED, t!("tracking.stopped").to_string())
         };
         ui.label(egui::RichText::new(status_text).color(status_color));
+
+        draw_camera_devices(ui, state);
 
         // Camera on but solve paused (pause hotkey) — offer the way back
         // right where the amber status is shown.
@@ -296,6 +333,101 @@ fn draw_camera_control(ui: &mut egui::Ui, state: &mut GuiApp) {
             );
         }
     });
+}
+
+/// Detected-camera list under the start button: which RealSense device
+/// the OS/driver answers with, its USB link, and — when it can't drive
+/// tracking — why. This is the "is my camera even seen?" answer that
+/// used to arrive only as a blocking error dialog after pressing Start.
+/// With several D400s connected, each row is a radio that records the
+/// pick (serial, persisted in `settings.json`) used by the next start.
+fn draw_camera_devices(ui: &mut egui::Ui, state: &mut GuiApp) {
+    use crate::gui::components::status_dot_label;
+
+    ui.add_space(4.0);
+    match state.tracking.available_cameras.as_deref() {
+        None => {
+            status_dot_label(ui, color::ON_SURFACE_MUTED, &t!("tracking.camera_scanning"));
+        }
+        Some([]) => {
+            status_dot_label(ui, color::ERROR, &t!("tracking.camera_detected_none"));
+            ui.label(
+                egui::RichText::new(t!("tracking.camera_detected_none_hint"))
+                    .small()
+                    .color(color::ON_SURFACE_VARIANT),
+            );
+        }
+        Some(cameras) => {
+            let selected_serial = state.tracking.camera_serial.clone();
+            let first_usable = cameras
+                .iter()
+                .find(|c| c.supported && !crate::tracking::usb_link_too_slow(c.usb_type.as_deref()))
+                .map(|c| c.serial.clone());
+            let usable_count = cameras
+                .iter()
+                .filter(|c| c.supported && !crate::tracking::usb_link_too_slow(c.usb_type.as_deref()))
+                .count();
+
+            for cam in cameras {
+                let usb_slow = crate::tracking::usb_link_too_slow(cam.usb_type.as_deref());
+                let usable = cam.supported && !usb_slow;
+                let usb = match cam.usb_type.as_deref() {
+                    Some(u) => t!("tracking.camera_usb_link", usb = u).to_string(),
+                    None => t!("tracking.camera_usb_unknown").to_string(),
+                };
+                let mut caption = format!(
+                    "{}  ·  {}  ·  {}",
+                    cam.name,
+                    t!("tracking.camera_serial", serial = cam.serial),
+                    usb
+                );
+                if usb_slow {
+                    caption.push_str(&format!("  ·  {}", t!("tracking.camera_usb2_warning")));
+                } else if !cam.supported {
+                    caption.push_str(&format!("  ·  {}", t!("tracking.camera_not_d400")));
+                }
+
+                if cam.supported {
+                    // Radio selects WHICH D400 to open; the pick rides
+                    // along to `RealSenseCapture::open` at the next
+                    // start. No explicit pick = first usable (implicit
+                    // selection mirrors the backend's fallback).
+                    // A USB-2 device can't stream, so its radio stays
+                    // visible (the row explains why) but unselectable.
+                    let checked = match selected_serial.as_deref() {
+                        Some(s) => s == cam.serial,
+                        None => first_usable.as_deref() == Some(cam.serial.as_str()),
+                    };
+                    let response = ui.add_enabled(
+                        usable,
+                        egui::RadioButton::new(checked, &caption),
+                    );
+                    if usable && response.clicked() {
+                        state.tracking.camera_serial = Some(cam.serial.clone());
+                        state.project_status.app_settings_dirty = true;
+                    }
+                } else {
+                    let dot = color::ON_SURFACE_MUTED;
+                    status_dot_label(ui, dot, &caption);
+                }
+            }
+
+            if usable_count > 1 && selected_serial.is_none() {
+                ui.label(
+                    egui::RichText::new(t!("tracking.camera_first_used"))
+                        .small()
+                        .color(color::ON_SURFACE_VARIANT),
+                );
+            }
+            if state.is_tracking_active() && usable_count > 0 {
+                ui.label(
+                    egui::RichText::new(t!("tracking.camera_selection_pending"))
+                        .small()
+                        .color(color::ON_SURFACE_VARIANT),
+                );
+            }
+        }
+    }
 }
 
 /// ② Calibration entry + status, promoted to its own card.
@@ -428,7 +560,10 @@ fn draw_input_device(ui: &mut egui::Ui, state: &mut GuiApp) {
                 {
                     let (w, h, fps) = effective_capture_params(state);
                     let pipeline = state.tracking.pipeline_config();
-                    state.app.start_tracking_with_params(w, h, fps, pipeline);
+                    let camera_serial = state.tracking.camera_serial.clone();
+                    state
+                        .app
+                        .start_tracking_with_params(w, h, fps, camera_serial, pipeline);
                     ui.ctx()
                         .data_mut(|d| d.insert_temp(applied_format_id(), current));
                     state.push_notification(t!(

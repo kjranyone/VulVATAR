@@ -227,6 +227,7 @@ impl GuiApp {
             pan_sensitivity: self.settings.pan_sensitivity,
             cloth_autosave_consent: self.cloth_authoring.autosave_consent,
             last_project_path: self.settings.last_project_path.clone(),
+            camera_serial: self.tracking.camera_serial.clone(),
             ..crate::persistence::AppSettings::default()
         }
     }

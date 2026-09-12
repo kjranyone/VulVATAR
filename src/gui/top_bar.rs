@@ -390,14 +390,30 @@ fn draw_camera_toggle(ui: &mut Ui, state: &mut GuiApp, label: &str) {
     use crate::gui::components::{filled_button, tonal_button, ButtonTone};
     let active = state.is_tracking_active();
     let ready = state.is_tracking_ready();
+    // The toggle lives in every mode, so it also keeps the enumeration
+    // fresh (once, then every few seconds while empty) — otherwise this
+    // gate would run on data the Tracking panel may never have scanned.
+    if !active {
+        if let Some(err) = state.rescan_cameras(false, std::time::Duration::from_secs(3)) {
+            state.push_warning_notification(err);
+        }
+    }
+    let startable = state.camera_startable();
     if active && ready {
         if tonal_button(ui, Some(ic::PAUSE), label, ButtonTone::Error, true).clicked() {
             state.app.stop_tracking();
         }
     } else if active {
         let _ = filled_button(ui, None, &t!("tracking.preparing"), false);
-    } else if filled_button(ui, Some(ic::PLAY), label, true).clicked() {
-        state.start_camera_with_current_params();
+    } else {
+        let start = filled_button(ui, Some(ic::PLAY), label, startable);
+        if startable {
+            if start.clicked() {
+                state.start_camera_with_current_params();
+            }
+        } else {
+            start.on_hover_text(t!("tracking.start_camera_no_device"));
+        }
     }
 }
 

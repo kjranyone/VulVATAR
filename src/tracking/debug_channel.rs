@@ -391,6 +391,7 @@ pub fn dump_gui_heartbeat(
     avatars_loaded: usize,
     tracking_enabled: bool,
     frame_count: u64,
+    sim_substeps: u32,
 ) {
     if !enabled() {
         return;
@@ -408,6 +409,11 @@ pub fn dump_gui_heartbeat(
         // `seq`, which advances on every frame. seq climbing while
         // frame_count holds still IS the paused signature.
         "frame_count": frame_count,
+        // Substeps the fixed-step sim clock yielded on the previous
+        // unpaused frame. Zero means the spring solver did not run that
+        // frame — correlate a one-frame hair clip with this before
+        // suspecting the solver itself.
+        "sim_substeps": sim_substeps,
     });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_gui.json"), &bytes);

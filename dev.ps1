@@ -820,6 +820,7 @@ $commands = @(
     @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
     @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
 
+    @{ Group = "Camera & depth"; Label = "diagnose realsense (enumerate + stream test)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('run','--bin','diagnose_realsense')" },
     @{ Group = "Camera & depth"; Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
     @{ Group = "Camera & depth"; Label = "install mf virtual camera (HKLM)"; Cmd = "Install-MfCameraSystem" },
     @{ Group = "Camera & depth"; Label = "uninstall mf virtual camera"; Cmd = "Uninstall-MfCamera" },

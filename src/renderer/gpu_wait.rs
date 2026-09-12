@@ -45,10 +45,7 @@ pub(crate) const GPU_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// other error the future is intentionally leaked (see module docs),
 /// the failure is logged at ERROR and stamped into the tracking stage
 /// log, and a descriptive error string is returned.
-pub(crate) fn wait_fence_bounded<F>(
-    fence: FenceSignalFuture<F>,
-    label: &str,
-) -> Result<(), String>
+pub(crate) fn wait_fence_bounded<F>(fence: FenceSignalFuture<F>, label: &str) -> Result<(), String>
 where
     F: GpuFuture,
 {

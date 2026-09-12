@@ -50,8 +50,8 @@ use crate::renderer::frame_input::RenderFrameInput;
 /// lookup); tune those first if the background shows up in frame profiles.
 mod background_fs {
     vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r"
+                ty: "fragment",
+                src: r"
 #version 450
 
 layout(location = 0) in vec2 frag_uv;
@@ -184,7 +184,7 @@ void main() {
     out_color = vec4(col * pc.intensity, 1.0);
 }
 "
-    }
+            }
 }
 
 /// Push-constant mirror of the shader's `Push` block (96 bytes, under the
@@ -224,8 +224,7 @@ pub(super) fn build_push_constants(input: &RenderFrameInput) -> BackgroundPushCo
     let view = &input.camera.view;
     let proj = &input.camera.projection;
 
-    let project =
-        |p: [f32; 3]| super::project_world_to_uv(view, proj, p).unwrap_or(CENTER);
+    let project = |p: [f32; 3]| super::project_world_to_uv(view, proj, p).unwrap_or(CENTER);
 
     let reactivity = if tracking.valid {
         settings.reactivity * input.avatar_opacity.clamp(0.0, 1.0)
