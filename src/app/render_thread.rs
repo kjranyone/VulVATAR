@@ -219,6 +219,8 @@ impl RenderThreadInner {
                             stats: crate::renderer::RenderStats::default(),
                             exported_frame: None,
                             depth_ndc: None,
+
+                            cloth_readback: Vec::new(),
                         });
                         continue;
                     }
@@ -241,7 +243,8 @@ impl RenderThreadInner {
                                 stats: crate::renderer::RenderStats::default(),
                                 exported_frame: None,
                                 depth_ndc: None,
-                            }
+
+                                cloth_readback: Vec::new(),                            }
                         }
                     };
                     self.publish_result(result);
@@ -322,7 +325,8 @@ mod tests {
             stats: RenderStats::default(),
             exported_frame: None,
             depth_ndc: None,
-        }
+
+            cloth_readback: Vec::new(),        }
     }
 
     fn cpu_result() -> RenderResult {
@@ -348,7 +352,8 @@ mod tests {
                 preview_pixels: None,
             }),
             depth_ndc: None,
-        }
+
+            cloth_readback: Vec::new(),        }
     }
 
     fn gpu_result(lease_id: u64) -> RenderResult {
@@ -384,7 +389,8 @@ mod tests {
                 preview_pixels: None,
             }),
             depth_ndc: None,
-        }
+
+            cloth_readback: Vec::new(),        }
     }
 
     #[test]

@@ -73,6 +73,13 @@ pub struct AppSettings {
     /// connected, so a stale pick never blocks capture.
     #[serde(default)]
     pub camera_serial: Option<String>,
+    /// Cloth solver backend for freshly attached cloth. `None` keeps
+    /// the `VULVATAR_CLOTH_GPU` env-var decision (CPU default);
+    /// `Some(true)` opts every future attach into the GPU compute
+    /// backend for this install. Takes effect on the NEXT attach —
+    /// the backend is a one-shot per-cloth decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloth_gpu_backend: Option<bool>,
 }
 
 fn default_app_settings_version() -> u32 {
@@ -90,6 +97,7 @@ impl Default for AppSettings {
             cloth_autosave_consent: None,
             last_project_path: None,
             camera_serial: None,
+            cloth_gpu_backend: None,
         }
     }
 }
@@ -161,5 +169,7 @@ pub(super) fn migrate_legacy_app_settings_from(path: &Path) -> Option<AppSetting
         last_project_path: None,
         // Legacy projects predate the device pick — no selection yet.
         camera_serial: None,
+        // And predate the cloth backend preference — env decides.
+        cloth_gpu_backend: None,
     })
 }

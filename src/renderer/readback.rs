@@ -141,6 +141,9 @@ impl VulkanRenderer {
             stats: pending.stats,
             exported_frame: Some(exported_frame),
             depth_ndc,
+            // Overwritten by `render` with the current-frame cloth
+            // readback before the result leaves the renderer.
+            cloth_readback: Vec::new(),
         }))
     }
 

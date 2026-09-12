@@ -19,7 +19,7 @@ use crate::asset::{MeshId, PrimitiveId};
 use crate::renderer::gpu_alloc;
 use crate::renderer::{
     pipeline, ClothGpuCollideResources, ClothGpuConstraintResources, ClothGpuNormalResources,
-    ClothGpuSlot, VulkanRenderer,
+    ClothGpuSelfColResources, ClothGpuSlot, ClothReadback, VulkanRenderer,
 };
 
 impl VulkanRenderer {
@@ -216,6 +216,7 @@ impl VulkanRenderer {
                 constraints,
                 normals,
                 collide: None,
+                selfcol: None,
             });
         }
         Ok(())
@@ -482,6 +483,174 @@ fn allocate_cloth_normal_resources(
         control_ubo,
         normal_set,
     })
+}
+
+impl VulkanRenderer {
+    /// Read the previous frame's GPU cloth state (positions + normals)
+    /// back to the CPU. Called from `render` after the frame's fence
+    /// has been waited (see `RenderResult::cloth_readback`), so the
+    /// host-visible SSBOs read coherently. Slots that never dispatched
+    /// (`version == 0`) are skipped; cost is one mapped read per
+    /// active GPU cloth (~30 KB + ~30 KB at 2.5k particles).
+    pub(crate) fn read_cloth_positions(&mut self) -> Vec<ClothReadback> {
+        let mut out = Vec::new();
+        for ((mesh_id, primitive_id), slot) in self.transform_cache.iter() {
+            let Some(gpu) = slot.cloth_gpu.as_ref() else {
+                continue;
+            };
+            if gpu.state.version == 0 {
+                continue; // allocated but never dispatched
+            }
+            let positions = match slot.cloth_pos_ssbo.read() {
+                Ok(guard) => guard.iter().map(|p| [p[0], p[1], p[2]]).collect(),
+                Err(e) => {
+                    log::warn!("render: cloth readback (positions) failed: {e}");
+                    continue;
+                }
+            };
+            let normals = if gpu.normals.is_some() {
+                slot.cloth_norm_ssbo
+                    .read()
+                    .ok()
+                    .map(|guard| guard.iter().map(|n| [n[0], n[1], n[2]]).collect())
+            } else {
+                None
+            };
+            out.push(ClothReadback {
+                mesh_id: *mesh_id,
+                primitive_id: *primitive_id,
+                version: gpu.state.version,
+                positions,
+                normals,
+            });
+        }
+        out
+    }
+}
+
+/// Allocate the per-slot self-collision resources (grid hash table +
+/// particle-neighbour CSR from the attach constraints + control UBO).
+/// Called lazily from the prepare half the first time a frame arrives
+/// with `self_collision` enabled; the CSR is attach-static, the
+/// control UBO's radius is rewritten per frame.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ensure_cloth_gpu_selfcol_resources(
+    renderer_slot: &mut crate::renderer::TransformGpuData,
+    constraints: &[(u32, u32, f32, f32)],
+    particle_count: u32,
+    radius: f32,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+    cloth_selfcol_build_pipeline: &Arc<ComputePipeline>,
+    cloth_selfcol_resolve_pipeline: &Arc<ComputePipeline>,
+) -> Result<(), String> {
+    use crate::simulation::cloth_gpu_boundary::build_particle_particle_adjacency;
+    {
+        let gpu = renderer_slot
+            .cloth_gpu
+            .as_mut()
+            .ok_or("renderer: selfcol resources require an allocated cloth slot")?;
+        if gpu.selfcol.is_some() {
+            if let Some(res) = gpu.selfcol.as_mut() {
+                let mut g = res
+                    .control_ubo
+                    .write()
+                    .map_err(|e| format!("renderer: selfcol UBO write: {e}"))?;
+                g.particle_count = particle_count;
+                g.radius = radius;
+            }
+            return Ok(());
+        }
+    }
+    let pairs: Vec<(u32, u32)> = constraints.iter().map(|c| (c.0, c.1)).collect();
+    let adj = build_particle_particle_adjacency(&pairs, particle_count);
+    let adj_offsets_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        adj.offsets.iter().copied(),
+        "selfcol adj offsets SSBO",
+    )?;
+    let adj_particles_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        adj.triangles.iter().copied(),
+        "selfcol adj particles SSBO",
+    )?;
+    let cell_counts_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+        vec![0u32; pipeline::CLOTH_SELFCOL_TABLE_SIZE as usize],
+        "selfcol cell counts SSBO",
+    )?;
+    let cell_entries_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        vec![0u32; (pipeline::CLOTH_SELFCOL_TABLE_SIZE * pipeline::CLOTH_SELFCOL_BUCKET_SLOTS)
+            as usize],
+        "selfcol cell entries SSBO",
+    )?;
+    let control = pipeline::ClothSelfColControl {
+        particle_count,
+        radius,
+        table_size: pipeline::CLOTH_SELFCOL_TABLE_SIZE,
+        _pad: 0,
+    };
+    let control_ubo = gpu_alloc::host_ubo(memory_allocator, control, "selfcol control UBO")?;
+
+    let build_layout = cloth_selfcol_build_pipeline
+        .layout()
+        .set_layouts()
+        .first()
+        .ok_or("renderer: selfcol build pipeline missing set 0")?
+        .clone();
+    let build_set = DescriptorSet::new(
+        ds_allocator.clone(),
+        build_layout,
+        [
+            WriteDescriptorSet::buffer(0, renderer_slot.cloth_pos_ssbo.clone()),
+            WriteDescriptorSet::buffer(1, cell_counts_ssbo.clone()),
+            WriteDescriptorSet::buffer(2, cell_entries_ssbo.clone()),
+            WriteDescriptorSet::buffer(3, control_ubo.clone()),
+        ],
+        [],
+    )
+    .map_err(|e| format!("renderer: selfcol build descriptor set: {e}"))?;
+
+    let resolve_layout = cloth_selfcol_resolve_pipeline
+        .layout()
+        .set_layouts()
+        .first()
+        .ok_or("renderer: selfcol resolve pipeline missing set 0")?
+        .clone();
+    let resolve_set = DescriptorSet::new(
+        ds_allocator.clone(),
+        resolve_layout,
+        [
+            WriteDescriptorSet::buffer(0, renderer_slot.cloth_pos_ssbo.clone()),
+            WriteDescriptorSet::buffer(1, adj_offsets_ssbo.clone()),
+            WriteDescriptorSet::buffer(2, adj_particles_ssbo.clone()),
+            WriteDescriptorSet::buffer(3, cell_counts_ssbo.clone()),
+            WriteDescriptorSet::buffer(4, cell_entries_ssbo.clone()),
+            WriteDescriptorSet::buffer(5, control_ubo.clone()),
+        ],
+        [],
+    )
+    .map_err(|e| format!("renderer: selfcol resolve descriptor set: {e}"))?;
+
+    let gpu = renderer_slot
+        .cloth_gpu
+        .as_mut()
+        .expect("cloth slot present");
+    gpu.selfcol = Some(ClothGpuSelfColResources {
+        adj_offsets_ssbo,
+        adj_particles_ssbo,
+        cell_counts_ssbo,
+        cell_entries_ssbo,
+        control_ubo,
+        build_set,
+        resolve_set,
+    });
+    Ok(())
 }
 
 /// Build / refresh the per-slot GPU collision resources for this

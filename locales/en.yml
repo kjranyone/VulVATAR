@@ -480,6 +480,7 @@ inspector:
   primary_sim_positions: "Primary sim positions: %{count}"
   primary_deform: "Primary deform version: %{version}"
   cloth_solver_backend: "Solver backend: %{backend}"
+  cloth_gpu_pref_next_attach: "GPU solver for new cloth (applies on next attach)"
   primary_state_none: "Primary cloth state: None (overlays only)"
   no_cloth_state: "No cloth state"
   model_library: "Model Library"

@@ -227,6 +227,16 @@ fn main() -> Result<(), String> {
                 sim.wind_direction = [0.35 * gust, (t * 1.8).cos() * 0.05, 0.2 * gust];
             }
 
+            // Force-enable self-collision for the GPU smoke when asked —
+            // the skirt asset ships with it off (matching the CPU default).
+            if std::env::var_os("VULVATAR_CLOTH_SELFCOL").is_some() {
+                if let Some(ref mut sim) = avatar.cloth_sim {
+                    sim.self_collision = true;
+                }
+                for slot in avatar.cloth_overlays.iter_mut() {
+                    slot.sim.self_collision = true;
+                }
+            }
             vulvatar_lib::simulation::cloth_solver::step_cloth(dt, &mut avatar, &[]);
         }
 
@@ -273,6 +283,20 @@ fn main() -> Result<(), String> {
             let render_result = renderer
                 .render(&frame_input)
                 .map_err(|e| format!("Rendering failed at frame {}: {}", frame, e))?;
+
+            // Fold the GPU readback into the overlay's ClothState so the
+            // per-frame health check reads the LIVE solver state (GPU
+            // backend: cs.sim_positions would otherwise stay frozen at
+            // the attach-time rest pose).
+            for entry in &render_result.cloth_readback {
+                for slot in avatar.cloth_overlays.iter_mut() {
+                    if slot.state.target_primitive_id == Some(entry.primitive_id) {
+                        slot.state.sim_positions = entry.positions.clone();
+                        slot.state.deform_output.deformed_positions = entry.positions.clone();
+                        slot.state.deform_output.version = entry.version as u64;
+                    }
+                }
+            }
 
             if let Some(exported) = render_result.exported_frame.as_ref() {
                 if let Some(pixels) = exported.cpu_pixel_data() {
@@ -761,6 +785,8 @@ fn build_render_frame_input(
                             ),
                             collision_margin: sim.collision_margin,
                             colliders: gpu_colliders(avatar),
+                            self_collision: sim.self_collision,
+                            self_collision_radius: sim.self_collision_radius,
                         }),
                         Some(ClothGpuAttachData {
                             constraints: sim

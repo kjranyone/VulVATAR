@@ -480,6 +480,7 @@ inspector:
   primary_sim_positions: "プライマリSIM位置: %{count}"
   primary_deform: "プライマリ変形バージョン: %{version}"
   cloth_solver_backend: "ソルバーバックエンド: %{backend}"
+  cloth_gpu_pref_next_attach: "新規クロスはGPUソルバー (次回アタッチから適用)"
   primary_state_none: "プライマリクロス状態: なし (オーバーレイのみ)"
   no_cloth_state: "クロス状態なし"
   model_library: "モデルライブラリ"

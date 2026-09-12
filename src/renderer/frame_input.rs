@@ -285,6 +285,13 @@ pub struct ClothGpuDispatchControl {
     /// Collision margin added to every capsule radius, mirroring
     /// `ClothSimState::collision_margin` on the CPU path.
     pub collision_margin: f32,
+    /// Whether the GPU self-collision passes run (mirrors
+    /// `ClothSimState::self_collision`; off by default, matching the
+    /// CPU solver).
+    pub self_collision: bool,
+    /// Self-collision particle radius (m). Particles closer than
+    /// `2 * radius` push apart; `ClothSimState::self_collision_radius`.
+    pub self_collision_radius: f32,
     /// World-space collision capsules for THIS frame (avatar-node
     /// colliders resolved from the current pose; spheres encoded as
     /// degenerate capsules with `p0 == p1`). Scene colliders and

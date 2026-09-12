@@ -773,6 +773,23 @@ fn draw_cloth_preview(
                         "inspector.cloth_solver_backend",
                         backend = cs.solver_backend.label()
                     ));
+                    // Persisted preference for FUTURE attaches (the
+                    // backend is a one-shot per-cloth decision; see
+                    // AppSettings::cloth_gpu_backend). Rides the
+                    // app-settings autosave tick.
+                    let mut gpu_pref =
+                        state.settings.cloth_gpu_backend.unwrap_or(false);
+                    if ui
+                        .checkbox(
+                            &mut gpu_pref,
+                            t!("inspector.cloth_gpu_pref_next_attach"),
+                        )
+                        .changed()
+                    {
+                        state.settings.cloth_gpu_backend = Some(gpu_pref);
+                        crate::simulation::cloth_gpu_boundary::set_cloth_backend_request(Some(gpu_pref));
+                        state.project_status.app_settings_dirty = true;
+                    }
                 } else if !avatar.cloth_overlays.is_empty() {
                     ui.label(t!("inspector.primary_state_none"));
                 } else {

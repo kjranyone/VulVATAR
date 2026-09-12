@@ -228,6 +228,7 @@ impl GuiApp {
             cloth_autosave_consent: self.cloth_authoring.autosave_consent,
             last_project_path: self.settings.last_project_path.clone(),
             camera_serial: self.tracking.camera_serial.clone(),
+            cloth_gpu_backend: self.settings.cloth_gpu_backend,
             ..crate::persistence::AppSettings::default()
         }
     }

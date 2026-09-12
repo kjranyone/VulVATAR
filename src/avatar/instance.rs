@@ -111,15 +111,13 @@ pub struct ClothState {
     /// (`VULVATAR_CLOTH_GPU=1`); a `RuntimeGpuBudget`-driven default
     /// flip is future work (needs a GPU collider stage first).
     ///
-    /// **Known limitation — mid-session flips**: Switching from `Gpu`
-    /// back to `Cpu` after the GPU solver has run for any frames will
-    /// resume the CPU solver from `deform_output.deformed_positions`,
-    /// which is the *initial rest pose* (the GPU writes only into the
-    /// renderer-owned `cloth_pos_ssbo` and never copies positions back
-    /// to the CPU-readable buffer). The cloth will jump to its rest
-    /// pose at the moment of the flip. Until a GPU→CPU readback path
-    /// is wired, treat `solver_backend` as a one-shot decision at
-    /// attach time, not a runtime toggle.
+    /// **Mid-session flips**: the renderer reads the GPU cloth state
+    /// back into `deform_output` every frame (one frame of latency,
+    /// fence-synchronised — see `RenderResult::cloth_readback`), so a
+    /// `Gpu` → `Cpu` switch resumes the CPU solver from the live
+    /// positions rather than the rest pose. Selection is still made
+    /// once per attach; flipping mid-garment remains untested and is
+    /// not exposed in the UI.
     pub solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend,
 }
 

@@ -794,6 +794,173 @@ void main() {
 }
 
 // ---------------------------------------------------------------------------
+// Cloth self-collision — grid build (P3-02 S2.3)
+// ---------------------------------------------------------------------------
+//
+// Bucketed spatial hash: cell size == min interaction distance
+// (2 * self_collision_radius), fixed-size table (16384 cells) with a
+// bounded slot count per cell (16). Distant cells hashing to the same
+// bucket are harmless (the resolve pass filters by exact distance);
+// bucket overflow DROPS entries, which is the one approximation vs
+// the CPU spatial hash — cloth needs >16 particles inside one
+// 2*radius cell for that, i.e. a fold far denser than the authoring
+// radius assumes. Counts are zeroed by the recording half
+// (`fill_buffer`) before each build dispatch, one grid per substep.
+pub mod cloth_selfcol_build_cs {
+    vulkano_shaders::shader! {
+                    ty: "compute",
+                    src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+layout(set = 0, binding = 1) buffer CellCounts {
+    uint count[];
+} cell_counts;
+layout(set = 0, binding = 2) buffer CellEntries {
+    uint e[];
+} cell_entries;
+// Rust mirror: `ClothSelfColControl`.
+layout(set = 0, binding = 3) uniform Control {
+    uint  particle_count;
+    float radius;
+    uint  table_size;
+    uint  _pad;
+} ctrl;
+
+// Shared with the resolve pass — must stay byte-identical.
+uint cell_hash(ivec3 c) {
+    uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u;
+    return h % ctrl.table_size;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= ctrl.particle_count) return;
+    vec4 pp = positions.p[i];
+    // NaN guard mirrors the CPU `SpatialHashGrid::insert` skip.
+    if (any(isnan(pp.xyz)) || any(isinf(pp.xyz))) return;
+    float cell = 2.0 * ctrl.radius;
+    ivec3 c = ivec3(floor(pp.xyz / max(cell, 1.0e-7)));
+    uint ci = cell_hash(c);
+    const uint K = 16u;
+    uint slot = atomicAdd(cell_counts.count[ci], 1u);
+    if (slot < K) {
+        cell_entries.e[ci * K + slot] = i;
+    }
+}
+"
+                }
+}
+
+// ---------------------------------------------------------------------------
+// Cloth self-collision — resolve (P3-02 S2.3)
+// ---------------------------------------------------------------------------
+//
+// Per-particle pass over the 27-cell neighbourhood: exact-distance
+// filter, pinned particles skipped (self and neighbour — CPU parity),
+// constraint-connected pairs skipped via the particle-neighbour CSR
+// built at attach time. Corrections are averaged per particle, which
+// is order-independent and therefore matches the CPU accumulator
+// despite a different iteration order. GPU twin of
+// `cloth_solver::collision::resolve_self_collisions`.
+pub mod cloth_selfcol_resolve_cs {
+    vulkano_shaders::shader! {
+                    ty: "compute",
+                    src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+// Particle-neighbour CSR: particles sharing a distance constraint.
+layout(set = 0, binding = 1) readonly buffer AdjOffsets {
+    uint o[];
+} adj_offsets;
+layout(set = 0, binding = 2) readonly buffer AdjParticles {
+    uint n[];
+} adj_particles;
+layout(set = 0, binding = 3) buffer CellCounts {
+    uint count[];
+} cell_counts;
+layout(set = 0, binding = 4) buffer CellEntries {
+    uint e[];
+} cell_entries;
+layout(set = 0, binding = 5) uniform Control {
+    uint  particle_count;
+    float radius;
+    uint  table_size;
+    uint  _pad;
+} ctrl;
+
+uint cell_hash(ivec3 c) {
+    uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u;
+    return h % ctrl.table_size;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= ctrl.particle_count) return;
+    vec4 pp = positions.p[i];
+    if (pp.w <= 0.0) return; // pinned — CPU `if particles[i].pinned continue`
+
+    float min_dist = 2.0 * ctrl.radius;
+    float cell = max(min_dist, 1.0e-7);
+    ivec3 base = ivec3(floor(pp.xyz / cell));
+    const uint K = 16u;
+
+    vec3 acc = vec3(0.0);
+    uint hits = 0u;
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                uint ci = cell_hash(base + ivec3(dx, dy, dz));
+                uint cnt = min(cell_counts.count[ci], K);
+                for (uint s = 0u; s < cnt; ++s) {
+                    uint j = cell_entries.e[ci * K + s];
+                    if (j == i) continue;
+                    vec4 q = positions.p[j];
+                    if (q.w <= 0.0) continue; // pinned neighbour
+                    // Constraint-connected pairs are expected to be
+                    // close — CPU `connected_pairs` skip.
+                    bool connected = false;
+                    for (uint k = adj_offsets.o[i]; k < adj_offsets.o[i + 1u]; ++k) {
+                        if (adj_particles.n[k] == j) {
+                            connected = true;
+                            break;
+                        }
+                    }
+                    if (connected) continue;
+                    vec3 diff = q.xyz - pp.xyz; // i -> j
+                    float d2 = dot(diff, diff);
+                    if (d2 < min_dist * min_dist && d2 > 1.0e-24) {
+                        float d = sqrt(d2);
+                        float overlap = min_dist - d;
+                        vec3 dir = diff / d;
+                        // CPU: corrections[i] -= dir * overlap * 0.5
+                        //      (averaged below) — i moves away from j.
+                        acc -= dir * (overlap * 0.5);
+                        hits += 1u;
+                    }
+                }
+            }
+        }
+    }
+    if (hits > 0u) {
+        vec3 avg = acc / float(hits);
+        positions.p[i] = vec4(pp.xyz + avg, pp.w);
+    }
+}
+"
+                }
+}
+
+// ---------------------------------------------------------------------------
 // Cloth collision projection compute shader (P3-02 S2.2)
 // ---------------------------------------------------------------------------
 //
@@ -1901,6 +2068,73 @@ pub fn create_cloth_collide_compute_pipeline(
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .map_err(|e| format!("failed to create cloth collide compute pipeline: {e}"))
+}
+
+/// Control block for the self-collision build/resolve passes. Rust
+/// mirror of the GLSL `Control` uniform.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothSelfColControl {
+    pub particle_count: u32,
+    pub radius: f32,
+    pub table_size: u32,
+    pub _pad: u32,
+}
+
+/// Cell-count entries in the self-collision hash table. Kept in sync
+/// with the `K` constants inside both shaders.
+pub const CLOTH_SELFCOL_BUCKET_SLOTS: u32 = 16;
+/// Self-collision hash table size. 16384 cells × 16 slots × 4 B = 1 MiB.
+pub const CLOTH_SELFCOL_TABLE_SIZE: u32 = 16384;
+
+pub fn create_cloth_selfcol_build_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_selfcol_build_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth selfcol build shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth selfcol build entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth selfcol build layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth selfcol build layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth selfcol build pipeline: {e}"))
+}
+
+pub fn create_cloth_selfcol_resolve_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_selfcol_resolve_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth selfcol resolve shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth selfcol resolve entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth selfcol resolve layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth selfcol resolve layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth selfcol resolve pipeline: {e}"))
 }
 
 /// Build the compute pipeline that fuses skinning, morph-target blend, and

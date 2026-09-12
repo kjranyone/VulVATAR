@@ -213,6 +213,14 @@ impl PhysicsWorld {
         }
     }
 
+    /// Scene colliders resolved to world space — the same list
+    /// `step_cloth` feeds the CPU solver. Exposed so the app-side GPU
+    /// cloth snapshot collector can merge them into the frame's
+    /// capsule list (`collect_cloth_deforms`).
+    pub fn resolved_scene_colliders(&self) -> Vec<cloth::ResolvedCollider> {
+        cloth::resolve_scene_colliders(&self.scene_colliders)
+    }
+
     pub fn step_cloth(&mut self, dt: f32, avatar: &mut AvatarInstance, gravity: &SceneGravity) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
         apply_cloth_gravity(avatar, gravity);

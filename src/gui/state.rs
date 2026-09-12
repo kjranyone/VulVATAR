@@ -436,6 +436,9 @@ pub struct SettingsGuiState {
     /// slot here). Updated by `remember_last_project` on every explicit
     /// project open / save; consumed once at startup for the auto-reopen.
     pub last_project_path: Option<String>,
+    /// Mirror of [`crate::persistence::AppSettings::cloth_gpu_backend`]
+    /// — see that field for the one-shot-per-attach semantics.
+    pub cloth_gpu_backend: Option<bool>,
 }
 
 impl Default for SettingsGuiState {
@@ -446,6 +449,7 @@ impl Default for SettingsGuiState {
             orbit_sensitivity: 0.3,
             pan_sensitivity: 1.0,
             last_project_path: None,
+            cloth_gpu_backend: None,
         }
     }
 }

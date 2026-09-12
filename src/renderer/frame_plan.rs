@@ -78,11 +78,21 @@ pub(super) struct PlannedCloth {
     pub(super) constraints: Option<PlannedClothConstraints>,
     pub(super) normal: Option<PlannedClothNormal>,
     pub(super) collide: Option<PlannedClothCollide>,
+    pub(super) selfcol: Option<PlannedClothSelfCol>,
 }
 
 pub(super) struct PlannedClothCollide {
     pub(super) set: Arc<DescriptorSet>,
     pub(super) collider_count: u32,
+}
+
+/// Self-collision pass pair: build (re-zero + atomic grid fill) then
+/// resolve (neighbour push). `counts_ssbo` is the fill-buffer target
+/// the recording half zeroes before every build dispatch.
+pub(super) struct PlannedClothSelfCol {
+    pub(super) build_set: Arc<DescriptorSet>,
+    pub(super) resolve_set: Arc<DescriptorSet>,
+    pub(super) counts_ssbo: Subbuffer<[u32]>,
 }
 
 pub(super) struct PlannedClothConstraints {

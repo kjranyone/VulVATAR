@@ -298,6 +298,14 @@ pub struct GuiApp {
     /// they are developer readouts, not streamer-facing signal.
     pub debug_status_bar: bool,
 
+    /// Live measurement of the layout hole between a side panel's
+    /// painted frame edge and the cursor it advanced to (egui 0.30
+    /// SidePanel quirk; see `inspector::draw`). `[frame_right,
+    /// cursor_left, width]` in points; `None` when the layout is
+    /// tight. Published to `debug_gui.json` so the "black band" can
+    /// be diagnosed from the outside.
+    pub debug_panel_hole: Option<[f32; 3]>,
+
     pub transform: TransformState,
     pub camera_orbit: CameraOrbitState,
     pub tracking: TrackingGuiState,
@@ -365,6 +373,9 @@ impl GuiApp {
             migrated
         });
         crate::i18n::set_locale(&app_settings.locale);
+        // Publish the persisted cloth backend preference before any
+        // avatar (and therefore any cloth attach) can happen.
+        crate::simulation::cloth_gpu_boundary::set_cloth_backend_request(app_settings.cloth_gpu_backend);
 
         if let Some(fonts) = build_font_definitions(&crate::i18n::locale()) {
             cc.egui_ctx.set_fonts(fonts);
@@ -429,6 +440,7 @@ impl GuiApp {
             profile_dialog: None,
             pending_profile_switch: None,
             debug_status_bar: false,
+            debug_panel_hole: None,
 
             transform: TransformState::default(),
             camera_orbit: CameraOrbitState::default(),
@@ -446,6 +458,7 @@ impl GuiApp {
                 orbit_sensitivity: app_settings.orbit_sensitivity,
                 pan_sensitivity: app_settings.pan_sensitivity,
                 last_project_path: app_settings.last_project_path.clone(),
+                cloth_gpu_backend: app_settings.cloth_gpu_backend,
             },
 
             mirror_view: false,
@@ -752,6 +765,7 @@ impl GuiApp {
             profile_dialog: None,
             pending_profile_switch: None,
             debug_status_bar: false,
+            debug_panel_hole: None,
 
             transform: TransformState::default(),
             camera_orbit: CameraOrbitState::default(),
@@ -1284,6 +1298,7 @@ impl eframe::App for GuiApp {
             self.tracking.toggle_tracking,
             self.runtime_status.frame_count,
             self.app.last_sim_substeps,
+            self.debug_panel_hole,
         );
 
         if !self.runtime_status.paused {

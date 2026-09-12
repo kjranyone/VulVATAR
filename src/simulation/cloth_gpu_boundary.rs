@@ -127,6 +127,48 @@ impl ClothGpuSimulationState {
     }
 }
 
+/// CSR adjacency mapping particle → the particles it shares a distance
+/// constraint with (each endpoint lists the other). The GPU
+/// self-collision resolve pass uses it to skip constraint-connected
+/// pairs, mirroring the CPU solver's `connected_pairs` set. Same CSR
+/// shape as [`build_particle_constraint_adjacency`] but with particle
+/// indices in the scatter array (that one carries constraint indices,
+/// which the constraint accumulate pass needs instead).
+pub fn build_particle_particle_adjacency(
+    pairs: &[(u32, u32)],
+    particle_count: u32,
+) -> VertexTriangleAdjacency {
+    let n = particle_count as usize;
+    let in_range =
+        |v: u32| (v as usize) < n;
+    let mut degree = vec![0u32; n + 1];
+    for &(a, b) in pairs {
+        // Pairs with either endpoint out of range are dropped entirely
+        // — degrees and scatter must agree.
+        if in_range(a) && in_range(b) {
+            degree[a as usize + 1] += 1;
+            degree[b as usize + 1] += 1;
+        }
+    }
+    for i in 0..n {
+        degree[i + 1] += degree[i];
+    }
+    let mut scatter = vec![0u32; degree[n] as usize];
+    let mut cursor = degree.clone();
+    for &(a, b) in pairs {
+        if (a as usize) < n && (b as usize) < n {
+            scatter[cursor[a as usize] as usize] = b;
+            cursor[a as usize] += 1;
+            scatter[cursor[b as usize] as usize] = a;
+            cursor[b as usize] += 1;
+        }
+    }
+    VertexTriangleAdjacency {
+        offsets: degree,
+        triangles: scatter,
+    }
+}
+
 /// Which solver backend produces the [`ClothRenderConsumableDeform`]
 /// snapshots for a given cloth. The compute path is intentionally not yet
 /// reachable; `Cpu` is the only variant the avatar layer constructs today.
@@ -165,12 +207,39 @@ impl ClothSolverBackend {
 /// overlay slots. Promoting `Gpu` to the default (or driving it from
 /// `RuntimeGpuBudget`) is deliberately not done yet: see the collider
 /// / readback gaps on [`ClothSolverBackend::Gpu`].
+/// Runtime backend request for freshly attached cloth, published from
+/// the persisted `AppSettings::cloth_gpu_backend` before the first
+/// attach of the session: `None` keeps the `VULVATAR_CLOTH_GPU` env
+/// decision, `Some(true/false)` overrides it. A plain static (one
+/// Application writes before any attach; attach sites only read) —
+/// same shape as the tracking cadence atomics.
+static CLOTH_BACKEND_REQUESTED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0); // 0 = unset, 1 = force CPU, 2 = force GPU
+
+/// Publish the persisted backend preference. Must run before the first
+/// cloth attach of the session (attach caches its decision per cloth).
+pub fn set_cloth_backend_request(request: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    CLOTH_BACKEND_REQUESTED.store(
+        match request {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 pub fn solver_backend_from_env() -> ClothSolverBackend {
     static CACHE: std::sync::OnceLock<ClothSolverBackend> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        match std::env::var_os("VULVATAR_CLOTH_GPU") {
-            Some(v) if v != "0" => ClothSolverBackend::Gpu,
-            _ => ClothSolverBackend::Cpu,
+        match CLOTH_BACKEND_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => ClothSolverBackend::Cpu,
+            2 => ClothSolverBackend::Gpu,
+            _ => match std::env::var_os("VULVATAR_CLOTH_GPU") {
+                Some(v) if v != "0" => ClothSolverBackend::Gpu,
+                _ => ClothSolverBackend::Cpu,
+            },
         }
     })
 }
@@ -1145,6 +1214,182 @@ mod tests {
                     (gpu[k] - cpu[k]).abs() < 1e-5,
                     "case {case} axis {k}: gpu {gpu:?} vs cpu {cpu:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn particle_particle_adjacency_lists_both_endpoints() {
+        // Chain 0-1-2 plus an out-of-range pair that must be dropped.
+        let adj = build_particle_particle_adjacency(
+            &[(0, 1), (1, 2), (2, 9)],
+            3,
+        );
+        assert_eq!(&adj.offsets, &[0, 1, 3, 4]);
+        assert_eq!(&adj.triangles, &[1, 0, 2, 1]);
+    }
+
+    /// GPU mirror of `cloth_selfcol_resolve_cs`'s per-particle body
+    /// with the grid replaced by a brute-force scan over all particles
+    /// — identical pair set (the 27-cell neighbourhood is lossless for
+    /// distances < min_dist), so formula parity is exact.
+    fn selfcol_resolve_mirror(
+        positions: &[[f32; 3]],
+        inv_mass: &[f32],
+        connected: &std::collections::HashSet<(usize, usize)>,
+        radius: f32,
+    ) -> Vec<[f32; 3]> {
+        let n = positions.len();
+        let min_dist = 2.0 * radius;
+        let mut out = positions.to_vec();
+        for i in 0..n {
+            if inv_mass[i] <= 0.0 {
+                continue;
+            }
+            let mut acc = [0.0f32; 3];
+            let mut hits = 0usize;
+            for j in 0..n {
+                if j == i || inv_mass[j] <= 0.0 {
+                    continue;
+                }
+                let lo = i.min(j);
+                let hi = i.max(j);
+                if connected.contains(&(lo, hi)) {
+                    continue;
+                }
+                let diff = [
+                    positions[j][0] - positions[i][0],
+                    positions[j][1] - positions[i][1],
+                    positions[j][2] - positions[i][2],
+                ];
+                let d2 = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
+                if d2 < min_dist * min_dist && d2 > 1.0e-24 {
+                    let d = d2.sqrt();
+                    let overlap = min_dist - d;
+                    let dir = [diff[0] / d, diff[1] / d, diff[2] / d];
+                    acc[0] -= dir[0] * (overlap * 0.5);
+                    acc[1] -= dir[1] * (overlap * 0.5);
+                    acc[2] -= dir[2] * (overlap * 0.5);
+                    hits += 1;
+                }
+            }
+            if hits > 0 {
+                for k in 0..3 {
+                    out[i][k] += acc[k] / hits as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// CPU reference: transcription of
+    /// `cloth_solver::collision::resolve_self_collisions` with the
+    /// spatial hash replaced by the same brute-force pair set.
+    fn selfcol_resolve_cpu(
+        positions: &[[f32; 3]],
+        pinned: &[bool],
+        connected: &std::collections::HashSet<(usize, usize)>,
+        radius: f32,
+    ) -> Vec<[f32; 3]> {
+        let n = positions.len();
+        let min_dist = 2.0 * radius;
+        let mut corrections = vec![[0.0f32; 3]; n];
+        let mut counts = vec![0u32; n];
+        for i in 0..n {
+            if pinned[i] {
+                continue;
+            }
+            for j in (i + 1)..n {
+                if pinned[j] {
+                    continue;
+                }
+                if connected.contains(&(i, j)) {
+                    continue;
+                }
+                let diff = [
+                    positions[j][0] - positions[i][0],
+                    positions[j][1] - positions[i][1],
+                    positions[j][2] - positions[i][2],
+                ];
+                let d2 = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
+                if d2 < min_dist * min_dist && d2 > 1.0e-24 {
+                    let d = d2.sqrt();
+                    let overlap = min_dist - d;
+                    let dir = [diff[0] / d, diff[1] / d, diff[2] / d];
+                    let half = [dir[0] * overlap * 0.5, dir[1] * overlap * 0.5, dir[2] * overlap * 0.5];
+                    for k in 0..3 {
+                        corrections[i][k] -= half[k];
+                        corrections[j][k] += half[k];
+                    }
+                    counts[i] += 1;
+                    counts[j] += 1;
+                }
+            }
+        }
+        let mut out = positions.to_vec();
+        for i in 0..n {
+            if counts[i] > 0 && !pinned[i] {
+                for k in 0..3 {
+                    out[i][k] += corrections[i][k] / counts[i] as f32;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cloth_selfcol_resolve_formula_matches_cpu() {
+        let mut rng_state = 42_424_242u64;
+        let mut lcg = |s: &mut u64| -> f32 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*s >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
+        };
+        for case in 0..60 {
+            let n = 6 + (case % 10);
+            let radius = 0.01 + lcg(&mut rng_state).abs() * 0.02;
+            // Cluster particles inside one min_dist ball so the push
+            // paths actually fire, plus a few spread far away.
+            let mut positions = Vec::with_capacity(n);
+            for i in 0..n {
+                if i % 3 == 0 {
+                    positions.push([
+                        lcg(&mut rng_state) * radius,
+                        lcg(&mut rng_state) * radius,
+                        lcg(&mut rng_state) * radius,
+                    ]);
+                } else {
+                    positions.push([
+                        lcg(&mut rng_state) * 10.0,
+                        lcg(&mut rng_state) * 10.0,
+                        lcg(&mut rng_state) * 10.0,
+                    ]);
+                }
+            }
+            let mut pinned = vec![false; n];
+            for (i, p) in pinned.iter_mut().enumerate() {
+                *p = i % 5 == 0; // some pinned particles on both sides
+            }
+            let inv_mass: Vec<f32> = pinned.iter().map(|&p| if p { 0.0 } else { 1.0 }).collect();
+            // Constraint connectivity mirrors the CPU `connected_pairs`
+            // construction (both endpoint orderings in the set).
+            let mut connected = std::collections::HashSet::new();
+            for i in 0..n.saturating_sub(1) {
+                if i % 2 == 0 {
+                    connected.insert((i, i + 1));
+                }
+            }
+
+            let gpu = selfcol_resolve_mirror(&positions, &inv_mass, &connected, radius);
+            let cpu = selfcol_resolve_cpu(&positions, &pinned, &connected, radius);
+            for i in 0..n {
+                for k in 0..3 {
+                    assert!(
+                        (gpu[i][k] - cpu[i][k]).abs() < 1e-5,
+                        "case {case} particle {i} axis {k}: gpu {:?} vs cpu {:?}",
+                        gpu[i],
+                        cpu[i]
+                    );
+                }
             }
         }
     }

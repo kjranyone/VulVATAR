@@ -77,6 +77,7 @@ fn app_settings_roundtrip() {
         cloth_autosave_consent: Some(true),
         last_project_path: Some("C:/projects/stream.vvtproj".to_string()),
         camera_serial: Some("1234567890".to_string()),
+        cloth_gpu_backend: Some(true),
     };
     save_app_settings_to(&original, &path).expect("save");
     let loaded = load_app_settings_from(&path).expect("load");
@@ -90,6 +91,7 @@ fn app_settings_roundtrip() {
         Some("C:/projects/stream.vvtproj")
     );
     assert_eq!(loaded.camera_serial.as_deref(), Some("1234567890"));
+    assert_eq!(loaded.cloth_gpu_backend, Some(true));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

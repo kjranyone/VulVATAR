@@ -480,6 +480,7 @@ inspector:
   primary_sim_positions: "기본 SIM 위치: %{count}"
   primary_deform: "기본 변형 버전: %{version}"
   cloth_solver_backend: "솔버 백엔드: %{backend}"
+  cloth_gpu_pref_next_attach: "새 천은 GPU 솔버 (다음 부착부터 적용)"
   primary_state_none: "기본 의상 상태: 없음 (오버레이만)"
   no_cloth_state: "의상 상태 없음"
   model_library: "모델 라이브러리"

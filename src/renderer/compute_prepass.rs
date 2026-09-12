@@ -27,7 +27,7 @@ use crate::asset::PrimitiveId;
 use crate::renderer::frame_input::{self, RenderFrameInput};
 use crate::renderer::frame_plan::{
     DrawInfo, PlannedCloth, PlannedClothCollide, PlannedClothConstraints, PlannedClothNormal,
-    PlannedInstance, PlannedPrim,
+    PlannedClothSelfCol, PlannedInstance, PlannedPrim,
 };
 use crate::renderer::pipeline::{self, GpuVertex};
 use crate::renderer::{mat4_cols_identity, VulkanRenderer, TRANSFORM_LOCAL_SIZE};
@@ -716,6 +716,56 @@ impl VulkanRenderer {
                             None
                         };
 
+                        // S2.3 — self-collision resources (opt-in,
+                        // mirrors `ClothSimState::self_collision`). The
+                        // particle-neighbour CSR is attach-static; the
+                        // control UBO's radius is per-frame.
+                        let selfcol_plan = if ctrl.self_collision && ctrl.self_collision_radius > 0.0
+                        {
+                            match (
+                                self.cloth_selfcol_build_pipeline.as_ref(),
+                                self.cloth_selfcol_resolve_pipeline.as_ref(),
+                                cloth.gpu_attach.as_ref().map(|a| a.constraints.clone()),
+                            ) {
+                                (Some(build_pl), Some(resolve_pl), Some(constraints)) => {
+                                    let slot = self
+                                        .transform_cache
+                                        .get_mut(&key)
+                                        .expect("transform slot present");
+                                    match super::cloth_cache::ensure_cloth_gpu_selfcol_resources(
+                                        slot,
+                                        &constraints,
+                                        particle_count,
+                                        ctrl.self_collision_radius,
+                                        memory_allocator,
+                                        ds_allocator,
+                                        build_pl,
+                                        resolve_pl,
+                                    ) {
+                                        Ok(()) => slot
+                                            .cloth_gpu
+                                            .as_ref()
+                                            .and_then(|g| g.selfcol.as_ref())
+                                            .map(|sc| PlannedClothSelfCol {
+                                                build_set: sc.build_set.clone(),
+                                                resolve_set: sc.resolve_set.clone(),
+                                                counts_ssbo: sc.cell_counts_ssbo.clone(),
+                                            }),
+                                        Err(e) => {
+                                            warn!(
+                                                "render: cloth selfcol resources failed for primitive {:?}: {}",
+                                                mesh_inst.primitive_id, e
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         cloth_plan = Some(PlannedCloth {
                             verlet_set,
                             groups: [groups, 1, 1],
@@ -724,6 +774,7 @@ impl VulkanRenderer {
                             constraints: constraints_plan,
                             normal: normal_plan,
                             collide: collide_plan,
+                            selfcol: selfcol_plan,
                         });
                     }
                 }
@@ -874,6 +925,8 @@ impl VulkanRenderer {
         cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
         cloth_normal_pipeline: &Arc<ComputePipeline>,
         cloth_collide_pipeline: &Arc<ComputePipeline>,
+        cloth_selfcol_build_pipeline: &Arc<ComputePipeline>,
+        cloth_selfcol_resolve_pipeline: &Arc<ComputePipeline>,
         instances: &[PlannedInstance],
     ) -> Result<(), String> {
         builder
@@ -1001,6 +1054,51 @@ impl VulkanRenderer {
                                     })?;
                                 }
                             }
+                        }
+                    }
+
+                    // S2.3 — self-collision (opt-in): rebuild the grid
+                    // (zero + atomic fill) then resolve, once per
+                    // substep, between the constraint iterations and
+                    // the capsule projection — the CPU step order.
+                    if let Some(selfcol) = &cloth.selfcol {
+                        builder
+                            .fill_buffer(
+                                selfcol.counts_ssbo.clone().reinterpret::<[u32]>(),
+                                0u32,
+                            )
+                            .map_err(|e| format!("render: selfcol counts fill: {e}"))?;
+                        builder
+                            .bind_pipeline_compute(cloth_selfcol_build_pipeline.clone())
+                            .map_err(|e| format!("render: bind selfcol build: {e}"))?;
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Compute,
+                                cloth_selfcol_build_pipeline.layout().clone(),
+                                0,
+                                selfcol.build_set.clone(),
+                            )
+                            .map_err(|e| format!("render: bind selfcol build set: {e}"))?;
+                        unsafe {
+                            builder.dispatch(cloth.groups).map_err(|e| {
+                                format!("render: selfcol build dispatch: {e}")
+                            })?;
+                        }
+                        builder
+                            .bind_pipeline_compute(cloth_selfcol_resolve_pipeline.clone())
+                            .map_err(|e| format!("render: bind selfcol resolve: {e}"))?;
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Compute,
+                                cloth_selfcol_resolve_pipeline.layout().clone(),
+                                0,
+                                selfcol.resolve_set.clone(),
+                            )
+                            .map_err(|e| format!("render: bind selfcol resolve set: {e}"))?;
+                        unsafe {
+                            builder.dispatch(cloth.groups).map_err(|e| {
+                                format!("render: selfcol resolve dispatch: {e}")
+                            })?;
                         }
                     }
 

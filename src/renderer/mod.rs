@@ -59,6 +59,14 @@ pub struct RenderResult {
     pub has_alpha: bool,
     pub stats: RenderStats,
     pub exported_frame: Option<output_export::ExportedFrame>,
+    /// GPU cloth positions/normals read back from the previous frame's
+    /// compute dispatches (empty unless a `Gpu`-backed cloth rendered).
+    /// One frame stale by construction — read after the frame's fence
+    /// — which is what makes the host-visible SSBO read coherent. The
+    /// app thread folds these into `ClothState::deform_output` so
+    /// CPU-side consumers (cloth inspector, backend flips) see the
+    /// live solver state.
+    pub cloth_readback: Vec<ClothReadback>,
     /// Per-pixel non-linear NDC depth (`[0,1]`, `extent[0] × extent[1]`,
     /// row-major top-down, matching the colour readback) — populated only
     /// when [`VulkanRenderer::set_depth_readback`]`(true)` is active and the
@@ -70,6 +78,20 @@ pub struct RenderResult {
 /// Output of a one-shot thumbnail render. Carries decoded RGBA pixels
 /// directly so the caller can hand them straight to a PNG encoder
 /// without unwrapping the regular `RenderResult` / `ExportedFrame` chain.
+/// One GPU cloth's solved state, read back to the CPU with the frame.
+#[derive(Clone, Debug)]
+pub struct ClothReadback {
+    pub mesh_id: MeshId,
+    pub primitive_id: PrimitiveId,
+    /// Dispatch-count version mirror (`ClothGpuSimulationState::version`);
+    /// monotonic per dispatched frame.
+    pub version: u32,
+    /// xyz per particle (the SSBO's `w` inv_mass channel dropped).
+    pub positions: Vec<[f32; 3]>,
+    /// Recomputed normals when the slot has the normal stage.
+    pub normals: Option<Vec<[f32; 3]>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ThumbnailRenderResult {
     pub width: u32,
@@ -220,6 +242,7 @@ struct ClothGpuSlot {
     /// no triangle index data.
     normals: Option<ClothGpuNormalResources>,
     collide: Option<ClothGpuCollideResources>,
+    selfcol: Option<ClothGpuSelfColResources>,
 }
 
 /// Per-primitive constraint-projection resources for the Jacobi
@@ -276,6 +299,21 @@ struct ClothGpuCollideResources {
     control_ubo: Subbuffer<pipeline::ClothCollideControl>,
     collide_set: Arc<DescriptorSet>,
     collider_count: u32,
+}
+
+struct ClothGpuSelfColResources {
+    #[allow(dead_code)]
+    adj_offsets_ssbo: Subbuffer<[u32]>,
+    #[allow(dead_code)]
+    adj_particles_ssbo: Subbuffer<[u32]>,
+    /// Zeroed by the recording half (`fill_buffer`) before each build
+    /// dispatch; TRANSFER_DST for exactly that.
+    cell_counts_ssbo: Subbuffer<[u32]>,
+    #[allow(dead_code)]
+    cell_entries_ssbo: Subbuffer<[u32]>,
+    control_ubo: Subbuffer<pipeline::ClothSelfColControl>,
+    build_set: Arc<DescriptorSet>,
+    resolve_set: Arc<DescriptorSet>,
 }
 
 struct ClothGpuNormalResources {
@@ -351,6 +389,8 @@ pub struct VulkanRenderer {
     /// Cloth vertex normal recomputation compute pipeline (S3.1).
     cloth_normal_pipeline: Option<Arc<ComputePipeline>>,
     cloth_collide_pipeline: Option<Arc<ComputePipeline>>,
+    cloth_selfcol_build_pipeline: Option<Arc<ComputePipeline>>,
+    cloth_selfcol_resolve_pipeline: Option<Arc<ComputePipeline>>,
     gpu_runtime_counters: GpuRuntimeCounters,
     texture_cache: HashMap<String, Arc<ImageView>>,
     device: Option<Arc<Device>>,
@@ -478,6 +518,8 @@ impl VulkanRenderer {
             cloth_constraint_apply_pipeline: None,
             cloth_normal_pipeline: None,
             cloth_collide_pipeline: None,
+            cloth_selfcol_build_pipeline: None,
+            cloth_selfcol_resolve_pipeline: None,
             gpu_runtime_counters: GpuRuntimeCounters::default(),
             texture_cache: HashMap::new(),
             device: None,
@@ -860,6 +902,18 @@ impl VulkanRenderer {
         )
         .expect("failed to create cloth collide compute pipeline");
         self.cloth_collide_pipeline = Some(cloth_collide_pipeline);
+        let cloth_selfcol_build_pipeline =
+            pipeline::create_cloth_selfcol_build_compute_pipeline(
+                self.device.as_ref().expect("device set above").clone(),
+            )
+            .expect("failed to create cloth selfcol build pipeline");
+        self.cloth_selfcol_build_pipeline = Some(cloth_selfcol_build_pipeline);
+        let cloth_selfcol_resolve_pipeline =
+            pipeline::create_cloth_selfcol_resolve_compute_pipeline(
+                self.device.as_ref().expect("device set above").clone(),
+            )
+            .expect("failed to create cloth selfcol resolve pipeline");
+        self.cloth_selfcol_resolve_pipeline = Some(cloth_selfcol_resolve_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
         self.post_sampler = Some(post_sampler);
@@ -1052,6 +1106,7 @@ impl VulkanRenderer {
                 stats: RenderStats::default(),
                 exported_frame: None,
                 depth_ndc: None,
+                cloth_readback: Vec::new(),
             });
         }
 
@@ -1154,14 +1209,27 @@ impl VulkanRenderer {
             color_space: input.output_request.color_space.clone(),
         });
 
-        Ok(harvested.unwrap_or(RenderResult {
-            extent,
-            timestamp_nanos: 0,
-            has_alpha: true,
-            stats,
-            exported_frame: None,
-            depth_ndc: None,
-        }))
+        // GPU cloth readback: harvest already waited the previous
+        // frame's fence (and the GPU-export path waits its own fence
+        // synchronously before publish), so the previous frame's cloth
+        // compute is complete and the host-visible SSBOs read
+        // coherently. Attach to whichever result this call returns.
+        let cloth_readback = self.read_cloth_positions();
+        match harvested {
+            Some(mut h) => {
+                h.cloth_readback = cloth_readback;
+                Ok(h)
+            }
+            None => Ok(RenderResult {
+                extent,
+                timestamp_nanos: 0,
+                has_alpha: true,
+                stats,
+                exported_frame: None,
+                depth_ndc: None,
+                cloth_readback,
+            }),
+        }
     }
 
     /// A/B knob for the command-buffer cache (`VULVATAR_CB_CACHE=0`
@@ -1274,6 +1342,16 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no cloth collide pipeline")?
             .clone();
+        let cloth_selfcol_build_pipeline = self
+            .cloth_selfcol_build_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth selfcol build pipeline")?
+            .clone();
+        let cloth_selfcol_resolve_pipeline = self
+            .cloth_selfcol_resolve_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth selfcol resolve pipeline")?
+            .clone();
 
         let mut builder = AutoCommandBufferBuilder::primary(
             cb_allocator,
@@ -1292,6 +1370,8 @@ impl VulkanRenderer {
             &cloth_apply_pipeline,
             &cloth_normal_pipeline,
             &cloth_collide_pipeline,
+            &cloth_selfcol_build_pipeline,
+            &cloth_selfcol_resolve_pipeline,
             &plan.instances,
         )?;
 

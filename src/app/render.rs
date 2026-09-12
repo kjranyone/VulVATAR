@@ -368,6 +368,7 @@ impl Application {
                 frame_dt,
                 fixed_dt,
                 substeps as u32,
+                &self.physics.resolved_scene_colliders(),
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -536,9 +537,58 @@ impl Application {
         }
     }
 
+    /// Write GPU cloth readback entries into the matching
+    /// `ClothState`s (primary first, then overlay slots — the same
+    /// first-wins-by-primitive ordering the snapshot collector uses).
+    fn apply_cloth_readback(&mut self, entries: &[crate::renderer::ClothReadback]) {
+        use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
+        for avatar in self.avatars.iter_mut() {
+            for entry in entries {
+                let mut apply = |cs: &mut crate::avatar::instance::ClothState| {
+                    cs.sim_positions = entry.positions.clone();
+                    cs.prev_sim_positions = entry.positions.clone();
+                    if let Some(n) = entry.normals.as_ref() {
+                        cs.sim_normals = n.clone();
+                    }
+                    cs.deform_output.deformed_positions = entry.positions.clone();
+                    cs.deform_output.deformed_normals = entry.normals.clone();
+                    cs.deform_output.version = entry.version as u64;
+                };
+                let primary_hit = avatar
+                    .cloth_state
+                    .as_ref()
+                    .is_some_and(|cs| {
+                        cs.solver_backend == ClothSolverBackend::Gpu
+                            && cs.target_primitive_id == Some(entry.primitive_id)
+                    });
+                if primary_hit {
+                    if let Some(cs) = avatar.cloth_state.as_mut() {
+                        apply(cs);
+                    }
+                    continue;
+                }
+                for slot in avatar.cloth_overlays.iter_mut() {
+                    if slot.state.solver_backend == ClothSolverBackend::Gpu
+                        && slot.state.target_primitive_id == Some(entry.primitive_id)
+                    {
+                        apply(&mut slot.state);
+                    }
+                }
+            }
+        }
+    }
+
     fn process_render_result(&mut self, render_result: crate::renderer::RenderResult) {
         self.output
             .update_export_pool_stats(render_result.stats.export_pool);
+        // Fold the GPU cloth readback into the avatar-side ClothState so
+        // CPU-side consumers (cloth inspector live view, backend flips to
+        // CPU) see the live solver state instead of the attach-time rest
+        // pose. Must run before the exported-frame early-return: token
+        // frames carry the readback too.
+        if !render_result.cloth_readback.is_empty() {
+            self.apply_cloth_readback(&render_result.cloth_readback);
+        }
         let Some(exported) = render_result.exported_frame else {
             self.rendered_pixels = None;
             return;
@@ -788,6 +838,7 @@ impl Application {
         _frame_dt: f32,
         fixed_dt: f32,
         substeps: u32,
+        scene_colliders: &[crate::simulation::cloth::ResolvedCollider],
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -828,7 +879,12 @@ impl Application {
                 // Avatar-node collision capsules in world space, resolved
                 // once per frame and shared by every cloth snapshot. Scene
                 // colliders are CPU-solver-only (see ClothGpuDispatchControl).
-                let gpu_colliders = gpu_colliders_for(avatar);
+                let mut gpu_colliders = gpu_colliders_for(avatar);
+                // Scene colliders ride the same capsule list (the CPU
+                // solver gets them via PhysicsWorld::step_cloth).
+                gpu_colliders.extend(
+                    scene_colliders.iter().cloned().map(resolved_to_gpu_collider),
+                );
                 let cloth_deforms = collect_cloth_deforms(
                     avatar
                         .cloth_state
@@ -1008,31 +1064,38 @@ fn gpu_colliders_for(
         &avatar.collider_enabled,
     )
     .into_iter()
-    .map(|c| {
-        let (p0, p1, radius) = match c {
-            crate::simulation::cloth::ResolvedCollider::Sphere { center, radius } => {
-                (center, center, radius)
-            }
-            crate::simulation::cloth::ResolvedCollider::Capsule {
-                center,
-                radius,
-                half_height,
-                axis,
-            } => {
-                let a = crate::math_utils::vec3_sub(
-                    &center,
-                    &crate::math_utils::vec3_scale(&axis, half_height),
-                );
-                let b = crate::math_utils::vec3_add(
-                    &center,
-                    &crate::math_utils::vec3_scale(&axis, half_height),
-                );
-                (a, b, radius)
-            }
-        };
-        crate::renderer::frame_input::ClothGpuCollider { p0, p1, radius }
-    })
+    .map(resolved_to_gpu_collider)
     .collect()
+}
+
+/// One resolved collider (sphere or capsule) → GPU capsule; spheres
+/// become degenerate capsules, which the closest-point math treats
+/// identically.
+fn resolved_to_gpu_collider(
+    rc: crate::simulation::cloth::ResolvedCollider,
+) -> crate::renderer::frame_input::ClothGpuCollider {
+    let (p0, p1, radius) = match rc {
+        crate::simulation::cloth::ResolvedCollider::Sphere { center, radius } => {
+            (center, center, radius)
+        }
+        crate::simulation::cloth::ResolvedCollider::Capsule {
+            center,
+            radius,
+            half_height,
+            axis,
+        } => {
+            let a = crate::math_utils::vec3_sub(
+                &center,
+                &crate::math_utils::vec3_scale(&axis, half_height),
+            );
+            let b = crate::math_utils::vec3_add(
+                &center,
+                &crate::math_utils::vec3_scale(&axis, half_height),
+            );
+            (a, b, radius)
+        }
+    };
+    crate::renderer::frame_input::ClothGpuCollider { p0, p1, radius }
 }
 
 /// Per-particle pin world targets for the GPU solver, mirroring CPU
@@ -1119,6 +1182,8 @@ fn collect_cloth_deforms<'a>(
                             pin_positions: gpu_pin_targets(sim, global_transforms),
                             collision_margin: sim.collision_margin,
                             colliders: colliders.to_vec(),
+                            self_collision: sim.self_collision,
+                            self_collision_radius: sim.self_collision_radius,
                         };
                         let attach = ClothGpuAttachData {
                             constraints: sim
