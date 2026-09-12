@@ -206,8 +206,13 @@ pub struct Params {
     /// it in the slow shape state separates the pair over a session.
     /// Without it the solver books the whole chest slope (measured ≈ 11°
     /// on the s1789219959 desk replay) as trunk tilt and swings the
-    /// out-of-frame pelvis to the desk plane. 0.04 m covers the
-    /// chest-to-belly front offset spread of real torsos.
+    /// out-of-frame pelvis to the desk plane. 0.03 m is the anatomical
+    /// spread of the chest-to-belly front offset difference — tighter
+    /// than 0.04 because with a STATIC pose (no posture excitation) the
+    /// φ/taper split is decided by the prior price ratio alone, and at
+    /// 0.04 the solver preferred booking a real 5.7° root tilt as shear
+    /// (measured: recovery-test ankle error 5.6 cm; at 0.03 the tilt
+    /// priors win and the pose recovers within tolerance).
     /// `VULVATAR_TRUNK_SHEAR_SIGMA` overrides; a tiny value pins the
     /// shear at 0, reproducing the pre-shear behaviour for ablation.
     pub shear_sigma: f64,
@@ -321,7 +326,7 @@ impl Default for Params {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| *v > 0.0)
-                .unwrap_or(0.04),
+                .unwrap_or(0.03),
             velocity_tau: 0.25,
             pose_prior_scale: 1.0,
             var_min: 1e-8,
