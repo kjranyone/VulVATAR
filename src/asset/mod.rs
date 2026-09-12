@@ -379,6 +379,18 @@ pub struct MeshPrimitiveAsset {
     pub skin_anchors: Option<Vec<SkinAnchor>>,
     /// ID of the target body primitive this primitive is anchored against.
     pub body_primitive_id: Option<PrimitiveId>,
+    /// Containment anchors clamping this (inner) layer's vertices back
+    /// inside the outer garment's surface. Kept separate from
+    /// `skin_anchors` / `body_primitive_id` so the middle layer of a 3+
+    /// layer stack can be clearance-constrained against its inner
+    /// neighbour and containment-constrained against its outer
+    /// neighbour at the same time.
+    #[serde(default)]
+    pub containment_anchors: Option<Vec<SkinAnchor>>,
+    /// ID of the outer primitive whose surface the containment anchors
+    /// reference.
+    #[serde(default)]
+    pub containment_primitive_id: Option<PrimitiveId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -536,6 +548,14 @@ pub struct SpringBoneAsset {
     pub drag_force: f32,
     pub gravity_dir: Vec3,
     pub gravity_power: f32,
+    /// Minimum fraction of Earth gravity this chain receives when
+    /// natural gravity is enabled (`SpringTuning::natural_gravity`).
+    /// Set per category at asset build: hair strands get a floor so they
+    /// re-hang under head motion even when the model author left
+    /// `gravity_power` at 0; non-hair chains (skirt, belt, …) keep 0.0
+    /// and stay faithful to their authored power. Legacy caches without
+    /// this field fail deserialization and rebuild — intended.
+    pub gravity_floor: f32,
     pub radius: f32,
     pub collider_refs: Vec<ColliderRef>,
     /// Per-joint stiffness overrides. When non-empty, index corresponds to `joints`.

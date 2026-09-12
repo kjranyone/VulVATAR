@@ -341,6 +341,8 @@ fn main() -> Result<(), String> {
     csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
 
     let mut torso_yaws = Vec::new();
+    let mut torso_pitches = Vec::new();
+    let mut root_zs = Vec::new();
     let mut yaw_ref_pairs: Vec<(f64, f64)> = Vec::new();
     let mut kp3d_err: [Vec<f64>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut head_yaws = Vec::new();
@@ -661,6 +663,8 @@ fn main() -> Result<(), String> {
             }
         }
         torso_yaws.push(ty);
+        torso_pitches.push(tp);
+        root_zs.push(est.state.root_t[2]);
         head_yaws.push(hy);
         head_pitches.push(hp);
         solve_ms.push(provider.last_solve_ms as f64);
@@ -919,6 +923,21 @@ fn main() -> Result<(), String> {
     let (em, _, _, emax) = stats(&est_ms);
     println!("solve time     : mean {sm:.1} ms  max {smax:.1} ms (estimator only: mean {em:.1} ms max {emax:.1} ms)");
     println!("torso yaw (deg): mean {ym:+.1} std {ys:.1} range [{ymin:+.1}, {ymax:+.1}]");
+    {
+        // Back-lean / pelvis-swing readout: pitch is negative when the
+        // trunk reclines (spine3 forward tilts up in the viewer frame),
+        // and a root-z median near the desk plane (~0.45 m at this
+        // framing) is the documented lower-torso-swing failure signature.
+        let (tm, ts, tmin, tmax) = stats(&torso_pitches);
+        let mut s = torso_pitches.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "torso pitch(deg): mean {tm:+.1} med {:+.1} std {ts:.1} range [{tmin:+.1}, {tmax:+.1}]",
+            s[s.len() / 2]
+        );
+        let (zm, _, zmin, zmax) = stats(&root_zs);
+        println!("root z (m)     : mean {zm:.3} range [{zmin:.3}, {zmax:.3}]");
+    }
     if !yaw_ref_pairs.is_empty() {
         let errs: Vec<f64> = yaw_ref_pairs.iter().map(|(a, b)| a - b).collect();
         let (em, es, emin, emax) = stats(&errs);

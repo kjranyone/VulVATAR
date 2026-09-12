@@ -178,6 +178,7 @@ impl GuiApp {
             toggle_spring: self.rendering.toggle_spring,
             spring_sway_scale: self.rendering.spring_tuning.sway_scale,
             spring_gravity_offset: self.rendering.spring_tuning.gravity_offset,
+            spring_natural_gravity: self.rendering.spring_tuning.natural_gravity,
             scene_gravity_direction: self.rendering.scene_gravity.direction,
             scene_gravity_strength: self.rendering.scene_gravity.strength,
             toggle_cloth: self.rendering.toggle_cloth,
@@ -381,6 +382,7 @@ impl GuiApp {
         self.rendering.toggle_spring = state.toggle_spring;
         self.rendering.spring_tuning.sway_scale = state.spring_sway_scale;
         self.rendering.spring_tuning.gravity_offset = state.spring_gravity_offset;
+        self.rendering.spring_tuning.natural_gravity = state.spring_natural_gravity;
         self.rendering.scene_gravity.direction = state.scene_gravity_direction;
         self.rendering.scene_gravity.strength = state.scene_gravity_strength;
         self.rendering.toggle_cloth = state.toggle_cloth;

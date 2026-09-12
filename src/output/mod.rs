@@ -8,9 +8,8 @@ pub use frame_sink::{create_sink_writer, FrameSink, FrameSinkQueuePolicy, Output
 
 use crate::avatar::pose::FrameTimestamp;
 pub use crate::frame_handoff::{
-    AlphaMode, ExportedResourceId, ExternalHandleType, FallbackReason, FrameLease,
-    FrameLifetimeContract, GpuFrameToken, HandoffPath, OutputColorSpace, OutputFrameId,
-    OutputSyncToken,
+    AlphaMode, ExternalHandleType, FallbackReason, FrameLease, FrameLifetimeContract,
+    GpuFrameToken, HandoffPath, OutputColorSpace, OutputFrameId, OutputSyncToken,
 };
 use log::{debug, error, info};
 use std::collections::VecDeque;

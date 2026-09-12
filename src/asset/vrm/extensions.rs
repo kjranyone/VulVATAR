@@ -394,6 +394,7 @@ fn build_v1_springs(ext: &v1::SpringBoneExtension) -> (Vec<SpringBoneAsset>, Vec
                 drag_force,
                 gravity_dir,
                 gravity_power,
+                gravity_floor: 0.0,
                 radius,
                 collider_refs,
                 joint_stiffness,
@@ -645,6 +646,7 @@ fn build_v0_springs(
                 drag_force: group.drag_force,
                 gravity_dir,
                 gravity_power: group.gravity_power,
+                gravity_floor: 0.0,
                 radius,
                 collider_refs: collider_refs.clone(),
                 // 0.x shares parameters across the whole chain, so broadcast

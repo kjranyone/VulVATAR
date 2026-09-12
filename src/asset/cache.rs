@@ -36,7 +36,14 @@ use std::time::SystemTime;
 const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// Cache file format version. Bump whenever `AvatarAsset`, `MeshAsset`,
 /// `PhysicsAsset`, or other cached types change layout or semantics.
-const VVT_CACHE_VERSION: u32 = 10;
+/// v11: `SkinAnchor::_pad` became the `mode` discriminator (clearance
+/// vs containment) and inner layered-clothing layers gained anchors.
+/// v12: containment anchors moved into their own
+/// `containment_anchors` / `containment_primitive_id` slots so middle
+/// layers can carry clearance and containment simultaneously — a v11
+/// cache stores containment data in the clearance slot and must not be
+/// reused.
+const VVT_CACHE_VERSION: u32 = 12;
 /// Default cap on the number of `.vvtcache` files retained under
 /// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
 /// drops the oldest-mtime entries on next startup.

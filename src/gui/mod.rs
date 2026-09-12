@@ -4,7 +4,6 @@ pub mod components;
 mod folder_watcher;
 pub mod hotkey;
 pub mod inspector;
-pub mod mesh_picking;
 pub mod mode_nav;
 pub mod notifications;
 pub mod profile;

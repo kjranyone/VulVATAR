@@ -42,7 +42,11 @@ impl VulkanRenderer {
     /// (see `pipeline::transform_cs` for the shader-side contract) and
     /// build the draw list. Kahn-orders primitives with hierarchical
     /// surface-clearance dependencies so a child's transform dispatch
-    /// reads its parent's freshly skinned vertices.
+    /// reads its parent's freshly skinned vertices. Containment children
+    /// (inner garment layers) read the parent's previous-frame VBO
+    /// instead — their parent's own clearance dispatch runs later in
+    /// the same order, so same-frame input is impossible without a
+    /// second pass.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_compute_prepass(
         &mut self,
@@ -88,8 +92,18 @@ impl VulkanRenderer {
                 .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
 
             // Topological dependency ordering for hierarchical surface clearances:
-            // If primitive B specifies body_primitive_id = Some(A), A must be dispatched before B.
-            // Using Kahn's algorithm with cycle detection to guarantee a valid dispatch order.
+            // If primitive B specifies body_primitive_id = Some(A) (clearance
+            // anchors), A must be dispatched before B so B reads A's freshly
+            // skinned vertices. Using Kahn's algorithm with cycle detection to
+            // guarantee a valid dispatch order.
+            //
+            // Containment parents (`containment_primitive_id`, the outer
+            // layer) deliberately do NOT become graph edges: their child's
+            // clamp reads the parent's previous-frame VBO because the
+            // parent's own clearance dispatch runs later in this order.
+            // Adding containment edges would form a 2-cycle with the
+            // clearance edge and the cycle fallback below would disable
+            // BOTH constraints.
             let n = instance.mesh_instances.len();
             let mut in_degree = vec![0usize; n];
             let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -109,7 +123,10 @@ impl VulkanRenderer {
 
             // Track which primitives have a strictly validated parent dependency.
             // Invalid dependencies (self-reference, missing parent, or duplicate/ambiguous IDs) are pruned immediately.
+            // `validated_parent_ids` covers the clearance edge; the
+            // containment equivalent lives in `validated_containment_ids`.
             let mut validated_parent_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
+            let mut validated_containment_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
 
             for (idx, mi) in instance.mesh_instances.iter().enumerate() {
                 // If this primitive itself has a duplicate ID, it cannot be safely ordered; prune
@@ -131,9 +148,9 @@ impl VulkanRenderer {
 
                     if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
                         if parent_idx != idx {
+                            validated_parent_ids.insert(mi.primitive_id, parent_id);
                             adj[parent_idx].push(idx);
                             in_degree[idx] += 1;
-                            validated_parent_ids.insert(mi.primitive_id, parent_id);
                         } else {
                             warn!(
                                 "render: self-referencing body_primitive_id {:?} pruned",
@@ -142,6 +159,28 @@ impl VulkanRenderer {
                         }
                     } else {
                         warn!("render: missing parent body_primitive_id {:?} for primitive {:?}; fallback to unconstrained skinning", parent_id, mi.primitive_id);
+                    }
+                }
+
+                if let Some(outer_id) = mi
+                    .primitive_data
+                    .as_ref()
+                    .and_then(|p| p.containment_primitive_id)
+                {
+                    if duplicate_ids.contains(&outer_id) || outer_id == mi.primitive_id {
+                        warn!(
+                            "render: invalid containment_primitive_id {:?} on primitive {:?}; pruning",
+                            outer_id, mi.primitive_id
+                        );
+                        continue;
+                    }
+                    if prim_id_to_idx.contains_key(&outer_id) {
+                        validated_containment_ids.insert(mi.primitive_id, outer_id);
+                    } else {
+                        warn!(
+                            "render: missing containment parent {:?} for primitive {:?}; clamping disabled",
+                            outer_id, mi.primitive_id
+                        );
                     }
                 }
             }
@@ -220,33 +259,30 @@ impl VulkanRenderer {
                     })
                     .unwrap_or(false);
 
-                // Look up parent surface transformed VBO ONLY if this primitive has a validated DAG parent
-                let validated_parent_pid =
-                    validated_parent_ids.get(&mesh_inst.primitive_id).copied();
-                let prim_parent_vbo = validated_parent_pid.and_then(|parent_pid| {
-                    instance
-                        .mesh_instances
-                        .iter()
-                        .find(|mi| mi.primitive_id == parent_pid)
-                        .and_then(|parent_mi| {
-                            if let Some(parent_asset) = parent_mi.primitive_data.as_ref() {
-                                let _ = self.ensure_transform_data(
-                                    parent_mi.mesh_id,
-                                    parent_mi.primitive_id,
-                                    parent_asset,
-                                    false,
-                                    false,
-                                    None,
-                                    &memory_allocator,
-                                    &ds_allocator,
-                                    &transform_pipeline,
-                                );
-                            }
-                            self.transform_cache
-                                .get(&(parent_mi.mesh_id, parent_mi.primitive_id))
-                                .map(|slot| slot.transformed_vbo.clone())
-                        })
-                });
+                // Look up parent surface transformed VBO ONLY if this primitive has a validated DAG parent.
+                // The parent slot is materialised WITHOUT anchors just to obtain a stable VBO handle;
+                // an existing slot is left untouched — re-ensuring it with a `None` parent VBO would
+                // downgrade its anchor binding every frame (the parent's own iteration below would
+                // then have to rebuild it right back).
+                let prim_parent_vbo = self.materialize_parent_vbo(
+                    instance,
+                    validated_parent_ids.get(&mesh_inst.primitive_id).copied(),
+                    &memory_allocator,
+                    &ds_allocator,
+                    &transform_pipeline,
+                );
+
+                // Containment parent (the OUTER garment). Same
+                // materialisation rules; no dispatch-ordering requirement
+                // because the containment clamp reads the parent's
+                // previous-frame VBO.
+                let containment_parent_vbo = self.materialize_parent_vbo(
+                    instance,
+                    validated_containment_ids.get(&mesh_inst.primitive_id).copied(),
+                    &memory_allocator,
+                    &ds_allocator,
+                    &transform_pipeline,
+                );
 
                 self.ensure_transform_data(
                     mesh_inst.mesh_id,
@@ -255,6 +291,7 @@ impl VulkanRenderer {
                     has_cloth_prim,
                     has_cloth_normals_prim,
                     prim_parent_vbo.clone(),
+                    containment_parent_vbo.clone(),
                     &memory_allocator,
                     &ds_allocator,
                     &transform_pipeline,
@@ -326,7 +363,14 @@ impl VulkanRenderer {
                             } else {
                                 0
                             };
-                        guard._pad0 = [0; 3];
+                        guard.has_containment = if prim_asset.containment_anchors.is_some()
+                            && containment_parent_vbo.is_some()
+                        {
+                            1
+                        } else {
+                            0
+                        };
+                        guard._pad0 = [0; 2];
                     }
                     if slot.target_count > 0 {
                         let mut weights = slot
@@ -870,5 +914,50 @@ impl VulkanRenderer {
             }
         }
         Ok(draws)
+    }
+
+    /// Resolve the transformed-VBO handle of a primitive's hierarchical
+    /// anchor parent (clearance or containment). When the parent slot is
+    /// missing it is materialised WITHOUT anchors just to obtain a
+    /// stable handle; an existing slot is left untouched — re-ensuring
+    /// it with a `None` parent VBO would downgrade its own anchor
+    /// binding every frame (the parent's iteration below would then
+    /// have to rebuild it right back).
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_parent_vbo(
+        &mut self,
+        instance: &frame_input::RenderAvatarInstance,
+        parent_pid: Option<PrimitiveId>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+        transform_pipeline: &Arc<ComputePipeline>,
+    ) -> Option<Subbuffer<[GpuVertex]>> {
+        let parent_pid = parent_pid?;
+        instance
+            .mesh_instances
+            .iter()
+            .find(|mi| mi.primitive_id == parent_pid)
+            .and_then(|parent_mi| {
+                let parent_key = (parent_mi.mesh_id, parent_mi.primitive_id);
+                if self.transform_cache.get(&parent_key).is_none() {
+                    if let Some(parent_asset) = parent_mi.primitive_data.as_ref() {
+                        let _ = self.ensure_transform_data(
+                            parent_mi.mesh_id,
+                            parent_mi.primitive_id,
+                            parent_asset,
+                            false,
+                            false,
+                            None,
+                            None,
+                            memory_allocator,
+                            ds_allocator,
+                            transform_pipeline,
+                        );
+                    }
+                }
+                self.transform_cache
+                    .get(&parent_key)
+                    .map(|slot| slot.transformed_vbo.clone())
+            })
     }
 }

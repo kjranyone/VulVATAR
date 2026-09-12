@@ -172,6 +172,8 @@ fn make_test_avatar() -> AvatarInstance {
         morph_targets: Vec::new(),
         skin_anchors: None,
         body_primitive_id: None,
+        containment_anchors: None,
+        containment_primitive_id: None,
     };
 
     let mesh = MeshAsset {

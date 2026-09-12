@@ -1029,6 +1029,20 @@ pub fn build_spring_bones_and_colliders(
             .map(|&idx| NodeId(idx as u64))
             .collect();
 
+        // Natural-gravity floor: hair strands always receive some
+        // world-down pull (authored gravityPower 0 must not leave hair
+        // gravity-less when the head tilts); other categories stay
+        // faithful to their authored power.
+        let gravity_floor = match chain.category {
+            ChainCategory::HairFront
+            | ChainCategory::HairSide
+            | ChainCategory::HairTwintale
+            | ChainCategory::HairBack
+            | ChainCategory::HairRibbon
+            | ChainCategory::HairWing => 0.15,
+            _ => 0.0,
+        };
+
         spring_bones.push(SpringBoneAsset {
             chain_root: NodeId(chain.root_node_idx as u64),
             joints: joint_nodes,
@@ -1036,6 +1050,7 @@ pub fn build_spring_bones_and_colliders(
             drag_force,
             gravity_dir: [0.0, -1.0, 0.0],
             gravity_power,
+            gravity_floor,
             radius,
             collider_refs: col_refs,
             joint_stiffness: Vec::new(),

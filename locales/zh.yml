@@ -344,6 +344,7 @@ inspector:
   spring_enabled: "启用弹簧"
   spring_sway: "摇摆强度"
   spring_gravity: "重力调整"
+  spring_natural_gravity: "自然重力 (物理标度)"
   gravity_global: "全局重力"
   gravity_strength: "强度"
   gravity_direction: "方向"

@@ -84,6 +84,7 @@ fn make_two_joint_spring_avatar_with(offset: [f32; 3], gravity_dir: [f32; 3]) ->
         drag_force: 0.4,
         gravity_dir,
         gravity_power: 1.0,
+        gravity_floor: 0.0,
         radius: 0.0,
         collider_refs: vec![],
         joint_stiffness: vec![],
@@ -126,6 +127,8 @@ fn make_two_joint_spring_avatar_with(offset: [f32; 3], gravity_dir: [f32; 3]) ->
 fn make_spring_avatar_with_colliders(
     joint_offsets: &[[f32; 3]],
     collider: Option<(ColliderShape, [f32; 3])>,
+    gravity_power: f32,
+    gravity_floor: f32,
 ) -> AvatarInstance {
     let n = joint_offsets.len();
     let mut nodes = vec![SkeletonNode {
@@ -166,7 +169,8 @@ fn make_spring_avatar_with_colliders(
         stiffness: 1.0,
         drag_force: 0.4,
         gravity_dir: [0.0, -1.0, 0.0],
-        gravity_power: 1.0,
+        gravity_power,
+        gravity_floor,
         radius: 0.02,
         collider_refs: collider
             .as_ref()
@@ -562,6 +566,8 @@ fn collider_contact_does_not_bounce() {
     let mut avatar = make_spring_avatar_with_colliders(
         &[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
         Some((ColliderShape::Sphere { radius: 0.15 }, [2.0, -0.15, 0.0])),
+        1.0,
+        0.0,
     );
     let bone_radius = avatar.asset.spring_bones[0].radius;
     let total_radius = 0.15 + bone_radius;
@@ -613,6 +619,8 @@ fn solved_positions_match_rendered_globals_when_bent() {
     let mut avatar = make_spring_avatar_with_colliders(
         &[[0.35, 0.0, 0.0], [0.35, 0.0, 0.0], [0.35, 0.0, 0.0]],
         None,
+        1.0,
+        0.0,
     );
     // Loose sway + gravity: the chain bends well away from rest.
     let soft = spring::SpringTuning {
@@ -638,4 +646,100 @@ fn solved_positions_match_rendered_globals_when_bent() {
             "joint {j}: solved {solved:?} vs rendered {rendered:?} diverged by {d:.4} m"
         );
     }
+}
+
+// -- Natural gravity force model ----------------------------------------
+
+/// Run a small horizontal chain (5 cm bones, avatar-realistic scale)
+/// until it settles and return the tip's vertical drop below its rest
+/// position. Used by the natural-gravity tests below.
+fn settle_tip_drop(tuning: &spring::SpringTuning, power: f32, floor: f32) -> f32 {
+    let mut world = PhysicsWorld::new();
+    let offsets = [[0.05, 0.0, 0.0], [0.05, 0.0, 0.0], [0.05, 0.0, 0.0]];
+    let mut avatar = make_spring_avatar_with_colliders(&offsets, None, power, floor);
+    let rest_tip_y = crate::math_utils::mat4_translation(
+        &avatar.pose.global_transforms[avatar.asset.spring_bones[0].joints[2].0 as usize],
+    )[1];
+    for _ in 0..600 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, tuning, &SceneGravity::default());
+    }
+    let tip_y = avatar.secondary_motion.spring_states[0].positions[2];
+    rest_tip_y - tip_y[1]
+}
+
+/// The natural-gravity floor is what makes authored-zero hair strands
+/// (Yumeka's bangs, sides, twintales) re-hang under head motion: without
+/// it a `gravity_power == 0` chain has no world-down force at all, and a
+/// model author's zero leaves the strand gravity-less forever.
+#[test]
+fn natural_gravity_floor_droops_zero_power_chain() {
+    let tuning = spring::SpringTuning::default();
+    // Authored zero, floor on: the strand must visibly sag.
+    let dropped = settle_tip_drop(&tuning, 0.0, 0.15);
+    assert!(
+        dropped > 0.003,
+        "floor must produce visible droop, got {dropped:.4} m"
+    );
+    // Authored zero, floor zero: nothing pulls the strand down.
+    let floating = settle_tip_drop(&tuning, 0.0, 0.0);
+    assert!(
+        floating.abs() < 0.0005,
+        "zero power + zero floor must stay at rest, got {floating:.4} m"
+    );
+    // The floor is defeated by the toggle: legacy mode reproduces the
+    // authored-faithful zero-gravity behaviour.
+    let legacy = settle_tip_drop(
+        &spring::SpringTuning {
+            natural_gravity: false,
+            ..Default::default()
+        },
+        0.0,
+        0.15,
+    );
+    assert!(
+        legacy.abs() < 0.0005,
+        "legacy mode must ignore the floor, got {legacy:.4} m"
+    );
+}
+
+/// The natural model must converge to the closed-form equilibrium sag
+/// `gravity_step / stiffness_factor` per joint (drag only affects the
+/// transient). This pins the force model's math, not just its direction.
+#[test]
+fn natural_gravity_settles_at_closed_form_sag() {
+    let dt = 1.0f32 / 60.0;
+    let tuning = spring::SpringTuning::default();
+    // Stiffness 1.0 (builder) -> rate 7/s; authored fraction 1.0 -> g.
+    let factor = -((-(7.0f32 * dt)).exp_m1());
+    let per_joint = 9.81 * dt * dt * factor.recip();
+    // Two solved joints sag ~2x the per-joint equilibrium (each target
+    // follows the previous joint's sag); allow generous 35% tolerance
+    // for the constraint projection and drag interplay.
+    let drop = settle_tip_drop(&tuning, 1.0, 0.0);
+    let expected = 2.0 * per_joint;
+    assert!(
+        ((drop - expected) / expected).abs() < 0.35,
+        "settled drop {drop:.4} m vs closed form {expected:.4} m (per joint {per_joint:.4})"
+    );
+}
+
+/// The gravity_offset slider stays meaningful in the natural model: a
+/// full negative offset drives the fraction to the clamp at zero (the
+/// floor wins — disabling gravity entirely is the toggle's job, not the
+/// trim slider's), and a positive offset deepens the sag.
+#[test]
+fn natural_gravity_offset_modulates_sag() {
+    let minus = settle_tip_drop(
+        &spring::SpringTuning {
+            gravity_offset: -1.0,
+            ..Default::default()
+        },
+        0.6,
+        0.0,
+    );
+    let plain = settle_tip_drop(&spring::SpringTuning::default(), 0.6, 0.0);
+    assert!(
+        plain > minus + 0.001,
+        "positive-authorised power must sag more than offset-cancelled: {plain:.4} vs {minus:.4}"
+    );
 }

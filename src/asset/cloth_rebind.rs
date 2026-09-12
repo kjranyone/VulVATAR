@@ -557,6 +557,8 @@ mod tests {
                     morph_targets: vec![],
                     skin_anchors: None,
                     body_primitive_id: None,
+                    containment_anchors: None,
+                    containment_primitive_id: None,
                 }),
                 std::sync::Arc::new(MeshPrimitiveAsset {
                     id: PrimitiveId(21),
@@ -570,6 +572,8 @@ mod tests {
                     morph_targets: vec![],
                     skin_anchors: None,
                     body_primitive_id: None,
+                    containment_anchors: None,
+                    containment_primitive_id: None,
                 }),
             ],
         };
@@ -611,6 +615,8 @@ mod tests {
                 morph_targets: vec![],
                 skin_anchors: None,
                 body_primitive_id: None,
+                containment_anchors: None,
+                containment_primitive_id: None,
             })],
         };
         let avatar = make_avatar(vec![], vec![body_mesh]);

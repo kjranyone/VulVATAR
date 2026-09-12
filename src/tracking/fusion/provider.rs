@@ -103,6 +103,28 @@ pub struct FusionProvider {
     pub last_sil: Option<super::visibility::Silhouette>,
     /// Dense surface points fed to the estimator this frame.
     pub last_dense_n: usize,
+    /// Depth-confirmed wrist hold, `[left, right]`: when the 2-D detector
+    /// drops a wrist it had been observing (frame border, desk clutter),
+    /// the last observation is kept alive for as long as the RealSense
+    /// depth still shows a surface at the predicted wrist pixel within
+    /// `Z_GATE` of the last measured depth. The sensor outlives the
+    /// detector's flicker, so a hand parked on the desk keeps its arm
+    /// instead of falling to the relaxed-pose prior and snapping back on
+    /// re-detection. Unlike the blanket `q_hold_floor` process-noise hold
+    /// (measured worse: a held arm fights its returning observation and
+    /// the trunk pays), this releases the moment the depth under the
+    /// prediction changes — and its σ grows with time since the last real
+    /// detection, so a re-acquired 2-D/3-D keypoint always outweighs it.
+    wrist_hold: [WristHold; 2],
+}
+
+/// State carried between frames for one wrist's depth-confirmed hold.
+#[derive(Clone, Copy, Default)]
+struct WristHold {
+    /// Capture time (s) of the last real wrist observation (2-D or 3-D).
+    last_t: Option<f64>,
+    /// Last sensor-confirmed surface depth under the wrist (m, camera z).
+    last_z: Option<f64>,
 }
 
 impl FusionProvider {
@@ -178,6 +200,7 @@ impl FusionProvider {
             last_crop_hint: None,
             last_sil: None,
             last_dense_n: 0,
+            wrist_hold: Default::default(),
         })
     }
 
@@ -307,6 +330,7 @@ impl PoseProvider for FusionProvider {
         self.hand_unsupported = [0, 0];
         self.hand_suspect = [false, false];
         self.hand_dupes = 0;
+        self.wrist_hold = Default::default();
         self.last_t = None;
         self.frames = 0;
     }
@@ -1015,7 +1039,21 @@ impl PoseProvider for FusionProvider {
             );
             for k in obs.kp2d[n_before..].iter_mut() {
                 if let Some(side) = self.arm_side_of(k.point) {
-                    k.sigma *= inflate[side];
+                    // Corroboration gate, as the post-solve burn-in loop:
+                    // an observation the prediction already agrees with is
+                    // confirmation, not a suspect re-entry.
+                    let agrees = std::env::var_os("VULVATAR_FUSION_NO_CORROB").is_none() && {
+                        let (_, pw) =
+                            super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
+                        intr.project(pw).is_some_and(|pv| {
+                            ((k.u - pv[0]) * (k.u - pv[0]) + (k.v - pv[1]) * (k.v - pv[1]))
+                                .sqrt()
+                                < 4.0 * k.sigma
+                        })
+                    };
+                    if !agrees {
+                        k.sigma *= inflate[side];
+                    }
                 }
             }
             // Depth-lifted joints: the absolute-depth anchor that resolves
@@ -1053,6 +1091,131 @@ impl PoseProvider for FusionProvider {
                         &mut obs.kp3d,
                         &mut obs.surface,
                     );
+                    // ---- depth-confirmed wrist hold (see `wrist_hold`) ----
+                    if std::env::var("VULVATAR_WRIST_HOLD").map(|v| v == "1").unwrap_or(false) {
+                        let hold_max = std::env::var("VULVATAR_WRIST_HOLD_MAX")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(2.5);
+                        for side in 0..2 {
+                            let j_wr =
+                                if side == 0 { self.h.j.l_wrist } else { self.h.j.r_wrist };
+                            let is_wr = |point: &super::estimator::ModelPoint| {
+                                matches!(point, super::estimator::ModelPoint::Joint(j) if *j == j_wr)
+                            };
+                            let seen_3d = obs.kp3d.iter().rev().find(|k| is_wr(&k.point));
+                            let seen_2d = obs.kp2d.iter().any(|k| is_wr(&k.point));
+                            let trace = std::env::var_os("VULVATAR_WRIST_HOLD_TRACE").is_some();
+                            if trace {
+                                eprintln!(
+                                    "WRISTHOLD f{frame_index} side {side} seen3d {} seen2d {} age {:.2}",
+                                    seen_3d.is_some(),
+                                    seen_2d,
+                                    t - self.wrist_hold[side].last_t.unwrap_or(t)
+                                );
+                            }
+                            if let Some(k) = seen_3d {
+                                self.wrist_hold[side] =
+                                    WristHold { last_t: Some(t), last_z: Some(k.p[2]) };
+                            } else if seen_2d {
+                                // Fresh bearing without a lifted 3-D point
+                                // (depth hole or hand-block-only frame): the
+                                // sensor can still testify the depth under
+                                // the pixel, which arms the hold for the
+                                // frames the detector goes quiet.
+                                let k2 = obs.kp2d.iter().rev().find(|k| is_wr(&k.point)).unwrap();
+                                let band = 0.7_f64;
+                                let (zlo, zhi) = match z_ref {
+                                    Some(z) => ((z - band) as f32, (z + band) as f32),
+                                    None => (0.15, 6.0),
+                                };
+                                let z = window_point(
+                                    &d.points_m,
+                                    d.width,
+                                    d.height,
+                                    k2.u,
+                                    k2.v,
+                                    3,
+                                    zlo,
+                                    zhi,
+                                )
+                                .filter(|p| p[2] > 0.1)
+                                .map(|p| p[2]);
+                                self.wrist_hold[side].last_t = Some(t);
+                                self.wrist_hold[side].last_z = z;
+                            } else if let (Some(t0), Some(z0)) =
+                                (self.wrist_hold[side].last_t, self.wrist_hold[side].last_z)
+                            {
+                                let trace = std::env::var_os("VULVATAR_WRIST_HOLD_TRACE").is_some();
+                                let age = t - t0;
+                                let miss = |why: &str| {
+                                    if trace {
+                                        eprintln!("WRISTHOLD side {side} age {age:.2} MISS {why}");
+                                    }
+                                };
+                                if !(0.0..=hold_max).contains(&age) {
+                                    miss("age");
+                                    continue;
+                                }
+                                let Some(uv) = intr.project(fk_pred.t[j_wr]) else {
+                                    miss("project");
+                                    continue;
+                                };
+                                let (mx, my) =
+                                    (0.02 * intr.width, 0.02 * intr.height);
+                                if uv[0] < mx || uv[0] > intr.width - mx
+                                    || uv[1] < my || uv[1] > intr.height - my
+                                {
+                                    miss(&format!("border uv {:.0},{:.0}", uv[0], uv[1]));
+                                    continue;
+                                }
+                                let Some(psurf) = window_point(
+                                    &d.points_m,
+                                    d.width,
+                                    d.height,
+                                    uv[0],
+                                    uv[1],
+                                    3,
+                                    (z0 - 0.2) as f32,
+                                    (z0 + 0.2) as f32,
+                                ) else {
+                                    miss("no-depth");
+                                    continue;
+                                };
+                                const Z_GATE: f64 = 0.12;
+                                if (psurf[2] - z0).abs() > Z_GATE {
+                                    miss(&format!("zgate {:.2} vs {:.2}", psurf[2], z0));
+                                    continue;
+                                }
+                                // Skin→joint push along the ray, as the
+                                // wrist entries of `body_kp3d`.
+                                let n = norm(psurf);
+                                if n < 0.1 {
+                                    continue;
+                                }
+                                let p_joint = scale(psurf, (n + 0.02) / n);
+                                // σ grows with time since the last real
+                                // detection, so a re-acquired keypoint
+                                // (σ ≈ 0.05) always outvotes the hold.
+                                let sigma = (0.05 + 0.08 * age).min(0.20);
+                                if trace {
+                                    eprintln!(
+                                        "WRISTHOLD side {side} age {age:.2} HOLD uv {:.0},{:.0} z {:.2} (was {:.2}) sigma {sigma:.2}",
+                                        uv[0], uv[1], psurf[2], z0
+                                    );
+                                }
+                                obs.kp3d.push(super::estimator::Kp3d {
+                                    point: super::estimator::ModelPoint::Joint(j_wr),
+                                    p: p_joint,
+                                    sigma,
+                                    lat_scale: 1.0,
+                                });
+                                // Follow the sensor within the gate so a
+                                // slow drift along the desk keeps tracking.
+                                self.wrist_hold[side].last_z = Some(psurf[2]);
+                            }
+                        }
+                    }
                     // Torso yaw from the chest depth slope — the only
                     // depth channel that carries it (see
                     // `ShoulderYawObs`). Hand crops and predicted arm
@@ -1390,15 +1553,41 @@ impl PoseProvider for FusionProvider {
                 .collect();
         }
         // Evidence burn-in on the metric arm terms and the hand-crop terms.
+        // Corroboration gate: an observation that already AGREES with the
+        // predicted pose is not a suspect re-entry — it is the sensor
+        // confirming where the arm is, and inflating it starves the arm's
+        // information EMA (measured deadlock on a desk session: the hand
+        // block fires in isolated single frames at the frame edge, every
+        // burst arrives at σ×4, trust never accumulates, R-wrist duty
+        // 0.08 and 32–39 wrist snaps / 600 frames). Only observations that
+        // DISAGREE with the prediction keep the burn-in inflation.
+        let corrob = std::env::var_os("VULVATAR_FUSION_NO_CORROB").is_none();
         for k in obs.kp3d.iter_mut() {
             if let Some(side) = self.arm_side_of(k.point) {
-                k.sigma *= inflate[side];
+                let agrees = corrob && {
+                    let (_, pw) =
+                        super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
+                    norm(sub(k.p, pw)) < 0.10
+                };
+                if !agrees {
+                    k.sigma *= inflate[side];
+                }
             }
         }
         let n_hand_start = self.hand_kp_start.min(obs.kp2d.len());
         for k in obs.kp2d[n_hand_start..].iter_mut() {
             if let Some(side) = self.arm_side_of(k.point) {
-                k.sigma *= inflate[side];
+                let agrees = corrob && {
+                    let (_, pw) =
+                        super::estimator::resolve_point(&self.h.model, &fk_pred, k.point);
+                    intr.project(pw).is_some_and(|pv| {
+                        ((k.u - pv[0]) * (k.u - pv[0]) + (k.v - pv[1]) * (k.v - pv[1])).sqrt()
+                            < 4.0 * k.sigma
+                    })
+                };
+                if !agrees {
+                    k.sigma *= inflate[side];
+                }
             }
         }
 

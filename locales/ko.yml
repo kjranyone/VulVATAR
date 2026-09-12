@@ -344,6 +344,7 @@ inspector:
   spring_enabled: "스프링 활성화"
   spring_sway: "흔들림 강도"
   spring_gravity: "중력 보정"
+  spring_natural_gravity: "자연스러운 중력 (물리 스케일)"
   gravity_global: "글로벌 중력"
   gravity_strength: "강도"
   gravity_direction: "방향"

@@ -142,17 +142,6 @@ pub struct ClothBendConstraint {
     pub rest_angle: f32,
     pub stiffness: f32,
 }
-
-// ---------------------------------------------------------------------------
-// Collider snapshot (world-space, resolved each frame)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub struct ResolvedSphereCollider {
-    pub center: Vec3,
-    pub radius: f32,
-}
-
 /// A resolved world-space collider that supports both sphere and capsule shapes.
 #[derive(Clone, Debug)]
 pub enum ResolvedCollider {

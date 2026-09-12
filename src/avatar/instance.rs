@@ -521,6 +521,8 @@ mod morph_weight_tests {
                 .collect(),
             skin_anchors: None,
             body_primitive_id: None,
+            containment_anchors: None,
+            containment_primitive_id: None,
         })
     }
 

@@ -71,19 +71,6 @@ pub fn zero_leg_chain(raw: &mut [RawKp], side: usize, cull_hip: bool) {
         }
     }
 }
-
-/// Zero out an arm detection chain (wrist and hand-block; elbow left for upper arm if needed).
-pub fn zero_arm_chain(raw: &mut [RawKp], side: usize) {
-    let mut idxs = vec![9 + side]; // wrist
-    let base = if side == 0 { 91 } else { 112 };
-    idxs.extend(base..base + 21);
-    for i in idxs {
-        if i < raw.len() {
-            raw[i].score = 0.0;
-        }
-    }
-}
-
 /// Sanitize lower body detections (pelvis width, thigh reach, shin reach, height ordering).
 pub fn filter_leg_coherence(
     raw: &mut [RawKp],

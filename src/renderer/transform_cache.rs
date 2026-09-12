@@ -37,24 +37,46 @@ impl VulkanRenderer {
         has_cloth: bool,
         has_cloth_normals: bool,
         body_transformed_vbo: Option<Subbuffer<[GpuVertex]>>,
+        containment_parent_vbo: Option<Subbuffer<[GpuVertex]>>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         transform_pipeline: &Arc<ComputePipeline>,
     ) -> Result<(), String> {
         let key = (mesh_id, prim_id);
         let has_anchors = prim.skin_anchors.is_some() && body_transformed_vbo.is_some();
+        let has_containment =
+            prim.containment_anchors.is_some() && containment_parent_vbo.is_some();
 
-        if let Some(existing) = self.transform_cache.get(&key) {
+        // When the slot exists with a matching allocation shape, keep it.
+        // Otherwise rebuild — with buffer-handle reuse: every immutable
+        // per-asset payload (base SSBO, index buffer, transformed VBO,
+        // morph runs, anchor SSBOs, control UBO) is taken from the old
+        // slot rather than reallocated. Keeping the `transformed_vbo`
+        // handle stable for the lifetime of the (mesh, prim) key is what
+        // lets OTHER primitives bind it as their hierarchical-clearance
+        // parent without their descriptor sets going stale: frame 1
+        // materialises a parent anchor-less before its own iteration
+        // upgrades it, and cloth/anchor shape flips later would
+        // otherwise hand every referencing child a dead VBO.
+        let previous = if let Some(existing) = self.transform_cache.get(&key) {
             if existing.has_cloth_alloc == has_cloth
                 && existing.has_cloth_normals_alloc == has_cloth_normals
                 && existing.has_skin_anchors_alloc == has_anchors
+                && existing.has_containment_alloc == has_containment
             {
                 return Ok(());
             }
-            // Cloth or anchor allocation shape changed under us; drop the slot so
-            // the fresh allocation lands below with the right SSBOs.
-            self.transform_cache.remove(&key);
-        }
+            self.transform_cache.remove(&key)
+        } else {
+            None
+        };
+        // Cloth SSBOs are the one payload whose SIZE depends on the
+        // allocation flags (full vertex count vs shared 1-element stub),
+        // so they are only reusable when that flag did not flip.
+        let (prev_had_cloth, prev_had_cloth_norm) = previous
+            .as_ref()
+            .map(|p| (p.has_cloth_alloc, p.has_cloth_normals_alloc))
+            .unwrap_or((false, false));
 
         let vd = prim
             .vertices
@@ -74,28 +96,37 @@ impl VulkanRenderer {
         };
         let index_count = idx_slice.len() as u32;
 
-        let base_data = pipeline::vertex_data_to_base(vd);
-        let base_ssbo = gpu_alloc::host_buffer(
-            memory_allocator,
-            BufferUsage::STORAGE_BUFFER,
-            base_data,
-            "base SSBO",
-        )?;
+        let base_ssbo = match previous.as_ref().map(|p| p.base_ssbo.clone()) {
+            Some(b) => b,
+            None => gpu_alloc::host_buffer(
+                memory_allocator,
+                BufferUsage::STORAGE_BUFFER,
+                pipeline::vertex_data_to_base(vd),
+                "base SSBO",
+            )?,
+        };
 
-        let index_buffer = gpu_alloc::host_buffer(
-            memory_allocator,
-            BufferUsage::INDEX_BUFFER,
-            idx_slice.iter().copied(),
-            "index buffer",
-        )?;
+        let index_buffer = match previous.as_ref().map(|p| p.index_buffer.clone()) {
+            Some(b) => b,
+            None => gpu_alloc::host_buffer(
+                memory_allocator,
+                BufferUsage::INDEX_BUFFER,
+                idx_slice.iter().copied(),
+                "index buffer",
+            )?,
+        };
 
         // Compute output: device-local storage + vertex buffer.
-        let transformed_vbo: Subbuffer<[GpuVertex]> = gpu_alloc::device_slice(
-            memory_allocator,
-            BufferUsage::VERTEX_BUFFER | BufferUsage::STORAGE_BUFFER,
-            vertex_count as u64,
-            "transformed VBO",
-        )?;
+        let transformed_vbo: Subbuffer<[GpuVertex]> =
+            match previous.as_ref().map(|p| p.transformed_vbo.clone()) {
+                Some(b) => b,
+                None => gpu_alloc::device_slice(
+                    memory_allocator,
+                    BufferUsage::VERTEX_BUFFER | BufferUsage::STORAGE_BUFFER,
+                    vertex_count as u64,
+                    "transformed VBO",
+                )?,
+            };
 
         // Sparse morph deltas, or the shared stubs when this primitive
         // has none. Dense storage (targets × vertices × 2 vec4s) made a
@@ -105,63 +136,79 @@ impl VulkanRenderer {
         // cap on the target count.
         let raw_target_count = prim.morph_targets.len();
         let target_count = raw_target_count as u32;
-        let (entries, infos) = pack_sparse_morphs(&prim.morph_targets);
-        let morph_entries = if raw_target_count == 0 {
-            gpu_alloc::get_or_init_stub(
-                &mut self.stub_storage_ssbo,
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                [0.0_f32; 4],
-                "stub SSBO",
-            )?
-        } else {
-            gpu_alloc::host_buffer(
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                entries,
-                "morph deltas",
-            )?
-        };
-        let morph_infos = if raw_target_count == 0 {
-            gpu_alloc::get_or_init_stub(
-                &mut self.stub_uvec4_ssbo,
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                [0u32; 4],
-                "stub uvec4 SSBO",
-            )?
-        } else {
-            gpu_alloc::host_buffer(
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                infos,
-                "morph infos",
-            )?
+        let (morph_entries, morph_infos) = match previous
+            .as_ref()
+            .map(|p| (p.morph_entries.clone(), p.morph_infos.clone()))
+        {
+            Some((e, i)) => (e, i),
+            None => {
+                let (entries, infos) = pack_sparse_morphs(&prim.morph_targets);
+                if raw_target_count == 0 {
+                    (
+                        gpu_alloc::get_or_init_stub(
+                            &mut self.stub_storage_ssbo,
+                            memory_allocator,
+                            BufferUsage::STORAGE_BUFFER,
+                            [0.0_f32; 4],
+                            "stub SSBO",
+                        )?,
+                        gpu_alloc::get_or_init_stub(
+                            &mut self.stub_uvec4_ssbo,
+                            memory_allocator,
+                            BufferUsage::STORAGE_BUFFER,
+                            [0u32; 4],
+                            "stub uvec4 SSBO",
+                        )?,
+                    )
+                } else {
+                    (
+                        gpu_alloc::host_buffer(
+                            memory_allocator,
+                            BufferUsage::STORAGE_BUFFER,
+                            entries,
+                            "morph deltas",
+                        )?,
+                        gpu_alloc::host_buffer(
+                            memory_allocator,
+                            BufferUsage::STORAGE_BUFFER,
+                            infos,
+                            "morph infos",
+                        )?,
+                    )
+                }
+            }
         };
         // Per-frame weight scratch, HOST_SEQUENTIAL so the render loop
         // can live-rewrite it through a mapped write each frame.
-        let morph_weights_buf = if raw_target_count == 0 {
-            gpu_alloc::get_or_init_stub(
-                &mut self.stub_f32_ssbo,
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                0.0_f32,
-                "stub f32 SSBO",
-            )?
-        } else {
-            gpu_alloc::host_buffer(
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                (0..raw_target_count).map(|_| 0.0_f32),
-                "morph weights",
-            )?
+        let morph_weights_buf = match previous.as_ref().map(|p| p.morph_weights_buf.clone()) {
+            Some(b) => b,
+            None => {
+                if raw_target_count == 0 {
+                    gpu_alloc::get_or_init_stub(
+                        &mut self.stub_f32_ssbo,
+                        memory_allocator,
+                        BufferUsage::STORAGE_BUFFER,
+                        0.0_f32,
+                        "stub f32 SSBO",
+                    )?
+                } else {
+                    gpu_alloc::host_buffer(
+                        memory_allocator,
+                        BufferUsage::STORAGE_BUFFER,
+                        (0..raw_target_count).map(|_| 0.0_f32),
+                        "morph weights",
+                    )?
+                }
+            }
         };
 
         // Cloth SSBOs, sized to `vertex_count` when the primitive is
         // cloth-bearing this frame; otherwise the shared stub. The render
         // loop rewrites `cloth_pos_ssbo` / `cloth_norm_ssbo` in place
         // whenever the cloth solver bumps its `version`.
-        let cloth_pos_ssbo = if has_cloth {
+        let cloth_pos_ssbo = if let (true, Some(p)) = (prev_had_cloth, previous.as_ref()) {
+            p.cloth_pos_ssbo.clone()
+        } else if has_cloth {
             gpu_alloc::host_buffer(
                 memory_allocator,
                 BufferUsage::STORAGE_BUFFER,
@@ -177,7 +224,9 @@ impl VulkanRenderer {
                 "stub SSBO",
             )?
         };
-        let cloth_norm_ssbo = if has_cloth_normals {
+        let cloth_norm_ssbo = if let (true, Some(p)) = (prev_had_cloth_norm, previous.as_ref()) {
+            p.cloth_norm_ssbo.clone()
+        } else if has_cloth_normals {
             gpu_alloc::host_buffer(
                 memory_allocator,
                 BufferUsage::STORAGE_BUFFER,
@@ -194,24 +243,70 @@ impl VulkanRenderer {
             )?
         };
 
-        let skin_anchors_ssbo = if let Some(ref anchors) = prim.skin_anchors {
-            gpu_alloc::host_buffer(
-                memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                anchors.iter().copied(),
-                "skin anchors SSBO",
-            )?
+        // Anchor payloads depend only on the asset, so an old slot's
+        // SSBOs are always reusable — only which parent VBO the set binds
+        // and the control flags change with `has_anchors` /
+        // `has_containment`.
+        let skin_anchors_ssbo = match previous.as_ref().map(|p| p.skin_anchors_ssbo.clone()) {
+            Some(b) => b,
+            None => {
+                if let Some(ref anchors) = prim.skin_anchors {
+                    gpu_alloc::host_buffer(
+                        memory_allocator,
+                        BufferUsage::STORAGE_BUFFER,
+                        anchors.iter().copied(),
+                        "skin anchors SSBO",
+                    )?
+                } else {
+                    gpu_alloc::get_or_init_stub(
+                        &mut self.stub_skin_anchor_ssbo,
+                        memory_allocator,
+                        BufferUsage::STORAGE_BUFFER,
+                        crate::asset::SkinAnchor::default(),
+                        "stub skin anchor SSBO",
+                    )?
+                }
+            }
+        };
+
+        let containment_anchors_ssbo =
+            match previous.as_ref().map(|p| p.containment_anchors_ssbo.clone()) {
+                Some(b) => b,
+                None => {
+                    if let Some(ref anchors) = prim.containment_anchors {
+                        gpu_alloc::host_buffer(
+                            memory_allocator,
+                            BufferUsage::STORAGE_BUFFER,
+                            anchors.iter().copied(),
+                            "containment anchors SSBO",
+                        )?
+                    } else {
+                        // Same 1-element stub content as the clearance
+                        // anchors, so the shared slot serves both.
+                        gpu_alloc::get_or_init_stub(
+                            &mut self.stub_skin_anchor_ssbo,
+                            memory_allocator,
+                            BufferUsage::STORAGE_BUFFER,
+                            crate::asset::SkinAnchor::default(),
+                            "stub skin anchor SSBO",
+                        )?
+                    }
+                }
+            };
+
+        let body_vbo = if let Some(ref vbo) = body_transformed_vbo {
+            vbo.clone()
         } else {
             gpu_alloc::get_or_init_stub(
-                &mut self.stub_skin_anchor_ssbo,
+                &mut self.stub_vertex_ssbo,
                 memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
-                crate::asset::SkinAnchor::default(),
-                "stub skin anchor SSBO",
+                BufferUsage::STORAGE_BUFFER | BufferUsage::VERTEX_BUFFER,
+                GpuVertex::default(),
+                "stub vertex SSBO",
             )?
         };
 
-        let body_vbo = if let Some(ref vbo) = body_transformed_vbo {
+        let containment_body_vbo = if let Some(ref vbo) = containment_parent_vbo {
             vbo.clone()
         } else {
             gpu_alloc::get_or_init_stub(
@@ -229,7 +324,13 @@ impl VulkanRenderer {
         ctrl.has_cloth = if has_cloth { 1 } else { 0 };
         ctrl.has_cloth_normals = if has_cloth_normals { 1 } else { 0 };
         ctrl.has_skin_anchors = if has_anchors { 1 } else { 0 };
-        let control_ubo = gpu_alloc::host_ubo(memory_allocator, ctrl, "control UBO")?;
+        ctrl.has_containment = if has_containment { 1 } else { 0 };
+        // The render loop rewrites every field of the control UBO right
+        // after this call, so the previous slot's buffer is reusable as-is.
+        let control_ubo = match previous.as_ref().map(|p| p.control_ubo.clone()) {
+            Some(b) => b,
+            None => gpu_alloc::host_ubo(memory_allocator, ctrl, "control UBO")?,
+        };
 
         let set0_layout = transform_pipeline
             .layout()
@@ -251,6 +352,8 @@ impl VulkanRenderer {
                 WriteDescriptorSet::buffer(7, body_vbo),
                 WriteDescriptorSet::buffer(8, morph_infos.clone()),
                 WriteDescriptorSet::buffer(9, morph_weights_buf.clone()),
+                WriteDescriptorSet::buffer(10, containment_anchors_ssbo.clone()),
+                WriteDescriptorSet::buffer(11, containment_body_vbo),
             ],
             [],
         )
@@ -269,6 +372,7 @@ impl VulkanRenderer {
                 cloth_pos_ssbo,
                 cloth_norm_ssbo,
                 skin_anchors_ssbo,
+                containment_anchors_ssbo,
                 transform_set,
                 index_count,
                 vertex_count: vertex_count as u32,
@@ -276,6 +380,7 @@ impl VulkanRenderer {
                 has_cloth_alloc: has_cloth,
                 has_cloth_normals_alloc: has_cloth_normals,
                 has_skin_anchors_alloc: has_anchors,
+                has_containment_alloc: has_containment,
                 last_cloth_version: None,
                 cloth_gpu: None,
             },

@@ -344,6 +344,7 @@ inspector:
   spring_enabled: "スプリング有効"
   spring_sway: "揺れの強さ"
   spring_gravity: "重力補正"
+  spring_natural_gravity: "自然な重力 (物理スケール)"
   gravity_global: "グローバル重力"
   gravity_strength: "強さ"
   gravity_direction: "向き"

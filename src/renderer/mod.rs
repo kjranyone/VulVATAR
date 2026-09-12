@@ -138,6 +138,8 @@ struct TransformGpuData {
     cloth_norm_ssbo: Subbuffer<[[f32; 4]]>,
     #[allow(dead_code)]
     skin_anchors_ssbo: Subbuffer<[crate::asset::SkinAnchor]>,
+    #[allow(dead_code)]
+    containment_anchors_ssbo: Subbuffer<[crate::asset::SkinAnchor]>,
     transform_set: Arc<DescriptorSet>,
     index_count: u32,
     vertex_count: u32,
@@ -145,6 +147,7 @@ struct TransformGpuData {
     has_cloth_alloc: bool,
     has_cloth_normals_alloc: bool,
     has_skin_anchors_alloc: bool,
+    has_containment_alloc: bool,
     last_cloth_version: Option<u64>,
     /// GPU cloth solver state, populated lazily on the first frame this
     /// primitive's snapshot reports `ClothSolverBackend::Gpu`. `None`

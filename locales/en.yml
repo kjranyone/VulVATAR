@@ -344,6 +344,7 @@ inspector:
   spring_enabled: "Spring Enabled"
   spring_sway: "Sway strength"
   spring_gravity: "Gravity adjust"
+  spring_natural_gravity: "Natural gravity (physical scale)"
   gravity_global: "Global Gravity"
   gravity_strength: "Strength"
   gravity_direction: "Direction"

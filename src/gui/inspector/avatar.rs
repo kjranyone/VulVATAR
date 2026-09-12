@@ -253,6 +253,11 @@ fn draw_runtime_toggles(ui: &mut egui::Ui, state: &mut GuiApp) {
                     )
                     .changed();
             });
+            ui.checkbox(
+                &mut state.rendering.spring_tuning.natural_gravity,
+                t!("inspector.spring_natural_gravity"),
+            )
+            .changed();
         });
         ui
             .checkbox(&mut state.rendering.toggle_cloth, t!("inspector.cloth_enabled"))

@@ -1,7 +1,7 @@
 //! Skin-Anchor Clearance Field
 //!
 //! Provides geometric anti-penetration constraints between clothing/skirts
-//! and the avatar's underlying body mesh.
+//! and the avatar's underlying body mesh, and between layered garments.
 //!
 //! At asset import time:
 //! 1. Identifies the avatar's primary body mesh/primitive (e.g. skin, torso + legs).
@@ -10,12 +10,19 @@
 //!    the nearest surface vertex on the body mesh with compatible outward normals.
 //! 4. Computes the rest clearance `c = dot(V_cloth - V_body, N_body)` and records a
 //!    [`SkinAnchor`].
+//! 5. Layered garment pairs (shirt under blazer, …) get anchors in both
+//!    directions: clearance anchors on the outer layer and containment
+//!    anchors on the inner layer.
 //!
 //! At runtime:
-//! The GPU compute shader (`transform_cs`) verifies `clearance >= min_clearance`.
-//! If a limb (e.g. thigh) swings forward and threatens penetration, the shader
-//! projects the clothing vertex outward along the body normal in < 1 nanosecond,
-//! guaranteeing zero penetration regardless of skeletal pose or cloth deformation.
+//! The GPU compute shader (`transform_cs`) applies each anchor according
+//! to its mode. Clearance anchors (skirts over legs, outer garments over
+//! inner ones) project the anchored vertex outward along the parent
+//! normal until it is at least `min_clearance` away. Containment anchors
+//! (inner garments) clamp the anchored vertex back inside the parent
+//! surface when its clearance along the parent normal exceeds
+//! `min_clearance`. Together the two modes keep the outer surface
+//! outside the inner one at bent joints.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +34,19 @@ use crate::asset::{
     AvatarAsset, Mat4, MeshId, MeshPrimitiveAsset, PrimitiveId,
 };
 
+/// Anchor mode: push this vertex OUTWARD off the parent surface until it
+/// is at least `min_clearance` along the parent vertex's outward normal.
+/// Used by outer garments (skirt over legs, blazer over shirt).
+pub const SKIN_ANCHOR_CLEARANCE: u32 = 0;
+
+/// Anchor mode: clamp this vertex back INSIDE the parent surface when
+/// its clearance along the parent vertex's outward normal exceeds
+/// `min_clearance` (typically rest-derived and negative). Used by inner
+/// garments (shirt under blazer) — the outer-surface clearance pass
+/// alone cannot stop an inner vertex sliding between two anchored
+/// outer vertices and poking through at bent joints.
+pub const SKIN_ANCHOR_CONTAINMENT: u32 = 1;
+
 /// Per-vertex skin anchor constraint.
 ///
 /// std430 alignment: 16 bytes (`uvec4`-aligned).
@@ -36,12 +56,17 @@ pub struct SkinAnchor {
     /// Index of the nearest body vertex in the body primitive's vertex buffer.
     /// `u32::MAX` indicates that this vertex is unconstrained.
     pub body_vertex_idx: u32,
-    /// Minimum required clearance distance in meters along the body outward normal.
+    /// Clearance target in meters along the parent vertex's outward
+    /// normal. Semantics depend on `mode`: minimum distance (clearance)
+    /// or maximum distance — usually negative, i.e. how far inside the
+    /// parent surface the vertex may sit at most (containment).
     pub min_clearance: f32,
     /// Influence weight (0.0 to 1.0).
     pub weight: f32,
-    /// Explicit padding to keep std430 16-byte alignment.
-    pub _pad: u32,
+    /// Anchor mode — see [`SKIN_ANCHOR_CLEARANCE`] /
+    /// [`SKIN_ANCHOR_CONTAINMENT`]. Occupies the fourth `uvec4` slot to
+    /// keep std430 16-byte alignment.
+    pub mode: u32,
 }
 
 impl Default for SkinAnchor {
@@ -50,7 +75,7 @@ impl Default for SkinAnchor {
             body_vertex_idx: u32::MAX,
             min_clearance: 0.0,
             weight: 0.0,
-            _pad: 0,
+            mode: SKIN_ANCHOR_CLEARANCE,
         }
     }
 }
@@ -433,7 +458,7 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                         body_vertex_idx: b_idx,
                         min_clearance,
                         weight,
-                        _pad: 0,
+                        mode: SKIN_ANCHOR_CLEARANCE,
                     });
                     bound_count += 1;
                 } else {
@@ -464,7 +489,7 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
 }
 
 /// Helper: computes cosine similarity between two vertex 4-bone weight sets.
-fn compute_bone_weight_similarity(
+pub fn compute_bone_weight_similarity(
     indices_a: &[u16; 4], weights_a: &[f32; 4],
     indices_b: &[u16; 4], weights_b: &[f32; 4],
 ) -> f32 {
@@ -499,13 +524,110 @@ fn aabb_intersects(min_a: [f32; 3], max_a: [f32; 3], min_b: [f32; 3], max_b: [f3
         && min_a[2] <= max_b[2] && max_a[2] >= min_b[2]
 }
 
+/// Spatial grid over a layer's rest-pose world vertices for the layered
+/// anchor searches. 3 cm cells (an anchor search window of a few cells
+/// covers the 4 cm binding radius).
+fn build_layer_grid(
+    verts: &[([f32; 3], [f32; 3])],
+    cell_size: f32,
+) -> HashMap<(i32, i32, i32), Vec<u32>> {
+    let inv_cell = 1.0 / cell_size.max(1e-4);
+    let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
+    for (idx, &(p, _)) in verts.iter().enumerate() {
+        let k = (
+            (p[0] * inv_cell).floor() as i32,
+            (p[1] * inv_cell).floor() as i32,
+            (p[2] * inv_cell).floor() as i32,
+        );
+        grid.entry(k).or_default().push(idx as u32);
+    }
+    grid
+}
+
+/// Nearest compatible vertex on a target layer for one query vertex,
+/// using the layered-clothing compatibility filters: outward-normal
+/// agreement (`dot >= 0`), bone-weight similarity `>= 0.2`, and within
+/// `max_radius` at rest. The score prefers near neighbours and high
+/// bone-weight similarity. Shared by the forward (outer→inner
+/// clearance) and reverse (inner→outer containment) anchor passes.
+#[allow(clippy::too_many_arguments)]
+fn query_layered_nearest(
+    query_pos: [f32; 3],
+    query_nrm: [f32; 3],
+    query_joint_indices: &[u16; 4],
+    query_joint_weights: &[f32; 4],
+    target_grid: &HashMap<(i32, i32, i32), Vec<u32>>,
+    target_verts: &[([f32; 3], [f32; 3])],
+    target_joint_indices: &[[u16; 4]],
+    target_joint_weights: &[[f32; 4]],
+    inv_cell: f32,
+    max_radius: f32,
+    min_sim: f32,
+) -> Option<u32> {
+    let max_r2 = max_radius * max_radius;
+    let ck = (
+        (query_pos[0] * inv_cell).floor() as i32,
+        (query_pos[1] * inv_cell).floor() as i32,
+        (query_pos[2] * inv_cell).floor() as i32,
+    );
+    let cell_radius = (max_radius * inv_cell).ceil() as i32;
+    let mut best_i = None;
+    let mut best_score = max_r2;
+
+    for dx in -cell_radius..=cell_radius {
+        for dy in -cell_radius..=cell_radius {
+            for dz in -cell_radius..=cell_radius {
+                if let Some(list) = target_grid.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz)) {
+                    for &idx in list {
+                        let (tp, tn) = target_verts[idx as usize];
+                        // Normal compatibility: the two surfaces must
+                        // face the same way at the pairing point.
+                        let dot_n = query_nrm[0] * tn[0] + query_nrm[1] * tn[1] + query_nrm[2] * tn[2];
+                        if dot_n < 0.0 {
+                            continue;
+                        }
+
+                        let w_sim = compute_bone_weight_similarity(
+                            query_joint_indices,
+                            query_joint_weights,
+                            &target_joint_indices[idx as usize],
+                            &target_joint_weights[idx as usize],
+                        );
+                        if w_sim < min_sim {
+                            continue;
+                        }
+
+                        let diff = [query_pos[0] - tp[0], query_pos[1] - tp[1], query_pos[2] - tp[2]];
+                        let d2 = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
+                        let score = d2 + 0.0003 * (1.0 - w_sim);
+                        if score < best_score {
+                            best_score = score;
+                            best_i = Some(idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best_i
+}
+
 /// Phase 2: Hierarchical Layered Clothing Clearance.
 ///
 /// Automatically discovers multi-layer clothing pairings (e.g. shirt -> blazer,
 /// inner blouse -> outer jacket, underwear -> outerwear) using rest-pose geometry
-/// and bone kinematics. Assigns GPU clearance anchors from the inner surface to the
-/// outer surface, guaranteeing that inner clothing never penetrates outer layers
-/// even during acute joint bending or cloth dynamics.
+/// and bone kinematics. Each pair gets anchors in BOTH directions:
+///
+/// - forward (clearance) on the outer layer: the transform shader pushes the
+///   outer surface off the inner one so the outer garment never sinks into it;
+/// - reverse (containment) on the inner layer: the shader clamps inner vertices
+///   back inside the outer surface when they poke through it — the outer-side
+///   clearance alone cannot stop an inner vertex sliding between two anchored
+///   outer vertices at bent joints.
+///
+/// The two directions live in separate slots (`skin_anchors` /
+/// `body_primitive_id` vs `containment_anchors` / `containment_primitive_id`),
+/// so the middle layer of a 3+ layer stack carries both at once.
 pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat4], skinning: &[Mat4]) {
     struct PrimCandidate {
         mesh_idx: usize,
@@ -708,7 +830,7 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
         }
     }
 
-    // Now generate anchors for outer primitives
+    // Forward pass: clearance anchors on the outer primitives
     for (&outer_idx, &(inner_idx, avg_c, n_overlap)) in &best_inner_for_outer {
         let outer_cand = &candidates[outer_idx];
         let inner_cand = &candidates[inner_idx];
@@ -722,52 +844,28 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
 
         let cell_size = 0.03f32;
         let inv_cell = 1.0 / cell_size;
-        let mut inner_grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
-        for (idx, &(p, _)) in inner_cand.world_verts.iter().enumerate() {
-            let k = ((p[0] * inv_cell).floor() as i32, (p[1] * inv_cell).floor() as i32, (p[2] * inv_cell).floor() as i32);
-            inner_grid.entry(k).or_default().push(idx as u32);
-        }
+        let inner_grid = build_layer_grid(&inner_cand.world_verts, cell_size);
 
         let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx].vertices.as_ref().unwrap();
         let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx].vertices.as_ref().unwrap();
 
-        let max_radius = 0.04f32;
-        let max_r2 = max_radius * max_radius;
         let mut anchors = Vec::with_capacity(outer_cand.world_verts.len());
         let mut bound_count = 0usize;
 
         for (oi, &(op, on)) in outer_cand.world_verts.iter().enumerate() {
-            let ck = ((op[0] * inv_cell).floor() as i32, (op[1] * inv_cell).floor() as i32, (op[2] * inv_cell).floor() as i32);
-            let mut best_i = None;
-            let mut best_score = max_r2;
-
-            for dx in -2..=2 {
-                for dy in -2..=2 {
-                    for dz in -2..=2 {
-                        if let Some(list) = inner_grid.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz)) {
-                            for &idx in list {
-                                let (ip, inrm) = inner_cand.world_verts[idx as usize];
-                                let dot_n = on[0]*inrm[0] + on[1]*inrm[1] + on[2]*inrm[2];
-                                if dot_n < 0.0 { continue; }
-
-                                let w_sim = compute_bone_weight_similarity(
-                                    &o_vd.joint_indices[oi], &o_vd.joint_weights[oi],
-                                    &i_vd.joint_indices[idx as usize], &i_vd.joint_weights[idx as usize],
-                                );
-                                if w_sim < 0.2 { continue; }
-
-                                let diff = [op[0] - ip[0], op[1] - ip[1], op[2] - ip[2]];
-                                let d2 = diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2];
-                                let score = d2 + 0.0003 * (1.0 - w_sim);
-                                if score < best_score {
-                                    best_score = score;
-                                    best_i = Some(idx);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let best_i = query_layered_nearest(
+                op,
+                on,
+                &o_vd.joint_indices[oi],
+                &o_vd.joint_weights[oi],
+                &inner_grid,
+                &inner_cand.world_verts,
+                &i_vd.joint_indices,
+                &i_vd.joint_weights,
+                inv_cell,
+                0.04,
+                0.2,
+            );
 
             if let Some(idx) = best_i {
                 let (ip, inrm) = inner_cand.world_verts[idx as usize];
@@ -778,7 +876,7 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
                     body_vertex_idx: idx,
                     min_clearance,
                     weight: 1.0,
-                    _pad: 0,
+                    mode: SKIN_ANCHOR_CLEARANCE,
                 });
                 bound_count += 1;
             } else {
@@ -794,6 +892,108 @@ pub fn generate_layered_clothing_anchors(asset: &mut AvatarAsset, globals: &[Mat
             let prim_mut = Arc::make_mut(&mut asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]);
             prim_mut.skin_anchors = Some(anchors);
             prim_mut.body_primitive_id = Some(inner_cand.prim_id);
+        }
+    }
+
+    // Reverse pass: containment anchors on the inner layers.
+    //
+    // The forward pass keeps the OUTER surface clear of the inner one at
+    // each anchor correspondence, but a *different* inner vertex can
+    // still slide between two anchored outer vertices and poke through
+    // at bent joints — the shirt-through-blazer failure. Each pair's
+    // inner layer therefore also gets containment anchors referencing
+    // the outer surface: the transform shader clamps those vertices
+    // back inside when their clearance along the outer normal exceeds
+    // the rest-derived target (`rest_clearance - CONTAINMENT_SLACK`),
+    // so the constraint never fires on the rest pose itself, however
+    // tight the layer gap.
+    //
+    // Containment anchors live in their own `containment_anchors` /
+    // `containment_primitive_id` slots, so the middle layer of a 3+
+    // layer stack carries clearance anchors against its inner
+    // neighbour AND containment anchors against its outer neighbour
+    // simultaneously. A primitive serves as the inner of at most one
+    // pair — when two outer layers share an inner candidate, the pair
+    // with the larger overlap count wins (sorted for determinism).
+    const CONTAINMENT_SLACK: f32 = 0.002;
+
+    let mut pairs: Vec<(usize, usize, usize)> = best_inner_for_outer
+        .iter()
+        .map(|(&outer_idx, &(inner_idx, _, n_overlap))| (outer_idx, inner_idx, n_overlap))
+        .collect();
+    pairs.sort_by(|a, b| b.2.cmp(&a.2));
+
+    for &(outer_idx, inner_idx, _n_overlap) in &pairs {
+        {
+            let inner_check =
+                &asset.meshes[candidates[inner_idx].mesh_idx].primitives[candidates[inner_idx].prim_idx];
+            if inner_check.containment_anchors.is_some()
+                || inner_check.containment_primitive_id.is_some()
+            {
+                continue;
+            }
+        }
+
+        let outer_cand = &candidates[outer_idx];
+        let inner_cand = &candidates[inner_idx];
+
+        let cell_size = 0.03f32;
+        let inv_cell = 1.0 / cell_size;
+        let outer_grid = build_layer_grid(&outer_cand.world_verts, cell_size);
+
+        let o_vd = asset.meshes[outer_cand.mesh_idx].primitives[outer_cand.prim_idx]
+            .vertices
+            .as_ref()
+            .unwrap();
+        let i_vd = asset.meshes[inner_cand.mesh_idx].primitives[inner_cand.prim_idx]
+            .vertices
+            .as_ref()
+            .unwrap();
+
+        let mut anchors = Vec::with_capacity(inner_cand.world_verts.len());
+        let mut bound_count = 0usize;
+
+        for (ii, &(ip, inrm)) in inner_cand.world_verts.iter().enumerate() {
+            let best = query_layered_nearest(
+                ip,
+                inrm,
+                &i_vd.joint_indices[ii],
+                &i_vd.joint_weights[ii],
+                &outer_grid,
+                &outer_cand.world_verts,
+                &o_vd.joint_indices,
+                &o_vd.joint_weights,
+                inv_cell,
+                0.08,
+                0.1,
+            );
+
+            if let Some(idx) = best {
+                let (op, on) = outer_cand.world_verts[idx as usize];
+                let diff = [ip[0] - op[0], ip[1] - op[1], ip[2] - op[2]];
+                let rest_c = diff[0] * on[0] + diff[1] * on[1] + diff[2] * on[2];
+                anchors.push(SkinAnchor {
+                    body_vertex_idx: idx,
+                    min_clearance: rest_c - CONTAINMENT_SLACK,
+                    weight: 1.0,
+                    mode: SKIN_ANCHOR_CONTAINMENT,
+                });
+                bound_count += 1;
+            } else {
+                anchors.push(SkinAnchor::default());
+            }
+        }
+
+        if bound_count > 0 {
+            info!(
+                "clearance: established {} containment anchors on inner '{}' (prim {:?}) -> outer '{}'",
+                bound_count, inner_cand.mesh_name, inner_cand.prim_id, outer_cand.mesh_name
+            );
+            let prim_mut = Arc::make_mut(
+                &mut asset.meshes[candidates[inner_idx].mesh_idx].primitives[candidates[inner_idx].prim_idx],
+            );
+            prim_mut.containment_anchors = Some(anchors);
+            prim_mut.containment_primitive_id = Some(outer_cand.prim_id);
         }
     }
 }

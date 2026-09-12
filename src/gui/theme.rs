@@ -24,7 +24,6 @@ pub mod color {
 
     // ── Brand / accent ────────────────────────────────────────────
     pub const PRIMARY: Color32 = Color32::from_rgb(124, 92, 255);
-    pub const PRIMARY_HOVER: Color32 = Color32::from_rgb(108, 76, 240);
     pub const ON_PRIMARY: Color32 = Color32::WHITE;
     /// Light-purple chip used for active mode-nav items, selected sort
     /// chips, and any "you are here" affordance.
@@ -60,7 +59,6 @@ pub mod color {
     pub const ON_WARNING_CONTAINER: Color32 = Color32::from_rgb(150, 90, 10);
 
     // ── Outlines / dividers ───────────────────────────────────────
-    pub const OUTLINE: Color32 = Color32::from_rgb(218, 213, 226);
     pub const OUTLINE_VARIANT: Color32 = Color32::from_rgb(232, 228, 240);
 
     // ── Viewport background (always dark for avatar contrast) ─────
@@ -133,7 +131,6 @@ pub mod viz {
     pub const GRID: Color32 = Color32::from_rgb(45, 45, 55);
     pub const CROSSHAIR: Color32 = Color32::from_rgb(70, 70, 85);
     pub const LABEL_PRIMARY: Color32 = Color32::from_rgb(100, 100, 115);
-    pub const LABEL_SECONDARY: Color32 = Color32::from_rgb(75, 75, 85);
 
     // ── Alpha-preview checkerboards ───────────────────────────────
     /// Light checker pair drawn *behind the rendered image* when alpha
@@ -162,7 +159,6 @@ pub mod space {
     pub const SM: f32 = 8.0;
     pub const MD: f32 = 16.0;
     pub const LG: f32 = 24.0;
-    pub const XL: f32 = 32.0;
 }
 
 pub mod radius {
@@ -210,7 +206,6 @@ pub mod typography {
 pub mod icon {
     // Mode nav
     pub const AVATAR: char = '\u{f8d6}'; // person_4
-    pub const PREVIEW: char = '\u{e8f4}'; // visibility
     pub const TRACKING_SETUP: char = '\u{e8aa}'; // track_changes
     pub const RENDERING: char = '\u{e40a}'; // palette
     pub const OUTPUT: char = '\u{ebbe}'; // output
@@ -224,11 +219,8 @@ pub mod icon {
     pub const MENU: char = '\u{e5d2}'; // menu (hamburger)
     pub const FOLDER_OPEN: char = '\u{e2c8}'; // folder_open
     pub const SAVE: char = '\u{e161}'; // save
-    pub const OPEN_OVERLAY: char = '\u{e89e}'; // layers
-    pub const SAVE_OVERLAY: char = '\u{eb4f}'; // save_alt
     pub const PAUSE: char = '\u{e034}'; // pause
     pub const PLAY: char = '\u{e037}'; // play_arrow
-    pub const PROFILE: char = '\u{e7fd}'; // person
     pub const MORE_VERT: char = '\u{e5d4}'; // more_vert
 
     // Common actions
@@ -237,18 +229,12 @@ pub mod icon {
     pub const ADD: char = '\u{e145}'; // add
     pub const REMOVE: char = '\u{e15b}'; // remove
     pub const DELETE: char = '\u{e872}'; // delete
-    pub const CLOSE: char = '\u{e5cd}'; // close
-    pub const FILTER: char = '\u{ef4f}'; // filter_alt
-    pub const FAVORITE: char = '\u{e838}'; // star (filled outline)
     pub const FAVORITE_FILLED: char = '\u{e838}'; // star
     pub const FAVORITE_BORDER: char = '\u{e83a}'; // star_border
 
     // Status indicators
     pub const STATUS_DOT: char = '\u{e061}'; // fiber_manual_record (small filled circle)
-    pub const FULLSCREEN: char = '\u{e5d0}'; // fullscreen
     pub const HOME: char = '\u{e88a}'; // home
-    pub const ZOOM_IN: char = '\u{e8ff}'; // zoom_in
-    pub const ZOOM_OUT: char = '\u{e900}'; // zoom_out
     pub const HISTORY: char = '\u{e889}'; // history
 }
 

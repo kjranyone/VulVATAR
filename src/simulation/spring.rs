@@ -6,6 +6,7 @@ use crate::math_utils::{
     vec3_dot, vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
 };
 use crate::simulation::cloth::ResolvedCollider;
+use crate::simulation::SceneGravity;
 
 /// User-facing spring-bone tuning, layered on top of the VRM asset's
 /// authored per-chain/per-joint values at simulation time (the asset is
@@ -29,6 +30,16 @@ pub struct SpringTuning {
     /// multiplier would be a dead knob on exactly the models whose hair
     /// most needs the droop.
     pub gravity_offset: f32,
+    /// Physically-scaled gravity (default on). Gravity parameters become
+    /// fractions of Earth gravity with per-chain floors
+    /// (`SpringBoneAsset::gravity_floor`, set for hair categories at
+    /// asset build) and stiffness becomes an exponential approach rate —
+    /// strands re-hang toward world-down on human-natural timescales
+    /// (~0.3–0.5 s) even when the model author left `gravityPower` at 0.
+    /// Off reproduces the legacy unitless force mix bit-for-bit
+    /// (gravityPower treated as m/s², positional `stiffness*dt` pull) —
+    /// the authored-faithful behaviour.
+    pub natural_gravity: bool,
 }
 
 impl SpringTuning {
@@ -41,9 +52,19 @@ impl Default for SpringTuning {
         Self {
             sway_scale: 1.0,
             gravity_offset: 0.0,
+            natural_gravity: true,
         }
     }
 }
+
+/// Natural-gravity model: how the authored stiffness parameter (the
+/// 0..1-ish VRC/VRM scale) maps to an exponential approach rate in 1/s.
+/// 7.0 puts a typical hair chain (stiffness 0.4) at ~2.8 /s — a settle
+/// time constant of ~0.36 s, inside the natural re-hang band. Under the
+/// 0.15 g hair floor the equilibrium sag per joint lands around
+/// 10–18 mm, so styled strands keep their shape while still hanging
+/// toward world-down as the head tilts.
+const NATURAL_STIFFNESS_RATE_GAIN: f32 = 7.0;
 
 /// Verlet integration-based spring bone solver.
 ///
@@ -57,23 +78,28 @@ impl Default for SpringTuning {
 ///
 /// Verlet position update for a single joint.
 ///
-/// Computes the next position from the current and previous positions using
-/// velocity (with drag), stiffness pull toward the rest pose, and gravity.
-#[allow(clippy::too_many_arguments)]
+/// Computes the next position from the current and previous positions
+/// using velocity (with drag), a positional pull toward the rest target,
+/// and a gravity displacement. The pull and gravity magnitudes are
+/// precomputed by the caller (they differ between the natural and
+/// legacy force models — see the joint loop):
+/// - `stiffness_factor` is the fraction of the rest-target offset to
+///   close this step (`stiffness * dt` legacy, `1 - exp(-rate*dt)`
+///   natural — both unconditionally < 1, so no overshoot),
+/// - `gravity_step` is the along-direction displacement this step
+///   (`power * dt²` legacy, `frac * g * dt²` natural).
 fn verlet_integrate_joint(
     current: &Vec3,
     previous: &Vec3,
     rest_world_target: &Vec3,
     gravity_dir: &Vec3,
     drag: f32,
-    stiffness: f32,
-    gravity_power: f32,
-    dt: f32,
-    dt2: f32,
+    stiffness_factor: f32,
+    gravity_step: f32,
 ) -> Vec3 {
     let velocity = vec3_scale(&vec3_sub(current, previous), (1.0 - drag).max(0.0));
-    let gravity = vec3_scale(gravity_dir, gravity_power * dt2);
-    let stiffness_force = vec3_scale(&vec3_sub(rest_world_target, current), stiffness * dt);
+    let gravity = vec3_scale(gravity_dir, gravity_step);
+    let stiffness_force = vec3_scale(&vec3_sub(rest_world_target, current), stiffness_factor);
     vec3_add(
         &vec3_add(&vec3_add(current, &velocity), &stiffness_force),
         &gravity,
@@ -200,9 +226,11 @@ pub fn step_spring_bones(
 
     let dt2 = dt * dt;
     // User tuning (see [`SpringTuning`]): sway inversely scales
-    // stiffness/drag. Stiffness is additionally capped at `1/dt` so a
-    // low sway setting cannot push the per-step rest pull past 1.0 and
-    // flip the Verlet integration into overshoot oscillation.
+    // stiffness/drag. In the legacy force model the positional
+    // stiffness pull is capped at `1/dt` so a low sway setting cannot
+    // push the per-step rest pull past 1.0 and flip the Verlet
+    // integration into overshoot oscillation; the natural model's
+    // `1 - exp(-rate*dt)` pull is unconditionally < 1 and needs no cap.
     let sway_inv = 1.0 / tuning.sway_scale.clamp(0.05, 2.0);
     let max_stiffness = 1.0 / dt;
 
@@ -271,13 +299,12 @@ pub fn step_spring_bones(
         };
 
         for j in 1..joints.len() {
-            let stiffness = (spring_asset
+            let stiffness_param = spring_asset
                 .joint_stiffness
                 .get(j)
                 .copied()
                 .unwrap_or(chain_stiffness)
-                * sway_inv)
-                .min(max_stiffness);
+                * sway_inv;
             let drag = (spring_asset
                 .joint_drag
                 .get(j)
@@ -285,16 +312,36 @@ pub fn step_spring_bones(
                 .unwrap_or(chain_drag)
                 * sway_inv)
                 .clamp(0.0, 1.0);
-            // authored power + user offset, then scaled by the scene
-            // gravity strength; clamped non-negative.
-            let gravity_power = ((spring_asset
+            let gravity_param = spring_asset
                 .joint_gravity_power
                 .get(j)
                 .copied()
-                .unwrap_or(chain_gravity_power)
-                + tuning.gravity_offset)
-                * gravity_scale)
-                .max(0.0);
+                .unwrap_or(chain_gravity_power);
+
+            // Force model. Natural gravity (default): gravity parameters
+            // are fractions of Earth gravity — authored power plus the
+            // user offset, floored per chain by `gravity_floor` — and
+            // stiffness is an exponential approach rate. Strands re-hang
+            // toward world-down on human-natural timescales even when
+            // the model author left `gravityPower` at 0. Legacy (toggle
+            // off) reproduces the original unitless mix bit-for-bit:
+            // gravityPower treated as m/s², positional `stiffness * dt`
+            // pull capped by `max_stiffness`.
+            let (stiffness_factor, gravity_step) = if tuning.natural_gravity {
+                let rate = stiffness_param * NATURAL_STIFFNESS_RATE_GAIN;
+                let factor = -((-(rate * dt)).exp_m1());
+                let frac = (gravity_param + tuning.gravity_offset)
+                    .clamp(0.0, 1.5)
+                    .max(spring_asset.gravity_floor);
+                (
+                    factor,
+                    frac * SceneGravity::EARTH_G * gravity_scale * dt2,
+                )
+            } else {
+                let stiffness = stiffness_param.min(max_stiffness);
+                let power = (gravity_param + tuning.gravity_offset).max(0.0) * gravity_scale;
+                (stiffness * dt, power * dt2)
+            };
             let node_idx = joints[j].0 as usize;
             let head_idx = joints[j - 1].0 as usize;
 
@@ -346,10 +393,8 @@ pub fn step_spring_bones(
                 &rest_world_target,
                 &gravity_dir,
                 drag,
-                stiffness,
-                gravity_power,
-                dt,
-                dt2,
+                stiffness_factor,
+                gravity_step,
             );
 
             // 2. Enforce bone length

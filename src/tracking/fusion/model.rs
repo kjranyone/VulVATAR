@@ -463,6 +463,20 @@ impl Humanoid {
         // ---- arms (left, then mirrored) ------------------------------------
         // Clavicle: from upper chest, mostly lateral+up. Shoulder joint sits
         // at the acromion. Elbow = flexion hinge + forearm twist hinge.
+        //
+        // Clavicle prior σ: loosening this (0.15 → 0.40, to let depth-lifted
+        // shoulder observations place the joints behind the chest skin via
+        // clavicle articulation instead of trunk pitch) was benched on the
+        // s1789219959 desk replay and measured INEFFECTIVE for the back-lean
+        // (torso pitch −11.1° → −10.7°) while degrading torso yaw against
+        // the shoulder-depth reference (mean +33.8 err +4.0 → mean +23.4
+        // err −6.4, std 3.4 → 6.3). Default stays 0.15;
+        // `VULVATAR_CLAV_SIGMA` re-runs the experiment for the bench.
+        let clav_sigma = std::env::var("VULVATAR_CLAV_SIGMA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(0.15);
         let l_arm = |b: &mut Builder, s: &mut SiteIdx, mirror: bool| -> ([usize; 5], [[usize; 4]; 5]) {
             let m = |v: V3| if mirror { mirror_v(v) } else { v };
             let mk = |k: JointKind| if mirror { mirror_kind(k) } else { k };
@@ -482,7 +496,7 @@ impl Humanoid {
                 mk(ball([-0.4, -0.5, -0.4], [0.4, 0.5, 0.6])),
                 Some(b_clav),
                 z3,
-                sig(0.15),
+                sig(clav_sigma),
             );
             let sh = b.joint(
                 if mirror { "r_shoulder" } else { "l_shoulder" },

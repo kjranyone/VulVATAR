@@ -82,7 +82,8 @@ pub struct TransformControl {
     pub has_cloth: u32,
     pub has_cloth_normals: u32,
     pub has_skin_anchors: u32,
-    pub _pad0: [u32; 3],
+    pub has_containment: u32,
+    pub _pad0: [u32; 2],
 }
 
 impl TransformControl {
@@ -93,7 +94,8 @@ impl TransformControl {
             has_cloth: 0,
             has_cloth_normals: 0,
             has_skin_anchors: 0,
-            _pad0: [0; 3],
+            has_containment: 0,
+            _pad0: [0; 2],
         }
     }
 }
@@ -976,7 +978,8 @@ layout(set = 0, binding = 4) uniform TransformControl {
     uint has_cloth;
     uint has_cloth_normals;
     uint has_skin_anchors;
-    uvec3 _pad0;
+    uint has_containment;
+    uvec2 _pad0;
 } ctrl;
 
 layout(set = 0, binding = 8) readonly buffer MorphTargetInfo {
@@ -998,7 +1001,11 @@ struct SkinAnchor {
     uint body_vertex_idx;
     float min_clearance;
     float weight;
-    uint _pad;
+    // 0 = clearance (push this vertex outward off the parent surface),
+    // 1 = containment (clamp this vertex back inside the parent surface).
+    // The two anchor sets travel in separate buffers (binding 6 vs 10)
+    // so the field is metadata; the shader branches per binding.
+    uint mode;
 };
 
 layout(set = 0, binding = 6) readonly buffer SkinAnchors {
@@ -1008,6 +1015,14 @@ layout(set = 0, binding = 6) readonly buffer SkinAnchors {
 layout(set = 0, binding = 7) readonly buffer BodyVertices {
     OutVertex v[];
 } body_v;
+
+layout(set = 0, binding = 10) readonly buffer ContainmentAnchors {
+    SkinAnchor a[];
+} containment_anchors;
+
+layout(set = 0, binding = 11) readonly buffer ContainmentParent {
+    OutVertex v[];
+} containment_parent_v;
 
 layout(set = 1, binding = 0) readonly buffer SkinningData {
     mat4 matrices[];
@@ -1177,18 +1192,70 @@ void main() {
         }
     }
 
-    // Skin anchor clearance projection (anti-penetration)
+    // Skin anchor anti-penetration, two independent constraint sets:
+    //
+    // Clearance (binding 6, `body_v` = the INNER surface): this vertex
+    //   must stay at least `min_clearance` OUTSIDE the parent surface,
+    //   measured along the parent vertex's outward normal — pushes the
+    //   outer garment off the inner one. At joints where the two
+    //   surfaces fold against each other the anchored parent normal can
+    //   end up opposing this vertex's own normal; the push direction
+    //   then flips to follow this vertex's facing so the fold opens
+    //   instead of crushing the outer layer inward. The flip is only
+    //   decided from a world-space normal — cloth vertices without
+    //   GPU-computed normals still carry a rest-space normal, so they
+    //   keep the unflipped behaviour.
+    //
+    // Containment (binding 10, `containment_parent_v` = the OUTER
+    //   surface): this vertex must stay at most `min_clearance`
+    //   (negative, rest-derived) outside the parent surface — clamps
+    //   the inner garment back inside the outer one when it pokes
+    //   through at bent joints. The two sets are separate so a middle
+    //   layer can carry both at once.
+    //
+    // Both read the parent through a sanity band on the parent position
+    // (avatar-local coords live well inside it) plus NaN-rejecting
+    // comparisons; containment parents run their own clearance dispatch
+    // later in the frame, so on the first frame their VBO may never
+    // have been written — garbage reads fail the band or the NaN
+    // comparison and stay inert.
     if (ctrl.has_skin_anchors > 0u) {
         SkinAnchor anc = skin_anchors.a[vid];
         if (anc.body_vertex_idx != 0xFFFFFFFFu && anc.weight > 1e-4) {
             vec3 bp = body_v.v[anc.body_vertex_idx].position.xyz;
             vec3 bn = body_v.v[anc.body_vertex_idx].normal.xyz;
+            float plen = length(bp);
             float nlen = length(bn);
-            if (nlen > 1e-4) {
+            if (plen > 1e-3 && plen < 10.0 && nlen > 1e-4) {
                 bn /= nlen;
-                float clearance = dot(world_pos - bp, bn);
+                // Clearance: push out, flipping along the vertex's
+                // own facing at fold regions.
+                vec3 eff_n = bn;
+                bool nrm_world_valid = (ctrl.has_cloth == 0u) || (ctrl.has_cloth_normals > 0u);
+                if (nrm_world_valid && dot(bn, world_nrm) < 0.0) {
+                    eff_n = -bn;
+                }
+                float clearance = dot(world_pos - bp, eff_n);
                 if (clearance < anc.min_clearance) {
-                    world_pos += bn * ((anc.min_clearance - clearance) * anc.weight);
+                    world_pos += eff_n * ((anc.min_clearance - clearance) * anc.weight);
+                }
+            }
+        }
+    }
+
+    if (ctrl.has_containment > 0u) {
+        SkinAnchor anc = containment_anchors.a[vid];
+        if (anc.body_vertex_idx != 0xFFFFFFFFu && anc.weight > 1e-4) {
+            vec3 op = containment_parent_v.v[anc.body_vertex_idx].position.xyz;
+            vec3 on = containment_parent_v.v[anc.body_vertex_idx].normal.xyz;
+            float plen = length(op);
+            float nlen = length(on);
+            if (plen > 1e-3 && plen < 10.0 && nlen > 1e-4) {
+                on /= nlen;
+                // Containment: clamp back inside the parent surface.
+                float c = dot(world_pos - op, on);
+                if (c > anc.min_clearance) {
+                    world_pos -= on * ((c - anc.min_clearance) * anc.weight);
                 }
             }
         }
@@ -1848,6 +1915,7 @@ mod tests {
         assert_eq!(offset_of!(TransformControl, has_cloth), 8);
         assert_eq!(offset_of!(TransformControl, has_cloth_normals), 12);
         assert_eq!(offset_of!(TransformControl, has_skin_anchors), 16);
-        assert_eq!(offset_of!(TransformControl, _pad0), 20);
+        assert_eq!(offset_of!(TransformControl, has_containment), 20);
+        assert_eq!(offset_of!(TransformControl, _pad0), 24);
     }
 }

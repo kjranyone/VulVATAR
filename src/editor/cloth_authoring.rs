@@ -12,13 +12,6 @@ pub struct RegionSelection {
     /// When non-empty this takes precedence over `selected_vertex_range`.
     pub selected_vertices: BTreeSet<usize>,
 }
-
-#[derive(Clone, Debug)]
-pub enum AuthoringValidationError {
-    UnresolvedNodeRef { node_name: String },
-    EmptySimulationMesh,
-}
-
 // ---------------------------------------------------------------------------
 // Task 3: Simulation mesh generation
 // ---------------------------------------------------------------------------
