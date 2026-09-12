@@ -9,15 +9,14 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::buffer::{BufferUsage, Subbuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::memory::allocator::{
-    AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator,
-};
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::{ComputePipeline, Pipeline};
 
 use crate::asset::{MeshId, PrimitiveId};
+use crate::renderer::gpu_alloc;
 use crate::renderer::{
     pipeline, ClothGpuConstraintResources, ClothGpuNormalResources, ClothGpuSlot, VulkanRenderer,
 };
@@ -94,37 +93,20 @@ impl VulkanRenderer {
             }
         };
 
-        let prev_pos_ssbo = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
+        let prev_pos_ssbo = gpu_alloc::host_buffer(
+            &memory_allocator,
+            BufferUsage::STORAGE_BUFFER,
             // Seed prev_pos to same as initial positions ⇒ zero
             // velocity at start. `w` = pinned flag (1.0 = locked).
             initial_positions
                 .iter()
                 .enumerate()
                 .map(|(i, p)| [p[0], p[1], p[2], pinned_at(i)]),
-        )
-        .map_err(|e| format!("renderer: cloth prev_pos SSBO alloc failed: {e}"))?;
+            "cloth prev_pos SSBO",
+        )?;
 
-        let verlet_control_ubo = Buffer::from_data(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::UNIFORM_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
+        let verlet_control_ubo = gpu_alloc::host_ubo(
+            &memory_allocator,
             pipeline::ClothVerletControl {
                 dt: 0.0,
                 damping: 0.0,
@@ -133,8 +115,8 @@ impl VulkanRenderer {
                 gravity: [0.0; 4],
                 wind: [0.0; 4],
             },
-        )
-        .map_err(|e| format!("renderer: cloth verlet control UBO alloc failed: {e}"))?;
+            "cloth verlet control UBO",
+        )?;
 
         let set0_layout = cloth_verlet_pipeline
             .layout()
@@ -159,9 +141,7 @@ impl VulkanRenderer {
             let mut guard = cloth_pos_ssbo
                 .write()
                 .map_err(|e| format!("renderer: cloth pos initial seed failed: {e}"))?;
-            for (i, (dst, p)) in
-                guard.iter_mut().zip(initial_positions.iter()).enumerate()
-            {
+            for (i, (dst, p)) in guard.iter_mut().zip(initial_positions.iter()).enumerate() {
                 *dst = [p[0], p[1], p[2], inv_mass_at(i)];
             }
         }
@@ -217,11 +197,12 @@ impl VulkanRenderer {
 
         if let Some(slot) = self.transform_cache.get_mut(&key) {
             slot.cloth_gpu = Some(ClothGpuSlot {
-                state: crate::simulation::cloth_gpu_boundary::ClothGpuSimulationState::from_authoring(
-                    particle_count,
-                    attach.constraints.len() as u32,
-                    8,
-                ),
+                state:
+                    crate::simulation::cloth_gpu_boundary::ClothGpuSimulationState::from_authoring(
+                        particle_count,
+                        attach.constraints.len() as u32,
+                        8,
+                    ),
                 prev_pos_ssbo,
                 verlet_control_ubo,
                 verlet_set,
@@ -244,40 +225,26 @@ fn allocate_cloth_constraint_resources(
     accumulate_pipeline: &Arc<ComputePipeline>,
     apply_pipeline: &Arc<ComputePipeline>,
 ) -> Result<ClothGpuConstraintResources, String> {
-    let constraint_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        constraints.iter().map(|(a, b, r, s)| pipeline::ClothConstraintGpu {
-            particle_a: *a,
-            particle_b: *b,
-            rest_length: *r,
-            stiffness: *s,
-        }),
-    )
-    .map_err(|e| format!("renderer: cloth constraint SSBO alloc: {e}"))?;
+    let constraint_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        constraints
+            .iter()
+            .map(|(a, b, r, s)| pipeline::ClothConstraintGpu {
+                particle_a: *a,
+                particle_b: *b,
+                rest_length: *r,
+                stiffness: *s,
+            }),
+        "cloth constraint SSBO",
+    )?;
 
-    let delta_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let delta_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         (0..particle_count as usize).map(|_| [0.0_f32; 4]),
-    )
-    .map_err(|e| format!("renderer: cloth delta SSBO alloc: {e}"))?;
+        "cloth delta SSBO",
+    )?;
 
     let constraint_pairs: Vec<(u32, u32)> =
         constraints.iter().map(|(a, b, _, _)| (*a, *b)).collect();
@@ -285,20 +252,12 @@ fn allocate_cloth_constraint_resources(
         &constraint_pairs,
         particle_count,
     );
-    let adj_offsets_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let adj_offsets_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         adj.offsets.iter().copied(),
-    )
-    .map_err(|e| format!("renderer: constraint adj offsets SSBO alloc: {e}"))?;
+        "constraint adj offsets SSBO",
+    )?;
     // Vulkano refuses zero-sized buffers; supply a single u32 stub
     // when the CSR scatter array is empty (no particle touches any
     // constraint). The shader's adjacency loop won't iterate
@@ -308,32 +267,15 @@ fn allocate_cloth_constraint_resources(
     } else {
         adj.triangles.clone()
     };
-    let adj_constraints_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let adj_constraints_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         adj_constraints_data,
-    )
-    .map_err(|e| format!("renderer: constraint adj scatter SSBO alloc: {e}"))?;
+        "constraint adj scatter SSBO",
+    )?;
 
-    let control_ubo = Buffer::from_data(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::UNIFORM_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let control_ubo = gpu_alloc::host_ubo(
+        &memory_allocator,
         pipeline::ClothConstraintControl {
             particle_count,
             // `constraint_count` and `dt` are populated by the render-
@@ -345,23 +287,15 @@ fn allocate_cloth_constraint_resources(
             dt: 0.0,
             _pad: 0,
         },
-    )
-    .map_err(|e| format!("renderer: constraint control UBO alloc: {e}"))?;
+        "constraint control UBO",
+    )?;
 
     // XPBD per-constraint Lagrange multiplier (accumulates across the
     // projection iterations within one substep; reset to zero at
     // substep start by the renderer's `fill_buffer`).
-    let lambda_ssbo: Subbuffer<[f32]> = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let lambda_ssbo: Subbuffer<[f32]> = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
         // Vulkano refuses zero-sized buffers — supply a single 0.0
         // stub when there are no constraints. Won't be read because
         // `constraint_count = 0` short-circuits the lambda-update
@@ -371,30 +305,22 @@ fn allocate_cloth_constraint_resources(
         } else {
             vec![0.0_f32; constraints.len()]
         },
-    )
-    .map_err(|e| format!("renderer: cloth lambda SSBO alloc: {e}"))?;
+        "cloth lambda SSBO",
+    )?;
 
     // Per-iteration Δλ_j scratch buffer. Written by the
     // lambda-update pass each iteration, read by the accumulate pass;
     // contents are overwritten so no initial state matters.
-    let dlambda_ssbo: Subbuffer<[f32]> = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let dlambda_ssbo: Subbuffer<[f32]> = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         if constraints.is_empty() {
             vec![0.0_f32]
         } else {
             vec![0.0_f32; constraints.len()]
         },
-    )
-    .map_err(|e| format!("renderer: cloth dlambda SSBO alloc: {e}"))?;
+        "cloth dlambda SSBO",
+    )?;
 
     let lambda_update_layout = lambda_update_pipeline
         .layout()
@@ -480,78 +406,45 @@ fn allocate_cloth_normal_resources(
     ds_allocator: &Arc<StandardDescriptorSetAllocator>,
     normal_pipeline: &Arc<ComputePipeline>,
 ) -> Result<ClothGpuNormalResources, String> {
-    let triangle_idx_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let triangle_idx_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         triangle_indices.iter().copied(),
-    )
-    .map_err(|e| format!("renderer: triangle index SSBO alloc: {e}"))?;
+        "triangle index SSBO",
+    )?;
 
     let adj = crate::simulation::cloth_gpu_boundary::build_vertex_triangle_adjacency(
         triangle_indices,
         particle_count,
     );
-    let adj_offsets_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let adj_offsets_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         adj.offsets.iter().copied(),
-    )
-    .map_err(|e| format!("renderer: normal adj offsets SSBO alloc: {e}"))?;
+        "normal adj offsets SSBO",
+    )?;
     let adj_triangles_data: Vec<u32> = if adj.triangles.is_empty() {
         vec![0_u32]
     } else {
         adj.triangles.clone()
     };
-    let adj_triangles_ssbo = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let adj_triangles_ssbo = gpu_alloc::host_buffer(
+        &memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
         adj_triangles_data,
-    )
-    .map_err(|e| format!("renderer: normal adj scatter SSBO alloc: {e}"))?;
+        "normal adj scatter SSBO",
+    )?;
 
-    let control_ubo = Buffer::from_data(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::UNIFORM_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
+    let control_ubo = gpu_alloc::host_ubo(
+        &memory_allocator,
         pipeline::ClothNormalControl {
             vertex_count: particle_count,
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
         },
-    )
-    .map_err(|e| format!("renderer: normal control UBO alloc: {e}"))?;
+        "normal control UBO",
+    )?;
 
     let normal_layout = normal_pipeline
         .layout()

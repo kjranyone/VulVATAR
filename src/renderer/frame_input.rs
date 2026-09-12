@@ -151,6 +151,69 @@ pub struct RenderMeshInstance {
     pub morph_weights: Vec<f32>,
 }
 
+impl RenderMeshInstance {
+    /// Standard construction from an asset primitive: the shared material
+    /// resolution chain (primitive's material → avatar's first material →
+    /// built-in default), the `alpha_mode` / `cull_mode` mapping from the
+    /// resolved material, a material-driven outline snapshot, and morph
+    /// weights from the avatar's current expression weights
+    /// ([`crate::avatar::AvatarInstance::morph_weights_for_prim`]).
+    ///
+    /// This is the ONE authoritative mapping — the live frame-input
+    /// builder, thumbnail snapshots, and the offline / diagnostic
+    /// renderers all start here and then override the pieces they differ
+    /// on (shading mode, debug view, disabled outline for depth-sensitive
+    /// benches) through field assignment.
+    pub fn from_primitive(
+        avatar: &crate::avatar::AvatarInstance,
+        mesh_id: crate::asset::MeshId,
+        prim: &std::sync::Arc<crate::asset::MeshPrimitiveAsset>,
+    ) -> Self {
+        let material_binding = avatar
+            .asset
+            .materials
+            .iter()
+            .find(|m| m.id == prim.material_id)
+            .map(MaterialUploadRequest::from_asset_material)
+            .or_else(|| {
+                avatar
+                    .asset
+                    .materials
+                    .first()
+                    .map(|m| MaterialUploadRequest::from_asset_material(m))
+            })
+            .unwrap_or_else(MaterialUploadRequest::default_material);
+
+        let alpha_mode = match material_binding.alpha_mode {
+            crate::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
+            crate::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
+            crate::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
+        };
+        let cull_mode = if material_binding.double_sided {
+            RenderCullMode::DoubleSided
+        } else {
+            RenderCullMode::BackFace
+        };
+        let outline = OutlineSnapshot {
+            enabled: material_binding.outline_width > 0.0,
+            width: material_binding.outline_width,
+            color: material_binding.outline_color,
+        };
+
+        Self {
+            mesh_id,
+            primitive_id: prim.id,
+            material_binding,
+            bounds: prim.bounds,
+            alpha_mode,
+            cull_mode,
+            outline,
+            primitive_data: Some(std::sync::Arc::clone(prim)),
+            morph_weights: avatar.morph_weights_for_prim(prim),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClothDeformSnapshot {
     /// Primitive the cloth applies to. Globally unique within an avatar,

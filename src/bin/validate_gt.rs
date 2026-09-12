@@ -36,11 +36,11 @@ use vulvatar_lib::math_utils::{
     vec3_normalize, vec3_scale, vec3_sub,
 };
 use vulvatar_lib::renderer::frame_input::{
-    CameraState, LightingState, OutputTargetRequest, RenderAlphaMode, RenderAvatarInstance,
-    RenderColorSpace, RenderCullMode, RenderDebugFlags, RenderExportMode, RenderFrameInput,
+    CameraState, LightingState, OutlineSnapshot, OutputTargetRequest, RenderAvatarInstance,
+    RenderColorSpace, RenderDebugFlags, RenderExportMode, RenderFrameInput,
     RenderMeshInstance, RenderOutputAlpha,
 };
-use vulvatar_lib::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
+use vulvatar_lib::renderer::material::MaterialShaderMode;
 use vulvatar_lib::renderer::VulkanRenderer;
 use vulvatar_lib::tracking::provider::create_pose_provider;
 use vulvatar_lib::tracking::metric_frame::MetricDepthFrame;
@@ -461,32 +461,12 @@ fn build_frame_input(avatar: &AvatarInstance, extent: [u32; 2]) -> RenderFrameIn
         .iter()
         .flat_map(|mesh| {
             mesh.primitives.iter().map(|prim| {
-                let material_asset = avatar.asset.materials.iter().find(|m| m.id == prim.material_id);
-                let mut material_binding = material_asset
-                    .map(MaterialUploadRequest::from_asset_material)
-                    .unwrap_or_else(MaterialUploadRequest::default_material);
-                material_binding.mode = MaterialShaderMode::ToonLike;
-                let alpha_mode = match material_binding.alpha_mode {
-                    vulvatar_lib::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
-                    vulvatar_lib::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
-                    vulvatar_lib::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
-                };
-                let cull_mode = if material_binding.double_sided {
-                    RenderCullMode::DoubleSided
-                } else {
-                    RenderCullMode::BackFace
-                };
-                RenderMeshInstance {
-                    mesh_id: mesh.id,
-                    primitive_id: prim.id,
-                    material_binding,
-                    bounds: prim.bounds,
-                    alpha_mode,
-                    cull_mode,
-                    outline: Default::default(),
-                    primitive_data: Some(Arc::clone(prim)),
-                    morph_weights: Vec::new(),
-                }
+                let mut mesh_instance = RenderMeshInstance::from_primitive(avatar, mesh.id, prim);
+                mesh_instance.material_binding.mode = MaterialShaderMode::ToonLike;
+                // This bench reads the depth buffer — outlines would
+                // inflate silhouette depth and skew the pose metrics.
+                mesh_instance.outline = OutlineSnapshot::default();
+                mesh_instance
             })
         })
         .collect();

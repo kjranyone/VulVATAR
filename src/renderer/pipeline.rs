@@ -2,6 +2,7 @@ use crate::renderer::frame_input::{RenderAlphaMode, RenderCullMode};
 use crate::renderer::material::MaterialShaderMode;
 use std::sync::Arc;
 use vulkano::device::Device;
+use vulkano::image::SampleCount;
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
@@ -10,7 +11,6 @@ use vulkano::pipeline::graphics::depth_stencil::{
     CompareOp, DepthState, DepthStencilState, StencilOp, StencilOpState, StencilState,
 };
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::image::SampleCount;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
@@ -68,11 +68,12 @@ pub struct GpuVertex {
 }
 
 /// Per-primitive control UBO consumed by the transform compute shader.
-/// `weights` is packed as `vec4[64]` (up to 256 morph targets); excess
-/// targets are clamped at upload time with a warning. The `has_cloth` /
-/// `has_cloth_normals` flags select between the per-primitive cloth SSBO
-/// (filled in-place by the CPU solver each frame) and the morph + base
-/// fallback path.
+/// Morph weights live in a separate SSBO (`MorphWeights`, set 0 binding 9)
+/// rather than a fixed-size UBO array, so the per-primitive target count
+/// is unbounded — dense-rig FBX avatars carry 400+ blend shapes on the
+/// face mesh alone. The `has_cloth` / `has_cloth_normals` flags select
+/// between the per-primitive cloth SSBO (filled in-place by the CPU
+/// solver each frame) and the morph + base fallback path.
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct TransformControl {
@@ -82,7 +83,6 @@ pub struct TransformControl {
     pub has_cloth_normals: u32,
     pub has_skin_anchors: u32,
     pub _pad0: [u32; 3],
-    pub weights: [[f32; 4]; 64],
 }
 
 impl TransformControl {
@@ -94,7 +94,6 @@ impl TransformControl {
             has_cloth_normals: 0,
             has_skin_anchors: 0,
             _pad0: [0; 3],
-            weights: [[0.0; 4]; 64],
         }
     }
 }
@@ -163,8 +162,8 @@ pub fn vertex_data_to_base(vd: &crate::asset::VertexData) -> Vec<GpuVertexBase> 
 
 pub mod vs {
     vulkano_shaders::shader! {
-        ty: "vertex",
-        src: r"
+                ty: "vertex",
+                src: r"
 #version 450
 
 layout(location = 0) in vec4 position;
@@ -196,13 +195,13 @@ void main() {
     gl_Position = camera.proj * camera.view * vec4(position.xyz, 1.0);
 }
 "
-    }
+            }
 }
 
 pub mod fs {
     vulkano_shaders::shader! {
-                                                                                                                                                                                                                                                                        ty: "fragment",
-                                                                                                                                                                                                                                                                        src: r"
+                                                                                                                                                                                                                                                                                ty: "fragment",
+                                                                                                                                                                                                                                                                                src: r"
 #version 450
 
 layout(location = 0) in vec3 frag_normal;
@@ -349,7 +348,7 @@ void main() {
     out_color = vec4(color.rgb, color.a * camera.fade_opacity);
 }
 "
-                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                            }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,8 +357,8 @@ void main() {
 
 pub mod outline_vs {
     vulkano_shaders::shader! {
-        ty: "vertex",
-        src: r"
+                ty: "vertex",
+                src: r"
 #version 450
 
 layout(location = 0) in vec4 position;
@@ -399,13 +398,13 @@ void main() {
     gl_Position = clip_pos;
 }
 "
-    }
+            }
 }
 
 pub mod outline_fs {
     vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r"
+                ty: "fragment",
+                src: r"
 #version 450
 
 layout(push_constant) uniform OutlinePush {
@@ -422,7 +421,7 @@ void main() {
     out_color = vec4(outline.r, outline.g, outline.b, outline.a);
 }
 "
-    }
+            }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,8 +453,8 @@ void main() {
 // `simulation::cloth_gpu_boundary::ClothGpuSimulationState`.
 pub mod cloth_verlet_cs {
     vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
+                ty: "compute",
+                src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -515,7 +514,7 @@ void main() {
     prev_positions.p[idx] = vec4(pos, pinned);
 }
 "
-    }
+            }
 }
 
 // =========================================================================
@@ -554,8 +553,8 @@ void main() {
 // disabled" exactly like the CPU path.
 pub mod cloth_constraint_lambda_update_cs {
     vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
+                ty: "compute",
+                src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -648,13 +647,13 @@ void main() {
     dlambda.l[cidx] = delta_lambda;
 }
 "
-    }
+            }
 }
 
 pub mod cloth_constraint_accumulate_cs {
     vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
+                ty: "compute",
+                src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -744,7 +743,7 @@ void main() {
     deltas.d[pid] = vec4(delta, 0.0);
 }
 "
-    }
+            }
 }
 
 // ---------------------------------------------------------------------------
@@ -752,8 +751,8 @@ void main() {
 // ---------------------------------------------------------------------------
 pub mod cloth_constraint_apply_cs {
     vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
+                ty: "compute",
+                src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -789,7 +788,7 @@ void main() {
     deltas.d[pid] = vec4(0.0);
 }
 "
-    }
+            }
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +813,8 @@ void main() {
 // `(0, 1, 0)`; CPU path uses the same fallback.
 pub mod cloth_normal_cs {
     vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
+                ty: "compute",
+                src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -908,7 +907,7 @@ void main() {
     normals.n[vid] = vec4(nrm, 0.0);
 }
 "
-    }
+            }
 }
 
 pub mod transform_cs {
@@ -918,13 +917,19 @@ pub mod transform_cs {
     // `GpuVertex` array that the graphics pipelines consume as their
     // vertex buffer.
     //
+    // Morph deltas are SPARSE: binding 1 holds per-target runs of
+    // (vertex, delta) entries sorted by vertex index, binding 8 locates
+    // each target's run, and binding 9 carries the per-frame weights as
+    // an unbounded float array. This keeps GPU memory proportional to
+    // non-zero deltas and removes any cap on targets per primitive.
+    //
     // Layout invariants (must match the Rust `GpuVertexBase` / `GpuVertex`
     // / `TransformControl` types in this file). std430 places `vec3` on
     // 16-byte alignment, so we pad to `vec4` on both ends — see the Rust
     // struct comments for byte-for-byte breakdown.
     vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
+                ty: "compute",
+                src: r"
 #version 450
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -950,8 +955,12 @@ layout(set = 0, binding = 0) readonly buffer BaseVertices {
 } base;
 
 layout(set = 0, binding = 1) readonly buffer MorphDeltas {
-    vec4 data[];
-} morph_deltas;
+    // Sparse per-target runs, located via `morph_info`. Each entry packs
+    // the vertex index in .x (float — exact for indices < 2^24) and the
+    // position delta in .yzw. Targets that also carry normal deltas use
+    // stride 2: a second vec4 (nx, ny, nz, unused) follows each entry.
+    vec4 e[];
+} morph;
 
 layout(set = 0, binding = 2) readonly buffer ClothPositions {
     vec4 p[];
@@ -968,8 +977,18 @@ layout(set = 0, binding = 4) uniform TransformControl {
     uint has_cloth_normals;
     uint has_skin_anchors;
     uvec3 _pad0;
-    vec4 weights[64];
 } ctrl;
+
+layout(set = 0, binding = 8) readonly buffer MorphTargetInfo {
+    // One uvec4 per morph target: x = first entry index into `morph.e`,
+    // y = entry count, z = entry stride (1 = position only, 2 = +normal),
+    // w = unused.
+    uvec4 i[];
+} morph_info;
+
+layout(set = 0, binding = 9) readonly buffer MorphWeights {
+    float w[];
+} morph_w;
 
 layout(set = 0, binding = 5) writeonly buffer OutVertices {
     OutVertex v[];
@@ -1064,13 +1083,33 @@ void main() {
     vec3 pos = b.position.xyz;
     vec3 nrm = b.normal.xyz;
 
-    // Morph target blend (vertex pulling).
+    // Morph target blend. Deltas are sparse: per target, a run of
+    // (vertex, delta) entries sorted by vertex index. Each vertex
+    // binary-searches its own index inside every *active* target's run,
+    // so per-frame cost scales with the number of driven expressions,
+    // and GPU memory scales with non-zero deltas instead of
+    // targets × vertices.
     for (uint t = 0u; t < ctrl.target_count; t++) {
-        float w = ctrl.weights[t / 4u][t % 4u];
+        float w = morph_w.w[t];
         if (abs(w) < 1e-6) continue;
-        uint i = (t * ctrl.vertex_count + vid) * 2u;
-        pos += w * morph_deltas.data[i + 0u].xyz;
-        nrm += w * morph_deltas.data[i + 1u].xyz;
+        uvec4 info = morph_info.i[t];
+        uint base = info.x;
+        uint count = info.y;
+        uint stride = info.z;
+        uint lo = 0u;
+        uint hi = count;
+        while (lo < hi) {
+            uint mid = lo + ((hi - lo) >> 1u);
+            if (uint(morph.e[base + mid * stride].x) < vid) lo = mid + 1u;
+            else hi = mid;
+        }
+        if (lo < count && uint(morph.e[base + lo * stride].x) == vid) {
+            vec4 entry = morph.e[base + lo * stride];
+            pos += w * entry.yzw;
+            if (stride == 2u) {
+                nrm += w * morph.e[base + lo * stride + 1u].xyz;
+            }
+        }
     }
 
     const float WEIGHT_EPS = 1.0e-4;
@@ -1161,7 +1200,7 @@ void main() {
     out_v.v[vid]._pad     = uvec2(0u, 0u);
 }
 "
-    }
+            }
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,9 +1642,7 @@ pub fn create_cloth_constraint_accumulate_compute_pipeline(
         device.clone(),
         PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
             .into_pipeline_layout_create_info(device.clone())
-            .map_err(|e| {
-                format!("failed to build cloth constraint accumulate layout info: {e}")
-            })?,
+            .map_err(|e| format!("failed to build cloth constraint accumulate layout info: {e}"))?,
     )
     .map_err(|e| format!("failed to create cloth constraint accumulate layout: {e}"))?;
     let stage = stages.into_iter().next().expect("compute stage present");
@@ -1791,26 +1828,26 @@ mod tests {
         assert_eq!(offset_of!(ClothConstraintControl, _pad), 12);
     }
 
-    // GLSL std140 layout for `TransformControl` UBO in transform_cs:
+    // GLSL std140 layout for `TransformControl` UBO in transform_cs.
+    // The morph weights moved out of this UBO into the `MorphWeights`
+    // SSBO (set 0 binding 9) so the target count is unbounded; what
+    // remains is scalars only.
     //   uint vertex_count;     // offset 0,  size 4
     //   uint target_count;     // offset 4,  size 4
     //   uint has_cloth;        // offset 8,  size 4
     //   uint has_cloth_normals;// offset 12, size 4
     //   uint has_skin_anchors; // offset 16, size 4
     //   uvec3 _pad0;           // offset 20, size 12
-    //   vec4 weights[64];      // offset 32, size 1024
-    //   total                  // 1056 bytes
+    //   total                  // 32 bytes
     #[test]
     fn transform_control_matches_std140_layout() {
         use super::TransformControl;
-        assert_eq!(size_of::<TransformControl>(), 1056);
+        assert_eq!(size_of::<TransformControl>(), 32);
         assert_eq!(offset_of!(TransformControl, vertex_count), 0);
         assert_eq!(offset_of!(TransformControl, target_count), 4);
         assert_eq!(offset_of!(TransformControl, has_cloth), 8);
         assert_eq!(offset_of!(TransformControl, has_cloth_normals), 12);
         assert_eq!(offset_of!(TransformControl, has_skin_anchors), 16);
         assert_eq!(offset_of!(TransformControl, _pad0), 20);
-        assert_eq!(offset_of!(TransformControl, weights), 32);
     }
 }
-

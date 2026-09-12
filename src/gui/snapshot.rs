@@ -100,10 +100,7 @@ impl GuiApp {
         &self,
         avatar: &crate::avatar::AvatarInstance,
     ) -> crate::renderer::frame_input::RenderFrameInput {
-        use crate::asset::AlphaMode;
         use crate::renderer::frame_input::*;
-        use crate::renderer::material::MaterialUploadRequest;
-        use std::sync::Arc;
 
         let extent = [
             crate::renderer::thumbnail::THUMBNAIL_WIDTH,
@@ -115,42 +112,9 @@ impl GuiApp {
             .meshes
             .iter()
             .flat_map(|mesh| {
-                mesh.primitives.iter().map(move |prim| {
-                    let material_asset = avatar
-                        .asset
-                        .materials
-                        .iter()
-                        .find(|m| m.id == prim.material_id);
-                    let material_binding = material_asset
-                        .map(MaterialUploadRequest::from_asset_material)
-                        .unwrap_or_else(MaterialUploadRequest::default_material);
-                    let outline = OutlineSnapshot {
-                        enabled: material_binding.outline_width > 0.0,
-                        width: material_binding.outline_width,
-                        color: material_binding.outline_color,
-                    };
-                    let alpha_mode = match material_binding.alpha_mode {
-                        AlphaMode::Opaque => RenderAlphaMode::Opaque,
-                        AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
-                        AlphaMode::Blend => RenderAlphaMode::Blend,
-                    };
-                    let cull_mode = if material_binding.double_sided {
-                        RenderCullMode::DoubleSided
-                    } else {
-                        RenderCullMode::BackFace
-                    };
-                    RenderMeshInstance {
-                        mesh_id: mesh.id,
-                        primitive_id: prim.id,
-                        material_binding,
-                        bounds: prim.bounds,
-                        alpha_mode,
-                        cull_mode,
-                        outline,
-                        primitive_data: Some(Arc::clone(prim)),
-                        morph_weights: Vec::new(),
-                    }
-                })
+                mesh.primitives
+                    .iter()
+                    .map(|prim| RenderMeshInstance::from_primitive(avatar, mesh.id, prim))
             })
             .collect();
 

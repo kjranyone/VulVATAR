@@ -13,12 +13,10 @@ use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
 use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
-    CameraState, ClothDeformSnapshot, OutlineSnapshot, OutputTargetRequest, RenderAlphaMode,
-    RenderAvatarInstance, RenderCullMode, RenderExportMode, RenderFrameInput, RenderMeshInstance,
-    RenderOutputAlpha,
+    CameraState, ClothDeformSnapshot, OutputTargetRequest, RenderAvatarInstance,
+    RenderExportMode, RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
 };
 use crate::renderer::material::MaterialShaderMode;
-use crate::renderer::material::MaterialUploadRequest;
 use crate::simulation::SimulationStepOptions;
 
 /// Maximum age the tracking mailbox may reach before the hold/fade
@@ -180,6 +178,10 @@ impl Application {
         // accumulator, leaving later avatars with zero substeps.
         let substeps = self.sim_clock.advance(frame_dt);
         let fixed_dt = self.sim_clock.fixed_dt();
+        // Surfaced for the live debug heartbeat (`debug_gui.json`) so a
+        // single-frame visual glitch can be correlated with a zero-substep
+        // frame instead of being inferred from frame pacing.
+        self.last_sim_substeps = substeps;
 
         for (avatar_idx, avatar) in self.avatars.iter_mut().enumerate() {
             avatar.build_base_pose();
@@ -258,6 +260,19 @@ impl Application {
                 spring_enabled: toggles.spring_enabled,
                 cloth_enabled: toggles.cloth_enabled && avatar.cloth_enabled,
             };
+
+            // Zero-substep frames skip the spring solver entirely (both
+            // the Rapier `step_all` early-return and the plain loop), but
+            // `build_base_pose` above has already reset the spring-driven
+            // joints to their rest rotations. Restore the last solved
+            // rotations so the hair does not render one frame in the rest
+            // pose — the single-frame clip into the head or body. On
+            // stepped frames the solver's writeback overwrites these
+            // anyway, so this path changes nothing there.
+            if step_options.spring_enabled && substeps == 0 {
+                avatar.reapply_spring_rotations();
+                avatar.compute_global_pose();
+            }
 
             if self.physics.rapier_initialized() {
                 self.physics.step_all(
@@ -768,103 +783,22 @@ impl Application {
                     .asset
                     .meshes
                     .iter()
-                    .enumerate()
-                    .flat_map(|(mi, mesh)| {
-                        mesh.primitives.iter().enumerate().map(move |(pi, prim)| {
-                            let material_asset = avatar
-                                .asset
-                                .materials
-                                .iter()
-                                .find(|m| m.id == prim.material_id);
-
-                            let mut material_binding = material_asset
-                                .map(MaterialUploadRequest::from_asset_material)
-                                .unwrap_or_else(|| {
-                                    if let Some(m) = avatar.asset.materials.first() {
-                                        MaterialUploadRequest::from_asset_material(m)
-                                    } else {
-                                        MaterialUploadRequest::default_material()
-                                    }
-                                });
-
-                            material_binding.mode = match material_mode_index {
-                                0 => MaterialShaderMode::Unlit,
-                                1 => MaterialShaderMode::SimpleLit,
-                                _ => MaterialShaderMode::ToonLike,
-                            };
-
-                            let outline = OutlineSnapshot {
-                                enabled: material_binding.outline_width > 0.0,
-                                width: material_binding.outline_width,
-                                color: material_binding.outline_color,
-                            };
-
-                            let alpha_mode = match material_binding.alpha_mode {
-                                crate::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
-                                crate::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
-                                crate::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
-                            };
-
-                            let cull_mode = if material_binding.double_sided {
-                                RenderCullMode::DoubleSided
-                            } else {
-                                RenderCullMode::BackFace
-                            };
-
-                            let morph_weights = if prim.morph_targets.is_empty() {
-                                Vec::new()
-                            } else {
-                                let mut weights = vec![0.0f32; prim.morph_targets.len()];
-                                for ew in &avatar.expression_weights {
-                                    if let Some(expr_def) = avatar
-                                        .asset
-                                        .default_expressions
-                                        .expressions
-                                        .iter()
-                                        .find(|e| e.name == ew.name)
-                                    {
-                                        for bind in &expr_def.morph_binds {
-                                            if let Some(&mesh_idx) =
-                                                avatar.asset.node_to_mesh.get(&bind.node_index)
-                                            {
-                                                if let Some(m) = avatar.asset.meshes.get(mesh_idx) {
-                                                    if m.primitives.iter().any(|p| p.id == prim.id)
-                                                        && bind.morph_target_index < weights.len()
-                                                    {
-                                                        weights[bind.morph_target_index] +=
-                                                            ew.weight * bind.weight;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                for w in &mut weights {
-                                    *w = w.clamp(0.0, 1.0);
-                                }
-                                weights
-                            };
-
-                            // `prim` is `&Arc<MeshPrimitiveAsset>` from
-                            // the asset; the per-frame snapshot keeps a
-                            // refcount bump rather than deep-cloning the
-                            // vertex / index / morph payload. `mi` and
-                            // `pi` are kept in scope for clarity but no
-                            // longer index a separate arc table.
-                            let _ = (mi, pi);
-                            let prim_arc = std::sync::Arc::clone(prim);
-
-                            RenderMeshInstance {
-                                mesh_id: mesh.id,
-                                primitive_id: prim.id,
-                                material_binding,
-                                bounds: prim.bounds,
-                                alpha_mode,
-                                cull_mode,
-                                outline,
-                                primitive_data: Some(prim_arc),
-                                morph_weights,
-                            }
+                    .flat_map(|mesh| {
+                        mesh.primitives.iter().map(|prim| {
+                            // Shared material resolution + alpha/cull/outline
+                            // mapping + morph weights live in
+                            // `RenderMeshInstance::from_primitive`; the only
+                            // live-path override is the user-selected shading
+                            // mode.
+                            let mut mesh_instance =
+                                RenderMeshInstance::from_primitive(avatar, mesh.id, prim);
+                            mesh_instance.material_binding.mode =
+                                match material_mode_index {
+                                    0 => MaterialShaderMode::Unlit,
+                                    1 => MaterialShaderMode::SimpleLit,
+                                    _ => MaterialShaderMode::ToonLike,
+                                };
+                            mesh_instance
                         })
                     })
                     .collect();

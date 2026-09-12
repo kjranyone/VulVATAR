@@ -11,11 +11,11 @@ use crate::app::ViewportCamera;
 use crate::asset::{AvatarAsset, Mat4, Transform};
 use crate::avatar::{AvatarInstance, AvatarInstanceId};
 use crate::renderer::frame_input::{
-    CameraState, LightingState, OutputTargetRequest, RenderAlphaMode, RenderAvatarInstance,
-    RenderColorSpace, RenderCullMode, RenderDebugFlags, RenderExportMode, RenderFrameInput,
-    RenderMeshInstance, RenderOutputAlpha,
+    CameraState, LightingState, OutlineSnapshot, OutputTargetRequest, RenderAvatarInstance,
+    RenderColorSpace, RenderDebugFlags, RenderExportMode, RenderFrameInput, RenderMeshInstance,
+    RenderOutputAlpha,
 };
-use crate::renderer::material::{MaterialShaderMode, MaterialUploadRequest};
+use crate::renderer::material::MaterialShaderMode;
 use crate::renderer::VulkanRenderer;
 
 /// Default bench framing: chest-height target, close enough that the
@@ -40,33 +40,12 @@ pub fn build_frame_input(
         .iter()
         .flat_map(|mesh| {
             mesh.primitives.iter().map(|prim| {
-                let material_asset =
-                    avatar.asset.materials.iter().find(|m| m.id == prim.material_id);
-                let mut material_binding = material_asset
-                    .map(MaterialUploadRequest::from_asset_material)
-                    .unwrap_or_else(MaterialUploadRequest::default_material);
-                material_binding.mode = MaterialShaderMode::ToonLike;
-                let alpha_mode = match material_binding.alpha_mode {
-                    crate::asset::AlphaMode::Opaque => RenderAlphaMode::Opaque,
-                    crate::asset::AlphaMode::Mask(_) => RenderAlphaMode::Cutout,
-                    crate::asset::AlphaMode::Blend => RenderAlphaMode::Blend,
-                };
-                let cull_mode = if material_binding.double_sided {
-                    RenderCullMode::DoubleSided
-                } else {
-                    RenderCullMode::BackFace
-                };
-                RenderMeshInstance {
-                    mesh_id: mesh.id,
-                    primitive_id: prim.id,
-                    material_binding,
-                    bounds: prim.bounds,
-                    alpha_mode,
-                    cull_mode,
-                    outline: Default::default(),
-                    primitive_data: Some(Arc::clone(prim)),
-                    morph_weights: Vec::new(),
-                }
+                let mut mesh_instance = RenderMeshInstance::from_primitive(avatar, mesh.id, prim);
+                mesh_instance.material_binding.mode = MaterialShaderMode::ToonLike;
+                // Bench imagery historically renders without outlines;
+                // keep pixel comparisons stable.
+                mesh_instance.outline = OutlineSnapshot::default();
+                mesh_instance
             })
         })
         .collect();
@@ -162,7 +141,9 @@ pub fn build_view_matrix(cam: &ViewportCamera) -> (Mat4, [f32; 3]) {
     let eye_z = cam.distance * cp * cy + wz;
     let target = [wx, wy, wz];
     let fwd = [target[0] - eye_x, target[1] - eye_y, target[2] - eye_z];
-    let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt().max(1e-6);
+    let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2])
+        .sqrt()
+        .max(1e-6);
     let f = [fwd[0] / len, fwd[1] / len, fwd[2] / len];
     let world_up = [0.0f32, 1.0, 0.0];
     let r = [
@@ -179,9 +160,24 @@ pub fn build_view_matrix(cam: &ViewportCamera) -> (Mat4, [f32; 3]) {
     ];
     (
         [
-            [r[0], r[1], r[2], -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z)],
-            [u[0], u[1], u[2], -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z)],
-            [-f[0], -f[1], -f[2], f[0] * eye_x + f[1] * eye_y + f[2] * eye_z],
+            [
+                r[0],
+                r[1],
+                r[2],
+                -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z),
+            ],
+            [
+                u[0],
+                u[1],
+                u[2],
+                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
+            ],
+            [
+                -f[0],
+                -f[1],
+                -f[2],
+                f[0] * eye_x + f[1] * eye_y + f[2] * eye_z,
+            ],
             [0.0, 0.0, 0.0, 1.0],
         ],
         [eye_x, eye_y, eye_z],

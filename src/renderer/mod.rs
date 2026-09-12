@@ -1,14 +1,17 @@
+mod background;
 mod cloth_cache;
+pub mod compute_prepass;
 pub mod debug;
+mod draw_pass;
 pub mod frame_input;
 pub mod frame_pool;
-mod gpu_wait;
+mod gpu_alloc;
 pub mod gpu_handle;
+mod gpu_wait;
 pub mod material;
 pub mod mtoon;
 pub mod offline;
 pub mod output_export;
-mod background;
 pub mod pipeline;
 #[allow(clippy::module_inception)]
 mod pipeline_lint_tests;
@@ -26,11 +29,10 @@ use output_export::OutputExporter;
 use pipeline::{GpuVertex, GpuVertexBase, TransformControl};
 use std::collections::HashMap;
 use std::sync::Arc;
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo,
-    RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -45,7 +47,7 @@ use vulkano::image::{Image, SampleCounts};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::viewport::Viewport;
-use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline, PipelineBindPoint};
+use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline};
 use vulkano::render_pass::{Framebuffer, RenderPass};
 use vulkano::sync::GpuFuture;
 use vulkano::VulkanLibrary;
@@ -90,29 +92,10 @@ pub struct RenderStats {
 #[derive(Clone, Debug, Default)]
 struct GpuRuntimeCounters {
     morph_gpu_resource_creations: u64,
-    morph_ubo_writes: u64,
+    morph_weight_writes: u64,
     cloth_cache_creations: u64,
     cloth_vbo_writes: u64,
 }
-
-/// Push constant layout for the outline pipeline (matches shader).
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct OutlinePushConstants {
-    outline_width: f32,
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
-}
-
-/// Hard cap on morph targets per primitive the compute prepass supports.
-/// VRoid Studio's default VRM ships ≲ 100 targets on the face primitive
-/// (mouth / eye / brow shapes), so 256 leaves comfortable headroom.
-/// Exceeding it logs a warning and clamps; this would only happen on
-/// hand-authored avatars with unusually dense expression rigs. Mirrors
-/// `pipeline::TransformControl::weights` length × 4.
-const MORPH_MAX_TARGETS: usize = 256;
 
 /// Workgroup size of `pipeline::transform_cs` (`local_size_x = 64`).
 /// Used to compute the dispatch count `ceil(vertex_count / 64)`.
@@ -121,25 +104,36 @@ const TRANSFORM_LOCAL_SIZE: u32 = 64;
 /// Persistent GPU resources backing the per-primitive compute prepass.
 /// Allocated once on first encounter of a primitive and reused for the
 /// lifetime of the avatar. The compute dispatch reads `base_ssbo` +
-/// `morph_deltas` + `cloth_pos_ssbo` + `cloth_norm_ssbo` + `control_ubo`
-/// and writes `transformed_vbo`, which the graphics pipelines bind as
-/// their vertex buffer.
+/// sparse morph resources (`morph_entries` / `morph_infos` /
+/// `morph_weights_buf`) + `cloth_pos_ssbo` + `cloth_norm_ssbo` +
+/// `control_ubo` and writes `transformed_vbo`, which the graphics
+/// pipelines bind as their vertex buffer.
 ///
 /// Stub-or-real selection at allocation time keeps the descriptor set
 /// pinned for the slot's lifetime: a primitive without morph targets
-/// points `morph_deltas` at the shared stub SSBO, and a primitive
-/// without cloth points the cloth buffers at the same stub. The
-/// `has_cloth` / `has_cloth_normals` flags in `control_ubo` make the
-/// shader skip reads from stubbed bindings so it never observes
-/// uninitialised data.
+/// points the morph bindings at shared stub SSBOs, and a primitive
+/// without cloth points the cloth buffers at the same kind of stub. The
+/// `has_cloth` / `has_cloth_normals` flags and `target_count == 0` in
+/// `control_ubo` make the shader skip reads from stubbed bindings so it
+/// never observes uninitialised data.
 struct TransformGpuData {
     #[allow(dead_code)] // Held to keep the SSBO alive for the descriptor set's lifetime.
     base_ssbo: Subbuffer<[GpuVertexBase]>,
     index_buffer: Subbuffer<[u32]>,
     transformed_vbo: Subbuffer<[GpuVertex]>,
     control_ubo: Subbuffer<TransformControl>,
+    /// Sparse morph deltas: per-target runs of
+    /// `(vertex_index, position_delta)` (+ normal delta at stride 2),
+    /// located by `morph_infos`. Immutable after allocation.
     #[allow(dead_code)]
-    morph_deltas: Subbuffer<[[f32; 4]]>,
+    morph_entries: Subbuffer<[[f32; 4]]>,
+    /// `(begin, count, stride, _)` per morph target into `morph_entries`.
+    #[allow(dead_code)]
+    morph_infos: Subbuffer<[[u32; 4]]>,
+    /// Per-frame morph weights, one float per target. Rewritten in-place
+    /// by the render loop each frame (same live-write safety as
+    /// `control_ubo`).
+    morph_weights_buf: Subbuffer<[f32]>,
     cloth_pos_ssbo: Subbuffer<[[f32; 4]]>,
     cloth_norm_ssbo: Subbuffer<[[f32; 4]]>,
     #[allow(dead_code)]
@@ -284,6 +278,12 @@ pub struct VulkanRenderer {
     stub_storage_ssbo: Option<Subbuffer<[[f32; 4]]>>,
     stub_skin_anchor_ssbo: Option<Subbuffer<[crate::asset::SkinAnchor]>>,
     stub_vertex_ssbo: Option<Subbuffer<[pipeline::GpuVertex]>>,
+    /// Shared 1-element stubs for the sparse-morph bindings of a
+    /// primitive with no morph targets (`morph_infos` / `morph_weights`
+    /// shader blocks). Distinct buffer types from `stub_storage_ssbo`,
+    /// so they cannot be shared with it.
+    stub_uvec4_ssbo: Option<Subbuffer<[[u32; 4]]>>,
+    stub_f32_ssbo: Option<Subbuffer<[f32]>>,
     /// Compute pipeline that fuses skinning, morph-target blending, and
     /// cloth deformation into a single dispatch per (instance, primitive).
     /// Output lands in [`TransformGpuData::transformed_vbo`] which the
@@ -410,6 +410,8 @@ impl VulkanRenderer {
             stub_storage_ssbo: None,
             stub_skin_anchor_ssbo: None,
             stub_vertex_ssbo: None,
+            stub_uvec4_ssbo: None,
+            stub_f32_ssbo: None,
             transform_compute_pipeline: None,
             cloth_verlet_pipeline: None,
             cloth_constraint_lambda_update_pipeline: None,
@@ -848,7 +850,6 @@ impl VulkanRenderer {
         Ok(())
     }
 
-
     /// Clamp a requested MSAA sample count down to what the physical device
     /// can actually use as a framebuffer attachment. Intersects the colour
     /// and depth framebuffer sample-count limits (both attachments are
@@ -1105,985 +1106,29 @@ impl VulkanRenderer {
             )
         };
 
-        // Per-primitive draw record built during the compute prepass and
-        // consumed by the graphics passes that follow. `vertex_buffer` is
-        // the compute shader's output, so the graphics passes never see
-        // base / morph / cloth data — only the world-space vertices.
-        struct DrawInfo {
-            pipeline: Arc<GraphicsPipeline>,
-            alpha_mode: frame_input::RenderAlphaMode,
-            vertex_buffer: Subbuffer<[GpuVertex]>,
-            index_buffer: Subbuffer<[u32]>,
-            index_count: u32,
-            material_set: Arc<DescriptorSet>,
-            outline: Option<(f32, [f32; 3])>,
-        }
-        let mut draws: Vec<DrawInfo> = Vec::new();
+        // ── Phase 2a: compute prepass (skinning + morph + cloth) ──────
+        let draws = self.record_compute_prepass(
+            &mut builder,
+            input,
+            &memory_allocator,
+            &ds_allocator,
+            &transform_pipeline,
+            &gfx_pipeline,
+            &default_tex,
+            &sampler,
+        )?;
 
-        // ── Compute prepass: fuse skinning + morph + cloth per primitive
-        builder
-            .bind_pipeline_compute(transform_pipeline.clone())
-            .map_err(|e| format!("render: bind_pipeline_compute failed: {e}"))?;
-
-        for (inst_idx, instance) in input.instances.iter().enumerate() {
-            let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
-                vec![mat4_cols_identity()]
-            } else {
-                instance.skinning_matrices.to_vec()
-            };
-            let mat_count = skinning_mats.len();
-
-            let skinning_set = self.get_or_update_skinning(
-                inst_idx,
-                &skinning_mats,
-                mat_count,
-                memory_allocator.clone(),
-                ds_allocator.clone(),
-                &transform_pipeline,
-            )?;
-
-            builder
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    transform_pipeline.layout().clone(),
-                    1,
-                    skinning_set,
-                )
-                .map_err(|e| format!("render: bind compute skinning set failed: {e}"))?;
-
-            // Topological dependency ordering for hierarchical surface clearances:
-            // If primitive B specifies body_primitive_id = Some(A), A must be dispatched before B.
-            // Using Kahn's algorithm with cycle detection to guarantee a valid dispatch order.
-            let n = instance.mesh_instances.len();
-            let mut in_degree = vec![0usize; n];
-            let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-            // Build unique primitive_id mapping; detect duplicate primitive IDs if any.
-            let mut prim_id_to_idx = HashMap::new();
-            let mut duplicate_ids = std::collections::HashSet::new();
-            for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-                if prim_id_to_idx.insert(mi.primitive_id, idx).is_some() {
-                    duplicate_ids.insert(mi.primitive_id);
-                    warn!("render: duplicate primitive_id {:?} in mesh instances", mi.primitive_id);
-                }
-            }
-
-            // Track which primitives have a strictly validated parent dependency.
-            // Invalid dependencies (self-reference, missing parent, or duplicate/ambiguous IDs) are pruned immediately.
-            let mut validated_parent_ids: HashMap<PrimitiveId, PrimitiveId> = HashMap::new();
-
-            for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-                // If this primitive itself has a duplicate ID, it cannot be safely ordered; prune
-                if duplicate_ids.contains(&mi.primitive_id) {
-                    continue;
-                }
-
-                if let Some(parent_id) = mi.primitive_data.as_ref().and_then(|p| p.body_primitive_id) {
-                    // If the parent ID is ambiguous due to duplicates, children cannot resolve it uniquely; prune
-                    if duplicate_ids.contains(&parent_id) {
-                        warn!(
-                            "render: parent primitive_id {:?} is ambiguous (duplicate IDs); pruning clearance on child {:?}",
-                            parent_id, mi.primitive_id
-                        );
-                        continue;
-                    }
-
-                    if let Some(&parent_idx) = prim_id_to_idx.get(&parent_id) {
-                        if parent_idx != idx {
-                            adj[parent_idx].push(idx);
-                            in_degree[idx] += 1;
-                            validated_parent_ids.insert(mi.primitive_id, parent_id);
-                        } else {
-                            warn!("render: self-referencing body_primitive_id {:?} pruned", parent_id);
-                        }
-                    } else {
-                        warn!("render: missing parent body_primitive_id {:?} for primitive {:?}; fallback to unconstrained skinning", parent_id, mi.primitive_id);
-                    }
-                }
-            }
-
-            let mut queue: std::collections::VecDeque<usize> = in_degree
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, &deg)| if deg == 0 { Some(idx) } else { None })
-                .collect();
-
-            let mut ordered_mesh_instances = Vec::with_capacity(n);
-            let mut visited = vec![false; n];
-
-            while let Some(u) = queue.pop_front() {
-                visited[u] = true;
-                ordered_mesh_instances.push(&instance.mesh_instances[u]);
-                for &v in &adj[u] {
-                    in_degree[v] -= 1;
-                    if in_degree[v] == 0 {
-                        queue.push_back(v);
-                    }
-                }
-            }
-
-            // Fallback for cyclic dependencies or unvisited nodes:
-            // Prune their parent dependencies to completely disable clearance constraints,
-            // falling back safely to standard skinning, then append remaining instances.
-            if ordered_mesh_instances.len() < n {
-                warn!(
-                    "render: cycle detected in clearance graph ({} of {} resolved); disabling clearance on cyclic nodes and falling back to standard skinning",
-                    ordered_mesh_instances.len(), n
-                );
-                for (idx, mi) in instance.mesh_instances.iter().enumerate() {
-                    if !visited[idx] {
-                        validated_parent_ids.remove(&mi.primitive_id);
-                        ordered_mesh_instances.push(mi);
-                    }
-                }
-            }
-
-            for &mesh_inst in &ordered_mesh_instances {
-                let prim_asset = match mesh_inst.primitive_data.as_ref() {
-                    Some(p) => p.as_ref(),
-                    None => continue,
-                };
-                let vd = match prim_asset.vertices.as_ref() {
-                    Some(vd) if !vd.positions.is_empty() => vd,
-                    _ => continue,
-                };
-                let key = (mesh_inst.mesh_id, mesh_inst.primitive_id);
-
-                // Per-primitive cloth scope: find the first snapshot that
-                // targets *this* primitive. Other primitives in the same
-                // instance get `has_cloth = false` and reuse the shared
-                // stub SSBO — no more "body collapses to origin because
-                // the cloth solver shipped a shorter vector" footgun.
-                let cloth_snap_opt = instance
-                    .cloth_deforms
-                    .iter()
-                    .find(|c| c.target_primitive_id == mesh_inst.primitive_id);
-                let has_cloth_prim = cloth_snap_opt.is_some();
-                // For Gpu-backed cloth with a triangulated mesh, the
-                // normal compute dispatch (S3.1) writes `cloth_norm_ssbo`
-                // even though the CPU snapshot's `deformed_normals` is
-                // `None` — flip the flag so `transform_cs` reads the
-                // GPU-written normals.
-                let has_cloth_normals_prim = cloth_snap_opt
-                    .map(|c| {
-                        c.deformed_normals.is_some()
-                            || (c.solver_backend
-                                == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
-                                && c.gpu_attach
-                                    .as_ref()
-                                    .map(|a| !a.triangle_indices.is_empty())
-                                    .unwrap_or(false))
-                    })
-                    .unwrap_or(false);
-
-                // Look up parent surface transformed VBO ONLY if this primitive has a validated DAG parent
-                let validated_parent_pid = validated_parent_ids.get(&mesh_inst.primitive_id).copied();
-                let prim_parent_vbo = validated_parent_pid.and_then(|parent_pid| {
-                    instance.mesh_instances.iter().find(|mi| mi.primitive_id == parent_pid).and_then(|parent_mi| {
-                        if let Some(parent_asset) = parent_mi.primitive_data.as_ref() {
-                            let _ = self.ensure_transform_data(
-                                parent_mi.mesh_id,
-                                parent_mi.primitive_id,
-                                parent_asset,
-                                false,
-                                false,
-                                None,
-                                &memory_allocator,
-                                &ds_allocator,
-                                &transform_pipeline,
-                            );
-                        }
-                        self.transform_cache
-                            .get(&(parent_mi.mesh_id, parent_mi.primitive_id))
-                            .map(|slot| slot.transformed_vbo.clone())
-                    })
-                });
-
-                self.ensure_transform_data(
-                    mesh_inst.mesh_id,
-                    mesh_inst.primitive_id,
-                    prim_asset,
-                    has_cloth_prim,
-                    has_cloth_normals_prim,
-                    prim_parent_vbo.clone(),
-                    &memory_allocator,
-                    &ds_allocator,
-                    &transform_pipeline,
-                )?;
-
-                // If the cloth snapshot reports GPU backend, lazily build
-                // the per-primitive GPU cloth solver slot (seeding both
-                // pos and prev_pos SSBOs from the rest pose). Dispatch
-                // happens after the per-frame control UBO is rewritten
-                // below.
-                let cloth_is_gpu = cloth_snap_opt
-                    .map(|c| {
-                        c.solver_backend
-                            == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
-                    })
-                    .unwrap_or(false);
-                if let (true, Some(cloth_snap)) = (cloth_is_gpu, cloth_snap_opt) {
-                    if let (
-                        Some(attach),
-                        Some(cloth_verlet_pipeline),
-                        Some(cloth_constraint_lambda_update_pipeline),
-                        Some(cloth_constraint_accumulate_pipeline),
-                        Some(cloth_constraint_apply_pipeline),
-                        Some(cloth_normal_pipeline),
-                    ) = (
-                        cloth_snap.gpu_attach.as_ref(),
-                        self.cloth_verlet_pipeline.clone(),
-                        self.cloth_constraint_lambda_update_pipeline.clone(),
-                        self.cloth_constraint_accumulate_pipeline.clone(),
-                        self.cloth_constraint_apply_pipeline.clone(),
-                        self.cloth_normal_pipeline.clone(),
-                    ) {
-                        self.ensure_cloth_gpu_slot(
-                            (mesh_inst.mesh_id, mesh_inst.primitive_id),
-                            &cloth_snap.deformed_positions,
-                            attach,
-                            &memory_allocator,
-                            &ds_allocator,
-                            &cloth_verlet_pipeline,
-                            &cloth_constraint_lambda_update_pipeline,
-                            &cloth_constraint_accumulate_pipeline,
-                            &cloth_constraint_apply_pipeline,
-                            &cloth_normal_pipeline,
-                        )?;
-                    }
-                }
-
-                // Write the control UBO with this frame's morph weights and
-                // cloth flags. Live-write is safe because the previous
-                // frame's fence has already been waited on at the top of
-                // `render` (via `harvest_pending_readback`).
-                {
-                    let slot = self
-                        .transform_cache
-                        .get(&key)
-                        .expect("ensure_transform_data populated the slot");
-                    let mut guard = slot
-                        .control_ubo
-                        .write()
-                        .map_err(|e| format!("render: control UBO write failed: {e}"))?;
-                    guard.vertex_count = slot.vertex_count;
-                    guard.target_count = slot.target_count;
-                    guard.has_cloth = if has_cloth_prim { 1 } else { 0 };
-                    guard.has_cloth_normals = if has_cloth_normals_prim { 1 } else { 0 };
-                    guard.has_skin_anchors = if prim_asset.skin_anchors.is_some() && prim_parent_vbo.is_some() { 1 } else { 0 };
-                    guard._pad0 = [0; 3];
-                    let copy_n = (slot.target_count as usize).min(MORPH_MAX_TARGETS);
-                    for i in 0..copy_n {
-                        let w = mesh_inst.morph_weights.get(i).copied().unwrap_or(0.0);
-                        guard.weights[i / 4][i % 4] = w;
-                    }
-                    for i in copy_n..MORPH_MAX_TARGETS {
-                        guard.weights[i / 4][i % 4] = 0.0;
-                    }
-                }
-                self.gpu_runtime_counters.morph_ubo_writes += 1;
-
-                // Cloth write: fill the SSBO with rest pose, then overlay
-                // the snapshot's `[offset..offset+count)` slice. Vertices
-                // outside the snapshot's vertex subset stay at rest pose
-                // — they belong to the same primitive but are not part
-                // of the cloth region.
-                //
-                // For `ClothSolverBackend::Gpu` cloths the GPU compute
-                // dispatch (below) writes `cloth_pos_ssbo` in place; the
-                // CPU snapshot copy is skipped so we don't clobber the
-                // simulation state.
-                let cloth_changed = if let (false, Some(cloth)) = (cloth_is_gpu, cloth_snap_opt) {
-                    let slot = self
-                        .transform_cache
-                        .get_mut(&key)
-                        .expect("slot present");
-                    if slot.last_cloth_version != Some(cloth.version) {
-                        let off = cloth.vertex_offset as usize;
-                        let cnt = cloth.vertex_count as usize;
-                        {
-                            let mut pos_guard = slot
-                                .cloth_pos_ssbo
-                                .write()
-                                .map_err(|e| format!("render: cloth pos write failed: {e}"))?;
-                            for (i, dst) in pos_guard.iter_mut().enumerate() {
-                                let p = if i >= off && i < off + cnt {
-                                    cloth
-                                        .deformed_positions
-                                        .get(i - off)
-                                        .copied()
-                                        .unwrap_or_else(|| {
-                                            vd.positions
-                                                .get(i)
-                                                .copied()
-                                                .unwrap_or([0.0, 0.0, 0.0])
-                                        })
-                                } else {
-                                    vd.positions.get(i).copied().unwrap_or([0.0, 0.0, 0.0])
-                                };
-                                *dst = [p[0], p[1], p[2], 1.0];
-                            }
-                        }
-                        if let Some(ref normals) = cloth.deformed_normals {
-                            let mut norm_guard = slot
-                                .cloth_norm_ssbo
-                                .write()
-                                .map_err(|e| format!("render: cloth norm write failed: {e}"))?;
-                            for (i, dst) in norm_guard.iter_mut().enumerate() {
-                                let n = if i >= off && i < off + cnt {
-                                    normals.get(i - off).copied().unwrap_or_else(|| {
-                                        vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])
-                                    })
-                                } else {
-                                    vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0])
-                                };
-                                *dst = [n[0], n[1], n[2], 0.0];
-                            }
-                        }
-                        slot.last_cloth_version = Some(cloth.version);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if cloth_changed {
-                    self.gpu_runtime_counters.cloth_vbo_writes += 1;
-                }
-
-                // GPU cloth Verlet integration dispatch. Runs before
-                // `transform_cs` reads `cloth_pos_ssbo`. Inter-dispatch
-                // synchronisation here relies on Vulkano 0.35's
-                // `AutoCommandBufferBuilder` resource-access tracking:
-                // when two dispatches in the same command buffer share
-                // a buffer with conflicting access (write→read or
-                // write→write), the builder inserts the appropriate
-                // `VkMemoryBarrier` at the bind-point boundary. This
-                // covers verlet → constraint accumulate → constraint
-                // apply → normal → transform_cs because each pair
-                // shares `cloth_pos_ssbo` and/or `delta_ssbo` /
-                // `cloth_norm_ssbo`. If the Vulkano version is bumped
-                // and auto-sync semantics change, this code needs to
-                // gain explicit `synchronization_pipeline_barrier`
-                // calls.
-                if let (true, Some(cloth)) = (cloth_is_gpu, cloth_snap_opt) {
-                    if cloth.gpu_control.is_none() {
-                        // Silent skip → renderer reads stale positions.
-                        // Warn loudly so the misconfiguration is visible
-                        // (typically: snapshot was collected without
-                        // `ClothSimState`, so the collector returned
-                        // `gpu_control: None` despite backend == Gpu).
-                        warn!(
-                            "render: cloth backend == Gpu but gpu_control \
-                             missing for primitive {:?}; cloth_pos_ssbo will \
-                             not advance this frame",
-                            mesh_inst.primitive_id
-                        );
-                    }
-                    if let (Some(ctrl), Some(cloth_verlet_pipeline)) = (
-                        cloth.gpu_control.as_ref(),
-                        self.cloth_verlet_pipeline.clone(),
-                    ) {
-                        let (verlet_set, particle_count) = {
-                            let slot = self
-                                .transform_cache
-                                .get(&key)
-                                .expect("transform slot present");
-                            match slot.cloth_gpu.as_ref() {
-                                Some(gpu) => {
-                                    (gpu.verlet_set.clone(), gpu.state.particle_count)
-                                }
-                                None => continue,
-                            }
-                        };
-                        {
-                            let slot = self
-                                .transform_cache
-                                .get_mut(&key)
-                                .expect("transform slot present");
-                            let gpu = slot
-                                .cloth_gpu
-                                .as_mut()
-                                .expect("cloth_gpu present (just checked)");
-                            let mut ctrl_guard = gpu
-                                .verlet_control_ubo
-                                .write()
-                                .map_err(|e| format!("render: cloth verlet UBO write: {e}"))?;
-                            *ctrl_guard = pipeline::ClothVerletControl {
-                                dt: ctrl.dt,
-                                damping: ctrl.damping,
-                                particle_count,
-                                _pad0: 0,
-                                gravity: [
-                                    ctrl.gravity[0],
-                                    ctrl.gravity[1],
-                                    ctrl.gravity[2],
-                                    0.0,
-                                ],
-                                wind: [
-                                    ctrl.wind_force[0],
-                                    ctrl.wind_force[1],
-                                    ctrl.wind_force[2],
-                                    0.0,
-                                ],
-                            };
-                            gpu.state.bump_version();
-                        }
-                        let groups = particle_count.div_ceil(TRANSFORM_LOCAL_SIZE);
-                        // S2.1 — XPBD constraint projection resources.
-                        //
-                        // Upper clamps are defence-in-depth at the GPU
-                        // boundary: `substeps` is already capped at 8 by
-                        // `SimulationClock` and `solver_iterations` at 32
-                        // by the cloth inspector's DragValue, but a
-                        // hand-edited project file bypasses both. The
-                        // dispatch count below is
-                        // `substeps × (1 + 3 × constraint_iters) + 1` in
-                        // ONE command buffer — unbounded values turn a
-                        // frame into a GPU burst long enough to trip the
-                        // driver watchdog (Intel Arc TDR history).
-                        let constraint_iters = ctrl.solver_iterations.clamp(1, 32);
-                        let substeps = ctrl.substeps.clamp(1, 8);
-                        if ctrl.solver_iterations > 32 || ctrl.substeps > 8 {
-                            warn!(
-                                "render: cloth dispatch params clamped (substeps {} → {}, iterations {} → {})",
-                                ctrl.substeps, substeps, ctrl.solver_iterations, constraint_iters
-                            );
-                        }
-                        let constraint_resources = self
-                            .transform_cache
-                            .get(&key)
-                            .and_then(|s| s.cloth_gpu.as_ref())
-                            .and_then(|g| g.constraints.as_ref())
-                            .map(|c| {
-                                (
-                                    c.lambda_update_set.clone(),
-                                    c.accumulate_set.clone(),
-                                    c.apply_set.clone(),
-                                    c.control_ubo.clone(),
-                                    c.lambda_ssbo.clone(),
-                                    c.constraint_count,
-                                )
-                            });
-                        // Write the constraint UBO once per frame —
-                        // particle_count + constraint_count are slot-
-                        // static, dt is the per-substep duration, and
-                        // we run every substep with the same value.
-                        // λ is reset per-substep via fill_buffer below.
-                        let constraint_pack = if let (
-                            Some((
-                                lambda_update_set,
-                                accumulate_set,
-                                apply_set,
-                                constraint_ctrl_ubo,
-                                lambda_ssbo,
-                                constraint_count,
-                            )),
-                            Some(lambda_update_pipeline),
-                            Some(accumulate_pipeline),
-                            Some(apply_pipeline),
-                        ) = (
-                            constraint_resources,
-                            self.cloth_constraint_lambda_update_pipeline.clone(),
-                            self.cloth_constraint_accumulate_pipeline.clone(),
-                            self.cloth_constraint_apply_pipeline.clone(),
-                        ) {
-                            {
-                                let mut g = constraint_ctrl_ubo.write().map_err(|e| {
-                                    format!("render: constraint UBO write: {e}")
-                                })?;
-                                *g = pipeline::ClothConstraintControl {
-                                    particle_count,
-                                    constraint_count,
-                                    dt: ctrl.dt,
-                                    _pad: 0,
-                                };
-                            }
-                            Some((
-                                lambda_update_set,
-                                accumulate_set,
-                                apply_set,
-                                lambda_ssbo,
-                                constraint_count,
-                                lambda_update_pipeline,
-                                accumulate_pipeline,
-                                apply_pipeline,
-                            ))
-                        } else {
-                            None
-                        };
-
-                        // Substep loop: each substep advances Verlet
-                        // integration by `ctrl.dt` (fixed_dt), then
-                        // runs `constraint_iters` XPBD constraint
-                        // iterations. Matches the CPU path's
-                        // `for _ in 0..substeps { step_cloth(fixed_dt) }`
-                        // loop in `simulation::step_cloth_overlays`.
-                        // Before this loop the GPU dispatched the
-                        // whole thing once at frame_dt, integrating
-                        // gravity·dt² with `substeps²` more energy and
-                        // making α̃ = α/dt² `substeps²` smaller — CPU
-                        // and GPU produced qualitatively different
-                        // cloth physics.
-                        for _ in 0..substeps {
-                            builder
-                                .bind_pipeline_compute(cloth_verlet_pipeline.clone())
-                                .map_err(|e| {
-                                    format!("render: bind cloth verlet pipeline: {e}")
-                                })?;
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Compute,
-                                    cloth_verlet_pipeline.layout().clone(),
-                                    0,
-                                    verlet_set.clone(),
-                                )
-                                .map_err(|e| {
-                                    format!("render: bind cloth verlet set: {e}")
-                                })?;
-                            unsafe {
-                                builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                    format!("render: cloth verlet dispatch: {e}")
-                                })?;
-                            }
-
-                            if let Some((
-                                lambda_update_set,
-                                accumulate_set,
-                                apply_set,
-                                lambda_ssbo,
-                                constraint_count,
-                                lambda_update_pipeline,
-                                accumulate_pipeline,
-                                apply_pipeline,
-                            )) = constraint_pack.as_ref()
-                            {
-                                // Reset λ for this substep. XPBD's λ
-                                // accumulates across the projection
-                                // iterations *within* one substep,
-                                // then starts fresh at the next
-                                // substep — same lifecycle as
-                                // `ClothSimTempBuffers::reset_lambda`
-                                // on the CPU side.
-                                builder
-                                    .fill_buffer(
-                                        lambda_ssbo.clone().reinterpret::<[u32]>(),
-                                        0u32,
-                                    )
-                                    .map_err(|e| {
-                                        format!("render: lambda fill_buffer: {e}")
-                                    })?;
-                                let constraint_groups =
-                                    constraint_count.div_ceil(64).max(1);
-                                for _ in 0..constraint_iters {
-                                    // Pass 1: per-constraint XPBD λ
-                                    // update writes Δλ_j to
-                                    // dlambda_ssbo and accumulates
-                                    // into lambda_ssbo.
-                                    builder
-                                        .bind_pipeline_compute(
-                                            lambda_update_pipeline.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint lambda update: {e}")
-                                        })?;
-                                    builder
-                                        .bind_descriptor_sets(
-                                            PipelineBindPoint::Compute,
-                                            lambda_update_pipeline.layout().clone(),
-                                            0,
-                                            lambda_update_set.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint lambda update set: {e}")
-                                        })?;
-                                    unsafe {
-                                        builder.dispatch([constraint_groups, 1, 1]).map_err(
-                                            |e| {
-                                                format!("render: constraint lambda update dispatch: {e}")
-                                            },
-                                        )?;
-                                    }
-                                    // Pass 2: per-particle Δx
-                                    // accumulate reads Δλ_j.
-                                    builder
-                                        .bind_pipeline_compute(
-                                            accumulate_pipeline.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint accumulate: {e}")
-                                        })?;
-                                    builder
-                                        .bind_descriptor_sets(
-                                            PipelineBindPoint::Compute,
-                                            accumulate_pipeline.layout().clone(),
-                                            0,
-                                            accumulate_set.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint accumulate set: {e}")
-                                        })?;
-                                    unsafe {
-                                        builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                            format!("render: constraint accumulate dispatch: {e}")
-                                        })?;
-                                    }
-                                    // Pass 3: apply Δx to positions,
-                                    // zero deltas for next iter.
-                                    builder
-                                        .bind_pipeline_compute(apply_pipeline.clone())
-                                        .map_err(|e| {
-                                            format!("render: bind constraint apply: {e}")
-                                        })?;
-                                    builder
-                                        .bind_descriptor_sets(
-                                            PipelineBindPoint::Compute,
-                                            apply_pipeline.layout().clone(),
-                                            0,
-                                            apply_set.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            format!("render: bind constraint apply set: {e}")
-                                        })?;
-                                    unsafe {
-                                        builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                            format!("render: constraint apply dispatch: {e}")
-                                        })?;
-                                    }
-                                }
-                            }
-                        }
-
-                        // S3.1 — vertex normal recomputation.
-                        let normal_resources = self
-                            .transform_cache
-                            .get(&key)
-                            .and_then(|s| s.cloth_gpu.as_ref())
-                            .and_then(|g| g.normals.as_ref())
-                            .map(|n| (n.normal_set.clone(), n.control_ubo.clone()));
-                        if let (Some((normal_set, normal_ctrl_ubo)), Some(normal_pipeline)) = (
-                            normal_resources,
-                            self.cloth_normal_pipeline.clone(),
-                        ) {
-                            {
-                                let mut g = normal_ctrl_ubo.write().map_err(|e| {
-                                    format!("render: normal UBO write: {e}")
-                                })?;
-                                *g = pipeline::ClothNormalControl {
-                                    vertex_count: particle_count,
-                                    _pad0: 0,
-                                    _pad1: 0,
-                                    _pad2: 0,
-                                };
-                            }
-                            builder
-                                .bind_pipeline_compute(normal_pipeline.clone())
-                                .map_err(|e| {
-                                    format!("render: bind cloth normal pipeline: {e}")
-                                })?;
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Compute,
-                                    normal_pipeline.layout().clone(),
-                                    0,
-                                    normal_set,
-                                )
-                                .map_err(|e| {
-                                    format!("render: bind cloth normal set: {e}")
-                                })?;
-                            unsafe {
-                                builder.dispatch([groups, 1, 1]).map_err(|e| {
-                                    format!("render: cloth normal dispatch: {e}")
-                                })?;
-                            }
-                        }
-
-                        // Switch the bound compute pipeline back to the
-                        // transform pipeline so the dispatch below uses
-                        // the right shader. (The descriptor set bound
-                        // afterwards targets a different layout, so an
-                        // explicit re-bind here is required.)
-                        builder
-                            .bind_pipeline_compute(transform_pipeline.clone())
-                            .map_err(|e| {
-                                format!("render: rebind transform pipeline: {e}")
-                            })?;
-                    }
-                }
-
-                // Bind set 0 + dispatch.
-                let (transform_set, vertex_count, vbo, ibo, idx_count) = {
-                    let slot = self.transform_cache.get(&key).expect("slot present");
-                    (
-                        slot.transform_set.clone(),
-                        slot.vertex_count,
-                        slot.transformed_vbo.clone(),
-                        slot.index_buffer.clone(),
-                        slot.index_count,
-                    )
-                };
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        transform_pipeline.layout().clone(),
-                        0,
-                        transform_set,
-                    )
-                    .map_err(|e| format!("render: bind transform set 0 failed: {e}"))?;
-                let groups = vertex_count.div_ceil(TRANSFORM_LOCAL_SIZE);
-                unsafe {
-                    builder
-                        .dispatch([groups, 1, 1])
-                        .map_err(|e| format!("render: dispatch failed: {e}"))?;
-                }
-
-                // Pick the graphics variant for the eventual draw.
-                let is_blend = matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Blend);
-                let is_cutout =
-                    matches!(mesh_inst.alpha_mode, frame_input::RenderAlphaMode::Cutout);
-                let active_pipeline = if is_cutout {
-                    // Cutout variants carry alpha-to-coverage (under MSAA) so
-                    // alpha-tested edges antialias. They share the opaque
-                    // variants' depth/blend state, so fall back to the opaque
-                    // variant of the same cull mode if a cutout pipeline is
-                    // somehow missing.
-                    match &mesh_inst.cull_mode {
-                        frame_input::RenderCullMode::DoubleSided => self
-                            .pipeline_no_cull_cutout
-                            .as_ref()
-                            .or(self.pipeline_no_cull.as_ref())
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        frame_input::RenderCullMode::FrontFace => self
-                            .pipeline_front_cull_cutout
-                            .as_ref()
-                            .or(self.pipeline_front_cull.as_ref())
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        frame_input::RenderCullMode::BackFace => self
-                            .graphics_pipeline_cutout
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                    }
-                } else {
-                    match (mesh_inst.cull_mode.clone(), is_blend) {
-                        (frame_input::RenderCullMode::DoubleSided, true) => self
-                            .pipeline_no_cull_blend
-                            .as_ref()
-                            .or(self.pipeline_no_cull.as_ref())
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::FrontFace, true) => self
-                            .pipeline_front_cull_blend
-                            .as_ref()
-                            .or(self.pipeline_front_cull.as_ref())
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::BackFace, true) => self
-                            .graphics_pipeline_blend
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::DoubleSided, false) => self
-                            .pipeline_no_cull
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::FrontFace, false) => self
-                            .pipeline_front_cull
-                            .as_ref()
-                            .unwrap_or(&gfx_pipeline)
-                            .clone(),
-                        (frame_input::RenderCullMode::BackFace, false) => gfx_pipeline.clone(),
-                    }
-                };
-
-                // Material descriptor. Allocated against the canonical
-                // `gfx_pipeline`; every variant has a structurally
-                // identical set 1 layout (same shaders) so the binding
-                // is valid under Vulkan descriptor set compatibility.
-                let texture_view =
-                    self.resolve_texture(&mesh_inst.material_binding.textures, &default_tex);
-                let shade_texture_view = self
-                    .resolve_shade_texture(&mesh_inst.material_binding.textures, &default_tex);
-                let matcap_view = self
-                    .resolve_matcap_texture(&mesh_inst.material_binding.textures, &default_tex);
-
-                let material_set = self.material_uploader.upload_to_gpu(
-                    Some((mesh_inst.mesh_id, mesh_inst.primitive_id)),
-                    &mesh_inst.material_binding,
-                    memory_allocator.clone(),
-                    ds_allocator.clone(),
-                    &gfx_pipeline,
-                    texture_view,
-                    shade_texture_view,
-                    sampler.clone(),
-                    matcap_view,
-                )?;
-
-                let outline_info = if !is_blend
-                    && !is_cutout
-                    && mesh_inst.outline.enabled
-                    && mesh_inst.outline.width > 0.0
-                {
-                    Some((mesh_inst.outline.width, mesh_inst.outline.color))
-                } else {
-                    None
-                };
-
-                draws.push(DrawInfo {
-                    pipeline: active_pipeline,
-                    alpha_mode: mesh_inst.alpha_mode.clone(),
-                    vertex_buffer: vbo,
-                    index_buffer: ibo,
-                    index_count: idx_count,
-                    material_set,
-                    outline: outline_info,
-                });
-            }
-        }
-
-        // ── Graphics pass: forward draws then outlines ──────────────────
-        // Vulkano inserts the compute-write → vertex-input-read barrier on
-        // each `transformed_vbo` automatically because the dispatch and the
-        // draw share this single command buffer.
-        let bg_clear = if input.transparent_background {
-            [0.0_f32, 0.0, 0.0, 0.0]
-        } else {
-            let [r, g, b] = input.background_color;
-            [r, g, b, 1.0]
-        };
-        // Clear values must line up with the render pass attachment order
-        // built in `build_render_pass`:
-        //   1×:   [color (Clear), depth (Clear)]
-        //   MSAA: [msaa_color (Clear), color/resolve (DontCare → None), depth (Clear)]
-        let clear_values = if self.current_sample_count > 1 {
-            vec![
-                Some(bg_clear.into()),
-                None,
-                Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
-            ]
-        } else {
-            vec![
-                Some(bg_clear.into()),
-                Some(vulkano::format::ClearValue::DepthStencil((1.0, 0))),
-            ]
-        };
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values,
-                    ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| format!("render: begin_render_pass failed: {e}"))?;
-
-        // Generative background: first draw inside the scene pass. Painter's
-        // order alone keeps it behind the avatar (its pipeline neither tests
-        // nor writes depth), and being inside the HDR scene pass means the
-        // bloom chain picks up its highlights like any other scene content.
-        if input.generative_background.enabled {
-            let bg_pipeline = self
-                .background_pipeline
-                .as_ref()
-                .ok_or("render: no background pipeline")?;
-            let push = background::build_push_constants(input);
-            background::record_background(&mut builder, bg_pipeline, push)?;
-        }
-
-        builder
-            .bind_pipeline_graphics(gfx_pipeline.clone())
-            .map_err(|e| format!("render: bind_pipeline_graphics failed: {e}"))?
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                gfx_pipeline.layout().clone(),
-                0,
-                camera_set,
-            )
-            .map_err(|e| format!("render: bind camera descriptor set failed: {e}"))?;
-
-        // Opaque pass then blend pass. The camera set 0 layout matches
-        // across all graphics variants, so it stays bound when we swap
-        // variant pipelines (Vulkan layout compatibility for set 0).
-        for blend_pass in [false, true] {
-            for draw in &draws {
-                let is_blend = matches!(draw.alpha_mode, frame_input::RenderAlphaMode::Blend);
-                if is_blend != blend_pass {
-                    continue;
-                }
-                builder
-                    .bind_pipeline_graphics(draw.pipeline.clone())
-                    .map_err(|e| {
-                        format!("render: bind_pipeline_graphics for variant failed: {e}")
-                    })?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        draw.pipeline.layout().clone(),
-                        1,
-                        draw.material_set.clone(),
-                    )
-                    .map_err(|e| format!("render: bind material descriptor set failed: {e}"))?
-                    .bind_vertex_buffers(0, draw.vertex_buffer.clone())
-                    .map_err(|e| format!("render: bind_vertex_buffers failed: {e}"))?
-                    .bind_index_buffer(draw.index_buffer.clone())
-                    .map_err(|e| format!("render: bind_index_buffer failed: {e}"))?;
-                unsafe {
-                    builder
-                        .draw_indexed(draw.index_count, 1, 0, 0, 0)
-                        .map_err(|e| format!("render: draw_indexed failed: {e}"))?;
-                }
-            }
-        }
-
-        // ── Outline pass ────────────────────────────────────────────────
-        let outline_count = draws.iter().filter(|d| d.outline.is_some()).count();
-        if outline_count > 0 {
-            builder
-                .bind_pipeline_graphics(outline_pipeline.clone())
-                .map_err(|e| format!("render: bind outline pipeline failed: {e}"))?
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    outline_pipeline.layout().clone(),
-                    0,
-                    outline_camera_set,
-                )
-                .map_err(|e| format!("render: bind outline camera set failed: {e}"))?;
-
-            for draw in &draws {
-                let Some((width, color)) = draw.outline else {
-                    continue;
-                };
-                let push = OutlinePushConstants {
-                    outline_width: width,
-                    r: color[0],
-                    g: color[1],
-                    b: color[2],
-                    a: 1.0,
-                };
-                builder
-                    .push_constants(outline_pipeline.layout().clone(), 0, push)
-                    .map_err(|e| format!("render: push_constants failed: {e}"))?
-                    .bind_vertex_buffers(0, draw.vertex_buffer.clone())
-                    .map_err(|e| format!("render: outline bind_vertex_buffers failed: {e}"))?
-                    .bind_index_buffer(draw.index_buffer.clone())
-                    .map_err(|e| format!("render: outline bind_index_buffer failed: {e}"))?;
-                unsafe {
-                    builder
-                        .draw_indexed(draw.index_count, 1, 0, 0, 0)
-                        .map_err(|e| format!("render: outline draw_indexed failed: {e}"))?;
-                }
-            }
-        }
-
-        builder
-            .end_render_pass(SubpassEndInfo::default())
-            .map_err(|e| format!("render: end_render_pass failed: {e}"))?;
+        // ── Phase 2b: scene pass (forward draws + outlines) ─────────────
+        self.record_scene_pass(
+            &mut builder,
+            input,
+            &draws,
+            &framebuffer,
+            &gfx_pipeline,
+            &outline_pipeline,
+            camera_set,
+            outline_camera_set,
+        )?;
 
         // ── Post effects: bloom chain + composite/encode ────────────────
         // The composite always runs — it is the HDR→8-bit encode stage that
@@ -2099,7 +1144,11 @@ impl VulkanRenderer {
             if use_bloom {
                 Self::record_bloom_chain(&mut builder, post, &input.bloom)?;
             }
-            let intensity = if use_bloom { input.bloom.intensity } else { 0.0 };
+            let intensity = if use_bloom {
+                input.bloom.intensity
+            } else {
+                0.0
+            };
             Self::record_composite(&mut builder, post, intensity, use_bloom)?;
         }
 
@@ -2192,11 +1241,11 @@ impl VulkanRenderer {
         if self.frame_counter.is_multiple_of(60) {
             let counters = &self.gpu_runtime_counters;
             info!(
-                "GPU_RUNTIME frame={} transform_resources={} ubo_writes={} \
+                "GPU_RUNTIME frame={} transform_resources={} weight_writes={} \
                  cloth_writes={} cloth_creations={} cache_slots={} readback_bytes={}",
                 self.frame_counter,
                 counters.morph_gpu_resource_creations,
-                counters.morph_ubo_writes,
+                counters.morph_weight_writes,
                 counters.cloth_vbo_writes,
                 counters.cloth_cache_creations,
                 self.transform_cache.len(),
@@ -2213,9 +1262,7 @@ impl VulkanRenderer {
         };
 
         self.pending_readback = Some(PendingReadbackState {
-            wait_fn: Box::new(move || {
-                gpu_wait::wait_fence_bounded(fence_future, "frame_readback")
-            }),
+            wait_fn: Box::new(move || gpu_wait::wait_fence_bounded(fence_future, "frame_readback")),
             readback_buffer,
             depth_buffer,
             extent,
@@ -2267,11 +1314,7 @@ impl VulkanRenderer {
                 Ok(v) => v,
                 Err(arc) => (*arc).clone(),
             },
-            _ => {
-                return Err(
-                    "render_thumbnail: exported pixel data isn't CPU readback".to_string()
-                )
-            }
+            _ => return Err("render_thumbnail: exported pixel data isn't CPU readback".to_string()),
         };
 
         Ok(ThumbnailRenderResult {
@@ -2286,105 +1329,6 @@ impl VulkanRenderer {
     /// into it. The descriptor set is allocated against the compute
     /// prepass pipeline's set 1 layout because the live consumer is now
     /// `pipeline::transform_cs`, not the graphics vertex shaders.
-    fn get_or_update_skinning(
-        &mut self,
-        inst_idx: usize,
-        skinning_mats: &[[[f32; 4]; 4]],
-        mat_count: usize,
-        memory_allocator: Arc<StandardMemoryAllocator>,
-        ds_allocator: Arc<StandardDescriptorSetAllocator>,
-        transform_pipeline: &Arc<ComputePipeline>,
-    ) -> Result<Arc<DescriptorSet>, String> {
-        // Grow the cache vector if needed.
-        while self.skinning_cache.len() <= inst_idx {
-            let buf = Buffer::from_iter(
-                memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                vec![mat4_cols_identity()],
-            )
-            .map_err(|e| format!("render: skinning buffer init failed: {e}"))?;
-
-            let layout = transform_pipeline
-                .layout()
-                .set_layouts()
-                .get(1)
-                .ok_or("render: transform pipeline missing skinning set layout")?
-                .clone();
-            let ds = DescriptorSet::new(
-                ds_allocator.clone(),
-                layout,
-                [WriteDescriptorSet::buffer(0, buf.clone())],
-                [],
-            )
-            .map_err(|e| format!("render: skinning desc set init failed: {e}"))?;
-
-            self.skinning_cache.push(SkinningCacheEntry {
-                buffer: buf,
-                descriptor_set: ds,
-                capacity: 1,
-            });
-        }
-
-        let entry = &mut self.skinning_cache[inst_idx];
-
-        // If the buffer is too small, reallocate.
-        if mat_count > entry.capacity {
-            let buf = Buffer::from_iter(
-                memory_allocator,
-                BufferCreateInfo {
-                    usage: BufferUsage::STORAGE_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                skinning_mats.iter().copied(),
-            )
-            .map_err(|e| format!("render: skinning buffer realloc failed: {e}"))?;
-
-            let layout = transform_pipeline
-                .layout()
-                .set_layouts()
-                .get(1)
-                .ok_or("render: transform pipeline missing skinning set layout")?
-                .clone();
-            let ds = DescriptorSet::new(
-                ds_allocator.clone(),
-                layout,
-                [WriteDescriptorSet::buffer(0, buf.clone())],
-                [],
-            )
-            .map_err(|e| format!("render: skinning desc set realloc failed: {e}"))?;
-
-            entry.buffer = buf;
-            entry.descriptor_set = ds;
-            entry.capacity = mat_count;
-
-            return Ok(entry.descriptor_set.clone());
-        }
-
-        // Buffer is large enough — write in-place.
-        {
-            let mut guard = entry
-                .buffer
-                .write()
-                .map_err(|e| format!("render: skinning buffer write failed: {e}"))?;
-            guard[..mat_count].copy_from_slice(skinning_mats);
-        }
-
-        Ok(entry.descriptor_set.clone())
-    }
-
 
     // Cloth GPU allocator (`ensure_cloth_gpu_slot` +
     // `allocate_cloth_constraint_resources` +
@@ -2416,7 +1360,6 @@ impl VulkanRenderer {
             frame_input::RenderColorSpace::LinearSrgb => Format::R8G8B8A8_UNORM,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -2465,10 +1408,7 @@ fn project_world_to_uv(
     if clip[3] <= 1e-6 {
         return None;
     }
-    Some([
-        clip[0] / clip[3] * 0.5 + 0.5,
-        clip[1] / clip[3] * 0.5 + 0.5,
-    ])
+    Some([clip[0] / clip[3] * 0.5 + 0.5, clip[1] / clip[3] * 0.5 + 0.5])
 }
 
 /// Convert row-major camera matrices into column-major for GLSL.
@@ -2532,20 +1472,9 @@ impl CameraRing {
         let mut outline_sets = Vec::with_capacity(FRAME_LAG);
 
         for _ in 0..FRAME_LAG {
-            let buffer = Buffer::from_data(
-                memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::UNIFORM_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                initial,
-            )
-            .expect("camera ring buffer alloc failed");
+            let buffer =
+                gpu_alloc::host_ubo(&memory_allocator, initial, "camera ring buffer alloc")
+                    .expect("camera ring buffer alloc failed");
 
             let main_set = DescriptorSet::new(
                 ds_allocator.clone(),

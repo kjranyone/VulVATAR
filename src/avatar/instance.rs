@@ -69,6 +69,14 @@ pub struct SpringChainState {
     pub positions: Vec<Vec3>,
     /// Per-joint previous positions for Verlet integration (one entry per joint).
     pub previous_positions: Vec<Vec3>,
+    /// Last local rotation the spring solver wrote back, one entry per
+    /// joint. Index `k` is the rotation of node `joints[k]`: the solver
+    /// writes each segment's rotation into the segment's head node, i.e.
+    /// `joints[j-1]` for solved joint `j`, so indices `0..len-1` are live
+    /// and the final index is a seeded rest rotation. Seeded with rest
+    /// rotations overall so [`AvatarInstance::reapply_spring_rotations`]
+    /// is a no-op before the first solve.
+    pub solved_rotations: Vec<[f32; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +169,18 @@ impl AvatarInstance {
                     joints: spring.joints.clone(),
                     positions: vec![[0.0, 0.0, 0.0]; joint_count],
                     previous_positions: vec![[0.0, 0.0, 0.0]; joint_count],
+                    solved_rotations: spring
+                        .joints
+                        .iter()
+                        .map(|j| {
+                            asset
+                                .skeleton
+                                .nodes
+                                .get(j.0 as usize)
+                                .map(|n| n.rest_local.rotation)
+                                .unwrap_or([0.0, 0.0, 0.0, 1.0])
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -353,6 +373,79 @@ impl AvatarInstance {
         );
     }
 
+    /// Resolve the per-primitive morph-target weight vector driven by the
+    /// avatar's current [`Self::expression_weights`].
+    ///
+    /// Expressions bind morph targets by `(skeleton node, target index)`;
+    /// a primitive's weight for target *t* is the sum of every bound
+    /// expression's `weight × bind.weight` whose node maps to a mesh
+    /// containing this primitive, clamped to `[0, 1]`. Returns an empty
+    /// `Vec` for primitives without morph targets. Pure function of
+    /// `(asset, expression_weights, prim)` — the render frame-input
+    /// builder, thumbnail snapshots, and offline renderers all go
+    /// through here so the mapping lives exactly once.
+    pub fn morph_weights_for_prim(&self, prim: &crate::asset::MeshPrimitiveAsset) -> Vec<f32> {
+        if prim.morph_targets.is_empty() {
+            return Vec::new();
+        }
+        let mut weights = vec![0.0f32; prim.morph_targets.len()];
+        for ew in &self.expression_weights {
+            let Some(expr_def) = self
+                .asset
+                .default_expressions
+                .expressions
+                .iter()
+                .find(|e| e.name == ew.name)
+            else {
+                continue;
+            };
+            for bind in &expr_def.morph_binds {
+                if let Some(&mesh_idx) = self.asset.node_to_mesh.get(&bind.node_index) {
+                    if let Some(m) = self.asset.meshes.get(mesh_idx) {
+                        if m.primitives.iter().any(|p| p.id == prim.id)
+                            && bind.morph_target_index < weights.len()
+                        {
+                            weights[bind.morph_target_index] += ew.weight * bind.weight;
+                        }
+                    }
+                }
+            }
+        }
+        for w in &mut weights {
+            *w = w.clamp(0.0, 1.0);
+        }
+        weights
+    }
+
+    /// Re-apply the spring solver's last written rotations over the local
+    /// transforms that [`Self::build_base_pose`] just reset to rest.
+    ///
+    /// The solver's writeback is the only thing that puts the solved
+    /// rotations into `local_transforms`, so on frames where the
+    /// fixed-step simulation clock yields zero substeps (fast or jittery
+    /// frame pacing) the spring-driven meshes would otherwise render one
+    /// frame in their rest pose — hair clipping into the head or body for
+    /// exactly one frame. No-op before the first solve because the store
+    /// is seeded with the rest rotations.
+    ///
+    /// The solver writes each segment's rotation into the segment's head
+    /// node — `joints[j-1]` for solved joint `j` — so the applied range is
+    /// nodes `0..len-1` of each chain.
+    pub fn reapply_spring_rotations(&mut self) {
+        for chain in &self.secondary_motion.spring_states {
+            let written_nodes = chain.joints.len().saturating_sub(1);
+            for k in 0..written_nodes {
+                let (node, rotation) = match (chain.joints.get(k), chain.solved_rotations.get(k)) {
+                    (Some(&node), Some(&rotation)) => (node, rotation),
+                    _ => continue,
+                };
+                if let Some(t) = self.pose.local_transforms.get_mut(node.0 as usize) {
+                    t.rotation = rotation;
+                }
+            }
+        }
+    }
+
     pub fn build_skinning_matrices(&mut self) {
         let skeleton = &self.asset.skeleton;
         let node_count = skeleton.nodes.len();
@@ -397,4 +490,148 @@ fn apply_render_target(state: &mut ClothState, cloth_asset: &ClothAsset) {
     state.target_mesh_id = binding.mesh.as_ref().map(|m| m.id);
     state.target_vertex_offset = binding.vertex_subset.offset;
     state.target_vertex_count = binding.vertex_subset.count;
+}
+
+#[cfg(test)]
+mod morph_weight_tests {
+    use super::*;
+    use crate::asset::{
+        Aabb, AssetSourceHash, AvatarAsset, AvatarAssetId, ExpressionAssetSet, ExpressionDef,
+        ExpressionMorphBind, MaterialId, MeshAsset, MeshId, MeshPrimitiveAsset, MorphTargetDelta,
+        PrimitiveId, SkeletonAsset, SkeletonNode, VrmMeta,
+    };
+    use std::collections::HashMap;
+
+    fn prim(id: u64, target_count: usize) -> std::sync::Arc<MeshPrimitiveAsset> {
+        std::sync::Arc::new(MeshPrimitiveAsset {
+            id: PrimitiveId(id),
+            vertex_count: 3,
+            index_count: 3,
+            material_id: MaterialId(1),
+            skin: None,
+            bounds: Aabb::empty(),
+            vertices: None,
+            indices: None,
+            morph_targets: (0..target_count)
+                .map(|t| MorphTargetDelta {
+                    name: format!("t{t}"),
+                    position_deltas: vec![],
+                    normal_deltas: vec![],
+                })
+                .collect(),
+            skin_anchors: None,
+            body_primitive_id: None,
+        })
+    }
+
+    fn expr(name: &str, binds: Vec<(usize, usize, f32)>) -> ExpressionDef {
+        ExpressionDef {
+            name: name.to_string(),
+            weight: 0.0,
+            morph_binds: binds
+                .into_iter()
+                .map(|(node_index, morph_target_index, weight)| ExpressionMorphBind {
+                    node_index,
+                    morph_target_index,
+                    weight,
+                })
+                .collect(),
+        }
+    }
+
+    fn avatar_with_face_prim() -> (AvatarInstance, std::sync::Arc<MeshPrimitiveAsset>) {
+        let face = prim(1, 3);
+        let plain = prim(2, 0);
+        let mut node_to_mesh = HashMap::new();
+        node_to_mesh.insert(0usize, 0usize);
+        let asset = std::sync::Arc::new(AvatarAsset {
+            id: AvatarAssetId(1),
+            source_path: std::path::PathBuf::from("test.fbx"),
+            source_hash: AssetSourceHash([0u8; 32]),
+            skeleton: SkeletonAsset {
+                root_nodes: vec![NodeId(0)],
+                nodes: vec![SkeletonNode {
+                    id: NodeId(0),
+                    name: "face".to_string(),
+                    parent: None,
+                    children: vec![],
+                    rest_local: Transform::default(),
+                    humanoid_bone: None,
+                }],
+                inverse_bind_matrices: vec![],
+            },
+            meshes: vec![MeshAsset {
+                id: MeshId(1),
+                name: "face".to_string(),
+                primitives: vec![face.clone(), plain],
+            }],
+            materials: vec![],
+            humanoid: None,
+            spring_bones: vec![],
+            colliders: vec![],
+            default_expressions: ExpressionAssetSet {
+                expressions: vec![
+                    expr("smile", vec![(0, 1, 1.0)]),
+                    expr("half", vec![(0, 2, 0.5)]),
+                    expr("over", vec![(0, 0, 1.0)]),
+                    expr("over2", vec![(0, 0, 1.0)]),
+                    // Out-of-range target index must be ignored, not panic.
+                    expr("oob", vec![(0, 99, 1.0)]),
+                ],
+            },
+            animation_clips: vec![],
+            node_to_mesh,
+            vrm_meta: VrmMeta::default(),
+            root_aabb: Aabb::empty(),
+            body_primitive_id: None,
+            loaded_from_cache: false,
+        });
+        let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset);
+        avatar.expression_weights = vec![
+            crate::avatar::expressions::ResolvedExpressionWeight {
+                name: "smile".into(),
+                weight: 0.8,
+            },
+            crate::avatar::expressions::ResolvedExpressionWeight {
+                name: "half".into(),
+                weight: 1.0,
+            },
+            crate::avatar::expressions::ResolvedExpressionWeight {
+                name: "over".into(),
+                weight: 1.0,
+            },
+            crate::avatar::expressions::ResolvedExpressionWeight {
+                name: "over2".into(),
+                weight: 1.0,
+            },
+            crate::avatar::expressions::ResolvedExpressionWeight {
+                name: "oob".into(),
+                weight: 1.0,
+            },
+        ];
+        (avatar, face)
+    }
+
+    #[test]
+    fn morph_weights_sum_bind_weights_and_clamp() {
+        let (avatar, face) = avatar_with_face_prim();
+        // target 0: over + over2 = 2.0 → clamped to 1.0
+        // target 1: smile × 1.0 = 0.8
+        // target 2: half × 0.5 = 0.5
+        assert_eq!(avatar.morph_weights_for_prim(&face), vec![1.0, 0.8, 0.5]);
+    }
+
+    #[test]
+    fn morph_weights_empty_for_primitive_without_targets() {
+        let (avatar, _) = avatar_with_face_prim();
+        let plain = avatar.asset.meshes[0].primitives[1].clone();
+        assert!(avatar.morph_weights_for_prim(&plain).is_empty());
+    }
+
+    #[test]
+    fn morph_weights_zero_when_no_expression_matches() {
+        let (mut avatar, face) = avatar_with_face_prim();
+        avatar.expression_weights.clear();
+        assert_eq!(avatar.morph_weights_for_prim(&face), vec![0.0, 0.0, 0.0]);
+    }
 }
