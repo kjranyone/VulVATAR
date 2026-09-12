@@ -1,6 +1,12 @@
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+pub mod scene_presets;
+
+pub use scene_presets::{
+    load_scene_presets, save_scene_presets, ScenePreset, ScenePresetCamera, ScenePresetLighting,
+    ScenePresetRendering,
+};
 
 /// Pure-data snapshot of the GUI/app state needed for project serialization.
 /// This struct lives here so that `persistence` never imports `gui::GuiApp`,
@@ -77,6 +83,7 @@ pub struct ProjectState {
     /// Spring-bone user tuning (see `simulation::spring::SpringTuning`).
     pub spring_sway_scale: f32,
     pub spring_gravity_offset: f32,
+    pub spring_natural_gravity: bool,
     /// Scene gravity (see `simulation::SceneGravity`).
     pub scene_gravity_direction: [f32; 3],
     pub scene_gravity_strength: f32,
@@ -463,6 +470,11 @@ pub struct RenderingConfig {
     pub spring_sway_scale: f32,
     #[serde(default)]
     pub spring_gravity_offset: f32,
+    /// Natural (physically-scaled) gravity for spring bones. Defaults
+    /// on: projects saved before the feature load with hair re-hanging
+    /// naturally rather than the legacy unitless force mix.
+    #[serde(default = "default_true")]
+    pub spring_natural_gravity: bool,
     #[serde(default = "default_gravity_direction")]
     pub scene_gravity_direction: [f32; 3],
     #[serde(default = "default_unit_scale")]
@@ -921,6 +933,7 @@ impl ProjectFile {
                 toggle_spring: state.toggle_spring,
                 spring_sway_scale: state.spring_sway_scale,
                 spring_gravity_offset: state.spring_gravity_offset,
+                spring_natural_gravity: state.spring_natural_gravity,
                 scene_gravity_direction: state.scene_gravity_direction,
                 scene_gravity_strength: state.scene_gravity_strength,
                 toggle_cloth: state.toggle_cloth,
@@ -1014,6 +1027,7 @@ impl ProjectFile {
             toggle_spring: self.rendering.toggle_spring,
             spring_sway_scale: self.rendering.spring_sway_scale,
             spring_gravity_offset: self.rendering.spring_gravity_offset,
+            spring_natural_gravity: self.rendering.spring_natural_gravity,
             scene_gravity_direction: self.rendering.scene_gravity_direction,
             scene_gravity_strength: self.rendering.scene_gravity_strength,
             toggle_cloth: self.rendering.toggle_cloth,
@@ -1802,98 +1816,5 @@ pub fn validate_recovery(snapshot: &RecoverySnapshot) -> Result<(), String> {
     }
     Ok(())
 }
-
-// ===========================================================================
-// Scene presets
-// ===========================================================================
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ScenePresetLighting {
-    pub main_light_dir: [f32; 3],
-    pub main_light_intensity: f32,
-    pub ambient_intensity: [f32; 3],
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ScenePresetCamera {
-    pub fov: f32,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ScenePresetRendering {
-    pub material_mode_index: usize,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct ScenePreset {
-    pub name: String,
-    pub lighting: ScenePresetLighting,
-    pub camera: ScenePresetCamera,
-    pub rendering: ScenePresetRendering,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ScenePresetFile {
-    pub format_version: u32,
-    pub created_with: String,
-    pub last_saved_with: String,
-    #[serde(default)]
-    pub presets: Vec<ScenePreset>,
-}
-
-fn scene_presets_path() -> std::path::PathBuf {
-    let mut path = app_data_dir();
-    path.push("scene_presets.vvtpresets");
-    path
-}
-
-pub fn load_scene_presets() -> Vec<ScenePreset> {
-    let path = scene_presets_path();
-    if !path.exists() {
-        let backup = backup_path_for(&path);
-        if !backup.exists() {
-            return Vec::new();
-        }
-    }
-    match load_or_backup::<ScenePresetFile>(&path) {
-        Ok(file) => {
-            info!("persistence: loaded {} scene presets", file.presets.len());
-            file.presets
-        }
-        Err(e) => {
-            error!(
-                "persistence: failed to load scene presets (primary and backup): {}",
-                e
-            );
-            Vec::new()
-        }
-    }
-}
-
-pub fn save_scene_presets(presets: &[ScenePreset]) -> Result<(), String> {
-    let path = scene_presets_path();
-    let existing_created_with = if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|data| serde_json::from_str::<ScenePresetFile>(&data).ok())
-            .map(|f| f.created_with)
-    } else {
-        None
-    };
-    let mut file = ScenePresetFile {
-        format_version: 1,
-        created_with: app_tag(),
-        last_saved_with: app_tag(),
-        presets: presets.to_vec(),
-    };
-    if let Some(cw) = existing_created_with {
-        file.created_with = cw;
-    }
-    let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
-    atomic_write(&path, &json)?;
-    info!("persistence: saved {} scene presets", presets.len());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;
