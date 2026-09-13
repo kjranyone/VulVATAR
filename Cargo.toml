@@ -12,6 +12,14 @@ exclude = ["vendor"]
 # The vendored copy writes bindings to OUT_DIR and pins rerun conditions.
 [patch.crates-io]
 realsense-sys = { path = "vendor/realsense-sys" }
+# Local patch of egui 0.30: upstream SidePanel clips panel painting to
+# the panel's allocation (#4475) but derives the panel's CLAIMED bounds
+# from the unclipped content rect, so content wider than the panel
+# claims a strip nothing paints — the window clear colour shows through
+# as a black band beside the panel. The vendored copy clamps the claim
+# to the allocation (claim == paint). Unfixed upstream through 0.34.3.
+# See `panel_fill_tests` in src/gui/inspector/mod.rs.
+egui = { path = "vendor/egui" }
 
 [package]
 name = "vulvatar"
