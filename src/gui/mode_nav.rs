@@ -14,6 +14,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     // `state.mode` this frame so the rail highlight and inspector
     // dispatch agree.
     state.mode = state.mode.normalized();
+    let mut panel_rect = egui::Rect::EVERYTHING;
     egui::SidePanel::left("mode_nav")
         .resizable(false)
         .exact_width(SIDEBAR_WIDTH)
@@ -24,6 +25,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
             ..Default::default()
         })
         .show(ctx, |ui| {
+            panel_rect = ui.clip_rect();
             // Same rationale as the inspector panel: egui 0.30 SidePanel
             // doesn't guarantee the frame fill covers the full panel
             // width, so claim it explicitly to avoid an unpainted
@@ -97,6 +99,13 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                 state.inspector_open = hidden;
             }
         });
+    // Same egui 0.30 SidePanel hole patch as the inspector: if the rail's
+    // content pushed the claimed area past the panel's painted edge, fill
+    // the orphaned strip before the next panel claims the rest.
+    if let Some(hole) = super::inspector::side_panel_hole(ctx, panel_rect) {
+        ctx.layer_painter(egui::LayerId::background())
+            .rect_filled(hole, 0.0, color::SURFACE_DIM);
+    }
 }
 
 /// Single sidebar row: icon + label inside a rounded pill that fills
@@ -106,12 +115,16 @@ fn mode_nav_item(ui: &mut Ui, glyph: char, label: &str, active: bool) -> Respons
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
 
+    // Hover fades in/out over the row; the active pill stays solid.
+    let hover_t = ui
+        .ctx()
+        .animate_bool_responsive(resp.id.with("hover"), resp.hovered() && !active);
     let bg = if active {
         color::PRIMARY_CONTAINER
-    } else if resp.hovered() {
-        color::with_alpha(color::PRIMARY, 18)
+    } else if hover_t > 0.001 {
+        color::with_alpha(color::PRIMARY, (18.0 * hover_t) as u8)
     } else {
-        Color32::TRANSPARENT
+        egui::Color32::TRANSPARENT
     };
     let fg = if active {
         color::ON_PRIMARY_CONTAINER
@@ -151,8 +164,11 @@ fn utility_nav_item(ui: &mut Ui, glyph: char, label: &str) -> Response {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
 
-    let bg = if resp.hovered() {
-        color::with_alpha(color::PRIMARY, 14)
+    let hover_t = ui
+        .ctx()
+        .animate_bool_responsive(resp.id.with("hover"), resp.hovered());
+    let bg = if hover_t > 0.001 {
+        color::with_alpha(color::PRIMARY, (14.0 * hover_t) as u8)
     } else {
         Color32::TRANSPARENT
     };

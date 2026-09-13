@@ -106,10 +106,20 @@ fn button_impl(
     };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, BUTTON_HEIGHT), sense);
 
+    // Hover fades in/out (press stays instant — immediacy is the point
+    // of a press). Blending rest → MD3 state layer by the animated
+    // factor is what removes the binary fill switch.
+    let hover_t = if enabled {
+        ui.ctx()
+            .animate_bool_responsive(resp.id.with("hover"), resp.hovered())
+    } else {
+        0.0
+    };
+    let hover_bg = color::state_layer(bg, fg);
     let bg = if enabled && resp.is_pointer_button_down_on() {
         color::pressed_layer(bg, fg)
-    } else if enabled && resp.hovered() {
-        color::state_layer(bg, fg)
+    } else if hover_t > 0.001 {
+        color::mix(bg, hover_bg, hover_t)
     } else {
         bg
     };

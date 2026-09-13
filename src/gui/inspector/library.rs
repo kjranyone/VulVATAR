@@ -507,6 +507,24 @@ pub(super) fn draw_model_library(ui: &mut egui::Ui, state: &mut GuiApp) {
                         })
                     });
 
+                    // MD3 hover state layer on top of the row (over its
+                    // content, per spec), faded — the row fill itself
+                    // stays stable so selection/missing states don't
+                    // fight the hover feedback.
+                    let row_hover = response.response.hovered() && !is_current;
+                    let hover_t = ui.ctx().animate_bool_responsive(
+                        response.response.id.with("hover"),
+                        row_hover,
+                    );
+                    if hover_t > 0.001 {
+                        let overlay = color::with_alpha(color::PRIMARY, (18.0 * hover_t) as u8);
+                        ui.painter().rect_filled(
+                            response.response.rect,
+                            egui::Rounding::same(radius::SM),
+                            overlay,
+                        );
+                    }
+
                     if response.response.clicked() {
                         state.library.selected_index = Some(row.idx);
                     }

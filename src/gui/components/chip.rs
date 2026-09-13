@@ -61,8 +61,13 @@ pub fn chip(ui: &mut Ui, label: &str, selected: bool) -> Response {
     } else {
         (color::SURFACE_VARIANT, color::ON_SURFACE_VARIANT)
     };
-    let bg = if resp.hovered() {
-        color::state_layer(base_bg, color::PRIMARY)
+    // Faded hover toward the state layer (see `button_impl`).
+    let hover_t = ui
+        .ctx()
+        .animate_bool_responsive(resp.id.with("hover"), resp.hovered());
+    let hover_bg = color::state_layer(base_bg, color::PRIMARY);
+    let bg = if hover_t > 0.001 {
+        color::mix(base_bg, hover_bg, hover_t)
     } else {
         base_bg
     };

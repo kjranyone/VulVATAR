@@ -46,6 +46,10 @@ pub fn card_with_action<R, A>(
     let mut action_value: Option<A> = None;
     let body = frame
         .show(ui, |ui| {
+            // Density rhythm: controls inside a card cluster tighter
+            // (SM) than the air between cards (LG, set by the
+            // inspector) — 粗密, coarse boundaries / fine controls.
+            ui.spacing_mut().item_spacing.y = space::SM;
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(title)
@@ -87,6 +91,9 @@ pub fn collapsible_card<R>(
     let frame = card_frame();
     frame
         .show(ui, |ui| {
+            // Density rhythm: tight controls inside, air between cards
+            // (see `card_with_action`).
+            ui.spacing_mut().item_spacing.y = space::SM;
             let id = ui.make_persistent_id(id_salt);
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -126,11 +133,19 @@ pub fn collapsible_card<R>(
                 egui::pos2(ui.max_rect().right(), header_rect.bottom()),
             );
             let resp = ui.interact(target, id.with("header"), Sense::click());
-            if resp.hovered() {
+            // Faded hover state layer (MD3 ~8%) — the ease in/out is
+            // what makes the header feel responsive instead of snapping
+            // between two fills. `animate_bool_responsive` keeps
+            // ticking (and requesting repaints) through the fade-out.
+            let hover_t = ui
+                .ctx()
+                .animate_bool_responsive(id.with("hdr_hover"), resp.hovered());
+            if hover_t > 0.001 {
+                let bg = color::with_alpha(color::PRIMARY, (20.0 * hover_t) as u8);
                 ui.painter().rect_filled(
                     target.expand2(egui::vec2(space::XS, space::XS * 0.5)),
                     Rounding::same(radius::SM),
-                    color::with_alpha(color::PRIMARY, 20),
+                    bg,
                 );
             }
             if resp.clicked() {
@@ -195,11 +210,16 @@ pub fn collapsible_section<R>(
         egui::pos2(ui.max_rect().right(), header_rect.bottom()),
     );
     let resp = ui.interact(target, id.with("header"), Sense::click());
-    if resp.hovered() {
+    // Same faded hover as `collapsible_card`.
+    let hover_t = ui
+        .ctx()
+        .animate_bool_responsive(id.with("hdr_hover"), resp.hovered());
+    if hover_t > 0.001 {
+        let bg = color::with_alpha(color::PRIMARY, (20.0 * hover_t) as u8);
         ui.painter().rect_filled(
             target.expand2(egui::vec2(space::XS, space::XS * 0.5)),
             Rounding::same(radius::SM),
-            color::with_alpha(color::PRIMARY, 20),
+            bg,
         );
     }
     if resp.clicked() {
