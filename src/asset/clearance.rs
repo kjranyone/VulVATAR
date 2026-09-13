@@ -368,9 +368,88 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
     }
 
     let max_influence_radius = 0.12f32; // 12 cm maximum distance to body surface at rest
-    // Layer-style grid over the body for anchor-target refinement.
-    let body_layer_grid = build_layer_grid(&body_world, 0.03);
-    let body_inv_cell = 1.0f32 / 0.03;
+
+    // Radial silhouette of the body: per (y-slice, angle) bin, the
+    // maximum radius from the slice centroid. Bottom-garment anchors
+    // against tangent planes alone leave convex bulges (belly,
+    // buttocks) poking through between the garment's vertices — the
+    // pushed vertex clears its own anchor plane but still rests inside
+    // the surface a centimetre over (measured: 1.7k body verts through
+    // Yumeka's skirt after the plain 2mm-floor anchors). Raising each
+    // anchor's target to the local silhouette radius + clearance makes
+    // the single push land beyond the WHOLE bulge; the silhouette is a
+    // smooth function of (y, θ), so unlike per-plane refinement the
+    // target field needs no smoothing and cannot balloon.
+    let silhouette = {
+        const DY: f32 = 0.01;
+        const N_ANG: usize = 96;
+        let mut y_min = f32::MAX;
+        let mut y_max = f32::MIN;
+        for &(p, _) in body_world.iter() {
+            y_min = y_min.min(p[1]);
+            y_max = y_max.max(p[1]);
+        }
+        let n_y = (((y_max - y_min) / DY).ceil() as usize).max(1) + 1;
+        let mut sum_xz = vec![[0.0f32; 3]; n_y]; // sum_x, sum_z, count
+        for &(p, _) in body_world.iter() {
+            let yi = ((p[1] - y_min) / DY).floor() as usize;
+            if yi < n_y {
+                sum_xz[yi][0] += p[0];
+                sum_xz[yi][1] += p[2];
+                sum_xz[yi][2] += 1.0;
+            }
+        }
+        let centroids: Vec<[f32; 2]> = sum_xz
+            .iter()
+            .map(|s| {
+                if s[2] > 0.5 {
+                    [s[0] / s[2], s[1] / s[2]]
+                } else {
+                    [f32::NAN, f32::NAN]
+                }
+            })
+            .collect();
+        // Fallback centroid for empty slices: nearest non-empty slice.
+        let mut centroids = centroids;
+        for i in 0..n_y {
+            if centroids[i][0].is_nan() {
+                let mut j = i;
+                while j < n_y && centroids[j][0].is_nan() {
+                    j += 1;
+                }
+                let src = if j < n_y { j } else { i };
+                if j < n_y {
+                    centroids[i] = centroids[j];
+                }
+                let _ = src;
+            }
+        }
+        for i in (0..n_y).rev() {
+            if centroids[i][0].is_nan() && i + 1 < n_y {
+                centroids[i] = centroids[i + 1];
+            }
+        }
+        let mut r_max = vec![0.0f32; n_y * N_ANG];
+        for &(p, _) in body_world.iter() {
+            let yi = (((p[1] - y_min) / DY).floor() as usize).min(n_y - 1);
+            let c = centroids[yi];
+            if c[0].is_nan() {
+                continue;
+            }
+            let (dx, dz) = (p[0] - c[0], p[2] - c[1]);
+            let r = (dx * dx + dz * dz).sqrt();
+            let theta = dz.atan2(dx);
+            let ai = (((theta + std::f32::consts::PI) / (2.0 * std::f32::consts::PI)
+                * N_ANG as f32)
+                .floor() as usize)
+                % N_ANG;
+            let cell = &mut r_max[yi * N_ANG + ai];
+            if r > *cell {
+                *cell = r;
+            }
+        }
+        (y_min, DY, n_y, N_ANG, centroids, r_max)
+    };
 
     // Process all other primitives in the avatar
     let mut anchors_generated_count = 0usize;
@@ -472,17 +551,48 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                     let raw_clearance = diff[0] * bn[0] + diff[1] * bn[1] + diff[2] * bn[2];
 
                     // Enforce at least 2mm clearance to prevent z-fighting and resting penetrations
-                    let min_clearance = raw_clearance.max(0.002);
-                    let min_clearance = refine_clearance_target(
-                        cp,
-                        bn,
-                        raw_clearance,
-                        min_clearance,
-                        &body_world,
-                        &body_layer_grid,
-                        body_inv_cell,
-                        0.06,
-                    );
+                    let mut min_clearance = raw_clearance.max(0.002);
+
+                    // Radial-silhouette enhancement (see the silhouette
+                    // construction above): raise the target so the push
+                    // lands beyond the body's local silhouette, not just
+                    // the anchor's tangent plane. The push direction is
+                    // the parent normal; scale the needed radial delta by
+                    // its alignment with the radial direction so the
+                    // LANDING radius (not the travel distance) reaches
+                    // the target.
+                    {
+                        let (y_min, dy, n_y, n_ang, centroids, r_max) = &silhouette;
+                        let yi = (((cp[1] - y_min) / dy).floor() as usize).min(n_y - 1);
+                        let c = centroids[yi];
+                        if !c[0].is_nan() {
+                            let (dx, dz) = (cp[0] - c[0], cp[2] - c[1]);
+                            let r_skirt = (dx * dx + dz * dz).sqrt();
+                            let theta = dz.atan2(dx);
+                            // Window max: ±2 y-bins, ±3 angle bins.
+                            let mut target = 0.0f32;
+                            for wy in yi.saturating_sub(2)..(*n_y).min(yi + 3) {
+                                for wa in 0..6usize {
+                                    let ai = (((theta + std::f32::consts::PI)
+                                        / (2.0 * std::f32::consts::PI)
+                                        * *n_ang as f32)
+                                        .floor() as i64)
+                                        + (wa as i64 - 3);
+                                    let ai = ai.rem_euclid(*n_ang as i64) as usize;
+                                    target = target.max(r_max[wy * *n_ang + ai]);
+                                }
+                            }
+                            let target = target + 0.006;
+                            if target > r_skirt {
+                                let rl = r_skirt.max(1e-4);
+                                let radial = [dx / rl, 0.0, dz / rl];
+                                let align = (bn[0] * radial[0] + bn[2] * radial[2]).max(0.5);
+                                let bump = (target - r_skirt) / align;
+                                min_clearance = (min_clearance + bump).min(0.06);
+                            }
+                        }
+                    }
+
                     let weight = 1.0f32;
 
                     anchors.push(SkinAnchor {
@@ -503,9 +613,6 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                     bound_count, prim_arc.id, mesh.name, mat_name
                 );
                 skirt_prim_ids.push(prim_arc.id);
-                if let Some(ref idx) = prim_arc.indices {
-                    smooth_anchor_targets(&mut anchors, idx, 3);
-                }
                 let prim_mut = Arc::make_mut(prim_arc);
                 prim_mut.skin_anchors = Some(anchors);
                 prim_mut.body_primitive_id = Some(body_prim_id);
@@ -689,19 +796,9 @@ pub fn generate_cross_region_anchors(
                         let raw = (op[0] - ip[0]) * inrm[0]
                             + (op[1] - ip[1]) * inrm[1]
                             + (op[2] - ip[2]) * inrm[2];
-                        let min_clearance = refine_clearance_target(
-                            op,
-                            inrm,
-                            raw,
-                            raw.max(0.006),
-                            &inner.verts,
-                            &inner_grid,
-                            inv_cell,
-                            0.04,
-                        );
                         anchors.push(SkinAnchor {
                             body_vertex_idx: idx as u32,
-                            min_clearance,
+                            min_clearance: raw.max(0.006),
                             weight: 1.0,
                             mode: SKIN_ANCHOR_CLEARANCE,
                         });
@@ -721,9 +818,6 @@ pub fn generate_cross_region_anchors(
                         bound_count,
                         outer_verts.len()
                     );
-                    if let Some(ref idx) = prim_arc.indices {
-                        smooth_anchor_targets(&mut anchors, idx, 3);
-                    }
                     let prim_mut = Arc::make_mut(prim_arc);
                     prim_mut.containment_anchors = Some(anchors);
                     prim_mut.containment_primitive_id = Some(inner.prim_id);
@@ -919,19 +1013,9 @@ pub fn generate_cross_region_anchors(
                     let raw = (bp[0] - cp[0]) * cn[0]
                         + (bp[1] - cp[1]) * cn[1]
                         + (bp[2] - cp[2]) * cn[2];
-                    let min_clearance = refine_clearance_target(
-                        bp,
-                        cn,
-                        raw,
-                        raw.max(0.006),
-                        &cand.verts,
-                        &c_grid,
-                        inv_cell,
-                        0.04,
-                    );
                     anchors.push(SkinAnchor {
                         body_vertex_idx: ci as u32,
-                        min_clearance,
+                        min_clearance: raw.max(0.006),
                         weight: 1.0,
                         mode: SKIN_ANCHOR_CLEARANCE,
                     });
@@ -951,151 +1035,11 @@ pub fn generate_cross_region_anchors(
                     bottom.verts.len(),
                     cand.pokes
                 );
-                if let Some(ref idx) =
-                    asset.meshes[b_mesh].primitives[b_prim].indices.clone()
-                {
-                    smooth_anchor_targets(&mut anchors, &idx, 3);
-                }
                 let prim_mut = Arc::make_mut(&mut asset.meshes[b_mesh].primitives[b_prim]);
                 prim_mut.containment_anchors = Some(anchors);
                 prim_mut.containment_primitive_id = Some(cand.prim_id);
                 break;
             }
-        }
-    }
-}
-
-/// Bump a clearance anchor's target until ONE push along the anchor
-/// normal lands the vertex outside every same-facing plane nearby.
-///
-/// A naive `(raw, floor)` target only clears the anchor's own plane:
-/// convex bulges (buttocks vs a skirt authored flat) and stacked
-/// sheets (frills) between anchor vertices still swallow the pushed
-/// vertex, and the rendered surface interpolates through them. The
-/// refinement simulates the push and raises the target until the
-/// landing point clears every nearby plane whose normal roughly
-/// agrees with the push direction — back-facing sheets are excluded,
-/// because a point outside a closed-ish surface is always behind some
-/// opposite-facing sheet and demanding clearance from those never
-/// converges (measured: over-pushed hems punching through far sheets).
-fn refine_clearance_target(
-    origin: [f32; 3],
-    push_normal: [f32; 3],
-    raw: f32,
-    mut min_clearance: f32,
-    parent_verts: &[([f32; 3], [f32; 3])],
-    parent_grid: &HashMap<(i32, i32, i32), Vec<u32>>,
-    inv_cell: f32,
-    max_target: f32,
-) -> f32 {
-    for _ in 0..4 {
-        if min_clearance >= max_target {
-            return max_target;
-        }
-        let t = min_clearance - raw;
-        let land = [
-            origin[0] + push_normal[0] * t,
-            origin[1] + push_normal[1] * t,
-            origin[2] + push_normal[2] * t,
-        ];
-        let lk = (
-            (land[0] * inv_cell).floor() as i32,
-            (land[1] * inv_cell).floor() as i32,
-            (land[2] * inv_cell).floor() as i32,
-        );
-        let mut worst = 0.0f32;
-        for dx in -2..=2 {
-            for dy in -2..=2 {
-                for dz in -2..=2 {
-                    if let Some(list) = parent_grid.get(&(lk.0 + dx, lk.1 + dy, lk.2 + dz)) {
-                        for &j in list {
-                            let (jp, jn) = parent_verts[j as usize];
-                            // Same-facing planes only.
-                            if jn[0] * push_normal[0] + jn[1] * push_normal[1]
-                                + jn[2] * push_normal[2]
-                                < 0.3
-                            {
-                                continue;
-                            }
-                            let c = (land[0] - jp[0]) * jn[0]
-                                + (land[1] - jp[1]) * jn[1]
-                                + (land[2] - jp[2]) * jn[2];
-                            worst = worst.min(c);
-                        }
-                    }
-                }
-            }
-        }
-        if worst >= 0.002 {
-            return min_clearance;
-        }
-        min_clearance += 0.002 - worst;
-    }
-    min_clearance.min(max_target)
-}
-
-/// Smooth the per-vertex clearance-target field over the owning mesh.
-///
-/// Refined targets vary sharply where the parent surface bulges (a
-/// skirt authored flat across the buttocks needs ~50 mm pushes at the
-/// peak and ~0 next to it); the rendered surface interpolates linearly
-/// between vertices, so unsmoothed targets leave deep dips between a
-/// pushed vertex and its neighbours — measured as worse residual
-/// penetration than no refinement at all. A few Jacobi iterations of
-/// neighbour averaging spread the peak over the region: the garment
-/// comes to REST on the bulge instead of tenting over it. Unbound
-/// vertices (default anchors) stay fixed — smoothing into them would
-/// invent pushes their anchor data can't express.
-fn smooth_anchor_targets(anchors: &mut [SkinAnchor], indices: &[u32], iterations: usize) {
-    if indices.is_empty() || anchors.is_empty() {
-        return;
-    }
-    let n = anchors.len();
-    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for t in (0..indices.len()).step_by(3) {
-        let tri = [&indices[t], &indices[t + 1], &indices[t + 2]];
-        for a in 0..3 {
-            for b in 0..3 {
-                if a != b {
-                    let (i, j) = (*tri[a] as usize, *tri[b] as usize);
-                    if i < n && j < n {
-                        adj[i].push(j as u32);
-                    }
-                }
-            }
-        }
-    }
-    for _ in 0..iterations {
-        let old: Vec<f32> = anchors
-            .iter()
-            .map(|a| {
-                if a.body_vertex_idx == u32::MAX {
-                    f32::NAN
-                } else {
-                    a.min_clearance
-                }
-            })
-            .collect();
-        for (i, a) in anchors.iter_mut().enumerate() {
-            if a.body_vertex_idx == u32::MAX {
-                continue;
-            }
-            let neighbors: Vec<f32> = adj[i]
-                .iter()
-                .filter_map(|j| {
-                    let v = old[*j as usize];
-                    if v.is_nan() {
-                        None
-                    } else {
-                        Some(v)
-                    }
-                })
-                .collect();
-            if neighbors.is_empty() {
-                continue;
-            }
-            let avg = neighbors.iter().sum::<f32>() / neighbors.len() as f32;
-            a.min_clearance = 0.5 * old[i] + 0.5 * avg;
         }
     }
 }

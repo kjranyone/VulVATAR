@@ -712,9 +712,45 @@ fn main() -> Result<(), String> {
                                 quad[qi] += 1;
                             }
                         }
+                        let mut w_pos = [0.0f32; 3];
+                        let mut w_val = 0.0f32;
+                        let mut w_by_y = std::collections::BTreeMap::new();
+                        for p in &w {
+                            if p[1] < s_lo || p[1] > s_hi {
+                                continue;
+                            }
+                            let mut best_f = (f32::INFINITY, 0usize);
+                            for (si, (sp, _)) in skirt_fixed.iter().enumerate() {
+                                let d2 = (p[0] - sp[0]).powi(2)
+                                    + (p[1] - sp[1]).powi(2)
+                                    + (p[2] - sp[2]).powi(2);
+                                if d2 < best_f.0 {
+                                    best_f = (d2, si);
+                                }
+                            }
+                            if best_f.0 > 0.06 * 0.06 {
+                                continue;
+                            }
+                            let (fp, fnn) = skirt_fixed[best_f.1];
+                            let df = (p[0] - fp[0]) * fnn[0]
+                                + (p[1] - fp[1]) * fnn[1]
+                                + (p[2] - fp[2]) * fnn[2];
+                            if df > 0.002 {
+                                let ybin = (p[1] * 50.0).round() as i32;
+                                *w_by_y.entry(ybin).or_insert(0usize) += 1;
+                                if df > w_val {
+                                    w_val = df;
+                                    w_pos = *p;
+                                }
+                            }
+                        }
                         println!(
                             "      residual poke quadrants [front-R, front-L, back-R, back-L]: {:?}",
                             quad
+                        );
+                        println!(
+                            "      residual by y(2cm bins): {:?}  worst=+{:.1}mm at ({:.2},{:.2},{:.2})",
+                            w_by_y, w_val * 1000.0, w_pos[0], w_pos[1], w_pos[2]
                         );
                     }
                 }
@@ -1090,6 +1126,211 @@ fn main() -> Result<(), String> {
             }
         }
     }
+    // ---- skirt mesh topology census ----------------------------------
+    {
+        let skirt = asset
+            .meshes
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case("circle.056"))
+            .and_then(|m| m.primitives.iter().find(|p| p.vertices.is_some()));
+        if let Some(skirt) = skirt {
+            let vd = skirt.vertices.as_ref().unwrap();
+            let idx = skirt.indices.as_ref().unwrap();
+            let mut edges = std::collections::HashSet::new();
+            for t in idx.chunks_exact(3) {
+                for pair in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edges.insert(if pair.0 < pair.1 { pair } else { (pair.1, pair.0) });
+                }
+            }
+            let mut degree = vec![0u32; vd.positions.len()];
+            for &(a, b) in &edges {
+                degree[a as usize] += 1;
+                degree[b as usize] += 1;
+            }
+            let mut hist = std::collections::BTreeMap::new();
+            for d in &degree {
+                *hist.entry(*d).or_insert(0usize) += 1;
+            }
+            println!(
+                "skirt topology: verts={} tris={} unique_edges={} degree_hist={:?}",
+                vd.positions.len(),
+                idx.len() / 3,
+                edges.len(),
+                hist
+            );
+        }
+    }
+
+    // ---- CPU-solver comparison on the same auto asset ----------------
+    {
+        for slot in avatar.cloth_overlays.iter_mut() {
+            slot.state.solver_backend =
+                vulvatar_lib::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu;
+        }
+        for fidx in 0..12usize {
+            avatar.build_base_pose();
+            avatar.compute_global_pose();
+            vulvatar_lib::simulation::cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+            if fidx == 0 {
+                if let Some(slot) = avatar.cloth_overlays.first() {
+                    let mut worst: Vec<(f32, usize)> = slot
+                        .state
+                        .sim_positions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (p[0].abs().max(p[1].abs()).max(p[2].abs()), i))
+                        .collect();
+                    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                    for (mag, i) in worst.iter().take(5) {
+                        let pin = slot.sim.particles.get(*i).map(|p| p.pinned);
+                        let n_c = slot
+                            .sim
+                            .distance_constraints
+                            .iter()
+                            .filter(|c| c.a as usize == *i || c.b as usize == *i)
+                            .count();
+                        println!(
+                            "cpu f0 worst particle i={i} |p|={mag:.3e} pinned={pin:?} degree={n_c}"
+                        );
+                    }
+                }
+            }
+            if fidx % 3 == 0 {
+                if let Some(slot) = avatar.cloth_overlays.first() {
+                    let mut lo = [f32::MAX; 3];
+                    let mut hi = [f32::MIN; 3];
+                    for q in &slot.state.sim_positions {
+                        for c in 0..3 {
+                            lo[c] = lo[c].min(q[c]);
+                            hi[c] = hi[c].max(q[c]);
+                        }
+                    }
+                    println!(
+                        "cpu cloth frame {fidx:>2}: bbox=[{:.2},{:.2},{:.2}]..[{:.2},{:.2},{:.2}]",
+                        lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- auto-cloth live test ----------------------------------------
+    // Reproduce the live bug offline: attach the auto-generated GPU
+    // cloth exactly like the app, render frames, and read back the
+    // solver's positions (the same readback the app folds every
+    // frame). A healthy skirt keeps its bbox near the hips.
+    {
+        let attached = vulvatar_lib::simulation::auto_cloth::attach_auto_cloth(&mut avatar);
+        println!("auto-cloth attached: {attached}");
+        let mut mesh_instances2 = frame_input2.instances[0].mesh_instances.clone();
+        for fidx in 0..12usize {
+            avatar.build_base_pose();
+            avatar.compute_global_pose();
+            avatar.build_skinning_matrices();
+            // collect cloth deforms like the app does (app/render.rs)
+            let mut cloth_deforms = Vec::new();
+            for slot in avatar.cloth_overlays.iter().filter(|s| s.enabled) {
+                let Some(target) = slot.state.target_primitive_id else { continue };
+                use vulvatar_lib::renderer::frame_input::{
+                    ClothDeformSnapshot, ClothGpuAttachData, ClothGpuDispatchControl,
+                };
+                let (gpu_control, gpu_attach) =
+                    if slot.state.solver_backend
+                        == vulvatar_lib::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+                    {
+                        let sim = &slot.sim;
+                        let wind = vulvatar_lib::math_utils::vec3_scale(
+                            &sim.wind_direction,
+                            sim.wind_response,
+                        );
+                        let pins = (0..sim.particles.len())
+                            .map(|_| [0.0f32; 3])
+                            .collect::<Vec<_>>();
+                        let _ = pins;
+                        let colliders: Vec<vulvatar_lib::renderer::frame_input::ClothGpuCollider> =
+                            Vec::new();
+                        (
+                            Some(ClothGpuDispatchControl {
+                                dt: 1.0 / 60.0,
+                                substeps: 1,
+                                damping: sim.damping,
+                                gravity: sim.gravity,
+                                wind_force: wind,
+                                solver_iterations: sim.solver_iterations as u32,
+                                pin_positions: gpu_pins(sim, &avatar.pose.global_transforms),
+                                collision_margin: sim.collision_margin,
+                                colliders,
+                                self_collision: sim.self_collision,
+                                self_collision_radius: sim.self_collision_radius,
+                            }),
+                            Some(ClothGpuAttachData {
+                                constraints: sim
+                                    .distance_constraints
+                                    .iter()
+                                    .map(|c| (c.a as u32, c.b as u32, c.rest_length, c.stiffness))
+                                    .collect(),
+                                triangle_indices: sim.triangle_indices.clone(),
+                                inv_masses: sim.particles.iter().map(|p| p.inv_mass).collect(),
+                                pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                            }),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                cloth_deforms.push(ClothDeformSnapshot {
+                    target_primitive_id: target,
+                    target_mesh_id: slot.state.target_mesh_id,
+                    vertex_offset: slot.state.target_vertex_offset,
+                    vertex_count: slot.state.target_vertex_count,
+                    deformed_positions: slot.state.deform_output.deformed_positions.clone(),
+                    deformed_normals: slot.state.deform_output.deformed_normals.clone(),
+                    version: slot.state.deform_output.version,
+                    solver_backend: slot.state.solver_backend,
+                    gpu_control,
+                    gpu_attach,
+                });
+            }
+            let mut fi = frame_input2.clone();
+            fi.instances[0].mesh_instances = mesh_instances2.clone();
+            fi.instances[0].skinning_matrices = avatar.pose.skinning_matrices.clone();
+            fi.instances[0].cloth_deforms = cloth_deforms;
+            let _ = renderer.render(&fi);
+            if let Ok(res) = renderer.render(&fi) {
+                if let Some(entry) = res.cloth_readback.first() {
+                    let mut lo = [f32::MAX; 3];
+                    let mut hi = [f32::MIN; 3];
+                    let mut nan = 0usize;
+                    for q in &entry.positions {
+                        for c in 0..3 {
+                            if q[c].is_nan() {
+                                nan += 1;
+                            } else {
+                                lo[c] = lo[c].min(q[c]);
+                                hi[c] = hi[c].max(q[c]);
+                            }
+                        }
+                    }
+                    println!(
+                        "cloth frame {fidx:>2}: n={} nan={nan} bbox=[{:.2},{:.2},{:.2}]..[{:.2},{:.2},{:.2}] v={}",
+                        entry.positions.len(), lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], entry.version
+                    );
+                }
+                if fidx == 11 {
+                    if let Some(exported) = res.exported_frame.as_ref() {
+                        if let Some(pixels) = exported.cpu_pixel_data() {
+                            let path = out.join("tpose_autocloth.png");
+                            let img: ImageBuffer<image::Rgba<u8>, _> =
+                                ImageBuffer::from_raw(width, height, pixels.to_vec())
+                                    .ok_or("png buffer construction failed")?;
+                            let _ = img.save(&path);
+                            println!("wrote {}", path.display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- expression/morph test --------------------------------------
     // Face tracking + lipsync drive expression morphs continuously —
     // even in T-pose. If morph weights leak onto garment primitives,
@@ -1161,6 +1402,30 @@ fn main() -> Result<(), String> {
     }
     println!("done");
     Ok(())
+}
+
+fn gpu_pins(
+    sim: &vulvatar_lib::simulation::cloth::ClothSimState,
+    global_transforms: &[vulvatar_lib::asset::Mat4],
+) -> Vec<[f32; 3]> {
+    let mut out = vec![[0.0f32; 3]; sim.particles.len()];
+    for pin in &sim.pin_targets {
+        let Some(mat) = global_transforms.get(pin.node_index) else {
+            continue;
+        };
+        let [ox, oy, oz] = pin.offset;
+        let world = [
+            mat[0][0] * ox + mat[1][0] * oy + mat[2][0] * oz + mat[3][0],
+            mat[0][1] * ox + mat[1][1] * oy + mat[2][1] * oz + mat[3][1],
+            mat[0][2] * ox + mat[1][2] * oy + mat[2][2] * oz + mat[3][2],
+        ];
+        for &pi in &pin.particle_indices {
+            if pi < out.len() {
+                out[pi] = world;
+            }
+        }
+    }
+    out
 }
 
 fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 3]) {

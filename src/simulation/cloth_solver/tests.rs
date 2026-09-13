@@ -200,12 +200,15 @@ fn distance_constraint_with_zero_stiffness_does_nothing() {
     assert_eq!(sim.particles[1].position, [3.0, 0.0, 0.0]);
 }
 
-/// XPBD's `α = 0` (rigid) limit must drive the constraint to **exactly**
-/// the rest length in a single projection pass. PBD with `stiffness = 1`
-/// behaved this way too; verify the migration preserves the property so
-/// existing assets keep looking the same.
+/// XPBD's `α = 0` (rigid) limit converges to the rest length
+/// geometrically under the under-relaxed Jacobi application
+/// (Δx / (n+1) — added because full-sum Jacobi diverges past a couple
+/// of constraints per particle; measured on Yumeka's welded skirt).
+/// A single constraint relaxes by 1/2 per pass, so one pass halves the
+/// error and a handful of passes converges — assert both the one-pass
+/// contraction and the converged limit.
 #[test]
-fn xpbd_rigid_stiffness_satisfies_constraint_in_one_pass() {
+fn xpbd_rigid_stiffness_converges_under_relaxed_jacobi() {
     let mut sim = make_simple_sim(2);
     sim.particles[0].position = [0.0, 0.0, 0.0];
     sim.particles[1].position = [3.0, 0.0, 0.0];
@@ -222,8 +225,17 @@ fn xpbd_rigid_stiffness_satisfies_constraint_in_one_pass() {
 
     let dist = (sim.particles[1].position[0] - sim.particles[0].position[0]).abs();
     assert!(
-        (dist - 1.0).abs() < 1e-4,
-        "after one XPBD pass at stiffness=1, distance should be ~rest_length=1.0, got {dist}",
+        (dist - 2.0).abs() < 1e-4,
+        "one pass at stiffness=1 must halve the error (relaxed Jacobi, n+1 = 2): expected 2.0, got {dist}",
+    );
+
+    for _ in 0..15 {
+        project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
+    }
+    let dist = (sim.particles[1].position[0] - sim.particles[0].position[0]).abs();
+    assert!(
+        (dist - 1.0).abs() < 1e-3,
+        "converged distance should be ~rest_length=1.0, got {dist}",
     );
 }
 
@@ -254,15 +266,16 @@ fn xpbd_lambda_accumulates_within_substep_and_resets_across_substeps() {
         "first XPBD pass must produce non-zero λ; got {lambda_after_iter_1}"
     );
 
-    // Second iter inside the SAME substep: the constraint is already
-    // ~satisfied (rigid case), so |Δλ| should be tiny. λ stays close
-    // to its post-first-iter value.
+    // Second iter inside the SAME substep: the relaxed application
+    // leaves a residual (error halved per pass), so λ keeps growing
+    // but geometrically — each Δλ roughly halves. Assert contraction,
+    // not saturation: the structural property under relaxed Jacobi.
     project_distance_constraints(&mut sim, &mut buffers, 1.0 / 60.0);
     let lambda_after_iter_2 = buffers.lambda_distance[0];
     let delta = (lambda_after_iter_2 - lambda_after_iter_1).abs();
     assert!(
-        delta < 0.1 * lambda_after_iter_1.abs().max(1e-6),
-        "rigid constraint already satisfied; second-iter Δλ should be tiny, got {delta}",
+        delta < lambda_after_iter_1.abs().max(1e-6),
+        "second-iter Δλ must contract (relaxed Jacobi halves the residual): got Δλ={delta} vs λ1={lambda_after_iter_1}",
     );
 
     // Reset simulates the start of the next substep.

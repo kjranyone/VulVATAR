@@ -481,6 +481,7 @@ inspector:
   primary_deform: "主变形版本：%{version}"
   cloth_solver_backend: "求解器后端: %{backend}"
   cloth_gpu_pref_next_attach: "新布料使用 GPU 求解器 (下次挂载生效)"
+  cloth_auto_pref: "裙子自动布料 (加载时自动生成 GPU 布料)"
   primary_state_none: "主布料状态：无 (仅覆盖层)"
   no_cloth_state: "无布料状态"
   model_library: "模型库"

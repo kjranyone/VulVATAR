@@ -1382,16 +1382,27 @@ fn test_layered_clothing_clearance_e2e() {
             .unwrap_or(0)
     };
 
+    // Containment-MODE anchors only: the containment slot can also
+    // carry cross-region clearance anchors (Phase 3 — e.g. the jacket's
+    // hem vs the skirt, the skirt vs the underwear), which must not
+    // read as a layered containment pairing.
+    let has_containment_mode = |p: &crate::asset::MeshPrimitiveAsset| {
+        p.containment_anchors
+            .as_ref()
+            .map(|a| {
+                a.iter()
+                    .any(|x| x.body_vertex_idx != u32::MAX && x.mode == containment)
+            })
+            .unwrap_or(false)
+    };
     let inner_prim = asset
         .meshes
         .iter()
         .flat_map(|m| &m.primitives)
         .find(|p| {
-            p.containment_anchors.is_some()
+            has_containment_mode(p)
                 && p.containment_primitive_id
-                    .and_then(|outer_pid| {
-                        prim_of(outer_pid).map(|o| o.containment_anchors.is_none())
-                    })
+                    .and_then(|outer_pid| prim_of(outer_pid).map(|o| !has_containment_mode(o)))
                     .unwrap_or(false)
         })
         .expect("no inner layer carries containment anchors against an outermost garment");
@@ -1777,14 +1788,23 @@ fn test_skin_through_sleeve_at_elbow_bend() {
             .flat_map(|m| &m.primitives)
             .find(|p| p.id == pid)
     };
+    let has_containment_mode = |p: &crate::asset::MeshPrimitiveAsset| {
+        p.containment_anchors
+            .as_ref()
+            .map(|a| {
+                a.iter()
+                    .any(|x| x.body_vertex_idx != u32::MAX && x.mode == crate::asset::clearance::SKIN_ANCHOR_CONTAINMENT)
+            })
+            .unwrap_or(false)
+    };
     let mid_prim = asset
         .meshes
         .iter()
         .flat_map(|m| &m.primitives)
         .find(|p| {
-            p.containment_anchors.is_some()
+            has_containment_mode(p)
                 && p.containment_primitive_id
-                    .and_then(|o| prim_of(o).map(|op| op.containment_anchors.is_none()))
+                    .and_then(|o| prim_of(o).map(|op| !has_containment_mode(op)))
                     .unwrap_or(false)
         })
         .expect("layered stack present");

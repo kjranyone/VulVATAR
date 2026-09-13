@@ -684,6 +684,9 @@ mod tests {
             let start = adj.offsets[pid] as usize;
             let end = adj.offsets[pid + 1] as usize;
             let mut delta = [0.0_f32; 3];
+            // Under-relaxed Jacobi denominator (n + 1) — mirrors the
+            // GLSL accumulate pass and the CPU apply loop.
+            let mut n_rel = 1.0_f32;
             for k in start..end {
                 let cidx = adj.triangles[k] as usize;
                 let (a, b, _, _) = constraints[cidx];
@@ -703,9 +706,14 @@ mod tests {
                     delta[0] += dir[0] * scale;
                     delta[1] += dir[1] * scale;
                     delta[2] += dir[2] * scale;
+                    n_rel += 1.0;
                 }
             }
-            deltas[pid] = delta;
+            deltas[pid] = [
+                delta[0] / n_rel,
+                delta[1] / n_rel,
+                delta[2] / n_rel,
+            ];
         }
 
         // Pass 3 — apply Δx (mirror of `cloth_constraint_apply_cs`).

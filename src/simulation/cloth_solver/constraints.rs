@@ -144,17 +144,18 @@ pub(crate) fn project_distance_constraints(
 
         buffers.correction_accumulator[a] = vec3_add(&buffers.correction_accumulator[a], &corr_a);
         buffers.correction_accumulator[b] = vec3_add(&buffers.correction_accumulator[b], &corr_b);
+        buffers.correction_count[a] += 1;
+        buffers.correction_count[b] += 1;
     }
 
-    // Sum-of-corrections Δx application: every constraint that
-    // touches particle `i` adds its full XPBD Δx_i contribution into
-    // the accumulator and we apply the sum. The previous Jacobi-
-    // averaged form (`accumulator / count`) was inconsistent with the
-    // per-constraint λ update — λ accumulates the un-averaged C/w_sum,
-    // so dividing the position by `count` biased the next iteration's
-    // C towards an inflated residual and let effective stiffness drift
-    // with mesh connectivity. Direct sum matches the GLSL accumulate
-    // pass byte-for-byte and is the formulation the XPBD paper assumes.
+    // Under-relaxed Jacobi application: Δx_i = Σ corr / (n_i + 1).
+    // The plain sum (the textbook Jacobi form, and what the GLSL
+    // accumulate pass did until now) diverges once per-particle
+    // constraint degree grows past a couple of edges — measured on
+    // Yumeka's welded skirt (degree ≈ 6): first-step positions at
+    // ±1e8. Relaxing by 1/(n+1) is the standard stable Jacobi cloth
+    // factor; λ stays per-constraint and un-averaged, only the
+    // position step is relaxed.
     for i in 0..sim.particles.len() {
         if sim.particles[i].pinned {
             continue;
@@ -163,7 +164,9 @@ pub(crate) fn project_distance_constraints(
         if corr[0] == 0.0 && corr[1] == 0.0 && corr[2] == 0.0 {
             continue;
         }
-        sim.particles[i].position = vec3_add(&sim.particles[i].position, &corr);
+        let relax = 1.0 / (buffers.correction_count[i] as f32 + 1.0);
+        let relaxed = vec3_scale(&corr, relax);
+        sim.particles[i].position = vec3_add(&sim.particles[i].position, &relaxed);
     }
 }
 

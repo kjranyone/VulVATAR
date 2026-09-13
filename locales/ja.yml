@@ -481,6 +481,7 @@ inspector:
   primary_deform: "プライマリ変形バージョン: %{version}"
   cloth_solver_backend: "ソルバーバックエンド: %{backend}"
   cloth_gpu_pref_next_attach: "新規クロスはGPUソルバー (次回アタッチから適用)"
+  cloth_auto_pref: "スカートを自動クロス化 (読込時にGPU布を自動生成)"
   primary_state_none: "プライマリクロス状態: なし (オーバーレイのみ)"
   no_cloth_state: "クロス状態なし"
   model_library: "モデルライブラリ"

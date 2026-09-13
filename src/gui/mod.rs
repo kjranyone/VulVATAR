@@ -382,6 +382,9 @@ impl GuiApp {
         }
         theme::apply(&cc.egui_ctx);
         let mut app = Box::new(Application::new());
+        // Auto-cloth opt-out — published before bootstrap so the
+        // default avatar's attach (inside bootstrap) already sees it.
+        app.set_auto_cloth_enabled(app_settings.auto_cloth.unwrap_or(true));
         app.bootstrap();
         app.avatar_library = crate::persistence::load_avatar_library();
         if std::env::var_os("VULVATAR_AUTOSTART_VIRTUAL_CAMERA").is_some() {
@@ -459,6 +462,7 @@ impl GuiApp {
                 pan_sensitivity: app_settings.pan_sensitivity,
                 last_project_path: app_settings.last_project_path.clone(),
                 cloth_gpu_backend: app_settings.cloth_gpu_backend,
+                auto_cloth: app_settings.auto_cloth,
             },
 
             mirror_view: false,

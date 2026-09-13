@@ -190,6 +190,11 @@ pub struct Application {
     pub avatars: Vec<AvatarInstance>,
     pub active_avatar_index: usize,
     pub next_avatar_instance_id: u64,
+    /// Auto-cloth opt-out: derive and attach GPU cloth for
+    /// skirt-classified primitives on every avatar load. Mirrors
+    /// `AppSettings::auto_cloth` (published at startup, before any
+    /// attach can race it).
+    pub auto_cloth_enabled: bool,
     pub running: bool,
     pub avatar_library: avatar_library::AvatarLibrary,
 
@@ -355,9 +360,21 @@ impl Application {
         self.physics.attach_avatar(&instance.asset);
         self.active_avatar_index = 0;
         self.avatars.push(instance);
+        if self.auto_cloth_enabled {
+            if let Some(avatar) = self.avatars.last_mut() {
+                crate::simulation::auto_cloth::attach_auto_cloth(avatar);
+            }
+        }
         if had_existing {
             self.evict_render_caches();
         }
+    }
+
+    /// Publish the auto-cloth preference. Called at startup, before
+    /// any avatar can attach (mirrors the cloth-backend request
+    /// publication timing).
+    pub fn set_auto_cloth_enabled(&mut self, enabled: bool) {
+        self.auto_cloth_enabled = enabled;
     }
 
     pub fn remove_avatar_at(&mut self, index: usize) {
@@ -420,6 +437,7 @@ impl Application {
             avatars: Vec::new(),
             active_avatar_index: 0,
             next_avatar_instance_id: 1,
+            auto_cloth_enabled: true,
             running: false,
             avatar_library: avatar_library::AvatarLibrary::new(),
             last_tracking_pose: None,

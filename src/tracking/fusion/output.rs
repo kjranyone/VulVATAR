@@ -44,7 +44,11 @@ pub struct RigPose {
     pub root_cam_m: [f32; 3],
     /// σ of the root position (m).
     pub root_sigma_m: f32,
-    /// Overall track quality in `[0,1]` (1 = torso well constrained).
+    /// Overall track quality in `[0,1]`: posterior torso σ (scaled by
+    /// projected shoulder span) times a measurement-support factor from
+    /// the trunk's data-only σ — collapses to 0 a few seconds after the
+    /// subject stops being observed, even though the prior keeps the
+    /// posterior covariance tight.
     pub quality: f32,
     /// Fraction of solved shape (0 = template, 1 = frozen personal shape).
     pub shape_confidence: f32,
@@ -54,12 +58,13 @@ pub struct RigPose {
     /// Subject shoulder span (m) under the current shape — the metric
     /// scale reference for 1:1 root translation.
     pub shoulder_span_m: f32,
-    /// Wrist position in the subject's own head frame (viewer axes),
+    /// Wrist position in the subject's own head-local frame, camera axes,
     /// per hand `[left, right]`. Rotation-only retarget preserves a
     /// reach's direction, not its endpoint, so a finger-to-lips pose
-    /// lands short on a different-proportioned avatar; consumers use
-    /// this to anchor the avatar's wrist at the same head-relative
-    /// spot (self-contact preservation). `[0;3]` when unavailable.
+    /// lands short on a different-proportioned avatar; consumers
+    /// conjugate this by the avatar head node's rest world rotation and
+    /// anchor the avatar's wrist at the same head-relative spot
+    /// (self-contact preservation). `[0;3]` when unavailable.
     pub head_local_wrists: [[f32; 3]; 2],
     /// Face-proximity weight per hand `[left, right]` in `[0,1]`: 1 with
     /// the wrist within `FACE_CONTACT_M` of the head, fading to 0 at
@@ -115,7 +120,21 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64, shoulder_span_px: Option<
         .map(|&j| est.joint_sigma(m, j))
         .fold(0.0, f64::max)
         .max(est.var[..3].iter().cloned().fold(0.0, f64::max).sqrt());
-    let mut quality = (1.0 - torso_sigma / 0.5).clamp(0.0, 1.0) as f32;
+    // Posterior σ alone cannot report "subject lost": with no
+    // measurements the pose prior keeps the covariance tight while the
+    // state random-walks (measured 2026-09-13: root drifting 0.9→3.9 m
+    // over 45 s of n2d=n3d=ncloud=0 with quality steady at 0.5-0.7, so
+    // the retarget kept driving the avatar on a runaway prior). Gate
+    // quality on the trunk's measurement-only σ as well — the leaky
+    // data-info EMA (~0.3 s) collapses it a few seconds after the last
+    // real constraint, and well-observed frames (cloud + keypoints feed
+    // the trunk) sit near 1.0, so normal tracking is unchanged.
+    let spine_data_sigma = [h.j.spine1, h.j.spine2, h.j.spine3]
+        .iter()
+        .map(|&j| est.joint_data_sigma(m, j))
+        .fold(0.0, f64::max);
+    let data_support = confidence_from_sigma(spine_data_sigma, 0.08, 0.6);
+    let mut quality = (1.0 - torso_sigma / 0.5).clamp(0.0, 1.0) as f32 * data_support;
     if let Some(px) = shoulder_span_px {
         // Full trust above ~60 px of shoulder span, none below ~25 px.
         quality *= ((px - 25.0) / 35.0).clamp(0.0, 1.0) as f32;
@@ -134,11 +153,14 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64, shoulder_span_px: Option<
     ];
     let shoulder_span_m = norm(sub(fk.t[h.j.l_shoulder], fk.t[h.j.r_shoulder])) as f32;
     // Head-local wrist anchors for self-contact poses. The offset is
-    // expressed in the head's own frame: o_view = F · (R_cam_headᵀ · d),
-    // with F = Rx(180°) (F² = I). Because the retarget applies
-    // R_av = F · R_cam · F, using o_view through R_av reproduces the
-    // subject's head-relative wrist placement on the avatar exactly
-    // regardless of global frame conventions.
+    // reported in the subject's own head-local frame on CAMERA axes:
+    // o = R_cam_headᵀ · (wrist_cam − head_cam). The retarget conjugates
+    // it by the avatar head node's rest world rotation before applying it
+    // through the solved avatar head transform (see
+    // `anchor_face_local_hands`), which reproduces the subject's
+    // head-relative wrist placement on the avatar exactly, regardless of
+    // the avatar's rest-pose or bone-axis conventions or the hips
+    // tilt-clamp rebase.
     let mut head_local_wrists = [[0.0f32; 3]; 2];
     let mut face_proximity = [0.0f32; 2];
     let head_r = &fk.r[h.j.head];
@@ -146,9 +168,9 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64, shoulder_span_px: Option<
     for (side, wrist) in [(0usize, h.j.l_wrist), (1usize, h.j.r_wrist)] {
         let d = sub(fk.t[wrist], head_t);
         let dist = norm(d);
-        // Rᵀ · d (camera axes), then flip y/z into the viewer frame.
+        // Rᵀ · d, kept in camera axes.
         let o = mat_vec(&transpose(head_r), d);
-        head_local_wrists[side] = [o[0] as f32, -o[1] as f32, -o[2] as f32];
+        head_local_wrists[side] = [o[0] as f32, o[1] as f32, o[2] as f32];
         face_proximity[side] = face_proximity_weight(dist) * hand_confidence[side];
     }
     RigPose {

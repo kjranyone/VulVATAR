@@ -80,6 +80,13 @@ pub struct AppSettings {
     /// the backend is a one-shot per-cloth decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloth_gpu_backend: Option<bool>,
+    /// Auto-cloth: derive and attach GPU cloth for skirt-classified
+    /// primitives on avatar load (no `.vvtcloth` authoring needed).
+    /// `None`/`true` = on (the feature's default); `Some(false)`
+    /// opts the install out. Published to
+    /// `Application::set_auto_cloth_enabled` at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cloth: Option<bool>,
 }
 
 fn default_app_settings_version() -> u32 {
@@ -98,6 +105,7 @@ impl Default for AppSettings {
             last_project_path: None,
             camera_serial: None,
             cloth_gpu_backend: None,
+            auto_cloth: None,
         }
     }
 }
@@ -170,6 +178,7 @@ pub(super) fn migrate_legacy_app_settings_from(path: &Path) -> Option<AppSetting
         // Legacy projects predate the device pick — no selection yet.
         camera_serial: None,
         // And predate the cloth backend preference — env decides.
+        auto_cloth: None,
         cloth_gpu_backend: None,
     })
 }

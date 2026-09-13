@@ -27,6 +27,21 @@ will invalidate that cache and trigger a rebuild.
 - ポーズ品質のベンチ: 合成 GT は `cargo run --bin validate_gt` (既知ポーズをレンダ→追跡→復元、coupling ゲイン算出、`diagnostics/validation_gt/summary.md`)、実録画は `diagnose_fusion_replay` (下の Tracking 節)。
 - **デスク配信エンベロープが主戦場** (頭+肩のみ・カメラ斜め・手は常時デスク下 = ユーザーの本番運用)。腕・顔まわりの変更は正面系リプレイ (wave/palms/namaste) に加えて必ずデスク系録画 (`diagnostics/sessions/<id>` / `diagnostics/depth/desk_*`) でも `diagnose_fusion_replay` を回すこと。デスク向け指標: 手首ジャンプ/snap 数、data-σ duty (非観測の手が誤駆動されていないか)、胴 yaw std、root ジャンプ。
 
+## Cloth / garment
+
+- **Auto-cloth**: skirt-classified primitives get a GPU-backed `ClothAsset`
+  derived at load (`src/simulation/auto_cloth.rs` — classifier mirrors
+  Phase-1: skirt/bottom/pants name or ≥40% skirt-bone weights, minus the
+  upper-body name list). Runtime-only slots (no `source_path`, never in
+  project saves); project `.vvtcloth` overlays supersede them per-primitive.
+  Opt-out: `settings.json` `auto_cloth: false` / Cloth パネルのチェックボックス。
+  CPU ベンド拘束は向きが反転する既知バグあり (T07 メモ) — bend を生成/移植する前に
+  修正とテストが先 (roadmap 参照)。
+- クリアランス (アンチ貫通アンカー) は `src/asset/clearance.rs` の Phase 1/2/3。
+  Phase 3 は containment スロットに clearance-mode アンカーを入れる cross-region
+  (ジャケット裾↔スカート、スカート↔下着)。アンカー実装を変えたら
+  `VVT_CACHE_VERSION` を上げること (v17 = 放射シルエット拡張)。
+
 ## Tracking (fusion estimator)
 
 - 本番プロバイダは `FusionProvider` (`src/tracking/fusion/provider.rs`) の一本のみ。ファクトリは `create_pose_provider` (`src/tracking/provider.rs`、`inference` feature 経由)。現行仕様は `docs/tracking-v2-design.md` (As-Is のみ、経緯は書かない)。

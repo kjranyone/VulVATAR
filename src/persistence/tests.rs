@@ -78,6 +78,7 @@ fn app_settings_roundtrip() {
         last_project_path: Some("C:/projects/stream.vvtproj".to_string()),
         camera_serial: Some("1234567890".to_string()),
         cloth_gpu_backend: Some(true),
+        auto_cloth: Some(false),
     };
     save_app_settings_to(&original, &path).expect("save");
     let loaded = load_app_settings_from(&path).expect("load");

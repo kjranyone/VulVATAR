@@ -1591,8 +1591,24 @@ impl PoseProvider for FusionProvider {
                     // pure cost.
                     let stride = if d.width >= 1000 { 12 } else { 8 };
                     let dense = sil.sample_points(&d.points_m, stride, &in_hand_rect);
+                    // Phantom-track guard: after the subject leaves, the
+                    // ≤1 s predicted-head bridge (or a one-frame detection
+                    // blip) can regrow a silhouette on the chair/wall and
+                    // hand the trunk a few dozen "measurements" — enough
+                    // to keep the data-info EMA, and with it rig quality,
+                    // alive while the state random-walks (measured
+                    // 2026-09-13: n2d=n3d=0 frames with 26-88 stray
+                    // surface points, quality bouncing 0.4-0.7, root
+                    // drifting 0.9→3.9 m over 45 s). A real subject at
+                    // desk distance yields ~1000 points and even a full
+                    // body at 3 m ~400; below this floor there is not
+                    // enough surface to claim a person — drop the samples
+                    // and let the estimator decay to unobserved.
+                    const MIN_DENSE_SURFACE_POINTS: usize = 200;
                     self.last_dense_n = dense.len();
-                    obs.surface.extend(dense);
+                    if dense.len() >= MIN_DENSE_SURFACE_POINTS {
+                        obs.surface.extend(dense);
+                    }
                     // Which capsules may claim surface points this frame.
                     let m = &self.h.model;
                     let tracked = |j: usize| self.est.joint_data_sigma(m, j) < 0.5;

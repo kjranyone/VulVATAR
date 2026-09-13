@@ -179,25 +179,38 @@ far: render FPS, YOLOX skip period, pose Hz, depth refresh period,
 FaceMesh EP preference (see "Consumer plumbing" above). Remaining
 slices:
 
-- **GPU cloth as default** — promote the GPU cloth backend from
-  parity-tested option to production default (potentially budget-driven),
-  shrinking the CPU snapshot vector to a metadata-only descriptor.
-  Opt-in per install via the Cloth panel's "GPU solver for new cloth"
-  checkbox (persisted in `settings.json`) or `VULVATAR_CLOTH_GPU=1`
-  for a single run (attach-time selection). Feature-complete vs the
-  CPU solver: dynamic bone-following pins, avatar + scene capsule
-  colliders (`cloth_collide_cs`), opt-in self-collision
+- **GPU cloth as default** — auto-cloth (below) lands the flip for
+  derived garments: skirt-classified primitives get a `ClothAsset`
+  generated at load (`src/simulation/auto_cloth.rs` — particles from
+  rest-pose skinned positions, waist pin ring bound to the skirt root
+  / hips, edge distance constraints) attached GPU-backed directly
+  (`slot.state.solver_backend = Gpu`, deterministic regardless of
+  process attach order), self-collision on, light idle wind. Opt-out
+  per install: `settings.json` `auto_cloth: false` or the Cloth
+  panel's "Auto-cloth for skirts" checkbox. Project-saved `.vvtcloth`
+  overlays still supersede the auto slot for the same primitive
+  (restore-time pruning). File-authored overlays keep the opt-in
+  `cloth_gpu_backend` / `VULVATAR_CLOTH_GPU` decision. Feature-complete
+  vs the CPU solver: dynamic bone-following pins, avatar + scene
+  capsule colliders (`cloth_collide_cs`), opt-in self-collision
   (`cloth_selfcol_{build,resolve}_cs`, bucketed grid — overflow beyond
   16 particles per cell drops pairs, the one approximation vs the CPU
   spatial hash), and a per-frame fence-synchronised GPU→CPU readback
   (`RenderResult::cloth_readback`) that keeps `deform_output` live for
-  CPU-side consumers. Formula parity for every stage is locked by
-  `cloth_gpu_boundary::tests`. Remaining gaps: bend constraints
-  (CPU-solver-only; distance + collision + self-collision are parity)
-  and the default flip itself — the CPU backend stays the default
-  until a live A/B on a cloth-bearing avatar says otherwise. Verified
-  end-to-end by `diagnose_cloth` (overlay snapshots, backend honored,
-  `VULVATAR_CLOTH_SELFCOL=1` exercises the self-collision passes).
+  CPU-side consumers. **Readback sync**: the SSBO map must run BEFORE
+  the current frame's `then_execute` — after submission the in-flight
+  dispatch makes vulkano refuse the CPU map; the live soak observed
+  the post-submit placement failing every frame (fixed; zero failures
+  over a 100 s soak). Formula parity for every stage is locked by
+  `cloth_gpu_boundary::tests`. Remaining gap: bend constraints —
+  CPU-solver-only AND its projection has a KNOWN inverted-correction
+  defect (`cloth_solver/constraints.rs`, T07 note: closes when it
+  should open). No auto-cloth asset generates bend constraints until
+  the CPU direction bug is fixed and regression-tested; the GPU port
+  is a parity port of the FIXED reference only. Verified end-to-end
+  by `diagnose_cloth` (backend honored, `VULVATAR_CLOTH_SELFCOL=1`
+  exercises self-collision) and the auto-cloth unit tests on the
+  Yumeka sample.
 - **GPU-local preview** — egui still consumes CPU pixels for the
   viewport; that is a distinct preview fallback path and must not
   define the output architecture.

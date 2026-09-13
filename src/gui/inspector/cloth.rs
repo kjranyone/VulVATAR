@@ -396,6 +396,7 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         t!("inspector.collision_proxies"),
         false,
         |ui| {
+            let mut pending_auto_cloth: Option<bool> = None;
             if let Some(avatar) = state.app.active_avatar_mut() {
                 let collider_count = avatar.asset.colliders.len();
                 // Keep the runtime enable mask sized to the collider list.
@@ -719,6 +720,7 @@ fn draw_cloth_preview(
         t!("inspector.preview"),
         false,
         |ui| {
+            let mut pending_auto_cloth: Option<bool> = None;
             if let Some(avatar) = state.app.active_avatar_mut() {
                 ui.checkbox(&mut avatar.cloth_enabled, t!("inspector.cloth_simulation"));
 
@@ -790,6 +792,21 @@ fn draw_cloth_preview(
                         crate::simulation::cloth_gpu_boundary::set_cloth_backend_request(Some(gpu_pref));
                         state.project_status.app_settings_dirty = true;
                     }
+                    // Auto-cloth opt-out: skirt-classified garments get
+                    // GPU cloth derived at load. Takes effect on the
+                    // next avatar load.
+                    let mut auto_pref = state.settings.auto_cloth.unwrap_or(true);
+                    if ui
+                        .checkbox(
+                            &mut auto_pref,
+                            t!("inspector.cloth_auto_pref"),
+                        )
+                        .changed()
+                    {
+                        state.settings.auto_cloth = Some(auto_pref);
+                        pending_auto_cloth = Some(auto_pref);
+                        state.project_status.app_settings_dirty = true;
+                    }
                 } else if !avatar.cloth_overlays.is_empty() {
                     ui.label(t!("inspector.primary_state_none"));
                 } else {
@@ -806,6 +823,9 @@ fn draw_cloth_preview(
                 }
             } else {
                 super::draw_no_avatar_state(ui);
+            }
+            if let Some(enabled) = pending_auto_cloth {
+                state.app.set_auto_cloth_enabled(enabled);
             }
         },
     );

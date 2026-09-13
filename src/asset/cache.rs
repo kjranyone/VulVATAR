@@ -53,7 +53,10 @@ const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// jacket↔skirt hem constraint and must regenerate. v16: Phase-3
 /// direction B — bottom garments (skirts) anchor off unanchored inner
 /// layers (underwear, garter straps) that poke through them.
-const VVT_CACHE_VERSION: u32 = 16;
+/// v17: Phase-1 bottom-garment anchors raise their targets to the
+/// body's radial silhouette (+6mm) — a v16 cache still lets the belly
+/// and buttocks poke through between skirt vertices.
+const VVT_CACHE_VERSION: u32 = 17;
 /// Default cap on the number of `.vvtcache` files retained under
 /// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
 /// drops the oldest-mtime entries on next startup.

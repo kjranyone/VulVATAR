@@ -439,6 +439,8 @@ pub struct SettingsGuiState {
     /// Mirror of [`crate::persistence::AppSettings::cloth_gpu_backend`]
     /// — see that field for the one-shot-per-attach semantics.
     pub cloth_gpu_backend: Option<bool>,
+    /// Mirror of [`crate::persistence::AppSettings::auto_cloth`].
+    pub auto_cloth: Option<bool>,
 }
 
 impl Default for SettingsGuiState {
@@ -450,6 +452,7 @@ impl Default for SettingsGuiState {
             pan_sensitivity: 1.0,
             last_project_path: None,
             cloth_gpu_backend: None,
+            auto_cloth: None,
         }
     }
 }

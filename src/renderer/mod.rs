@@ -1157,6 +1157,16 @@ impl VulkanRenderer {
         // ── Phase 3: Get or build the frame command buffer ──────────────
         let command_buffer = self.get_or_build_frame_cb(&plan)?;
 
+        // GPU cloth readback: harvest (above) already waited the
+        // previous frame's fence, so the previous frame's cloth compute
+        // is complete and the host-visible SSBOs read coherently. This
+        // MUST run before the current frame's submission — after
+        // `then_execute` the new dispatch holds the SSBOs in flight
+        // and vulkano's usage tracking refuses the CPU map ("resource
+        // already in use"), which the live soak observed failing every
+        // frame. Attached to whichever result this call returns.
+        let cloth_readback = self.read_cloth_positions();
+
         crate::tracking::stagelog::mark(self.frame_counter, "render_submit");
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
         let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
@@ -1209,12 +1219,6 @@ impl VulkanRenderer {
             color_space: input.output_request.color_space.clone(),
         });
 
-        // GPU cloth readback: harvest already waited the previous
-        // frame's fence (and the GPU-export path waits its own fence
-        // synchronously before publish), so the previous frame's cloth
-        // compute is complete and the host-visible SSBOs read
-        // coherently. Attach to whichever result this call returns.
-        let cloth_readback = self.read_cloth_positions();
         match harvested {
             Some(mut h) => {
                 h.cloth_readback = cloth_readback;

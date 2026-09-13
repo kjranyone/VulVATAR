@@ -229,6 +229,7 @@ impl GuiApp {
             last_project_path: self.settings.last_project_path.clone(),
             camera_serial: self.tracking.camera_serial.clone(),
             cloth_gpu_backend: self.settings.cloth_gpu_backend,
+            auto_cloth: self.settings.auto_cloth,
             ..crate::persistence::AppSettings::default()
         }
     }
@@ -487,6 +488,29 @@ impl GuiApp {
                 continue; // rebind reported Failed; skip attach
             }
             if let Some(avatar) = self.app.active_avatar_mut() {
+                // A project-saved overlay for the same primitive
+                // supersedes the load-time auto-cloth slot: remove the
+                // generated one so `collect_cloth_deforms`' first-wins
+                // dedupe doesn't shadow the authored garment.
+                let target = cloth_asset
+                    .render_bindings
+                    .first()
+                    .map(|b| b.primitive.id);
+                if let Some(target) = target {
+                    let auto_dup: Vec<usize> = avatar
+                        .cloth_overlays
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| {
+                            s.source_path.is_none()
+                                && s.state.target_primitive_id == Some(target)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    for i in auto_dup.into_iter().rev() {
+                        avatar.remove_cloth_overlay(i);
+                    }
+                }
                 let overlay_id =
                     crate::asset::ClothOverlayId((avatar.cloth_overlay_count() as u64) + 2);
                 let idx = avatar.attach_cloth_overlay(overlay_id);

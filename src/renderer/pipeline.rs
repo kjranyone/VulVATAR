@@ -724,6 +724,11 @@ void main() {
 
     uint start = adj_offsets.o[pid];
     uint end   = adj_offsets.o[pid + 1u];
+    // Under-relaxed Jacobi: Δx = Σ corr / (n + 1). The plain sum
+    // diverges once per-particle constraint degree grows past a
+    // couple of edges (measured: welded skirt, degree ≈ 6, first-step
+    // positions ±1e8). Mirrors the CPU apply pass exactly.
+    float n_rel = 1.0;
     for (uint k = start; k < end; ++k) {
         uint cidx = adj_constraints.c[k];
         Constraint cn = constraints.c[cidx];
@@ -740,9 +745,10 @@ void main() {
             //     = -d_CPU and the sign flip cancels).
             float dl = dlambda.l[cidx];
             delta += -(dir / len) * w_self * dl;
+            n_rel += 1.0;
         }
     }
-    deltas.d[pid] = vec4(delta, 0.0);
+    deltas.d[pid] = vec4(delta / n_rel, 0.0);
 }
 "
                     }

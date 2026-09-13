@@ -83,6 +83,17 @@ pub struct RetargetParams {
     pub lower_body_tracking_enabled: bool,
     /// Bones whose joint σ exceeds this are left at rest (rad).
     pub sigma_rest: f32,
+    /// Bones whose measurement-only σ (`RigBone::data_sigma`) exceeds
+    /// this are left at rest even when the posterior σ looks confident:
+    /// with no recent measurements the posterior stays tight (the pose
+    /// prior dominates an information-starved solve) while the state
+    /// random-walks — measured 2026-09-13 on a face-only stretch (body
+    /// detector lost, FaceMesh alive): arm data-σ pinned at 10 rad while
+    /// the posterior read 0.3-0.9, and the wrists teleported ±1.5 m for
+    /// minutes. Observed joints sit at ~0.001-0.05 rad; the leaky
+    /// data-info EMA (~0.3 s) crosses this bound a couple of seconds
+    /// after a joint stops being measured.
+    pub sigma_data_rest: f32,
     /// Rig quality below which nothing is driven (subject lost / tiny).
     pub min_quality: f32,
     /// Seconds of well-tracked data used to seed the root anchor.
@@ -118,6 +129,7 @@ impl Default for RetargetParams {
             hand_tracking_enabled: true,
             lower_body_tracking_enabled: true,
             sigma_rest: 1.2,
+            sigma_data_rest: 0.6,
             min_quality: 0.2,
             anchor_seed_s: 1.0,
             max_root_tilt: 0.35,
@@ -528,9 +540,16 @@ pub fn apply_rig_pose(
             && (params.lower_body_tracking_enabled || !is_leg(bone));
 
         // Target local rotation. A low-quality rig (subject lost / tiny)
-        // drives nothing: every bone relaxes to rest.
+        // drives nothing: every bone relaxes to rest. A bone with no
+        // recent measurements (data-σ grown past `sigma_data_rest`)
+        // also rests — its posterior σ is prior-dominated and cannot be
+        // trusted however confident it looks.
         let (target, tracking_valid) = match rig.bones.get(&bone) {
-            Some(rb) if is_tracked && rb.sigma <= params.sigma_rest => {
+            Some(rb)
+                if is_tracked
+                    && rb.sigma <= params.sigma_rest
+                    && rb.data_sigma <= params.sigma_data_rest =>
+            {
                 let corrected = quat_mul(&rebase, &rb.delta_world);
                 let desired_world = quat_mul(&corrected, &state.rest_world_rot[node]);
                 let parent_world = match skeleton.nodes[node].parent {
@@ -649,7 +668,7 @@ pub fn apply_rig_pose(
     }
 
     // ---- self-contact anchoring (head-local wrist, Two-Bone IK) ----------
-    anchor_face_local_hands(skeleton, humanoid, local_transforms, rig, params);
+    anchor_face_local_hands(skeleton, humanoid, local_transforms, rig, params, state);
 
     // ---- hand cross prevention (Two-Bone IK) ---------------------------------
     prevent_hand_crossing(skeleton, humanoid, local_transforms, state, params);
@@ -661,10 +680,16 @@ pub fn apply_rig_pose(
 /// different-proportioned avatar a finger-to-lips pose lands short
 /// (measured on the composite bench: fingertip at the chin, a quarter
 /// head-height low). The rig reports the wrist offset in the subject's
-/// head frame; expressing it through the avatar's solved head transform
-/// gives the equivalent spot on the avatar ("one hand-length in front of
-/// the mouth"), and the existing two-bone IK moves the wrist there while
-/// preserving the hand's world rotation. The correction is scaled by
+/// head-local frame (camera axes); conjugating it by the avatar head
+/// node's rest world rotation expresses it in the same head-local frame
+/// the solved `h_rot` lives in, because the rotation path realises
+/// `h_rot ≈ rebase · Rx180 · R_cam_head · rest_world_head`, so
+/// `h_rot · (rest_world_head⁻¹ · o) = rebase · Rx180 · R_cam_head · o` —
+/// the subject's offset mapped into this avatar's solved frame regardless
+/// of the avatar's rest-pose or bone-axis conventions (an FBX head bone
+/// with a pitched rest or the hips tilt-clamp rebase are both absorbed).
+/// The existing two-bone IK moves the wrist there while preserving the
+/// hand's world rotation. The correction is scaled by
 /// `rig.face_proximity` and is exactly zero away from the face, so every
 /// other pose keeps the pure rotation path.
 fn anchor_face_local_hands(
@@ -673,6 +698,7 @@ fn anchor_face_local_hands(
     local_transforms: &mut [Transform],
     rig: &RigPose,
     params: &RetargetParams,
+    state: &RetargetState,
 ) {
     if !params.face_contact_anchoring || rig.quality < params.min_quality {
         return;
@@ -685,6 +711,12 @@ fn anchor_face_local_hands(
         return;
     }
     let (h_pos, h_rot) = node_world_transform(skeleton, local_transforms, head_node);
+    let rest_head_world = state
+        .rest_world_rot
+        .get(head_node)
+        .copied()
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let rest_head_world_inv = quat_conjugate(&rest_head_world);
     for (side, bones) in [
         (
             0usize,
@@ -715,7 +747,9 @@ fn anchor_face_local_hands(
         let (s_pos, s_rot) = node_world_transform(skeleton, local_transforms, un);
         let (e_pos, e_rot) = node_world_transform(skeleton, local_transforms, ln);
         let (w_pos, w_rot) = node_world_transform(skeleton, local_transforms, hn);
-        let off = rig.head_local_wrists[side];
+        // Camera-axes head-local offset → this avatar's head-node-local
+        // offset (see the derivation in the doc comment above).
+        let off = quat_rotate_vec3(&rest_head_world_inv, &rig.head_local_wrists[side]);
         let rot_off = quat_rotate_vec3(&h_rot, &off);
         let target = [
             h_pos[0] + rot_off[0],
