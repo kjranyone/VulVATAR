@@ -330,6 +330,14 @@ pub fn hand_observations(
         });
         if let Some(w) = wrist_abs {
             if i > 0 {
+                // NOTE: currently unreachable from the provider — the
+                // converted checkpoint's "world" output is not metric and
+                // its proportions proved too noisy for Cartesian terms
+                // even after per-frame re-scaling (measured wrist snap
+                // 1→3–4, max jump 0.48 m). The intended revival is as
+                // finger-joint ANGLE observations from landmark triples
+                // (invariant to scale and to the wrist anchor), not as
+                // these absolute points.
                 let rel = [
                     res.world[i][0] as f64,
                     res.world[i][1] as f64,
@@ -338,7 +346,7 @@ pub fn hand_observations(
                 out3d.push(Kp3d {
                     point: pt,
                     p: add(w, rel),
-                    sigma: 0.015 * (1.0 + 2.0 * (1.0 - res.presence as f64)),
+                    sigma: 0.05 * (1.0 + 2.0 * (1.0 - res.presence as f64)) * sigma_scale,
                     lat_scale: 1.0,
                 });
             }

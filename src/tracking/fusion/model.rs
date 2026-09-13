@@ -58,8 +58,15 @@ pub enum RadGroup {
     Thigh = 5,
     Shin = 6,
     Neck = 7,
+    /// Trunk DEPTH (camera-facing) semi-axis, separate from the lateral
+    /// `Torso` group: the elliptic section's aspect decides how much of
+    /// the chest's depth a rotation can trade against width, and a
+    /// hard-coded 1.62:1 against a thick-jacket / arms-crossed subject
+    /// is what let the surface fit prefer a yawed trunk (measured:
+    /// yaw −67° with the dense term on vs +26° with it off).
+    TorsoDepth = 8,
 }
-pub const NUM_RAD_GROUPS: usize = 8;
+pub const NUM_RAD_GROUPS: usize = 9;
 
 #[derive(Clone, Debug)]
 pub struct JointDef {
@@ -128,6 +135,10 @@ pub struct CapsuleDef {
     /// well 30° off).
     pub lateral: Option<PointRef>,
     pub aspect: f64,
+    /// Shape group multiplying `aspect` (log-space, prior at 1.0) so the
+    /// section's depth can be fitted to the subject instead of fighting
+    /// the surface fit with a fixed 1.62:1 slab.
+    pub aspect_group: Option<RadGroup>,
     /// Which limb this capsule belongs to (for association bookkeeping and
     /// visibility duty accounting).
     pub part: Part,
@@ -343,6 +354,7 @@ impl Builder {
             part,
             lateral: None,
             aspect: 1.0,
+            aspect_group: None,
         });
     }
     #[allow(clippy::too_many_arguments)]
@@ -354,6 +366,7 @@ impl Builder {
         r_lat: f64,
         aspect: f64,
         g: RadGroup,
+        aspect_group: RadGroup,
         part: Part,
     ) {
         self.capsules.push(CapsuleDef {
@@ -364,6 +377,7 @@ impl Builder {
             part,
             lateral: Some(lateral),
             aspect,
+            aspect_group: Some(aspect_group),
         });
     }
 }
@@ -481,6 +495,7 @@ impl Humanoid {
             0.17,
             0.105 / 0.17,
             R::Torso,
+            R::TorsoDepth,
             Part::Torso,
         );
         b.capsule(
@@ -1243,7 +1258,14 @@ impl Model {
     /// capsule, `radius × aspect` for an elliptic one. Occlusion tests use
     /// this — the conservative extent toward the camera.
     pub fn capsule_depth_radius(&self, st: &State, c: &CapsuleDef) -> f64 {
-        self.capsule_radius(st, c) * c.aspect
+        self.capsule_radius(st, c) * self.capsule_aspect(st, c)
+    }
+
+    /// Shape-fitted multiplier on an elliptic capsule's `aspect` (1.0 =
+    /// as authored). Only the trunk carries an `aspect_group`.
+    #[inline]
+    pub fn capsule_aspect(&self, st: &State, c: &CapsuleDef) -> f64 {
+        c.aspect_group.map(|g| st.rad_mul(g)).unwrap_or(1.0) * c.aspect
     }
 
     /// Joint index whose `bone` equals `b`, if any.

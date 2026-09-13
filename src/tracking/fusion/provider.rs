@@ -1327,13 +1327,22 @@ impl PoseProvider for FusionProvider {
                             if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
                                 eprintln!("CHEST fired yaw {:.3} n {}", yaw, n);
                             }
+                            // ~7° at a full 15-column fit, widening as
+                            // columns drop out. `VULVATAR_CHESTYAW_SIGMA`
+                            // scales it (basin-selection bench: the default
+                            // 0.12 leaves the trunk's cloud term free to
+                            // pick a self-consistent wrong-yaw basin).
+                            let base_sigma = 0.12 * (15.0 / n as f64).sqrt();
+                            let scale = std::env::var("VULVATAR_CHESTYAW_SIGMA")
+                                .ok()
+                                .and_then(|v| v.parse::<f64>().ok())
+                                .filter(|v| *v > 0.0)
+                                .unwrap_or(1.0);
                             obs.shoulder_yaw = Some(super::estimator::ShoulderYawObs {
                                 left: self.h.j.l_shoulder,
                                 right: self.h.j.r_shoulder,
                                 yaw,
-                                // ~7° at a full 15-column fit, widening as
-                                // columns drop out.
-                                sigma: 0.12 * (15.0 / n as f64).sqrt(),
+                                sigma: base_sigma * scale,
                             });
                         }
                     }
@@ -1512,7 +1521,20 @@ impl PoseProvider for FusionProvider {
                 self.h.j.r_wrist
             };
             // The converted model's "world" output is not metric on this
-            // checkpoint (index MCP reads ~3 cm from the wrist) — 2-D only.
+            // checkpoint (index MCP reads ~3 cm from the wrist). Its
+            // PROPORTIONS are usable though, so it is re-scaled per frame
+            // against the model's own wrist→index-MCP span and fed as 3-D
+            // terms — finger curl is a depth DOF and the 2-D-only fallback
+            // left it free to hyperextend through a clenched fist (the
+            // projected silhouette of a fist is 2-D-degenerate with an
+            // extended, rotated hand).
+            // The converted model's "world" output is not metric on this
+            // checkpoint (index MCP reads ~3 cm from the wrist); its
+            // proportions are too noisy (±30–60 %) for Cartesian terms
+            // even after per-frame re-scaling — measured: wrist snap
+            // 1→3–4, max jump 0.48 m, med2d 3.6→9.6 on a desk session.
+            // 2-D only until curl is observed as scale/wrist-invariant
+            // finger-joint angles (see hands.rs).
             let _ = wrist_j;
             super::hands::hand_observations(
                 &self.h,

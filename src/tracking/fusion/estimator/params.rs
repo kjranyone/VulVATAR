@@ -71,6 +71,22 @@ pub struct Params {
     /// fixture through `validate_gt`) before this can be enabled with a
     /// calibrated σ. `VULVATAR_TRUNK_SHEAR_SIGMA=0.03` re-enables.
     pub shear_sigma: f64,
+    /// Obliquity gain for the torso dense-surface weight. Measured
+    /// (s1789246071 ablation, 2026-09-13): at the habitual oblique desk
+    /// pose (~40° trunk yaw) the dense torso-surface fit booked 35-40° of
+    /// phantom spine/chest recline while the person sat upright (dense-off
+    /// solves upright; the elliptical capsule section's approximation
+    /// error projects into the trunk pitch DOF at oblique view). The
+    /// weight of torso surface points is divided by
+    /// `1 + k·sin⁴(trunk yaw)` — sin⁴ is a near-deadzone that keeps
+    /// frontal view at full primary-observation weight (sin² let the
+    /// frontal synthetic's yaw wander into the down-weighting region and
+    /// drift), while at the habitual 40° pose it restores the upright
+    /// solve (replay s1789246071: avatar Chest→Neck lean +57° → +21° ≈
+    /// the asset rest profile; the shoulder-depth yaw reference on
+    /// streamer_da also tracks better, err +9.4° → ~−5°). Flat optimum
+    /// over k 20-30. `VULVATAR_TRUNK_SURF_OBLIQ` overrides; 0 disables.
+    pub trunk_surf_obliq_k: f64,
     /// Velocity damping time constant (s) — the constant-velocity
     /// prediction decays toward zero over this horizon.
     pub velocity_tau: f64,
@@ -205,6 +221,12 @@ impl Default for Params {
                 .filter(|v| *v > 0.0)
                 // 1e-9 = pinned (disabled by default; see the field doc).
                 .unwrap_or(1e-9),
+            trunk_surf_obliq_k: std::env::var("VULVATAR_TRUNK_SURF_OBLIQ")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v >= 0.0)
+                // 25 = middle of the flat optimum (k 20-30), see field doc.
+                .unwrap_or(25.0),
             velocity_tau: 0.25,
             pose_prior_scale: 1.0,
             var_min: 1e-8,
@@ -219,7 +241,15 @@ impl Default for Params {
                     .filter(|v| *v > 0.0)
                     .unwrap_or(0.02)
             },
-            upright_sigma: 0.12,
+            // `VULVATAR_UPRIGHT_SIGMA` is a bench knob (desk-lean sweeps);
+            // 0.12 is the calibrated default — a 40° tilt only pays ~2×(sin
+            // 40°/σ)² ≈ 29 cost units per component here, which the
+            // surface/2-D terms outvote by the hundreds (measured live).
+            upright_sigma: std::env::var("VULVATAR_UPRIGHT_SIGMA")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(0.12),
             seed_win_ratio: 0.95,
             lost_rms_px: 40.0,
             cauchy_2d: true,

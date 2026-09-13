@@ -1068,8 +1068,8 @@ fn main() -> Result<(), String> {
                                         vulvatar_lib::tracking::fusion::math::quat_to_mat(
                                             rb.delta_world,
                                         );
-                                    let (y, p, _) = ypr_deg(&m3);
-                                    format!("{} y{:+.0} p{:+.0}", hb_short(*b), y, p)
+                                    let (y, p, r) = ypr_deg(&m3);
+                                    format!("{} y{:+.0} p{:+.0} r{:+.0}", hb_short(*b), y, p, r)
                                 })
                             })
                             .collect::<Vec<_>>()

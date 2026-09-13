@@ -255,6 +255,94 @@ impl Application {
                     },
                     head_axes,
                 );
+                // Costume-health probe: spring-driven garment bones + the
+                // skirt mesh's CPU-skinned bbox + attached-cloth state.
+                // Written to debug_avatar_extra.json so the live bug can
+                // be split into "vertices actually wrong" vs "render-only".
+                // The whole probe is debug-gated: it costs a 2.4k-vertex
+                // skinning pass per frame.
+                if crate::tracking::debug_channel::enabled() {
+                    let costume_bones: Vec<(String, [f32; 3])> = avatar
+                        .asset
+                        .skeleton
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| {
+                            let l = n.name.to_lowercase();
+                            l == "skirt_root"
+                                || (l.starts_with("skirt_") && l.ends_with(".003"))
+                                || l == "tail.013"
+                        })
+                        .filter_map(|(i, n)| {
+                            gt.get(i).map(|m| (n.name.clone(), [m[3][0], m[3][1], m[3][2]]))
+                        })
+                        .collect();
+                    avatar.build_skinning_matrices();
+                    let skirt_bbox = {
+                        let sm = &avatar.pose.skinning_matrices;
+                        let skirt = avatar
+                            .asset
+                            .meshes
+                            .iter()
+                            .find(|m| m.name.eq_ignore_ascii_case("circle.056"))
+                            .and_then(|m| m.primitives.iter().find(|p| p.vertices.is_some()));
+                        skirt.and_then(|prim| {
+                            let vd = prim.vertices.as_ref().unwrap();
+                            let mut lo = [f32::MAX; 3];
+                            let mut hi = [f32::MIN; 3];
+                            for (i, &pos) in vd.positions.iter().enumerate() {
+                                let mut world = [0.0f32; 3];
+                                let mut total_w = 0.0;
+                                if i < vd.joint_weights.len() && i < vd.joint_indices.len() {
+                                    for k in 0..4 {
+                                        let w = vd.joint_weights[i][k];
+                                        if w > 0.0001 {
+                                            let j = vd.joint_indices[i][k] as usize;
+                                            if let Some(m) = sm.get(j) {
+                                                for c in 0..3 {
+                                                    world[c] += w
+                                                        * (m[0][c] * pos[0]
+                                                            + m[1][c] * pos[1]
+                                                            + m[2][c] * pos[2]
+                                                            + m[3][c]);
+                                                }
+                                                total_w += w;
+                                            }
+                                        }
+                                    }
+                                }
+                                if total_w > 0.001 {
+                                    for c in 0..3 {
+                                        world[c] /= total_w;
+                                    }
+                                }
+                                for c in 0..3 {
+                                    lo[c] = lo[c].min(world[c]);
+                                    hi[c] = hi[c].max(world[c]);
+                                }
+                            }
+                            Some((lo, hi))
+                        })
+                    };
+                    let mut cloth_targets: Vec<crate::asset::PrimitiveId> = avatar
+                        .cloth_overlays
+                        .iter()
+                        .filter(|s| s.enabled)
+                        .filter_map(|s| s.state.target_primitive_id)
+                        .collect();
+                    if let Some(cs) = avatar.cloth_state.as_ref() {
+                        if let Some(t) = cs.target_primitive_id {
+                            cloth_targets.push(t);
+                        }
+                    }
+                    crate::tracking::debug_channel::dump_costume_probe(
+                        costume_bones,
+                        skirt_bbox,
+                        cloth_targets.len(),
+                        cloth_targets,
+                    );
+                }
             }
 
             let step_options = SimulationStepOptions {

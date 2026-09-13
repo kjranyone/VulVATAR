@@ -368,9 +368,15 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
     }
 
     let max_influence_radius = 0.12f32; // 12 cm maximum distance to body surface at rest
+    // Layer-style grid over the body for anchor-target refinement.
+    let body_layer_grid = build_layer_grid(&body_world, 0.03);
+    let body_inv_cell = 1.0f32 / 0.03;
 
     // Process all other primitives in the avatar
     let mut anchors_generated_count = 0usize;
+    // Phase-1 bottom garments (skirts), consumed by the Phase-3
+    // cross-region pass below.
+    let mut skirt_prim_ids: Vec<PrimitiveId> = Vec::new();
 
     for mesh in &mut asset.meshes {
         let m_name = mesh.name.to_lowercase();
@@ -467,6 +473,16 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
 
                     // Enforce at least 2mm clearance to prevent z-fighting and resting penetrations
                     let min_clearance = raw_clearance.max(0.002);
+                    let min_clearance = refine_clearance_target(
+                        cp,
+                        bn,
+                        raw_clearance,
+                        min_clearance,
+                        &body_world,
+                        &body_layer_grid,
+                        body_inv_cell,
+                        0.06,
+                    );
                     let weight = 1.0f32;
 
                     anchors.push(SkinAnchor {
@@ -486,6 +502,10 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                     "clearance: generated {} skin anchors for primitive {:?} ('{}', mat='{}')",
                     bound_count, prim_arc.id, mesh.name, mat_name
                 );
+                skirt_prim_ids.push(prim_arc.id);
+                if let Some(ref idx) = prim_arc.indices {
+                    smooth_anchor_targets(&mut anchors, idx, 3);
+                }
                 let prim_mut = Arc::make_mut(prim_arc);
                 prim_mut.skin_anchors = Some(anchors);
                 prim_mut.body_primitive_id = Some(body_prim_id);
@@ -509,6 +529,575 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
         &body_joint_indices,
         &body_joint_weights,
     );
+
+    // Phase 3: cross-region (upper-outer vs bottom-inner) clearance.
+    generate_cross_region_anchors(asset, &skinning, body_prim_id, &skirt_prim_ids);
+}
+
+/// Phase 3 — cross-region clearance between the layered-clothing stack
+/// and Phase-1 bottom garments.
+///
+/// Phase 1 anchors bottom garments (skirts, pants) against the body;
+/// Phase 2 pairs the UPPER layered stack (body ← shirt ← jacket) but
+/// excludes already-anchored prims from its candidate set — so the two
+/// branches never meet and nothing constrains an upper garment's hem
+/// against a bottom garment it drapes over. Yumeka measures ~340 jacket
+/// vertices resting inside the skirt volume at bind (worst −28 mm),
+/// which reads as "the jacket sinks into the skirt" the moment the
+/// spring-driven skirt swings.
+///
+/// The pass binds each layered OUTER (a prim whose clearance parent is
+/// another garment, not the body) to the overlapping bottom garment
+/// with clearance-mode anchors stored in the outer's containment slot
+/// (`containment_anchors` + `containment_primitive_id`). The transform
+/// shader branches per anchor `mode`, so the slot carries either
+/// semantic; outers whose containment slot is already occupied (middle
+/// layers of a 3+ stack) are skipped — the single-slot limitation is
+/// logged, not silently ignored. Skirt-in-jacket pokes in the other
+/// direction stay unconstrained on purpose: a skirt surface hidden
+/// inside the jacket volume is occluded and visually correct, while a
+/// jacket hem inside the skirt cone visibly swallows the hem.
+pub fn generate_cross_region_anchors(
+    asset: &mut AvatarAsset,
+    skinning: &[Mat4],
+    body_pid: PrimitiveId,
+    skirt_prim_ids: &[PrimitiveId],
+) {
+    if skirt_prim_ids.is_empty() {
+        return;
+    }
+
+    struct InnerSurface {
+        prim_id: PrimitiveId,
+        mesh_name: String,
+        verts: Vec<([f32; 3], [f32; 3])>,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+    }
+    let mut inners: Vec<InnerSurface> = Vec::new();
+    for mesh in asset.meshes.iter() {
+        for prim in mesh.primitives.iter() {
+            if !skirt_prim_ids.contains(&prim.id) {
+                continue;
+            }
+            let verts = compute_rest_world_vertices(prim, skinning);
+            if verts.is_empty() {
+                continue;
+            }
+            let mut aabb_min = [f32::MAX; 3];
+            let mut aabb_max = [f32::MIN; 3];
+            for &(p, _) in &verts {
+                for c in 0..3 {
+                    aabb_min[c] = aabb_min[c].min(p[c]);
+                    aabb_max[c] = aabb_max[c].max(p[c]);
+                }
+            }
+            inners.push(InnerSurface {
+                prim_id: prim.id,
+                mesh_name: mesh.name.clone(),
+                verts,
+                aabb_min,
+                aabb_max,
+            });
+        }
+    }
+    if inners.is_empty() {
+        return;
+    }
+
+    for mesh in &mut asset.meshes {
+        for prim_arc in &mut mesh.primitives {
+            if prim_arc.id == body_pid
+                || skirt_prim_ids.contains(&prim_arc.id)
+                || prim_arc.containment_anchors.is_some()
+            {
+                continue;
+            }
+            // Layered outers only: clearance parent is a garment, not
+            // the body (Phase-1 bottoms and middle layers anchor
+            // against the body and are skipped).
+            let is_layered_outer = prim_arc.skin_anchors.is_some()
+                && prim_arc.body_primitive_id != Some(body_pid)
+                && prim_arc.body_primitive_id.is_some();
+            if !is_layered_outer {
+                continue;
+            }
+
+            let outer_verts = compute_rest_world_vertices(prim_arc, skinning);
+            if outer_verts.is_empty() {
+                continue;
+            }
+            let mut o_min = [f32::MAX; 3];
+            let mut o_max = [f32::MIN; 3];
+            for &(p, _) in &outer_verts {
+                for c in 0..3 {
+                    o_min[c] = o_min[c].min(p[c]);
+                    o_max[c] = o_max[c].max(p[c]);
+                }
+            }
+
+            for inner in &inners {
+                if !aabb_intersects(o_min, o_max, inner.aabb_min, inner.aabb_max) {
+                    continue;
+                }
+                let cell_size = 0.03f32;
+                let inv_cell = 1.0 / cell_size;
+                let inner_grid = build_layer_grid(&inner.verts, cell_size);
+                let min_bound = (outer_verts.len() / 50).max(32);
+
+                let mut anchors = Vec::with_capacity(outer_verts.len());
+                let mut bound_count = 0usize;
+                for &(op, _) in &outer_verts {
+                    // Nearest inner vertex within 4 cm. No normal
+                    // filter: a hem vertex resting inside the skirt
+                    // cone lies BEHIND every nearby skirt vertex, so a
+                    // "front-facing only" filter would drop exactly the
+                    // penetrating anchors this pass exists to create.
+                    // Pushing along the nearest vertex's outward normal
+                    // is the escape direction either way.
+                    let ck = (
+                        (op[0] * inv_cell).floor() as i32,
+                        (op[1] * inv_cell).floor() as i32,
+                        (op[2] * inv_cell).floor() as i32,
+                    );
+                    let mut best: Option<(f32, usize)> = None;
+                    let max_r2 = 0.04f32 * 0.04f32;
+                    // ±2 cells of 3 cm cover the full 4 cm radius.
+                    for dx in -2..=2 {
+                        for dy in -2..=2 {
+                            for dz in -2..=2 {
+                                if let Some(list) =
+                                    inner_grid.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz))
+                                {
+                                    for &idx in list {
+                                        let (ip, _) = inner.verts[idx as usize];
+                                        let d2 = (op[0] - ip[0]).powi(2)
+                                            + (op[1] - ip[1]).powi(2)
+                                            + (op[2] - ip[2]).powi(2);
+                                        if d2 < max_r2
+                                            && best.map_or(true, |(b, _)| d2 < b)
+                                        {
+                                            best = Some((d2, idx as usize));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some((_, idx)) = best {
+                        let (ip, inrm) = inner.verts[idx];
+                        let raw = (op[0] - ip[0]) * inrm[0]
+                            + (op[1] - ip[1]) * inrm[1]
+                            + (op[2] - ip[2]) * inrm[2];
+                        let min_clearance = refine_clearance_target(
+                            op,
+                            inrm,
+                            raw,
+                            raw.max(0.006),
+                            &inner.verts,
+                            &inner_grid,
+                            inv_cell,
+                            0.04,
+                        );
+                        anchors.push(SkinAnchor {
+                            body_vertex_idx: idx as u32,
+                            min_clearance,
+                            weight: 1.0,
+                            mode: SKIN_ANCHOR_CLEARANCE,
+                        });
+                        bound_count += 1;
+                    } else {
+                        anchors.push(SkinAnchor::default());
+                    }
+                }
+
+                if bound_count >= min_bound {
+                    info!(
+                        "clearance: cross-region pair: outer '{}' (prim {:?}) -> bottom '{}' (prim {:?}), {} / {} verts bound",
+                        mesh.name,
+                        prim_arc.id,
+                        inner.mesh_name,
+                        inner.prim_id,
+                        bound_count,
+                        outer_verts.len()
+                    );
+                    if let Some(ref idx) = prim_arc.indices {
+                        smooth_anchor_targets(&mut anchors, idx, 3);
+                    }
+                    let prim_mut = Arc::make_mut(prim_arc);
+                    prim_mut.containment_anchors = Some(anchors);
+                    prim_mut.containment_primitive_id = Some(inner.prim_id);
+                    // One bottom parent per outer: stop at the first
+                    // (currently the only) overlapping bottom garment.
+                    break;
+                } else {
+                    info!(
+                        "clearance: bottom candidate '{}' bound only {}/{} verts on outer '{}' (min {}); skipping pair",
+                        inner.mesh_name,
+                        bound_count,
+                        outer_verts.len(),
+                        mesh.name,
+                        min_bound
+                    );
+                }
+            }
+        }
+    }
+
+    // Direction B — the same gap seen from the bottom: an UNANCHORED
+    // inner layer the bottom should wrap outside (Yumeka's underwear,
+    // garter straps) pokes through the bottom's surface. Phase 1 keeps
+    // the bottom off the BODY, but the underwear sits a few mm ABOVE
+    // the body, so the body-anchored bottom still swallows it — the
+    // visible "underwear through the skirt" clip. Bind the bottom's
+    // (free) containment slot with clearance-mode anchors against the
+    // worst rest penetrator.
+    for bottom in &inners {
+        // The bottom prim's own mesh slot.
+        let mut bottom_loc: Option<(usize, usize)> = None;
+        for (m_idx, mesh) in asset.meshes.iter().enumerate() {
+            for (p_idx, prim) in mesh.primitives.iter().enumerate() {
+                if prim.id == bottom.prim_id {
+                    bottom_loc = Some((m_idx, p_idx));
+                }
+            }
+        }
+        let Some((b_mesh, b_prim)) = bottom_loc else {
+            continue;
+        };
+        if asset.meshes[b_mesh].primitives[b_prim]
+            .containment_anchors
+            .is_some()
+        {
+            continue;
+        }
+
+        // Candidate inner layers: unanchored, not the body, not
+        // bottoms, not face/hair classes, overlapping the bottom, and
+        // mostly INSIDE it (a majority-outside prim is a belt worn over
+        // the bottom and must not receive this constraint).
+        struct UnderCandidate {
+            prim_id: PrimitiveId,
+            mesh_name: String,
+            verts: Vec<([f32; 3], [f32; 3])>,
+            pokes: usize,
+        }
+        let mut cands: Vec<UnderCandidate> = Vec::new();
+        let b_grid = build_layer_grid(&bottom.verts, 0.04);
+        for mesh in asset.meshes.iter() {
+            let m_name = mesh.name.to_lowercase();
+            if m_name.contains("hair") || m_name.contains("face") || m_name.contains("eye") {
+                continue;
+            }
+            for prim in mesh.primitives.iter() {
+                if prim.id == body_pid
+                    || prim.id == bottom.prim_id
+                    || skirt_prim_ids.contains(&prim.id)
+                    || prim.skin_anchors.is_some()
+                    || prim.vertex_count < 100
+                {
+                    continue;
+                }
+                let mat_name = asset
+                    .materials
+                    .iter()
+                    .find(|m| m.id == prim.material_id)
+                    .map(|m| m.name.to_lowercase())
+                    .unwrap_or_default();
+                if mat_name.contains("hair") || mat_name.contains("face") {
+                    continue;
+                }
+                let verts = compute_rest_world_vertices(prim, skinning);
+                if verts.is_empty() {
+                    continue;
+                }
+                let mut c_min = [f32::MAX; 3];
+                let mut c_max = [f32::MIN; 3];
+                for &(p, _) in &verts {
+                    for c in 0..3 {
+                        c_min[c] = c_min[c].min(p[c]);
+                        c_max[c] = c_max[c].max(p[c]);
+                    }
+                }
+                if !aabb_intersects(c_min, c_max, bottom.aabb_min, bottom.aabb_max) {
+                    continue;
+                }
+
+                // Sample: nearest bottom vertex within 6 cm; count
+                // rest pokes (beyond the bottom surface) and near pairs.
+                let inv_cell = 1.0f32 / 0.04;
+                let step = (verts.len() / 500).max(1);
+                let mut near = 0usize;
+                let mut pokes = 0usize;
+                for vi in (0..verts.len()).step_by(step) {
+                    let (cp, _) = verts[vi];
+                    let ck = (
+                        (cp[0] * inv_cell).floor() as i32,
+                        (cp[1] * inv_cell).floor() as i32,
+                        (cp[2] * inv_cell).floor() as i32,
+                    );
+                    let mut best: Option<(f32, usize)> = None;
+                    let max_r2 = 0.06f32 * 0.06f32;
+                    for dx in -2..=2 {
+                        for dy in -2..=2 {
+                            for dz in -2..=2 {
+                                if let Some(list) =
+                                    b_grid.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz))
+                                {
+                                    for &bi in list {
+                                        let (bp, _) = bottom.verts[bi as usize];
+                                        let d2 = (cp[0] - bp[0]).powi(2)
+                                            + (cp[1] - bp[1]).powi(2)
+                                            + (cp[2] - bp[2]).powi(2);
+                                        if d2 < max_r2 && best.map_or(true, |(b, _)| d2 < b) {
+                                            best = Some((d2, bi as usize));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some((_, bi)) = best {
+                        let (bp, bn) = bottom.verts[bi];
+                        let d = (cp[0] - bp[0]) * bn[0]
+                            + (cp[1] - bp[1]) * bn[1]
+                            + (cp[2] - bp[2]) * bn[2];
+                        near += 1;
+                        if d > 0.002 {
+                            pokes += 1;
+                        }
+                    }
+                }
+                // Inner-layer gate: enough overlap, real penetration,
+                // and a majority still inside (an over-belt reads as
+                // mostly pokes and is excluded).
+                if pokes >= 40 && near >= 80 && (near - pokes) * 2 >= near {
+                    cands.push(UnderCandidate {
+                        prim_id: prim.id,
+                        mesh_name: mesh.name.clone(),
+                        verts,
+                        pokes,
+                    });
+                }
+            }
+        }
+        cands.sort_by(|a, b| b.pokes.cmp(&a.pokes));
+
+        for cand in &cands {
+            let c_grid = build_layer_grid(&cand.verts, 0.03);
+            let inv_cell = 1.0f32 / 0.03f32;
+            let min_bound = (bottom.verts.len() / 50).max(32);
+            let mut anchors = Vec::with_capacity(bottom.verts.len());
+            let mut bound_count = 0usize;
+            for &(bp, _) in &bottom.verts {
+                let ck = (
+                    (bp[0] * inv_cell).floor() as i32,
+                    (bp[1] * inv_cell).floor() as i32,
+                    (bp[2] * inv_cell).floor() as i32,
+                );
+                let mut best: Option<(f32, usize)> = None;
+                let max_r2 = 0.04f32 * 0.04f32;
+                for dx in -2..=2 {
+                    for dy in -2..=2 {
+                        for dz in -2..=2 {
+                            if let Some(list) = c_grid.get(&(ck.0 + dx, ck.1 + dy, ck.2 + dz)) {
+                                for &ci in list {
+                                    let (cp, _) = cand.verts[ci as usize];
+                                    let d2 = (bp[0] - cp[0]).powi(2)
+                                        + (bp[1] - cp[1]).powi(2)
+                                        + (bp[2] - cp[2]).powi(2);
+                                    if d2 < max_r2 && best.map_or(true, |(b, _)| d2 < b) {
+                                        best = Some((d2, ci as usize));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((_, ci)) = best {
+                    let (cp, cn) = cand.verts[ci];
+                    let raw = (bp[0] - cp[0]) * cn[0]
+                        + (bp[1] - cp[1]) * cn[1]
+                        + (bp[2] - cp[2]) * cn[2];
+                    let min_clearance = refine_clearance_target(
+                        bp,
+                        cn,
+                        raw,
+                        raw.max(0.006),
+                        &cand.verts,
+                        &c_grid,
+                        inv_cell,
+                        0.04,
+                    );
+                    anchors.push(SkinAnchor {
+                        body_vertex_idx: ci as u32,
+                        min_clearance,
+                        weight: 1.0,
+                        mode: SKIN_ANCHOR_CLEARANCE,
+                    });
+                    bound_count += 1;
+                } else {
+                    anchors.push(SkinAnchor::default());
+                }
+            }
+            if bound_count >= min_bound {
+                info!(
+                    "clearance: cross-region pair (direction B): bottom '{}' (prim {:?}) -> inner '{}' (prim {:?}), {} / {} verts bound ({} rest pokes)",
+                    bottom.mesh_name,
+                    bottom.prim_id,
+                    cand.mesh_name,
+                    cand.prim_id,
+                    bound_count,
+                    bottom.verts.len(),
+                    cand.pokes
+                );
+                if let Some(ref idx) =
+                    asset.meshes[b_mesh].primitives[b_prim].indices.clone()
+                {
+                    smooth_anchor_targets(&mut anchors, &idx, 3);
+                }
+                let prim_mut = Arc::make_mut(&mut asset.meshes[b_mesh].primitives[b_prim]);
+                prim_mut.containment_anchors = Some(anchors);
+                prim_mut.containment_primitive_id = Some(cand.prim_id);
+                break;
+            }
+        }
+    }
+}
+
+/// Bump a clearance anchor's target until ONE push along the anchor
+/// normal lands the vertex outside every same-facing plane nearby.
+///
+/// A naive `(raw, floor)` target only clears the anchor's own plane:
+/// convex bulges (buttocks vs a skirt authored flat) and stacked
+/// sheets (frills) between anchor vertices still swallow the pushed
+/// vertex, and the rendered surface interpolates through them. The
+/// refinement simulates the push and raises the target until the
+/// landing point clears every nearby plane whose normal roughly
+/// agrees with the push direction — back-facing sheets are excluded,
+/// because a point outside a closed-ish surface is always behind some
+/// opposite-facing sheet and demanding clearance from those never
+/// converges (measured: over-pushed hems punching through far sheets).
+fn refine_clearance_target(
+    origin: [f32; 3],
+    push_normal: [f32; 3],
+    raw: f32,
+    mut min_clearance: f32,
+    parent_verts: &[([f32; 3], [f32; 3])],
+    parent_grid: &HashMap<(i32, i32, i32), Vec<u32>>,
+    inv_cell: f32,
+    max_target: f32,
+) -> f32 {
+    for _ in 0..4 {
+        if min_clearance >= max_target {
+            return max_target;
+        }
+        let t = min_clearance - raw;
+        let land = [
+            origin[0] + push_normal[0] * t,
+            origin[1] + push_normal[1] * t,
+            origin[2] + push_normal[2] * t,
+        ];
+        let lk = (
+            (land[0] * inv_cell).floor() as i32,
+            (land[1] * inv_cell).floor() as i32,
+            (land[2] * inv_cell).floor() as i32,
+        );
+        let mut worst = 0.0f32;
+        for dx in -2..=2 {
+            for dy in -2..=2 {
+                for dz in -2..=2 {
+                    if let Some(list) = parent_grid.get(&(lk.0 + dx, lk.1 + dy, lk.2 + dz)) {
+                        for &j in list {
+                            let (jp, jn) = parent_verts[j as usize];
+                            // Same-facing planes only.
+                            if jn[0] * push_normal[0] + jn[1] * push_normal[1]
+                                + jn[2] * push_normal[2]
+                                < 0.3
+                            {
+                                continue;
+                            }
+                            let c = (land[0] - jp[0]) * jn[0]
+                                + (land[1] - jp[1]) * jn[1]
+                                + (land[2] - jp[2]) * jn[2];
+                            worst = worst.min(c);
+                        }
+                    }
+                }
+            }
+        }
+        if worst >= 0.002 {
+            return min_clearance;
+        }
+        min_clearance += 0.002 - worst;
+    }
+    min_clearance.min(max_target)
+}
+
+/// Smooth the per-vertex clearance-target field over the owning mesh.
+///
+/// Refined targets vary sharply where the parent surface bulges (a
+/// skirt authored flat across the buttocks needs ~50 mm pushes at the
+/// peak and ~0 next to it); the rendered surface interpolates linearly
+/// between vertices, so unsmoothed targets leave deep dips between a
+/// pushed vertex and its neighbours — measured as worse residual
+/// penetration than no refinement at all. A few Jacobi iterations of
+/// neighbour averaging spread the peak over the region: the garment
+/// comes to REST on the bulge instead of tenting over it. Unbound
+/// vertices (default anchors) stay fixed — smoothing into them would
+/// invent pushes their anchor data can't express.
+fn smooth_anchor_targets(anchors: &mut [SkinAnchor], indices: &[u32], iterations: usize) {
+    if indices.is_empty() || anchors.is_empty() {
+        return;
+    }
+    let n = anchors.len();
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for t in (0..indices.len()).step_by(3) {
+        let tri = [&indices[t], &indices[t + 1], &indices[t + 2]];
+        for a in 0..3 {
+            for b in 0..3 {
+                if a != b {
+                    let (i, j) = (*tri[a] as usize, *tri[b] as usize);
+                    if i < n && j < n {
+                        adj[i].push(j as u32);
+                    }
+                }
+            }
+        }
+    }
+    for _ in 0..iterations {
+        let old: Vec<f32> = anchors
+            .iter()
+            .map(|a| {
+                if a.body_vertex_idx == u32::MAX {
+                    f32::NAN
+                } else {
+                    a.min_clearance
+                }
+            })
+            .collect();
+        for (i, a) in anchors.iter_mut().enumerate() {
+            if a.body_vertex_idx == u32::MAX {
+                continue;
+            }
+            let neighbors: Vec<f32> = adj[i]
+                .iter()
+                .filter_map(|j| {
+                    let v = old[*j as usize];
+                    if v.is_nan() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                })
+                .collect();
+            if neighbors.is_empty() {
+                continue;
+            }
+            let avg = neighbors.iter().sum::<f32>() / neighbors.len() as f32;
+            a.min_clearance = 0.5 * old[i] + 0.5 * avg;
+        }
+    }
 }
 
 /// Helper: computes cosine similarity between two vertex 4-bone weight sets.

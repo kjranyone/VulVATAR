@@ -47,7 +47,13 @@ const VVT_CACHE_MAGIC: [u8; 8] = *b"VVTCACHE";
 /// stolen pairing no longer drops an outer layer's clearance silently.
 /// v14: middle and innermost layered garments anchor their clearance
 /// against the body surface (sleeve coverage), not the garment-inner.
-const VVT_CACHE_VERSION: u32 = 14;
+/// v15: Phase-3 cross-region clearance — layered outer garments (e.g.
+/// Yumeka's jacket) carry clearance-mode anchors in their containment
+/// slot against Phase-1 bottom garments (skirts); a v14 cache lacks the
+/// jacket↔skirt hem constraint and must regenerate. v16: Phase-3
+/// direction B — bottom garments (skirts) anchor off unanchored inner
+/// layers (underwear, garter straps) that poke through them.
+const VVT_CACHE_VERSION: u32 = 16;
 /// Default cap on the number of `.vvtcache` files retained under
 /// `%APPDATA%\VulVATAR\cache`. Beyond this count, [`evict_to_count`]
 /// drops the oldest-mtime entries on next startup.

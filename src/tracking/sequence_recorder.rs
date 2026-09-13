@@ -55,8 +55,13 @@
 //! a frame budget (default [`DEFAULT_MAX_FRAMES`]). The flag is POLLED, so a
 //! session already in flight can be armed without restarting the app — which
 //! is the normal case, since the behaviour worth recording shows up during
-//! ordinary use. Recording stops at a budget and does not restart within the
-//! process, so a forgotten flag file cannot quietly fill a disk.
+//! ordinary use. The flag is CONSUMED by the session it arms: deleted on
+//! read, and remembered by identity (mtime, len) for the case the delete
+//! fails, so exactly one session fires per flag file. When a session ends
+//! the recorder returns to idle and the next flag arms a fresh session —
+//! any number of recordings per process lifetime, while a forgotten flag
+//! still cannot quietly fill a disk: every recording costs a new act of
+//! intent (creating the flag again).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -102,7 +107,9 @@ impl Frame {
 /// Recorder lifecycle. The flag file is polled while idle rather than read
 /// once: the operator arms the recorder on a session that is ALREADY
 /// running, and a one-shot read at the first frame would latch "off" forever
-/// (which is exactly what happened on the first attempt).
+/// (which is exactly what happened on the first attempt). When a session
+/// ends the recorder returns to idle — the flag that armed it was consumed,
+/// so a second session needs a new flag file, not just the passage of time.
 enum State {
     Idle {
         last_check_ms: u64,
@@ -112,12 +119,19 @@ enum State {
         bytes: usize,
         dir: PathBuf,
     },
-    Finished,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 static MAX_FRAMES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_FRAMES);
+/// Identity (mtime ms, len) of the flag file consumed by the last arm.
+/// Guards the disk-fill property when the flag cannot be deleted: the SAME
+/// file must never arm twice, but a newly written one always may.
+static ARMED_FLAG: OnceLock<Mutex<Option<(u64, u64)>>> = OnceLock::new();
+
+fn armed_flag() -> &'static Mutex<Option<(u64, u64)>> {
+    ARMED_FLAG.get_or_init(|| Mutex::new(None))
+}
 
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::Idle { last_check_ms: 0 }))
@@ -170,9 +184,51 @@ fn write_npy_u16(
     f.flush()
 }
 
-/// Try to arm from the flag file, returning the session directory.
+/// `(mtime ms, len)` of a flag file, or `None` when it cannot be stat-ed.
+/// The pair identifies one act of intent; NTFS mtime granularity (100 ns)
+/// makes a same-length rewrite within the same millisecond effectively
+/// impossible, which is the collision this fallback has to reject.
+fn flag_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mod_ms = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((mod_ms, m.len()))
+}
+
+/// Remember `id` as consumed and delete the flag file. `false` when this
+/// exact identity already armed a session — the caller must not arm again.
+fn consume_flag(path: &std::path::Path, id: (u64, u64)) -> bool {
+    let Ok(mut armed) = armed_flag().lock() else { return false };
+    if *armed == Some(id) {
+        return false;
+    }
+    *armed = Some(id);
+    if let Err(e) = std::fs::remove_file(path) {
+        log::warn!(
+            "sequence_recorder: armed, but could not remove the flag ({e}); \
+             its identity is remembered so it cannot re-fire"
+        );
+    }
+    true
+}
+
+/// Try to arm from the flag file, returning the session directory. The flag
+/// is consumed on a successful arm (see [`consume_flag`]); a failed arm
+/// (unreadable budget, uncreatable session dir) leaves it in place so the
+/// next poll retries.
 fn try_start() -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(base_dir().join("record.on")).ok()?;
+    let flag = base_dir().join("record.on");
+    let contents = std::fs::read_to_string(&flag).ok()?;
+    let id = flag_identity(&flag).unwrap_or((0, 0));
+    if let Some(prev) = *armed_flag().lock().ok()? {
+        if prev == id {
+            return None;
+        }
+    }
     if let Ok(n) = contents.trim().parse::<u64>() {
         if n > 0 {
             MAX_FRAMES.store(n, Ordering::Relaxed);
@@ -185,6 +241,9 @@ fn try_start() -> Option<PathBuf> {
     let dir = sessions_root().join(format!("s{stamp}"));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("sequence_recorder: cannot create {}: {e}", dir.display());
+        return None;
+    }
+    if !consume_flag(&flag, id) {
         return None;
     }
     log::info!(
@@ -256,7 +315,6 @@ fn flush(frames: Vec<Frame>, dir: PathBuf) {
 pub fn record(frame_index: u64, frame: &RealSenseFrame) {
     let Ok(mut st) = state().lock() else { return };
     match &mut *st {
-        State::Finished => (),
         State::Idle { last_check_ms } => {
             let now_ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
             if *last_check_ms != 0 && now_ms.saturating_sub(*last_check_ms) < FLAG_POLL_MS {
@@ -303,7 +361,10 @@ pub fn record(frame_index: u64, frame: &RealSenseFrame) {
                 );
                 let taken = std::mem::take(frames);
                 let dir = dir.clone();
-                *st = State::Finished;
+                // Back to idle with the poll timer reset: a flag written
+                // DURING this capture arms the next session within one
+                // poll interval, and the consumed flag cannot re-fire.
+                *st = State::Idle { last_check_ms: 0 };
                 flush(taken, dir);
             }
         }
@@ -359,6 +420,39 @@ mod tests {
             due(1000, 1000 + FLAG_POLL_MS),
             "checks again after the interval"
         );
+    }
+
+    /// One flag file arms exactly one session. The normal path deletes the
+    /// file on arm; when deletion fails (locked file, read-only media) the
+    /// remembered identity must reject a re-arm of the SAME file while a
+    /// freshly written one still arms. This is the disk-fill guard that
+    /// replaced the old terminal `Finished` state when the recorder became
+    /// re-armable.
+    #[test]
+    fn a_flag_file_arms_exactly_one_session() {
+        let dir = std::env::temp_dir().join("vulvatar_flag_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("record.on");
+        std::fs::write(&path, b"900").expect("write flag");
+
+        // First arm consumes and deletes; the second call with the SAME
+        // identity must be rejected by the remembered id alone (this is
+        // also the locked-file path: identity, not deletion, is the guard).
+        let id = flag_identity(&path).expect("identity");
+        assert!(consume_flag(&path, id), "first arm consumes");
+        assert!(!path.exists(), "flag deleted on consume");
+        assert!(!consume_flag(&path, id), "same identity cannot re-arm");
+
+        // A freshly written flag is a new act of intent: different identity,
+        // arms again. Sleep past any conceivable mtime granularity so the
+        // rewrite cannot collide with the first write's timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&path, b"600").expect("rewrite flag");
+        let id2 = flag_identity(&path).expect("identity 2");
+        assert_ne!(id, id2, "rewrite must produce a new identity");
+        assert!(consume_flag(&path, id2), "new flag arms a new session");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// The memory ceiling must end a session before the app pages itself

@@ -4,9 +4,17 @@
 //!
 //! Every driven bone's *world* rotation is set to `Δ_V · rest_world`, i.e.
 //! the same rotation the subject's corresponding segment made from its own
-//! T-pose rest, so body-proportion differences never move a hand short of
-//! or past its target (there is no position matching and no IK). Local
-//! rotations are recovered top-down against the already-solved parents.
+//! T-pose rest, so body-proportion differences never bias a reach's
+//! direction (there is no global position matching). Two bounded
+//! positional corrections run after the rotation pass, each fading to the
+//! pure rotation result outside its zone: hand-cross prevention, and
+//! face-contact anchoring (the wrist is placed at the subject's
+//! head-relative position when the hand is near the face, so
+//! self-contact poses like finger-to-lips survive proportion
+//! differences — measured on the composite bench, rotation-only
+//! transfer landed the fingertip a quarter head-height short).
+//! Local rotations are recovered top-down against the already-solved
+//! parents.
 //!
 //! Display smoothing is a dt-aware slerp toward the target (the user's
 //! `rotation_blend` setting) from the previous frame's solved local
@@ -86,6 +94,10 @@ pub struct RetargetParams {
     pub max_root_tilt: f32,
     /// Prevent hands from crossing each other in front of the body (Two-Bone IK anti-cross).
     pub hand_cross_prevention: bool,
+    /// Anchor the wrist at the subject's head-relative position when the
+    /// hand is near the face (`rig.face_proximity`), so self-contact
+    /// poses (finger to lips) survive avatar proportion differences.
+    pub face_contact_anchoring: bool,
     /// Minimum lateral distance (m) between left and right hand centers when touching.
     pub min_hand_distance: f32,
     /// Enable 1€ (One Euro) adaptive smoothing filter for rotation and root translation.
@@ -110,6 +122,7 @@ impl Default for RetargetParams {
             anchor_seed_s: 1.0,
             max_root_tilt: 0.35,
             hand_cross_prevention: true,
+            face_contact_anchoring: true,
             min_hand_distance: 0.08,
             one_euro_enabled: true,
             one_euro_min_cutoff: 1.0,
@@ -635,8 +648,95 @@ pub fn apply_rig_pose(
         }
     }
 
+    // ---- self-contact anchoring (head-local wrist, Two-Bone IK) ----------
+    anchor_face_local_hands(skeleton, humanoid, local_transforms, rig, params);
+
     // ---- hand cross prevention (Two-Bone IK) ---------------------------------
     prevent_hand_crossing(skeleton, humanoid, local_transforms, state, params);
+}
+
+/// Place the avatar's wrist at the subject's head-relative wrist position
+/// when the subject's hand is near their own face. Rotation-only transfer
+/// preserves a reach's direction, not its endpoint, so on a
+/// different-proportioned avatar a finger-to-lips pose lands short
+/// (measured on the composite bench: fingertip at the chin, a quarter
+/// head-height low). The rig reports the wrist offset in the subject's
+/// head frame; expressing it through the avatar's solved head transform
+/// gives the equivalent spot on the avatar ("one hand-length in front of
+/// the mouth"), and the existing two-bone IK moves the wrist there while
+/// preserving the hand's world rotation. The correction is scaled by
+/// `rig.face_proximity` and is exactly zero away from the face, so every
+/// other pose keeps the pure rotation path.
+fn anchor_face_local_hands(
+    skeleton: &SkeletonAsset,
+    humanoid: &HumanoidMap,
+    local_transforms: &mut [Transform],
+    rig: &RigPose,
+    params: &RetargetParams,
+) {
+    if !params.face_contact_anchoring || rig.quality < params.min_quality {
+        return;
+    }
+    let Some(NodeId(head_node)) = humanoid.bone_map.get(&HB::Head).copied() else {
+        return;
+    };
+    let head_node = head_node as usize;
+    if head_node >= local_transforms.len() {
+        return;
+    }
+    let (h_pos, h_rot) = node_world_transform(skeleton, local_transforms, head_node);
+    for (side, bones) in [
+        (
+            0usize,
+            (HB::LeftUpperArm, HB::LeftLowerArm, HB::LeftHand),
+        ),
+        (
+            1usize,
+            (HB::RightUpperArm, HB::RightLowerArm, HB::RightHand),
+        ),
+    ] {
+        let w = rig.face_proximity[side];
+        if w <= 0.01 {
+            continue;
+        }
+        let (upper_b, lower_b, hand_b) = bones;
+        let (Some(NodeId(un)), Some(NodeId(ln)), Some(NodeId(hn))) = (
+            humanoid.bone_map.get(&upper_b).copied(),
+            humanoid.bone_map.get(&lower_b).copied(),
+            humanoid.bone_map.get(&hand_b).copied(),
+        ) else {
+            continue;
+        };
+        let (un, ln, hn) = (un as usize, ln as usize, hn as usize);
+        let n = local_transforms.len();
+        if un >= n || ln >= n || hn >= n {
+            continue;
+        }
+        let (s_pos, s_rot) = node_world_transform(skeleton, local_transforms, un);
+        let (e_pos, e_rot) = node_world_transform(skeleton, local_transforms, ln);
+        let (w_pos, w_rot) = node_world_transform(skeleton, local_transforms, hn);
+        let off = rig.head_local_wrists[side];
+        let rot_off = quat_rotate_vec3(&h_rot, &off);
+        let target = [
+            h_pos[0] + rot_off[0],
+            h_pos[1] + rot_off[1],
+            h_pos[2] + rot_off[2],
+        ];
+        let err = vec3_length(&vec3_sub(&target, &w_pos));
+        if err < 0.005 {
+            continue;
+        }
+        let parent_rot = match skeleton.nodes[un].parent {
+            Some(NodeId(p)) => world_rot(skeleton, local_transforms, p as usize),
+            None => [0.0, 0.0, 0.0, 1.0],
+        };
+        let (u_new, l_new, h_new) = solve_two_bone_ik(
+            s_pos, e_pos, w_pos, target, s_rot, e_rot, w_rot, parent_rot,
+        );
+        local_transforms[un].rotation = slerp_short(&local_transforms[un].rotation, &u_new, w);
+        local_transforms[ln].rotation = slerp_short(&local_transforms[ln].rotation, &l_new, w);
+        local_transforms[hn].rotation = slerp_short(&local_transforms[hn].rotation, &h_new, w);
+    }
 }
 
 /// Compute world position and world rotation of node `node` given `locals`.

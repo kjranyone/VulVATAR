@@ -502,13 +502,39 @@ pub fn chest_yaw_from_depth(
             continue;
         }
         let mut zz: Vec<f64> = med.iter().map(|c| c.1).collect();
-        zz.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mid = zz[zz.len() / 2];
-        let pts: Vec<(f64, f64)> = med
-            .iter()
-            .copied()
-            .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
-            .collect();
+        zz.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let _ = zz.drain(..);
+        // Slope-aware column filter (`VULVATAR_CHEST_LINEFIT=1`): reject by
+        // residual to a first-pass line z(x) instead of the global depth
+        // median. The median window (−6/+12 cm) cannot hold a genuinely
+        // yawed trunk (0.4 m span at 40° spans ~26 cm of depth) and kills
+        // the shoulder-top band (measured 576/600 frames by `zfilter`).
+        // NOT the default: with the trunk's aspect now shape-fitted, the
+        // chest observation at σ 0.12 FIGHTS the aspect fit and drags the
+        // pathological session back to a leaned solution (measured:
+        // aspect-only yaw −25°/tilt 2.6° → +obs yaw −59°/tilt 26°). Keep
+        // env-gated until its σ is re-derived against the fitted trunk.
+        let pts: Vec<(f64, f64)> = if std::env::var_os("VULVATAR_CHEST_LINEFIT").is_some() {
+            let n = med.len() as f64;
+            let mx = med.iter().map(|p| p.0).sum::<f64>() / n;
+            let mz = med.iter().map(|p| p.1).sum::<f64>() / n;
+            let (mut num, mut den) = (0.0, 0.0);
+            for (x, z) in &med {
+                num += (x - mx) * (z - mz);
+                den += (x - mx) * (x - mx);
+            }
+            let a = num / den.max(1e-9);
+            med.iter()
+                .copied()
+                .filter(|(x, z)| (z - (mz + a * (x - mx))).abs() < 0.05)
+                .collect()
+        } else {
+            let mid = med[med.len() / 2].1;
+            med.iter()
+                .copied()
+                .filter(|(_, z)| *z > mid - 0.06 && *z < mid + 0.12)
+                .collect()
+        };
         if pts.len() < if skip_middle { 6 } else { 8 } {
             if std::env::var_os("VULVATAR_CHEST_DUMP").is_some() {
                 eprintln!("CHESTFAIL zfilter {} of {}", pts.len(), med.len());

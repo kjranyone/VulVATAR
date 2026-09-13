@@ -151,6 +151,14 @@ fn recover_with(parts: Option<&[super::super::model::Part]>) {
         m,
         Params {
             shear_sigma: 1e-9,
+            // Pin the obliquity down-weighting: this fixture's 12-point
+            // surface at 23° root yaw is evidence-poor enough that the
+            // production tradeoff (relax the trunk toward its priors at
+            // oblique view, benched on real dense recordings) degrades
+            // its recovery past the tolerance. The fixture's contract is
+            // "the surface term recovers the trunk", which the pinned
+            // weight measures directly.
+            trunk_surf_obliq_k: 0.0,
             ..Params::default()
         },
     );

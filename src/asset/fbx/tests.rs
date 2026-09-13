@@ -873,10 +873,21 @@ fn test_yumeka_skin_anchors_generation() {
                 .flatten()
                 .filter(|x| x.body_vertex_idx != u32::MAX)
             {
-                assert_eq!(
-                    a.mode, containment,
-                    "containment_anchors must be containment-mode"
+                // The slot carries either semantic: containment anchors
+                // for middle layers, clearance-mode cross-region anchors
+                // (Phase 3: upper-outer hems vs bottom garments, e.g.
+                // Yumeka's jacket over the skirt).
+                assert!(
+                    a.mode == containment || a.mode == clearance,
+                    "containment_anchors must be containment- or clearance-mode"
                 );
+                if a.mode == clearance {
+                    assert!(
+                        a.min_clearance >= 0.006,
+                        "cross-region clearance anchor below 6mm floor: {}",
+                        a.min_clearance
+                    );
+                }
             }
             // Each anchor set indexes its OWN parent's vertex buffer —
             // the middle layer of a 3-layer stack has two different

@@ -1246,8 +1246,10 @@ struct SkinAnchor {
     float weight;
     // 0 = clearance (push this vertex outward off the parent surface),
     // 1 = containment (clamp this vertex back inside the parent surface).
-    // The two anchor sets travel in separate buffers (binding 6 vs 10)
-    // so the field is metadata; the shader branches per binding.
+    // The two anchor sets travel in separate buffers (binding 6 vs 10).
+    // Binding 6 applies clearance unconditionally; binding 10 branches
+    // per anchor mode so the containment slot can also carry
+    // cross-region clearance anchors (upper-outer vs bottom garments).
     uint mode;
 };
 
@@ -1485,10 +1487,22 @@ void main() {
             float nlen = length(on);
             if (plen > 1e-3 && plen < 10.0 && nlen > 1e-4) {
                 on /= nlen;
-                // Containment: clamp back inside the parent surface.
                 float c = dot(world_pos - op, on);
-                if (c > anc.min_clearance) {
-                    world_pos -= on * ((c - anc.min_clearance) * anc.weight);
+                // The slot carries either semantic; the anchor's mode
+                // decides. Containment (middle layers): clamp back
+                // inside the outer surface. Clearance (cross-region,
+                // e.g. a jacket hem over a skirt): push this vertex
+                // out to at least `min_clearance` off the inner
+                // surface — same math as the binding-6 branch, against
+                // a garment parent the clearance slot cannot reference.
+                if (anc.mode == 1u) {
+                    if (c > anc.min_clearance) {
+                        world_pos -= on * ((c - anc.min_clearance) * anc.weight);
+                    }
+                } else {
+                    if (c < anc.min_clearance) {
+                        world_pos += on * ((anc.min_clearance - c) * anc.weight);
+                    }
                 }
             }
         }

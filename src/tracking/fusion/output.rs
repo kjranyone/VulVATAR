@@ -54,6 +54,28 @@ pub struct RigPose {
     /// Subject shoulder span (m) under the current shape — the metric
     /// scale reference for 1:1 root translation.
     pub shoulder_span_m: f32,
+    /// Wrist position in the subject's own head frame (viewer axes),
+    /// per hand `[left, right]`. Rotation-only retarget preserves a
+    /// reach's direction, not its endpoint, so a finger-to-lips pose
+    /// lands short on a different-proportioned avatar; consumers use
+    /// this to anchor the avatar's wrist at the same head-relative
+    /// spot (self-contact preservation). `[0;3]` when unavailable.
+    pub head_local_wrists: [[f32; 3]; 2],
+    /// Face-proximity weight per hand `[left, right]` in `[0,1]`: 1 with
+    /// the wrist within `FACE_CONTACT_M` of the head, fading to 0 at
+    /// `FACE_FADE_M`, scaled by that hand's confidence. The retarget
+    /// scales the head-local anchoring by this, so far-from-face poses
+    /// keep the pure rotation path untouched.
+    pub face_proximity: [f32; 2],
+}
+
+/// Wrist-to-head distance at which face-contact anchoring is fully on.
+pub const FACE_CONTACT_M: f64 = 0.30;
+/// Wrist-to-head distance at which face-contact anchoring has faded to 0.
+pub const FACE_FADE_M: f64 = 0.45;
+
+fn face_proximity_weight(dist_m: f64) -> f32 {
+    ((FACE_FADE_M - dist_m) / (FACE_FADE_M - FACE_CONTACT_M)).clamp(0.0, 1.0) as f32
 }
 
 /// Build the rig pose from the estimator posterior. `shoulder_span_px` is
@@ -111,10 +133,30 @@ pub fn rig_pose(h: &Humanoid, est: &Estimator, t: f64, shoulder_span_px: Option<
         (1.0 - est.joint_data_sigma(m, h.j.r_wrist) / 0.6).clamp(0.0, 1.0) as f32,
     ];
     let shoulder_span_m = norm(sub(fk.t[h.j.l_shoulder], fk.t[h.j.r_shoulder])) as f32;
+    // Head-local wrist anchors for self-contact poses. The offset is
+    // expressed in the head's own frame: o_view = F · (R_cam_headᵀ · d),
+    // with F = Rx(180°) (F² = I). Because the retarget applies
+    // R_av = F · R_cam · F, using o_view through R_av reproduces the
+    // subject's head-relative wrist placement on the avatar exactly
+    // regardless of global frame conventions.
+    let mut head_local_wrists = [[0.0f32; 3]; 2];
+    let mut face_proximity = [0.0f32; 2];
+    let head_r = &fk.r[h.j.head];
+    let head_t = fk.t[h.j.head];
+    for (side, wrist) in [(0usize, h.j.l_wrist), (1usize, h.j.r_wrist)] {
+        let d = sub(fk.t[wrist], head_t);
+        let dist = norm(d);
+        // Rᵀ · d (camera axes), then flip y/z into the viewer frame.
+        let o = mat_vec(&transpose(head_r), d);
+        head_local_wrists[side] = [o[0] as f32, -o[1] as f32, -o[2] as f32];
+        face_proximity[side] = face_proximity_weight(dist) * hand_confidence[side];
+    }
     RigPose {
         t,
         bones,
         shoulder_span_m,
+        head_local_wrists,
+        face_proximity,
         root_cam_m: [
             est.state.root_t[0] as f32,
             est.state.root_t[1] as f32,

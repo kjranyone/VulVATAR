@@ -110,7 +110,7 @@ cargo build --features realsense --bin diagnose_fusion_replay
 
 人間がカメラの前に座るのは**一度だけ**にする。録ったら以降は無人で何度でも回す。
 
-**リプレイ用フルレート録画 (sequence recorder)** — アプリ稼働中にフラグファイル `%ProgramData%\VulVATAR\record.on` を作る (2 秒ポーリング、リビルド不要)。ファイルの中身にフレーム数を書ける (空なら既定 600 frame、RAM 1.2 GB 上限)。フレームは RAM にギャップレス確保され、終了後に別スレッドで `diagnostics/sessions/s<unix>/` へ `f#####_color.png` + `f#####_depth_mm.npy` + `meta.jsonl` (実 intrinsics・タイムスタンプ) として吐かれる。
+**リプレイ用フルレート録画 (sequence recorder)** — アプリ稼働中にフラグファイル `%ProgramData%\VulVATAR\record.on` を作る (2 秒ポーリング、リビルド不要)。ファイルの中身にフレーム数を書ける (空なら既定 600 frame、RAM 1.2 GB 上限)。**フラグは録画開始時に消費される (削除。削除失敗時は mtime/len 同一性で記憶)** なので再録画には再作成が要る — 1 プロセスで何度でも録画可能で、放置フラグが連続録画を引き起こすこともない。フレームは RAM にギャップレス確保され、終了後に別スレッドで `diagnostics/sessions/s<unix>/` へ `f#####_color.png` + `f#####_depth_mm.npy` + `meta.jsonl` (実 intrinsics・タイムスタンプ) として吐かれる。
 
 ```powershell
 cargo run --release --bin diagnose_fusion_replay -- diagnostics\sessions\s<unix>   # 温度状態を継続して本番プロバイダに流す

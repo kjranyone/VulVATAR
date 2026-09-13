@@ -1412,7 +1412,7 @@ impl Estimator {
                     b: fk.point(c.b),
                     c: c.lateral.map(|l| fk.point(l)),
                     r: model.capsule_radius(st, c),
-                    k: c.aspect,
+                    k: model.capsule_aspect(st, c),
                 })
                 .collect();
             let assoc_ok: Vec<bool> = model
@@ -1537,6 +1537,45 @@ impl Estimator {
             for it in &items {
                 per_cap[it.1] += 1;
             }
+            // Trunk-facing obliquity: the shoulder-line direction (across
+            // the torso capsules' axis midpoints) vs the camera x-axis.
+            // sin² is sign-free; frontal view → 0. See
+            // `Params::trunk_surf_obliq_k` for the measurement.
+            let torso_obliq = {
+                let k = self.params.trunk_surf_obliq_k;
+                if k <= 0.0 {
+                    1.0f64
+                } else {
+                    let mut min3 = [f64::INFINITY; 3];
+                    let mut max3 = [f64::NEG_INFINITY; 3];
+                    let mut any = false;
+                    for (g, c) in caps.iter().zip(model.capsules.iter()) {
+                        if !matches!(c.part, super::model::Part::Torso) {
+                            continue;
+                        }
+                        for d in 0..3 {
+                            let m = (g.a[d] + g.b[d]) * 0.5;
+                            min3[d] = min3[d].min(m);
+                            max3[d] = max3[d].max(m);
+                        }
+                        any = true;
+                    }
+                    if !any {
+                        1.0
+                    } else {
+                        let (dx, dz) = (max3[0] - min3[0], max3[2] - min3[2]);
+                        // sin⁴ of the shoulder-line tilt: a deadzone that
+                        // keeps frontal view (|yaw| ≲ 20°) at (nearly) full
+                        // weight — sin² alone let the frontal synthetic
+                        // bench's trunk yaw wander into the down-weighting
+                        // region and drift (streamer_da: yaw mean −1.3° →
+                        // −15.9°), a feedback loop sin⁴ breaks at small
+                        // angles (sin⁴ 10° = 0.0008 vs sin² 10° = 0.03).
+                        let s2 = dz * dz / (dx * dx + dz * dz).max(1e-9);
+                        1.0 / (1.0 + k * s2 * s2)
+                    }
+                }
+            };
             let cap_w: Vec<f64> = per_cap
                 .iter()
                 .enumerate()
@@ -1549,7 +1588,12 @@ impl Estimator {
                         super::model::Part::Torso => self.params.surf_n_eff,
                         _ => self.params.surf_n_eff_limb,
                     };
-                    (n_eff / n as f64).min(1.0)
+                    let w = (n_eff / n as f64).min(1.0);
+                    if matches!(model.capsules[ci].part, super::model::Part::Torso) {
+                        w * torso_obliq
+                    } else {
+                        w
+                    }
                 })
                 .collect();
             if n_assoc > 0 {
@@ -1559,7 +1603,10 @@ impl Estimator {
                 // capture everything; the expansion into H is done once per
                 // capsule instead of once per point.
                 let nc = model.capsules.len();
-                const NA: usize = 10;
+                // α columns: [a(3), b(3), lateral(3), log-radius,
+                // log-aspect]. The last is nonzero only for capsules with
+                // an `aspect_group` (the trunk).
+                const NA: usize = 11;
                 let mut mm = vec![[[0.0f64; NA]; NA]; nc];
                 let mut mv = vec![[0.0f64; NA]; nc];
                 let mut used = vec![false; nc];
@@ -1618,6 +1665,11 @@ impl Estimator {
                         let mut gp = g.clone();
                         gp.r *= (EPS * 10.0).exp();
                         alpha[9] = (gp.dist(pt).0 - d0) / (EPS * 10.0) * inv_s;
+                        if model.capsules[ci].aspect_group.is_some() {
+                            let mut gk = g.clone();
+                            gk.k *= (EPS * 10.0).exp();
+                            alpha[10] = (gk.dist(pt).0 - d0) / (EPS * 10.0) * inv_s;
+                        }
                     }
                     let m = &mut mm[ci];
                     for k in 0..NA {
@@ -1694,6 +1746,16 @@ impl Estimator {
                             &mut self.row_idx,
                             &mut bloc,
                         );
+                        if let Some(ag) = c.aspect_group {
+                            touch(
+                                model.beta_rad + ag as usize,
+                                10,
+                                1.0,
+                                &mut self.row_acc,
+                                &mut self.row_idx,
+                                &mut bloc,
+                            );
+                        }
                         let l = self.row_idx.len();
                         // MB = B·M  (L×NA)
                         let m = &mm[ci];
