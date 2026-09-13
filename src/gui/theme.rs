@@ -99,18 +99,18 @@ pub mod color {
         Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
     }
     /// Cool-blue accent used to outline overlay panels inside the
-    /// viewport (camera PIP, calibration preview pane). Distinct from
+    /// viewport (camera PIP). Distinct from
     /// the brand purple so the viewport's own affordances don't read
     /// as just-another-button.
     pub const VIEWPORT_OVERLAY_OUTLINE: Color32 = Color32::from_rgb(60, 130, 200);
 }
 
 /// Colours for content painted *inside* the always-dark viewport and
-/// the camera/calibration preview panes: skeleton annotations, grid,
+/// the camera preview pane: skeleton annotations, grid,
 /// crosshair, overlay badges. Kept separate from [`color`] because the
 /// viewport is its own dark context regardless of app theme — but
 /// still tokenised so the same annotation reads identically in every
-/// pane that draws it (viewport PIP and calibration preview used to
+/// pane that draws it (panes used to
 /// carry copy-pasted literals that could drift apart).
 pub mod viz {
     use super::Color32;

@@ -73,7 +73,6 @@ Purpose:
 Purpose:
 
 - start or stop the RealSense D435 capture
-- calibrate pose reference and anchors
 - configure driven body parts (head, face, lower body, root translation, hands)
 - inspect tracking latency, confidence, and solver diagnostics
 - adjust smoothing parameters and safety fallbacks
@@ -131,7 +130,6 @@ The top bar provides global session actions:
 - project title & dirty status
 - avatar picker / quick switch
 - camera start / stop
-- pose calibration launcher
 - runtime pause toggle
 - File dropdown menu (New / Open / Save project, import avatar, load/save overlay)
 

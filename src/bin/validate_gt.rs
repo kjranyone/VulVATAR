@@ -752,7 +752,7 @@ fn main() -> Result<(), String> {
     // learns its session estimators (frontal shoulder span, torso
     // depth EMA) while the user sits naturally before moving. Feeding
     // each pose as an isolated single frame instead would deny the
-    // pipeline exactly the calibration the live session always has —
+    // pipeline exactly that warmup the live session always has —
     // and the anatomical floor then fabricates twist on narrow rigs.
     let (neutral_rgba, neutral_depth) = {
         let locals = build_gt_pose(&asset, &pose_suite()[0].1);
@@ -804,10 +804,10 @@ fn main() -> Result<(), String> {
             dump_depth_stats(name, &gt_metric, &out_dir);
         }
 
-        // Track + solve: reset, neutral warmup (session calibration),
-        // then two passes on the pose frame (acquire + self-tracked
-        // crop). Each pass is fed its frame's aligned depth (neutral vs
-        // GT), mirroring the live worker.
+        // Track + solve: reset, neutral warmup, then two passes on the
+        // pose frame (acquire + self-tracked crop). Each pass is fed
+        // its frame's aligned depth (neutral vs GT), mirroring the
+        // live worker.
         infer.reset_temporal_state();
         let base = (idx as u64) * 8;
         for k in 0..3 {

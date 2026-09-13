@@ -1,5 +1,4 @@
 pub mod avatar_load;
-pub mod calibration;
 pub mod components;
 mod folder_watcher;
 pub mod hotkey;
@@ -288,11 +287,6 @@ pub struct GuiApp {
     /// management actions); drawn by `top_bar::draw_profile_dialogs`.
     pub(crate) profile_dialog: Option<top_bar::ProfileDialog>,
 
-    /// Target index of a profile switch that would drop the current
-    /// pose calibration (calibrated → uncalibrated) — held until the
-    /// user confirms, since re-capturing costs a full hold-still cycle.
-    pub(crate) pending_profile_switch: Option<usize>,
-
     /// Session-only Settings toggle: show the diagnostic status-bar
     /// fields (frame counter, output queue/dropped). Off by default —
     /// they are developer readouts, not streamer-facing signal.
@@ -323,10 +317,6 @@ pub struct GuiApp {
     // Blender-style drag-grab state, and the camera-wipe PIP toggle +
     // its companion texture / scratch buffer. See `ViewportUiState`.
     pub viewport: ViewportUiState,
-
-    // Pose-calibration modal. Aggregated into
-    // `calibration::CalibrationUiState`.
-    pub calibration: calibration::CalibrationUiState,
 
     // Lip sync
     pub lipsync: LipSyncGuiState,
@@ -428,12 +418,12 @@ impl GuiApp {
             ),
 
             hotkeys: hotkey::HotkeyMap::new(),
-            // Profiles persist across project loads — calibration
-            // (which is per-room/setup, not per-scene) lives on
-            // them, so a fresh-install fallback to the built-in
-            // presets is fine but a parse failure of an existing
-            // file should not silently wipe out the user's data
-            // (load_profiles already logs and returns None then).
+            // Profiles persist across project loads (which is
+            // per-room/setup, not per-scene), so a fresh-install
+            // fallback to the built-in presets is fine but a parse
+            // failure of an existing file should not silently wipe
+            // out the user's data (load_profiles already logs and
+            // returns None then).
             profiles: crate::persistence::load_profiles().unwrap_or_default(),
 
             notifications: Vec::new(),
@@ -441,7 +431,6 @@ impl GuiApp {
             pending_file_dialog: None,
             pending_avatar_drop: None,
             profile_dialog: None,
-            pending_profile_switch: None,
             debug_status_bar: false,
             debug_panel_hole: None,
 
@@ -470,8 +459,6 @@ impl GuiApp {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
             },
-
-            calibration: calibration::CalibrationUiState::default(),
 
             lipsync: LipSyncGuiState {
                 available_mics: crate::lipsync::audio_capture::list_audio_devices(),
@@ -713,22 +700,6 @@ impl GuiApp {
         }
         let _ = crate::persistence::save_watched_folders(&state.library.watched_avatar_dirs);
 
-        // Seed the active profile's pose calibration into Application
-        // + tracking mailbox at startup. Without this, a user who
-        // calibrated last session and re-launches sees the loaded
-        // calibration sitting on the profile but the depth pipeline
-        // operating on the auto-EMA fallback until the first manual
-        // profile-switch. We deliberately don't call apply_profile()
-        // here — only this *one* field needs forwarding at startup;
-        // the rest of apply_profile would clobber render / output
-        // settings that load_state will set from the project file
-        // a moment later.
-        if let Some(active) = state.profiles.active() {
-            let cal = active.pose_calibration.clone();
-            state.app.tracking_calibration.pose = cal.clone();
-            state.app.tracking.mailbox().set_calibration(cal);
-        }
-
         state
     }
 
@@ -767,7 +738,6 @@ impl GuiApp {
             pending_file_dialog: None,
             pending_avatar_drop: None,
             profile_dialog: None,
-            pending_profile_switch: None,
             debug_status_bar: false,
             debug_panel_hole: None,
 
@@ -784,8 +754,6 @@ impl GuiApp {
                 show_detection_annotations: true,
                 ..ViewportUiState::default()
             },
-
-            calibration: calibration::CalibrationUiState::default(),
 
             lipsync: LipSyncGuiState::default(),
 
@@ -902,48 +870,6 @@ impl GuiApp {
         let camera_serial = self.tracking.camera_serial.clone();
         self.app
             .start_tracking_with_params(w, h, fps, camera_serial, pipeline);
-    }
-
-    /// Open the pose-calibration modal at the active profile's last
-    /// calibrated mode. A FIRST capture defaults from the live framing
-    /// instead of a fixed FullBody: a desk-framed streamer (head +
-    /// shoulders, hips below the image) physically cannot present the
-    /// FullBody T-pose, and being greeted by one reads as "calibration
-    /// is impossible at my setup" — the UpperBody mode (arms down,
-    /// with the bust-up stillness fallback) is the one that actually
-    /// works there. Hip visibility on the latest tracking sample is
-    /// the discriminator the runtime anchor selection itself uses.
-    /// Mirrors the Tracking panel's launcher, including the
-    /// avatar-load gate — the load Window is its own modal and
-    /// stacking the calibration scrim over it would bury the progress
-    /// readout.
-    pub(crate) fn open_calibration_modal(&mut self) {
-        if self.library.avatar_load_job.is_some() {
-            self.push_warning_notification(t!("top_bar.avatar_load_in_progress"));
-            return;
-        }
-        let default_mode = self
-            .app
-            .tracking_calibration
-            .pose
-            .as_ref()
-            .map(|c| c.mode)
-            .unwrap_or_else(|| {
-                let hips_tracked = self
-                    .app
-                    .tracking
-                    .mailbox()
-                    .snapshot()
-                    .pose
-                    .as_ref()
-                    .is_some_and(|p| p.root_anchor_is_hip);
-                if hips_tracked {
-                    crate::tracking::CalibrationMode::FullBody
-                } else {
-                    crate::tracking::CalibrationMode::UpperBody
-                }
-            });
-        self.calibration.modal.open(default_mode);
     }
 
     /// Save the avatar library to disk and surface failures as an error
@@ -1228,7 +1154,7 @@ impl eframe::App for GuiApp {
                         if ui.button(t!("dialog.replace_avatar_confirm")).clicked() {
                             decision = Some(true);
                         }
-                        if ui.button(t!("calibration.cancel")).clicked() {
+                        if ui.button(t!("dialog.cancel")).clicked() {
                             decision = Some(false);
                         }
                     });
@@ -1245,8 +1171,8 @@ impl eframe::App for GuiApp {
             }
         }
 
-        // Profile management dialogs (New / Rename / Delete) + the
-        // calibration-loss switch confirmation from the top-bar combo.
+        // Profile management dialogs (New / Rename / Delete) from the
+        // top-bar combo.
         top_bar::draw_profile_dialogs(ctx, self);
 
         // Drain any finished OS file-dialog worker (open/save pickers
@@ -1377,11 +1303,6 @@ impl eframe::App for GuiApp {
         inspector::draw(ctx, self);
         viewport::draw(ctx, self);
 
-        // Pose-calibration modal. Rendered after viewport so the dim
-        // overlay covers the entire viewport interior, not just the
-        // inspector panel. No-op when the modal is closed.
-        calibration::draw_modal(ctx, self);
-
         // Loading-spinner overlay while a background avatar load is in flight.
         if let Some(job) = self.library.avatar_load_job.as_ref() {
             let stage_label = load_stage_label(&job.current_stage);
@@ -1395,9 +1316,9 @@ impl eframe::App for GuiApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .collapsible(false)
                 .resizable(false)
-                // Match the calibration modal: live above any
-                // `Order::Middle` scrim and any default-Order Window
-                // so the load progress isn't visually buried by either.
+                // Live above any `Order::Middle` scrim and any
+                // default-Order Window so the load progress isn't
+                // visually buried by either.
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -1459,7 +1380,6 @@ impl eframe::App for GuiApp {
         // - avatar load in progress (progress bar)
         // - notification toast still visible (fade animation)
         // - clip animation playing (`active_clip` set on any avatar)
-        // - calibration modal open (consumes tracking samples per-frame)
         // - a render result is in flight: `run_frame` submitted a frame
         //   to the render thread but hasn't drained the result yet, so
         //   `process_render_result` won't fire until we tick again. A
@@ -1477,14 +1397,12 @@ impl eframe::App for GuiApp {
             .iter()
             .any(|a| a.animation_state.active_clip.is_some());
         let render_in_flight = self.app.has_pending_render_result();
-        let calibration_modal_open = self.calibration.modal.is_open();
         let needs_animation_frame = self.tracking.toggle_tracking
             || self.app.is_lipsync_enabled()
             || self.library.avatar_load_job.is_some()
             || !self.notifications.is_empty()
             || animation_playing
-            || render_in_flight
-            || calibration_modal_open;
+            || render_in_flight;
         if needs_animation_frame
             || self.project_status.project_dirty
             || self.project_status.profiles_dirty
@@ -1538,9 +1456,9 @@ impl eframe::App for GuiApp {
             }
         }
 
-        // Flush the other two dirty stores as well — profiles carry
-        // pose calibrations and settings carry locale/sensitivities;
-        // both used to be silently dropped on a quick quit.
+        // Flush the other two dirty stores as well — settings carry
+        // locale/sensitivities; both used to be silently dropped on a
+        // quick quit.
         if self.project_status.profiles_dirty {
             if let Err(e) = crate::persistence::save_profiles(&self.profiles) {
                 warn!("persistence: final save_profiles on exit failed: {}", e);

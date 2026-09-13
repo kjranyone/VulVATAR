@@ -466,7 +466,6 @@ impl TrackingWorker {
         info!("tracking-worker: RealSense opened successfully");
         stagelog::mark(0, "provider_load_end");
         ready.store(true, Ordering::SeqCst);
-        let mut last_calibration_seq: u64 = 0;
         // P3-03 pose-Hz pacing state (device-clock accumulator).
         let mut pose_next_pub_ms: f64 = 0.0;
         let mut pose_published_once = false;
@@ -485,15 +484,6 @@ impl TrackingWorker {
             else {
                 break;
             };
-
-            // Forward calibration updates to the provider (edge-detected:
-            // forward only on change).
-            if let Some(ref mut provider) = pose_provider {
-                if let Some((cal, seq)) = mailbox.poll_calibration(last_calibration_seq) {
-                    provider.set_calibration(cal);
-                    last_calibration_seq = seq;
-                }
-            }
 
             let width = rs_frame.width;
             let height = rs_frame.height;

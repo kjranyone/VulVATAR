@@ -126,11 +126,8 @@ pub(super) fn derive_face_pose_from_body(
     // visible ear reflected through the nose's XZ position. Nose
     // is forward of the head's actual rotation axis, so the
     // reflection over-rotates the reconstructed ear and `ear_dz`
-    // carries a systematic yaw-magnitude bias in these views. Note
-    // this bias is NOT absorbed by the per-session calibration: the
-    // reconstruction only fires on occluded-ear (turned-head) frames,
-    // and the calibration neutral is captured during a *frontal* hold
-    // where this branch never runs. The bias is accepted as-is —
+    // carries a systematic yaw-magnitude bias in these views. The bias
+    // is accepted as-is —
     // it overstates how far the head is turned but preserves turn
     // direction and motion continuity, which is what the avatar's
     // head bone visibly needs in profile views.
@@ -224,8 +221,7 @@ const DLIB_EYE_CORNERS: [usize; 4] = [36, 39, 42, 45];
 
 /// Frontal-neutral value of the vertical ratio below, i.e. how far down the
 /// eye-line→chin span the nose tip sits on a level head. Measured 0.26 over
-/// the live desk capture's level-gaze frames (2026-07-27); the per-person
-/// residual is absorbed by `PoseCalibration::neutral_face_ypr_body`.
+/// the live desk capture's level-gaze frames (2026-07-27).
 const VERTICAL_RATIO_NEUTRAL: f32 = 0.26;
 /// Converts the ratio's deviation from neutral into `tan(pitch)`. The ratio
 /// moves as `a/b + (d/b)·tan(pitch)` where `b` is the eye-line→chin distance
@@ -307,11 +303,8 @@ fn legacy_pitch_from_inter_eye(
     // neutral pose the nose tip sits a fixed fraction below the eye line,
     // so the raw ratio maps to a large spurious `+pitch` (chin-down) —
     // before this subtraction a forward-facing head decoded ~50° down.
-    // The per-person residual (camera height, face proportions) is
-    // absorbed by `PoseCalibration::neutral_face_ypr_body`, captured
-    // during the Calibrate Pose hold (from `face_body_raw`, so the
-    // body path is measured even while the mesh wins selection) and
-    // subtracted per-source in `apply_calibration`.
+    // Per-person residuals (camera height, face proportions) are not
+    // corrected anywhere; the constant is a population neutral.
     //
     // Computed in model-pixel space (`nx·INPUT_W, ny·INPUT_H`) rather than
     // source space so the ratio is independent of the shoulder-derived
@@ -541,16 +534,10 @@ impl FaceSourceSelector {
                                 yaw: lerp_angle(from.yaw, target.yaw, t),
                                 pitch: lerp_angle(from.pitch, target.pitch, t),
                                 roll: lerp_angle(from.roll, target.roll, t),
-                                // Calibration must interpolate the per-source
-                                // neutrals with this same t (see
-                                // `FacePose::blend`). `from.source` is exact
-                                // for a switch out of steady state; a switch
-                                // landing mid-blend anchors on the previous
-                                // target's source, whose neutral only
-                                // approximates the mixed anchor pose — the
-                                // residual is bounded by the neutral gap
-                                // times the interrupted blend's remaining
-                                // fraction and decays over this blend.
+                                // `from.source` is exact for a switch out
+                                // of steady state; a switch landing
+                                // mid-blend anchors on the previous
+                                // target's source.
                                 blend: Some((from.source, t)),
                                 ..target
                             }
@@ -613,7 +600,6 @@ mod tests {
     /// Nominal 30 fps step — the baseline the crossfade schedule was
     /// calibrated at (6 blended frames, target on the 7th).
     const DT: f32 = 1.0 / 30.0;
-    /// Ideal per-frame calibrated-space increment divisor at 30 fps.
     const BLEND_STEPS_AT_30: u32 = 7;
 
     fn dj(nx: f32, ny: f32, nz: f32) -> DecodedJoint {
@@ -904,86 +890,8 @@ mod tests {
     }
 
     #[test]
-    fn crossfade_is_continuous_in_calibrated_space() {
-        // C1 regression: the crossfade blends RAW angles, but the
-        // per-source neutral subtraction keys on the (target) source
-        // tag. Without interpolating the neutrals with the same t, the
-        // switch frame subtracts the full target neutral from angles
-        // that are still ~6/7 from-source — the inter-source neutral
-        // gap appears as a calibrated-space head step on the exact
-        // frame the crossfade exists to smooth.
-        use crate::tracking::{
-            CalibrationMode, PoseCalibration, SourceSkeleton, TrackingCalibration,
-        };
-        let n_body = [0.3, 0.0, 0.0];
-        let n_mesh = [-0.5, 0.0, 0.0];
-        let cal = TrackingCalibration {
-            pose: Some(PoseCalibration {
-                mode: CalibrationMode::UpperBody,
-                captured_at: String::new(),
-                captured_at_unix: 0,
-                frame_count: 1,
-                q_neutral: None,
-                anchor_x: 0.0,
-                anchor_y: 0.0,
-                anchor_depth_m: None,
-                confidence: 1.0,
-                anchor_depth_jitter_m: None,
-                shoulder_span_m: None,
-                x_range_observed: None,
-                z_range_observed: None,
-                neutral_expressions: Vec::new(),
-                neutral_face_ypr_mesh: Some(n_mesh),
-                neutral_face_ypr_body: Some(n_body),
-                neutral_body_yaw: None,
-            }),
-        };
-        let calibrated = |p: FacePose| -> f32 {
-            let mut sk = SourceSkeleton::default();
-            sk.face = Some(p);
-            cal.apply_calibration(&mut sk);
-            sk.face.unwrap().yaw
-        };
-
-        // Body at its own neutral (calibrated 0), mesh well off it.
-        let body = pose(n_body[0], 0.7);
-        let mesh = mesh_pose(-1.07, 1.0);
-        let mesh_cal_target = -1.07 - n_mesh[0]; // −0.57
-
-        let mut sel = FaceSourceSelector::default();
-        let mut prev = calibrated(sel.select(Some(body), Some(mesh), 0.05, DT).unwrap());
-        assert!(prev.abs() < 1e-6, "body at its neutral must calibrate to 0");
-
-        // Switch to mesh: every calibrated-space step must stay near
-        // the ideal per-frame increment (gap / (BLEND+1) ≈ 0.081) —
-        // in particular NO step anywhere near the raw neutral gap
-        // (0.8) or the pre-fix switch-frame jump (~0.6).
-        let gap = (mesh_cal_target - prev).abs();
-        let max_step = gap / BLEND_STEPS_AT_30 as f32 + 0.01;
-        for frame in 0..12 {
-            let now = calibrated(sel.select(Some(body), Some(mesh), 0.9, DT).unwrap());
-            assert!(
-                (now - prev).abs() <= max_step,
-                "frame {frame}: calibrated yaw stepped {:.3} (limit {:.3})",
-                (now - prev).abs(),
-                max_step
-            );
-            prev = now;
-            if (now - mesh_cal_target).abs() < 1e-6 {
-                break;
-            }
-        }
-        assert!(
-            (prev - mesh_cal_target).abs() < 1e-6,
-            "must converge to the mesh calibrated pose, ended at {prev}"
-        );
-    }
-
-    #[test]
     fn blend_metadata_marks_only_crossfade_frames() {
-        // P4 regression: the calibration hold keys on `FacePose::blend`
-        // to reject mid-crossfade frames (target tag over mixed
-        // angles). Steady frames must NOT carry it, every crossfade
+        // Steady frames must NOT carry the blend mark, every crossfade
         // frame must, and it must clear once the blend completes.
         let body = pose(-0.04, 0.7);
         let mesh = mesh_pose(-1.07, 1.0);
@@ -1033,7 +941,7 @@ mod tests {
         let at_15 = count_blend_frames(2.0 * DT);
         assert_eq!(
             at_30, 6,
-            "30 fps keeps the calibrated 6-blended-frame schedule"
+            "30 fps keeps the 6-blended-frame schedule"
         );
         assert_eq!(
             at_15, 3,

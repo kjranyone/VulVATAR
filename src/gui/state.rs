@@ -115,9 +115,8 @@ pub struct ViewportUiState {
     /// Whether the 2D detection annotation overlay is drawn over the
     /// camera-wipe PIP.
     pub show_detection_annotations: bool,
-    /// egui texture for the camera-wipe PIP (separate from the
-    /// calibration preview's texture so toggling either doesn't tear
-    /// the other).
+    /// egui texture for the camera-wipe PIP (separate texture slot so
+    /// toggling the PIP doesn't tear the preview).
     pub camera_wipe_texture: Option<egui::TextureHandle>,
     /// Preview-mailbox sequence of the last frame we uploaded into
     /// `camera_wipe_texture`. Driven off `preview_sequence`, not

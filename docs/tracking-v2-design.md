@@ -4,7 +4,7 @@
 本書は **As-Is の仕様** を書く。変更の経緯・計測記録は git log と `diagnostics/` に置き、ここには残さない。
 
 関連: [architecture.md](architecture.md), [threading-model.md](threading-model.md),
-[calibration-ux.md](calibration-ux.md)。運用手順 (ライブ計測・録画・リプレイ) は `CLAUDE.md`。
+運用手順 (ライブ計測・録画・リプレイ) は `CLAUDE.md`。
 
 ---
 
@@ -150,7 +150,7 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
   + Σ ρ_C(‖J(x) − p‖²/σ²)          深度リフト 3D 点
   + Σ ρ_C(d(p, surface)²/σ²)       表面点 (gate 0.20 m × GNC)
   + OriObs / ShoulderYawObs         SO(3) / 1-DoF 方位観測
-  + hinge(q) + ‖q − q_neutral‖²    関節限界・姿勢事前
+  + hinge(q) + ‖q − q̄‖²           関節限界・姿勢事前 (q̄ はモデル relaxed pose)
   + (root up · x, z)²/σ²           root 直立事前 (σ 0.12)
   + (trunk axis · z)²/σ²           胴軸事前 (σ 0.15): 骨盤が画面外のとき面項が下部胴をカメラ側へ振る (root 深度 0.79→0.43 m) のを止める
   + ‖x_t − f(x_{t−1})‖²_Q          時間事前 (q_joint 2.0 rad²/s、頭は trunk に含め q 0.15)
@@ -203,7 +203,6 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_HOLD_Q` / `VULVATAR_NO_UPRIGHT` / `VULVATAR_TRUNK_AXIS_SIGMA` | 未観測肢ホールド係数 / 胴軸事前の無効化・σ |
 | `VULVATAR_FUSION_OBSDUMP=<frame>` | 観測とモデルの対応ダンプ |
 | `VULVATAR_REPLAY_CPU` / `VULVATAR_REPLAY_NO_YOLOX` | リプレイの EP / YOLOX 無効化 (CPU と DirectML の SimCC 統計は小数 4 桁で一致) |
-| `VULVATAR_FUSION_NO_QNEUTRAL` | キャリブレーションの q_neutral 姿勢事前を無効化 (モデル既定の relaxed-pose 事前に戻す) |
 
 ---
 
@@ -219,7 +218,7 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | リターゲット・アプリ配線 | ✅ (v1 経路は削除済み) |
 | align-to-color 廃止 (native 深度 + extrinsics) | ❌ 未着手 |
 | AprilTag GT リグ / 実データ mm-deg ベンチ | ❌ 未着手 |
-| 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床なし。姿勢事前のみ q_neutral 実装済み (キャリブレーションホールドの関節角中央値が各関節の prior mean を差し替え、σ は不変。効果検証は `VULVATAR_FUSION_NO_QNEUTRAL` で A/B) |
+| 脚・床平面・学習姿勢事前 | △ 脚はモデル・観測にあるが床なし。姿勢事前はモデル relaxed pose のみ (キャリブレーション由来の q_neutral は 2026-09-13 に撤去済み) |
 
 既知の課題:
 
@@ -231,8 +230,4 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 - 未観測腕のプロセスノイズ (q_joint 2.0) が緩く、腕の観測が消えた/戻った時の往復が残る。
 - 肘の深度リフトに約 14 cm の系統誤差 (Cauchy で無視されている)。
 - 参照 (胸部深度勾配) と `ShoulderYawObs` は同じ物理信号なので、参照だけでは姿勢の正しさを証明できない。独立指標は 2D 再投影誤差と合成目視。
-- q_neutral (mean 置換・σ 不変) の A/B 測定 (2026-09-13, `diagnose_fusion_replay --qneutral-hold 90` = 先頭 90 frame の解関節中央値を注入、対照: 注入+`VULVATAR_FUSION_NO_QNEUTRAL` で baseline と完全一致):
-  - s1789234881 (斜めデスク・参照無し): 胴 yaw std **12.5° → 2.4°**、root z レンジ 0.166 → 0.097 m、estimator 30.8 → 28.8 ms。手首指標は不変~改善。
-  - s1789219959 (肩深度参照あり): yaw 参照誤差 **−0.1° → −4.6°** (hold 自体が推定バイアス ~5° を焼き込む)、yaw std 2.1 → 2.4、R 手首 max jump 0.413 → 0.198 m。
-  - 解釈: 観測が弱い (デスク構図) セッションの drift/wander を強力に止める一方、よく観測されたセッションでは hold 時点の推定誤差方向へ pin する。次の改良候補は関節別 data-σ による prior の重み調整だが、σ は本測定をベースに段階的に。
 - align-to-color 廃止の初手として「リプレイが meta.jsonl の実 intrinsics を読む」改善が有効 (現在は名目 D435 値で固定、AGENTS.md の前提)。ただし bench 数値の連続性が切れるので opt-in フラグ (`--real-intrinsics`) で。

@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::tracking::PoseCalibration;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamProfile {
     pub name: String,
@@ -26,15 +24,6 @@ pub struct StreamProfile {
     pub output_color_space_index: usize,
     #[serde(default)]
     pub output_msaa_index: usize,
-    /// Per-setup pose calibration. Lives on the profile (rather than
-    /// the project file) so the user's "home desk" setup vs.
-    /// "office desk" setup can each carry its own anchor / range
-    /// values and switching profiles snaps the depth pipeline to
-    /// the right baseline. `None` until the user runs `Calibrate
-    /// Pose ▼` while this profile is active. See
-    /// `docs/calibration-ux.md`.
-    #[serde(default)]
-    pub pose_calibration: Option<PoseCalibration>,
 }
 
 fn default_output_has_alpha() -> bool {
@@ -56,7 +45,6 @@ impl StreamProfile {
             output_has_alpha: true,
             output_color_space_index: 0,
             output_msaa_index: 0,
-            pose_calibration: None,
         }
     }
 
@@ -76,7 +64,6 @@ impl StreamProfile {
             output_has_alpha: true,
             output_color_space_index: 0,
             output_msaa_index: 0,
-            pose_calibration: None,
         }
     }
 
@@ -96,7 +83,6 @@ impl StreamProfile {
             output_has_alpha: true,
             output_color_space_index: 0,
             output_msaa_index: 0,
-            pose_calibration: None,
         }
     }
 }
@@ -144,9 +130,9 @@ impl ProfileLibrary {
     }
 
     /// Whether `remove` may be called at all: the library must never
-    /// become empty (calibration and output settings live on the
-    /// active profile — an empty library would leave the app with no
-    /// place to persist them).
+    /// become empty (output settings live on the active profile — an
+    /// empty library would leave the app with no place to persist
+    /// them).
     pub fn can_remove(&self) -> bool {
         self.profiles.len() > 1
     }
@@ -169,10 +155,8 @@ impl ProfileLibrary {
         }
     }
 
-    /// Deep-copy the profile at `index` (calibration included — a
-    /// duplicate exists to tweak a working setup, so it starts from
-    /// the same baseline), append it under a uniquified name, and
-    /// return the new profile's index.
+    /// Deep-copy the profile at `index`, append it under a uniquified
+    /// name, and return the new profile's index.
     pub fn duplicate_at(&mut self, index: usize) -> Option<usize> {
         let source = self.profiles.get(index)?.clone();
         let mut copy = source;
@@ -272,36 +256,6 @@ mod profile_management_tests {
         // Duplicating the duplicate keeps walking the suffix.
         let idx2 = lib.duplicate_at(2).expect("duplicate again");
         assert_eq!(lib.profiles[idx2].name, "Desk (3) (2)");
-    }
-
-    #[test]
-    fn duplicate_carries_calibration_with_it() {
-        let mut lib = library_with(&["Desk"], 0);
-        lib.profiles[0].pose_calibration = Some(crate::tracking::PoseCalibration {
-            mode: crate::tracking::CalibrationMode::UpperBody,
-            captured_at: "2026-01-15T12:34:56Z".to_string(),
-            captured_at_unix: 1_768_654_496,
-            frame_count: 12,
-            anchor_x: 0.0,
-            anchor_y: 0.0,
-            anchor_depth_m: Some(1.2),
-            confidence: 0.9,
-            anchor_depth_jitter_m: None,
-            shoulder_span_m: Some(0.4),
-            x_range_observed: None,
-            z_range_observed: None,
-            neutral_expressions: Vec::new(),
-            neutral_face_ypr_mesh: None,
-            neutral_face_ypr_body: None,
-            neutral_body_yaw: None,
-            q_neutral: None,
-        });
-        let idx = lib.duplicate_at(0).expect("duplicate");
-        assert!(
-            lib.profiles[idx].pose_calibration.is_some(),
-            "a duplicate exists to tweak a working setup — it must start \
-             from the same calibration baseline"
-        );
     }
 
     #[test]
@@ -406,33 +360,6 @@ mod profile_roundtrip_tests {
             output_has_alpha: false,
             output_color_space_index: 1,
             output_msaa_index: 3,
-            // Distinctive non-default values so a missing-field
-            // deserialization that filled in `None` would be caught
-            // by the assertions below. The captured-at* / frame_count
-            // / anchor / depth fields are all set to specific values
-            // that don't match any preset constructor.
-            pose_calibration: Some(crate::tracking::PoseCalibration {
-                mode: crate::tracking::CalibrationMode::UpperBody,
-                captured_at: "2026-01-15T12:34:56Z".to_string(),
-                captured_at_unix: 1_768_654_496,
-                frame_count: 47,
-                anchor_x: 0.125,
-                anchor_y: -0.0625,
-                anchor_depth_m: Some(1.875),
-                confidence: 0.875,
-                anchor_depth_jitter_m: Some(0.025),
-                shoulder_span_m: Some(0.412),
-                x_range_observed: Some(0.6),
-                z_range_observed: Some(0.35),
-                // Tiny 2×2 template is enough to round-trip-check
-                // the serde plumbing; the inference-time path uses
-                // 32×32 grids in production.
-                neutral_expressions: Vec::new(),
-                neutral_face_ypr_mesh: Some([-0.61, 0.14, 0.02]),
-                neutral_face_ypr_body: Some([-0.55, 0.31, 0.01]),
-                neutral_body_yaw: Some(-0.42),
-            q_neutral: None,
-            }),
         }
     }
 
@@ -470,59 +397,6 @@ mod profile_roundtrip_tests {
         assert_eq!(r.output_has_alpha, o.output_has_alpha);
         assert_eq!(r.output_color_space_index, o.output_color_space_index);
         assert_eq!(r.output_msaa_index, o.output_msaa_index);
-
-        // pose_calibration must round-trip every field — the per-axis
-        // anchor + depth + jitter + range values all drive solver
-        // behaviour, so a silent default insertion here would be a
-        // calibration-loss bug across an app restart.
-        match (&r.pose_calibration, &o.pose_calibration) {
-            (Some(rc), Some(oc)) => {
-                assert_eq!(rc.mode, oc.mode);
-                assert_eq!(rc.captured_at, oc.captured_at);
-                assert_eq!(rc.captured_at_unix, oc.captured_at_unix);
-                assert_eq!(rc.frame_count, oc.frame_count);
-                approx_eq(rc.anchor_x, oc.anchor_x, "pose.anchor_x");
-                approx_eq(rc.anchor_y, oc.anchor_y, "pose.anchor_y");
-                match (rc.anchor_depth_m, oc.anchor_depth_m) {
-                    (Some(a), Some(b)) => approx_eq(a, b, "pose.anchor_depth_m"),
-                    (None, None) => {}
-                    _ => panic!("pose.anchor_depth_m presence drifted across round-trip"),
-                }
-                approx_eq(rc.confidence, oc.confidence, "pose.confidence");
-                match (rc.anchor_depth_jitter_m, oc.anchor_depth_jitter_m) {
-                    (Some(a), Some(b)) => approx_eq(a, b, "pose.anchor_depth_jitter_m"),
-                    (None, None) => {}
-                    _ => panic!("pose.anchor_depth_jitter_m presence drifted across round-trip"),
-                }
-                match (rc.x_range_observed, oc.x_range_observed) {
-                    (Some(a), Some(b)) => approx_eq(a, b, "pose.x_range_observed"),
-                    (None, None) => {}
-                    _ => panic!("pose.x_range_observed presence drifted across round-trip"),
-                }
-                match (rc.z_range_observed, oc.z_range_observed) {
-                    (Some(a), Some(b)) => approx_eq(a, b, "pose.z_range_observed"),
-                    (None, None) => {}
-                    _ => panic!("pose.z_range_observed presence drifted across round-trip"),
-                }
-                match (rc.neutral_face_ypr_mesh, oc.neutral_face_ypr_mesh) {
-                    (Some(a), Some(b)) => approx_eq_arr3(a, b, "pose.neutral_face_ypr_mesh"),
-                    (None, None) => {}
-                    _ => panic!("pose.neutral_face_ypr_mesh presence drifted across round-trip"),
-                }
-                match (rc.neutral_face_ypr_body, oc.neutral_face_ypr_body) {
-                    (Some(a), Some(b)) => approx_eq_arr3(a, b, "pose.neutral_face_ypr_body"),
-                    (None, None) => {}
-                    _ => panic!("pose.neutral_face_ypr_body presence drifted across round-trip"),
-                }
-                match (rc.neutral_body_yaw, oc.neutral_body_yaw) {
-                    (Some(a), Some(b)) => approx_eq(a, b, "pose.neutral_body_yaw"),
-                    (None, None) => {}
-                    _ => panic!("pose.neutral_body_yaw presence drifted across round-trip"),
-                }
-            }
-            (None, None) => {}
-            _ => panic!("pose_calibration presence drifted across round-trip"),
-        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -574,12 +448,12 @@ mod profile_roundtrip_tests {
         // The core fields (tracking_mirror, lighting, fov, sink /
         // resolution / framerate indices) carry no `#[serde(default)]`,
         // so a partial JSON must error rather than silently fill in
-        // zeros. Only later-added fields (pose_calibration, the output
-        // alpha / colour-space / MSAA trio) default for backwards
-        // compat. If a future change adds defaults to the core fields,
-        // this test will start passing unexpectedly — that's the moment
-        // to revisit whether the chosen default is what the GUI
-        // actually wants and to expand the round-trip coverage above.
+        // zeros. Only later-added fields (the output alpha /
+        // colour-space / MSAA trio) default for backwards compat. If a
+        // future change adds defaults to the core fields, this test
+        // will start passing unexpectedly — that's the moment to
+        // revisit whether the chosen default is what the GUI actually
+        // wants and to expand the round-trip coverage above.
         let dir = make_tempdir("partial");
         let path = dir.join("partial.json");
         // Missing every field except `name`.

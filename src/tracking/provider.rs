@@ -65,15 +65,6 @@ pub trait PoseProvider {
         frame_index: u64,
     ) -> PoseEstimate;
 
-    /// Update the provider's view of the user's pose calibration. The
-    /// tracking worker calls this each iteration with the latest value
-    /// from `Application::tracking_calibration.pose` (forwarded via
-    /// the calibration mailbox); the depth pipeline uses it to switch
-    /// anchor selection (`Upper Body` mode forces shoulder anchor) and
-    /// to clamp the metric calibration scale against the captured
-    /// jitter range.
-    fn set_calibration(&mut self, _calibration: Option<crate::tracking::PoseCalibration>) {}
-
     /// Reset per-session temporal state (self-tracking crop, YOLOX
     /// sticky result, fusion estimator). Called between *unrelated*
     /// inputs — `validate_gt` calls this before every pose so pose N's

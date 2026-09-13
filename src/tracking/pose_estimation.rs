@@ -86,7 +86,7 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
         roll: 0.0,
         confidence,
         // Not a real estimator (skin-centroid sway fallback); tag as
-        // Body so no mesh-calibrated neutral gets subtracted from it.
+        // Body so downstream source-keyed logic treats it accordingly.
         ..Default::default()
     });
     skeleton.overall_confidence = confidence;

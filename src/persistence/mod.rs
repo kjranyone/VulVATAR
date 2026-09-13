@@ -5,7 +5,7 @@
 //! Module layout:
 //! - `project`       — `ProjectState` / `ProjectFile`, save + load +
 //!                     the version-migration chain, `.vvtcloth` overlays
-//! - `project_dto`   — on-disk config DTOs + calibration conversions
+//! - `project_dto`   — on-disk config DTOs
 //! - `app_settings`  — app-level settings (independent of projects)
 //! - `library`       — the %APPDATA% small-file family
 //! - `scene_presets` — saved lighting/camera/rendering presets
@@ -53,8 +53,6 @@ use project::{app_tag, default_gravity_direction, default_spring_sway_scale, def
 use app_settings::{load_app_settings_from, migrate_legacy_app_settings_from, save_app_settings_to};
 #[cfg(test)]
 use project::{migrate_chain, migrate_cloth_overlay_json, read_format_version};
-#[cfg(test)]
-use project_dto::{default_true, dto_to_pose_calibration, PoseCalibrationDto};
 
 #[cfg(test)]
 mod tests;

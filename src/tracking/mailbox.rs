@@ -11,8 +11,8 @@
 //! write) used to be one-lock atomic. They now span two locks (pose
 //! and preview), so a reader that races a writer can observe the new
 //! pose-side sequence with the previous frame for at most one
-//! publish_estimate. The GUI consumers (`viewport.rs` camera wipe,
-//! `calibration/refresh.rs` telemetry) dedup on `sequence`, so a
+//! publish_estimate. The GUI consumers (`viewport.rs` camera wipe)
+//! dedup on `sequence`, so a
 //! torn read shows up as one extra "no-update" frame at worst — no
 //! rendering corruption.
 //!
@@ -24,9 +24,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::{
-    PoseCalibration, PoseEstimate, SourceSkeleton, TrackingErrorLevel, TrackingSmoothingParams,
-};
+use super::{PoseEstimate, SourceSkeleton, TrackingErrorLevel, TrackingSmoothingParams};
 
 #[derive(Clone)]
 pub struct TrackingMailbox {
@@ -43,11 +41,6 @@ pub struct TrackingMailbox {
     /// Low-frequency worker → GUI diagnostics: error toasts +
     /// inference backend label.
     diagnostics: Arc<Mutex<DiagnosticsMailboxInner>>,
-    /// Bidirectional calibration channel: GUI → worker commands
-    /// (calibration, torso-capture toggle, mode hint) plus worker → GUI
-    /// results (captured torso template). All edge-detected via
-    /// matching `_seq` counters.
-    calibration: Arc<Mutex<CalibrationChannelInner>>,
     stale_timeout_nanos: u64,
 }
 
@@ -92,21 +85,6 @@ struct DiagnosticsMailboxInner {
     inference_backend_label: Option<String>,
 }
 
-struct CalibrationChannelInner {
-    /// Latest pose-calibration capture pushed from the GUI. The
-    /// tracking worker reads this each iteration and forwards it to
-    /// the provider via `PoseProvider::set_calibration`. Replaces
-    /// (rather than queues) on each write — only the most recent
-    /// value matters; the worker doesn't care about intermediate
-    /// captures the user dismissed.
-    calibration: Option<PoseCalibration>,
-    /// Bumped each time `set_calibration` writes. The worker compares
-    /// against its last-seen value to skip the `set_calibration`
-    /// call on iterations where nothing changed (avoids the per-frame
-    /// `Option::clone` of the calibration).
-    calibration_seq: u64,
-}
-
 /// Captured snapshot of the tracking mailbox state. Not strictly
 /// cross-lock-atomic — see `TrackingMailbox::snapshot` for the
 /// torn-read trade-off. `sequence` is the pose-side counter (use for
@@ -143,10 +121,6 @@ impl TrackingMailbox {
             diagnostics: Arc::new(Mutex::new(DiagnosticsMailboxInner {
                 pending_error: None,
                 inference_backend_label: None,
-            })),
-            calibration: Arc::new(Mutex::new(CalibrationChannelInner {
-                calibration: None,
-                calibration_seq: 0,
             })),
             stale_timeout_nanos: TrackingSmoothingParams::default().stale_timeout_nanos,
         }
@@ -231,29 +205,6 @@ impl TrackingMailbox {
     pub fn drain_error(&self) -> Option<(String, TrackingErrorLevel)> {
         let mut d = self.diagnostics.lock().unwrap_or_else(|e| e.into_inner());
         d.pending_error.take()
-    }
-
-    /// GUI-side push: stash the latest pose calibration so the worker
-    /// thread can pick it up on its next iteration. Replaces (rather
-    /// than queues) — only the most recent value matters; bumping the
-    /// sequence lets the worker skip the per-frame
-    /// `set_calibration` call when nothing changed.
-    pub fn set_calibration(&self, calibration: Option<PoseCalibration>) {
-        let mut c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        c.calibration = calibration;
-        c.calibration_seq += 1;
-    }
-
-    /// Worker-side poll: returns `Some((calibration, seq))` only when
-    /// `seq` has advanced past `last_seen_seq`, so the worker
-    /// processes a calibration update at most once per write.
-    pub fn poll_calibration(&self, last_seen_seq: u64) -> Option<(Option<PoseCalibration>, u64)> {
-        let c = self.calibration.lock().unwrap_or_else(|e| e.into_inner());
-        if c.calibration_seq != last_seen_seq {
-            Some((c.calibration.clone(), c.calibration_seq))
-        } else {
-            None
-        }
     }
 
     /// Set the inference-backend label. Called once by the worker after
@@ -357,30 +308,6 @@ mod mailbox_tests {
         let snap = mb.snapshot();
         assert_eq!(snap.sequence, 1);
         assert_eq!(snap.preview_sequence, 1);
-    }
-
-    #[test]
-    fn calibration_command_and_template_use_independent_seqs() {
-        let mb = TrackingMailbox::new();
-        // Calibration command seq is independent of pose / preview seq.
-        mb.set_calibration(None);
-        let snap = mb.snapshot();
-        assert_eq!(snap.sequence, 0, "calibration write must not bump pose seq");
-        assert_eq!(
-            snap.preview_sequence, 0,
-            "calibration write must not bump preview seq"
-        );
-
-        // Calibration mailbox uses its own seqs for edge detection.
-        assert!(
-            mb.poll_calibration(0).is_some(),
-            "first poll sees the write"
-        );
-        let observed_seq = mb.poll_calibration(0).map(|(_, s)| s).unwrap();
-        assert!(
-            mb.poll_calibration(observed_seq).is_none(),
-            "no advance, no work"
-        );
     }
 
     #[test]

@@ -157,15 +157,6 @@ impl GuiApp {
             smoothing_rotation_blend: self.tracking.smoothing.rotation_blend,
             smoothing_expression_blend: self.tracking.smoothing.expression_blend,
             smoothing_face_confidence: self.tracking.smoothing.face_confidence_threshold,
-            // Calibration now lives on `StreamProfile.pose_calibration`
-            // (per-room/setup storage), not the project file. New saves
-            // never emit this field — the on-disk DTO has
-            // `#[serde(skip_serializing_if = "Option::is_none")]` so
-            // older project files that *did* carry a calibration get
-            // their value migrated onto the active profile by
-            // `load_state`, then this `None` ensures the field is
-            // dropped from the next save.
-            pose_calibration: None,
 
             material_mode_index: self.rendering.material_mode_index,
             light_direction: self.rendering.main_light_dir,
@@ -283,21 +274,6 @@ impl GuiApp {
         self.output.output_has_alpha = profile.output_has_alpha;
         self.output.output_color_space_index = profile.output_color_space_index;
         self.output.msaa_index = profile.output_msaa_index;
-        // Pose calibration follows the profile — switching to "Office
-        // desk" pulls in the office calibration; switching to "Home
-        // setup" pulls in the home one. Push to both Application
-        // (so the solver's per-frame `apply_calibration` sees it
-        // next tick) and the tracking mailbox (so the depth-pipeline
-        // provider re-applies the c-clamp / anchor-mode for the new
-        // setup). `None` here is meaningful: it deliberately clears
-        // any previous setup's calibration so the auto-EMA falls
-        // back to its first-frame seed instead of carrying over a
-        // baseline from the wrong room.
-        self.app.tracking_calibration.pose = profile.pose_calibration.clone();
-        self.app
-            .tracking
-            .mailbox()
-            .set_calibration(profile.pose_calibration.clone());
         // Profiles don't carry lipsync settings; pass current App requested
         // state to keep them unchanged.
         self.apply_pipeline_bound_settings(
@@ -340,41 +316,6 @@ impl GuiApp {
         self.tracking.smoothing.rotation_blend = state.smoothing_rotation_blend;
         self.tracking.smoothing.expression_blend = state.smoothing_expression_blend;
         self.tracking.smoothing.face_confidence_threshold = state.smoothing_face_confidence;
-        // Pose calibration migration: per-profile storage replaced
-        // per-project storage in this version. When the loaded
-        // project file carries a legacy `pose_calibration` value
-        // *and* the currently-active profile has none yet, treat it
-        // as a one-time rescue and copy it onto the profile (marking
-        // the profile library dirty so it lands in `profiles.json`
-        // on the next autosave). When the profile already has a
-        // calibration, the legacy value is discarded — the user has
-        // since calibrated under the per-profile model and that
-        // takes precedence.
-        //
-        // Either way, push the *resulting* calibration (active
-        // profile's, post-rescue) to Application + tracking mailbox
-        // so the solver and depth pipeline see the right value
-        // immediately. Calling with `None` is meaningful — it means
-        // "no calibration for this profile; fall back to auto-EMA".
-        if let Some(legacy) = state.pose_calibration.as_ref() {
-            if let Some(idx) = self.profiles.active_index {
-                if let Some(active_profile) = self.profiles.profiles.get_mut(idx) {
-                    if active_profile.pose_calibration.is_none() {
-                        active_profile.pose_calibration = Some(legacy.clone());
-                        self.project_status.profiles_dirty = true;
-                    }
-                }
-            }
-        }
-        let active_calibration = self
-            .profiles
-            .active()
-            .and_then(|p| p.pose_calibration.clone());
-        self.app.tracking_calibration.pose = active_calibration.clone();
-        self.app
-            .tracking
-            .mailbox()
-            .set_calibration(active_calibration);
 
         self.rendering.material_mode_index = state.material_mode_index;
         self.rendering.main_light_dir = state.light_direction;
@@ -594,8 +535,8 @@ impl GuiApp {
     /// set, retries back off exponentially (250 ms → 10 s), and the user
     /// sees exactly one sticky error toast per failing target, cleared
     /// when a later attempt succeeds. Profiles and settings previously
-    /// cleared their dirty flag on failure, silently discarding pose
-    /// calibrations and locale changes.
+    /// cleared their dirty flag on failure, silently discarding
+    /// locale changes.
     pub(super) fn autosave_tick(&mut self) {
         // Unsaved-state autosave (session slot or project sidecar). No
         // toast on success: a "saved" notification firing 4× a second
@@ -638,11 +579,9 @@ impl GuiApp {
             }
         }
 
-        // Profile-library autosave. Triggered by the Calibrate Pose
-        // modal writing into the active profile's `pose_calibration`,
-        // and by any future profile-edit UI. Calibration data is
-        // expensive to recapture, so a failure keeps the dirty flag,
-        // backs off, and surfaces a sticky error toast.
+        // Profile-library autosave. Triggered by any profile-edit UI.
+        // A failure keeps the dirty flag, backs off, and surfaces a
+        // sticky error toast.
         if self.project_status.profiles_dirty && self.project_status.profiles_save_retry.due() {
             self.project_status.profiles_save_retry.record_attempt();
             match crate::persistence::save_profiles(&self.profiles) {

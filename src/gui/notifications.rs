@@ -17,9 +17,8 @@
 //!   underlying condition resolves (e.g. a save finally succeeding).
 //!
 //! Toasts are drawn on `egui::Order::Tooltip` so they sit above every
-//! modal (`Foreground`), the calibration scrim (`Middle`), and ordinary
-//! panels — they're read-only status reports and should be visible
-//! regardless of what dialog is open.
+//! modal (`Foreground`) and ordinary panels — they're read-only status
+//! reports and should be visible regardless of what dialog is open.
 
 use std::time::Instant;
 
@@ -162,8 +161,7 @@ impl GuiApp {
         egui::Area::new(egui::Id::new("notifications"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -40.0))
             // Tooltip ordering puts toasts above every modal
-            // (`Order::Foreground`), the calibration scrim
-            // (`Order::Middle`), and ordinary panels (default
+            // (`Order::Foreground`) and ordinary panels (default
             // `Order::Middle`). Notifications are read-only
             // status reports — they should always be visible
             // regardless of what dialog is open.

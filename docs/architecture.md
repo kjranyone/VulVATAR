@@ -562,7 +562,7 @@ per-concern sibling files:
 - `src/asset/vrc/{mod,unitypackage,physbone,tests}.rs`
 - `src/tracking/fusion/{mod,estimator,observe,output,provider,model,math,hands,seed}.rs`
 - `src/tracking/rtmw3d/{mod,consts,decode,preprocess,face,annotation,session,yolox_worker}.rs`
-- `src/tracking/{calibration, debug_channel, face_mediapipe, realsense, source_skeleton, yolox}.rs`
+- `src/tracking/{debug_channel, face_mediapipe, realsense, source_skeleton, yolox}.rs`
 - `src/gui/inspector/{mod,avatar,tracking,rendering,output,cloth,library,settings}.rs`
 
 Directory discipline: split by responsibility inside each top-level
@@ -605,7 +605,6 @@ Detailed contracts per domain:
 - [threading-model.md](threading-model.md) — thread roles, ownership, shutdown order
 - [gpu-runtime-roadmap.md](gpu-runtime-roadmap.md) — GPU pressure policy (`RuntimeGpuBudget`)
 - [tracking-v2-design.md](tracking-v2-design.md) — fusion estimator + retarget contract
-- [calibration-ux.md](calibration-ux.md) — pose calibration spec
 - [output-interop.md](output-interop.md) — GPU frame handoff / VGTK sidecar protocol
 - [mf-virtual-camera.md](mf-virtual-camera.md) — MediaFoundation virtual camera contract
 - [vulkano-renderer-design.md](vulkano-renderer-design.md) — renderer design, API boundary, materials, MToon status

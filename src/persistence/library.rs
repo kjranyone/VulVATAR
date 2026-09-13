@@ -107,9 +107,8 @@ fn recent_avatars_path() -> std::path::PathBuf {
 /// Where the user's `StreamProfile` library is stored. Lives next to
 /// `last_session.vvtproj` under the OS app-data dir so the same set of
 /// profiles is available across every project the user opens — the
-/// "home desk" / "office desk" / "show stage" lighting + calibration
-/// presets follow the *user*, not whichever scene file they happened
-/// to open last.
+/// "home desk" / "office desk" / "show stage" lighting presets follow
+/// the *user*, not whichever scene file they happened to open last.
 pub fn profiles_path() -> std::path::PathBuf {
     let mut path = app_data_dir();
     path.push("profiles.json");
@@ -153,8 +152,7 @@ pub fn load_profiles() -> Option<crate::gui::profile::ProfileLibrary> {
 
 /// Persist the user's `ProfileLibrary`. Called from
 /// `GuiApp::save_profiles_if_dirty` whenever `profiles_dirty` flips —
-/// triggered by `Calibrate Pose ▼` writing into the active profile,
-/// by future profile-edit UI, etc. Atomic write via `atomic_write`
+/// triggered by profile-edit UI, etc. Atomic write via `atomic_write`
 /// so a mid-write crash never leaves a half-truncated file behind.
 pub fn save_profiles(library: &crate::gui::profile::ProfileLibrary) -> Result<(), String> {
     let path = profiles_path();

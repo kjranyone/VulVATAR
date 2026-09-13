@@ -1,7 +1,7 @@
 //! Status indicator row: a small coloured dot glyph followed by a
 //! caption label. The single way this GUI expresses "state + colour"
 //! (tracking state in the status bar, pass/fail telemetry in the
-//! calibration modal) so OK/NG semantics always look the same.
+//! inspector) so OK/NG semantics always look the same.
 
 use eframe::egui::{self, Ui};
 

@@ -42,13 +42,6 @@ pub struct Estimator {
     pub frames: u64,
     /// Whether the shape has been frozen (β prior tightened).
     pub shape_frozen: bool,
-    /// Calibrated neutral joint pose (rotation vector per joint,
-    /// `State::joint_rotvec` order) from `PoseCalibration::q_neutral`.
-    /// When set (and length-matched to the model), each joint's
-    /// posture-prior *mean* comes from here instead of the model's
-    /// built-in relaxed pose; `prior_sigma` is unchanged so the prior
-    /// keeps its original strength. `None` = today's behaviour.
-    pub q_neutral: Option<Vec<V3>>,
     dense: Dense,
     delta: Vec<f64>,
     jac: Vec<(usize, V3)>,
@@ -166,7 +159,6 @@ impl Estimator {
             last_t: None,
             frames: 0,
             shape_frozen: false,
-            q_neutral: None,
             dense: Dense::new(n),
             delta: vec![0.0; n],
             jac: Vec::with_capacity(64),
@@ -962,16 +954,8 @@ impl Estimator {
                                 self.dense.add_residual(&[(pidx, inv_lim)], r, 1.0);
                             }
                         }
-                        // prior — mean from the calibrated neutral when
-                        // available (q_neutral), else the model's
-                        // relaxed pose.
-                        let mean0 = self
-                            .q_neutral
-                            .as_ref()
-                            .filter(|qn| qn.len() == model.joints.len())
-                            .and_then(|qn| qn.get(j))
-                            .map(|v| v[0])
-                            .unwrap_or(jd.prior_mean[0]);
+                        // prior — the model's relaxed pose.
+                        let mean0 = jd.prior_mean[0];
                         let sp = (jd.prior_sigma[0] * p.pose_prior_scale).max(1e-4);
                         let r = (a - mean0) / sp;
                         cost += r * r;
@@ -990,13 +974,7 @@ impl Estimator {
                             } else {
                                 0.0
                             };
-                            let mean_k = self
-                                .q_neutral
-                                .as_ref()
-                                .filter(|qn| qn.len() == model.joints.len())
-                                .and_then(|qn| qn.get(j))
-                                .map(|v| v[k])
-                                .unwrap_or(jd.prior_mean[k]);
+                            let mean_k = jd.prior_mean[k];
                             let sp = (jd.prior_sigma[k] * p.pose_prior_scale).max(1e-4);
                             let rp = (w[k] - mean_k) / sp;
                             cost += rp * rp;
@@ -1034,6 +1012,18 @@ impl Estimator {
                     }
                     let inv = 1.0 / o.sigma.max(1e-3);
                     let r = e * inv;
+                    // Deliberately NOT robustified (despite the module
+                    // contract): this obs is an anchor, not an
+                    // outlier-prone measurement. Benched on s1789303569
+                    // (2026-09-13): a Cauchy tail (c=3) let the trunk
+                    // hover between basins — yaw err std 4.7 vs 4.0, and
+                    // with the tail alone (no arm σ cap) 22.6 with -53°
+                    // excursions, i.e. a weakened-but-abandoning anchor is
+                    // worse than none. The committed L2 pull recovers from
+                    // deep disagreement; its fight with arm transients is
+                    // instead bounded at the source by the arm kp3d σ cap
+                    // (provider) and the default σ scale 1.5 below the obs
+                    // creation site.
                     cost += r * r;
                     if build {
                         // dθ/dv = (−v_z, 0, v_x) / (v_x² + v_z²)

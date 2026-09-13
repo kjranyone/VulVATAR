@@ -15,7 +15,7 @@
 //!   * `E` (Extrapolated) — the depth sample was a hole and the joint was
 //!     pinned one anthropometric bone-length along its 2D ray. A cluster of
 //!     jumps here means the *bone lengths* are wrong, which points at
-//!     `reference_span_m` (calibration scale), not at the detector.
+//!     `reference_span_m` (body-scale reference), not at the detector.
 //!   * `O` (Observed) — the sensor really returned that depth. Jumps here
 //!     are depth-sampling / person-masking failures.
 //!   * `S` (Synthesized) — a fabricated canonical pair; should never move
@@ -252,7 +252,7 @@ fn analyze(dir: &Path, frames: &[Frame]) -> String {
             r,
             "- `reference_span_m`: min {lo:.4} / median {med:.4} / max {hi:.4}{}",
             if constant {
-                "  — **constant ⇒ a stored calibration is driving the scale**"
+                "  — **constant span reading**"
             } else {
                 "  (varying ⇒ the provider's auto/stabilised span)"
             }

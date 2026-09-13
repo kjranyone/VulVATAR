@@ -46,10 +46,8 @@ pub struct SourceJoint {
 /// Which estimator produced a [`FacePose`]. The two sources have
 /// *different* systematic residuals (different landmark sets, different
 /// hardcoded anatomical neutrals — body ≈ 1.25, mesh ≈ 0.49 pitch
-/// signal), so the per-session neutral captured during calibration is
-/// only valid for the source it was measured from. Consumers that
-/// subtract a calibrated neutral (`TrackingCalibration::apply_calibration`)
-/// and the calibration accumulator itself must key on this tag.
+/// signal), so their raw angle spaces are not comparable. Consumers
+/// that must not mix them (source selection / crossfade) key on this tag.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FaceSource {
     /// RTMW3D body face keypoints (nose / eyes / ears, COCO 0..=4).
@@ -84,25 +82,14 @@ pub struct FacePose {
     /// Which estimator produced these angles — see [`FaceSource`].
     /// Stamped by the producer (`derive_face_pose_from_body` → `Body`,
     /// `derive_face_pose_from_landmarks` → `Mesh`) and preserved
-    /// through source selection / crossfade so calibration subtraction
-    /// picks the neutral measured for the *same* estimator.
+    /// through source selection / crossfade so downstream consumers can
+    /// tell which estimator's angle space they are reading.
     pub source: FaceSource,
     /// `Some((from_source, t))` while the source-switch crossfade is
     /// easing this pose between two estimators (`t ∈ (0, 1)`, the
-    /// blend fraction toward [`Self::source`]). Two consumers key on
-    /// it:
-    ///
-    /// * `TrackingCalibration::apply_calibration` interpolates the
-    ///   per-source neutrals with the *same* `t` — the raw angles are
-    ///   a lerp of the two sources' raw spaces, so subtracting the
-    ///   target's neutral outright would re-introduce the
-    ///   inter-source neutral gap as a calibrated-space head step on
-    ///   the very frame the crossfade exists to smooth (lerp is
-    ///   linear, so `lerp(raw) − lerp(neutral) =
-    ///   lerp(raw − neutral)`: exactly a calibrated-space blend).
-    /// * The calibration hold skips these frames entirely — a mixed
-    ///   pose under the target's tag would pollute that source's
-    ///   neutral accumulator.
+    /// blend fraction toward [`Self::source`]). The raw angles are a
+    /// lerp of the two sources' raw spaces, so a consumer that needs a
+    /// source-pure value must blend per source with the same `t`.
     ///
     /// `None` on every steady-state frame.
     pub blend: Option<(FaceSource, f32)>,
@@ -154,8 +141,8 @@ pub struct MetricFrameInfo {
     /// the source frame. `source_units = metres / mpsu`.
     pub mpsu: f32,
     /// The subject's real shoulder span in metres used as the normalisation
-    /// reference (calibration, else this frame's measured span, else an
-    /// anatomical mean). The solver derives the metres→avatar-unit scale for
+    /// reference (this frame's measured span, else an anatomical mean).
+    /// The solver derives the metres→avatar-unit scale for
     /// 1:1 root placement from this: `avatar_rest_shoulder_span / reference_span_m`.
     pub reference_span_m: f32,
     /// Colour-image pinhole intrinsics for the frame this skeleton came from.
@@ -193,24 +180,6 @@ pub struct SourceSkeleton {
     /// same sample is observed on multiple render frames.
     pub capture_timestamp_ms: Option<f64>,
     pub joints: HashMap<HumanoidBone, SourceJoint>,
-    /// Raw body-derived face pose for this frame, published *alongside*
-    /// the selected [`Self::face`] so the calibration hold can
-    /// accumulate a per-source neutral for BOTH estimators in one
-    /// capture (during a frontal hold the mesh wins selection nearly
-    /// every frame, so the body neutral would otherwise never be
-    /// measured). Never calibration-subtracted and never consumed by
-    /// the solver — calibration capture only. `None` when the body
-    /// face keypoints were below the visibility floor.
-    pub face_body_raw: Option<FacePose>,
-    /// Solved fusion-model joint state (rotation vector per model
-    /// joint, `State::joint_rotvec` order) as of this frame. Populated
-    /// only by `FusionProvider`; the calibration modal accumulates it
-    /// during the neutral hold into `PoseCalibration::q_neutral`. The
-    /// joint indexing is the estimator model's, not a humanoid-bone
-    /// map — consumers must validate the length against the model
-    /// they hold. `None` on frames from other producers or when the
-    /// estimator did not run.
-    pub estimator_joint_state: Option<Vec<[f32; 3]>>,
     /// Auxiliary positions for finger *tips* (the keypoint beyond the
     /// `*Distal` bone). Keyed by the distal bone whose tip it represents —
     /// e.g. `fingertips[LeftIndexDistal]` is the 3D position of the left
@@ -231,12 +200,11 @@ pub struct SourceSkeleton {
     /// upstream). `0.0` means "no person detected".
     pub overall_confidence: f32,
     /// Body-anchor offset from a neutral camera-frame reference
-    /// (image centre for 2D-only providers; the calibration-anchor
+    /// (image centre for 2D-only providers; the torso-fit anchor's
     /// metric position for depth-aware providers). Used by
     /// the retarget to translate the avatar's `Hips`
     /// bone so the avatar follows the subject's side-step / lean-in /
-    /// crouch motion instead of just spinning in place, and read by
-    /// the pose-calibration modal as the per-frame anchor sample.
+    /// crouch motion instead of just spinning in place.
     ///
     /// `None` when *neither* the hip pair *nor* the shoulder pair was
     /// detected — solver leaves the avatar at its rest position.
@@ -246,22 +214,19 @@ pub struct SourceSkeleton {
     /// camera **metres** with the axes flipped to the source
     /// orientation (selfie-mirror x, y-up, z toward camera → negative
     /// for a subject in front of the lens); the solver's "Metric
-    /// translation" 1:1 contract and the calibration anchor fields
-    /// both build on this. Legacy 2D path (`rtmw3d`-only): `x ∈
-    /// [-aspect, +aspect]`, `y ∈ [-1, +1]`, `z = 0`.
+    /// translation" 1:1 contract builds on this. Legacy 2D path
+    /// (`rtmw3d`-only): `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`,
+    /// `z = 0`.
     ///
     /// Use [`Self::root_anchor_is_hip`] to disambiguate hip vs
-    /// shoulder anchor for downstream consumers (calibration mode
-    /// matching, EMA seed selection).
+    /// shoulder anchor for downstream consumers (EMA seed selection).
     pub root_offset: Option<[f32; 3]>,
     /// `true` when [`Self::root_offset`] was derived from the hip
     /// pair (COCO 11/12); `false` when it fell back to the shoulder
     /// pair (COCO 5/6) — the `Upper Body Only` framing where the
-    /// pelvis is below the camera frame. Pose calibration uses this
-    /// to verify the captured anchor matches the user's chosen mode
-    /// and to gate the runtime EMA seeding (a hip-calibrated session
-    /// shouldn't drive translation off a shoulder-anchor frame and
-    /// vice-versa).
+    /// pelvis is below the camera frame. Consumers gate the runtime
+    /// EMA seeding on this (a hip-anchored session shouldn't drive
+    /// translation off a shoulder-anchor frame and vice-versa).
     pub root_anchor_is_hip: bool,
     /// `Some` iff this skeleton was built from a true metric-depth backend
     /// (RealSense D435). See [`MetricFrameInfo`] — its presence is the
@@ -281,8 +246,6 @@ impl SourceSkeleton {
             source_timestamp,
             capture_timestamp_ms: None,
             joints: HashMap::new(),
-            estimator_joint_state: None,
-            face_body_raw: None,
             fingertips: HashMap::new(),
             face: None,
             expressions: Vec::new(),

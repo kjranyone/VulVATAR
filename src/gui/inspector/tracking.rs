@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use crate::gui::components::{collapsible_card, filled_button, tonal_button, ButtonTone};
-use crate::gui::theme::{color, icon as ic, typography};
+use crate::gui::theme::{color, icon as ic};
 use crate::gui::GuiApp;
 use crate::t;
 
@@ -51,18 +51,13 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
     // buried inside the collapsed "Input Device" section).
     draw_camera_control(ui, state);
 
-    // ② Calibration — quality lives or dies on this for a depth
-    // pipeline, so it gets its own card right under the start button
-    // (it used to sit at the very bottom of the Retargeting section).
-    draw_calibration_card(ui, state);
-
-    // ③ Which body parts drive the avatar.
+    // ② Which body parts drive the avatar.
     draw_body_parts(ui, state);
 
-    // ④ Capture format details — visited rarely, collapsed by default.
+    // ③ Capture format details — visited rarely, collapsed by default.
     draw_input_device(ui, state);
 
-    // ⑤ Display / mirroring options, with the two distinct "mirror"
+    // ④ Display / mirroring options, with the two distinct "mirror"
     // concepts finally side by side and explained.
     draw_display_options(ui, state);
 
@@ -474,35 +469,6 @@ fn draw_camera_devices(ui: &mut egui::Ui, state: &mut GuiApp) {
     }
 }
 
-/// ② Calibration entry + status, promoted to its own card.
-fn draw_calibration_card(ui: &mut egui::Ui, state: &mut GuiApp) {
-    crate::gui::components::card(ui, t!("tracking.calibration_section"), |ui| {
-        // Pose calibration entry — opens the fullscreen modal directly.
-        // Mode selection (Full Body / Upper Body) happens *inside* the
-        // modal via Segmented Buttons. Disabled while an avatar load is
-        // in progress — the load Window is its own modal, and stacking
-        // the calibration scrim on top would bury the load progress
-        // while leaving its click target reachable through the
-        // (paint-only) scrim. Same gate enforced on the open() side.
-        let calib_enabled = state.library.avatar_load_job.is_none();
-        if filled_button(ui, None, &t!("calibration.button"), calib_enabled).clicked()
-            && calib_enabled
-        {
-            // Reopen at the mode the active profile was last calibrated
-            // with, falling back to FullBody for a first-time capture.
-            let default_mode = state
-                .app
-                .tracking_calibration
-                .pose
-                .as_ref()
-                .map(|c| c.mode)
-                .unwrap_or(crate::tracking::CalibrationMode::FullBody);
-            state.calibration.modal.open(default_mode);
-        }
-        draw_calibration_status(ui, state);
-    });
-}
-
 /// ③ Which body parts drive the avatar.
 fn draw_body_parts(ui: &mut egui::Ui, state: &mut GuiApp) {
     collapsible_card(
@@ -832,148 +798,6 @@ fn draw_lipsync(ui: &mut egui::Ui, state: &mut GuiApp) {
         });
     if ms != state.lipsync.mouth_source {
         state.lipsync.mouth_source = ms;
-    }
-}
-
-/// Renders the pose-calibration status line(s) under the
-/// Calibrate Pose ▼ button. Three rendering paths:
-///
-/// 1. **Calibrated + matching anchor** (the happy case): green
-///    "Calibrated 5 min ago — Full Body" + a depth/jitter/sample
-///    line so the user can sanity-check the captured values.
-/// 2. **Calibrated + mismatched anchor**: amber warning when the
-///    runtime tracker is currently using the *other* anchor (e.g.
-///    calibrated in T-pose but the user is now seated and only the
-///    shoulders are visible). Solver auto-falls back to EMA in this
-///    case; the warning lets the user re-calibrate intentionally.
-/// 3. **Uncalibrated**: grey "Pose not calibrated — auto-EMA active"
-///    so first-time users know the feature exists.
-fn draw_calibration_status(ui: &mut egui::Ui, state: &mut GuiApp) {
-    let pose = match state.app.tracking_calibration.pose.clone() {
-        Some(p) => p,
-        None => {
-            ui.label(
-                egui::RichText::new(t!("calibration.status_uncalibrated"))
-                    .font(typography::caption())
-                    .color(color::ON_SURFACE_MUTED),
-            );
-            return;
-        }
-    };
-
-    let mode_label = match pose.mode {
-        crate::tracking::CalibrationMode::FullBody => t!("calibration.mode_full_body"),
-        crate::tracking::CalibrationMode::UpperBody => t!("calibration.mode_upper_body"),
-    };
-    let age_label = format_age(pose.captured_at_unix);
-
-    // Mismatch detection: if the live tracker is producing an anchor
-    // type that doesn't match the calibration mode, show an amber
-    // warning instead of the green "all good" line. Mismatch is the
-    // user's signal to either re-calibrate or change their framing.
-    let runtime_mismatch = state
-        .app
-        .last_tracking_pose
-        .as_ref()
-        .filter(|p| p.root_offset.is_some())
-        .map(|p| match pose.mode {
-            crate::tracking::CalibrationMode::FullBody => !p.root_anchor_is_hip,
-            crate::tracking::CalibrationMode::UpperBody => p.root_anchor_is_hip,
-        })
-        .unwrap_or(false);
-
-    if runtime_mismatch {
-        ui.label(
-            egui::RichText::new(t!(
-                "calibration.status_mismatch",
-                age = age_label,
-                mode = mode_label
-            ))
-            .font(typography::caption())
-            .color(color::WARNING),
-        );
-    } else {
-        ui.label(
-            egui::RichText::new(t!(
-                "calibration.status_calibrated",
-                age = age_label,
-                mode = mode_label
-            ))
-            .font(typography::caption())
-            .color(color::SUCCESS),
-        );
-    }
-
-    // Detail line: depth + jitter + sample count + confidence. Skipped
-    // when the calibration is from rtmw3d (no depth) — only the sample
-    // / confidence parts are meaningful there.
-    let detail = match (pose.anchor_depth_m, pose.anchor_depth_jitter_m) {
-        (Some(d), Some(j)) => t!(
-            "calibration.status_detail_depth",
-            depth = format!("{:.2}", d),
-            jitter = format!("{:.3}", j),
-            samples = format!("{}", pose.frame_count),
-            confidence = format!("{:.2}", pose.confidence)
-        ),
-        _ => t!(
-            "calibration.status_detail_no_depth",
-            samples = format!("{}", pose.frame_count),
-            confidence = format!("{:.2}", pose.confidence)
-        ),
-    };
-    ui.label(
-        egui::RichText::new(detail)
-            .font(typography::caption())
-            .color(color::ON_SURFACE_MUTED),
-    );
-
-    // Neutral body yaw (oblique camera placement). Surfacing the
-    // measured angle lets the user sanity-check its sign/magnitude
-    // against their physical camera placement. Above BODY_YAW_WARN_RAD the
-    // line turns amber — tracking still runs, but depth shadowing on
-    // the far arm degrades measurably at very oblique angles.
-    if let Some(yaw) = pose.neutral_body_yaw {
-        let deg = yaw.to_degrees();
-        if yaw.abs() >= crate::tracking::BODY_YAW_WARN_RAD {
-            ui.label(
-                egui::RichText::new(t!(
-                    "calibration.status_body_yaw_oblique",
-                    yaw = format!("{:+.0}", deg)
-                ))
-                .font(typography::caption())
-                .color(color::WARNING),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new(t!(
-                    "calibration.status_body_yaw",
-                    yaw = format!("{:+.0}", deg)
-                ))
-                .font(typography::caption())
-                .color(color::ON_SURFACE_MUTED),
-            );
-        }
-    }
-}
-
-/// Format a unix timestamp as a relative-age label ("5 min ago",
-/// "just now", "1 day ago"). Future timestamps (clock skew) render as
-/// "just now" rather than "in N min" to keep the status line from
-/// looking broken.
-fn format_age(captured_unix: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age_secs = now.saturating_sub(captured_unix);
-    if age_secs < 60 {
-        t!("calibration.age_just_now")
-    } else if age_secs < 3600 {
-        t!("calibration.age_minutes", n = format!("{}", age_secs / 60))
-    } else if age_secs < 86_400 {
-        t!("calibration.age_hours", n = format!("{}", age_secs / 3600))
-    } else {
-        t!("calibration.age_days", n = format!("{}", age_secs / 86_400))
     }
 }
 

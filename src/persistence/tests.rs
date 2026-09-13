@@ -1,5 +1,4 @@
 use super::*;
-use crate::persistence::project_dto::dto_to_pose_calibration;
 use serde_json::json;
 
 fn settings_tempdir(tag: &str) -> std::path::PathBuf {
@@ -10,56 +9,6 @@ fn settings_tempdir(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create tempdir");
     dir
-}
-
-/// A DTO carrying only the fields these tests care about.
-fn calibration_dto(shoulder_span_m: Option<f32>) -> PoseCalibrationDto {
-    PoseCalibrationDto {
-        mode: "full_body".to_string(),
-        captured_at: "2026-05-08T09:33:48Z".to_string(),
-        captured_at_unix: 1_778_232_828,
-        frame_count: 41,
-        anchor_x: 0.033_656_113,
-        anchor_y: -0.072_242_945,
-        anchor_depth_m: Some(0.788_906_34),
-        confidence: 0.673_795_76,
-        anchor_depth_jitter_m: Some(0.027_591_532),
-        shoulder_span_m,
-        x_range_observed: None,
-        z_range_observed: None,
-        neutral_expressions: Vec::new(),
-        neutral_face_ypr: [0.0; 3],
-        neutral_face_ypr_mesh: None,
-        neutral_face_ypr_body: None,
-        neutral_body_yaw: None,
-        q_neutral: None,
-    }
-}
-
-#[test]
-fn load_drops_a_source_unit_shoulder_span() {
-    // Value taken verbatim from a real pre-fix profiles.json: the
-    // capture path measured the already-normalised published
-    // skeleton, so it recorded the source-space target constant
-    // instead of the subject's metres. Consumed as metres it makes
-    // every anthropometric bone ~1.8× too long.
-    let loaded =
-        dto_to_pose_calibration(&calibration_dto(Some(0.691_979_17))).expect("mode parses");
-    assert_eq!(
-        loaded.shoulder_span_m, None,
-        "an implausible span must not reach the solver — the auto-measured \
-             span is strictly better than a 1.8×-inflated one"
-    );
-    // The rest of the record still loads: dropping the span must
-    // not throw away a good anchor.
-    assert_eq!(loaded.frame_count, 41);
-    assert_eq!(loaded.anchor_depth_m, Some(0.788_906_34));
-}
-
-#[test]
-fn load_keeps_a_plausible_shoulder_span() {
-    let loaded = dto_to_pose_calibration(&calibration_dto(Some(0.41))).expect("mode parses");
-    assert_eq!(loaded.shoulder_span_m, Some(0.41));
 }
 
 #[test]

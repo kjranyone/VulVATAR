@@ -962,10 +962,6 @@ impl Rtmw3dInference {
         skeleton.face = self
             .face_selector
             .select(body_face_pose, mesh_face_pose, mesh_conf, dt_s);
-        // Raw body pose published alongside the selection so the
-        // calibration hold can accumulate a neutral for BOTH sources
-        // in one capture (see `SourceSkeleton::face_body_raw`).
-        skeleton.face_body_raw = body_face_pose;
         if crate::tracking::debug_channel::enabled() {
             crate::tracking::debug_channel::stash_face_debug(
                 dbg_bbox,

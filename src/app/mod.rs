@@ -20,9 +20,7 @@ use crate::output::{FrameSink, OutputRouter};
 use crate::renderer::frame_input::LightingState;
 use crate::renderer::VulkanRenderer;
 use crate::simulation::{PhysicsWorld, SimulationClock};
-use crate::tracking::{
-    TrackingCalibration, TrackingSmoothingParams, TrackingSource, TrackingWorker,
-};
+use crate::tracking::{TrackingSmoothingParams, TrackingSource, TrackingWorker};
 
 /// All per-frame parameters passed from the GUI to `run_frame()`.
 #[derive(Clone, Debug)]
@@ -166,7 +164,6 @@ pub struct Application {
     pub render_thread: Option<RenderThread>,
     pub physics: PhysicsWorld,
     pub tracking: TrackingSource,
-    pub tracking_calibration: TrackingCalibration,
     pub output: OutputRouter,
     /// P3-03: central GPU pressure / pacing policy. Driven per-frame by
     /// [`Self::update_runtime_gpu_budget`]; read by render/output/tracking
@@ -425,7 +422,6 @@ impl Application {
             render_thread: None,
             physics: PhysicsWorld::new(),
             tracking: TrackingSource::new(),
-            tracking_calibration: TrackingCalibration::default(),
             output: OutputRouter::new(FrameSink::SharedMemory),
             runtime_gpu_budget: runtime_gpu_budget::RuntimeGpuBudget::new(now),
             last_output_drop_count: 0,

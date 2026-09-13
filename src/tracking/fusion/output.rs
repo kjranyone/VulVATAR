@@ -1,6 +1,6 @@
 //! Estimator posterior → [`RigPose`] (what the avatar retarget consumes)
 //! and a compatibility [`SourceSkeleton`] (what the GUI overlay,
-//! calibration modal, debug channel and expression solver still read).
+//! debug channel and expression solver still read).
 
 use std::collections::HashMap;
 

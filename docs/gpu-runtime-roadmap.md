@@ -43,7 +43,7 @@ exportable GPU image
 
 ### Ownership rule
 
-- **CPU owns** scene intent: pose targets, morph weights, calibration,
+- **CPU owns** scene intent: pose targets, morph weights,
   scheduling, UI state.
 - **GPU owns** large transient fields: vertex deltas, render targets,
   cloth particle state (GPU backend), exported frames.

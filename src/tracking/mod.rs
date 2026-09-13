@@ -12,7 +12,6 @@ mod pose_estimation;
 pub mod provider;
 pub mod stagelog;
 
-pub mod calibration;
 pub mod debug_channel;
 pub mod devices;
 pub mod face_mediapipe;
@@ -25,18 +24,6 @@ pub mod worker;
 #[cfg(feature = "inference")]
 pub mod yolox;
 
-// `CalibrationMode` / `PoseCalibration` are `pub`: they are embedded in
-// pub API across the crate (GUI state, `PoseProvider` trait methods,
-// persisted `ProjectState`), so a crate-only visibility would trip
-// `private_interfaces` at every one of those sites. The remaining
-// calibration items are crate-visible only (visibility-tightening
-// pass), and a `pub use` cannot re-export them outward.
-pub use calibration::{median_joint_state, CalibrationMode, PoseCalibration};
-pub(crate) use calibration::{
-    rotate_xz, shoulder_line_yaw, shoulder_span_plausible, TrackingCalibration,
-    BODY_YAW_MAX_RAD, BODY_YAW_MIN_SAMPLES, BODY_YAW_WARN_RAD, SHOULDER_SPAN_MAX_M,
-    SHOULDER_SPAN_MIN_M,
-};
 pub use devices::{
     camera_fps_for_index, camera_fps_index_for, camera_resolution_for_index,
     camera_resolution_index_for, d400_product_name, enumerate_cameras, usable_capture_device,

@@ -23,16 +23,6 @@ pub fn load_avatar_from_path(state: &mut GuiApp, path: &Path) {
         state.push_notification(t!("top_bar.avatar_load_in_progress"));
         return;
     }
-    // Block while a calibration is mid-capture: the load Window
-    // would otherwise pop on top of the calibration scrim, and the
-    // user's HoldStill / Collecting timer would keep advancing
-    // behind a UI they can't reach. Surfacing a notification gives
-    // the user something to act on instead of silently swallowing
-    // the click.
-    if state.calibration.modal.is_open() {
-        state.push_notification(t!("top_bar.avatar_load_blocked_by_calibration"));
-        return;
-    }
     state.push_notification(t!(
         "top_bar.loading_avatar",
         path = path.display().to_string()
@@ -153,13 +143,11 @@ fn draw_left(ui: &mut Ui, state: &mut GuiApp) {
 
 /// Display-ordered top-bar actions that may collapse into the File
 /// menu when the bar is too narrow. Camera start/stop and the avatar
-/// picker are session-critical and never collapse; pause goes first,
-/// then calibrate.
-const DROP_PRIORITY: [usize; 2] = [ACTION_PAUSE, ACTION_CALIBRATE];
+/// picker are session-critical and never collapse; pause goes first.
+const DROP_PRIORITY: [usize; 1] = [ACTION_PAUSE];
 const ACTION_AVATAR: usize = 0;
 const ACTION_CAMERA: usize = 1;
-const ACTION_CALIBRATE: usize = 2;
-const ACTION_PAUSE: usize = 3;
+const ACTION_PAUSE: usize = 2;
 
 /// Which display-ordered actions stay on the bar at `available` px.
 /// Anything dropped is rendered inside the File menu instead — the
@@ -208,7 +196,6 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
     } else {
         t!("top_bar.start_camera")
     };
-    let calibrate_label = t!("calibration.button");
 
     // Measure before laying out so narrow windows collapse the
     // low-priority actions into the File menu instead of clipping.
@@ -220,10 +207,9 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
         space::MD + icon_w + galley.size().x + space::MD + ui.spacing().item_spacing.x
     };
     let file_menu_w = measure(&t!("top_bar.file_menu"), false);
-    let mut widths = [0.0f32; 4];
+    let mut widths = [0.0f32; 3];
     widths[ACTION_AVATAR] = measure(&avatar_label, true) + 16.0; // combo arrow allowance
     widths[ACTION_CAMERA] = measure(&camera_label, true);
-    widths[ACTION_CALIBRATE] = measure(&calibrate_label, false);
     widths[ACTION_PAUSE] = measure(&pause_label, true);
     let available = (ui.available_width() - file_menu_w).max(0.0);
     let visible = fit_topbar_actions(available, &widths);
@@ -233,11 +219,6 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
 
     // ── Camera start/stop (never collapses) ──────────────────────
     draw_camera_toggle(ui, state, &camera_label);
-
-    // ── Calibrate ────────────────────────────────────────────────
-    if visible[ACTION_CALIBRATE] {
-        draw_calibrate_button(ui, state, &calibrate_label);
-    }
 
     // ── Pause ────────────────────────────────────────────────────
     if visible[ACTION_PAUSE] {
@@ -280,10 +261,6 @@ fn draw_actions(ui: &mut Ui, state: &mut GuiApp) {
             let overflowed = visible.iter().any(|v| !v);
             if overflowed {
                 ui.separator();
-                if !visible[ACTION_CALIBRATE] && ui.button(calibrate_label.as_str()).clicked() {
-                    state.open_calibration_modal();
-                    ui.close_menu();
-                }
                 if !visible[ACTION_PAUSE] && ui.button(pause_label.as_str()).clicked() {
                     state.runtime_status.paused = !state.runtime_status.paused;
                     ui.close_menu();
@@ -435,37 +412,23 @@ fn draw_camera_toggle(ui: &mut Ui, state: &mut GuiApp, label: &str) {
     }
 }
 
-fn draw_calibrate_button(ui: &mut Ui, state: &mut GuiApp, label: &str) {
-    use crate::gui::components::{tonal_button, ButtonTone};
-    let enabled = state.is_tracking_active() && state.library.avatar_load_job.is_none();
-    let resp = tonal_button(ui, None, label, ButtonTone::Primary, enabled);
-    if enabled {
-        if resp.clicked() {
-            state.open_calibration_modal();
-        }
-    } else {
-        resp.on_hover_text(t!("top_bar.calibrate_needs_camera"));
-    }
-}
-
 fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
     // Items lay out right-to-left: profile combo first (rightmost),
     // then the tracking dot.
 
-    // Profile combo + management. Rows show a calibration marker so
-    // "which setups are calibrated" is visible before switching; the
-    // management actions surface the create/duplicate/rename/delete
-    // API that previously existed only in the data layer.
+    // Profile combo + management. The management actions surface the
+    // create/duplicate/rename/delete API that previously existed only
+    // in the data layer.
     let active_idx = state.profiles.active_index.unwrap_or(0);
-    let rows: Vec<(String, bool)> = state
+    let rows: Vec<String> = state
         .profiles
         .profiles
         .iter()
-        .map(|p| (p.name.clone(), p.pose_calibration.is_some()))
+        .map(|p| p.name.clone())
         .collect();
     let selected_name = rows
         .get(active_idx)
-        .map(|(n, _)| n.clone())
+        .cloned()
         .unwrap_or_else(|| t!("top_bar.profile_none"));
     let mut clicked_index: Option<usize> = None;
     let mut open_dialog: Option<ProfileDialog> = None;
@@ -477,21 +440,11 @@ fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
                 .color(color::ON_SURFACE),
         )
         .show_ui(ui, |ui| {
-            for (i, (name, calibrated)) in rows.iter().enumerate() {
-                // U+25C6 diamond from the text font marks a profile
-                // that carries a pose calibration.
-                let row_label = if *calibrated {
-                    format!("{} \u{25C6}", name)
-                } else {
-                    name.clone()
-                };
-                let resp = ui.selectable_label(i == active_idx, row_label);
-                let resp = if *calibrated {
-                    resp.on_hover_text(t!("top_bar.profile_calibrated"))
-                } else {
-                    resp.on_hover_text(t!("top_bar.profile_uncalibrated"))
-                };
-                if resp.clicked() {
+            for (i, name) in rows.iter().enumerate() {
+                if ui
+                    .selectable_label(i == active_idx, name.clone())
+                    .clicked()
+                {
                     clicked_index = Some(i);
                 }
             }
@@ -507,10 +460,7 @@ fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
                 ui.close_menu();
             }
             if ui.button(t!("top_bar.profile_rename")).clicked() {
-                let name = rows
-                    .get(active_idx)
-                    .map(|(n, _)| n.clone())
-                    .unwrap_or_default();
+                let name = rows.get(active_idx).cloned().unwrap_or_default();
                 open_dialog = Some(ProfileDialog::Rename {
                     index: active_idx,
                     name,
@@ -541,27 +491,7 @@ fn draw_right(ui: &mut Ui, state: &mut GuiApp) {
     }
     if let Some(i) = clicked_index {
         if i != active_idx {
-            // Switching from a calibrated setup to an uncalibrated one
-            // clears the live calibration (apply_profile pushes `None`
-            // through to the solver) — warn before doing that, because
-            // a calibration capture costs the user a full hold-still
-            // cycle to get back.
-            let losing_calibration = state
-                .profiles
-                .active()
-                .map(|p| p.pose_calibration.is_some())
-                .unwrap_or(false)
-                && state
-                    .profiles
-                    .profiles
-                    .get(i)
-                    .map(|p| p.pose_calibration.is_none())
-                    .unwrap_or(false);
-            if losing_calibration {
-                state.pending_profile_switch = Some(i);
-            } else {
-                switch_to_profile(state, i);
-            }
+            switch_to_profile(state, i);
         }
     }
     ui.add_space(space::SM);
@@ -890,47 +820,9 @@ pub(crate) fn switch_to_profile(state: &mut GuiApp, index: usize) {
     }
 }
 
-/// Draw the profile New/Rename/Delete dialogs plus the
-/// calibration-loss switch confirmation. Called once per frame from
-/// `GuiApp::update` alongside the other modal dialogs.
+/// Draw the profile New/Rename/Delete dialogs. Called once per frame
+/// from `GuiApp::update` alongside the other modal dialogs.
 pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
-    // ── Switch-with-calibration-loss confirmation ─────────────────
-    if let Some(target) = state.pending_profile_switch {
-        let target_name = state
-            .profiles
-            .profiles
-            .get(target)
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-        let mut decision: Option<bool> = None;
-        egui::Window::new(t!("dialog.profile_switch_title"))
-            .id(egui::Id::new("profile_switch_confirm"))
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .collapsible(false)
-            .resizable(false)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.label(t!("dialog.profile_switch_body", name = target_name.clone()));
-                ui.add_space(space::SM);
-                ui.horizontal(|ui| {
-                    if ui.button(t!("dialog.profile_switch_confirm")).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button(t!("calibration.cancel")).clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                state.pending_profile_switch = None;
-                switch_to_profile(state, target);
-            }
-            Some(false) => state.pending_profile_switch = None,
-            None => {}
-        }
-    }
-
     let Some(dialog) = state.profile_dialog.take() else {
         return;
     };
@@ -961,7 +853,6 @@ pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
                             let mut profile =
                                 crate::gui::profile::StreamProfile::streaming_default();
                             profile.name = unique.clone();
-                            profile.pose_calibration = None;
                             state.profiles.add(profile);
                             state.project_status.profiles_dirty = true;
                             state.push_success_notification(t!(
@@ -970,7 +861,7 @@ pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
                             ));
                             done = true;
                         }
-                        if ui.button(t!("calibration.cancel")).clicked() {
+                        if ui.button(t!("dialog.cancel")).clicked() {
                             done = true;
                         }
                     });
@@ -1013,7 +904,7 @@ pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
                                 }
                             }
                         }
-                        if ui.button(t!("calibration.cancel")).clicked() {
+                        if ui.button(t!("dialog.cancel")).clicked() {
                             done = true;
                         }
                     });
@@ -1065,7 +956,7 @@ pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
                             }
                             done = true;
                         }
-                        if ui.button(t!("calibration.cancel")).clicked() {
+                        if ui.button(t!("dialog.cancel")).clicked() {
                             done = true;
                         }
                     });
@@ -1082,28 +973,19 @@ pub(crate) fn draw_profile_dialogs(ctx: &egui::Context, state: &mut GuiApp) {
 mod topbar_layout_tests {
     use super::*;
 
-    // Display order: [avatar, camera, calibrate, pause] — see the
-    // ACTION_* constants.
-    const W: [f32; 4] = [120.0, 100.0, 90.0, 80.0];
+    // Display order: [avatar, camera, pause] — see the ACTION_* constants.
+    const W: [f32; 3] = [120.0, 100.0, 80.0];
 
     #[test]
     fn everything_visible_when_the_bar_is_wide_enough() {
         let vis = fit_topbar_actions(1000.0, &W);
-        assert_eq!(vis, vec![true, true, true, true]);
+        assert_eq!(vis, vec![true, true, true]);
     }
 
     #[test]
-    fn pause_collapses_first_then_calibrate() {
-        // Wide enough for all but pause.
-        let vis = fit_topbar_actions(330.0, &W);
-        assert_eq!(vis, vec![true, true, true, false], "pause drops first");
-        // Only avatar + camera fit.
+    fn pause_collapses_first() {
         let vis = fit_topbar_actions(230.0, &W);
-        assert_eq!(
-            vis,
-            vec![true, true, false, false],
-            "calibrate drops second"
-        );
+        assert_eq!(vis, vec![true, true, false], "pause drops first");
     }
 
     #[test]

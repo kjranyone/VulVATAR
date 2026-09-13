@@ -31,9 +31,8 @@ impl AvatarPose {
 /// its parent's already-computed world. Nodes whose index is past
 /// the end of `locals` or `out` are silently skipped.
 ///
-/// This is the pure-function form of [`AvatarInstance::compute_global_pose`];
-/// the snapshot path (`gui::calibration::target_pose`) uses it
-/// without needing a `&mut AvatarInstance`.
+/// This is the pure-function form of [`AvatarInstance::compute_global_pose`]:
+/// usable without needing a `&mut AvatarInstance`.
 pub fn compute_global_transforms(skeleton: &SkeletonAsset, locals: &[Transform], out: &mut [Mat4]) {
     let mut stack: Vec<(usize, Option<usize>)> = Vec::new();
     for root in skeleton.root_nodes.iter().rev() {
@@ -58,9 +57,8 @@ pub fn compute_global_transforms(skeleton: &SkeletonAsset, locals: &[Transform],
 /// for each node that has both a global transform and an
 /// inverse-bind matrix.
 ///
-/// Used by `AvatarInstance::build_skinning_matrices` and the
-/// calibration target-pose snapshot path. Both paths previously
-/// duplicated this loop almost verbatim.
+/// Used by `AvatarInstance::build_skinning_matrices`, which previously
+/// duplicated this loop inline.
 pub fn build_skinning_matrices(skeleton: &SkeletonAsset, globals: &[Mat4], out: &mut [Mat4]) {
     let n = out.len();
     for i in 0..n {

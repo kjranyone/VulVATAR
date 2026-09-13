@@ -126,15 +126,6 @@ struct WristHold {
     last_z: Option<f64>,
 }
 
-/// `VULVATAR_FUSION_NO_QNEUTRAL` ablation for the calibrated posture
-/// prior (docs/tracking-v2-design.md §7 convention): keeps
-/// `set_calibration` wiring honest in benches by forcing the estimator
-/// back to the model's relaxed-pose prior.
-fn q_neutral_ablated() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("VULVATAR_FUSION_NO_QNEUTRAL").is_some())
-}
-
 impl FusionProvider {
     pub fn from_models_dir_with_config(
         models_dir: impl AsRef<Path>,
@@ -357,25 +348,6 @@ impl PoseProvider for FusionProvider {
 
     fn set_external_depth(&mut self, depth: MetricDepthFrame) {
         self.external_depth = Some(depth);
-    }
-
-    fn set_calibration(&mut self, calibration: Option<crate::tracking::PoseCalibration>) {
-        // Forward the calibrated neutral joint pose into the estimator's
-        // posture prior (‖q − q_neutral‖² — mean replacement only, the
-        // joint's own sigma stays). Length is validated against the
-        // model inside `accumulate_at`, so a capture taken against a
-        // different model version degrades to the relaxed-pose prior
-        // rather than mis-indexing. `VULVATAR_FUSION_NO_QNEUTRAL`
-        // ablates for benches (same convention as the other NO_* gates
-        // in docs/tracking-v2-design.md §7).
-        self.est.q_neutral = match calibration.as_ref().and_then(|c| c.q_neutral.as_ref()) {
-            Some(_) if q_neutral_ablated() => None,
-            qn => qn.map(|v| {
-                v.iter()
-                    .map(|r| [r[0] as f64, r[1] as f64, r[2] as f64])
-                    .collect()
-            }),
-        };
     }
 
     fn estimate_pose(
@@ -1329,15 +1301,34 @@ impl PoseProvider for FusionProvider {
                             }
                             // ~7° at a full 15-column fit, widening as
                             // columns drop out. `VULVATAR_CHESTYAW_SIGMA`
-                            // scales it (basin-selection bench: the default
-                            // 0.12 leaves the trunk's cloud term free to
-                            // pick a self-consistent wrong-yaw basin).
+                            // scales it (basin-selection bench: σ 0.12 keeps
+                            // the trunk's cloud term from picking a
+                            // self-consistent wrong-yaw basin).
+                            // Default scale 1.5 (σ ≈ 0.18 rad): measured on
+                            // the s1789303569 desk replay (2026-09-13) — at
+                            // scale 1.0 the obs's hard L2 clamp fights the
+                            // trunk terms through every arm transient
+                            // (torso-yaw err std 4.0°, excursions to
+                            // -28.5°, and the fight's damage surfaces as
+                            // R-wrist snaps: max jump 0.71 m). A robust
+                            // kernel tail is NOT the answer — benched 4×
+                            // worse (a weakened-but-abandoning anchor lets
+                            // the trunk hover between basins, yaw err std
+                            // 22.6°); the committed quadratic pull must
+                            // stay. Scale 1.5 keeps that pull while easing
+                            // the clamp: on s1789303569 yaw err std 4.0 →
+                            // 2.3°, range [-28.5°,+8.8°] → [-8.1°,+10.6°];
+                            // on s1789246660 R-wrist snaps stay at 0
+                            // (scale 2.0 re-introduced 4 there) while its
+                            // yaw err std holds at 2.6°. The remaining
+                            // s1789303569 wrist slam is the mis-detected
+                            // elbow itself (see the arm σ cap above).
                             let base_sigma = 0.12 * (15.0 / n as f64).sqrt();
                             let scale = std::env::var("VULVATAR_CHESTYAW_SIGMA")
                                 .ok()
                                 .and_then(|v| v.parse::<f64>().ok())
                                 .filter(|v| *v > 0.0)
-                                .unwrap_or(1.0);
+                                .unwrap_or(1.5);
                             obs.shoulder_yaw = Some(super::estimator::ShoulderYawObs {
                                 left: self.h.j.l_shoulder,
                                 right: self.h.j.r_shoulder,
@@ -1694,6 +1685,21 @@ impl PoseProvider for FusionProvider {
         // 0.08 and 32–39 wrist snaps / 600 frames). Only observations that
         // DISAGREE with the prediction keep the burn-in inflation.
         let corrob = std::env::var_os("VULVATAR_FUSION_NO_CORROB").is_none();
+        // The inflation exists so a first re-acquisition still moves the arm
+        // "proportionally to the evidence". Past ~2.7× the elbow's honest
+        // σ (~3 cm) it breaks the 3-D Cauchy kernel instead: c_3d saturates
+        // at 5σ, so a σ 0.23 m entry pulls with ~96% weight toward a
+        // 0.47 m mis-detection (measured on s1789303569: the desk-edge
+        // elbow slam behind every R-wrist snap; snap frames carried
+        // σ 0.15–0.23 with 2-D innovation 278 px at claimed σ 9.9 px).
+        // Cap the fiction: 8 cm keeps first-frame damping (3× base) while
+        // a 0.4 m+ slam whitens back to ≥5σ where Cauchy actually
+        // saturates. `VULVATAR_FUSION_ARM_SIG_CAP` overrides; 0 disables.
+        let arm_sig_cap = std::env::var("VULVATAR_FUSION_ARM_SIG_CAP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(0.08);
         for k in obs.kp3d.iter_mut() {
             if let Some(side) = self.arm_side_of(k.point) {
                 let agrees = corrob && {
@@ -1703,6 +1709,7 @@ impl PoseProvider for FusionProvider {
                 if !agrees {
                     k.sigma *= inflate[side];
                 }
+                k.sigma = k.sigma.min(arm_sig_cap);
             }
         }
         let n_hand_start = self.hand_kp_start.min(obs.kp2d.len());
@@ -1775,20 +1782,7 @@ impl PoseProvider for FusionProvider {
         skeleton.expressions = base.skeleton.expressions;
         skeleton.face_mesh_confidence = base.skeleton.face_mesh_confidence;
         skeleton.face = base.skeleton.face;
-        skeleton.face_body_raw = base.skeleton.face_body_raw;
         skeleton.capture_timestamp_ms = ts_ms;
-        // Solved joint state for the calibration modal's q_neutral hold.
-        // Published unconditionally: the modal gates admission on frame
-        // quality itself, and debug tooling finds a always-present field
-        // easier to reason about than a confidence-conditional one.
-        skeleton.estimator_joint_state = Some(
-            (0..self.h.model.joints.len())
-                .map(|j| {
-                    let v = self.est.state.joint_rotvec(&self.h.model, j);
-                    [v[0] as f32, v[1] as f32, v[2] as f32]
-                })
-                .collect(),
-        );
         skeleton.rig = Some(Arc::new(rig));
         self.last_solve_ms = t0.elapsed().as_secs_f32() * 1000.0;
         if crate::tracking::debug_channel::enabled() {
