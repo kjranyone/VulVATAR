@@ -13,8 +13,8 @@ use crate::avatar::AvatarInstance;
 use crate::output::OutputFrame;
 use crate::renderer::frame_input::RenderDebugFlags;
 use crate::renderer::frame_input::{
-    CameraState, ClothDeformSnapshot, OutputTargetRequest, RenderAvatarInstance, RenderExportMode,
-    RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
+    BodySdfPlan, CameraState, ClothDeformSnapshot, OutputTargetRequest, RenderAvatarInstance,
+    RenderExportMode, RenderFrameInput, RenderMeshInstance, RenderOutputAlpha,
 };
 use crate::renderer::material::MaterialShaderMode;
 use crate::simulation::SimulationStepOptions;
@@ -330,6 +330,10 @@ impl Application {
                 avatar.compute_global_pose();
             }
 
+            // The body distance field is an Arc in the avatar — clone
+            // the handle out so the solvers can borrow it while `avatar`
+            // is mutably borrowed.
+            let avatar_body_sdf = avatar.body_sdf.clone();
             if self.physics.rapier_initialized() {
                 self.physics.step_all(
                     fixed_dt,
@@ -338,6 +342,7 @@ impl Application {
                     step_options,
                     &config.spring_tuning,
                     &config.scene_gravity,
+                    avatar_body_sdf.as_ref(),
                 );
                 avatar.compute_global_pose();
             } else {
@@ -348,6 +353,7 @@ impl Application {
                         avatar,
                         &config.spring_tuning,
                         &config.scene_gravity,
+                        avatar_body_sdf.as_ref(),
                     );
                     avatar.compute_global_pose();
                 }
@@ -671,6 +677,27 @@ impl Application {
         }
     }
 
+    /// Fold the body-SDF readback rows into the matching avatar
+    /// instances so the spring solver picks the field up on the next
+    /// `run_frame`. Delivery matches on `AvatarInstanceId` — an entry
+    /// for an instance that no longer exists is dropped.
+    fn apply_sdf_readback(&mut self, fields: &[crate::renderer::sdf_field::SdfFieldReadback]) {
+        if fields.is_empty() {
+            return;
+        }
+        for avatar in self.avatars.iter_mut() {
+            for entry in fields {
+                if entry.instance_id == avatar.id.0 {
+                    avatar.body_sdf = Some(crate::simulation::sdf::SdfField::new(
+                        entry.grid,
+                        entry.data.clone(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
     fn process_render_result(&mut self, render_result: crate::renderer::RenderResult) {
         self.output
             .update_export_pool_stats(render_result.stats.export_pool);
@@ -681,6 +708,7 @@ impl Application {
         // frames carry the readback too.
         if !render_result.cloth_readback.is_empty() {
             self.apply_cloth_readback(&render_result.cloth_readback);
+            self.apply_sdf_readback(&render_result.sdf_fields);
         }
         // R2 final-VBO audit (only rows when `VULVATAR_VBO_AUDIT=1`):
         // publish the render-side correction telemetry for the external
@@ -1020,12 +1048,99 @@ impl Application {
                     &gpu_colliders,
                 );
 
+                // Body-SDF splat request: only while the spring solver
+                // runs and only when a body primitive exists to splat.
+                // The grid is a pure function of the rest AABB, so
+                // renderer-side slot reuse stays stable across frames.
+                let body_sdf = if toggles.spring_enabled
+                    && avatar
+                        .asset
+                        .spring_bones
+                        .iter()
+                        .any(|sb| sb.body_collision)
+                {
+                    // Splat list: the body surface plus any face/head
+                    // surface — on many models the face is its own
+                    // primitive, and hair bangs / twintails collide
+                    // against it. Union their rest AABBs for the grid:
+                    // the root AABB can be bloated by hair prims and a
+                    // T-pose bind, which coarsens the voxels for
+                    // everyone. Contacts only happen within the splat
+                    // shell of these surfaces, so strands outside the
+                    // grid correctly sample "no collision".
+                    let mut splat: Vec<(crate::asset::MeshId, crate::asset::PrimitiveId)> =
+                        Vec::new();
+                    let mut union = crate::asset::Aabb::empty();
+                    {
+                        let mut push_prim = |mesh_id, primitive_id, bounds: &crate::asset::Aabb| {
+                            if splat.len() >= 4
+                                || splat.iter().any(|&(m, p)| m == mesh_id && p == primitive_id)
+                            {
+                                return;
+                            }
+                            splat.push((mesh_id, primitive_id));
+                            union.expand(bounds);
+                        };
+                        if let Some((mesh_id, primitive_id)) =
+                            crate::asset::clearance::find_body_primitive(&avatar.asset)
+                                .or_else(|| {
+                                    avatar.asset.body_primitive_id.and_then(|pid| {
+                                        avatar.asset.meshes.iter().find_map(|m| {
+                                            m.primitives
+                                                .iter()
+                                                .find(|p| p.id == pid)
+                                                .map(|_| (m.id, pid))
+                                        })
+                                    })
+                                })
+                        {
+                            for m in &avatar.asset.meshes {
+                                if m.id != mesh_id {
+                                    continue;
+                                }
+                                for p in &m.primitives {
+                                    if p.id == primitive_id {
+                                        push_prim(mesh_id, primitive_id, &p.bounds);
+                                    }
+                                }
+                            }
+                        }
+                        for m in &avatar.asset.meshes {
+                            let mesh_hit =
+                                m.name.to_lowercase().contains("face")
+                                    || m.name.to_lowercase().contains("head");
+                            for p in &m.primitives {
+                                let mat_hit = avatar
+                                    .asset
+                                    .materials
+                                    .iter()
+                                    .find(|mat| mat.id == p.material_id)
+                                    .map(|mat| {
+                                        let n = mat.name.to_lowercase();
+                                        n.contains("face") || n.contains("head")
+                                    })
+                                    .unwrap_or(false);
+                                if (mesh_hit || mat_hit) && p.vertex_count > 100 {
+                                    push_prim(m.id, p.id, &p.bounds);
+                                }
+                            }
+                        }
+                    }
+                    (!splat.is_empty()).then(|| BodySdfPlan {
+                        prims: splat,
+                        grid: crate::simulation::sdf::SdfGrid::for_aabb(&union),
+                    })
+                } else {
+                    None
+                };
+
                 RenderAvatarInstance {
                     instance_id: avatar.id,
                     world_transform: avatar.world_transform.clone(),
                     mesh_instances,
                     skinning_matrices: avatar.pose.skinning_matrices.clone(),
                     cloth_deforms,
+                    body_sdf,
                     debug_flags: RenderDebugFlags {
                         show_skeleton: toggles.skeleton_debug,
                         show_colliders: toggles.collision_debug,

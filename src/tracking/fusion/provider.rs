@@ -126,6 +126,57 @@ struct WristHold {
     last_z: Option<f64>,
 }
 
+/// σ ceiling `[left, right]` for the depth-lifted ELBOW from forearm bone
+/// rigidity: if the elbow lift and the same side's wrist lift disagree on
+/// the obs-obs forearm length (rigid, shape-fitted — model state plays no
+/// part), at least one of them is not on the arm, and the hand block is
+/// the better-evidenced end (a crop with 25 corroborating keypoints vs a
+/// single body keypoint). This is the one mis-detection that survives
+/// every other filter: a desk-edge elbow passes the reach filter (it sits
+/// a plausible 0.2 m from the shoulder) and its σ follows visibility, not
+/// correctness — benched on s1789303569, such a lift pulled the wrist
+/// 0.5 m for a frame and drove 5 of 6 R-wrist snaps. The 2-D elbow
+/// residual stays (Cauchy already neuters it); only the metric lift is
+/// demoted, mirroring the face-keypoint-under-a-hand-crop handling.
+fn elbow_chain_sigma_cap(
+    pred_fk: &Fk,
+    kp3d: &[super::estimator::Kp3d],
+    elbows: [usize; 2],
+    wrists: [usize; 2],
+) -> [f64; 2] {
+    use super::estimator::ModelPoint;
+    let mut cap = [f64::INFINITY, f64::INFINITY];
+    // σ ceiling for a chain-contradicted elbow lift: ~2× its honest base
+    // σ. At the benched 0.47 m innovation that whitens to ~16σ, where the
+    // 3-D Cauchy weight drops to ≈0.1 — the hand block outvotes it.
+    const CONTRADICTED_SIGMA: f64 = 0.03;
+    // Tolerance beyond the model forearm length before the pair counts as
+    // contradictory: skin→joint lifting offsets along two different rays
+    // plus depth-median noise account for a few cm. 0.05 measured on
+    // s1789311387: the desk-edge left-elbow lift reads the surface behind
+    // the arm (0.728 m vs the true ~0.6 m), overshooting the wrist-to-elbow
+    // obs span by 0.055 — at 0.06 it slipped through and the avatar's left
+    // elbow stayed tucked behind the reach ("left elbow not tracked").
+    // `VULVATAR_FUSION_CHAIN_TOL` overrides.
+    const OVERSHOOT_TOL: f64 = 0.05;
+    let lift = |j: usize| -> Option<&super::estimator::Kp3d> {
+        kp3d.iter()
+            .filter(|k| matches!(k.point, ModelPoint::Joint(jj) if jj == j))
+            .min_by(|a, b| a.sigma.total_cmp(&b.sigma))
+    };
+    for (side, (&e_j, &w_j)) in elbows.iter().zip(wrists.iter()).enumerate() {
+        let (Some(e), Some(w)) = (lift(e_j), lift(w_j)) else {
+            continue;
+        };
+        let bone_obs = norm(sub(e.p, w.p));
+        let bone_model = norm(sub(pred_fk.t[e_j], pred_fk.t[w_j]));
+        if bone_obs - bone_model > OVERSHOOT_TOL {
+            cap[side] = CONTRADICTED_SIGMA;
+        }
+    }
+    cap
+}
+
 impl FusionProvider {
     pub fn from_models_dir_with_config(
         models_dir: impl AsRef<Path>,
@@ -919,6 +970,9 @@ impl PoseProvider for FusionProvider {
             arm_inflate(self.h.j.l_wrist, self.h.j.l_elbow),
             arm_inflate(self.h.j.r_wrist, self.h.j.r_elbow),
         ];
+        // Elbow σ ceilings from forearm bone-rigidity (filled after the
+        // depth-lifts exist; see `elbow_chain_sigma_cap`).
+        let mut chain_cap = [f64::INFINITY, f64::INFINITY];
 
         if let Some(aux) = aux.as_ref() {
             let mut raw: Vec<RawKp> = aux
@@ -1122,6 +1176,12 @@ impl PoseProvider for FusionProvider {
                         &pred,
                         &mut obs.kp3d,
                         &mut obs.surface,
+                    );
+                    chain_cap = elbow_chain_sigma_cap(
+                        &fk_pred,
+                        &obs.kp3d,
+                        [self.h.j.l_elbow, self.h.j.r_elbow],
+                        [self.h.j.l_wrist, self.h.j.r_wrist],
                     );
                     // ---- depth-confirmed wrist hold (see `wrist_hold`) ----
                     if std::env::var("VULVATAR_WRIST_HOLD")
@@ -1709,7 +1769,17 @@ impl PoseProvider for FusionProvider {
                 if !agrees {
                     k.sigma *= inflate[side];
                 }
-                k.sigma = k.sigma.min(arm_sig_cap);
+                // The chain cap is elbow-only: the contradicting wrist /
+                // hand-block lift must keep its full say.
+                let is_elbow = matches!(
+                    k.point,
+                    super::estimator::ModelPoint::Joint(jj)
+                        if jj == self.h.j.l_elbow || jj == self.h.j.r_elbow
+                );
+                k.sigma = k
+                    .sigma
+                    .min(arm_sig_cap)
+                    .min(if is_elbow { chain_cap[side] } else { f64::INFINITY });
             }
         }
         let n_hand_start = self.hand_kp_start.min(obs.kp2d.len());

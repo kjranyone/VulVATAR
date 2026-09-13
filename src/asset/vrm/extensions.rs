@@ -396,6 +396,9 @@ fn build_v1_springs(ext: &v1::SpringBoneExtension) -> (Vec<SpringBoneAsset>, Vec
                 gravity_floor: 0.0,
                 radius,
                 collider_refs,
+                // Category refinement happens in
+                // `apply_body_collision_flags` once node names are at hand.
+                body_collision: true,
                 joint_stiffness,
                 joint_drag,
                 joint_gravity_power,
@@ -645,6 +648,9 @@ fn build_v0_springs(
                 gravity_floor: 0.0,
                 radius,
                 collider_refs: collider_refs.clone(),
+                // Category refinement happens in
+                // `apply_body_collision_flags` once node names are at hand.
+                body_collision: true,
                 // 0.x shares parameters across the whole chain, so broadcast
                 // the group values into per-joint slots.
                 joint_stiffness: vec![group.stiffiness; joint_count],
@@ -745,5 +751,31 @@ fn parse_humanoid_bone(name: &str) -> Option<HumanoidBone> {
         "rightLittleDistal" => Some(HumanoidBone::RightLittleDistal),
 
         _ => None,
+    }
+}
+
+/// Refine [`SpringBoneAsset::body_collision`] by chain-root node name.
+/// VRM spring chains default to colliding against the body-surface
+/// distance field; chains authored to hug or wrap the body surface —
+/// skirts (the GPU clearance field owns their anti-penetration),
+/// breast and belt decorations (the field would float them off the
+/// skin) — opt out. Called once per loaded asset, after the node table
+/// is assembled.
+pub(super) fn apply_body_collision_flags(
+    springs: &mut [crate::asset::SpringBoneAsset],
+    nodes: &[SkeletonNode],
+) {
+    for spring in springs.iter_mut() {
+        let root_name = nodes
+            .iter()
+            .find(|n| n.id == spring.chain_root)
+            .map(|n| n.name.to_lowercase())
+            .unwrap_or_default();
+        if root_name.contains("skirt")
+            || root_name.contains("breast")
+            || root_name.contains("belt")
+        {
+            spring.body_collision = false;
+        }
     }
 }

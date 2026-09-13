@@ -2,6 +2,7 @@ pub mod auto_cloth;
 pub mod cloth;
 pub mod cloth_gpu_boundary;
 pub mod cloth_solver;
+pub mod sdf;
 pub mod spring;
 
 use log::info;
@@ -205,12 +206,13 @@ impl PhysicsWorld {
         avatar: &mut AvatarInstance,
         tuning: &spring::SpringTuning,
         gravity: &SceneGravity,
+        body_sdf: Option<&sdf::SdfField>,
     ) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
         let dir = gravity.local_dir(&avatar.world_transform.rotation);
         let scale = gravity.spring_power_scale();
         for _ in 0..substeps {
-            spring::step_spring_bones(fixed_dt, avatar, &world_colliders, tuning, dir, scale);
+            spring::step_spring_bones(fixed_dt, avatar, &world_colliders, tuning, dir, scale, body_sdf);
         }
     }
 
@@ -265,6 +267,7 @@ impl PhysicsWorld {
         options: SimulationStepOptions,
         spring_tuning: &spring::SpringTuning,
         gravity: &SceneGravity,
+        body_sdf: Option<&sdf::SdfField>,
     ) {
         if substeps == 0 {
             return;
@@ -283,6 +286,7 @@ impl PhysicsWorld {
                     spring_tuning,
                     spring_dir,
                     spring_scale,
+                    body_sdf,
                 );
             }
             if options.cloth_enabled {

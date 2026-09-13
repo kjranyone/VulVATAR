@@ -325,6 +325,7 @@ fn test_load_yumeka_fbx() {
             &tuning,
             [0.0, -1.0, 0.0],
             1.0,
+            None,
         );
     }
     // Verify positions are finite (no NaN / Inf)
@@ -604,6 +605,7 @@ fn test_inspect_hair_and_colliders() {
             &tuning,
             [0.0, -0.707, 0.707], // forward/downward gravity
             1.0,
+            None,
         );
     }
     for state in &avatar.secondary_motion.spring_states {
@@ -741,6 +743,7 @@ fn test_inspect_thigh_colliders_and_skirt() {
             &tuning,
             [0.0, -1.0, 0.0],
             1.0,
+            None,
         );
     }
 

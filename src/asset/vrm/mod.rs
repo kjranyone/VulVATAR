@@ -335,6 +335,9 @@ impl VrmAssetLoader {
 
         // Generate Skin-Anchor Clearance Field for anti-penetration
         crate::asset::clearance::generate_skin_anchors(&mut asset);
+        // Body-field collision flags need node names — refine defaults
+        // set during extension parsing.
+        extensions::apply_body_collision_flags(&mut asset.spring_bones, &asset.skeleton.nodes);
 
         // Cache save
         if let Err(e) = crate::asset::cache::save(&source_path, &asset) {

@@ -128,7 +128,11 @@ impl VulkanRenderer {
             Some(b) => b,
             None => gpu_alloc::host_buffer(
                 memory_allocator,
-                BufferUsage::INDEX_BUFFER,
+                // STORAGE_BUFFER: the body-SDF splat dispatch reads the
+                // indices through a descriptor set, not as a draw's
+                // index binding (usage is a runtime contract — missed
+                // once already on the transformed VBO's TRANSFER_SRC).
+                BufferUsage::INDEX_BUFFER | BufferUsage::STORAGE_BUFFER,
                 idx_slice.iter().copied(),
                 "index buffer",
             )?,

@@ -87,6 +87,7 @@ fn make_two_joint_spring_avatar_with(offset: [f32; 3], gravity_dir: [f32; 3]) ->
         gravity_floor: 0.0,
         radius: 0.0,
         collider_refs: vec![],
+        body_collision: false,
         joint_stiffness: vec![],
         joint_drag: vec![],
         joint_gravity_power: vec![],
@@ -176,6 +177,7 @@ fn make_spring_avatar_with_colliders(
             .as_ref()
             .map(|_| vec![ColliderRef { id: ColliderId(1) }])
             .unwrap_or_default(),
+        body_collision: false,
         joint_stiffness: vec![],
         joint_drag: vec![],
         joint_gravity_power: vec![],
@@ -251,6 +253,7 @@ fn step_all_with_spring_disabled_does_not_mutate_spring_state() {
         },
         &spring::SpringTuning::default(),
         &SceneGravity::default(),
+        None,
     );
 
     let after: Vec<Vec<[f32; 3]>> = avatar
@@ -286,6 +289,7 @@ fn step_all_with_spring_enabled_does_mutate_spring_state() {
         },
         &spring::SpringTuning::default(),
         &SceneGravity::default(),
+        None,
     );
 
     let after: Vec<Vec<[f32; 3]>> = avatar
@@ -305,7 +309,7 @@ fn settle_tip(tuning: &spring::SpringTuning, steps: u32) -> [f32; 3] {
     // gravity must be perpendicular to the bone to produce droop.
     let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
     for _ in 0..steps {
-        world.step_springs(1.0 / 60.0, 1, &mut avatar, tuning, &SceneGravity::default());
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, tuning, &SceneGravity::default(), None);
         avatar.compute_global_pose();
     }
     *avatar.secondary_motion.spring_states[0]
@@ -454,7 +458,7 @@ fn spring_preserves_authored_gravity_dir_at_default_scene() {
         strength: 3.0,
     };
     for _ in 0..240 {
-        world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &strong);
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &strong, None);
         avatar.compute_global_pose();
     }
     let tip = *avatar.secondary_motion.spring_states[0]
@@ -505,7 +509,7 @@ fn zero_substep_frame_preserves_last_solved_spring_rotation() {
         ..Default::default()
     };
     for _ in 0..120 {
-        world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &SceneGravity::default());
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &SceneGravity::default(), None);
         avatar.compute_global_pose();
     }
     let written_node = avatar.asset.spring_bones[0].joints[0].0 as usize;
@@ -582,6 +586,7 @@ fn collider_contact_does_not_bounce() {
             &mut avatar,
             &spring::SpringTuning::default(),
             &SceneGravity::default(),
+            None,
         );
         avatar.compute_global_pose();
         let tip = avatar.secondary_motion.spring_states[0].positions[1];
@@ -628,7 +633,7 @@ fn solved_positions_match_rendered_globals_when_bent() {
         ..Default::default()
     };
     for _ in 0..240 {
-        world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &SceneGravity::default());
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &soft, &SceneGravity::default(), None);
     }
     avatar.compute_global_pose();
     let joints = &avatar.asset.spring_bones[0].joints;
@@ -661,7 +666,7 @@ fn settle_tip_drop(tuning: &spring::SpringTuning, power: f32, floor: f32) -> f32
         &avatar.pose.global_transforms[avatar.asset.spring_bones[0].joints[2].0 as usize],
     )[1];
     for _ in 0..600 {
-        world.step_springs(1.0 / 60.0, 1, &mut avatar, tuning, &SceneGravity::default());
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, tuning, &SceneGravity::default(), None);
     }
     let tip_y = avatar.secondary_motion.spring_states[0].positions[2];
     rest_tip_y - tip_y[1]

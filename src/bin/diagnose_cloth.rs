@@ -125,8 +125,21 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.755);
+    // Pin-band depth knob: a deeper pinned band shortens the free cloth
+    // length so hip sway translates the skirt instead of letting it
+    // buckle/fold at the sides (distance-only XPBD has zero bending
+    // stiffness).
+    let pin_band_depth: f32 = std::env::var("CLOTH_PIN_BAND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.035);
+    let cloth_damping: f32 = std::env::var("CLOTH_DAMPING")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.035);
 
-    let (cloth_asset, skirt_prim_id) = build_skirt_cloth_asset(&avatar, pin_y_threshold)?;
+    let (cloth_asset, skirt_prim_id) =
+        build_skirt_cloth_asset(&avatar, pin_y_threshold, pin_band_depth, cloth_damping)?;
     println!(
         "ClothAsset created: {} particles, {} distance constraints, {} pin points",
         cloth_asset.simulation_mesh.vertices.len(),
@@ -153,6 +166,11 @@ fn main() -> Result<(), String> {
         );
     }
 
+    // CLOTH_OFF=1: skip cloth entirely — the skirt renders as its
+    // static skinned mesh (the ORIGINAL FBX silhouette reference the
+    // user compares against).
+    let cloth_off = std::env::var_os("CLOTH_OFF").is_some();
+
     // 2. Attach Cloth to AvatarInstance
     let overlay_id = ClothOverlayId(1);
     let overlay_slot_idx = avatar.attach_cloth_overlay(overlay_id);
@@ -161,7 +179,16 @@ fn main() -> Result<(), String> {
     // Also init primary cloth for direct snapshot feed
     avatar.init_cloth_sim(&cloth_asset);
     avatar.cloth_enabled = true;
+    if cloth_off {
+        avatar.cloth_enabled = false;
+        avatar.cloth_state = None;
+        avatar.cloth_overlays.clear();
+        println!("CLOTH_OFF: skirt renders as the static FBX skinned mesh");
+    }
 
+    // COLLIDERS_OFF=1: keep every body collider disabled — isolates
+    // collider geometry as the cloth-push source.
+    let colliders_off = std::env::var_os("COLLIDERS_OFF").is_some();
     // Enable colliders for thighs (UpperLeg_L and UpperLeg_R)
     for (i, col) in avatar.asset.colliders.iter().enumerate() {
         let node_name = avatar
@@ -171,10 +198,11 @@ fn main() -> Result<(), String> {
             .get(col.node.0 as usize)
             .map(|n| n.name.to_lowercase())
             .unwrap_or_default();
-        if node_name.contains("upperleg")
-            || node_name.contains("leg")
-            || node_name.contains("thigh")
-            || node_name.contains("hips")
+        if !colliders_off
+            && (node_name.contains("upperleg")
+                || node_name.contains("leg")
+                || node_name.contains("thigh")
+                || node_name.contains("hips"))
         {
             avatar.collider_enabled[i] = true;
             println!(
@@ -192,6 +220,31 @@ fn main() -> Result<(), String> {
         sim.collision_margin = 0.015; // 1.5 cm collider margin around legs
         sim.wind_direction = [0.3, 0.0, 0.15];
         sim.wind_response = 0.8; // visible flutter
+    }
+
+    for (i, c) in vulvatar_lib::simulation::cloth::resolve_colliders(
+        &avatar.asset.colliders,
+        &avatar.pose.global_transforms,
+        &avatar.collider_enabled,
+    )
+    .iter()
+    .enumerate()
+    {
+        match c {
+            vulvatar_lib::simulation::cloth::ResolvedCollider::Sphere { center, radius } => println!(
+                "COLLIDER #{i} sphere center [{:.3},{:.3},{:.3}] r {:.3}",
+                center[0], center[1], center[2], radius
+            ),
+            vulvatar_lib::simulation::cloth::ResolvedCollider::Capsule {
+                center,
+                radius,
+                half_height,
+                axis,
+            } => println!(
+                "COLLIDER #{i} capsule center [{:.3},{:.3},{:.3}] r {:.3} hh {:.3} axis [{:.2},{:.2},{:.2}]",
+                center[0], center[1], center[2], radius, half_height, axis[0], axis[1], axis[2]
+            ),
+        }
     }
 
     // 3. Initialize Vulkan renderer
@@ -263,6 +316,13 @@ fn main() -> Result<(), String> {
             avatar.compute_global_pose();
             avatar.build_skinning_matrices();
 
+            // RIDE-UP diagnosis knob: skip spring stepping entirely to
+            // test whether the skirt/hem deformation is spring-driven.
+            // (The knob must wrap the SPRING step itself — an earlier
+            // placement only wrapped wind + cloth and left springs
+            // running, invalidating the first A/B.)
+            let springs_off = std::env::var_os("SPRINGS_OFF").is_some();
+            if !springs_off {
             // Step secondary motion (hair, accessories) with newly attached body colliders
             let spring_tuning = vulvatar_lib::simulation::spring::SpringTuning::default();
             vulvatar_lib::simulation::spring::step_spring_bones(
@@ -272,14 +332,26 @@ fn main() -> Result<(), String> {
                 &spring_tuning,
                 [0.0, -1.0, 0.0],
                 1.0,
+                None,
             );
             avatar.compute_global_pose();
             avatar.build_skinning_matrices();
 
-            // Apply gentle fluctuating breeze
+            // Apply gentle fluctuating breeze. `WIND_SCALE` scales the
+            // response for the cloth-stability experiment (0 = no wind).
             if let Some(ref mut sim) = avatar.cloth_sim {
                 let gust = (t * 2.2).sin() * 0.4 + 0.6;
-                sim.wind_direction = [0.35 * gust, (t * 1.8).cos() * 0.05, 0.2 * gust];
+                let wind_scale = std::env::var("WIND_SCALE")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                let wind = [0.35 * gust, (t * 1.8).cos() * 0.05, 0.2 * gust];
+                sim.wind_direction = [
+                    wind[0] * wind_scale,
+                    wind[1] * wind_scale,
+                    wind[2] * wind_scale,
+                ];
+                sim.wind_response = 0.8 * wind_scale;
             }
 
             // Force-enable self-collision for the GPU smoke when asked —
@@ -310,6 +382,7 @@ fn main() -> Result<(), String> {
                 }
             }
             vulvatar_lib::simulation::cloth_solver::step_cloth(dt, &mut avatar, &[]);
+            } // !springs_off
         }
 
         // Check simulation health
@@ -368,6 +441,11 @@ fn main() -> Result<(), String> {
                         slot.state.deform_output.version = entry.version as u64;
                     }
                 }
+            }
+
+            if frame == 0 {
+                audit_sweater_bones(&avatar, PrimitiveId(5));
+                audit_sweater_bones(&avatar, PrimitiveId(12));
             }
 
             // CPU anchor evaluation: locate WHICH clearance anchors
@@ -460,6 +538,81 @@ fn main() -> Result<(), String> {
 /// parent primitive's CPU-LBS surface and report the worst offenders.
 /// Locates WHICH anchors / parent vertices drive the ~180 mm pushes the
 /// VBO audit measures.
+/// RIDE-UP diagnosis: which bones drive the sweater mesh, and are they
+/// spring-driven? Prints the dominant bones for the whole primitive and
+/// for its lowest-y band (the hem) with spring-bone membership marks.
+fn audit_sweater_bones(avatar: &AvatarInstance, prim_id: PrimitiveId) {
+    use std::collections::HashMap;
+    let asset = &avatar.asset;
+    let Some(prim) = asset
+        .meshes
+        .iter()
+        .flat_map(|m| m.primitives.iter())
+        .find(|p| p.id == prim_id)
+    else {
+        return;
+    };
+    let Some(vd) = prim.vertices.as_ref() else {
+        return;
+    };
+    // Spring chains list their joints per chain; every joint node is a
+    // spring-driven node.
+    let spring_nodes: std::collections::HashSet<usize> = asset
+        .spring_bones
+        .iter()
+        .flat_map(|sb| sb.joints.iter().map(|j| j.0 as usize))
+        .collect();
+    let node_name = |i: usize| -> String {
+        asset
+            .skeleton
+            .nodes
+            .get(i)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| format!("node{i}"))
+    };
+
+    // Full-mesh bone histogram + hem-band (lowest 15% by y) histogram.
+    let mut ys: Vec<(f32, usize)> = vd
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p[1], i))
+        .collect();
+    ys.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let hem_count = (vd.positions.len() as f32 * 0.15) as usize;
+    let hem_set: std::collections::HashSet<usize> =
+        ys.iter().take(hem_count).map(|(_, i)| *i).collect();
+
+    let mut full: HashMap<usize, f32> = HashMap::new();
+    let mut hem: HashMap<usize, f32> = HashMap::new();
+    for (i, indices) in vd.joint_indices.iter().enumerate() {
+        for (slot, &ji) in indices.iter().enumerate() {
+            let w = vd.joint_weights.get(i).map(|w| w[slot]).unwrap_or(0.0);
+            if w > 0.0001 && (ji as usize) < asset.skeleton.nodes.len() {
+                *full.entry(ji as usize).or_default() += w;
+                if hem_set.contains(&i) {
+                    *hem.entry(ji as usize).or_default() += w;
+                }
+            }
+        }
+    }
+    let dump = |m: &HashMap<usize, f32>, label: &str| {
+        let mut v: Vec<(usize, f32)> = m.iter().map(|(k, w)| (*k, *w)).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        println!("  BONES {label} prim {}:", prim_id.0);
+        for (node, w) in v.iter().take(8) {
+            println!(
+                "    {:>6.2} {} {}",
+                w,
+                if spring_nodes.contains(node) { "[spring]" } else { "        " },
+                node_name(*node)
+            );
+        }
+    };
+    dump(&full, "all");
+    dump(&hem, "hem");
+}
+
 fn audit_clearance_anchors_with(
     skinning: &[vulvatar_lib::asset::Mat4],
     label: &str,
@@ -764,6 +917,8 @@ fn audit_clearance_anchors(avatar: &AvatarInstance, prim_id: PrimitiveId, top_k:
 fn build_skirt_cloth_asset(
     avatar: &AvatarInstance,
     pin_y: f32,
+    pin_band_depth: f32,
+    cloth_damping: f32,
 ) -> Result<(ClothAsset, PrimitiveId), String> {
     let asset = &avatar.asset;
 
@@ -887,7 +1042,12 @@ fn build_skirt_cloth_asset(
             world_pos = pos;
         }
 
-        let is_pin = world_pos[1] >= pin_y;
+        // Pin band: waistband threshold plus a deeper pinned band
+        // (`pin_band_depth` below the threshold) — a longer pinned
+        // region shortens the free cloth so hip sway translates the
+        // skirt instead of letting the zero-bending-stiffness cloth
+        // buckle at the sides.
+        let is_pin = world_pos[1] >= pin_y - pin_band_depth;
         let normal = vd.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
         let uv = vd.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
 
@@ -1058,7 +1218,7 @@ fn build_skirt_cloth_asset(
             substeps: 4,
             iterations: 8,
             gravity_scale: 1.0,
-            damping: 0.035,
+            damping: cloth_damping,
             self_collision: false,
             collision_margin: 0.015,
             wind_response: 0.8,
@@ -1316,6 +1476,7 @@ fn build_render_frame_input(
         mesh_instances,
         skinning_matrices: avatar.pose.skinning_matrices.clone(),
         cloth_deforms,
+body_sdf: None,
         debug_flags: RenderDebugFlags::default(),
     };
 

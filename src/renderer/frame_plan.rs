@@ -108,6 +108,19 @@ pub(super) struct PlannedClothNormal {
     pub(super) set: Arc<DescriptorSet>,
 }
 
+/// One instance's body-SDF splat dispatches, recorded after every
+/// transform dispatch of that instance (they read the freshly skinned
+/// vertices of each splatted primitive — body + face/head surfaces —
+/// and accumulate into the shared field via atomicMin).
+pub(super) struct PlannedSdf {
+    /// One (set, groups) pair per splatted primitive.
+    pub(super) dispatches: Vec<(Arc<DescriptorSet>, [u32; 3])>,
+    /// The field buffer, sentinel-filled (`fill_buffer` u32::MAX) once
+    /// before the dispatches — command-buffer-visible identity, hashed
+    /// into the key.
+    pub(super) field: Subbuffer<[u32]>,
+}
+
 /// One primitive's transform dispatch in Kahn order, with its optional
 /// cloth prologue.
 pub(super) struct PlannedPrim {
@@ -119,6 +132,7 @@ pub(super) struct PlannedPrim {
 pub(super) struct PlannedInstance {
     pub(super) skinning_set: Arc<DescriptorSet>,
     pub(super) prims: Vec<PlannedPrim>,
+    pub(super) sdf: Option<PlannedSdf>,
 }
 
 /// Everything one frame's command buffer needs, minus the per-frame buffer
@@ -358,6 +372,20 @@ impl VulkanRenderer {
             for prim in &inst.prims {
                 hash_arc(&mut h, &prim.transform_set);
                 h.write_u32(prim.groups[0]);
+                // Body-SDF splat resources are bound by the recorded
+                // command buffer too — same command-buffer-visible
+                // identity rule as the cloth sets above.
+                if let Some(sdf) = &inst.sdf {
+                    h.write_u8(1);
+                    h.write_usize(sdf.dispatches.len());
+                    for (set, groups) in &sdf.dispatches {
+                        hash_arc(&mut h, set);
+                        h.write_u32(groups[0]);
+                    }
+                    sdf.field.hash(&mut h);
+                } else {
+                    h.write_u8(0);
+                }
                 if let Some(cloth) = &prim.cloth {
                     h.write_u8(1);
                     hash_arc(&mut h, &cloth.verlet_set);

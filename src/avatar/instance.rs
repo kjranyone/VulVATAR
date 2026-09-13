@@ -7,6 +7,7 @@ use crate::avatar::animation::{self, AnimationState};
 use crate::avatar::expressions::{ExpressionState, ResolvedExpressionWeight};
 use crate::avatar::pose::{self as pose_helpers, AvatarPose};
 use crate::simulation::cloth::{ClothSimState, ClothSimTempBuffers};
+use crate::simulation::sdf::SdfField;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AvatarInstanceId(pub u64);
@@ -32,6 +33,11 @@ pub struct AvatarInstance {
     /// GUI shadow). `resolve_colliders` skips entries set to `false`.
     /// Runtime-only (not persisted); resets to all-enabled on (re)load.
     pub collider_enabled: Vec<bool>,
+    /// Body-surface distance field (avatar-root space) read back from
+    /// the renderer's splat dispatch, refreshed every rendered frame.
+    /// The spring solver resolves `body_collision` chains against it —
+    /// see `simulation/sdf.rs`. `None` until the first field arrives.
+    pub body_sdf: Option<SdfField>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
     /// Temporal state for the expression (blend-shape) solve.
     pub expression_state: ExpressionState,
@@ -202,6 +208,11 @@ impl AvatarInstance {
             cloth_sim_buffers: None,
             cloth_overlays: Vec::new(),
             collider_enabled: vec![true; collider_count],
+            // Body-surface distance field delivered by the renderer's
+            // readback one frame after each splat; `None` until the
+            // first field arrives (spring bones simply don't collide
+            // with the body yet).
+            body_sdf: None,
             expression_weights,
             expression_state: ExpressionState::default(),
             retarget_state: Default::default(),

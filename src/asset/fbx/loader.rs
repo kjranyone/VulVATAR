@@ -87,6 +87,7 @@ impl FbxAssetLoader {
                 }
             }
             if cached.body_primitive_id.is_none() {
+                crate::asset::clearance::demote_distant_breast_weights(&mut cached);
                 crate::asset::clearance::generate_skin_anchors(&mut cached);
                 let _ = crate::asset::cache::save(&source_path, &cached);
             }
@@ -668,7 +669,8 @@ impl FbxAssetLoader {
         };
 
         // Generate Skin-Anchor Clearance Field for anti-penetration
-        crate::asset::clearance::generate_skin_anchors(&mut asset);
+        crate::asset::clearance::demote_distant_breast_weights(&mut asset);
+    crate::asset::clearance::generate_skin_anchors(&mut asset);
 
         // Cache save
         if let Err(e) = crate::asset::cache::save(&source_path, &asset) {

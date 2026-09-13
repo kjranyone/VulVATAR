@@ -954,9 +954,19 @@ impl Estimator {
                                 self.dense.add_residual(&[(pidx, inv_lim)], r, 1.0);
                             }
                         }
-                        // prior — the model's relaxed pose.
-                        let mean0 = jd.prior_mean[0];
+                        // prior — the model's relaxed pose. NOTE: since the
+                        // pose-calibration neutral went out (058bfba) this
+                        // mean is the model's hang-down pose, ~1+ rad from
+                        // a desk user's reaching arms; benched on
+                        // s1789311387, the prior (with the trunk terms)
+                        // holds a reaching left elbow ~0.2 m behind its
+                        // observation (L-wrist snaps 6, freed at
+                        // PRIOR_SCALE 0.05 — but global relaxation wrecks
+                        // trunk yaw, and shoulder-/elbow-only relaxation
+                        // frees neither). The per-user neutral from the
+                        // calibration rebuild is the real fix.
                         let sp = (jd.prior_sigma[0] * p.pose_prior_scale).max(1e-4);
+                        let mean0 = jd.prior_mean[0];
                         let r = (a - mean0) / sp;
                         cost += r * r;
                         if build {

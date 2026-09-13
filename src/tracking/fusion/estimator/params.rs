@@ -228,7 +228,11 @@ impl Default for Params {
                 // 25 = middle of the flat optimum (k 20-30), see field doc.
                 .unwrap_or(25.0),
             velocity_tau: 0.25,
-            pose_prior_scale: 1.0,
+            pose_prior_scale: std::env::var("VULVATAR_FUSION_PRIOR_SCALE")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(1.0),
             var_min: 1e-8,
             var_max: 25.0,
             elbow_low_sigma: 0.10,

@@ -149,19 +149,75 @@
 (bn = 純 -x)、child は**胸の前面** (z = +0.09) — normal 互換 (dot ≥ 0.1)
 を通過する誤対応が生成姿勢の評価では raw ≥ -5 mm でも、実行ポーズでは
 -81.8 mm になり、shader 防御 (deep-negative skip) がこれを無効化する。
-残る軽微な事項: スカート面の髪の毛幅の seam ライン (フラットシェード
-コピーの微ドリフト — 個体縫い目仕様の範囲、Phase C の粒子/描画頂点分離
-で消える)。
+
+### お腹露出 (セーター裾の乗り上がり) — 同日・第3ラウンド
+
+ユーザー指摘「お腹丸見え」の再現と修正。 clearances 修正前後の両実行で
+裾の上昇が発生 (clearance とは無関係) を確認後、ボーン加重ヒストグラム
+診断 (`audit_sweater_bones`) で確定:
+
+- **セーター (prim 5) の裾頂点の支配ウェイトが `Breast_1_L/R`
+  (spring 駆動チェーン) に塗られている** (裾バンド 596/593 — 全体でも
+  Chest を上回る最大加重)。sway/spring の動きで裾が胸チェーンに
+  引きずられ、腹部が露出する。**アセットのウェイト塗り問題**。
+- 修正: `demote_distant_breast_weights` (clearance.rs, import 時後処理)
+  — breast ノードから 1.5×チェーン長より遠い頂点の breast ウェイトを
+  最近傍の非 breast 祖先 (Chest) へ降格。Yumeka で **5,376 weights**
+  降格 (Breast_1/2/3 → Chest、gate 90-174 mm)。v21 キャッシュ無効化。
+- 検証: 90フレーム通してニットが腹部を覆い、露出解消
+  (`diagnostics/cloth_belly_fixed/belly_fixed_timeline.png`)。
+  frame 90 に裾トリム下の小さな白いスリバー残存 (軽微 — Phase C の
+  粒子/描画頂点分離またはウェイト再塗りの対象)。
+- 残課題: breast 揺れ表現は breast 近傍ウェイトのみで成立するため
+  影響は限定的だが、リアクティブな胸揺れの変化を実機で確認すること。
 
 ```powershell
-$env:PKG_CONFIG_PATH="$PWDuild-support\pkgconfig"
-$env:LIBCLANG_PATH="C:\Program Files\LLVMin"
+$env:PKG_CONFIG_PATH="$PWD\build-support\pkgconfig"
+$env:LIBCLANG_PATH="C:\Program Files\LLVM\bin"
 $env:RUST_LOG="info"
 $env:VULVATAR_CLOTH_GPU="1"; $env:VULVATAR_CLOTH_SELFCOL="1"
 $env:VULVATAR_VBO_AUDIT="1"; $env:CLOTH_RENDER_EVERY="1"
+$env:CLOTH_PIN_BAND="0.10"
 $env:CLOTH_SUBSTEPS="4"
-cargo run --bin diagnose_cloth -- sample_data/YUMEKA_v1.0.3/FBX/Yumeka_v1.0.3.fbx diagnostics/cloth_verify_clean 90
+cargo run --bin diagnose_cloth -- sample_data/YUMEKA_v1.0.3/FBX/Yumeka_v1.0.3.fbx diagnostics/cloth_final_front 90
+# 背面: $env:CAM_YAW="180" を追加して diagnostics/cloth_final_back へ
 ```
+
+### メッシュ暴れ・ケツ見え・シルエット崩壊の分離実験 — 同日・第4ラウンド
+
+ユーザー指摘「ケツが見える / FBXと違うシルエット / メッシュが暴れる」を
+背面カメラ (`CAM_YAW=180`) と隔離knob (`SPRINGS_OFF` / `WIND_SCALE` /
+`COLLIDERS_OFF` / `CLOTH_OFF`) で切り分けた:
+
+| 構成 | スカート状態 |
+|---|---|
+| 全ON (cloth + springs + wind + colliders) | 側面で裾が折れ上がり、腰/尻が露出 |
+| springs OFF (cloth+wind+colliders) | 同様に崩壊 — springs は無関係 |
+| springs OFF + wind 0 | 同様に崩壊 — wind も無関係 |
+| springs OFF + wind 0 + colliders OFF | 同様に崩壊 — colliders も無関係 |
+| **cloth OFF (純スキニング, springs ON)** | **同様に崩壊 — Skirt_* スプリングチェーンの暴れがスキン経路でも再現** |
+| **springs OFF + cloth OFF** | **完全正常 (FBXシルエット)** |
+| **cloth + pin band 10 cm** (springs ON, wind 0.5, colliders ON) | **正常 — プリーツAライン維持、お尻カバー** |
+
+結論: (a) 純スキニング経路の暴れは Skirt_* スプリングチェーンの
+過剰スイング (spring tuning または authored DynamicBone 値の問題 —
+ライブでは SpringTuning の sway を絞ることで緩和可能);
+(b) cloth 経路の暴れは **ゼロ曲げ剛性 (距離拘束のみ) の布が腰の sway
+で側面に座屈する現象**で、深いピン帯 (自由長の短縮) が実用対処。
+恒久対処は曲げ拘束のGPU展開 (Phase D、CPU 参照モデルは R7 で修正済み
+— auto-cloth は bend を生成していない) と body-SDF (並行リファクタで
+実装中の `body_sdf` / SdfField)。
+
+`auto_cloth.rs` のピン帯を garment 高さ比例 (40%, clamp 3.5-12 cm) に
+変更済み — ライブ auto-cloth に反映される。
+
+最終検証: `diagnostics/final_verification.png` — 正面・背面とも t0 と
+t90 で FBXシルエット (プリーツAライン) を維持、お尻カバー回復、暴れ
+なし、telemetry 安定 (prim 5 corr max 9.7 mm、prim 12 corr max
+24.2 mm、NaN 0)。waistband の薄色スリバーとフラットシェード継ぎ目の
+髪の毛ラインが残る (Phase C の粒子/描画頂点分離またはアセット側縫い目
+ウェルドの対象)。
+
 
 合格基準: prim 5 corr max < 30 mm (radial 温存分)、prim 12 corr max
 < 40 mm (radial clamp 20 mm + margin)、NaN 0、胸の浮遊破片なし、

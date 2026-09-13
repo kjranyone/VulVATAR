@@ -19,6 +19,7 @@ mod pipeline_lint_tests;
 mod pipeline_targets;
 mod post_effects;
 mod readback;
+pub mod sdf_field;
 mod texture_cache;
 pub mod thumbnail;
 mod transform_cache;
@@ -74,6 +75,12 @@ pub struct RenderResult {
     /// from host-visible staging one frame stale (same fence semantics
     /// as `cloth_readback`).
     pub vbo_audit: Vec<VboAuditEntry>,
+    /// Body-surface distance fields read back from the previous frame's
+    /// splat dispatch, one row per avatar instance planned this frame.
+    /// One frame stale by construction (same fence semantics as
+    /// `cloth_readback`). The spring solver resolves hair against the
+    /// matching avatar's field — see `simulation/sdf.rs`.
+    pub sdf_fields: Vec<sdf_field::SdfFieldReadback>,
     /// Per-pixel non-linear NDC depth (`[0,1]`, `extent[0] × extent[1]`,
     /// row-major top-down, matching the colour readback) — populated only
     /// when [`VulkanRenderer::set_depth_readback`]`(true)` is active and the
@@ -523,6 +530,16 @@ pub struct VulkanRenderer {
     /// resource; LRU-capped at [`CB_CACHE_CAP`].
     cb_cache: HashMap<u64, CachedFrameCb>,
 
+    /// Per-avatar-instance body-SDF splat resources (field + params UBO
+    /// + descriptor set). See `sdf_field.rs`.
+    sdf_slots: sdf_field::SdfSlotMap,
+    /// The splat compute pipeline (created with the other compute
+    /// pipelines at device init).
+    sdf_pipeline: Option<Arc<ComputePipeline>>,
+    /// Instance ids whose splat dispatch was planned THIS frame — the
+    /// readback window only maps fields the current frame will refresh.
+    sdf_planned: Vec<u64>,
+
     // Async readback ring: two-stage (staging + readback) buffers and pending fence.
     staging_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
     readback_buffers: [Option<Subbuffer<[u8]>>; READBACK_RING_SIZE],
@@ -617,6 +634,9 @@ impl VulkanRenderer {
             camera_ring: None,
             bg_uniform_ring: None,
             cb_cache: HashMap::new(),
+            sdf_slots: HashMap::new(),
+            sdf_pipeline: None,
+            sdf_planned: Vec::new(),
 
             staging_buffers: [None, None],
             readback_buffers: [None, None],
@@ -974,6 +994,14 @@ impl VulkanRenderer {
             )
             .expect("failed to create cloth selfcol resolve pipeline");
         self.cloth_selfcol_resolve_pipeline = Some(cloth_selfcol_resolve_pipeline);
+        // Body-SDF splat pipeline. Created upfront like the cloth
+        // compute pipelines; the per-instance field slots allocate
+        // lazily on first frame that requests one.
+        let body_sdf_splat_pipeline = pipeline::create_body_sdf_splat_compute_pipeline(
+            self.device.as_ref().expect("device set above").clone(),
+        )
+        .expect("failed to create body SDF splat compute pipeline");
+        self.sdf_pipeline = Some(body_sdf_splat_pipeline);
         self.sampler = Some(sampler);
         self.default_texture_view = Some(default_texture_view);
         self.post_sampler = Some(post_sampler);
@@ -1134,6 +1162,10 @@ impl VulkanRenderer {
         // Cached command buffers reference the old per-primitive /
         // skinning resources — they must not survive an avatar swap.
         self.cb_cache.clear();
+        // SDF slots pin the old instances' field buffers and descriptor
+        // sets; drop them with everything else.
+        self.sdf_slots.clear();
+        self.sdf_planned.clear();
         // `stub_storage_ssbo` is intentionally retained — it is a tiny
         // 1-element zero buffer with no per-avatar state, and reallocating
         // would burn one needless VRAM round-trip on every avatar swap.
@@ -1168,6 +1200,7 @@ impl VulkanRenderer {
                 depth_ndc: None,
                 cloth_readback: Vec::new(),
                 vbo_audit: Vec::new(),
+                sdf_fields: Vec::new(),
             });
         }
 
@@ -1228,8 +1261,12 @@ impl VulkanRenderer {
         // frame. Attached to whichever result this call returns.
         let cloth_readback = self.read_cloth_positions();
         // Same one-frame-stale discipline as the cloth readback above
-        // (previous frame's fence already waited). Empty unless
-        // `VULVATAR_VBO_AUDIT=1`.
+        // (previous frame's fence already waited). Only the instances
+        // planned THIS frame map their fields; rows for gated-off
+        // instances would ship stale geometry.
+        let sdf_planned = std::mem::take(&mut self.sdf_planned);
+        let sdf_fields = sdf_field::read_sdf_fields(&self.sdf_slots, &sdf_planned);
+        // Same overwrite discipline as `cloth_readback` above.
         let vbo_audit = self.read_vbo_audit();
 
         crate::tracking::stagelog::mark(self.frame_counter, "render_submit");
@@ -1288,6 +1325,7 @@ impl VulkanRenderer {
             Some(mut h) => {
                 h.cloth_readback = cloth_readback;
                 h.vbo_audit = vbo_audit;
+                h.sdf_fields = sdf_fields;
                 Ok(h)
             }
             None => Ok(RenderResult {
@@ -1299,6 +1337,7 @@ impl VulkanRenderer {
                 depth_ndc: None,
                 cloth_readback,
                 vbo_audit,
+                sdf_fields,
             }),
         }
     }
@@ -1470,6 +1509,11 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no cloth selfcol resolve pipeline")?
             .clone();
+        let body_sdf_splat_pipeline = self
+            .sdf_pipeline
+            .as_ref()
+            .ok_or("renderer: no body SDF splat pipeline")?
+            .clone();
 
         let mut builder = AutoCommandBufferBuilder::primary(
             cb_allocator,
@@ -1490,6 +1534,7 @@ impl VulkanRenderer {
             &cloth_collide_pipeline,
             &cloth_selfcol_build_pipeline,
             &cloth_selfcol_resolve_pipeline,
+            &body_sdf_splat_pipeline,
             &plan.instances,
             &plan.containment_copies,
             &plan.audit_copies,

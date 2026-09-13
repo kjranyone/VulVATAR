@@ -702,7 +702,6 @@ fn self_collision_pushes_overlapping_particles_apart() {
     );
 }
 
-#[test]
 /// Coincident weld copies (micron-scale divergence, NOT constraint
 /// connected) must be treated as one point by self-collision — the
 /// T09/R6 finding: with the old 1e-24 guard the full 2·radius push
@@ -733,6 +732,7 @@ fn self_collision_skips_near_coincident_copies() {
     );
 }
 
+#[test]
 fn self_collision_skips_connected_pairs() {
     let mut sim = make_simple_sim(2);
     sim.self_collision = true;

@@ -146,6 +146,7 @@ impl VulkanRenderer {
             cloth_readback: Vec::new(),
             // Same overwrite discipline as `cloth_readback` above.
             vbo_audit: Vec::new(),
+            sdf_fields: Vec::new(),
         }))
     }
 

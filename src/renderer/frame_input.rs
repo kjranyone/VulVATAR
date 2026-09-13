@@ -110,6 +110,21 @@ impl Default for BloomSettings {
     }
 }
 
+/// Request for the body-surface distance field splat on this instance.
+/// The renderer voxel-splats the skinned primitive into a grid covering
+/// the avatar's rest AABB (expanded by the collision shell) every frame
+/// and ships the field back via `RenderResult::sdf_fields`, where the
+/// spring solver picks it up — see `simulation/sdf.rs`.
+#[derive(Clone, Debug)]
+pub struct BodySdfPlan {
+    /// Primitives to splat: the body surface plus any face/head
+    /// surface (often a separate primitive; hair bangs and twintails
+    /// collide against it). Each splats into the shared field through
+    /// its own dispatch.
+    pub prims: Vec<(crate::asset::MeshId, crate::asset::PrimitiveId)>,
+    pub grid: crate::simulation::sdf::SdfGrid,
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderAvatarInstance {
     pub instance_id: AvatarInstanceId,
@@ -122,6 +137,11 @@ pub struct RenderAvatarInstance {
     /// primitive identified by `target_primitive_id`. Empty when the
     /// avatar has no cloth or the cloth has no render binding yet.
     pub cloth_deforms: Vec<ClothDeformSnapshot>,
+    /// `Some` when the instance's spring chains want body collision —
+    /// the renderer splats the named primitive into `grid`'s field as
+    /// part of the compute prepass. `None` when the asset has no body
+    /// primitive or the spring solver is toggled off.
+    pub body_sdf: Option<BodySdfPlan>,
     pub debug_flags: RenderDebugFlags,
 }
 

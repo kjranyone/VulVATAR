@@ -1046,6 +1046,23 @@ pub fn build_spring_bones_and_colliders(
             _ => 0.0,
         };
 
+        // Body-field collision: hair / tail / wing strands resolve
+        // against the body-surface distance field at runtime. Skirt
+        // chains are excluded (the GPU clearance field owns skirt
+        // anti-penetration) and so are surface-hugging decorative
+        // chains (breast, belt) the field would float off the skin.
+        let body_collision = matches!(
+            chain.category,
+            ChainCategory::HairFront
+                | ChainCategory::HairSide
+                | ChainCategory::HairTwintale
+                | ChainCategory::HairBack
+                | ChainCategory::HairRibbon
+                | ChainCategory::HairWing
+                | ChainCategory::Tail
+                | ChainCategory::Wing
+        );
+
         spring_bones.push(SpringBoneAsset {
             chain_root: NodeId(chain.root_node_idx as u64),
             joints: joint_nodes,
@@ -1056,6 +1073,7 @@ pub fn build_spring_bones_and_colliders(
             gravity_floor,
             radius,
             collider_refs: col_refs,
+            body_collision,
             joint_stiffness: Vec::new(),
             joint_drag: Vec::new(),
             joint_gravity_power: Vec::new(),

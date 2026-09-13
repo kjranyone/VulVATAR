@@ -208,7 +208,8 @@ fn main() -> Result<(), String> {
                 mesh_instances,
                 skinning_matrices: avatar.pose.skinning_matrices.clone(),
                 cloth_deforms: Vec::new(),
-                debug_flags: Default::default(),
+    body_sdf: None,
+            debug_flags: Default::default(),
             }],
             output_request: OutputTargetRequest {
                 preview_enabled: true,

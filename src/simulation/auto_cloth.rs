@@ -29,10 +29,19 @@ use crate::asset::{
 };
 use crate::avatar::AvatarInstance;
 
-/// How far below the primitive's top the pin band reaches. 3.5 cm
-/// covers a waistband ring on human-scale avatars without pinning the
-/// flare below it.
+/// How far below the primitive's top the pin band reaches. A DEEP pin
+/// band is the anti-buckling contract for distance-only XPBD (zero
+/// bending stiffness): a shallow 3.5 cm band left most of the skirt as
+/// free cloth, and hip sway buckled it at the sides — the hem folded up
+/// to the waist exposing the hips/butt (measured, `diagnostics/
+/// pinband_ab.png`). Pinning ~40% of the garment height keeps the
+/// authored A-line while the free lower half still sways. Scaled by the
+/// garment's own height and clamped so small and long garments stay
+/// sane.
 const PIN_BAND: f32 = 0.035;
+const PIN_BAND_MIN: f32 = 0.035;
+const PIN_BAND_MAX: f32 = 0.12;
+const PIN_BAND_HEIGHT_FRACTION: f32 = 0.4;
 /// Skirt classifier bone-weight threshold (Phase 1 parity).
 const SKIRT_WEIGHT_RATIO: f32 = 0.4;
 
@@ -250,9 +259,13 @@ fn build_cloth_for_prim(
         })
         .collect();
 
-    // Pin band: the primitive's own top ring.
+    // Pin band: the primitive's own top ring, deepened by the garment's
+    // own height (see the PIN_BAND contract above).
     let top = world.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
-    let pin_y = top - PIN_BAND;
+    let bottom = world.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+    let pin_band = (PIN_BAND_HEIGHT_FRACTION * (top - bottom))
+        .clamp(PIN_BAND_MIN, PIN_BAND_MAX);
+    let pin_y = top - pin_band;
 
     let mut sim_vertices = Vec::with_capacity(world.len());
     let mut pins = Vec::new();
@@ -628,8 +641,12 @@ mod tests {
                 "expected a waist pin ring, got {} pins",
                 a.pins.len()
             );
+            // The deep anti-buckling pin band (40% of garment height,
+            // clamped) legitimately pins a larger share than the old
+            // 3.5 cm band; the hard bound only guards against the band
+            // swallowing the whole garment.
             assert!(
-                a.pins.len() < a.simulation_mesh.vertices.len() / 3,
+                a.pins.len() * 2 < a.simulation_mesh.vertices.len(),
                 "pin band must not swallow the garment ({} of {})",
                 a.pins.len(),
                 a.simulation_mesh.vertices.len()

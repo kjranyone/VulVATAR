@@ -81,6 +81,9 @@ impl VulkanRenderer {
         // every transform dispatch when `VULVATAR_VBO_AUDIT=1`. Staging
         // is read back after the frame fence by `read_vbo_audit`.
         let mut audit_copies: Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)> = Vec::new();
+        // Body-SDF readback queue: only instances planned this frame get
+        // their (previous frame's) field mapped at the next read window.
+        self.sdf_planned.clear();
 
         for (inst_idx, instance) in input.instances.iter().enumerate() {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
@@ -988,9 +991,71 @@ impl VulkanRenderer {
                     outline: outline_info,
                 });
             }
+            // ── Body-SDF splat slot ─────────────────────────────────────
+            // Planned after every transform dispatch of this instance so
+            // the splats read the freshly skinned vertices of each
+            // requested primitive (body + face/head surfaces). The slot
+            // allocates lazily per instance and is keyed by grid
+            // geometry + primitive list; see `renderer/sdf_field.rs`.
+            let mut sdf_plan = None;
+            if let Some(request) = instance.body_sdf.as_ref() {
+                let pipeline = self
+                    .sdf_pipeline
+                    .as_ref()
+                    .ok_or("renderer: no body SDF splat pipeline")?
+                    .clone();
+                let mut splat_prims = Vec::new();
+                let mut splat_ids = Vec::new();
+                for &(mesh_id, primitive_id) in &request.prims {
+                    let key = (mesh_id, primitive_id);
+                    let Some(slot) = self.transform_cache.get(&key) else {
+                        warn!(
+                            "render: body SDF request names primitive {key:?} which has no transform slot; skipping it"
+                        );
+                        continue;
+                    };
+                    let index_count = slot.index_buffer.len() as u32;
+                    if index_count < 3 {
+                        continue;
+                    }
+                    splat_prims.push(super::sdf_field::SplatPrimInput {
+                        vertex_buffer: slot.transformed_vbo.clone(),
+                        index_buffer: slot.index_buffer.clone(),
+                        tri_count: index_count / 3,
+                    });
+                    splat_ids.push(key);
+                }
+                if !splat_prims.is_empty() {
+                    super::sdf_field::ensure_sdf_slot(
+                        &mut self.sdf_slots,
+                        instance.instance_id.0,
+                        request.grid,
+                        &splat_prims,
+                        splat_ids,
+                        memory_allocator,
+                        ds_allocator,
+                        &pipeline,
+                    )?;
+                    let slot = self
+                        .sdf_slots
+                        .get(&instance.instance_id.0)
+                        .expect("just ensured");
+                    sdf_plan = Some(super::frame_plan::PlannedSdf {
+                        dispatches: slot
+                            .prims
+                            .iter()
+                            .map(|p| (p.set.clone(), p.groups))
+                            .collect(),
+                        field: slot.field.clone(),
+                    });
+                    self.sdf_planned.push(instance.instance_id.0);
+                }
+            }
+
             planned_instances.push(PlannedInstance {
                 skinning_set,
                 prims: planned_prims,
+                sdf: sdf_plan,
             });
         }
         Ok((
@@ -1018,6 +1083,7 @@ impl VulkanRenderer {
         cloth_collide_pipeline: &Arc<ComputePipeline>,
         cloth_selfcol_build_pipeline: &Arc<ComputePipeline>,
         cloth_selfcol_resolve_pipeline: &Arc<ComputePipeline>,
+        body_sdf_splat_pipeline: &Arc<ComputePipeline>,
         instances: &[PlannedInstance],
         containment_copies: &[(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)],
         audit_copies: &[(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)],
@@ -1292,6 +1358,35 @@ impl VulkanRenderer {
                     builder
                         .dispatch(prim.groups)
                         .map_err(|e| format!("render: dispatch failed: {e}"))?;
+                }
+            }
+
+            // Body-SDF splat: sentinel-fill once, then splat each
+            // requested primitive (body + face/head surfaces) into the
+            // instance's shared distance field. Runs after every
+            // transform dispatch of this instance so it reads this
+            // frame's freshly skinned vertices.
+            if let Some(sdf) = &inst.sdf {
+                builder
+                    .fill_buffer(sdf.field.clone(), u32::MAX)
+                    .map_err(|e| format!("render: body SDF sentinel fill failed: {e}"))?;
+                builder
+                    .bind_pipeline_compute(body_sdf_splat_pipeline.clone())
+                    .map_err(|e| format!("render: bind body SDF splat pipeline: {e}"))?;
+                for (set, groups) in &sdf.dispatches {
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Compute,
+                            body_sdf_splat_pipeline.layout().clone(),
+                            0,
+                            set.clone(),
+                        )
+                        .map_err(|e| format!("render: bind body SDF splat set: {e}"))?;
+                    unsafe {
+                        builder
+                            .dispatch(*groups)
+                            .map_err(|e| format!("render: body SDF splat dispatch: {e}"))?;
+                    }
                 }
             }
         }

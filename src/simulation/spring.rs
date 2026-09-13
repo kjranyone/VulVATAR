@@ -1,4 +1,3 @@
-use crate::asset::ColliderShape;
 use crate::avatar::AvatarInstance;
 use crate::math_utils::{
     closest_point_on_segment, mat4_rotation_to_quat, mat4_translation, quat_conjugate,
@@ -6,6 +5,7 @@ use crate::math_utils::{
     vec3_length, vec3_length_sq, vec3_scale, vec3_sub, Vec3,
 };
 use crate::simulation::cloth::ResolvedCollider;
+use crate::simulation::sdf::SdfField;
 use crate::simulation::SceneGravity;
 
 /// User-facing spring-bone tuning, layered on top of the VRM asset's
@@ -66,6 +66,11 @@ impl Default for SpringTuning {
 /// toward world-down as the head tilts.
 const NATURAL_STIFFNESS_RATE_GAIN: f32 = 7.0;
 
+/// Extra clearance beyond the strand's own `radius` when resolving
+/// against the body distance field. Keeps the sampled distance at the
+/// isosurface from re-triggering contacts after trilinear smoothing.
+const SDF_CONTACT_MARGIN: f32 = 0.004;
+
 /// Verlet integration-based spring bone solver.
 ///
 /// For each spring chain defined in the avatar asset, this solver:
@@ -73,7 +78,8 @@ const NATURAL_STIFFNESS_RATE_GAIN: f32 = 7.0;
 /// 2. Computes velocity via Verlet (current - previous) with drag
 /// 3. Applies stiffness pull toward rest pose, plus gravity
 /// 4. Normalizes the result to preserve bone length
-/// 5. Resolves sphere/capsule collider penetrations
+/// 5. Resolves body-surface distance-field penetrations, plus any
+///    scene-level (Rapier) colliders
 /// 6. Writes solved rotations back into the avatar's local transforms
 ///
 /// Verlet position update for a single joint.
@@ -218,6 +224,12 @@ pub fn step_spring_bones(
     // down.
     gravity_dir: [f32; 3],
     gravity_scale: f32,
+    // Body-surface distance field in avatar-root space, freshly read
+    // back from the renderer one frame late. The ONLY body collision
+    // spring chains get: per-collider capsules (`collider_refs`) are
+    // legacy authoring data now reserved for cloth — see
+    // `simulation/sdf.rs` for the field contract.
+    body_sdf: Option<&SdfField>,
 ) {
     let chain_count = avatar.secondary_motion.spring_states.len();
     if chain_count == 0 || dt <= 0.0 {
@@ -257,11 +269,6 @@ pub fn step_spring_bones(
         let gravity_dir = quat_rotate_vec3(&gravity_delta, &spring_asset.gravity_dir);
         let chain_gravity_power = spring_asset.gravity_power;
         let bone_radius = spring_asset.radius;
-        let colliders: Vec<&crate::asset::ColliderAsset> = spring_asset
-            .collider_refs
-            .iter()
-            .filter_map(|r| avatar.asset.colliders.iter().find(|c| c.id == r.id))
-            .collect();
 
         let joints = avatar.secondary_motion.spring_states[chain_idx]
             .joints
@@ -395,55 +402,22 @@ pub fn step_spring_bones(
             // 2. Enforce bone length
             next = enforce_bone_length(&next, &parent_world_pos, bone_length);
 
-            // 3. Collider resolution. Snapshot the pre-collision position
-            // so the total projection can be subtracted from the implicit
-            // velocity in step 4.
+            // 3. Collision resolution. Snapshot the pre-collision
+            // position so the total projection can be subtracted from
+            // the implicit velocity in step 4.
             let pre_collision = next;
-            for collider in &colliders {
-                let collider_node = collider.node.0 as usize;
-                if collider_node >= avatar.pose.global_transforms.len() {
-                    continue;
-                }
-                let collider_world_pos =
-                    mat4_translation(&avatar.pose.global_transforms[collider_node]);
-                let rotated_offset = mat4_transform_direction(
-                    &avatar.pose.global_transforms[collider_node],
-                    &collider.offset,
-                );
-                let collider_center = vec3_add(&collider_world_pos, &rotated_offset);
 
-                match collider.shape {
-                    ColliderShape::Sphere { radius } => {
-                        next = resolve_sphere_collision(
-                            &next,
-                            &collider_center,
-                            radius,
-                            bone_radius,
-                            &parent_world_pos,
-                            bone_length,
-                        );
-                    }
-                    ColliderShape::Capsule { radius, height } => {
-                        let up = mat4_transform_direction(
-                            &avatar.pose.global_transforms[collider_node],
-                            &[0.0, 1.0, 0.0],
-                        );
-                        let up_len = vec3_length(&up);
-                        let up_norm = if up_len > 1e-8 {
-                            vec3_scale(&up, 1.0 / up_len)
-                        } else {
-                            [0.0, 1.0, 0.0]
-                        };
-                        next = resolve_capsule_collision(
-                            &next,
-                            &collider_center,
-                            &up_norm,
-                            height * 0.5,
-                            radius,
-                            bone_radius,
-                            &parent_world_pos,
-                            bone_length,
-                        );
+            // 3a. Body-surface distance field. The splat shell is a few
+            // centimetres thick, so the contact band is
+            // `bone_radius + margin`; the projection moves the joint
+            // onto that isosurface along the sampled gradient before
+            // step 4 folds the correction into the implicit velocity.
+            if spring_asset.body_collision {
+                if let Some(field) = body_sdf {
+                    if let Some((pushed, _)) =
+                        field.resolve(next, bone_radius + SDF_CONTACT_MARGIN)
+                    {
+                        next = enforce_bone_length(&pushed, &parent_world_pos, bone_length);
                     }
                 }
             }
@@ -546,17 +520,6 @@ pub fn step_spring_bones(
 // ---------------------------------------------------------------------------
 // Mat4 helpers (column-major) -- specific to spring bone solver
 // ---------------------------------------------------------------------------
-
-/// Transform a direction vector (no translation) by the upper-left 3x3 of a
-/// column-major 4x4 matrix.
-#[inline]
-fn mat4_transform_direction(m: &[[f32; 4]; 4], d: &Vec3) -> Vec3 {
-    [
-        m[0][0] * d[0] + m[1][0] * d[1] + m[2][0] * d[2],
-        m[0][1] * d[0] + m[1][1] * d[1] + m[2][1] * d[2],
-        m[0][2] * d[0] + m[1][2] * d[1] + m[2][2] * d[2],
-    ]
-}
 
 /// Build a quaternion that rotates unit vector `from` to unit vector `to`.
 fn quat_from_to(from: &Vec3, to: &Vec3) -> [f32; 4] {

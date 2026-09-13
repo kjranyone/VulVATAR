@@ -1168,6 +1168,141 @@ void main() {
                     }
 }
 
+pub mod body_sdf_splat_cs {
+    // One workgroup invocation per triangle. Splats the triangle's
+    // exact point-to-triangle distance into an avatar-root-space voxel
+    // field via `atomicMin` on the f32 bit pattern (valid for
+    // non-negative floats, and splatted distances are non-negative).
+    // The recording half fills the field with `u32::MAX` before this
+    // dispatch; unsplatted cells stay at the sentinel, which the CPU
+    // sampler (simulation/sdf.rs) reads as "outside the collision
+    // band".
+    //
+    // The skinned vertices are in avatar-root space (see
+    // frame_input.rs — the instance world transform is never applied),
+    // which is exactly the space the grid and the spring solver live
+    // in, so no vertex transform happens here.
+    vulkano_shaders::shader! {
+                    ty: "compute",
+                    src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct OutVertex {
+    vec4 position;
+    vec4 normal;
+    vec2 uv;
+    uvec2 _pad;
+};
+
+layout(set = 0, binding = 0) readonly buffer Vertices {
+    OutVertex v[];
+} verts;
+
+layout(set = 0, binding = 1) readonly buffer TriangleIndices {
+    uint i[];
+} idx;
+
+layout(set = 0, binding = 2) buffer Field {
+    uint d[];
+} field;
+
+// std140. Rust mirror: `BodySdfSplatParams`.
+layout(set = 0, binding = 3) uniform Params {
+    // xyz = grid dims, w = triangle count.
+    uvec4 dims_tri;
+    // xyz = grid origin (avatar-root), w = metres per cell.
+    vec4 origin_voxel;
+    // x = splat shell (metres). The rest pads to 16 B.
+    vec4 shell_pad;
+} prm;
+
+// Cells never written past the shell stay at u32::MAX (filled by the
+// recording half before this dispatch). The CPU side mirrors this
+// contract as `simulation::sdf::SENTINEL`.
+
+// Closest point on triangle (a,b,c) to p — Ericson, Real-Time
+// Collision Detection §5.1.5.
+vec3 closest_point_on_triangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 ab = b - a;
+    vec3 ac = c - a;
+    vec3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+    vec3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        float v = d1 / (d1 - d3);
+        return a + v * ab;
+    }
+    vec3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        float w = d2 / (d2 - d6);
+        return a + w * ac;
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + w * (c - b);
+    }
+    float denom = 1.0 / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+void main() {
+    uint tri = gl_GlobalInvocationID.x;
+    if (tri >= prm.dims_tri.w) return;
+
+    vec3 p0 = verts.v[idx.i[tri * 3u + 0u]].position.xyz;
+    vec3 p1 = verts.v[idx.i[tri * 3u + 1u]].position.xyz;
+    vec3 p2 = verts.v[idx.i[tri * 3u + 2u]].position.xyz;
+
+    // Degenerate triangles contribute nothing (their point-to-triangle
+    // distance is still exact below, but skipping saves the loop).
+    vec3 cross_len = cross(p1 - p0, p2 - p0);
+    if (dot(cross_len, cross_len) < 1e-20) return;
+
+    float shell = prm.shell_pad.x;
+    float voxel = prm.origin_voxel.w;
+    vec3 lo = min(p0, min(p1, p2)) - vec3(shell);
+    vec3 hi = max(p0, max(p1, p2)) + vec3(shell);
+
+    ivec3 dims = ivec3(prm.dims_tri.xyz);
+    ivec3 c0 = max(ivec3(floor((lo - prm.origin_voxel.xyz) / voxel)), ivec3(0));
+    // ceil-1 == floor for the inclusive upper cell index.
+    ivec3 c1 = min(ivec3(floor((hi - prm.origin_voxel.xyz) / voxel)), dims - 1);
+
+    for (int z = c0.z; z <= c1.z; ++z) {
+        for (int y = c0.y; y <= c1.y; ++y) {
+            for (int x = c0.x; x <= c1.x; ++x) {
+                // Node sampling: the value at node (x,y,z) is the
+                // distance from that node's position — the CPU sampler
+                // (SdfField::sample) trilinearly interpolates node
+                // values, which is only coherent with this convention.
+                vec3 node = prm.origin_voxel.xyz + vec3(x, y, z) * voxel;
+                float dist = length(node - closest_point_on_triangle(node, p0, p1, p2));
+                if (dist > shell) continue;
+                uint cell_idx = uint(x) + uint(dims.x) * (uint(y) + uint(dims.y) * uint(z));
+                atomicMin(field.d[cell_idx], floatBitsToUint(dist));
+            }
+        }
+    }
+}
+"
+                    }
+}
+
 pub mod transform_cs {
     // One workgroup invocation per output vertex. Reads the immutable
     // base SSBO, the per-frame morph weights / cloth deformed positions,
@@ -2651,3 +2786,47 @@ mod dqs_contract_tests {
     }
 }
     
+
+/// Control block for the body-SDF splat pass. Rust mirror of the GLSL
+/// `Params` uniform in `body_sdf_splat_cs` (std140: every member on a
+/// 16-byte boundary). Grid geometry must match
+/// `simulation::sdf::SdfGrid` exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BodySdfSplatParams {
+    /// xyz = grid dims (cells), w = triangle count.
+    pub dims_tri: [u32; 4],
+    /// xyz = grid origin (avatar-root space), w = metres per cell.
+    pub origin_voxel: [f32; 4],
+    /// x = splat shell in metres; yzw pad to 16 B.
+    pub shell_pad: [f32; 4],
+}
+
+/// Build the compute pipeline that splats the freshly skinned body
+/// primitive into the avatar-root-space distance field the spring
+/// solver resolves hair against. See `body_sdf_splat_cs` and
+/// `simulation/sdf.rs` for the field contract.
+pub fn create_body_sdf_splat_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = body_sdf_splat_cs::load(device.clone())
+        .map_err(|e| format!("failed to load body SDF splat compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "body SDF splat compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build body SDF splat pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create body SDF splat pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create body SDF splat compute pipeline: {e}"))
+}

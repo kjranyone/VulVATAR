@@ -72,6 +72,7 @@ pub fn build_frame_input(
             mesh_instances,
             skinning_matrices: avatar.pose.skinning_matrices.clone(),
             cloth_deforms: Vec::new(),
+            body_sdf: None,
             debug_flags: RenderDebugFlags::default(),
         }],
         output_request: OutputTargetRequest {

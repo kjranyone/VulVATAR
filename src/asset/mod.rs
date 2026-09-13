@@ -558,6 +558,14 @@ pub struct SpringBoneAsset {
     pub gravity_floor: f32,
     pub radius: f32,
     pub collider_refs: Vec<ColliderRef>,
+    /// Whether this chain collides against the body-surface distance
+    /// field (the spring solver's only collision source — legacy
+    /// per-collider capsules are no longer consulted for spring bones).
+    /// Hair / tail / wing strands opt in; surface-hugging decorative
+    /// chains (breast, belt) and skirt chains (anti-penetration runs
+    /// through the GPU clearance field) opt out so the field cannot
+    /// float them off the skin they are authored to touch.
+    pub body_collision: bool,
     /// Per-joint stiffness overrides. When non-empty, index corresponds to `joints`.
     pub joint_stiffness: Vec<f32>,
     /// Per-joint drag overrides. When non-empty, index corresponds to `joints`.

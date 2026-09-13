@@ -1813,3 +1813,174 @@ pub fn generate_layered_clothing_anchors(
         }
     }
 }
+
+/// RIDE-UP fix: demote breast-bone skin weights that sit FAR outside the
+/// breast region down to their nearest non-breast ancestor (Chest).
+///
+/// Measured on Yumeka v1.0.3: the sweater's HEM vertices carry their
+/// dominant weights on `Breast_1_L/R` (spring-driven chains). Any pose
+/// or spring motion lifts the hem with the breast chains, exposing the
+/// belly (the "お腹丸見え" report). Breast weights belong to vertices
+/// near the breast; a hem vertex is authoring noise. The demotion keeps
+/// real breast deformation and restores the hem to the torso chain.
+///
+/// Threshold: 1.5 × the breast chain's own length from the chain root —
+/// comfortably above any genuinely breast-shaped geometry, far below the
+/// hem (decimetres away).
+pub fn demote_distant_breast_weights(asset: &mut AvatarAsset) {
+    use std::collections::HashMap;
+
+    // Collect breast chains: nodes whose name contains "breast" and
+    // their ancestors up to the first non-breast node.
+    let nodes = &asset.skeleton.nodes;
+    let is_breast = |i: usize| -> bool {
+        nodes
+            .get(i)
+            .map(|n| n.name.to_lowercase().contains("breast"))
+            .unwrap_or(false)
+    };
+    // Node position in rest pose (for the distance gate).
+    let mut globals = vec![crate::asset::identity_matrix(); nodes.len()];
+    let locals: Vec<_> = nodes.iter().map(|n| n.rest_local.clone()).collect();
+    crate::avatar::pose::compute_global_transforms(&asset.skeleton, &locals, &mut globals);
+    let node_pos = |i: usize| -> Option<[f32; 3]> {
+        let m = globals.get(i)?;
+        Some([m[3][0], m[3][1], m[3][2]])
+    };
+    // Nearest non-breast ancestor for each breast node.
+    let mut demote_to: HashMap<usize, usize> = HashMap::new();
+    for i in 0..nodes.len() {
+        if !is_breast(i) {
+            continue;
+        }
+        let mut cur: Option<usize> = nodes[i].parent.map(|p| p.0 as usize);
+        while let Some(p) = cur {
+            if is_breast(p) {
+                cur = nodes[p].parent.map(|q| q.0 as usize);
+            } else {
+                break;
+            }
+        }
+        if let Some(p) = cur {
+            demote_to.insert(i, p);
+        }
+    }
+    if demote_to.is_empty() {
+        info!("clearance: breast-weight demotion: no breast nodes found ({} skeleton nodes)", nodes.len());
+        return;
+    }
+
+    let mut skinning = vec![crate::asset::identity_matrix(); nodes.len()];
+    crate::avatar::pose::build_skinning_matrices(&asset.skeleton, &globals, &mut skinning);
+
+    // Per-node chain-length gate: distance from the breast node to its
+    // demote target × 1.5.
+    let gate: HashMap<usize, f32> = demote_to
+        .iter()
+        .filter_map(|(&b, &anc)| {
+            Some((
+                b,
+                1.5
+                    * node_pos(b)?
+                        .iter()
+                        .zip(node_pos(anc)?)
+                        .map(|(a, c)| (a - c) * (a - c))
+                        .sum::<f32>()
+                        .sqrt(),
+            ))
+        })
+        .collect();
+
+    for (&b, &anc) in demote_to.iter() {
+        info!(
+            "clearance: breast demotion map: {} -> {} (gate {:.1} mm)",
+            nodes[b].name,
+            nodes[anc].name,
+            gate.get(&b).copied().unwrap_or(0.0) * 1000.0
+        );
+    }
+    let mut demoted = 0usize;
+    for mesh in &mut asset.meshes {
+        for prim_arc in mesh.primitives.iter_mut() {
+            // Primitives are Arc-shared; clone-on-write for the weight
+            // edit (import-time diagnostic pass).
+            let prim = std::sync::Arc::make_mut(prim_arc);
+            let Some(vd) = prim.vertices.as_mut() else {
+                continue;
+            };
+            for vi in 0..vd.positions.len() {
+                let pos = vd.positions[vi];
+                // Skinned rest position of THIS vertex.
+                let mut wp = [0.0f32; 3];
+                let mut tw = 0.0f32;
+                if vi < vd.joint_weights.len() && vi < vd.joint_indices.len() {
+                    for k in 0..4 {
+                        let w = vd.joint_weights[vi][k];
+                        if w > 1e-4 {
+                            let j = vd.joint_indices[vi][k] as usize;
+                            if let Some(sm) = skinning.get(j) {
+                                for c in 0..3 {
+                                    wp[c] +=
+                                        w * (sm[0][c] * pos[0] + sm[1][c] * pos[1] + sm[2][c] * pos[2] + sm[3][c]);
+                                }
+                                tw += w;
+                            }
+                        }
+                    }
+                }
+                if tw <= 0.0 {
+                    continue;
+                }
+                for c in 0..3 {
+                    wp[c] /= tw;
+                }
+                for k in 0..4 {
+                    let w = vd.joint_weights[vi][k];
+                    if w <= 1e-4 {
+                        continue;
+                    }
+                    let j = vd.joint_indices[vi][k] as usize;
+                    if let (Some(&anc), Some(&limit)) = (demote_to.get(&j), gate.get(&j)) {
+                        let d = node_pos(j)
+                            .map(|bpos| {
+                                (wp[0] - bpos[0]).powi(2)
+                                    + (wp[1] - bpos[1]).powi(2)
+                                    + (wp[2] - bpos[2]).powi(2)
+                            })
+                            .unwrap_or(0.0)
+                            .sqrt();
+                        if d <= limit {
+                            continue; // genuinely near the breast — keep
+                        }
+                        // Demote: move the weight to the nearest
+                        // non-breast ancestor (its node index). Find the
+                        // joint-index slot for the ancestor and merge.
+                        let anc_idx = vd.joint_indices[vi]
+                            .iter()
+                            .position(|&x| (x as usize) == anc);
+                        match anc_idx {
+                            Some(slot) => {
+                                vd.joint_weights[vi][slot] += w;
+                                vd.joint_weights[vi][k] = 0.0;
+                            }
+                            None => {
+                                // Replace the breast slot with the
+                                // ancestor node.
+                                if vd.joint_indices[vi][k] as usize == j {
+                                    vd.joint_indices[vi][k] = anc as u16;
+                                }
+                            }
+                        }
+                        demoted += 1;
+                    }
+                }
+            }
+        }
+    }
+    if demoted > 0 {
+        info!(
+            "clearance: demoted {} breast weights beyond the breast region to their torso ancestors",
+            demoted
+        );
+    }
+}

@@ -1013,6 +1013,90 @@ fn main() -> Result<(), String> {
                     }
                 }
             }
+            // Arm transfer audit: the SOURCE upper-arm direction (estimator
+            // FK, camera axes → viewer axes) vs the direction the retarget
+            // actually landed on the avatar, plus the rig delta ypr for
+            // both arm bones. Localizes a lost elbow swing: near-0° angle ⇒
+            // the loss is estimator-side (the published delta already
+            // points the wrong way); a large angle ⇒ retarget-side.
+            if std::env::var_os("VULVATAR_REPLAY_ARMCMP").is_some() && n % 8 == 0 {
+                if let Some(hm) = asset.humanoid.as_ref() {
+                    use vulvatar_lib::asset::HumanoidBone as HB;
+                    use vulvatar_lib::math_utils::{quat_mul, quat_rotate_vec3};
+                    let fk = m.fk(&est.state);
+                    let pos_of = |bone: HB| -> Option<[f32; 3]> {
+                        let node = hm.bone_map.get(&bone)?;
+                        let mut chain = vec![];
+                        let mut i = node.0 as usize;
+                        loop {
+                            chain.push(i);
+                            match asset.skeleton.nodes[i].parent {
+                                Some(p) => i = p.0 as usize,
+                                None => break,
+                            }
+                        }
+                        let mut p = [0.0f32; 3];
+                        let mut rot = [0.0f32, 0.0, 0.0, 1.0];
+                        for &k in chain.iter().rev() {
+                            let lt = locals[k].translation;
+                            let off = quat_rotate_vec3(&rot, &lt);
+                            for q in 0..3 {
+                                p[q] += off[q];
+                            }
+                            rot = quat_mul(&rot, &locals[k].rotation);
+                        }
+                        Some(p)
+                    };
+                    let rig = est_out.skeleton.rig.as_ref();
+                    for (side, (up_b, lo_b, sh_j, el_j)) in [
+                        (
+                            "L",
+                            (HB::LeftUpperArm, HB::LeftLowerArm, h.j.l_shoulder, h.j.l_elbow),
+                        ),
+                        (
+                            "R",
+                            (HB::RightUpperArm, HB::RightLowerArm, h.j.r_shoulder, h.j.r_elbow),
+                        ),
+                    ] {
+                        let (Some(pu), Some(pl)) = (pos_of(up_b), pos_of(lo_b)) else {
+                            continue;
+                        };
+                        let dv = [pl[0] - pu[0], pl[1] - pu[1], pl[2] - pu[2]];
+                        let nv = (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]).sqrt().max(1e-6);
+                        let av = [dv[0] / nv, dv[1] / nv, dv[2] / nv];
+                        // camera → viewer: (x, −y, −z) (see rig_pose's Δ_V).
+                        let s = [
+                            (fk.t[el_j][0] - fk.t[sh_j][0]) as f32,
+                            -(fk.t[el_j][1] - fk.t[sh_j][1]) as f32,
+                            -(fk.t[el_j][2] - fk.t[sh_j][2]) as f32,
+                        ];
+                        let ns = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt().max(1e-6);
+                        let sv = [s[0] / ns, s[1] / ns, s[2] / ns];
+                        let dot = (av[0] * sv[0] + av[1] * sv[1] + av[2] * sv[2]).clamp(-1.0, 1.0);
+                        let ang = dot.acos().to_degrees();
+                        let rig_line = |b: HB| -> String {
+                            rig.and_then(|r| r.bones.get(&b))
+                                .map(|rb| {
+                                    let m3 = vulvatar_lib::tracking::fusion::math::quat_to_mat(
+                                        rb.delta_world,
+                                    );
+                                    let (y, p, r) = ypr_deg(&m3);
+                                    format!(
+                                        "rig {y:+.0}/{p:+.0}/{r:+.0} σ{:+.2}/{:+.2}",
+                                        rb.sigma, rb.data_sigma
+                                    )
+                                })
+                                .unwrap_or_else(|| "rig ---".to_string())
+                        };
+                        eprintln!(
+                            "ARMCMP idx {idx} {side} srcV {:+.2}/{:+.2}/{:+.2} av {:+.2}/{:+.2}/{:+.2} ang {ang:.1}° up[{}] lo[{}]",
+                            sv[0], sv[1], sv[2], av[0], av[1], av[2],
+                            rig_line(up_b),
+                            rig_line(lo_b)
+                        );
+                    }
+                }
+            }
             if render_every > 0 && n % render_every == 0 {
                 let inst = offline::make_instance(asset, locals);
                 let side = ch.min(720);
