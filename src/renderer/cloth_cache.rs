@@ -43,6 +43,7 @@ impl VulkanRenderer {
     pub(super) fn ensure_cloth_gpu_slot(
         &mut self,
         key: (MeshId, PrimitiveId),
+        owner_instance: u64,
         initial_positions: &[crate::asset::Vec3],
         attach: &crate::renderer::frame_input::ClothGpuAttachData,
         memory_allocator: &Arc<StandardMemoryAllocator>,
@@ -85,6 +86,15 @@ impl VulkanRenderer {
             .get(&key)
             .map(|s| s.cloth_gpu.is_some())
             .unwrap_or(true);
+        // R4 delivery contract: stamp WHICH avatar instance simulated
+        // this slot THIS frame — every frame, not just on allocation —
+        // so `read_cloth_positions` rows are delivered back only to the
+        // instance whose `ClothState` produced them (two avatars can
+        // carry the same primitive id; primitive id alone mis-delivers
+        // across avatars).
+        if let Some(slot) = self.transform_cache.get_mut(&key) {
+            slot.cloth_owner_instance = Some(owner_instance);
+        }
         if already_alloc || initial_positions.is_empty() {
             return Ok(());
         }
@@ -519,6 +529,9 @@ impl VulkanRenderer {
             out.push(ClothReadback {
                 mesh_id: *mesh_id,
                 primitive_id: *primitive_id,
+                // Which avatar simulated this slot this frame (R4);
+                // `None` on a slot that never saw an instance stamp.
+                instance_id: slot.cloth_owner_instance,
                 version: gpu.state.version,
                 positions,
                 normals,

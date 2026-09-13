@@ -400,36 +400,148 @@ pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(
     }
 }
 
+/// CPU-LBS bbox of one cloth-target primitive at ONE deformation stage
+/// (R5). The pair of stages (pre/post physics) lets an external watcher
+/// attribute a broken frame to a stage instead of inferring it.
+#[derive(Clone, Debug)]
+pub struct CostumePrimProbe {
+    pub mesh: String,
+    pub primitive: u64,
+    /// Clearance anchor parent primitive (`body_primitive_id`), if the
+    /// asset assigned one — the §10 "対応表" requirement: screen
+    /// positions must NOT be mapped to ids by guesswork.
+    pub clearance_parent: Option<u64>,
+    /// Containment anchor parent primitive
+    /// (`containment_primitive_id`).
+    pub containment_parent: Option<u64>,
+    /// `None` when the primitive has no CPU vertex payload or was not
+    /// found on the avatar.
+    pub pre_physics: Option<CostumeBBox>,
+    pub post_physics: Option<CostumeBBox>,
+}
+
+/// Min/max world-space corner pair from a CPU LBS skinning pass.
+#[derive(Clone, Copy, Debug)]
+pub struct CostumeBBox {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
 /// Costume-health probe: world positions of spring-driven garment bones
-/// (skirt chains, tail) plus a CPU-side skinned bbox of the skirt mesh
-/// and the cloth-deform count the render thread received. Written to
-/// `debug_avatar_extra.json` so an external watcher can tell "the
-/// garment vertices are actually somewhere wrong" (solver/pose side)
-/// from "the numbers are healthy but the pixels are not" (renderer
-/// side). No-op unless the debug flag file exists.
+/// (skirt chains, tail), taken pre- and post-physics, plus CPU-LBS
+/// bounding boxes of every cloth-target primitive at both stages.
+/// Written to `debug_avatar_extra.json`.
+///
+/// R5 scope contract — what this probe measures and what it CANNOT:
+/// the bboxes come from a CPU **linear blend skinning** pass over the
+/// rest mesh. They do NOT include GPU dual-quaternion skinning
+/// differences, the GPU cloth SSBO override, the clearance /
+/// containment render-side corrections, or the final drawn VBO. A
+/// healthy bbox here proves the pose + CPU skinning stage is sane; it
+/// does NOT prove healthy drawn vertices (a GPU-side garment tear is
+/// invisible to this probe). Use it to split
+/// "solver/pose side is wrong" from "the numbers are healthy but the
+/// pixels are not" — never to certify the render path.
+///
+/// No-op unless the debug flag file exists.
 pub fn dump_costume_probe(
     bones: Vec<(String, [f32; 3])>,
-    skirt_bbox: Option<([f32; 3], [f32; 3])>,
+    bones_post_physics: Vec<(String, [f32; 3])>,
+    prim_probes: Vec<CostumePrimProbe>,
     cloth_deform_count: usize,
     cloth_targets: Vec<crate::asset::PrimitiveId>,
+    sim_substeps: u32,
+    fixed_dt: f32,
 ) {
     if !enabled() {
         return;
     }
     let seq = AVATAR_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let map: serde_json::Map<String, serde_json::Value> = bones
-        .into_iter()
-        .map(|(name, p)| (name, serde_json::json!(p)))
-        .collect();
+    let bone_map = |bones: Vec<(String, [f32; 3])>| {
+        serde_json::Value::Object(
+            bones
+                .into_iter()
+                .map(|(name, p)| (name, serde_json::json!(p)))
+                .collect(),
+        )
+    };
     let state = serde_json::json!({
         "seq": seq,
-        "bones": map,
-        "skirt_bbox": skirt_bbox.map(|(lo, hi)| serde_json::json!({"min": lo, "max": hi})),
+        // `sim_substeps == 0` marks a frozen-physics frame: the post
+        // stage then equals the pre stage BY CONTRACT, not by accident.
+        "sim_substeps": sim_substeps,
+        "fixed_dt": fixed_dt,
+        "bones": bone_map(bones),
+        "bones_post_physics": bone_map(bones_post_physics),
         "cloth_deforms": cloth_deform_count,
         "cloth_targets": cloth_targets.iter().map(|t| t.0).collect::<Vec<_>>(),
+        "cpu_lbs_prim_bbox": {
+            "measured": "CPU LBS skinning only — no GPU DQS, no cloth SSBO override, no clearance/containment, no final VBO",
+            "prims": prim_probes
+                .iter()
+                .map(|p| serde_json::json!({
+                    "mesh": p.mesh,
+                    "primitive": p.primitive,
+                    "clearance_parent": p.clearance_parent,
+                    "containment_parent": p.containment_parent,
+                    "pre_physics": p.pre_physics.map(|b| serde_json::json!({"min": b.min, "max": b.max})),
+                    "post_physics": p.post_physics.map(|b| serde_json::json!({"min": b.min, "max": b.max})),
+                }))
+                .collect::<Vec<_>>(),
+        },
     });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_avatar_extra.json"), &bytes);
+    }
+}
+
+/// One anchor-bearing primitive's final-VBO audit stats (R2), mirrored
+/// from `renderer::VboAuditEntry` so the tracking channel does not
+/// depend on the renderer module.
+#[derive(Clone, Copy, Debug)]
+pub struct VboAuditRow {
+    pub mesh: u64,
+    pub primitive: u64,
+    pub instance: Option<u64>,
+    pub vertex_count: usize,
+    pub nan_count: usize,
+    pub max_correction_m: f32,
+    pub p95_correction_m: f32,
+    pub max_pos_len_m: f32,
+}
+
+/// R2 final-VBO audit dump: per-primitive render-side correction
+/// telemetry (the `position.w` channel `transform_cs` publishes),
+/// written to `debug_vbo_audit.json`. Populated only when
+/// `VULVATAR_VBO_AUDIT=1` — the readback copy does not exist otherwise.
+/// Use it to detect clearance/containment runaway corrections and NaN
+/// vertices that the CPU-side probes cannot see (they measure LBS
+/// skinning, not the GPU path).
+///
+/// No-op unless the debug flag file exists.
+pub fn dump_vbo_audit(rows: Vec<VboAuditRow>, timestamp_nanos: u64) {
+    if !enabled() || rows.is_empty() {
+        return;
+    }
+    let state = serde_json::json!({
+        "timestamp_nanos": timestamp_nanos,
+        "note": "corrections are render-only (not written back to physics); max = MAX_RENDER_CORRECTION_M (0.25 m) means the clamp saturated",
+        "prims": rows
+            .iter()
+            .map(|r| serde_json::json!({
+                "mesh": r.mesh,
+                "primitive": r.primitive,
+                "instance": r.instance,
+                "vertex_count": r.vertex_count,
+                "nan_count": r.nan_count,
+                "max_correction_m": r.max_correction_m,
+                "p95_correction_m": r.p95_correction_m,
+                "max_pos_len_m": r.max_pos_len_m,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        atomic_write(&base_dir().join("debug_vbo_audit.json"), &bytes);
     }
 }
 

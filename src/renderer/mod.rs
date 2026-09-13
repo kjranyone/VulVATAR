@@ -67,6 +67,13 @@ pub struct RenderResult {
     /// CPU-side consumers (cloth inspector, backend flips) see the
     /// live solver state.
     pub cloth_readback: Vec<ClothReadback>,
+    /// Final-VBO audit rows (R2) — populated only when
+    /// `VULVATAR_VBO_AUDIT=1`. One row per anchor-bearing primitive:
+    /// per-vertex clearance/containment correction telemetry from
+    /// `transform_cs` (published in `GpuVertex.position.w`), read back
+    /// from host-visible staging one frame stale (same fence semantics
+    /// as `cloth_readback`).
+    pub vbo_audit: Vec<VboAuditEntry>,
     /// Per-pixel non-linear NDC depth (`[0,1]`, `extent[0] × extent[1]`,
     /// row-major top-down, matching the colour readback) — populated only
     /// when [`VulkanRenderer::set_depth_readback`]`(true)` is active and the
@@ -83,6 +90,11 @@ pub struct RenderResult {
 pub struct ClothReadback {
     pub mesh_id: MeshId,
     pub primitive_id: PrimitiveId,
+    /// Avatar instance that simulated this slot on the frame the
+    /// readback belongs to (`AvatarInstanceId::0`, R4 delivery
+    /// contract). `None` on a slot never stamped by a GPU-cloth
+    /// dispatch — such rows must not be applied anywhere.
+    pub instance_id: Option<u64>,
     /// Dispatch-count version mirror (`ClothGpuSimulationState::version`);
     /// monotonic per dispatched frame.
     pub version: u32,
@@ -90,6 +102,32 @@ pub struct ClothReadback {
     pub positions: Vec<[f32; 3]>,
     /// Recomputed normals when the slot has the normal stage.
     pub normals: Option<Vec<[f32; 3]>>,
+}
+
+/// One anchor-bearing primitive's final-VBO audit stats (R2 detection
+/// half). The correction telemetry is the total displacement the
+/// render-side clearance/containment branches applied on top of the
+/// physics state — the exact quantity the physics-side diagnostics
+/// cannot see.
+#[derive(Clone, Debug)]
+pub struct VboAuditEntry {
+    pub mesh_id: MeshId,
+    pub primitive_id: PrimitiveId,
+    /// Owning avatar instance when the slot is a GPU-cloth slot.
+    pub instance_id: Option<u64>,
+    pub vertex_count: usize,
+    /// Vertices with a NaN position (or NaN telemetry) in the final VBO.
+    pub nan_count: usize,
+    /// Largest per-vertex render-side correction (metres). Spikes past
+    /// `MAX_RENDER_CORRECTION_M` mean the clamp saturated on this
+    /// primitive.
+    pub max_correction_m: f32,
+    /// 95th percentile of the per-vertex correction (metres).
+    pub p95_correction_m: f32,
+    /// Largest `|position|` in the final VBO (metres) — a runaway
+    /// vertex shows up as a huge radius even when corrections are
+    /// clamped.
+    pub max_pos_len_m: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +200,14 @@ struct TransformGpuData {
     base_ssbo: Subbuffer<[GpuVertexBase]>,
     index_buffer: Subbuffer<[u32]>,
     transformed_vbo: Subbuffer<[GpuVertex]>,
+    /// R3: previous-frame FINAL vertices for slots that serve as
+    /// containment parents. Written by a `copy_buffer` after every
+    /// transform dispatch each frame; containment children bind THIS
+    /// buffer (not `transformed_vbo`) so their clamp reads a
+    /// deterministic last-frame surface instead of "whatever the
+    /// parent's VBO happens to hold at dispatch time". `None` for slots
+    /// that are not containment parents.
+    containment_prev_vbo: Option<Subbuffer<[GpuVertex]>>,
     control_ubo: Subbuffer<TransformControl>,
     /// Sparse morph deltas: per-target runs of
     /// `(vertex_index, position_delta)` (+ normal delta at stride 2),
@@ -203,6 +249,20 @@ struct TransformGpuData {
     /// here keeps them tied to the same lifecycle as the primitive's
     /// other compute resources.
     cloth_gpu: Option<ClothGpuSlot>,
+    /// Which avatar instance simulated this slot's cloth on the most
+    /// recent frame (`AvatarInstanceId::0`, R4). `transform_cache` is
+    /// keyed by `(mesh_id, primitive_id)` — ids that are unique per
+    /// avatar ASSET but shared across instances of the same asset — so
+    /// the owner stamp is what keeps the per-frame cloth readback from
+    /// being delivered to the wrong avatar. Rewritten every frame by
+    /// `ensure_cloth_gpu_slot`.
+    cloth_owner_instance: Option<u64>,
+    /// R2 diagnostic: host-readable staging copy target for this
+    /// primitive's final VBO, allocated only when `VULVATAR_VBO_AUDIT=1`
+    /// and the primitive carries clearance/containment anchors (the only
+    /// paths that write correction telemetry). Filled by a
+    /// `copy_buffer` recorded after every transform dispatch.
+    audit_staging: Option<Subbuffer<[GpuVertex]>>,
 }
 
 /// Per-primitive GPU cloth solver resources. Built once on the first
@@ -1107,6 +1167,7 @@ impl VulkanRenderer {
                 exported_frame: None,
                 depth_ndc: None,
                 cloth_readback: Vec::new(),
+                vbo_audit: Vec::new(),
             });
         }
 
@@ -1166,6 +1227,10 @@ impl VulkanRenderer {
         // already in use"), which the live soak observed failing every
         // frame. Attached to whichever result this call returns.
         let cloth_readback = self.read_cloth_positions();
+        // Same one-frame-stale discipline as the cloth readback above
+        // (previous frame's fence already waited). Empty unless
+        // `VULVATAR_VBO_AUDIT=1`.
+        let vbo_audit = self.read_vbo_audit();
 
         crate::tracking::stagelog::mark(self.frame_counter, "render_submit");
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
@@ -1222,6 +1287,7 @@ impl VulkanRenderer {
         match harvested {
             Some(mut h) => {
                 h.cloth_readback = cloth_readback;
+                h.vbo_audit = vbo_audit;
                 Ok(h)
             }
             None => Ok(RenderResult {
@@ -1232,8 +1298,19 @@ impl VulkanRenderer {
                 exported_frame: None,
                 depth_ndc: None,
                 cloth_readback,
+                vbo_audit,
             }),
         }
+    }
+
+    /// R2 diagnostic knob (`VULVATAR_VBO_AUDIT=1`): allocate host-
+    /// readable staging for anchor-bearing primitives and copy their
+    /// final VBOs into it every frame. Process-static on purpose — the
+    /// audit copies are part of the cached command buffer, so flipping
+    /// the flag mid-run would need a `cb_cache` invalidation.
+    fn vbo_audit_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_VBO_AUDIT").is_ok_and(|v| v == "1"))
     }
 
     /// A/B knob for the command-buffer cache (`VULVATAR_CB_CACHE=0`
@@ -1241,6 +1318,43 @@ impl VulkanRenderer {
     fn cb_cache_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_CACHE").map_or(true, |v| v != "0"))
+    }
+
+    /// Read the previous frame's final-VBO audit rows from the
+    /// host-visible staging buffers. MUST be called after the previous
+    /// frame's fence has been waited (same discipline as
+    /// `read_cloth_positions`, which the call site honours) and before
+    /// the current frame's submission. Empty unless
+    /// `VULVATAR_VBO_AUDIT=1`.
+    pub(crate) fn read_vbo_audit(&mut self) -> Vec<VboAuditEntry> {
+        if !Self::vbo_audit_enabled() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for ((mesh_id, primitive_id), slot) in self.transform_cache.iter() {
+            let Some(staging) = slot.audit_staging.as_ref() else {
+                continue;
+            };
+            let guard = match staging.read() {
+                Ok(g) => g,
+                Err(e) => {
+                    log::warn!("render: vbo audit read failed for {:?}: {e}", primitive_id);
+                    continue;
+                }
+            };
+            let (nan_count, max_corr, p95, max_pos_len) = vbo_audit_stats(&guard);
+            out.push(VboAuditEntry {
+                mesh_id: *mesh_id,
+                primitive_id: *primitive_id,
+                instance_id: slot.cloth_owner_instance,
+                vertex_count: guard.len(),
+                nan_count,
+                max_correction_m: max_corr,
+                p95_correction_m: p95,
+                max_pos_len_m: max_pos_len,
+            });
+        }
+        out
     }
 
     /// Fetch the cached command buffer for `plan.shape_key`, or record +
@@ -1377,6 +1491,8 @@ impl VulkanRenderer {
             &cloth_selfcol_build_pipeline,
             &cloth_selfcol_resolve_pipeline,
             &plan.instances,
+            &plan.containment_copies,
+            &plan.audit_copies,
         )?;
 
         // ── Scene pass: forward draws + outlines ────────────────────────
@@ -1669,5 +1785,83 @@ impl CameraRing {
             main_sets,
             outline_sets,
         }
+    }
+}
+
+/// Pure stats core of [`VulkanRenderer::read_vbo_audit`]: scan a final
+/// VBO and return `(nan_count, max_correction, p95_correction,
+/// max_pos_len)`. Position `.w` carries the render-side correction
+/// total written by `transform_cs`; NaN positions are counted and
+/// skipped.
+pub(crate) fn vbo_audit_stats(vertices: &[GpuVertex]) -> (usize, f32, f32, f32) {
+    let mut nan_count = 0usize;
+    let mut max_corr = 0.0f32;
+    let mut max_pos_len = 0.0f32;
+    let mut corrs: Vec<f32> = Vec::with_capacity(vertices.len());
+    for v in vertices {
+        let p = v.position;
+        if !p[0].is_finite() || !p[1].is_finite() || !p[2].is_finite() {
+            nan_count += 1;
+            continue;
+        }
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if len.is_finite() {
+            max_pos_len = max_pos_len.max(len);
+        }
+        // Non-finite telemetry means a corrupt vertex state too.
+        let corr = if p[3].is_finite() {
+            p[3]
+        } else {
+            nan_count += 1;
+            0.0
+        };
+        corrs.push(corr);
+        max_corr = max_corr.max(corr);
+    }
+    corrs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = corrs
+        .get(((corrs.len() as f32) * 0.95) as usize)
+        .copied()
+        .unwrap_or(0.0);
+    (nan_count, max_corr, p95, max_pos_len)
+}
+
+#[cfg(test)]
+mod vbo_audit_tests {
+    use super::{vbo_audit_stats, GpuVertex};
+
+    fn v(x: f32, y: f32, z: f32, corr: f32) -> GpuVertex {
+        GpuVertex {
+            position: [x, y, z, corr],
+            normal: [0.0, 1.0, 0.0, 0.0],
+            uv: [0.0; 2],
+            _pad: [0; 2],
+        }
+    }
+
+    /// Healthy frame: finite positions, millimetre-scale corrections.
+    #[test]
+    fn audit_stats_healthy_frame() {
+        let verts = vec![v(1.0, 0.0, 0.0, 0.004), v(0.0, 2.0, 0.0, 0.012)];
+        let (nan, max, p95, max_len) = vbo_audit_stats(&verts);
+        assert_eq!(nan, 0);
+        assert!((max - 0.012).abs() < 1e-6);
+        assert!((p95 - 0.012).abs() < 1e-6);
+        assert!((max_len - 2.0).abs() < 1e-5);
+    }
+
+    /// NaN positions are counted and excluded from radius/correction
+    /// stats; NaN telemetry counts as a NaN vertex too.
+    #[test]
+    fn audit_stats_counts_nan_and_saturating_corrections() {
+        let verts = vec![
+            v(0.0, 0.0, 0.0, 0.3),   // clamp-saturated correction
+            v(f32::NAN, 0.0, 1.0, 0.0),
+            v(3.0, 4.0, 0.0, f32::NAN), // NaN telemetry counts as NaN vertex
+        ];
+        let (nan, max, _p95, max_len) = vbo_audit_stats(&verts);
+        assert_eq!(nan, 2, "NaN position and NaN telemetry both count");
+        assert!((max - 0.3).abs() < 1e-6, "max correction sees the saturated push");
+        assert!((max_len - 5.0).abs() < 1e-5, "radius ignores the NaN vertex");
     }
 }

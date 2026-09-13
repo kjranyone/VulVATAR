@@ -221,6 +221,7 @@ impl RenderThreadInner {
                             depth_ndc: None,
 
                             cloth_readback: Vec::new(),
+                            vbo_audit: Vec::new(),
                         });
                         continue;
                     }
@@ -244,7 +245,8 @@ impl RenderThreadInner {
                                 exported_frame: None,
                                 depth_ndc: None,
 
-                                cloth_readback: Vec::new(),                            }
+                                cloth_readback: Vec::new(),
+                            vbo_audit: Vec::new(),                            }
                         }
                     };
                     self.publish_result(result);
@@ -326,7 +328,8 @@ mod tests {
             exported_frame: None,
             depth_ndc: None,
 
-            cloth_readback: Vec::new(),        }
+            cloth_readback: Vec::new(),
+                            vbo_audit: Vec::new(),        }
     }
 
     fn cpu_result() -> RenderResult {
@@ -353,7 +356,8 @@ mod tests {
             }),
             depth_ndc: None,
 
-            cloth_readback: Vec::new(),        }
+            cloth_readback: Vec::new(),
+                            vbo_audit: Vec::new(),        }
     }
 
     fn gpu_result(lease_id: u64) -> RenderResult {
@@ -390,7 +394,8 @@ mod tests {
             }),
             depth_ndc: None,
 
-            cloth_readback: Vec::new(),        }
+            cloth_readback: Vec::new(),
+                            vbo_audit: Vec::new(),        }
     }
 
     #[test]

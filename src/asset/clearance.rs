@@ -550,6 +550,25 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                     let diff = [cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]];
                     let raw_clearance = diff[0] * bn[0] + diff[1] * bn[1] + diff[2] * bn[2];
 
+                    // A cloth vertex resting BEHIND its anchor plane
+                    // (raw_clearance negative) means the
+                    // nearest-vertex pairing matched across a fold, the
+                    // bust cleft, or the SIDE of the torso — the parent
+                    // vertex is not this vertex's surface. Measured on
+                    // Yumeka: the bust-front sweater vertex paired with
+                    // a LEFT-SIDE body vertex (bn = pure -x) sat 76 mm
+                    // "behind" it, and the anchor slammed the vertex
+                    // 78 mm outward EVERY frame = the floating chest
+                    // shard + the torn chest in the user's report.
+                    // Reject at 5 mm: the anchor deficit distribution's
+                    // average is 3.8 mm, so healthy anchors sit far
+                    // above this threshold while side/fold mis-pairings
+                    // (decimetres-scale projections) are removed.
+                    if raw_clearance < -0.005 {
+                        anchors.push(SkinAnchor::default());
+                        continue;
+                    }
+
                     // Enforce at least 2mm clearance to prevent z-fighting and resting penetrations
                     let mut min_clearance = raw_clearance.max(0.002);
 
@@ -588,7 +607,17 @@ pub fn generate_skin_anchors(asset: &mut AvatarAsset) {
                                 let radial = [dx / rl, 0.0, dz / rl];
                                 let align = (bn[0] * radial[0] + bn[2] * radial[2]).max(0.5);
                                 let bump = (target - r_skirt) / align;
-                                min_clearance = (min_clearance + bump).min(0.06);
+                                // Cap at 20 mm: the ±2-y-bin / ±3-angle-bin
+                                // window propagates r_max from WIDER body
+                                // bands (hips, bust) into narrow waist
+                                // bins, which set 60 mm targets on the
+                                // close-fitting waistband and blew the
+                                // waist area apart (measured: skirt
+                                // min_clearance median 21 mm, max 60 mm
+                                // with this clamp at 0.06). 20 mm keeps
+                                // the bust shape-to-fit (≈15 mm) while
+                                // restoring waist contact.
+                                min_clearance = (min_clearance + bump).min(0.02);
                             }
                         }
                     }

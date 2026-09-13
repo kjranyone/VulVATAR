@@ -35,8 +35,17 @@ will invalidate that cache and trigger a rebuild.
   upper-body name list). Runtime-only slots (no `source_path`, never in
   project saves); project `.vvtcloth` overlays supersede them per-primitive.
   Opt-out: `settings.json` `auto_cloth: false` / Cloth パネルのチェックボックス。
-  CPU ベンド拘束は向きが反転する既知バグあり (T07 メモ) — bend を生成/移植する前に
-  修正とテストが先 (roadmap 参照)。
+  CPU ベンド拘束の反転バグ (T07) は 2026-09-13 に修正済み — 3点 edge-angle
+  hinge として翼頂点のみを補正するモデル (`cloth_solver/constraints.rs`、
+  方向・収束・pinned・退化のテスト8件)。GPU へ bend を移植する際はこの
+  参照実装を使うこと (旧実装は禁止)。**weld×selfcol 崩壊も 2026-09-13
+  に修正済み**: 位置weld のコピー群を保つ拘束が無く、自己衝突がコピーを
+  押し分けて全面スパイク崩壊する (CPU/GPU 共通) → 群内一致拘束
+  (`intra_weld_group_constraints`, rest=0) + 近接重複epsilon
+  (`SELF_COL_COINCIDENT_EPS_M` = 0.5mm, CPU/GPU ミラー) で解決。
+  実機検証: `diagnostics/cloth_gpu_selfcol_glued/` (正常) vs
+  `cloth_gpu_every_frame/` (修正前の崩壊)。auto-cloth の位置weld は層を
+  区別しない限界あり (`WeldGroups` コメント、Phase C 課題)。
 - クリアランス (アンチ貫通アンカー) は `src/asset/clearance.rs` の Phase 1/2/3。
   Phase 3 は containment スロットに clearance-mode アンカーを入れる cross-region
   (ジャケット裾↔スカート、スカート↔下着)。アンカー実装を変えたら

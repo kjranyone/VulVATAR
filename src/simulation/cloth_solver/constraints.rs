@@ -174,30 +174,55 @@ pub(crate) fn project_distance_constraints(
 // Bend constraint projection (M1)
 // =========================================================================
 
-/// Project bend constraints using a dihedral-angle approach.
+/// Project bend constraints — three-point **edge-angle hinge**.
 ///
-/// Each bend constraint has three indices (p0, p1, p2). p0 is the hinge
-/// vertex; p1 and p2 are the wing vertices.  The dihedral angle is measured
-/// between edges p0->p1 and p0->p2, and corrections are applied to restore
-/// the rest angle.
+/// MODEL CONTRACT (T09): the constrained quantity is the angle at the
+/// hinge vertex `p0` between the edges to the wing vertices `p1` and
+/// `p2`, measured in the plane the two edges span. This is NOT the
+/// two-triangle dihedral angle along a shared edge; generation code
+/// must not feed shared-edge triangle pairs here expecting dihedral
+/// semantics. Auto-cloth generates no bend constraints; authored
+/// `.vvtcloth` files get this edge-angle model.
 ///
-/// KNOWN ISSUE: the unit test `bend_constraint_changes_angle` only verifies
-/// that the angle moves; the correction direction was observed to be inverted
-/// against simple synthetic inputs (closes the angle when it should open and
-/// vice versa) during T07 verification. Investigate when wiring against real
-/// cloth meshes — synthetic-test behaviour may not be the prod-relevant case.
+/// CORRECTION MODEL (linearised, both directions): moving wing `p1` by
+/// `δ` along the in-plane unit perpendicular toward `p2` changes the
+/// angle at the exact first-order rate `−δ/|p0p1|` (symmetric for
+/// `p2`), so a free wing's step is
+/// `delta = perp · (w / w_free) · stiffness · err · |edge|` with `w`
+/// the wing's inv-mass share among FREE wings only. Both signs of
+/// `err` strictly reduce `|err|` in the linear regime; repeated
+/// projection converges to `rest_angle` (unit-tested: monotone error
+/// decay, both directions).
+///
+/// Fixed points and degeneracies:
+/// - The hinge vertex `p0` is NEVER moved by this constraint. Its
+///   second-order positional drift is repaired by the distance
+///   constraints on the following passes. (The pre-T09 hinge
+///   compensation term fought the wing correction and, with both wings
+///   pinned, drove the free hinge away without bound — measured by
+///   `bend_constraint_pinned_wings_is_a_fixed_point` against the old
+///   implementation.)
+/// - Pinned wings never move and carry no share; two pinned wings make
+///   the constraint inert.
+/// - Exactly-collinear edges (sin ≈ 0) or a zero-length edge have no
+///   correction direction — the constraint stays inert and NaN-free.
+///
+/// The GPU cloth stages currently implement distance constraints only.
+/// When a bend stage is ported it must mirror THIS model — the
+/// pre-T09 implementation had the correction direction inverted and
+/// must not be used as the reference.
 pub(super) fn project_bend_constraints(sim: &mut ClothSimState) {
-    // We need to index into sim.particles mutably while iterating bend_constraints.
-    // Use index-based access.
     let n = sim.particles.len();
-    let constraint_count = sim.bend_constraints.len();
 
-    for ci in 0..constraint_count {
+    for ci in 0..sim.bend_constraints.len() {
         let p0 = sim.bend_constraints[ci].p0;
         let p1 = sim.bend_constraints[ci].p1;
         let p2 = sim.bend_constraints[ci].p2;
         let rest_angle = sim.bend_constraints[ci].rest_angle;
         let stiffness = sim.bend_constraints[ci].stiffness.clamp(0.0, 1.0);
+        if stiffness <= 0.0 {
+            continue;
+        }
 
         if p0 >= n || p1 >= n || p2 >= n {
             continue;
@@ -207,92 +232,75 @@ pub(super) fn project_bend_constraints(sim: &mut ClothSimState) {
         let x1 = sim.particles[p1].position;
         let x2 = sim.particles[p2].position;
 
-        // Edges from hinge vertex
         let e1 = vec3_sub(&x1, &x0);
         let e2 = vec3_sub(&x2, &x0);
 
-        // Current angle between e1 and e2
-        let dot = vec3_dot(&e1, &e2);
-        let cross = vec3_cross(&e1, &e2);
-        let cross_len = vec3_length(&cross);
-        let current_angle = cross_len.atan2(dot);
-
-        let angle_err = current_angle - rest_angle;
-        if angle_err.abs() < 1e-6 {
-            continue;
-        }
-
-        // Correction magnitude (scaled by stiffness)
-        let correction = angle_err * stiffness;
-
-        // Correction direction: rotate p1 and p2 around the cross-product axis
-        // to reduce the angle error.  We use a simple linearized approach:
-        // move p1 and p2 along the directions perpendicular to their respective
-        // edges, in the plane spanned by e1 and e2.
         let e1_len = vec3_length(&e1);
         let e2_len = vec3_length(&e2);
         if e1_len < 1e-12 || e2_len < 1e-12 {
             continue;
         }
 
-        // Perpendicular component of e2 w.r.t. e1 (and vice versa) gives the
-        // tangent direction for angle change.
+        let dot = vec3_dot(&e1, &e2);
+        let cross_len = vec3_length(&vec3_cross(&e1, &e2));
+        // |perp| equals sin(angle) for unit edges — the same quantity the
+        // perpendicular directions below normalise by. Near-collinear
+        // edges leave no stable correction direction; stay inert.
+        if cross_len < 1e-6 * e1_len * e2_len {
+            continue;
+        }
+        let current_angle = cross_len.atan2(dot);
+
+        let err = current_angle - rest_angle;
+        if err.abs() < 1e-6 {
+            continue;
+        }
+
+        // Unit in-plane perpendiculars: p1's points toward p2's side,
+        // p2's toward p1's side. Moving p1 along +perp1 lowers the
+        // angle at rate 1/|e1| (and symmetrically for p2).
         let e1_norm = vec3_scale(&e1, 1.0 / e1_len);
         let e2_norm = vec3_scale(&e2, 1.0 / e2_len);
-
-        // Direction to move p1: perpendicular to e1, toward e2
-        let perp1 = vec3_sub(
-            &e2_norm,
-            &vec3_scale(&e1_norm, vec3_dot(&e2_norm, &e1_norm)),
-        );
+        let perp1 = vec3_sub(&e2_norm, &vec3_scale(&e1_norm, dot / (e1_len * e2_len)));
         let perp1_len = vec3_length(&perp1);
         if perp1_len < 1e-6 {
             continue;
         }
         let perp1 = vec3_scale(&perp1, 1.0 / perp1_len);
-
-        // Direction to move p2: perpendicular to e2, toward e1
-        let perp2 = vec3_sub(
-            &e1_norm,
-            &vec3_scale(&e2_norm, vec3_dot(&e1_norm, &e2_norm)),
-        );
+        let perp2 = vec3_sub(&e1_norm, &vec3_scale(&e2_norm, dot / (e1_len * e2_len)));
         let perp2_len = vec3_length(&perp2);
         if perp2_len < 1e-6 {
             continue;
         }
         let perp2 = vec3_scale(&perp2, 1.0 / perp2_len);
 
-        let inv_mass_0 = sim.particles[p0].inv_mass;
-        let inv_mass_1 = sim.particles[p1].inv_mass;
-        let inv_mass_2 = sim.particles[p2].inv_mass;
-        let total_inv_mass = inv_mass_0 + inv_mass_1 + inv_mass_2;
-        if total_inv_mass < 1e-12 {
+        // Inv-mass shares among FREE wings only. Pinned wings move
+        // nothing and dilute nothing; the hinge is never moved.
+        let w1 = if sim.particles[p1].pinned {
+            0.0
+        } else {
+            sim.particles[p1].inv_mass
+        };
+        let w2 = if sim.particles[p2].pinned {
+            0.0
+        } else {
+            sim.particles[p2].inv_mass
+        };
+        let w_sum = w1 + w2;
+        if w_sum < 1e-12 {
             continue;
         }
 
-        // Move p1 along -perp1 and p2 along -perp2 to close the angle,
-        // scaled by each particle's share of inverse mass.
-        let scale = correction * 0.5; // half for each wing vertex
-
-        if !sim.particles[p1].pinned {
-            let w1 = inv_mass_1 / total_inv_mass;
-            let delta1 = vec3_scale(&perp1, -scale * w1 * e1_len);
+        // Linearised step: Δθ = −(w/w_sum) · stiffness · err per wing,
+        // so the free wings jointly remove `stiffness · err` each pass.
+        let scale = stiffness * err;
+        if w1 > 0.0 {
+            let delta1 = vec3_scale(&perp1, (w1 / w_sum) * scale * e1_len);
             sim.particles[p1].position = vec3_add(&sim.particles[p1].position, &delta1);
         }
-        if !sim.particles[p2].pinned {
-            let w2 = inv_mass_2 / total_inv_mass;
-            let delta2 = vec3_scale(&perp2, -scale * w2 * e2_len);
+        if w2 > 0.0 {
+            let delta2 = vec3_scale(&perp2, (w2 / w_sum) * scale * e2_len);
             sim.particles[p2].position = vec3_add(&sim.particles[p2].position, &delta2);
-        }
-        // Optionally move hinge vertex to conserve momentum
-        if !sim.particles[p0].pinned {
-            let w0 = inv_mass_0 / total_inv_mass;
-            let delta1_comp = vec3_scale(&perp1, scale * w0 * e1_len * 0.5);
-            let delta2_comp = vec3_scale(&perp2, scale * w0 * e2_len * 0.5);
-            sim.particles[p0].position = vec3_add(
-                &sim.particles[p0].position,
-                &vec3_add(&delta1_comp, &delta2_comp),
-            );
         }
     }
 }

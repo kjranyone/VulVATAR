@@ -144,6 +144,8 @@ impl VulkanRenderer {
             // Overwritten by `render` with the current-frame cloth
             // readback before the result leaves the renderer.
             cloth_readback: Vec::new(),
+            // Same overwrite discipline as `cloth_readback` above.
+            vbo_audit: Vec::new(),
         }))
     }
 

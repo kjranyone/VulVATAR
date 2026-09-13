@@ -77,6 +77,29 @@ pub(super) fn host_ubo<T: BufferContents>(
     .map_err(|e| format!("renderer: {label} alloc failed: {e}"))
 }
 
+/// Host-READABLE uninitialised buffer of `len` elements (diagnostic
+/// staging: the recording half copies a device-local compute output
+/// into it, and the CPU maps it after the frame fence). Requires the
+/// `HOST_RANDOM_ACCESS` filter — `HOST_SEQUENTIAL_WRITE` memory is
+/// write-only by contract.
+pub(super) fn host_read_slice<T: BufferContents>(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    len: u64,
+    label: &str,
+) -> Result<Subbuffer<[T]>, String> {
+    Buffer::new_slice::<T>(
+        memory_allocator.clone(),
+        buffer_info(BufferUsage::TRANSFER_DST | BufferUsage::STORAGE_BUFFER),
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        len,
+    )
+    .map_err(|e| format!("renderer: {label} alloc failed: {e}"))
+}
+
 /// Device-local uninitialised buffer of `len` elements (compute output).
 pub(super) fn device_slice<T: BufferContents>(
     memory_allocator: &Arc<StandardMemoryAllocator>,

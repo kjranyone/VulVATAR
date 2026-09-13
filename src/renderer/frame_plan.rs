@@ -38,7 +38,7 @@
 //! keep animating.
 
 use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use vulkano::buffer::Subbuffer;
@@ -135,6 +135,14 @@ pub(super) struct FramePlan {
     pub(super) instances: Vec<PlannedInstance>,
     /// Flat draw list in the same order the dispatches were planned.
     pub(super) draws: Vec<DrawInfo>,
+    /// R3 containment history copies: (parent's transformed VBO →
+    /// parent's history VBO), recorded after every transform dispatch.
+    /// Command-buffer-visible identity, hence part of the shape key.
+    pub(super) containment_copies:
+        Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)>,
+    /// R2 audit copies (final VBO -> host staging), only when
+    /// `VULVATAR_VBO_AUDIT=1`. Also command-buffer-visible identity.
+    pub(super) audit_copies: Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)>,
     pub(super) bloom: frame_input::BloomSettings,
     pub(super) use_bloom: bool,
     pub(super) composite_intensity: f32,
@@ -244,7 +252,7 @@ impl VulkanRenderer {
         }
 
         // ── Compute prepass CPU writes + dispatch-structure capture ─────
-        let (instances, draws) = self.prepare_compute_prepass(
+        let (instances, draws, containment_copies, audit_copies) = self.prepare_compute_prepass(
             input,
             &memory_allocator,
             &ds_allocator,
@@ -307,6 +315,8 @@ impl VulkanRenderer {
             clear,
             instances,
             draws,
+            containment_copies,
+            audit_copies,
             bloom: input.bloom.clone(),
             use_bloom,
             composite_intensity,
@@ -369,6 +379,39 @@ impl VulkanRenderer {
                         hash_arc(&mut h, &n.set);
                     } else {
                         h.write_u8(0);
+                    }
+                    // S2.2/S2.3 collision resources are bound by the
+                    // recorded command buffer too — their (re)allocation
+                    // must invalidate the cached recording. (R1 moved
+                    // collision INTO the substep loop; these sets are now
+                    // dispatched substeps × per frame.)
+                    if let Some(c) = &cloth.collide {
+                        h.write_u8(1);
+                        hash_arc(&mut h, &c.set);
+                        h.write_u32(c.collider_count);
+                    } else {
+                        h.write_u8(0);
+                    }
+                    if let Some(sc) = &cloth.selfcol {
+                        h.write_u8(1);
+                        hash_arc(&mut h, &sc.build_set);
+                        hash_arc(&mut h, &sc.resolve_set);
+                        sc.counts_ssbo.hash(&mut h);
+                    } else {
+                        h.write_u8(0);
+                    }
+                    // R3 containment history copies are
+                    // command-buffer-visible buffer identities.
+                    h.write_usize(plan.containment_copies.len());
+                    for (src, dst) in &plan.containment_copies {
+                        src.hash(&mut h);
+                        dst.hash(&mut h);
+                    }
+                    // R2 audit copies likewise.
+                    h.write_usize(plan.audit_copies.len());
+                    for (src, dst) in &plan.audit_copies {
+                        src.hash(&mut h);
+                        dst.hash(&mut h);
                     }
                 } else {
                     h.write_u8(0);

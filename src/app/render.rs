@@ -123,14 +123,6 @@ impl Application {
             }
         }
 
-        // Effective calibration for this frame (explicit modal capture /
-        // persisted project). Applies to the compat source skeleton's
-        // face channels only — the rig pose from the fusion estimator is
-        // already metric and needs no calibration.
-        let effective_calibration = crate::tracking::TrackingCalibration {
-            pose: self.tracking_calibration.pose.clone(),
-        };
-
         // Global avatar fade-out when person detection is lost. Target is full
         // opacity while a person is present (fresh sample or within the hold
         // window) and zero once detection has been lost past the hold window;
@@ -185,11 +177,19 @@ impl Application {
         self.last_sim_substeps = substeps;
 
         for (avatar_idx, avatar) in self.avatars.iter_mut().enumerate() {
+            // Costume-health probe payload (R5): captured PRE-physics
+            // inside the `avatar_idx == 0` block below, completed with
+            // the POST-physics stage after the solver ran, and dumped
+            // once at the end of this avatar iteration.
+            let mut probe: Option<(
+                Vec<(String, [f32; 3])>,
+                Vec<crate::asset::PrimitiveId>,
+                Vec<crate::tracking::debug_channel::CostumePrimProbe>,
+            )> = None;
+
             avatar.build_base_pose();
 
             if let Some(ref mut source) = tracking_sample.clone() {
-                effective_calibration.apply_calibration(source);
-
                 let humanoid = avatar.asset.humanoid.as_ref();
                 if let (Some(rig), Some(hm)) = (source.rig.as_ref(), humanoid) {
                     // Tracking v2: joint rotations from the fusion estimator.
@@ -255,76 +255,13 @@ impl Application {
                     },
                     head_axes,
                 );
-                // Costume-health probe: spring-driven garment bones + the
-                // skirt mesh's CPU-skinned bbox + attached-cloth state.
-                // Written to debug_avatar_extra.json so the live bug can
-                // be split into "vertices actually wrong" vs "render-only".
-                // The whole probe is debug-gated: it costs a 2.4k-vertex
-                // skinning pass per frame.
+                // Costume-health probe, PRE-physics stage (R5). Every
+                // cloth-target primitive is probed by id (not by a
+                // hardcoded mesh name) so a chest/hem breakdown can be
+                // attributed to a specific primitive + material. The
+                // POST-physics stage is measured after the solver ran —
+                // see the dump call at the end of this avatar iteration.
                 if crate::tracking::debug_channel::enabled() {
-                    let costume_bones: Vec<(String, [f32; 3])> = avatar
-                        .asset
-                        .skeleton
-                        .nodes
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, n)| {
-                            let l = n.name.to_lowercase();
-                            l == "skirt_root"
-                                || (l.starts_with("skirt_") && l.ends_with(".003"))
-                                || l == "tail.013"
-                        })
-                        .filter_map(|(i, n)| {
-                            gt.get(i).map(|m| (n.name.clone(), [m[3][0], m[3][1], m[3][2]]))
-                        })
-                        .collect();
-                    avatar.build_skinning_matrices();
-                    let skirt_bbox = {
-                        let sm = &avatar.pose.skinning_matrices;
-                        let skirt = avatar
-                            .asset
-                            .meshes
-                            .iter()
-                            .find(|m| m.name.eq_ignore_ascii_case("circle.056"))
-                            .and_then(|m| m.primitives.iter().find(|p| p.vertices.is_some()));
-                        skirt.and_then(|prim| {
-                            let vd = prim.vertices.as_ref().unwrap();
-                            let mut lo = [f32::MAX; 3];
-                            let mut hi = [f32::MIN; 3];
-                            for (i, &pos) in vd.positions.iter().enumerate() {
-                                let mut world = [0.0f32; 3];
-                                let mut total_w = 0.0;
-                                if i < vd.joint_weights.len() && i < vd.joint_indices.len() {
-                                    for k in 0..4 {
-                                        let w = vd.joint_weights[i][k];
-                                        if w > 0.0001 {
-                                            let j = vd.joint_indices[i][k] as usize;
-                                            if let Some(m) = sm.get(j) {
-                                                for c in 0..3 {
-                                                    world[c] += w
-                                                        * (m[0][c] * pos[0]
-                                                            + m[1][c] * pos[1]
-                                                            + m[2][c] * pos[2]
-                                                            + m[3][c]);
-                                                }
-                                                total_w += w;
-                                            }
-                                        }
-                                    }
-                                }
-                                if total_w > 0.001 {
-                                    for c in 0..3 {
-                                        world[c] /= total_w;
-                                    }
-                                }
-                                for c in 0..3 {
-                                    lo[c] = lo[c].min(world[c]);
-                                    hi[c] = hi[c].max(world[c]);
-                                }
-                            }
-                            Some((lo, hi))
-                        })
-                    };
                     let mut cloth_targets: Vec<crate::asset::PrimitiveId> = avatar
                         .cloth_overlays
                         .iter()
@@ -336,12 +273,42 @@ impl Application {
                             cloth_targets.push(t);
                         }
                     }
-                    crate::tracking::debug_channel::dump_costume_probe(
-                        costume_bones,
-                        skirt_bbox,
-                        cloth_targets.len(),
-                        cloth_targets,
-                    );
+                    // Refresh the skinning matrices against the
+                    // pre-physics global pose before the CPU LBS probe.
+                    avatar.build_skinning_matrices();
+                    let prim_probes = cloth_targets
+                        .iter()
+                        .map(|t| {
+                            let (clearance_parent, containment_parent) =
+                                prim_anchor_parents(avatar, *t);
+                            match cpu_lbs_prim_bbox(avatar, *t) {
+                                Some((mesh, lo, hi)) => {
+                                    crate::tracking::debug_channel::CostumePrimProbe {
+                                        mesh,
+                                        primitive: t.0,
+                                        clearance_parent,
+                                        containment_parent,
+                                        pre_physics: Some(
+                                            crate::tracking::debug_channel::CostumeBBox {
+                                                min: lo,
+                                                max: hi,
+                                            },
+                                        ),
+                                        post_physics: None,
+                                    }
+                                }
+                                None => crate::tracking::debug_channel::CostumePrimProbe {
+                                    mesh: "<missing vertex data>".to_string(),
+                                    primitive: t.0,
+                                    clearance_parent,
+                                    containment_parent,
+                                    pre_physics: None,
+                                    post_physics: None,
+                                },
+                            }
+                        })
+                        .collect();
+                    probe = Some((costume_bone_positions(avatar), cloth_targets, prim_probes));
                 }
             }
 
@@ -394,6 +361,35 @@ impl Application {
             }
 
             avatar.build_skinning_matrices();
+
+            // Costume-health probe, POST-physics stage (R5): the same
+            // cloth-target primitives re-probed against the post-solver
+            // skinning matrices, then one dump carrying both stages.
+            // On a frozen frame (substeps == 0) the two stages match BY
+            // CONTRACT — the JSON carries `sim_substeps` so the reader
+            // can tell "physics didn't run" from "physics ran and did
+            // nothing".
+            if let Some((bones_pre, cloth_targets, mut prim_probes)) = probe.take() {
+                for p in prim_probes.iter_mut() {
+                    if let Some((_, lo, hi)) =
+                        cpu_lbs_prim_bbox(avatar, crate::asset::PrimitiveId(p.primitive))
+                    {
+                        p.post_physics = Some(crate::tracking::debug_channel::CostumeBBox {
+                            min: lo,
+                            max: hi,
+                        });
+                    }
+                }
+                crate::tracking::debug_channel::dump_costume_probe(
+                    bones_pre,
+                    costume_bone_positions(avatar),
+                    prim_probes,
+                    cloth_targets.len(),
+                    cloth_targets,
+                    substeps,
+                    fixed_dt,
+                );
+            }
         }
 
         if !self.avatars.is_empty() {
@@ -628,11 +624,19 @@ impl Application {
     /// Write GPU cloth readback entries into the matching
     /// `ClothState`s (primary first, then overlay slots — the same
     /// first-wins-by-primitive ordering the snapshot collector uses).
+    ///
+    /// Delivery contract (R4): an entry is applied ONLY where ALL of
+    /// `instance_id`, `mesh_id`, and `primitive_id` match the
+    /// avatar's own identity and the cloth's resolved render target.
+    /// `primitive_id` is unique within one avatar, not across
+    /// avatars, so the old primitive-only match mis-delivered one
+    /// avatar's solved state into another's `ClothState`. Rows with
+    /// no instance stamp (a slot that never saw a GPU dispatch) are
+    /// never applied.
     fn apply_cloth_readback(&mut self, entries: &[crate::renderer::ClothReadback]) {
-        use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
         for avatar in self.avatars.iter_mut() {
             for entry in entries {
-                let mut apply = |cs: &mut crate::avatar::instance::ClothState| {
+                let apply = |cs: &mut crate::avatar::instance::ClothState| {
                     cs.sim_positions = entry.positions.clone();
                     cs.prev_sim_positions = entry.positions.clone();
                     if let Some(n) = entry.normals.as_ref() {
@@ -642,23 +646,24 @@ impl Application {
                     cs.deform_output.deformed_normals = entry.normals.clone();
                     cs.deform_output.version = entry.version as u64;
                 };
-                let primary_hit = avatar
+                // Instance + mesh must match this avatar AND the cloth
+                // must be GPU-backed and bound to this entry's primitive.
+                let targets_entry =
+                    |cs: &crate::avatar::instance::ClothState| {
+                        cloth_readback_matches(entry, avatar.id, cs)
+                    };
+                if avatar
                     .cloth_state
                     .as_ref()
-                    .is_some_and(|cs| {
-                        cs.solver_backend == ClothSolverBackend::Gpu
-                            && cs.target_primitive_id == Some(entry.primitive_id)
-                    });
-                if primary_hit {
+                    .is_some_and(|cs| targets_entry(cs))
+                {
                     if let Some(cs) = avatar.cloth_state.as_mut() {
                         apply(cs);
                     }
                     continue;
                 }
                 for slot in avatar.cloth_overlays.iter_mut() {
-                    if slot.state.solver_backend == ClothSolverBackend::Gpu
-                        && slot.state.target_primitive_id == Some(entry.primitive_id)
-                    {
+                    if targets_entry(&slot.state) {
                         apply(&mut slot.state);
                     }
                 }
@@ -676,6 +681,29 @@ impl Application {
         // frames carry the readback too.
         if !render_result.cloth_readback.is_empty() {
             self.apply_cloth_readback(&render_result.cloth_readback);
+        }
+        // R2 final-VBO audit (only rows when `VULVATAR_VBO_AUDIT=1`):
+        // publish the render-side correction telemetry for the external
+        // watcher before the export early-return — token frames carry
+        // the audit too.
+        if !render_result.vbo_audit.is_empty() {
+            crate::tracking::debug_channel::dump_vbo_audit(
+                render_result
+                    .vbo_audit
+                    .iter()
+                    .map(|e| crate::tracking::debug_channel::VboAuditRow {
+                        mesh: e.mesh_id.0,
+                        primitive: e.primitive_id.0,
+                        instance: e.instance_id,
+                        vertex_count: e.vertex_count,
+                        nan_count: e.nan_count,
+                        max_correction_m: e.max_correction_m,
+                        p95_correction_m: e.p95_correction_m,
+                        max_pos_len_m: e.max_pos_len_m,
+                    })
+                    .collect(),
+                render_result.timestamp_nanos,
+            );
         }
         let Some(exported) = render_result.exported_frame else {
             self.rendered_pixels = None;
@@ -1215,6 +1243,114 @@ fn gpu_pin_targets(
     out
 }
 
+/// R5 probe: world positions of the spring-driven garment bones the
+/// costume probe tracks (skirt chains, tail). Same name filter as the
+/// original inline probe.
+fn costume_bone_positions(avatar: &AvatarInstance) -> Vec<(String, [f32; 3])> {
+    let gt = &avatar.pose.global_transforms;
+    avatar
+        .asset
+        .skeleton
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            let l = n.name.to_lowercase();
+            l == "skirt_root" || (l.starts_with("skirt_") && l.ends_with(".003")) || l == "tail.013"
+        })
+        .filter_map(|(i, n)| gt.get(i).map(|m| (n.name.clone(), [m[3][0], m[3][1], m[3][2]])))
+        .collect()
+}
+
+/// R5 probe: CPU linear-blend-skinning bbox of one primitive (4-weight
+/// blend, weight-normalised when the weights sum above a threshold —
+/// the same recipe as the original inline probe and the clearance
+/// pass). Returns `(mesh_name, min, max)`, or `None` when the
+/// primitive has no CPU vertex payload. Requires
+/// `pose.skinning_matrices` to be current with `pose.global_transforms`
+/// — callers refresh them first.
+fn cpu_lbs_prim_bbox(
+    avatar: &AvatarInstance,
+    prim_id: crate::asset::PrimitiveId,
+) -> Option<(String, [f32; 3], [f32; 3])> {
+    let sm = &avatar.pose.skinning_matrices;
+    let mesh = avatar
+        .asset
+        .meshes
+        .iter()
+        .find(|m| m.primitives.iter().any(|p| p.id == prim_id))?;
+    let prim = mesh.primitives.iter().find(|p| p.id == prim_id)?;
+    let vd = prim.vertices.as_ref()?;
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for (i, &pos) in vd.positions.iter().enumerate() {
+        let mut world = [0.0f32; 3];
+        let mut total_w = 0.0;
+        if i < vd.joint_weights.len() && i < vd.joint_indices.len() {
+            for k in 0..4 {
+                let w = vd.joint_weights[i][k];
+                if w > 0.0001 {
+                    let j = vd.joint_indices[i][k] as usize;
+                    if let Some(m) = sm.get(j) {
+                        for c in 0..3 {
+                            world[c] +=
+                                w * (m[0][c] * pos[0] + m[1][c] * pos[1] + m[2][c] * pos[2] + m[3][c]);
+                        }
+                        total_w += w;
+                    }
+                }
+            }
+        }
+        if total_w > 0.001 {
+            for c in 0..3 {
+                world[c] /= total_w;
+            }
+        }
+        for c in 0..3 {
+            lo[c] = lo[c].min(world[c]);
+            hi[c] = hi[c].max(world[c]);
+        }
+    }
+    Some((mesh.name.clone(), lo, hi))
+}
+
+/// R5 probe: the clearance (`body_primitive_id`) and containment
+/// (`containment_primitive_id`) anchor parents of a primitive, straight
+/// from the asset — the primitive-ID correspondence table the quality
+/// plan's §10 asks for, instead of guessing ids from screen positions.
+fn prim_anchor_parents(
+    avatar: &AvatarInstance,
+    prim_id: crate::asset::PrimitiveId,
+) -> (Option<u64>, Option<u64>) {
+    let prim = avatar
+        .asset
+        .meshes
+        .iter()
+        .flat_map(|m| m.primitives.iter())
+        .find(|p| p.id == prim_id);
+    (
+        prim.and_then(|p| p.body_primitive_id).map(|id| id.0),
+        prim.and_then(|p| p.containment_primitive_id).map(|id| id.0),
+    )
+}
+
+/// R4 delivery predicate: does this GPU cloth readback row belong to
+/// this avatar's cloth slot? All three identifiers must agree — the
+/// avatar instance that simulated the slot, the mesh, and the
+/// primitive the cloth is bound to — and the slot must be GPU-backed.
+/// Free function so the contract stays unit-testable without an
+/// `Application` or a Vulkan device.
+fn cloth_readback_matches(
+    entry: &crate::renderer::ClothReadback,
+    avatar_id: crate::avatar::AvatarInstanceId,
+    cs: &crate::avatar::instance::ClothState,
+) -> bool {
+    entry.instance_id == Some(avatar_id.0)
+        && cs.solver_backend == crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu
+        && cs.target_mesh_id == Some(entry.mesh_id)
+        && cs.target_primitive_id == Some(entry.primitive_id)
+}
+
 /// Collect per-primitive cloth snapshots from `(ClothState, Option<ClothSimState>)` pairs.
 ///
 /// Cloth is scoped per primitive (`target_primitive_id`), so multiple cloths
@@ -1545,5 +1681,85 @@ mod cloth_collection_tests {
 
         assert_eq!(result.len(), 1, "cloth with no render target is dropped");
         assert_eq!(result[0].target_primitive_id.0, 10);
+    }
+
+    // ---- R4 readback delivery contract -------------------------------
+
+    use crate::avatar::AvatarInstanceId;
+    use crate::renderer::ClothReadback;
+
+    fn gpu_cloth_state(
+        overlay_id: u64,
+        target_primitive_id: Option<PrimitiveId>,
+    ) -> ClothState {
+        let mut cs = make_cloth_state(overlay_id, target_primitive_id, 8, 1);
+        cs.solver_backend = crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu;
+        cs
+    }
+
+    fn readback(instance: Option<u64>, mesh: MeshId, prim: PrimitiveId) -> ClothReadback {
+        ClothReadback {
+            mesh_id: mesh,
+            primitive_id: prim,
+            instance_id: instance,
+            version: 1,
+            positions: vec![[0.0; 3]],
+            normals: None,
+        }
+    }
+
+    /// A row stamped with the simulating instance, mesh, and primitive
+    /// is delivered to that cloth slot. (`make_cloth_state` derives
+    /// `target_mesh_id = MeshId(primitive.0)`, so the agreeing mesh
+    /// here is `MeshId(12)`.)
+    #[test]
+    fn readback_matches_when_all_identifiers_agree() {
+        let cs = gpu_cloth_state(1, Some(PrimitiveId(12)));
+        assert!(cloth_readback_matches(
+            &readback(Some(7), MeshId(12), PrimitiveId(12)),
+            AvatarInstanceId(7),
+            &cs,
+        ));
+    }
+
+    /// The old bug: primitive id alone is unique per avatar, not across
+    /// avatars — a row from another instance must NOT be delivered.
+    #[test]
+    fn readback_rejected_on_instance_mismatch() {
+        let cs = gpu_cloth_state(1, Some(PrimitiveId(12)));
+        assert!(!cloth_readback_matches(
+            &readback(Some(9), MeshId(3), PrimitiveId(12)),
+            AvatarInstanceId(7),
+            &cs,
+        ));
+        // Unstamped rows are never applied either.
+        assert!(!cloth_readback_matches(
+            &readback(None, MeshId(3), PrimitiveId(12)),
+            AvatarInstanceId(7),
+            &cs,
+        ));
+    }
+
+    /// Same primitive id on a DIFFERENT mesh (two garments inside one
+    /// avatar sharing a primitive index) must not cross-deliver.
+    #[test]
+    fn readback_rejected_on_mesh_mismatch() {
+        let cs = gpu_cloth_state(1, Some(PrimitiveId(12)));
+        assert!(!cloth_readback_matches(
+            &readback(Some(7), MeshId(4), PrimitiveId(12)),
+            AvatarInstanceId(7),
+            &cs,
+        ));
+    }
+
+    /// CPU-backed slots take the snapshot-copy path, not the readback.
+    #[test]
+    fn readback_rejected_on_cpu_backend() {
+        let cs = make_cloth_state(1, Some(PrimitiveId(12)), 8, 1);
+        assert!(!cloth_readback_matches(
+            &readback(Some(7), MeshId(3), PrimitiveId(12)),
+            AvatarInstanceId(7),
+            &cs,
+        ));
     }
 }

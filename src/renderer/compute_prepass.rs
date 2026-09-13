@@ -38,10 +38,12 @@ impl VulkanRenderer {
     /// build the draw list. Kahn-orders primitives with hierarchical
     /// surface-clearance dependencies so a child's transform dispatch
     /// reads its parent's freshly skinned vertices. Containment children
-    /// (inner garment layers) read the parent's previous-frame VBO
-    /// instead — their parent's own clearance dispatch runs later in
-    /// the same order, so same-frame input is impossible without a
-    /// second pass.
+    /// (inner garment layers) read the parent's PREVIOUS-frame history
+    /// VBO instead (R3): the history buffer is filled by a
+    /// `copy_buffer` after every transform dispatch, so the reference
+    /// surface is deterministic last-frame FINAL state regardless of
+    /// whether the parent's dispatch happened to run before or after
+    /// the child's in the Kahn order.
     ///
     /// This is the prepare half: every GPU-bound value reaches the GPU
     /// through a persistent buffer written here, and the dispatch
@@ -57,9 +59,28 @@ impl VulkanRenderer {
         gfx_pipeline: &Arc<GraphicsPipeline>,
         default_tex: &Arc<ImageView>,
         sampler: &Arc<Sampler>,
-    ) -> Result<(Vec<PlannedInstance>, Vec<DrawInfo>), String> {
+    ) -> Result<
+        (
+            Vec<PlannedInstance>,
+            Vec<DrawInfo>,
+            Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)>,
+            Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)>,
+        ),
+        String,
+    > {
         let mut planned_instances: Vec<PlannedInstance> = Vec::new();
         let mut draws: Vec<DrawInfo> = Vec::new();
+        // R3: (current VBO → history VBO) copies for containment parent
+        // slots, executed by the recording half AFTER every transform
+        // dispatch. Containment children read the history buffers, so
+        // this is what makes their reference surface deterministic
+        // previous-frame FINAL state.
+        let mut containment_copies: Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)> =
+            Vec::new();
+        // R2 audit: (final VBO -> host staging) copies, recorded after
+        // every transform dispatch when `VULVATAR_VBO_AUDIT=1`. Staging
+        // is read back after the frame fence by `read_vbo_audit`.
+        let mut audit_copies: Vec<(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)> = Vec::new();
 
         for (inst_idx, instance) in input.instances.iter().enumerate() {
             let skinning_mats: Vec<[[f32; 4]; 4]> = if instance.skinning_matrices.is_empty() {
@@ -208,6 +229,12 @@ impl VulkanRenderer {
                 }
             }
 
+            // Primitives that other primitives clamp against through the
+            // containment slot this frame: they need the R3 history
+            // buffer + post-dispatch copy.
+            let containment_parent_slots: std::collections::HashSet<PrimitiveId> =
+                validated_containment_ids.values().copied().collect();
+
             let mut planned_prims: Vec<PlannedPrim> = Vec::new();
             for &mesh_inst in &ordered_mesh_instances {
                 let prim_asset = match mesh_inst.primitive_data.as_ref() {
@@ -255,6 +282,7 @@ impl VulkanRenderer {
                 let prim_parent_vbo = self.materialize_parent_vbo(
                     instance,
                     validated_parent_ids.get(&mesh_inst.primitive_id).copied(),
+                    false,
                     memory_allocator,
                     ds_allocator,
                     &transform_pipeline,
@@ -263,12 +291,13 @@ impl VulkanRenderer {
                 // Containment parent (the OUTER garment). Same
                 // materialisation rules; no dispatch-ordering requirement
                 // because the containment clamp reads the parent's
-                // previous-frame VBO.
+                // PREVIOUS-FRAME history VBO (R3).
                 let containment_parent_vbo = self.materialize_parent_vbo(
                     instance,
                     validated_containment_ids
                         .get(&mesh_inst.primitive_id)
                         .copied(),
+                    true,
                     memory_allocator,
                     ds_allocator,
                     &transform_pipeline,
@@ -282,10 +311,48 @@ impl VulkanRenderer {
                     has_cloth_normals_prim,
                     prim_parent_vbo.clone(),
                     containment_parent_vbo.clone(),
+                    containment_parent_slots.contains(&mesh_inst.primitive_id),
                     memory_allocator,
                     ds_allocator,
                     &transform_pipeline,
                 )?;
+
+                // This slot serves as a containment parent this frame:
+                // schedule the post-dispatch copy that publishes its
+                // final vertices as next frame's (and this frame's)
+                // containment reference surface.
+                // This slot serves as a containment parent this frame
+                // (R3): schedule the post-dispatch copy that publishes
+                // its final vertices as the deterministic
+                // previous-frame reference surface. WITHOUT this copy
+                // the history buffer stays uninitialised and every
+                // containment clamp stays inert forever.
+                if containment_parent_slots.contains(&mesh_inst.primitive_id) {
+                    let slot = self
+                        .transform_cache
+                        .get(&key)
+                        .expect("ensure_transform_data populated the slot");
+                    if let Some(prev) = slot.containment_prev_vbo.as_ref() {
+                        containment_copies.push((slot.transformed_vbo.clone(), prev.clone()));
+                    }
+                }
+                // R2 audit: schedule the (final VBO -> host staging)
+                // copy for this frame's post-run statistics.
+                if let Some(staging) = self
+                    .transform_cache
+                    .get(&key)
+                    .and_then(|slot| slot.audit_staging.clone())
+                {
+                    // Fetch the live VBO in a second lookup (clone of the
+                    // Subbuffer handle, cheap).
+                    let vbo = self
+                        .transform_cache
+                        .get(&key)
+                        .expect("ensure_transform_data populated the slot")
+                        .transformed_vbo
+                        .clone();
+                    audit_copies.push((vbo, staging));
+                }
 
                 // If the cloth snapshot reports GPU backend, lazily build
                 // the per-primitive GPU cloth solver slot (seeding both
@@ -316,6 +383,7 @@ impl VulkanRenderer {
                     ) {
                         self.ensure_cloth_gpu_slot(
                             (mesh_inst.mesh_id, mesh_inst.primitive_id),
+                            instance.instance_id.0,
                             &cloth_snap.deformed_positions,
                             attach,
                             memory_allocator,
@@ -496,6 +564,20 @@ impl VulkanRenderer {
                         );
                     }
                     if let Some(ctrl) = cloth.gpu_control.as_ref() {
+                        // FROZEN-FRAME CONTRACT (R1): the substep count
+                        // arrives from the same `SimulationClock::advance`
+                        // value the CPU loop consumed
+                        // (`build_frame_input_multi` → snapshot → here).
+                        // 0 substeps means the CPU ran no `step_cloth`
+                        // this frame, so the GPU must dispatch NOTHING —
+                        // no verlet, no constraints, no collisions, not
+                        // even pin-target writes — and the SSBO keeps
+                        // last frame's state (the old `clamp(1, 8)` ran a
+                        // full substep including a collision dispatch on
+                        // frames the CPU physics was frozen, diverging
+                        // from the CPU path on a frame-pacing hiccup).
+                        let substeps = ctrl.substeps.clamp(0, 8);
+                        if substeps > 0 {
                         let (verlet_set, particle_count) = {
                             let slot = self
                                 .transform_cache
@@ -546,7 +628,10 @@ impl VulkanRenderer {
                         // pinned/immobile particles entirely, and the
                         // constraint passes treat inv_mass == 0 as
                         // immovable, so the pin rows are only ever
-                        // authored here.
+                        // authored here. (Frozen frames — 0 substeps —
+                        // skip this write too, matching the CPU path
+                        // where `apply_pin_targets` only runs inside
+                        // `step_cloth`.)
                         if let Some(attach) = cloth.gpu_attach.as_ref() {
                             if !ctrl.pin_positions.is_empty() {
                                 let (pos_buf, prev_buf) = {
@@ -582,12 +667,12 @@ impl VulkanRenderer {
                         // by the cloth inspector's DragValue, but a
                         // hand-edited project file bypasses both. The
                         // dispatch count below is
-                        // `substeps × (1 + 3 × constraint_iters) + 1` in
-                        // ONE command buffer — unbounded values turn a
-                        // frame into a GPU burst long enough to trip the
-                        // driver watchdog (Intel Arc TDR history).
+                        // `substeps × (1 + 3 × constraint_iters + selfcol
+                        // + collide) + normals` in ONE command buffer —
+                        // unbounded values turn a frame into a GPU burst
+                        // long enough to trip the driver watchdog (Intel
+                        // Arc TDR history).
                         let constraint_iters = ctrl.solver_iterations.clamp(1, 32);
-                        let substeps = ctrl.substeps.clamp(1, 8);
                         if ctrl.solver_iterations > 32 || ctrl.substeps > 8 {
                             warn!(
                         "render: cloth dispatch params clamped (substeps {} → {}, iterations {} → {})",
@@ -776,6 +861,7 @@ impl VulkanRenderer {
                             collide: collide_plan,
                             selfcol: selfcol_plan,
                         });
+                        }
                     }
                 }
 
@@ -907,7 +993,12 @@ impl VulkanRenderer {
                 prims: planned_prims,
             });
         }
-        Ok((planned_instances, draws))
+        Ok((
+            planned_instances,
+            draws,
+            containment_copies,
+            audit_copies,
+        ))
     }
 
     /// Recording half of the compute prepass: replay a prepared dispatch
@@ -928,6 +1019,8 @@ impl VulkanRenderer {
         cloth_selfcol_build_pipeline: &Arc<ComputePipeline>,
         cloth_selfcol_resolve_pipeline: &Arc<ComputePipeline>,
         instances: &[PlannedInstance],
+        containment_copies: &[(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)],
+        audit_copies: &[(Subbuffer<[GpuVertex]>, Subbuffer<[GpuVertex]>)],
     ) -> Result<(), String> {
         builder
             .bind_pipeline_compute(transform_pipeline.clone())
@@ -945,12 +1038,14 @@ impl VulkanRenderer {
 
             for prim in &inst.prims {
                 if let Some(cloth) = &prim.cloth {
-                    // Substep loop: each substep advances Verlet
-                    // integration by the fixed `ctrl.dt`, then runs
-                    // `constraint_iters` XPBD constraint iterations.
-                    // Matches the CPU path's
-                    // `for _ in 0..substeps { step_cloth(fixed_dt) }`
-                    // loop in `simulation::step_cloth_overlays`.
+                    // Per-substep loop — the GPU twin of one CPU
+                    // `cloth_solver::step_cloth(fixed_dt)` call:
+                    // verlet integration → XPBD constraint iterations →
+                    // self-collision → capsule projection, each substep,
+                    // in the CPU step order. (R1 fix: collision used to
+                    // run once per FRAME here while the CPU ran it once
+                    // per substep, so multi-substep frames let cloth
+                    // tunnel through colliders on the GPU path only.)
                     for _ in 0..cloth.substeps {
                         builder
                             .bind_pipeline_compute(cloth_verlet_pipeline.clone())
@@ -1055,84 +1150,89 @@ impl VulkanRenderer {
                                 }
                             }
                         }
+
+                        // S2.3 — self-collision (opt-in): rebuild the
+                        // grid (zero + atomic fill) then resolve, once
+                        // per SUBSTEP, between the constraint iterations
+                        // and the capsule projection — the CPU step
+                        // order (`resolve_self_collisions` runs inside
+                        // every `step_cloth`).
+                        if let Some(selfcol) = &cloth.selfcol {
+                            builder
+                                .fill_buffer(
+                                    selfcol.counts_ssbo.clone().reinterpret::<[u32]>(),
+                                    0u32,
+                                )
+                                .map_err(|e| format!("render: selfcol counts fill: {e}"))?;
+                            builder
+                                .bind_pipeline_compute(cloth_selfcol_build_pipeline.clone())
+                                .map_err(|e| format!("render: bind selfcol build: {e}"))?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_selfcol_build_pipeline.layout().clone(),
+                                    0,
+                                    selfcol.build_set.clone(),
+                                )
+                                .map_err(|e| format!("render: bind selfcol build set: {e}"))?;
+                            unsafe {
+                                builder.dispatch(cloth.groups).map_err(|e| {
+                                    format!("render: selfcol build dispatch: {e}")
+                                })?;
+                            }
+                            builder
+                                .bind_pipeline_compute(cloth_selfcol_resolve_pipeline.clone())
+                                .map_err(|e| format!("render: bind selfcol resolve: {e}"))?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_selfcol_resolve_pipeline.layout().clone(),
+                                    0,
+                                    selfcol.resolve_set.clone(),
+                                )
+                                .map_err(|e| format!("render: bind selfcol resolve set: {e}"))?;
+                            unsafe {
+                                builder.dispatch(cloth.groups).map_err(|e| {
+                                    format!("render: selfcol resolve dispatch: {e}")
+                                })?;
+                            }
+                        }
+
+                        // S2.2 — collision projection: push particles
+                        // out of the world-space capsules, once per
+                        // SUBSTEP after the constraint iterations (CPU
+                        // step order: XPBD → self-collision → colliders,
+                        // all inside one `step_cloth`). Pinned rows are
+                        // skipped in-shader (the CPU's `enforce_pins`
+                        // twin), so the pin targets authored in prepare
+                        // survive.
+                        if let Some(collide) = &cloth.collide {
+                            builder
+                                .bind_pipeline_compute(cloth_collide_pipeline.clone())
+                                .map_err(|e| format!("render: bind cloth collide pipeline: {e}"))?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_collide_pipeline.layout().clone(),
+                                    0,
+                                    collide.set.clone(),
+                                )
+                                .map_err(|e| format!("render: bind cloth collide set: {e}"))?;
+                            unsafe {
+                                builder.dispatch(cloth.groups).map_err(|e| {
+                                    format!("render: cloth collide dispatch: {e}")
+                                })?;
+                            }
+                        }
                     }
 
-                    // S2.3 — self-collision (opt-in): rebuild the grid
-                    // (zero + atomic fill) then resolve, once per
-                    // substep, between the constraint iterations and
-                    // the capsule projection — the CPU step order.
-                    if let Some(selfcol) = &cloth.selfcol {
-                        builder
-                            .fill_buffer(
-                                selfcol.counts_ssbo.clone().reinterpret::<[u32]>(),
-                                0u32,
-                            )
-                            .map_err(|e| format!("render: selfcol counts fill: {e}"))?;
-                        builder
-                            .bind_pipeline_compute(cloth_selfcol_build_pipeline.clone())
-                            .map_err(|e| format!("render: bind selfcol build: {e}"))?;
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Compute,
-                                cloth_selfcol_build_pipeline.layout().clone(),
-                                0,
-                                selfcol.build_set.clone(),
-                            )
-                            .map_err(|e| format!("render: bind selfcol build set: {e}"))?;
-                        unsafe {
-                            builder.dispatch(cloth.groups).map_err(|e| {
-                                format!("render: selfcol build dispatch: {e}")
-                            })?;
-                        }
-                        builder
-                            .bind_pipeline_compute(cloth_selfcol_resolve_pipeline.clone())
-                            .map_err(|e| format!("render: bind selfcol resolve: {e}"))?;
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Compute,
-                                cloth_selfcol_resolve_pipeline.layout().clone(),
-                                0,
-                                selfcol.resolve_set.clone(),
-                            )
-                            .map_err(|e| format!("render: bind selfcol resolve set: {e}"))?;
-                        unsafe {
-                            builder.dispatch(cloth.groups).map_err(|e| {
-                                format!("render: selfcol resolve dispatch: {e}")
-                            })?;
-                        }
-                    }
-
-                    // S2.2 — collision projection: push particles out of
-                    // the world-space capsules, once per substep after
-                    // the constraint iterations (CPU step order: XPBD →
-                    // self-collision → colliders; self-collision stays
-                    // CPU-side). Pinned rows are skipped in-shader, so
-                    // the pin targets authored in prepare survive. The
-                    // verlet pipeline is re-bound afterwards because the
-                    // next substep iteration starts from it.
-                    if let Some(collide) = &cloth.collide {
-                        builder
-                            .bind_pipeline_compute(cloth_collide_pipeline.clone())
-                            .map_err(|e| format!("render: bind cloth collide pipeline: {e}"))?;
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Compute,
-                                cloth_collide_pipeline.layout().clone(),
-                                0,
-                                collide.set.clone(),
-                            )
-                            .map_err(|e| format!("render: bind cloth collide set: {e}"))?;
-                        unsafe {
-                            builder.dispatch(cloth.groups).map_err(|e| {
-                                format!("render: cloth collide dispatch: {e}")
-                            })?;
-                        }
-                        builder
-                            .bind_pipeline_compute(cloth_verlet_pipeline.clone())
-                            .map_err(|e| format!("render: rebind cloth verlet pipeline: {e}"))?;
-                    }
-
-                    // S3.1 — vertex normal recomputation.
+                    // S3.1 — vertex normal recomputation, ONCE after the
+                    // substep loop: only the final substep's normals are
+                    // ever read (by transform_cs below), so recomputing
+                    // per substep would be pure waste. Positions the
+                    // normals describe are the post-collision state of
+                    // the last substep — same as the CPU's final
+                    // `compute_normals` writeback.
                     if let Some(normal) = &cloth.normal {
                         builder
                             .bind_pipeline_compute(cloth_normal_pipeline.clone())
@@ -1195,6 +1295,34 @@ impl VulkanRenderer {
                 }
             }
         }
+
+        // R3 containment history: after ALL transform dispatches (any
+        // ordering), publish each containment parent's final vertices
+        // into its history buffer. Containment children dispatching
+        // anywhere above read the pre-copy (i.e. previous-frame)
+        // content of that buffer — same-frame reads are impossible by
+        // construction, not by Kahn-order luck.
+        for (src, dst) in containment_copies {
+            builder
+                .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                    src.clone(),
+                    dst.clone(),
+                ))
+                .map_err(|e| format!("render: containment history copy failed: {e}"))?;
+        }
+
+        // R2 audit copies (empty unless `VULVATAR_VBO_AUDIT=1`): after
+        // every transform dispatch, so each staging buffer ends the
+        // prepass holding the frame's FINAL vertices including the
+        // correction telemetry in `.w`.
+        for (src, dst) in audit_copies {
+            builder
+                .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                    src.clone(),
+                    dst.clone(),
+                ))
+                .map_err(|e| format!("render: vbo audit copy failed: {e}"))?;
+        }
         Ok(())
     }
 
@@ -1205,11 +1333,21 @@ impl VulkanRenderer {
     /// it with a `None` parent VBO would downgrade its own anchor
     /// binding every frame (the parent's own iteration below would then
     /// have to rebuild it right back).
+    ///
+    /// R3 time contract: a CLEARANCE parent returns its
+    /// `transformed_vbo` — the graph guarantees the parent dispatches
+    /// before the child, so the child reads this frame's freshly skinned
+    /// surface. A CONTAINMENT parent returns its `containment_prev_vbo`
+    /// history buffer (allocated here via `is_containment_parent`) —
+    /// filled after all dispatches each frame, so the child always reads
+    /// the parent's previous-frame FINAL state regardless of dispatch
+    /// order.
     #[allow(clippy::too_many_arguments)]
     fn materialize_parent_vbo(
         &mut self,
         instance: &frame_input::RenderAvatarInstance,
         parent_pid: Option<PrimitiveId>,
+        as_containment: bool,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         transform_pipeline: &Arc<ComputePipeline>,
@@ -1231,15 +1369,32 @@ impl VulkanRenderer {
                             false,
                             None,
                             None,
+                            as_containment,
                             memory_allocator,
                             ds_allocator,
                             transform_pipeline,
                         );
                     }
                 }
-                self.transform_cache
-                    .get(&parent_key)
-                    .map(|slot| slot.transformed_vbo.clone())
+                self.transform_cache.get(&parent_key).and_then(|slot| {
+                    if as_containment {
+                        slot.containment_prev_vbo
+                            .clone()
+                            // Fall back to the live VBO only if the
+                            // history allocation failed — degradation
+                            // to the old behaviour beats disabling the
+                            // clamp entirely.
+                            .or_else(|| {
+                                warn!(
+                                    "render: containment history VBO missing for parent {:?}; clamping against this-frame surface",
+                                    parent_pid
+                                );
+                                Some(slot.transformed_vbo.clone())
+                            })
+                    } else {
+                        Some(slot.transformed_vbo.clone())
+                    }
+                })
             })
     }
 }

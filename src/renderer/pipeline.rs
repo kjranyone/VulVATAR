@@ -944,7 +944,14 @@ void main() {
                     if (connected) continue;
                     vec3 diff = q.xyz - pp.xyz; // i -> j
                     float d2 = dot(diff, diff);
-                    if (d2 < min_dist * min_dist && d2 > 1.0e-24) {
+                    // Near-coincident pairs (< 0.5 mm) are weld copies /
+                    // seam overlaps, not penetrations — must mirror the
+                    // CPU's SELF_COL_COINCIDENT_EPS_M (5e-4 m; eps² =
+                    // 2.5e-7). The old 1e-24 guard let a micron of
+                    // divergence trigger the full 2·radius push and
+                    // blew welded seams apart into spikes.
+                    const float COINCIDENT_EPS_SQ = 2.5e-7;
+                    if (d2 < min_dist * min_dist && d2 > COINCIDENT_EPS_SQ) {
                         float d = sqrt(d2);
                         float overlap = min_dist - d;
                         vec3 dir = diff / d;
@@ -1381,6 +1388,23 @@ void main() {
     const float WEIGHT_EPS = 1.0e-4;
     vec3 world_pos;
     vec3 world_nrm;
+    // R2 telemetry: total render-side correction applied by the
+    // clearance / containment branches below (metres), published in
+    // out_v.position.w — the vertex shaders only read .xyz, so the
+    // channel is free. This is exactly the per-vertex gap between the
+    // physics state (cloth SSBO / skinned position) and the drawn
+    // position, which the physics-side diagnostics cannot see.
+    float corr_len = 0.0;
+    // R2: render-only corrections are NOT written back into the cloth /
+    // physics state, so an unbounded push can stretch the drawn mesh
+    // arbitrarily far from the state the solver validated. Bound each
+    // anchor's applied displacement: healthy frames see millimetre-to-
+    // centimetre corrections, so this cap only bites on runaway frames,
+    // turning an unbounded tear into a bounded, telemetry-visible
+    // defect. The persistent fix (folding the correction into the
+    // physics constraints, or auditing per-stage vertex deltas) is
+    // tracked in docs/quality-improvement-plan.md R2.
+    const float MAX_RENDER_CORRECTION_M = 0.25;
 
     // Cloth override: the physics solver writes per-frame world-space
     // positions into `cloth_pos` and normals into `cloth_norm`. Pinned
@@ -1461,12 +1485,17 @@ void main() {
     //   bent joints. The two sets are separate so a middle layer can
     //   carry both at once.
     //
-    // Both read the parent through a sanity band on the parent position
-    // (avatar-local coords live well inside it) plus NaN-rejecting
-    // comparisons; containment parents run their own clearance dispatch
-    // later in the frame, so on the first frame their VBO may never
-    // have been written — garbage reads fail the band or the NaN
-    // comparison and stay inert.
+    // R3 time contract for the containment parent surface:
+    // `containment_parent_v` is the parent's PREVIOUS-frame FINAL VBO
+    // (filled by a `copy_buffer` after every transform dispatch — see
+    // `compute_prepass`), so the clamp reads a deterministic
+    // last-frame state no matter where in the dispatch order the
+    // parent ran. Both parent surfaces are read through a sanity band
+    // on the parent position (avatar-local coords live well inside
+    // it) plus NaN-rejecting comparisons; on the very first frame the
+    // history buffer is uninitialised — garbage reads fail the band
+    // or the NaN comparison and the clamp stays inert until the first
+    // copy lands.
     if (ctrl.has_skin_anchors > 0u) {
         SkinAnchor anc = skin_anchors.a[vid];
         if (anc.body_vertex_idx != 0xFFFFFFFFu && anc.weight > 1e-4) {
@@ -1477,8 +1506,20 @@ void main() {
             if (plen > 1e-3 && plen < 10.0 && nlen > 1e-4) {
                 bn /= nlen;
                 float clearance = dot(world_pos - bp, bn);
-                if (clearance < anc.min_clearance) {
-                    world_pos += bn * ((anc.min_clearance - clearance) * anc.weight);
+                // Anchor contract: anchors are derived at the
+                // GENERATION pose and only certify small penetrations.
+                // clearance < -5 mm means this vertex paired across a
+                // fold / side of the torso and is now far behind the
+                // anchor plane in THIS pose — 'correcting' it slams the
+                // vertex ~8 cm outward every frame (measured: floating
+                // chest shards). Skip deep negatives; only real, small
+                // penetrations are corrected. Mirrors the generation
+                // side's -5 mm rejection (clearance.rs, v20).
+                if (clearance < anc.min_clearance && clearance > -0.005) {
+                    float push = min((anc.min_clearance - clearance) * anc.weight,
+                                     MAX_RENDER_CORRECTION_M);
+                    world_pos += bn * push;
+                    corr_len += push;
                 }
             }
         }
@@ -1501,20 +1542,28 @@ void main() {
                 // out to at least `min_clearance` off the inner
                 // surface — same math as the binding-6 branch, against
                 // a garment parent the clearance slot cannot reference.
+                // Same deep-negative skip as the clearance branch
+                // above: cross-region pairs are pose-derived too.
                 if (anc.mode == 1u) {
-                    if (c > anc.min_clearance) {
-                        world_pos -= on * ((c - anc.min_clearance) * anc.weight);
+                    if (c > anc.min_clearance && c < anc.min_clearance + 0.005 + MAX_RENDER_CORRECTION_M) {
+                        float pull = min((c - anc.min_clearance) * anc.weight,
+                                         MAX_RENDER_CORRECTION_M);
+                        world_pos -= on * pull;
+                        corr_len += pull;
                     }
                 } else {
-                    if (c < anc.min_clearance) {
-                        world_pos += on * ((anc.min_clearance - c) * anc.weight);
+                    if (c < anc.min_clearance && c > -0.005) {
+                        float push = min((anc.min_clearance - c) * anc.weight,
+                                         MAX_RENDER_CORRECTION_M);
+                        world_pos += on * push;
+                        corr_len += push;
                     }
                 }
             }
         }
     }
 
-    out_v.v[vid].position = vec4(world_pos, 0.0);
+    out_v.v[vid].position = vec4(world_pos, corr_len);
     out_v.v[vid].normal   = vec4(world_nrm, 0.0);
     out_v.v[vid].uv       = b.uv;
     out_v.v[vid]._pad     = uvec2(0u, 0u);
@@ -2284,3 +2333,321 @@ mod tests {
         assert_eq!(offset_of!(TransformControl, _pad0), 24);
     }
 }
+
+/// R8 — CPU mirror of `transform_cs`'s Dual Quaternion Skinning math,
+/// used to pin the shader's input contract without a Vulkan device.
+/// The GLSL reads matrices column-major (`m[col][row]`); the Rust
+/// `Mat4` is row-major, so every index pair is transposed here. These
+/// tests exist to separate the INTENDED DQS-vs-LBS differences from
+/// INPUT-CONTRACT violations (non-rigid skinning matrices), per the
+/// quality-improvement-plan R8 review item.
+#[cfg(test)]
+mod dqs_contract_tests {
+    use crate::asset::Mat4;
+
+    type Q = [f32; 4]; // (x, y, z, w)
+
+    /// Mike Day's robust mat3→quat, transposed to row-major input.
+    /// Direct mirror of the GLSL `mat3_to_quat` in `transform_cs`.
+    fn mat3_to_quat(r: [[f32; 3]; 3]) -> Q {
+        let trace = r[0][0] + r[1][1] + r[2][2];
+        if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            [
+                (r[2][1] - r[1][2]) / s,
+                (r[0][2] - r[2][0]) / s,
+                (r[1][0] - r[0][1]) / s,
+                0.25 * s,
+            ]
+        } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
+            let s = (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt() * 2.0;
+            [
+                0.25 * s,
+                (r[0][1] + r[1][0]) / s,
+                (r[0][2] + r[2][0]) / s,
+                (r[2][1] - r[1][2]) / s,
+            ]
+        } else if r[1][1] > r[2][2] {
+            let s = (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt() * 2.0;
+            [
+                (r[0][1] + r[1][0]) / s,
+                0.25 * s,
+                (r[1][2] + r[2][1]) / s,
+                (r[1][0] - r[0][1]) / s,
+            ]
+        } else {
+            let s = (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt() * 2.0;
+            [
+                (r[0][2] + r[2][0]) / s,
+                (r[1][2] + r[2][1]) / s,
+                0.25 * s,
+                (r[1][0] - r[0][1]) / s,
+            ]
+        }
+    }
+
+    fn quat_rotate(q: Q, v: [f32; 3]) -> [f32; 3] {
+        let (ux, uy, uz) = (q[0], q[1], q[2]);
+        let w = q[3];
+        let cross_uv = [uy * v[2] - uz * v[1], uz * v[0] - ux * v[2], ux * v[1] - uy * v[0]];
+        let t = [
+            cross_uv[0] + w * v[0],
+            cross_uv[1] + w * v[1],
+            cross_uv[2] + w * v[2],
+        ];
+        let cross_ut = [uy * t[2] - uz * t[1], uz * t[0] - ux * t[2], ux * t[1] - uy * t[0]];
+        [
+            v[0] + 2.0 * cross_ut[0],
+            v[1] + 2.0 * cross_ut[1],
+            v[2] + 2.0 * cross_ut[2],
+        ]
+    }
+
+    fn dot(a: Q, b: Q) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+    }
+
+    /// Full mirror of the shader's DQS branch for ONE vertex with the
+    /// given joint indices / weights.
+    fn dqs_skin(mats: &[Mat4], indices: [u32; 4], weights: [f32; 4], pos: [f32; 3]) -> [f32; 3] {
+        const WEIGHT_EPS: f32 = 1.0e-4;
+        let mut ref_real = [0.0f32, 0.0, 0.0, 1.0];
+        for i in 0..4 {
+            if weights[i] > WEIGHT_EPS {
+                let m = &mats[indices[i] as usize];
+                ref_real = mat3_to_quat([
+                    // Transposed: the mirror expects the MATH 3x3
+                    // (R[row][col] = m[col][row] in codebase storage).
+                    [m[0][0], m[1][0], m[2][0]],
+                    [m[0][1], m[1][1], m[2][1]],
+                    [m[0][2], m[1][2], m[2][2]],
+                ]);
+                break;
+            }
+        }
+        let mut acc_real = [0.0f32; 4];
+        let mut acc_dual = [0.0f32; 4];
+        for i in 0..4 {
+            let wi = weights[i];
+            if wi <= WEIGHT_EPS {
+                continue;
+            }
+            let m = &mats[indices[i] as usize];
+            let mut qr = mat3_to_quat([
+                // Transposed: see the ref_real note above.
+                [m[0][0], m[1][0], m[2][0]],
+                [m[0][1], m[1][1], m[2][1]],
+                [m[0][2], m[1][2], m[2][2]],
+            ]);
+            let s = if dot(qr, ref_real) >= 0.0 { 1.0 } else { -1.0 };
+            qr = [qr[0] * s, qr[1] * s, qr[2] * s, qr[3] * s];
+            let ti = [m[3][0], m[3][1], m[3][2]];
+            let qrxyz = [qr[0], qr[1], qr[2]];
+            let qrw = qr[3];
+            // dxyz = 0.5*(qrw*ti + cross(ti, qrxyz)); dw = -0.5*dot(ti,qrxyz)
+            let cross_t_q = [
+                ti[1] * qrxyz[2] - ti[2] * qrxyz[1],
+                ti[2] * qrxyz[0] - ti[0] * qrxyz[2],
+                ti[0] * qrxyz[1] - ti[1] * qrxyz[0],
+            ];
+            let dxyz = [
+                0.5 * (qrw * ti[0] + cross_t_q[0]),
+                0.5 * (qrw * ti[1] + cross_t_q[1]),
+                0.5 * (qrw * ti[2] + cross_t_q[2]),
+            ];
+            let dw = -0.5 * (ti[0] * qrxyz[0] + ti[1] * qrxyz[1] + ti[2] * qrxyz[2]);
+            acc_real = [
+                acc_real[0] + wi * qr[0],
+                acc_real[1] + wi * qr[1],
+                acc_real[2] + wi * qr[2],
+                acc_real[3] + wi * qr[3],
+            ];
+            acc_dual = [
+                acc_dual[0] + wi * dxyz[0],
+                acc_dual[1] + wi * dxyz[1],
+                acc_dual[2] + wi * dxyz[2],
+                acc_dual[3] + wi * dw,
+            ];
+        }
+        let acc_len = dot(acc_real, acc_real).sqrt();
+        assert!(acc_len >= 1.0e-6, "degenerate DQS blend");
+        let inv = 1.0 / acc_len;
+        let q_real = [acc_real[0] * inv, acc_real[1] * inv, acc_real[2] * inv, acc_real[3] * inv];
+        let q_dual = [acc_dual[0] * inv, acc_dual[1] * inv, acc_dual[2] * inv, acc_dual[3] * inv];
+        let rqxyz = [-q_real[0], -q_real[1], -q_real[2]];
+        let rqw = q_real[3];
+        let c = [
+            q_dual[1] * rqxyz[2] - q_dual[2] * rqxyz[1],
+            q_dual[2] * rqxyz[0] - q_dual[0] * rqxyz[2],
+            q_dual[0] * rqxyz[1] - q_dual[1] * rqxyz[0],
+        ];
+        let t_recovered = [
+            2.0 * (q_dual[3] * rqxyz[0] + rqw * q_dual[0] + c[0]),
+            2.0 * (q_dual[3] * rqxyz[1] + rqw * q_dual[1] + c[1]),
+            2.0 * (q_dual[3] * rqxyz[2] + rqw * q_dual[2] + c[2]),
+        ];
+        let rotated = quat_rotate(q_real, pos);
+        [
+            rotated[0] + t_recovered[0],
+            rotated[1] + t_recovered[1],
+            rotated[2] + t_recovered[2],
+        ]
+    }
+
+    /// Row-major rigid matrix from an axis-angle rotation about Y plus
+    /// a translation, in the CODEBASE `Mat4` convention (established by
+    /// `gpu_pin_targets` / `apply_pin_targets`: `m[col][row]` — the
+    /// math matrix M is stored TRANSPOSED, translation in
+    /// `m[3][0..3]`). This is exactly the memory layout the GLSL sees.
+    fn rigid_y(deg: f32, t: [f32; 3]) -> Mat4 {
+        let a = deg.to_radians();
+        let (s, c) = (a.sin(), a.cos());
+        // M (math, row-major) = [[c,0,s],[0,1,0],[-s,0,c]]; store m[i][j] = M[j][i].
+        [
+            [c, 0.0, -s, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [s, 0.0, c, 0.0],
+            [t[0], t[1], t[2], 1.0],
+        ]
+    }
+
+    /// Apply a codebase-convention `Mat4` to a point (same arithmetic
+    /// as `gpu_pin_targets`).
+    fn mat4_apply(m: &Mat4, v: [f32; 3]) -> [f32; 3] {
+        [
+            m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2] + m[3][0],
+            m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2] + m[3][1],
+            m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2] + m[3][2],
+        ]
+    }
+
+    /// Contract 1: ONE rigid joint → DQS reproduces the matrix
+    /// transform exactly (quaternion extraction is lossless for rigid
+    /// input; translation comes from the 4th row).
+    #[test]
+    fn dqs_matches_matrix_for_single_rigid_joint() {
+        let identity = crate::asset::identity_matrix();
+        let mats = vec![rigid_y(30.0, [0.4, -0.2, 1.5]), identity];
+        let got = dqs_skin(&mats, [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0], [0.3, -0.7, 1.1]);
+        let want = mat4_apply(&mats[0], [0.3, -0.7, 1.1]);
+        for c in 0..3 {
+            assert!(
+                (got[c] - want[c]).abs() < 1.0e-4,
+                "DQS != LBS on rigid input: got {got:?} want {want:?}"
+            );
+        }
+    }
+
+    /// Contract 2: blending rigid joints yields a RIGID result — the
+    /// blended unit-quaternion transform preserves distances between
+    /// two probe points (no shear, no scale leakage, antipodality fix
+    /// keeps the blend well-defined).
+    #[test]
+    fn dqs_blend_of_rigid_joints_preserves_distance() {
+        let mats = vec![
+            rigid_y(40.0, [0.0, 0.0, 0.0]),
+            rigid_y(-25.0, [0.05, 0.02, -0.03]),
+        ];
+        // Two points skin both joints with complementary weights, so
+        // they see the SAME blended transform only if we keep the
+        // weights fixed — instead skin ONE extra point through the same
+        // weights by re-running the mirror on a second probe. The
+        // mirror takes the point as a parameter.
+        let p1 = [0.3f32, -0.7, 1.1];
+        let p2 = [-0.4f32, 0.5, 0.2];
+        let a1 = dqs_skin(&mats, [0, 1, 0, 0], [0.6, 0.4, 0.0, 0.0], p1);
+        let a2 = dqs_skin(&mats, [0, 1, 0, 0], [0.6, 0.4, 0.0, 0.0], p2);
+        let rest = (p1[0] - p2[0]).powi(2) + (p1[1] - p2[1]).powi(2) + (p1[2] - p2[2]).powi(2);
+        let deformed = (a1[0] - a2[0]).powi(2) + (a1[1] - a2[1]).powi(2) + (a1[2] - a2[2]).powi(2);
+        assert!(
+            (rest - deformed).abs() < 1.0e-2,
+            "blended DQS must be rigid (distance preserved): rest²={rest} deformed²={deformed}"
+        );
+    }
+
+    /// Contract 3 (the R8 input-violation probe): a NON-UNIFORM SCALE
+    /// in the skinning matrix is silently dropped by the DQS rotation
+    /// extraction — the shader rotates but does not scale, while the
+    /// CPU LBS probes (and the clearance / auto-cloth rest-position
+    /// recipes) apply the full matrix. Any asset whose import leaks a
+    /// scaled node therefore renders DQS-displaced vertices against
+    /// LBS-shaped collision/clearance surfaces. This test pins the
+    /// divergence so the import-side fix (scale stripping at load)
+    /// has a regression anchor.
+    #[test]
+    fn dqs_drops_nonuniform_scale_unlike_lbs() {
+        // Codebase convention (m[col][row]): math S = x-scale 2 +
+        // translation 0.1, stored transposed with translation row 3.
+        let scale: Mat4 = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.1, 0.0, 0.0, 1.0],
+        ];
+        let probe = [0.3f32, -0.7, 1.1];
+        let got = dqs_skin(&[scale.clone()], [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0], probe);
+        let lbs = mat4_apply(&scale, probe);
+        // LBS doubles x; DQS must NOT.
+        assert!(
+            (lbs[0] - 0.7).abs() < 1.0e-5,
+            "sanity: LBS applies the scale (x 0.3 → 0.7 incl. translation)"
+        );
+        assert!(
+            (got[0] - lbs[0]).abs() > 1.0e-2,
+            "DQS is expected to diverge from LBS under non-uniform scale; got {got:?} lbs {lbs:?}"
+        );
+        // And the divergence stays bounded (rotation-magnitude, not a
+        // blow-up).
+        assert!(got.iter().all(|c| c.is_finite() && c.abs() < 10.0));
+    }
+
+    /// Contract 4 (R8, real asset): Yumeka's per-frame skinning
+    /// matrices must be RIGID (orthonormal 3×3, det +1) — the DQS
+    /// shader's input contract. A failure here means the import path
+    /// leaks scale/mirror into `global_transforms` or the inverse-binds
+    /// and every DQS-vs-LBS mismatch downstream is an import bug, not
+    /// a skinning bug.
+    #[test]
+    fn yumeka_skinning_matrices_are_rigid() {
+        let pinned = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+        if !std::path::Path::new(pinned).exists() {
+            return;
+        }
+        let loader = crate::asset::fbx::FbxAssetLoader::new();
+        let asset = loader.load(pinned).expect("load Yumeka");
+        let mut avatar = crate::avatar::AvatarInstance::new(
+            crate::avatar::AvatarInstanceId(1),
+            asset,
+        );
+        // The base pose is what every load path guarantees; the
+        // rigidity contract must hold there (and is re-checked on real
+        // poses by the replay benches).
+        avatar.build_base_pose();
+        avatar.compute_global_pose();
+        avatar.build_skinning_matrices();
+
+        assert!(avatar.pose.skinning_matrices.len() > 10);
+        for (i, m) in avatar.pose.skinning_matrices.iter().enumerate() {
+            // Row orthonormality: R·Rᵀ = I.
+            for r in 0..3 {
+                for c in 0..3 {
+                    let dot = (0..3).map(|k| m[r][k] * m[c][k]).sum::<f32>();
+                    let want = if r == c { 1.0 } else { 0.0 };
+                    assert!(
+                        (dot - want).abs() < 1.0e-3,
+                        "skinning matrix {i} 3x3 not orthonormal: R·Rᵀ[{r}][{c}] = {dot}"
+                    );
+                }
+            }
+            // Rigid, not mirrored.
+            let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            assert!(
+                (det - 1.0).abs() < 1.0e-3,
+                "skinning matrix {i} determinant {det} (expected +1: rigid, unmirrored)"
+            );
+        }
+    }
+}
+    

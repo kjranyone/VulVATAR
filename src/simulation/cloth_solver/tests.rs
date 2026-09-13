@@ -351,6 +351,207 @@ fn bend_constraint_changes_angle() {
     );
 }
 
+/// Hinge fixture: p0 at the origin, p1 at (1, 0, 0), p2 on the unit
+/// circle at `start_deg`. One bend constraint with `rest_deg`.
+fn make_hinge_sim(rest_deg: f32, start_deg: f32) -> ClothSimState {
+    let mut sim = make_simple_sim(3);
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    sim.particles[1].position = [1.0, 0.0, 0.0];
+    let start = start_deg.to_radians();
+    sim.particles[2].position = [start.cos(), start.sin(), 0.0];
+    sim.bend_constraints.push(ClothBendConstraint {
+        p0: 0,
+        p1: 1,
+        p2: 2,
+        rest_angle: rest_deg.to_radians(),
+        stiffness: 0.3,
+    });
+    sim
+}
+
+fn hinge_angle(sim: &ClothSimState) -> f32 {
+    let e1 = vec3_sub(&sim.particles[1].position, &sim.particles[0].position);
+    let e2 = vec3_sub(&sim.particles[2].position, &sim.particles[0].position);
+    vec3_length(&vec3_cross(&e1, &e2)).atan2(vec3_dot(&e1, &e2))
+}
+
+/// T09 contract: when the current angle is BELOW rest, the constraint
+/// must open it toward rest — not close it further (the inverted-hinge
+/// behaviour observed in T07).
+#[test]
+fn bend_constraint_opens_when_below_rest() {
+    let mut sim = make_hinge_sim(60.0, 30.0);
+    let before = hinge_angle(&sim);
+    project_bend_constraints(&mut sim);
+    let after = hinge_angle(&sim);
+    assert!(
+        after > before,
+        "angle below rest must open: before={} after={}",
+        before.to_degrees(),
+        after.to_degrees()
+    );
+    assert!(
+        after <= 60.0f32.to_radians() + 1e-3,
+        "correction must not overshoot past rest in one step: {}",
+        after.to_degrees()
+    );
+}
+
+/// T09 contract: symmetric direction — angle ABOVE rest must close.
+#[test]
+fn bend_constraint_closes_when_above_rest() {
+    let mut sim = make_hinge_sim(60.0, 90.0);
+    let before = hinge_angle(&sim);
+    project_bend_constraints(&mut sim);
+    let after = hinge_angle(&sim);
+    assert!(
+        after < before,
+        "angle above rest must close: before={} after={}",
+        before.to_degrees(),
+        after.to_degrees()
+    );
+    assert!(
+        after >= 60.0f32.to_radians() - 1e-3,
+        "correction must not undershoot past rest in one step: {}",
+        after.to_degrees()
+    );
+}
+
+/// T09 contract: repeated projection converges to the rest angle and
+/// the error shrinks monotonically (no oscillation, no divergence) for
+/// both sides of the rest angle.
+#[test]
+fn bend_constraint_converges_monotonically_from_both_sides() {
+    for start_deg in [10.0f32, 30.0, 90.0, 120.0, 170.0].iter() {
+        let mut sim = make_hinge_sim(60.0, *start_deg);
+        let mut prev_err = (hinge_angle(&sim) - 60.0f32.to_radians()).abs();
+        for _ in 0..200 {
+            project_bend_constraints(&mut sim);
+            let err = (hinge_angle(&sim) - 60.0f32.to_radians()).abs();
+            assert!(
+                err <= prev_err + 1e-4,
+                "start {}: error must not grow ({} → {})",
+                start_deg,
+                prev_err.to_degrees(),
+                err.to_degrees()
+            );
+            prev_err = err;
+        }
+        assert!(
+            prev_err < 1.0f32.to_radians(),
+            "start {}: should converge to rest within 1°, got {}",
+            start_deg,
+            prev_err.to_degrees()
+        );
+        assert!(
+            hinge_angle(&sim).is_finite(),
+            "converged angle must stay finite"
+        );
+    }
+}
+
+/// T09 contract: with BOTH wings pinned there is no free vertex that
+/// can change the angle, so the constraint must be a fixed point — in
+/// particular it must not push the free hinge away (the old hinge
+/// compensation term diverged exactly here: hinge moved with no
+/// counteracting wing correction).
+#[test]
+fn bend_constraint_pinned_wings_is_a_fixed_point() {
+    let mut sim = make_hinge_sim(60.0, 90.0);
+    sim.particles[1].pinned = true;
+    sim.particles[1].inv_mass = 0.0;
+    sim.particles[2].pinned = true;
+    sim.particles[2].inv_mass = 0.0;
+    let hinge_before = sim.particles[0].position;
+    let angle_before = hinge_angle(&sim);
+
+    for _ in 0..50 {
+        project_bend_constraints(&mut sim);
+    }
+
+    assert_eq!(
+        sim.particles[0].position, hinge_before,
+        "free hinge must not move when both wings are pinned"
+    );
+    assert!(
+        (hinge_angle(&sim) - angle_before).abs() < 1e-5,
+        "fully pinned hinge must be inert"
+    );
+    assert!(hinge_angle(&sim).is_finite());
+}
+
+/// T09 contract: a PINNED hinge must not disable the correction — the
+/// free wings still converge to rest.
+#[test]
+fn bend_constraint_pinned_hinge_still_converges() {
+    let mut sim = make_hinge_sim(60.0, 110.0);
+    sim.particles[0].pinned = true;
+    sim.particles[0].inv_mass = 0.0;
+
+    for _ in 0..200 {
+        project_bend_constraints(&mut sim);
+    }
+
+    let err = (hinge_angle(&sim) - 60.0f32.to_radians()).abs();
+    assert!(
+        err < 1.0f32.to_radians(),
+        "pinned hinge: wings should still converge, err={}",
+        err.to_degrees()
+    );
+    assert_eq!(
+        sim.particles[0].position,
+        [0.0, 0.0, 0.0],
+        "pinned hinge must never move"
+    );
+}
+
+/// T09 contract: exactly-collinear edges have no correction direction
+/// (the perpendicular degenerates); the constraint must stay inert and
+/// produce no NaN rather than inventing a direction.
+#[test]
+fn bend_constraint_collinear_config_is_inert_and_nan_free() {
+    let mut sim = make_hinge_sim(60.0, 0.0);
+    let before: Vec<[f32; 3]> = sim.particles.iter().map(|p| p.position).collect();
+
+    for _ in 0..10 {
+        project_bend_constraints(&mut sim);
+    }
+
+    for (i, p) in sim.particles.iter().enumerate() {
+        assert!(
+            p.position[0].is_finite() && p.position[1].is_finite() && p.position[2].is_finite(),
+            "particle {} went NaN on a collinear config",
+            i
+        );
+    }
+    for (i, (a, b)) in before.iter().zip(sim.particles.iter()).enumerate() {
+        assert_eq!(
+            a, &b.position,
+            "particle {} moved on a collinear (degenerate) config",
+            i
+        );
+    }
+}
+
+/// T09 contract: a zero-length edge has no direction either — inert
+/// and NaN-free.
+#[test]
+fn bend_constraint_zero_length_edge_is_inert() {
+    let mut sim = make_hinge_sim(60.0, 90.0);
+    sim.particles[1].position = [0.0, 0.0, 0.0];
+    let before: Vec<[f32; 3]> = sim.particles.iter().map(|p| p.position).collect();
+
+    project_bend_constraints(&mut sim);
+
+    for (i, (a, b)) in before.iter().zip(sim.particles.iter()).enumerate() {
+        assert_eq!(
+            a, &b.position,
+            "particle {} moved on a zero-length edge",
+            i
+        );
+    }
+}
+
 // =========================================================================
 // Pin enforcement
 // =========================================================================
@@ -502,6 +703,36 @@ fn self_collision_pushes_overlapping_particles_apart() {
 }
 
 #[test]
+/// Coincident weld copies (micron-scale divergence, NOT constraint
+/// connected) must be treated as one point by self-collision — the
+/// T09/R6 finding: with the old 1e-24 guard the full 2·radius push
+/// detonated welded seams into surface-wide spikes.
+#[test]
+fn self_collision_skips_near_coincident_copies() {
+    let mut sim = make_simple_sim(2);
+    sim.self_collision = true;
+    sim.self_collision_radius = 0.5;
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    // 1 µm apart — far above the old 1e-24 guard, far below the
+    // 0.5 mm coincident epsilon.
+    sim.particles[1].position = [1.0e-6, 0.0, 0.0];
+    sim.connected_pairs = HashSet::new();
+    sim.spatial_hash = SpatialHashGrid::new(2.0);
+
+    resolve_self_collisions(&mut sim);
+
+    assert_eq!(
+        sim.particles[0].position,
+        [0.0, 0.0, 0.0],
+        "near-coincident copy must not be pushed"
+    );
+    assert_eq!(
+        sim.particles[1].position,
+        [1.0e-6, 0.0, 0.0],
+        "near-coincident copy must not be pushed"
+    );
+}
+
 fn self_collision_skips_connected_pairs() {
     let mut sim = make_simple_sim(2);
     sim.self_collision = true;

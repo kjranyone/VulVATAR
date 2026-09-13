@@ -59,6 +59,23 @@ pub(super) fn collide(sim: &mut ClothSimState, colliders: &[ResolvedCollider]) {
 /// grid.  Two particles collide when their distance is less than
 /// `2 * self_collision_radius`.  Pairs connected by a distance constraint are
 /// skipped since they are expected to be close.
+/// Pairs closer than this are treated as COINCIDENT COPIES — weld
+/// duplicates and seam overlaps — not penetrations, and skipped by
+/// self-collision entirely (CPU reference AND the GPU
+/// `cloth_selfcol_resolve_cs` mirror must keep the same value).
+///
+/// Why: weld groups hold several particles at one position that are
+/// NOT constraint-connected to each other (constraints always span
+/// different weld groups), so the `connected_pairs` skip does not
+/// cover them. They start exactly coincident; the moment they diverge
+/// by any epsilon, the old `d² > 1e-24` guard let the full
+/// `min_dist − d` ≈ 2·radius push slam them apart — measured as the
+/// full-surface spike collapse of the welded skirt on the GPU smoke
+/// (`diagnostics/cloth_gpu_every_frame/`). 0.5 mm sits three orders
+/// above the 0.05 mm weld quantum and typical per-substep copy
+/// divergence, and far below any visually meaningful contact.
+const SELF_COL_COINCIDENT_EPS_M: f32 = 5.0e-4;
+
 pub(super) fn resolve_self_collisions(sim: &mut ClothSimState) {
     if !sim.self_collision {
         return;
@@ -109,7 +126,8 @@ pub(super) fn resolve_self_collisions(sim: &mut ClothSimState) {
             let diff = vec3_sub(&pos_j, &pos_i);
             let dist_sq = vec3_dot(&diff, &diff);
 
-            if dist_sq < min_dist_sq && dist_sq > 1e-24 {
+            let eps_sq = SELF_COL_COINCIDENT_EPS_M * SELF_COL_COINCIDENT_EPS_M;
+            if dist_sq < min_dist_sq && dist_sq > eps_sq {
                 let dist = dist_sq.sqrt();
                 let overlap = min_dist - dist;
                 let dir = vec3_scale(&diff, 1.0 / dist);

@@ -28,6 +28,14 @@ use crate::renderer::{mat4_cols_identity, SkinningCacheEntry, TransformGpuData, 
 impl VulkanRenderer {
     /// Ensure a [`TransformGpuData`] slot exists for `(mesh_id, prim_id)`
     /// with cloth and skin-anchor allocation matching this frame's requirements.
+    ///
+    /// `is_containment_parent` marks slots whose transformed VBO other
+    /// primitives clamp against through the containment slot (R3): such
+    /// slots additionally own a `containment_prev_vbo` history buffer
+    /// that the recording half fills with a `copy_buffer` of the final
+    /// vertices AFTER every transform dispatch, giving containment
+    /// children a deterministic PREVIOUS-FRAME surface regardless of
+    /// dispatch order.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ensure_transform_data(
         &mut self,
@@ -38,6 +46,7 @@ impl VulkanRenderer {
         has_cloth_normals: bool,
         body_transformed_vbo: Option<Subbuffer<[GpuVertex]>>,
         containment_parent_vbo: Option<Subbuffer<[GpuVertex]>>,
+        is_containment_parent: bool,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         ds_allocator: &Arc<StandardDescriptorSetAllocator>,
         transform_pipeline: &Arc<ComputePipeline>,
@@ -58,11 +67,16 @@ impl VulkanRenderer {
         // materialises a parent anchor-less before its own iteration
         // upgrades it, and cloth/anchor shape flips later would
         // otherwise hand every referencing child a dead VBO.
+        // R2 audit staging is needed when the flag is on and the
+        // primitive can receive render-side corrections.
+        let needs_audit = Self::vbo_audit_enabled() && (has_anchors || has_containment);
         let previous = if let Some(existing) = self.transform_cache.get(&key) {
             if existing.has_cloth_alloc == has_cloth
                 && existing.has_cloth_normals_alloc == has_cloth_normals
                 && existing.has_skin_anchors_alloc == has_anchors
                 && existing.has_containment_alloc == has_containment
+                && (!is_containment_parent || existing.containment_prev_vbo.is_some())
+                && (!needs_audit || existing.audit_staging.is_some())
             {
                 return Ok(());
             }
@@ -126,11 +140,63 @@ impl VulkanRenderer {
                 Some(b) => b,
                 None => gpu_alloc::device_slice(
                     memory_allocator,
-                    BufferUsage::VERTEX_BUFFER | BufferUsage::STORAGE_BUFFER,
+                    // TRANSFER_SRC: the R3 containment history copy and
+                    // the R2 audit copy both read this buffer as a
+                    // copy source (missed until the offscreen GPU smoke
+                    // ran — usage is a runtime contract, not a type one).
+                    BufferUsage::VERTEX_BUFFER
+                        | BufferUsage::STORAGE_BUFFER
+                        | BufferUsage::TRANSFER_SRC,
                     vertex_count as u64,
                     "transformed VBO",
                 )?,
             };
+
+        // R3 containment history buffer: same shape as the transformed
+        // VBO, written once per frame by a `copy_buffer` executed after
+        // ALL transform dispatches (see the recording half). Children
+        // bind THIS buffer as their containment parent surface, so a
+        // clamp always reads the parent's previous-frame FINAL state —
+        // deterministic, independent of whether the parent happened to
+        // dispatch before or after the child in the Kahn order.
+        // Uninitialised on the very first frame; the shader's
+        // sane-band / NaN guards keep the clamp inert until the first
+        // copy lands.
+        let containment_prev_vbo = if !is_containment_parent {
+            None
+        } else {
+            match previous.as_ref().map(|p| p.containment_prev_vbo.clone()) {
+                Some(b) => b,
+                None => Some(gpu_alloc::device_slice(
+                    memory_allocator,
+                    // TRANSFER_DST: this buffer is written by the
+                    // per-frame history copy, never by a descriptor set.
+                    BufferUsage::VERTEX_BUFFER
+                        | BufferUsage::STORAGE_BUFFER
+                        | BufferUsage::TRANSFER_DST,
+                    vertex_count as u64,
+                    "containment history VBO",
+                )?),
+            }
+        };
+
+        // R2 audit staging: host-readable copy target for the final VBO,
+        // only for primitives whose transform dispatch can write
+        // clearance/containment corrections. The recording half appends
+        // a `copy_buffer` per audited slot after all transform dispatches;
+        // `read_vbo_audit` maps it after the frame fence.
+        let audit_staging = if !needs_audit {
+            None
+        } else {
+            match previous.as_ref().map(|p| p.audit_staging.clone()) {
+                Some(b) => b,
+                None => Some(gpu_alloc::host_read_slice(
+                    memory_allocator,
+                    vertex_count as u64,
+                    "vbo audit staging",
+                )?),
+            }
+        };
 
         // Sparse morph deltas, or the shared stubs when this primitive
         // has none. Dense storage (targets × vertices × 2 vec4s) made a
@@ -376,6 +442,7 @@ impl VulkanRenderer {
                 base_ssbo,
                 index_buffer,
                 transformed_vbo,
+                containment_prev_vbo,
                 control_ubo,
                 morph_entries,
                 morph_infos,
@@ -395,6 +462,8 @@ impl VulkanRenderer {
                 has_containment_alloc: has_containment,
                 last_cloth_version: None,
                 cloth_gpu: None,
+                cloth_owner_instance: None,
+                audit_staging,
             },
         );
         self.gpu_runtime_counters.morph_gpu_resource_creations += 1;
