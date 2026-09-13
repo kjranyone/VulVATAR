@@ -262,6 +262,14 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
                 .get(&bone)
                 .map(|x| serde_json::json!({ "sigma": x.sigma, "data_sigma": x.data_sigma }))
         };
+        let db = |r: &crate::tracking::fusion::output::RigPose, bone: HumanoidBone| {
+            r.bones.get(&bone).map(|x| {
+                serde_json::json!({
+                    "sigma": x.sigma,
+                    "delta_world": x.delta_world,
+                })
+            })
+        };
         serde_json::json!({
             "t": r.t,
             "quality": r.quality,
@@ -280,7 +288,15 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
                     "delta_world": x.delta_world,
                 })
             }),
-            "upper_chest": b(HumanoidBone::UpperChest),
+            // Spine-chain deltas (same contract as `head`) for the recline
+            // localization: which trunk delta pitches the avatar's
+            // Chest→Neck segment back when the person sits upright.
+            "hips": db(r, HumanoidBone::Hips),
+            "spine": db(r, HumanoidBone::Spine),
+            "chest": db(r, HumanoidBone::Chest),
+            "upper_chest": db(r, HumanoidBone::UpperChest),
+            "neck": db(r, HumanoidBone::Neck),
+            "upper_chest_sigma": b(HumanoidBone::UpperChest),
             "l_upper_arm": b(HumanoidBone::LeftUpperArm),
             "r_upper_arm": b(HumanoidBone::RightUpperArm),
             "l_hand": b(HumanoidBone::LeftHand),
@@ -384,6 +400,39 @@ pub fn dump_avatar_pose<F: Fn(HumanoidBone) -> Option<[f32; 3]>>(
     }
 }
 
+/// Costume-health probe: world positions of spring-driven garment bones
+/// (skirt chains, tail) plus a CPU-side skinned bbox of the skirt mesh
+/// and the cloth-deform count the render thread received. Written to
+/// `debug_avatar_extra.json` so an external watcher can tell "the
+/// garment vertices are actually somewhere wrong" (solver/pose side)
+/// from "the numbers are healthy but the pixels are not" (renderer
+/// side). No-op unless the debug flag file exists.
+pub fn dump_costume_probe(
+    bones: Vec<(String, [f32; 3])>,
+    skirt_bbox: Option<([f32; 3], [f32; 3])>,
+    cloth_deform_count: usize,
+    cloth_targets: Vec<crate::asset::PrimitiveId>,
+) {
+    if !enabled() {
+        return;
+    }
+    let seq = AVATAR_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let map: serde_json::Map<String, serde_json::Value> = bones
+        .into_iter()
+        .map(|(name, p)| (name, serde_json::json!(p)))
+        .collect();
+    let state = serde_json::json!({
+        "seq": seq,
+        "bones": map,
+        "skirt_bbox": skirt_bbox.map(|(lo, hi)| serde_json::json!({"min": lo, "max": hi})),
+        "cloth_deforms": cloth_deform_count,
+        "cloth_targets": cloth_targets.iter().map(|t| t.0).collect::<Vec<_>>(),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        atomic_write(&base_dir().join("debug_avatar_extra.json"), &bytes);
+    }
+}
+
 /// GUI-thread heartbeat: the handful of raw flags that decide whether the
 /// per-frame pipeline runs at all. Written from `GuiApp::update` *outside*
 /// every gate, so its `seq` advances whenever the GUI is alive regardless
@@ -403,6 +452,7 @@ pub fn dump_gui_heartbeat(
     tracking_enabled: bool,
     frame_count: u64,
     sim_substeps: u32,
+    panel_hole: Option<[f32; 3]>,
 ) {
     if !enabled() {
         return;
@@ -423,8 +473,14 @@ pub fn dump_gui_heartbeat(
         // Substeps the fixed-step sim clock yielded on the previous
         // unpaused frame. Zero means the spring solver did not run that
         // frame — correlate a one-frame hair clip with this before
-        // suspecting the solver itself.
+        // suspecting the solver.
         "sim_substeps": sim_substeps,
+        // Live egui-0.30 side-panel layout hole measurement (the
+        // "black band beside the inspector" bug): `[frame_right,
+        // cursor_left, width]` in points, null when the layout is
+        // tight. A persistently non-null value means some inspector
+        // widget still overflows the panel width.
+        "panel_hole": panel_hole,
     });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_gui.json"), &bytes);
