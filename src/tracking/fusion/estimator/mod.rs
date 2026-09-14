@@ -531,6 +531,15 @@ impl Estimator {
         // ---- LM loop --------------------------------------------------------
         let start = self.state.clone();
         let mut cost = self.lm_loop(model, obs, &prior_var, dt);
+        // Seed contest is judged WITHOUT the dense-surface cost: an analytic
+        // arm seed is derived from the metric keypoint lifts, and letting the
+        // surface term vote on its acceptance re-derives the association the
+        // seed itself changed — with arm capsules claiming points, a candidate
+        // that merely re-poses the arm to explain its own pixels won on
+        // association gain, not landmark evidence (wave replay: seed wins
+        // 3 → 15, wrists jumping 0.5–0.8 m). The surface term stays in the
+        // SOLVE for every candidate; only the accept test excludes it.
+        let mut cmp_cost = cost - self.diag.cost_cloud;
         let mut best_state = self.state.clone();
         let mut best_diag = self.diag;
         let mut best_gnc_final = true;
@@ -538,13 +547,16 @@ impl Estimator {
             let Some(cand) = seed(&start) else { continue };
             self.state = cand;
             let c = self.lm_loop(model, obs, &prior_var, dt);
+            let c_cmp = c - self.diag.cost_cloud;
             if std::env::var_os("VULVATAR_SEED_DUMP").is_some() {
                 eprintln!(
-                    "SEEDCAND cost {cost:.1} cand {c:.1} ratio {:.3}",
-                    c / cost.max(1e-6)
+                    "SEEDCAND cost {cost:.1} cand {c:.1} ratio {:.3} (surf-excl {cmp_cost:.1} vs {c_cmp:.1} ratio {:.3})",
+                    c / cost.max(1e-6),
+                    c_cmp / cmp_cost.max(1e-6)
                 );
             }
-            if c < cost * self.params.seed_win_ratio {
+            if c_cmp < cmp_cost * self.params.seed_win_ratio {
+                cmp_cost = c_cmp;
                 cost = c;
                 best_state = self.state.clone();
                 best_diag = self.diag;
@@ -744,15 +756,32 @@ impl Estimator {
             self.diag.cov_failures += 1;
         }
         // Velocity: parameter-space difference to the previous posterior.
-        let d = param_difference(model, &self.state, prev);
-        let alpha = 0.6;
-        for k in 0..n {
-            let v = d[k] / dt;
-            self.vel[k] = if self.last_t.is_some() {
-                alpha * v + (1.0 - alpha) * self.vel[k]
-            } else {
-                0.0
-            };
+        // A frame with ZERO data terms carries no evidence of motion, and
+        // the difference below would otherwise re-ingest the prediction's
+        // own extrapolation (≈0.96× the old velocity per frame — the
+        // decay inside `predict` is almost exactly cancelled), letting one
+        // junk-detection spike keep the root drifting 0.1–0.2 m per frame
+        // for the whole dropout (measured s1789279985: root_z 0.93 → 1.32 m
+        // over 12 unobserved frames, 172 of the session's 203 wrist snaps).
+        // Zero it: prediction = last state, the pose holds until data
+        // returns (or `mark_lost` resets on junk).
+        let no_data =
+            self.diag.n_kp2d == 0 && self.diag.n_kp3d == 0 && self.diag.n_cloud == 0;
+        if no_data {
+            for v in self.vel.iter_mut() {
+                *v = 0.0;
+            }
+        } else {
+            let d = param_difference(model, &self.state, prev);
+            let alpha = 0.6;
+            for k in 0..n {
+                let v = d[k] / dt;
+                self.vel[k] = if self.last_t.is_some() {
+                    alpha * v + (1.0 - alpha) * self.vel[k]
+                } else {
+                    0.0
+                };
+            }
         }
         // Clamp velocities to sane magnitudes.
         for k in 0..n {
