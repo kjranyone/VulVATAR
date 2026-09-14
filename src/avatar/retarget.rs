@@ -44,9 +44,13 @@ pub struct RetargetState {
     anchor_seed_start: Option<f64>,
     /// Cached rest world rotations / positions of every node (keyed by node
     /// count to detect a swapped avatar).
-    rest_world_rot: Vec<Quat>,
-    rest_world_pos: Vec<Vec3>,
+    pub(crate) rest_world_rot: Vec<Quat>,
+    pub(crate) rest_world_pos: Vec<Vec3>,
     rest_cache_len: usize,
+    /// A-pose display-rest locals for the arm bones (see `avatar::relax`),
+    /// rebuilt together with the rest cache. Bones relaxing through the
+    /// quality / σ gates target these instead of the T-pose bind.
+    pub(crate) arelax_local: crate::avatar::relax::APoseOverlay,
     /// 1€ adaptive filter state per bone rotation.
     one_euro_bones: HashMap<HumanoidBone, OneEuroQuat>,
     /// 1€ adaptive filter state for hips root translation.
@@ -68,8 +72,28 @@ impl RetargetState {
         self.prev_local.clear();
         self.prev_hips_translation = None;
         self.rest_cache_len = 0;
+        self.arelax_local.clear();
         self.one_euro_bones.clear();
         self.one_euro_hips_t.reset();
+    }
+
+    /// Seed the display smoothing from an externally-produced pose (the
+    /// idle A-pose relax) so the next tracked frame's slerp starts from
+    /// what is on screen instead of the bind rest.
+    pub fn seed_display_smoothing(&mut self, humanoid: &HumanoidMap, locals: &[Transform]) {
+        for bone in ORDER {
+            let Some(&NodeId(node)) = humanoid.bone_map.get(&bone) else {
+                continue;
+            };
+            if let Some(t) = locals.get(node as usize) {
+                self.prev_local.insert(bone, t.rotation);
+            }
+        }
+        if let Some(NodeId(hips)) = humanoid.bone_map.get(&HumanoidBone::Hips) {
+            if let Some(t) = locals.get(*hips as usize) {
+                self.prev_hips_translation = Some(t.translation);
+            }
+        }
     }
 }
 
@@ -176,7 +200,7 @@ fn dt_aware_blend(slider_blend: f32, dt: f32) -> f32 {
     1.0 - (-dt / tau).exp()
 }
 
-fn slerp_short(a: &Quat, b: &Quat, t: f32) -> Quat {
+pub(crate) fn slerp_short(a: &Quat, b: &Quat, t: f32) -> Quat {
     let mut d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
     let mut b2 = *b;
     if d < 0.0 {
@@ -432,7 +456,15 @@ fn is_leg(b: HumanoidBone) -> bool {
     )
 }
 
-fn ensure_rest_cache(state: &mut RetargetState, skeleton: &SkeletonAsset) {
+/// Fill the cached rest world rotations / positions (rebuilding when the
+/// node count changes = swapped avatar) and derive the A-pose display
+/// rest overlay from them. `humanoid` is `None` for non-humanoid rigs,
+/// which simply get no overlay.
+pub(crate) fn ensure_rest_cache(
+    state: &mut RetargetState,
+    skeleton: &SkeletonAsset,
+    humanoid: Option<&HumanoidMap>,
+) {
     if state.rest_cache_len == skeleton.nodes.len() && !state.rest_world_rot.is_empty() {
         return;
     }
@@ -457,6 +489,9 @@ fn ensure_rest_cache(state: &mut RetargetState, skeleton: &SkeletonAsset) {
             stack.push(c.0 as usize);
         }
     }
+    state.arelax_local = humanoid
+        .map(|hm| crate::avatar::relax::a_pose_overlay(skeleton, hm, &rot, &pos))
+        .unwrap_or_default();
     state.rest_world_rot = rot;
     state.rest_world_pos = pos;
     state.rest_cache_len = n;
@@ -502,7 +537,7 @@ pub fn apply_rig_pose(
     state: &mut RetargetState,
     dt: f32,
 ) {
-    ensure_rest_cache(state, skeleton);
+    ensure_rest_cache(state, skeleton, Some(humanoid));
     let blend = dt_aware_blend(params.rotation_blend, dt);
 
     // ---- upright root: yaw-only hips with a clamped lean ----------------------
@@ -555,10 +590,11 @@ pub fn apply_rig_pose(
             && (params.lower_body_tracking_enabled || !is_leg(bone));
 
         // Target local rotation. A low-quality rig (subject lost / tiny)
-        // drives nothing: every bone relaxes to rest. A bone with no
-        // recent measurements (data-σ grown past `sigma_data_rest`)
-        // also rests — its posterior σ is prior-dominated and cannot be
-        // trusted however confident it looks.
+        // drives nothing: every bone relaxes toward the display rest
+        // (A-pose for the arms, bind otherwise). A bone with no recent
+        // measurements (data-σ grown past `sigma_data_rest`) also rests
+        // — its posterior σ is prior-dominated and cannot be trusted
+        // however confident it looks.
         let (target, tracking_valid) = match rig.bones.get(&bone) {
             Some(rb)
                 if is_tracked
@@ -576,7 +612,14 @@ pub fn apply_rig_pose(
                     true,
                 )
             }
-            _ => (rest_local_rot, false),
+            _ => (
+                state
+                    .arelax_local
+                    .get(&bone)
+                    .map(|(_, q)| *q)
+                    .unwrap_or(rest_local_rot),
+                false,
+            ),
         };
 
         // 1€ filter smooths tracking jitter adaptively when tracked;
@@ -1288,6 +1331,153 @@ mod tests {
         rig.bones.get_mut(&HumanoidBone::Spine).unwrap().sigma = 5.0;
         apply_rig_pose(&rig, &sk, &hm, &mut locals, &params, &mut st, 1.0 / 60.0);
         assert!((locals[2].rotation[3] - 1.0).abs() < 1e-5);
+    }
+
+    /// T-pose arms: Hips → Spine → Chest → (±UpperArm → LowerArm → Hand),
+    /// arms along ±X (the hand-cross test's skeleton, identity rest).
+    fn arm_skeleton() -> (SkeletonAsset, HumanoidMap) {
+        let mk =
+            |id: u64, parent: Option<u64>, children: Vec<u64>, t: [f32; 3], bone| SkeletonNode {
+                id: NodeId(id),
+                name: format!("n{id}"),
+                parent: parent.map(NodeId),
+                children: children.into_iter().map(NodeId).collect(),
+                rest_local: Transform {
+                    translation: t,
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                humanoid_bone: bone,
+            };
+        let nodes = vec![
+            mk(0, None, vec![1], [0.0, 0.0, 0.0], None),
+            mk(
+                1,
+                Some(0),
+                vec![2],
+                [0.0, 1.0, 0.0],
+                Some(HumanoidBone::Hips),
+            ),
+            mk(
+                2,
+                Some(1),
+                vec![3],
+                [0.0, 0.2, 0.0],
+                Some(HumanoidBone::Spine),
+            ),
+            mk(
+                3,
+                Some(2),
+                vec![4, 7],
+                [0.0, 0.2, 0.0],
+                Some(HumanoidBone::Chest),
+            ),
+            mk(
+                4,
+                Some(3),
+                vec![5],
+                [0.2, 0.0, 0.0],
+                Some(HumanoidBone::LeftUpperArm),
+            ),
+            mk(
+                5,
+                Some(4),
+                vec![6],
+                [0.25, 0.0, 0.0],
+                Some(HumanoidBone::LeftLowerArm),
+            ),
+            mk(
+                6,
+                Some(5),
+                vec![],
+                [0.25, 0.0, 0.0],
+                Some(HumanoidBone::LeftHand),
+            ),
+            mk(
+                7,
+                Some(3),
+                vec![8],
+                [-0.2, 0.0, 0.0],
+                Some(HumanoidBone::RightUpperArm),
+            ),
+            mk(
+                8,
+                Some(7),
+                vec![9],
+                [-0.25, 0.0, 0.0],
+                Some(HumanoidBone::RightLowerArm),
+            ),
+            mk(
+                9,
+                Some(8),
+                vec![],
+                [-0.25, 0.0, 0.0],
+                Some(HumanoidBone::RightHand),
+            ),
+        ];
+        let sk = SkeletonAsset {
+            nodes,
+            root_nodes: vec![NodeId(0)],
+            inverse_bind_matrices: vec![],
+        };
+        let mut bone_map = HashMap::new();
+        for (b, id) in [
+            (HumanoidBone::Hips, 1),
+            (HumanoidBone::Spine, 2),
+            (HumanoidBone::Chest, 3),
+            (HumanoidBone::LeftUpperArm, 4),
+            (HumanoidBone::LeftLowerArm, 5),
+            (HumanoidBone::LeftHand, 6),
+            (HumanoidBone::RightUpperArm, 7),
+            (HumanoidBone::RightLowerArm, 8),
+            (HumanoidBone::RightHand, 9),
+        ] {
+            bone_map.insert(b, NodeId(id));
+        }
+        (sk, HumanoidMap { bone_map })
+    }
+
+    #[test]
+    fn sigma_gated_arm_relaxes_to_a_pose_not_bind() {
+        let (sk, hm) = arm_skeleton();
+        let mut locals: Vec<Transform> = sk.nodes.iter().map(|n| n.rest_local.clone()).collect();
+        let qy = |a: f32| [0.0, (a / 2.0).sin(), 0.0, (a / 2.0).cos()];
+        let mut rig = RigPose {
+            quality: 1.0,
+            ..Default::default()
+        };
+        rig.bones.insert(
+            HumanoidBone::LeftUpperArm,
+            RigBone {
+                delta_world: qy(0.4),
+                sigma: 0.05,
+                data_sigma: 0.05,
+            },
+        );
+        let mut st = RetargetState::default();
+        let params = RetargetParams {
+            rotation_blend: 1.0,
+            ..Default::default()
+        };
+        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params, &mut st, 1.0 / 30.0);
+        // Driven: the yaw delta is on the bone, not the A-pose overlay.
+        assert!((locals[4].rotation[1] - (0.2f32).sin()).abs() < 1e-4);
+
+        // σ blows past the gate: the arm must relax toward the A-pose
+        // overlay, not the T-pose bind (identity here).
+        rig.bones
+            .get_mut(&HumanoidBone::LeftUpperArm)
+            .unwrap()
+            .sigma = 5.0;
+        apply_rig_pose(&rig, &sk, &hm, &mut locals, &params, &mut st, 1.0 / 30.0);
+        let (_, a_local) = st.arelax_local[&HumanoidBone::LeftUpperArm];
+        let dot = locals[4].rotation[0] * a_local[0]
+            + locals[4].rotation[1] * a_local[1]
+            + locals[4].rotation[2] * a_local[2]
+            + locals[4].rotation[3] * a_local[3];
+        assert!(dot.abs() > 0.9999, "arm relax target is not the A-pose");
+        // The A-pose is a non-identity rotation on this T-bind rig.
+        assert!(a_local[3] < 0.9999, "A-pose overlay must rotate the arm");
     }
 
     #[test]

@@ -396,7 +396,6 @@ pub(super) fn draw_cloth_authoring(ui: &mut egui::Ui, state: &mut GuiApp) {
         t!("inspector.collision_proxies"),
         false,
         |ui| {
-            let mut pending_auto_cloth: Option<bool> = None;
             if let Some(avatar) = state.app.active_avatar_mut() {
                 let collider_count = avatar.asset.colliders.len();
                 // Keep the runtime enable mask sized to the collider list.

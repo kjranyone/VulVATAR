@@ -69,8 +69,9 @@ impl Application {
         //      confidence threshold gradually as the decay proceeds,
         //      so the pose drifts back to base rather than snapping.
         //    - **Expired** (age past the hold window, or never
-        //      published): drop the sample. Solver bypass restores
-        //      base / animation pose.
+        //      published): drop the sample. The avatar then eases into
+        //      the procedural A-pose rest (avatar::relax) rather than
+        //      snapping to the bind pose.
         let (tracking_sample, sample_is_fresh, tracking_present) = if toggles.tracking_enabled {
             let mailbox = self.tracking.mailbox();
             // Single mailbox lock per frame: age + stale_timeout
@@ -187,6 +188,21 @@ impl Application {
                 Vec<crate::tracking::debug_channel::CostumePrimProbe>,
             )> = None;
 
+            // Rest relax: while a driver (tracking or an animation clip)
+            // produces the pose, the relax state stays armed; the first
+            // undriven frame captures the outgoing pose so later frames
+            // ease into the procedural A-pose rest (avatar::relax)
+            // instead of snapping to the T-pose bind in one frame.
+            // Capture must run before build_base_pose resets the locals.
+            let animation_active = avatar.animation_state.active_clip.is_some();
+            let pose_driven = tracking_sample.as_ref().is_some_and(|s| s.rig.is_some())
+                && avatar.asset.humanoid.is_some();
+            if pose_driven || animation_active {
+                avatar.relax_mark_driven();
+            } else {
+                avatar.relax_capture();
+            }
+
             avatar.build_base_pose();
 
             if let Some(ref mut source) = tracking_sample.clone() {
@@ -216,6 +232,8 @@ impl Application {
                     );
                     avatar.expression_weights = new_weights;
                 }
+            } else if !animation_active {
+                avatar.relax_apply(frame_dt);
             }
 
             avatar.compute_global_pose();

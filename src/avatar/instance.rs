@@ -45,6 +45,10 @@ pub struct AvatarInstance {
     pub expression_state: ExpressionState,
     /// Tracking-v2 retarget state (rig-pose path, see `avatar::retarget`).
     pub retarget_state: crate::avatar::retarget::RetargetState,
+    /// Eased transition into the procedural A-pose rest (see
+    /// `avatar::relax`). Armed while tracking / an animation drives the
+    /// pose; the first undriven frame captures the outgoing pose.
+    pub relax: crate::avatar::relax::RelaxState,
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +222,7 @@ impl AvatarInstance {
             expression_weights,
             expression_state: ExpressionState::default(),
             retarget_state: Default::default(),
+            relax: Default::default(),
         }
     }
 
@@ -383,6 +388,52 @@ impl AvatarInstance {
             &self.pose.local_transforms,
             &mut self.pose.global_transforms,
         );
+    }
+
+    /// Arm the rest relax for the next driver stop — call on frames
+    /// where tracking or an animation produced the pose.
+    pub fn relax_mark_driven(&mut self) {
+        self.relax.mark_driven();
+    }
+
+    /// Capture the outgoing pose for the rest relax — call BEFORE
+    /// [`Self::build_base_pose`] on frames where no driver produced the
+    /// pose (the locals still hold the last solved pose there).
+    pub fn relax_capture(&mut self) {
+        self.relax.capture(&self.pose.local_transforms);
+    }
+
+    /// Ease the avatar into the procedural A-pose rest (see
+    /// `avatar::relax`). Call AFTER [`Self::build_base_pose`] on frames
+    /// where neither tracking nor an animation clip is driving the pose.
+    /// Also seeds the retarget's display smoothing from the on-screen
+    /// pose so the next tracked frame blends from here rather than from
+    /// the bind rest.
+    pub fn relax_apply(&mut self, dt: f32) {
+        let humanoid = self.asset.humanoid.as_ref();
+        crate::avatar::retarget::ensure_rest_cache(
+            &mut self.retarget_state,
+            &self.asset.skeleton,
+            humanoid,
+        );
+        let mut target: Vec<Transform> = self
+            .asset
+            .skeleton
+            .nodes
+            .iter()
+            .map(|n| n.rest_local.clone())
+            .collect();
+        for (_, (node, rot)) in self.retarget_state.arelax_local.iter() {
+            if let Some(t) = target.get_mut(node.0 as usize) {
+                t.rotation = *rot;
+            }
+        }
+        self.relax
+            .step_blend(dt, &target, &mut self.pose.local_transforms);
+        if let Some(hm) = humanoid {
+            self.retarget_state
+                .seed_display_smoothing(hm, &self.pose.local_transforms);
+        }
     }
 
     /// Resolve the per-primitive morph-target weight vector driven by the
