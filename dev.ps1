@@ -680,6 +680,47 @@ function Invoke-CargoStaticCrt {
 #   * PATH            → WinGet pkg-config + the SDK's bin\x64 (realsense2.dll)
 # Paths default to the documented install locations and are overridable
 # with $env:VULVATAR_REALSENSE_SDK (SDK root) and $env:LIBCLANG_PATH.
+# Generate build-support\pkgconfig\realsense2.pc from the .example template
+# (docs/realsense-build.md §"The hand-written realsense2.pc"). The prefix uses
+# the 8.3 short path because the default Documents install contains a space,
+# which breaks pkg-config / linker arg splitting; Version is read from the
+# SDK's own rs.h so bindgen regenerates against the right headers.
+function New-Realsense2Pc {
+    param(
+        [Parameter(Mandatory)] [string]$PkgConfigDir,
+        [Parameter(Mandatory)] [string]$SdkRoot
+    )
+
+    $example = Join-Path $PkgConfigDir "realsense2.pc.example"
+    if (-not (Test-Path $example)) {
+        throw "template not found: $example"
+    }
+
+    $fso = New-Object -ComObject Scripting.FileSystemObject
+    $prefix = $fso.GetFolder($SdkRoot).ShortPath -replace '\\', '/'   # 8.3 path, no spaces
+    if ($prefix -eq ($SdkRoot -replace '\\', '/')) {
+        # 8.3 generation disabled on this volume — fall back to the real path
+        # and let the user rename if the linker chokes on the space.
+        Write-Warning "no 8.3 short path for '$SdkRoot'; using the full path in realsense2.pc"
+    }
+
+    $rsH = Join-Path $SdkRoot "include\librealsense2\rs.h"
+    if (-not (Test-Path $rsH)) { $rsH = Join-Path $SdkRoot "include\librealsense2\h\rs.h" }
+    $version = "2.58.2"
+    if (Test-Path $rsH) {
+        $macros = @{}
+        switch -Regex (Get-Content $rsH) {
+            '#define\s+RS2_API_(MAJOR|MINOR|PATCH)_VERSION\s+(\d+)' { $macros[$Matches[1]] = $Matches[2] }
+        }
+        if ($macros.Count -eq 3) { $version = "$($macros['MAJOR']).$($macros['MINOR']).$($macros['PATCH'])" }
+    }
+
+    (Get-Content $example) `
+        -replace 'prefix=.*', "prefix=$prefix" `
+        -replace 'Version:.*', "Version: $version" |
+        Set-Content (Join-Path $PkgConfigDir "realsense2.pc")
+}
+
 function Invoke-CargoRealsense {
     param([Parameter(Mandatory)] [string[]]$CargoArgs)
 
@@ -691,14 +732,15 @@ function Invoke-CargoRealsense {
                    else { Join-Path $env:ProgramFiles "LLVM\bin" }
     $wingetLinks = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links"
 
-    if (-not (Test-Path (Join-Path $pkgConfig "realsense2.pc"))) {
-        throw "build-support\pkgconfig\realsense2.pc missing — see docs/realsense-build.md."
-    }
     if (-not (Test-Path $llvmBin)) {
         throw "libclang not found at '$llvmBin'. Install LLVM (winget install LLVM.LLVM) or set `$env:LIBCLANG_PATH. See docs/realsense-build.md."
     }
     if (-not (Test-Path $sdkBin)) {
         throw "RealSense SDK not found at '$sdkBin'. Install it or set `$env:VULVATAR_REALSENSE_SDK to its root. See docs/realsense-build.md."
+    }
+    if (-not (Test-Path (Join-Path $pkgConfig "realsense2.pc"))) {
+        Write-Host "realsense2.pc missing — generating from realsense2.pc.example (SDK: $sdkRoot)"
+        New-Realsense2Pc -PkgConfigDir $pkgConfig -SdkRoot $sdkRoot
     }
     if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue) -and
         -not (Test-Path (Join-Path $wingetLinks "pkg-config.exe"))) {
