@@ -38,7 +38,6 @@ use crate::avatar::AvatarInstance;
 /// authored A-line while the free lower half still sways. Scaled by the
 /// garment's own height and clamped so small and long garments stay
 /// sane.
-const PIN_BAND: f32 = 0.035;
 const PIN_BAND_MIN: f32 = 0.035;
 const PIN_BAND_MAX: f32 = 0.12;
 const PIN_BAND_HEIGHT_FRACTION: f32 = 0.4;

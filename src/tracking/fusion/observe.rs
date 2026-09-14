@@ -281,7 +281,8 @@ pub fn body_kp3d(
         } else {
             sigma
         };
-        let Some(p) = window_point(points, width, height, u, v, 3, zlo, zhi) else {
+        let Some((p, z_spread)) = window_point_with_spread(points, width, height, u, v, 3, zlo, zhi)
+        else {
             continue;
         };
         let n = norm(p);
@@ -290,7 +291,30 @@ pub fn body_kp3d(
         }
         let p_joint = scale(p, (n + off) / n);
         // Low detector score → the pixel may not be on the joint at all.
-        let s = sigma * SCORE_INFLATE_BASE_3D() * (1.0 + 1.0 * (1.0 - kp.score as f64));
+        let mut s = sigma * SCORE_INFLATE_BASE_3D() * (1.0 + 1.0 * (1.0 - kp.score as f64));
+        // A two-surface window (arm against the desk plane, sleeve against
+        // the background — common at the frame's bottom edge, where the
+        // desk-entry elbows live) means the median depth is whichever
+        // surface won this frame; it flips between frames while σ keeps
+        // claiming confidence, and the slam lands downstream (measured:
+        // the desk-edge left-elbow lift, and the R-wrist snaps on
+        // s1789303569). ELBOW entries only: the wrist/hand-block lifts sit
+        // inside an active hand crop whose window is legitimately mixed
+        // (hand over desk) and demoting them starves the arm's trusted
+        // metric anchor (benched: L-wrist snaps 2 → 3, max 0.19 → 0.30 m
+        // on s1789311387 when the gate covered them too). Demote to a
+        // kernel-neutering σ: small innovations still track, large ones
+        // get outvoted by the robust loss. `VULVATAR_FUSION_LIFT_SPREAD`
+        // overrides the gate; 0 disables.
+        let spread_gate = std::env::var("VULVATAR_FUSION_LIFT_SPREAD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(0.05);
+        let is_elbow = i == 7 || i == 8;
+        if is_elbow && z_spread > spread_gate {
+            s = s.min(0.025);
+        }
         out.push(Kp3d {
             point: *point,
             p: p_joint,
@@ -741,6 +765,27 @@ pub fn window_point(
     z_lo: f32,
     z_hi: f32,
 ) -> Option<V3> {
+    window_point_with_spread(points, width, height, u, v, radius, z_lo, z_hi).map(|(p, _)| p)
+}
+
+/// `window_point` plus the spread of the window's valid depths
+/// (p90 − p10 of `zs`). A wide spread means the window straddles TWO
+/// surfaces — an arm against the desk plane, a sleeve edge against the
+/// background — and the median depth is whichever surface won the
+/// majority this frame: it flips between them frame to frame while the
+/// lift's σ keeps claiming millimetre confidence (measured live on the
+/// desk rig: the left-elbow depth swung 0.45 ↔ 0.88 m at σ 0.03). The
+/// spread is the sensor's own admission that the sample is ambiguous.
+pub fn window_point_with_spread(
+    points: &[[f32; 3]],
+    width: u32,
+    height: u32,
+    u: f64,
+    v: f64,
+    radius: i32,
+    z_lo: f32,
+    z_hi: f32,
+) -> Option<(V3, f32)> {
     let (w, h) = (width as i32, height as i32);
     let cu = u.round() as i32;
     let cv = v.round() as i32;
@@ -772,9 +817,18 @@ pub fn window_point(
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    Some([
-        med(&mut xs) as f64,
-        med(&mut ys) as f64,
-        med(&mut zs) as f64,
-    ])
+    let spread = {
+        zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let lo = zs[zs.len() / 10];
+        let hi = zs[(zs.len() * 9 / 10).min(zs.len() - 1)];
+        hi - lo
+    };
+    Some((
+        [
+            med(&mut xs) as f64,
+            med(&mut ys) as f64,
+            med(&mut zs) as f64,
+        ],
+        spread,
+    ))
 }

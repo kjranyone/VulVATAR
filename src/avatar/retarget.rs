@@ -124,7 +124,17 @@ pub struct RetargetParams {
 impl Default for RetargetParams {
     fn default() -> Self {
         Self {
-            rotation_blend: 0.35,
+            // Tracking-lag calibrated (ARMCMP audit, s1789311387, 2026-09-13):
+            // at the old 0.35 a fast left reach landed up to 15.2° behind
+            // its source with 6.7% of audited frames >13°; β 2 + blend 0.6
+            // removes the >13° tail entirely (max 11.4°) while the still
+            // arm's frame-to-frame jitter DROPS (med 4.69 → 3.94°) — less
+            // lag is less noise there too.
+            rotation_blend: std::env::var("VULVATAR_RETARGET_BLEND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(0.6),
             root_translation_enabled: true,
             hand_tracking_enabled: true,
             lower_body_tracking_enabled: true,
@@ -138,7 +148,12 @@ impl Default for RetargetParams {
             min_hand_distance: 0.08,
             one_euro_enabled: true,
             one_euro_min_cutoff: 1.0,
-            one_euro_beta: 1.0,
+            // Speed coefficient: higher tracks fast motion with less lag
+            // (calibrated with rotation_blend above).
+            one_euro_beta: std::env::var("VULVATAR_RETARGET_BETA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0),
             one_euro_d_cutoff: 1.0,
         }
     }

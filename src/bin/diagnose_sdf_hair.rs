@@ -25,6 +25,7 @@ use vulvatar_lib::renderer::frame_input::{
     RenderOutputAlpha,
 };
 use vulvatar_lib::renderer::material::MaterialShaderMode;
+use vulvatar_lib::app::ViewportCamera;
 use vulvatar_lib::renderer::VulkanRenderer;
 use vulvatar_lib::simulation::sdf::{SdfField, SdfGrid, SENTINEL};
 use vulvatar_lib::simulation::spring::SpringTuning;
@@ -123,6 +124,12 @@ fn main() -> Result<(), String> {
         grid.cell_count() as f32 * 4.0 / 1e6
     );
 
+    // Rest pose so bone-position measurements below are meaningful.
+    for (i, node) in avatar.asset.skeleton.nodes.iter().enumerate() {
+        avatar.pose.local_transforms[i] = node.rest_local.clone();
+    }
+    avatar.compute_global_pose();
+
     // Head node for the swing animation.
     let head_idx = avatar
         .asset
@@ -178,6 +185,22 @@ fn main() -> Result<(), String> {
         hair_chains.len(),
         shoulder_y
     );
+    // Shell-budget evidence: the field band must cover
+    // max(radius) + SDF_CONTACT_MARGIN + interpolation support; printing
+    // the actual distribution grounds the SHELL_METRES / voxel policy.
+    let mut radii: Vec<f32> = hair_chains.iter().map(|(_, _, r)| *r).collect();
+    radii.sort_by(|a, b| a.total_cmp(b));
+    if let (Some(min), Some(max)) = (radii.first(), radii.last()) {
+        println!(
+            "chain radius: min {:.1} mm / median {:.1} mm / max {:.1} mm (contact band = max + 4 mm margin)",
+            min * 1000.0,
+            radii[radii.len() / 2] * 1000.0,
+            max * 1000.0
+        );
+    }
+    for (_, name, r) in &hair_chains {
+        println!("  chain {:?} radius {:.1} mm", name, r * 1000.0);
+    }
 
     let mut renderer = VulkanRenderer::new();
     renderer.initialize();
@@ -324,27 +347,6 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn save_png(
-    path: &Path,
-    extent: [u32; 2],
-    rgba: &[u8],
-) -> Result<(), String> {
-    let expected = (extent[0] as usize) * (extent[1] as usize) * 4;
-    if rgba.len() < expected {
-        return Err(format!(
-            "pixel buffer too small: {} < {}",
-            rgba.len(),
-            expected
-        ));
-    }
-    let mut img = image::ImageBuffer::new(extent[0], extent[1]);
-    for (x, y, pixel) in img.enumerate_pixels_mut() {
-        let i = ((y as usize) * extent[0] as usize + x as usize) * 4;
-        *pixel = image::Rgba([rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]);
-    }
-    img.save(path)
-        .map_err(|e| format!("save {}: {e}", path.display()))
-}
 
 fn build_frame_input(
     avatar: &vulvatar_lib::avatar::AvatarInstance,
@@ -391,18 +393,26 @@ fn build_frame_input(
 
     // Back three-quarter view of the head and shoulders, where the old
     // heuristic capsules used to block the hair.
-    let eye = [0.55_f32, 1.35, 1.35];
-    let target = [0.0_f32, 1.05, 0.0];
-    let view = look_at(&eye, &target);
-    let fov = 36.0_f32.to_radians();
-    let aspect = width as f32 / height as f32;
-    let proj = perspective(fov, aspect, 0.05, 20.0);
+    let camera = ViewportCamera {
+        distance: 1.15,
+        pan: [0.0, 1.05],
+        yaw_deg: 160.0,
+        pitch_deg: 5.0,
+        fov_deg: 36.0,
+    };
+    let (view, eye_pos) = build_view_matrix(&camera);
+    let projection = build_projection_matrix(
+        camera.fov_deg,
+        width as f32 / height as f32,
+        0.05,
+        20.0,
+    );
 
     RenderFrameInput {
         camera: CameraState {
             view,
-            projection: proj,
-            position_ws: eye,
+            projection,
+            position_ws: eye_pos,
             viewport_extent: [width, height],
         },
         lighting: LightingState::default(),
@@ -436,40 +446,93 @@ fn build_frame_input(
     }
 }
 
-fn look_at(eye: &[f32; 3], target: &[f32; 3]) -> [[f32; 4]; 4] {
-    let up = [0.0_f32, 1.0, 0.0];
-    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-    let norm = |a: [f32; 3]| {
-        let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
-        [a[0] / l, a[1] / l, a[2] / l]
-    };
-    let cross = |a: [f32; 3], b: [f32; 3]| {
+fn build_view_matrix(cam: &ViewportCamera) -> (vulvatar_lib::asset::Mat4, [f32; 3]) {
+    let yaw = cam.yaw_deg.to_radians();
+    let pitch = cam.pitch_deg.to_radians();
+    let (sy, cy) = (yaw.sin(), yaw.cos());
+    let (sp, cp) = (pitch.sin(), pitch.cos());
+
+    let right = [cy, 0.0, -sy];
+    let up = [-sy * sp, cp, -cy * sp];
+
+    let wx = cam.pan[0] * right[0] + cam.pan[1] * up[0];
+    let wy = cam.pan[0] * right[1] + cam.pan[1] * up[1];
+    let wz = cam.pan[0] * right[2] + cam.pan[1] * up[2];
+
+    let eye_x = cam.distance * cp * sy + wx;
+    let eye_y = cam.distance * sp + wy;
+    let eye_z = cam.distance * cp * cy + wz;
+
+    let target = [wx, wy, wz];
+    let fwd = [target[0] - eye_x, target[1] - eye_y, target[2] - eye_z];
+    let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2])
+        .sqrt()
+        .max(1e-6);
+    let f = [fwd[0] / len, fwd[1] / len, fwd[2] / len];
+
+    let world_up = [0.0f32, 1.0, 0.0];
+    let r = [
+        f[1] * world_up[2] - f[2] * world_up[1],
+        f[2] * world_up[0] - f[0] * world_up[2],
+        f[0] * world_up[1] - f[1] * world_up[0],
+    ];
+    let rlen = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt().max(1e-6);
+    let r = [r[0] / rlen, r[1] / rlen, r[2] / rlen];
+
+    let u = [
+        r[1] * f[2] - r[2] * f[1],
+        r[2] * f[0] - r[0] * f[2],
+        r[0] * f[1] - r[1] * f[0],
+    ];
+
+    (
         [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
-    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    let fwd = norm(sub(*target, *eye));
-    let right = norm(cross(fwd, up));
-    let up2 = cross(right, fwd);
-    // Column-major view matrix.
+            [
+                r[0],
+                r[1],
+                r[2],
+                -(r[0] * eye_x + r[1] * eye_y + r[2] * eye_z),
+            ],
+            [
+                u[0],
+                u[1],
+                u[2],
+                -(u[0] * eye_x + u[1] * eye_y + u[2] * eye_z),
+            ],
+            [
+                -f[0],
+                -f[1],
+                -f[2],
+                (f[0] * eye_x + f[1] * eye_y + f[2] * eye_z),
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        [eye_x, eye_y, eye_z],
+    )
+}
+
+fn build_projection_matrix(
+    fov_deg: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> vulvatar_lib::asset::Mat4 {
+    let fov_rad = fov_deg.to_radians();
+    let f = 1.0 / (fov_rad * 0.5).tan();
+    let a = far / (near - far);
+    let b = far * near / (near - far);
     [
-        [right[0], up2[0], -fwd[0], 0.0],
-        [right[1], up2[1], -fwd[1], 0.0],
-        [right[2], up2[2], -fwd[2], 0.0],
-        [-dot(right, *eye), -dot(up2, *eye), dot(fwd, *eye), 1.0],
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, -f, 0.0, 0.0],
+        [0.0, 0.0, a, b],
+        [0.0, 0.0, -1.0, 0.0],
     ]
 }
 
-fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fov_y * 0.5).tan();
-    let nf = 1.0 / (near - far);
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) * nf, -1.0],
-        [0.0, 0.0, 2.0 * far * near * nf, 0.0],
-    ]
+fn save_png(path: &Path, extent: [u32; 2], pixels: &[u8]) -> Result<(), String> {
+    let img: image::ImageBuffer<image::Rgba<u8>, _> =
+        image::ImageBuffer::from_raw(extent[0], extent[1], pixels.to_vec())
+            .ok_or_else(|| format!("PNG buffer construction failed for {}", path.display()))?;
+    img.save(path)
+        .map_err(|e| format!("failed to save '{}': {e}", path.display()))
 }
