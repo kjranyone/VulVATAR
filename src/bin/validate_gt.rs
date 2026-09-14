@@ -131,6 +131,13 @@ fn pose_suite() -> Vec<(&'static str, Vec<PoseOp>)> {
             with_base(vec![RotateWorld(UpperChest, y, -30.0)]),
         ),
         ("head_yaw_30", with_base(vec![RotateWorld(Head, y, 30.0)])),
+        // Signed head-roll round trip: avatar world is x-right / y-up /
+        // z-toward-camera, so roll = rotation about +z. +25 tips the head
+        // top toward −x (screen left, the avatar's RIGHT); −25 the other
+        // way. `head_roll_deg` (GT vs REC sign) is the "avatar tilts the
+        // opposite way" regression test.
+        ("head_roll_pos25", with_base(vec![RotateWorld(Head, z, 25.0)])),
+        ("head_roll_neg25", with_base(vec![RotateWorld(Head, z, -25.0)])),
         (
             "shrug_left_20",
             with_base(vec![RotateWorld(LeftShoulder, z, 20.0)]),
@@ -380,6 +387,10 @@ struct PoseMetrics {
     /// the source skeleton — it has no head rotation, only a face
     /// pose).
     head_rot_deg: f32,
+    /// Signed head roll vs rest (deg): rotation of the head's up basis
+    /// about the world view axis, atan2(up_x, up_y). A GT/REC sign flip
+    /// here is the "avatar tilts the opposite way" bug.
+    head_roll_deg: f32,
 }
 
 /// Metrics computed directly from the DETECTED source skeleton —
@@ -402,6 +413,7 @@ fn metrics_source(
         wrist_height: ((wl[1] - mid[1]) + (wr[1] - mid[1])) * 0.5 / span,
         left_shoulder_lift: (sl[1] - mid[1]) / span,
         head_rot_deg: f32::NAN,
+        head_roll_deg: f32::NAN,
     })
 }
 
@@ -434,6 +446,11 @@ fn metrics(asset: &AvatarAsset, locals: &[Transform], rest_head: &Quat) -> PoseM
     } else {
         head_rot_deg
     };
+    // Signed roll: where the head's up basis tips when the delta rotation
+    // is applied to the rest up vector. atan2(x, y): + when the top of the
+    // head moves toward world +x.
+    let up = quat_rotate_vec3(&d, &[0.0, 1.0, 0.0]);
+    let head_roll_deg = up[0].atan2(up[1]).to_degrees();
 
     PoseMetrics {
         shoulder_yaw_deg: line[2].atan2(line[0]).to_degrees(),
@@ -442,6 +459,7 @@ fn metrics(asset: &AvatarAsset, locals: &[Transform], rest_head: &Quat) -> PoseM
         wrist_height: ((wl[1] - mid[1]) + (wr[1] - mid[1])) * 0.5 / span,
         left_shoulder_lift: (sl[1] - mid[1]) / span,
         head_rot_deg,
+        head_roll_deg,
     }
 }
 
@@ -964,11 +982,11 @@ fn write_summary(
          subject, so SRC/REC yaw-type metrics come back SIGN-FLIPPED\n\
          relative to GT; coupling means |Δ| matching vs the neutral row.\n\n",
     );
-    md.push_str("| pose | shoulder_yaw gt/src/rec | wrist_gap gt/src/rec | wrist_fwd gt/src/rec | wrist_h gt/src/rec | L_lift gt/src/rec | head_rot gt/rec |\n");
-    md.push_str("|---|---|---|---|---|---|---|\n");
+    md.push_str("| pose | shoulder_yaw gt/src/rec | wrist_gap gt/src/rec | wrist_fwd gt/src/rec | wrist_h gt/src/rec | L_lift gt/src/rec | head_rot gt/rec | head_roll gt/rec |\n");
+    md.push_str("|---|---|---|---|---|---|---|---|\n");
     for (name, gt, src, rec) in rows {
         md.push_str(&format!(
-            "| {name} | {:+.1}° / {:+.1}° / {:+.1}° | {:.2} / {:.2} / {:.2} | {:+.2} / {:+.2} / {:+.2} | {:+.2} / {:+.2} / {:+.2} | {:+.2} / {:+.2} / {:+.2} | {:.1}° / {:.1}° |\n",
+            "| {name} | {:+.1}° / {:+.1}° / {:+.1}° | {:.2} / {:.2} / {:.2} | {:+.2} / {:+.2} / {:+.2} | {:+.2} / {:+.2} / {:+.2} | {:+.2} / {:+.2} / {:+.2} | {:.1}° / {:.1}° | {:+.1}° / {:+.1}° |\n",
             gt.shoulder_yaw_deg,
             src.shoulder_yaw_deg,
             rec.shoulder_yaw_deg,
@@ -986,6 +1004,8 @@ fn write_summary(
             rec.left_shoulder_lift,
             gt.head_rot_deg,
             rec.head_rot_deg,
+            gt.head_roll_deg,
+            rec.head_roll_deg,
         ));
     }
 

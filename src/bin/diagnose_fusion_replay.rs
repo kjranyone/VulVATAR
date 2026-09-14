@@ -357,6 +357,9 @@ fn main() -> Result<(), String> {
     // the input for the visibility calibration (`diagnostics/visibility`).
     let vis_dump = std::env::var_os("VULVATAR_REPLAY_VISDUMP").is_some();
     let mut vis_csv = String::new();
+    let hand_dump = std::env::var_os("VULVATAR_REPLAY_HAND_DUMP").is_some();
+    let mut hand_csv = String::from("idx,hand,src,presence,handedness,cx,cy,csz,wrist_x,wrist_y
+");
     if vis_dump {
         vis_csv.push_str("frame,j,nx,ny,nz,score,sx,sy,second_x,second_y,half_x,half_y,zscore,crop_x,crop_y,crop_w,crop_h,depth_z,p_vis,sil_dist,sil_zref,sil_bottom,sil_height,hint_x1,hint_y1,hint_x2,hint_y2");
     }
@@ -390,6 +393,12 @@ fn main() -> Result<(), String> {
     let mut prev_lost = 0u64;
     let mut lwr_sig = Vec::new();
     let mut rwr_sig = Vec::new();
+    // Finger churn per frame (see the loop) + its frame ids, written to
+    // fingers.csv and summarised in stdout.
+    let mut fing_churn: Vec<f64> = Vec::new();
+    let mut fing_churn_idx: Vec<u64> = Vec::new();
+    let mut prev_finger_angles: std::collections::HashMap<usize, f64> =
+        std::collections::HashMap::new();
 
     for (n, (idx, cp, dp)) in pairs.iter().enumerate() {
         let (rgb, mut metric) = load_metric_frame(cp, dp)?;
@@ -400,6 +409,27 @@ fn main() -> Result<(), String> {
         provider.set_external_depth(metric);
         let est_out = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64);
         let rig = est_out.skeleton.rig.clone();
+        // VULVATAR_REPLAY_HAND_DUMP=1: per-frame hand-crop provenance +
+        // wrist landmark — for attributing wrist-observation noise to its
+        // source (0 prev-lock, 1 detector block, 2 prediction).
+        if hand_dump {
+            for hand in 0..2 {
+                match provider.last_hands[hand].as_ref() {
+                    Some(r) => hand_csv.push_str(&format!(
+                        "{idx},{hand},{},{:.3},{:.3},{:.0},{:.0},{:.0},{:.1},{:.1}\n",
+                        r.src,
+                        r.presence,
+                        r.handedness,
+                        r.crop.0,
+                        r.crop.1,
+                        r.crop.2,
+                        r.px[0][0],
+                        r.px[0][1]
+                    )),
+                    None => hand_csv.push_str(&format!("{idx},{hand},-1,\n")),
+                }
+            }
+        }
         if std::env::var_os("VULVATAR_REPLAY_KPDUMP").is_some() {
             let k = &est_out.annotation.keypoints;
             eprint!("frame {idx} kps:");
@@ -476,6 +506,27 @@ fn main() -> Result<(), String> {
         );
         let d = est.diag;
         let q = rig.as_ref().map(|r| r.quality).unwrap_or(0.0);
+        // Finger churn (deg/frame): mean change of the estimator's LOCAL
+        // finger hinge angles (MCP flex/abd + PIP + DIP, both hands) —
+        // the numeric face of "fingers flail", measured where it is
+        // produced (world-delta metrics also carry forearm/wrist jitter).
+        {
+            let mut churn = 0.0f64;
+            let mut n = 0usize;
+            for hand in 0..2 {
+                for f in 0..5 {
+                    for &j in h.j.finger[hand][f].iter() {
+                        if let Some(prev) = prev_finger_angles.get(&j) {
+                            churn += (est.state.angle[j] - prev).abs().to_degrees();
+                            n += 1;
+                        }
+                        prev_finger_angles.insert(j, est.state.angle[j]);
+                    }
+                }
+            }
+            fing_churn.push(if n > 0 { churn / n as f64 } else { f64::NAN });
+            fing_churn_idx.push(*idx);
+        }
         csv.push_str(&format!(
             "{idx},{:.3},{:.2},{:.2},{:.1},{:.1},{},{},{},{},{:.2},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}\n",
             *idx as f64 / 30.0,
@@ -1200,6 +1251,29 @@ fn main() -> Result<(), String> {
         }
     }
     std::fs::write(out_dir.join("frames.csv"), csv).map_err(|e| e.to_string())?;
+    {
+        let mut s = String::from("idx,finger_churn_deg\n");
+        let valid: Vec<f64> = fing_churn.iter().copied().filter(|v| v.is_finite()).collect();
+        for (i, c) in fing_churn_idx.iter().zip(fing_churn.iter()) {
+            s.push_str(&format!("{i},{c:.3}\n"));
+        }
+        std::fs::write(out_dir.join("fingers.csv"), s).map_err(|e| e.to_string())?;
+        if hand_dump {
+            std::fs::write(out_dir.join("hands.csv"), &hand_csv).map_err(|e| e.to_string())?;
+        }
+        if !valid.is_empty() {
+            let mean = valid.iter().sum::<f64>() / valid.len() as f64;
+            let p95 = {
+                let mut v = valid.clone();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[(v.len() as f64 * 0.95) as usize % v.len()]
+            };
+            eprintln!(
+                "fingers: churn mean {mean:.2} deg/frame  p95 {p95:.2}  max {:.2}",
+                valid.iter().cloned().fold(0.0, f64::max)
+            );
+        }
+    }
     if vis_dump {
         std::fs::write(out_dir.join("kps.csv"), vis_csv).map_err(|e| e.to_string())?;
         println!("kps: {}", out_dir.join("kps.csv").display());

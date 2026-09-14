@@ -24,10 +24,12 @@ mod obs;
 mod params;
 mod geom;
 
-pub use obs::{Intrinsics, ModelPoint, Kp2d, Kp3d, OriObs, ShoulderYawObs, FrameObs};
+pub use obs::{AngleObs, Intrinsics, ModelPoint, Kp2d, Kp3d, OriObs, ShoulderYawObs, FrameObs};
 pub use params::Params;
 pub use geom::{closest_on_segment, param_difference, ray_capsule_entry, resolve_point, CapGeom};
-use geom::{locked_params, point_jac, point_y_jac, trunk_params};
+use geom::{
+    arm_params, finger_params, head_params, locked_params, point_jac, point_y_jac, trunk_params,
+};
 
 /// Estimator with its carried temporal state.
 pub struct Estimator {
@@ -78,6 +80,20 @@ pub struct Estimator {
     idx_r_elbow: usize,
     /// Per-parameter flag: belongs to the trunk (slow process noise).
     trunk_param: Vec<bool>,
+    /// Per-parameter flag: belongs to the head joint (own process noise,
+    /// `Params::q_head`).
+    head_param: Vec<bool>,
+    /// Per-parameter flag: inside a finger chain (below the wrists) —
+    /// `Params::q_finger`.
+    finger_param: Vec<bool>,
+    /// Per-parameter flag: the ARM chains (shoulder + elbow + wrist +
+    /// finger subtree, both sides). With `VULVATAR_ARM_CHAIN_DEPTH=1`,
+    /// observations resolving inside an arm chain have their Jacobian
+    /// masked to these parameters: hand/wrist evidence may pose the arm
+    /// but not drag the clavicle / spine / root — every hand-side σ
+    /// adjustment measured flipping the profile-session torso basin
+    /// (s1789349575: −23.7°→+59.5° hand σ, +4.3°→−64° finger σ).
+    arm_param: Vec<bool>,
     /// Per-parameter flag: locked (never solved) — the pelvis ball, which is
     /// redundant with the root rotation.
     locked_param: Vec<bool>,
@@ -209,6 +225,9 @@ impl Estimator {
                 .position(|j| j.name == "r_elbow")
                 .unwrap_or(0),
             trunk_param: trunk_params(model),
+            head_param: head_params(model),
+            finger_param: finger_params(model),
+            arm_param: arm_params(model),
             locked_param: locked_params(model),
             data_info: vec![0.0; n],
             data_info_ema: vec![0.0; n],
@@ -428,6 +447,12 @@ impl Estimator {
             let pred_fk = model.fk(&self.pred);
             for k in 0..2 {
                 let (wj, ok) = self.wrist_joints[k];
+                // NOTE: activation hysteresis (2-frame delay) and a σ
+                // ramp-in were both benched on the full recording set and
+                // REJECTED (snaps 184→193 total, 10 sessions worse vs 7
+                // better, 2026-09-14): delaying or softening the pin lets
+                // brief hand-crop dropouts free-walk the wrist. Keep the
+                // instant, fixed-σ hold.
                 let active = ok && self.last_t.is_some() && !wrist_observed[k];
                 self.hold_targets[k] = (active, sub(pred_fk.t[wj], self.pred.root_t));
             }
@@ -440,7 +465,9 @@ impl Estimator {
             } else if k < 6 {
                 self.params.q_root_t
             } else if k < model.beta_scale {
-                if self.trunk_param[k] {
+                if self.head_param[k] {
+                    self.params.q_head
+                } else if self.trunk_param[k] {
                     self.params.q_trunk
                 } else {
                     // Hold when unobserved: a limb nobody is looking at has
@@ -452,7 +479,16 @@ impl Estimator {
                     let info = self.data_info_ema.get(k).copied().unwrap_or(0.0);
                     let f =
                         (info / self.params.q_hold_info_ref).clamp(self.params.q_hold_floor, 1.0);
-                    self.params.q_joint * f
+                    // Fingers share the hold scaling but have their own
+                    // base rate: curl is a depth DOF the 2-D landmarks
+                    // barely see, so the swing-scale q_joint is far too
+                    // loose for them.
+                    let base = if self.finger_param[k] {
+                        self.params.q_finger
+                    } else {
+                        self.params.q_joint
+                    };
+                    base * f
                 }
             } else {
                 self.params.q_shape
@@ -823,6 +859,9 @@ impl Estimator {
             } else {
                 Kernel::GemanMcClure(c2)
             };
+            // Default OFF (0): opt-in until the full bench proves it.
+            let arm_mask =
+                std::env::var("VULVATAR_ARM_CHAIN_DEPTH").map_or(false, |v| v != "0");
             for kp in &obs.kp2d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
                 let Some(uv) = intr.project(pw) else { continue };
@@ -844,6 +883,21 @@ impl Estimator {
                     continue;
                 }
                 point_jac(model, st, fk, kp.point, joint, &mut self.jac);
+                // Arm-chain masking (VULVATAR_ARM_CHAIN_DEPTH=1): an
+                // observation resolving inside an arm chain may only move
+                // that arm's parameters — hand/wrist evidence poses the
+                // arm, the trunk (clavicle/spine/root) stays owned by the
+                // torso observations. Measured motivation: every hand-side
+                // σ adjustment flipped the profile-session torso basin.
+                let mask_arm = arm_mask
+                    && self
+                        .arm_param
+                        .get(model.joint_param.get(joint).copied().unwrap_or(0))
+                        .copied()
+                        .unwrap_or(false);
+                if mask_arm {
+                    self.jac.retain(|(i, _)| self.arm_param.get(*i).copied().unwrap_or(false));
+                }
                 // ∂u/∂p = fx/z (1, 0, -x/z) ; ∂v/∂p = fy/z (0, 1, -y/z)
                 let iz = 1.0 / pw[2];
                 let du = [intr.fx * iz, 0.0, -intr.fx * pw[0] * iz * iz];
@@ -859,10 +913,104 @@ impl Estimator {
             }
         }
 
+        // ---- planar joint angles (finger curl) -------------------------------
+        // Interior angle at the vertex of a projected model triple vs the
+        // landmark triple's angle. Invariant to scale / translation /
+        // wrist anchor — the property that makes finger curl (2-D
+        // degenerate for point reprojection) observable. OFF by default:
+        // on the desk replays the local finger churn it targets is
+        // already small (mean 1.6°/frame, p95 8–9°) and the first
+        // implementation neither won nor lost (mean 1.62 vs 1.66, p95
+        // 9.1 vs 8.3 — σ uncalibrated, thumb geometry approximate).
+        // Enable with VULVATAR_FUSION_ANG=1 while iterating.
+        if let Some(intr) = obs.intr {
+            if std::env::var_os("VULVATAR_FUSION_ANG").is_some() {
+                let ca = p.c_2d * self.gnc;
+                let kern = Kernel::Cauchy(ca);
+                for ob in &obs.angles {
+                    let Some(rho) = (|| {
+                        let (ja, pa) = resolve_point(model, fk, ob.a);
+                        let (jv, pv) = resolve_point(model, fk, ob.vertex);
+                        let (jb, pb) = resolve_point(model, fk, ob.b);
+                        let ua = intr.project(pa)?;
+                        let uv = intr.project(pv)?;
+                        let ub = intr.project(pb)?;
+                        let u = [ua[0] - uv[0], ua[1] - uv[1]];
+                        let v = [ub[0] - uv[0], ub[1] - uv[1]];
+                        let c = u[0] * v[1] - u[1] * v[0];
+                        let d = u[0] * v[0] + u[1] * v[1];
+                        let theta = c.atan2(d);
+                        let inv_s = 1.0 / ob.sigma.max(0.02);
+                        let r = (theta - ob.angle) * inv_s;
+                        let s = r * r;
+                        let (rho, w) = kern.eval(s);
+                        if !build {
+                            return Some(rho);
+                        }
+                        // dθ/d(each projected coordinate) = (d·dc − c·dd)/(c²+d²).
+                        let den = c * c + d * d;
+                        if den < 1e-9 {
+                            return Some(rho);
+                        }
+                        let grad = |dc: [f64; 2], dd: [f64; 2]| -> [f64; 2] {
+                            [
+                                (d * dc[0] - c * dd[0]) / den,
+                                (d * dc[1] - c * dd[1]) / den,
+                            ]
+                        };
+                        let ga = grad([v[1], -v[0]], [v[0], v[1]]);
+                        let gb = grad([-u[1], u[0]], [u[0], u[1]]);
+                        let gv = grad(
+                            [u[1] - v[1], v[0] - u[0]],
+                            [-v[0] - u[0], -v[1] - u[1]],
+                        );
+                        self.row_out.clear();
+                        for (mp, pw, g, joint) in [
+                            (ob.a, pa, ga, ja),
+                            (ob.b, pb, gb, jb),
+                            (ob.vertex, pv, gv, jv),
+                        ] {
+                            let [gx, gy] = g;
+                            if gx == 0.0 && gy == 0.0 {
+                                continue;
+                            }
+                            let iz = 1.0 / pw[2];
+                            let du = [intr.fx * iz, 0.0, -intr.fx * pw[0] * iz * iz];
+                            let dv = [0.0, intr.fy * iz, -intr.fy * pw[1] * iz * iz];
+                            point_jac(model, st, fk, mp, joint, &mut self.jac);
+                            for &(i, vv) in &self.jac {
+                                self.row_out.push((
+                                    i,
+                                    (dot(du, vv) * gx + dot(dv, vv) * gy) * inv_s,
+                                ));
+                            }
+                        }
+                        // Merge duplicates (three points share ancestor params).
+                        self.row_out.sort_by(|x, y| x.0.cmp(&y.0));
+                        let mut merged: Vec<(usize, f64)> = Vec::with_capacity(self.row_out.len());
+                        for &(i, val) in &self.row_out {
+                            match merged.last_mut() {
+                                Some((li, lv)) if *li == i => *lv += val,
+                                _ => merged.push((i, val)),
+                            }
+                        }
+                        self.dense.add_residual(&merged, r, w);
+                        Some(rho)
+                    })() else {
+                        continue;
+                    };
+                    cost += rho;
+                    c2d += rho;
+                }
+            }
+        }
+
         // ---- 3-D points -----------------------------------------------------
         {
             let c3 = p.c_3d * self.gnc;
             let kern = Kernel::Cauchy(c3);
+            let arm_mask =
+                std::env::var("VULVATAR_ARM_CHAIN_DEPTH").map_or(false, |v| v != "0");
             for kp in &obs.kp3d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
                 let d = sub(pw, kp.p);
@@ -879,6 +1027,13 @@ impl Estimator {
                     continue;
                 }
                 point_jac(model, st, fk, kp.point, joint, &mut self.jac);
+                if arm_mask
+                    && self.arm_param.get(model.joint_param.get(joint).copied().unwrap_or(0))
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    self.jac.retain(|(i, _)| self.arm_param.get(*i).copied().unwrap_or(false));
+                }
                 self.jac2.clear();
                 for &(i, v) in &self.jac {
                     self.jac2

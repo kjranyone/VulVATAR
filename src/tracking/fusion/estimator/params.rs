@@ -39,6 +39,17 @@ pub struct Params {
     /// the torso turns far slower than a limb swings, so its yaw must keep
     /// memory across a frame where a shoulder is occluded.
     pub q_trunk: f64,
+    /// Process noise for the head joint. Head yaw is weakly observed
+    /// (circular capsule, profile-view landmarks fight the yaw), so the
+    /// random walk is the dominant stabiliser; sweeping it on the
+    /// s1789349575 profile-view replay with `VULVATAR_Q_HEAD`.
+    pub q_head: f64,
+    /// Base process noise for finger-chain joints (MCP/PIP/DIP, both
+    /// hands). Finger curl is 2-D-degenerate so the limb swing rate
+    /// (`q_joint`) lets unobserved curl walk frame to frame — measured
+    /// as finger churn on desk replays. Default equals `q_joint`
+    /// (behavior unchanged); `VULVATAR_Q_FINGER` sweeps it.
+    pub q_finger: f64,
     pub q_root_rot: f64,
     pub q_root_t: f64,
     pub q_shape: f64,
@@ -206,6 +217,14 @@ impl Default for Params {
                 )
             },
             q_trunk: 0.15, // rad²/s — the trunk turns ~120°/s at most
+            q_head: std::env::var("VULVATAR_Q_HEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.15),
+            q_finger: std::env::var("VULVATAR_Q_FINGER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0),
             q_root_rot: 0.15,
             q_root_t: std::env::var("VULVATAR_FUSION_Q_ROOT_T")
                 .ok()

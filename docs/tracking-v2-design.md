@@ -91,7 +91,7 @@ crop は **状態の関数** であり、フレーム毎の検出結果がフィ
 - 方位は `OriObs` (FaceMesh transformation-matrix の SO(3) 直接観測、全チェーンヤコビアン)。|yaw| > 0.35 rad の主張は深度頬プロファイル (顔ボックス列中央値の勾配、|Δz| > 0.025 m、手と重なる間は 0.040 m、符号一致) の裏付け必須。裏付けは連続 target 限定で 20 フレームの grace。
 - 顔オクルージョン: 鼻が手矩形内なら 5 フレームのクールダウンで方位を止める。顎に手はブロックしない。
 - 個人差は canonical テンプレートのスケール + オフセットのみ EMA 学習 (`FaceFit`)。
-- SimCC 顔 kp (0..4) は mesh 重心がある間 σ ×(1 + 2·conf 連続補間)。頭の depth_at 窓は予測頭 ±0.20 m。
+- SimCC 顔 kp (0..4) は mesh 重心がある間 σ ×(1 + 2·conf 連続補間)、さらに ×0.5 (2026-09-14、29 録画ベンチ: 胴 yaw |err| 合計 156°→74°、頭 roll の GT 利得改善。`VULVATAR_HEAD_KP_SCALE` で上書き)。頭の depth_at 窓は予測頭 ±0.20 m。
 
 ### 3.5 手 (`fusion/hands.rs`, `provider.rs` の hand crops 節)
 
@@ -106,7 +106,7 @@ crop は **状態の関数** であり、フレーム毎の検出結果がフィ
 
 - body 17 点 + 手首は、キーポイント直下 (3 px 窓) の深度中央値を人物帯でゲートし、皮膚→関節オフセットで視線方向へ押し込んで 3D 観測にする。手矩形内の画素は顔の深度に使わない。予測腕カプセルがレイを遮る場合は表面点に格下げ。
 - σ: 2D は `KpSigma { floor 2.8 px, simcc_gain 1.9, score_inflate 3.0 }`、3D は `SCORE_INFLATE_BASE_3D = 1.3` × (1 + (1 − p_vis))。gain/floor/base は較正済み p_vis (鋭いピークで ≈ 0.99) 前提の値。
-- `ShoulderYawObs`: 胸部ストリップの列中央値深度の LS 勾配 (手クロップ画素のみ除外、胸が塞がる姿勢では肩上面バンド) を 1-DoF の胴 yaw 観測として注入。胴カプセルは自軸対称なので表面項は yaw 情報を持たない。
+- `ShoulderYawObs`: 胸部ストリップの列中央値深度の LS 勾配 (手クロップ画素のみ除外、胸が塞がる姿勢では肩上面バンド) を 1-DoF の胴 yaw 観測として注入。胴カプセルは自軸対称なので表面項は yaw 情報を持たない。σ スケール既定 0.5 (2026-09-14、29 録画ベンチ: 胴 yaw sd 概ね半減 s1789349252 12.7→4.9 / s1789088238 37.4→6.0、|err| 合計 ~103°→~60°、手首 snap 中立 195→191、独立指標の 2D 再投影は 11/11 不変。0.25 は腕と闘って snap 5→22)。`VULVATAR_CHESTYAW_SIGMA` で上書き。
 
 ### 3.7 密表面点 (主観測、`Silhouette::sample_points` → `Estimator::surface_term`)
 
@@ -169,7 +169,8 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 ## 6. リターゲット (`src/avatar/retarget.rs`)
 
 - 入力 `TrackingRigPose { t, 関節回転 (親相対), root, 手関節角, blendshape, チャンネル別 σ }`。
-- rest offset を掛けた回転コピー (world-delta)。σ がしきい値を超えた関節は idle へ smoothstep、root はアンカー。
+- rest offset を掛けた回転コピー (world-delta)。σ がしきい値を超えた関節は idle へ smoothstep (上腕の idle は A ポーズ、他は bind)、root はアンカー。
+- 表示レストはプロシージャル A ポーズ (`src/avatar/relax.rs`)。bind (T ポーズ) は skinning・cloth bind・SDF の数学的参照なので書き換えず、上腕を rest 形状 (上腕→肘方向) から水平 45° 下ろすオーバーレイを表示側に掛ける。既に A ポーズで bind された rig は不変。ドライバー (追跡・アニメ) が外れた最初のフレームで最終ポーズをキャプチャし、0.9 秒 smoothstep でレストへイージングする (即時ジャンプしない)。`VULVATAR_APOSE_DEG` (下ろし角) / `VULVATAR_RELAX_S` (遷移秒、0 = 従来の即時) で調整。
 - 表情・視線・スプリング・クロスは従来どおり。
 
 ---
@@ -196,6 +197,10 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_FUSION_NO_HINT` | crop ヒントを渡さない |
 | `VULVATAR_FUSION_OLDSIGMA` | σ 再表現前の gain/floor/base (1.0 / 1.5 px / 1.0) |
 | `VULVATAR_FUSION_NO_{SURF,3D,BURNIN,REACH,CHESTYAW}` | 各項の無効化 |
+| `VULVATAR_HEAD_KP_SCALE` | SimCC 顔 kp σ 膨張の倍率 (既定 0.5) |
+| `VULVATAR_HEAD_CULL_FACING` | 頭 far-side cull の facing 閾値 (既定 -0.15) |
+| `VULVATAR_Q_HEAD` | 頭ジョイントのプロセスノイズ q (既定 0.15 = trunk と同一) |
+| `VULVATAR_HAND_SIGMA_SCALE` | 手ランドマーク σ の倍率 (既定 1.0) |
 | `VULVATAR_FUSION_NO_WHOLD` / `VULVATAR_FUSION_WHOLD_SIGMA` | 未観測手首ホールドの無効化 / σ (m) (§3.8) |
 | `VULVATAR_FUSION_SEEDGATE_SIGMA` | アームシードの定常ゲート閾値 (data-σ)。0 = 常時シード (旧動作) |
 | `VULVATAR_FUSION_NO_DENSE` / `VULVATAR_DENSE_ARMS` / `VULVATAR_DENSE_NOHEAD` / `VULVATAR_DENSE_NONECK` | 密表面項の無効化 / 腕カプセル許可 / 頭・首の除外 |

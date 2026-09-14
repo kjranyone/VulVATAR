@@ -455,6 +455,7 @@ impl PoseProvider for FusionProvider {
             intr: Some(intr),
             kp2d: Vec::with_capacity(700),
             kp3d: Vec::with_capacity(600),
+            angles: Vec::with_capacity(30),
             ori: Vec::new(),
             shoulder_yaw: None,
             torso_hint: None,
@@ -833,8 +834,9 @@ impl PoseProvider for FusionProvider {
                     candidates.push(c);
                 }
                 let mut best: Option<super::hands::HandResult> = None;
-                for crop in candidates {
-                    if let Some(res) = hl.estimate(rgb_data, width, height, crop) {
+                for (ci, crop) in candidates.into_iter().enumerate() {
+                    if let Some(mut res) = hl.estimate(rgb_data, width, height, crop) {
+                        res.src = ci as u8;
                         // Handedness veto: a slot must never lock onto the opposing hand
                         // when the classifier is decisive (left ≈0.15, right ≈0.85).
                         // Middle band [0.30, 0.70] is genuinely uncertain and passes.
@@ -1114,6 +1116,20 @@ impl PoseProvider for FusionProvider {
             } else {
                 1.0
             };
+            // Scale on the SimCC face-kp σ inflation. The conf-derived
+            // ×3 inflation suppresses the eye-line signal so much that
+            // head roll under-responds (GT round-trip gain 0.1–0.4,
+            // validate_gt head_roll_*) and the profile-view torso lands
+            // in the wrong basin. ×0.5 halves the inflation: full 29-
+            // recording bench 2026-09-14 — torso yaw |err| sum 156°→74°,
+            // big-error sessions collapse (−38.8→+4.3, −13.4→+2.9,
+            // namaste −9.0→−1.1); jitter mixed (s1787200720 sd 18→30,
+            // s1789349575 yaw jit 1.7→3.9). Env overrides for sweeps.
+            let head_scale = head_scale
+                * std::env::var("VULVATAR_HEAD_KP_SCALE")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.5);
             body_kp2d(
                 &self.body_map,
                 &raw,
@@ -1384,11 +1400,20 @@ impl PoseProvider for FusionProvider {
                             // s1789303569 wrist slam is the mis-detected
                             // elbow itself (see the arm σ cap above).
                             let base_sigma = 0.12 * (15.0 / n as f64).sqrt();
+                            // 0.5 (2026-09-14, full 29-recording bench):
+                            // torso yaw sd roughly halves on the noisy
+                            // sessions (s1789349252 12.7→4.9, s1789088238
+                            // 37.4→6.0), |err| sum ~103°→~60°, wrist snaps
+                            // neutral (195→191) and the INDEPENDENT 2-D
+                            // reprojection fit unchanged (11/11) — i.e. the
+                            // gain is not just parroting the same-signal
+                            // shoulder-depth reference. 0.25 was too tight
+                            // (arm fights: L snaps 5→22 on s1789349252).
                             let scale = std::env::var("VULVATAR_CHESTYAW_SIGMA")
                                 .ok()
                                 .and_then(|v| v.parse::<f64>().ok())
                                 .filter(|v| *v > 0.0)
-                                .unwrap_or(1.5);
+                                .unwrap_or(0.5);
                             obs.shoulder_yaw = Some(super::estimator::ShoulderYawObs {
                                 left: self.h.j.l_shoulder,
                                 right: self.h.j.r_shoulder,
@@ -1515,6 +1540,15 @@ impl PoseProvider for FusionProvider {
         // normal (radial from the head centre) faces away from the camera
         // is on the far side of the head and cannot be a real observation.
         if std::env::var_os("VULVATAR_ABL_NOCULL").is_none() {
+            // Facing threshold for the cull below. −0.15 was the original
+            // lenient value; at 3/4-view (head yaw 60°+ replay s1789349575)
+            // the retained far eye/ear sat 19–22 px off the model with a
+            // sign pattern that torques yaw, feeding a ~13 Hz head shake.
+            // `VULVATAR_HEAD_CULL_FACING` sweeps it.
+            let facing_min = std::env::var("VULVATAR_HEAD_CULL_FACING")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(-0.15);
             let head_c = fk_pred.site[self.h.s.head_center];
             let head_sites = [
                 self.h.s.l_eye,
@@ -1540,7 +1574,7 @@ impl PoseProvider for FusionProvider {
                     }
                     _ => return true,
                 };
-                facing_of(pw) > -0.15
+                facing_of(pw) > facing_min
             });
             obs.kp3d.retain(|k| {
                 use super::estimator::ModelPoint;
@@ -1556,7 +1590,7 @@ impl PoseProvider for FusionProvider {
                     }
                     _ => return true,
                 };
-                facing_of(pw) > -0.15
+                facing_of(pw) > facing_min
             });
         }
 
@@ -1597,6 +1631,7 @@ impl PoseProvider for FusionProvider {
                 if self.hand_suspect[hand] { 4.0 } else { 1.0 },
                 &mut obs.kp2d,
                 &mut obs.kp3d,
+                &mut obs.angles,
             );
         }
 

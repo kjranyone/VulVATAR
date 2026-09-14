@@ -64,6 +64,107 @@ pub(super) fn trunk_params(model: &Model) -> Vec<bool> {
     v
 }
 
+/// Head-joint parameters — same shape as `trunk_params` but only the
+/// "head" joint, so the estimator can give the head its own process
+/// noise. Head yaw is weakly observed (circular capsule, profile-view
+/// landmarks) and a too-loose random walk lets shallow-basin noise
+/// oscillate it frame to frame.
+pub(super) fn head_params(model: &Model) -> Vec<bool> {
+    named_params(model, &["head"])
+}
+
+/// Finger-chain parameters: every joint that descends from a wrist
+/// joint (MCP flex/abd + pip + dip, both hands). Finger curl is
+/// 2-D-degenerate (a fist projects like an extended, rotated hand) so
+/// the process noise is the main thing keeping unobserved curl still;
+/// `Params::q_finger` lets it differ from the limb swing rate.
+pub(super) fn finger_params(model: &Model) -> Vec<bool> {
+    let wrist: Vec<usize> = model
+        .joints
+        .iter()
+        .enumerate()
+        .filter(|(_, jd)| jd.name == "l_wrist" || jd.name == "r_wrist")
+        .map(|(j, _)| j)
+        .collect();
+    let mut in_chain = vec![false; model.joints.len()];
+    // Walk children via parent links (few passes over a small tree).
+    loop {
+        let mut changed = false;
+        for (j, jd) in model.joints.iter().enumerate() {
+            if in_chain[j] {
+                continue;
+            }
+            let touches = wrist.contains(&j)
+                || jd.parent.map(|p| in_chain[p]).unwrap_or(false);
+            if touches {
+                in_chain[j] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut v = vec![false; model.num_params];
+    for (j, jd) in model.joints.iter().enumerate() {
+        if !in_chain[j] || jd.name == "l_wrist" || jd.name == "r_wrist" {
+            continue; // the wrist itself stays a limb joint
+        }
+        let p = model.joint_param[j];
+        let n = match jd.kind {
+            JointKind::Ball { .. } => 3,
+            JointKind::Hinge { .. } => 1,
+        };
+        for k in 0..n {
+            v[p + k] = true;
+        }
+    }
+    v
+}
+
+/// Parameters of joints whose name is in `names` (all DoF of each).
+fn named_params(model: &Model, names: &[&str]) -> Vec<bool> {
+    let mut v = vec![false; model.num_params];
+    for (j, jd) in model.joints.iter().enumerate() {
+        if !names.contains(&jd.name) {
+            continue;
+        }
+        let p = model.joint_param[j];
+        let n = match jd.kind {
+            JointKind::Ball { .. } => 3,
+            JointKind::Hinge { .. } => 1,
+        };
+        for k in 0..n {
+            v[p + k] = true;
+        }
+    }
+    v
+}
+
+/// Arm-chain parameters: the finger subtrees (see `finger_params`) plus
+/// the wrist / elbow / shoulder joints of both sides. Used to mask
+/// hand-side observation Jacobians away from the trunk (`arm_param`).
+pub(super) fn arm_params(model: &Model) -> Vec<bool> {
+    let mut v = finger_params(model);
+    for j in 0..model.joints.len() {
+        if !matches!(
+            model.joints[j].name,
+            "l_shoulder" | "l_elbow" | "l_wrist" | "r_shoulder" | "r_elbow" | "r_wrist"
+        ) {
+            continue;
+        }
+        let p = model.joint_param[j];
+        let n = match model.joints[j].kind {
+            JointKind::Ball { .. } => 3,
+            JointKind::Hinge { .. } => 1,
+        };
+        for k in 0..n {
+            v[p + k] = true;
+        }
+    }
+    v
+}
+
 /// Parameter-space difference `a ⊖ b` (left perturbation for rotations).
 pub fn param_difference(model: &Model, a: &State, b: &State) -> Vec<f64> {
     let n = model.num_params;

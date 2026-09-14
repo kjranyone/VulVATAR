@@ -24,7 +24,7 @@ use ort::value::TensorRef;
 
 use crate::tracking::rtmw3d::session::build_session_cpu_only;
 
-use super::estimator::{Intrinsics, Kp2d, Kp3d, ModelPoint};
+use super::estimator::{AngleObs, Intrinsics, Kp2d, Kp3d, ModelPoint};
 use super::math::*;
 use super::model::*;
 
@@ -41,6 +41,12 @@ pub struct HandResult {
     pub handedness: f32,
     /// Crop used `(x, y, size)` in frame pixels.
     pub crop: (f32, f32, f32),
+    /// Which crop candidate produced this result: 0 = previous frame's
+    /// locked hand re-cropped, 1 = the body detector's hand block,
+    /// 2 = the model prediction. Provenance for wrist-obs noise
+    /// attribution (a prediction crop over desk pixels can hallucinate
+    /// a coherent hand); the provider sets it.
+    pub src: u8,
 }
 
 pub struct HandLandmarker {
@@ -296,10 +302,34 @@ pub fn hand_observations(
     sigma_scale: f64,
     out2d: &mut Vec<Kp2d>,
     out3d: &mut Vec<Kp3d>,
+    out_ang: &mut Vec<AngleObs>,
 ) {
     let scale = res.crop.2 as f64 / INPUT as f64;
-    // ~2 px in crop space, inflated by (1 − presence).
-    let sigma_px = (2.0 * scale).max(1.0) * (1.0 + 2.0 * (1.0 - res.presence as f64)) * sigma_scale;
+    // Landmark noise measured live (2026-09-14, MCP keypoints on a held
+    // desk hand) is 15–19 px rms frame-to-frame at 640w — far above this
+    // σ — but inflating it destabilises the torso basin (same replay:
+    // ×4 flips torso yaw mean −23.7°→+59.5°; ×8 → −20.5°). The hand
+    // terms are load-bearing beyond the hand, so the calibrated crop-space
+    // base stays; `VULVATAR_HAND_SIGMA_SCALE` multiplies it for future
+    // work (the right fix is per-finger angle observations, not global
+    // inflation).
+    let sigma_scale_env = std::env::var("VULVATAR_HAND_SIGMA_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    // Fingers-only multiplier (VULVATAR_FINGER_SIGMA_SCALE): inflating the
+    // WRIST landmark σ destabilises the torso basin (it anchors the arm
+    // chain → clavicle → spine yaw; measured −23.7°→+59.5° flip), so the
+    // wrist keeps the calibrated σ while the finger landmarks — measured
+    // 15–33 px rms in poor-visibility sessions vs ~1 px σ — loosen alone.
+    let finger_scale_env = std::env::var("VULVATAR_FINGER_SIGMA_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let sigma_px = (2.0 * scale).max(1.0)
+        * (1.0 + 2.0 * (1.0 - res.presence as f64))
+        * sigma_scale
+        * sigma_scale_env;
     let wrist = if hand == 0 { h.j.l_wrist } else { h.j.r_wrist };
     let mut points: [Option<ModelPoint>; HAND_KP] = [None; HAND_KP];
     points[0] = Some(ModelPoint::Joint(wrist));
@@ -326,7 +356,7 @@ pub fn hand_observations(
             point: pt,
             u,
             v,
-            sigma: sigma_px,
+            sigma: if i == 0 { sigma_px } else { sigma_px * finger_scale_env },
         });
         if let Some(w) = wrist_abs {
             if i > 0 {
@@ -351,5 +381,57 @@ pub fn hand_observations(
                 });
             }
         }
+    }
+    // Inter-phalanx angle observations from landmark triples — the
+    // scale/wrist-invariant core of finger curl. Per finger: the angle at
+    // the MCP (wrist–MCP–PIP), at the PIP (MCP–PIP–DIP) and at the DIP
+    // (PIP–DIP–tip). σ propagates the landmark σ through the angle
+    // (dθ ≈ σ·(1/d₁ + 1/d₂)), floored so a near-degenerate triple can't
+    // become an infinitely sharp constraint. The thumb's CMC angle is
+    // skipped (its model triple is not co-planar with the landmark one).
+    let push_angle = |out_ang: &mut Vec<AngleObs>,
+                      (ia, iv, ib): (usize, usize, usize),
+                      (pa, pv, pb): (ModelPoint, ModelPoint, ModelPoint)| {
+        let valid = |p: [f32; 3]| {
+            p[0].is_finite()
+                && p[1].is_finite()
+                && p[0] >= 0.0
+                && p[1] >= 0.0
+                && (p[0] as f64) < width as f64
+                && (p[1] as f64) < height as f64
+        };
+        let (a, v, b) = (res.px[ia], res.px[iv], res.px[ib]);
+        if !valid(a) || !valid(v) || !valid(b) {
+            return;
+        }
+        let u = [a[0] as f64 - v[0] as f64, a[1] as f64 - v[1] as f64];
+        let w = [b[0] as f64 - v[0] as f64, b[1] as f64 - v[1] as f64];
+        let d1 = (u[0] * u[0] + u[1] * u[1]).sqrt();
+        let d2 = (w[0] * w[0] + w[1] * w[1]).sqrt();
+        if d1 < 4.0 || d2 < 4.0 {
+            return; // foreshortened segment: the angle is pure noise
+        }
+        let cross = u[0] * w[1] - u[1] * w[0];
+        let dot = u[0] * w[0] + u[1] * w[1];
+        let sigma = (sigma_px * (1.0 / d1 + 1.0 / d2)).max(0.06);
+        out_ang.push(AngleObs {
+            a: pa,
+            vertex: pv,
+            b: pb,
+            angle: cross.atan2(dot),
+            sigma: sigma * sigma_scale,
+        });
+    };
+    for f in 0..5 {
+        let (mcp, pip, dip, tip) = (
+            points[1 + f * 4].unwrap(),
+            points[2 + f * 4].unwrap(),
+            points[3 + f * 4].unwrap(),
+            points[4 + f * 4].unwrap(),
+        );
+        let wrist_mp = ModelPoint::Joint(wrist);
+        push_angle(out_ang, (0, 1 + f * 4, 2 + f * 4), (wrist_mp, mcp, pip));
+        push_angle(out_ang, (1 + f * 4, 2 + f * 4, 3 + f * 4), (mcp, pip, dip));
+        push_angle(out_ang, (2 + f * 4, 3 + f * 4, 4 + f * 4), (pip, dip, tip));
     }
 }

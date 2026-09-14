@@ -104,6 +104,26 @@ pub struct ShoulderYawObs {
     pub sigma: f64,
 }
 
+/// A planar joint-angle observation: the interior angle at the middle
+/// point of a 3-point landmark triple (e.g. wrist–MCP–PIP of a finger),
+/// compared against the angle of the same triple's model PROJECTION.
+/// Scale-, translation- and wrist-anchor-invariant — which is exactly
+/// what makes finger curl observable: for plain point reprojection a
+/// clenched fist is 2-D degenerate with an extended, rotated hand, but
+/// the inter-phalanx angle is not.
+#[derive(Clone, Copy, Debug)]
+pub struct AngleObs {
+    /// Triple endpoints and the vertex (the joint whose angle is
+    /// observed). All three are needed to form the model-side angle.
+    pub a: ModelPoint,
+    pub vertex: ModelPoint,
+    pub b: ModelPoint,
+    /// Observed interior angle at the vertex, radians.
+    pub angle: f64,
+    /// σ (rad).
+    pub sigma: f64,
+}
+
 /// Everything observed at one capture time.
 #[derive(Clone, Debug, Default)]
 pub struct FrameObs {
@@ -112,6 +132,8 @@ pub struct FrameObs {
     pub intr: Option<Intrinsics>,
     pub kp2d: Vec<Kp2d>,
     pub kp3d: Vec<Kp3d>,
+    /// Planar joint-angle observations (see [`AngleObs`]).
+    pub angles: Vec<AngleObs>,
     /// Direct world-orientation observations (see [`OriObs`]).
     pub ori: Vec<OriObs>,
     /// Torso yaw from the chest depth slope (see [`ShoulderYawObs`]).
