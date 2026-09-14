@@ -26,6 +26,8 @@ status:
   confidence: "Confidence: %{pct}%"
   camera_fps: "Camera: %{fps} fps"
   queue_dropped: "Queue: %{queue}  Dropped: %{dropped}"
+  render_fps: "Render: %{fps} fps"
+  submit_dropped: "Cmd drops: %{drops}"
   frame: "Frame: %{frame}"
   fps: "FPS: %{fps}  (%{ms} ms)"
   modified: "* Modified"

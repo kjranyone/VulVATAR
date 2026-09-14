@@ -448,6 +448,53 @@ impl Application {
                     None
                 },
             };
+            // Body-SDF splat skip + cadence gate: the field is a pure
+            // function of the posed body, so when the pose key is
+            // unchanged (no tracking sample, no clip, hair settled) the
+            // previous field is still exact — drop the plan and let the
+            // renderer keep last frame's slot instead of re-running the
+            // sentinel fill + splat dispatches (hundreds of ms of GPU
+            // time on current models). While the pose *is* changing,
+            // splat at most every `SDF_SPLAT_MIN_INTERVAL` — 30 Hz
+            // matches the tracking cadence, so no field information is
+            // ever lost; the intervening frames reuse the ~33 ms-stale
+            // field, the same latency class the pipeline already has
+            // (one frame stale by construction). The app-side
+            // `AvatarInstance::body_sdf` keeps the last readback
+            // (`apply_sdf_readback` never clears), so the spring solver
+            // is unaffected.
+            const SDF_SPLAT_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_millis(33);
+            let mut sdf_splat_changed = std::collections::HashSet::new();
+            for avatar in &self.avatars {
+                let spring_driven: std::collections::HashSet<usize> = avatar
+                    .asset
+                    .spring_bones
+                    .iter()
+                    .flat_map(|sb| {
+                        std::iter::once(sb.chain_root.0 as usize)
+                            .chain(sb.joints.iter().map(|&n| n.0 as usize))
+                    })
+                    .collect();
+                let key = Self::splat_pose_key(
+                    &avatar.pose.local_transforms,
+                    &spring_driven,
+                    &avatar.expression_weights,
+                );
+                let changed = self.sdf_splat_pose_keys.get(&avatar.id.0) != Some(&key);
+                let due = self
+                    .sdf_splat_last
+                    .get(&avatar.id.0)
+                    .map_or(true, |t| t.elapsed() >= SDF_SPLAT_MIN_INTERVAL);
+                // Only fold the key in when the splat actually runs;
+                // otherwise a skipped frame would swallow the change and
+                // the field would never refresh.
+                if changed && due {
+                    sdf_splat_changed.insert(avatar.id.0);
+                    self.sdf_splat_pose_keys.insert(avatar.id.0, key);
+                    self.sdf_splat_last.insert(avatar.id.0, std::time::Instant::now());
+                }
+            }
             let frame_input = Self::build_frame_input_multi(
                 &self.avatars,
                 &fi_config,
@@ -459,6 +506,7 @@ impl Application {
                 fixed_dt,
                 substeps as u32,
                 &self.physics.resolved_scene_colliders(),
+                &sdf_splat_changed,
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -532,6 +580,11 @@ impl Application {
             // one failure per frame still accumulates to the
             // `EmergencyCpu` threshold within seconds.
             gpu_export_failures_this_tick: self.output.take_gpu_export_failure_count(),
+            // Render thread's own production rate. Under render-thread
+            // starvation the GUI keeps ticking (the repaint gate spins
+            // on `render_results_pending`), so `render_dt` stays small
+            // and only this measurement sees the shortfall.
+            render_fps: self.render_thread_fps(),
         };
         self.runtime_gpu_budget.update(&measurements, now);
 
@@ -972,6 +1025,61 @@ impl Application {
         bone_pos(Head).or_else(|| bone_pos(Hips))
     }
 
+    /// Diagnosis switch for the body-SDF splat cost: `VULVATAR_NO_BODY_SDF=1`
+    /// drops the splat request from the frame input entirely, so the
+    /// renderer never sentinel-fills, dispatches, or reads the field
+    /// back (spring chains then sample "outside the band" everywhere =
+    /// no hair collision). Used to attribute GPU time to the splat pass
+    /// vs the rest of the frame.
+    fn body_sdf_disabled_by_env() -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DISABLED.get_or_init(|| {
+            std::env::var_os("VULVATAR_NO_BODY_SDF")
+                .map(|v| v.to_string_lossy() != "0")
+                .unwrap_or(false)
+        })
+    }
+
+    /// Quantized pose key covering everything the splatted vertices
+    /// depend on: the skeleton pose (`local_transforms`, with
+    /// spring-driven nodes excluded — hair chains jitter by
+    /// construction and none of their bones skin the splatted
+    /// body/face primitives) and the expression weights (the only
+    /// morph driver). Quantizing to ~2^-11 relative means
+    /// solver-settling jitter cannot keep the key moving; a boundary
+    /// crossing costs one extra splat, never a stale field (the field
+    /// is a pure function of the exact pose — the key only decides
+    /// whether it is recomputed this frame).
+    fn splat_pose_key(
+        local_transforms: &[crate::asset::Transform],
+        spring_driven: &std::collections::HashSet<usize>,
+        expression_weights: &[crate::avatar::expressions::ResolvedExpressionWeight],
+    ) -> u64 {
+        #[inline]
+        fn feed(h: &mut u64, x: f32) {
+            *h ^= (x.to_bits() >> 10) as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+        let mut h = 0xcbf29ce484222325u64;
+        for (i, t) in local_transforms.iter().enumerate() {
+            if spring_driven.contains(&i) {
+                continue;
+            }
+            for c in t
+                .translation
+                .iter()
+                .chain(t.rotation.iter())
+                .chain(t.scale.iter())
+            {
+                feed(&mut h, *c);
+            }
+        }
+        for w in expression_weights {
+            feed(&mut h, w.weight);
+        }
+        h
+    }
+
     fn build_frame_input_multi(
         avatars: &[AvatarInstance],
         fi_config: &FrameInputConfig,
@@ -983,6 +1091,7 @@ impl Application {
         fixed_dt: f32,
         substeps: u32,
         scene_colliders: &[crate::simulation::cloth::ResolvedCollider],
+        sdf_splat_changed: &std::collections::HashSet<u64>,
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -1049,10 +1158,16 @@ impl Application {
                 );
 
                 // Body-SDF splat request: only while the spring solver
-                // runs and only when a body primitive exists to splat.
+                // runs, only when a body primitive exists to splat, and
+                // only when the posed body actually changed since the
+                // last splat (see the pose-key diff in `run_frame` —
+                // the field is a pure function of the posed body, so an
+                // unchanged pose reuses the previous field verbatim).
                 // The grid is a pure function of the rest AABB, so
                 // renderer-side slot reuse stays stable across frames.
                 let body_sdf = if toggles.spring_enabled
+                    && !Self::body_sdf_disabled_by_env()
+                    && sdf_splat_changed.contains(&avatar.id.0)
                     && avatar
                         .asset
                         .spring_bones
@@ -1876,5 +1991,89 @@ mod cloth_collection_tests {
             AvatarInstanceId(7),
             &cs,
         ));
+    }
+}
+
+#[cfg(test)]
+mod splat_pose_key_tests {
+    use super::*;
+
+    fn transform(t: [f32; 3], r: [f32; 4]) -> crate::asset::Transform {
+        crate::asset::Transform {
+            translation: t,
+            rotation: r,
+            scale: [1.0, 1.0, 1.0],
+        }
+    }
+
+    fn weight(w: f32) -> crate::avatar::expressions::ResolvedExpressionWeight {
+        crate::avatar::expressions::ResolvedExpressionWeight {
+            name: "a".to_string(),
+            weight: w,
+        }
+    }
+
+    fn pose() -> Vec<crate::asset::Transform> {
+        vec![
+            transform([0.0, 0.8, 0.0], [0.0, 0.0, 0.0, 1.0]),
+            transform([0.1, 0.4, 0.0], [0.1, 0.0, 0.0, 0.9]),
+            transform([0.0, 0.2, 0.3], [0.0, 0.2, 0.0, 0.9]),
+        ]
+    }
+
+    fn key(
+        transforms: &[crate::asset::Transform],
+        weights: &[crate::avatar::expressions::ResolvedExpressionWeight],
+    ) -> u64 {
+        Application::splat_pose_key(transforms, &std::collections::HashSet::new(), weights)
+    }
+
+    #[test]
+    fn unchanged_pose_yields_unchanged_key() {
+        let (t, w) = (pose(), vec![weight(0.5)]);
+        assert_eq!(key(&t, &w), key(&t, &w));
+    }
+
+    /// Solver-settling jitter (below the ~2^-11 quantization) must not
+    /// read as a pose change — otherwise the skip never fires and the
+    /// splat runs at full cost every frame anyway.
+    #[test]
+    fn sub_quantization_jitter_is_ignored() {
+        let w = vec![weight(0.5)];
+        let t = pose();
+        let mut jittered = pose();
+        jittered[1].rotation[0] += 1.0e-7;
+        jittered[2].translation[1] -= 1.0e-7;
+        assert_ne!(t[1].rotation, jittered[1].rotation, "jitter must be real");
+        assert_eq!(key(&t, &w), key(&jittered, &w));
+    }
+
+    #[test]
+    fn body_bone_change_changes_key() {
+        let w = vec![weight(0.5)];
+        let mut moved = pose();
+        moved[1].rotation[1] += 0.01;
+        assert_ne!(key(&pose(), &w), key(&moved, &w));
+    }
+
+    #[test]
+    fn spring_driven_bone_change_is_ignored() {
+        let w = vec![weight(0.5)];
+        let mut spring_set = std::collections::HashSet::new();
+        spring_set.insert(2usize);
+        let mut moved = pose();
+        moved[2].rotation[2] += 0.03;
+        let base = Application::splat_pose_key(&pose(), &spring_set, &w);
+        assert_eq!(base, Application::splat_pose_key(&moved, &spring_set, &w));
+        // A body bone still moves the key under the same mask.
+        let mut moved_body = pose();
+        moved_body[1].rotation[1] += 0.01;
+        assert_ne!(base, Application::splat_pose_key(&moved_body, &spring_set, &w));
+    }
+
+    #[test]
+    fn expression_weight_change_changes_key() {
+        let t = pose();
+        assert_ne!(key(&t, &[weight(0.5)]), key(&t, &[weight(0.6)]));
     }
 }

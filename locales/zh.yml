@@ -26,6 +26,8 @@ status:
   confidence: "置信度：%{pct}%"
   camera_fps: "相机：%{fps} fps"
   queue_dropped: "队列：%{queue}  丢弃：%{dropped}"
+  render_fps: "渲染：%{fps} fps"
+  submit_dropped: "命令丢弃：%{drops}"
   frame: "帧：%{frame}"
   fps: "FPS：%{fps}  (%{ms} ms)"
   modified: "* 已修改"

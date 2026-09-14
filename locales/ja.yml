@@ -26,6 +26,8 @@ status:
   confidence: "確信度: %{pct}%"
   camera_fps: "カメラ: %{fps} fps"
   queue_dropped: "キュー: %{queue}  ドロップ: %{dropped}"
+  render_fps: "レンダー: %{fps} fps"
+  submit_dropped: "コマンド落ち: %{drops}"
   frame: "フレーム: %{frame}"
   fps: "FPS: %{fps}  (%{ms} ms)"
   modified: "* 変更あり"

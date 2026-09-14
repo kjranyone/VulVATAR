@@ -6,17 +6,22 @@
 //! only when the grid geometry or the splatted-primitive list changes.
 //! Each primitive gets its own descriptor set (its skinned VBO + index
 //! buffer + the shared field + its own params UBO) and its own
-//! dispatch; the atomicMin splats accumulate across dispatches. The
-//! field buffer is host-visible so `read_sdf_fields` can map it
-//! directly after the previous frame's fence — the same
-//! one-frame-stale discipline as the cloth position readback
+//! dispatch; the atomicMin splats accumulate across dispatches.
+//!
+//! The field lives in **device-local** memory — the splat issues
+//! ~10⁷ scattered `atomicMin`s per frame, and on a discrete GPU
+//! host-visible memory atomics are PCIe/BAR round-trips (measured:
+//! the whole frame collapsed to ~1.5 fps until this was split). The
+//! readback path copies field → host-visible staging at the end of the
+//! same submission and maps the staging after the previous frame's
+//! fence — the exact pattern of the cloth position readback
 //! (`read_cloth_positions`). Field semantics live in
 //! `simulation/sdf.rs`; the splat shader is `pipeline::body_sdf_splat_cs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vulkano::buffer::Subbuffer;
+use vulkano::buffer::{BufferUsage, Subbuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::memory::allocator::StandardMemoryAllocator;
@@ -37,9 +42,13 @@ pub(super) struct BodySdfPrimGpu {
 
 /// Per-instance GPU resources for the splat dispatches.
 pub(super) struct BodySdfSlot {
-    /// The distance field. `u32` cells holding f32 bit patterns;
-    /// `u32::MAX` (the `fill_buffer` value) = unsplatted sentinel.
+    /// Device-local distance field the sentinel fill + splat atomics
+    /// target. `u32` cells holding f32 bit patterns; `u32::MAX` (the
+    /// `fill_buffer` value) = unsplatted sentinel.
     pub(super) field: Subbuffer<[u32]>,
+    /// Host-visible copy target for the readback (`read_sdf_fields`
+    /// maps this, never `field`).
+    pub(super) staging: Subbuffer<[u32]>,
     pub(super) prims: Vec<BodySdfPrimGpu>,
     /// Grid + primitive list the slot was built for — identifies stale
     /// slots after an avatar swap.
@@ -84,7 +93,18 @@ pub(super) fn ensure_sdf_slot(
     };
     if needs_rebuild {
         let cells = grid.cell_count() as u64;
-        let field = gpu_alloc::host_read_slice(memory_allocator, cells, "body SDF field")?;
+        // Device-local: the splat's scattered atomicMin stream must hit
+        // VRAM caches, not host-visible BAR/PCIe memory (see module doc).
+        let field = gpu_alloc::device_slice(
+            memory_allocator,
+            BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_SRC
+                | BufferUsage::TRANSFER_DST,
+            cells,
+            "body SDF field (device)",
+        )?;
+        let staging =
+            gpu_alloc::host_read_slice::<u32>(memory_allocator, cells, "body SDF staging")?;
         let set_layout = pipeline
             .layout()
             .set_layouts()
@@ -129,6 +149,7 @@ pub(super) fn ensure_sdf_slot(
             instance_id,
             BodySdfSlot {
                 field,
+                staging,
                 prims: prim_gpu,
                 grid,
                 prim_ids,
@@ -150,10 +171,12 @@ pub(super) fn ensure_sdf_slot(
     Ok(())
 }
 
-/// Map the (previous frame's) field buffers into CPU memory, for the
+/// Map the (previous frame's) staging copies into CPU memory, for the
 /// instances planned this frame. Must be called after the previous
 /// frame's fence has been waited and before this frame's submission —
-/// the same window `read_cloth_positions` uses.
+/// the same window `read_cloth_positions` uses. The fence guarantees
+/// the frame-N copy (`field` → `staging`, recorded after the splat
+/// dispatches) completed before the map.
 pub(super) fn read_sdf_fields(
     slots: &SdfSlotMap,
     planned_instances: &[u64],
@@ -163,7 +186,7 @@ pub(super) fn read_sdf_fields(
         let Some(slot) = slots.get(instance_id) else {
             continue;
         };
-        let guard = match slot.field.read() {
+        let guard = match slot.staging.read() {
             Ok(g) => g,
             Err(e) => {
                 log::warn!("render: body SDF readback failed: {e}");

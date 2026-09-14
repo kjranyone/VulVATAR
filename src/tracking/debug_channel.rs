@@ -565,6 +565,9 @@ pub fn dump_gui_heartbeat(
     frame_count: u64,
     sim_substeps: u32,
     panel_hole: Option<[f32; 3]>,
+    render_fps: Option<f32>,
+    render_submit_drops: u64,
+    render_cpu_ms: Option<f32>,
 ) {
     if !enabled() {
         return;
@@ -593,6 +596,23 @@ pub fn dump_gui_heartbeat(
         // tight. A persistently non-null value means some inspector
         // widget still overflows the panel width.
         "panel_hole": panel_hole,
+        // Render thread's own production rate (fps, active frames
+        // only; null = no fresh measurement — paused / no avatar /
+        // just resumed). Persistently below the output target while
+        // `seq` climbs is the "GUI spins faster than the renderer can
+        // draw" signature; the egui-side FPS display cannot see this
+        // because backpressure makes it tick *faster*.
+        "render_fps": render_fps,
+        // Cumulative RenderFrame submits rejected because the render
+        // thread's bounded command channel (capacity 2) was full.
+        // Climbing ~1 per GUI frame = sustained backpressure; this is
+        // the counter behind the (now rate-limited) "command queue
+        // full" warning.
+        "render_submit_drops": render_submit_drops,
+        // CPU-side render() duration EMA (fence wait included). At the
+        // frame budget while render_fps sags = GPU-bound; small while
+        // fps sags = recording path itself is the cost.
+        "render_cpu_ms": render_cpu_ms,
     });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_gui.json"), &bytes);

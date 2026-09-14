@@ -34,9 +34,11 @@ pub struct AvatarInstance {
     /// Runtime-only (not persisted); resets to all-enabled on (re)load.
     pub collider_enabled: Vec<bool>,
     /// Body-surface distance field (avatar-root space) read back from
-    /// the renderer's splat dispatch, refreshed every rendered frame.
-    /// The spring solver resolves `body_collision` chains against it —
-    /// see `simulation/sdf.rs`. `None` until the first field arrives.
+    /// the renderer's splat dispatch, refreshed whenever the posed body
+    /// changes — unchanged-pose frames reuse the previous field (see
+    /// `app::render::splat_pose_key`). The spring solver resolves
+    /// `body_collision` chains against it — see `simulation/sdf.rs`.
+    /// `None` until the first field arrives.
     pub body_sdf: Option<SdfField>,
     pub expression_weights: Vec<ResolvedExpressionWeight>,
     /// Temporal state for the expression (blend-shape) solve.

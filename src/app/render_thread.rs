@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::renderer::frame_input::RenderFrameInput;
 use crate::renderer::output_export::ExportedPixelData;
@@ -47,17 +48,59 @@ pub enum RenderCommand {
 /// to the export pool so the slot doesn't leak.
 type ResultMailbox = Arc<Mutex<Option<RenderResult>>>;
 
+/// GUI ticks can outrun the render thread (heavy scene, GPU shared with
+/// tracking inference), so `submit` rejections are *normal backpressure*
+/// under latest-frame-wins semantics — not errors. A per-drop `warn!`
+/// therefore floods the log at GUI tick rate (~60-144 lines/s) the
+/// moment the render thread falls behind. This aggregator keeps the
+/// signal but bounds the spam: at most one line per
+/// [`SUBMIT_DROP_WARN_COOLDOWN`], carrying how many drops accumulated
+/// since the previous line.
+struct SubmitDropWarnAggregator {
+    last_warn: Option<Instant>,
+    suppressed_since_warn: u64,
+}
+
+/// Minimum interval between two "command queue full" warnings.
+const SUBMIT_DROP_WARN_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Gaps between consecutive rendered frames larger than this are an
+/// idle period (paused, no avatar, GUI not submitting) rather than a
+/// production interval, so they reset the render-fps sampler instead
+/// of diluting its EMA toward zero.
+const ACTIVE_PRODUCTION_GAP: Duration = Duration::from_millis(500);
+/// EMA weight of the newest frame interval in the render-fps sampler.
+const RENDER_FPS_EMA_ALPHA: f32 = 1.0 / 8.0;
+
 struct RenderThreadInner {
     renderer: VulkanRenderer,
     cmd_rx: Receiver<RenderCommand>,
     result_mailbox: ResultMailbox,
     result_dropped: Arc<AtomicU64>,
+    /// Shared sink for the render-fps sampler (EMA frame interval in
+    /// nanos; 0 = no measurement yet). Written by the render thread,
+    /// read by the GUI via `RenderThread::render_fps`.
+    render_frame_period_nanos: Arc<AtomicU64>,
+    /// EMA of the CPU-side duration of `VulkanRenderer::render` (the
+    /// previous frame's fence wait included). When this sits at the
+    /// frame budget, the thread is blocked on GPU fences = GPU-bound;
+    /// when it is small while fps sags, recording itself is the cost.
+    render_cpu_nanos: Arc<AtomicU64>,
 }
 
 pub struct RenderThread {
     cmd_tx: SyncSender<RenderCommand>,
     result_mailbox: ResultMailbox,
     result_dropped: Arc<AtomicU64>,
+    /// Cumulative count of `submit` calls rejected because the command
+    /// channel was full. Monotonic display/diagnostic counter.
+    submit_drops: Arc<AtomicU64>,
+    /// GUI-side clone of the render-fps sampler sink (see
+    /// `RenderThreadInner::render_frame_period_nanos`).
+    render_frame_period_nanos: Arc<AtomicU64>,
+    /// GUI-side clone of the render-CPU-time sampler sink.
+    render_cpu_nanos: Arc<AtomicU64>,
+    warn_state: Mutex<SubmitDropWarnAggregator>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -66,6 +109,9 @@ impl RenderThread {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<RenderCommand>(2);
         let result_mailbox: ResultMailbox = Arc::new(Mutex::new(None));
         let result_dropped = Arc::new(AtomicU64::new(0));
+        let submit_drops = Arc::new(AtomicU64::new(0));
+        let render_frame_period_nanos = Arc::new(AtomicU64::new(0));
+        let render_cpu_nanos = Arc::new(AtomicU64::new(0));
 
         let init_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let barrier_clone = init_barrier.clone();
@@ -75,6 +121,8 @@ impl RenderThread {
             cmd_rx,
             result_mailbox: Arc::clone(&result_mailbox),
             result_dropped: Arc::clone(&result_dropped),
+            render_frame_period_nanos: Arc::clone(&render_frame_period_nanos),
+            render_cpu_nanos: Arc::clone(&render_cpu_nanos),
         };
 
         let handle = thread::Builder::new()
@@ -94,6 +142,13 @@ impl RenderThread {
             cmd_tx,
             result_mailbox,
             result_dropped,
+            submit_drops,
+            render_frame_period_nanos,
+            render_cpu_nanos,
+            warn_state: Mutex::new(SubmitDropWarnAggregator {
+                last_warn: None,
+                suppressed_since_warn: 0,
+            }),
             handle: Some(handle),
         }
     }
@@ -104,14 +159,69 @@ impl RenderThread {
     /// and the caller should *not* count it as in-flight). Callers
     /// driving the GUI repaint gate use the return value to decide
     /// whether to expect a result back next frame.
+    ///
+    /// A `false` return is expected backpressure whenever the render
+    /// thread's production rate falls below the GUI tick rate, so the
+    /// warning is aggregated: at most one log line per
+    /// `SUBMIT_DROP_WARN_COOLDOWN`, with the suppressed-drop count.
     pub fn submit(&self, cmd: RenderCommand) -> bool {
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => true,
             Err(e) => {
-                warn!("render_thread: failed to send command: {}", e);
+                self.submit_drops.fetch_add(1, Ordering::Relaxed);
+                let mut agg = self
+                    .warn_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                agg.suppressed_since_warn += 1;
+                let due = agg
+                    .last_warn
+                    .map_or(true, |t| t.elapsed() >= SUBMIT_DROP_WARN_COOLDOWN);
+                if due {
+                    let suppressed = agg.suppressed_since_warn;
+                    agg.suppressed_since_warn = 0;
+                    agg.last_warn = Some(Instant::now());
+                    drop(agg);
+                    warn!(
+                        "render_thread: command queue full ({}), dropping frame — \
+                         render thread slower than GUI tick rate \
+                         ({} dropped since last report, {} total)",
+                        e,
+                        suppressed,
+                        self.submit_drops.load(Ordering::Relaxed)
+                    );
+                }
                 false
             }
         }
+    }
+
+    /// Cumulative count of commands dropped because the channel was
+    /// full. Read-and-*keep* — this is a display/diagnostic counter
+    /// (status bar, `debug_gui.json`), unlike `take_dropped_results`
+    /// which the app must drain to keep its in-flight math honest.
+    pub fn submit_drops_total(&self) -> u64 {
+        self.submit_drops.load(Ordering::Relaxed)
+    }
+
+    /// Effective production rate of the render thread in fps, from an
+    /// EMA over back-to-back `RenderFrame` intervals only. Gaps longer
+    /// than `ACTIVE_PRODUCTION_GAP` (pause, no avatar) reset the
+    /// sampler instead of diluting the rate, so a resumed session
+    /// reads `None` until two fresh frames have landed.
+    pub fn render_fps(&self) -> Option<f32> {
+        let nanos = self.render_frame_period_nanos.load(Ordering::Relaxed);
+        (nanos > 0).then(|| 1_000_000_000.0 / nanos as f32)
+    }
+
+    /// EMA of the CPU-side `render()` duration in milliseconds
+    /// (including the previous frame's fence wait), or `None` before
+    /// the first frame. `render_fps()` below the target while this sits
+    /// at the frame budget = GPU-bound; this small while fps sags =
+    /// the recording path itself is the cost.
+    pub fn render_cpu_ms(&self) -> Option<f32> {
+        let nanos = self.render_cpu_nanos.load(Ordering::Relaxed);
+        (nanos > 0).then(|| nanos as f32 / 1_000_000.0)
     }
 
     /// Submit a thumbnail render and return the receiving end of the
@@ -193,6 +303,11 @@ impl RenderThreadInner {
 
     fn run(mut self) {
         info!("render_thread: started");
+        // Render-fps sampler state. `last_frame_at` + `ema_period` are
+        // local because only this thread writes them; the result is
+        // published through the shared atomic in `inner`.
+        let mut last_frame_at: Option<Instant> = None;
+        let mut ema_period: Option<Duration> = None;
         loop {
             let cmd = match self.cmd_rx.recv() {
                 Ok(cmd) => cmd,
@@ -234,6 +349,7 @@ impl RenderThreadInner {
                     // `process_render_result` a no-op (clears
                     // `rendered_pixels`) without surfacing a fake
                     // successful frame to the output worker.
+                    let render_started = Instant::now();
                     let result = match self.renderer.render(&input) {
                         Ok(r) => r,
                         Err(e) => {
@@ -251,6 +367,51 @@ impl RenderThreadInner {
                             sdf_fields: Vec::new(),                            }
                         }
                     };
+                    // CPU-side render duration (fence wait included):
+                    // EMA published alongside the fps sampler so the
+                    // heartbeat can separate GPU-bound from
+                    // record-bound frames.
+                    {
+                        let cpu = render_started.elapsed();
+                        let prev = self.render_cpu_nanos.load(Ordering::Relaxed);
+                        let blended = if prev == 0 {
+                            cpu.as_nanos() as u64
+                        } else {
+                            (prev as f32 * (1.0 - RENDER_FPS_EMA_ALPHA)
+                                + cpu.as_nanos() as f32 * RENDER_FPS_EMA_ALPHA)
+                                as u64
+                        };
+                        self.render_cpu_nanos.store(blended, Ordering::Relaxed);
+                    }
+                    // Feed the fps sampler on both the success and error
+                    // path — both consumed a frame slot at production
+                    // pace. The exclusive-active skip above intentionally
+                    // does NOT reach here: no rendering happened.
+                    let now = Instant::now();
+                    if let Some(last) = last_frame_at {
+                        let gap = now.duration_since(last);
+                        if gap < ACTIVE_PRODUCTION_GAP {
+                            ema_period = Some(match ema_period {
+                                Some(ema) => ema.mul_f32(1.0 - RENDER_FPS_EMA_ALPHA)
+                                    + gap.mul_f32(RENDER_FPS_EMA_ALPHA),
+                                None => gap,
+                            });
+                            if let Some(ema) = ema_period {
+                                self.render_frame_period_nanos.store(
+                                    ema.as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        } else {
+                            // Idle gap (pause / no submits): resync the
+                            // sampler without feeding it, and clear any
+                            // pre-pause rate so callers read `None`
+                            // rather than a stale number.
+                            ema_period = None;
+                            self.render_frame_period_nanos.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    last_frame_at = Some(now);
                     self.publish_result(result);
                 }
                 RenderCommand::RenderThumbnail {

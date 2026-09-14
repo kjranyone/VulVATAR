@@ -26,6 +26,8 @@ status:
   confidence: "신뢰도: %{pct}%"
   camera_fps: "카메라: %{fps} fps"
   queue_dropped: "큐: %{queue}  드롭: %{dropped}"
+  render_fps: "렌더: %{fps} fps"
+  submit_dropped: "명령 드롭: %{drops}"
   frame: "프레임: %{frame}"
   fps: "FPS: %{fps}  (%{ms} ms)"
   modified: "* 수정됨"

@@ -4,9 +4,9 @@
 //! previously scattered as constants across `OutputRouter::set_target_fps`
 //! and `tracking/rtmw3d/mod.rs::YOLOX_REFRESH_PERIOD`. Consumers read the
 //! latest target from the budget; the budget reads live measurements
-//! (render dt, output queue depth, export pool occupancy, recent GPU
-//! export failures) and decides one global [`DegradedMode`] level that
-//! drives the wired targets together.
+//! (render-thread fps, render dt, output queue depth, export pool
+//! occupancy, recent GPU export failures) and decides one global
+//! [`DegradedMode`] level that drives the wired targets together.
 //!
 //! Currently wired:
 //! - `render_fps_target` → `OutputRouter::set_target_fps` via
@@ -92,6 +92,18 @@ pub struct RuntimeMeasurements {
     /// per-tick counts of 0 or 1 would otherwise never reach the
     /// threshold in normal operation.
     pub gpu_export_failures_this_tick: u32,
+    /// Effective production rate of the render thread in fps, measured
+    /// over back-to-back frames only (`RenderThread::render_fps`).
+    /// `None` = no fresh measurement (no avatar / paused / just
+    /// resumed) and is treated as "no signal", never as pressure.
+    ///
+    /// This is the only signal that can see render-thread starvation
+    /// directly. `render_dt` is the *GUI tick* EMA, and the GUI keeps
+    /// ticking (the repaint gate spins on `render_results_pending`), so
+    /// a GPU-bound renderer shows up as GUI-side command-queue drops —
+    /// invisible to `render_dt` — while the production rate sags below
+    /// the user's target.
+    pub render_fps: Option<f32>,
 }
 
 impl Default for RuntimeMeasurements {
@@ -103,6 +115,7 @@ impl Default for RuntimeMeasurements {
             export_pool_leased: 0,
             export_pool_capacity: 2,
             gpu_export_failures_this_tick: 0,
+            render_fps: None,
         }
     }
 }
@@ -149,6 +162,10 @@ pub enum TransitionReason {
     #[default]
     InitialState,
     RenderOverrun,
+    /// `render_fps` measured by the render thread itself is persistently
+    /// below the user's target (starvation the GUI-side `render_dt`
+    /// EMA cannot see — see `RuntimeMeasurements::render_fps`).
+    RenderStarved,
     OutputDrops,
     ExportPoolSaturated,
     Sustained,
@@ -161,6 +178,7 @@ impl TransitionReason {
         match self {
             TransitionReason::InitialState => "initial state",
             TransitionReason::RenderOverrun => "render time exceeded target",
+            TransitionReason::RenderStarved => "render thread below target fps",
             TransitionReason::OutputDrops => "output dropping frames",
             TransitionReason::ExportPoolSaturated => "export pool saturated",
             TransitionReason::Sustained => "sustained pressure",
@@ -354,7 +372,14 @@ impl RuntimeGpuBudget {
 
     fn detect_pressure(&self, m: &RuntimeMeasurements) -> Option<TransitionReason> {
         let target = m.render_target.as_secs_f32().max(1e-6);
+        let target_fps = 1.0 / target;
         let render_overrun = m.render_dt.as_secs_f32() > RENDER_OVERRUN_MULTIPLE * target;
+        // Mirror image of `render_overrun`: same 1.2× threshold, but
+        // measured on the render thread's own production rate. Only
+        // fires on a fresh measurement (`Some`), never on "unknown".
+        let render_starved = m
+            .render_fps
+            .is_some_and(|fps| fps < target_fps / RENDER_OVERRUN_MULTIPLE);
         let high_drops = m.output_drops_per_sec > LIGHT_DROP_RATE_PER_SEC;
         let pool_saturated =
             m.export_pool_capacity > 0 && m.export_pool_leased >= m.export_pool_capacity;
@@ -362,6 +387,8 @@ impl RuntimeGpuBudget {
             Some(TransitionReason::ExportPoolSaturated)
         } else if render_overrun {
             Some(TransitionReason::RenderOverrun)
+        } else if render_starved {
+            Some(TransitionReason::RenderStarved)
         } else if high_drops {
             Some(TransitionReason::OutputDrops)
         } else {
@@ -466,6 +493,52 @@ mod tests {
         let mut m = RuntimeMeasurements::default();
         m.output_drops_per_sec = HEAVY_DROP_RATE_PER_SEC + 1.0;
         m
+    }
+
+    /// Target 60 fps → starvation threshold 60/1.2 = 50 fps. A render
+    /// thread producing 30 fps (the sustained "command queue full" log
+    /// scenario) must count as pressure even though the GUI tick EMA
+    /// (`render_dt`) looks perfectly healthy — the GUI keeps ticking
+    /// under backpressure, which is exactly what `render_dt` cannot
+    /// see through.
+    #[test]
+    fn render_thread_starvation_is_a_pressure_signal() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        let mut m = healthy_measurements();
+        m.render_fps = Some(30.0);
+        budget.update(&m, t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
+        assert_eq!(
+            budget.last_transition_reason(),
+            TransitionReason::RenderStarved
+        );
+    }
+
+    /// A render thread at (or just above) the starvation threshold is
+    /// healthy backpressure, e.g. a 144 Hz GUI feeding a 55 fps
+    /// renderer: drops at GUI tick rate happen, but the budget must
+    /// not degrade tracking cadence for it.
+    #[test]
+    fn render_fps_at_threshold_is_not_pressure() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        let mut m = healthy_measurements();
+        m.render_fps = Some(60.0 / RENDER_OVERRUN_MULTIPLE);
+        budget.update(&m, t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::Healthy);
+    }
+
+    /// `None` means "no fresh measurement" (paused / no avatar / just
+    /// resumed), never "zero fps" — it must not be pressure.
+    #[test]
+    fn unknown_render_fps_is_never_pressure() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        let mut m = healthy_measurements();
+        m.render_fps = None;
+        budget.update(&m, t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::Healthy);
     }
 
     #[test]

@@ -1229,6 +1229,9 @@ impl eframe::App for GuiApp {
             self.runtime_status.frame_count,
             self.app.last_sim_substeps,
             self.debug_panel_hole,
+            self.app.render_thread_fps(),
+            self.app.render_submit_drops_total(),
+            self.app.render_thread_cpu_ms(),
         );
 
         if !self.runtime_status.paused {

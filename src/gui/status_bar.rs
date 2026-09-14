@@ -139,6 +139,35 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         .font(typography::caption())
                         .color(color::ON_SURFACE_MUTED),
                     );
+                    // Render thread's own production rate + command-queue
+                    // drops. The right-aligned FPS readout measures the
+                    // egui tick, which speeds *up* under backpressure —
+                    // these two are what actually show renderer starvation.
+                    if let Some(fps) = state.app.render_thread_fps() {
+                        ui.label(
+                            egui::RichText::new(t!(
+                                "status.render_fps",
+                                fps = format!("{:.0}", fps)
+                            ))
+                            .font(typography::caption())
+                            .color(color::ON_SURFACE_MUTED),
+                        );
+                    }
+                    let submit_drops = state.app.render_submit_drops_total();
+                    if submit_drops > 0 {
+                        ui.label(
+                            egui::RichText::new(t!(
+                                "status.submit_dropped",
+                                drops = submit_drops
+                            ))
+                            .font(typography::caption())
+                            .color(if state.app.render_thread_fps().is_none() {
+                                color::ON_SURFACE_MUTED
+                            } else {
+                                color::WARNING
+                            }),
+                        );
+                    }
                     ui.label(
                         egui::RichText::new(t!(
                             "status.frame",

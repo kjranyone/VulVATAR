@@ -307,6 +307,14 @@ pub struct Application {
     /// avatar still gets at least one follow-up frame to upload the
     /// re-rendered texture instead of stalling on the previous image.
     render_results_pending: u32,
+    /// Last quantized pose key per avatar instance, used to skip the
+    /// body-SDF splat on frames where the posed body is unchanged
+    /// (see `app::render::splat_pose_key`). Only advanced when a splat
+    /// actually runs (see the cadence gate in `run_frame`).
+    sdf_splat_pose_keys: std::collections::HashMap<u64, u64>,
+    /// Last instant each instance's body-SDF splat ran, gating the
+    /// refresh cadence to 30 Hz while the pose is moving.
+    sdf_splat_last: std::collections::HashMap<u64, std::time::Instant>,
     /// Lifetime tally of render results the render thread had to drop
     /// because the app hadn't drained the mailbox yet. Each entry is a
     /// frame that completed on the GPU but never reached
@@ -471,6 +479,8 @@ impl Application {
             ground_grid_visible: false,
             logged_first_render_result: false,
             render_results_pending: 0,
+            sdf_splat_pose_keys: std::collections::HashMap::new(),
+            sdf_splat_last: std::collections::HashMap::new(),
             render_results_dropped: 0,
             pending_export_lease_releases: VecDeque::new(),
         }
@@ -491,6 +501,35 @@ impl Application {
     /// the previous frame yet.
     pub fn render_results_dropped_count(&self) -> u64 {
         self.render_results_dropped
+    }
+
+    /// Effective production rate of the render thread (fps), or `None`
+    /// while it has no fresh measurement (paused, no avatar, or fewer
+    /// than two back-to-back frames since the last idle gap). Surfaced
+    /// to the status bar debug readout, `debug_gui.json`, and the GPU
+    /// budget — the GUI-side fps display only measures the egui tick,
+    /// which spins *faster* than the renderer under backpressure and
+    /// therefore cannot see this.
+    pub fn render_thread_fps(&self) -> Option<f32> {
+        self.render_thread.as_ref().and_then(|rt| rt.render_fps())
+    }
+
+    /// EMA of the render thread's CPU-side `render()` duration in ms
+    /// (previous frame's fence wait included). Sits at the frame
+    /// budget while production sags = GPU-bound; small while fps sags
+    /// = the recording path itself is the cost.
+    pub fn render_thread_cpu_ms(&self) -> Option<f32> {
+        self.render_thread.as_ref().and_then(|rt| rt.render_cpu_ms())
+    }
+
+    /// Cumulative count of render commands dropped because the render
+    /// thread's bounded command channel was full. Sustained growth is
+    /// the direct counterpart of the "failed to send command" warning.
+    pub fn render_submit_drops_total(&self) -> u64 {
+        self.render_thread
+            .as_ref()
+            .map(|rt| rt.submit_drops_total())
+            .unwrap_or(0)
     }
 
     /// Set the desired viewport resolution (called by the GUI when the viewport panel resizes).

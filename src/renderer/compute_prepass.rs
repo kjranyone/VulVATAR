@@ -1047,6 +1047,7 @@ impl VulkanRenderer {
                             .map(|p| (p.set.clone(), p.groups))
                             .collect(),
                         field: slot.field.clone(),
+                        staging: slot.staging.clone(),
                     });
                     self.sdf_planned.push(instance.instance_id.0);
                 }
@@ -1365,7 +1366,10 @@ impl VulkanRenderer {
             // requested primitive (body + face/head surfaces) into the
             // instance's shared distance field. Runs after every
             // transform dispatch of this instance so it reads this
-            // frame's freshly skinned vertices.
+            // frame's freshly skinned vertices. The field is
+            // device-local (VRAM atomics — see `renderer/sdf_field.rs`);
+            // the block ends with a field → staging copy so the
+            // readback maps host-visible memory instead.
             if let Some(sdf) = &inst.sdf {
                 builder
                     .fill_buffer(sdf.field.clone(), u32::MAX)
@@ -1388,6 +1392,12 @@ impl VulkanRenderer {
                             .map_err(|e| format!("render: body SDF splat dispatch: {e}"))?;
                     }
                 }
+                builder
+                    .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                        sdf.field.clone(),
+                        sdf.staging.clone(),
+                    ))
+                    .map_err(|e| format!("render: body SDF staging copy failed: {e}"))?;
             }
         }
 

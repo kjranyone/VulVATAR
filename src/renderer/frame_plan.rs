@@ -115,10 +115,13 @@ pub(super) struct PlannedClothNormal {
 pub(super) struct PlannedSdf {
     /// One (set, groups) pair per splatted primitive.
     pub(super) dispatches: Vec<(Arc<DescriptorSet>, [u32; 3])>,
-    /// The field buffer, sentinel-filled (`fill_buffer` u32::MAX) once
-    /// before the dispatches — command-buffer-visible identity, hashed
-    /// into the key.
+    /// The device-local field buffer, sentinel-filled (`fill_buffer`
+    /// u32::MAX) once before the dispatches — command-buffer-visible
+    /// identity, hashed into the key.
     pub(super) field: Subbuffer<[u32]>,
+    /// Host-visible readback target, copied from `field` at the end of
+    /// the splat block and mapped by `read_sdf_fields` one frame stale.
+    pub(super) staging: Subbuffer<[u32]>,
 }
 
 /// One primitive's transform dispatch in Kahn order, with its optional
