@@ -87,6 +87,19 @@ pub struct SpringChainState {
     /// rotations overall so [`AvatarInstance::reapply_spring_rotations`]
     /// is a no-op before the first solve.
     pub solved_rotations: Vec<[f32; 4]>,
+    /// Settle-sleep bookkeeping (idle z-fight fix, 2026-09-15). The
+    /// solver's residual per-step jitter is far below every diagnostic's
+    /// resolution yet enough to flip depth ties between nearly-coincident
+    /// surfaces — the breast garment sits ~1 mm off the skin, so
+    /// micro-jitter makes the two flicker violently at idle. A chain
+    /// whose joints stay under `SPRING_SLEEP_EPS` motion for
+    /// `SPRING_SLEEP_QUIET_FRAMES` consecutive steps AND whose driving
+    /// inputs (root world position, scene gravity) are bit-identical is
+    /// skipped entirely, freezing its vertex stream to bit-stable.
+    pub quiet_frames: u32,
+    pub sleeping: bool,
+    pub last_root_pos: Vec3,
+    pub last_gravity: ([f32; 3], f32),
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +205,10 @@ impl AvatarInstance {
                                 .unwrap_or([0.0, 0.0, 0.0, 1.0])
                         })
                         .collect(),
+                    quiet_frames: 0,
+                    sleeping: false,
+                    last_root_pos: [f32::NAN; 3],
+                    last_gravity: ([f32::NAN; 3], f32::NAN),
                 }
             })
             .collect();

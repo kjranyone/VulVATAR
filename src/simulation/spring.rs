@@ -208,6 +208,19 @@ fn resolve_capsule_collision(
     }
 }
 
+/// Settle-sleep threshold: joint motion per step below this counts as
+/// "quiet" (metres). 100 µm is invisible motion — a fraction of a pixel
+/// — but sits above the residual oscillation of a converged chain
+/// (measured ~10 µm post-settle offline; the tail's sustained swing is
+/// mm-scale and legitimately stays awake). The point is not "no motion"
+/// but "no motion the depth buffer can resolve differently than last
+/// frame": once asleep the vertex stream is bit-stable against surfaces
+/// ~1 mm away (idle z-fight, 2026-09-15).
+const SPRING_SLEEP_EPS: f32 = 1e-4;
+/// Consecutive quiet steps before a chain may sleep. With 1-2 substeps
+/// per frame this is a few frames (~0.1 s) after the last real motion.
+const SPRING_SLEEP_QUIET_FRAMES: u32 = 5;
+
 pub fn step_spring_bones(
     dt: f32,
     avatar: &mut AvatarInstance,
@@ -262,6 +275,28 @@ pub fn step_spring_bones(
             continue;
         }
         let spring_asset = &avatar.asset.spring_bones[chain_idx];
+
+        // Settle sleep (idle z-fight fix, 2026-09-15): a chain that has
+        // been quiet AND whose driving inputs are bit-identical to the
+        // last stepped frame is skipped. The root's world transform
+        // covers the entire upstream pose (any tracked or animated
+        // ancestor change moves it), so a sleeping chain wakes the
+        // first frame its driver moves — tracking behaviour is
+        // unchanged. Uses the FUNCTION-param gravity, before the
+        // per-chain shadow below.
+        let root_pos =
+            mat4_translation(&avatar.pose.global_transforms[spring_asset.chain_root.0 as usize]);
+        {
+            let st = &avatar.secondary_motion.spring_states[chain_idx];
+            if st.sleeping
+                && st.last_root_pos == root_pos
+                && st.last_gravity == (gravity_dir, gravity_scale)
+            {
+                continue;
+            }
+        }
+        let pre_positions = avatar.secondary_motion.spring_states[chain_idx].positions.clone();
+
         let chain_stiffness = spring_asset.stiffness;
         let chain_drag = spring_asset.drag_force;
         // Authored per-chain direction, reoriented by the scene-gravity
@@ -510,6 +545,30 @@ pub fn step_spring_bones(
                 head_parent_basis = quat_mul(&head_parent_basis, &written);
             }
             anchor = next;
+        }
+
+        // Settle-sleep bookkeeping: the largest joint motion this step
+        // decides quiet-vs-active. Sub-resolution jitter (µm) counts as
+        // quiet — the point is not "no motion" but "no motion the
+        // depth buffer can resolve differently than last frame".
+        let mut max_move = 0.0f32;
+        {
+            let st = &mut avatar.secondary_motion.spring_states[chain_idx];
+            for (j, pre) in pre_positions.iter().enumerate() {
+                if let Some(post) = st.positions.get(j) {
+                    max_move = max_move.max(vec3_length(&vec3_sub(post, pre)));
+                }
+            }
+            st.quiet_frames = if max_move < SPRING_SLEEP_EPS {
+                st.quiet_frames.saturating_add(1)
+            } else {
+                0
+            };
+            if st.quiet_frames >= SPRING_SLEEP_QUIET_FRAMES {
+                st.sleeping = true;
+            }
+            st.last_root_pos = root_pos;
+            st.last_gravity = (gravity_dir, gravity_scale);
         }
     }
 
