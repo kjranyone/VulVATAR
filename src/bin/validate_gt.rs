@@ -288,6 +288,25 @@ fn apply_world_delta(
     bone: HumanoidBone,
     delta_world: Quat,
 ) {
+    // VRChat-class rigs often merge the chest segments (Yumeka:
+    // Hips/Spine/Chest, no UpperChest) — without the fallback the twist
+    // ops silently vanished and those poses measured neutral.
+    let bone = match humanoid.get(&bone) {
+        Some(_) => bone,
+        None => {
+            let candidates: &[HumanoidBone] = match bone {
+                HumanoidBone::UpperChest => {
+                    &[HumanoidBone::Chest, HumanoidBone::Spine]
+                }
+                HumanoidBone::Chest => &[HumanoidBone::Spine],
+                _ => &[],
+            };
+            match candidates.iter().copied().find(|b| humanoid.contains_key(b)) {
+                Some(b) => b,
+                None => return,
+            }
+        }
+    };
     let Some(NodeId(idx)) = humanoid.get(&bone).copied() else {
         return;
     };
@@ -728,10 +747,20 @@ fn main() -> Result<(), String> {
     }
 
     let vrm = std::env::var("VULVATAR_VRM").unwrap_or_else(|_| VRM_PATH_DEFAULT.to_string());
-    eprintln!("loading VRM {vrm}…");
-    let asset = VrmAssetLoader::new()
-        .load(&vrm)
-        .map_err(|e| format!("load VRM: {e:?}"))?;
+    // VRM or FBX (the production avatar class is VRChat models such as
+    // Yumeka, which ship as FBX; the replay bench already loads them the
+    // same way). `VULVATAR_VRM=<path>.fbx` selects the FBX loader.
+    let asset = if vrm.to_ascii_lowercase().ends_with(".fbx") {
+        eprintln!("loading FBX {vrm}…");
+        vulvatar_lib::asset::fbx::FbxAssetLoader::new()
+            .load(&vrm)
+            .map_err(|e| format!("load FBX: {e:?}"))?
+    } else {
+        eprintln!("loading VRM {vrm}…");
+        VrmAssetLoader::new()
+            .load(&vrm)
+            .map_err(|e| format!("load VRM: {e:?}"))?
+    };
 
     eprintln!("loading pose provider…");
     let config = vulvatar_lib::tracking::provider::TrackingPipelineConfig::default();
