@@ -1564,17 +1564,24 @@ fn gpu_pin_targets(
 /// original inline probe.
 fn costume_bone_positions(avatar: &AvatarInstance) -> Vec<(String, [f32; 3])> {
     let gt = &avatar.pose.global_transforms;
-    avatar
-        .asset
-        .skeleton
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| {
-            let l = n.name.to_lowercase();
-            l == "skirt_root" || (l.starts_with("skirt_") && l.ends_with(".003")) || l == "tail.013"
+    // All spring-chain joints (root + joints), not just skirt/tail: the
+    // 2026-09-15 nipple-area flail report needs breast/hair chains in the
+    // live dump. Named by node so chains stay identifiable.
+    let mut seen = std::collections::HashSet::new();
+    let mut idxs: Vec<usize> = Vec::new();
+    for sb in &avatar.asset.spring_bones {
+        for &nid in std::iter::once(&sb.chain_root).chain(sb.joints.iter()) {
+            if seen.insert(nid.0) {
+                idxs.push(nid.0 as usize);
+            }
+        }
+    }
+    idxs.sort_unstable();
+    idxs.into_iter()
+        .filter_map(|i| {
+            let n = avatar.asset.skeleton.nodes.get(i)?;
+            gt.get(i).map(|m| (n.name.clone(), [m[3][0], m[3][1], m[3][2]]))
         })
-        .filter_map(|(i, n)| gt.get(i).map(|m| (n.name.clone(), [m[3][0], m[3][1], m[3][2]])))
         .collect()
 }
 
