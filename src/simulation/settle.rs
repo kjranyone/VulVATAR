@@ -116,7 +116,9 @@ mod tests {
         let (q, sleep) = settle_bump(q, 0.0);
         assert_eq!((q, sleep), (2, false));
         let mut q = q;
-        for _ in 2..SETTLE_SLEEP_QUIET_FRAMES {
+        // Two more quiet bumps land on QUIET_FRAMES − 1 without sleeping;
+        // the threshold itself is crossed by the bump after the loop.
+        for _ in 2..SETTLE_SLEEP_QUIET_FRAMES - 1 {
             let (nq, sleep) = settle_bump(q, 0.0);
             assert!(!sleep);
             q = nq;

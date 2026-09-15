@@ -124,6 +124,32 @@ impl Application {
             }
         }
 
+        // Display-rate pose interpolation. The estimator publishes at its
+        // compute-bound cadence (~20-30 Hz); replaying the newest sample
+        // as-is rendered the motion as a staircase — frozen for the full
+        // inter-sample interval, then a multi-millimetre jump when the
+        // next sample landed. Ingest the fresh sample, then hand the
+        // avatar loop a slerped rig instead. `last_tracking_pose` above
+        // keeps the raw sample: hold/fade, viewport overlay and status
+        // bar read diagnostics, which must stay raw.
+        let mut tracking_sample = tracking_sample;
+        if sample_is_fresh {
+            if let Some(s) = tracking_sample.as_mut() {
+                if let Some(rig) = s.rig.clone() {
+                    self.pose_timeline.ingest(&rig);
+                    if smoothing_params.pose_interp_enabled {
+                        s.rig = Some(Arc::new(self.pose_timeline.sample_at(
+                            crate::avatar::pose_timeline::PoseInterpParams {
+                                delay_frac: smoothing_params.pose_interp_delay_frac,
+                                ..Default::default()
+                            },
+                            std::time::Instant::now(),
+                        )));
+                    }
+                }
+            }
+        }
+
         // Global avatar fade-out when person detection is lost. Target is full
         // opacity while a person is present (fresh sample or within the hold
         // window) and zero once detection has been lost past the hold window;
@@ -2335,9 +2361,11 @@ mod cloth_collection_tests {
         blown.wind_response = 0.5;
         assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &blown, &transforms, &colliders), base);
 
-        // Capsule move.
+        // Capsule move: exactly 1 ULP — a +1e-9 literal would round back
+        // to 0.1f32 (ULP here is 8.9e-9) and the key would legitimately
+        // not change.
         let mut pushed = colliders.clone();
-        pushed[0].radius = 0.1 + 1e-9;
+        pushed[0].radius = f32::from_bits(0.1f32.to_bits() + 1);
         assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &transforms, &pushed), base);
 
         // Ctrl dt.

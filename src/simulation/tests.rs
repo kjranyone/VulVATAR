@@ -5,6 +5,7 @@ use crate::asset::{
     Transform,
 };
 use crate::avatar::{AvatarInstance, AvatarInstanceId};
+use crate::simulation::sdf::{SdfField, SdfGrid, SENTINEL};
 use std::sync::Arc;
 
 /// Regression test for Finding #6: a single frame must yield the same
