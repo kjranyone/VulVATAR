@@ -96,6 +96,21 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
                     .color(color::ON_SURFACE_VARIANT),
             );
             ui.add_space(4.0);
+            ui.checkbox(
+                &mut state.tracking.smoothing.pose_interp_enabled,
+                t!("tracking.pose_interp"),
+            )
+            .on_hover_text(t!("tracking.pose_interp_tooltip"));
+            if state.tracking.smoothing.pose_interp_enabled {
+                ui.add(
+                    egui::Slider::new(
+                        &mut state.tracking.smoothing.pose_interp_delay_frac,
+                        0.25..=1.0,
+                    )
+                    .text(t!("tracking.pose_interp_delay")),
+                )
+                .on_hover_text(t!("tracking.pose_interp_delay_tooltip"));
+            }
             ui.add(
                 egui::Slider::new(&mut state.tracking.smoothing.rotation_blend, 0.0..=1.0)
                     .text(t!("tracking.rotation_blend")),
@@ -125,6 +140,9 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
             .clicked()
             {
                 let defaults = crate::tracking::TrackingSmoothingParams::default();
+                state.tracking.smoothing.pose_interp_enabled = defaults.pose_interp_enabled;
+                state.tracking.smoothing.pose_interp_delay_frac =
+                    defaults.pose_interp_delay_frac;
                 state.tracking.smoothing.rotation_blend = defaults.rotation_blend;
                 state.tracking.smoothing.expression_blend = defaults.expression_blend;
                 state.tracking.smoothing.face_confidence_threshold =

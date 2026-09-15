@@ -197,6 +197,12 @@ pub struct Application {
 
     pub last_tracking_pose: Option<crate::tracking::SourceSkeleton>,
 
+    /// Display-rate rig interpolation buffer (see `avatar::pose_timeline`).
+    /// `run_frame` ingests every fresh tracking sample here and feeds the
+    /// avatar loop a slerped rig, so the estimator's ~20-30 Hz cadence
+    /// doesn't render as a staircase at display refresh rate.
+    pub pose_timeline: crate::avatar::pose_timeline::PoseTimeline,
+
     /// Smoothed global avatar opacity for the fade-out-when-no-person feature.
     /// Lerps toward 1.0 while a person is detected (or within the hold window)
     /// and toward 0.0 once detection has been lost past the hold window. Fed
@@ -450,6 +456,7 @@ impl Application {
             running: false,
             avatar_library: avatar_library::AvatarLibrary::new(),
             last_tracking_pose: None,
+            pose_timeline: crate::avatar::pose_timeline::PoseTimeline::default(),
             tracking_fade_opacity: 1.0,
             rendered_pixels: None,
             rendered_extent: [0, 0],

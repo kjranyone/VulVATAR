@@ -492,6 +492,23 @@ fn make_instance(asset: &Arc<AvatarAsset>, locals: Vec<Transform>) -> AvatarInst
     avatar.pose.local_transforms = locals;
     avatar.compute_global_pose();
     avatar.build_skinning_matrices();
+    // VULVATAR_GT_EXPR=Name=weight[,Name=weight…]: pre-set expression
+    // weights (e.g. VRChat outfit-fit shape keys like Shrink_Jacket) so
+    // bench renders can A/B a morph against the same pose. Applies to
+    // both the GT and the recovered-side avatar.
+    if let Ok(spec) = std::env::var("VULVATAR_GT_EXPR") {
+        for pair in spec.split(',') {
+            let Some((name, w)) = pair.rsplit_once('=') else {
+                continue;
+            };
+            let Ok(w) = w.parse::<f32>() else {
+                continue;
+            };
+            for ew in avatar.expression_weights.iter_mut().filter(|e| e.name == name) {
+                ew.weight = w.clamp(0.0, 1.0);
+            }
+        }
+    }
     avatar
 }
 

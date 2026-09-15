@@ -157,6 +157,8 @@ impl GuiApp {
             smoothing_rotation_blend: self.tracking.smoothing.rotation_blend,
             smoothing_expression_blend: self.tracking.smoothing.expression_blend,
             smoothing_face_confidence: self.tracking.smoothing.face_confidence_threshold,
+            smoothing_pose_interp_enabled: self.tracking.smoothing.pose_interp_enabled,
+            smoothing_pose_interp_delay_frac: self.tracking.smoothing.pose_interp_delay_frac,
 
             material_mode_index: self.rendering.material_mode_index,
             light_direction: self.rendering.main_light_dir,
@@ -316,6 +318,8 @@ impl GuiApp {
         self.tracking.smoothing.rotation_blend = state.smoothing_rotation_blend;
         self.tracking.smoothing.expression_blend = state.smoothing_expression_blend;
         self.tracking.smoothing.face_confidence_threshold = state.smoothing_face_confidence;
+        self.tracking.smoothing.pose_interp_enabled = state.smoothing_pose_interp_enabled;
+        self.tracking.smoothing.pose_interp_delay_frac = state.smoothing_pose_interp_delay_frac;
 
         self.rendering.material_mode_index = state.material_mode_index;
         self.rendering.main_light_dir = state.light_direction;

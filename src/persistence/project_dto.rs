@@ -79,6 +79,10 @@ pub struct TrackingConfig {
     pub smoothing_expression_blend: f32,
     #[serde(default)]
     pub smoothing_face_confidence: f32,
+    #[serde(default = "default_true")]
+    pub smoothing_pose_interp_enabled: bool,
+    #[serde(default = "default_pose_interp_delay_frac")]
+    pub smoothing_pose_interp_delay_frac: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -207,6 +211,10 @@ fn default_rotation_blend() -> f32 {
 
 fn default_expression_blend() -> f32 {
     0.8
+}
+
+fn default_pose_interp_delay_frac() -> f32 {
+    0.5
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

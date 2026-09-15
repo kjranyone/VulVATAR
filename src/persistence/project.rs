@@ -71,6 +71,8 @@ pub struct ProjectState {
     pub smoothing_rotation_blend: f32,
     pub smoothing_expression_blend: f32,
     pub smoothing_face_confidence: f32,
+    pub smoothing_pose_interp_enabled: bool,
+    pub smoothing_pose_interp_delay_frac: f32,
 
     // Rendering config
     pub material_mode_index: usize,
@@ -346,6 +348,8 @@ impl ProjectFile {
                 smoothing_rotation_blend: state.smoothing_rotation_blend,
                 smoothing_expression_blend: state.smoothing_expression_blend,
                 smoothing_face_confidence: state.smoothing_face_confidence,
+                smoothing_pose_interp_enabled: state.smoothing_pose_interp_enabled,
+                smoothing_pose_interp_delay_frac: state.smoothing_pose_interp_delay_frac,
             },
             rendering: RenderingConfig {
                 material_mode_index: state.material_mode_index,
@@ -438,6 +442,8 @@ impl ProjectFile {
             smoothing_rotation_blend: self.tracking.smoothing_rotation_blend,
             smoothing_expression_blend: self.tracking.smoothing_expression_blend,
             smoothing_face_confidence: self.tracking.smoothing_face_confidence,
+            smoothing_pose_interp_enabled: self.tracking.smoothing_pose_interp_enabled,
+            smoothing_pose_interp_delay_frac: self.tracking.smoothing_pose_interp_delay_frac,
 
             material_mode_index: self.rendering.material_mode_index,
             light_direction: self.rendering.light_direction,

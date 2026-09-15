@@ -54,6 +54,19 @@ pub struct TrackingSmoothingParams {
     /// Per-frame blend factor toward the new rotation. Maps directly to
     /// `RetargetParams::rotation_blend`.
     pub rotation_blend: f32,
+    /// Render-rate rig interpolation (staircase removal). The estimator
+    /// publishes at its compute-bound cadence (~20-30 Hz, solve-time
+    /// bound); with this on, `run_frame` slerps between the last two rig
+    /// samples every render frame (see `avatar::pose_timeline`) instead of
+    /// replaying the newest sample as-is. Off = the pre-interpolation
+    /// behaviour exactly.
+    pub pose_interp_enabled: bool,
+    /// Interpolation delay as a fraction of the latest inter-sample
+    /// interval. 0.5 renders half an interval behind the newest sample
+    /// and extrapolates (bounded) across the rest — low added latency;
+    /// 1.0 is pure interpolation with a full interval of latency and no
+    /// steady-state extrapolation.
+    pub pose_interp_delay_frac: f32,
     /// Per-frame blend factor toward new expression weights.
     pub expression_blend: f32,
     /// Minimum face-pose confidence for the head to react.
@@ -73,6 +86,8 @@ impl Default for TrackingSmoothingParams {
         // ARKit blendshapes chatter visibly.
         Self {
             rotation_blend: 1.0,
+            pose_interp_enabled: true,
+            pose_interp_delay_frac: 0.5,
             expression_blend: 0.8,
             face_confidence_threshold: 0.0,
             stale_timeout_nanos: 200_000_000,
