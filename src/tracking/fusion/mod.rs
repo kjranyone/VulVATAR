@@ -8,6 +8,8 @@
 
 pub mod canonical_face;
 pub mod coherence;
+#[cfg(feature = "inference")]
+mod detector_thread;
 pub mod estimator;
 #[cfg(feature = "inference")]
 pub mod hands;

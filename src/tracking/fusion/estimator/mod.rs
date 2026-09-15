@@ -52,6 +52,8 @@ pub struct Estimator {
     pred: State,
     /// Last solve diagnostics.
     pub diag: SolveDiag,
+    /// Last solve wall-time breakdown (reset per `update_with_seeds`).
+    pub timings: SolveTimings,
     /// Current GNC multiplier on the robust kernel scales.
     gnc: f64,
     /// Sparse-row scratch: dense accumulator + touched index list.
@@ -159,6 +161,28 @@ pub struct SolveDiag {
     pub cov_failures: u64,
 }
 
+/// Per-frame wall-time breakdown (ms) of one [`Estimator::update_with_seeds`].
+/// `acc_ms` / `eval_ms` / `lin_ms` accumulate across every LM loop of the
+/// frame (main + seed contests + re-accumulate), so together with the phase
+/// totals they localise where the solve spends its budget.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SolveTimings {
+    /// Residual + normal-equation accumulation passes.
+    pub acc_ms: f64,
+    /// Cost-only evaluation passes (the LM accept test).
+    pub eval_ms: f64,
+    /// Damped LDLᵀ linear solves.
+    pub lin_ms: f64,
+    /// The main LM loop (warm start from the prediction).
+    pub main_ms: f64,
+    /// Seed-contest LM loops.
+    pub seeds_ms: f64,
+    /// Winner re-accumulate + covariance restore.
+    pub reacc_ms: f64,
+    /// `finish()`: covariance inverse + σ propagation + bookkeeping.
+    pub finish_ms: f64,
+}
+
 impl Estimator {
     pub fn new(model: &Model, params: Params) -> Self {
         let n = model.num_params;
@@ -180,6 +204,7 @@ impl Estimator {
             jac: Vec::with_capacity(64),
             jac2: Vec::with_capacity(64),
             diag: SolveDiag::default(),
+            timings: SolveTimings::default(),
             gnc: 1.0,
             row_acc: vec![0.0; n],
             row_idx: Vec::with_capacity(128),
@@ -416,6 +441,7 @@ impl Estimator {
         seeds: &[&dyn Fn(&State) -> Option<State>],
     ) {
         let n = model.num_params;
+        self.timings = SolveTimings::default();
         let dt = match self.last_t {
             Some(lt) if obs.t > lt => (obs.t - lt).clamp(1e-3, 0.25),
             Some(_) => 1.0 / 30.0,
@@ -530,7 +556,9 @@ impl Estimator {
         }
         // ---- LM loop --------------------------------------------------------
         let start = self.state.clone();
+        let t_phase = std::time::Instant::now();
         let mut cost = self.lm_loop(model, obs, &prior_var, dt);
+        self.timings.main_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
         // Seed contest is judged WITHOUT the dense-surface cost: an analytic
         // arm seed is derived from the metric keypoint lifts, and letting the
         // surface term vote on its acceptance re-derives the association the
@@ -543,6 +571,7 @@ impl Estimator {
         let mut best_state = self.state.clone();
         let mut best_diag = self.diag;
         let mut best_gnc_final = true;
+        let t_seeds = std::time::Instant::now();
         for seed in seeds {
             let Some(cand) = seed(&start) else { continue };
             self.state = cand;
@@ -564,6 +593,8 @@ impl Estimator {
                 self.diag.seed_wins += 1;
             }
         }
+        self.timings.seeds_ms = t_seeds.elapsed().as_secs_f64() * 1000.0;
+        let t_reacc = std::time::Instant::now();
         if !best_gnc_final || !seeds.is_empty() {
             // Re-accumulate at the winner so H (covariance) matches it.
             self.state = best_state;
@@ -574,8 +605,11 @@ impl Estimator {
             self.diag.seed_wins = seed_wins;
             cost = self.accumulate(model, obs, &fk, &prior_var, dt, true);
         }
+        self.timings.reacc_ms = t_reacc.elapsed().as_secs_f64() * 1000.0;
         self.diag.cost_final = cost;
+        let t_finish = std::time::Instant::now();
         self.finish(model, &prev, dt, obs.t);
+        self.timings.finish_ms = t_finish.elapsed().as_secs_f64() * 1000.0;
         // ---- track health: a fit whose sparse residuals stay far off is a
         // lost track (association collapse); re-acquire next frame ---------------
         // Track health is determined by sparse body/face sites. Finger residuals
@@ -661,7 +695,9 @@ impl Estimator {
             self.params.gnc_tracked.max(1.0)
         };
         let mut fk = model.fk(&self.state);
+        let t_acc = std::time::Instant::now();
         let mut cost = self.accumulate(model, obs, &fk, prior_var, dt, true);
+        self.timings.acc_ms += t_acc.elapsed().as_secs_f64() * 1000.0;
         self.diag = SolveDiag {
             iters: 0,
             cost_initial: cost,
@@ -675,19 +711,23 @@ impl Estimator {
         for it in 0..self.params.max_iters {
             let mut solved = false;
             for _attempt in 0..6 {
+                let t_lin = std::time::Instant::now();
                 self.apply_locks();
-                if self
+                let solved_lin = self
                     .dense
                     .solve_damped(lambda, 1e-9, &mut self.delta)
-                    .is_none()
-                {
+                    .is_some();
+                self.timings.lin_ms += t_lin.elapsed().as_secs_f64() * 1000.0;
+                if !solved_lin {
                     lambda *= 10.0;
                     continue;
                 }
                 let mut trial = self.state.clone();
                 trial.apply_delta(model, &self.delta);
                 let fk_trial = model.fk(&trial);
+                let t_eval = std::time::Instant::now();
                 let cost_trial = self.eval_cost(model, obs, &fk_trial, &trial, prior_var, dt);
+                self.timings.eval_ms += t_eval.elapsed().as_secs_f64() * 1000.0;
                 if cost_trial.is_finite() && cost_trial <= cost {
                     self.state = trial;
                     fk = fk_trial;
@@ -698,7 +738,10 @@ impl Estimator {
                     self.diag.iters = it + 1;
                     if improvement < 1e-4 && self.gnc <= 1.0 {
                         // converged
-                        return self.accumulate(model, obs, &fk, prior_var, dt, true);
+                        let t_acc = std::time::Instant::now();
+                        let c = self.accumulate(model, obs, &fk, prior_var, dt, true);
+                        self.timings.acc_ms += t_acc.elapsed().as_secs_f64() * 1000.0;
+                        return c;
                     }
                     break;
                 } else {
@@ -711,11 +754,16 @@ impl Estimator {
             // Anneal the cloud kernel; the cost is re-evaluated under the new
             // scale so the acceptance test stays consistent.
             self.gnc = (self.gnc * self.params.gnc_decay).max(1.0);
+            let t_acc = std::time::Instant::now();
             cost = self.accumulate(model, obs, &fk, prior_var, dt, true);
+            self.timings.acc_ms += t_acc.elapsed().as_secs_f64() * 1000.0;
         }
         let _ = cost;
         self.gnc = 1.0;
-        self.accumulate(model, obs, &fk, prior_var, dt, true)
+        let t_acc = std::time::Instant::now();
+        let c = self.accumulate(model, obs, &fk, prior_var, dt, true);
+        self.timings.acc_ms += t_acc.elapsed().as_secs_f64() * 1000.0;
+        c
     }
 
     /// Posterior bookkeeping after the LM loop: covariance from the final

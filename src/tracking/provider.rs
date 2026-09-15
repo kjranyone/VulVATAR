@@ -86,6 +86,25 @@ pub trait PoseProvider {
     /// (`build_metric_frame_from_d435`) needs the `realsense` feature.
     #[cfg(feature = "inference")]
     fn set_external_depth(&mut self, _depth: crate::tracking::metric_frame::MetricDepthFrame) {}
+
+    /// Live-tracking entry point that tolerates a pipelined provider:
+    /// submit THIS frame's detector work and return the freshest finished
+    /// result, or `None` when the detector has nothing new yet — the
+    /// worker then skips publishing for that capture and the camera paces
+    /// the retry. The returned estimate may describe an EARLIER frame
+    /// than `frame_index` (the published pose carries its own
+    /// `capture_timestamp_ms` — consumers must not overwrite it with the
+    /// capture's time). The default delegates to [`Self::estimate_pose`],
+    /// which never skips.
+    fn estimate_pose_latest(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        frame_index: u64,
+    ) -> Option<PoseEstimate> {
+        Some(self.estimate_pose(rgb_data, width, height, frame_index))
+    }
 }
 
 /// Build the production pose provider: RTMW3D, shaped by the user's
@@ -98,6 +117,34 @@ pub fn create_pose_provider(
     #[cfg(feature = "inference")]
     {
         super::fusion::provider::FusionProvider::from_models_dir_with_config(models_dir, config)
+            .map(|p| Box::new(p) as Box<dyn PoseProvider>)
+    }
+    #[cfg(not(feature = "inference"))]
+    {
+        let _ = (models_dir, config);
+        Err("pose provider requires the `inference` cargo feature".to_string())
+    }
+}
+
+/// Live-tracking variant of [`create_pose_provider`]: runs the detector
+/// stage (RTMW3D + FaceMesh) on its own thread so it overlaps the solver
+/// stage — live tracking is camera-paced, and the two stages together
+/// (~48 ms) exceed the 33 ms frame period while each alone does not.
+/// The pair with [`PoseProvider::estimate_pose_latest`].
+///
+/// Falls back to the synchronous provider in safe mode (`force_cpu`) or
+/// with `VULVATAR_NO_PIPELINE=1` (rollback switch). Offline harnesses
+/// keep using [`create_pose_provider`], whose behaviour is unchanged.
+pub fn create_pose_provider_live(
+    models_dir: impl AsRef<Path>,
+    config: TrackingPipelineConfig,
+) -> Result<Box<dyn PoseProvider>, String> {
+    if std::env::var_os("VULVATAR_NO_PIPELINE").is_some() {
+        return create_pose_provider(models_dir, config);
+    }
+    #[cfg(feature = "inference")]
+    {
+        super::fusion::provider::FusionProvider::from_models_dir_live(models_dir, config)
             .map(|p| Box::new(p) as Box<dyn PoseProvider>)
     }
     #[cfg(not(feature = "inference"))]

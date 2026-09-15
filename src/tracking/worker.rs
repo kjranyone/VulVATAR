@@ -432,7 +432,7 @@ impl TrackingWorker {
         let mut pose_provider = {
             let _gpu_exclusive =
                 crate::gpu_coordination::GpuExclusiveGuard::acquire("pose-provider-init");
-            match provider::create_pose_provider("models", pipeline) {
+            match provider::create_pose_provider_live("models", pipeline) {
                 Ok(mut provider) => {
                     let warnings = provider.take_load_warnings();
                     if !warnings.is_empty() {
@@ -539,15 +539,40 @@ impl TrackingWorker {
                         cached_metric.clone().unwrap()
                     };
                 provider.set_external_depth(metric);
-                provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
+                // Session recording pairs every pose with its own raw
+                // capture (provenance analysis depends on it) — run the
+                // synchronous protocol there, which consumes exactly this
+                // frame's detector result. Otherwise use the pipelined
+                // live entry point: may return None when the detector
+                // thread has no fresh result yet — skip this capture
+                // entirely (same shape as the pose-Hz throttle path); a
+                // returned pose may describe the PREVIOUS capture,
+                // carrying its own capture_timestamp_ms.
+                if session_record::active() {
+                    provider.estimate_pose(&rs_frame.rgb, width, height, frame_index)
+                } else {
+                    match provider.estimate_pose_latest(&rs_frame.rgb, width, height, frame_index)
+                    {
+                        Some(est) => est,
+                        None => {
+                            stagelog::mark(frame_index, "estimate_skipped");
+                            continue;
+                        }
+                    }
+                }
             } else {
                 pose_estimation::estimate_pose(&rs_frame.rgb, width, height, frame_index)
             };
             // Stamp the device capture time onto the published sample —
             // the solver's measurement filters derive their dt from
             // consecutive capture timestamps (render/wall clocks say
-            // nothing about when the subject actually moved).
-            estimate.skeleton.capture_timestamp_ms = Some(rs_frame.timestamp_ms);
+            // nothing about when the subject actually moved). The fusion
+            // provider already stamps the CONSUMED frame's device time
+            // (which in pipelined mode is the previous capture's), so
+            // only fill the gap for providers that don't know better.
+            if estimate.skeleton.capture_timestamp_ms.is_none() {
+                estimate.skeleton.capture_timestamp_ms = Some(rs_frame.timestamp_ms);
+            }
 
             // Live debug channel: publish camera + 2D keypoints + source
             // arm joints for an external overlay (no-op unless the debug

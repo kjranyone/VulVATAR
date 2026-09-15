@@ -40,6 +40,15 @@ D435 color 640×480 + aligned depth
 
 GUI/レンダースレッドとの接続は `app/render.rs` (`rig` 経路)。ONNX セッションは GPU 逐次実行 (Arc ドライバ TDR 対策)。
 
+### 2.1 検出ステージのパイプライン化 (ライブ)
+
+ライブ実行のみ、検出ステージ (YOLOX 待ち + crop/preprocess + RTMW3D DirectML 実行 + decode + FaceMesh、実測 ~29 ms) は `tracking-detect` スレッド (`fusion/detector_thread.rs`) に置かれ、ソルバ ステージ (可視性〜出力、~20 ms) と重叠する。直列実行では合計 ~48 ms > カメラ周期 33 ms のため publish レートが ~19 Hz に頭打ちだったが、分割後は `max(検出, ソルバ)` が周期となりカメラ 30 Hz が全文publish できる。
+
+- プロトコル: ワーカーは `estimate_pose_latest` で当該フレームのジョブを submit し、完了済みの最新結果を消費する (未完了なら `None` = そのフレームはスキップ、カメラがペーサ)。ジョブは latest-wins、結果セルも最新のみ。消費される結果は通常 1 フレーム前で、公開ポーズは自身の `capture_timestamp_ms` を持つ (ワーカーは上書きしない)。
+- 深度の対合: 消費結果のフレーム番号に対応する `MetricDepthFrame` を `depth_ring` で保持する。
+- 同期フォールバック: `estimate_pose` (ブロッキング) は自分のフレームの結果を正確に消費する。録画中 (`VULVATAR_RECORD`) はこれを強制し raw フレームとの対合を保つ。`validate_gt` / リプレイ / ベンチは従来通り Inline (同期) 構成で動作し、数値はパイプライン化前と同一 (`VULVATAR_NO_PIPELINE=1` でライブも Inline に戻せる)。
+- crop ヒントは submit 時点の推定器状態から計算されるため、Inline と同一の値がジョブに乗る。
+
 ---
 
 ## 3. 観測生成
@@ -183,6 +192,8 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_REPLAY_VISDUMP=1` | `kps.csv`: 133 関節 × 全フレームの SimCC 統計、p_vis、シルエット距離、crop、crop ヒント、各段階のスコア |
 | `diagnostics/visibility/` | `analyze_vis.py` (較正・混同行列)、`bench_compare.py <runsA> <runsB>` (セッション別 + 合計、crop 遷移数、顔可視率)、`overlay_vis.py` (判定オーバーレイ)、`ablate.ps1` / `dense_ablate.ps1` / `dense_multi.ps1` / `dense_sweep.ps1` (アブレーション行列、密表面項の off/on 比較) |
 | `VULVATAR_FUSION_OBSDUMP=<frame>` | 観測とモデルの対応ダンプ。カプセル幾何 (`cap N ... allow=`) と各表面点の推定器側対応 (`est=<capsule>`, −1 = 棄却) を含む |
+| フェーズ別タイミング | `debug_state.json` の `rig.diag.phases` と `frames.csv` の `ph_*` 列 (hint / rtmw / vis / hands / head / dense / facefit / output + 推定器内訳 acc / eval / lin / main / seeds / reacc / finish、単位 ms)。`rig.diag.solve_ms` / `est_ms` は粗い全体値 |
+| `VULVATAR_NO_PIPELINE=1` | ライブの検出スレッド分割を無効化 (Inline 同期に戻す。§2.1) |
 | `validate_gt` | 合成 GT (既知ポーズをレンダ → 追跡 → 復元) |
 | ライブ debug チャネル | `CLAUDE.md` 参照 (`debug_state.json` / `debug_avatar.json` / `debug_depth.bin`) |
 

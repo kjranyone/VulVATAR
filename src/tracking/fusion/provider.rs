@@ -12,8 +12,9 @@ use crate::tracking::metric_frame::MetricDepthFrame;
 use crate::tracking::provider::{PoseProvider, TrackingPipelineConfig};
 use crate::tracking::rtmw3d::{Rtmw3dInference, Rtmw3dOptions};
 use crate::tracking::source_skeleton::CameraIntrinsics;
-use crate::tracking::PoseEstimate;
+use crate::tracking::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
 
+use super::detector_thread;
 use super::estimator::{Estimator, FrameObs, Intrinsics, Params};
 use super::math::*;
 use super::model::*;
@@ -21,8 +22,49 @@ use super::observe::*;
 use super::output;
 use super::visibility::{build_silhouette, window_median_z, SilhouetteParams, VisPolicy};
 
+/// Per-phase wall-time breakdown (ms) of one `estimate_pose` call, from
+/// `Instant` pairs around each section. `solve_ms` / `est_ms` are the
+/// coarse totals; these localise the rest. Estimator-internal fields are
+/// copies of [`super::estimator::SolveTimings`]. Exposed for the live
+/// debug channel and the replay harness — the tracking-v2 counterpart
+/// of the render pipeline's `PROFILE` log.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PhaseTimings {
+    /// Crop hint derivation from the predicted state.
+    pub hint_ms: f32,
+    /// RTMW3D detector pass: YOLOX wait + crop/preprocess + ONNX run +
+    /// decode + FaceMesh/blendshapes (the `yolox`…`face` stage-log span).
+    pub rtmw_ms: f32,
+    /// Keypoint visibility policy (SimCC p_vis + silhouette test).
+    pub vis_ms: f32,
+    /// Hand-block assignment + hand crops + per-arm burn-in prep.
+    pub hands_ms: f32,
+    /// Hand-crop observations + head orientation from FaceMesh.
+    pub head_ms: f32,
+    /// Dense surface sampling + observation σ prep.
+    pub dense_ms: f32,
+    /// Canonical face-shape learning from the posterior.
+    pub facefit_ms: f32,
+    /// Rig pose + source skeleton construction.
+    pub output_ms: f32,
+    /// Estimator: residual/normal-equation accumulation passes.
+    pub acc_ms: f32,
+    /// Estimator: cost-only evaluations (LM accept test).
+    pub eval_ms: f32,
+    /// Estimator: damped LDLᵀ solves.
+    pub lin_ms: f32,
+    /// Estimator: main LM loop total.
+    pub main_ms: f32,
+    /// Estimator: seed-contest LM loops total.
+    pub seeds_ms: f32,
+    /// Estimator: winner re-accumulate.
+    pub reacc_ms: f32,
+    /// Estimator: `finish()` (covariance inverse + σ propagation).
+    pub finish_ms: f32,
+}
+
 pub struct FusionProvider {
-    rtmw3d: Rtmw3dInference,
+    det: DetectorSlot,
     hands: Option<super::hands::HandLandmarker>,
     /// Last hand-crop results `[left, right]` (diagnostics).
     pub last_hands: [Option<super::hands::HandResult>; 2],
@@ -71,6 +113,8 @@ pub struct FusionProvider {
     pub last_solve_ms: f32,
     /// Estimator-only time (ms) of the last frame (excludes inference).
     pub last_est_ms: f32,
+    /// Per-phase wall-time breakdown (ms) of the last `estimate_pose`.
+    pub last_timings: PhaseTimings,
     /// Diagnostics: sparse surface points.
     pub last_surface: Vec<[f32; 3]>,
     /// Diagnostics: metric joint observations `(joint index, point, σ)`.
@@ -115,6 +159,35 @@ pub struct FusionProvider {
     /// prediction changes — and its σ grows with time since the last real
     /// detection, so a re-acquired 2-D/3-D keypoint always outweighs it.
     wrist_hold: [WristHold; 2],
+    /// In Remote (pipelined) mode, metric depths waiting for their
+    /// detector result: the result consumed at call N is usually frame
+    /// N−1's, so each frame's depth — handed in via `set_external_depth`
+    /// before its `estimate_pose` call — is buffered under its capture
+    /// index until the matching result is consumed. Cleared on temporal
+    /// resets. (MetricDepthFrame is a few hundred KB; the ring stays at
+    /// one or two entries in steady state.)
+    depth_ring: Vec<(u64, MetricDepthFrame)>,
+    /// Highest consumed detector frame index (Remote mode). `None` until
+    /// the first consume so frame 0 passes the freshness test.
+    last_consumed: Option<u64>,
+    /// Logged once when the detector thread is found dead.
+    det_dead_logged: bool,
+}
+
+/// Where the RTMW3D detector pass runs.
+enum DetectorSlot {
+    /// Inline inside `estimate_pose` — offline harnesses (replay /
+    /// bench / validate_gt), safe mode, active session recording, and
+    /// `VULVATAR_NO_PIPELINE=1`. Bit-identical to the pre-pipelining
+    /// behaviour.
+    Inline(Rtmw3dInference),
+    /// The detector runs on the `tracking-detect` thread
+    /// ([`detector_thread::DetectorClient`]) so it overlaps the solver
+    /// stage; `estimate_pose_latest` is the live entry point.
+    Remote {
+        client: detector_thread::DetectorClient,
+        backend_label: String,
+    },
 }
 
 /// State carried between frames for one wrist's depth-confirmed hold.
@@ -178,20 +251,69 @@ fn elbow_chain_sigma_cap(
 }
 
 impl FusionProvider {
+    /// Synchronous constructor: the detector pass runs inline inside
+    /// `estimate_pose` (offline harnesses and the degraded paths).
     pub fn from_models_dir_with_config(
         models_dir: impl AsRef<Path>,
         config: TrackingPipelineConfig,
     ) -> Result<Self, String> {
+        Self::construct(models_dir, config, false)
+    }
+
+    /// Live-tracking constructor: runs the detector stage on the
+    /// `tracking-detect` thread so it overlaps the solver
+    /// ([`PoseProvider::estimate_pose_latest`] is the matching entry
+    /// point). Safe mode keeps everything inline and CPU-bound — the
+    /// pipelining is a throughput optimisation, not a safety property.
+    pub fn from_models_dir_live(
+        models_dir: impl AsRef<Path>,
+        config: TrackingPipelineConfig,
+    ) -> Result<Self, String> {
+        Self::construct(models_dir, config, !config.force_cpu)
+    }
+
+    fn construct(
+        models_dir: impl AsRef<Path>,
+        config: TrackingPipelineConfig,
+        remote: bool,
+    ) -> Result<Self, String> {
         let dir = models_dir.as_ref();
-        let mut rtmw3d = Rtmw3dInference::from_models_dir_with_options(
-            dir,
-            Rtmw3dOptions {
-                face_ep: crate::tracking::face_mediapipe::FaceMeshEp::Auto,
-                force_cpu: config.force_cpu,
-                yolox_enabled: config.yolox_enabled,
-            },
-        )?;
-        let mut warnings = rtmw3d.take_load_warnings();
+        let opts = Rtmw3dOptions {
+            face_ep: crate::tracking::face_mediapipe::FaceMeshEp::Auto,
+            force_cpu: config.force_cpu,
+            yolox_enabled: config.yolox_enabled,
+        };
+        let (det, backend_label, mut warnings) = if remote {
+            // The detector thread builds its ONNX sessions while this
+            // constructor blocks on `ready` — under the caller's
+            // GPU-exclusive guard.
+            let (client, ready_rx) = detector_thread::DetectorClient::spawn(dir.to_path_buf(), opts);
+            match ready_rx.recv() {
+                Ok(Ok(ready)) => {
+                    let warnings = ready.warnings;
+                    let label = ready.backend_label;
+                    (
+                        DetectorSlot::Remote {
+                            client,
+                            backend_label: label.clone(),
+                        },
+                        label,
+                        warnings,
+                    )
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("detector thread died during model load".to_string()),
+            }
+        } else {
+            let mut rtmw3d = Rtmw3dInference::from_models_dir_with_options(dir, opts)?;
+            let label = rtmw3d.backend().label();
+            let warnings = rtmw3d.take_load_warnings();
+            (
+                DetectorSlot::Inline(rtmw3d),
+                label,
+                warnings,
+            )
+        };
         let hands = match super::hands::HandLandmarker::try_from_models_dir(dir) {
             Ok(h) => {
                 if h.is_none() {
@@ -205,15 +327,16 @@ impl FusionProvider {
             }
         };
         info!(
-            "Fusion provider ready (RTMW3D {})",
-            rtmw3d.backend().label()
+            "Fusion provider ready (RTMW3D {}{})",
+            backend_label,
+            if remote { ", pipelined" } else { "" }
         );
         let h = Humanoid::new();
         let params = Params::default();
         let est = Estimator::new(&h.model, params);
         let body_map = BodyMap::new(&h);
         Ok(Self {
-            rtmw3d,
+            det,
             hands,
             last_hands: [None, None],
             prev_hands: [None, None],
@@ -244,6 +367,7 @@ impl FusionProvider {
             hand_kp_start: 0,
             last_solve_ms: 0.0,
             last_est_ms: 0.0,
+            last_timings: PhaseTimings::default(),
             last_surface: Vec::new(),
             last_kp3d: Vec::new(),
             last_raw_joints: Vec::new(),
@@ -258,6 +382,9 @@ impl FusionProvider {
             last_sil: None,
             last_dense_n: 0,
             wrist_hold: Default::default(),
+            depth_ring: Vec::new(),
+            last_consumed: None,
+            det_dead_logged: false,
         })
     }
 
@@ -376,7 +503,11 @@ impl FusionProvider {
 
 impl PoseProvider for FusionProvider {
     fn label(&self) -> String {
-        format!("Fusion v2 / RTMW3D {}", self.rtmw3d.backend().label())
+        let backend = match &self.det {
+            DetectorSlot::Inline(rtmw3d) => rtmw3d.backend().label(),
+            DetectorSlot::Remote { backend_label, .. } => backend_label.clone(),
+        };
+        format!("Fusion v2 / RTMW3D {backend}")
     }
 
     fn take_load_warnings(&mut self) -> Vec<String> {
@@ -384,7 +515,18 @@ impl PoseProvider for FusionProvider {
     }
 
     fn reset_temporal_state(&mut self) {
-        self.rtmw3d.reset_temporal_state();
+        match &mut self.det {
+            DetectorSlot::Inline(rtmw3d) => rtmw3d.reset_temporal_state(),
+            DetectorSlot::Remote { client, .. } => {
+                // In-order on the detector thread: the reset is applied
+                // before any job submitted after it; buffered depths
+                // belong to discarded frames.
+                client.reset_temporal_state();
+                self.depth_ring.clear();
+                self.last_consumed = None;
+                self.det_dead_logged = false;
+            }
+        }
         self.est.reset(&self.h.model);
         self.prev_hands = [None, None];
         self.face_fit.reset();
@@ -408,17 +550,50 @@ impl PoseProvider for FusionProvider {
         height: u32,
         frame_index: u64,
     ) -> PoseEstimate {
-        let t0 = std::time::Instant::now();
-        let depth = self.external_depth.take();
-        let ts_ms = depth.as_ref().and_then(|d| d.timestamp_ms);
-        // Time base: device clock when available, else nominal 30 fps.
-        let t = match ts_ms {
-            Some(ms) => ms / 1000.0,
-            None => frame_index as f64 / 30.0,
-        };
-        self.rtmw3d.set_frame_timestamp_ms(ts_ms);
+        self.estimate_pose_inner(rgb_data, width, height, frame_index, false)
+            .expect("synchronous estimate always yields an estimate")
+    }
 
-        let intr_cam: Option<CameraIntrinsics> = depth.as_ref().and_then(|d| d.intrinsics);
+    fn estimate_pose_latest(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        frame_index: u64,
+    ) -> Option<PoseEstimate> {
+        self.estimate_pose_inner(rgb_data, width, height, frame_index, true)
+    }
+
+}
+
+impl FusionProvider {
+    /// One estimate pass. `latest` selects the pipelined live protocol:
+    /// submit THIS frame's detector job, consume the freshest finished
+    /// result, and return `None` when none is ready (the caller skips the
+    /// frame; the camera paces the retry). With `latest = false` the call
+    /// waits for exactly its own frame — the pre-pipelining behaviour.
+    ///
+    /// In Remote mode the frame whose solve runs here is the CONSUMED
+    /// result's frame (`det_frame_index`), not the capture that triggered
+    /// the call; everything downstream (observation build, output,
+    /// diagnostics) is keyed off the consumed frame.
+    fn estimate_pose_inner(
+        &mut self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        frame_index: u64,
+        latest: bool,
+    ) -> Option<PoseEstimate> {
+        let t0 = std::time::Instant::now();
+        let incoming_depth = self.external_depth.take();
+        // This frame's device time — what the detector job (and the crop
+        // hint derived from the predicted state) are keyed to.
+        let job_ts_ms = incoming_depth.as_ref().and_then(|d| d.timestamp_ms);
+        let job_t = job_ts_ms.map_or(frame_index as f64 / 30.0, |ms| ms / 1000.0);
+
+        let intr_cam: Option<CameraIntrinsics> =
+            incoming_depth.as_ref().and_then(|d| d.intrinsics);
         let intr = match intr_cam {
             Some(i) => Intrinsics {
                 fx: i.fx as f64,
@@ -437,18 +612,126 @@ impl PoseProvider for FusionProvider {
         // the subset of keypoints that happened to be sharp last frame.
         // Same principle as the hand crops: the crop is a function of the
         // state, so per-frame visibility cannot feed back into it.
+        let t_hint = std::time::Instant::now();
         let crop_hint = if std::env::var_os("VULVATAR_FUSION_NO_HINT").is_some() {
             None
         } else {
-            self.crop_hint_from_state(t, &intr, width, height)
+            self.crop_hint_from_state(job_t, &intr, width, height)
         };
         self.last_crop_hint = crop_hint.map(|b| (b.x1, b.y1, b.x2, b.y2));
-        self.rtmw3d.set_crop_hint(crop_hint);
+        let mut ph = PhaseTimings {
+            hint_ms: t_hint.elapsed().as_secs_f32() * 1000.0,
+            ..PhaseTimings::default()
+        };
 
-        let mut base = self
-            .rtmw3d
-            .estimate_pose(rgb_data, width, height, frame_index);
-        let mut aux = self.rtmw3d.take_aux();
+        // ---- detector stage ---------------------------------------------------
+        // (inline RTMW3D pass, or a job on the tracking-detect thread).
+        let remote = matches!(self.det, DetectorSlot::Remote { .. });
+        let mut det_depth: Option<MetricDepthFrame>;
+        if remote {
+            // Buffer this frame's metric depth until its result is
+            // consumed (usually on the NEXT call).
+            if let Some(d) = incoming_depth {
+                self.depth_ring.push((frame_index, d));
+            }
+            det_depth = None;
+        } else {
+            det_depth = incoming_depth;
+        }
+        let mut det_frame_index = frame_index;
+        let (mut base, mut aux) = 'det: {
+            match &mut self.det {
+                DetectorSlot::Inline(rtmw3d) => {
+                    rtmw3d.set_frame_timestamp_ms(job_ts_ms);
+                    rtmw3d.set_crop_hint(crop_hint);
+                    let t_rtmw = std::time::Instant::now();
+                    let base = rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
+                    let aux = rtmw3d.take_aux();
+                    ph.rtmw_ms = t_rtmw.elapsed().as_secs_f32() * 1000.0;
+                    break 'det (base, aux);
+                }
+                DetectorSlot::Remote { client, .. } => {
+                    client.submit(detector_thread::DetectorJob {
+                        frame_index,
+                        ts_ms: job_ts_ms,
+                        rgb: Arc::new(rgb_data.to_vec()),
+                        width,
+                        height,
+                        crop_hint,
+                    });
+                    let res = if latest {
+                        match client.take_latest(self.last_consumed) {
+                            Some(res) if res.frame_index != u64::MAX => res,
+                            // Nothing fresh, or a stray reset ack: skip.
+                            _ => return None,
+                        }
+                    } else if !client.alive() {
+                        if !self.det_dead_logged {
+                            self.det_dead_logged = true;
+                            log::error!("fusion: detector thread is gone; publishing rest pose");
+                        }
+                        break 'det (
+                            PoseEstimate {
+                                skeleton: SourceSkeleton::default(),
+                                annotation: DetectionAnnotation::default(),
+                            },
+                            None,
+                        );
+                    } else {
+                        match client.wait_for(frame_index) {
+                            Some(res) => res,
+                            None => {
+                                log::error!("fusion: detector thread lost frame {frame_index}");
+                                break 'det (
+                                    PoseEstimate {
+                                        skeleton: SourceSkeleton::default(),
+                                        annotation: DetectionAnnotation::default(),
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                    };
+                    det_frame_index = res.frame_index;
+                    // Pair the consumed result with its own capture's
+                    // depth; fall back to THIS call's depth (one frame
+                    // stale, visually identical scene) rather than
+                    // solving 2-D-only.
+                    let pos = self
+                        .depth_ring
+                        .iter()
+                        .position(|(i, _)| *i == det_frame_index);
+                    det_depth = match pos.map(|p| self.depth_ring.remove(p).1) {
+                        Some(d) => Some(d),
+                        None => {
+                            log::warn!(
+                                "fusion: no buffered depth for consumed frame {det_frame_index}"
+                            );
+                            // Pathological (the matching depth is pushed
+                            // before its job is submitted): fall back to
+                            // the freshest buffered depth rather than a
+                            // 2-D-only solve.
+                            self.depth_ring.last().map(|(_, d)| d.clone())
+                        }
+                    };
+                    self.depth_ring.retain(|(i, _)| *i > det_frame_index);
+                    self.last_consumed = Some(det_frame_index);
+                    break 'det (res.base, res.aux);
+                }
+            }
+        };
+        let depth = det_depth;
+        let ts_ms = if det_frame_index == u64::MAX {
+            None
+        } else {
+            depth.as_ref().and_then(|d| d.timestamp_ms)
+        };
+        // Time base of the SOLVED frame: device clock when available,
+        // else nominal 30 fps.
+        let t = match ts_ms {
+            Some(ms) => ms / 1000.0,
+            None => det_frame_index as f64 / 30.0,
+        };
 
         let mut obs = FrameObs {
             t,
@@ -475,6 +758,7 @@ impl PoseProvider for FusionProvider {
         // not on the person's surface is dropped whatever its peak looks
         // like. The calibrated probability REPLACES the detector score from
         // here on (every downstream consumer reads `score`).
+        let t_vis = std::time::Instant::now();
         self.last_vis.clear();
         self.last_silhouette = None;
         self.last_sil = None;
@@ -742,6 +1026,8 @@ impl PoseProvider for FusionProvider {
             || std::env::var_os("VULVATAR_FUSION_NO_VIS").is_some();
 
         // ---- hand-block L/R assignment --------------------------------------
+        ph.vis_ms = t_vis.elapsed().as_secs_f32() * 1000.0;
+        let t_hands = std::time::Instant::now();
         // The detector's left/right hand blocks can be transposed when the
         // hands cross or touch. Decide the assignment against the predicted
         // wrists (only when both wrists are currently tracked): keep the
@@ -1595,6 +1881,8 @@ impl PoseProvider for FusionProvider {
         }
 
         // ---- hand crop observations ---------------------------------------------
+        ph.hands_ms = t_hands.elapsed().as_secs_f32() * 1000.0;
+        let t_head = std::time::Instant::now();
         self.hand_kp_start = obs.kp2d.len();
         for hand in 0..2 {
             let Some(res) = self.last_hands[hand].as_ref() else {
@@ -1661,6 +1949,8 @@ impl PoseProvider for FusionProvider {
         }
 
         // ---- dense surface (primary metric observation) ----------------------
+        ph.head_ms = t_head.elapsed().as_secs_f32() * 1000.0;
+        let t_dense = std::time::Instant::now();
         // Every visible pixel of the person's silhouette is a measured point
         // on the body surface. Fitted against the capsule surfaces it fixes
         // root depth and trunk orientation frame by frame; the sparse 2-D
@@ -1834,9 +2124,18 @@ impl PoseProvider for FusionProvider {
         }
 
         // ---- solve (with analytic arm re-seeds from metric joints) ------------
+        ph.dense_ms = t_dense.elapsed().as_secs_f32() * 1000.0;
         let t_est = std::time::Instant::now();
         super::seed::update_with_arm_seeds(&self.h, &mut self.est, &obs);
         self.last_est_ms = t_est.elapsed().as_secs_f32() * 1000.0;
+        let et = self.est.timings;
+        ph.acc_ms = et.acc_ms as f32;
+        ph.eval_ms = et.eval_ms as f32;
+        ph.lin_ms = et.lin_ms as f32;
+        ph.main_ms = et.main_ms as f32;
+        ph.seeds_ms = et.seeds_ms as f32;
+        ph.reacc_ms = et.reacc_ms as f32;
+        ph.finish_ms = et.finish_ms as f32;
 
         dump_obs_post_solve(
             &self.h,
@@ -1851,6 +2150,7 @@ impl PoseProvider for FusionProvider {
         self.frames += 1;
 
         // ---- learn face shapes from the posterior ------------------------------
+        let t_facefit = std::time::Instant::now();
         {
             let fk = self.h.model.fk(&self.est.state);
             let head_sigma = self.est.joint_sigma(&self.h.model, head_j);
@@ -1863,8 +2163,10 @@ impl PoseProvider for FusionProvider {
                 }
             }
         }
+        ph.facefit_ms = t_facefit.elapsed().as_secs_f32() * 1000.0;
 
         // ---- output ----------------------------------------------------------------
+        let t_output = std::time::Instant::now();
         let span_px = {
             let fk = self.h.model.fk(&self.est.state);
             match (
@@ -1890,8 +2192,11 @@ impl PoseProvider for FusionProvider {
         skeleton.capture_timestamp_ms = ts_ms;
         skeleton.rig = Some(Arc::new(rig));
         self.last_solve_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        ph.output_ms = t_output.elapsed().as_secs_f32() * 1000.0;
+        self.last_timings = ph;
         if crate::tracking::debug_channel::enabled() {
             let d = self.est.diag;
+            let t = &self.last_timings;
             crate::tracking::debug_channel::stash_rig_diag(serde_json::json!({
                 "solve_ms": self.last_solve_ms,
                 "est_ms": self.last_est_ms,
@@ -1907,13 +2212,21 @@ impl PoseProvider for FusionProvider {
                 "face68_learned": 0,
                 "mesh_learned": self.face_fit.n,
                 "shape_frozen": self.est.shape_frozen,
+                "phases": {
+                    "hint": t.hint_ms, "rtmw": t.rtmw_ms, "vis": t.vis_ms,
+                    "hands": t.hands_ms, "head": t.head_ms, "dense": t.dense_ms,
+                    "facefit": t.facefit_ms, "output": t.output_ms,
+                    "acc": t.acc_ms, "eval": t.eval_ms, "lin": t.lin_ms,
+                    "main": t.main_ms, "seeds": t.seeds_ms,
+                    "reacc": t.reacc_ms, "finish": t.finish_ms,
+                },
             }));
         }
 
-        PoseEstimate {
+        Some(PoseEstimate {
             skeleton,
             annotation: base.annotation,
-        }
+        })
     }
 }
 
@@ -2028,5 +2341,71 @@ fn dump_obs_post_solve(
                 )))
         );
         eprintln!("  diag {:?}", est.diag);
+    }
+}
+
+#[cfg(all(test, feature = "inference"))]
+mod live_pipeline_tests {
+    use super::*;
+
+    /// Smoke test for the pipelined (Remote) detector path: thread spawn +
+    /// model load, the latest-result protocol (Some / None), the
+    /// synchronous protocol, the reset round trip, and clean shutdown.
+    /// `#[ignore]`d — it loads the full RTMW3D model (~370 MB, DirectML
+    /// init); run explicitly with
+    /// `cargo test --features realsense live_pipeline -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn remote_detector_pipeline_produces_estimates() {
+        let mut provider = FusionProvider::from_models_dir_live(
+            "models",
+            crate::tracking::provider::TrackingPipelineConfig::default(),
+        )
+        .expect("live provider construction");
+
+        // A protocol walk paced like the camera (~30 fps): the detector
+        // needs its ~30 ms budget per frame, and without pacing the loop
+        // every submission would supersede the previous job before it
+        // runs — that coalescing is by design.
+        let rgb = vec![90u8; 640 * 480 * 3];
+        let mut got = 0;
+        let mut skipped = 0;
+        for i in 0..24u64 {
+            std::thread::sleep(std::time::Duration::from_millis(33));
+            match provider.estimate_pose_latest(&rgb, 640, 480, i) {
+                Some(est) => {
+                    got += 1;
+                    let _ = est.skeleton.capture_timestamp_ms;
+                }
+                None => skipped += 1,
+            }
+            if got >= 3 {
+                break;
+            }
+        }
+        assert!(got >= 3, "pipelined path produced only {got} estimates ({skipped} skips)");
+
+        // Synchronous protocol must consume exactly its own frame.
+        let est = provider.estimate_pose(&rgb, 640, 480, 900);
+        let _ = est;
+
+        // Reset round trip must not deadlock (ack via the result cell).
+        provider.reset_temporal_state();
+
+        // Post-reset the pipeline still produces estimates.
+        let mut got_after = 0;
+        for i in 1_000..1_024u64 {
+            std::thread::sleep(std::time::Duration::from_millis(33));
+            if provider.estimate_pose_latest(&rgb, 640, 480, i).is_some() {
+                got_after += 1;
+            }
+            if got_after >= 2 {
+                break;
+            }
+        }
+        assert!(got_after >= 2, "pipeline dead after reset");
+
+        // Drop joins the detector thread; if it deadlocked this hangs.
+        drop(provider);
     }
 }

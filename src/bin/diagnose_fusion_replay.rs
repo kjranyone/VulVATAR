@@ -366,7 +366,7 @@ fn main() -> Result<(), String> {
     let mut vis_header_done = false;
 
     let mut csv = String::new();
-    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,shear,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,cost_whold,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
+    csv.push_str("idx,t,solve_ms,est_ms,cost0,cost1,iters,n2d,n3d,ncloud,quality,root_x,root_y,root_z,root_sig,torso_yaw,torso_pitch,torso_roll,head_yaw,head_pitch,head_roll,Lw_x,Lw_y,Lw_z,Rw_x,Rw_y,Rw_z,sig_spine,sig_neck,sig_head,sig_Lsh,sig_Lel,sig_Lwr,sig_Rsh,sig_Rel,sig_Rwr,scale,face68,mesh,ph_hint,ph_rtmw,ph_vis,ph_hands,ph_head,ph_dense,ph_facefit,ph_output,ph_acc,ph_eval,ph_lin,ph_main,ph_seeds,ph_reacc,ph_finish,len0,len1,len2,len3,len4,len5,len6,len7,rad0,rad1,rad2,shear,cost_2d,cost_3d,cost_cloud,cost_prior,cost_temporal,cost_whold,med2d_px,mean3d_m,meancloud_m,dsig_Lhip,dsig_Lknee,dsig_Lankle,dsig_Rhip,dsig_Rknee,dsig_Rankle,Lk_x,Lk_y,Lk_z,Rk_x,Rk_y,Rk_z,La_x,La_y,La_z,Ra_x,Ra_y,Ra_z\n");
 
     let mut torso_yaws = Vec::new();
     let mut torso_pitches = Vec::new();
@@ -377,6 +377,13 @@ fn main() -> Result<(), String> {
     let mut head_pitches = Vec::new();
     let mut solve_ms = Vec::new();
     let mut est_ms = Vec::new();
+    // Per-frame phase timings (order = the `ph_*` frames.csv columns) for
+    // the summary's mean/median breakdown.
+    const PHASE_NAMES: [&str; 15] = [
+        "hint", "rtmw", "vis", "hands", "head", "dense", "facefit",
+        "output", "acc", "eval", "lin", "main", "seeds", "reacc", "finish",
+    ];
+    let mut phase_ms: Vec<[f32; 15]> = Vec::new();
     let mut hand_frames = [0usize; 2];
     let mut lw_prev: Option<V3> = None;
     let mut rw_prev: Option<V3> = None;
@@ -551,6 +558,17 @@ fn main() -> Result<(), String> {
             est.state.scale,
             0, provider.mesh_learned(),
         ));
+        {
+            // Phase timing columns (see `FusionProvider::last_timings`).
+            let t = provider.last_timings;
+            csv.pop();
+            csv.push_str(&format!(
+                ",{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}\n",
+                t.hint_ms, t.rtmw_ms, t.vis_ms, t.hands_ms, t.head_ms, t.dense_ms,
+                t.facefit_ms, t.output_ms, t.acc_ms, t.eval_ms, t.lin_ms,
+                t.main_ms, t.seeds_ms, t.reacc_ms, t.finish_ms,
+            ));
+        }
         {
             let l = &est.state.len;
             let r = &est.state.rad;
@@ -784,6 +802,14 @@ fn main() -> Result<(), String> {
         head_pitches.push(hp);
         solve_ms.push(provider.last_solve_ms as f64);
         est_ms.push(provider.last_est_ms as f64);
+        {
+            let t = provider.last_timings;
+            phase_ms.push([
+                t.hint_ms, t.rtmw_ms, t.vis_ms, t.hands_ms, t.head_ms, t.dense_ms,
+                t.facefit_ms, t.output_ms, t.acc_ms, t.eval_ms, t.lin_ms,
+                t.main_ms, t.seeds_ms, t.reacc_ms, t.finish_ms,
+            ]);
+        }
         for hand in 0..2 {
             if let Some(hr) = provider.last_hands[hand].as_ref() {
                 hand_frames[hand] += 1;
@@ -1311,6 +1337,33 @@ fn main() -> Result<(), String> {
     println!("=== fusion replay: {} frames ===", pairs.len());
     let (em, _, _, emax) = stats(&est_ms);
     println!("solve time     : mean {sm:.1} ms  max {smax:.1} ms (estimator only: mean {em:.1} ms max {emax:.1} ms)");
+    {
+        // Phase breakdown (mean / median ms per section). The `solve_ms`
+        // total is NOT the sum of the phases — it also carries provider
+        // entry work (intrinsics, depth handoff) and the gaps between the
+        // sections.
+        let mut cols: Vec<[f64; 15]> = vec![[0.0; 15]; phase_ms.len()];
+        for (r, row) in phase_ms.iter().enumerate() {
+            for (k, v) in row.iter().enumerate() {
+                cols[r][k] = *v as f64;
+            }
+        }
+        for (k, name) in PHASE_NAMES.iter().enumerate() {
+            let col: Vec<f64> = cols.iter().map(|r| r[k]).collect();
+            if col.is_empty() {
+                break;
+            }
+            let (mean, _, _, _) = stats(&col);
+            let mut sorted = col.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "  phase {:>7}: mean {:6.2} ms  med {:6.2} ms",
+                name,
+                mean,
+                sorted[sorted.len() / 2]
+            );
+        }
+    }
     println!("torso yaw (deg): mean {ym:+.1} std {ys:.1} range [{ymin:+.1}, {ymax:+.1}]");
     {
         // Back-lean / pelvis-swing readout: pitch is negative when the

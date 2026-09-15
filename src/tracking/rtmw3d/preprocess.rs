@@ -163,6 +163,25 @@ pub(super) fn preprocess(rgb: &[u8], src_w: u32, src_h: u32) -> Array4<f32> {
     let inv_std_g = 1.0 / STD_RGB[1];
     let inv_std_b = 1.0 / STD_RGB[2];
 
+    // Column invariants of the bilinear resample, hoisted out of the row
+    // loop: `scale_x` is constant, so every dst column has fixed source
+    // neighbours and weights. Per-pixel arithmetic (weight products, the
+    // channel sums and their order) is unchanged — the outputs stay
+    // bit-identical to the un-hoisted loop.
+    let mut col_w = Vec::with_capacity(dst_w * 4);
+    let mut col_ix = Vec::with_capacity(dst_w * 2);
+    for dx in 0..dst_w {
+        let fx = ((dx as f32) + 0.5) * scale_x - 0.5;
+        let x0f = fx.floor();
+        let wx1 = (fx - x0f).clamp(0.0, 1.0);
+        let wx0 = 1.0 - wx1;
+        let x0 = (x0f as i32).clamp(0, max_x as i32) as usize;
+        let x1 = ((x0f as i32) + 1).clamp(0, max_x as i32) as usize;
+        col_ix.push((x0, x1));
+        col_w.push((wx0, wx1));
+    }
+
+    let samples = tensor.as_slice_mut().unwrap();
     for dy in 0..dst_h {
         // OpenCV-style pixel-centre sampling: dst (dy + 0.5) maps to
         // src ((dy + 0.5) * scale_y - 0.5).
@@ -175,12 +194,8 @@ pub(super) fn preprocess(rgb: &[u8], src_w: u32, src_h: u32) -> Array4<f32> {
         let row0 = y0 * stride;
         let row1 = y1 * stride;
         for dx in 0..dst_w {
-            let fx = ((dx as f32) + 0.5) * scale_x - 0.5;
-            let x0f = fx.floor();
-            let wx1 = (fx - x0f).clamp(0.0, 1.0);
-            let wx0 = 1.0 - wx1;
-            let x0 = (x0f as i32).clamp(0, max_x as i32) as usize;
-            let x1 = ((x0f as i32) + 1).clamp(0, max_x as i32) as usize;
+            let (x0, x1) = col_ix[dx];
+            let (wx0, wx1) = col_w[dx];
             let i00 = row0 + x0 * 3;
             let i01 = row0 + x1 * 3;
             let i10 = row1 + x0 * 3;
@@ -201,9 +216,12 @@ pub(super) fn preprocess(rgb: &[u8], src_w: u32, src_h: u32) -> Array4<f32> {
                 + rgb[i01 + 2] as f32 * w01
                 + rgb[i10 + 2] as f32 * w10
                 + rgb[i11 + 2] as f32 * w11;
-            tensor[(0, 0, dy, dx)] = (r - MEAN_RGB[0]) * inv_std_r;
-            tensor[(0, 1, dy, dx)] = (g - MEAN_RGB[1]) * inv_std_g;
-            tensor[(0, 2, dy, dx)] = (b - MEAN_RGB[2]) * inv_std_b;
+            // Row-major NCHW: `Array4::zeros` is contiguous, so the flat
+            // write is `((c * dst_h) + dy) * dst_w + dx`.
+            let o = (dy * dst_w + dx) as usize;
+            samples[o] = (r - MEAN_RGB[0]) * inv_std_r;
+            samples[dst_h * dst_w + o] = (g - MEAN_RGB[1]) * inv_std_g;
+            samples[2 * dst_h * dst_w + o] = (b - MEAN_RGB[2]) * inv_std_b;
         }
     }
     tensor
@@ -222,6 +240,97 @@ mod tests {
             sx: 0.002,
             sy: 0.002,
             ..Default::default()
+        }
+    }
+
+    /// Reference copy of the pre-hoisting preprocess loop. The hoisted
+    /// version must be BIT-identical: same per-pixel weight products and
+    /// channel sums in the same order, only the per-column invariants
+    /// (source indices, x weights) lifted out of the row loop.
+    fn preprocess_reference(rgb: &[u8], src_w: u32, src_h: u32) -> Array4<f32> {
+        let dst_w = INPUT_W as usize;
+        let dst_h = INPUT_H as usize;
+        let mut tensor = Array4::<f32>::zeros((1, 3, dst_h, dst_w));
+        if src_w == 0 || src_h == 0 {
+            return tensor;
+        }
+        let src_w_us = src_w as usize;
+        let src_h_us = src_h as usize;
+        let max_x = src_w_us.saturating_sub(1);
+        let max_y = src_h_us.saturating_sub(1);
+        let scale_x = src_w as f32 / dst_w as f32;
+        let scale_y = src_h as f32 / dst_h as f32;
+        let stride = src_w_us * 3;
+        if rgb.len() < stride * src_h_us {
+            return tensor;
+        }
+        let inv_std_r = 1.0 / STD_RGB[0];
+        let inv_std_g = 1.0 / STD_RGB[1];
+        let inv_std_b = 1.0 / STD_RGB[2];
+        for dy in 0..dst_h {
+            let fy = ((dy as f32) + 0.5) * scale_y - 0.5;
+            let y0f = fy.floor();
+            let wy1 = (fy - y0f).clamp(0.0, 1.0);
+            let wy0 = 1.0 - wy1;
+            let y0 = (y0f as i32).clamp(0, max_y as i32) as usize;
+            let y1 = ((y0f as i32) + 1).clamp(0, max_y as i32) as usize;
+            let row0 = y0 * stride;
+            let row1 = y1 * stride;
+            for dx in 0..dst_w {
+                let fx = ((dx as f32) + 0.5) * scale_x - 0.5;
+                let x0f = fx.floor();
+                let wx1 = (fx - x0f).clamp(0.0, 1.0);
+                let wx0 = 1.0 - wx1;
+                let x0 = (x0f as i32).clamp(0, max_x as i32) as usize;
+                let x1 = ((x0f as i32) + 1).clamp(0, max_x as i32) as usize;
+                let i00 = row0 + x0 * 3;
+                let i01 = row0 + x1 * 3;
+                let i10 = row1 + x0 * 3;
+                let i11 = row1 + x1 * 3;
+                let w00 = wy0 * wx0;
+                let w01 = wy0 * wx1;
+                let w10 = wy1 * wx0;
+                let w11 = wy1 * wx1;
+                let r = rgb[i00] as f32 * w00
+                    + rgb[i01] as f32 * w01
+                    + rgb[i10] as f32 * w10
+                    + rgb[i11] as f32 * w11;
+                let g = rgb[i00 + 1] as f32 * w00
+                    + rgb[i01 + 1] as f32 * w01
+                    + rgb[i10 + 1] as f32 * w10
+                    + rgb[i11 + 1] as f32 * w11;
+                let b = rgb[i00 + 2] as f32 * w00
+                    + rgb[i01 + 2] as f32 * w01
+                    + rgb[i10 + 2] as f32 * w10
+                    + rgb[i11 + 2] as f32 * w11;
+                tensor[(0, 0, dy, dx)] = (r - MEAN_RGB[0]) * inv_std_r;
+                tensor[(0, 1, dy, dx)] = (g - MEAN_RGB[1]) * inv_std_g;
+                tensor[(0, 2, dy, dx)] = (b - MEAN_RGB[2]) * inv_std_b;
+            }
+        }
+        tensor
+    }
+
+    /// The hoisted resample must produce bit-identical tensors to the
+    /// un-hoisted loop, including the sub-pixel edge cases (1-px source,
+    /// extreme upscale, non-integer scale factors).
+    #[test]
+    fn preprocess_hoist_is_bit_identical() {
+        // Deterministic pseudo-random RGB covering the full byte range.
+        let mut seed = 0x12345678u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u8
+        };
+        for (w, h) in [(1u32, 1u32), (2, 3), (63, 47), (288, 384), (640, 480), (1920, 1080)] {
+            let rgb: Vec<u8> = (0..(w as usize * h as usize * 3)).map(|_| next()).collect();
+            let a = preprocess(&rgb, w, h);
+            let b = preprocess_reference(&rgb, w, h);
+            assert_eq!(
+                a.as_slice().unwrap(),
+                b.as_slice().unwrap(),
+                "preprocess mismatch at {w}x{h}"
+            );
         }
     }
 
