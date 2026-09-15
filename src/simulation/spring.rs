@@ -1,4 +1,5 @@
 use crate::avatar::AvatarInstance;
+use crate::asset::SpringBoneAsset;
 use crate::math_utils::{
     closest_point_on_segment, mat4_rotation_to_quat, mat4_translation, quat_conjugate,
     quat_from_vectors, quat_mul, quat_normalize, quat_rotate_vec3, vec3_add, vec3_cross, vec3_dot,
@@ -6,6 +7,7 @@ use crate::math_utils::{
 };
 use crate::simulation::cloth::ResolvedCollider;
 use crate::simulation::sdf::SdfField;
+use crate::simulation::settle::{settle_bump, SettleHasher};
 use crate::simulation::SceneGravity;
 
 /// User-facing spring-bone tuning, layered on top of the VRM asset's
@@ -208,18 +210,15 @@ fn resolve_capsule_collision(
     }
 }
 
-/// Settle-sleep threshold: joint motion per step below this counts as
-/// "quiet" (metres). 100 µm is invisible motion — a fraction of a pixel
-/// — but sits above the residual oscillation of a converged chain
-/// (measured ~10 µm post-settle offline; the tail's sustained swing is
-/// mm-scale and legitimately stays awake). The point is not "no motion"
-/// but "no motion the depth buffer can resolve differently than last
-/// frame": once asleep the vertex stream is bit-stable against surfaces
-/// ~1 mm away (idle z-fight, 2026-09-15).
-const SPRING_SLEEP_EPS: f32 = 1e-4;
-/// Consecutive quiet steps before a chain may sleep. With 1-2 substeps
-/// per frame this is a few frames (~0.1 s) after the last real motion.
-const SPRING_SLEEP_QUIET_FRAMES: u32 = 5;
+/// Sleeping chains re-sample the body distance field at their joints
+/// every frame and wake when any sample moves more than this (metres).
+/// Bit-identity is deliberately not required: the field is a GPU
+/// readback that legitimately carries sub-voxel noise (the garment
+/// layer splats live cloth), and reacting to sub-0.1 mm field noise
+/// would keep chains near garments awake forever. A real intrusion —
+/// a hand sweeping into back hair — moves the sampled distances by
+/// millimetres and wakes the chain immediately.
+const SPRING_SDF_WAKE_EPS: f32 = 1e-3;
 
 pub fn step_spring_bones(
     dt: f32,
@@ -277,31 +276,49 @@ pub fn step_spring_bones(
         let spring_asset = &avatar.asset.spring_bones[chain_idx];
 
         // Settle sleep (idle z-fight fix, 2026-09-15): a chain that has
-        // been quiet AND whose driving inputs are bit-identical to the
-        // last stepped frame is skipped. The root's world transform
-        // covers the entire upstream pose (any tracked or animated
-        // ancestor change moves it), so a sleeping chain wakes the
-        // first frame its driver moves — tracking behaviour is
-        // unchanged. Uses the FUNCTION-param gravity, before the
-        // per-chain shadow below.
+        // been quiet AND whose driving inputs are identical to the last
+        // stepped frame is skipped, freezing its vertex stream
+        // bit-stable. The key must cover everything that flows into the
+        // step besides the chain's own state:
+        // - the root's world transform = the entire upstream pose (any
+        //   tracked or animated ancestor change moves it),
+        // - the FUNCTION-param scene gravity — compared before the
+        //   per-chain shadow below, and stored as the same value so the
+        //   key compares like with like,
+        // - dt / user tuning / scene colliders (hashed),
+        // - the body-SDF distances at this chain's joints, within
+        //   `SPRING_SDF_WAKE_EPS` — covers body parts NOT upstream of
+        //   the chain root (a hand sweeping into back hair) and the
+        //   garment layer of the splat.
         let root_pos =
             mat4_translation(&avatar.pose.global_transforms[spring_asset.chain_root.0 as usize]);
+        let colliders_hash = hash_world_colliders(world_colliders);
         {
             let st = &avatar.secondary_motion.spring_states[chain_idx];
+            let sdf_stable =
+                sdf_samples_stable(body_sdf, spring_asset, &st.positions, &st.last_sdf_samples);
             if st.sleeping
                 && st.last_root_pos == root_pos
                 && st.last_gravity == (gravity_dir, gravity_scale)
+                && st.last_dt == dt
+                && st.last_tuning == *tuning
+                && st.last_colliders_hash == colliders_hash
+                && sdf_stable
             {
                 continue;
             }
         }
-        let pre_positions = avatar.secondary_motion.spring_states[chain_idx].positions.clone();
 
         let chain_stiffness = spring_asset.stiffness;
         let chain_drag = spring_asset.drag_force;
         // Authored per-chain direction, reoriented by the scene-gravity
         // delta above (identity when the global gravity is default-down).
-        let gravity_dir = quat_rotate_vec3(&gravity_delta, &spring_asset.gravity_dir);
+        // Deliberately NOT named `gravity_dir`: that name stays the
+        // function param, which is what the sleep key stores — the
+        // first version stored this per-chain value instead and the
+        // key never matched for chains whose authored direction is not
+        // straight down (they never slept).
+        let chain_gravity_dir = quat_rotate_vec3(&gravity_delta, &spring_asset.gravity_dir);
         let chain_gravity_power = spring_asset.gravity_power;
         let bone_radius = spring_asset.radius;
 
@@ -312,6 +329,11 @@ pub fn step_spring_bones(
         if joints.len() < 2 {
             continue;
         }
+
+        // Largest joint motion this step (pre-vs-post per joint,
+        // accumulated at the write site below) — the settle-sleep
+        // quiet metric.
+        let mut max_move = 0.0f32;
 
         // Carried frame for the joint loop. Iteration `j` solves the
         // segment (joints[j-1] → joints[j]): its anchor is the origin of
@@ -428,7 +450,7 @@ pub fn step_spring_bones(
                 &current,
                 &previous,
                 &rest_world_target,
-                &gravity_dir,
+                &chain_gravity_dir,
                 drag,
                 stiffness_factor,
                 gravity_step,
@@ -503,6 +525,11 @@ pub fn step_spring_bones(
                 .positions
                 .get_mut(j)
             {
+                // `current` is the pre-step value of this joint (with
+                // the uninitialized fallback applied), so the delta is
+                // exactly this step's total motion — integration plus
+                // collision correction.
+                max_move = max_move.max(vec3_length(&vec3_sub(&next, &current)));
                 *pos = next;
             }
             if let Some(prev) = avatar.secondary_motion.spring_states[chain_idx]
@@ -547,33 +574,103 @@ pub fn step_spring_bones(
             anchor = next;
         }
 
-        // Settle-sleep bookkeeping: the largest joint motion this step
-        // decides quiet-vs-active. Sub-resolution jitter (µm) counts as
-        // quiet — the point is not "no motion" but "no motion the
-        // depth buffer can resolve differently than last frame".
-        let mut max_move = 0.0f32;
+        // Settle-sleep bookkeeping. `sleeping` is RE-EVALUATED from the
+        // quiet streak, never latched: a chain woken by an input change
+        // stays awake until the induced motion decays below
+        // SETTLE_SLEEP_EPS again. The first version latched `true`
+        // forever, so a driver that stopped bit-stable mid-swing froze
+        // the chain in place instead of letting it settle
+        // (regression, 2026-09-15).
         {
             let st = &mut avatar.secondary_motion.spring_states[chain_idx];
-            for (j, pre) in pre_positions.iter().enumerate() {
-                if let Some(post) = st.positions.get(j) {
-                    max_move = max_move.max(vec3_length(&vec3_sub(post, pre)));
-                }
-            }
-            st.quiet_frames = if max_move < SPRING_SLEEP_EPS {
-                st.quiet_frames.saturating_add(1)
-            } else {
-                0
-            };
-            if st.quiet_frames >= SPRING_SLEEP_QUIET_FRAMES {
-                st.sleeping = true;
-            }
+            let (quiet_frames, sleeping) = settle_bump(st.quiet_frames, max_move);
+            st.quiet_frames = quiet_frames;
+            st.sleeping = sleeping;
             st.last_root_pos = root_pos;
             st.last_gravity = (gravity_dir, gravity_scale);
+            st.last_dt = dt;
+            st.last_tuning = *tuning;
+            st.last_colliders_hash = colliders_hash;
+            st.last_sdf_samples = sample_sdf(body_sdf, spring_asset, &st.positions);
         }
     }
 
     // Update collision cache contact count (informational).
     avatar.secondary_motion.collision_cache.contact_count = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Settle-sleep key helpers
+// ---------------------------------------------------------------------------
+
+/// Fingerprint the world colliders a chain step consumes. The list is
+/// tiny (scene colliders only — body collision is the SDF), so a full
+/// FNV over the shape parameters per step is negligible.
+fn hash_world_colliders(colliders: &[ResolvedCollider]) -> u64 {
+    let mut h = SettleHasher::new();
+    h.write_u32(colliders.len() as u32);
+    for c in colliders {
+        match c {
+            ResolvedCollider::Sphere { center, radius } => {
+                h.write_u32(0);
+                h.write_f32s(center);
+                h.write_f32(*radius);
+            }
+            ResolvedCollider::Capsule {
+                center,
+                radius,
+                half_height,
+                axis,
+            } => {
+                h.write_u32(1);
+                h.write_f32s(center);
+                h.write_f32(*radius);
+                h.write_f32(*half_height);
+                h.write_f32s(axis);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// Sample the body distance field at every solved joint — the stored
+/// fingerprint for the sleep key (tolerance `SPRING_SDF_WAKE_EPS`).
+/// Empty for chains that do not collide with the body or when no field
+/// exists yet: an empty fingerprint is only ever compared against
+/// another empty one, so chains without body collision cannot be woken
+/// by field changes they would not feel.
+fn sample_sdf(
+    body_sdf: Option<&SdfField>,
+    spring_asset: &SpringBoneAsset,
+    positions: &[Vec3],
+) -> Vec<f32> {
+    if !spring_asset.body_collision {
+        return Vec::new();
+    }
+    let Some(field) = body_sdf else {
+        return Vec::new();
+    };
+    positions.iter().map(|p| field.sample(*p)).collect()
+}
+
+/// Compare the stored fingerprint against the field sampled at the
+/// chain's (frozen) joint positions. Both sides derive from the same
+/// `body_collision` flag and field presence, so a length mismatch
+/// means the inputs changed → unstable.
+fn sdf_samples_stable(
+    body_sdf: Option<&SdfField>,
+    spring_asset: &SpringBoneAsset,
+    positions: &[Vec3],
+    stored: &[f32],
+) -> bool {
+    let fresh = sample_sdf(body_sdf, spring_asset, positions);
+    if fresh.len() != stored.len() {
+        return false;
+    }
+    fresh
+        .iter()
+        .zip(stored.iter())
+        .all(|(a, b)| (a - b).abs() <= SPRING_SDF_WAKE_EPS)
 }
 
 // ---------------------------------------------------------------------------

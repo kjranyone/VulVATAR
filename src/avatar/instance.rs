@@ -100,6 +100,15 @@ pub struct SpringChainState {
     pub sleeping: bool,
     pub last_root_pos: Vec3,
     pub last_gravity: ([f32; 3], f32),
+    /// Rest of the settle-sleep wake key (see `simulation/spring.rs`):
+    /// the remaining step inputs — fixed dt, user tuning, a fingerprint
+    /// of the scene colliders, and the body-SDF distances sampled at
+    /// this chain's joints. All must match the last stepped frame for a
+    /// sleeping chain to stay asleep.
+    pub last_dt: f32,
+    pub last_tuning: crate::simulation::spring::SpringTuning,
+    pub last_colliders_hash: u64,
+    pub last_sdf_samples: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +153,11 @@ pub struct ClothState {
     /// once per attach; flipping mid-garment remains untested and is
     /// not exposed in the UI.
     pub solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend,
+    /// Settle-sleep state (idle z-fight campaign, 2026-09-15): the GPU
+    /// dispatch is skipped when the sim has been quiet AND its inputs
+    /// are unchanged, so the persistent `cloth_pos_ssbo` stays
+    /// bit-stable. See `simulation/settle.rs`.
+    pub settle: crate::simulation::settle::ClothSettleSleep,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +223,10 @@ impl AvatarInstance {
                     sleeping: false,
                     last_root_pos: [f32::NAN; 3],
                     last_gravity: ([f32::NAN; 3], f32::NAN),
+                    last_dt: f32::NAN,
+                    last_tuning: Default::default(),
+                    last_colliders_hash: 0,
+                    last_sdf_samples: Vec::new(),
                 }
             })
             .collect();
@@ -269,6 +287,7 @@ impl AvatarInstance {
             target_vertex_count: 0,
             solver_backend:
                 crate::simulation::cloth_gpu_boundary::solver_backend_from_env(),
+            settle: Default::default(),
         });
     }
 
@@ -326,6 +345,7 @@ impl AvatarInstance {
             target_vertex_count: 0,
             solver_backend:
                 crate::simulation::cloth_gpu_boundary::solver_backend_from_env(),
+            settle: Default::default(),
         };
         let sim = ClothSimState::default();
         let n = sim.particle_count();

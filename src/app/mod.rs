@@ -568,10 +568,23 @@ impl Application {
                     state
                         .as_ref()
                         .map(|cs| {
+                            let s = &cs.settle;
                             serde_json::json!({
                                 "enabled": cs.enabled,
                                 "target_primitive": cs.target_primitive_id.map(|p| p.0),
                                 "solver_backend": backend,
+                                // Settle-sleep (idle z-fight campaign):
+                                // "ウエストがちらつく" の一次情報 —
+                                // sleeping が立っているのに視覚的に
+                                // 揺れているなら B 側 (render/z-fight)、
+                                // 常に awake なら last_max_delta がどれ
+                                // だけ残っているかで閾値の適否を判定する。
+                                "settle": {
+                                    "sleeping": s.sleeping,
+                                    "quiet_frames": s.quiet_frames,
+                                    "max_delta_mm": s.last_max_delta * 1000.0,
+                                    "suppressed_this_frame": s.suppress_dispatch,
+                                },
                             })
                         })
                         .unwrap_or(serde_json::Value::Null)
@@ -611,6 +624,7 @@ impl Application {
                             .cloth_overlays
                             .iter()
                             .map(|slot| {
+                                let s = &slot.state.settle;
                                 serde_json::json!({
                                     "enabled": slot.enabled,
                                     "source_path": slot
@@ -619,6 +633,12 @@ impl Application {
                                         .map(|p| p.display().to_string()),
                                     "target_primitive": slot.state.target_primitive_id.map(|p| p.0),
                                     "solver_backend": format!("{:?}", slot.state.solver_backend),
+                                    "settle": {
+                                        "sleeping": s.sleeping,
+                                        "quiet_frames": s.quiet_frames,
+                                        "max_delta_mm": s.last_max_delta * 1000.0,
+                                        "suppressed_this_frame": s.suppress_dispatch,
+                                    },
                                 })
                             })
                             .collect::<Vec<_>>(),

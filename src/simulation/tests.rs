@@ -748,3 +748,253 @@ fn natural_gravity_offset_modulates_sag() {
         "positive-authorised power must sag more than offset-cancelled: {plain:.4} vs {minus:.4}"
     );
 }
+
+// =========================================================================
+// Settle-sleep state machine (idle z-fight fix, 2026-09-15)
+// =========================================================================
+
+/// Two-joint chain that collides against the body distance field
+/// (`body_collision: true`, strand radius 2 cm) — the SDF wake-key
+/// tests need a chain the field can actually push.
+fn make_body_collision_spring_avatar() -> AvatarInstance {
+    let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
+    // Rebuild the spring asset with body collision enabled. The rest of
+    // the asset is shared with the standard two-joint builder.
+    let old = avatar.asset.spring_bones[0].clone();
+    let asset = std::sync::Arc::make_mut(&mut avatar.asset);
+    asset.spring_bones[0] = crate::asset::SpringBoneAsset {
+        body_collision: true,
+        radius: 0.02,
+        ..old
+    };
+    avatar
+}
+
+/// Distance field around the two-joint chain: the grid is tall enough
+/// to contain the drooped joints (samples outside the grid are
+/// SENTINEL everywhere, which would mask any planted surface), and
+/// `true` plants a zero-distance plane one cell BELOW z=0 — a joint
+/// resting near z=0 samples d≈0.01 with a clean +z gradient (a slab
+/// centred exactly on the joint is a symmetric pit: zero gradient, the
+/// ambiguous-minimum case `resolve` deliberately skips).
+fn make_test_sdf(surface: bool) -> crate::simulation::sdf::SdfField {
+    // Covers the WHOLE solved chain (the solved joint sits at x≈2.0,
+    // y≈-0.03) — samples outside the grid are SENTINEL everywhere, so
+    // a grid that misses the joints looks "unchanged" even with a
+    // surface planted. The zero plane sits one cell BELOW z=0: a joint
+    // near z=0 samples d≈0.01 with a clean +z gradient (a slab centred
+    // exactly on the joint is a symmetric pit — zero gradient, the
+    // ambiguous-minimum case `resolve` deliberately skips).
+    let grid = SdfGrid {
+        origin: [-0.05, -0.3, -0.08],
+        voxel: 0.01,
+        dims: [215, 48, 16],
+    };
+    let mut data = vec![SENTINEL; grid.cell_count()];
+    if surface {
+        for x in 5..210 {
+            for y in 8..44 {
+                data[grid.index(x, y, 6)] = 0.01;
+                data[grid.index(x, y, 7)] = 0.0;
+                data[grid.index(x, y, 8)] = 0.01;
+            }
+        }
+    }
+    SdfField::new(grid, std::sync::Arc::new(data))
+}
+fn spring_tip(avatar: &AvatarInstance) -> [f32; 3] {
+    *avatar.secondary_motion.spring_states[0]
+        .positions
+        .last()
+        .unwrap()
+}
+
+/// A settled chain must sleep and its output must be bit-stable — the
+/// whole point of the gate: the solver's residual per-step jitter is
+/// below every diagnostic's resolution yet flips depth ties.
+#[test]
+fn spring_settled_chain_sleeps_and_output_is_bit_stable() {
+    let mut world = PhysicsWorld::new();
+    let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
+    let tuning = spring::SpringTuning::default();
+    let gravity = SceneGravity::default();
+    for _ in 0..60 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    }
+    assert!(
+        avatar.secondary_motion.spring_states[0].sleeping,
+        "chain must sleep once settled"
+    );
+    let frozen = avatar.secondary_motion.spring_states[0].positions.clone();
+    for _ in 0..5 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    }
+    assert_eq!(
+        avatar.secondary_motion.spring_states[0].positions,
+        frozen,
+        "sleeping chain must reproduce its vertex stream bit-for-bit"
+    );
+}
+
+/// Regression (2026-09-15): the first version LATCHED `sleeping` true
+/// forever, so a driver that stopped bit-stable mid-swing froze the
+/// chain in place. `sleeping` must be re-evaluated from the quiet
+/// streak: the chain keeps stepping until the swing decays, then
+/// sleeps again.
+#[test]
+fn spring_sleep_resettles_after_driver_stops_instead_of_freezing() {
+    let mut world = PhysicsWorld::new();
+    let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
+    let tuning = spring::SpringTuning::default();
+    let gravity = SceneGravity::default();
+    for _ in 0..60 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    }
+    assert!(avatar.secondary_motion.spring_states[0].sleeping);
+
+    // Drive the chain root for several frames — inputs change every
+    // frame, so the chain stays awake and swings.
+    for k in 0..8 {
+        let off = if k % 2 == 0 { 0.08 } else { -0.08 };
+        avatar.pose.local_transforms[0].translation = [off, 0.0, 0.0];
+        avatar.compute_global_pose();
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    }
+    assert!(
+        !avatar.secondary_motion.spring_states[0].sleeping,
+        "a driven chain must be awake"
+    );
+
+    // Driver stops bit-stable (locals frozen, globals last computed):
+    // the chain must keep evolving while the swing decays, then
+    // re-sleep and freeze.
+    let mut moving_steps = 0;
+    let mut prev = avatar.secondary_motion.spring_states[0].positions.clone();
+    for _ in 0..120 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+        let cur = &avatar.secondary_motion.spring_states[0].positions;
+        let moved = cur.iter().zip(prev.iter()).any(|(a, b)| {
+            crate::math_utils::vec3_length(&crate::math_utils::vec3_sub(a, b)) > 1e-4
+        });
+        if moved {
+            moving_steps += 1;
+        }
+        prev = cur.clone();
+    }
+    assert!(
+        moving_steps >= 3,
+        "chain must keep settling after the driver stops (moved in \
+         {moving_steps} steps), not freeze mid-swing"
+    );
+    assert!(
+        avatar.secondary_motion.spring_states[0].sleeping,
+        "chain must re-sleep once the swing has decayed"
+    );
+    let frozen = avatar.secondary_motion.spring_states[0].positions.clone();
+    for _ in 0..5 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    }
+    assert_eq!(avatar.secondary_motion.spring_states[0].positions, frozen);
+}
+
+/// Regression: the first version STORED the per-chain reoriented
+/// gravity direction in the sleep key but COMPARED the function-param
+/// scene gravity — a chain whose authored `gravity_dir` is not straight
+/// down never matched and never slept.
+#[test]
+fn spring_sleep_key_matches_for_side_authored_gravity() {
+    let mut world = PhysicsWorld::new();
+    // Authored gravity +x (side-swept hair), scene gravity default down.
+    let mut avatar = make_two_joint_spring_avatar_with([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+    for _ in 0..80 {
+        world.step_springs(
+            1.0 / 60.0,
+            1,
+            &mut avatar,
+            &spring::SpringTuning::default(),
+            &SceneGravity::default(),
+            None,
+        );
+    }
+    assert!(
+        avatar.secondary_motion.spring_states[0].sleeping,
+        "side-gravity chain must sleep once quiet (the key must compare \
+         like with like)"
+    );
+}
+
+/// A sleeping chain must wake when the body distance field under its
+/// joints changes: the SDF is NOT upstream of the chain root (a hand
+/// sweeping into back hair moves no chest bone), so only the sampled
+/// distances can deliver the change.
+#[test]
+fn spring_sleep_wakes_when_body_sdf_intrudes() {
+    let mut world = PhysicsWorld::new();
+    let mut avatar = make_body_collision_spring_avatar();
+    let tuning = spring::SpringTuning::default();
+    let gravity = SceneGravity::default();
+    let far = make_test_sdf(false);
+    for _ in 0..60 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, Some(&far));
+    }
+    assert!(avatar.secondary_motion.spring_states[0].sleeping);
+    let frozen = avatar.secondary_motion.spring_states[0].positions.clone();
+
+    // A surface appears under the chain: the sleeping chain must wake
+    // and be pushed off the skin.
+    let near = make_test_sdf(true);
+    let mut woke = false;
+    for _ in 0..10 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, Some(&near));
+        if avatar.secondary_motion.spring_states[0].positions != frozen {
+            woke = true;
+        }
+    }
+    assert!(woke, "SDF intrusion must wake the chain and move joints");
+    assert!(!avatar.secondary_motion.spring_states[0].sleeping);
+
+    // Surface withdrawn: the chain re-settles to its free hang and
+    // re-sleeps. (Resting in sustained contact under full gravity moves
+    // ~g*dt^2 per step — legitimately awake, the same class as the
+    // offline tail's sustained swing.)
+    let mut reslept = false;
+    for _ in 0..240 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, Some(&far));
+        if avatar.secondary_motion.spring_states[0].sleeping {
+            reslept = true;
+            break;
+        }
+    }
+    assert!(reslept, "chain must re-sleep once the intrusion is gone");
+}
+
+/// A sleeping chain must wake when a scene collider appears — the
+/// collider list is fingerprinted, so a new/moved collider breaks the
+/// key even though every bone transform is unchanged.
+#[test]
+fn spring_sleep_wakes_when_scene_collider_appears() {
+    use crate::asset::{ColliderShape, SceneColliderAsset, SceneColliderId};
+    let mut world = PhysicsWorld::new();
+    let mut avatar = make_two_joint_spring_avatar_with_offset([1.0, 0.0, 0.0]);
+    let tuning = spring::SpringTuning::default();
+    let gravity = SceneGravity::default();
+    for _ in 0..60 {
+        world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    }
+    assert!(avatar.secondary_motion.spring_states[0].sleeping);
+    let frozen = spring_tip(&avatar);
+
+    // Sphere lands on the tip: centre [2,0,0], 6 cm radius vs the
+    // chain's 0 strand radius — well inside contact.
+    world.add_scene_collider(SceneColliderAsset {
+        id: SceneColliderId(1),
+        position: [2.0, 0.0, 0.0],
+        shape: ColliderShape::Sphere { radius: 0.06 },
+    });
+    world.step_springs(1.0 / 60.0, 1, &mut avatar, &tuning, &gravity, None);
+    assert!(
+        spring_tip(&avatar) != frozen,
+        "new scene collider must wake the chain and push the tip"
+    );
+    assert!(!avatar.secondary_motion.spring_states[0].sleeping);
+}

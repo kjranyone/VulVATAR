@@ -855,6 +855,7 @@ fn write_back_copies_positions_and_normals() {
         target_vertex_offset: 0,
         target_vertex_count: 0,
         solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+        settle: Default::default(),
     };
 
     write_back(&sim, &mut cloth_state);
@@ -892,6 +893,7 @@ fn write_back_increments_version() {
         target_vertex_offset: 0,
         target_vertex_count: 0,
         solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+        settle: Default::default(),
     };
 
     write_back(&sim, &mut cloth_state);
@@ -1395,5 +1397,136 @@ fn cloth_lod_disables_self_collision_at_low_ratio() {
     assert!(
         sim.self_collision,
         "self-collision should remain on at Half LoD"
+    );
+}
+// =========================================================================
+// Settle-sleep gate — CPU solver (idle z-fight campaign, 2026-09-15)
+// =========================================================================
+
+/// Avatar with a single CPU-backed cloth slot holding a constraint-free
+/// 4-particle sim at zero gravity — perfectly still once settled, so
+/// the quiet streak deterministically completes.
+fn make_sleep_test_avatar() -> crate::avatar::AvatarInstance {
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(0),
+        make_minimal_avatar_asset(),
+    );
+    avatar.attach_cloth(crate::asset::ClothOverlayId(0));
+    if let Some(cs) = avatar.cloth_state.as_mut() {
+        cs.solver_backend = crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu;
+    }
+    let mut sim = make_simple_sim(4);
+    // No gravity: the particles hold still, the quiet streak completes.
+    sim.gravity = [0.0, 0.0, 0.0];
+    avatar.cloth_sim = Some(sim);
+    avatar.cloth_enabled = true;
+    avatar
+}
+
+/// A settled CPU cloth must sleep and then reproduce its positions
+/// bit-for-bit — the CPU solver mirrors the spring gate and the GPU
+/// frozen-frame contract.
+#[test]
+fn cpu_cloth_settles_to_sleep_and_freezes_bitwise() {
+    let mut avatar = make_sleep_test_avatar();
+    for _ in 0..30 {
+        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    }
+    let cs = avatar.cloth_state.as_ref().unwrap();
+    assert!(
+        cs.settle.sleeping,
+        "still cloth must sleep (quiet={}, max_delta={})",
+        cs.settle.quiet_frames, cs.settle.last_max_delta
+    );
+    let frozen = cs.sim_positions.clone();
+    for _ in 0..10 {
+        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    }
+    let cs = avatar.cloth_state.as_ref().unwrap();
+    assert_eq!(
+        cs.sim_positions, frozen,
+        "sleeping CPU cloth must skip the substep entirely"
+    );
+}
+
+/// Any solver-relevant input change must wake a sleeping cloth. Two
+/// representatives of the two hash halves: a parameter change (gravity
+/// on the sim) and a collision change (a world collider appearing).
+#[test]
+fn cpu_cloth_wakes_when_inputs_change() {
+    // (a) parameter change: gravity turns on — the cloth must fall.
+    let mut avatar = make_sleep_test_avatar();
+    for _ in 0..30 {
+        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    }
+    assert!(avatar.cloth_state.as_ref().unwrap().settle.sleeping);
+    let frozen = avatar.cloth_state.as_ref().unwrap().sim_positions.clone();
+    avatar.cloth_sim.as_mut().unwrap().gravity = [0.0, -9.81, 0.0];
+    step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    let cs = avatar.cloth_state.as_ref().unwrap();
+    assert_ne!(
+        cs.sim_positions, frozen,
+        "gravity change must wake the cloth"
+    );
+    assert!(!cs.settle.sleeping);
+
+    // (b) collision change: a world collider appears on a resting cloth.
+    let mut avatar = make_sleep_test_avatar();
+    for _ in 0..30 {
+        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    }
+    assert!(avatar.cloth_state.as_ref().unwrap().settle.sleeping);
+    let frozen = avatar.cloth_state.as_ref().unwrap().sim_positions.clone();
+    let colliders = vec![ResolvedCollider::Sphere {
+        // 4 cm off the particle's exact centre — `collide` skips the
+        // degenerate dist==0 case.
+        center: [2.96, 0.0, 0.0],
+        radius: 0.05,
+    }];
+    step_cloth(1.0 / 60.0, &mut avatar, &colliders);
+    let cs = avatar.cloth_state.as_ref().unwrap();
+    assert_ne!(
+        cs.sim_positions, frozen,
+        "new scene collider must wake the cloth and push particles"
+    );
+    assert!(!cs.settle.sleeping);
+}
+
+/// Overlay slots must gate independently — one slot asleep while a
+/// sibling keeps moving.
+#[test]
+fn cpu_cloth_overlay_gates_independently() {
+    let mut avatar = crate::avatar::AvatarInstance::new(
+        crate::avatar::AvatarInstanceId(0),
+        make_minimal_avatar_asset(),
+    );
+    let a = avatar.attach_cloth_overlay(crate::asset::ClothOverlayId(1));
+    let b = avatar.attach_cloth_overlay(crate::asset::ClothOverlayId(2));
+    for (idx, moving) in [(a, false), (b, true)] {
+        let slot = &mut avatar.cloth_overlays[idx];
+        slot.state.solver_backend =
+            crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu;
+        let mut sim = make_simple_sim(4);
+        sim.gravity = if moving { [0.0, -9.81, 0.0] } else { [0.0; 3] };
+        slot.sim = sim;
+    }
+    avatar.cloth_enabled = true;
+    for _ in 0..30 {
+        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    }
+    assert!(avatar.cloth_overlays[a].state.settle.sleeping);
+    assert!(!avatar.cloth_overlays[b].state.settle.sleeping);
+    let frozen = avatar.cloth_overlays[a].state.sim_positions.clone();
+    let before_b = avatar.cloth_overlays[b].state.sim_positions.clone();
+    for _ in 0..5 {
+        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    }
+    assert_eq!(
+        avatar.cloth_overlays[a].state.sim_positions, frozen,
+        "sleeping overlay must stay frozen while its sibling moves"
+    );
+    assert_ne!(
+        avatar.cloth_overlays[b].state.sim_positions, before_b,
+        "moving overlay must keep stepping"
     );
 }

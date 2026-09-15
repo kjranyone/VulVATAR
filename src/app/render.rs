@@ -177,6 +177,11 @@ impl Application {
         // frame instead of being inferred from frame pacing.
         self.last_sim_substeps = substeps;
 
+        // Scene colliders are constant for the whole frame; resolve once
+        // for the cloth settle-sleep gate and the snapshot collector
+        // instead of once per use site.
+        let scene_colliders = self.physics.resolved_scene_colliders();
+
         for (avatar_idx, avatar) in self.avatars.iter_mut().enumerate() {
             // Costume-health probe payload (R5): captured PRE-physics
             // inside the `avatar_idx == 0` block below, completed with
@@ -386,6 +391,21 @@ impl Application {
 
             avatar.build_skinning_matrices();
 
+            // Settle-sleep gate for cloth (idle z-fight campaign,
+            // 2026-09-15): fingerprint every solver input for each
+            // GPU-backed cloth slot and, when the sim has gone quiet
+            // (quiet streak fed from the position readback), suppress
+            // this frame's dispatch — the snapshot's `substeps` is
+            // forced to 0 and the renderer's frozen-frame contract
+            // keeps `cloth_pos_ssbo` bit-stable. Must run before
+            // `build_frame_input_multi` consumes `suppress_dispatch`.
+            update_cloth_settle_gate(
+                avatar,
+                fixed_dt,
+                step_options.cloth_enabled,
+                &scene_colliders,
+            );
+
             // Costume-health probe, POST-physics stage (R5): the same
             // cloth-target primitives re-probed against the post-solver
             // skinning matrices, then one dump carrying both stages.
@@ -534,7 +554,7 @@ impl Application {
                 frame_dt,
                 fixed_dt,
                 substeps as u32,
-                &self.physics.resolved_scene_colliders(),
+                &scene_colliders,
                 &sdf_splat_changed,
                 &self.sdf_garment_prims,
             );
@@ -726,6 +746,12 @@ impl Application {
         for avatar in self.avatars.iter_mut() {
             for entry in entries {
                 let apply = |cs: &mut crate::avatar::instance::ClothState| {
+                    // Settle-sleep accounting first: this row is the
+                    // delta baseline for the quiet streak. Runs even on
+                    // suppressed (frozen) slots — identical bytes hold
+                    // the streak; real motion breaks it and the gate
+                    // stops suppressing on the next frame.
+                    fold_cloth_readback_settle(cs, &entry.positions);
                     cs.sim_positions = entry.positions.clone();
                     cs.prev_sim_positions = entry.positions.clone();
                     if let Some(n) = entry.normals.as_ref() {
@@ -1483,6 +1509,162 @@ impl Application {
     }
 }
 
+/// Full-precision fingerprint of every input one GPU cloth dispatch
+/// consumes besides particle state: the ctrl dt (post-clamp, exactly
+/// what `collect_cloth_deforms` puts in the snapshot), sim parameters,
+/// pin bindings + the transforms they resolve against, and the merged
+/// capsule list. Full f32 bits — quantizing would hide driver motion
+/// below ~1 mm, the band the settle-sleep gate must wake on.
+fn cloth_gpu_inputs_hash(
+    ctrl_dt: f32,
+    sim: &crate::simulation::cloth::ClothSimState,
+    global_transforms: &[crate::asset::Mat4],
+    colliders: &[crate::renderer::frame_input::ClothGpuCollider],
+) -> u64 {
+    use crate::math_utils::vec3_scale;
+    use crate::simulation::settle::SettleHasher;
+    let mut h = SettleHasher::new();
+    h.write_f32(ctrl_dt);
+    h.write_f32(sim.damping);
+    h.write_f32s(&sim.gravity);
+    h.write_f32s(&vec3_scale(&sim.wind_direction, sim.wind_response));
+    h.write_u32(sim.solver_iterations);
+    h.write_f32(sim.collision_margin);
+    h.write_bool(sim.self_collision);
+    h.write_f32(sim.self_collision_radius);
+    h.write_u32(sim.pin_targets.len() as u32);
+    for pin in &sim.pin_targets {
+        h.write_u32(pin.node_index as u32);
+        h.write_f32s(&pin.offset);
+    }
+    h.write_u32(global_transforms.len() as u32);
+    for m in global_transforms {
+        for col in m {
+            h.write_f32s(col);
+        }
+    }
+    h.write_u32(colliders.len() as u32);
+    for c in colliders {
+        h.write_f32s(&c.p0);
+        h.write_f32s(&c.p1);
+        h.write_f32(c.radius);
+    }
+    h.finish()
+}
+
+/// Per-frame settle-sleep gate for every cloth slot on one avatar
+/// (app thread, before the snapshot collector — idle z-fight campaign,
+/// 2026-09-15). Suppression piggybacks on the renderer's existing
+/// frozen-frame contract: `substeps == 0` skips every cloth dispatch,
+/// pin write and version bump, so the persistent `cloth_pos_ssbo`
+/// keeps last frame's bits exactly.
+///
+/// Sleep requires BOTH halves: a quiet position-readback streak
+/// (folded by [`fold_cloth_readback_settle`]) and an unchanged input
+/// fingerprint. Any input change wakes the slot immediately; the quiet
+/// streak then re-accumulates while the induced motion decays.
+fn update_cloth_settle_gate(
+    avatar: &mut crate::avatar::AvatarInstance,
+    fixed_dt: f32,
+    gate_active: bool,
+    scene_colliders: &[crate::simulation::cloth::ResolvedCollider],
+) {
+    // Reset first — a suppression flag must never survive a frame the
+    // gate did not evaluate (cloth toggle off, GUI pause, …).
+    if let Some(cs) = avatar.cloth_state.as_mut() {
+        cs.settle.suppress_dispatch = false;
+    }
+    for slot in &mut avatar.cloth_overlays {
+        slot.state.settle.suppress_dispatch = false;
+    }
+    if !gate_active {
+        return;
+    }
+    // Same merged list the snapshot collector ships: avatar-node
+    // capsules + scene colliders, spheres as degenerate capsules.
+    let mut gpu_colliders = gpu_colliders_for(avatar);
+    gpu_colliders.extend(scene_colliders.iter().cloned().map(resolved_to_gpu_collider));
+    // Same clamp `collect_cloth_deforms` applies to the ctrl dt — hash
+    // what the dispatch will actually consume.
+    let ctrl_dt = fixed_dt.max(1.0 / 1000.0);
+
+    fn gate_slot(
+        cs: &mut crate::avatar::instance::ClothState,
+        sim: Option<&crate::simulation::cloth::ClothSimState>,
+        ctrl_dt: f32,
+        global_transforms: &[crate::asset::Mat4],
+        colliders: &[crate::renderer::frame_input::ClothGpuCollider],
+    ) {
+        use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
+        if cs.solver_backend != ClothSolverBackend::Gpu || !cs.enabled {
+            return;
+        }
+        let Some(sim) = sim else { return };
+        let hash = cloth_gpu_inputs_hash(ctrl_dt, sim, global_transforms, colliders);
+        let settle = &mut cs.settle;
+        if settle.last_inputs != Some(hash) {
+            settle.sleeping = false;
+            settle.quiet_frames = 0;
+            settle.last_inputs = Some(hash);
+        } else if settle.sleeping {
+            settle.suppress_dispatch = true;
+        }
+    }
+
+    if let Some(cs) = avatar.cloth_state.as_mut() {
+        gate_slot(
+            cs,
+            avatar.cloth_sim.as_ref(),
+            ctrl_dt,
+            &avatar.pose.global_transforms,
+            &gpu_colliders,
+        );
+    }
+    for slot in &mut avatar.cloth_overlays {
+        gate_slot(
+            &mut slot.state,
+            Some(&slot.sim),
+            ctrl_dt,
+            &avatar.pose.global_transforms,
+            &gpu_colliders,
+        );
+    }
+}
+
+/// Fold one GPU position readback row into a cloth slot's settle
+/// state: the largest per-particle motion since the previous row
+/// advances the quiet streak (`settle_bump` re-evaluates `sleeping`).
+/// While the slot is suppressed the renderer maps a frozen SSBO, so
+/// the delta is exactly 0 and the streak keeps holding. A length
+/// mismatch (first row after attach, re-attach, topology change) has
+/// no baseline — delta 0, baseline re-seeded.
+fn fold_cloth_readback_settle(
+    cs: &mut crate::avatar::instance::ClothState,
+    positions: &[crate::asset::Vec3],
+) -> f32 {
+    use crate::math_utils::{vec3_length, vec3_sub};
+    use crate::simulation::settle::settle_bump;
+
+    let settle = &mut cs.settle;
+    let max_delta = if settle.last_readback.len() == positions.len() {
+        settle
+            .last_readback
+            .iter()
+            .zip(positions.iter())
+            .map(|(a, b)| vec3_length(&vec3_sub(a, b)))
+            .fold(0.0f32, f32::max)
+    } else {
+        0.0
+    };
+    settle.last_readback.clear();
+    settle.last_readback.extend_from_slice(positions);
+    settle.last_max_delta = max_delta;
+    let (quiet_frames, sleeping) = settle_bump(settle.quiet_frames, max_delta);
+    settle.quiet_frames = quiet_frames;
+    settle.sleeping = sleeping;
+    max_delta
+}
+
 /// World-space avatar collision capsules for the GPU cloth stage —
 /// the sibling of the CPU solver's `resolve_colliders` output, with
 /// spheres encoded as degenerate capsules. Enabled mask and node-index
@@ -1719,7 +1901,7 @@ fn collect_cloth_deforms<'a>(
                 match sim_opt {
                     Some(sim) => {
                         let wind_force = vec3_scale(&sim.wind_direction, sim.wind_response);
-                        let ctrl = ClothGpuDispatchControl {
+                        let mut ctrl = ClothGpuDispatchControl {
                             dt: fixed_dt,
                             substeps,
                             damping: sim.damping,
@@ -1732,6 +1914,17 @@ fn collect_cloth_deforms<'a>(
                             self_collision: sim.self_collision,
                             self_collision_radius: sim.self_collision_radius,
                         };
+                        // Settle-sleep (idle z-fight campaign, 2026-09-15):
+                        // the app-side gate suppressed this cloth — ship 0
+                        // substeps so the renderer's frozen-frame contract
+                        // skips every dispatch, pin write and version bump,
+                        // keeping `cloth_pos_ssbo` bit-stable. The state
+                        // stays where it was; `substeps` is hashed into the
+                        // frame shape key, so the command buffer cache
+                        // simply holds one variant per sleep state.
+                        if cs.settle.suppress_dispatch {
+                            ctrl.substeps = 0;
+                        }
                         let attach = ClothGpuAttachData {
                             constraints: sim
                                 .distance_constraints
@@ -1903,6 +2096,7 @@ mod cloth_collection_tests {
             target_vertex_offset: 0,
             target_vertex_count: vertex_count,
             solver_backend: crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Cpu,
+            settle: Default::default(),
         }
     }
 
@@ -2084,6 +2278,70 @@ mod cloth_collection_tests {
             AvatarInstanceId(7),
             &cs,
         ));
+    }
+
+    /// The quiet streak sleeps after five identical readbacks and any
+    /// real motion resets it — this is the half of the gate fed from
+    /// the one-frame-stale position readback.
+    #[test]
+    fn cloth_readback_settle_quiet_streak_sleeps_and_motion_wakes() {
+        let mut cs = gpu_cloth_state(1, Some(PrimitiveId(12)));
+        let rest = [[0.0f32; 3]; 4];
+        // First row seeds the baseline (no delta yet).
+        fold_cloth_readback_settle(&mut cs, &rest);
+        for q in 1..5 {
+            assert!(!cs.settle.sleeping, "quiet_frames={q}");
+            fold_cloth_readback_settle(&mut cs, &rest);
+        }
+        assert!(cs.settle.sleeping, "five quiet rows must sleep");
+        // Frozen stream holds the sleep…
+        fold_cloth_readback_settle(&mut cs, &rest);
+        assert!(cs.settle.sleeping);
+        // …and 2 mm of real motion wakes.
+        let mut moved = rest;
+        moved[0][1] = 0.002;
+        let delta = fold_cloth_readback_settle(&mut cs, &moved);
+        assert!((delta - 0.002).abs() < 1e-6, "delta={delta}");
+        assert!(!cs.settle.sleeping);
+        assert_eq!(cs.settle.quiet_frames, 0);
+    }
+
+    /// The wake key is bit-precise: identical inputs hash identically,
+    /// and a one-ULP change on ANY consumed input (transform, sim
+    /// parameter, capsule, ctrl dt) must change the hash.
+    #[test]
+    fn cloth_gpu_inputs_hash_is_bit_precise() {
+        let transforms = vec![crate::asset::identity_matrix()];
+        let sim = crate::simulation::cloth::ClothSimState::default();
+        let colliders = vec![crate::renderer::frame_input::ClothGpuCollider {
+            p0: [0.0, 0.0, 0.0],
+            p1: [0.0, 1.0, 0.0],
+            radius: 0.1,
+        }];
+        let base = cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &transforms, &colliders);
+        assert_eq!(
+            cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &transforms, &colliders),
+            base,
+            "identical inputs must hash identically"
+        );
+
+        // 1 ULP on one transform element.
+        let mut moved = transforms.clone();
+        moved[0][0][0] = f32::from_bits(moved[0][0][0].to_bits() + 1);
+        assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &moved, &colliders), base);
+
+        // Sim parameter (wind feeds the verlet acceleration).
+        let mut blown = crate::simulation::cloth::ClothSimState::default();
+        blown.wind_response = 0.5;
+        assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &blown, &transforms, &colliders), base);
+
+        // Capsule move.
+        let mut pushed = colliders.clone();
+        pushed[0].radius = 0.1 + 1e-9;
+        assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &transforms, &pushed), base);
+
+        // Ctrl dt.
+        assert_ne!(cloth_gpu_inputs_hash(1.0 / 59.0, &sim, &transforms, &colliders), base);
     }
 }
 

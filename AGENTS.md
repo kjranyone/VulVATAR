@@ -50,6 +50,29 @@ will invalidate that cache and trigger a rebuild.
   Phase 3 は containment スロットに clearance-mode アンカーを入れる cross-region
   (ジャケット裾↔スカート、スカート↔下着)。アンカー実装を変えたら
   `VVT_CACHE_VERSION` を上げること (v17 = 放射シルエット拡張)。
+- **Settle-sleep (idle z-fight 対策, 2026-09-15)**: spring チェーンと cloth
+  (GPU/CPU 両バックエンド) は「quiet (< 100 µm/step) が 5 ステップ続いた
+  AND 全入力が最後のステップと同一」ならステップ全体をスキップし、頂点
+  ストリームを bit-stable に保つ (ソルバーの残留振動 ~10 µm でも、~1 mm
+  離れた 2 面の深度順位を反転させて点滅するため)。spring の wake キーは
+  `simulation/spring.rs`: chain root world 位置 / 関数パラメータの scene
+  gravity / dt / tuning / scene collider ハッシュ / 関節位置での body-SDF
+  サンプル (許容 1 mm — 上流にない体部位の手の接近と SDF garment レイヤー
+  を検知するため)。**`sleeping` はラッチではなく quiet ストリークから毎
+  ステップ再評価** (初版はラッチで、ドライバ停止時に揺れ途中で凍るバグが
+  あった)。GPU cloth は `ClothState::settle` が app 側ゲート
+  (`app/render.rs` `update_cloth_settle_gate`、入力は f32 全ビットの
+  FNV フィンガープリント) でスナップショットの `substeps` を 0 に強制し、
+  既存の frozen-frame 契約 (dispatch/pin 書き込み/version bump 全スキップ)
+  で `cloth_pos_ssbo` を bit-stable 維持。quiet の給源は 1 フレーム遅延の
+  位置 readback (`fold_cloth_readback_settle`)。CPU cloth は
+  `cloth_solver::step_cloth_*` 内で同ゲート。観測:
+  `debug_gui.json` の `scene.cloth.*.settle` (sleeping / quiet_frames /
+  max_delta_mm / suppressed_this_frame)。回帰テスト:
+  `tests/settle_verify.rs` (公開 API 経由の統合テスト — `cargo test --lib`
+  が tracking 側 WIP で壊れている間も実行可能な実行版を兼ねる) ほか
+  `simulation/tests.rs` / `cloth_solver/tests.rs` / `app/render.rs` の各
+  テストモジュール。
 
 ## Tracking (fusion estimator)
 
