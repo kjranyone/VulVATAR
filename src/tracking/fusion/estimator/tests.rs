@@ -558,3 +558,68 @@ fn wrist_hold_jacobian_matches_finite_difference() {
 }
 
 
+
+#[test]
+fn two_stage_locks_freeze_their_stages() {
+    let h = Humanoid::new();
+    let m = &h.model;
+    let gt = gt_state(&h);
+    let intr = intr();
+    let fk_gt = m.fk(&gt);
+    let kp3d: Vec<Kp3d> = [h.j.l_wrist, h.j.r_wrist, h.j.l_elbow, h.j.r_elbow]
+        .iter()
+        .map(|&j| Kp3d {
+            point: ModelPoint::Joint(j),
+            p: fk_gt.t[j],
+            sigma: 0.02,
+            lat_scale: 1.0,
+        })
+        .collect();
+    let obs = FrameObs {
+        t: 0.0,
+        intr: Some(intr),
+        kp2d: observe(m, &gt, intr, 1.0),
+        kp3d,
+        angles: Vec::new(),
+        ori: Vec::new(),
+        shoulder_yaw: None,
+        torso_hint: None,
+        surface: surface_from_capsules_parts(m, &gt, 12, None),
+        surf_allow: Vec::new(),
+    };
+    let mut est = Estimator::new(m, Params::default());
+    est.state.root_t = [0.0, 0.3, 1.5];
+    let n = m.num_params;
+    let prior_var = vec![1e-2; n];
+
+    // Trunk stage: arm-chain DoF must stay at the warm start exactly.
+    let before = est.state.clone();
+    est.run_locked(m, &obs, &prior_var, 1.0 / 30.0, super::LockSet::TrunkStage);
+    let d = param_difference(m, &before, &est.state);
+    for k in 0..n {
+        if est.arm_param[k] {
+            assert!(
+                d[k].abs() < 1e-9,
+                "arm param {k} moved {} in trunk stage",
+                d[k]
+            );
+        }
+    }
+    // Arm stage: root / trunk / shape must stay at the trunk-stage result.
+    let before = est.state.clone();
+    est.run_locked(m, &obs, &prior_var, 1.0 / 30.0, super::LockSet::ArmStage);
+    let d = param_difference(m, &before, &est.state);
+    for k in 0..n {
+        if k < 6 || est.trunk_param[k] || k >= m.beta_scale {
+            assert!(
+                d[k].abs() < 1e-9,
+                "locked param {k} moved {} in arm stage",
+                d[k]
+            );
+        }
+    }
+    // And the arm really did move in the arm stage — guards against a
+    // silently over-broad lock set that freezes everything.
+    let moved = (0..n).any(|k| est.arm_param[k] && d[k].abs() > 1e-6);
+    assert!(moved, "arm stage moved no arm DoF — lock set too broad?");
+}

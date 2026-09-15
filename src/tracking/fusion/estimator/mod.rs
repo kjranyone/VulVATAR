@@ -28,7 +28,8 @@ pub use obs::{AngleObs, Intrinsics, ModelPoint, Kp2d, Kp3d, OriObs, ShoulderYawO
 pub use params::Params;
 pub use geom::{closest_on_segment, param_difference, ray_capsule_entry, resolve_point, CapGeom};
 use geom::{
-    arm_params, finger_params, head_params, locked_params, point_jac, point_y_jac, trunk_params,
+    arm_below_shoulder_params, arm_params, finger_params, head_params, locked_params, point_jac,
+    point_y_jac, trunk_params,
 };
 
 /// Estimator with its carried temporal state.
@@ -120,6 +121,28 @@ pub struct Estimator {
     /// on bootstrap frames and on any frame where the wrist carries an
     /// observation (see `Params::wrist_hold_sigma`).
     hold_targets: [(bool, V3); 2],
+    /// Trunk-stage observation policy (two-stage solve): keypoint / angle
+    /// observations anchored in the arm chain and the wrist holds are
+    /// excluded from the residual build — the arm chain is frozen there
+    /// and its lagging prediction must not reach the trunk through the
+    /// chain Jacobians. Set by `run_locked(LockSet::TrunkStage)`.
+    arm_obs_masked: bool,
+    /// Per-parameter flag: the arm chain BELOW the shoulder balls
+    /// (elbow / twist / wrist / fingers). Unlike `arm_param` the shoulder
+    /// itself is excluded: a shoulder-anchored keypoint is trunk-side
+    /// evidence (clavicle / spine placement) and stays in the trunk
+    /// stage, while the shoulder ball DoF stays frozen there.
+    arm_below_shoulder: Vec<bool>,
+}
+
+/// Which parameter set a two-stage `run_locked` solve freezes on top of
+/// the standing (pelvis) locks.
+#[derive(Clone, Copy, Debug)]
+enum LockSet {
+    /// Trunk stage: arm chain frozen at the warm start.
+    TrunkStage,
+    /// Arm stage: root + trunk joints + shape frozen at the trunk stage.
+    ArmStage,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -275,6 +298,8 @@ impl Estimator {
                 ),
             ],
             hold_targets: [(false, [0.0; 3]), (false, [0.0; 3])],
+            arm_obs_masked: false,
+            arm_below_shoulder: arm_below_shoulder_params(model),
             cov: Vec::new(),
             world_sigma: vec![1.0; model.joints.len()],
         }
@@ -555,9 +580,54 @@ impl Estimator {
             }
         }
         // ---- LM loop --------------------------------------------------------
+        // Two-stage solve (trunk → arms), `VULVATAR_FUSION_TWOSTAGE=1`:
+        // stage 1 freezes the arm chain at the prediction and runs a
+        // TRUNK-ONLY problem — observations anchored below the shoulder
+        // balls and the wrist holds are excluded, limb capsules are
+        // removed from surface association (a frozen arm at the real limb
+        // position eats chest points as nearest-limb drops on one side
+        // and the trunk fits the asymmetric remainder), so an arm in the
+        // wrong basin cannot trade torso yaw / clavicle splay for its own
+        // residuals. Stage 2 frees the arms with trunk + root + shape
+        // frozen, so arm capsules may claim dense-surface points
+        // (`VULVATAR_DENSE_ARMS`) without inventing the substitute that
+        // blew |err| 19.0→32.7 in the single-stage bench. Analytic arm
+        // seeds re-seed the STAGE-1 trunk and re-run stage 2 only.
+        // (Intermediate measurements: keeping arm keypoints in the trunk
+        // stage even under Cauchy → yaw sd 1–4° → 29–108°; core-only
+        // association without the shoulder keypoints → yaw sd 11°.)
+        static TWOSTAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Bootstrap / re-acquisition frames (no temporal prior yet) keep the
+        // single-stage joint solve: a wrong torso hint from junk detections
+        // is rejected there precisely by the arm observations the trunk
+        // stage masks out (measured: dropout session s1789279985, the
+        // re-entry seeded the root at a 2.9 m wall and every later frame
+        // tracked it — 5 re-acquisitions and yaw err −16.5°).
+        let twostage = self.last_t.is_some()
+            && *TWOSTAGE.get_or_init(|| {
+                std::env::var("VULVATAR_FUSION_TWOSTAGE")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+            });
+        let mut cost;
         let start = self.state.clone();
         let t_phase = std::time::Instant::now();
-        let mut cost = self.lm_loop(model, obs, &prior_var, dt);
+        let mut stage1: Option<State> = None;
+        if twostage {
+            self.run_locked(model, obs, &prior_var, dt, LockSet::TrunkStage);
+            stage1 = Some(self.state.clone());
+            // Diagnostics: `VULVATAR_FUSION_TS_STAGE1_ONLY=1` publishes the
+            // trunk-stage state (arms still at the prediction, seeds off).
+            let stage1_only =
+                std::env::var_os("VULVATAR_FUSION_TS_STAGE1_ONLY").is_some();
+            cost = if stage1_only {
+                self.diag.cost_final
+            } else {
+                self.run_locked(model, obs, &prior_var, dt, LockSet::ArmStage)
+            };
+        } else {
+            cost = self.lm_loop(model, obs, &prior_var, dt);
+        }
         self.timings.main_ms = t_phase.elapsed().as_secs_f64() * 1000.0;
         // Seed contest is judged WITHOUT the dense-surface cost: an analytic
         // arm seed is derived from the metric keypoint lifts, and letting the
@@ -572,10 +642,24 @@ impl Estimator {
         let mut best_diag = self.diag;
         let mut best_gnc_final = true;
         let t_seeds = std::time::Instant::now();
+        // Seeds grow from the prediction in single-stage mode, and from the
+        // stage-1 (trunk-solved, arms-still-predicted) state in two-stage
+        // mode — the analytic seed only re-poses the arm, so the trunk it
+        // hangs from should be the solved one.
+        let seed_base = stage1.as_ref().unwrap_or(&start);
+        let skip_seeds = stage1.is_some()
+            && std::env::var_os("VULVATAR_FUSION_TS_STAGE1_ONLY").is_some();
         for seed in seeds {
-            let Some(cand) = seed(&start) else { continue };
+            if skip_seeds {
+                break;
+            }
+            let Some(cand) = seed(seed_base) else { continue };
             self.state = cand;
-            let c = self.lm_loop(model, obs, &prior_var, dt);
+            let c = if twostage {
+                self.run_locked(model, obs, &prior_var, dt, LockSet::ArmStage)
+            } else {
+                self.lm_loop(model, obs, &prior_var, dt)
+            };
             let c_cmp = c - self.diag.cost_cloud;
             if std::env::var_os("VULVATAR_SEED_DUMP").is_some() {
                 eprintln!(
@@ -660,6 +744,49 @@ impl Estimator {
             self.dense.h[k * n + k] = 1.0;
             self.dense.g[k] = 0.0;
         }
+    }
+
+    /// Run one stage of the two-stage solve: `lm_loop` with a temporary
+    /// parameter lock set applied on top of the standing locks (pelvis).
+    /// See `update_with_seeds` for the rationale.
+    fn run_locked(
+        &mut self,
+        model: &Model,
+        obs: &FrameObs,
+        prior_var: &[f64],
+        dt: f64,
+        locks: LockSet,
+    ) -> f64 {
+        let saved = self.locked_param.clone();
+        self.arm_obs_masked = matches!(locks, LockSet::TrunkStage);
+        for (k, l) in self.locked_param.iter_mut().enumerate() {
+            let extra = match locks {
+                // Trunk stage: the whole arm chain (incl. fingers and
+                // pronation) stays at the warm start, and arm-anchored
+                // observations / wrist holds are excluded from the build
+                // (`arm_obs_masked`).
+                LockSet::TrunkStage => self.arm_param[k],
+                // Arm stage: root, trunk joints and shape stay at the
+                // stage-1 solve; only limbs below the clavicles move.
+                LockSet::ArmStage => k < 6 || self.trunk_param[k] || k >= model.beta_scale,
+            };
+            *l = saved[k] || extra;
+        }
+        let cost = self.lm_loop(model, obs, prior_var, dt);
+        self.locked_param = saved;
+        self.arm_obs_masked = false;
+        cost
+    }
+
+    /// Does the observation resolving to `joint` land inside the arm chain
+    /// below the shoulder balls (trunk-stage observation policy)? The
+    /// shoulder keypoints themselves stay — they carry clavicle / spine
+    /// placement, which the trunk stage owns.
+    fn arm_anchored(&self, model: &Model, joint: usize) -> bool {
+        self.arm_below_shoulder
+            .get(model.joint_param.get(joint).copied().unwrap_or(0))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Drop the temporal state AND the pose itself so the next frame
@@ -941,6 +1068,15 @@ impl Estimator {
                 std::env::var("VULVATAR_ARM_CHAIN_DEPTH").map_or(false, |v| v != "0");
             for kp in &obs.kp2d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
+                // Trunk stage of the two-stage solve: keypoint observations
+                // anchored in the (frozen) arm chain are dropped entirely —
+                // a lagging predicted arm would otherwise pull the trunk
+                // through its chain Jacobians even under Cauchy (measured:
+                // 12-recording bench, torso yaw sd 1–4° → 29–108° with them
+                // included). Stage 2 re-admits them with the arms free.
+                if self.arm_obs_masked && self.arm_anchored(model, joint) {
+                    continue;
+                }
                 let Some(uv) = intr.project(pw) else { continue };
                 let inv_s = 1.0 / kp.sigma.max(0.25);
                 let ru = (uv[0] - kp.u) * inv_s;
@@ -1005,9 +1141,17 @@ impl Estimator {
                 let ca = p.c_2d * self.gnc;
                 let kern = Kernel::Cauchy(ca);
                 for ob in &obs.angles {
+                    // Trunk stage: finger triples are arm-anchored.
+                    let masked = self.arm_obs_masked && {
+                        let (jv, _) = resolve_point(model, fk, ob.vertex);
+                        self.arm_anchored(model, jv)
+                    };
                     let Some(rho) = (|| {
                         let (ja, pa) = resolve_point(model, fk, ob.a);
                         let (jv, pv) = resolve_point(model, fk, ob.vertex);
+                        if masked {
+                            return None;
+                        }
                         let (jb, pb) = resolve_point(model, fk, ob.b);
                         let ua = intr.project(pa)?;
                         let uv = intr.project(pv)?;
@@ -1090,6 +1234,10 @@ impl Estimator {
                 std::env::var("VULVATAR_ARM_CHAIN_DEPTH").map_or(false, |v| v != "0");
             for kp in &obs.kp3d {
                 let (joint, pw) = resolve_point(model, fk, kp.point);
+                // Trunk stage: see the kp2d loop.
+                if self.arm_obs_masked && self.arm_anchored(model, joint) {
+                    continue;
+                }
                 let d = sub(pw, kp.p);
                 let inv_s = 1.0 / kp.sigma.max(1e-4);
                 let inv_lat = inv_s / kp.lat_scale.max(1.0);
@@ -1542,7 +1690,10 @@ impl Estimator {
         // keep pulling exactly when the deviation is large. Gated per frame
         // in `update_with_seeds` (active only with zero wrist observations).
         let sig_wh = p.wrist_hold_sigma;
-        if sig_wh > 1e-6 {
+        if sig_wh > 1e-6 && !self.arm_obs_masked {
+            // Trunk stage: the hold pins an unobserved wrist's root-frame
+            // position; with the arm joints frozen that non-robust pull
+            // would land on the spine / clavicle instead.
             let inv_s = 1.0 / sig_wh;
             for k in 0..2 {
                 let (active, tgt) = self.hold_targets[k];
@@ -1688,6 +1839,17 @@ impl Estimator {
                 let mut best_limb = (usize::MAX, f64::INFINITY, [0.0; 3], 0.0);
                 let mut best_hand = f64::INFINITY;
                 for (ci, g) in caps.iter().enumerate() {
+                    // Trunk stage of the two-stage solve: limb capsules are
+                    // excluded from association entirely — a frozen arm at
+                    // the (solved, real) limb position eats chest points as
+                    // nearest-limb drops on one side only, and the trunk
+                    // fits the asymmetric remainder (measured: torso yaw
+                    // climbs +4°/frame once a wave crosses the chest). The
+                    // core front gate already rejects real-arm points
+                    // (occluders) exactly as if the limbs were absent.
+                    if self.arm_obs_masked && !is_core[ci] {
+                        continue;
+                    }
                     let (lo, hi) = boxes[ci];
                     if pt[0] < lo[0]
                         || pt[0] > hi[0]

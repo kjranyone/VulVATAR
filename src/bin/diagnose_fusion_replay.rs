@@ -12,7 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
-use vulvatar_lib::tracking::fusion::estimator::Intrinsics;
+use vulvatar_lib::tracking::fusion::estimator::{Intrinsics, ray_capsule_entry};
+use vulvatar_lib::tracking::fusion::observe::window_point;
 use vulvatar_lib::tracking::fusion::math::*;
 use vulvatar_lib::tracking::fusion::model::*;
 use vulvatar_lib::tracking::fusion::provider::FusionProvider;
@@ -357,6 +358,16 @@ fn main() -> Result<(), String> {
     // the input for the visibility calibration (`diagnostics/visibility`).
     let vis_dump = std::env::var_os("VULVATAR_REPLAY_VISDUMP").is_some();
     let mut vis_csv = String::new();
+    // Elbow depth-lift audit (P0): per-frame signed residual of the elbow
+    // kp3d against the converged model along the viewing ray, the raw
+    // window depth, and the model's own first-surface ray entry under the
+    // same pixel — separates "the lift reads a surface the model doesn't
+    // have" from "the skin→joint push is wrong" from "the model arm is
+    // elsewhere". Written to <out_dir>/elbow.csv.
+    let elbow_dump = std::env::var_os("VULVATAR_REPLAY_ELBOW_DUMP").is_some();
+    let mut elbow_csv = String::from(
+        "idx,side,score,u,v,z_raw,ox,oy,oz,osig,mx,my,mz,d_ray,d_z,fov_uarm,fov_farm,entry_z,entry_part\n",
+    );
     let hand_dump = std::env::var_os("VULVATAR_REPLAY_HAND_DUMP").is_some();
     let mut hand_csv = String::from("idx,hand,src,presence,handedness,cx,cy,csz,wrist_x,wrist_y
 ");
@@ -768,6 +779,58 @@ fn main() -> Result<(), String> {
                 3
             };
             kp3d_err[slot].push(e);
+        }
+        if elbow_dump {
+            let k = &est_out.annotation.keypoints;
+            for (side, ci, j_el, j_sh, j_wr) in [
+                ('L', 7usize, h.j.l_elbow, h.j.l_shoulder, h.j.l_wrist),
+                ('R', 8usize, h.j.r_elbow, h.j.r_shoulder, h.j.r_wrist),
+            ] {
+                let Some((nx, ny, sc)) = k.get(ci).copied() else {
+                    continue;
+                };
+                if sc < 0.3 {
+                    continue;
+                }
+                let (u, v) = (nx as f64 * cw as f64, ny as f64 * ch as f64);
+                let raw =
+                    window_point(&depth_pts, cw, ch, u, v, 3, 0.2, 3.0);
+                let obs = provider.last_kp3d.iter().find(|(j, _, _)| *j == j_el);
+                let me = fk.t[j_el];
+                // Ray direction through the keypoint pixel (from the raw
+                // depth sample; fall back to the model elbow direction).
+                let dir = match raw {
+                    Some(p) => normalize([p[0] as f64, p[1] as f64, p[2] as f64]),
+                    None => normalize(me),
+                };
+                let mut entry: Option<(f64, Part)> = None;
+                for c in &m.capsules {
+                    let r = m.capsule_radius(&est.state, c);
+                    if let Some(t) =
+                        ray_capsule_entry(dir, fk.point(c.a), fk.point(c.b), r)
+                    {
+                        if entry.as_ref().map(|(z, _)| t < *z).unwrap_or(true) {
+                            entry = Some((t, c.part));
+                        }
+                    }
+                }
+                let fov = |a: V3, b: V3| dot(normalize(sub(b, a)), dir);
+                let (ox, oy, oz, osig, d_ray, d_z) = match obs {
+                    Some((_, p, s)) => {
+                        (p[0], p[1], p[2], *s, dot(sub(*p, me), dir), p[2] - me[2])
+                    }
+                    None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+                };
+                elbow_csv.push_str(&format!(
+                    "{idx},{side},{sc:.2},{u:.0},{v:.0},{:.3},{ox:.3},{oy:.3},{oz:.3},{osig:.3},{:.3},{:.3},{:.3},{d_ray:+.3},{d_z:+.3},{:.2},{:.2},{},{:?}\n",
+                    raw.map(|p| p[2] as f64).unwrap_or(f64::NAN),
+                    me[0], me[1], me[2],
+                    fov(fk.t[j_sh], me),
+                    fov(me, fk.t[j_wr]),
+                    entry.as_ref().map(|(z, _)| *z).unwrap_or(f64::NAN),
+                    entry.map(|(_, p)| format!("{p:?}")).unwrap_or("none".into()),
+                ));
+            }
         }
         if std::env::var_os("VULVATAR_REPLAY_POSTURE").is_some() {
             // Whole-body posture split: root tilt (deg from upright in the
@@ -1303,6 +1366,10 @@ fn main() -> Result<(), String> {
     if vis_dump {
         std::fs::write(out_dir.join("kps.csv"), vis_csv).map_err(|e| e.to_string())?;
         println!("kps: {}", out_dir.join("kps.csv").display());
+    }
+    if elbow_dump {
+        std::fs::write(out_dir.join("elbow.csv"), &elbow_csv).map_err(|e| e.to_string())?;
+        println!("elbow: {}", out_dir.join("elbow.csv").display());
     }
 
     let (ym, ys, ymin, ymax) = stats(&torso_yaws);

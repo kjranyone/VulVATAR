@@ -143,13 +143,50 @@ fn named_params(model: &Model, names: &[&str]) -> Vec<bool> {
 
 /// Arm-chain parameters: the finger subtrees (see `finger_params`) plus
 /// the wrist / elbow / shoulder joints of both sides. Used to mask
-/// hand-side observation Jacobians away from the trunk (`arm_param`).
+/// hand-side observation Jacobians away from the trunk (`arm_param`) and
+/// to freeze the arm chain during the trunk stage of the two-stage solve.
+/// `*_elbow_twist` (forearm pronation, elbow→wrist) belongs to the chain:
+/// leaving it free would let the trunk stage absorb arm observations
+/// into pronation.
 pub(super) fn arm_params(model: &Model) -> Vec<bool> {
     let mut v = finger_params(model);
     for j in 0..model.joints.len() {
         if !matches!(
             model.joints[j].name,
-            "l_shoulder" | "l_elbow" | "l_wrist" | "r_shoulder" | "r_elbow" | "r_wrist"
+            "l_shoulder"
+                | "l_elbow"
+                | "l_elbow_twist"
+                | "l_wrist"
+                | "r_shoulder"
+                | "r_elbow"
+                | "r_elbow_twist"
+                | "r_wrist"
+        ) {
+            continue;
+        }
+        let p = model.joint_param[j];
+        let n = match model.joints[j].kind {
+            JointKind::Ball { .. } => 3,
+            JointKind::Hinge { .. } => 1,
+        };
+        for k in 0..n {
+            v[p + k] = true;
+        }
+    }
+    v
+}
+
+/// Parameters of the arm chain BELOW the shoulder balls: elbow, elbow
+/// twist, wrist and the finger subtrees. Used by the two-stage trunk
+/// stage's observation policy — shoulder-anchored keypoints are trunk
+/// evidence (clavicle / spine placement) and stay in that stage, while
+/// everything hanging off a frozen shoulder ball is excluded.
+pub(super) fn arm_below_shoulder_params(model: &Model) -> Vec<bool> {
+    let mut v = finger_params(model);
+    for j in 0..model.joints.len() {
+        if !matches!(
+            model.joints[j].name,
+            "l_elbow" | "l_elbow_twist" | "l_wrist" | "r_elbow" | "r_elbow_twist" | "r_wrist"
         ) {
             continue;
         }

@@ -167,6 +167,7 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 ```
 
 - sparse LM、warm start = `predict(t)`、GNC ブートストラップ。共分散は H⁻¹ の対角ブロック → 関節ごとの周辺 σ (`joint_world_sigma`) と観測到達度 (`joint_data_sigma`、< 0.5 で「追跡中」)。
+- **2 段ソルブ** (`VULVATAR_FUSION_TWOSTAGE=1`、既定 OFF): 追跡中の帧のみ、単一 LM を胴ステージ → 腕ステージに分割する。胴ステージは腕チェーン (肩ボール・肘・回内・手首・指) を予測位置に凍結し、**肩より下に解決する観渑 (肘/手首/手の 2D・3D・指角度) と未観測手首ホールドを残差から除外**、**表面対応付けから肢カプセルを除外** (core-only) する — 凍結腕が遅れた分、実腕領域の点が nearest-limb 棄却で片側だけ胴証拠を欠き、胴が非対称な残りに合わせる (実測: wave で胴 yaw が +4°/帧で漂流、12 録画 yaw sd 1–4°→29–108°)。肩 2D/3D は**胴証拠として残す** (鎖骨・脊椎の位置決め。除外すると yaw sd 11° に劣化)。腕ステージは root・胴関節・形状を胴ステージ解で凍結し腕のみを解く — 単段 DENSE_ARMS で腕が (胴 yaw + 鎖骨開き) の代替説明を作る破綻を構造的に排除する。アームシードは胴ステージ結果をベースに腕ステージのみ再実行。(再) 捕捉帧 (temporal prior 無し) は単一段のまま — 誤 torso hint を弾くのは胴ステージが排除する腕観測だから (s1789279985: 再捕捉が壁 2.9 m に張り付いた)。12 録画ベンチ (2026-09-15): TWOSTAGE 単独 snap 158/|err| 30.4 (机下の未観測手首が観測ノイズをフル追従)、+DENSE_ARMS で snap 100/|err| 26.0/seed 16 — 11 の良観測セッションに限れば snap 50・|err| 9.5 と基準 (p3: 48・14.9) 並みか改善、ドロップアウト 40% のジャンク 1 録画 (壁クラウドへの root 飛び) が全体基準の障害。既定 OFF のまま。
 - `predict(t)` は任意時刻の状態 + 共分散 (レンダースレッドが 60 Hz で呼ぶ)。1€ フィルタは持たない。**観測ゼロ帧は速度をゼロに落とす** (`finish`): データ項が無い帧で速度差分を取り直すと予測自身の外挿 (≈0.96×旧速度/帧) を再摂取して減衰がほぼ打ち消され、ジャンク検出 1 枚の速度スパイク (root 3 m/s) がドロップアウト全体を 0.1–0.2 m/帧で暴れさせる (実測 s1789279985: root_z 0.93→1.32 m、203 snap 中 172 がこのモード。修正で 12 録画 snap 合計 244→109、胴 yaw |err| は不変)。
 - 健全性: スパース主要関節の 2D 残差中央値 (`med_sparse_2d_px`) が `lost_rms_px` (40 px) を 2 フレーム連続で超えたら lost。頭/肩の 3D アンカーが追従中 (`n_kp3d ≥ 4` かつ `mean_3d_m < 0.12`) か、密表面が当たっている (§3.7) なら lost にしない。lost 時も直前深度を引き継ぐ。
 - 未観測肢のプロセスノイズ縮小 (`q_hold_floor`) は 0.25 で悪化 (保持された腕が戻ってきた観測と喧嘩し胴が代償を払う) を実測し、既定 1.0 (無効)。
@@ -215,6 +216,8 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_FUSION_NO_WHOLD` / `VULVATAR_FUSION_WHOLD_SIGMA` | 未観測手首ホールドの無効化 / σ (m) (§3.8) |
 | `VULVATAR_FUSION_SEEDGATE_SIGMA` | アームシードの定常ゲート閾値 (data-σ)。0 = 常時シード (旧動作) |
 | `VULVATAR_FUSION_NO_DENSE` / `VULVATAR_DENSE_ARMS` / `VULVATAR_DENSE_NOHEAD` / `VULVATAR_DENSE_NONECK` | 密表面項の無効化 / 腕カプセル許可 / 頭・首の除外 |
+| `VULVATAR_FUSION_TWOSTAGE` | 2 段ソルブ (胴ステージ → 腕ステージ、§5)。既定 OFF。`VULVATAR_FUSION_TS_STAGE1_ONLY=1` は胴ステージ結果をそのまま publish する診断用サブフラグ |
+| `VULVATAR_REPLAY_ELBOW_DUMP` | `elbow.csv`: 肘深度リフトの監査 (観測 vs 収束モデルの視線方向符号付き残差、生窓深度、モデル第一表面のレイ入口)。`VULVATAR_FUSION_KEEP_CLOUD=1` と併用 (観測ダンプはそちらで有効化) |
 | `VULVATAR_DENSE_NEFF` / `VULVATAR_DENSE_NEFF_HEAD` / `VULVATAR_DENSE_FRONT` / `VULVATAR_DENSE_FREEZE` | 実効点数・前方ゲート・形状凍結の上書き |
 | `VULVATAR_HOLD_Q` / `VULVATAR_NO_UPRIGHT` / `VULVATAR_TRUNK_AXIS_SIGMA` | 未観測肢ホールド係数 / 胴軸事前の無効化・σ |
 | `VULVATAR_FUSION_OBSDUMP=<frame>` | 観測とモデルの対応ダンプ |
@@ -245,6 +248,6 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 - 頭 yaw 振幅: mesh conf < 0.2 の区間は方位ソースが無い。
 - namaste 持続カバー中の偽お辞儀: 手に覆われた SimCC 鼻/目が手の表面に捏造される。per-kp ゲートでは解けず据置、次の一手は耳ベース頭アンカー。
 - 未観測腕のプロセスノイズ (q_joint 2.0) が緩く、腕の観測が消えた/戻った時の往復が残る。
-- 肘の深度リフトに約 14 cm の系統誤差 (Cauchy で無視されている)。
+- ~~肘の深度リフトに約 14 cm の系統誤差~~ → **解消 (2026-09-15 監査、12 録画 12,007 観測)**: 14 cm は「リフトの誤差」ではなく**既定ソルブのモデル腕がセンサ表面より ~7.6 cm 深い均衡に留まる」ことのノルム残差**。肘ピクセル直下の生深度は push 0.035 m と整合し、腕を密表面に乗せると肘残差は norm 中央 ~3 cm (腕が面上の帧では観測とモデル肘は +0.8 cm) に縮む — push 補正は不要。監査は `VULVATAR_REPLAY_ELBOW_DUMP=1` + `VULVATAR_FUSION_KEEP_CLOUD=1` → `elbow.csv` (`scratchpad/agg_elbow.py` で集計)。
 - 参照 (胸部深度勾配) と `ShoulderYawObs` は同じ物理信号なので、参照だけでは姿勢の正しさを証明できない。独立指標は 2D 再投影誤差と合成目視。
 - align-to-color 廃止の初手として「リプレイが meta.jsonl の実 intrinsics を読む」改善が有効 (現在は名目 D435 値で固定、AGENTS.md の前提)。ただし bench 数値の連続性が切れるので opt-in フラグ (`--real-intrinsics`) で。
