@@ -63,6 +63,11 @@ pub struct PhaseTimings {
     pub finish_ms: f32,
 }
 
+/// Max buffered metric depths awaiting their detector result (Remote
+/// mode). Steady state holds 1–2; the cap only matters while the
+/// detector is stalled or dead and nothing consumes entries.
+const DEPTH_RING_CAP: usize = 8;
+
 pub struct FusionProvider {
     det: DetectorSlot,
     hands: Option<super::hands::HandLandmarker>,
@@ -630,8 +635,13 @@ impl FusionProvider {
         let mut det_depth: Option<MetricDepthFrame>;
         if remote {
             // Buffer this frame's metric depth until its result is
-            // consumed (usually on the NEXT call).
+            // consumed (usually on the NEXT call). Capped: while the
+            // detector is stalled or dead nothing consumes entries, and
+            // each frame's cloud is a few hundred KB.
             if let Some(d) = incoming_depth {
+                if self.depth_ring.len() >= DEPTH_RING_CAP {
+                    self.depth_ring.remove(0);
+                }
                 self.depth_ring.push((frame_index, d));
             }
             det_depth = None;
@@ -693,6 +703,10 @@ impl FusionProvider {
                         }
                     };
                     det_frame_index = res.frame_index;
+                    // The detector work ran off-thread; surface its own
+                    // elapsed time in the phase breakdown (0 would read
+                    // as "stage missing").
+                    ph.rtmw_ms = res.det_ms;
                     // Pair the consumed result with its own capture's
                     // depth; fall back to THIS call's depth (one frame
                     // stale, visually identical scene) rather than

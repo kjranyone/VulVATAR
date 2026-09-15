@@ -85,6 +85,10 @@ pub(crate) struct DetectorResult {
     pub frame_index: u64,
     pub base: PoseEstimate,
     pub aux: Option<Rtmw3dAux>,
+    /// Wall time the detector thread spent on this frame (job dequeue →
+    /// outputs ready). The solver-side `ph.rtmw_ms` carries this on the
+    /// pipelined path, where the work happens off the solver thread.
+    pub det_ms: f32,
 }
 
 enum Request {
@@ -293,17 +297,20 @@ fn run_detector(
                     frame_index: u64::MAX,
                     base: empty_estimate(),
                     aux: None,
+                    det_ms: 0.0,
                 });
             }
             Request::Job(job) => {
                 rtmw3d.set_frame_timestamp_ms(job.ts_ms);
                 rtmw3d.set_crop_hint(job.crop_hint);
+                let t_det = std::time::Instant::now();
                 let base = rtmw3d.estimate_pose(&job.rgb, job.width, job.height, job.frame_index);
                 let aux = rtmw3d.take_aux();
                 results.put(DetectorResult {
                     frame_index: job.frame_index,
                     base,
                     aux,
+                    det_ms: t_det.elapsed().as_secs_f32() * 1000.0,
                 });
             }
         }
