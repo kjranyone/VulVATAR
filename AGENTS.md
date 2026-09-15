@@ -81,6 +81,14 @@ channel で計測する。アプリがカメラを掴んでいる間は pyrealse
   `root` / `root_is_hip` / `metric` (anchor_cam_m, mpsu, ref_span_m)、`face`、`mesh_c`、`face_dbg`。
 - `debug_avatar.json` — ソルバー後のアバター主要関節ワールド座標 (`seq` で新フレーム検出)。
   ユーザーが見ているものの数値化はこちら (rest 判定は Hips y ≈ 0.845 等)。
+- `debug_gui.json` — GUI フレーム毎。`paused` / `frame_count` / `sim_substeps` に加え
+  `scene` ブロック = **今表示しているもの** (アバター毎の source ファイル・primitive 数・
+  cloth スロット・カメラ/出力設定・fade opacity) と render ヘルスカウンタ。
+- `debug_render.json` — レンダーフレーム毎 (render thread)。**描画の課題**の一次情報:
+  `kind` (`ok` / `error` / `gpu_exclusive_skip`)、`input` (描画依頼の内容) と `result`
+  (`RenderStats`・ピクセル有無・export pool) の対比、累積 error / pixel 無しカウンタ。
+  「ビューポートが古いまま」が render error なのか exclusive skip なのかパイプ未到達なのかは
+  この `counters` で決まる (ログには出ない)。
 - `debug_depth.bin` — 毎秒1回、フル解像度アライン済み深度 (`VDBD` 32B ヘッダ + u16 mm)。
   任意キーポイント直下の生深度ピクセルの監査用。`debug_camera.bin` は 640px 幅 RGBA (`VDBG`)。
 - 計測手順: Python ポーラで `debug_state.json`/`debug_avatar.json` を 5-10ms 間隔で読み
@@ -117,9 +125,10 @@ cargo build --features realsense --bin diagnose_fusion_replay
 
 | ファイル | 書き手 | 中身 |
 |---|---|---|
-| `debug_gui.json` | GUI スレッド (**全ゲートの手前**) | `paused` / `avatars_loaded` / `tracking_enabled` / `frame_count` / `seq` / `sim_substeps` (0 = そのフレームは固定ステップの積算が足らず spring solver 未実行。1フレームだけの髪めり込みはまずこれと突き合わせる) |
+| `debug_gui.json` | GUI スレッド (**全ゲートの手前**) | `paused` / `avatars_loaded` / `tracking_enabled` / `frame_count` / `seq` / `sim_substeps` (0 = そのフレームは固定ステップの積算が足らず spring solver 未実行。1フレームだけの髪めり込みはまずこれと突き合わせる) / `scene` (何が表示されているか — `Application::scene_debug_snapshot`: アバター毎の source ファイル・primitive/頂点数・cloth スロット・アニメ状態、カメラ/出力設定、fade opacity、GPU budget、render ヘルスカウンタ) |
 | `debug_state.json` | トラッキングワーカー | 2D キーポイント + source 関節 (位置・信頼度) + face pose |
 | `debug_avatar.json` | `run_frame` 内 | ソルブ後のアバター world 関節 + head 軸 |
+| `debug_render.json` | レンダースレッド (RenderFrame 処理毎) | `kind` (`ok` / `error` / `gpu_exclusive_skip`) + `input` (描画を依頼した内容: instances / mesh prims / cloth deforms / body SDF plan 数 / 出力 extent / export mode) + `result` (`RenderStats` instances・meshes・materials・cloth instances・export pool スロット、ピクセル有無、handoff fallback) + `counters` (累積 render errors / GPU exclusive skip / pixel 無し結果 / render_cpu_ms EMA)。`input` と `result.stats` の食い違いで「依頼したのに描かれていない」をローカライズする。render errors はここを見る (ログだけでは外部ポーラが読めない) |
 | `debug_camera.bin` | トラッキングワーカー | カメラ RGBA (32 byte ヘッダ `VDBG`) |
 
 「アバターが動かない」の切り分けは `debug_gui.json` の 2 値で決まる。`seq` は毎 GUI フレーム、`frame_count` は**非 pause フレームのみ**進む:

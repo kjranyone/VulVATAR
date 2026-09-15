@@ -353,6 +353,53 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
     });
 }
 
+/// Latest-only handoff for the render-thread dump writer — same
+/// latest-frame semantics as the tracking dump: the render thread only
+/// pays for JSON assembly, and a slow disk drops intermediate frames
+/// instead of back-pressuring the render loop (a diagnostics channel
+/// must not add jitter to the thing it observes).
+fn render_dump_cell() -> &'static Arc<LatestCell<serde_json::Value>> {
+    static CELL: OnceLock<Arc<LatestCell<serde_json::Value>>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let cell = LatestCell::<serde_json::Value>::new();
+        let worker = Arc::clone(&cell);
+        let spawned = std::thread::Builder::new()
+            .name("debug-render-dump".into())
+            .spawn(move || {
+                while let Some(state) = worker.take_blocking() {
+                    if let Ok(bytes) = serde_json::to_vec(&state) {
+                        atomic_write(&base_dir().join("debug_render.json"), &bytes);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            log::warn!("debug_channel: could not spawn debug-render-dump writer thread");
+        }
+        cell
+    })
+}
+
+static RENDER_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Publish one render-thread frame record for an external observer.
+/// `state` is the caller-built JSON body (input summary, `RenderStats`,
+/// result kind, cumulative counters); a `seq` counter is stamped in
+/// here so a reader can tell fresh frames apart without trusting wall
+/// clocks. Written to `debug_render.json`. No-op unless the debug flag
+/// file exists.
+pub fn dump_render_result(mut state: serde_json::Value) {
+    if !enabled() {
+        return;
+    }
+    if let Some(obj) = state.as_object_mut() {
+        obj.insert(
+            "seq".to_string(),
+            serde_json::json!(RENDER_DUMP_SEQ.fetch_add(1, Ordering::Relaxed)),
+        );
+    }
+    render_dump_cell().put(state);
+}
+
 static AVATAR_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Publish the SOLVED avatar's key joint world positions (after
@@ -568,6 +615,7 @@ pub fn dump_gui_heartbeat(
     render_fps: Option<f32>,
     render_submit_drops: u64,
     render_cpu_ms: Option<f32>,
+    scene: serde_json::Value,
 ) {
     if !enabled() {
         return;
@@ -613,6 +661,13 @@ pub fn dump_gui_heartbeat(
         // frame budget while render_fps sags = GPU-bound; small while
         // fps sags = recording path itself is the cost.
         "render_cpu_ms": render_cpu_ms,
+        // WHAT is on screen: per-avatar identity (file, primitive
+        // counts, cloth slots), camera/output configuration, and the
+        // render-thread health counters. Built by
+        // `Application::scene_debug_snapshot`; `null` here means the
+        // caller observed the debug flag off at build time, not an
+        // empty scene.
+        "scene": scene,
     });
     if let Ok(bytes) = serde_json::to_vec(&state) {
         atomic_write(&base_dir().join("debug_gui.json"), &bytes);

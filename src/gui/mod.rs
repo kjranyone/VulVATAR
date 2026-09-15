@@ -1221,7 +1221,14 @@ impl eframe::App for GuiApp {
         // decide whether anything below runs. Its `seq` advances on every
         // GUI frame, so a stalled avatar can be attributed to the exact
         // switch responsible instead of inferred from which files stopped
-        // being written. No-op unless the debug flag file exists.
+        // being written. No-op unless the debug flag file exists. The
+        // scene snapshot (WHAT is loaded and drawn) costs a few dozen
+        // string allocations, so it is only built while the flag is on.
+        let scene_snapshot = if crate::tracking::debug_channel::enabled() {
+            self.app.scene_debug_snapshot()
+        } else {
+            serde_json::Value::Null
+        };
         crate::tracking::debug_channel::dump_gui_heartbeat(
             self.runtime_status.paused,
             self.app.avatars.len(),
@@ -1232,6 +1239,7 @@ impl eframe::App for GuiApp {
             self.app.render_thread_fps(),
             self.app.render_submit_drops_total(),
             self.app.render_thread_cpu_ms(),
+            scene_snapshot,
         );
 
         if !self.runtime_status.paused {

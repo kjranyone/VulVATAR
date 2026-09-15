@@ -538,6 +538,142 @@ impl Application {
             .unwrap_or(0)
     }
 
+    /// WHAT is on screen, as one JSON value for the live debug channel
+    /// (`debug_gui.json`'s `scene` block): per-avatar identity (source
+    /// file, primitive/vertex counts, cloth slots), camera + output
+    /// configuration, and the render-thread health counters. Built only
+    /// when the debug flag is on — the caller gates construction on
+    /// `debug_channel::enabled()` so the off-path stays allocation-free.
+    ///
+    /// Exists because `avatars_loaded: 1` answers "is anything posed"
+    /// but not "which file, how many primitives, which cloth is
+    /// attached, where is the camera pointing" — the questions every
+    /// "what am I actually looking at" diagnosis starts with.
+    pub fn scene_debug_snapshot(&self) -> serde_json::Value {
+        let avatars: Vec<serde_json::Value> = self
+            .avatars
+            .iter()
+            .enumerate()
+            .map(|(i, avatar)| {
+                let primitives: usize = avatar.asset.meshes.iter().map(|m| m.primitives.len()).sum();
+                let vertices: u64 = avatar
+                    .asset
+                    .meshes
+                    .iter()
+                    .flat_map(|m| m.primitives.iter())
+                    .map(|p| p.vertex_count as u64)
+                    .sum();
+                let cloth_slot = |state: &Option<crate::avatar::instance::ClothState>,
+                                  backend: Option<_>| {
+                    state
+                        .as_ref()
+                        .map(|cs| {
+                            serde_json::json!({
+                                "enabled": cs.enabled,
+                                "target_primitive": cs.target_primitive_id.map(|p| p.0),
+                                "solver_backend": backend,
+                            })
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                };
+                serde_json::json!({
+                    "index": i,
+                    "id": avatar.id.0,
+                    "active": i == self.active_avatar_index,
+                    "name": avatar
+                        .asset
+                        .source_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy())
+                        .unwrap_or_default(),
+                    "source_path": avatar.asset.source_path.display().to_string(),
+                    "loaded_from_cache": avatar.asset.loaded_from_cache,
+                    "meshes": avatar.asset.meshes.len(),
+                    "primitives": primitives,
+                    "vertices": vertices,
+                    "humanoid": avatar.asset.humanoid.is_some(),
+                    "spring_chains": avatar.asset.spring_bones.len(),
+                    "colliders": avatar.asset.colliders.len(),
+                    "animation_clip": avatar
+                        .animation_state
+                        .active_clip
+                        .map(|c| format!("{c:?}")),
+                    "world_translation": avatar.world_transform.translation,
+                    "cloth": {
+                        "auto_cloth_enabled": self.auto_cloth_enabled,
+                        "primary": cloth_slot(
+                            &avatar.cloth_state,
+                            avatar.cloth_state.as_ref().map(|cs| {
+                                format!("{:?}", cs.solver_backend)
+                            }),
+                        ),
+                        "overlays": avatar
+                            .cloth_overlays
+                            .iter()
+                            .map(|slot| {
+                                serde_json::json!({
+                                    "enabled": slot.enabled,
+                                    "source_path": slot
+                                        .source_path
+                                        .as_ref()
+                                        .map(|p| p.display().to_string()),
+                                    "target_primitive": slot.state.target_primitive_id.map(|p| p.0),
+                                    "solver_backend": format!("{:?}", slot.state.solver_backend),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    },
+                })
+            })
+            .collect();
+        let render_health = self.render_thread.as_ref().map(|rt| {
+            serde_json::json!({
+                "errors_total": rt.render_errors_total(),
+                "last_error": rt.last_render_error(),
+                "gpu_exclusive_skips_total": rt.gpu_exclusive_skips_total(),
+                "no_pixel_results_total": rt.no_pixel_results_total(),
+                "results_dropped_total": self.render_results_dropped,
+            })
+        });
+        serde_json::json!({
+            "avatars": avatars,
+            // Fade-out-when-no-person opacity — a viewport that "went
+            // black" is often just this at 0, invisible to every other
+            // counter.
+            "avatar_fade_opacity": self.tracking_fade_opacity,
+            "scene": {
+                "ground_grid": self.ground_grid_visible,
+                "background_image": self
+                    .viewport_background
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                "transparent_background": self.transparent_background,
+                "generative_background": self.generative_background.enabled,
+            },
+            "camera": {
+                "yaw_deg": self.viewport_camera.yaw_deg,
+                "pitch_deg": self.viewport_camera.pitch_deg,
+                "distance": self.viewport_camera.distance,
+                "fov_deg": self.viewport_camera.fov_deg,
+                // Sensor (mirror) camera engages only when the toggle
+                // is on AND the live pose carries metric intrinsics —
+                // the mismatch case is invisible in the GUI toggle.
+                "sensor_camera_available": self
+                    .last_tracking_pose
+                    .as_ref()
+                    .is_some_and(|p| p.metric_frame_info.is_some()),
+            },
+            "output": {
+                "viewport_extent": self.viewport_extent,
+                "output_extent": self.output_extent,
+                "preserve_alpha": self.output_preserve_alpha,
+                "requested_sink": format!("{:?}", self.requested_sink()),
+            },
+            "gpu_budget": format!("{:?}", self.runtime_gpu_budget.degraded_mode()),
+            "render": render_health,
+        })
+    }
+
     /// Set the desired viewport resolution (called by the GUI when the viewport panel resizes).
     pub fn set_viewport_size(&mut self, width: u32, height: u32) {
         let w = width.max(1);
