@@ -312,6 +312,11 @@ pub struct Application {
     /// (see `app::render::splat_pose_key`). Only advanced when a splat
     /// actually runs (see the cadence gate in `run_frame`).
     sdf_splat_pose_keys: std::collections::HashMap<u64, u64>,
+    /// Garment splat list per avatar instance (see
+    /// `clearance::sdf_garment_splat_prims`) — derived once per load,
+    /// consumed by the body-SDF plan builder.
+    sdf_garment_prims:
+        std::collections::HashMap<u64, Vec<(crate::asset::MeshId, crate::asset::PrimitiveId)>>,
     /// Last instant each instance's body-SDF splat ran, gating the
     /// refresh cadence to 30 Hz while the pose is moving.
     sdf_splat_last: std::collections::HashMap<u64, std::time::Instant>,
@@ -480,6 +485,7 @@ impl Application {
             logged_first_render_result: false,
             render_results_pending: 0,
             sdf_splat_pose_keys: std::collections::HashMap::new(),
+            sdf_garment_prims: std::collections::HashMap::new(),
             sdf_splat_last: std::collections::HashMap::new(),
             render_results_dropped: 0,
             pending_export_lease_releases: VecDeque::new(),

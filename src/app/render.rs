@@ -485,6 +485,17 @@ impl Application {
                 std::time::Duration::from_millis(33);
             let mut sdf_splat_changed = std::collections::HashSet::new();
             for avatar in &self.avatars {
+                // Garment splat list is a pure function of the asset —
+                // derive once per instance (the weight-mass scan is not
+                // per-frame material).
+                self.sdf_garment_prims
+                    .entry(avatar.id.0)
+                    .or_insert_with(|| {
+                        crate::asset::clearance::sdf_garment_splat_prims(
+                            &avatar.asset,
+                            Self::sdf_garment_cap(),
+                        )
+                    });
                 let spring_driven: std::collections::HashSet<usize> = avatar
                     .asset
                     .spring_bones
@@ -525,6 +536,7 @@ impl Application {
                 substeps as u32,
                 &self.physics.resolved_scene_colliders(),
                 &sdf_splat_changed,
+                &self.sdf_garment_prims,
             );
 
             if let Some(ref rt) = self.render_thread {
@@ -1058,6 +1070,20 @@ impl Application {
         })
     }
 
+    /// How many garment primitives join the body-SDF splat (see
+    /// `clearance::sdf_garment_splat_prims`). Env
+    /// `VULVATAR_SDF_GARMENTS` (0 disables the garment layer — the
+    /// skin+face-only behaviour before 2026-09-15). Defaults to 3.
+    fn sdf_garment_cap() -> usize {
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("VULVATAR_SDF_GARMENTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3)
+        })
+    }
+
     /// Quantized pose key covering everything the splatted vertices
     /// depend on: the skeleton pose (`local_transforms`, with
     /// spring-driven nodes excluded — hair chains jitter by
@@ -1110,6 +1136,7 @@ impl Application {
         substeps: u32,
         scene_colliders: &[crate::simulation::cloth::ResolvedCollider],
         sdf_splat_changed: &std::collections::HashSet<u64>,
+        garment_splat: &std::collections::HashMap<u64, Vec<(crate::asset::MeshId, crate::asset::PrimitiveId)>>,
     ) -> RenderFrameInput {
         let cam = &fi_config.camera;
         let lighting = &fi_config.lighting;
@@ -1195,18 +1222,47 @@ impl Application {
                     // Splat list: the body surface plus any face/head
                     // surface — on many models the face is its own
                     // primitive, and hair bangs / twintails collide
-                    // against it. Union their rest AABBs for the grid:
-                    // the root AABB can be bloated by hair prims and a
-                    // T-pose bind, which coarsens the voxels for
-                    // everyone. Contacts only happen within the splat
-                    // shell of these surfaces, so strands outside the
-                    // grid correctly sample "no collision".
+                    // against it — plus the garment layer
+                    // (`clearance::sdf_garment_splat_prims`) so hair
+                    // resting on clothing resolves against the CLOTHED
+                    // surface, not the skin beneath it (measured:
+                    // Yumeka's jacket floats p50 20 mm and hair sank
+                    // 9–16 mm into it, `diagnostics/sdf_hair_20260915`).
+                    // Union their rest AABBs for the grid: the root AABB
+                    // can be bloated by hair prims and a T-pose bind,
+                    // which coarsens the voxels for everyone. Contacts
+                    // only happen within the splat shell of these
+                    // surfaces, so strands outside the grid correctly
+                    // sample "no collision".
+                    let garment_cap = Self::sdf_garment_cap();
+                    let garment_prims: Vec<_> = (garment_cap > 0)
+                        .then(|| {
+                            // Cloth-simulated targets are excluded: their
+                            // surface moves with the solver, and the
+                            // solver-driven skirt rarely touches hair —
+                            // splatting it would only add cells.
+                            let cloth_targets: std::collections::HashSet<u64> = avatar
+                                .cloth_overlays
+                                .iter()
+                                .filter_map(|s| s.state.target_primitive_id.map(|p| p.0))
+                                .collect();
+                            garment_splat
+                                .get(&avatar.id.0)
+                                .map(|v| v.as_slice())
+                                .unwrap_or(&[])
+                                .iter()
+                                .filter(|(_, p)| !cloth_targets.contains(&p.0))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     let mut splat: Vec<(crate::asset::MeshId, crate::asset::PrimitiveId)> =
                         Vec::new();
                     let mut union = crate::asset::Aabb::empty();
                     {
+                        let splat_cap = 4 + garment_prims.len();
                         let mut push_prim = |mesh_id, primitive_id, bounds: &crate::asset::Aabb| {
-                            if splat.len() >= 4
+                            if splat.len() >= splat_cap
                                 || splat.iter().any(|&(m, p)| m == mesh_id && p == primitive_id)
                             {
                                 return;
@@ -1256,6 +1312,18 @@ impl Application {
                                 if (mesh_hit || mat_hit) && p.vertex_count > 100 {
                                     push_prim(m.id, p.id, &p.bounds);
                                 }
+                            }
+                        }
+                        for (mesh_id, primitive_id) in &garment_prims {
+                            if let Some(bounds) = avatar
+                                .asset
+                                .meshes
+                                .iter()
+                                .find(|m| m.id == *mesh_id)
+                                .and_then(|m| m.primitives.iter().find(|p| p.id == *primitive_id))
+                                .map(|p| p.bounds)
+                            {
+                                push_prim(*mesh_id, *primitive_id, &bounds);
                             }
                         }
                     }

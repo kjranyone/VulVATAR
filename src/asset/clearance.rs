@@ -80,6 +80,108 @@ impl Default for SkinAnchor {
     }
 }
 
+/// Garment surfaces to add to the body-SDF splat list, so hair collides
+/// with the CLOTHED body. The default splat (skin + face) leaves hair
+/// that drapes over clothing sinking into the garment by its float off
+/// the skin — measured on Yumeka v1.0.3 (2026-09-15,
+/// `diagnostics/sdf_hair_20260915`): the jacket floats p50 20 mm off
+/// the skin and side/back hair rendered 9–16 mm INSIDE it while
+/// resolving perfectly against the skin.
+///
+/// Selection by skin-weight mass: a primitive qualifies when at most
+/// half its weight mass binds to non-drape bones — the leg/foot and
+/// head chains (nearest humanoid ancestor) plus spring-chain (strand)
+/// bones. Note garment HEMS bind to UpperLeg, so a positive
+/// torso-mass threshold would reject exactly the long jackets this
+/// exists for; the exclusion form keeps them while socks/legs
+/// (LowerLeg-dominant), wings/tails and the hair shells themselves
+/// still fail. Requires ≥ 1 000 vertices. Ranked by vertex count,
+/// capped at `max`.
+pub fn sdf_garment_splat_prims(
+    asset: &AvatarAsset,
+    max: usize,
+) -> Vec<(MeshId, PrimitiveId)> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let body_pid = find_body_primitive(asset).map(|(_, p)| p);
+
+    // Strand nodes: every spring chain's bones (hair/tail/wing/skirt
+    // chains all skin their own meshes to themselves).
+    let mut strand_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for sb in &asset.spring_bones {
+        strand_nodes.insert(sb.chain_root.0);
+        for &n in &sb.joints {
+            strand_nodes.insert(n.0);
+        }
+    }
+
+    // Excluded chains per node: walk up to the nearest humanoid
+    // ancestor; leg/foot/head surfaces are not hair-drape surfaces.
+    let is_leg_or_head = |bone: crate::asset::HumanoidBone| -> bool {
+        use crate::asset::HumanoidBone as HB;
+        matches!(
+            bone,
+            HB::Head
+                | HB::LeftUpperLeg
+                | HB::LeftLowerLeg
+                | HB::LeftFoot
+                | HB::RightUpperLeg
+                | HB::RightLowerLeg
+                | HB::RightFoot
+        )
+    };
+    let nodes = &asset.skeleton.nodes;
+    let mut excluded = vec![false; nodes.len()];
+    for i in 0..nodes.len() {
+        let mut cur = Some(i);
+        while let Some(idx) = cur {
+            if let Some(bone) = nodes[idx].humanoid_bone {
+                excluded[i] = is_leg_or_head(bone);
+                break;
+            }
+            cur = nodes[idx].parent.map(|p| p.0 as usize);
+        }
+    }
+
+    let mut hits: Vec<(usize, MeshId, PrimitiveId)> = Vec::new();
+    for mesh in &asset.meshes {
+        for prim in &mesh.primitives {
+            if Some(prim.id) == body_pid {
+                continue;
+            }
+            let Some(vd) = prim.vertices.as_ref() else {
+                continue;
+            };
+            let verts = vd.positions.len();
+            if verts < 1000 || prim.indices.as_ref().map_or(true, |ix| ix.len() < 3) {
+                continue;
+            }
+            let mut mass_excluded = 0.0f32;
+            let mut mass_total = 0.0f32;
+            for (vi, joints) in vd.joint_indices.iter().enumerate() {
+                for (slot, &ji) in joints.iter().enumerate() {
+                    let w = vd.joint_weights.get(vi).map_or(0.0, |w| w[slot]);
+                    if w <= 1e-4 || (ji as usize) >= nodes.len() {
+                        continue;
+                    }
+                    mass_total += w;
+                    if excluded[ji as usize] || strand_nodes.contains(&(ji as u64)) {
+                        mass_excluded += w;
+                    }
+                }
+            }
+            if mass_total < 1e-4 || mass_excluded / mass_total > 0.5 {
+                continue;
+            }
+            hits.push((verts, mesh.id, prim.id));
+        }
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.truncate(max);
+    hits.into_iter().map(|(_, m, p)| (m, p)).collect()
+}
+
 /// Identifies the avatar's primary body primitive.
 ///
 /// Prioritizes primitives whose mesh or material name contains "body" or "skin",

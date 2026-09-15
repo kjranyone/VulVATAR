@@ -954,6 +954,86 @@ fn test_yumeka_skin_anchors_generation() {
     );
 }
 
+/// Garment SDF splat selection (`clearance::sdf_garment_splat_prims`):
+/// the jacket layer must join the body field so hair drapes over the
+/// CLOTHED surface; leg/head-bound meshes must not (they cost cells and
+/// never touch hair).
+#[test]
+fn test_sdf_garment_splat_picks_jacket_not_legs() {
+    let Some(fbx_path) = yumeka_fbx_path() else {
+        return;
+    };
+    let loader = crate::asset::fbx::FbxAssetLoader::new();
+    let asset = loader.load(&fbx_path).expect("Failed to load Yumeka FBX");
+
+    let picks = crate::asset::clearance::sdf_garment_splat_prims(&asset, 3);
+    assert!(!picks.is_empty(), "Yumeka's jacket layer must classify");
+    let names: Vec<String> = picks
+        .iter()
+        .filter_map(|(mesh_id, _)| {
+            asset
+                .meshes
+                .iter()
+                .find(|m| m.id == *mesh_id)
+                .map(|m| m.name.clone())
+        })
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("circle.051")),
+        "the jacket (Circle.051) must join the SDF splat, got {names:?}"
+    );
+    // Nothing leg- or head-bound may be picked: every pick's dominant
+    // bone chain must be torso (arms included).
+    for (mesh_id, prim_id) in &picks {
+        let prim = asset
+            .meshes
+            .iter()
+            .find(|m| m.id == *mesh_id)
+            .and_then(|m| m.primitives.iter().find(|p| p.id == *prim_id))
+            .expect("pick resolves to a primitive");
+        let Some(vd) = prim.vertices.as_ref() else {
+            panic!("pick has no vertex data");
+        };
+        let mut leg_head_mass = 0.0f32;
+        let mut total = 0.0f32;
+        for (vi, joints) in vd.joint_indices.iter().enumerate() {
+            for (slot, &ji) in joints.iter().enumerate() {
+                let w = vd.joint_weights.get(vi).map_or(0.0, |w| w[slot]);
+                if w <= 1e-4 {
+                    continue;
+                }
+                total += w;
+                let mut cur = asset.skeleton.nodes.get(ji as usize);
+                while let Some(node) = cur {
+                    if let Some(bone) = node.humanoid_bone {
+                        if matches!(
+                            bone,
+                            crate::asset::HumanoidBone::Head
+                                | crate::asset::HumanoidBone::LeftUpperLeg
+                                | crate::asset::HumanoidBone::LeftLowerLeg
+                                | crate::asset::HumanoidBone::LeftFoot
+                                | crate::asset::HumanoidBone::RightUpperLeg
+                                | crate::asset::HumanoidBone::RightLowerLeg
+                                | crate::asset::HumanoidBone::RightFoot
+                        ) {
+                            leg_head_mass += w;
+                        }
+                        break;
+                    }
+                    cur = node.parent.and_then(|p| asset.skeleton.nodes.get(p.0 as usize));
+                }
+            }
+        }
+        assert!(
+            leg_head_mass / total.max(1e-6) < 0.5,
+            "splat pick '{}' is leg/head-bound",
+            names.iter().find(|n| !n.is_empty()).unwrap_or(&"?".into())
+        );
+    }
+}
+
 #[test]
 fn test_yumeka_anti_penetration_projection_on_leg_lift() {
     let Some(fbx_path) = yumeka_fbx_path() else {

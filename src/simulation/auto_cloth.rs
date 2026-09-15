@@ -680,6 +680,28 @@ mod tests {
             assert!(slot.state.target_primitive_id.is_some());
             assert!(slot.source_path.is_none(), "auto slots are runtime-only");
         }
+
+        // The simulated garment must NOT keep its load-time clearance
+        // anchors: the solver owns its body interaction, render-only
+        // anchors fight the simulated state (`init_cloth_overlay`
+        // strips them; measured p95 15–18 mm drawn-vs-simulated skew,
+        // diagnostics/cloth_vboaudit_20260915).
+        for slot in &avatar.cloth_overlays {
+            let Some(pid) = slot.state.target_primitive_id else {
+                continue;
+            };
+            let prim = avatar
+                .asset
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .find(|p| p.id == pid)
+                .expect("cloth target prim present");
+            assert!(
+                prim.skin_anchors.is_none(),
+                "simulated garment must not carry render-side clearance anchors"
+            );
+        }
     }
 
     /// The classifier must NOT swallow upper-body garments even when

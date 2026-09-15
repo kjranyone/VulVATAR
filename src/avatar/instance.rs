@@ -339,6 +339,30 @@ impl AvatarInstance {
             slot.buffers = ClothSimTempBuffers::new(n);
             apply_render_target(&mut slot.state, cloth_asset);
         }
+        // A simulated garment owns its body interaction (solver capsule
+        // collision). Render-only clearance anchors on the same
+        // primitive fight that state instead of helping: the anchor
+        // branch displaces DRAWN vertices without ever feeding the
+        // correction back, so the skirt renders p95 15–18 mm away from
+        // its simulated positions every frame (measured 2026-09-15,
+        // `diagnostics/cloth_vboaudit_20260915`). Strip the target
+        // primitive's clearance anchors; containment (if any) keeps
+        // running. Load-time anchors on the asset are untouched — this
+        // only CoWs the instance's view of the one primitive.
+        if let Some(pid) = self
+            .cloth_overlays
+            .get(slot_index)
+            .and_then(|s| s.state.target_primitive_id)
+        {
+            let asset = std::sync::Arc::make_mut(&mut self.asset);
+            for mesh in asset.meshes.iter_mut() {
+                for prim in mesh.primitives.iter_mut() {
+                    if prim.id == pid && prim.skin_anchors.is_some() {
+                        std::sync::Arc::make_mut(prim).skin_anchors = None;
+                    }
+                }
+            }
+        }
     }
 
     pub fn remove_cloth_overlay(&mut self, slot_index: usize) {

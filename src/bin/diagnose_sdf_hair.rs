@@ -56,13 +56,26 @@ fn main() -> Result<(), String> {
 
     // Body primitive + grid, the same selection the app's frame input
     // builder performs.
-    // Splat list: body + face/head surfaces, union AABB for the grid —
-    // the same selection the app's frame input builder performs.
+    // Splat list: body + face/head surfaces + the garment layer, union
+    // AABB for the grid — the same selection the app's frame input
+    // builder performs.
+    let garments = vulvatar_lib::asset::clearance::sdf_garment_splat_prims(&avatar.asset, 3);
+    for (mesh_id, prim_id) in &garments {
+        let name = avatar
+            .asset
+            .meshes
+            .iter()
+            .find(|m| m.id == *mesh_id)
+            .map(|m| m.name.as_str())
+            .unwrap_or("?");
+        println!("garment pick '{}' (mesh {}, prim {})", name, mesh_id.0, prim_id.0);
+    }
     let mut splat: Vec<(vulvatar_lib::asset::MeshId, vulvatar_lib::asset::PrimitiveId)> =
         Vec::new();
     let mut union = vulvatar_lib::asset::Aabb::empty();
+    let splat_cap = 4 + garments.len();
     let mut push_prim = |mesh_id, primitive_id, bounds: &vulvatar_lib::asset::Aabb| {
-        if splat.len() >= 4
+        if splat.len() >= splat_cap
             || splat
                 .iter()
                 .any(|&(m, p)| m == mesh_id && p == primitive_id)
@@ -107,6 +120,18 @@ fn main() -> Result<(), String> {
             if (mesh_hit || mat_hit) && p.vertex_count > 100 {
                 push_prim(m.id, p.id, &p.bounds);
             }
+        }
+    }
+    for (mesh_id, primitive_id) in &garments {
+        if let Some(bounds) = avatar
+            .asset
+            .meshes
+            .iter()
+            .find(|m| m.id == *mesh_id)
+            .and_then(|m| m.primitives.iter().find(|p| p.id == *primitive_id))
+            .map(|p| p.bounds)
+        {
+            push_prim(*mesh_id, *primitive_id, &bounds);
         }
     }
     if splat.is_empty() {
@@ -341,6 +366,16 @@ fn main() -> Result<(), String> {
         "\n- frames the solver ran WITH a field: {}\n",
         sdf_ready_frames
     ));
+
+    // Garment-gap report (2026-09-15): the splat list is skin + face
+    // only, so hair resolves against the BODY surface. Measure how far
+    // the settled joints sit from each non-splatted garment surface —
+    // a joint whose contact band (radius + 4 mm margin) exceeds that
+    // distance renders INSIDE the garment. Also samples the body field
+    // at each garment's skinned vertices to report how far the garment
+    // itself floats off the skin (the shell thickness hair must clear).
+    garment_gap_report(&avatar, &hair_chains, &mut report);
+
     let report_path = Path::new(&output_dir).join("summary.md");
     std::fs::write(&report_path, &report).map_err(|e| format!("write summary: {e}"))?;
     println!("summary: {}", report_path.display());
@@ -535,4 +570,358 @@ fn save_png(path: &Path, extent: [u32; 2], pixels: &[u8]) -> Result<(), String> 
             .ok_or_else(|| format!("PNG buffer construction failed for {}", path.display()))?;
     img.save(path)
         .map_err(|e| format!("failed to save '{}': {e}", path.display()))
+}
+
+/// Settled-joint distance to every non-splatted garment surface, plus
+/// each garment's own float off the skin (sampled from the body field).
+/// `hair_chains` carries `(spring_bones index, chain name, radius)` —
+/// the same list the min-gap loop above reports on.
+fn garment_gap_report(
+    avatar: &vulvatar_lib::avatar::AvatarInstance,
+    hair_chains: &[(usize, String, f32)],
+    report: &mut String,
+) {
+    use vulvatar_lib::asset::{MeshId, PrimitiveId};
+
+    // Nodes belonging to a hair chain (root + joints) — used to exclude
+    // the hair's own meshes, whose surfaces obviously contain the joints.
+    let mut hair_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for &(ci, _, _) in hair_chains {
+        if let Some(sb) = avatar.asset.spring_bones.get(ci) {
+            hair_nodes.insert(sb.chain_root.0);
+            for &n in &sb.joints {
+                hair_nodes.insert(n.0);
+            }
+        }
+    }
+
+    let body_pid = vulvatar_lib::asset::clearance::find_body_primitive(&avatar.asset)
+        .map(|(_, p)| p);
+
+    // A prim is "hair" when a third of its vertices are majority-bound
+    // to hair-chain nodes (Yumeka's meshes are all "Circle.xxx", so
+    // names cannot make the call).
+    let is_hair_prim = |vd: &vulvatar_lib::asset::VertexData| -> bool {
+        if vd.positions.is_empty() {
+            return false;
+        }
+        let mut hair_verts = 0usize;
+        for (vi, joints) in vd.joint_indices.iter().enumerate() {
+            let mut best_w = 0.0f32;
+            let mut best_is_hair = false;
+            for (slot, &ji) in joints.iter().enumerate() {
+                let w = vd.joint_weights.get(vi).map_or(0.0, |w| w[slot]);
+                if w > best_w {
+                    best_w = w;
+                    best_is_hair = hair_nodes.contains(&(ji as u64));
+                }
+            }
+            if best_is_hair {
+                hair_verts += 1;
+            }
+        }
+        hair_verts as f32 / vd.positions.len() as f32 >= 0.3
+    };
+
+    // Splatted (skin + face/head) prims are not garments.
+    let splat_pids: std::collections::HashSet<(MeshId, PrimitiveId)> = avatar
+        .asset
+        .meshes
+        .iter()
+        .flat_map(|m| {
+            let mesh_hit = {
+                let n = m.name.to_lowercase();
+                n.contains("face") || n.contains("head")
+            };
+            m.primitives
+                .iter()
+                .filter(move |p| {
+                    let mat_hit = avatar
+                        .asset
+                        .materials
+                        .iter()
+                        .find(|mat| mat.id == p.material_id)
+                        .map(|mat| {
+                            let n = mat.name.to_lowercase();
+                            n.contains("face") || n.contains("head")
+                        })
+                        .unwrap_or(false);
+                    mesh_hit || mat_hit
+                })
+                .map(move |p| (m.id, p.id))
+        })
+        .collect();
+
+    // Settled joint positions per chain (skip the chain root — it rides
+    // the head skeleton, not the solved strand).
+    let settled: Vec<(usize, String, f32, Vec<[f32; 3]>)> = hair_chains
+        .iter()
+        .filter_map(|&(ci, ref name, radius)| {
+            let positions: Vec<[f32; 3]> = avatar.secondary_motion.spring_states
+                .get(ci)?
+                .positions
+                .iter()
+                .skip(1)
+                .copied()
+                .collect();
+            (!positions.is_empty()).then_some((ci, name.clone(), radius, positions))
+        })
+        .collect();
+
+    let field = avatar.body_sdf.as_ref();
+    report.push_str("\n## Garment gap (settled joints vs non-splatted garments)\n\n");
+
+    for mesh in &avatar.asset.meshes {
+        for prim in &mesh.primitives {
+            let (Some(vd), Some(indices)) = (prim.vertices.as_ref(), prim.indices.as_ref())
+            else {
+                continue;
+            };
+            if indices.len() < 3 || Some(prim.id) == body_pid {
+                continue;
+            }
+            if splat_pids.contains(&(mesh.id, prim.id)) || is_hair_prim(vd) {
+                continue;
+            }
+
+            // Skinned triangles at the settled pose (weight-normalized
+            // LBS, the clearance/auto-cloth CPU recipe).
+            let world: Vec<[f32; 3]> = vd
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(i, &pos)| lbs_position(avatar, vd, i, pos))
+                .collect();
+            let tri: Vec<[[f32; 3]; 3]> = indices
+                .chunks_exact(3)
+                .map(|t| [world[t[0] as usize], world[t[1] as usize], world[t[2] as usize]])
+                .collect();
+            let mut lo = [f32::MAX; 3];
+            let mut hi = [f32::MIN; 3];
+            for p in &world {
+                for c in 0..3 {
+                    lo[c] = lo[c].min(p[c]);
+                    hi[c] = hi[c].max(p[c]);
+                }
+            }
+
+            // Identification: hair-bound share plus the top bones by
+            // accumulated weight mass, so the reader can tell a true
+            // garment (jacket → arm/chest bones) from a hair shell the
+            // 30% classifier missed.
+            let mut bone_mass: std::collections::HashMap<u64, f32> =
+                std::collections::HashMap::new();
+            for (vi, joints) in vd.joint_indices.iter().enumerate() {
+                for (slot, &ji) in joints.iter().enumerate() {
+                    let w = vd.joint_weights.get(vi).map_or(0.0, |w| w[slot]);
+                    if w > 1e-4 {
+                        *bone_mass.entry(ji as u64).or_insert(0.0) += w;
+                    }
+                }
+            }
+            let hair_mass: f32 = bone_mass
+                .iter()
+                .filter(|(n, _)| hair_nodes.contains(n))
+                .map(|(_, w)| *w)
+                .sum();
+            let total_mass: f32 = bone_mass.values().sum();
+            let mut top: Vec<(f32, &u64)> = bone_mass.iter().map(|(n, w)| (*w, n)).collect();
+            top.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top_bones = top
+                .iter()
+                .take(3)
+                .map(|(w, n)| {
+                    format!(
+                        "{}:{:.0}%",
+                        avatar
+                            .asset
+                            .skeleton
+                            .nodes
+                            .get(**n as usize)
+                            .map(|nd| nd.name.as_str())
+                            .unwrap_or("?"),
+                        100.0 * w / total_mass.max(1e-6)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (p05, p50) = match field {
+                Some(f) => (pct_off_skin(f, &world, 0.05), pct_off_skin(f, &world, 0.5)),
+                None => (None, None),
+            };
+            let float_text = match (p05, p50) {
+                (Some(a), Some(b)) => format!("float off skin p5 {:.0} / p50 {:.0} mm", a, b),
+                _ => "float off skin n/a".to_string(),
+            };
+            report.push_str(&format!(
+                "- garment '{}' ({} verts): {}; hair-bound mass {:.0}%; top bones {}\n",
+                mesh.name,
+                world.len(),
+                float_text,
+                100.0 * hair_mass / total_mass.max(1e-6),
+                top_bones
+            ));
+            println!(
+                "garment '{}' ({} verts): {}; hair-bound {:.0}%; top: {}",
+                mesh.name,
+                world.len(),
+                float_text,
+                100.0 * hair_mass / total_mass.max(1e-6),
+                top_bones
+            );
+
+
+            // Per-chain closest joint distance to this garment's
+            // triangles (AABB-culled brute force).
+            let mut lines: Vec<String> = Vec::new();
+            for (_, name, radius, positions) in &settled {
+                let mut best = f32::MAX;
+                for p in positions {
+                    if p[0] < lo[0] - 0.15
+                        || p[0] > hi[0] + 0.15
+                        || p[1] < lo[1] - 0.15
+                        || p[1] > hi[1] + 0.15
+                        || p[2] < lo[2] - 0.15
+                        || p[2] > hi[2] + 0.15
+                    {
+                        continue;
+                    }
+                    for t in &tri {
+                        best = best.min(point_triangle_dist(*p, t));
+                    }
+                }
+                if best.is_finite() {
+                    // Mirror the solver's contact band: radius +
+                    // SDF_CONTACT_MARGIN (spring.rs, 4 mm).
+                    let band = radius + 0.004;
+                    let verdict = if best < band {
+                        format!("  <-- INSIDE by {:.0} mm", (band - best) * 1000.0)
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!(
+                        "  - {:?} r {:.0} mm: joint-to-garment {:.0} mm{}\n",
+                        name,
+                        radius * 1000.0,
+                        best * 1000.0,
+                        verdict
+                    ));
+                }
+            }
+            if !lines.is_empty() {
+                report.push_str(&format!(
+                    "- joint distances vs '{}':\n{}",
+                    mesh.name,
+                    lines.join("")
+                ));
+            }
+        }
+    }
+}
+
+/// Percentile (mm) of the garment's skinned vertices' body-field
+/// distance — how far the garment floats off the skin. `q` in 0..=1.
+fn pct_off_skin(field: &SdfField, world: &[[f32; 3]], q: f32) -> Option<f32> {
+    let mut gaps: Vec<f32> = world
+        .iter()
+        .map(|p| field.sample(*p))
+        .filter(|d| *d < SENTINEL)
+        .collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.total_cmp(b));
+    let idx = ((gaps.len() as f32 - 1.0) * q).round() as usize;
+    Some(gaps[idx.min(gaps.len() - 1)] * 1000.0)
+}
+
+/// Weight-normalized 4-influence LBS against the instance's skinning
+/// matrices (same recipe as `auto_cloth` / `clearance` CPU passes).
+fn lbs_position(
+    avatar: &vulvatar_lib::avatar::AvatarInstance,
+    vd: &vulvatar_lib::asset::VertexData,
+    i: usize,
+    pos: [f32; 3],
+) -> [f32; 3] {
+    let mut out = [0.0f32; 3];
+    let mut total_w = 0.0;
+    if i < vd.joint_weights.len() && i < vd.joint_indices.len() {
+        for k in 0..4 {
+            let w = vd.joint_weights[i][k];
+            if w > 0.0001 {
+                let j = vd.joint_indices[i][k] as usize;
+                if let Some(sm) = avatar.pose.skinning_matrices.get(j) {
+                    for c in 0..3 {
+                        out[c] += w
+                            * (sm[0][c] * pos[0] + sm[1][c] * pos[1] + sm[2][c] * pos[2]
+                                + sm[3][c]);
+                    }
+                    total_w += w;
+                }
+            }
+        }
+    }
+    if total_w > 0.001 {
+        for c in 0..3 {
+            out[c] /= total_w;
+        }
+    }
+    out
+}
+
+/// Squared-free point-to-triangle distance (Ericson 5.1.5).
+fn point_triangle_dist(p: [f32; 3], t: &[[f32; 3]; 3]) -> f32 {
+    let (a, b, c) = (t[0], t[1], t[2]);
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+    let d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return len(ap);
+    }
+    let bp = [p[0] - b[0], p[1] - b[1], p[2] - b[2]];
+    let d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
+    let d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+    if d3 >= 0.0 && d4 <= d3 {
+        return len(bp);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return len([ab[0] * v - ap[0], ab[1] * v - ap[1], ab[2] * v - ap[2]]);
+    }
+    let cp = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    let d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
+    let d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+    if d6 >= 0.0 && d5 <= d6 {
+        return len(cp);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return len([ac[0] * w - ap[0], ac[1] * w - ap[1], ac[2] * w - ap[2]]);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let bc = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+        return len([
+            bc[0] * w - bp[0],
+            bc[1] * w - bp[1],
+            bc[2] * w - bp[2],
+        ]);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    len([
+        ab[0] * v + ac[0] * w - ap[0],
+        ab[1] * v + ac[1] * w - ap[1],
+        ab[2] * v + ac[2] * w - ap[2],
+    ])
+}
+
+fn len(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
