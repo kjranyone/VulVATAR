@@ -285,6 +285,69 @@ pub fn detector_hand_crop(
     ))
 }
 
+/// Crop seeded from the BODY wrist/elbow keypoints (COCO 7/9 left,
+/// 8/10 right) — the wholebody hand blocks [`detector_hand_crop`]
+/// relies on are gone with YOLO26, so this is the only detector-side
+/// seed left for hand acquisition. The centre extrapolates past the
+/// wrist along the elbow→wrist direction (the hand extends beyond the
+/// wrist joint), sized from the projected forearm length; without a
+/// confident elbow it falls back to a fixed-size crop centred on the
+/// wrist. `None` when the wrist is unconfident / out of frame.
+pub fn wrist_hand_crop(
+    kps: &[(f32, f32, f32)],
+    hand: usize,
+    width: u32,
+    height: u32,
+    min_score: f32,
+    min_px: f64,
+) -> Option<(f32, f32, f32)> {
+    let (el, wr) = if hand == 0 { (7usize, 9usize) } else { (8, 10) };
+    let px = |i: usize| -> Option<(f64, f64)> {
+        let (nx, ny, sc) = kps.get(i)?;
+        if *sc < min_score || !(0.0..=1.0).contains(nx) || !(0.0..=1.0).contains(ny) {
+            return None;
+        }
+        Some((*nx as f64 * width as f64, *ny as f64 * height as f64))
+    };
+    let (wu, wv) = px(wr)?;
+    let (cu, cv, size) = match px(el) {
+        Some((eu, ev)) => {
+            let du = wu - eu;
+            let dv = wv - ev;
+            let fore = (du * du + dv * dv).sqrt();
+            let size = (fore * 1.2).clamp(min_px, 320.0);
+            if fore < 1.0 {
+                (wu, wv, size)
+            } else {
+                // Centre a quarter crop-size past the wrist along the
+                // forearm direction.
+                (
+                    wu + du / fore * size * 0.25,
+                    wv + dv / fore * size * 0.25,
+                    size,
+                )
+            }
+        }
+        // No confident elbow (bent arms hide it on desk/palms sessions):
+        // enlarge generously instead of extrapolating — the hand may
+        // extend in any direction from the wrist joint, and a wrist-tight
+        // crop only ever sees the cuff.
+        None => (wu, wv, min_px * 2.4),
+    };
+    if cu < -size * 0.2
+        || cv < -size * 0.2
+        || cu > width as f64 + size * 0.2
+        || cv > height as f64 + size * 0.2
+    {
+        return None;
+    }
+    Some((
+        (cu - size * 0.5) as f32,
+        (cv - size * 0.5) as f32,
+        size as f32,
+    ))
+}
+
 /// Turn a hand result into estimator observations: 21 2-D keypoints
 /// (σ from crop scale) and, when an absolute wrist position is known,
 /// absolute 3-D points for the finger joints from the wrist-relative
@@ -433,5 +496,50 @@ pub fn hand_observations(
         push_angle(out_ang, (0, 1 + f * 4, 2 + f * 4), (wrist_mp, mcp, pip));
         push_angle(out_ang, (1 + f * 4, 2 + f * 4, 3 + f * 4), (mcp, pip, dip));
         push_angle(out_ang, (2 + f * 4, 3 + f * 4, 4 + f * 4), (pip, dip, tip));
+    }
+}
+
+#[cfg(test)]
+mod wrist_crop_tests {
+    use super::*;
+
+    fn kps_133() -> Vec<(f32, f32, f32)> {
+        vec![(0.0, 0.0, 0.0); 133]
+    }
+
+    #[test]
+    fn wrist_crop_centres_past_the_wrist_along_the_forearm() {
+        let mut kps = kps_133();
+        // Left elbow at (0.3, 0.5), wrist at (0.5, 0.5) on a 640x480 frame:
+        // forearm points +x, 128 px long → size = 153.6, centre past the
+        // wrist by a quarter size.
+        kps[7] = (0.30, 0.50, 0.9);
+        kps[9] = (0.50, 0.50, 0.9);
+        let (x, y, size) = wrist_hand_crop(&kps, 0, 640, 480, 0.35, 96.0).unwrap();
+        assert!((size - 153.6).abs() < 0.1, "size {size}");
+        let cx = x as f64 + size as f64 * 0.5;
+        let cy = y as f64 + size as f64 * 0.5;
+        assert!((cx - (320.0 + 153.6 * 0.25)).abs() < 0.1, "cx {cx}");
+        assert!((cy - 240.0).abs() < 0.1, "cy {cy}");
+    }
+
+    #[test]
+    fn wrist_crop_falls_back_to_the_wrist_without_an_elbow() {
+        let mut kps = kps_133();
+        kps[10] = (0.50, 0.60, 0.9);
+        let (x, y, size) = wrist_hand_crop(&kps, 1, 640, 480, 0.35, 96.0).unwrap();
+        assert!((size - 96.0 * 2.4).abs() < 0.01, "elbow-less fallback enlarges the crop");
+        assert!((x as f64 + size as f64 * 0.5 - 320.0).abs() < 0.1);
+        assert!((y as f64 + size as f64 * 0.5 - 288.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn wrist_crop_rejects_unconfident_or_out_of_frame_wrists() {
+        let mut kps = kps_133();
+        kps[9] = (0.50, 0.60, 0.2);
+        assert!(wrist_hand_crop(&kps, 0, 640, 480, 0.35, 96.0).is_none(), "low score");
+        let mut kps = kps_133();
+        kps[9] = (1.20, 0.60, 0.9);
+        assert!(wrist_hand_crop(&kps, 0, 640, 480, 0.35, 96.0).is_none(), "out of frame");
     }
 }

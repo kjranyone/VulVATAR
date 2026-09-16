@@ -1045,6 +1045,20 @@ impl FusionProvider {
                 {
                     candidates.push(c);
                 }
+                // YOLO26 fills no hand blocks, so the candidate above is
+                // dead since the swap; the body wrist/elbow keypoints are
+                // the only detector-side seed left for acquisition. The
+                // palm-vs-cuff offset and pose variance make the right
+                // crop size unpredictable, and the landmarker's presence
+                // is bimodal (a hit reads ~0.9), so escalate sizes — the
+                // extra attempt only runs when the smaller crop missed.
+                for min_px in [96.0f32, 160.0] {
+                    if let Some(c) =
+                        super::hands::wrist_hand_crop(&det_kps, hand, width, height, 0.35, f64::from(min_px))
+                    {
+                        candidates.push(c);
+                    }
+                }
                 if let Some(c) =
                     super::hands::predicted_hand_crop(&self.h, &fk_pred, hand, &intr, 96.0)
                 {
@@ -2148,6 +2162,17 @@ impl FusionProvider {
         }
         ph.facefit_ms = t_facefit.elapsed().as_secs_f32() * 1000.0;
 
+        // Hand blocks of the annotation: the hand landmarker owns hand
+        // keypoints now that no wholebody detector fills them. The GUI
+        // wipe plots every entry with score ≥ 0.1, so without this the
+        // hands vanished from the preview overlay after the YOLO26 swap.
+        fill_hand_annotation(
+            &mut base.annotation.keypoints,
+            &self.last_hands,
+            width,
+            height,
+        );
+
         // ---- output ----------------------------------------------------------------
         let t_output = std::time::Instant::now();
         let span_px = {
@@ -2324,6 +2349,64 @@ fn dump_obs_post_solve(
                 )))
         );
         eprintln!("  diag {:?}", est.diag);
+    }
+}
+
+/// Publish the hand-landmarker results into the annotation's
+/// COCO-Wholebody hand blocks (left 91..112, right 112..133) in
+/// MediaPipe landmark order (0 = wrist) — the layout the wholebody
+/// detector used to fill and the GUI wipe plots (score ≥ 0.1). Score
+/// carries the crop's presence; a slot without a hand result keeps its
+/// zero-score entries (nothing drawn).
+fn fill_hand_annotation(
+    keypoints: &mut [(f32, f32, f32)],
+    hands: &[Option<super::hands::HandResult>; 2],
+    width: u32,
+    height: u32,
+) {
+    const SLOT0: [usize; 2] = [91, 112];
+    let (w, h) = (width as f32, height as f32);
+    for (hand_res, slot0) in hands.iter().zip(SLOT0) {
+        let Some(res) = hand_res else { continue };
+        for (k, p) in res.px.iter().enumerate() {
+            if let Some(slot) = keypoints.get_mut(slot0 + k) {
+                *slot = (p[0] / w, p[1] / h, res.presence);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod hand_annotation_tests {
+    use super::*;
+
+    #[test]
+    fn hand_results_fill_coco_wholebody_blocks_normalized() {
+        let mut hands = [None, None];
+        let mut res = crate::tracking::fusion::hands::HandResult {
+            presence: 0.8,
+            ..Default::default()
+        };
+        // Wrist and pinky tip at 640x480 → normalised frame coords.
+        res.px[0] = [64.0, 48.0, 0.0];
+        res.px[20] = [320.0, 240.0, 0.0];
+        hands[0] = Some(res);
+
+        let mut kps = vec![(0.0f32, 0.0f32, 0.0f32); 133];
+        fill_hand_annotation(&mut kps, &hands, 640, 480);
+
+        assert_eq!(kps[91], (0.1, 0.1, 0.8), "left block starts at 91 (wrist)");
+        assert_eq!(kps[91 + 20], (0.5, 0.5, 0.8));
+        // Right block and body block stay zero without results.
+        assert_eq!(kps[112], (0.0, 0.0, 0.0));
+        assert_eq!(kps[0], (0.0, 0.0, 0.0));
+
+        hands[1] = Some(crate::tracking::fusion::hands::HandResult {
+            presence: 0.4,
+            ..Default::default()
+        });
+        fill_hand_annotation(&mut kps, &hands, 640, 480);
+        assert_eq!(kps[112], (0.0, 0.0, 0.4), "right block starts at 112");
     }
 }
 
