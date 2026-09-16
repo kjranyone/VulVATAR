@@ -133,6 +133,16 @@ fn main() -> Result<(), String> {
         if attached == 0 {
             return Err("AUTO_CLOTH: no skirt classified".into());
         }
+        // `attach_auto_cloth` sets its own constant wind (0.35) on every
+        // slot AFTER the stilling block further down ran, so the A/B
+        // below would silently run wind-driven flutter. Re-still here,
+        // after the attach — `WIND_ON=1` opts back in for wind A/Bs.
+        if std::env::var_os("WIND_ON").is_none() {
+            for slot in avatar.cloth_overlays.iter_mut() {
+                slot.sim.wind_response = 0.0;
+                slot.sim.wind_direction = [0.0, 0.0, 0.0];
+            }
+        }
         let slot = avatar
             .cloth_overlays
             .iter()
@@ -240,8 +250,71 @@ fn main() -> Result<(), String> {
     // COLLIDERS_OFF=1: keep every body collider disabled — isolates
     // collider geometry as the cloth-push source.
     let colliders_off = std::env::var_os("COLLIDERS_OFF").is_some();
+    // COLLIDERS_ALL=1: mirror the app path (`collider_enabled` starts
+    // as vec![true]) — arms/spine/chest/head capsules included. The
+    // default filter below only enables the lower-body set, so every
+    // offline A/B up to now was blind to torso/arm collider pushes the
+    // live app does apply. Subtract families for attribution:
+    // COLLIDERS_NO_TORSO=1 (spine+chest), COLLIDERS_NO_ARMS=1.
+    let colliders_all = std::env::var_os("COLLIDERS_ALL").is_some();
+    let no_torso = std::env::var_os("COLLIDERS_NO_TORSO").is_some();
+    let no_arms = std::env::var_os("COLLIDERS_NO_ARMS").is_some();
+    // CLOTH_CHURN_CSV=<path>: per-capture-frame max/p95 particle
+    // displacement (mm) since the previous capture — the offline
+    // equivalent of debug_gui.json `cloth.settle.max_delta_mm`, for
+    // attributing the continuous waist churn the live app shows
+    // (bursts 20-80 mm/step, never quiet). Needs CLOTH_RENDER_EVERY=1
+    // so every frame gets a readback fold.
+    let churn_csv = std::env::var("CLOTH_CHURN_CSV").ok();
+    let mut churn_prev: Vec<[f32; 3]> = Vec::new();
+    // The auto path's SDF contact mask (upper-body humanoid capsules
+    // off, thighs/hips kept) mirrors the app, where nothing re-enables
+    // them afterwards — don't defeat it here either.
+    let sdf_masked = avatar
+        .cloth_overlays
+        .iter()
+        .any(|s| s.sim.sdf_contact > 0.0);
     // Enable colliders for thighs (UpperLeg_L and UpperLeg_R)
     for (i, col) in avatar.asset.colliders.iter().enumerate() {
+        if sdf_masked {
+            // SDF contact owns the upper-body mask; keep only the
+            // lower-body set live, like the app.
+            // COLLIDERS_NONE=1: leave every collider disabled (the SDF
+            // contact field still applies) — isolates the capsule set
+            // from pins/integration in the churn A/B.
+            if std::env::var_os("COLLIDERS_NONE").is_some() {
+                continue;
+            }
+            let node_name = avatar
+                .asset
+                .skeleton
+                .nodes
+                .get(col.node.0 as usize)
+                .map(|n| n.name.to_lowercase())
+                .unwrap_or_default();
+            if node_name.contains("leg")
+                || node_name.contains("thigh")
+                || node_name.contains("hips")
+            {
+                // COLLIDERS_NO_THIGH=1: isolate the thigh-capsule
+                // contribution to the waist churn (the VRC thighs measure
+                // ~74 mm vs ~53 mm on the body).
+                let no_thigh = std::env::var_os("COLLIDERS_NO_THIGH").is_some();
+                if no_thigh
+                    && (node_name.contains("thigh")
+                        || node_name.contains("upperleg")
+                        || (node_name.contains("leg") && !node_name.contains("hips")))
+                {
+                    continue;
+                }
+                avatar.collider_enabled[i] = true;
+                println!(
+                    "Enabled collider #{}: {} on node '{}' (SDF mask keeps lower body)",
+                    i, col.id.0, node_name
+                );
+            }
+            continue;
+        }
         let node_name = avatar
             .asset
             .skeleton
@@ -249,12 +322,18 @@ fn main() -> Result<(), String> {
             .get(col.node.0 as usize)
             .map(|n| n.name.to_lowercase())
             .unwrap_or_default();
-        if !colliders_off
-            && (node_name.contains("upperleg")
-                || node_name.contains("leg")
-                || node_name.contains("thigh")
-                || node_name.contains("hips"))
-        {
+        let lower_body = node_name.contains("upperleg")
+            || node_name.contains("leg")
+            || node_name.contains("thigh")
+            || node_name.contains("hips");
+        let torso = node_name.contains("spine") || node_name.contains("chest");
+        let arm = node_name.contains("arm");
+        let enable = if colliders_all {
+            !(no_torso && torso) && !(no_arms && arm)
+        } else {
+            !colliders_off && lower_body
+        };
+        if enable {
             avatar.collider_enabled[i] = true;
             println!(
                 "Enabled collider #{}: {} on node '{}'",
@@ -528,6 +607,41 @@ fn main() -> Result<(), String> {
                         slot.state.deform_output.deformed_positions = entry.positions.clone();
                         slot.state.deform_output.version = entry.version as u64;
                     }
+                }
+            }
+
+            if let Some(path) = &churn_csv {
+                for slot in avatar.cloth_overlays.iter() {
+                    let pos = &slot.state.sim_positions;
+                    if pos.is_empty() {
+                        continue;
+                    }
+                    let mut deltas: Vec<f32> = if churn_prev.len() == pos.len() {
+                        pos.iter()
+                            .zip(churn_prev.iter())
+                            .map(|(q, p)| {
+                                ((q[0] - p[0]).powi(2)
+                                    + (q[1] - p[1]).powi(2)
+                                    + (q[2] - p[2]).powi(2))
+                                .sqrt()
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let max_mm = deltas.last().map(|d| d * 1000.0).unwrap_or(0.0);
+                    let p95_mm = deltas
+                        .get((deltas.len() as f32 * 0.95) as usize)
+                        .map(|d| d * 1000.0)
+                        .unwrap_or(0.0);
+                    if let Ok(mut f) =
+                        std::fs::OpenOptions::new().create(true).append(true).open(path)
+                    {
+                        use std::io::Write as _;
+                        let _ = writeln!(f, "{frame},{max_mm:.3},{p95_mm:.3}");
+                    }
+                    churn_prev = pos.clone();
                 }
             }
 

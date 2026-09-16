@@ -65,13 +65,23 @@ will invalidate that cache and trigger a rebuild.
   押し出し + GPU bend 制約 (Phase C 系)。ピン帯深さは
   `VULVATAR_AUTO_PIN_FRACTION`、selfcol は `VULVATAR_AUTO_NO_SELFCOL` /
   `VULVATAR_AUTO_SELFCOL_RADIUS` で A/B 可能。
-- **cloth body-SDF 接触 (2026-09-16, 実験フラグ)**: `ClothSimState::
-  sdf_contact` (> 0 で有効, `VULVATAR_AUTO_SDF_CONTACT=<m>` 例 0.004) が
+- **cloth body-SDF 接触 (2026-09-16 既定 ON)**: `ClothSimState::
+  sdf_contact` (既定 `AUTO_CLOTH_SDF_CONTACT_M` = 0.004 m、
+  `VULVATAR_AUTO_SDF_CONTACT=<m>` で調整・`=0` で capsule のみに戻す) が
   立つと、自由粒子を body SDF の `sdf_contact` 等値面へ勾配に沿って投影する
   スムーズ接触段階が capsule 段階の後に走る (CPU `collision::collide` と
   GPU `cloth_collide_cs` のミラー — sentinel/NaN セマンティクス含む)。
-  発動時は attach が humanoid-bound body capsule をマスクする (hard radial
-  push が先にプリーツを裂くため; scene collider は残る)。SDF field は
+  発動時は attach が humanoid-bound capsule のうち**上半身** (spine/chest/
+  腕/頭) をマスクする (hard radial push が先にプリーツを裂くため)。腿/腰
+  カプセルは保持 — 全 humanoid をマスクすると前パネルが腿間に落ち込み、
+  両腿の SDF 勾配の谷で引き裂かれる
+  (`diagnostics/skirt_tent_rest_sdfdefault`)。既定 ON の理由: Spine カプセル
+  (r90) が live デスク姿勢でスカート前面より ~1.5cm 突出し前パネルを常時
+  ドーム化していた (「ちんちん」、計測は `skirt-front-dome` メモ /
+  `diagnostics/skirt_tent_*`)。アプリは `collider_enabled` 全 true で cloth
+  に渡すが、`diagnose_cloth` の A/B は下肢フィルタで上半身押しを見ていな
+  かった — `COLLIDERS_ALL=1` でアプリと同じ構成になる (bin に追加済み)。
+  SDF field は
   spring と同じ splat 資源 (`self.sdf_slots`, avatar-root 空間) を共有し、
   idle フレームは最後の field を再利用する (splat plan は pose 変化時のみ —
   計画し直すと sentinel 再フィルで壊れる)。settle の入力ハッシュには
@@ -79,7 +89,8 @@ will invalidate that cache and trigger a rebuild.
   が wake をカバー)。A/B: `diagnostics/skirt_rest_sdf` (rest sway 裂けなし・
   密着 — VRC 参照 `skirt_rest_vrc` の浮きと conformal `skirt_rest_capped`
   の裂け両方を解消)、`skirt_sit_sdf` / `skirt_desk_sdf` (座りは lap 前面開放
-  が残る = 腿頂点がバンド上方的幾何限界、bend/摩擦は未実装)。
+  が残る = 腿頂点がバンド上方的幾何限界、bend/摩擦は未実装)、
+  `skirt_tent_rest_sdfv2` / `skirt_tent_desk_sdfv2` (既定 ON 構成の再確認)。
   **制約**: field は spring 有効時しか splat されない (app 側ゲート)。
 - **GPU bend 制約 (2026-09-16 実装)**: `auto_cloth` が welded edge ごとに
   edge-angle hinge を 2 本 (`edge_angle_bend_constraints` — 両端 hinge、
@@ -96,6 +107,23 @@ will invalidate that cache and trigger a rebuild.
   (`skirt_desk_sdfbend` = SDF 接触との併用が本命構成)。lap 正面の開放のみ
   幾何限界として残る (腿頂点 > ウエストバンド + 摩擦/lap テント未実装)。
   テスト: bend 生成 3 件追加 (`bend_generation_tests`)。
+- **ウエスト cloth チャーン = GPU/FPS 戦役の根因 (2026-09-16)**: ライブで cloth が
+  一度も settle せず (`quiet_frames` 0 固定、5-6mm/step)、GPU cloth 全チェーンが恒時
+  操業してレンダースレッドを 34Hz まで圧迫していた (`render_cpu_ms` EMA 29ms、bench_render
+  単体は 3ms — レンダラ本体は健常で GPU キュー待ち)。オフライン A/B (`diagnose_cloth`
+  AUTO_CLOTH=1 + SKIRT_POSE=desk + COLLIDERS_ALL=1 + VULVATAR_CLOTH_GPU=1 +
+  CLOTH_RENDER_EVERY=1 + CLOTH_CHURN_CSV、p95 mm/step) で切分けた結果:
+  SDF 接触 / bend 単独 / self-col / torso・arm・thigh collider は無罪、conformal
+  collider で半減、**根本は (a) attach 時に `wind_response 0.35` の定数風が常時 ON
+  (デモ用残骸 → 既定 0 に修正、GUI スライダーで opt-in)、(b) damping 0.035 + iter 8
+  の限界サイクル (p95 5.3mm → damping 0.15 + iter 32 で 0.22mm、レンダ A/B で
+  drape 同等)**。さらに settle fingerprint は f32 bit 一致契約だったため tracking
+  微動で毎フレーム wake していた → `cloth_gpu_inputs_hash` は 0.5mm グリッド量子化
+  に改訂 (`settle_quant`、テスト `cloth_gpu_inputs_hash_is_quantized`)。残課題:
+  p95 ~0.22mm は quiet 閾値 100µm に未達 — ライブで `debug_gui.json` の
+  `cloth.settle.max_delta_mm` を観測し、`SETTLE_SLEEP_EPS` 引き上げを判断する。
+  A/B ノブ: `VULVATAR_AUTO_DAMPING` / `VULVATAR_AUTO_ITERATIONS`、diagnose_cloth に
+  `COLLIDERS_NONE` / `COLLIDERS_NO_THIGH` / `WIND_ON` を追加。
 - クリアランス (アンチ貫通アンカー) は `src/asset/clearance.rs` の Phase 1/2/3。
   Phase 3 は containment スロットに clearance-mode アンカーを入れる cross-region
   (ジャケット裾↔スカート、スカート↔下着)。アンカー実装を変えたら

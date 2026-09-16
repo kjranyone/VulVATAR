@@ -1524,6 +1524,19 @@ impl Application {
 /// pin bindings + the transforms they resolve against, and the merged
 /// capsule list. Full f32 bits — quantizing would hide driver motion
 /// below ~1 mm, the band the settle-sleep gate must wake on.
+/// Spatial quantisation grid of the cloth settle fingerprint, in metres
+/// (~0.49 mm). Bit-precise hashing was the original contract, but live
+/// tracking jitters every driven transform at f32 granularity, so the
+/// fingerprint changed EVERY frame and the cloth never slept (measured
+/// 2026-09-16: quiet_frames stuck at 0 with a still subject). The
+/// solver cannot respond below ~0.5 mm anyway — collision margin is
+/// 15 mm, SDF contact 4 mm — so motion inside one grid cell is noise
+/// by contract, while any real ≥1 mm driver motion crosses cells and
+/// wakes the slot.
+fn settle_quant(v: f32) -> f32 {
+    (v * 2048.0).round()
+}
+
 fn cloth_gpu_inputs_hash(
     ctrl_dt: f32,
     sim: &crate::simulation::cloth::ClothSimState,
@@ -1545,19 +1558,20 @@ fn cloth_gpu_inputs_hash(
     h.write_u32(sim.pin_targets.len() as u32);
     for pin in &sim.pin_targets {
         h.write_u32(pin.node_index as u32);
-        h.write_f32s(&pin.offset);
+        // Pin offsets are spatial (metres) — quantise.
+        h.write_f32s(&pin.offset.map(settle_quant));
     }
     h.write_u32(global_transforms.len() as u32);
     for m in global_transforms {
         for col in m {
-            h.write_f32s(col);
+            h.write_f32s(&col.map(settle_quant));
         }
     }
     h.write_u32(colliders.len() as u32);
     for c in colliders {
-        h.write_f32s(&c.p0);
-        h.write_f32s(&c.p1);
-        h.write_f32(c.radius);
+        h.write_f32s(&c.p0.map(settle_quant));
+        h.write_f32s(&c.p1.map(settle_quant));
+        h.write_f32(settle_quant(c.radius));
     }
     h.finish()
 }
@@ -2363,7 +2377,7 @@ mod cloth_collection_tests {
     /// and a one-ULP change on ANY consumed input (transform, sim
     /// parameter, capsule, ctrl dt) must change the hash.
     #[test]
-    fn cloth_gpu_inputs_hash_is_bit_precise() {
+    fn cloth_gpu_inputs_hash_is_quantized() {
         let transforms = vec![crate::asset::identity_matrix()];
         let sim = crate::simulation::cloth::ClothSimState::default();
         let colliders = vec![crate::renderer::frame_input::ClothGpuCollider {
@@ -2378,21 +2392,30 @@ mod cloth_collection_tests {
             "identical inputs must hash identically"
         );
 
-        // 1 ULP on one transform element.
+        // Sub-grid jitter (~0.1 mm) on a transform element must NOT wake
+        // the slot — live tracking jitters every driven transform at f32
+        // granularity, and bit-precise hashing never let the cloth sleep.
+        let mut jittered = transforms.clone();
+        jittered[0][3][0] += 1e-4;
+        assert_eq!(
+            cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &jittered, &colliders),
+            base,
+            "sub-grid tracking jitter must not wake the cloth"
+        );
+
+        // A real driver motion (2 mm) crosses grid cells and wakes it.
         let mut moved = transforms.clone();
-        moved[0][0][0] = f32::from_bits(moved[0][0][0].to_bits() + 1);
+        moved[0][3][0] += 0.002;
         assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &moved, &colliders), base);
 
-        // Sim parameter (wind feeds the verlet acceleration).
+        // Sim parameter (wind feeds the verlet acceleration) — exact.
         let mut blown = crate::simulation::cloth::ClothSimState::default();
         blown.wind_response = 0.5;
         assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &blown, &transforms, &colliders), base);
 
-        // Capsule move: exactly 1 ULP — a +1e-9 literal would round back
-        // to 0.1f32 (ULP here is 8.9e-9) and the key would legitimately
-        // not change.
+        // Capsule move past the grid (2 mm).
         let mut pushed = colliders.clone();
-        pushed[0].radius = f32::from_bits(0.1f32.to_bits() + 1);
+        pushed[0].radius = 0.102;
         assert_ne!(cloth_gpu_inputs_hash(1.0 / 60.0, &sim, &transforms, &pushed), base);
 
         // Ctrl dt.

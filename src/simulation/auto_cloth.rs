@@ -45,6 +45,9 @@ const PIN_BAND_MAX: f32 = 0.12;
 const PIN_BAND_HEIGHT_FRACTION: f32 = 0.4;
 /// Skirt classifier bone-weight threshold (Phase 1 parity).
 const SKIRT_WEIGHT_RATIO: f32 = 0.4;
+/// Default body-SDF contact band for auto-cloth garments (metres).
+/// Measured sweet spot of the `skirt_*_sdfbend` A/B set (2026-09-16).
+const AUTO_CLOTH_SDF_CONTACT_M: f32 = 0.004;
 
 /// Build one `ClothAsset` per skirt-classified primitive on the avatar.
 /// The instance must have its rest pose built (base pose → global pose
@@ -423,12 +426,33 @@ fn build_cloth_for_prim(
         lods: Vec::new(),
         solver_params: ClothSolverParams {
             substeps: 4,
-            iterations: 8,
+            iterations: std::env::var("VULVATAR_AUTO_ITERATIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32),
             gravity_scale: 1.0,
-            damping: 0.035,
+            // VULVATAR_AUTO_DAMPING / _ITERATIONS: churn A/B knobs.
+            // Damping 0.15 + 32 iterations is the churn-campaign
+            // outcome (2026-09-16, desk-pose A/B on the GPU backend):
+            // the shipped 0.035/8 rang at ~5.3 mm p95 per step forever —
+            // a limit cycle that kept the settle gate from ever going
+            // quiet — while this pair settles to ~0.22 mm p95 with
+            // visually identical drape (skirt_frame_075 A/B). ~0.22 mm
+            // still sits above the 100 µm quiet threshold, so live
+            // settle behaviour decides whether SETTLE_SLEEP_EPS needs a
+            // follow-up raise.
+            damping: std::env::var("VULVATAR_AUTO_DAMPING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.15),
             self_collision: true,
             collision_margin: 0.015,
-            wind_response: 0.35,
+            // Constant wind on a constrained skirt sustains permanent
+            // particle motion — the settle gate can then never go quiet
+            // and the GPU cloth never stops (live FPS campaign
+            // 2026-09-16). Default OFF; the cloth inspector's wind
+            // slider opts back in.
+            wind_response: 0.0,
         },
     })
 }
@@ -661,8 +685,9 @@ pub fn attach_auto_cloth(avatar: &mut AvatarInstance) -> usize {
         let slot_idx = avatar.attach_cloth_overlay(cloth_asset.id);
         avatar.init_cloth_overlay(slot_idx, &cloth_asset);
         if let Some(slot) = avatar.cloth_overlays.get_mut(slot_idx) {
-            slot.sim.wind_direction = [0.3, 0.0, 0.15];
-            slot.sim.wind_response = 0.35;
+            // No default wind (see the solver_params note above).
+            slot.sim.wind_direction = [0.0, 0.0, 0.0];
+            slot.sim.wind_response = 0.0;
             // Self-collision on by default; `VULVATAR_AUTO_NO_SELFCOL=1`
             // disables it and `VULVATAR_AUTO_SELFCOL_RADIUS=<m>` tunes
             // the exclusion radius (12 mm ⇒ 24 mm min spacing — already
@@ -678,19 +703,34 @@ pub fn attach_auto_cloth(avatar: &mut AvatarInstance) -> usize {
             }
             // Body-SDF contact band (metres; 0 = capsules only). The
             // smooth gradient projection engages on garments whenever the
-            // app supplies the posed body field. When active, the
-            // humanoid-bound body CAPSULES are masked off for this
-            // avatar: a hard radial push would tear the pleats before
-            // the smooth stage runs, and the field already IS the body
-            // surface (mesh-accurate, no fat VRChat radii). Scene
-            // colliders (props) stay. Instance-level mask — cloth-only
-            // by construction, springs never see `asset.colliders`.
-            if let Some(r) = std::env::var("VULVATAR_AUTO_SDF_CONTACT")
+            // app supplies the posed body field. ON by default
+            // (2026-09-16): the humanoid TORSO capsules (Spine r 90 mm /
+            // Chest r 114 mm on Yumeka) protrude through the skirt front
+            // panel in the live desk pose (measured: spine capsule front
+            // z +0.119..+0.122 vs skirt panel z +0.106) and domed it into
+            // a phallic bulge the stiff bend constraints then held — so
+            // upper-body humanoid capsules are masked off for this
+            // avatar. Thigh/hips capsules STAY: without them the free
+            // front panel sags into the leg gap and the SDF gradient
+            // ridge between the thighs shreds it into strips
+            // (`diagnostics/skirt_tent_rest_sdfdefault`; the validated
+            // `skirt_rest_sdf` A/B ran with the thigh capsules active).
+            // Scene colliders (props) stay. Instance-level mask —
+            // cloth-only by construction, springs never see
+            // `asset.colliders`. `VULVATAR_AUTO_SDF_CONTACT=<m>` retunes
+            // the band, `=0` falls back to capsules-only. The app-side
+            // splat runs with the spring solver; without it the contact
+            // stage is inert (kernel gate `has_sdf != 0 &&
+            // sdf_contact > 0`).
+            let sdf_contact = match std::env::var("VULVATAR_AUTO_SDF_CONTACT")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .filter(|r| *r > 0.0)
             {
-                slot.sim.sdf_contact = r;
+                Some(r) => r.max(0.0),
+                None => AUTO_CLOTH_SDF_CONTACT_M,
+            };
+            if sdf_contact > 0.0 {
+                slot.sim.sdf_contact = sdf_contact;
                 let humanoid_nodes: std::collections::HashSet<_> = avatar
                     .asset
                     .humanoid
@@ -698,14 +738,24 @@ pub fn attach_auto_cloth(avatar: &mut AvatarInstance) -> usize {
                     .map(|h| h.bone_map.values().copied().collect())
                     .unwrap_or_default();
                 for (i, c) in avatar.asset.colliders.iter().enumerate() {
-                    if humanoid_nodes.contains(&c.node) {
+                    let node_name = avatar
+                        .asset
+                        .skeleton
+                        .nodes
+                        .get(c.node.0 as usize)
+                        .map(|n| n.name.to_lowercase())
+                        .unwrap_or_default();
+                    let lower_body = node_name.contains("leg")
+                        || node_name.contains("thigh")
+                        || node_name.contains("hips");
+                    if humanoid_nodes.contains(&c.node) && !lower_body {
                         if let Some(flag) = avatar.collider_enabled.get_mut(i) {
                             *flag = false;
                         }
                     }
                 }
                 info!(
-                    "auto-cloth: SDF contact {r} m — body capsules masked off for avatar {}",
+                    "auto-cloth: SDF contact {sdf_contact} m — upper-body capsules masked off for avatar {}",
                     avatar.id.0
                 );
             }
