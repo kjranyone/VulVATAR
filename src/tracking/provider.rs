@@ -1,7 +1,7 @@
 //! Pose provider boundary.
 //!
 //! `TrackingWorker` talks to this module instead of binding directly to
-//! a specific model. There is a single production pipeline: RTMW3D
+//! a specific model. There is a single production pipeline: YOLO11-pose
 //! perception feeding the fusion estimator. Metric depth is supplied
 //! externally by a RealSense D435 (`set_external_depth`); without it
 //! the estimator still runs on 2-D keypoints alone.
@@ -21,16 +21,12 @@ pub struct TrackingPipelineConfig {
     /// pipeline entirely. Slower, but isolates tracking from
     /// GPU-driver instability (see the 2026-06-11 freeze incident).
     pub force_cpu: bool,
-    /// Run the YOLOX person-crop stage; off falls back to whole-frame
-    /// RTMW3D inference.
-    pub yolox_enabled: bool,
 }
 
 impl Default for TrackingPipelineConfig {
     fn default() -> Self {
         Self {
             force_cpu: false,
-            yolox_enabled: true,
         }
     }
 }
@@ -42,7 +38,6 @@ impl TrackingPipelineConfig {
     pub fn safe_mode() -> Self {
         Self {
             force_cpu: true,
-            yolox_enabled: false,
         }
     }
 }
@@ -107,7 +102,7 @@ pub trait PoseProvider {
     }
 }
 
-/// Build the production pose provider: RTMW3D, shaped by the user's
+/// Build the production pose provider: YOLO11-pose, shaped by the user's
 /// pipeline configuration. Metric depth, when present, is fed in
 /// externally via [`PoseProvider::set_external_depth`].
 pub fn create_pose_provider(
@@ -127,7 +122,7 @@ pub fn create_pose_provider(
 }
 
 /// Live-tracking variant of [`create_pose_provider`]: runs the detector
-/// stage (RTMW3D + FaceMesh) on its own thread so it overlaps the solver
+/// stage (YOLO11-pose + FaceMesh) on its own thread so it overlaps the solver
 /// stage — live tracking is camera-paced, and the two stages together
 /// (~48 ms) exceed the 33 ms frame period while each alone does not.
 /// The pair with [`PoseProvider::estimate_pose_latest`].

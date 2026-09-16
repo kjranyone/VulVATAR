@@ -1172,7 +1172,7 @@ body_sdf: None,
         for fidx in 0..12usize {
             avatar.build_base_pose();
             avatar.compute_global_pose();
-            vulvatar_lib::simulation::cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+            vulvatar_lib::simulation::cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[], None);
             if fidx == 0 {
                 if let Some(slot) = avatar.cloth_overlays.first() {
                     let mut worst: Vec<(f32, usize)> = slot
@@ -1264,6 +1264,7 @@ body_sdf: None,
                                 colliders,
                                 self_collision: sim.self_collision,
                                 self_collision_radius: sim.self_collision_radius,
+                                sdf_contact: sim.sdf_contact,
                             }),
                             Some(ClothGpuAttachData {
                                 constraints: sim
@@ -1274,6 +1275,9 @@ body_sdf: None,
                                 triangle_indices: sim.triangle_indices.clone(),
                                 inv_masses: sim.particles.iter().map(|p| p.inv_mass).collect(),
                                 pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                                bend: Vec::new(),
+                                bend_adj_offsets: Vec::new(),
+                                bend_adj_constraints: Vec::new(),
                             }),
                         )
                     } else {

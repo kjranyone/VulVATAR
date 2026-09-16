@@ -21,16 +21,29 @@ mod tests;
 // =========================================================================
 
 /// Advance cloth simulation by `dt` seconds for the given avatar instance.
-pub fn step_cloth(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[ResolvedCollider]) {
+///
+/// `body_sdf` is the posed body's distance field (as consumed by the
+/// spring solver); it only engages for slots with `sdf_contact > 0`.
+pub fn step_cloth(
+    dt: f32,
+    avatar: &mut AvatarInstance,
+    world_colliders: &[ResolvedCollider],
+    body_sdf: Option<&crate::simulation::sdf::SdfField>,
+) {
     if !avatar.cloth_enabled {
         return;
     }
 
-    step_cloth_single(dt, avatar, world_colliders);
-    step_cloth_overlays(dt, avatar, world_colliders);
+    step_cloth_single(dt, avatar, world_colliders, body_sdf);
+    step_cloth_overlays(dt, avatar, world_colliders, body_sdf);
 }
 
-fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[ResolvedCollider]) {
+fn step_cloth_single(
+    dt: f32,
+    avatar: &mut AvatarInstance,
+    world_colliders: &[ResolvedCollider],
+    body_sdf: Option<&crate::simulation::sdf::SdfField>,
+) {
     // We need both cloth_state (runtime positions) and a ClothSimState to work
     // with.  On first call we lazily initialise ClothSimState from the asset.
     // ClothSimState lives inside AvatarInstance::cloth_sim (we will add it).
@@ -116,7 +129,7 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
     collision::resolve_self_collisions(sim);
 
     // ---- collision ------------------------------------------------------------
-    collision::collide(sim, &all_colliders);
+    collision::collide(sim, &all_colliders, body_sdf);
 
     // ---- enforce pins after all projections ------------------------------------
     collision::enforce_pins(sim);
@@ -134,7 +147,12 @@ fn step_cloth_single(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[Re
     output::write_back(sim, cloth_state);
 }
 
-fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[ResolvedCollider]) {
+fn step_cloth_overlays(
+    dt: f32,
+    avatar: &mut AvatarInstance,
+    world_colliders: &[ResolvedCollider],
+    body_sdf: Option<&crate::simulation::sdf::SdfField>,
+) {
     if avatar.cloth_overlays.is_empty() {
         return;
     }
@@ -191,7 +209,7 @@ fn step_cloth_overlays(dt: f32, avatar: &mut AvatarInstance, world_colliders: &[
         }
 
         collision::resolve_self_collisions(&mut slot.sim);
-        collision::collide(&mut slot.sim, &all_colliders);
+        collision::collide(&mut slot.sim, &all_colliders, body_sdf);
         collision::enforce_pins(&mut slot.sim);
         output::compute_normals(&mut slot.sim);
         integrator::derive_velocity(&mut slot.sim, dt);
@@ -219,6 +237,7 @@ fn cloth_cpu_inputs_hash(
     let mut h = SettleHasher::new();
     h.write_f32(dt);
     h.write_f32(sim.damping);
+    h.write_f32(sim.sdf_contact);
     h.write_f32s(&sim.gravity);
     h.write_f32s(&vec3_scale(&sim.wind_direction, sim.wind_response));
     h.write_u32(sim.solver_iterations);

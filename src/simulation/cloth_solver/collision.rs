@@ -4,12 +4,17 @@ use crate::math_utils::{
     closest_point_on_segment, vec3_add, vec3_dot, vec3_length, vec3_scale, vec3_sub, Vec3,
 };
 use crate::simulation::cloth::{ClothSimState, ResolvedCollider};
+use crate::simulation::sdf::SdfField;
 
 // =========================================================================
-// Collision (M3: sphere + capsule, E6: collision_margin)
+// Collision (M3: sphere + capsule, E6: collision_margin, 2026-09: body SDF)
 // =========================================================================
 
-pub(super) fn collide(sim: &mut ClothSimState, colliders: &[ResolvedCollider]) {
+pub(super) fn collide(
+    sim: &mut ClothSimState,
+    colliders: &[ResolvedCollider],
+    body_sdf: Option<&SdfField>,
+) {
     let collision_margin = sim.collision_margin;
 
     for p in sim.particles.iter_mut() {
@@ -45,6 +50,22 @@ pub(super) fn collide(sim: &mut ClothSimState, colliders: &[ResolvedCollider]) {
                         let normal = vec3_scale(&diff, 1.0 / dist);
                         p.position = vec3_add(&closest, &vec3_scale(&normal, effective_radius));
                     }
+                }
+            }
+        }
+
+        // Body-surface distance field: the contact band is
+        // `sim.sdf_contact` around the skinned body mesh. Projecting
+        // along the SDF gradient (like the spring solver) instead of
+        // the radial capsule push keeps the correction direction
+        // continuous across the surface — pleats fold instead of
+        // scattering when the resting garment overlaps a collider.
+        // Deep-frozen cells (SENTINEL) and points off the grid return
+        // no contact, same as the spring path.
+        if sim.sdf_contact > 0.0 {
+            if let Some(field) = body_sdf {
+                if let Some((pushed, _)) = field.resolve(p.position, sim.sdf_contact) {
+                    p.position = pushed;
                 }
             }
         }

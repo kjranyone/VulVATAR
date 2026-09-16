@@ -1,7 +1,7 @@
 //! Detector-side thread of the pipelined fusion provider.
 //!
 //! Live tracking is camera-paced at 30 fps while the detector stage
-//! (YOLOX wait + crop/preprocess + the DirectML RTMW3D run + decode +
+//! (letterbox + the DirectML YOLO11-pose run + decode +
 //! FaceMesh) costs ~29 ms and the solver stage (visibility, hand crops,
 //! dense surface, the fusion estimator, output) another ~19 ms — run
 //! serially on one thread they cap the published pose rate at
@@ -54,7 +54,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use crate::tracking::rtmw3d::{Rtmw3dAux, Rtmw3dInference, Rtmw3dOptions};
+use crate::tracking::detector::yolo11::Yolo11PoseInference;
+use crate::tracking::detector::{DetectorAux, DetectorOptions};
 use crate::tracking::{PoseEstimate, SourceSkeleton, DetectionAnnotation};
 
 /// Construction outcome reported by the detector thread once its ONNX
@@ -69,22 +70,19 @@ pub(crate) struct DetectorReady {
 pub(crate) struct DetectorJob {
     pub frame_index: u64,
     /// Device capture timestamp (ms), forwarded to
-    /// `Rtmw3dInference::set_frame_timestamp_ms`.
+    /// `Yolo11PoseInference::set_frame_timestamp_ms`.
     pub ts_ms: Option<f64>,
     pub rgb: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
-    /// State-driven person crop hint computed by the solver for THIS
-    /// frame — the same value the inline path would have passed.
-    pub crop_hint: Option<crate::tracking::yolox::PersonBbox>,
 }
 
-/// One finished detector pass. `Rtmw3dAux` carries the raw keypoints +
+/// One finished detector pass. `DetectorAux` carries the raw keypoints +
 /// FaceMesh landmarks that the inline path drains via `take_aux`.
 pub(crate) struct DetectorResult {
     pub frame_index: u64,
     pub base: PoseEstimate,
-    pub aux: Option<Rtmw3dAux>,
+    pub aux: Option<DetectorAux>,
     /// Wall time the detector thread spent on this frame (job dequeue →
     /// outputs ready). The solver-side `ph.rtmw_ms` carries this on the
     /// pipelined path, where the work happens off the solver thread.
@@ -93,7 +91,7 @@ pub(crate) struct DetectorResult {
 
 enum Request {
     Job(DetectorJob),
-    /// Apply `Rtmw3dInference::reset_temporal_state`; acknowledged with a
+    /// Apply `Yolo11PoseInference::reset_temporal_state`; acknowledged with a
     /// `frame_index == u64::MAX` result.
     Reset,
 }
@@ -164,7 +162,7 @@ impl DetectorClient {
     /// thread does its DirectML setup under the caller's guard.
     pub(crate) fn spawn(
         models_dir: PathBuf,
-        opts: Rtmw3dOptions,
+        opts: DetectorOptions,
     ) -> (Self, Receiver<Result<DetectorReady, String>>) {
         let (ready_tx, ready_rx) = mpsc::channel();
         let requests = Arc::new(Cell::<Request>::default());
@@ -177,13 +175,13 @@ impl DetectorClient {
             std::thread::Builder::new()
                 .name("tracking-detect".into())
                 .spawn(move || {
-                    match Rtmw3dInference::from_models_dir_with_options(models_dir, opts) {
-                        Ok(mut rtmw3d) => {
+                    match Yolo11PoseInference::from_models_dir_with_options(models_dir, opts) {
+                        Ok(mut detector) => {
                             let _ = ready_tx.send(Ok(DetectorReady {
-                                backend_label: rtmw3d.backend().label(),
-                                warnings: rtmw3d.take_load_warnings(),
+                                backend_label: detector.backend().label(),
+                                warnings: detector.take_load_warnings(),
                             }));
-                            run_detector(rtmw3d, &requests, &results, &stop);
+                            run_detector(detector, &requests, &results, &stop);
                         }
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
@@ -281,7 +279,7 @@ impl Drop for DetectorClient {
 /// the freshest job, publish results. Exits when `stop` is set and no
 /// request is pending.
 fn run_detector(
-    mut rtmw3d: Rtmw3dInference,
+    mut detector: Yolo11PoseInference,
     requests: &Cell<Request>,
     results: &Cell<DetectorResult>,
     stop: &Mutex<bool>,
@@ -292,7 +290,7 @@ fn run_detector(
         };
         match req {
             Request::Reset => {
-                rtmw3d.reset_temporal_state();
+                detector.reset_temporal_state();
                 results.put(DetectorResult {
                     frame_index: u64::MAX,
                     base: empty_estimate(),
@@ -301,11 +299,10 @@ fn run_detector(
                 });
             }
             Request::Job(job) => {
-                rtmw3d.set_frame_timestamp_ms(job.ts_ms);
-                rtmw3d.set_crop_hint(job.crop_hint);
-                let t_det = std::time::Instant::now();
-                let base = rtmw3d.estimate_pose(&job.rgb, job.width, job.height, job.frame_index);
-                let aux = rtmw3d.take_aux();
+                detector.set_frame_timestamp_ms(job.ts_ms);
+                                let t_det = std::time::Instant::now();
+                let base = detector.estimate_pose(&job.rgb, job.width, job.height, job.frame_index);
+                let aux = detector.take_aux();
                 results.put(DetectorResult {
                     frame_index: job.frame_index,
                     base,

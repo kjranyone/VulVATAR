@@ -5,7 +5,7 @@
 //! while the Vulkan render thread was still submitting at 60 fps —
 //! `provider_load_end` never arrived and the final log line died
 //! mid-flush. DirectML session initialisation (uploading the 370 MB
-//! RTMW3D-x graph and compiling its kernels) is the single heaviest
+//! ONNX pose graph and compiling its kernels) is the single heaviest
 //! GPU operation in the app, and racing it against an active Vulkan
 //! submission stream on one device is what hung the driver.
 //!

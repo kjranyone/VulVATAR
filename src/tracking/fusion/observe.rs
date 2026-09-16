@@ -1,4 +1,4 @@
-//! Observation builders: turn perception outputs (RTMW3D 133 keypoints
+//! Observation builders: turn perception outputs (the 133-entry
 //! with SimCC σ, FaceMesh landmarks, the D435 point cloud) into the
 //! estimator's [`FrameObs`] terms. No gating logic lives here beyond
 //! "is this measurement physically usable" (in frame, finite, inside the

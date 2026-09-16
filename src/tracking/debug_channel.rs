@@ -116,7 +116,7 @@ pub fn dump_depth_snapshot(frame_index: u64, depth_raw: &[u16], w: u32, h: u32, 
     atomic_write(&base_dir().join("debug_depth.bin"), &out);
 }
 
-/// Face-stage diagnostics stashed by the RTMW3D face block (which has the
+/// Face-stage diagnostics stashed by the detector's face block (which has the
 /// crop bbox + both pose candidates in scope) and merged into
 /// `debug_state.json` by `dump_observation` (which does not). One slot,
 /// overwritten per frame — the dump runs on the same worker right after.
@@ -325,7 +325,7 @@ pub fn dump_observation(frame_index: u64, rgb: &[u8], w: u32, h: u32, est: &Pose
         // head-pose source (mesh vs body ear-line) actually won.
         "mesh_c": est.skeleton.face_mesh_confidence,
         // Crop bbox + per-estimator pose candidates from the face stage
-        // (stashed by the RTMW3D worker just before this dump).
+        // (stashed by the detector just before this dump).
         "face_dbg": FACE_DEBUG.lock().ok().and_then(|mut s| s.take()),
         "torso": {
             "Head": arm(HumanoidBone::Head),

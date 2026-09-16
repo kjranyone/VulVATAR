@@ -76,9 +76,24 @@ pub(super) struct PlannedCloth {
     pub(super) substeps: u32,
     pub(super) constraint_iters: u32,
     pub(super) constraints: Option<PlannedClothConstraints>,
+    pub(super) bend: Option<PlannedClothBend>,
     pub(super) normal: Option<PlannedClothNormal>,
     pub(super) collide: Option<PlannedClothCollide>,
     pub(super) selfcol: Option<PlannedClothSelfCol>,
+}
+
+/// Bend stage (T09 edge-angle hinge): three dispatches per constraint
+/// iteration — update (per constraint), accumulate + apply (per
+/// particle). Runs after the distance apply pass, mirroring the CPU
+/// step's `project_bend_constraints` call inside the iteration loop.
+pub(super) struct PlannedClothBend {
+    pub(super) update_set: Arc<DescriptorSet>,
+    pub(super) accumulate_set: Arc<DescriptorSet>,
+    pub(super) apply_set: Arc<DescriptorSet>,
+    /// Dispatch groups for the per-constraint update pass.
+    pub(super) bend_groups: [u32; 3],
+    /// Dispatch groups for the per-particle passes.
+    pub(super) particle_groups: [u32; 3],
 }
 
 pub(super) struct PlannedClothCollide {

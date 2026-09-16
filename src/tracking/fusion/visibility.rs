@@ -24,7 +24,7 @@
 //!    by the frame bottom (the hips and everything below are then out of
 //!    frame by construction).
 
-use crate::tracking::rtmw3d::DecodedJoint;
+use crate::tracking::detector::DecodedJoint;
 
 /// Logistic visibility calibration over the SimCC peak statistics.
 ///

@@ -264,10 +264,6 @@ pub(super) fn draw_output(ui: &mut egui::Ui, state: &mut GuiApp) {
                 user = budget.user_render_fps(),
             ));
             ui.label(t!(
-                "inspector.runtime_budget_yolox_skip",
-                period = budget.yolox_skip_period()
-            ));
-            ui.label(t!(
                 "inspector.runtime_budget_pose_hz",
                 hz = budget.pose_hz_target()
             ));

@@ -224,6 +224,7 @@ impl VulkanRenderer {
                 verlet_control_ubo,
                 verlet_set,
                 constraints,
+                bend: None,
                 normals,
                 collide: None,
                 selfcol: None,
@@ -413,6 +414,145 @@ fn allocate_cloth_constraint_resources(
         lambda_update_set,
         accumulate_set,
         apply_set,
+    })
+}
+
+/// Allocate the GPU bend stage (T09 edge-angle hinge) for one cloth
+/// slot: constraint table, wing CSR, per-constraint correction rows and
+/// the per-particle gather buffer, plus the three descriptor sets
+/// (update / accumulate / apply). Attach-static — rebuilt only when the
+/// bend table changes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn allocate_cloth_bend_resources(
+    bend: &[pipeline::ClothBendGpu],
+    adj_offsets: &[u32],
+    adj_constraints: &[u32],
+    particle_count: u32,
+    cloth_pos_ssbo: &Subbuffer<[[f32; 4]]>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    ds_allocator: &Arc<StandardDescriptorSetAllocator>,
+    update_pipeline: &Arc<ComputePipeline>,
+    accumulate_pipeline: &Arc<ComputePipeline>,
+    apply_pipeline: &Arc<ComputePipeline>,
+) -> Result<super::ClothGpuBendResources, String> {
+    let bend_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        bend.iter().copied(),
+        "cloth bend SSBO",
+    )?;
+
+    // Vulkano refuses zero-sized buffers — single-entry stubs keep the
+    // bindings live when a garment ships CSR data empty (the control's
+    // bend_count = 0 short-circuits every dispatch).
+    let stub_u32 = |v: &[u32], label: &'static str| -> Result<Subbuffer<[u32]>, String> {
+        gpu_alloc::host_buffer(
+            memory_allocator,
+            BufferUsage::STORAGE_BUFFER,
+            if v.is_empty() { vec![0_u32] } else { v.to_vec() },
+            label,
+        )
+    };
+    let adj_offsets_ssbo = stub_u32(adj_offsets, "cloth bend adj offsets SSBO")?;
+    let adj_ssbo = stub_u32(adj_constraints, "cloth bend adj scatter SSBO")?;
+
+    let rows_a_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        (0..bend.len().max(1)).map(|_| [0.0_f32; 4]),
+        "cloth bend delta rows A SSBO",
+    )?;
+    let rows_b_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        (0..bend.len().max(1)).map(|_| [0.0_f32; 4]),
+        "cloth bend delta rows B SSBO",
+    )?;
+    let deltas_ssbo = gpu_alloc::host_buffer(
+        memory_allocator,
+        BufferUsage::STORAGE_BUFFER,
+        (0..particle_count as usize).map(|_| [0.0_f32; 4]),
+        "cloth bend deltas SSBO",
+    )?;
+
+    let control_ubo = gpu_alloc::host_ubo(
+        memory_allocator,
+        pipeline::ClothBendControl {
+            particle_count,
+            bend_count: bend.len() as u32,
+            _pad: [0; 2],
+        },
+        "cloth bend control UBO",
+    )?;
+
+    let update_layout = update_pipeline
+        .layout()
+        .set_layouts()
+        .first()
+        .ok_or("renderer: cloth bend update pipeline missing set 0")?
+        .clone();
+    let update_set = DescriptorSet::new(
+        ds_allocator.clone(),
+        update_layout,
+        [
+            WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+            WriteDescriptorSet::buffer(1, bend_ssbo.clone()),
+            WriteDescriptorSet::buffer(2, control_ubo.clone()),
+            WriteDescriptorSet::buffer(3, rows_a_ssbo.clone()),
+            WriteDescriptorSet::buffer(4, rows_b_ssbo.clone()),
+        ],
+        [],
+    )
+    .map_err(|e| format!("renderer: cloth bend update descriptor set: {e}"))?;
+
+    let accumulate_layout = accumulate_pipeline
+        .layout()
+        .set_layouts()
+        .first()
+        .ok_or("renderer: cloth bend accumulate pipeline missing set 0")?
+        .clone();
+    let accumulate_set = DescriptorSet::new(
+        ds_allocator.clone(),
+        accumulate_layout,
+        [
+            WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+            WriteDescriptorSet::buffer(1, adj_offsets_ssbo.clone()),
+            WriteDescriptorSet::buffer(2, adj_ssbo.clone()),
+            WriteDescriptorSet::buffer(3, bend_ssbo.clone()),
+            WriteDescriptorSet::buffer(4, rows_a_ssbo.clone()),
+            WriteDescriptorSet::buffer(5, rows_b_ssbo.clone()),
+            WriteDescriptorSet::buffer(6, deltas_ssbo.clone()),
+            WriteDescriptorSet::buffer(7, control_ubo.clone()),
+        ],
+        [],
+    )
+    .map_err(|e| format!("renderer: cloth bend accumulate descriptor set: {e}"))?;
+
+    let apply_layout = apply_pipeline
+        .layout()
+        .set_layouts()
+        .first()
+        .ok_or("renderer: cloth bend apply pipeline missing set 0")?
+        .clone();
+    let apply_set = DescriptorSet::new(
+        ds_allocator.clone(),
+        apply_layout,
+        [
+            WriteDescriptorSet::buffer(0, cloth_pos_ssbo.clone()),
+            WriteDescriptorSet::buffer(1, deltas_ssbo.clone()),
+            WriteDescriptorSet::buffer(2, control_ubo.clone()),
+        ],
+        [],
+    )
+    .map_err(|e| format!("renderer: cloth bend apply descriptor set: {e}"))?;
+
+    Ok(super::ClothGpuBendResources {
+        bend_ssbo,
+        control_ubo,
+        update_set,
+        accumulate_set,
+        apply_set,
+        bend_count: bend.len() as u32,
     })
 }
 
@@ -671,12 +811,22 @@ pub(super) fn ensure_cloth_gpu_selfcol_resources(
 /// follow the bones) and reallocated only when the count changes; the
 /// control UBO carries the (slot-static) particle count plus the
 /// frame's collider count and margin.
+///
+/// `sdf` wires the avatar's splat-filled distance field into the
+/// collide kernel's smooth body-contact stage (`sdf_contact > 0`
+/// enables it). When absent, a one-cell dummy field is bound with
+/// `has_sdf = 0` — the descriptor layout is static, so the binding
+/// must always be live. The set is rebuilt when the field identity
+/// flips (the buffer itself is rewritten in place by the splat pass);
+/// `contact` rides the live control UBO update.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ensure_cloth_gpu_collide_resources(
     renderer_slot: &mut crate::renderer::TransformGpuData,
     colliders: &[crate::renderer::frame_input::ClothGpuCollider],
     particle_count: u32,
     margin: f32,
+    sdf: Option<(&Subbuffer<[u32]>, &crate::simulation::sdf::SdfGrid)>,
+    sdf_contact: f32,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     ds_allocator: &Arc<StandardDescriptorSetAllocator>,
     cloth_collide_pipeline: &Arc<ComputePipeline>,
@@ -687,10 +837,11 @@ pub(super) fn ensure_cloth_gpu_collide_resources(
         .cloth_gpu
         .as_mut()
         .ok_or("renderer: collide resources require an allocated cloth slot")?;
+    let has_sdf = sdf.is_some();
     let needs_rebuild = gpu
         .collide
         .as_ref()
-        .map(|c| c.collider_count != count)
+        .map(|c| c.collider_count != count || c.has_sdf != has_sdf)
         .unwrap_or(true);
     if needs_rebuild {
         let collider_ssbo = gpu_alloc::host_buffer(
@@ -708,10 +859,48 @@ pub(super) fn ensure_cloth_gpu_collide_resources(
                 particle_count,
                 collider_count: count,
                 margin,
-                _pad: 0,
+                has_sdf: u32::from(has_sdf),
+                sdf_contact,
+                _pad: [0; 2],
             },
             "cloth collide control UBO",
         )?;
+        // The field bound at set-build time; the splat pass rewrites it
+        // in place, so no per-frame rebinding is needed.
+        let (sdf_field_ssbo, sdf_params) = match sdf {
+            Some((field, grid)) => {
+                let params = gpu_alloc::host_ubo(
+                    memory_allocator,
+                    pipeline::ClothSdfParams {
+                        origin_voxel: [
+                            grid.origin[0],
+                            grid.origin[1],
+                            grid.origin[2],
+                            grid.voxel,
+                        ],
+                        dims_pad: [grid.dims[0], grid.dims[1], grid.dims[2], 0],
+                    },
+                    "cloth collide sdf params UBO",
+                )?;
+                (field.clone(), params)
+            }
+            None => {
+                // One sentinel cell — the kernel gates on `has_sdf`
+                // before touching it.
+                let dummy = gpu_alloc::host_buffer(
+                    memory_allocator,
+                    BufferUsage::STORAGE_BUFFER,
+                    [u32::MAX],
+                    "cloth collide sdf dummy",
+                )?;
+                let params = gpu_alloc::host_ubo(
+                    memory_allocator,
+                    pipeline::ClothSdfParams::default(),
+                    "cloth collide sdf params UBO (dummy)",
+                )?;
+                (dummy, params)
+            }
+        };
         let set_layout = cloth_collide_pipeline
             .layout()
             .set_layouts()
@@ -728,6 +917,8 @@ pub(super) fn ensure_cloth_gpu_collide_resources(
                 WriteDescriptorSet::buffer(0, cloth_pos_ssbo),
                 WriteDescriptorSet::buffer(1, collider_ssbo.clone()),
                 WriteDescriptorSet::buffer(2, control_ubo.clone()),
+                WriteDescriptorSet::buffer(3, sdf_field_ssbo),
+                WriteDescriptorSet::buffer(4, sdf_params),
             ],
             [],
         )
@@ -737,6 +928,7 @@ pub(super) fn ensure_cloth_gpu_collide_resources(
             control_ubo,
             collide_set,
             collider_count: count,
+            has_sdf,
         });
     } else if let Some(res) = gpu.collide.as_mut() {
         // Refresh the capsule rows in place (same live-write pattern as
@@ -760,6 +952,8 @@ pub(super) fn ensure_cloth_gpu_collide_resources(
         g.collider_count = count;
         g.margin = margin;
         g.particle_count = particle_count;
+        g.has_sdf = u32::from(has_sdf);
+        g.sdf_contact = sdf_contact;
     }
     Ok(())
 }

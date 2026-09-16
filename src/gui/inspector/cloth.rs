@@ -749,7 +749,7 @@ fn draw_cloth_preview(
                         // apply_cloth_gravity normally runs, so without this
                         // the Gravity Scale slider would be inert while paused.
                         crate::simulation::apply_cloth_gravity(avatar, &scene_gravity);
-                        crate::simulation::cloth_solver::step_cloth(1.0 / 60.0, avatar, &[]);
+                        crate::simulation::cloth_solver::step_cloth(1.0 / 60.0, avatar, &[], None);
                     }
                     if tonal_button(ui, None, &t!("inspector.reset"), ButtonTone::Error, true)
                         .clicked()

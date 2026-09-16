@@ -1,13 +1,26 @@
-//! Head pose (yaw / pitch / roll) derivation from RTMW3D's body face
-//! keypoints, plus the dlib-68 face bbox we hand to the FaceMesh
-//! cascade. Everything in this file consumes [`super::decode::DecodedJoint`]
-//! and produces source-space outputs (`FacePose`, `FaceBbox`) — no
-//! ONNX inference of its own.
+//! Head pose (yaw / pitch / roll) derivation from the detector's body
+//! face keypoints (0=nose, 1=left_eye, 2=right_eye, 3=left_ear,
+//! 4=right_ear), plus the FaceMesh bbox derivation. Everything in this
+//! file consumes [`super::decode::DecodedJoint`] and produces
+//! source-space outputs (`FacePose` etc.) — no ONNX inference of its own.
+//!
+//! `pitch_from_vertical_ratio` reads the SimCC face-68 block (indices
+//! 23..=90) when a detector provides it and falls back to the legacy
+//! inter-eye pitch otherwise — the YOLO11 body-17 path always takes the
+//! fallback.
 
-use super::super::face_mediapipe::{derive_face_bbox, FaceBbox};
 use super::super::{FacePose, FaceSource};
-use super::consts::{INPUT_H, INPUT_W, KEYPOINT_VISIBILITY_FLOOR};
 use super::decode::DecodedJoint;
+
+/// Nominal detector input geometry, in the same spirit as the removed
+/// RTMW3D preprocess constants: only the ASPECT ratio is meaningful —
+/// every use multiplies a whole-frame-normalised coordinate to get a
+/// pixel-space quantity for angle/ratio math.
+const INPUT_W: f32 = 288.0;
+const INPUT_H: f32 = 384.0;
+/// Score below which a keypoint is treated as absent by the face
+/// geometry paths.
+const KEYPOINT_VISIBILITY_FLOOR: f32 = 0.05;
 
 /// Derive head yaw / pitch / roll from RTMW3D's body face keypoints
 /// (0=nose, 1=left_eye, 2=right_eye, 3=left_ear, 4=right_ear) in
@@ -577,22 +590,6 @@ impl FaceSourceSelector {
 /// the chin. The face-68 set spans the whole face including mouth
 /// and jaw, so its centroid lands on the actual face centre. Returns
 /// `None` when too few face keypoints clear the confidence floor.
-pub(super) fn build_face_bbox_from_joints(
-    joints: &[DecodedJoint],
-    width: u32,
-    height: u32,
-) -> Option<FaceBbox> {
-    let mut points_px: Vec<(f32, f32)> = Vec::with_capacity(68);
-    for i in 23..=90 {
-        let Some(j) = joints.get(i) else { continue };
-        if j.score < KEYPOINT_VISIBILITY_FLOOR {
-            continue;
-        }
-        points_px.push((j.nx * width as f32, j.ny * height as f32));
-    }
-    derive_face_bbox(&points_px, width, height)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

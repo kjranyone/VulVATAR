@@ -334,6 +334,7 @@ fn cloth_avatar(gravity: [f32; 3]) -> AvatarInstance {
         self_collision_radius: 0.01,
         connected_pairs: HashSet::new(),
         spatial_hash: SpatialHashGrid::new(0.04),
+        sdf_contact: 0.0,
     };
     sim.gravity = gravity;
     avatar.cloth_sim = Some(sim);
@@ -345,7 +346,7 @@ fn cloth_avatar(gravity: [f32; 3]) -> AvatarInstance {
 fn cpu_cloth_settles_to_sleep_and_freezes_bitwise() {
     let mut avatar = cloth_avatar([0.0, 0.0, 0.0]);
     for _ in 0..30 {
-        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert!(
@@ -355,7 +356,7 @@ fn cpu_cloth_settles_to_sleep_and_freezes_bitwise() {
     );
     let frozen = cs.sim_positions.clone();
     for _ in 0..10 {
-        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert_eq!(
         avatar.cloth_state.as_ref().unwrap().sim_positions,
@@ -369,12 +370,12 @@ fn cpu_cloth_wakes_when_inputs_change() {
     // (a) gravity turns on.
     let mut avatar = cloth_avatar([0.0, 0.0, 0.0]);
     for _ in 0..30 {
-        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert!(avatar.cloth_state.as_ref().unwrap().settle.sleeping);
     let frozen = avatar.cloth_state.as_ref().unwrap().sim_positions.clone();
     avatar.cloth_sim.as_mut().unwrap().gravity = [0.0, -9.81, 0.0];
-    cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert_ne!(cs.sim_positions, frozen, "gravity change must wake the cloth");
     assert!(!cs.settle.sleeping);
@@ -383,7 +384,7 @@ fn cpu_cloth_wakes_when_inputs_change() {
     // centre: `collide` skips the degenerate dist==0 case.
     let mut avatar = cloth_avatar([0.0, 0.0, 0.0]);
     for _ in 0..30 {
-        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert!(avatar.cloth_state.as_ref().unwrap().settle.sleeping);
     let frozen = avatar.cloth_state.as_ref().unwrap().sim_positions.clone();
@@ -391,7 +392,7 @@ fn cpu_cloth_wakes_when_inputs_change() {
         center: [2.96, 0.0, 0.0], // 4 cm from particle 3, inside its 5 cm radius
         radius: 0.05,
     }];
-    cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &colliders);
+    cloth_solver::step_cloth(1.0 / 60.0, &mut avatar, &colliders, None);
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert_ne!(
         cs.sim_positions, frozen,

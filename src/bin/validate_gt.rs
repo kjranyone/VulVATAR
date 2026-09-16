@@ -14,7 +14,7 @@
 //! * wrist forward (z) / height (y)     — arm elevation coupling
 //! * head world-rotation geodesic delta — head coupling
 //!
-//! Caveat: RTMW3D is trained on photos; detection on a stylized
+//! Caveat: the detector is trained on photos; detection on a stylized
 //! render is noisier than on a webcam frame. The metrics here are
 //! therefore COARSE coupling gains (does a 30° twist come back as
 //! ~30°, ~0°, or inverted?), not sub-degree accuracy scores.

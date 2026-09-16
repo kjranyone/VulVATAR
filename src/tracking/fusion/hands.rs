@@ -22,7 +22,7 @@ use ndarray::Array4;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::tracking::rtmw3d::session::build_session_cpu_only;
+use crate::tracking::detector::session::build_session_cpu_only;
 
 use super::estimator::{AngleObs, Intrinsics, Kp2d, Kp3d, ModelPoint};
 use super::math::*;

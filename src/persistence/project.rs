@@ -61,7 +61,6 @@ pub struct ProjectState {
     pub root_translation_enabled: bool,
     pub fade_on_tracking_loss: bool,
     pub force_cpu_inference: bool,
-    pub yolox_enabled: bool,
     pub show_camera_wipe: bool,
     pub show_detection_annotations: bool,
     // Pose-solver smoothing (Advanced smoothing inspector section). The
@@ -342,7 +341,6 @@ impl ProjectFile {
                 root_translation_enabled: state.root_translation_enabled,
                 fade_on_tracking_loss: state.fade_on_tracking_loss,
                 force_cpu_inference: state.force_cpu_inference,
-                yolox_enabled: state.yolox_enabled,
                 show_camera_wipe: state.show_camera_wipe,
                 show_detection_annotations: state.show_detection_annotations,
                 smoothing_rotation_blend: state.smoothing_rotation_blend,
@@ -436,7 +434,6 @@ impl ProjectFile {
             root_translation_enabled: self.tracking.root_translation_enabled,
             fade_on_tracking_loss: self.tracking.fade_on_tracking_loss,
             force_cpu_inference: self.tracking.force_cpu_inference,
-            yolox_enabled: self.tracking.yolox_enabled,
             show_camera_wipe: self.tracking.show_camera_wipe,
             show_detection_annotations: self.tracking.show_detection_annotations,
             smoothing_rotation_blend: self.tracking.smoothing_rotation_blend,

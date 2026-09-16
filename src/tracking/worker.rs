@@ -36,7 +36,7 @@ use super::{DetectionAnnotation, PreviewFrame, SourceSkeleton, TrackingMailbox};
 // ---------------------------------------------------------------------------
 // RuntimeGpuBudget cadence knobs (P3-03)
 // ---------------------------------------------------------------------------
-// Same shape as `rtmw3d::YOLOX_REFRESH_PERIOD`: one Application writes,
+// Same shape as the former `rtmw3d::YOLOX_REFRESH_PERIOD` knob: one Application writes,
 // the tracking-worker loop reads, so a plain static beats `Arc<Atomic>`
 // plumbing (see that static's doc for the full rationale).
 

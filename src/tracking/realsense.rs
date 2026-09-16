@@ -6,7 +6,7 @@
 //! It streams synchronized color + depth and, each frame, aligns the depth
 //! image into the color image so that a color pixel indexes the matching depth
 //! sample directly. Each grabbed frame is handed to the pipeline as:
-//!   - an RGB8 buffer (`w*h*3`, row-major, top-down) so the RTMW3D provider
+//!   - an RGB8 buffer (`w*h*3`, row-major, top-down) so the pose provider
 //!     consumes it unchanged, plus
 //!   - the aligned depth as raw Z16 + the metric scale + the color intrinsics,
 //!     ready to be deprojected into a metric point cloud.

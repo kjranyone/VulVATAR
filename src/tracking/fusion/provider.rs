@@ -10,7 +10,8 @@ use log::info;
 
 use crate::tracking::metric_frame::MetricDepthFrame;
 use crate::tracking::provider::{PoseProvider, TrackingPipelineConfig};
-use crate::tracking::rtmw3d::{Rtmw3dInference, Rtmw3dOptions};
+use crate::tracking::detector::yolo11::Yolo11PoseInference;
+use crate::tracking::detector::DetectorOptions;
 use crate::tracking::source_skeleton::CameraIntrinsics;
 use crate::tracking::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
 
@@ -126,7 +127,7 @@ pub struct FusionProvider {
     pub last_kp3d: Vec<(usize, V3, f64)>,
     /// Diagnostics: the detector's raw 133 keypoints of the last frame
     /// (whole-frame normalised, before any gate) with SimCC peak stats.
-    pub last_raw_joints: Vec<crate::tracking::rtmw3d::DecodedJoint>,
+    pub last_raw_joints: Vec<crate::tracking::detector::DecodedJoint>,
     /// Diagnostics: person crop `(x, y, w, h)` fed to the detector.
     pub last_crop: Option<(f32, f32, f32, f32)>,
     /// Diagnostics: per-gate score snapshots of the last frame —
@@ -146,7 +147,6 @@ pub struct FusionProvider {
     /// (`u32::MAX` before the first).
     frames_since_face: u32,
     /// Diagnostics: crop hint pushed to the detector this frame (px).
-    pub last_crop_hint: Option<(f32, f32, f32, f32)>,
     /// This frame's person silhouette (dense surface source, GUI overlay).
     pub last_sil: Option<super::visibility::Silhouette>,
     /// Dense surface points fed to the estimator this frame.
@@ -185,7 +185,7 @@ enum DetectorSlot {
     /// bench / validate_gt), safe mode, active session recording, and
     /// `VULVATAR_NO_PIPELINE=1`. Bit-identical to the pre-pipelining
     /// behaviour.
-    Inline(Rtmw3dInference),
+    Inline(Yolo11PoseInference),
     /// The detector runs on the `tracking-detect` thread
     /// ([`detector_thread::DetectorClient`]) so it overlaps the solver
     /// stage; `estimate_pose_latest` is the live entry point.
@@ -283,10 +283,9 @@ impl FusionProvider {
         remote: bool,
     ) -> Result<Self, String> {
         let dir = models_dir.as_ref();
-        let opts = Rtmw3dOptions {
+        let opts = DetectorOptions {
             face_ep: crate::tracking::face_mediapipe::FaceMeshEp::Auto,
             force_cpu: config.force_cpu,
-            yolox_enabled: config.yolox_enabled,
         };
         let (det, backend_label, mut warnings) = if remote {
             // The detector thread builds its ONNX sessions while this
@@ -310,11 +309,11 @@ impl FusionProvider {
                 Err(_) => return Err("detector thread died during model load".to_string()),
             }
         } else {
-            let mut rtmw3d = Rtmw3dInference::from_models_dir_with_options(dir, opts)?;
-            let label = rtmw3d.backend().label();
-            let warnings = rtmw3d.take_load_warnings();
+            let mut detector = Yolo11PoseInference::from_models_dir_with_options(dir, opts)?;
+            let label = detector.backend().label();
+            let warnings = detector.take_load_warnings();
             (
-                DetectorSlot::Inline(rtmw3d),
+                DetectorSlot::Inline(detector),
                 label,
                 warnings,
             )
@@ -332,7 +331,7 @@ impl FusionProvider {
             }
         };
         info!(
-            "Fusion provider ready (RTMW3D {}{})",
+            "Fusion provider ready (YOLO11-pose {}{})",
             backend_label,
             if remote { ", pipelined" } else { "" }
         );
@@ -383,76 +382,12 @@ impl FusionProvider {
             last_vis: Vec::new(),
             last_silhouette: None,
             frames_since_face: u32::MAX,
-            last_crop_hint: None,
             last_sil: None,
             last_dense_n: 0,
             wrist_hold: Default::default(),
             depth_ring: Vec::new(),
             last_consumed: None,
             det_dead_logged: false,
-        })
-    }
-
-    /// Predicted upper-body bbox (frame px) for the detector crop, or
-    /// `None` when the head is not currently tracked.
-    fn crop_hint_from_state(
-        &self,
-        t: f64,
-        intr: &Intrinsics,
-        width: u32,
-        height: u32,
-    ) -> Option<crate::tracking::yolox::PersonBbox> {
-        self.est.last_t?;
-        let m = &self.h.model;
-        if self.est.joint_data_sigma(m, self.h.j.head) >= 0.5 {
-            return None;
-        }
-        let pred = self.est.predict(m, t);
-        let fk = m.fk(&pred);
-        let ls = fk.t[self.h.j.l_shoulder];
-        let rs = fk.t[self.h.j.r_shoulder];
-        let mid = scale(add(ls, rs), 0.5);
-        // Camera space: +y is image-down. Cover head top → chest and a
-        // hand's width outside each shoulder.
-        let pts = [
-            fk.site[self.h.s.head_top],
-            fk.site[self.h.s.head_center],
-            add(ls, [-0.12, 0.0, 0.0]),
-            add(rs, [0.12, 0.0, 0.0]),
-            add(ls, [0.12, 0.0, 0.0]),
-            add(rs, [-0.12, 0.0, 0.0]),
-            add(mid, [0.0, 0.30, 0.0]),
-        ];
-        // The predicted arms are deliberately NOT part of the hint: the
-        // self-track bbox (visible keypoints, unioned at the crop site)
-        // already covers a hand that is actually seen, and extending the
-        // hint with the predicted arms was measured worse (torso yaw std
-        // sum 114 → 128 over 23 recordings — the crop follows a wrist
-        // prediction that is itself uncertain).
-        let (mut x1, mut y1, mut x2, mut y2) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for p in pts {
-            let q = intr.project(p)?;
-            x1 = x1.min(q[0]);
-            y1 = y1.min(q[1]);
-            x2 = x2.max(q[0]);
-            y2 = y2.max(q[1]);
-        }
-        let (w, h) = (width as f64, height as f64);
-        let (x1, y1, x2, y2) = (
-            x1.clamp(0.0, w),
-            y1.clamp(0.0, h),
-            x2.clamp(0.0, w),
-            y2.clamp(0.0, h),
-        );
-        if x2 - x1 < 48.0 || y2 - y1 < 48.0 {
-            return None;
-        }
-        Some(crate::tracking::yolox::PersonBbox {
-            x1: x1 as f32,
-            y1: y1 as f32,
-            x2: x2 as f32,
-            y2: y2 as f32,
-            score: 1.0,
         })
     }
 
@@ -509,10 +444,10 @@ impl FusionProvider {
 impl PoseProvider for FusionProvider {
     fn label(&self) -> String {
         let backend = match &self.det {
-            DetectorSlot::Inline(rtmw3d) => rtmw3d.backend().label(),
+            DetectorSlot::Inline(detector) => detector.backend().label(),
             DetectorSlot::Remote { backend_label, .. } => backend_label.clone(),
         };
-        format!("Fusion v2 / RTMW3D {backend}")
+        format!("Fusion v2 / YOLO11-pose {backend}")
     }
 
     fn take_load_warnings(&mut self) -> Vec<String> {
@@ -521,7 +456,7 @@ impl PoseProvider for FusionProvider {
 
     fn reset_temporal_state(&mut self) {
         match &mut self.det {
-            DetectorSlot::Inline(rtmw3d) => rtmw3d.reset_temporal_state(),
+            DetectorSlot::Inline(detector) => detector.reset_temporal_state(),
             DetectorSlot::Remote { client, .. } => {
                 // In-order on the detector thread: the reset is applied
                 // before any job submitted after it; buffered depths
@@ -595,7 +530,6 @@ impl FusionProvider {
         // This frame's device time — what the detector job (and the crop
         // hint derived from the predicted state) are keyed to.
         let job_ts_ms = incoming_depth.as_ref().and_then(|d| d.timestamp_ms);
-        let job_t = job_ts_ms.map_or(frame_index as f64 / 30.0, |ms| ms / 1000.0);
 
         let intr_cam: Option<CameraIntrinsics> =
             incoming_depth.as_ref().and_then(|d| d.intrinsics);
@@ -612,22 +546,7 @@ impl FusionProvider {
         };
 
         // ---- state-driven crop hint -----------------------------------------
-        // While the head is tracked, the detector's person crop follows the
-        // ESTIMATED upper body (head top → chest, shoulders ± a hand), not
-        // the subset of keypoints that happened to be sharp last frame.
-        // Same principle as the hand crops: the crop is a function of the
-        // state, so per-frame visibility cannot feed back into it.
-        let t_hint = std::time::Instant::now();
-        let crop_hint = if std::env::var_os("VULVATAR_FUSION_NO_HINT").is_some() {
-            None
-        } else {
-            self.crop_hint_from_state(job_t, &intr, width, height)
-        };
-        self.last_crop_hint = crop_hint.map(|b| (b.x1, b.y1, b.x2, b.y2));
-        let mut ph = PhaseTimings {
-            hint_ms: t_hint.elapsed().as_secs_f32() * 1000.0,
-            ..PhaseTimings::default()
-        };
+        let mut ph = PhaseTimings::default();
 
         // ---- detector stage ---------------------------------------------------
         // (inline RTMW3D pass, or a job on the tracking-detect thread).
@@ -651,13 +570,12 @@ impl FusionProvider {
         let mut det_frame_index = frame_index;
         let (mut base, mut aux) = 'det: {
             match &mut self.det {
-                DetectorSlot::Inline(rtmw3d) => {
-                    rtmw3d.set_frame_timestamp_ms(job_ts_ms);
-                    rtmw3d.set_crop_hint(crop_hint);
-                    let t_rtmw = std::time::Instant::now();
-                    let base = rtmw3d.estimate_pose(rgb_data, width, height, frame_index);
-                    let aux = rtmw3d.take_aux();
-                    ph.rtmw_ms = t_rtmw.elapsed().as_secs_f32() * 1000.0;
+                DetectorSlot::Inline(detector) => {
+                    detector.set_frame_timestamp_ms(job_ts_ms);
+                    let t_det = std::time::Instant::now();
+                    let base = detector.estimate_pose(rgb_data, width, height, frame_index);
+                    let aux = detector.take_aux();
+                    ph.rtmw_ms = t_det.elapsed().as_secs_f32() * 1000.0;
                     break 'det (base, aux);
                 }
                 DetectorSlot::Remote { client, .. } => {
@@ -667,7 +585,6 @@ impl FusionProvider {
                         rgb: Arc::new(rgb_data.to_vec()),
                         width,
                         height,
-                        crop_hint,
                     });
                     let res = if latest {
                         match client.take_latest(self.last_consumed) {

@@ -313,9 +313,6 @@ fn main() -> Result<(), String> {
     }
 
     let mut cfg = TrackingPipelineConfig::default();
-    if std::env::var_os("VULVATAR_REPLAY_NO_YOLOX").is_some() {
-        cfg.yolox_enabled = false;
-    }
     if std::env::var_os("VULVATAR_REPLAY_CPU").is_some() {
         cfg.force_cpu = true;
     }
@@ -488,14 +485,10 @@ fn main() -> Result<(), String> {
                     .last_silhouette
                     .map(|(z, b, a)| (z, b as u8, a))
                     .unwrap_or((f64::NAN, 0, f64::NAN));
-                let (hx1, hy1, hx2, hy2) =
-                    provider
-                        .last_crop_hint
-                        .unwrap_or((f32::NAN, f32::NAN, f32::NAN, f32::NAN));
                 vis_csv.push_str(&format!(
-                    "{idx},{j},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4},{:.3},{},{:.4},{:.1},{:.1},{:.1},{:.1}",
+                    "{idx},{j},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4},{:.3},{},{:.4}",
                     kp.nx, kp.ny, kp.nz, kp.score, kp.sx, kp.sy, kp.second_x, kp.second_y,
-                    kp.half_x, kp.half_y, kp.zscore, cx, cy, cw_, ch_, dz, pv, sd, sz, sb, sa, hx1, hy1, hx2, hy2
+                    kp.half_x, kp.half_y, kp.zscore, cx, cy, cw_, ch_, dz, pv, sd, sz, sb, sa
                 ));
                 for (_, scores) in &provider.last_kp_stages {
                     vis_csv.push_str(&format!(

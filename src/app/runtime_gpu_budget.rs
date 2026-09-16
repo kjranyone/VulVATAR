@@ -2,8 +2,8 @@
 //!
 //! Centralises the render / output / tracking cadence decisions that were
 //! previously scattered as constants across `OutputRouter::set_target_fps`
-//! and `tracking/rtmw3d/mod.rs::YOLOX_REFRESH_PERIOD`. Consumers read the
-//! latest target from the budget; the budget reads live measurements
+//! and the worker pacing atomics. Consumers read the latest target from
+//! the budget; the budget reads live measurements
 //! (render-thread fps, render dt, output queue depth, export pool
 //! occupancy, recent GPU export failures) and decides one global
 //! [`DegradedMode`] level that drives the wired targets together.
@@ -11,8 +11,6 @@
 //! Currently wired:
 //! - `render_fps_target` → `OutputRouter::set_target_fps` via
 //!   `Application::set_user_render_fps`
-//! - `yolox_skip_period` → `tracking::rtmw3d::YOLOX_REFRESH_PERIOD`
-//!   (`pub static AtomicU64`)
 //! - `pose_hz_target` → `tracking::worker::POSE_HZ_TARGET` (read in
 //!   the worker's estimate loop; frames that fail the pacing check
 //!   are dropped before inference)
@@ -131,7 +129,6 @@ pub struct RuntimeGpuBudget {
     user_render_fps: u32,
 
     render_fps_target: u32,
-    yolox_skip_period: u32,
     /// Pose estimate cadence (Hz) the tracking worker should honour.
     /// Camera-rate at Healthy; stepwise lower under pressure.
     pose_hz_target: u32,
@@ -210,7 +207,6 @@ impl RuntimeGpuBudget {
         Self {
             user_render_fps: 60,
             render_fps_target: 60,
-            yolox_skip_period: 4,
             pose_hz_target: 30,
             depth_refresh_period: 1,
             facemesh_cpu_ep: false,
@@ -237,9 +233,6 @@ impl RuntimeGpuBudget {
 
     pub fn render_fps_target(&self) -> u32 {
         self.render_fps_target
-    }
-    pub fn yolox_skip_period(&self) -> u32 {
-        self.yolox_skip_period
     }
     pub fn pose_hz_target(&self) -> u32 {
         self.pose_hz_target
@@ -439,28 +432,24 @@ impl RuntimeGpuBudget {
         match self.degraded_mode {
             DegradedMode::Healthy => {
                 self.render_fps_target = self.user_render_fps;
-                self.yolox_skip_period = 4;
                 self.pose_hz_target = 30;
                 self.depth_refresh_period = 1;
                 self.facemesh_cpu_ep = false;
             }
             DegradedMode::PressureLight => {
                 self.render_fps_target = self.user_render_fps.min(45);
-                self.yolox_skip_period = 6;
                 self.pose_hz_target = 25;
                 self.depth_refresh_period = 2;
                 self.facemesh_cpu_ep = false;
             }
             DegradedMode::PressureHeavy => {
                 self.render_fps_target = self.user_render_fps.min(30);
-                self.yolox_skip_period = 8;
                 self.pose_hz_target = 20;
                 self.depth_refresh_period = 3;
                 self.facemesh_cpu_ep = true;
             }
             DegradedMode::EmergencyCpu => {
                 self.render_fps_target = self.user_render_fps.min(30);
-                self.yolox_skip_period = 12;
                 self.pose_hz_target = 15;
                 self.depth_refresh_period = 4;
                 self.facemesh_cpu_ep = true;
@@ -631,7 +620,6 @@ mod tests {
         m.gpu_export_failures_this_tick = EMERGENCY_FAILURE_COUNT as u32;
         budget.update(&m, t0 + Duration::from_millis(32));
         assert_eq!(budget.degraded_mode(), DegradedMode::EmergencyCpu);
-        assert_eq!(budget.yolox_skip_period(), 12);
     }
 
     /// Failures arriving one-per-tick still accumulate to the
@@ -878,33 +866,7 @@ mod tests {
         );
     }
 
-    /// Contract: no mode emits `yolox_skip_period = 0`. The tracking
-    /// thread reads the period inside `frame_index.is_multiple_of(period)`
-    /// which would panic on zero. Defence-in-depth `.max(1)` on the
-    /// read site backs this, but the invariant should hold at the
-    /// source too.
-    #[test]
-    fn all_modes_emit_nonzero_yolox_skip_period() {
-        let t0 = Instant::now();
-        let mut budget = RuntimeGpuBudget::new(t0);
-        for mode in [
-            DegradedMode::Healthy,
-            DegradedMode::PressureLight,
-            DegradedMode::PressureHeavy,
-            DegradedMode::EmergencyCpu,
-        ] {
-            // Force the mode + recompute targets through the public surface.
-            budget.degraded_mode = mode;
-            budget.recompute_targets();
-            assert!(
-                budget.yolox_skip_period() >= 1,
-                "mode {:?} emitted yolox_skip_period = 0",
-                mode
-            );
-        }
-    }
-
-    /// Defence-in-depth twin of the YOLOX invariant for the two new
+    /// Defence-in-depth invariant for the two cadence knobs
     /// cadence knobs: a zero pose Hz / depth period must never be
     /// emitted (`is_multiple_of(0)` panics; a 0 Hz pose gate would
     /// starve tracking). `.max(1)`/`hz == 0` guards on the read sites

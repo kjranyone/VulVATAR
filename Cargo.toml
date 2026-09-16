@@ -138,6 +138,13 @@ required-features = ["realsense"]
 name = "diagnose_fusion_replay"
 required-features = ["inference"]
 
+# YOLO11-pose (Ultralytics export) vs RTMW3D detector benchmark: timing +
+# COCO-17 keypoint agreement over recorded session frames. inference-only,
+# no camera — runs while the live app holds realsense2.dll.
+[[bin]]
+name = "diagnose_yolo11_pose"
+required-features = ["inference"]
+
 # GT round-trip renders an aligned metric depth buffer and feeds it via
 # `set_external_depth` so the recovered pose is scored end-to-end through
 # the fusion estimator. That path is `realsense`-gated, so the bench is too.

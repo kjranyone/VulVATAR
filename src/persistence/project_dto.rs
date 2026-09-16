@@ -64,8 +64,6 @@ pub struct TrackingConfig {
     /// provider previously hardcoded.
     #[serde(default)]
     pub force_cpu_inference: bool,
-    #[serde(default = "default_true")]
-    pub yolox_enabled: bool,
     #[serde(default)]
     pub show_camera_wipe: bool,
     #[serde(default)]

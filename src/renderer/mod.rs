@@ -305,6 +305,9 @@ struct ClothGpuSlot {
     /// no distance constraints (e.g. authoring only set up a triangulated
     /// mesh for normal recomputation).
     constraints: Option<ClothGpuConstraintResources>,
+    /// Edge-angle bend stage. `None` when the garment has no bend
+    /// constraints.
+    bend: Option<ClothGpuBendResources>,
     /// Vertex normal recomputation resources. `None` when the cloth has
     /// no triangle index data.
     normals: Option<ClothGpuNormalResources>,
@@ -366,6 +369,23 @@ struct ClothGpuCollideResources {
     control_ubo: Subbuffer<pipeline::ClothCollideControl>,
     collide_set: Arc<DescriptorSet>,
     collider_count: u32,
+    /// Whether the descriptor set binds the avatar's real SDF field —
+    /// part of the rebuild key (flipping presence reallocs the set).
+    has_sdf: bool,
+}
+
+/// Per-slot resources for the GPU bend stage (T09 edge-angle hinge —
+/// `cloth_bend_{update,accumulate,apply}_cs`). Attach-static topology;
+/// allocated once at first plan, refreshed only when the bend table
+/// changes.
+pub(super) struct ClothGpuBendResources {
+    #[allow(dead_code)]
+    bend_ssbo: Subbuffer<[pipeline::ClothBendGpu]>,
+    control_ubo: Subbuffer<pipeline::ClothBendControl>,
+    update_set: Arc<DescriptorSet>,
+    accumulate_set: Arc<DescriptorSet>,
+    apply_set: Arc<DescriptorSet>,
+    bend_count: u32,
 }
 
 struct ClothGpuSelfColResources {
@@ -456,6 +476,9 @@ pub struct VulkanRenderer {
     /// Cloth vertex normal recomputation compute pipeline (S3.1).
     cloth_normal_pipeline: Option<Arc<ComputePipeline>>,
     cloth_collide_pipeline: Option<Arc<ComputePipeline>>,
+    cloth_bend_update_pipeline: Option<Arc<ComputePipeline>>,
+    cloth_bend_accumulate_pipeline: Option<Arc<ComputePipeline>>,
+    cloth_bend_apply_pipeline: Option<Arc<ComputePipeline>>,
     cloth_selfcol_build_pipeline: Option<Arc<ComputePipeline>>,
     cloth_selfcol_resolve_pipeline: Option<Arc<ComputePipeline>>,
     gpu_runtime_counters: GpuRuntimeCounters,
@@ -595,6 +618,9 @@ impl VulkanRenderer {
             cloth_constraint_apply_pipeline: None,
             cloth_normal_pipeline: None,
             cloth_collide_pipeline: None,
+            cloth_bend_update_pipeline: None,
+            cloth_bend_accumulate_pipeline: None,
+            cloth_bend_apply_pipeline: None,
             cloth_selfcol_build_pipeline: None,
             cloth_selfcol_resolve_pipeline: None,
             gpu_runtime_counters: GpuRuntimeCounters::default(),
@@ -982,6 +1008,22 @@ impl VulkanRenderer {
         )
         .expect("failed to create cloth collide compute pipeline");
         self.cloth_collide_pipeline = Some(cloth_collide_pipeline);
+        let cloth_bend_update_pipeline = pipeline::create_cloth_bend_update_compute_pipeline(
+            self.device.as_ref().expect("device set above").clone(),
+        )
+        .expect("failed to create cloth bend update compute pipeline");
+        self.cloth_bend_update_pipeline = Some(cloth_bend_update_pipeline);
+        let cloth_bend_accumulate_pipeline =
+            pipeline::create_cloth_bend_accumulate_compute_pipeline(
+                self.device.as_ref().expect("device set above").clone(),
+            )
+            .expect("failed to create cloth bend accumulate compute pipeline");
+        self.cloth_bend_accumulate_pipeline = Some(cloth_bend_accumulate_pipeline);
+        let cloth_bend_apply_pipeline = pipeline::create_cloth_bend_apply_compute_pipeline(
+            self.device.as_ref().expect("device set above").clone(),
+        )
+        .expect("failed to create cloth bend apply compute pipeline");
+        self.cloth_bend_apply_pipeline = Some(cloth_bend_apply_pipeline);
         let cloth_selfcol_build_pipeline =
             pipeline::create_cloth_selfcol_build_compute_pipeline(
                 self.device.as_ref().expect("device set above").clone(),
@@ -1499,6 +1541,21 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or("renderer: no cloth collide pipeline")?
             .clone();
+        let cloth_bend_update_pipeline = self
+            .cloth_bend_update_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth bend update pipeline")?
+            .clone();
+        let cloth_bend_accumulate_pipeline = self
+            .cloth_bend_accumulate_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth bend accumulate pipeline")?
+            .clone();
+        let cloth_bend_apply_pipeline = self
+            .cloth_bend_apply_pipeline
+            .as_ref()
+            .ok_or("renderer: no cloth bend apply pipeline")?
+            .clone();
         let cloth_selfcol_build_pipeline = self
             .cloth_selfcol_build_pipeline
             .as_ref()
@@ -1532,6 +1589,9 @@ impl VulkanRenderer {
             &cloth_apply_pipeline,
             &cloth_normal_pipeline,
             &cloth_collide_pipeline,
+            &cloth_bend_update_pipeline,
+            &cloth_bend_accumulate_pipeline,
+            &cloth_bend_apply_pipeline,
             &cloth_selfcol_build_pipeline,
             &cloth_selfcol_resolve_pipeline,
             &body_sdf_splat_pipeline,

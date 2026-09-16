@@ -26,7 +26,7 @@ use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, Pipeline, PipelineBin
 use crate::asset::PrimitiveId;
 use crate::renderer::frame_input::{self, RenderFrameInput};
 use crate::renderer::frame_plan::{
-    DrawInfo, PlannedCloth, PlannedClothCollide, PlannedClothConstraints, PlannedClothNormal,
+    DrawInfo, PlannedCloth, PlannedClothBend, PlannedClothCollide, PlannedClothConstraints, PlannedClothNormal,
     PlannedClothSelfCol, PlannedInstance, PlannedPrim,
 };
 use crate::renderer::pipeline::{self, GpuVertex};
@@ -772,11 +772,23 @@ impl VulkanRenderer {
                                         .transform_cache
                                         .get_mut(&key)
                                         .expect("transform slot present");
+                                    // Resolve the avatar's splat field
+                                    // directly (independent of whether a
+                                    // splat block is planned THIS frame —
+                                    // idle frames reuse the last built
+                                    // field; planning a splat block would
+                                    // sentinel-reset it for nothing).
+                                    let cloth_sdf = self
+                                        .sdf_slots
+                                        .get(&instance.instance_id.0)
+                                        .map(|s| (&s.field, &s.grid));
                                     match super::cloth_cache::ensure_cloth_gpu_collide_resources(
                                         slot,
                                         &ctrl.colliders,
                                         particle_count,
                                         ctrl.collision_margin,
+                                        cloth_sdf,
+                                        ctrl.sdf_contact,
                                         memory_allocator,
                                         ds_allocator,
                                         collide_pipeline,
@@ -854,12 +866,91 @@ impl VulkanRenderer {
                             None
                         };
 
+                        // Bend stage (T09 edge-angle hinge): attach-
+                        // static topology, allocated once at first plan
+                        // from the snapshot's attach data.
+                        let bend_plan = if let Some(attach) = cloth.gpu_attach.as_ref() {
+                            if !attach.bend.is_empty() {
+                                let slot = self
+                                    .transform_cache
+                                    .get_mut(&key)
+                                    .expect("transform slot present");
+                                let need_rebuild = slot
+                                    .cloth_gpu
+                                    .as_ref()
+                                    .and_then(|g| g.bend.as_ref())
+                                    .map(|b| b.bend_count != attach.bend.len() as u32)
+                                    .unwrap_or(true);
+                                if need_rebuild {
+                                    match (
+                                        self.cloth_bend_update_pipeline.as_ref(),
+                                        self.cloth_bend_accumulate_pipeline.as_ref(),
+                                        self.cloth_bend_apply_pipeline.as_ref(),
+                                    ) {
+                                        (Some(upd), Some(acc), Some(app)) => {
+                                            match super::cloth_cache::allocate_cloth_bend_resources(
+                                                &attach.bend,
+                                                &attach.bend_adj_offsets,
+                                                &attach.bend_adj_constraints,
+                                                particle_count,
+                                                &slot.cloth_pos_ssbo,
+                                                memory_allocator,
+                                                ds_allocator,
+                                                upd,
+                                                acc,
+                                                app,
+                                            ) {
+                                                Ok(res) => {
+                                                    slot.cloth_gpu
+                                                        .as_mut()
+                                                        .expect("cloth slot present")
+                                                        .bend = Some(res);
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "render: cloth bend resources failed for primitive {:?}: {}",
+                                                        mesh_inst.primitive_id, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                slot.cloth_gpu
+                                    .as_ref()
+                                    .and_then(|g| g.bend.as_ref())
+                                    .map(|b| PlannedClothBend {
+                                        update_set: b.update_set.clone(),
+                                        accumulate_set: b.accumulate_set.clone(),
+                                        apply_set: b.apply_set.clone(),
+                                        bend_groups: [
+                                            (attach.bend.len() as u32)
+                                                .div_ceil(64)
+                                                .max(1),
+                                            1,
+                                            1,
+                                        ],
+                                        particle_groups: [
+                                            particle_count.div_ceil(64),
+                                            1,
+                                            1,
+                                        ],
+                                    })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         cloth_plan = Some(PlannedCloth {
                             verlet_set,
                             groups: [groups, 1, 1],
                             substeps,
                             constraint_iters,
                             constraints: constraints_plan,
+                            bend: bend_plan,
                             normal: normal_plan,
                             collide: collide_plan,
                             selfcol: selfcol_plan,
@@ -1082,6 +1173,9 @@ impl VulkanRenderer {
         cloth_constraint_apply_pipeline: &Arc<ComputePipeline>,
         cloth_normal_pipeline: &Arc<ComputePipeline>,
         cloth_collide_pipeline: &Arc<ComputePipeline>,
+        cloth_bend_update_pipeline: &Arc<ComputePipeline>,
+        cloth_bend_accumulate_pipeline: &Arc<ComputePipeline>,
+        cloth_bend_apply_pipeline: &Arc<ComputePipeline>,
         cloth_selfcol_build_pipeline: &Arc<ComputePipeline>,
         cloth_selfcol_resolve_pipeline: &Arc<ComputePipeline>,
         body_sdf_splat_pipeline: &Arc<ComputePipeline>,
@@ -1215,6 +1309,64 @@ impl VulkanRenderer {
                                         format!("render: constraint apply dispatch: {e}")
                                     })?;
                                 }
+                            }
+                        }
+
+                        // Bend stage (T09 mirror) — per iteration,
+                        // after the distance apply: update per
+                        // constraint, then per-particle gather + apply.
+                        if let Some(bend) = &cloth.bend {
+                            builder
+                                .bind_pipeline_compute(cloth_bend_update_pipeline.clone())
+                                .map_err(|e| format!("render: bind bend update: {e}"))?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_bend_update_pipeline.layout().clone(),
+                                    0,
+                                    bend.update_set.clone(),
+                                )
+                                .map_err(|e| format!("render: bind bend update set: {e}"))?;
+                            unsafe {
+                                builder.dispatch(bend.bend_groups).map_err(|e| {
+                                    format!("render: bend update dispatch: {e}")
+                                })?;
+                            }
+                            builder
+                                .bind_pipeline_compute(
+                                    cloth_bend_accumulate_pipeline.clone(),
+                                )
+                                .map_err(|e| format!("render: bind bend accumulate: {e}"))?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_bend_accumulate_pipeline.layout().clone(),
+                                    0,
+                                    bend.accumulate_set.clone(),
+                                )
+                                .map_err(|e| {
+                                    format!("render: bind bend accumulate set: {e}")
+                                })?;
+                            unsafe {
+                                builder.dispatch(bend.particle_groups).map_err(|e| {
+                                    format!("render: bend accumulate dispatch: {e}")
+                                })?;
+                            }
+                            builder
+                                .bind_pipeline_compute(cloth_bend_apply_pipeline.clone())
+                                .map_err(|e| format!("render: bind bend apply: {e}"))?;
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Compute,
+                                    cloth_bend_apply_pipeline.layout().clone(),
+                                    0,
+                                    bend.apply_set.clone(),
+                                )
+                                .map_err(|e| format!("render: bind bend apply set: {e}"))?;
+                            unsafe {
+                                builder.dispatch(bend.particle_groups).map_err(|e| {
+                                    format!("render: bend apply dispatch: {e}")
+                                })?;
                             }
                         }
 

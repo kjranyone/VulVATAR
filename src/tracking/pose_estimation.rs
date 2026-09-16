@@ -4,7 +4,7 @@
 //! that locates a single skin-coloured region in the frame and produces a
 //! bare-minimum [`SourceSkeleton`] (no body joints, just a face pose
 //! derived from the centroid) so the GUI still has a heartbeat. Proper
-//! pose estimation comes from RTMW3D + the fusion estimator.
+//! pose estimation comes from the ONNX detector + the fusion estimator.
 
 use super::{DetectionAnnotation, FacePose, PoseEstimate, SourceSkeleton};
 

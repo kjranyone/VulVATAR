@@ -36,6 +36,18 @@ pub const SENTINEL: f32 = f32::MAX;
 /// use; beyond it collision is a no-op anyway.
 pub const SHELL_METRES: f32 = 0.06;
 
+/// Extra Z-only headroom on the grid. The grid is derived from the REST
+/// AABB, but the live pose moves: measured on the desk rig (2026-09-15,
+/// 30 s poll of `debug_avatar.json`), the tracked head displaces
+/// z ∈ [−0.14, +0.17] m (p95 +0.10) and strand joints sit up to ~0.11 m
+/// in front of the head bone — without this pad, bangs and side hair
+/// sample `SENTINEL` and silently lose body collision during ordinary
+/// forward leans. X needs nothing (the T-pose arm span dwarfs torso
+/// sway) and Y nothing (the body column is full-height); +0.12 m on
+/// both Z faces covers the observed extreme with ~2× margin while the
+/// Yumeka grid stays under [`MAX_CELLS`] at the same 10 mm voxel.
+pub const GRID_LEAN_PAD_M: f32 = 0.12;
+
 /// Value substituted for unsplatted cells during interpolation. Large
 /// enough that no real contact radius ever triggers, small enough that
 /// gradients stay finite and sane at the shell boundary (a raw
@@ -43,9 +55,13 @@ pub const SHELL_METRES: f32 = 0.06;
 const OUTSIDE_VALUE: f32 = SHELL_METRES * 2.0;
 
 /// Hard cap on total cells so a huge avatar AABB cannot balloon the
-/// per-frame readback. ~1.05 M cells × 4 B ≈ 4.2 MB — the same order
-/// as the existing full-frame pixel readback.
-const MAX_CELLS: usize = 1_050_000;
+/// per-frame readback. ~1.26 M cells × 4 B ≈ 5.0 MB — still under the
+/// full-frame pixel readback (8 MB) the pipeline already sustains at
+/// 30 Hz. Sized so a Yumeka-class grid (T-pose X span, full-height Y)
+/// keeps its 10 mm voxel WITH the Z lean pad folded in and ~20 % slack
+/// for larger garments (at the old 1.05 M cap the padded grid landed
+/// 2.6 % under and any slightly bigger model fell to 12.5 mm voxels).
+const MAX_CELLS: usize = 1_260_000;
 
 /// Candidate voxel sizes (metres), coarse-to-fine search order.
 const VOXEL_CANDIDATES: [f32; 6] = [0.020, 0.016, 0.0125, 0.010, 0.008, 0.006];
@@ -64,13 +80,22 @@ pub struct SdfGrid {
 
 impl SdfGrid {
     /// Build a grid covering `aabb` padded by [`SHELL_METRES`] on every
-    /// side, choosing the finest voxel size whose cell count fits
-    /// [`MAX_CELLS`]. Falls back to the coarsest candidate when even
-    /// that overflows (degenerate oversized assets).
+    /// side plus [`GRID_LEAN_PAD_M`] on Z (posed-torso headroom — see
+    /// the constant's doc), choosing the finest voxel size whose cell
+    /// count fits [`MAX_CELLS`]. Falls back to the coarsest candidate
+    /// when even that overflows (degenerate oversized assets).
     pub fn for_aabb(aabb: &Aabb) -> Self {
         let pad = SHELL_METRES;
-        let min = [aabb.min[0] - pad, aabb.min[1] - pad, aabb.min[2] - pad];
-        let max = [aabb.max[0] + pad, aabb.max[1] + pad, aabb.max[2] + pad];
+        let min = [
+            aabb.min[0] - pad,
+            aabb.min[1] - pad,
+            aabb.min[2] - pad - GRID_LEAN_PAD_M,
+        ];
+        let max = [
+            aabb.max[0] + pad,
+            aabb.max[1] + pad,
+            aabb.max[2] + pad + GRID_LEAN_PAD_M,
+        ];
         // Defensive: degenerate/empty AABB still yields a sliver grid
         // instead of a division by zero below.
         let size = [
@@ -233,6 +258,38 @@ mod tests {
         assert!(g.origin[0] <= aabb.min[0] - SHELL_METRES + 1e-4);
         let extent_x = g.origin[0] + g.dims[0] as f32 * g.voxel;
         assert!(extent_x >= aabb.max[0] + SHELL_METRES - 1e-4);
+    }
+
+    /// The lean headroom is Z-only and must not cost the voxel size:
+    /// a Yumeka-class grid (T-pose arm span in X, full-height Y) keeps
+    /// its 10 mm cells with the pad folded in — a pad that pushed the
+    /// cell count past [`MAX_CELLS`] would soften every contact by the
+    /// 12.5 mm fallback.
+    #[test]
+    fn grid_adds_z_lean_headroom_without_coarsening() {
+        let aabb = Aabb {
+            min: [-0.53, 0.0, -0.13],
+            max: [0.53, 1.35, 0.13],
+        };
+        let g = SdfGrid::for_aabb(&aabb);
+        assert!(
+            g.origin[2] <= aabb.min[2] - SHELL_METRES - GRID_LEAN_PAD_M + 1e-4,
+            "z min face lacks the lean pad"
+        );
+        let extent_z = g.origin[2] + g.dims[2] as f32 * g.voxel;
+        assert!(
+            extent_z >= aabb.max[2] + SHELL_METRES + GRID_LEAN_PAD_M - 1e-4,
+            "z max face lacks the lean pad"
+        );
+        // X/Y pad stays shell-only.
+        assert!(g.origin[0] >= aabb.min[0] - SHELL_METRES - 1e-4);
+        assert!(g.origin[1] >= aabb.min[1] - SHELL_METRES - 1e-4);
+        assert!(g.cell_count() <= MAX_CELLS);
+        assert!(
+            (g.voxel - 0.010).abs() < 1e-6,
+            "voxel coarsened to {:.4} m — the pad ate the budget",
+            g.voxel
+        );
     }
 
     #[test]

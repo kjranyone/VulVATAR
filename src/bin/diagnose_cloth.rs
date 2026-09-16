@@ -120,50 +120,99 @@ fn main() -> Result<(), String> {
     avatar.compute_global_pose();
     avatar.build_skinning_matrices();
 
-    // 1. Build cloth asset targeting skirt (Circle.056)
-    let pin_y_threshold: f32 = std::env::var("CLOTH_PIN_Y")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.755);
-    // Pin-band depth knob: a deeper pinned band shortens the free cloth
-    // length so hip sway translates the skirt instead of letting it
-    // buckle/fold at the sides (distance-only XPBD has zero bending
-    // stiffness).
-    let pin_band_depth: f32 = std::env::var("CLOTH_PIN_BAND")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.035);
-    let cloth_damping: f32 = std::env::var("CLOTH_DAMPING")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.035);
+    // AUTO_CLOTH=1: attach through the app path (`attach_auto_cloth`) —
+    // the auto classifier, the deep pin band, GPU backend, and the
+    // cloth-target skin-anchor strip — instead of this bin's own legacy
+    // pin recipe. Everything downstream (GPU dispatch, colliders, pin
+    // targets) reads the same overlay slots, so the renderer flow is
+    // unchanged. SKIRT_POSE=sit|lean|sit_lean then drives the skeleton
+    // through the desk-envelope poses (ramped over frames 1..30).
+    let auto_cloth = std::env::var_os("AUTO_CLOTH").is_some();
+    let (cloth_asset_opt, skirt_prim_id) = if auto_cloth {
+        let attached = vulvatar_lib::simulation::auto_cloth::attach_auto_cloth(&mut avatar);
+        if attached == 0 {
+            return Err("AUTO_CLOTH: no skirt classified".into());
+        }
+        let slot = avatar
+            .cloth_overlays
+            .iter()
+            .max_by_key(|s| s.sim.particles.len())
+            .unwrap();
+        let pid = slot
+            .state
+            .target_primitive_id
+            .ok_or("AUTO_CLOTH: slot has no target primitive")?;
+        println!(
+            "AUTO_CLOTH: {} garment(s), primary slot prim {:?} ({} particles, {} pins)",
+            attached,
+            pid.0,
+            slot.sim.particles.len(),
+            slot.sim.pin_targets.len()
+        );
+        (None, pid)
+    } else {
+        // 1. Build cloth asset targeting skirt (Circle.056)
+        let pin_y_threshold: f32 = std::env::var("CLOTH_PIN_Y")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.755);
+        // Pin-band depth knob: a deeper pinned band shortens the free cloth
+        // length so hip sway translates the skirt instead of letting it
+        // buckle/fold at the sides (distance-only XPBD has zero bending
+        // stiffness).
+        let pin_band_depth: f32 = std::env::var("CLOTH_PIN_BAND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.035);
+        let cloth_damping: f32 = std::env::var("CLOTH_DAMPING")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.035);
 
-    let (cloth_asset, skirt_prim_id) =
-        build_skirt_cloth_asset(&avatar, pin_y_threshold, pin_band_depth, cloth_damping)?;
+        let (cloth_asset, skirt_prim_id) =
+            build_skirt_cloth_asset(&avatar, pin_y_threshold, pin_band_depth, cloth_damping)?;
+        (Some(cloth_asset), skirt_prim_id)
+    };
     println!(
         "ClothAsset created: {} particles, {} distance constraints, {} pin points",
-        cloth_asset.simulation_mesh.vertices.len(),
-        cloth_asset.constraints.distance_constraints.len(),
-        cloth_asset.pins.len()
+        cloth_asset_opt
+            .as_ref()
+            .map(|c| c.simulation_mesh.vertices.len())
+            .unwrap_or_default(),
+        cloth_asset_opt
+            .as_ref()
+            .map(|c| c.constraints.distance_constraints.len())
+            .unwrap_or_default(),
+        cloth_asset_opt.as_ref().map(|c| c.pins.len()).unwrap_or_default()
     );
+    // SKIRT_POSE desk-envelope anchors: applied from the REST locals each
+    // frame (overwriting the idle sway), ramped in over frames 1..30.
+    let skirt_pose = std::env::var("SKIRT_POSE").unwrap_or_default();
+    let rest_locals = avatar.pose.local_transforms.clone();
+    if !skirt_pose.is_empty() {
+        println!("SKIRT_POSE: driving '{skirt_pose}' (ramp over frames 1..30)");
+    }
 
-    // Save cloth overlay to disk as .vvtcloth
-    let overlay_save_path = output_dir_path.join("yumeka_skirt.vvtcloth");
-    let overlay_file = vulvatar_lib::persistence::ClothOverlayFile {
-        format_version: vulvatar_lib::persistence::OVERLAY_FORMAT_VERSION,
-        created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
-        last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
-        overlay_name: "Yumeka Skirt Cloth".to_string(),
-        target_avatar_path: Some(input_path.clone()),
-        cloth_asset: Some(cloth_asset.clone()),
-        last_rebound_with: None,
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&overlay_file) {
-        let _ = std::fs::write(&overlay_save_path, json);
-        println!(
-            "Saved cloth overlay asset to: {}",
-            overlay_save_path.display()
-        );
+    // Save cloth overlay to disk as .vvtcloth (legacy recipe only —
+    // AUTO_CLOTH slots are runtime-only and already attached).
+    if let Some(cloth_asset) = &cloth_asset_opt {
+        let overlay_save_path = output_dir_path.join("yumeka_skirt.vvtcloth");
+        let overlay_file = vulvatar_lib::persistence::ClothOverlayFile {
+            format_version: vulvatar_lib::persistence::OVERLAY_FORMAT_VERSION,
+            created_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+            last_saved_with: format!("VulVATAR {}", env!("CARGO_PKG_VERSION")),
+            overlay_name: "Yumeka Skirt Cloth".to_string(),
+            target_avatar_path: Some(input_path.clone()),
+            cloth_asset: Some(cloth_asset.clone()),
+            last_rebound_with: None,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&overlay_file) {
+            let _ = std::fs::write(&overlay_save_path, json);
+            println!(
+                "Saved cloth overlay asset to: {}",
+                overlay_save_path.display()
+            );
+        }
     }
 
     // CLOTH_OFF=1: skip cloth entirely — the skirt renders as its
@@ -171,14 +220,16 @@ fn main() -> Result<(), String> {
     // user compares against).
     let cloth_off = std::env::var_os("CLOTH_OFF").is_some();
 
-    // 2. Attach Cloth to AvatarInstance
-    let overlay_id = ClothOverlayId(1);
-    let overlay_slot_idx = avatar.attach_cloth_overlay(overlay_id);
-    avatar.init_cloth_overlay(overlay_slot_idx, &cloth_asset);
+    // 2. Attach Cloth to AvatarInstance (legacy recipe only)
+    if let Some(cloth_asset) = &cloth_asset_opt {
+        let overlay_id = ClothOverlayId(1);
+        let overlay_slot_idx = avatar.attach_cloth_overlay(overlay_id);
+        avatar.init_cloth_overlay(overlay_slot_idx, cloth_asset);
 
-    // Also init primary cloth for direct snapshot feed
-    avatar.init_cloth_sim(&cloth_asset);
-    avatar.cloth_enabled = true;
+        // Also init primary cloth for direct snapshot feed
+        avatar.init_cloth_sim(cloth_asset);
+    }
+    avatar.cloth_enabled = !cloth_off && (cloth_asset_opt.is_some() || auto_cloth);
     if cloth_off {
         avatar.cloth_enabled = false;
         avatar.cloth_state = None;
@@ -220,6 +271,18 @@ fn main() -> Result<(), String> {
         sim.collision_margin = 0.015; // 1.5 cm collider margin around legs
         sim.wind_direction = [0.3, 0.0, 0.15];
         sim.wind_response = 0.8; // visible flutter
+    }
+    if auto_cloth {
+        // The auto path keeps its own solver params; just still the wind
+        // so the A/B isolates pose + anchors.
+        for slot in avatar.cloth_overlays.iter_mut() {
+            slot.sim.wind_response = 0.0;
+            slot.sim.wind_direction = [0.0, 0.0, 0.0];
+        }
+        if let Some(ref mut sim) = avatar.cloth_sim {
+            sim.wind_response = 0.0;
+            sim.wind_direction = [0.0, 0.0, 0.0];
+        }
     }
 
     for (i, c) in vulvatar_lib::simulation::cloth::resolve_colliders(
@@ -316,6 +379,31 @@ fn main() -> Result<(), String> {
             avatar.compute_global_pose();
             avatar.build_skinning_matrices();
 
+            // SKIRT_POSE override: rebuild the locals from REST + the
+            // desk-envelope ops (ramped over frames 1..30), replacing
+            // the idle sway. Signs calibrated on this rig (probe in
+            // diagnose_skirt_fit): spine −X = lean back, thighs −X =
+            // thigh raise, knees +X = knee bend.
+            if !skirt_pose.is_empty() {
+                let ramp = (frame as f32 / 30.0).min(1.0);
+                let mut locals = rest_locals.clone();
+                apply_skirt_pose(
+                    &asset.skeleton,
+                    asset
+                        .humanoid
+                        .as_ref()
+                        .expect("humanoid map")
+                        .bone_map
+                        .clone(),
+                    &mut locals,
+                    &skirt_pose,
+                    ramp,
+                );
+                avatar.pose.local_transforms = locals;
+                avatar.compute_global_pose();
+                avatar.build_skinning_matrices();
+            }
+
             // RIDE-UP diagnosis knob: skip spring stepping entirely to
             // test whether the skirt/hem deformation is spring-driven.
             // (The knob must wrap the SPRING step itself — an earlier
@@ -381,7 +469,7 @@ fn main() -> Result<(), String> {
                     println!("Self-collision radius override: {} m", r);
                 }
             }
-            vulvatar_lib::simulation::cloth_solver::step_cloth(dt, &mut avatar, &[]);
+            vulvatar_lib::simulation::cloth_solver::step_cloth(dt, &mut avatar, &[], None);
             } // !springs_off
         }
 
@@ -504,14 +592,20 @@ fn main() -> Result<(), String> {
         skirt_prim_id.0
     ));
     report.push_str(&format!(
-        "- Vertices: {}\n",
-        cloth_asset.simulation_mesh.vertices.len()
+        "- Target Skirt Mesh: Circle.056 (PrimitiveId({})){}\n",
+        skirt_prim_id.0,
+        if auto_cloth { " (auto-cloth app path)" } else { "" }
     ));
-    report.push_str(&format!(
-        "- Distance Constraints: {}\n",
-        cloth_asset.constraints.distance_constraints.len()
-    ));
-    report.push_str(&format!("- Pinned Particles: {}\n", cloth_asset.pins.len()));
+    if let Some(c) = cloth_asset_opt.as_ref() {
+        report.push_str(&format!("- Vertices: {}\n", c.simulation_mesh.vertices.len()));
+        report.push_str(&format!(
+            "- Distance Constraints: {}\n",
+            c.constraints.distance_constraints.len()
+        ));
+        report.push_str(&format!("- Pinned Particles: {}\n", c.pins.len()));
+    } else {
+        report.push_str("- Recipe: auto-cloth (params from `auto_cloth.rs`)\n");
+    }
     report.push_str(&format!(
         "- Total Simulated Frames: {} ({} s at 60 FPS)\n\n",
         total_frames,
@@ -1402,18 +1496,68 @@ fn build_render_frame_input(
                             colliders: gpu_colliders(avatar),
                             self_collision: sim.self_collision,
                             self_collision_radius: sim.self_collision_radius,
+                            sdf_contact: sim.sdf_contact,
                         }),
-                        Some(ClothGpuAttachData {
-                            constraints: sim
-                                .distance_constraints
-                                .iter()
-                                .map(|c| {
-                                    (c.a as u32, c.b as u32, c.rest_length, c.stiffness)
-                                })
-                                .collect(),
-                            triangle_indices: sim.triangle_indices.clone(),
-                            inv_masses: sim.particles.iter().map(|p| p.inv_mass).collect(),
-                            pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                        Some({
+                            // Bend-wing CSR (same recipe as the app's
+                            // collect_cloth_deforms).
+                            let mut bend_adj_offsets =
+                                vec![0u32; sim.particles.len() + 1];
+                            for bc in &sim.bend_constraints {
+                                for wing in [bc.p1, bc.p2] {
+                                    if wing < sim.particles.len() {
+                                        bend_adj_offsets[wing + 1] += 1;
+                                    }
+                                }
+                            }
+                            for v in 1..bend_adj_offsets.len() {
+                                bend_adj_offsets[v] += bend_adj_offsets[v - 1];
+                            }
+                            let mut cursor = bend_adj_offsets.clone();
+                            let mut bend_adj_constraints: Vec<u32> =
+                                vec![0; sim.bend_constraints.len() * 2];
+                            for (ci, bc) in sim.bend_constraints.iter().enumerate() {
+                                for wing in [bc.p1, bc.p2] {
+                                    if wing < sim.particles.len() {
+                                        bend_adj_constraints[cursor[wing] as usize] =
+                                            ci as u32;
+                                        cursor[wing] += 1;
+                                    }
+                                }
+                            }
+                            ClothGpuAttachData {
+                                constraints: sim
+                                    .distance_constraints
+                                    .iter()
+                                    .map(|c| {
+                                        (c.a as u32, c.b as u32, c.rest_length, c.stiffness)
+                                    })
+                                    .collect(),
+                                triangle_indices: sim.triangle_indices.clone(),
+                                inv_masses: sim
+                                    .particles
+                                    .iter()
+                                    .map(|p| p.inv_mass)
+                                    .collect(),
+                                pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                                bend: sim
+                                    .bend_constraints
+                                    .iter()
+                                    .map(|bc| {
+                                        vulvatar_lib::renderer::pipeline::ClothBendGpu {
+                                            p0: bc.p0 as u32,
+                                            p1: bc.p1 as u32,
+                                            p2: bc.p2 as u32,
+                                            _pad: 0,
+                                            rest_angle: bc.rest_angle,
+                                            stiffness: bc.stiffness,
+                                            _pad2: [0; 2],
+                                        }
+                                    })
+                                    .collect(),
+                                bend_adj_offsets,
+                                bend_adj_constraints,
+                            }
                         }),
                     )
                 })
@@ -1470,13 +1614,33 @@ fn build_render_frame_input(
         20.0,
     );
 
+    // Body-SDF splat plan (body prim only): gives the cloth collide
+    // kernel its smooth body-contact field offline. `SDF_ON=1` runs are
+    // the whole point of the skirt-constraint A/B — without a slot the
+    // GPU stage binds a dummy and stays inert.
+    let body_sdf = avatar
+        .asset
+        .body_primitive_id
+        .and_then(|pid| {
+            avatar.asset.meshes.iter().find_map(|m| {
+                m.primitives
+                    .iter()
+                    .find(|p| p.id == pid)
+                    .map(|p| (m.id, p.id, p.bounds))
+            })
+        })
+        .map(|(mesh_id, pid, bounds)| vulvatar_lib::renderer::frame_input::BodySdfPlan {
+            prims: vec![(mesh_id, pid)],
+            grid: vulvatar_lib::simulation::sdf::SdfGrid::for_aabb(&bounds),
+        });
+
     let avatar_instance = RenderAvatarInstance {
         instance_id: avatar.id,
         world_transform: avatar.world_transform.clone(),
         mesh_instances,
         skinning_matrices: avatar.pose.skinning_matrices.clone(),
         cloth_deforms,
-body_sdf: None,
+        body_sdf,
         debug_flags: RenderDebugFlags::default(),
     };
 
@@ -1599,4 +1763,139 @@ fn save_png(path: &Path, extent: [u32; 2], pixels: &[u8]) -> Result<(), String> 
             .ok_or_else(|| format!("PNG buffer construction failed for {}", path.display()))?;
     img.save(path)
         .map_err(|e| format!("failed to save '{}': {e}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// SKIRT_POSE desk-envelope driving (signs calibrated in diagnose_skirt_fit)
+// ---------------------------------------------------------------------------
+
+type Quat = [f32; 4];
+
+fn pose_fk(
+    skeleton: &vulvatar_lib::asset::SkeletonAsset,
+    locals: &[vulvatar_lib::asset::Transform],
+) -> Vec<(Quat, [f32; 3])> {
+    let mut world: Vec<(Quat, [f32; 3])> =
+        vec![([0.0, 0.0, 0.0, 1.0], [0.0; 3]); skeleton.nodes.len()];
+    let mut stack: Vec<vulvatar_lib::asset::NodeId> = skeleton.root_nodes.clone();
+    while let Some(idx) = stack.pop() {
+        let i = idx.0 as usize;
+        if i >= skeleton.nodes.len() || i >= locals.len() {
+            continue;
+        }
+        let (p_rot, p_pos) = skeleton
+            .nodes[i]
+            .parent
+            .map(|p| world[p.0 as usize])
+            .unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
+        let rot = vulvatar_lib::math_utils::quat_normalize(&vulvatar_lib::math_utils::quat_mul(
+            &p_rot,
+            &locals[i].rotation,
+        ));
+        let pos = vulvatar_lib::math_utils::vec3_add(
+            &p_pos,
+            &vulvatar_lib::math_utils::quat_rotate_vec3(&p_rot, &locals[i].translation),
+        );
+        world[i] = (rot, pos);
+        stack.extend(skeleton.nodes[i].children.iter().copied());
+    }
+    world
+}
+
+fn pose_axis_angle(axis: &[f32; 3], deg: f32) -> Quat {
+    let rad = deg.to_radians() * 0.5;
+    let s = rad.sin();
+    [axis[0] * s, axis[1] * s, axis[2] * s, rad.cos()]
+}
+
+/// Pre-multiply `bone`'s world rotation by `delta_world` as a local-rotation
+/// update (validate_gt recipe, incl. the Yumeka chest fallback).
+fn pose_apply_world_delta(
+    skeleton: &vulvatar_lib::asset::SkeletonAsset,
+    humanoid: &std::collections::HashMap<
+        vulvatar_lib::asset::HumanoidBone,
+        vulvatar_lib::asset::NodeId,
+    >,
+    locals: &mut [vulvatar_lib::asset::Transform],
+    bone: vulvatar_lib::asset::HumanoidBone,
+    delta_world: &Quat,
+) {
+    use vulvatar_lib::asset::HumanoidBone;
+    use vulvatar_lib::math_utils::{quat_conjugate, quat_mul, quat_normalize};
+    let bone = match humanoid.get(&bone) {
+        Some(_) => bone,
+        None => {
+            let candidates: &[HumanoidBone] = match bone {
+                HumanoidBone::UpperChest => &[HumanoidBone::Chest, HumanoidBone::Spine],
+                HumanoidBone::Chest => &[HumanoidBone::Spine],
+                _ => &[],
+            };
+            match candidates.iter().copied().find(|b| humanoid.contains_key(b)) {
+                Some(b) => b,
+                None => return,
+            }
+        }
+    };
+    let Some(vulvatar_lib::asset::NodeId(idx)) = humanoid.get(&bone).copied() else {
+        return;
+    };
+    let i = idx as usize;
+    let world = pose_fk(skeleton, locals);
+    let p_rot = skeleton
+        .nodes[i]
+        .parent
+        .map(|p| world[p.0 as usize].0)
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let local_delta = quat_mul(&quat_mul(&quat_conjugate(&p_rot), delta_world), &p_rot);
+    locals[i].rotation = quat_normalize(&quat_mul(&local_delta, &locals[i].rotation));
+}
+
+/// `name`: `lean` (spine −15°), `sit` (thighs −70°, knees +80°),
+/// `sit_lean` (both). `ramp` 0..1 scales all angles.
+fn apply_skirt_pose(
+    skeleton: &vulvatar_lib::asset::SkeletonAsset,
+    humanoid: std::collections::HashMap<
+        vulvatar_lib::asset::HumanoidBone,
+        vulvatar_lib::asset::NodeId,
+    >,
+    locals: &mut [vulvatar_lib::asset::Transform],
+    name: &str,
+    ramp: f32,
+) {
+    use vulvatar_lib::asset::HumanoidBone;
+    let mut ops: Vec<(HumanoidBone, [f32; 3], f32)> = Vec::new();
+    if name.contains("desk") {
+        // Production desk envelope: pelvis tips back, the spine
+        // counter-rotates so the torso stays erect, thighs raise to the
+        // seat. Exercises hips+spine+thighs together (the visible band
+        // region), unlike the pure `sit`.
+        ops.push((HumanoidBone::Hips, [1.0, 0.0, 0.0], -20.0));
+        ops.push((HumanoidBone::Spine, [1.0, 0.0, 0.0], 20.0));
+        for b in [HumanoidBone::LeftUpperLeg, HumanoidBone::RightUpperLeg] {
+            ops.push((b, [1.0, 0.0, 0.0], -60.0));
+        }
+        for b in [HumanoidBone::LeftLowerLeg, HumanoidBone::RightLowerLeg] {
+            ops.push((b, [1.0, 0.0, 0.0], 75.0));
+        }
+    }
+    if name.contains("lean") && !name.contains("desk") {
+        ops.push((HumanoidBone::Spine, [1.0, 0.0, 0.0], -15.0));
+    }
+    if name.contains("sit") && !name.contains("desk") {
+        for b in [HumanoidBone::LeftUpperLeg, HumanoidBone::RightUpperLeg] {
+            ops.push((b, [1.0, 0.0, 0.0], -70.0));
+        }
+        for b in [HumanoidBone::LeftLowerLeg, HumanoidBone::RightLowerLeg] {
+            ops.push((b, [1.0, 0.0, 0.0], 80.0));
+        }
+    }
+    for (bone, axis, deg) in ops {
+        pose_apply_world_delta(
+            skeleton,
+            &humanoid,
+            locals,
+            bone,
+            &pose_axis_angle(&axis, deg * ramp),
+        );
+    }
 }

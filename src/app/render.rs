@@ -669,27 +669,10 @@ impl Application {
         self.output
             .set_target_fps(self.runtime_gpu_budget.render_fps_target());
 
-        // P3-03 B4 — publish the YOLOX submit period to the tracking
-        // pipeline via the shared atomic. `Rtmw3dInference` reads this
-        // each frame; the cadence flip takes effect on the next
-        // `frame_index.is_multiple_of(period)` check (typically next
-        // submit cycle).
-        //
-        // Ordering::Relaxed is intentional: the value is an advisory
-        // cadence knob, no other state depends on this load's freshness,
-        // and a one-frame stale read on the tracking thread is
-        // semantically equivalent to the budget recomputing one frame
-        // later (which can happen anyway). Worst-case lag: at Healthy
-        // (period=4) the tracker only checks `frame_index.is_multiple_of(period)`
-        // every 4 frames, so a transition to Emergency (period=12)
-        // can take up to 3 frames before the new period takes effect.
-        // Acceptable given the budget's own 5s/30s dwell times.
+        // FaceMesh CPU-EP preference under pressure (takes effect on the
+        // next tracking start — the ONNX session is built there).
         #[cfg(feature = "inference")]
         {
-            crate::tracking::rtmw3d::YOLOX_REFRESH_PERIOD.store(
-                self.runtime_gpu_budget.yolox_skip_period() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
             crate::tracking::face_mediapipe::FACEMESH_EP_CPU.store(
                 self.runtime_gpu_budget.facemesh_prefers_cpu_ep(),
                 std::sync::atomic::Ordering::Relaxed,
@@ -698,7 +681,7 @@ impl Application {
         // Pose Hz + depth refresh are consumed by the realsense
         // worker's estimate loop (worker::POSE_HZ_TARGET /
         // worker::DEPTH_REFRESH_PERIOD). Same Relaxed rationale.
-        #[cfg(feature = "realsense")]
+#[cfg(feature = "realsense")]
         {
             crate::tracking::worker::POSE_HZ_TARGET.store(
                 self.runtime_gpu_budget.pose_hz_target(),
@@ -1552,6 +1535,7 @@ fn cloth_gpu_inputs_hash(
     let mut h = SettleHasher::new();
     h.write_f32(ctrl_dt);
     h.write_f32(sim.damping);
+    h.write_f32(sim.sdf_contact);
     h.write_f32s(&sim.gravity);
     h.write_f32s(&vec3_scale(&sim.wind_direction, sim.wind_response));
     h.write_u32(sim.solver_iterations);
@@ -1939,6 +1923,7 @@ fn collect_cloth_deforms<'a>(
                             colliders: colliders.to_vec(),
                             self_collision: sim.self_collision,
                             self_collision_radius: sim.self_collision_radius,
+                            sdf_contact: sim.sdf_contact,
                         };
                         // Settle-sleep (idle z-fight campaign, 2026-09-15):
                         // the app-side gate suppressed this cloth — ship 0
@@ -1951,6 +1936,33 @@ fn collect_cloth_deforms<'a>(
                         if cs.settle.suppress_dispatch {
                             ctrl.substeps = 0;
                         }
+                        // Bend-wing CSR: constraint rows indexed per
+                        // WING particle (the hinge never appears — the
+                        // bend kernels never move it).
+                        let mut bend_adj_offsets =
+                            vec![0u32; sim.particles.len() + 1];
+                        for bc in &sim.bend_constraints {
+                            for wing in [bc.p1, bc.p2] {
+                                if wing < sim.particles.len() {
+                                    bend_adj_offsets[wing + 1] += 1;
+                                }
+                            }
+                        }
+                        for v in 1..bend_adj_offsets.len() {
+                            bend_adj_offsets[v] += bend_adj_offsets[v - 1];
+                        }
+                        let mut cursor = bend_adj_offsets.clone();
+                        let mut ordered: Vec<u32> =
+                            vec![0; sim.bend_constraints.len() * 2];
+                        for (ci, bc) in sim.bend_constraints.iter().enumerate() {
+                            for wing in [bc.p1, bc.p2] {
+                                if wing < sim.particles.len() {
+                                    let slot = cursor[wing] as usize;
+                                    ordered[slot] = ci as u32;
+                                    cursor[wing] += 1;
+                                }
+                            }
+                        }
                         let attach = ClothGpuAttachData {
                             constraints: sim
                                 .distance_constraints
@@ -1960,6 +1972,21 @@ fn collect_cloth_deforms<'a>(
                             triangle_indices: sim.triangle_indices.clone(),
                             inv_masses: sim.particles.iter().map(|p| p.inv_mass).collect(),
                             pinned: sim.particles.iter().map(|p| p.pinned).collect(),
+                            bend: sim
+                                .bend_constraints
+                                .iter()
+                                .map(|bc| crate::renderer::pipeline::ClothBendGpu {
+                                    p0: bc.p0 as u32,
+                                    p1: bc.p1 as u32,
+                                    p2: bc.p2 as u32,
+                                    _pad: 0,
+                                    rest_angle: bc.rest_angle,
+                                    stiffness: bc.stiffness,
+                                    _pad2: [0; 2],
+                                })
+                                .collect(),
+                            bend_adj_offsets,
+                            bend_adj_constraints: ordered,
                         };
                         (Some(ctrl), Some(attach))
                     }

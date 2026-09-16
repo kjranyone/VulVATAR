@@ -213,6 +213,17 @@ pub struct ClothSimState {
     pub connected_pairs: HashSet<(usize, usize)>,
     /// Reusable spatial hash grid (allocated once, cleared each frame).
     pub spatial_hash: SpatialHashGrid,
+    /// Body-SDF contact radius in metres (0 = disabled). When set and a
+    /// body `SdfField` is supplied to the solver, free particles inside
+    /// the band are projected onto the isosurface along the smooth SDF
+    /// gradient — unlike the hard radial capsule push, the direction
+    /// field varies continuously, so pleated garments deform instead of
+    /// being blasted apart by overlapping colliders (measured 93 mm
+    /// displacement in 33 ms, `diagnostics/skirt_fit_baseline/`). The
+    /// field is a pure function of the posed body, so the settle-sleep
+    /// input hashes (which cover the global transforms) already wake the
+    /// sim when it changes; only the radius joins the hashes.
+    pub sdf_contact: f32,
 }
 
 impl ClothSimState {
@@ -340,11 +351,11 @@ impl ClothSimState {
             self_collision_radius,
             connected_pairs,
             spatial_hash,
+            sdf_contact: 0.0,
         }
     }
 
-    pub fn particle_count(&self) -> usize {
-        self.particles.len()
+    pub fn particle_count(&self) -> usize {        self.particles.len()
     }
 
     pub fn apply_lod(&mut self, level: &ClothLoDLevel) {
@@ -377,6 +388,7 @@ impl Default for ClothSimState {
             self_collision_radius: 0.02,
             connected_pairs: HashSet::new(),
             spatial_hash: SpatialHashGrid::default(),
+            sdf_contact: 0.0,
         }
     }
 }

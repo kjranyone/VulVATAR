@@ -215,7 +215,7 @@ pub struct SourceSkeleton {
     /// orientation (selfie-mirror x, y-up, z toward camera → negative
     /// for a subject in front of the lens); the solver's "Metric
     /// translation" 1:1 contract builds on this. Legacy 2D path
-    /// (`rtmw3d`-only): `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`,
+    /// (SimCC-era detectors): `x ∈ [-aspect, +aspect]`, `y ∈ [-1, +1]`,
     /// `z = 0`.
     ///
     /// Use [`Self::root_anchor_is_hip`] to disambiguate hip vs

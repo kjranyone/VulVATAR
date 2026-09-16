@@ -228,7 +228,7 @@ impl PhysicsWorld {
     pub fn step_cloth(&mut self, dt: f32, avatar: &mut AvatarInstance, gravity: &SceneGravity) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
         apply_cloth_gravity(avatar, gravity);
-        cloth_solver::step_cloth(dt, avatar, &world_colliders);
+        cloth_solver::step_cloth(dt, avatar, &world_colliders, None);
     }
 
     pub fn step_cloth_with_camera_distance(
@@ -248,7 +248,7 @@ impl PhysicsWorld {
             slot.sim.apply_lod(&lod);
         }
         apply_cloth_gravity(avatar, gravity);
-        cloth_solver::step_cloth(dt, avatar, &world_colliders);
+        cloth_solver::step_cloth(dt, avatar, &world_colliders, None);
     }
 
     /// Step all enabled secondary-motion solvers for `substeps` ticks of
@@ -292,7 +292,7 @@ impl PhysicsWorld {
             }
             if options.cloth_enabled {
                 apply_cloth_gravity(avatar, gravity);
-                cloth_solver::step_cloth(fixed_dt, avatar, &world_colliders);
+                cloth_solver::step_cloth(fixed_dt, avatar, &world_colliders, body_sdf);
             }
             #[cfg(feature = "rapier")]
             if let Some(ref mut rapier) = self.rapier {

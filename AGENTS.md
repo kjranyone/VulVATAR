@@ -46,6 +46,56 @@ will invalidate that cache and trigger a rebuild.
   実機検証: `diagnostics/cloth_gpu_selfcol_glued/` (正常) vs
   `cloth_gpu_every_frame/` (修正前の崩壊)。auto-cloth の位置weld は層を
   区別しない限界あり (`WeldGroups` コメント、Phase C 課題)。
+- **スカート干渉の実測切分け (2026-09-16)**: `diagnose_skirt_fit`
+  (pose sweep で pin skew・collider カバレッジ・体の帯外突出、既定出力
+  `diagnostics/skirt_fit_*/`) と `diagnose_cloth` の `AUTO_CLOTH=1` +
+  `SKIRT_POSE=sit|lean|sit_lean|desk` (描画 A/B、`CLOTH_OFF=1` が authored
+  リグ参照、`diagnostics/skirt_*/`)。確定済み: (a) Yumeka のスカート骨は
+  全部 Hips 子なので単一ノード深ピン帯 (40%) と各頂点 LBS はどのポーズでも
+  一致 (skew 0) — multi-bone pin 化はこのリグでは無効果。(b) VRC 由来
+  collider は cloth に対し過太 (太腿 74mm vs 実測 ~53mm) で、座り pose の
+  t=0 に自由粒子を弾き飛ばす (33ms で 93mm、前面パネルが腿の後ろへ散る)。
+  (c) 腿頂点 (y≈0.83) はウエストバンド (0.789) より上 — 深く屈曲した座り
+  では帯領域が腿に貫通するのは authored リグでも同時 (`CLOTH_OFF` 参照)。
+  (d) 実験フラグ `VULVATAR_AUTO_CONFORMAL_COLLIDERS=1` で cloth 用 collider
+  を body メッシュ適合半径に再計測 (pelvis/shin 追加、スカート静止内包絡で
+  cap、station-nearest 半径推定、冪等) — 密着は直るが sway のたびに hip
+  capsule がプリーツを押し開ける (rest で裂け目、`skirt_rest_capped/` vs
+  健全な `skirt_rest_vrc/`) ので既定 OFF。恒久対応は SDF ベースのスムーズ
+  押し出し + GPU bend 制約 (Phase C 系)。ピン帯深さは
+  `VULVATAR_AUTO_PIN_FRACTION`、selfcol は `VULVATAR_AUTO_NO_SELFCOL` /
+  `VULVATAR_AUTO_SELFCOL_RADIUS` で A/B 可能。
+- **cloth body-SDF 接触 (2026-09-16, 実験フラグ)**: `ClothSimState::
+  sdf_contact` (> 0 で有効, `VULVATAR_AUTO_SDF_CONTACT=<m>` 例 0.004) が
+  立つと、自由粒子を body SDF の `sdf_contact` 等値面へ勾配に沿って投影する
+  スムーズ接触段階が capsule 段階の後に走る (CPU `collision::collide` と
+  GPU `cloth_collide_cs` のミラー — sentinel/NaN セマンティクス含む)。
+  発動時は attach が humanoid-bound body capsule をマスクする (hard radial
+  push が先にプリーツを裂くため; scene collider は残る)。SDF field は
+  spring と同じ splat 資源 (`self.sdf_slots`, avatar-root 空間) を共有し、
+  idle フレームは最後の field を再利用する (splat plan は pose 変化時のみ —
+  計画し直すと sentinel 再フィルで壊れる)。settle の入力ハッシュには
+  `sdf_contact` を追加済み (field は pose の純関数なので transforms ハッシュ
+  が wake をカバー)。A/B: `diagnostics/skirt_rest_sdf` (rest sway 裂けなし・
+  密着 — VRC 参照 `skirt_rest_vrc` の浮きと conformal `skirt_rest_capped`
+  の裂け両方を解消)、`skirt_sit_sdf` / `skirt_desk_sdf` (座りは lap 前面開放
+  が残る = 腿頂点がバンド上方的幾何限界、bend/摩擦は未実装)。
+  **制約**: field は spring 有効時しか splat されない (app 側ゲート)。
+- **GPU bend 制約 (2026-09-16 実装)**: `auto_cloth` が welded edge ごとに
+  edge-angle hinge を 2 本 (`edge_angle_bend_constraints` — 両端 hinge、
+  翼は反対頂点の weld 代表、`from_asset` が rest 角を計算、既定 stiffness
+  0.9 / `VULVATAR_AUTO_BEND_STIFFNESS` / `VULVATAR_AUTO_NO_BEND=1`) 生成し、
+  GPU は `cloth_bend_{update,accumulate,apply}_cs` 3 カーネルで
+  `constraints.rs` の T09 参照をミラー (hinge 不動・free 翼のみ inv_mass
+  配分・under-relaxed Jacobi Δx/(n+1))。距離制約の反復ループ内で apply の
+  後に毎イテレーション dispatch。attach data は wing CSR を同梱
+  (`ClothGpuAttachData.bend*`)。`VULVATAR_AUTO_NO_SELFCOL` 系ノブと併用可。
+  **ランタイム A/B 実施済み (2026-09-16, `diagnostics/skirt_*_bend/`)**:
+  rest sway はプリーツが鮮明なまま崩壊なし (bend 単体で rest 安定)、
+  sit/desk は「片側への流脱」が解消され両側構造を保持
+  (`skirt_desk_sdfbend` = SDF 接触との併用が本命構成)。lap 正面の開放のみ
+  幾何限界として残る (腿頂点 > ウエストバンド + 摩擦/lap テント未実装)。
+  テスト: bend 生成 3 件追加 (`bend_generation_tests`)。
 - クリアランス (アンチ貫通アンカー) は `src/asset/clearance.rs` の Phase 1/2/3。
   Phase 3 は containment スロットに clearance-mode アンカーを入れる cross-region
   (ジャケット裾↔スカート、スカート↔下着)。アンカー実装を変えたら

@@ -534,6 +534,7 @@ mod tests {
             self_collision_radius: 0.0,
             connected_pairs: HashSet::new(),
             spatial_hash: SpatialHashGrid::new(0.04),
+            sdf_contact: 0.0,
         };
         for _ in 0..60 {
             verlet_integrate(&mut sim, dt);
@@ -837,6 +838,7 @@ mod tests {
                 self_collision_radius: 0.0,
                 connected_pairs: HashSet::new(),
                 spatial_hash: SpatialHashGrid::new(0.04),
+            sdf_contact: 0.0,
             };
             let mut buffers = ClothSimTempBuffers::new(n);
             buffers.reset_lambda(sim.distance_constraints.len());
@@ -1053,6 +1055,7 @@ mod tests {
             self_collision_radius: 0.0,
             connected_pairs: HashSet::new(),
             spatial_hash: SpatialHashGrid::new(0.04),
+            sdf_contact: 0.0,
         };
         compute_normals(&mut sim);
         let cpu_normals = sim.computed_normals.clone();

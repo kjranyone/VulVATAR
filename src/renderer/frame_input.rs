@@ -312,6 +312,10 @@ pub struct ClothGpuDispatchControl {
     /// Self-collision particle radius (m). Particles closer than
     /// `2 * radius` push apart; `ClothSimState::self_collision_radius`.
     pub self_collision_radius: f32,
+    /// Body-SDF contact radius (m; 0 = stage off). Mirrors
+    /// `ClothSimState::sdf_contact`; the collide kernel projects free
+    /// particles onto the isosurface along the smooth SDF gradient.
+    pub sdf_contact: f32,
     /// World-space collision capsules for THIS frame (avatar-node
     /// colliders resolved from the current pose; spheres encoded as
     /// degenerate capsules with `p0 == p1`). Scene colliders and
@@ -363,6 +367,16 @@ pub struct ClothGpuAttachData {
     /// branch wins, particle holds its previous position). Written
     /// into the `w` component of `prev_pos_ssbo`.
     pub pinned: Vec<bool>,
+    /// Edge-angle bend constraints (T09 model, rest angles
+    /// precomputed). Empty when the garment has none — the renderer's
+    /// bend kernels stay unallocated and undispached.
+    pub bend: Vec<crate::renderer::pipeline::ClothBendGpu>,
+    /// Bend-wing CSR over particles: `bend_adj_offsets[v] ..
+    /// [v+1]` indexes into `bend_adj_constraints` (constraint rows
+    /// where `v` is a wing). The hinge never appears — it is never
+    /// moved.
+    pub bend_adj_offsets: Vec<u32>,
+    pub bend_adj_constraints: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

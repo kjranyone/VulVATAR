@@ -68,10 +68,6 @@ pub(super) fn draw_tracking(ui: &mut egui::Ui, state: &mut GuiApp) {
         false,
         |ui| {
             ui.checkbox(
-                &mut state.tracking.yolox_enabled,
-                t!("tracking.pipeline_yolox"),
-            );
-            ui.checkbox(
                 &mut state.tracking.force_cpu_inference,
                 t!("tracking.pipeline_force_cpu"),
             );

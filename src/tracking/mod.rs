@@ -17,12 +17,11 @@ pub mod devices;
 pub mod face_mediapipe;
 pub mod fusion;
 pub mod mailbox;
-pub mod rtmw3d;
+pub mod detector;
 pub mod session_record;
 pub mod source_skeleton;
 pub mod worker;
 #[cfg(feature = "inference")]
-pub mod yolox;
 
 pub use devices::{
     camera_fps_for_index, camera_fps_index_for, camera_resolution_for_index,

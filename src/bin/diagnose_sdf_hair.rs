@@ -367,6 +367,94 @@ fn main() -> Result<(), String> {
         sdf_ready_frames
     ));
 
+    // Lean sweep: the grid is rest-AABB-derived, so a forward-leaning
+    // torso can walk the splatted surfaces out of it — joints sampling
+    // SENTINEL silently lose body collision. `GRID_LEAN_PAD_M` must keep
+    // the desk-envelope lean covered (measured live: head z p95 +0.10 /
+    // max +0.17 m). Acceptance: no outside-grid joints through 15°.
+    if let Some(spine_idx) = avatar.asset.skeleton.nodes.iter().position(|n| {
+        n.humanoid_bone == Some(vulvatar_lib::asset::HumanoidBone::Spine)
+    }) {
+        let spine_rest = avatar.asset.skeleton.nodes[spine_idx].rest_local.clone();
+        report.push_str("\n## Lean sweep (joints outside the grid = collision off)\n\n");
+        report.push_str("| lean | head z (m) | joints outside grid |\n|---:|---:|---:|\n");
+        for lean_deg in [0.0f32, 10.0, 20.0, 30.0] {
+            // Sign the lean so the head moves +z (face forward): try
+            // both rotations about the spine's local X and keep the
+            // forward one.
+            let head_z_for = |sign: f32, avatar: &mut vulvatar_lib::avatar::AvatarInstance| {
+                for (i, node) in avatar.asset.skeleton.nodes.iter().enumerate() {
+                    avatar.pose.local_transforms[i] = node.rest_local.clone();
+                }
+                let th = sign * lean_deg.to_radians();
+                let q = [(th * 0.5).sin(), 0.0, 0.0, (th * 0.5).cos()];
+                let mut t = spine_rest.clone();
+                t.rotation = vulvatar_lib::math_utils::quat_mul(&q, &spine_rest.rotation);
+                avatar.pose.local_transforms[spine_idx] = t;
+                avatar.compute_global_pose();
+                avatar.pose.global_transforms[head_idx][3][2]
+            };
+            let sign = if head_z_for(1.0, &mut avatar) >= head_z_for(-1.0, &mut avatar) {
+                1.0
+            } else {
+                -1.0
+            };
+            let _ = head_z_for(sign, &mut avatar);
+            avatar.build_skinning_matrices();
+
+            // Settle the strands under the lean with a refreshing field
+            // (same two-render harvest pattern as the swing loop).
+            for _ in 0..30 {
+                let sdf = avatar.body_sdf.clone();
+                for _ in 0..2 {
+                    vulvatar_lib::simulation::spring::step_spring_bones(
+                        dt,
+                        &mut avatar,
+                        &[],
+                        &tuning,
+                        [0.0, -1.0, 0.0],
+                        1.0,
+                        sdf.as_ref(),
+                    );
+                }
+                avatar.compute_global_pose();
+                avatar.build_skinning_matrices();
+                let fi = build_frame_input(&avatar, splat.clone(), grid, width, height);
+                let _ = renderer.render(&fi)?;
+                let result = renderer.render(&fi)?;
+                for entry in &result.sdf_fields {
+                    if entry.instance_id == avatar.id.0 {
+                        avatar.body_sdf = Some(SdfField::new(entry.grid, entry.data.clone()));
+                    }
+                }
+            }
+
+            let mut outside = 0usize;
+            let mut total = 0usize;
+            if let Some(field) = avatar.body_sdf.as_ref() {
+                for &(ci, _, _) in &hair_chains {
+                    if let Some(state) = avatar.secondary_motion.spring_states.get(ci) {
+                        for p in state.positions.iter().skip(1) {
+                            total += 1;
+                            if field.sample(*p) == SENTINEL {
+                                outside += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let head_z = avatar.pose.global_transforms[head_idx][3][2];
+            report.push_str(&format!(
+                "| {:.0}° | {:+.3} | {} / {} |\n",
+                lean_deg, head_z, outside, total
+            ));
+            println!(
+                "lean {:.0}°: head_z {:+.3} m, outside-grid joints {}/{}",
+                lean_deg, head_z, outside, total
+            );
+        }
+    }
+
     // Garment-gap report (2026-09-15): the splat list is skin + face
     // only, so hair resolves against the BODY surface. Measure how far
     // the settled joints sit from each non-splatted garment surface —

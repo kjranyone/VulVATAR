@@ -18,14 +18,16 @@
 //! band is the primitive's own top ring rather than a fixed world Y.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use log::{info, warn};
 
 use crate::asset::{
-    AvatarAsset, ClothAsset, ClothConstraintSet, ClothMappingMode, ClothMeshMapping, ClothOverlayId,
-    ClothOverlayMetadata, ClothPin, ClothRegionTag, ClothRenderRegionBinding, ClothSimVertex,
-    ClothSimulationMesh, ClothSolverParams, ClothStableRefSet, DistanceConstraint, MeshRef,
-    NodeRef, PrimitiveRef, VertexSubsetRef,
+    AvatarAsset, ClothAsset, ClothConstraintSet, ColliderAsset, ColliderId, ColliderShape,
+    ClothMappingMode, ClothMeshMapping, ClothOverlayId, ClothOverlayMetadata, ClothPin,
+    ClothRegionTag, ClothRenderRegionBinding, ClothSimVertex, ClothSimulationMesh,
+    ClothSolverParams, ClothStableRefSet, DistanceConstraint, HumanoidBone, Mat4, MeshRef, NodeRef,
+    PrimitiveRef, VertexSubsetRef,
 };
 use crate::avatar::AvatarInstance;
 
@@ -260,10 +262,15 @@ fn build_cloth_for_prim(
 
     // Pin band: the primitive's own top ring, deepened by the garment's
     // own height (see the PIN_BAND contract above).
+    // `VULVATAR_AUTO_PIN_FRACTION` overrides the depth fraction for the
+    // band A/B (seated drape vs sway buckling); unset keeps 0.4.
+    let pin_fraction = std::env::var("VULVATAR_AUTO_PIN_FRACTION")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(PIN_BAND_HEIGHT_FRACTION);
     let top = world.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
     let bottom = world.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
-    let pin_band = (PIN_BAND_HEIGHT_FRACTION * (top - bottom))
-        .clamp(PIN_BAND_MIN, PIN_BAND_MAX);
+    let pin_band = (pin_fraction * (top - bottom)).clamp(PIN_BAND_MIN, PIN_BAND_MAX);
     let pin_y = top - pin_band;
 
     let mut sim_vertices = Vec::with_capacity(world.len());
@@ -336,6 +343,22 @@ fn build_cloth_for_prim(
     distance_constraints.extend(intra);
     rest_lengths.extend(intra_rest);
 
+    // Edge-angle bend constraints over the welded topology (see
+    // `edge_angle_bend_constraints`): keeps the authored pleat folds
+    // and the A-line without deepening the pin band — the anti-buckling
+    // job the deep band was doing alone. `VULVATAR_AUTO_NO_BEND=1`
+    // disables for A/B.
+    let bend_stiffness = std::env::var("VULVATAR_AUTO_BEND_STIFFNESS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.9);
+    let bend_constraints: Vec<crate::asset::BendConstraint> =
+        if std::env::var_os("VULVATAR_AUTO_NO_BEND").is_some() {
+            Vec::new()
+        } else {
+            edge_angle_bend_constraints(&weld, indices, bend_stiffness)
+        };
+
     let vert_count = sim_vertices.len() as u32;
     let sim_mesh = ClothSimulationMesh {
         vertices: sim_vertices,
@@ -394,7 +417,7 @@ fn build_cloth_for_prim(
         pins,
         constraints: ClothConstraintSet {
             distance_constraints,
-            bend_constraints: Vec::new(),
+            bend_constraints,
         },
         collision_bindings: Vec::new(),
         lods: Vec::new(),
@@ -543,6 +566,70 @@ pub fn intra_weld_group_constraints(
     (constraints, rest_lengths)
 }
 
+/// Edge-angle bend constraints over the welded topology.
+///
+/// For every interior welded edge — shared by exactly two triangles —
+/// the two opposite vertices fold across that edge. This model's
+/// contract (T09, see `cloth_solver::constraints` — the hinge is never
+/// moved) is the angle AT a vertex, so each shared edge yields TWO
+/// constraints, hinging at each endpoint between the two opposite
+/// vertices: `(a; c1, c2)` and `(b; c1, c2)`. All three indices use the
+/// weld group's FIRST particle as its representative — the hinge is
+/// never moved anyway, and the wings' duplicates follow through the
+/// intra-weld glue constraints. `from_asset` derives `rest_angle` from
+/// the rest positions, so only indices + stiffness travel here.
+///
+/// Boundary edges (one triangle) and non-manifold seams (3+) produce
+/// nothing: there is nothing to fold across, or the direction is
+/// ambiguous.
+pub fn edge_angle_bend_constraints(
+    weld: &WeldGroups,
+    indices: &[u32],
+    stiffness: f32,
+) -> Vec<crate::asset::BendConstraint> {
+    use std::collections::HashMap;
+
+    if stiffness <= 0.0 {
+        return Vec::new();
+    }
+    let rep = |g: u32| weld.dup_lists[g as usize][0];
+
+    // Welded edge → opposite vertices.
+    let mut opposites: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    for tri in indices.chunks_exact(3) {
+        let w = [
+            weld.weld_of[tri[0] as usize],
+            weld.weld_of[tri[1] as usize],
+            weld.weld_of[tri[2] as usize],
+        ];
+        for k in 0..3 {
+            let (a, b, opp) = (w[k], w[(k + 1) % 3], w[(k + 2) % 3]);
+            let key = if a < b { (a, b) } else { (b, a) };
+            opposites.entry(key).or_default().push(opp);
+        }
+    }
+
+    let mut out = Vec::new();
+    for ((a, b), opps) in opposites {
+        if opps.len() != 2 {
+            continue;
+        }
+        let (c1, c2) = (opps[0], opps[1]);
+        if c1 == c2 {
+            continue;
+        }
+        out.push(crate::asset::BendConstraint {
+            indices: [rep(a), rep(c1), rep(c2)],
+            stiffness,
+        });
+        out.push(crate::asset::BendConstraint {
+            indices: [rep(b), rep(c1), rep(c2)],
+            stiffness,
+        });
+    }
+    out
+}
+
 /// Attach auto-generated cloth for every skirt-classified primitive,
 /// running on the GPU backend. Returns how many garments were attached.
 ///
@@ -550,6 +637,19 @@ pub fn intra_weld_group_constraints(
 /// wide request) so the choice is deterministic regardless of what
 /// attached earlier in the process lifetime. Wind is a light idle
 /// breeze; the asset's response (0.35) keeps it a sway, not a flag.
+///
+/// Also re-measures the body colliders against the body mesh when
+/// `VULVATAR_AUTO_CONFORMAL_COLLIDERS=1` (see
+/// [`ensure_body_conformal_cloth_colliders`] — EXPERIMENTAL). The
+/// VRChat-derived default keeps the whole skirt floating clear of the
+/// body: intact silhouette, but it floats 3–8 cm off the belly/thighs
+/// (the front-top "shelf") and ejects deep-overlap particles on the
+/// first simulated frames in folded poses. The conformal set hugs the
+/// body and fixes both, but on a pleated skirt the hip capsules then
+/// push on every sway frame and spread the pleats open (holes at the
+/// hips, `diagnostics/skirt_rest_conformal/` + `skirt_rest_capped/` vs
+/// the intact `skirt_rest_vrc/`) — shipping that needs the solver-grade
+/// follow-ups (SDF-based smooth push + GPU bend), not harder capsules.
 pub fn attach_auto_cloth(avatar: &mut AvatarInstance) -> usize {
     let first_id = avatar.cloth_overlays.len() + 2;
     avatar.build_base_pose();
@@ -563,17 +663,373 @@ pub fn attach_auto_cloth(avatar: &mut AvatarInstance) -> usize {
         if let Some(slot) = avatar.cloth_overlays.get_mut(slot_idx) {
             slot.sim.wind_direction = [0.3, 0.0, 0.15];
             slot.sim.wind_response = 0.35;
-            slot.sim.self_collision = true;
-            slot.sim.self_collision_radius = 0.012;
+            // Self-collision on by default; `VULVATAR_AUTO_NO_SELFCOL=1`
+            // disables it and `VULVATAR_AUTO_SELFCOL_RADIUS=<m>` tunes
+            // the exclusion radius (12 mm ⇒ 24 mm min spacing — already
+            // past this skirt's pleat pitch, see the R6 notes).
+            if std::env::var_os("VULVATAR_AUTO_NO_SELFCOL").is_none() {
+                slot.sim.self_collision = true;
+                if let Some(r) = std::env::var("VULVATAR_AUTO_SELFCOL_RADIUS")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                {
+                    slot.sim.self_collision_radius = r;
+                }
+            }
+            // Body-SDF contact band (metres; 0 = capsules only). The
+            // smooth gradient projection engages on garments whenever the
+            // app supplies the posed body field. When active, the
+            // humanoid-bound body CAPSULES are masked off for this
+            // avatar: a hard radial push would tear the pleats before
+            // the smooth stage runs, and the field already IS the body
+            // surface (mesh-accurate, no fat VRChat radii). Scene
+            // colliders (props) stay. Instance-level mask — cloth-only
+            // by construction, springs never see `asset.colliders`.
+            if let Some(r) = std::env::var("VULVATAR_AUTO_SDF_CONTACT")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|r| *r > 0.0)
+            {
+                slot.sim.sdf_contact = r;
+                let humanoid_nodes: std::collections::HashSet<_> = avatar
+                    .asset
+                    .humanoid
+                    .as_ref()
+                    .map(|h| h.bone_map.values().copied().collect())
+                    .unwrap_or_default();
+                for (i, c) in avatar.asset.colliders.iter().enumerate() {
+                    if humanoid_nodes.contains(&c.node) {
+                        if let Some(flag) = avatar.collider_enabled.get_mut(i) {
+                            *flag = false;
+                        }
+                    }
+                }
+                info!(
+                    "auto-cloth: SDF contact {r} m — body capsules masked off for avatar {}",
+                    avatar.id.0
+                );
+            }
             slot.state.solver_backend =
                 crate::simulation::cloth_gpu_boundary::ClothSolverBackend::Gpu;
         }
         attached += 1;
     }
+    let colliders = if std::env::var_os("VULVATAR_AUTO_CONFORMAL_COLLIDERS").is_some() {
+        ensure_body_conformal_cloth_colliders(avatar)
+    } else {
+        0
+    };
+    if colliders > 0 {
+        info!(
+            "auto-cloth: re-measured {colliders} body collider(s) against the body mesh"
+        );
+    }
     if attached > 0 {
         info!("auto-cloth: attached {attached} GPU garment(s)");
     }
     attached
+}
+
+/// Humanoid bone chains the cloth colliders are measured over: the
+/// capsule binds to the first bone of the pair, whose local Y points
+/// down the chain (true for humanoid skeletons). Ids are reused by
+/// node wherever a collider already binds the chain head (the VRChat
+/// one on the first pass, ours on re-runs).
+const COLLIDER_CHAINS: &[(HumanoidBone, HumanoidBone)] = &[
+    (HumanoidBone::Hips, HumanoidBone::Spine), // pelvis
+    (HumanoidBone::Spine, HumanoidBone::Chest),
+    (HumanoidBone::Chest, HumanoidBone::Neck),
+    (HumanoidBone::LeftUpperLeg, HumanoidBone::LeftLowerLeg),
+    (HumanoidBone::RightUpperLeg, HumanoidBone::RightLowerLeg),
+    (HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot), // shin
+    (HumanoidBone::RightLowerLeg, HumanoidBone::RightFoot),
+    (HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm),
+    (HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm),
+    (HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand),
+    (HumanoidBone::RightLowerArm, HumanoidBone::RightHand),
+];
+
+/// Re-measure the body colliders against the body mesh at attach time.
+///
+/// The VRChat-derived collider set is authored for dynamic-bone
+/// pushback and is far fatter than the mesh (Yumeka: UpperLeg r=74 mm
+/// vs ~57 mm measured; Chest r=114 mm). Cloth resolves these every
+/// substep, and at rest hundreds of hem particles sit INSIDE the
+/// oversized volumes — the first simulated frames eject them onto the
+/// capsule surfaces (measured: 93 mm max displacement within 33 ms,
+/// `diagnostics/skirt_fit_baseline/metrics.csv`), which scatters the
+/// skirt's front panel behind the legs in seated poses.
+///
+/// This pass replaces each humanoid-bound collider with a capsule (or
+/// head sphere) measured from the body primitive's rest surface: the
+/// segment runs between the chain's two joints, and the radius is the
+/// 85th-percentile distance of nearby body vertices to that segment
+/// (p85 ≈ limb radius; the remaining tail is clothing/contact noise).
+/// Segments the VRChat set lacks (pelvis, shins) are appended — the
+/// pelvis capsule closes the gap between the spine and thigh colliders
+/// that the pinned band region previously floated over. Non-humanoid
+/// colliders (props) are left untouched. Idempotent: the measurement
+/// depends only on the rest mesh and skeleton, never on the current
+/// collider list.
+///
+/// Cloth-only by construction: the spring solver receives scene
+/// colliders + the body SDF, never `asset.colliders`.
+pub fn ensure_body_conformal_cloth_colliders(avatar: &mut AvatarInstance) -> usize {
+    use crate::asset::clearance::compute_rest_world_vertices;
+
+    const CUTOFF: f32 = 0.14;
+    const RADIUS_MIN: f32 = 0.018;
+    const RADIUS_MAX: f32 = 0.16;
+    const HEIGHT_MIN: f32 = 0.02;
+
+    let humanoid = match avatar.asset.humanoid.as_ref() {
+        Some(h) => h.bone_map.clone(),
+        None => return 0,
+    };
+    let node_of = |b: HumanoidBone| humanoid.get(&b).map(|id| id.0 as usize);
+    let skinning: Vec<Mat4> = avatar.pose.skinning_matrices.clone();
+
+    // Body-mesh rest world vertices for the radius measurement.
+    let body_verts: Vec<[f32; 3]> = avatar
+        .asset
+        .body_primitive_id
+        .and_then(|pid| {
+            avatar
+                .asset
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .find(|p| p.id == pid)
+        })
+        .map(|p| {
+            compute_rest_world_vertices(p, &skinning)
+                .into_iter()
+                .map(|(pos, _)| pos)
+                .collect()
+        })
+        .unwrap_or_default();
+    if body_verts.is_empty() {
+        return 0;
+    }
+
+    // Rest inner envelope of the cloth garments: a capsule fatter than
+    // this overlaps the resting skirt and shoves its pleats apart on
+    // every sway frame (measured: hip-height tears exposing skin,
+    // `diagnostics/skirt_rest_conformal/` vs the intact VRC reference).
+    // Each measured radius is capped so the capsule at rest stays just
+    // INSIDE the skirt's inner surface; body motion still sweeps the
+    // capsule through the cloth exactly as before.
+    let skirt_verts: Vec<[f32; 3]> = avatar
+        .cloth_overlays
+        .iter()
+        .filter_map(|s| s.state.target_primitive_id)
+        .filter_map(|pid| {
+            avatar
+                .asset
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .find(|p| p.id == pid)
+        })
+        .flat_map(|p| {
+            compute_rest_world_vertices(p, &skinning)
+                .into_iter()
+                .map(|(pos, _)| pos)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Limb-radius measurement: walk K stations down the segment and take
+    // the distance to the NEAREST body vertex at each station — the
+    // closest surface to a bone axis is the limb's own skin, so the
+    // per-station minimum is the local limb radius, and neighbouring
+    // parts (the other thigh, the pelvis beside a forearm) never win
+    // because they are farther. Radius = median over stations; reject
+    // the chain when no surface lies within the cutoff anywhere.
+    let measured_radius = |a: [f32; 3], b: [f32; 3]| -> Option<f32> {
+        const STATIONS: usize = 8;
+        let mut station_min: Vec<f32> = Vec::with_capacity(STATIONS - 1);
+        for i in 1..STATIONS {
+            let t = i as f32 / STATIONS as f32;
+            let s = [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ];
+            let mut min_d2 = f32::MAX;
+            for p in &body_verts {
+                let d2 = (p[0] - s[0]).powi(2) + (p[1] - s[1]).powi(2) + (p[2] - s[2]).powi(2);
+                if d2 < min_d2 {
+                    min_d2 = d2;
+                }
+            }
+            if min_d2 > CUTOFF * CUTOFF {
+                return None;
+            }
+            station_min.push(min_d2.sqrt());
+        }
+        station_min.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let mut r = station_min[station_min.len() / 2];
+        // Cap by the garments' rest inner envelope (see skirt_verts):
+        // never fatter than skirt_inner − 5 mm, so the resting skirt is
+        // never overlapped (and never pushed by an idle sway).
+        if !skirt_verts.is_empty() {
+            let mut skirt_min = f32::MAX;
+            for p in &skirt_verts {
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+                let ab2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if ab2 > 1e-12 {
+                    ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let dx = p[0] - (a[0] + ab[0] * t);
+                let dy = p[1] - (a[1] + ab[1] * t);
+                let dz = p[2] - (a[2] + ab[2] * t);
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < skirt_min {
+                    skirt_min = d2;
+                }
+            }
+            let skirt_min = skirt_min.sqrt();
+            if skirt_min > 0.025 {
+                r = r.min(skirt_min - 0.005);
+            }
+        }
+        Some(r.clamp(RADIUS_MIN, RADIUS_MAX))
+    };
+
+    // World-space joint positions at rest.
+    let world_pos = |b: HumanoidBone| -> Option<[f32; 3]> {
+        let i = node_of(b)?;
+        let m = avatar.pose.global_transforms.get(i)?;
+        Some([m[3][0], m[3][1], m[3][2]])
+    };
+    // World→local of node A at rest (rigid: inverse rotation = transpose).
+    let to_local = |a: usize, w: [f32; 3]| -> [f32; 3] {
+        let m = &avatar.pose.global_transforms[a];
+        let d = [
+            w[0] - m[3][0],
+            w[1] - m[3][1],
+            w[2] - m[3][2],
+        ];
+        [
+            m[0][0] * d[0] + m[0][1] * d[1] + m[0][2] * d[2],
+            m[1][0] * d[0] + m[1][1] * d[1] + m[1][2] * d[2],
+            m[2][0] * d[0] + m[2][1] * d[1] + m[2][2] * d[2],
+        ]
+    };
+
+    // Build the measured collider set.
+    let mut measured: Vec<ColliderAsset> = Vec::new();
+    let mut next_id = avatar
+        .asset
+        .colliders
+        .iter()
+        .map(|c| c.id.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    for &(head, tail) in COLLIDER_CHAINS {
+        // Yumeka-class rigs often merge the neck into the head — fall
+        // back to the head joint so the chest collider survives.
+        let tail = if node_of(tail).is_none() && head == HumanoidBone::Chest {
+            HumanoidBone::Head
+        } else {
+            tail
+        };
+        let (Some(a_idx), Some(_b_idx)) = (node_of(head), node_of(tail)) else {
+            continue;
+        };
+        let (Some(wa), Some(wb)) = (world_pos(head), world_pos(tail)) else {
+            continue;
+        };
+        let Some(radius) = measured_radius(wa, wb) else {
+            continue;
+        };
+        let height = ((wb[0] - wa[0]).powi(2)
+            + (wb[1] - wa[1]).powi(2)
+            + (wb[2] - wa[2]).powi(2))
+        .sqrt()
+        .max(HEIGHT_MIN);
+        let mid_world = [
+            (wa[0] + wb[0]) * 0.5,
+            (wa[1] + wb[1]) * 0.5,
+            (wa[2] + wb[2]) * 0.5,
+        ];
+        let offset = to_local(a_idx, mid_world);
+        let node = avatar.asset.skeleton.nodes[a_idx].id;
+        // Reuse the id of whatever collider already binds this node (a
+        // VRChat one on the first run, our own on re-runs — the pass
+        // must be idempotent), else mint a fresh one.
+        let id = avatar
+            .asset
+            .colliders
+            .iter()
+            .find(|c| c.node == node)
+            .map(|c| c.id)
+            .unwrap_or_else(|| {
+                let id = ColliderId(next_id);
+                next_id += 1;
+                id
+            });
+        measured.push(ColliderAsset {
+            id,
+            node,
+            shape: ColliderShape::Capsule { radius, height },
+            offset,
+        });
+    }
+    // Head sphere (the VRChat set has one; keep the coverage).
+    if let (Some(h_idx), Some(hw)) = (node_of(HumanoidBone::Head), world_pos(HumanoidBone::Head))
+    {
+        let node = avatar.asset.skeleton.nodes[h_idx].id;
+        if !measured.iter().any(|c| c.node == node) {
+            if let Some(radius) = measured_radius(hw, hw) {
+                let id = avatar
+                    .asset
+                    .colliders
+                    .iter()
+                    .find(|c| c.node == node)
+                    .map(|c| c.id)
+                    .unwrap_or_else(|| {
+                        let id = ColliderId(next_id);
+                        next_id += 1;
+                        id
+                    });
+                measured.push(ColliderAsset {
+                    id,
+                    node,
+                    shape: ColliderShape::Sphere { radius },
+                    offset: [0.0, 0.0, 0.0],
+                });
+            }
+        }
+    }
+
+    if measured.is_empty() {
+        return 0;
+    }
+
+    // CoW swap: keep any non-humanoid colliders (props) the asset
+    // carried, drop the replaced body ones, extend the enable mask for
+    // appended entries.
+    let humanoid_nodes: std::collections::HashSet<_> = humanoid.values().copied().collect();
+    let asset = Arc::make_mut(&mut avatar.asset);
+    let mut kept: Vec<ColliderAsset> = asset
+        .colliders
+        .iter()
+        .filter(|c| !humanoid_nodes.contains(&c.node))
+        .cloned()
+        .collect();
+    kept.extend(measured);
+    let new_len = kept.len();
+    asset.colliders = kept;
+    if avatar.collider_enabled.len() < new_len {
+        avatar.collider_enabled.resize(new_len, true);
+    }
+    new_len
 }
 
 #[cfg(test)]
@@ -701,6 +1157,102 @@ mod tests {
                 prim.skin_anchors.is_none(),
                 "simulated garment must not carry render-side clearance anchors"
             );
+        }
+    }
+
+    /// The conformal-collider re-measure (experimental,
+    /// `VULVATAR_AUTO_CONFORMAL_COLLIDERS=1`): every humanoid-bound
+    /// collider gets a mesh-measured radius, and the pelvis capsule the
+    /// VRChat set lacks is appended. Radii must be body-conformal —
+    /// thinner than the VRChat thigh capsule (74 mm) — and finite.
+    #[test]
+    fn auto_cloth_conformal_colliders_measure_body() {
+        let Some(path) = yumeka_fbx_path() else {
+            return;
+        };
+        let loader = crate::asset::fbx::FbxAssetLoader::new();
+        let asset = loader.load(&path).expect("load Yumeka");
+        let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset);
+        avatar.build_base_pose();
+        avatar.compute_global_pose();
+        avatar.build_skinning_matrices();
+
+        let before = avatar.asset.colliders.len();
+        let n = ensure_body_conformal_cloth_colliders(&mut avatar);
+        assert!(n > 0, "humanoid colliders must be re-measured");
+        assert!(n >= before, "appended {n} of {before}");
+
+        let humanoid = &avatar.asset.humanoid.as_ref().expect("humanoid map").bone_map;
+        let hips_node = humanoid.get(&HumanoidBone::Hips).expect("hips node").0;
+        assert!(
+            avatar.asset.colliders.iter().any(|c| c.node.0 == hips_node),
+            "pelvis capsule must exist (the VRChat set has none)"
+        );
+        for c in &avatar.asset.colliders {
+            match c.shape {
+                ColliderShape::Sphere { radius } | ColliderShape::Capsule { radius, .. } => {
+                    assert!(
+                        radius.is_finite() && (0.015..=0.2).contains(&radius),
+                        "measured radius out of range: {radius}"
+                    );
+                }
+            }
+        }
+        // Thigh capsules must be thinner than the VRChat 74 mm pushback
+        // spheres — the whole point of the re-measure.
+        for bone in [HumanoidBone::LeftUpperLeg, HumanoidBone::RightUpperLeg] {
+            let node = humanoid.get(&bone).expect("upper leg node").0;
+            let col = avatar
+                .asset
+                .colliders
+                .iter()
+                .find(|c| c.node.0 == node)
+                .expect("thigh collider");
+            let r = match col.shape {
+                ColliderShape::Capsule { radius, .. } => radius,
+                ColliderShape::Sphere { radius } => radius,
+            };
+            assert!(
+                r < 0.074,
+                "measured thigh radius {r} must be thinner than the VRChat 74 mm"
+            );
+        }
+    }
+
+    /// The conformal re-measure must be idempotent — running it twice
+    /// (re-attach scenarios) keeps the same collider count and radii,
+    /// because the measurement depends only on the rest mesh.
+    #[test]
+    fn auto_cloth_conformal_colliders_are_idempotent() {
+        let Some(path) = yumeka_fbx_path() else {
+            return;
+        };
+        let loader = crate::asset::fbx::FbxAssetLoader::new();
+        let asset = loader.load(&path).expect("load Yumeka");
+        let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset);
+        avatar.build_base_pose();
+        avatar.compute_global_pose();
+        avatar.build_skinning_matrices();
+
+        ensure_body_conformal_cloth_colliders(&mut avatar);
+        let snapshot: Vec<_> = avatar
+            .asset
+            .colliders
+            .iter()
+            .map(|c| (c.id, c.node, c.shape.clone(), c.offset))
+            .collect();
+        ensure_body_conformal_cloth_colliders(&mut avatar);
+        let after: Vec<_> = avatar
+            .asset
+            .colliders
+            .iter()
+            .map(|c| (c.id, c.node, c.shape.clone(), c.offset))
+            .collect();
+        assert_eq!(snapshot.len(), after.len());
+        for (a, b) in snapshot.iter().zip(after.iter()) {
+            assert_eq!(a.0, b.0, "collider ids must be stable");
+            assert_eq!(a.1, b.1, "collider nodes must be stable");
+            assert_eq!(a.3, b.3, "collider offsets must be stable");
         }
     }
 
@@ -1032,6 +1584,140 @@ mod tests {
             for c in &a.constraints.distance_constraints {
                 assert!(c.rest_length.is_finite() && c.rest_length >= 0.0);
                 assert_ne!(c.indices[0], c.indices[1]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bend_generation_tests {
+    use super::*;
+    use crate::avatar::{AvatarInstance, AvatarInstanceId};
+
+    // The sibling `tests` module's helper is private to it — a local
+    // copy for the integration case below.
+    fn yumeka_fbx_path() -> Option<String> {
+        let pinned = "sample_data/YUMEKA_v1.0.1/FBX/Yumeka_v1.0.fbx";
+        if std::path::Path::new(pinned).exists() {
+            return Some(pinned.to_string());
+        }
+        let mut best: Option<(String, String)> = None;
+        let Ok(entries) = std::fs::read_dir("sample_data") else {
+            return None;
+        };
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if !dir_name.starts_with("YUMEKA_v") {
+                continue;
+            }
+            let Ok(fbx_dir) = std::fs::read_dir(entry.path().join("FBX")) else {
+                continue;
+            };
+            for f in fbx_dir.flatten() {
+                if f.path().extension().and_then(|e| e.to_str()) != Some("fbx") {
+                    continue;
+                }
+                let is_newer = match &best {
+                    Some((cur, _)) => dir_name > *cur,
+                    None => true,
+                };
+                if is_newer {
+                    if let Some(p) = f.path().to_str() {
+                        best = Some((dir_name.clone(), p.to_string()));
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    // 1 cm quad corners (local copies — the R6 test module's consts are
+    // private to it).
+    const Q0: [f32; 3] = [0.0, 0.0, 0.0];
+    const Q1: [f32; 3] = [0.01, 0.0, 0.0];
+    const Q2: [f32; 3] = [0.0, 0.01, 0.0];
+    const Q3: [f32; 3] = [0.01, 0.01, 0.0];
+
+    /// Two triangles sharing one welded edge → exactly TWO edge-angle
+    /// constraints (hinge at each endpoint, wings = the two opposite
+    /// vertices); boundary edges produce nothing.
+    #[test]
+    fn bend_generation_hinges_each_endpoint_of_interior_edges() {
+        // Welded quad: P0-P1 shared edge, wings P2 and P3.
+        // tri1 = (P0,P1,P2), tri2 = (P1,P0,P3) — reversed winding so
+        // the shared edge appears from both sides.
+        let world = vec![Q0, Q1, Q2, Q3];
+        let weld = weld_by_quantized_position(&world);
+        let indices: Vec<u32> = vec![0, 1, 2, 1, 0, 3];
+
+        let bends = edge_angle_bend_constraints(&weld, &indices, 0.9);
+        assert_eq!(bends.len(), 2, "one interior edge → two hinges");
+
+        let groups: Vec<[u32; 3]> = bends
+            .iter()
+            .map(|b| [
+                weld.weld_of[b.indices[0] as usize],
+                weld.weld_of[b.indices[1] as usize],
+                weld.weld_of[b.indices[2] as usize],
+            ])
+            .collect();
+        // Each hinge weld is an endpoint of the shared edge (groups 0
+        // or 1), with wings = the two opposite welds (2 and 3).
+        for g in &groups {
+            assert!(
+                (g[0] == 0 || g[0] == 1) && g[1] != g[2],
+                "hinge on a shared-edge endpoint, distinct wings: {g:?}"
+            );
+            assert!(
+                [g[1], g[2]].iter().all(|w| *w == 2 || *w == 3),
+                "wings are the two opposite vertices: {g:?}"
+            );
+        }
+        // Both endpoints hinge, i.e. the two constraints differ in p0.
+        assert_ne!(groups[0][0], groups[1][0]);
+        for b in &bends {
+            assert_eq!(b.stiffness, 0.9);
+        }
+    }
+
+    /// A lone triangle (all boundary edges) generates nothing.
+    #[test]
+    fn bend_generation_ignores_boundary_edges() {
+        let world = vec![Q0, Q1, Q2];
+        let weld = weld_by_quantized_position(&world);
+        let bends = edge_angle_bend_constraints(&weld, &[0, 1, 2], 0.9);
+        assert!(bends.is_empty());
+    }
+
+    /// Yumeka integration: the auto skirt carries a healthy bend set —
+    /// one in each direction around every interior welded edge, never
+    /// exceeding two per edge.
+    #[test]
+    fn auto_cloth_yumeka_skirt_generates_bend_constraints() {
+        let Some(path) = yumeka_fbx_path() else {
+            return;
+        };
+        let loader = crate::asset::fbx::FbxAssetLoader::new();
+        let asset = loader.load(&path).expect("load Yumeka");
+        let mut avatar = AvatarInstance::new(AvatarInstanceId(1), asset);
+        avatar.build_base_pose();
+        avatar.compute_global_pose();
+        avatar.build_skinning_matrices();
+
+        let assets = build_auto_cloth_assets(&avatar, 2);
+        assert!(!assets.is_empty());
+        for a in &assets {
+            assert!(
+                !a.constraints.bend_constraints.is_empty(),
+                "pleated skirt must generate bend constraints"
+            );
+            for bc in &a.constraints.bend_constraints {
+                assert!(
+                    (bc.indices[0] < a.simulation_mesh.vertices.len() as u32)
+                        && (bc.indices[1] < a.simulation_mesh.vertices.len() as u32)
+                        && (bc.indices[2] < a.simulation_mesh.vertices.len() as u32),
+                    "bend indices in particle range"
+                );
             }
         }
     }

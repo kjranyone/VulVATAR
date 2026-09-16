@@ -35,6 +35,7 @@ fn make_simple_sim(particle_count: usize) -> ClothSimState {
         self_collision_radius: 0.01,
         connected_pairs: HashSet::new(),
         spatial_hash: SpatialHashGrid::new(0.04),
+            sdf_contact: 0.0,
     }
 }
 
@@ -595,7 +596,7 @@ fn sphere_collision_pushes_particle_out() {
         radius: 1.0,
     }];
 
-    collide(&mut sim, &colliders);
+    collide(&mut sim, &colliders, None);
 
     let dist = vec3_length(&sim.particles[0].position);
     assert!(
@@ -616,7 +617,7 @@ fn sphere_collision_respects_margin() {
         radius: 1.0,
     }];
 
-    collide(&mut sim, &colliders);
+    collide(&mut sim, &colliders, None);
 
     let dist = vec3_length(&sim.particles[0].position);
     let effective_radius = 1.0 + 0.5;
@@ -639,7 +640,7 @@ fn sphere_collision_skips_pinned() {
         radius: 1.0,
     }];
 
-    collide(&mut sim, &colliders);
+    collide(&mut sim, &colliders, None);
 
     assert_eq!(sim.particles[0].position, [0.0, 0.0, 0.0]);
 }
@@ -662,7 +663,7 @@ fn capsule_collision_pushes_particle_out() {
         axis: [0.0, 1.0, 0.0],
     }];
 
-    collide(&mut sim, &colliders);
+    collide(&mut sim, &colliders, None);
 
     let dist_from_axis =
         (sim.particles[0].position[0].powi(2) + sim.particles[0].position[2].powi(2)).sqrt();
@@ -980,7 +981,7 @@ fn step_cloth_does_nothing_when_avatar_cloth_disabled() {
     );
     avatar.cloth_enabled = false;
 
-    step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    step_cloth(1.0 / 60.0, &mut avatar, &[], None);
 }
 
 // =========================================================================
@@ -1116,7 +1117,7 @@ fn world_colliders_are_included_in_collision() {
         radius: 1.0,
     }];
 
-    collide(&mut sim, &world_colliders);
+    collide(&mut sim, &world_colliders, None);
 
     let dist = vec3_length(&sim.particles[0].position);
     assert!(
@@ -1430,7 +1431,7 @@ fn make_sleep_test_avatar() -> crate::avatar::AvatarInstance {
 fn cpu_cloth_settles_to_sleep_and_freezes_bitwise() {
     let mut avatar = make_sleep_test_avatar();
     for _ in 0..30 {
-        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert!(
@@ -1440,7 +1441,7 @@ fn cpu_cloth_settles_to_sleep_and_freezes_bitwise() {
     );
     let frozen = cs.sim_positions.clone();
     for _ in 0..10 {
-        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert_eq!(
@@ -1457,12 +1458,12 @@ fn cpu_cloth_wakes_when_inputs_change() {
     // (a) parameter change: gravity turns on — the cloth must fall.
     let mut avatar = make_sleep_test_avatar();
     for _ in 0..30 {
-        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert!(avatar.cloth_state.as_ref().unwrap().settle.sleeping);
     let frozen = avatar.cloth_state.as_ref().unwrap().sim_positions.clone();
     avatar.cloth_sim.as_mut().unwrap().gravity = [0.0, -9.81, 0.0];
-    step_cloth(1.0 / 60.0, &mut avatar, &[]);
+    step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert_ne!(
         cs.sim_positions, frozen,
@@ -1473,7 +1474,7 @@ fn cpu_cloth_wakes_when_inputs_change() {
     // (b) collision change: a world collider appears on a resting cloth.
     let mut avatar = make_sleep_test_avatar();
     for _ in 0..30 {
-        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert!(avatar.cloth_state.as_ref().unwrap().settle.sleeping);
     let frozen = avatar.cloth_state.as_ref().unwrap().sim_positions.clone();
@@ -1483,7 +1484,7 @@ fn cpu_cloth_wakes_when_inputs_change() {
         center: [2.96, 0.0, 0.0],
         radius: 0.05,
     }];
-    step_cloth(1.0 / 60.0, &mut avatar, &colliders);
+    step_cloth(1.0 / 60.0, &mut avatar, &colliders, None);
     let cs = avatar.cloth_state.as_ref().unwrap();
     assert_ne!(
         cs.sim_positions, frozen,
@@ -1512,14 +1513,14 @@ fn cpu_cloth_overlay_gates_independently() {
     }
     avatar.cloth_enabled = true;
     for _ in 0..30 {
-        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert!(avatar.cloth_overlays[a].state.settle.sleeping);
     assert!(!avatar.cloth_overlays[b].state.settle.sleeping);
     let frozen = avatar.cloth_overlays[a].state.sim_positions.clone();
     let before_b = avatar.cloth_overlays[b].state.sim_positions.clone();
     for _ in 0..5 {
-        step_cloth(1.0 / 60.0, &mut avatar, &[]);
+        step_cloth(1.0 / 60.0, &mut avatar, &[], None);
     }
     assert_eq!(
         avatar.cloth_overlays[a].state.sim_positions, frozen,
@@ -1528,5 +1529,72 @@ fn cpu_cloth_overlay_gates_independently() {
     assert_ne!(
         avatar.cloth_overlays[b].state.sim_positions, before_b,
         "moving overlay must keep stepping"
+    );
+}
+
+/// The body-SDF contact stage: a free particle inside the field's
+/// shell is projected onto the `sdf_contact` isosurface along the
+/// smooth gradient; `sdf_contact = 0` (the default) leaves it alone;
+/// pinned particles are never touched. Mirrors the GLSL stage in
+/// `cloth_collide_cs` (same resolve formula, sentinel semantics).
+#[test]
+fn sdf_contact_projects_onto_isosurface_only_when_enabled() {
+    use crate::simulation::sdf::{SdfField, SdfGrid, SENTINEL};
+
+    // Linear-ramp field: `v = 0.005·(x − 5) − 0.01` metres everywhere —
+    // the cell at the origin holds −0.01 (inside the surface) and the
+    // gradient is a constant +X. A single-splat field would NOT do: the
+    // central-difference taps land exactly on cell boundaries where the
+    // trilinear weights zero the splat out and the gradient collapses
+    // to None.
+    let grid = SdfGrid {
+        origin: [-0.05, -0.05, -0.05],
+        voxel: 0.01,
+        dims: [11, 11, 11],
+    };
+    let data: Vec<f32> = (0..grid.cell_count())
+        .map(|i| {
+            let x = i as u32 % grid.dims[0];
+            0.005 * (x as f32 - 5.0) - 0.01
+        })
+        .collect();
+    let field = SdfField::new(grid, std::sync::Arc::new(data));
+
+    let mut sim = make_simple_sim(2);
+    sim.sdf_contact = 0.004;
+    // Particle at the splat cell: inside the surface, must be pushed.
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    // Particle far outside the grid: untouched.
+    sim.particles[1].position = [1.0, 1.0, 1.0];
+
+    collide(&mut sim, &[], Some(&field));
+    let [a, b] = [sim.particles[0].position, sim.particles[1].position];
+    assert!(
+        a[0] > 0.0,
+        "inside particle must be pushed out along the gradient, got {a:?}"
+    );
+    assert_eq!(b, [1.0, 1.0, 1.0], "outside-grid particle must not move");
+
+    // Disabled (default): nothing moves.
+    let mut sim = make_simple_sim(1);
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    collide(&mut sim, &[], Some(&field));
+    assert_eq!(
+        sim.particles[0].position,
+        [0.0, 0.0, 0.0],
+        "sdf_contact = 0 must leave particles alone"
+    );
+
+    // Pinned particles skip the stage, same as the capsule stage.
+    let mut sim = make_simple_sim(1);
+    sim.particles[0].pinned = true;
+    sim.particles[0].inv_mass = 0.0;
+    sim.particles[0].position = [0.0, 0.0, 0.0];
+    sim.sdf_contact = 0.004;
+    collide(&mut sim, &[], Some(&field));
+    assert_eq!(
+        sim.particles[0].position,
+        [0.0, 0.0, 0.0],
+        "pinned particles must not be SDF-corrected"
     );
 }

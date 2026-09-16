@@ -2,7 +2,7 @@
 //! downstream consumers. Carries the full COCO-Wholebody 133 keypoints
 //! in image-normalised coords; the skeleton edge list still describes
 //! only the body-17 topology so the GUI renderer keeps working without
-//! changes. Depth-aware providers (`rtmw3d-with-depth`) read the full
+//! changes. Depth-aware providers read the full
 //! 133 to back-project hands and face.
 
 use super::super::DetectionAnnotation;

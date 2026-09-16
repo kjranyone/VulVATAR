@@ -757,6 +757,247 @@ void main() {
 // ---------------------------------------------------------------------------
 // Cloth XPBD distance constraint projection — apply pass (P3-02 S2.1)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Cloth bend constraints — three-point edge-angle hinge (T09 mirror).
+// ---------------------------------------------------------------------------
+//
+// The GPU port of `cloth_solver::constraints::project_bend_constraints`
+// (the T09 reference — correction direction, wing-only weights, and the
+// never-moved hinge all mirror it exactly). Three passes, run inside the
+// constraint iteration loop AFTER the distance apply pass:
+//
+//   bend_update     — per constraint: measure the angle at the hinge,
+//                     write the two wing correction rows.
+//   bend_accumulate — per particle: gather wing corrections over the
+//                     bend CSR (wings only; the hinge never appears),
+//                     under-relaxed Jacobi Δx / (n + 1) — same
+//                     divergence guard as the distance accumulate pass.
+//   bend_apply      — per particle: add the gathered delta, zero it.
+//
+// The CPU reference applies corrections sequentially (Gauss-Seidel);
+// the GPU is Jacobi with the same per-constraint formula and the same
+// 1/(n+1) under-relaxation the distance path uses for the same reason.
+pub mod cloth_bend_update_cs {
+    vulkano_shaders::shader! {
+                        ty: "compute",
+                        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+// Rust mirror: `ClothBendGpu`.
+struct BendConstraint {
+    uint  p0;   // hinge — never moved
+    uint  p1;   // wing
+    uint  p2;   // wing
+    uint  _pad;
+    float rest_angle;
+    float stiffness;
+    uvec2 _pad2;
+};
+layout(set = 0, binding = 1) readonly buffer BendConstraints {
+    BendConstraint c[];
+} bend;
+
+layout(set = 0, binding = 2) uniform Control {
+    uint  particle_count;
+    uint  bend_count;
+    uvec2 _pad;
+} ctrl;
+
+// One correction row per constraint per wing. xyz = delta, w unused.
+layout(set = 0, binding = 3) writeonly buffer DeltaRowsA {
+    vec4 d[];
+} rows_a;
+layout(set = 0, binding = 4) writeonly buffer DeltaRowsB {
+    vec4 d[];
+} rows_b;
+
+void main() {
+    uint cidx = gl_GlobalInvocationID.x;
+    if (cidx >= ctrl.bend_count) return;
+
+    BendConstraint bc = bend.c[cidx];
+    float stiffness = clamp(bc.stiffness, 0.0, 1.0);
+    vec3 delta1 = vec3(0.0);
+    vec3 delta2 = vec3(0.0);
+
+    if (stiffness > 0.0) {
+        vec4 x0 = positions.p[bc.p0];
+        vec4 x1 = positions.p[bc.p1];
+        vec4 x2 = positions.p[bc.p2];
+        vec3 e1 = x1.xyz - x0.xyz;
+        vec3 e2 = x2.xyz - x0.xyz;
+        float e1_len = length(e1);
+        float e2_len = length(e2);
+        // Zero-length edge: no correction (CPU skips identically).
+        if (e1_len >= 1.0e-12 && e2_len >= 1.0e-12) {
+            float dot = dot(e1, e2);
+            float cross_len = length(cross(e1, e2));
+            // Near-collinear edges leave no stable correction direction.
+            if (cross_len >= 1.0e-6 * e1_len * e2_len) {
+                float current_angle = atan(cross_len, dot);
+                float err = current_angle - bc.rest_angle;
+                if (abs(err) >= 1.0e-6) {
+                    vec3 e1_norm = e1 / e1_len;
+                    vec3 e2_norm = e2 / e2_len;
+                    float cos_over = dot / (e1_len * e2_len);
+                    vec3 perp1 = e2_norm - e1_norm * cos_over;
+                    vec3 perp2 = e1_norm - e2_norm * cos_over;
+                    float perp1_len = length(perp1);
+                    float perp2_len = length(perp2);
+                    if (perp1_len >= 1.0e-6 && perp2_len >= 1.0e-6) {
+                        perp1 /= perp1_len;
+                        perp2 /= perp2_len;
+                        // Inv-mass shares among FREE wings only; the
+                        // hinge never moves. inv_mass 0 = pinned.
+                        float w1 = x1.w;
+                        float w2 = x2.w;
+                        float w_sum = w1 + w2;
+                        if (w_sum >= 1.0e-12) {
+                            float scale = stiffness * err;
+                            if (w1 > 0.0) {
+                                delta1 = perp1 * ((w1 / w_sum) * scale * e1_len);
+                            }
+                            if (w2 > 0.0) {
+                                delta2 = perp2 * ((w2 / w_sum) * scale * e2_len);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rows_a.d[cidx] = vec4(delta1, 0.0);
+    rows_b.d[cidx] = vec4(delta2, 0.0);
+}
+"
+                    }
+}
+
+pub mod cloth_bend_accumulate_cs {
+    vulkano_shaders::shader! {
+                        ty: "compute",
+                        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Positions {
+    vec4 p[];
+} positions;
+
+layout(set = 0, binding = 1) readonly buffer BendAdjOffsets {
+    uint o[];
+} adj_offsets;
+layout(set = 0, binding = 2) readonly buffer BendAdjConstraints {
+    uint c[];
+} adj_constraints;
+
+struct BendConstraint {
+    uint  p0;
+    uint  p1;
+    uint  p2;
+    uint  _pad;
+    float rest_angle;
+    float stiffness;
+    uvec2 _pad2;
+};
+layout(set = 0, binding = 3) readonly buffer BendConstraints {
+    BendConstraint c[];
+} bend;
+
+layout(set = 0, binding = 4) readonly buffer DeltaRowsA {
+    vec4 d[];
+} rows_a;
+layout(set = 0, binding = 5) readonly buffer DeltaRowsB {
+    vec4 d[];
+} rows_b;
+
+layout(set = 0, binding = 6) writeonly buffer BendDeltas {
+    vec4 d[];
+} out_deltas;
+
+layout(set = 0, binding = 7) uniform Control {
+    uint  particle_count;
+    uint  bend_count;
+    uvec2 _pad;
+} ctrl;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 pp = positions.p[pid];
+    if (pp.w <= 0.0) {
+        out_deltas.d[pid] = vec4(0.0);
+        return;
+    }
+
+    vec3 delta = vec3(0.0);
+    float n_rel = 1.0;
+    uint start = adj_offsets.o[pid];
+    uint end   = adj_offsets.o[pid + 1u];
+    for (uint k = start; k < end; ++k) {
+        uint cidx = adj_constraints.c[k];
+        BendConstraint bc = bend.c[cidx];
+        // The CSR holds wings only (the hinge is never in it), but the
+        // guard keeps a degenerate entry harmless.
+        if (bc.p1 == pid) {
+            delta += rows_a.d[cidx].xyz;
+            n_rel += 1.0;
+        } else if (bc.p2 == pid) {
+            delta += rows_b.d[cidx].xyz;
+            n_rel += 1.0;
+        }
+    }
+    // Under-relaxed Jacobi — mirrors the distance accumulate pass.
+    out_deltas.d[pid] = vec4(delta / n_rel, 0.0);
+}
+"
+                    }
+}
+
+pub mod cloth_bend_apply_cs {
+    vulkano_shaders::shader! {
+                        ty: "compute",
+                        src: r"
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Positions {
+    vec4 p[];
+} positions;
+
+layout(set = 0, binding = 1) buffer BendDeltas {
+    vec4 d[];
+} bend_deltas;
+
+layout(set = 0, binding = 2) uniform Control {
+    uint  particle_count;
+    uint  bend_count;
+    uvec2 _pad;
+} ctrl;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ctrl.particle_count) return;
+
+    vec4 pos = positions.p[pid];
+    vec4 d = bend_deltas.d[pid];
+    pos.xyz += d.xyz;
+    positions.p[pid] = pos;
+    bend_deltas.d[pid] = vec4(0.0);
+}
+"
+                    }
+}
+
 pub mod cloth_constraint_apply_cs {
     vulkano_shaders::shader! {
                         ty: "compute",
@@ -1005,13 +1246,67 @@ layout(set = 0, binding = 1) readonly buffer Colliders {
     Capsule c[];
 } colliders;
 
+// Body-SDF distance field the splat pass filled (u32 cells holding f32
+// bit patterns; u32(-1) = unsplatted sentinel). Avatar-root space —
+// the same contract the spring solver's field uses.
+layout(set = 0, binding = 3) readonly buffer SdfFieldBuf {
+    uint v[];
+} sdf;
+
+// xyz = grid origin (metres), w = voxel size; dims in yzw via uvec4.
+struct SdfParams {
+    vec4 origin_voxel;
+    uvec4 dims_pad;
+};
+layout(set = 0, binding = 4) uniform SdfCtl {
+    SdfParams s;
+} sdfctl;
+
 // Rust mirror: `ClothCollideControl`.
 layout(set = 0, binding = 2) uniform Control {
     uint  particle_count;
     uint  collider_count;
     float margin;
-    uint  _pad;
+    uint  has_sdf;
+    float sdf_contact;
+    uvec2 _pad;
 } ctrl;
+
+// Matches `simulation::sdf::{SENTINEL, OUTSIDE_VALUE}` (f32::MAX).
+const float SDF_SENTINEL_F = 3.402823466e38;
+const float SDF_OUTSIDE = 0.12; // SHELL_METRES * 2.0
+
+// Trilinear sample mirroring `SdfField::sample`, including the
+// sentinel semantics: out-of-grid => SENTINEL, a `raw >= SENTINEL`
+// corner interpolates as OUTSIDE (an unsplatted u32(-1) corner stays
+// NaN through this compare — exactly like the CPU, and NaN fails the
+// `d < contact` gate below, so both paths mean no contact).
+float sdf_sample(vec3 p) {
+    vec3 o = sdfctl.s.origin_voxel.xyz;
+    float voxel = sdfctl.s.origin_voxel.w;
+    vec3 f = (p - o) / voxel;
+    if (f.x < 0.0 || f.y < 0.0 || f.z < 0.0) return SDF_SENTINEL_F;
+    ivec3 c = ivec3(floor(f));
+    uvec3 dims = sdfctl.s.dims_pad.xyz;
+    if (c.x + 1 >= int(dims.x) || c.y + 1 >= int(dims.y) || c.z + 1 >= int(dims.z))
+        return SDF_SENTINEL_F;
+    vec3 t = f - vec3(c);
+    float acc = 0.0;
+    for (uint dz = 0u; dz < 2u; ++dz) {
+        float wz = dz == 0u ? 1.0 - t.z : t.z;
+        for (uint dy = 0u; dy < 2u; ++dy) {
+            float wy = dy == 0u ? 1.0 - t.y : t.y;
+            for (uint dx = 0u; dx < 2u; ++dx) {
+                float wx = dx == 0u ? 1.0 - t.x : t.x;
+                uint idx = uint(c.x + int(dx))
+                         + dims.x * (uint(c.y + int(dy)) + dims.y * uint(c.z + int(dz)));
+                float raw = uintBitsToFloat(sdf.v[idx]);
+                acc += (raw >= SDF_SENTINEL_F ? SDF_OUTSIDE : raw) * wx * wy * wz;
+            }
+        }
+    }
+    return acc;
+}
 
 void main() {
     uint pid = gl_GlobalInvocationID.x;
@@ -1022,7 +1317,7 @@ void main() {
     if (pp.w <= 0.0) return;
 
     vec3 pos = pp.xyz;
-    for (uint k = 0; k < ctrl.collider_count; ++k) {
+    for (uint k = 0u; k < ctrl.collider_count; ++k) {
         vec3 a = colliders.c[k].a.xyz;
         vec3 b = colliders.c[k].b.xyz;
         float radius = colliders.c[k].a.w + ctrl.margin;
@@ -1043,6 +1338,33 @@ void main() {
             pos = closest + n * radius;
         }
     }
+
+    // Body-SDF stage (mirrors `SdfField::resolve`): project onto the
+    // `sdf_contact` isosurface along the central-difference gradient.
+    // The smooth direction field lets pleats fold instead of being
+    // blasted apart by the capsule radial pushes above.
+    if (ctrl.has_sdf != 0u && ctrl.sdf_contact > 0.0) {
+        float d = sdf_sample(pos);
+        if (d < ctrl.sdf_contact) {
+            float h = sdfctl.s.origin_voxel.w;
+            vec3 o = sdfctl.s.origin_voxel.xyz;
+            vec3 g = vec3(
+                sdf_sample(pos + vec3(h, 0.0, 0.0)) - sdf_sample(pos - vec3(h, 0.0, 0.0)),
+                sdf_sample(pos + vec3(0.0, h, 0.0)) - sdf_sample(pos - vec3(0.0, h, 0.0)),
+                sdf_sample(pos + vec3(0.0, 0.0, h)) - sdf_sample(pos - vec3(0.0, 0.0, h))
+            );
+            float gl = length(g);
+            // `!(len > eps)` also catches NaN gradients (unsplatted
+            // region) — same no-contact outcome as the CPU's
+            // `gradient() -> None`.
+            if (gl > 1.0e-6) {
+                vec3 n = g / gl;
+                float target = min(ctrl.sdf_contact, 0.12 * 0.9);
+                pos += n * (target - d);
+            }
+        }
+    }
+
     positions.p[pid] = vec4(pos, pp.w);
 }
 "
@@ -2080,6 +2402,33 @@ pub struct ClothConstraintGpu {
     pub stiffness: f32,
 }
 
+/// SSBO row for one edge-angle bend constraint (T09 model — see
+/// `cloth_solver::constraints::project_bend_constraints`, the CPU
+/// reference the bend kernels mirror). `p0` is the hinge (never
+/// moved), `p1`/`p2` the wings; `rest_angle` is derived from the rest
+/// positions by `ClothSimState::from_asset` on the CPU and shipped
+/// here precomputed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothBendGpu {
+    pub p0: u32,
+    pub p1: u32,
+    pub p2: u32,
+    pub _pad: u32,
+    pub rest_angle: f32,
+    pub stiffness: f32,
+    pub _pad2: [u32; 2],
+}
+
+/// Control block for the bend kernels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothBendControl {
+    pub particle_count: u32,
+    pub bend_count: u32,
+    pub _pad: [u32; 2],
+}
+
 /// Per-frame control block consumed by the constraint shaders.
 /// std140 layout — 16 bytes packed.
 ///
@@ -2236,7 +2585,25 @@ pub struct ClothCollideControl {
     pub particle_count: u32,
     pub collider_count: u32,
     pub margin: f32,
-    pub _pad: u32,
+    /// 0 = SDF stage inert (dummy field bound), 1 = sample `sdf`.
+    pub has_sdf: u32,
+    /// Body-SDF contact radius in metres (mirrors
+    /// `ClothSimState::sdf_contact`; 0 disables — belt and braces with
+    /// `has_sdf`).
+    pub sdf_contact: f32,
+    pub _pad: [u32; 2],
+}
+
+/// Params UBO for the collide kernel's SDF stage — the grid the splat
+/// pass filled (mirror of `SdfGrid` + `BodySdfSplatParams` layout
+/// conventions). Avatar-root space, same as the spring solver's field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothSdfParams {
+    /// xyz = grid origin (avatar-root space, metres), w = voxel size.
+    pub origin_voxel: [f32; 4],
+    /// xyz = grid dims (cells), w = pad.
+    pub dims_pad: [u32; 4],
 }
 
 /// SSBO row for one collision capsule: `a.xyz`/`b.xyz` = segment
@@ -2273,6 +2640,81 @@ pub fn create_cloth_collide_compute_pipeline(
     )
     .map_err(|e| format!("failed to create cloth collide compute pipeline: {e}"))
 }
+pub fn create_cloth_bend_apply_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_bend_apply_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth bend apply compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth bend apply compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth bend apply pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth bend apply pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth bend apply compute pipeline: {e}"))
+}
+
+pub fn create_cloth_bend_accumulate_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_bend_accumulate_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth bend accumulate compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth bend accumulate compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth bend accumulate pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth bend accumulate pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth bend accumulate compute pipeline: {e}"))
+}
+
+pub fn create_cloth_bend_update_compute_pipeline(
+    device: Arc<Device>,
+) -> Result<Arc<ComputePipeline>, String> {
+    let cs_module = cloth_bend_update_cs::load(device.clone())
+        .map_err(|e| format!("failed to load cloth bend update compute shader: {e}"))?;
+    let cs_entry = cs_module
+        .entry_point("main")
+        .ok_or_else(|| "cloth bend update compute shader entry point 'main' not found".to_string())?;
+    let stages = [PipelineShaderStageCreateInfo::new(cs_entry)];
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| format!("failed to build cloth bend update pipeline layout info: {e}"))?,
+    )
+    .map_err(|e| format!("failed to create cloth bend update pipeline layout: {e}"))?;
+    let stage = stages.into_iter().next().expect("compute stage present");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|e| format!("failed to create cloth bend update compute pipeline: {e}"))
+}
+
 
 /// Control block for the self-collision build/resolve passes. Rust
 /// mirror of the GLSL `Control` uniform.

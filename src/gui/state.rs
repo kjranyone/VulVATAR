@@ -257,9 +257,7 @@ pub struct TrackingGuiState {
     /// off the GPU entirely. Slower but isolates tracking from GPU
     /// driver instability. Bound at tracking start.
     pub force_cpu_inference: bool,
-    /// Run the YOLOX person-crop stage; off = whole-frame RTMW3D.
     /// Bound at tracking start.
-    pub yolox_enabled: bool,
     /// Session-only safe-mode latch set from the unclean-exit banner.
     /// While true, tracking starts use the degraded
     /// `TrackingPipelineConfig::safe_mode()` regardless of the saved
@@ -296,7 +294,6 @@ impl TrackingGuiState {
         } else {
             crate::tracking::provider::TrackingPipelineConfig {
                 force_cpu: self.force_cpu_inference,
-                yolox_enabled: self.yolox_enabled,
             }
         }
     }
@@ -472,7 +469,6 @@ impl Default for TrackingGuiState {
             fade_on_tracking_loss: false,
             smoothing: TrackingSmoothingParams::default(),
             force_cpu_inference: false,
-            yolox_enabled: true,
             safe_mode_armed: false,
             unclean_exit_log: crate::tracking::stagelog::stale_sentinel(),
             available_cameras: None,

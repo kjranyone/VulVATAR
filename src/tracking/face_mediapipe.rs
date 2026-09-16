@@ -49,7 +49,7 @@ use ort::value::TensorRef;
 #[cfg(feature = "inference")]
 use std::path::Path;
 
-use super::rtmw3d::InferenceBackend;
+use super::detector::InferenceBackend;
 
 /// Input dimensions for the FaceMeshV2 landmarker (PINTO export of
 /// MediaPipe `face_landmarks_detector` — input is `(1, 3, 256, 256)`
@@ -187,7 +187,7 @@ pub enum FaceMeshEp {
 /// Cross-thread FaceMesh EP preference published by
 /// `RuntimeGpuBudget` (PressureHeavy and above force CPU so the small
 /// face cascade stops contending with RTMW3D on DirectML). Consulted
-/// where ONNX sessions are built (`rtmw3d::from_models_dir_with_options`),
+/// where ONNX sessions are built (`DetectorInference` construction),
 /// so a flip takes effect on the next tracking start — the same
 /// latency class as the existing user-facing `force_cpu` toggle.
 /// `false` (default) keeps the caller's `FaceMeshEp` choice intact.
@@ -251,9 +251,9 @@ impl FaceMeshInference {
         );
         let (face_session, backend) = match face_ep {
             FaceMeshEp::Auto => {
-                super::rtmw3d::build_session(&face_path.to_string_lossy(), 2, "FaceMeshV2")?
+                super::detector::session::build_session(&face_path.to_string_lossy(), 2, "FaceMeshV2")?
             }
-            FaceMeshEp::ForceCpu => super::rtmw3d::build_session_cpu_only(
+            FaceMeshEp::ForceCpu => super::detector::session::build_session_cpu_only(
                 &face_path.to_string_lossy(),
                 2,
                 "FaceMeshV2",
@@ -281,9 +281,9 @@ impl FaceMeshInference {
         );
         let (blendshape_session, _) = match face_ep {
             FaceMeshEp::Auto => {
-                super::rtmw3d::build_session(&blend_path.to_string_lossy(), 2, "BlendshapeV2")?
+                super::detector::session::build_session(&blend_path.to_string_lossy(), 2, "BlendshapeV2")?
             }
-            FaceMeshEp::ForceCpu => super::rtmw3d::build_session_cpu_only(
+            FaceMeshEp::ForceCpu => super::detector::session::build_session_cpu_only(
                 &blend_path.to_string_lossy(),
                 2,
                 "BlendshapeV2",
