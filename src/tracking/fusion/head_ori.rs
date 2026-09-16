@@ -283,6 +283,112 @@ impl HeadOriTracker {
             chain_depth: usize::MAX,
         })
     }
+
+    /// Roll-only head observation from the FaceMesh channel's eye-line
+    /// tilt.
+    ///
+    /// Opt-in (`VULVATAR_FUSION_ROLLORI=1`, default OFF): the 2026-09-16
+    /// bench measured no roll benefit on the 12-recording set — the mesh
+    /// channel reaches this code on ~10/782 desk frames (conf ≥ 0.2 +
+    /// hand cooldown), and where it fires the correction loses to the
+    /// eye kp + priors (roll trace identical at σ down to 0.005) while
+    /// perturbing the solve (+3–8 wrist snaps on knife-edge sessions).
+    /// Kept for the frontal, well-lit, hands-away case where the channel
+    /// is actually live.
+    ///
+    /// The full `estimate_orientation` is heavily gated (depth cheek
+    /// slope, step/agreement, |yaw| envelope) and fires on a small
+    /// minority of desk frames — but its ROLL component is just the
+    /// image tilt of the eye line, the most robust quantity the channel
+    /// produces (2026-09-16 pixel-level audit: within ±3° of the true
+    /// eye-line tilt while the estimator rests −3..−6° low). The body
+    /// detector's eye keypoints cannot supply absolute roll at the desk
+    /// pose: the model's projected eye separator carries a pitch×yaw
+    /// perspective cross-term (+7° at yaw 29° / pitch 14°, frame-dump
+    /// measured) that the roll DOF absorbs as a rest bias. This obs
+    /// injects ONLY the roll difference between the channel and the
+    /// current prediction — a rotation about the bone's forward axis
+    /// leaves yaw/pitch residuals exactly zero.
+    pub fn estimate_roll_ori(
+        &self,
+        base: &PoseEstimate,
+        occl: &FaceOcclusionStatus,
+        fk_pred_head_r: &M3,
+        head_j: usize,
+    ) -> Option<OriObs> {
+        if std::env::var_os("VULVATAR_FUSION_ROLLORI").is_none() {
+            return None;
+        }
+        let (Some(f), Some(c)) = (base.skeleton.face, base.skeleton.face_mesh_confidence) else {
+            return None;
+        };
+        roll_ori_obs(f, c, occl, self.cooldown == 0, fk_pred_head_r, head_j)
+    }
+}
+
+/// Gate-free core of [`HeadOriTracker::estimate_roll_ori`] (the env
+/// enable/cooldown gates live in the caller so tests can exercise the
+/// geometry directly).
+fn roll_ori_obs(
+    f: crate::tracking::FacePose,
+    c: f32,
+    occl: &FaceOcclusionStatus,
+    cooldown_ok: bool,
+    fk_pred_head_r: &M3,
+    head_j: usize,
+) -> Option<OriObs> {
+    if !matches!(f.source, crate::tracking::FaceSource::Mesh)
+        || c < 0.2
+        || f.yaw.abs() >= 1.35
+        || !cooldown_ok
+    {
+        return None;
+    }
+    // Geometric roll of the predicted head bone in the viewer frame —
+    // the same decomposition `diagnose_fusion_replay::ypr_deg` uses.
+    let rc = mat_mul(&super::model::FACING_CAMERA, fk_pred_head_r);
+    let fwd = col(&rc, 2);
+    let up = col(&rc, 1);
+    let right = cross(up, fwd);
+    let roll_pred = right[1].atan2(up[1].abs().max(1e-6));
+    // Channel roll, mirrored into the viewer frame (see the
+    // composition in `estimate_orientation`).
+    let roll_ch = -(f.roll as f64);
+    let delta = roll_ch - roll_pred;
+    // Trim-sized corrections only: this obs exists to remove the
+    // measured −4..−6° rest bias (0.07–0.10 rad), not to rescue large
+    // disagreements — a >0.15 rad gap means occlusion artifacts or a
+    // broken prediction, and step-applying it yanks the head through
+    // the solver (measured: 10 firings, δ up to 0.28 rad, +6 wrist
+    // snaps on s1789246660; 22 without).
+    if !delta.is_finite() || delta.abs() > 0.15 {
+        return None;
+    }
+    if std::env::var_os("VULVATAR_ROLLORI_DUMP").is_some() {
+        eprintln!(
+            "ROLLORI cand roll_pred {roll_pred:+.3} ch {roll_ch:+.3} Δ{delta:+.3} c {c:.2} cd_ok {cooldown_ok} yaw {:.2}",
+            f.yaw
+        );
+    }
+    let sigma = std::env::var("VULVATAR_ROLLORI_SIGMA")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.03 + 0.08 * (1.0 - c as f64))
+        * if occl.face_overlaps_hand { 2.0 } else { 1.0 };
+    if std::env::var_os("VULVATAR_ROLLORI_DUMP").is_some() {
+        eprintln!(
+            "ROLLORI fired roll_pred {roll_pred:+.2} ch {roll_ch:+.2} Δ{delta:+.2} σ{sigma:.3} c {c:.2}"
+        );
+    }
+    Some(OriObs {
+        joint: head_j,
+        // A rotation about the bone's LOCAL forward axis (+Z = face
+        // forward) by `delta`: the world residual is then exactly a
+        // forward-axis rotation, i.e. pure roll in the readout above.
+        target: mat_mul(fk_pred_head_r, &so3_exp([0.0, 0.0, delta])),
+        sigma,
+        chain_depth: usize::MAX,
+    })
 }
 
 fn face_depth_slope(
@@ -390,4 +496,98 @@ fn face_depth_slope(
     };
     let need = if face_overlaps_hand { 0.040 } else { 0.025 };
     Some(nose_turned || (dz_full.abs() >= need && (dz_full < 0.0) == (claimed_yaw < 0.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracking::source_skeleton::{FacePose, SourceSkeleton};
+    use crate::tracking::FaceSource;
+    use crate::tracking::PoseEstimate;
+
+    fn base_with(mesh_roll_rad: f32, conf: f32) -> PoseEstimate {
+        let mut sk = SourceSkeleton::empty(0);
+        sk.face = Some(FacePose {
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: mesh_roll_rad,
+            confidence: conf,
+            source: FaceSource::Mesh,
+            ..Default::default()
+        });
+        sk.face_mesh_confidence = Some(conf);
+        PoseEstimate {
+            skeleton: sk,
+            annotation: Default::default(),
+        }
+    }
+
+    /// The roll-only target must differ from the prediction by exactly a
+    /// forward-axis rotation of the channel-vs-prediction roll gap — yaw
+    /// and pitch residuals stay zero, and a zero gap returns the
+    /// prediction unchanged. Exercises the gate-free core (the env
+    /// opt-in lives in the wrapper).
+    #[test]
+    fn roll_ori_is_pure_forward_axis_correction() {
+        let occl = FaceOcclusionStatus {
+            face_occluded: false,
+            face_overlaps_hand: false,
+            nose_in_hand: false,
+        };
+        // Viewer-frame readout (same decomposition as the replay binary).
+        let ypr = |r: &M3| {
+            let rc = mat_mul(&super::super::model::FACING_CAMERA, r);
+            let fwd = col(&rc, 2);
+            let up = col(&rc, 1);
+            let right = cross(up, fwd);
+            (
+                fwd[0].atan2(fwd[2]),
+                (-fwd[1]).asin(),
+                right[1].atan2(up[1].abs().max(1e-6)),
+            )
+        };
+        // A desk-like prediction: yaw 0.5 rad, pitch 0.24 rad, roll 0.
+        let pred = mat_mul(
+            &super::super::model::FACING_CAMERA,
+            &mat_mul(
+                &so3_exp([0.0, 0.5, 0.0]),
+                &mat_mul(&so3_exp([0.24, 0.0, 0.0]), &so3_exp([0.0, 0.0, 0.0])),
+            ),
+        );
+        let (y0, p0, r0) = ypr(&pred);
+        // Channel reads the head +6° more rolled than the prediction.
+        let base = base_with(-6f64.to_radians() as f32, 0.5);
+        let ori = roll_ori_obs(
+            base.skeleton.face.unwrap(),
+            base.skeleton.face_mesh_confidence.unwrap(),
+            &occl,
+            true,
+            &pred,
+            7,
+        )
+        .expect("roll ori should fire");
+        let (y1, p1, r1) = ypr(&ori.target);
+        assert!(
+            (r1 - r0 - 6f64.to_radians()).abs() < 1e-6,
+            "roll {r0:.6}→{r1:.6} Δ={} (want +6°)",
+            r1 - r0
+        );
+        assert!(
+            (y1 - y0).abs() < 1e-6 && (p1 - p0).abs() < 1e-6,
+            "yaw/pitch moved {y0:.4}→{y1:.4} {p0:.4}→{p1:.4}"
+        );
+        // Zero gap → target == prediction.
+        let base0 = base_with(-r0 as f32, 0.5);
+        let ori0 = roll_ori_obs(
+            base0.skeleton.face.unwrap(),
+            base0.skeleton.face_mesh_confidence.unwrap(),
+            &occl,
+            true,
+            &pred,
+            7,
+        )
+        .unwrap();
+        let e0 = so3_log(&mat_mul(&pred, &transpose(&ori0.target)));
+        assert!(norm(e0) < 1e-9, "zero-gap residual {e0:?}");
+    }
 }

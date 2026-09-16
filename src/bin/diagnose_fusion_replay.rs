@@ -842,12 +842,27 @@ fn main() -> Result<(), String> {
         }
         if std::env::var_os("VULVATAR_REPLAY_HEADREF").is_some() {
             // Estimator head yaw vs the FaceMesh-selected face channel
-            // (dense 478-landmark pose, trustworthy to ~±45°).
+            // (dense 478-landmark pose, trustworthy to ~±45°). Roll: the
+            // channel is source-frame (mirrored), the estimator readout is
+            // viewer-frame, so compare `hr` against −f.roll (the composition
+            // head_ori applies). P1-c: a constant est-vs-channel roll gap
+            // indicts the estimator; agreement means the head really is
+            // rolled.
             if let (Some(f), Some(c)) =
                 (est_out.skeleton.face, est_out.skeleton.face_mesh_confidence)
             {
-                if c > 0.6 {
-                    eprintln!("HEADREF idx {idx} est_yaw {hy:.1} est_pitch {hp:.1} sel_yaw {:.1} sel_pitch {:.1} mesh_c {c:.2}", f.yaw.to_degrees(), f.pitch.to_degrees());
+                if c > 0.2 {
+                    // Third, estimator-independent roll probe: the image
+                    // tilt of the BODY detector's own eye keypoints (COCO
+                    // 1/2, full-frame pixel space, no face crop involved).
+                    let bk = &est_out.annotation.keypoints;
+                    let body_eye_tilt = match (bk.get(1), bk.get(2)) {
+                        (Some(a), Some(b)) if a.2 > 0.3 && b.2 > 0.3 => {
+                            ((a.1 - b.1) as f64).atan2((a.0 - b.0) as f64).to_degrees()
+                        }
+                        _ => f64::NAN,
+                    };
+                    eprintln!("HEADREF idx {idx} est_yaw {hy:.1} est_pitch {hp:.1} est_roll {hr:.1} est_torso_roll {tr:.1} sel_yaw {:.1} sel_pitch {:.1} sel_roll_view {:.1} body_eye_tilt {body_eye_tilt:.1} mesh_c {c:.2} src {:?}", f.yaw.to_degrees(), f.pitch.to_degrees(), -f.roll.to_degrees(), f.source);
                 }
             }
         }

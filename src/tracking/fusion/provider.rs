@@ -1651,6 +1651,11 @@ impl FusionProvider {
             .as_ref()
             .and_then(|a| a.face_mesh.as_ref())
             .filter(|(_, conf)| *conf >= 0.35)
+            // ABL_NOMESH: bench ablation — cut the canonical-face attach
+            // (centroid 2-D anchor + depth-lifted 3-D landmarks), keeping
+            // the mesh-pose channel itself. Isolates how much head roll
+            // the estimator draws from the dense template fit.
+            .filter(|_| std::env::var_os("VULVATAR_ABL_NOMESH").is_none())
             .map(|(lm, _)| lm);
 
         // Canonical-face observations.
@@ -1892,6 +1897,7 @@ impl FusionProvider {
         // absolute orientation), so landmark terms alone under-rotate the
         // head. FaceMesh's dense-landmark pose derivation tracks yaw
         // to ~±60° with high confidence — feed it as a direct world-
+        let mut have_full_ori = false;
         if let Some(ori) = self.head_ori.estimate_orientation(
             &base,
             &occl,
@@ -1909,6 +1915,20 @@ impl FusionProvider {
             &hand_rects,
         ) {
             obs.ori.push(ori);
+            have_full_ori = true;
+        }
+        if !have_full_ori {
+            // Roll-only fallback (opt-in VULVATAR_FUSION_ROLLORI=1, default
+            // OFF): the mesh channel's eye-line tilt where the full
+            // orientation obs is gated out (head_ori.rs docs).
+            if let Some(rori) = self.head_ori.estimate_roll_ori(
+                &base,
+                &occl,
+                &fk_pred.r[self.h.j.head],
+                self.h.j.head,
+            ) {
+                obs.ori.push(rori);
+            }
         }
 
         // ---- dense surface (primary metric observation) ----------------------

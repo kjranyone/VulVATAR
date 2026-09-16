@@ -168,8 +168,22 @@ pub fn body_kp2d(
     let w = width as f64;
     let h = height as f64;
     let abl_no_headkp = std::env::var_os("VULVATAR_ABL_NOHEADKP").is_some();
+    // Face-kp subset ablations (bench attribution of the rest-roll bias):
+    // which of nose / eyes / ears carries the systematic roll torque.
+    // Indices: 0 nose, 1/2 eyes, 3/4 ears.
+    let abl_drop = |i: usize| -> bool {
+        if i >= 5 {
+            return false;
+        }
+        std::env::var_os("VULVATAR_ABL_NONOSE").is_some() && i == 0
+            || std::env::var_os("VULVATAR_ABL_NOEYES").is_some() && (1..=2).contains(&i)
+            || std::env::var_os("VULVATAR_ABL_NOEARS").is_some() && (3..=4).contains(&i)
+    };
     for (i, kp) in kps.iter().enumerate() {
         if abl_no_headkp && i < 5 {
+            continue;
+        }
+        if abl_drop(i) {
             continue;
         }
         let Some(Some(point)) = map.points.get(i) else {

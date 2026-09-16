@@ -137,10 +137,41 @@ s1789279985 のみ 61→27 snap・yaw sd 79.5→47.8・root max 2.04→0.92 m �
   σ 膨張 (facing 0→−0.15 で ×1→×4、以下は従来通り棄却) に置換。ナイフエッジ
   (0.25 だけで roll +40°→+14°) を構造的に除去。`VULVATAR_HEAD_CULL_FACING` は
   棄却下限のまま。
-- **安静時 roll バイアス**: 静止セッションの head_roll 平均 −3〜−6° (2026-09-16
-  実測、上記変更でも不変)。推定器側か FaceMesh テンプレート vs モデル頭部形状の
-  オフセットかは未調査 — 次手は ori obs なしの静止録画での roll 分布と
-  canonical_face テンプレートの幾何突き合わせ。
+- ~~**安静時 roll バイアス**~~ → 2026-09-16 夜に機構解明 (下記) + roll 専用 ori 観測
+  を実装。**デスク本番環境では mesh チャネル自体が不発火 (conf ~0 / 推論なし) なので
+  バイアス −4〜−6° は残る** — 根本修正は顔サイト幾何の per-user 較正 (下記残課題)。
+
+  **機構 (2026-09-16 監査、ピクセル GT 付き)**:
+  - 生フレームの目視 GT (vision reader を合成画像で較正 ±0°、4 セッション):
+    真の eye-line 傾きは +8/−1.5/0/+3° とセッション毎に違い、**est は常に
+    −1〜−9° (平均 −5°) 負側にずれ**。mesh チャネル roll (ランドマーク 33/263 の
+    画像傾き) は GT ±3° 以内で正確。
+  - est−mesh チャネル差は 3 セッションで **−6.1〜−6.5° でほぼ一定** (HEADREF 拡張
+    `VULVATAR_REPLAY_HEADREF`、`body_eye_tilt` 追加、`diagnostics/fusion/headref4_p1c`)。
+  - ablation (`VULVATAR_ABL_NOHEADKP/NOEYES/NOEARS/NONOSE/NOMESH`、
+    `diagnostics/fusion/ablp1c_*`): **eye 2D kp 単独が原因** — NOEYES で両検証
+    セッションとも GT まで回復 (+1.2→+5.7 vs GT+8、−5.8→+6.5 vs GT+3)。
+    nose/ears/mesh attach/3D lift/dense は中立。
+  - 機構: OBSDUMP (frame dump) で model eye サイト射影の傾き +8.4° vs 観測 kp 傾き
+    +5.0°@est roll +1.2° — 頭 yaw ~29° × pitch 誤差 (~+12° vs mesh チャネル) の
+    **射影交絡項 (+7° 相当) を roll DOF が吸収**。モデル顔サイト幾何 (eye y+0.09/
+    ear y+0.07/nose y+0.055) とユーザー解剖 (実測 ear-eye 落ち ~0.8cm vs モデル 2cm)
+    のズレが残差を生み、斜め視点で roll/pitch に分配される。
+  - **実装 (既定 OFF、`VULVATAR_FUSION_ROLLORI=1` で有効)**:
+    `HeadOriTracker::estimate_roll_ori` (head_ori.rs) — mesh チャネルの
+    eye-line tilt と現在予測の roll 差だけを forward 軸回転の OriObs として注入
+    (yaw/pitch 残差は厳密に 0、契約テスト付き)。full ori 不発火帧のみ、conf ≥ 0.2・
+    手遮蔽 cooldown 準拠、|Δ| ≤ 0.15 rad (トリム用)。`VULVATAR_ROLLORI_SIGMA` σ 上書き、
+    `VULVATAR_ROLLORI_DUMP` 発火ログ。
+  - **なぜ既定 OFF か (2026-09-16 実測)**: ① mesh チャネルの利用可能性がボトルネック
+    — s1789246660 で候補 10/782 帧 (conf≥0.2 + cooldown)、s1789234881 は手が顔前に
+    ある 595/600 帧、s1789246212/s1789303569 は mesh 推論自体なし。② 発火帧でも
+    補正は eye kp + 事前に負けて roll 軌跡が全桁不変 (σ 0.005 まで確認)。③ その上で
+    ソルバ搅乱で snap +3〜8 (12 録画 116/15.6/36 vs 基準 108/15.6/35、|err| は同一)。
+    正面・良照明・手が離れた場面 (mesh が常時走る) でのみ意味があるため opt-in。
+  - **残課題 (次の根本修正)**: 顔サイト (l/r_eye, l/r_ear, nose) のローカルオフセット
+    を per-user 学習 (FaceFit の scale+offset と同じ EMA 系) — pitch/roll バイアスの
+    both を消す。デスク環境の roll は eye kp 由来のままなので、これが本命。
 
 ## P2 — 指角度観測の較正 (`VULVATAR_FUSION_ANG=1`)
 
