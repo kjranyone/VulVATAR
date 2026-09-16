@@ -266,9 +266,17 @@ impl Yolo26PoseInference {
             for (i, slot) in joints.iter_mut().take(17).enumerate() {
                 let [x, y, c] = kps[i];
                 let score = ((c as f64 * score_gain) as f32).min(1.0);
+                // RAW normalised coords, deliberately NOT clamped to [0,1]:
+                // the provider's out-of-frame gate reads `nx`/`ny` against a
+                // ±5% tolerance and zeroes keypoints the detector hallucinate
+                // past the frame edge (measured RTMW3D-era: elbows/wrists at
+                // nx 1.12 with sharp scores). Clamping here would pin those
+                // exactly ON the border — inside the tolerance, invisible to
+                // the gate — so they'd carry their overconfident score into
+                // the solve and onto the preview wipe as border dots.
                 *slot = DecodedJoint {
-                    nx: (x / w).clamp(0.0, 1.0),
-                    ny: (y / h).clamp(0.0, 1.0),
+                    nx: x / w,
+                    ny: y / h,
                     nz: 0.0,
                     score,
                     sx,
