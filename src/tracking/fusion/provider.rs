@@ -1757,11 +1757,15 @@ impl FusionProvider {
         // normal (radial from the head centre) faces away from the camera
         // is on the far side of the head and cannot be a real observation.
         if std::env::var_os("VULVATAR_ABL_NOCULL").is_none() {
-            // Facing threshold for the cull below. −0.15 was the original
-            // lenient value; at 3/4-view (head yaw 60°+ replay s1789349575)
-            // the retained far eye/ear sat 19–22 px off the model with a
-            // sign pattern that torques yaw, feeding a ~13 Hz head shake.
-            // `VULVATAR_HEAD_CULL_FACING` sweeps it.
+            // Continuous far-side de-weighting (2026-09-16, replaces the
+            // binary cull): a landmark still on the near hemisphere but
+            // turning away gets its σ inflated smoothly up to ×4 at the
+            // old cull edge, instead of a knife-edge drop at a single
+            // threshold — sweeping the old binary threshold showed the
+            // discontinuity (0.25 alone flipped one replay's head roll
+            // +40°→+14° while 0.20/0.35 were unchanged). Below
+            // `facing_min` (still `VULVATAR_HEAD_CULL_FACING`, −0.15) the
+            // landmark remains dropped: it cannot be a real observation.
             let facing_min = std::env::var("VULVATAR_HEAD_CULL_FACING")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
@@ -1778,36 +1782,64 @@ impl FusionProvider {
                 let to_cam = normalize(scale(pw, -1.0));
                 dot(n, to_cam)
             };
+            // σ multiplier for a still-visible landmark (None = drop).
+            let facing_weight = |facing: f64| -> Option<f64> {
+                if facing >= 0.0 {
+                    Some(1.0)
+                } else if facing > facing_min {
+                    Some(1.0 + 3.0 * (facing / facing_min))
+                } else {
+                    None
+                }
+            };
             let h = &self.h;
             let pred = &pred;
             let fkp = &fk_pred;
-            obs.kp2d.retain(|k| {
+            let head_pw = |k: &super::estimator::Kp2d| -> Option<V3> {
                 use super::estimator::ModelPoint;
-                let pw = match k.point {
-                    ModelPoint::Site(sid) if head_sites.contains(&sid) => fkp.site[sid],
+                match k.point {
+                    ModelPoint::Site(sid) if head_sites.contains(&sid) => Some(fkp.site[sid]),
                     ModelPoint::Attached { joint, local } if joint == h.j.head => {
                         let _ = pred;
-                        add(fkp.t[joint], mat_vec(&fkp.r[joint], local))
+                        Some(add(fkp.t[joint], mat_vec(&fkp.r[joint], local)))
                     }
-                    _ => return true,
-                };
-                facing_of(pw) > facing_min
-            });
-            obs.kp3d.retain(|k| {
+                    _ => None,
+                }
+            };
+            let head_pw3 = |k: &super::estimator::Kp3d| -> Option<V3> {
                 use super::estimator::ModelPoint;
-                let pw = match k.point {
+                match k.point {
                     // Site-based head points (nose / eyes / ears lifted by
-                    // `body_kp3d`) need the same far-side cull as the 2-D
-                    // ones: the detector places the hidden ear on the
+                    // `body_kp3d`) need the same far-side treatment as the
+                    // 2-D ones: the detector places the hidden ear on the
                     // silhouette, where the depth belongs to the NEAR side
                     // of the head.
-                    ModelPoint::Site(sid) if head_sites.contains(&sid) => fkp.site[sid],
+                    ModelPoint::Site(sid) if head_sites.contains(&sid) => Some(fkp.site[sid]),
                     ModelPoint::Attached { joint, local } if joint == h.j.head => {
-                        add(fkp.t[joint], mat_vec(&fkp.r[joint], local))
+                        Some(add(fkp.t[joint], mat_vec(&fkp.r[joint], local)))
                     }
-                    _ => return true,
-                };
-                facing_of(pw) > facing_min
+                    _ => None,
+                }
+            };
+            obs.kp2d.retain_mut(|k| match head_pw(k) {
+                Some(pw) => match facing_weight(facing_of(pw)) {
+                    Some(w) => {
+                        k.sigma *= w;
+                        true
+                    }
+                    None => false,
+                },
+                None => true,
+            });
+            obs.kp3d.retain_mut(|k| match head_pw3(k) {
+                Some(pw) => match facing_weight(facing_of(pw)) {
+                    Some(w) => {
+                        k.sigma *= w;
+                        true
+                    }
+                    None => false,
+                },
+                None => true,
             });
         }
 

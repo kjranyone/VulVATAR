@@ -125,15 +125,22 @@ s1789279985 のみ 61→27 snap・yaw sd 79.5→47.8・root max 2.04→0.92 m �
 
 ## P1 — 頭の残課題 (横顔)
 
-- **頭 tilt 中の過小応答**: 頭を傾けている最中に FaceMesh conf が落ち、
-  顔サイト σ が 17 px まで膨張して eye line 信号がほぼ消える
-  (GT 往復利得 0.1–0.4)。conf 低下時の膨張率を (1+2·conf) から緩い曲線に
-  するか、conf の下限クランプを検討。悪化時は 29 録画ベンチで
-  胴 |err| が HK=0.5 の成果 (156°→74°) を毀損しないことを確認すること。
-- **遠側 eye/ear の連続的 σ 膨張**: far-side cull の二値閾値はナイフエッジ
-  (0.25 の一点だけ roll +40°→+14°、0.20/0.35 は不変)。facing 値に比例した
-  σ 膨張に置き換える。`VULVATAR_HEAD_CULL_FACING` で現状を再現可能。
-- 安静時 roll バイアス +5〜10° の残存。
+**2026-09-16: a./b. 実施・コミット済み** (12 録画ベンチ YOLO11 基準 108/15.6/35 に対し
+108/15.7/35 で全良観測セッション全指標中立、s1789279985 の頭/胴 yaw sd 85.5→19.4
+・head yaw sd max 93→18.7 改善。validate_gt (Yumeka) の roll 往復利得は合成レンダ
+では σ が cap に届かず変化なし — cap の効果は実機 tilt でのみ発現):
+
+- ~~**頭 tilt 中の過小応答**~~ → 顔 kp σ に cap (既定 8 px、`VULVATAR_FACE_KP_MAX_PX`)。
+  tilt 中は SimCC の spread × score-inflate が ~17 px まで膨張して eye line が消える
+  のを防ぐ (信頼時 σ ~3-4 px は cap に触れない)。
+- ~~**遠側 eye/ear の連続的 σ 膨張**~~ → far-side cull の二値閾値を facing 比例の
+  σ 膨張 (facing 0→−0.15 で ×1→×4、以下は従来通り棄却) に置換。ナイフエッジ
+  (0.25 だけで roll +40°→+14°) を構造的に除去。`VULVATAR_HEAD_CULL_FACING` は
+  棄却下限のまま。
+- **安静時 roll バイアス**: 静止セッションの head_roll 平均 −3〜−6° (2026-09-16
+  実測、上記変更でも不変)。推定器側か FaceMesh テンプレート vs モデル頭部形状の
+  オフセットかは未調査 — 次手は ori obs なしの静止録画での roll 分布と
+  canonical_face テンプレートの幾何突き合わせ。
 
 ## P2 — 指角度観測の較正 (`VULVATAR_FUSION_ANG=1`)
 

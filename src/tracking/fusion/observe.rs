@@ -197,6 +197,21 @@ pub fn body_kp2d(
             // past ~30° head yaw just like the dense mesh — the caller
             // widens them whenever a better head-position anchor exists.
             sigma *= head_scale;
+            // Tilt protection: while the head tilts the SimCC peak
+            // flattens and the score drops, and spread × score-inflate
+            // has been measured reaching ~17 px — the eye-line signal
+            // dies and head roll under-responds (validate_gt round-trip
+            // gain ~0.2–0.4 on ±25° rolls, 2026-09-16 baseline). Cap the
+            // uncertainty-driven blow-up; the confident-detection σ
+            // (~3–4 px incl. head_scale) is far below the cap, so this
+            // only bites during tilt/occlusion. `VULVATAR_FACE_KP_MAX_PX`
+            // overrides (0 = no cap).
+            let cap = std::env::var("VULVATAR_FACE_KP_MAX_PX")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(8.0);
+            sigma = sigma.min(cap);
         }
         out.push(Kp2d {
             point: *point,

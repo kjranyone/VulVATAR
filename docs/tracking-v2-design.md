@@ -211,7 +211,8 @@ E = Σ ρ_C(‖π(J(x)) − u‖²/σ²)      2D 再投影 (body / face 重心 /
 | `VULVATAR_FUSION_OLDSIGMA` | σ 再表現前の gain/floor/base (1.0 / 1.5 px / 1.0) |
 | `VULVATAR_FUSION_NO_{SURF,3D,BURNIN,REACH,CHESTYAW}` | 各項の無効化 |
 | `VULVATAR_HEAD_KP_SCALE` | SimCC 顔 kp σ 膨張の倍率 (既定 0.5) |
-| `VULVATAR_HEAD_CULL_FACING` | 頭 far-side cull の facing 閾値 (既定 -0.15) |
+| `VULVATAR_FACE_KP_MAX_PX` | 顔 kp (鼻/目/耳) σ の cap。既定 8 px (tilt 中の spread×score-inflate 膨張 ~17 px から eye line を守る)。0 で無効 |
+| `VULVATAR_HEAD_CULL_FACING` | 頭 far-side 棄却の facing 下限 (既定 -0.15)。2026-09-16 から下限までの連続 σ 膨張 (×1→×4) に置換 (二値 cull のナイフエッジ除去) |
 | `VULVATAR_Q_HEAD` | 頭ジョイントのプロセスノイズ q (既定 0.15 = trunk と同一) |
 | `VULVATAR_HAND_SIGMA_SCALE` | 手ランドマーク σ の倍率 (既定 1.0) |
 | `VULVATAR_FUSION_NO_WHOLD` / `VULVATAR_FUSION_WHOLD_SIGMA` | 未観測手首ホールドの無効化 / σ (m) (§3.8) |
