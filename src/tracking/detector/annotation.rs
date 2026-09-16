@@ -14,6 +14,7 @@ pub(super) fn build_annotation(joints: &[DecodedJoint]) -> DetectionAnnotation {
         keypoints,
         skeleton: coco_body_edges(),
         bounding_box: None,
+        hand_crops: [None, None],
     }
 }
 

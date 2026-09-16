@@ -352,9 +352,24 @@ pub struct PreviewFrame {
 #[derive(Clone, Debug, Default)]
 pub struct DetectionAnnotation {
     /// Keypoints as (x, y, confidence) in normalised [0, 1] image coords.
+    /// COCO-Wholebody layout: body 0..17, feet 17..23, face 23..91,
+    /// left hand 91..112, right hand 112..133.
     pub keypoints: Vec<(f32, f32, f32)>,
     /// Skeleton line connections as pairs of keypoint indices.
     pub skeleton: Vec<(usize, usize)>,
     /// Bounding box (min_x, min_y, max_x, max_y) in normalised coords.
     pub bounding_box: Option<(f32, f32, f32, f32)>,
+    /// Per-hand observability: the crop each hand landmarker ran on
+    /// (normalised x, y, w, h) and the lock presence, `[left, right]`.
+    /// `None` = no crop attempted / no lock this frame.
+    pub hand_crops: [Option<HandCropDiag>; 2],
+}
+
+/// One hand-landmarker attempt, as surfaced on the preview wipe.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HandCropDiag {
+    /// Crop rect in normalised frame coords (x, y, w, h).
+    pub rect: (f32, f32, f32, f32),
+    /// Landmarker presence for the best attempt on this crop (0..1).
+    pub presence: f32,
 }

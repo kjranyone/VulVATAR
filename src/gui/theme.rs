@@ -128,6 +128,37 @@ pub mod viz {
     pub fn bbox() -> Color32 {
         Color32::from_rgba_unmultiplied(255, 220, 80, 200)
     }
+    /// Hand-landmarker keypoints / edges — a distinct hue so the hand
+    /// stage reads separately from the body skeleton on the wipe.
+    pub fn hand_keypoint() -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 120, 60, 220)
+    }
+    pub fn hand_bone() -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 120, 60, 130)
+    }
+    /// Hand-crop diagnostic rect (what the hand stage looked at).
+    pub fn hand_crop() -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 120, 60, 90)
+    }
+    /// Wipe status badge text (drawn on a dark plate).
+    pub fn wipe_badge() -> Color32 {
+        Color32::from_rgba_unmultiplied(220, 228, 235, 230)
+    }
+    pub fn wipe_badge_plate() -> Color32 {
+        Color32::from_rgba_unmultiplied(10, 12, 16, 170)
+    }
+
+    /// Keypoint colour with the confidence baked into the alpha, so a dot
+    /// visually encodes how sure the inference was — a 0.2 detection
+    /// reads fainter than a 0.9 one on the wipe.
+    pub fn keypoint_graded(conf: f32) -> Color32 {
+        let c = conf.clamp(0.0, 1.0);
+        Color32::from_rgba_unmultiplied(0, 255, 128, (90.0 + 140.0 * c) as u8)
+    }
+    pub fn hand_keypoint_graded(conf: f32) -> Color32 {
+        let c = conf.clamp(0.0, 1.0);
+        Color32::from_rgba_unmultiplied(255, 120, 60, (90.0 + 140.0 * c) as u8)
+    }
 
     // ── Empty-viewport furniture ──────────────────────────────────
     pub const GRID: Color32 = Color32::from_rgb(45, 45, 55);

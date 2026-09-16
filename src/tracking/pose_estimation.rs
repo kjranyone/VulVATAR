@@ -102,6 +102,7 @@ pub fn estimate_pose(rgb_data: &[u8], width: u32, height: u32, frame_index: u64)
             skin_max_x as f32 / w,
             skin_max_y as f32 / h,
         )),
+            hand_crops: [None, None],
     };
 
     PoseEstimate {

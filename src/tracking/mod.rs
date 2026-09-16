@@ -28,7 +28,7 @@ pub use devices::{
     camera_resolution_index_for, d400_product_name, enumerate_cameras, usable_capture_device,
     usb_link_too_slow, CameraDeviceInfo,
 };
-pub use mailbox::{DetectionAnnotation, MailboxSnapshot, PreviewFrame, TrackingMailbox};
+pub use mailbox::{DetectionAnnotation, HandCropDiag, MailboxSnapshot, PreviewFrame, TrackingMailbox};
 pub use source_skeleton::{
     CameraIntrinsics, FacePose, FaceSource, MetricFrameInfo, SourceExpression, SourceJoint,
     SourceSkeleton,

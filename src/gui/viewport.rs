@@ -686,7 +686,6 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                         // ── Detection annotations ──────────────────────
                         if state.viewport.show_detection_annotations {
                             if let Some(ref ann) = state.viewport.camera_wipe_annotation {
-                                let kpt_color = viz::keypoint();
                                 let line_color = viz::bone();
                                 let bb_color = viz::bbox();
 
@@ -697,14 +696,29 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 };
                                 let map_y = |ny: f32| pip_rect.top() + ny * pip_rect.height();
 
-                                for &(kx, ky, conf) in &ann.keypoints {
+                                // Confidence-graded dots: radius AND alpha
+                                // encode the calibrated score, so the wipe
+                                // shows not just WHERE the inference placed
+                                // a joint but HOW sure it was. Hands get
+                                // their own hue — they come from a separate
+                                // stage (the hand landmarker) than the body
+                                // block (the pose detector).
+                                let mut drawn_kps = 0usize;
+                                for (i, &(kx, ky, conf)) in ann.keypoints.iter().enumerate() {
                                     if conf < 0.1 {
                                         continue;
                                     }
+                                    drawn_kps += 1;
+                                    let hand = i >= 91;
+                                    let color = if hand {
+                                        viz::hand_keypoint_graded(conf)
+                                    } else {
+                                        viz::keypoint_graded(conf)
+                                    };
                                     painter.circle_filled(
                                         egui::pos2(map_x(kx), map_y(ky)),
-                                        3.0,
-                                        kpt_color,
+                                        2.0 + 1.5 * conf,
+                                        color,
                                     );
                                 }
 
@@ -724,6 +738,57 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     }
                                 }
 
+                                // Hand topology: MediaPipe's 21-landmark
+                                // chain (wrist → 5 finger rays), drawn per
+                                // hand block so the landmarker's output is
+                                // readable as a hand, not 21 loose dots.
+                                const HAND_EDGES: [(usize, usize); 21] = [
+                                    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7),
+                                    (7, 8), (5, 9), (9, 10), (10, 11), (11, 12), (9, 13),
+                                    (13, 14), (14, 15), (15, 16), (13, 17), (17, 18), (18, 19),
+                                    (19, 20), (0, 17),
+                                ];
+                                for base in [91usize, 112] {
+                                    for &(a, b) in &HAND_EDGES {
+                                        let (ia, ib) = (base + a, base + b);
+                                        let (Some(&(ax, ay, ac)), Some(&(bx, by, bc))) = (
+                                            ann.keypoints.get(ia),
+                                            ann.keypoints.get(ib),
+                                        ) else {
+                                            continue;
+                                        };
+                                        if ac >= 0.1 && bc >= 0.1 {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(map_x(ax), map_y(ay)),
+                                                    egui::pos2(map_x(bx), map_y(by)),
+                                                ],
+                                                egui::Stroke::new(1.0, viz::hand_bone()),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Hand-crop diagnostics: what the hand
+                                // stage looked at this frame, with the lock
+                                // presence — a rect that fades with a weak
+                                // lock makes "tried and barely saw a hand"
+                                // visible at a glance.
+                                for crop in ann.hand_crops.iter().flatten() {
+                                    let (cx, cy, cw, ch) = crop.rect;
+                                    let (px1, px2) = (map_x(cx), map_x(cx + cw));
+                                    let (py1, py2) = (map_y(cy), map_y(cy + ch));
+                                    let r = egui::Rect::from_min_max(
+                                        egui::pos2(px1.min(px2), py1.min(py2)),
+                                        egui::pos2(px1.max(px2), py1.max(py2)),
+                                    );
+                                    painter.rect_stroke(
+                                        r,
+                                        0.0,
+                                        egui::Stroke::new(1.0, viz::hand_crop()),
+                                    );
+                                }
+
                                 if let Some((bx1, by1, bx2, by2)) = ann.bounding_box {
                                     let px1 = map_x(bx1);
                                     let py1 = map_y(by1);
@@ -739,6 +804,42 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                         egui::Stroke::new(1.5, bb_color),
                                     );
                                 }
+
+                                // Status badge under the PIP: how many
+                                // keypoints survived the gates, and the
+                                // hand stage's lock presence per side.
+                                let hand_label = |slot: Option<&crate::tracking::HandCropDiag>| {
+                                    match slot {
+                                        Some(c) => format!("{:.2}", c.presence),
+                                        None => "–".to_string(),
+                                    }
+                                };
+                                let badge = format!(
+                                    "kp {drawn_kps}/{}  hand L {} R {}",
+                                    ann.keypoints.len(),
+                                    hand_label(ann.hand_crops[0].as_ref()),
+                                    hand_label(ann.hand_crops[1].as_ref()),
+                                );
+                                let badge_pos = egui::pos2(
+                                    pip_rect.left(),
+                                    pip_rect.bottom() + 4.0,
+                                );
+                                let font = egui::FontId::monospace(9.0);
+                                let galley = painter.layout_no_wrap(
+                                    badge.clone(),
+                                    font.clone(),
+                                    viz::wipe_badge(),
+                                );
+                                let plate = egui::Rect::from_min_size(
+                                    badge_pos,
+                                    galley.size() + egui::vec2(6.0, 4.0),
+                                );
+                                painter.rect_filled(plate, 2.0, viz::wipe_badge_plate());
+                                painter.galley(
+                                    badge_pos + egui::vec2(3.0, 2.0),
+                                    galley,
+                                    viz::wipe_badge(),
+                                );
                             }
                         }
                     }

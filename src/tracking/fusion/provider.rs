@@ -2166,8 +2166,10 @@ impl FusionProvider {
         // keypoints now that no wholebody detector fills them. The GUI
         // wipe plots every entry with score ≥ 0.1, so without this the
         // hands vanished from the preview overlay after the YOLO26 swap.
+        // The crop rects ride along as observability: what the hand
+        // stage looked at, and how confidently it locked.
         fill_hand_annotation(
-            &mut base.annotation.keypoints,
+            &mut base.annotation,
             &self.last_hands,
             width,
             height,
@@ -2359,20 +2361,34 @@ fn dump_obs_post_solve(
 /// carries the crop's presence; a slot without a hand result keeps its
 /// zero-score entries (nothing drawn).
 fn fill_hand_annotation(
-    keypoints: &mut [(f32, f32, f32)],
+    annotation: &mut crate::tracking::DetectionAnnotation,
     hands: &[Option<super::hands::HandResult>; 2],
     width: u32,
     height: u32,
 ) {
     const SLOT0: [usize; 2] = [91, 112];
     let (w, h) = (width as f32, height as f32);
-    for (hand_res, slot0) in hands.iter().zip(SLOT0) {
+    for ((hand_res, slot0), crop_slot) in hands
+        .iter()
+        .zip(SLOT0)
+        .zip(annotation.hand_crops.iter_mut())
+    {
         let Some(res) = hand_res else { continue };
         for (k, p) in res.px.iter().enumerate() {
-            if let Some(slot) = keypoints.get_mut(slot0 + k) {
+            if let Some(slot) = annotation.keypoints.get_mut(slot0 + k) {
                 *slot = (p[0] / w, p[1] / h, res.presence);
             }
         }
+        let (cx, cy, size) = res.crop;
+        *crop_slot = Some(crate::tracking::HandCropDiag {
+            rect: (
+                (cx / w).max(0.0),
+                (cy / h).max(0.0),
+                (size / w).min(1.0),
+                (size / h).min(1.0),
+            ),
+            presence: res.presence,
+        });
     }
 }
 
@@ -2387,26 +2403,36 @@ mod hand_annotation_tests {
             presence: 0.8,
             ..Default::default()
         };
-        // Wrist and pinky tip at 640x480 → normalised frame coords.
+        // Wrist and pinky tip at 640x480 → normalised frame coords; the
+        // crop is the left half of the frame.
         res.px[0] = [64.0, 48.0, 0.0];
         res.px[20] = [320.0, 240.0, 0.0];
+        res.crop = (0.0, 0.0, 320.0);
         hands[0] = Some(res);
 
-        let mut kps = vec![(0.0f32, 0.0f32, 0.0f32); 133];
-        fill_hand_annotation(&mut kps, &hands, 640, 480);
+        let mut ann = crate::tracking::DetectionAnnotation {
+            keypoints: vec![(0.0f32, 0.0f32, 0.0f32); 133],
+            ..Default::default()
+        };
+        ann.keypoints = vec![(0.0, 0.0, 0.0); 133];
+        fill_hand_annotation(&mut ann, &hands, 640, 480);
 
-        assert_eq!(kps[91], (0.1, 0.1, 0.8), "left block starts at 91 (wrist)");
-        assert_eq!(kps[91 + 20], (0.5, 0.5, 0.8));
+        assert_eq!(ann.keypoints[91], (0.1, 0.1, 0.8), "left block starts at 91 (wrist)");
+        assert_eq!(ann.keypoints[91 + 20], (0.5, 0.5, 0.8));
         // Right block and body block stay zero without results.
-        assert_eq!(kps[112], (0.0, 0.0, 0.0));
-        assert_eq!(kps[0], (0.0, 0.0, 0.0));
+        assert_eq!(ann.keypoints[112], (0.0, 0.0, 0.0));
+        assert_eq!(ann.keypoints[0], (0.0, 0.0, 0.0));
+        // The crop rect rides along for the wipe.
+        let crop = ann.hand_crops[0].expect("left crop diag");
+        assert_eq!(crop.rect, (0.0, 0.0, 0.5, 2.0f32 / 3.0), "crop rect normalised");
+        assert_eq!(crop.presence, 0.8);
 
         hands[1] = Some(crate::tracking::fusion::hands::HandResult {
             presence: 0.4,
             ..Default::default()
         });
-        fill_hand_annotation(&mut kps, &hands, 640, 480);
-        assert_eq!(kps[112], (0.0, 0.0, 0.4), "right block starts at 112");
+        fill_hand_annotation(&mut ann, &hands, 640, 480);
+        assert_eq!(ann.keypoints[112], (0.0, 0.0, 0.4), "right block starts at 112");
     }
 }
 
