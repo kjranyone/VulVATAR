@@ -558,6 +558,27 @@ impl Estimator {
                 (*p, s2)
             })
             .collect();
+        // Junk-burst guard: the dense cloud is sampled from the depth
+        // person-mask, which is produced by the SAME detector pipeline
+        // whose sparse keypoints we can watch. When the previous frame's
+        // sparse residual was already at lost-level (> `lost_rms_px`),
+        // the mask is not trustworthy either — during such bursts the
+        // cloud has been measured covering room walls (1 657 points at
+        // z≈3.2 m) and dragging the root 1.8→3.2 m into a permanent lock
+        // (s1789279985 frames 150–209). Drop the cloud for that frame;
+        // the temporal prior carries the pose through the burst instead
+        // of a hard `mark_lost` reset. `VULVATAR_FUSION_NO_JUNKCLOUD=1`
+        // disables.
+        static JUNKCLOUD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let junkcloud = *JUNKCLOUD.get_or_init(|| {
+            std::env::var_os("VULVATAR_FUSION_NO_JUNKCLOUD").is_none()
+        });
+        if junkcloud
+            && self.last_t.is_some()
+            && self.diag.med_sparse_2d_px > self.params.lost_rms_px
+        {
+            self.surf_pts.clear();
+        }
 
         // ---- bootstrap: no temporal prior yet → seed the root from the torso
         // hint and fit the sparse terms with a wide (near-L2) kernel first, so

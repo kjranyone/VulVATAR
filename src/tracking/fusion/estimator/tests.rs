@@ -623,3 +623,61 @@ fn two_stage_locks_freeze_their_stages() {
     let moved = (0..n).any(|k| est.arm_param[k] && d[k].abs() > 1e-6);
     assert!(moved, "arm stage moved no arm DoF — lock set too broad?");
 }
+
+#[test]
+fn junk_cloud_gate_drops_cloud_after_lost_level_sparse_frame() {
+    // The dense cloud comes from the same person-mask pipeline as the
+    // sparse keypoints: after a frame whose sparse residual was at
+    // lost level (> `lost_rms_px`), the next frame must not ingest the
+    // cloud (measured: junk bursts feeding wall points, root locking
+    // 1.8→3.2 m). Contract: prev-frame med_sparse_2d_px > threshold ⇒
+    // this frame solves with zero cloud points.
+    let h = Humanoid::new();
+    let m = &h.model;
+    let gt = gt_state(&h);
+    let intr = intr();
+    let make_obs = |junk: bool, t: f64| {
+        // Junk pattern: alternate ±60 px — no rigid model motion explains
+        // it, so the sparse residual stays at lost level after the solve.
+        let kp2d = observe(m, &gt, intr, 1.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut k)| {
+                if junk {
+                    k.u += if i % 2 == 0 { 100.0 } else { -100.0 };
+                }
+                k
+            })
+            .collect::<Vec<_>>();
+        FrameObs {
+            t,
+            intr: Some(intr),
+            kp2d,
+            kp3d: Vec::new(),
+            angles: Vec::new(),
+            ori: Vec::new(),
+            shoulder_yaw: None,
+            torso_hint: None,
+            surface: surface_from_capsules_parts(m, &gt, 12, None),
+            surf_allow: Vec::new(),
+        }
+    };
+    let mut est = Estimator::new(m, Params::default());
+    est.state.root_t = [0.0, 0.3, 1.5];
+    // Frame 1: sparse keypoints offset far past lost level, cloud present.
+    est.update(m, &make_obs(true, 0.0));
+    assert!(
+        est.diag.med_sparse_2d_px > 40.0,
+        "fixture must reach lost level, med_sparse {}",
+        est.diag.med_sparse_2d_px
+    );
+    assert!(est.diag.n_cloud > 0);
+    // Frame 2: same junk — the gate must drop the cloud for this frame.
+    est.update(m, &make_obs(true, 1.0 / 30.0));
+    assert_eq!(est.diag.n_cloud, 0, "junk-cloud gate did not fire");
+    // And with a clean frame following (sparse back at pixel level), the
+    // cloud is re-ingested on the frame after that.
+    est.update(m, &make_obs(false, 2.0 / 30.0));
+    est.update(m, &make_obs(false, 3.0 / 30.0));
+    assert!(est.diag.n_cloud > 0, "gate stayed closed on clean frames");
+}
