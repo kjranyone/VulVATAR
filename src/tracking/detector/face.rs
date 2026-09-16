@@ -6,7 +6,7 @@
 //!
 //! `pitch_from_vertical_ratio` reads the SimCC face-68 block (indices
 //! 23..=90) when a detector provides it and falls back to the legacy
-//! inter-eye pitch otherwise — the YOLO11 body-17 path always takes the
+//! inter-eye pitch otherwise — the YOLO26 body-17 path always takes the
 //! fallback.
 
 use super::super::{FacePose, FaceSource};

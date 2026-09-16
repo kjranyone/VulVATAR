@@ -10,7 +10,7 @@ use log::info;
 
 use crate::tracking::metric_frame::MetricDepthFrame;
 use crate::tracking::provider::{PoseProvider, TrackingPipelineConfig};
-use crate::tracking::detector::yolo11::Yolo11PoseInference;
+use crate::tracking::detector::yolo26::Yolo26PoseInference;
 use crate::tracking::detector::DetectorOptions;
 use crate::tracking::source_skeleton::CameraIntrinsics;
 use crate::tracking::{DetectionAnnotation, PoseEstimate, SourceSkeleton};
@@ -185,7 +185,7 @@ enum DetectorSlot {
     /// bench / validate_gt), safe mode, active session recording, and
     /// `VULVATAR_NO_PIPELINE=1`. Bit-identical to the pre-pipelining
     /// behaviour.
-    Inline(Yolo11PoseInference),
+    Inline(Yolo26PoseInference),
     /// The detector runs on the `tracking-detect` thread
     /// ([`detector_thread::DetectorClient`]) so it overlaps the solver
     /// stage; `estimate_pose_latest` is the live entry point.
@@ -309,7 +309,7 @@ impl FusionProvider {
                 Err(_) => return Err("detector thread died during model load".to_string()),
             }
         } else {
-            let mut detector = Yolo11PoseInference::from_models_dir_with_options(dir, opts)?;
+            let mut detector = Yolo26PoseInference::from_models_dir_with_options(dir, opts)?;
             let label = detector.backend().label();
             let warnings = detector.take_load_warnings();
             (
@@ -331,7 +331,7 @@ impl FusionProvider {
             }
         };
         info!(
-            "Fusion provider ready (YOLO11-pose {}{})",
+            "Fusion provider ready (YOLO26-pose {}{})",
             backend_label,
             if remote { ", pipelined" } else { "" }
         );
@@ -447,7 +447,7 @@ impl PoseProvider for FusionProvider {
             DetectorSlot::Inline(detector) => detector.backend().label(),
             DetectorSlot::Remote { backend_label, .. } => backend_label.clone(),
         };
-        format!("Fusion v2 / YOLO11-pose {backend}")
+        format!("Fusion v2 / YOLO26-pose {backend}")
     }
 
     fn take_load_warnings(&mut self) -> Vec<String> {

@@ -127,14 +127,14 @@ will invalidate that cache and trigger a rebuild.
 ## Tracking (fusion estimator)
 
 - 本番プロバイダは `FusionProvider` (`src/tracking/fusion/provider.rs`) の一本のみ。ファクトリは `create_pose_provider` (`src/tracking/provider.rs`、`inference` feature 経由)。現行仕様は `docs/tracking-v2-design.md` (As-Is のみ、経緯は書かない)。
-- **姿勢検出器は YOLO11-pose** (`src/tracking/detector/yolo11.rs`、body-17 を COCO-Wholebody 133 の他ブロック score 0 で満たす)。重みソース `yolo11{n,s}-pose.pt` はリポジトリ直下だが**実行には ONNX エクスポートが要る** (`models/` は ignore 済みでエクスポート物は commit されない)。新環境での手順:
+- **姿勢検出器は YOLO26-pose** (`src/tracking/detector/yolo26.rs`、body-17 を COCO-Wholebody 133 の他ブロック score 0 で満たす)。重みソース `yolo26{n,s}-pose.pt` はリポジトリ直下だが**実行には ONNX エクスポートが要る** (`models/` は ignore 済みでエクスポート物は commit されない)。新環境での手順:
   ```bash
   python -m venv "$TEMP/yolo_export_venv"
   "$TEMP/yolo_export_venv/Scripts/pip" install ultralytics onnx onnxslim
-  "$TEMP/yolo_export_venv/Scripts/python" -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt').export(format='onnx', imgsz=480, opset=17, simplify=True)"
-  mv yolo11n-pose.onnx models/yolo11n-pose_480.onnx   # ファイル名の _480 が入力サイズの契約
+  "$TEMP/yolo_export_venv/Scripts/python" -c "from ultralytics import YOLO; YOLO('yolo26n-pose.pt').export(format='onnx', imgsz=480, opset=17, simplify=True)"
+  mv yolo26n-pose.onnx models/yolo26n-pose_480.onnx   # ファイル名の _480 が入力サイズの契約
   ```
-  無い場合 tracking は「YOLO11-pose model not found」でブロッキングエラーになる。実測 (2026-09-16, s1789360037 リプレイ, 無競合): 検出ステージ中央値 6.6ms (RTMW3D 時 13.8ms)、provider 全体 19.7ms、尾も 390ms→50ms に縮む。
+  無い場合 tracking は「YOLO26-pose model not found」でブロッキングエラーになる。実測 (2026-09-16, 無競合): 単体ベンチ (diagnose_yolo26_pose, s1789360037 261f, DirectML) 中央値 5.1ms / p95 19ms、fusion リプレイの provider 全体 ~20-30ms = 実効 30Hz 以上 (RTMW3D 時は検出 ~14ms・全体 ~30ms・尾 390ms)。4録画 (デスク+正面3) の品質は YOLO11n と互角だが session 毎に優劣が分かれる (namaste 被覆ストレスは 26 が劣位 std 30° vs 15° — 既知の崩壊症例、ライブwatch項目)。
 - **主観測は密深度表面点**: シルエット内部をサンプリングした点群 (~1,300 点 @640×480, stride 8) をカプセルモデル表面までの距離で拘束 (Cauchy×GNC、AABB 事前棄却、trunk/head 優先)。2D キーポイントは表面だけでは決まらない自由度 (左右の判別・表面に沿う位置・手) の補助に降格している。腕は既定で表面主張に参加しない (`VULVATAR_DENSE_ARMS` で有効化)、脚はシルエット高さと膝追跡の条件付き、手は常に除外。
 - オフライン検証: `cargo run --bin diagnose_fusion_replay -- <dir> [out_dir] [--render N] [--avatar]`
   (`*_color.png` + `*_depth_mm.npy` ペアのディレクトリを食う = `diagnostics/depth/*_replay` と sequence recorder の `diagnostics/sessions/<id>`。出力先の既定は `diagnostics/fusion/<dirname>`)。

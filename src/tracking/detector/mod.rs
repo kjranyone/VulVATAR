@@ -1,4 +1,4 @@
-//! The pose detector stage: Ultralytics YOLO11-pose (single-stage
+//! The pose detector stage: Ultralytics YOLO26-pose (single-stage
 //! whole-frame person + COCO-17) plus the shared perception pieces every
 //! detector feeds — the 133-entry COCO-Wholebody keypoint record, the
 //! MediaPipe face-cascade orchestration, and the DirectML/CPU session
@@ -6,8 +6,8 @@
 //!
 //! Replaced RTMW3D (SimCC wholebody, 2026-09): the fusion estimator's
 //! contract (`DetectorAux` — 133 keypoints + FaceMesh landmarks + person
-//! crop) is unchanged; YOLO11 fills the body-17 block and the estimator's
-//! visibility calibration takes over the rest. See `yolo11.rs` for the
+//! crop) is unchanged; YOLO26 fills the body-17 block and the estimator's
+//! visibility calibration takes over the rest. See `yolo26.rs` for the
 //! score/σ calibration notes and `docs/tracking-v2-design.md` for the
 //! estimator side.
 
@@ -20,7 +20,7 @@ pub(crate) mod face;
 #[cfg(feature = "inference")]
 pub(crate) mod session;
 #[cfg(feature = "inference")]
-pub(crate) mod yolo11;
+pub(crate) mod yolo26;
 
 /// Which ONNX Runtime execution provider the session ended up on.
 /// Surfaced to the GUI so users can tell whether the GPU path is active
@@ -51,7 +51,7 @@ impl InferenceBackend {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DetectorAux {
     /// 133 COCO-Wholebody keypoints, whole-frame normalised `[0,1]`.
-    /// YOLO11 fills the body 17; every other block carries score 0,
+    /// YOLO26 fills the body 17; every other block carries score 0,
     /// which the estimator's gates treat as absent.
     pub joints: Vec<decode::DecodedJoint>,
     /// FaceMesh 478 landmarks in frame pixels (`z` in pixel scale) and
@@ -71,7 +71,7 @@ pub struct DetectorOptions {
     pub face_ep: crate::tracking::face_mediapipe::FaceMeshEp,
     /// Run the detector and FaceMesh on the CPU EP, keeping DirectML —
     /// and therefore the GPU driver's compute queue — completely out of
-    /// the tracking pipeline. YOLO11-pose is fast enough on CPU (~34 ms)
+    /// the tracking pipeline. YOLO26-pose is fast enough on CPU (~34 ms)
     /// for this to be a usable degraded mode.
     pub force_cpu: bool,
 }

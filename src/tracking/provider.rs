@@ -1,7 +1,7 @@
 //! Pose provider boundary.
 //!
 //! `TrackingWorker` talks to this module instead of binding directly to
-//! a specific model. There is a single production pipeline: YOLO11-pose
+//! a specific model. There is a single production pipeline: YOLO26-pose
 //! perception feeding the fusion estimator. Metric depth is supplied
 //! externally by a RealSense D435 (`set_external_depth`); without it
 //! the estimator still runs on 2-D keypoints alone.
@@ -102,7 +102,7 @@ pub trait PoseProvider {
     }
 }
 
-/// Build the production pose provider: YOLO11-pose, shaped by the user's
+/// Build the production pose provider: YOLO26-pose, shaped by the user's
 /// pipeline configuration. Metric depth, when present, is fed in
 /// externally via [`PoseProvider::set_external_depth`].
 pub fn create_pose_provider(
@@ -122,7 +122,7 @@ pub fn create_pose_provider(
 }
 
 /// Live-tracking variant of [`create_pose_provider`]: runs the detector
-/// stage (YOLO11-pose + FaceMesh) on its own thread so it overlaps the solver
+/// stage (YOLO26-pose + FaceMesh) on its own thread so it overlaps the solver
 /// stage — live tracking is camera-paced, and the two stages together
 /// (~48 ms) exceed the 33 ms frame period while each alone does not.
 /// The pair with [`PoseProvider::estimate_pose_latest`].

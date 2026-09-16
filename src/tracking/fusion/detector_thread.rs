@@ -1,7 +1,7 @@
 //! Detector-side thread of the pipelined fusion provider.
 //!
 //! Live tracking is camera-paced at 30 fps while the detector stage
-//! (letterbox + the DirectML YOLO11-pose run + decode +
+//! (letterbox + the DirectML YOLO26-pose run + decode +
 //! FaceMesh) costs ~29 ms and the solver stage (visibility, hand crops,
 //! dense surface, the fusion estimator, output) another ~19 ms — run
 //! serially on one thread they cap the published pose rate at
@@ -54,7 +54,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use crate::tracking::detector::yolo11::Yolo11PoseInference;
+use crate::tracking::detector::yolo26::Yolo26PoseInference;
 use crate::tracking::detector::{DetectorAux, DetectorOptions};
 use crate::tracking::{PoseEstimate, SourceSkeleton, DetectionAnnotation};
 
@@ -70,7 +70,7 @@ pub(crate) struct DetectorReady {
 pub(crate) struct DetectorJob {
     pub frame_index: u64,
     /// Device capture timestamp (ms), forwarded to
-    /// `Yolo11PoseInference::set_frame_timestamp_ms`.
+    /// `Yolo26PoseInference::set_frame_timestamp_ms`.
     pub ts_ms: Option<f64>,
     pub rgb: Arc<Vec<u8>>,
     pub width: u32,
@@ -91,7 +91,7 @@ pub(crate) struct DetectorResult {
 
 enum Request {
     Job(DetectorJob),
-    /// Apply `Yolo11PoseInference::reset_temporal_state`; acknowledged with a
+    /// Apply `Yolo26PoseInference::reset_temporal_state`; acknowledged with a
     /// `frame_index == u64::MAX` result.
     Reset,
 }
@@ -175,7 +175,7 @@ impl DetectorClient {
             std::thread::Builder::new()
                 .name("tracking-detect".into())
                 .spawn(move || {
-                    match Yolo11PoseInference::from_models_dir_with_options(models_dir, opts) {
+                    match Yolo26PoseInference::from_models_dir_with_options(models_dir, opts) {
                         Ok(mut detector) => {
                             let _ = ready_tx.send(Ok(DetectorReady {
                                 backend_label: detector.backend().label(),
@@ -279,7 +279,7 @@ impl Drop for DetectorClient {
 /// the freshest job, publish results. Exits when `stop` is set and no
 /// request is pending.
 fn run_detector(
-    mut detector: Yolo11PoseInference,
+    mut detector: Yolo26PoseInference,
     requests: &Cell<Request>,
     results: &Cell<DetectorResult>,
     stop: &Mutex<bool>,
