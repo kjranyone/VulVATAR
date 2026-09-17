@@ -52,6 +52,11 @@ pub struct HandResult {
     /// attribution (a prediction crop over desk pixels can hallucinate
     /// a coherent hand); the provider sets it.
     pub src: u8,
+    /// Distilled presence-classifier score on the wrist-centred window,
+    /// when the net ran for this candidate (the veto path or the
+    /// provider's palm re-score). Unlike the SimCC sharpness in
+    /// `presence`, this is calibrated and crop-size independent.
+    pub net_presence: Option<f32>,
 }
 
 pub struct HandLandmarker {
@@ -228,6 +233,8 @@ pub struct RtmposeHand {
     /// Optional distilled presence classifier; absent → presence falls
     /// back to the SimCC sharpness proxy (unreliable — see PresenceNet).
     presence_net: Option<PresenceNet>,
+    /// Full-frame wrist proposals (optional export, see [`PalmNet`]).
+    palm_net: Option<PalmNet>,
     /// Inverts the chirality→handedness mapping (`VULVATAR_HAND_CHIRALITY_FLIP=1`).
     chirality_flip: bool,
 }
@@ -256,6 +263,157 @@ struct PresenceNet {
 }
 
 const PRESENCE_NET_FILE: &str = "rtmpose-hand-presence_64.onnx";
+
+/// Full-frame palm proposal net: a 16×16 wrist heatmap distilled from the
+/// same MP labels as the presence classifier, run on the letterboxed full
+/// frame (the `yolo_pose::letterbox` contract — grey 114, centred pads).
+/// This is what turns acquisition from heuristic crops (wrist / face-below
+/// / predicted) into actual detections: the case it exists for is the hand
+/// the body detector never sees (chin pose, hands entering the frame
+/// edge). Optional — without the export the chain keeps heuristics only.
+struct PalmNet {
+    session: Session,
+    input_name: String,
+    tensor: Array4<f32>,
+}
+
+const PALM_NET_FILE: &str = "rtmpose-hand-palm_256.onnx";
+const PALM_GRID: usize = 16;
+const PALM_CELL: f32 = 256.0 / PALM_GRID as f32;
+
+impl PalmNet {
+    fn try_from_models_dir(dir: &Path) -> Option<Self> {
+        let path = dir.join(PALM_NET_FILE);
+        if !path.is_file() {
+            return None;
+        }
+        let (session, _backend) = build_session(&path.to_string_lossy(), 1, "RTMPose-hand-palm").ok()?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        Some(Self {
+            session,
+            input_name,
+            tensor: Array4::zeros((1, 3, 256, 256)),
+        })
+    }
+
+    /// Wrist proposals in frame pixels: `[score, x, y]`, best first, top 3,
+    /// 3×3 local-max + parabolic sub-cell refine — the same decode the
+    /// trainer validates (`scratchpad/train_hand_palm.py::peaks`).
+    fn detect(&mut self, rgb: &[u8], width: u32, height: u32) -> Vec<[f32; 3]> {
+        use crate::tracking::detector::yolo_pose::letterbox;
+        let thresh = std::env::var("VULVATAR_HAND_PALM_THRESH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5);
+        self.tensor = letterbox(rgb, width, height, 256);
+        let input = match TensorRef::from_array_view(&self.tensor) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("hand-palm: tensor ref failed: {e}");
+                return Vec::new();
+            }
+        };
+        let Some(outputs) = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])
+            .ok()
+        else {
+            return Vec::new();
+        };
+        let Some(out) = outputs.get("heat") else {
+            return Vec::new();
+        };
+        let Ok((_, data)) = out.try_extract_tensor::<f32>() else {
+            return Vec::new();
+        };
+        if data.len() < PALM_GRID * PALM_GRID {
+            return Vec::new();
+        }
+        let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
+        let mut hm = [[0.0f32; PALM_GRID]; PALM_GRID];
+        for y in 0..PALM_GRID {
+            for x in 0..PALM_GRID {
+                hm[y][x] = sig(data[y * PALM_GRID + x]);
+            }
+        }
+        // 3×3 local maxima above threshold, NMS'd at 2 cells, top 3.
+        let mut cand: Vec<(f32, usize, usize)> = Vec::new();
+        for y in 0..PALM_GRID {
+            for x in 0..PALM_GRID {
+                let v = hm[y][x];
+                if v < thresh {
+                    continue;
+                }
+                let mut is_max = true;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let (ny, nx) = (y as i32 + dy, x as i32 + dx);
+                        if ny < 0 || nx < 0 || ny >= PALM_GRID as i32 || nx >= PALM_GRID as i32 {
+                            continue;
+                        }
+                        if hm[ny as usize][nx as usize] > v {
+                            is_max = false;
+                        }
+                    }
+                }
+                if is_max {
+                    cand.push((v, y, x));
+                }
+            }
+        }
+        cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut picked: Vec<[f32; 3]> = Vec::new();
+        for (v, y, x) in cand {
+            if picked
+                .iter()
+                .any(|p| (p[2] - y as f32).powi(2) + (p[1] - x as f32).powi(2) < 4.0)
+            {
+                continue;
+            }
+            // parabolic sub-cell refine (clamped ±0.5), mirroring the trainer
+            let refine = |l: f32, m: f32, r: f32| {
+                let den = l - 2.0 * m + r;
+                if den.abs() < 1e-6 {
+                    0.0
+                } else {
+                    (0.5 * (l - r) / den).clamp(-0.5, 0.5)
+                }
+            };
+            let dx = if x > 0 && x + 1 < PALM_GRID {
+                refine(hm[y][x - 1], hm[y][x], hm[y][x + 1])
+            } else {
+                0.0
+            };
+            let dy = if y > 0 && y + 1 < PALM_GRID {
+                refine(hm[y - 1][x], hm[y][x], hm[y + 1][x])
+            } else {
+                0.0
+            };
+            let tx = (x as f32 + dx + 0.5) * PALM_CELL;
+            let ty = (y as f32 + dy + 0.5) * PALM_CELL;
+            // un-letterbox (same geometry letterbox() applied)
+            let r = (256.0 / width as f32).min(256.0 / height as f32);
+            let nw = (width as f32 * r).round();
+            let nh = (height as f32 * r).round();
+            let pad_x = ((256.0 - nw) / 2.0).max(0.0);
+            let pad_y = ((256.0 - nh) / 2.0).max(0.0);
+            let fx = (tx - pad_x) / r;
+            let fy = (ty - pad_y) / r;
+            if !(0.0..width as f32).contains(&fx) || !(0.0..height as f32).contains(&fy) {
+                continue;
+            }
+            picked.push([v, fx, fy]);
+            if picked.len() >= 3 {
+                break;
+            }
+        }
+        picked
+    }
+}
 
 impl PresenceNet {
     fn try_from_models_dir(dir: &Path) -> Option<Self> {
@@ -349,6 +507,7 @@ impl RtmposeHand {
                  falling back to the SimCC sharpness proxy"
             );
         }
+        let palm_net = PalmNet::try_from_models_dir(dir);
         info!(
             "RTMPose hand model ready ({}, input '{}x{}', chirality_flip {})",
             path.display(),
@@ -362,6 +521,7 @@ impl RtmposeHand {
             size,
             tensor: Array4::<f32>::zeros((1, 3, size as usize, size as usize)),
             presence_net,
+            palm_net,
             chirality_flip,
         }))
     }
@@ -443,28 +603,16 @@ impl RtmposeHand {
             px[j][0] = refine_peak(xs, ix) / bins as f32;
             px[j][1] = refine_peak(ys, iy) / bins as f32;
         }
-        // Presence = SimCC sharpness median. The distilled classifier can
-        // additionally VETO candidates it scores as confidently-not-hand:
-        // `VULVATAR_HAND_PRESENCE_VETO=<threshold>` enables it with a
-        // sigmoid threshold (0.03 default when set bare). Desk-background
-        // windows score ~0.00 while sliver hand windows hold ~0.5+, so the
-        // veto separates them with a wide margin.
-        let presence_veto = std::env::var("VULVATAR_HAND_PRESENCE_VETO")
-            .ok()
-            .map(|v| if v.is_empty() { 0.03 } else { v.parse().unwrap_or(0.03) });
-        // The veto scores the wrist-centred sub-window: the decoded wrist
-        // is where the "hand" claim lives, and a small window there sees
-        // fingers vs sleeve/skin without the scene context that lets the
-        // full-crop view confound the classifier (faces dominate it).
-        if let Some(veto_below) = presence_veto {
-            if let Some(net) = self.presence_net.as_mut() {
-                let wrist_px = [x0 + px[0][0] * size, _y0 + px[0][1] * size];
-                match net.score(rgb, width, height, wrist_px, size) {
-                    Some(s) if s < veto_below => return None,
-                    _ => {}
-                }
-            }
-        }
+        // Presence = SimCC sharpness median (crop-size dependent, and
+        // ANTI-correlated with correctness on wrong-window decodes). The
+        // provider re-scores every accepted candidate with the distilled
+        // presence net — peak-centred for palm proposals, decoded-wrist
+        // centred for the rest — which is calibrated and separates real
+        // hands (~0.5-0.99) from cuff/face decodes (~0.00) with a wide
+        // margin. Keeping the net call in the provider avoids scoring it
+        // twice per candidate and lets palm candidates use the peak as the
+        // window centre (the decoded wrist sits ~40 px off it on the chin
+        // pose, which put the window on forearm fabric).
         let mut out = HandResult {
             presence: median(&mut sharp).clamp(0.0, 1.0),
             crop,
@@ -525,6 +673,33 @@ impl RtmposeHand {
         }
         out.handedness = chirality_handedness(&out.px, self.chirality_flip);
         Some(out)
+    }
+
+    /// Re-score a palm-proposal result with the distilled presence net and
+    /// OVERWRITE its presence with the calibrated score. The window is
+    /// centred on the PALM HEATMAP PEAK (the detection), not the decoded
+    /// wrist: SimCC decodes the chin-pose wrist ~40 px off the peak, and a
+    /// window there sees forearm fabric — measured 0.00 net vs 0.89
+    /// peak-centred on the same frames. SimCC sharpness is additionally
+    /// crop-size dependent, so for palm proposals the net is the presence
+    /// authority, full stop. `false` leaves the result untouched.
+    pub fn rescore_presence(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        res: &mut HandResult,
+        centre: [f32; 2],
+    ) -> bool {
+        let Some(net) = self.presence_net.as_mut() else {
+            return false;
+        };
+        let Some(s) = net.score(rgb, width, height, centre, res.crop.2) else {
+            return false;
+        };
+        res.net_presence = Some(s);
+        res.presence = s;
+        true
     }
 }
 
@@ -636,6 +811,34 @@ impl HandBackend {
         match self {
             Self::MediaPipe(m) => m.estimate(rgb, width, height, crop),
             Self::Rtmpose(r) => r.estimate(rgb, width, height, crop),
+        }
+    }
+
+    /// Full-frame wrist proposals `[score, x, y]` from the palm heatmap,
+    /// best first. `None` when the backend has no palm net (MediaPipe, or
+    /// the export is missing) — callers fall back to heuristic crops.
+    pub fn palm_peaks(&mut self, rgb: &[u8], width: u32, height: u32) -> Option<Vec<[f32; 3]>> {
+        match self {
+            Self::MediaPipe(_) => None,
+            Self::Rtmpose(r) => r.palm_net.as_mut().map(|p| p.detect(rgb, width, height)),
+        }
+    }
+
+    /// Calibrated presence re-score for a palm-proposal result, window
+    /// centred on `centre` (the palm peak; see
+    /// [`RtmposeHand::rescore_presence`]). No-op `false` on backends
+    /// without the distilled net.
+    pub fn rescore_presence(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        res: &mut super::hands::HandResult,
+        centre: [f32; 2],
+    ) -> bool {
+        match self {
+            Self::MediaPipe(_) => false,
+            Self::Rtmpose(r) => r.rescore_presence(rgb, width, height, res, centre),
         }
     }
 

@@ -5,6 +5,11 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+
+/// Aggregate palm-candidate outcome tallies for `VULVATAR_HAND_PALM_DEBUG`:
+/// [proposed, depth-gate reject, handedness reject, passed all gates].
+static PALM_TALLY: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 
 use log::info;
 
@@ -1051,6 +1056,28 @@ impl FusionProvider {
             depth.as_ref().map(|d| d.points_m.as_slice());
         let mut hand_done = [false; 2];        self.last_hands = [None, None];
         if let Some(hl) = self.hands.as_mut() {
+            // Palm-net proposals: ONE full-frame pass per frame (rtmpose
+            // backend with the heatmap export; free for MediaPipe). This is
+            // the acquisition source for hands the body detector never
+            // sees — the chin pose, hands entering the frame edge.
+            // `VULVATAR_HAND_NO_PALM=1` disables.
+            let palm_peaks = if std::env::var_os("VULVATAR_HAND_NO_PALM").is_none() {
+                let peaks = hl.palm_peaks(rgb_data, width, height).unwrap_or_default();
+                if std::env::var_os("VULVATAR_HAND_PALM_DEBUG").is_some() {
+                    static PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let n = PC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 40 {
+                        info!(
+                            "hand-palm peaks frame{n}: {} peaks {:?}",
+                            peaks.len(),
+                            peaks.iter().take(3).map(|p| (p[0], p[1], p[2])).collect::<Vec<_>>()
+                        );
+                    }
+                }
+                peaks
+            } else {
+                Vec::new()
+            };
             for hand in 0..2 {
                 // Gate anchor: the body-detector wrist is a MEASUREMENT that
                 // tracks a raised arm even while no hand lock exists, so
@@ -1084,13 +1111,27 @@ impl FusionProvider {
                 } else {
                     self.h.j.r_wrist
                 }];
+                let p_elbow = fk_pred.t[if hand == 0 {
+                    self.h.j.l_elbow
+                } else {
+                    self.h.j.r_elbow
+                }];
                 let had_lock = self.prev_hands[hand].is_some();
                 // Depth-consistency gate. Tiered by evidence: an established
                 // lock continues on the loose band; escalation candidates
                 // (temporal backing lost mid-scan) sit tight against the FK
                 // wrist; fresh acquisition must corroborate against the
-                // measured body wrist when one exists.
-                let hand_gate = |px: [f32; 2], ci: usize| -> bool {
+                // measured body wrist when one exists. Palm-net proposals
+                // get their own tier: they exist for the poses where the FK
+                // wrist prior is WRONG (the chin hand, hands entering the
+                // frame), so demanding FK proximity would reject exactly the
+                // detections this net is for — they pass on the measured
+                // body wrist OR a loose FK band instead.
+                let palm_gate_tol_m: f64 = std::env::var("VULVATAR_HAND_PALM_GATE_TOL_M")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.45);
+                let hand_gate = |px: [f32; 2], ci: usize, palm: bool, net_presence: f32| -> bool {
                     if !hand_depth_gate {
                         return true;
                     }
@@ -1126,6 +1167,58 @@ impl FusionProvider {
                         + (p[1] - p_fk[1]).powi(2)
                         + (p[2] - p_fk[2]).powi(2))
                     .sqrt();
+                    if palm {
+                        // Palm-net detections must clear the measured body
+                        // wrist OR carry strong calibrated presence when
+                        // only the (lag-prone) FK prior corroborates. A cuff
+                        // within 0.45 m of the FK wrist on a handless
+                        // recording otherwise locks (measured: 48 L locks on
+                        // desk_nohands vs MP's 20). The forearm ray covers
+                        // the forward-extended hand (wave/palms/namaste):
+                        // the real hand sits ON the elbow→wrist direction
+                        // past the wrist, metres from the wrist POINT in
+                        // 3D, because the hand is simply closer to the
+                        // camera.
+                        let ok_meas = meas_anchor
+                            .map(|a| {
+                                ((p[0] - a[0]).powi(2)
+                                    + (p[1] - a[1]).powi(2)
+                                    + (p[2] - a[2]).powi(2))
+                                .sqrt()
+                                    <= 0.25
+                            })
+                            .unwrap_or(false);
+                        if ok_meas {
+                            return true;
+                        }
+                        if net_presence >= 0.70 {
+                            if d_fk <= palm_gate_tol_m {
+                                return true;
+                            }
+                            // distance from p to the elbow→wrist ray
+                            let (w, e) = (p_fk, p_elbow);
+                            let dir = [w[0] - e[0], w[1] - e[1], w[2] - e[2]];
+                            let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+                            if len2 > 1e-9 {
+                                let rel = [
+                                    p[0] - w[0],
+                                    p[1] - w[1],
+                                    p[2] - w[2],
+                                ];
+                                let t = (rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2])
+                                    / len2;
+                                if t >= -0.5 {
+                                    let perp2 = (rel[0] * rel[0] + rel[1] * rel[1]
+                                        + rel[2] * rel[2])
+                                        - t * t * len2;
+                                    if perp2 <= 0.20 * 0.20 {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        return d_fk <= 0.25 && net_presence >= 0.50;
+                    }
                     if ci == 0 && had_lock {
                         return d_fk <= hand_depth_tol_m;
                     }
@@ -1195,14 +1288,126 @@ impl FusionProvider {
                 {
                     candidates.push(c);
                 }
+                // Palm-net crops, last: these are unverified detections, so
+                // they only run when every FK-anchored crop missed — which
+                // is exactly the acquisition case they exist for. Peaks are
+                // assigned to the slot whose FK wrist projects nearest (a
+                // shared peak never seeds both hands), sized from the MP
+                // crop statistics this net was distilled from (crop size
+                // 0.26-0.62 × frame width, wrist at (0.71, 0.74) of the
+                // crop; oversize-biased — RTMPose degrades gracefully on a
+                // loose crop and badly on a tight one).
+                // Everything at this index or beyond is palm-sourced; the
+                // optional heuristics above shift the index every frame, so
+                // the palm tier can NEVER be keyed on the candidate count.
+                let palm_from = candidates.len();
+                let mut palm_peak: Option<[f32; 2]> = None;
+                if !palm_peaks.is_empty() {
+                    let other = 1 - hand;
+                    let p_self = intr.project(fk_pred.t[if hand == 0 {
+                        self.h.j.l_wrist
+                    } else {
+                        self.h.j.r_wrist
+                    }]);
+                    let p_other = intr.project(fk_pred.t[if other == 0 {
+                        self.h.j.l_wrist
+                    } else {
+                        self.h.j.r_wrist
+                    }]);
+                    if let (Some(a), Some(b)) = (p_self, p_other) {
+                        let d = |pk: &[f32; 3], p: [f64; 2]| {
+                            (pk[1] as f64 - p[0]).powi(2) + (pk[2] as f64 - p[1]).powi(2)
+                        };
+                        let mut mine: Vec<&[f32; 3]> = palm_peaks
+                            .iter()
+                            .filter(|pk| {
+                                let (d0, d1) = (d(pk, a), d(pk, b));
+                                if hand == 0 {
+                                    d0 <= d1
+                                } else {
+                                    d1 < d0
+                                }
+                            })
+                            .collect();
+                        mine.sort_by(|x, y| y[0].partial_cmp(&x[0]).unwrap_or(std::cmp::Ordering::Equal));
+                        // Top peak only — the runner-up is usually the other
+                        // hand (assigned to the opposite slot) or scene
+                        // clutter the RTMPose+presence chain would have to
+                        // burn calls on.
+                        if let Some(pk) = mine.first() {
+                            palm_peak = Some([pk[1], pk[2]]);
+                            for frac in [0.30f32, 0.50] {
+                                let sz = frac * width as f32;
+                                candidates.push((
+                                    pk[1] - 0.71 * sz,
+                                    pk[2] - 0.74 * sz,
+                                    sz,
+                                ));
+                            }
+                        }
+                    }
+                }
                 let mut best: Option<super::hands::HandResult> = None;
+                let palm_debug = std::env::var_os("VULVATAR_HAND_PALM_DEBUG").is_some();
                 for (ci, crop) in candidates.into_iter().enumerate() {
+                    let is_palm = ci >= palm_from;
+                    if is_palm {
+                        PALM_TALLY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if palm_debug && is_palm {
+                        static PDB: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let n = PDB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 80 {
+                            info!(
+                                "hand-palm cand hand{hand} ci{ci} crop ({:.0},{:.0},{:.0})",
+                                crop.0, crop.1, crop.2
+                            );
+                        }
+                    }
                     if let Some(mut res) = hl.estimate(rgb_data, width, height, crop) {
                         res.src = ci as u8;
+                        // Presence authority: the calibrated net. Palm
+                        // proposals are scored at the PEAK (the decoded
+                        // wrist sits ~40 px off it on the chin pose — its
+                        // window reads forearm fabric), every other
+                        // candidate at its decoded wrist (the net's training
+                        // modality). This replaces the SimCC sharpness,
+                        // which is crop-size dependent and anti-correlated
+                        // with correctness on wrong-window decodes — the
+                        // pre-net nohands hallucinations locked at
+                        // sharpness 0.83.
+                        if is_palm {
+                            if let Some(pk) = palm_peak {
+                                hl.rescore_presence(rgb_data, width, height, &mut res, pk);
+                            }
+                        } else {
+                            let c = [res.px[0][0], res.px[0][1]];
+                            hl.rescore_presence(rgb_data, width, height, &mut res, c);
+                        }
                         // Depth-consistency veto (see the anchor note above):
                         // reject candidates whose wrist pixel sits at an
                         // inconsistent surface.
-                        if !hand_gate([res.px[0][0], res.px[0][1]], ci) {
+                        let gate_px = if is_palm {
+                            palm_peak.unwrap_or([res.px[0][0], res.px[0][1]])
+                        } else {
+                            [res.px[0][0], res.px[0][1]]
+                        };
+                        if !hand_gate(gate_px, ci, is_palm, res.presence) {
+                            if is_palm {
+                                PALM_TALLY[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if palm_debug && is_palm {
+                                static PDG: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                let n = PDG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 80 {
+                                    info!(
+                                        "hand-palm reject hand{hand} ci{ci} depth-gate wrist ({:.0},{:.0}) presence {:.2}",
+                                        res.px[0][0], res.px[0][1], res.presence
+                                    );
+                                }
+                            }
                             continue;
                         }
                         // Handedness veto: a slot must never lock onto the opposing hand
@@ -1213,8 +1418,48 @@ impl FusionProvider {
                         } else {
                             res.handedness < 0.30
                         };
-                        if wrong_hand {
+                        // Palm proposals with strong calibrated presence
+                        // skip the hard veto: RTMPose's 2D chirality cannot
+                        // tell palm from back and reads the chin-pose fist
+                        // at the OPPOSITE pole from MediaPipe's learned head
+                        // (measured: 935 high-net rejects on desk_chin, MP
+                        // locks the same hand in the same slot at ≈0.15).
+                        // The duplicate-lock vote + FK slot assignment still
+                        // arbitrate cross-locks downstream. The bar sits at
+                        // 0.85: nohands cuff decodes reach net 0.5-0.7 and
+                        // double-locked both slots there (4 dupes vs MP's
+                        // 0), while the true chin hand's net median is 0.89.
+                        let chirality_trusted = !(is_palm && res.presence >= 0.85);
+                        if wrong_hand && chirality_trusted {
+                            if is_palm {
+                                PALM_TALLY[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if palm_debug && is_palm {
+                                static PDH: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                let n = PDH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 80 {
+                                    info!(
+                                        "hand-palm reject hand{hand} ci{ci} handedness {:.2} presence {:.2}",
+                                        res.handedness, res.presence
+                                    );
+                                }
+                            }
                             continue;
+                        }
+                        if is_palm {
+                            PALM_TALLY[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if palm_debug {
+                                static PDP: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                let n = PDP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 80 {
+                                    info!(
+                                        "hand-palm pass hand{hand} ci{ci} presence {:.2} (lock needs 0.6, publish 0.5)",
+                                        res.presence
+                                    );
+                                }
+                            }
                         }
                         // Candidate acceptance. An ESTABLISHED lock
                         // continues on its own re-crop (candidate 0) at a
@@ -1222,9 +1467,17 @@ impl FusionProvider {
                         // genuine hands, so a per-frame best-of scan
                         // re-rolls the window lottery every frame —
                         // measured as 57 px median wrist jumps on a
-                        // clasped-hands recording. Fresh ACQUISITION still
-                        // demands lock-grade (≥0.6) evidence.
-                        if had_lock && ci == 0 && res.presence >= 0.40 {
+                        // clasped-hands recording. The bar must sit UNDER
+                        // the hover floor: a scan that falls through to the
+                        // detector/predicted crops decodes the wrist tens of
+                        // px off the re-crop decode, and the src flip-flop
+                        // alone produced 23 wrist snaps on the chin session
+                        // (vs MP's 4). Fresh ACQUISITION still demands
+                        // lock-grade (≥0.6) evidence.
+                        //
+                        // (the rescore above already gave the re-crop its
+                        // calibrated presence).
+                        if had_lock && ci == 0 && res.presence >= 0.50 {
                             best = Some(res);
                             break;
                         }
@@ -1300,9 +1553,15 @@ impl FusionProvider {
                             // passes through.
                             if let Some(prev) = self.prev_hands[hand].as_ref() {
                                 for (p, q) in res.px.iter_mut().zip(prev.px.iter()) {
+                                    // The fresh-take threshold sits above the
+                                    // crop-decode disagreement (~110-190 px,
+                                    // see the src flip note on candidate 0) so
+                                    // a candidate switch blends instead of
+                                    // snapping, while genuinely fast hand
+                                    // motion still converges in ~2 frames.
                                     let jump =
                                         ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
-                                    let a = if jump > 80.0 { 1.0 } else { 0.5 };
+                                    let a = if jump > 200.0 { 1.0 } else { 0.5 };
                                     p[0] = a * p[0] + (1.0 - a) * q[0];
                                     p[1] = a * p[1] + (1.0 - a) * q[1];
                                 }
@@ -1316,7 +1575,7 @@ impl FusionProvider {
                             self.hand_acq_streak[hand] += 1;
                         }
                     }
-                    Some(res) if res.presence >= 0.45 && self.hand_hold[hand] < 3 => {
+                    Some(res) if res.presence >= 0.20 && self.hand_hold[hand] < 3 => {
                         match self.prev_hands[hand].as_ref() {
                             // Established lock: hold through the soft read.
                             Some(prev) => {
@@ -1341,6 +1600,22 @@ impl FusionProvider {
                         self.hand_acq_streak[hand] = 0;
                         self.hand_hold[hand] = 0;
                     }
+                }
+            }
+            if std::env::var_os("VULVATAR_HAND_PALM_DEBUG").is_some() {
+                static T_FRAME: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let f = T_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if f % 240 == 239 {
+                    use std::sync::atomic::Ordering::Relaxed as R;
+                    info!(
+                        "hand-palm tally frame{}: cand {} depth_rej {} handed_rej {} pass {}",
+                        f + 1,
+                        PALM_TALLY[0].load(R),
+                        PALM_TALLY[1].load(R),
+                        PALM_TALLY[2].load(R),
+                        PALM_TALLY[3].load(R),
+                    );
                 }
             }
             // Duplicate lock: with the hands clasped or crossing, both
