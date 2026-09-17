@@ -277,8 +277,16 @@ impl PresenceNet {
         })
     }
 
-    fn score(&mut self, rgb: &[u8], width: u32, height: u32, crop: (f32, f32, f32)) -> Option<f32> {
+    /// Score a wrist-centred sub-window (the training modality): a small
+    /// window around the decoded wrist contains fingers vs sleeve/skin and
+    /// stays free of the scene context that dominates the full crop.
+    fn score(&mut self, rgb: &[u8], width: u32, height: u32, wrist: [f32; 2], base: f32) -> Option<f32> {
         use crate::tracking::detector::yolo_pose::fill_crop_tensor;
+        let sub = (base * 0.35).max(48.0);
+        let crop = (wrist[0] - sub / 2.0, wrist[1] - sub / 2.0, sub);
+        if crop.0 > width as f32 || crop.1 > height as f32 {
+            return None;
+        }
         fill_crop_tensor(rgb, width, height, crop, &mut self.tensor);
         let input = match TensorRef::from_array_view(&self.tensor) {
             Ok(v) => v,
@@ -303,18 +311,6 @@ impl PresenceNet {
                     "hand-presence: logit {logit:.3} presence {p:.3} at ({:.0},{:.0}) size {:.0}",
                     crop.0, crop.1, crop.2
                 );
-                // Dump the exact classifier input as a P6 PPM so the
-                // python side can score the identical pixels.
-                let view = self.tensor.view();
-                let mut ppm = format!("P6\n64 64\n255\n").into_bytes();
-                for y in 0..64 {
-                    for x in 0..64 {
-                        for c in 0..3 {
-                            ppm.push((view[[0, c, y, x]].clamp(0.0, 1.0) * 255.0) as u8);
-                        }
-                    }
-                }
-                let _ = std::fs::write(format!("scratchpad/presence_dbg_{n:03}.ppm"), ppm);
             }
         }
         Some(p)
@@ -456,9 +452,14 @@ impl RtmposeHand {
         let presence_veto = std::env::var("VULVATAR_HAND_PRESENCE_VETO")
             .ok()
             .map(|v| if v.is_empty() { 0.03 } else { v.parse().unwrap_or(0.03) });
+        // The veto scores the wrist-centred sub-window: the decoded wrist
+        // is where the "hand" claim lives, and a small window there sees
+        // fingers vs sleeve/skin without the scene context that lets the
+        // full-crop view confound the classifier (faces dominate it).
         if let Some(veto_below) = presence_veto {
             if let Some(net) = self.presence_net.as_mut() {
-                match net.score(rgb, width, height, crop) {
+                let wrist_px = [x0 + px[0][0] * size, _y0 + px[0][1] * size];
+                match net.score(rgb, width, height, wrist_px, size) {
                     Some(s) if s < veto_below => return None,
                     _ => {}
                 }
