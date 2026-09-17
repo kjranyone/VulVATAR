@@ -225,6 +225,9 @@ pub struct RtmposeHand {
     /// Square model input side (from the `_NNN` filename convention).
     size: u32,
     tensor: Array4<f32>,
+    /// Optional distilled presence classifier; absent → presence falls
+    /// back to the SimCC sharpness proxy (unreliable — see PresenceNet).
+    presence_net: Option<PresenceNet>,
     /// Inverts the chirality→handedness mapping (`VULVATAR_HAND_CHIRALITY_FLIP=1`).
     chirality_flip: bool,
 }
@@ -238,6 +241,85 @@ const RTMOSE_HAND_CANDIDATES: [&str; 1] = ["rtmpose-m-hand_256.onnx"];
 /// (divided by 255 to match `fill_crop_tensor`'s output range).
 const RTMOSE_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const RTMOSE_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+/// Tiny hand-vs-not classifier distilled OFFLINE from MediaPipe's
+/// bimodal presence labels on this camera's own recordings — the runtime
+/// stays MP-free. This is the presence authority for the RTMPose backend:
+/// SimCC sharpness cannot separate a genuine hand from a confident
+/// cuff/face answer (measured: sharpness 0.80 on hallucinations vs 0.52
+/// on true hands, i.e. anti-correlated with correctness). Input contract
+/// `(1,3,64,64)` float RGB in [0,1] — `fill_crop_tensor`'s output as-is.
+struct PresenceNet {
+    session: Session,
+    input_name: String,
+    tensor: Array4<f32>,
+}
+
+const PRESENCE_NET_FILE: &str = "rtmpose-hand-presence_64.onnx";
+
+impl PresenceNet {
+    fn try_from_models_dir(dir: &Path) -> Option<Self> {
+        let path = dir.join(PRESENCE_NET_FILE);
+        if !path.is_file() {
+            return None;
+        }
+        let (session, _backend) =
+            build_session_cpu_only(&path.to_string_lossy(), 1, "RTMPose-hand-presence").ok()?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        Some(Self {
+            session,
+            input_name,
+            tensor: Array4::zeros((1, 3, 64, 64)),
+        })
+    }
+
+    fn score(&mut self, rgb: &[u8], width: u32, height: u32, crop: (f32, f32, f32)) -> Option<f32> {
+        use crate::tracking::detector::yolo_pose::fill_crop_tensor;
+        fill_crop_tensor(rgb, width, height, crop, &mut self.tensor);
+        let input = match TensorRef::from_array_view(&self.tensor) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("hand-presence: tensor ref failed: {e}");
+                return None;
+            }
+        };
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])
+            .ok()?;
+        let out = outputs.get("logit")?;
+        let (_, data) = out.try_extract_tensor::<f32>().ok()?;
+        let logit = *data.first()?;
+        let p = 1.0 / (1.0 + (-logit).exp());
+        if std::env::var_os("VULVATAR_HAND_PRESENCE_DEBUG").is_some() {
+            static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 40 {
+                info!(
+                    "hand-presence: logit {logit:.3} presence {p:.3} at ({:.0},{:.0}) size {:.0}",
+                    crop.0, crop.1, crop.2
+                );
+                // Dump the exact classifier input as a P6 PPM so the
+                // python side can score the identical pixels.
+                let view = self.tensor.view();
+                let mut ppm = format!("P6\n64 64\n255\n").into_bytes();
+                for y in 0..64 {
+                    for x in 0..64 {
+                        for c in 0..3 {
+                            ppm.push((view[[0, c, y, x]].clamp(0.0, 1.0) * 255.0) as u8);
+                        }
+                    }
+                }
+                let _ = std::fs::write(format!("scratchpad/presence_dbg_{n:03}.ppm"), ppm);
+            }
+        }
+        Some(p)
+    }
+}
 
 impl RtmposeHand {
     pub fn try_from_models_dir(dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
@@ -264,6 +346,13 @@ impl RtmposeHand {
         let chirality_flip = std::env::var("VULVATAR_HAND_CHIRALITY_FLIP")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let presence_net = PresenceNet::try_from_models_dir(dir);
+        if presence_net.is_none() {
+            warn!(
+                "RTMPose hand presence model missing (models/{PRESENCE_NET_FILE}); \
+                 falling back to the SimCC sharpness proxy"
+            );
+        }
         info!(
             "RTMPose hand model ready ({}, input '{}x{}', chirality_flip {})",
             path.display(),
@@ -276,6 +365,7 @@ impl RtmposeHand {
             input_name,
             size,
             tensor: Array4::<f32>::zeros((1, 3, size as usize, size as usize)),
+            presence_net,
             chirality_flip,
         }))
     }
@@ -358,6 +448,23 @@ impl RtmposeHand {
             px[j][1] = refine_peak(ys, iy) / bins as f32;
         }
         let scale = size / self.size as f32;
+        // Presence = SimCC sharpness median. The distilled classifier can
+        // additionally VETO candidates it scores as confidently-not-hand:
+        // `VULVATAR_HAND_PRESENCE_VETO=<threshold>` enables it with a
+        // sigmoid threshold (0.03 default when set bare). Desk-background
+        // windows score ~0.00 while sliver hand windows hold ~0.5+, so the
+        // veto separates them with a wide margin.
+        let presence_veto = std::env::var("VULVATAR_HAND_PRESENCE_VETO")
+            .ok()
+            .map(|v| if v.is_empty() { 0.03 } else { v.parse().unwrap_or(0.03) });
+        if let Some(veto_below) = presence_veto {
+            if let Some(net) = self.presence_net.as_mut() {
+                match net.score(rgb, width, height, crop) {
+                    Some(s) if s < veto_below => return None,
+                    _ => {}
+                }
+            }
+        }
         let mut out = HandResult {
             presence: median(&mut sharp).clamp(0.0, 1.0),
             crop,
