@@ -19,6 +19,11 @@ pub(crate) mod decode;
 pub(crate) mod face;
 #[cfg(feature = "inference")]
 pub(crate) mod session;
+/// Shared YOLO26-pose letterbox / decode geometry. `pub`: the
+/// `diagnose_yolo26_pose` bench bin consumes it across the crate
+/// boundary, so its copies can't drift from production.
+#[cfg(feature = "inference")]
+pub mod yolo_pose;
 #[cfg(feature = "inference")]
 pub(crate) mod yolo26;
 

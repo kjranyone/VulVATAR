@@ -2,24 +2,27 @@
 //! optional CPU EP) over recorded session frames, plus per-frame person
 //! detection counts.
 //!
-//! The letterbox + decode mirrors Ultralytics' ONNX conventions
-//! (114-grey padding, bilinear resize, `(1, 56, A)` output with box
-//! cx/cy/w/h in input pixels at channel 0..4, person score at channel 4,
-//! and 17×(x, y, conf) keypoints from channel 5) — the same contract the
-//! production detector consumes.
+//! The letterbox + decode is the shared production geometry
+//! (`vulvatar_lib::tracking::detector::yolo_pose`): Ultralytics ONNX
+//! conventions (114-grey padding, bilinear resize, `(1, 5+3K, A)`
+//! output with box cx/cy/w/h in input pixels at channel 0..4,
+//! objectness at channel 4, and K×(x, y, conf) keypoints from channel
+//! 5). The body export is K = 17; the crop-local hand / face exports
+//! bench through the same code with `--kps 21` / `--kps 98`.
 //!
 //! Output: `diagnostics/yolo26_bench/` — `summary.md` + one CSV per
 //! model. The app may run concurrently; timing includes that contention.
 //!
 //! Usage:
-//!   cargo run --release --no-default-features --features inference,inference-gpu //!     --bin diagnose_yolo26_pose -- [session_dir ...] [--model <path>]... //!     [--frames N] [--cpu] [--out <dir>]
+//!   cargo run --release --no-default-features --features inference,inference-gpu //!     --bin diagnose_yolo26_pose -- [session_dir ...] [--model <path>]... //!     [--frames N] [--kps K] [--cpu] [--out <dir>]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ndarray::Array4;
 use ort::session::Session;
 use ort::value::TensorRef;
+
+use vulvatar_lib::tracking::detector::yolo_pose::{self, letterbox, pose_channels};
 
 const BOX_SCORE_MIN: f32 = 0.25;
 const NMS_IOU: f32 = 0.65;
@@ -28,6 +31,7 @@ struct Args {
     sessions: Vec<PathBuf>,
     models: Vec<PathBuf>,
     frames_per_session: usize,
+    keypoints: usize,
     also_cpu: bool,
     out_dir: PathBuf,
 }
@@ -36,6 +40,7 @@ fn parse_args() -> Args {
     let mut sessions = Vec::new();
     let mut models = Vec::new();
     let mut frames = 150usize;
+    let mut keypoints = 17usize;
     let mut also_cpu = false;
     let mut out_dir = PathBuf::from("diagnostics/yolo26_bench");
     let mut it = std::env::args().skip(1);
@@ -43,6 +48,7 @@ fn parse_args() -> Args {
         match a.as_str() {
             "--model" => models.push(PathBuf::from(it.next().expect("--model <path>"))),
             "--frames" => frames = it.next().expect("--frames <n>").parse().unwrap(),
+            "--kps" => keypoints = it.next().expect("--kps <count>").parse().unwrap(),
             "--cpu" => also_cpu = true,
             "--out" => out_dir = PathBuf::from(it.next().expect("--out <dir>")),
             other => {
@@ -83,18 +89,22 @@ fn parse_args() -> Args {
         sessions,
         models,
         frames_per_session: frames,
+        keypoints,
         also_cpu,
         out_dir,
     }
 }
 
-/// One frame's decoded COCO-17 output: `[x_px, y_px, conf]`.
-type FrameKps = Option<[[f32; 3]; 17]>;
+/// One frame's decoded keypoints: `[x_px, y_px, conf]` per joint.
+type FrameKps = Option<Vec<[f32; 3]>>;
 
 struct FrameRun {
     ms_total: f32,
     ms_run: f32,
     persons: usize,
+    /// Decoded keypoints, kept for future per-joint agreement benches
+    /// (model-vs-model). Not read by the timing report today.
+    #[allow(dead_code)]
     kps: FrameKps,
 }
 
@@ -181,6 +191,7 @@ fn main() -> Result<(), String> {
             input_name,
             output_name,
             size,
+            keypoints: args.keypoints,
         };
 
         let mut runs = Vec::with_capacity(total_frames);
@@ -228,6 +239,7 @@ fn main() -> Result<(), String> {
                 input_name,
                 output_name,
                 size,
+                keypoints: args.keypoints,
             };
             let mut times = Vec::with_capacity(30);
             for (_, frames) in sampled.iter().take(1) {
@@ -252,6 +264,8 @@ struct YoloRunner {
     input_name: String,
     output_name: String,
     size: u32,
+    /// Keypoint count of this export (17 body / 21 hand / 98 face).
+    keypoints: usize,
 }
 
 impl YoloRunner {
@@ -271,12 +285,14 @@ impl YoloRunner {
         let ms_run = t0.elapsed().as_secs_f32() * 1000.0;
         let out = outputs.get(self.output_name.as_str()).expect("output");
         let (_, data) = out.try_extract_tensor::<f32>().expect("f32 tensor");
+        let expected = pose_channels(self.keypoints);
         assert!(
-            data.len() % 56 == 0,
-            "unexpected YOLO26-pose output size {} (expected 56×A)",
-            data.len()
+            data.len() % expected == 0,
+            "unexpected pose output size {} (expected {}×A)",
+            data.len(),
+            expected
         );
-        let anchors = data.len() / 56;
+        let anchors = data.len() / expected;
 
         // Channel-major (1, 56, A): channel c, anchor a → data[c * A + a].
         let at = |c: usize, a: usize| data[c * anchors + a];
@@ -309,17 +325,20 @@ impl YoloRunner {
         }
 
         let persons = kept.len();
-        let kps = kept.first().map(|&best| {
-            let mut arr = [[0f32; 3]; 17];
-            for (k, slot) in arr.iter_mut().enumerate() {
-                let base = 5 + k * 3;
+        let kps = kept
+            .first()
+            .map(|&best| {
                 // Model-input pixels → frame pixels (undo letterbox).
-                slot[0] = (at(base, best) - pad_x) / r;
-                slot[1] = (at(base + 1, best) - pad_y) / r;
-                slot[2] = at(base + 2, best);
-            }
-            arr
-        });
+                yolo_pose::anchor_keypoints(
+                    &data,
+                    anchors,
+                    best,
+                    self.keypoints,
+                    pad_x,
+                    pad_y,
+                    r,
+                )
+            });
         (kps, persons, ms_run)
     }
 }
@@ -338,42 +357,6 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     } else {
         0.0
     }
-}
-
-/// Ultralytics letterbox: bilinear resize so the long side fits `s`, pad
-/// the short side with grey (114/255), NCHW RGB 0..1.
-fn letterbox(rgb: &[u8], w: u32, h: u32, s: u32) -> Array4<f32> {
-    let r = (s as f32 / w as f32).min(s as f32 / h as f32);
-    let nw = (w as f32 * r).round() as i64;
-    let nh = (h as f32 * r).round() as i64;
-    let pad_x = ((s as i64 - nw) / 2).max(0);
-    let pad_y = ((s as i64 - nh) / 2).max(0);
-    let mut arr = Array4::<f32>::from_elem((1, 3, s as usize, s as usize), 114.0 / 255.0);
-    for y in 0..nh {
-        let sy = ((y as f32 + 0.5) / r - 0.5).max(0.0);
-        let y0 = sy.floor() as u32;
-        let y1 = (y0 + 1).min(h - 1);
-        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..nw {
-            let sx = ((x as f32 + 0.5) / r - 0.5).max(0.0);
-            let x0 = sx.floor() as u32;
-            let x1 = (x0 + 1).min(w - 1);
-            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-            for c in 0..3usize {
-                let p00 = rgb[(y0 as usize * w as usize + x0 as usize) * 3 + c] as f32;
-                let p01 = rgb[(y0 as usize * w as usize + x1 as usize) * 3 + c] as f32;
-                let p10 = rgb[(y1 as usize * w as usize + x0 as usize) * 3 + c] as f32;
-                let p11 = rgb[(y1 as usize * w as usize + x1 as usize) * 3 + c] as f32;
-                let top = p00 * (1.0 - fx) + p01 * fx;
-                let bot = p10 * (1.0 - fx) + p11 * fx;
-                let v = (top * (1.0 - fy) + bot * fy) / 255.0;
-                let dx = (x + pad_x) as usize;
-                let dy = (y + pad_y) as usize;
-                arr[[0, c, dy, dx]] = v;
-            }
-        }
-    }
-    arr
 }
 
 fn load_rgb(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {

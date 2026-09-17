@@ -1,28 +1,33 @@
-//! State-driven hand crops → MediaPipe Hand Landmarker (21 keypoints,
-//! 2.5-D screen + wrist-relative metric 3-D) → estimator observations.
+//! State-driven hand crops → hand landmark model (21 keypoints) →
+//! estimator observations.
 //!
 //! The body detector's hand block is coarse (≈ 20 px σ on a 1280-wide
 //! frame); a dedicated crop around the *predicted* hand runs the hand
-//! model at native resolution, giving finger keypoints good to a couple of
-//! pixels plus a wrist-relative 3-D layout that resolves finger curl the
-//! 2-D terms cannot. Crops are cut from the prediction, so no palm
-//! detector is needed; a hand whose prediction leaves the frame is simply
-//! not cropped (the estimator then relaxes it).
+//! model at native resolution, giving finger keypoints good to a couple
+//! of pixels. Crops are cut from the prediction, so no palm detector is
+//! needed; a hand whose prediction leaves the frame is simply not
+//! cropped (the estimator then relaxes it).
 //!
-//! Model: `models/mediapipe_hand_landmark.onnx` (OpenCV's conversion of
-//! MediaPipe `hand_landmark_full`), input `(1,224,224,3)` NHWC `[0,1]`,
-//! outputs `Identity` (63: screen x,y,z in crop px), `Identity_1`
-//! (presence), `Identity_2` (handedness), `Identity_3` (63: world metres,
-//! wrist-relative, camera-aligned axes).
+//! Backends (see [`HandBackend`]):
+//! * `mediapipe` (default) — `models/mediapipe_hand_landmark.onnx`
+//!   (OpenCV's conversion of MediaPipe `hand_landmark_full`), input
+//!   `(1,224,224,3)` NHWC `[0,1]`, outputs `Identity` (63: screen x,y,z
+//!   in crop px), `Identity_1` (presence), `Identity_2` (handedness),
+//!   `Identity_3` (63: world metres, wrist-relative, camera-aligned).
+//! * `rtmpose` — `models/rtmpose-m-hand_256.onnx` (RTMPose-m hand,
+//!   SimCC heads), input `(1,3,256,256)` NCHW ImageNet-normalised RGB,
+//!   outputs `simcc_x`/`simcc_y` `(1,21,512)`; presence is a SimCC peak
+//!   sharpness proxy and handedness is chirality-geometric (see
+//!   [`RtmposeHand`]).
 
 use std::path::Path;
 
-use log::{error, info};
+use log::{error, info, warn};
 use ndarray::Array4;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::tracking::detector::session::build_session_cpu_only;
+use crate::tracking::detector::session::{build_session, build_session_cpu_only};
 
 use super::estimator::{AngleObs, Intrinsics, Kp2d, Kp3d, ModelPoint};
 use super::math::*;
@@ -189,6 +194,301 @@ impl HandLandmarker {
             out.world[i] = [world[i * 3], world[i * 3 + 1], world[i * 3 + 2]];
         }
         Some(out)
+    }
+}
+
+/// Crop-local RTMPose-m hand model (21 keypoints, InterHand2.6M-style
+/// canonical order) — the MediaPipe-free backend. Selected with
+/// `VULVATAR_HAND_BACKEND=rtmpose` via [`HandBackend`]; the default
+/// remains MediaPipe until the A/B gate (AGENTS.md) passes.
+///
+/// Mapping from the model's outputs to the [`HandResult`] contract:
+/// * `simcc_x` / `simcc_y` (`(1, 21, 512)` each — SimCC classification
+///   heatmaps at 2× input resolution) → landmark pixels via per-keypoint
+///   argmax + 3-point sub-bin refinement. There is NO detection score:
+///   presence is the median SimCC peak sharpness (softmax mass vs
+///   absolute-mass ratio) across the keypoints — a confidence proxy for
+///   the provider's 0.5/0.6 lock gates, NOT a hand/no-hand probability.
+///   The provider's wrist-move tracking stays the face-crop guard.
+/// * `handedness` is NOT a model output — RTMPose hand heads have no
+///   classification side head. It is reconstructed geometrically from
+///   the landmark chirality (see `chirality_handedness`), which cannot
+///   separate palm-up from palm-down views; the provider's FK-based L/R
+///   assignment and duplicate-lock vote are the authority, the veto
+///   bands only demote.
+/// * `world` is zeros. It is diagnostics-only today (`wrist_abs` is
+///   `None` in the provider — measured ±30–60 % proportion noise), so
+///   nothing consumes it.
+pub struct RtmposeHand {
+    session: Session,
+    input_name: String,
+    /// Square model input side (from the `_NNN` filename convention).
+    size: u32,
+    tensor: Array4<f32>,
+    /// Inverts the chirality→handedness mapping (`VULVATAR_HAND_CHIRALITY_FLIP=1`).
+    chirality_flip: bool,
+}
+
+/// Export filename candidates, fastest first. The `_NNN` suffix is the
+/// square input side (same contract as the body export). This export
+/// family's SimCC bins run at 2× the input side.
+const RTMOSE_HAND_CANDIDATES: [&str; 1] = ["rtmpose-m-hand_256.onnx"];
+
+/// ImageNet normalisation mmpose applies on top of `[0, 1]` RGB
+/// (divided by 255 to match `fill_crop_tensor`'s output range).
+const RTMOSE_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const RTMOSE_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+impl RtmposeHand {
+    pub fn try_from_models_dir(dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
+        let dir = dir.as_ref();
+        let Some(path) = RTMOSE_HAND_CANDIDATES
+            .iter()
+            .map(|c| dir.join(c))
+            .find(|p| p.is_file())
+        else {
+            return Ok(None);
+        };
+        let (session, _backend) = build_session(&path.to_string_lossy(), 2, "RTMPose-hand")?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        let size: u32 = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit('_').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+        let chirality_flip = std::env::var("VULVATAR_HAND_CHIRALITY_FLIP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        info!(
+            "RTMPose hand model ready ({}, input '{}x{}', chirality_flip {})",
+            path.display(),
+            input_name,
+            size,
+            chirality_flip
+        );
+        Ok(Some(Self {
+            session,
+            input_name,
+            size,
+            tensor: Array4::<f32>::zeros((1, 3, size as usize, size as usize)),
+            chirality_flip,
+        }))
+    }
+
+    /// Same contract as [`HandLandmarker::estimate`]: run on a square
+    /// crop `(x0, y0, size)` of the RGB frame, return landmarks in
+    /// frame pixels.
+    pub fn estimate(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        crop: (f32, f32, f32),
+    ) -> Option<HandResult> {
+        use crate::tracking::detector::yolo_pose::fill_crop_tensor;
+        let (x0, _y0, size) = crop;
+        if size < 8.0 || rgb.len() < (width as usize) * (height as usize) * 3 {
+            return None;
+        }
+        fill_crop_tensor(rgb, width, height, crop, &mut self.tensor);
+        {
+            let mut view = self.tensor.view_mut();
+            for c in 0..3 {
+                let (m, s) = (RTMOSE_MEAN[c], RTMOSE_STD[c]);
+                view.slice_mut(ndarray::s![0, c, .., ..])
+                    .mapv_inplace(|v| (v - m) / s);
+            }
+        }
+        let input = match TensorRef::from_array_view(&self.tensor) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("rtmpose-hand: tensor ref failed: {e}");
+                return None;
+            }
+        };
+        let outputs = match self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => input])
+        {
+            Ok(o) => o,
+            Err(e) => {
+                error!("rtmpose-hand: run failed: {e}");
+                return None;
+            }
+        };
+        let Some(out_x) = outputs.get("simcc_x") else {
+            error!("rtmpose-hand: output 'simcc_x' missing");
+            return None;
+        };
+        let Some(out_y) = outputs.get("simcc_y") else {
+            error!("rtmpose-hand: output 'simcc_y' missing");
+            return None;
+        };
+        let Ok((shape_x, data_x)) = out_x.try_extract_tensor::<f32>() else {
+            error!("rtmpose-hand: simcc_x not f32");
+            return None;
+        };
+        let Ok((_, data_y)) = out_y.try_extract_tensor::<f32>() else {
+            error!("rtmpose-hand: simcc_y not f32");
+            return None;
+        };
+        if shape_x.len() != 3 || shape_x[1] != HAND_KP as i64 {
+            error!(
+                "rtmpose-hand: unexpected simcc_x shape {:?} (expected [1, {} bins])",
+                shape_x, HAND_KP
+            );
+            return None;
+        }
+        let bins = shape_x[2] as usize;
+        let mut px = [[0.0f32; 3]; HAND_KP];
+        let mut sharp: Vec<f32> = Vec::with_capacity(HAND_KP * 2);
+        for j in 0..HAND_KP {
+            let xs = &data_x[j * bins..(j + 1) * bins];
+            let ys = &data_y[j * bins..(j + 1) * bins];
+            let (ix, qx) = peak_and_sharpness(xs);
+            let (iy, qy) = peak_and_sharpness(ys);
+            sharp.push(qx);
+            sharp.push(qy);
+            px[j][0] = refine_peak(xs, ix) / bins as f32;
+            px[j][1] = refine_peak(ys, iy) / bins as f32;
+        }
+        let scale = size / self.size as f32;
+        let mut out = HandResult {
+            presence: median(&mut sharp).clamp(0.0, 1.0),
+            crop,
+            ..Default::default()
+        };
+        for (slot, k) in out.px.iter_mut().zip(px.iter()) {
+            slot[0] = x0 + k[0] * scale;
+            slot[1] = _y0 + k[1] * scale;
+        }
+        out.handedness = chirality_handedness(&out.px, self.chirality_flip);
+        Some(out)
+    }
+}
+
+/// Argmax bin and its SimCC peak sharpness: softmax mass over absolute
+/// deviation from the peak (1.0 = a delta spike, ~0.5 = a broad bump).
+fn peak_and_sharpness(bins: &[f32]) -> (usize, f32) {
+    let mut best = 0usize;
+    let mut max = f32::NEG_INFINITY;
+    for (i, v) in bins.iter().enumerate() {
+        if *v > max {
+            max = *v;
+            best = i;
+        }
+    }
+    let mut mass = 0.0f32;
+    let mut abs = 0.0f32;
+    for v in bins.iter() {
+        let m = v - max;
+        mass += m.exp();
+        abs += m.abs();
+    }
+    (best, mass / (abs + mass))
+}
+
+/// 3-point parabolic sub-bin offset around `peak`, clamped to ±0.5 —
+/// the same refinement `decode_simcc` applies to RTMW3D's SimCC.
+fn refine_peak(bins: &[f32], peak: usize) -> f32 {
+    if peak == 0 || peak + 1 >= bins.len() {
+        return peak as f32;
+    }
+    let (l, m, r) = (bins[peak - 1], bins[peak], bins[peak + 1]);
+    let denom = l - 2.0 * m + r;
+    if denom.abs() < 1e-9 {
+        return peak as f32;
+    }
+    peak as f32 + (0.5 * (l - r) / denom).clamp(-0.5, 0.5)
+}
+
+fn median(v: &mut [f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+/// 2-D landmark chirality → the pipeline's handedness convention
+/// (`≈0.15` = left hand, `≈0.85` = right hand — the values MediaPipe's
+/// head reads on this camera's frames, see the provider's veto bands).
+///
+/// Sign of the (index-MCP − wrist) × (pinky-MCP − wrist) cross product:
+/// a RIGHT hand with the palm toward the camera has its index MCP on
+/// the image LEFT of the pinky MCP, giving a positive cross in image
+/// coordinates (x right, y down). Palm-away views invert the sign —
+/// this heuristic cannot tell palm from back, which is the one thing
+/// MediaPipe's learned head does better. The veto bands demote (σ×4)
+/// rather than drop, and the provider's FK-based slot assignment stays
+/// the L/R authority, so a wrong chirality degrades gracefully.
+fn chirality_handedness(px: &[[f32; 3]; HAND_KP], flip: bool) -> f32 {
+    let (w, index, pinky) = (px[0], px[5], px[17]);
+    let cross =
+        (index[0] - w[0]) * (pinky[1] - w[1]) - (index[1] - w[1]) * (pinky[0] - w[0]);
+    let reads_right = if flip { cross < 0.0 } else { cross > 0.0 };
+    if reads_right {
+        0.85
+    } else {
+        0.15
+    }
+}
+
+/// Which hand model runs the crop chain. Selected once at construction
+/// with `VULVATAR_HAND_BACKEND` (`rtmpose` | `mediapipe`, default
+/// `mediapipe`); an `rtmpose` request with no export in `models/` falls
+/// back to MediaPipe with a warning instead of losing the hand chain.
+pub enum HandBackend {
+    MediaPipe(HandLandmarker),
+    Rtmpose(RtmposeHand),
+}
+
+impl HandBackend {
+    pub fn try_from_models_dir(dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
+        if std::env::var("VULVATAR_HAND_BACKEND")
+            .map(|v| v.eq_ignore_ascii_case("rtmpose"))
+            .unwrap_or(false)
+        {
+            match RtmposeHand::try_from_models_dir(&dir) {
+                Ok(Some(b)) => return Ok(Some(Self::Rtmpose(b))),
+                Ok(None) => warn!(
+                    "VULVATAR_HAND_BACKEND=rtmpose but no hand export in models/ \
+                     (expected {}); falling back to MediaPipe",
+                    RTMOSE_HAND_CANDIDATES[0]
+                ),
+                Err(e) => warn!("RTMPose hand model failed to load: {e}; falling back to MediaPipe"),
+            }
+        }
+        Ok(HandLandmarker::try_from_models_dir(dir)?.map(Self::MediaPipe))
+    }
+
+    /// Run the hand model on a square frame crop; see
+    /// [`HandLandmarker::estimate`] for the contract both backends
+    /// implement.
+    pub fn estimate(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        crop: (f32, f32, f32),
+    ) -> Option<HandResult> {
+        match self {
+            Self::MediaPipe(m) => m.estimate(rgb, width, height, crop),
+            Self::Rtmpose(r) => r.estimate(rgb, width, height, crop),
+        }
+    }
+
+    /// Which backend was selected (GUI / debug surface).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::MediaPipe(_) => "mediapipe",
+            Self::Rtmpose(_) => "rtmpose",
+        }
     }
 }
 
@@ -496,6 +796,44 @@ pub fn hand_observations(
         push_angle(out_ang, (0, 1 + f * 4, 2 + f * 4), (wrist_mp, mcp, pip));
         push_angle(out_ang, (1 + f * 4, 2 + f * 4, 3 + f * 4), (mcp, pip, dip));
         push_angle(out_ang, (2 + f * 4, 3 + f * 4, 4 + f * 4), (pip, dip, tip));
+    }
+}
+
+#[cfg(test)]
+mod chirality_tests {
+    use super::*;
+
+    fn layout(index: [f32; 2], pinky: [f32; 2]) -> [[f32; 3]; HAND_KP] {
+        let mut px = [[0.0f32; 3]; HAND_KP];
+        px[0] = [100.0, 100.0, 0.0];
+        px[5] = [index[0], index[1], 0.0];
+        px[17] = [pinky[0], pinky[1], 0.0];
+        px
+    }
+
+    #[test]
+    fn right_palm_reads_right_left_palm_reads_left() {
+        // Palm toward the camera, fingers up: the RIGHT hand's index MCP
+        // sits on the image LEFT of the pinky MCP.
+        let right = layout([80.0, 70.0], [120.0, 65.0]);
+        assert!((chirality_handedness(&right, false) - 0.85).abs() < 1e-6);
+        let left = layout([120.0, 70.0], [80.0, 65.0]);
+        assert!((chirality_handedness(&left, false) - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flip_env_inverts_the_mapping() {
+        let right = layout([80.0, 70.0], [120.0, 65.0]);
+        assert!((chirality_handedness(&right, true) - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn back_of_hand_inverts_like_a_flipped_palm() {
+        // Palm away from the camera: the chirality sign inverts, which is
+        // the documented limit of the geometric heuristic (the veto bands
+        // demote, they don't drop — see chirality_handedness).
+        let right_back = layout([120.0, 70.0], [80.0, 65.0]);
+        assert!((chirality_handedness(&right_back, false) - 0.15).abs() < 1e-6);
     }
 }
 

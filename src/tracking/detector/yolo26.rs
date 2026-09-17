@@ -25,12 +25,12 @@
 
 use std::path::Path;
 
-use ndarray::Array4;
 use ort::session::Session;
 use ort::value::TensorRef;
 
 use super::super::face_mediapipe::{derive_face_bbox, FaceBbox, FaceMeshInference};
 use super::session::build_session;
+use super::yolo_pose::{anchor_box, anchor_keypoints, best_pose_anchor, letterbox, pose_anchor_count, pose_channels};
 use super::{
     annotation, decode::DecodedJoint, face, DetectorAux, DetectorOptions, InferenceBackend,
 };
@@ -403,50 +403,28 @@ impl Yolo26PoseInference {
             warn!("YOLO26-pose: output not f32");
             return (None, None, t0.elapsed().as_secs_f32() * 1000.0);
         };
-        if data.len() % 56 != 0 {
+        let Some(anchors) = pose_anchor_count(data.len(), 17) else {
             warn!(
-                "YOLO26-pose: unexpected output size {} (expected 56×A)",
-                data.len()
+                "YOLO26-pose: unexpected output size {} (expected {}×A)",
+                data.len(),
+                pose_channels(17)
             );
             return (None, None, t0.elapsed().as_secs_f32() * 1000.0);
-        }
-        let anchors = data.len() / 56;
-        let at = |c: usize, a: usize| data[c * anchors + a];
+        };
 
         // Best-scoring anchor above the box threshold; a single-user desk
         // pipeline wants no NMS dance — take the argmax and require a
         // sane score.
-        let mut best: Option<usize> = None;
-        let mut best_score = 0f32;
-        for a in 0..anchors {
-            let s = at(4, a);
-            if s >= 0.25 && s > best_score {
-                best_score = s;
-                best = Some(a);
-            }
-        }
         let det_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        let Some(a) = best else {
+        let Some((a, _)) = best_pose_anchor(&data, anchors, 0.25) else {
             return (None, None, det_ms);
         };
-        let bx0 = at(0, a) - at(2, a) / 2.0;
-        let by0 = at(1, a) - at(3, a) / 2.0;
-        let bx1 = at(0, a) + at(2, a) / 2.0;
-        let by1 = at(1, a) + at(3, a) / 2.0;
-        let person = [
-            (bx0 - pad_x) / r,
-            (by0 - pad_y) / r,
-            (bx1 - pad_x) / r,
-            (by1 - pad_y) / r,
-        ];
-        let mut kps = [[0f32; 3]; 17];
-        for (k, slot) in kps.iter_mut().enumerate() {
-            let base = 5 + k * 3;
-            slot[0] = (at(base, a) - pad_x) / r;
-            slot[1] = (at(base + 1, a) - pad_y) / r;
-            slot[2] = at(base + 2, a);
-        }
-        (Some(person), Some(kps), det_ms)
+        let person = anchor_box(&data, anchors, a, pad_x, pad_y, r);
+        let kps: Option<[[f32; 3]; 17]> =
+            anchor_keypoints(&data, anchors, a, 17, pad_x, pad_y, r)
+                .try_into()
+                .ok();
+        (Some(person), kps, det_ms)
     }
 }
 
@@ -475,38 +453,4 @@ fn build_face_bbox_from_body(
     bbox.x = cx - bbox.size / 2.0;
     bbox.y = cy - bbox.size / 2.0;
     Some(bbox)
-}
-
-/// Ultralytics letterbox: bilinear resize so the long side fits `s`, pad
-/// the short side with grey (114/255), NCHW RGB 0..1.
-fn letterbox(rgb: &[u8], w: u32, h: u32, s: u32) -> Array4<f32> {
-    let r = (s as f32 / w as f32).min(s as f32 / h as f32);
-    let nw = (w as f32 * r).round() as i64;
-    let nh = (h as f32 * r).round() as i64;
-    let pad_x = ((s as i64 - nw) / 2).max(0);
-    let pad_y = ((s as i64 - nh) / 2).max(0);
-    let mut arr = Array4::<f32>::from_elem((1, 3, s as usize, s as usize), 114.0 / 255.0);
-    for y in 0..nh {
-        let sy = ((y as f32 + 0.5) / r - 0.5).max(0.0);
-        let y0 = sy.floor() as u32;
-        let y1 = (y0 + 1).min(h - 1);
-        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-        for x in 0..nw {
-            let sx = ((x as f32 + 0.5) / r - 0.5).max(0.0);
-            let x0 = sx.floor() as u32;
-            let x1 = (x0 + 1).min(w - 1);
-            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-            for c in 0..3usize {
-                let p00 = rgb[(y0 as usize * w as usize + x0 as usize) * 3 + c] as f32;
-                let p01 = rgb[(y0 as usize * w as usize + x1 as usize) * 3 + c] as f32;
-                let p10 = rgb[(y1 as usize * w as usize + x0 as usize) * 3 + c] as f32;
-                let p11 = rgb[(y1 as usize * w as usize + x1 as usize) * 3 + c] as f32;
-                let top = p00 * (1.0 - fx) + p01 * fx;
-                let bot = p10 * (1.0 - fx) + p11 * fx;
-                let v = (top * (1.0 - fy) + bot * fy) / 255.0;
-                arr[[0, c, (y + pad_y) as usize, (x + pad_x) as usize]] = v;
-            }
-        }
-    }
-    arr
 }

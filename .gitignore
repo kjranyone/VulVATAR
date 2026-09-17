@@ -67,3 +67,8 @@ nul
 # machine from `realsense2.pc.example` (see docs/realsense-build.md) —
 # the SDK install path differs on every developer box.
 /build-support/pkgconfig/realsense2.pc
+
+# Local ML training/bench artifacts (hand-model campaign leftovers).
+/datasets/
+/runs/
+/weights/
