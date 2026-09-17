@@ -1165,6 +1165,17 @@ impl FusionProvider {
                 {
                     candidates.push(c);
                 }
+                // The streaming "hand at mouth/chin" pose: the body wrist
+                // sits near the face there, so a window just below the face
+                // covers it even when the wrist keypoint itself is mush.
+                if let Some(c) = super::hands::face_below_hand_crop(
+                    &det_kps,
+                    width,
+                    height,
+                    0.5,
+                ) {
+                    candidates.push(c);
+                }
                 // YOLO26 fills no hand blocks, so the candidate above is
                 // dead since the swap; the body wrist/elbow keypoints are
                 // the only detector-side seed left for acquisition. The

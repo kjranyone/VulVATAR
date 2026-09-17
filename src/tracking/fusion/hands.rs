@@ -741,6 +741,34 @@ pub fn detector_hand_crop(
     ))
 }
 
+/// Crop centred just BELOW the face — the streaming "hand at mouth/chin"
+/// pose, where the body wrist keypoint is unreliable and the FK prior
+/// lags behind a raising arm. Placement from the nose + eye keypoints;
+/// `None` when they are not confident.
+pub fn face_below_hand_crop(
+    kps: &[(f32, f32, f32)],
+    width: u32,
+    height: u32,
+    min_score: f32,
+) -> Option<(f32, f32, f32)> {
+    let nose = kps.get(0)?;
+    let le = kps.get(1)?;
+    let re = kps.get(2)?;
+    if nose.2 < min_score || le.2 < min_score || re.2 < min_score {
+        return None;
+    }
+    let ear_span = ((le.0 - re.0).abs() * width as f32)
+        .max((le.1 - re.1).abs() * height as f32)
+        .max(40.0);
+    let nx = nose.0 * width as f32;
+    let ny = nose.1 * height as f32;
+    let down = ear_span * 1.4;
+    let size = ear_span * 2.2;
+    let cx = nx;
+    let cy = ny + down;
+    Some((cx - size / 2.0, cy - size / 2.0, size))
+}
+
 /// Crop seeded from the BODY wrist/elbow keypoints (COCO 7/9 left,
 /// 8/10 right) — the wholebody hand blocks [`detector_hand_crop`]
 /// relies on are gone with YOLO26, so this is the only detector-side
