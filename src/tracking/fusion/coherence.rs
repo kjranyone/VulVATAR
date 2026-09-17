@@ -43,6 +43,53 @@ pub fn sample_depth_at(
     .map(|p| p[2])
 }
 
+/// Nearest-surface depth sample (m): minimum valid depth in a 7×7 window,
+/// then the median of samples within 6 cm of that minimum. A palm-proposal
+/// peak sitting a few px off the hand/silhouette boundary otherwise lets
+/// the plain median sample the BACKGROUND behind the hand (a chin hand at
+/// 0.6 m over a 3 m wall flips the 3-D gates wholesale); pinning to the
+/// closest surface patch is the right read for "the hand is the nearest
+/// thing here".
+#[inline]
+pub fn sample_depth_nearest(
+    points: &[[f32; 3]],
+    width: u32,
+    height: u32,
+    nx: f64,
+    ny: f64,
+) -> Option<f64> {
+    if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) {
+        return None;
+    }
+    let (w, h) = (width as i32, height as i32);
+    let (cu, cv) = ((nx * width as f64).round() as i32, (ny * height as f64).round() as i32);
+    let r = 3;
+    let mut zs: Vec<f32> = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
+    for dy in -r..=r {
+        let y = cv + dy;
+        if y < 0 || y >= h {
+            continue;
+        }
+        for dx in -r..=r {
+            let x = cu + dx;
+            if x < 0 || x >= w {
+                continue;
+            }
+            let z = points[(y * w + x) as usize][2];
+            if z.is_finite() && z > 0.05 && z < 8.0 {
+                zs.push(z);
+            }
+        }
+    }
+    if zs.is_empty() {
+        return None;
+    }
+    let zmin = zs.iter().cloned().fold(f32::INFINITY, f32::min);
+    let mut near: Vec<f32> = zs.into_iter().filter(|z| *z <= zmin + 0.06).collect();
+    near.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Some(near[near.len() / 2] as f64)
+}
+
 /// Projective bone length (m) between two keypoints at depth `z` (focal length `fx`).
 #[inline]
 pub fn projective_bone_length(

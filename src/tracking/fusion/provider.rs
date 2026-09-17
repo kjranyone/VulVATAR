@@ -1149,13 +1149,29 @@ impl FusionProvider {
                     if !(0.0..width as f64).contains(&u) || !(0.0..height as f64).contains(&v) {
                         return false;
                     }
-                    let Some(z) = super::coherence::sample_depth_at(
-                        pts,
-                        width,
-                        height,
-                        (px[0] / width as f32) as f64,
-                        (px[1] / height as f32) as f64,
-                    ) else {
+                    let Some(z) = (if palm {
+                        // Palm peaks sit close to the hand/silhouette
+                        // boundary: a plain 5×5 median flips to the
+                        // BACKGROUND behind the hand (chin hand 0.6 m over a
+                        // 3 m wall) on a few px of peak wander and the 3-D
+                        // gates explode. Pin the sample to the NEAREST
+                        // surface patch instead.
+                        super::coherence::sample_depth_nearest(
+                            pts,
+                            width,
+                            height,
+                            (px[0] / width as f32) as f64,
+                            (px[1] / height as f32) as f64,
+                        )
+                    } else {
+                        super::coherence::sample_depth_at(
+                            pts,
+                            width,
+                            height,
+                            (px[0] / width as f32) as f64,
+                            (px[1] / height as f32) as f64,
+                        )
+                    }) else {
                         return true; // interior depth hole: the other gates still apply
                     };
                     let p = [
@@ -1538,10 +1554,50 @@ impl FusionProvider {
                 // consecutive passing frames (see `hand_acq_streak`); an
                 // established lock survives up to 2 consecutive soft reads
                 // (see `hand_hold`) before dropping, so one soft frame
-                // doesn't snap the wrist to the prior.
+                // doesn't snap the wrist to the prior. Palm-source results
+                // publish at a lower bar: their net score swings with
+                // training-run variance (same config re-measured chin
+                // coverage 386 ↔ 60 locks across net inits at 0.5) and the
+                // acquisition gates (net ≥0.5/0.7 + depth tier + streak 2)
+                // already filtered them.
                 match best {
-                    Some(mut res) if res.presence >= 0.5 => {
-                        if self.prev_hands[hand].is_some() || self.hand_acq_streak[hand] >= 2 {
+                    Some(mut res)
+                        if res.presence
+                            >= if (res.src as usize) >= palm_from { 0.35 } else { 0.5 } =>
+                    {
+                        // Strong calibrated palm evidence publishes in ONE
+                        // frame: net ≥0.7 already cleared the depth tier (a
+                        // measured anchor or a FK/forearm-ray corroboration)
+                        // and demanding a 2nd consecutive frame just loses
+                        // to evidence flicker — palm passes arrive scattered
+                        // (366 passes / 782 frames on chin) so streak 2
+                        // rarely completes, while MediaPipe publishes
+                        // instantly on its stable 0.9 reads.
+                        let strong_palm =
+                            (res.src as usize) >= palm_from && res.presence >= 0.7;
+                        let streak_needed = if strong_palm { 1 } else { 2 };
+                        // Pre-emptive duplicate suppression for PALM-source
+                        // results only: when both slots' windows latch onto
+                        // one blob their nets agree and both publish — the
+                        // loser feeds the duplicate vote one churn cycle
+                        // later. FK-anchored candidates (detector/predicted
+                        // crops) keep the old path: at clasp the two REAL
+                        // wrists sit inside the dupe radius and both slots
+                        // must stay lockable (measured: R 780 → 5 locks
+                        // when this suppressed them too).
+                        let near_other = (res.src as usize) >= palm_from
+                            && self.last_hands[1 - hand]
+                                .as_ref()
+                                .map(|o| {
+                                    let d = ((res.px[0][0] - o.px[0][0]).powi(2)
+                                        + (res.px[0][1] - o.px[0][1]).powi(2))
+                                    .sqrt();
+                                    d < 0.06 * width as f32
+                                })
+                                .unwrap_or(false);
+                        if self.prev_hands[hand].is_some()
+                            || !near_other && self.hand_acq_streak[hand] + 1 >= streak_needed
+                        {
                             // Landmark EMA on continuation — the same
                             // substitution the body detector makes for
                             // RTMW3D's self-tracking crop. SimCC decodes each
