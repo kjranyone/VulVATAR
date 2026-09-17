@@ -8,17 +8,18 @@
 //! needed; a hand whose prediction leaves the frame is simply not
 //! cropped (the estimator then relaxes it).
 //!
-//! Backends (see [`HandBackend`]):
-//! * `mediapipe` (default) — `models/mediapipe_hand_landmark.onnx`
-//!   (OpenCV's conversion of MediaPipe `hand_landmark_full`), input
-//!   `(1,224,224,3)` NHWC `[0,1]`, outputs `Identity` (63: screen x,y,z
-//!   in crop px), `Identity_1` (presence), `Identity_2` (handedness),
-//!   `Identity_3` (63: world metres, wrist-relative, camera-aligned).
-//! * `rtmpose` — `models/rtmpose-m-hand_256.onnx` (RTMPose-m hand,
-//!   SimCC heads), input `(1,3,256,256)` NCHW ImageNet-normalised RGB,
-//!   outputs `simcc_x`/`simcc_y` `(1,21,512)`; presence is a SimCC peak
-//!   sharpness proxy and handedness is chirality-geometric (see
-//!   [`RtmposeHand`]).
+//! The backend is `rtmpose` — `models/rtmpose-m-hand_256.onnx`
+//! (RTMPose-m hand, SimCC heads), input `(1,3,256,256)` NCHW
+//! ImageNet-normalised RGB, outputs `simcc_x`/`simcc_y` `(1,21,512)`;
+//! presence is a distilled calibrated classifier (see [`PresenceNet`])
+//! and handedness is chirality-geometric (see [`RtmposeHand`]).
+//! Acquisition is two-stage: a full-frame palm-proposal heatmap (see
+//! [`PalmNet`]) feeds candidate crops into the crop chain. The old
+//! MediaPipe hand-landmark backend was removed on 2026-09-18 after the
+//! six-recording A/B gate passed (clasp 780/781 duty 1.00/1.00 snaps
+//! 0/0 vs MediaPipe 782/782/0; chin duty 0.90 vs 0.88; palms 0.89 vs
+//! 0.26; namaste 0.97/0.75 vs 0.66/0.72; nohands FPs ≈ MediaPipe's
+//! own) — git history has the reference implementation.
 
 use std::path::Path;
 
@@ -34,7 +35,6 @@ use super::math::*;
 use super::model::*;
 
 pub const HAND_KP: usize = 21;
-const INPUT: usize = 224;
 
 #[derive(Clone, Debug, Default)]
 pub struct HandResult {
@@ -59,153 +59,11 @@ pub struct HandResult {
     pub net_presence: Option<f32>,
 }
 
-pub struct HandLandmarker {
-    session: Session,
-    input_name: String,
-    output_names: Vec<String>,
-    tensor: Array4<f32>,
-}
-
-impl HandLandmarker {
-    pub fn try_from_models_dir(dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
-        let path = dir.as_ref().join("mediapipe_hand_landmark.onnx");
-        if !path.is_file() {
-            return Ok(None);
-        }
-        let (session, _backend) =
-            build_session_cpu_only(&path.to_string_lossy(), 2, "MediaPipeHand-CPU")?;
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .unwrap_or_else(|| "input_1".to_string());
-        let output_names: Vec<String> = session
-            .outputs()
-            .iter()
-            .map(|o| o.name().to_string())
-            .collect();
-        if output_names.len() < 4 {
-            return Err(format!(
-                "hand model declared {} outputs, expected 4",
-                output_names.len()
-            ));
-        }
-        info!("Hand landmarker ready ({})", path.display());
-        Ok(Some(Self {
-            session,
-            input_name,
-            output_names,
-            tensor: Array4::<f32>::zeros((1, INPUT, INPUT, 3)),
-        }))
-    }
-
-    /// Run on a square crop `(x0, y0, size)` of the RGB frame (bilinear
-    /// resample into 224×224). Returns landmarks in frame pixels.
-    pub fn estimate(
-        &mut self,
-        rgb: &[u8],
-        width: u32,
-        height: u32,
-        crop: (f32, f32, f32),
-    ) -> Option<HandResult> {
-        let (x0, y0, size) = crop;
-        if size < 8.0 || rgb.len() < (width as usize) * (height as usize) * 3 {
-            return None;
-        }
-        let scale = size / INPUT as f32;
-        let (w, h) = (width as i64, height as i64);
-        for ty in 0..INPUT {
-            let sy = y0 + (ty as f32 + 0.5) * scale - 0.5;
-            for tx in 0..INPUT {
-                let sx = x0 + (tx as f32 + 0.5) * scale - 0.5;
-                let (fx, fy) = (sx.floor(), sy.floor());
-                let (ax, ay) = (sx - fx, sy - fy);
-                let (ix, iy) = (fx as i64, fy as i64);
-                let mut acc = [0.0f32; 3];
-                let mut wsum = 0.0f32;
-                for (dy, wy) in [(0i64, 1.0 - ay), (1, ay)] {
-                    for (dx, wx) in [(0i64, 1.0 - ax), (1, ax)] {
-                        let (px, py) = (ix + dx, iy + dy);
-                        if px < 0 || py < 0 || px >= w || py >= h {
-                            continue;
-                        }
-                        let wgt = wx * wy;
-                        let i = ((py * w + px) * 3) as usize;
-                        acc[0] += rgb[i] as f32 * wgt;
-                        acc[1] += rgb[i + 1] as f32 * wgt;
-                        acc[2] += rgb[i + 2] as f32 * wgt;
-                        wsum += wgt;
-                    }
-                }
-                let inv = if wsum > 0.0 {
-                    1.0 / (255.0 * wsum)
-                } else {
-                    0.0
-                };
-                self.tensor[(0, ty, tx, 0)] = acc[0] * inv;
-                self.tensor[(0, ty, tx, 1)] = acc[1] * inv;
-                self.tensor[(0, ty, tx, 2)] = acc[2] * inv;
-            }
-        }
-        let input = match TensorRef::from_array_view(&self.tensor) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("hand: tensor ref failed: {e}");
-                return None;
-            }
-        };
-        let outputs = match self
-            .session
-            .run(ort::inputs![self.input_name.as_str() => input])
-        {
-            Ok(o) => o,
-            Err(e) => {
-                error!("hand: run failed: {e}");
-                return None;
-            }
-        };
-        let extract = |name: &str, expected: usize| -> Option<Vec<f32>> {
-            let v = outputs.get(name)?;
-            let (_, data) = v.try_extract_tensor::<f32>().ok()?;
-            if data.len() < expected {
-                None
-            } else {
-                Some(data[..expected].to_vec())
-            }
-        };
-        let screen = extract(&self.output_names[0], 63)?;
-        let presence = extract(&self.output_names[1], 1)
-            .map(|v| v[0])
-            .unwrap_or(0.0);
-        let handedness = extract(&self.output_names[2], 1)
-            .map(|v| v[0])
-            .unwrap_or(0.0);
-        let world = extract(&self.output_names[3], 63)?;
-        drop(outputs);
-        // The converted checkpoint emits probabilities (an empty crop reads
-        // ≈ 0.0, a hand ≈ 0.7–1.0), not logits.
-        let mut out = HandResult {
-            presence: presence.clamp(0.0, 1.0),
-            handedness: handedness.clamp(0.0, 1.0),
-            crop,
-            ..Default::default()
-        };
-        for i in 0..HAND_KP {
-            out.px[i] = [
-                x0 + screen[i * 3] * scale,
-                y0 + screen[i * 3 + 1] * scale,
-                screen[i * 3 + 2] * scale,
-            ];
-            out.world[i] = [world[i * 3], world[i * 3 + 1], world[i * 3 + 2]];
-        }
-        Some(out)
-    }
-}
-
 /// Crop-local RTMPose-m hand model (21 keypoints, InterHand2.6M-style
-/// canonical order) — the MediaPipe-free backend. Selected with
-/// `VULVATAR_HAND_BACKEND=rtmpose` via [`HandBackend`]; the default
-/// remains MediaPipe until the A/B gate (AGENTS.md) passes.
+/// canonical order) — the MediaPipe-free backend, and the default via
+/// [`HandBackend`] since the six-recording A/B gate passed
+/// (2026-09-18); `VULVATAR_HAND_BACKEND=mediapipe` restores the old
+/// path.
 ///
 /// Mapping from the model's outputs to the [`HandResult`] contract:
 /// * `simcc_x` / `simcc_y` (`(1, 21, 512)` each — SimCC classification
@@ -526,9 +384,8 @@ impl RtmposeHand {
         }))
     }
 
-    /// Same contract as [`HandLandmarker::estimate`]: run on a square
-    /// crop `(x0, y0, size)` of the RGB frame, return landmarks in
-    /// frame pixels.
+    /// Run on a square crop `(x0, y0, size)` of the RGB frame, return
+    /// landmarks in frame pixels.
     pub fn estimate(
         &mut self,
         rgb: &[u8],
@@ -771,37 +628,33 @@ fn chirality_handedness(px: &[[f32; 3]; HAND_KP], flip: bool) -> f32 {
     }
 }
 
-/// Which hand model runs the crop chain. Selected once at construction
-/// with `VULVATAR_HAND_BACKEND` (`rtmpose` | `mediapipe`, default
-/// `mediapipe`); an `rtmpose` request with no export in `models/` falls
-/// back to MediaPipe with a warning instead of losing the hand chain.
+/// The hand crop-chain backend: RTMPose-m hand + distilled presence/palm
+/// nets, the sole backend since the MediaPipe hand-landmarker was
+/// removed on 2026-09-18 (the six-recording A/B gate passed: clasp
+/// 780/781 duty 1.00/1.00 snaps 0/0 vs MediaPipe 782/782/0, chin duty
+/// 0.90 vs 0.88, palms 0.89 vs 0.26, namaste 0.97/0.75 vs 0.66/0.72,
+/// nohands FPs ≈ MediaPipe's own). Exports live in `models/` (gitignored
+/// — see `RTMOSE_HAND_CANDIDATES` and the distilled-net filenames);
+/// without them tracking fails loudly instead of silently losing hands.
 pub enum HandBackend {
-    MediaPipe(HandLandmarker),
     Rtmpose(RtmposeHand),
 }
 
 impl HandBackend {
-    pub fn try_from_models_dir(dir: impl AsRef<Path>) -> Result<Option<Self>, String> {
-        if std::env::var("VULVATAR_HAND_BACKEND")
-            .map(|v| v.eq_ignore_ascii_case("rtmpose"))
-            .unwrap_or(false)
-        {
-            match RtmposeHand::try_from_models_dir(&dir) {
-                Ok(Some(b)) => return Ok(Some(Self::Rtmpose(b))),
-                Ok(None) => warn!(
-                    "VULVATAR_HAND_BACKEND=rtmpose but no hand export in models/ \
-                     (expected {}); falling back to MediaPipe",
-                    RTMOSE_HAND_CANDIDATES[0]
-                ),
-                Err(e) => warn!("RTMPose hand model failed to load: {e}; falling back to MediaPipe"),
-            }
+    pub fn try_from_models_dir(dir: impl AsRef<Path>) -> Result<Self, String> {
+        match RtmposeHand::try_from_models_dir(&dir) {
+            Ok(Some(b)) => Ok(Self::Rtmpose(b)),
+            Ok(None) => Err(format!(
+                "no RTMPose hand export in models/ (expected {}); the hand \
+                 chain cannot start",
+                RTMOSE_HAND_CANDIDATES[0]
+            )),
+            Err(e) => Err(format!("RTMPose hand model failed to load: {e}")),
         }
-        Ok(HandLandmarker::try_from_models_dir(dir)?.map(Self::MediaPipe))
     }
 
     /// Run the hand model on a square frame crop; see
-    /// [`HandLandmarker::estimate`] for the contract both backends
-    /// implement.
+    /// [`RtmposeHand::estimate`] for the contract.
     pub fn estimate(
         &mut self,
         rgb: &[u8],
@@ -809,27 +662,23 @@ impl HandBackend {
         height: u32,
         crop: (f32, f32, f32),
     ) -> Option<HandResult> {
-        match self {
-            Self::MediaPipe(m) => m.estimate(rgb, width, height, crop),
-            Self::Rtmpose(r) => r.estimate(rgb, width, height, crop),
-        }
+        let Self::Rtmpose(r) = self;
+        r.estimate(rgb, width, height, crop)
     }
 
     /// Full-frame wrist proposals `[score, x, y]` from the palm heatmap,
-    /// best first. `None` when the backend has no palm net (MediaPipe, or
-    /// the export is missing) — callers fall back to heuristic crops.
+    /// best first. `None` when the export is missing — callers fall back
+    /// to heuristic crops.
     pub fn palm_peaks(&mut self, rgb: &[u8], width: u32, height: u32) -> Option<Vec<[f32; 3]>> {
-        match self {
-            Self::MediaPipe(_) => None,
-            Self::Rtmpose(r) => r.palm_net.as_mut().map(|p| p.detect(rgb, width, height)),
-        }
+        let Self::Rtmpose(r) = self;
+        r.palm_net.as_mut().map(|p| p.detect(rgb, width, height))
     }
 
     /// Calibrated presence re-score for a palm-proposal result, window
     /// centred on `centre` (the palm peak; see
     /// [`RtmposeHand::rescore_presence`]). `base` is the crop size the
     /// window scale derives from (see `PresenceNet::score`). No-op
-    /// `false` on backends without the distilled net.
+    /// `false` when the distilled net is absent.
     pub fn rescore_presence(
         &mut self,
         rgb: &[u8],
@@ -839,16 +688,13 @@ impl HandBackend {
         centre: [f32; 2],
         base: f32,
     ) -> bool {
-        match self {
-            Self::MediaPipe(_) => false,
-            Self::Rtmpose(r) => r.rescore_presence(rgb, width, height, res, centre, base),
-        }
+        let Self::Rtmpose(r) = self;
+        r.rescore_presence(rgb, width, height, res, centre, base)
     }
 
     /// Which backend was selected (GUI / debug surface).
     pub fn label(&self) -> &'static str {
         match self {
-            Self::MediaPipe(_) => "mediapipe",
             Self::Rtmpose(_) => "rtmpose",
         }
     }
@@ -1057,7 +903,13 @@ pub fn hand_observations(
     out3d: &mut Vec<Kp3d>,
     out_ang: &mut Vec<AngleObs>,
 ) {
-    let scale = res.crop.2 as f64 / INPUT as f64;
+    // Denominator of the calibrated landmark-σ base, retained from the
+    // MediaPipe era where it was the model input side (224). The σ was
+    // empirically calibrated through it and the six-recording A/B gate
+    // (2026-09-18) passed with this value; changing it re-scales every
+    // hand observation σ.
+    const HAND_SIGMA_CROP_DIVISOR: f64 = 224.0;
+    let scale = res.crop.2 as f64 / HAND_SIGMA_CROP_DIVISOR;
     // Landmark noise measured live (2026-09-14, MCP keypoints on a held
     // desk hand) is 15–19 px rms frame-to-frame at 640w — far above this
     // σ — but inflating it destabilises the torso basin (same replay:

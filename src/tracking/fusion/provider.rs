@@ -339,16 +339,11 @@ impl FusionProvider {
         };
         let hands = match super::hands::HandBackend::try_from_models_dir(dir) {
             Ok(h) => {
-                if h.is_none() {
-                    warnings.push("hand pose model missing (models/mediapipe_hand_landmark.onnx or rtmpose-m-hand_256.onnx): fingers use the body detector only".to_string());
-                }
-                if let Some(b) = &h {
-                    info!("hand backend: {}", b.label());
-                }
-                h
+                info!("hand backend: {}", h.label());
+                Some(h)
             }
             Err(e) => {
-                warnings.push(format!("hand landmarker unavailable: {e}"));
+                warnings.push(format!("hand chain unavailable: {e}"));
                 None
             }
         };
@@ -1453,15 +1448,15 @@ impl FusionProvider {
                                 // scores 0.89 while its SimCC decode reads
                                 // 0.00, and the clasp R peak reads 0.00
                                 // while windows near the true wrist read
-                                // 0.99. Take the max over the DETECTION's
+                                // 0.99. Take the max over the detection's
                                 // two centres: the heatmap peak and the
                                 // SimCC decode. The detector wrist pixel is
-                                // deliberately NOT in the set: scoring a
-                                // window at a confident-but-wrong measurement
-                                // every frame re-opens the cuff/lap
-                                // hallucinations on handless recordings
-                                // (measured: nohands locks 73 → 160).
-                                // (2026-09-17)
+                                // deliberately NOT a centre: it re-opens
+                                // fold FPs (nohands 24 → 45 R locks, snaps
+                                // ×2) and measured ZERO benefit on the
+                                // chin/namaste hold dips it was meant to
+                                // bridge — the dips are hard drops, not
+                                // window-placement misses. (2026-09-18)
                                 let mut best_p: f32 = 0.0;
                                 let centres: [[f32; 2]; 2] =
                                     [pk, [res.px[0][0], res.px[0][1]]];
@@ -1646,7 +1641,18 @@ impl FusionProvider {
                         // 1-frame flicker locks on folds/clothing
                         // (measured: nohands locks 73 → 198 under the
                         // carve-outs). (2026-09-17)
-                        let streak_needed = 2;
+                        //
+                        // Evidence-conditional streak (2026-09-18): a flat
+                        // streak 3 priced fold-flicker FPs out but broke
+                        // true-lock continuity (chin duty 0.90 → 0.82,
+                        // namaste L 0.97 → 0.53 — one acquisition frame
+                        // lost per soft read); a flat streak 2 left nohands
+                        // at 2× MP. The published-score distributions
+                        // separate cleanly: 95-97% of true-hand locks
+                        // (clasp/chin) read ≥0.93 while only 28% of fold
+                        // FPs do (median 0.85). So near-certain reads
+                        // acquire in 2 frames, everything else needs 3.
+                        let streak_needed = if res.presence >= 0.93 { 2 } else { 3 };
                         // Pre-emptive duplicate suppression for PALM-source
                         // results only: when both slots' windows latch onto
                         // one blob their nets agree and both publish — the
@@ -1702,7 +1708,16 @@ impl FusionProvider {
                             self.hand_acq_streak[hand] += 1;
                         }
                     }
-                    Some(res) if res.presence >= 0.20 && self.hand_hold[hand] < 3 => {
+                    // 5-frame soft hold (2026-09-18): with acquisition at
+                    // streak 3 the fold-flicker FPs are gone, but the chin
+                    // and namaste-L reads dip <0.5 for 2-4 frames mid-hold
+                    // (fist rotation, sibling-hand occlusion) and a 3-frame
+                    // band dropped the lock into a re-acquisition — chin
+                    // duty 0.90 → 0.82, namaste L 0.97 → 0.53. Five soft
+                    // frames (167 ms) bridges those dips; a genuinely gone
+                    // hand is cut sooner by `hand_unsupported` when the
+                    // detector contradicts the lock.
+                    Some(res) if res.presence >= 0.20 && self.hand_hold[hand] < 5 => {
                         match self.prev_hands[hand].as_ref() {
                             // Established lock: hold through the soft read.
                             Some(prev) => {
