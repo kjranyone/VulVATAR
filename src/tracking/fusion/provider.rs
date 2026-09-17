@@ -1072,6 +1072,14 @@ impl FusionProvider {
                             peaks.len(),
                             peaks.iter().take(3).map(|p| (p[0], p[1], p[2])).collect::<Vec<_>>()
                         );
+                        let (dl, dr) = (det_kps[9], det_kps[10]);
+                        let fkp = |j| intr.project(fk_pred.t[j]);
+                        info!(
+                            "hand-palm anchors frame{n}: detL ({:.2},{:.2},{:.2}) detR ({:.2},{:.2},{:.2}) fkL {:?} fkR {:?}",
+                            dl.0, dl.1, dl.2, dr.0, dr.1, dr.2,
+                            fkp(self.h.j.l_wrist),
+                            fkp(self.h.j.r_wrist),
+                        );
                     }
                 }
                 peaks
@@ -1223,7 +1231,14 @@ impl FusionProvider {
                                 ];
                                 let t = (rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2])
                                     / len2;
-                                if t >= -0.5 {
+                                // t is in forearm lengths past the wrist.
+                                // The upper bound is a physical one: a hand
+                                // extends at most ~one forearm past the
+                                // wrist joint. Without it the ray accepts
+                                // background ON the elbow→wrist direction
+                                // metres away (measured: a 4.9 m wrist
+                                // excursion on namaste). (2026-09-17)
+                                if t >= -0.5 && t <= 2.5 {
                                     let perp2 = (rel[0] * rel[0] + rel[1] * rel[1]
                                         + rel[2] * rel[2])
                                         - t * t * len2;
@@ -1307,29 +1322,51 @@ impl FusionProvider {
                 // Palm-net crops, last: these are unverified detections, so
                 // they only run when every FK-anchored crop missed — which
                 // is exactly the acquisition case they exist for. Peaks are
-                // assigned to the slot whose FK wrist projects nearest (a
+                // assigned to the slot whose wrist anchor sits nearest (a
                 // shared peak never seeds both hands), sized from the MP
                 // crop statistics this net was distilled from (crop size
                 // 0.26-0.62 × frame width, wrist at (0.71, 0.74) of the
                 // crop; oversize-biased — RTMPose degrades gracefully on a
                 // loose crop and badly on a tight one).
+                //
+                // The anchor is the body detector's wrist PIXEL when
+                // confident, falling back to the FK projection: at clasp
+                // the never-tracked slot's FK prior projected onto the
+                // OTHER hand's blob, which crossed the assignment (each
+                // slot received its sibling's peak; measured on
+                // s1789349575 — R's own peak decoded on L's slot and both
+                // slots' depth gates rejected the wrong-hand decodes, so R
+                // stayed lockless). The detector wrist is a measurement
+                // that carries no tracking history, and it is the same
+                // anchor the depth gate's `ok_meas` tier scores against,
+                // so an accepted peak lands on an anchor the gate can
+                // corroborate. (2026-09-17)
                 // Everything at this index or beyond is palm-sourced; the
                 // optional heuristics above shift the index every frame, so
                 // the palm tier can NEVER be keyed on the candidate count.
                 let palm_from = candidates.len();
                 let mut palm_peak: Option<[f32; 2]> = None;
                 if !palm_peaks.is_empty() {
+                    let wrist_anchor = |slot: usize| -> Option<[f64; 2]> {
+                        let dw = det_kps[9 + slot];
+                        if dw.2 >= 0.5 && (0.0..=1.0).contains(&dw.0) && (0.0..=1.0).contains(&dw.1)
+                        {
+                            Some([
+                                f64::from(dw.0) * f64::from(width),
+                                f64::from(dw.1) * f64::from(height),
+                            ])
+                        } else {
+                            intr.project(fk_pred.t[if slot == 0 {
+                                self.h.j.l_wrist
+                            } else {
+                                self.h.j.r_wrist
+                            }])
+                            .map(|p| [p[0], p[1]])
+                        }
+                    };
                     let other = 1 - hand;
-                    let p_self = intr.project(fk_pred.t[if hand == 0 {
-                        self.h.j.l_wrist
-                    } else {
-                        self.h.j.r_wrist
-                    }]);
-                    let p_other = intr.project(fk_pred.t[if other == 0 {
-                        self.h.j.l_wrist
-                    } else {
-                        self.h.j.r_wrist
-                    }]);
+                    let p_self = wrist_anchor(hand);
+                    let p_other = wrist_anchor(other);
                     if let (Some(a), Some(b)) = (p_self, p_other) {
                         let d = |pk: &[f32; 3], p: [f64; 2]| {
                             (pk[1] as f64 - p[0]).powi(2) + (pk[2] as f64 - p[1]).powi(2)
@@ -1338,10 +1375,14 @@ impl FusionProvider {
                             .iter()
                             .filter(|pk| {
                                 let (d0, d1) = (d(pk, a), d(pk, b));
+                                // `a` is THIS slot's anchor, `b` the other
+                                // slot's: keep peaks nearer our own anchor.
+                                // Exact ties go to slot 0 so a shared peak
+                                // never seeds both hands.
                                 if hand == 0 {
                                     d0 <= d1
                                 } else {
-                                    d1 < d0
+                                    d0 < d1
                                 }
                             })
                             .collect();
@@ -1395,11 +1436,46 @@ impl FusionProvider {
                         // sharpness 0.83.
                         if is_palm {
                             if let Some(pk) = palm_peak {
-                                hl.rescore_presence(rgb_data, width, height, &mut res, pk);
+                                // Fixed base 96 → a 48 px window, the scale
+                                // the rest of the candidate chain already
+                                // rescores at. Bigger windows fall off the
+                                // net's calibration cliff (measured on the
+                                // clasp recording: R's gripping hand reads
+                                // 0.994 in a 48 px window, 0.001 in the
+                                // 67 px one the palm crop size produced).
+                                //
+                                // The window CENTRE is equally brittle: the
+                                // net only reads "hand" where its training
+                                // windows sat, and the landscape swings
+                                // 1.00 ↔ 0.00 across 20 px on the same hand
+                                // (measured grid probe). No single centre
+                                // survives every posture — the chin peak
+                                // scores 0.89 while its SimCC decode reads
+                                // 0.00, and the clasp R peak reads 0.00
+                                // while windows near the true wrist read
+                                // 0.99. Take the max over the DETECTION's
+                                // two centres: the heatmap peak and the
+                                // SimCC decode. The detector wrist pixel is
+                                // deliberately NOT in the set: scoring a
+                                // window at a confident-but-wrong measurement
+                                // every frame re-opens the cuff/lap
+                                // hallucinations on handless recordings
+                                // (measured: nohands locks 73 → 160).
+                                // (2026-09-17)
+                                let mut best_p: f32 = 0.0;
+                                let centres: [[f32; 2]; 2] =
+                                    [pk, [res.px[0][0], res.px[0][1]]];
+                                for c in &centres {
+                                    hl.rescore_presence(rgb_data, width, height, &mut res, *c, 96.0);
+                                    best_p = best_p.max(res.presence);
+                                }
+                                res.presence = best_p;
+                                res.net_presence = Some(best_p);
                             }
                         } else {
                             let c = [res.px[0][0], res.px[0][1]];
-                            hl.rescore_presence(rgb_data, width, height, &mut res, c);
+                            let base = res.crop.2;
+                            hl.rescore_presence(rgb_data, width, height, &mut res, c, base);
                         }
                         // Depth-consistency veto (see the anchor note above):
                         // reject candidates whose wrist pixel sits at an
@@ -1550,32 +1626,27 @@ impl FusionProvider {
                 } else {
                     self.hand_unsupported[hand] = 0;
                 }
-                // Publish with temporal debounce: a NEW lock needs 3
+                // Publish with temporal debounce: a NEW lock needs 2
                 // consecutive passing frames (see `hand_acq_streak`); an
                 // established lock survives up to 2 consecutive soft reads
                 // (see `hand_hold`) before dropping, so one soft frame
-                // doesn't snap the wrist to the prior. Palm-source results
-                // publish at a lower bar: their net score swings with
-                // training-run variance (same config re-measured chin
-                // coverage 386 ↔ 60 locks across net inits at 0.5) and the
-                // acquisition gates (net ≥0.5/0.7 + depth tier + streak 2)
-                // already filtered them.
+                // doesn't snap the wrist to the prior. One publish bar for
+                // every source — see the streak note below on why the palm
+                // carve-outs went away with the v4 presence net.
                 match best {
-                    Some(mut res)
-                        if res.presence
-                            >= if (res.src as usize) >= palm_from { 0.35 } else { 0.5 } =>
-                    {
-                        // Strong calibrated palm evidence publishes in ONE
-                        // frame: net ≥0.7 already cleared the depth tier (a
-                        // measured anchor or a FK/forearm-ray corroboration)
-                        // and demanding a 2nd consecutive frame just loses
-                        // to evidence flicker — palm passes arrive scattered
-                        // (366 passes / 782 frames on chin) so streak 2
-                        // rarely completes, while MediaPipe publishes
-                        // instantly on its stable 0.9 reads.
-                        let strong_palm =
-                            (res.src as usize) >= palm_from && res.presence >= 0.7;
-                        let streak_needed = if strong_palm { 1 } else { 2 };
+                    Some(mut res) if res.presence >= 0.5 => {
+                        // Palm candidates used to publish at 0.35 and a
+                        // strong palm (net ≥0.7) at streak 1: the v3 net's
+                        // reads swung with training-run variance and its
+                        // passes arrived scattered, so the special case
+                        // bought coverage. The v4 net (placement-augmented,
+                        // val pos-acc 0.999) reads true hands at 0.95-1.00
+                        // consistently, so palm candidates meet the same
+                        // bar as every other source — which also stops
+                        // 1-frame flicker locks on folds/clothing
+                        // (measured: nohands locks 73 → 198 under the
+                        // carve-outs). (2026-09-17)
+                        let streak_needed = 2;
                         // Pre-emptive duplicate suppression for PALM-source
                         // results only: when both slots' windows latch onto
                         // one blob their nets agree and both publish — the

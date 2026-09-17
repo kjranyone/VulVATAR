@@ -690,11 +690,12 @@ impl RtmposeHand {
         height: u32,
         res: &mut HandResult,
         centre: [f32; 2],
+        base: f32,
     ) -> bool {
         let Some(net) = self.presence_net.as_mut() else {
             return false;
         };
-        let Some(s) = net.score(rgb, width, height, centre, res.crop.2) else {
+        let Some(s) = net.score(rgb, width, height, centre, base) else {
             return false;
         };
         res.net_presence = Some(s);
@@ -826,8 +827,9 @@ impl HandBackend {
 
     /// Calibrated presence re-score for a palm-proposal result, window
     /// centred on `centre` (the palm peak; see
-    /// [`RtmposeHand::rescore_presence`]). No-op `false` on backends
-    /// without the distilled net.
+    /// [`RtmposeHand::rescore_presence`]). `base` is the crop size the
+    /// window scale derives from (see `PresenceNet::score`). No-op
+    /// `false` on backends without the distilled net.
     pub fn rescore_presence(
         &mut self,
         rgb: &[u8],
@@ -835,10 +837,11 @@ impl HandBackend {
         height: u32,
         res: &mut super::hands::HandResult,
         centre: [f32; 2],
+        base: f32,
     ) -> bool {
         match self {
             Self::MediaPipe(_) => false,
-            Self::Rtmpose(r) => r.rescore_presence(rgb, width, height, res, centre),
+            Self::Rtmpose(r) => r.rescore_presence(rgb, width, height, res, centre, base),
         }
     }
 
