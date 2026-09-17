@@ -447,7 +447,6 @@ impl RtmposeHand {
             px[j][0] = refine_peak(xs, ix) / bins as f32;
             px[j][1] = refine_peak(ys, iy) / bins as f32;
         }
-        let scale = size / self.size as f32;
         // Presence = SimCC sharpness median. The distilled classifier can
         // additionally VETO candidates it scores as confidently-not-hand:
         // `VULVATAR_HAND_PRESENCE_VETO=<threshold>` enables it with a
@@ -470,9 +469,58 @@ impl RtmposeHand {
             crop,
             ..Default::default()
         };
+        // SimCC coords are normalised over the model input ([0,1] after the
+        // bin division), so the frame mapping is x0 + n * crop_size — NOT
+        // x0 + n * (crop_size / model_size): that collapses all 21 points
+        // into a ~1 px blob at the crop origin.
         for (slot, k) in out.px.iter_mut().zip(px.iter()) {
-            slot[0] = x0 + k[0] * scale;
-            slot[1] = _y0 + k[1] * scale;
+            slot[0] = x0 + k[0] * size;
+            slot[1] = _y0 + k[1] * size;
+        }
+        // Geometry gate: SimCC decodes each keypoint independently, so a
+        // pattern-match on a face/forearm often collapses (palm ~0) or
+        // stretches to an impossible skeleton. A real hand keeps the
+        // knuckle-width / palm-length ratio in a narrow band — measured
+        // 75% of true-hand windows in [0.15, 0.9] vs 22% of hallucinations.
+        // `VULVATAR_HAND_NO_GEOM_GATE=1` disables.
+        if std::env::var_os("VULVATAR_HAND_NO_GEOM_GATE").is_none() {
+            let palm = ((out.px[9][0] - out.px[0][0]).powi(2)
+                + (out.px[9][1] - out.px[0][1]).powi(2))
+            .sqrt();
+            let knuckle = ((out.px[5][0] - out.px[17][0]).powi(2)
+                + (out.px[5][1] - out.px[17][1]).powi(2))
+            .sqrt();
+            let ratio = if palm > 1e-3 { knuckle / palm } else { 0.0 };
+            if palm < 8.0 || !(0.15..=0.9).contains(&ratio) {
+                static R: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = R.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 30 {
+                    info!(
+                        "hand-geom reject: palm {palm:.1}px knuckle {knuckle:.1}px ratio {ratio:.2} presence {:.2}",
+                        out.presence
+                    );
+                }
+                return None;
+            }
+        }
+        if std::env::var_os("VULVATAR_HAND_GEOM_DEBUG").is_some() {
+            // Palm-length / knuckle-width: a real hand sits in a narrow
+            // ratio band; a SimCC pattern-match on a face/forearm does not.
+            let palm = ((out.px[9][0] - out.px[0][0]).powi(2)
+                + (out.px[9][1] - out.px[0][1]).powi(2))
+            .sqrt();
+            let knuckle = ((out.px[5][0] - out.px[17][0]).powi(2)
+                + (out.px[5][1] - out.px[17][1]).powi(2))
+            .sqrt();
+            let ratio = if palm > 1e-3 { knuckle / palm } else { 0.0 };
+            static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = G.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 60 {
+                info!(
+                    "hand-geom: palm {palm:.1}px knuckle {knuckle:.1}px ratio {ratio:.2} presence {:.2}",
+                    out.presence
+                );
+            }
         }
         out.handedness = chirality_handedness(&out.px, self.chirality_flip);
         Some(out)
