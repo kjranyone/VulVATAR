@@ -60,10 +60,9 @@ pub struct HandResult {
 }
 
 /// Crop-local RTMPose-m hand model (21 keypoints, InterHand2.6M-style
-/// canonical order) — the MediaPipe-free backend, and the default via
-/// [`HandBackend`] since the six-recording A/B gate passed
-/// (2026-09-18); `VULVATAR_HAND_BACKEND=mediapipe` restores the old
-/// path.
+/// canonical order) — the sole hand backend via [`HandBackend`] since
+/// the six-recording A/B gate passed and the MediaPipe hand-landmarker
+/// was removed (2026-09-18).
 ///
 /// Mapping from the model's outputs to the [`HandResult`] contract:
 /// * `simcc_x` / `simcc_y` (`(1, 21, 512)` each — SimCC classification
