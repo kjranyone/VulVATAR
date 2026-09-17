@@ -273,3 +273,290 @@ pub fn source_skeleton(
     }
     sk
 }
+
+/// Per-update published-rotation cap (degrees, world delta).
+/// `VULVATAR_TRANSITION_MAX_STEP_DEG` overrides; 0 disables the limiter.
+pub const TRANSITION_MAX_STEP_DEG_DEFAULT: f32 = 25.0;
+/// Per-update cap (m) for the head-local wrist anchors. Desk hand motion
+/// tops out ≈ 0.10 m/update at 20 Hz; 0.12 m leaves it untouched while
+/// the measured 0.2-0.35 m yanks become 2-3 update glides.
+const TRANSITION_WRIST_STEP_M: f32 = 0.12;
+/// Publication gap (s) that clears the limiter's memory (person left /
+/// re-seeded — the pose itself resets there, nothing to cap from).
+const TRANSITION_MEMORY_GAP_S: f64 = 0.5;
+
+/// Last published state of one bone (post-cap): the value the NEXT
+/// frame's rotation step is measured against.
+#[derive(Clone, Copy, Debug)]
+struct PublishedBone {
+    delta: [f32; 4],
+    wrist: [f32; 3],
+}
+
+/// Rate-limits published bone rotations to a physical per-update ceiling.
+///
+/// Measured live (desk streaming, 2026-09-16): when a hand leaves the
+/// frame or its detection drops, the solved wrist teleports 0.2-0.35 m
+/// and the bone world-deltas jump 90-155° in a single ~50 ms update —
+/// >1000°/s, physically impossible. `data_sigma` leaks out over ~0.3 s,
+/// so those yanks mostly happen when BOTH frames already read
+/// unobserved, and single mis-detection frames produce them while BOTH
+/// read observed — no observation-state gate can catch the whole class
+/// (measured: a flip-gated blender engaged zero times on replay456).
+/// The limiter is therefore observation-agnostic: any per-update change
+/// over `max_step` publishes only `max_step` of rotation toward the new
+/// pose. Real motion under the cap passes untouched; motion over the
+/// cap catches up within a couple of updates, reading as a fast glide.
+/// The wrist anchors get the same treatment in position space.
+pub struct PoseTransitionBlender {
+    max_step: f32,
+    /// Last published state per bone.
+    last: HashMap<HumanoidBone, PublishedBone>,
+    last_t: f64,
+}
+
+impl PoseTransitionBlender {
+    pub fn new() -> Self {
+        let deg = std::env::var("VULVATAR_TRANSITION_MAX_STEP_DEG")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(TRANSITION_MAX_STEP_DEG_DEFAULT);
+        Self {
+            max_step: deg.to_radians(),
+            last: HashMap::new(),
+            last_t: f64::NAN,
+        }
+    }
+
+    /// Apply to the rig right before publication. With the step knob at
+    /// 0 this is a pass-through that still maintains the per-bone memory,
+    /// so toggling the knob at runtime is continuous.
+    pub fn apply(&mut self, rig: &mut RigPose) {
+        if !self.last_t.is_nan() && rig.t - self.last_t > TRANSITION_MEMORY_GAP_S {
+            self.last.clear();
+        }
+        self.last_t = rig.t;
+        for (bone, rb) in rig.bones.iter_mut() {
+            let new = rb.delta_world;
+            let side = hand_side(bone);
+            let Some(prev) = self.last.get(bone).copied() else {
+                let wrist = side.map(|i| rig.head_local_wrists[i]).unwrap_or([0.0; 3]);
+                self.last.insert(
+                    bone.clone(),
+                    PublishedBone {
+                        delta: new,
+                        wrist,
+                    },
+                );
+                continue;
+            };
+            if self.max_step > 0.0 {
+                let angle = quat_angle_between(prev.delta, new);
+                if angle > self.max_step {
+                    rb.delta_world = quat_slerp_short2(prev.delta, new, self.max_step / angle);
+                }
+                if let Some(i) = side {
+                    let target = rig.head_local_wrists[i];
+                    let d = ((target[0] - prev.wrist[0]).powi(2)
+                        + (target[1] - prev.wrist[1]).powi(2)
+                        + (target[2] - prev.wrist[2]).powi(2))
+                    .sqrt();
+                    if d > TRANSITION_WRIST_STEP_M {
+                        rig.head_local_wrists[i] =
+                            lerp3(prev.wrist, target, TRANSITION_WRIST_STEP_M / d);
+                    }
+                }
+            }
+            let wrist = match side {
+                Some(i) => rig.head_local_wrists[i],
+                None => prev.wrist,
+            };
+            self.last.insert(
+                bone.clone(),
+                PublishedBone {
+                    delta: rb.delta_world,
+                    wrist,
+                },
+            );
+        }
+    }
+}
+
+/// 0 = left hand, 1 = right hand, None = not a hand (wrist) bone.
+fn hand_side(bone: &HumanoidBone) -> Option<usize> {
+    match bone {
+        HumanoidBone::LeftHand => Some(0),
+        HumanoidBone::RightHand => Some(1),
+        _ => None,
+    }
+}
+
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Rotation angle (rad) between two quaternions, hemisphere-agnostic.
+fn quat_angle_between(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let mut d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    if d < 0.0 {
+        d = -d;
+    }
+    2.0 * d.clamp(-1.0, 1.0).acos()
+}
+
+/// Short-arc slerp for `[x, y, z, w]` quaternions (nearly-parallel safe).
+fn quat_slerp_short2(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    let b = if dot < 0.0 {
+        dot = -dot;
+        [-b[0], -b[1], -b[2], -b[3]]
+    } else {
+        b
+    };
+    if dot > 0.9995 {
+        return [
+            a[0] + t * (b[0] - a[0]),
+            a[1] + t * (b[1] - a[1]),
+            a[2] + t * (b[2] - a[2]),
+            a[3] + t * (b[3] - a[3]),
+        ];
+    }
+    let theta = dot.clamp(-1.0, 1.0).acos();
+    let sin_t = theta.sin();
+    let wa = (theta * (1.0 - t)).sin() / sin_t;
+    let wb = (theta * t).sin() / sin_t;
+    let q = [
+        a[0] * wa + b[0] * wb,
+        a[1] * wa + b[1] * wb,
+        a[2] * wa + b[2] * wb,
+        a[3] * wa + b[3] * wb,
+    ];
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if n > 1e-8 {
+        [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+    } else {
+        q
+    }
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + t * (b[0] - a[0]),
+        a[1] + t * (b[1] - a[1]),
+        a[2] + t * (b[2] - a[2]),
+    ]
+}
+
+#[cfg(test)]
+mod transition_blend_tests {
+    use super::*;
+
+    fn rig(t: f64, delta: [f32; 4], wrist: [f32; 3]) -> RigPose {
+        let mut r = RigPose::default();
+        r.t = t;
+        r.bones.insert(
+            HumanoidBone::LeftHand,
+            RigBone {
+                delta_world: delta,
+                sigma: 0.1,
+                data_sigma: 10.0,
+            },
+        );
+        r.head_local_wrists = [wrist, [0.0; 3]];
+        r
+    }
+
+    const IDENTITY: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    const QUARTER_TURN: [f32; 4] = [0.0, 0.3826834, 0.0, 0.9238795];
+    /// 10° — a real rotation change too small to hit the cap.
+    const SMALL_TURN: [f32; 4] = [0.0, 0.0871557, 0.0, 0.9961947];
+
+    fn limiter() -> PoseTransitionBlender {
+        let mut b = PoseTransitionBlender::new();
+        b.max_step = 25.0f32.to_radians();
+        b
+    }
+
+    #[test]
+    fn jump_over_cap_spreads_over_updates_and_converges() {
+        let mut b = limiter();
+        b.apply(&mut rig(1.0, IDENTITY, [0.1, 0.2, 0.3]));
+        // 45° yank in one update: first frame publishes exactly the cap.
+        let mut r = rig(1.05, QUARTER_TURN, [0.5, 0.2, 0.3]);
+        b.apply(&mut r);
+        let a1 = quat_angle_between(r.bones[&HumanoidBone::LeftHand].delta_world, IDENTITY);
+        assert!((a1 - 25.0f32.to_radians()).abs() < 1e-3, "first frame {a1} rad");
+        // Remaining 20° is under the cap: next frame reaches the target.
+        let mut r = rig(1.1, QUARTER_TURN, [0.5, 0.2, 0.3]);
+        b.apply(&mut r);
+        assert!(
+            quat_angle_between(r.bones[&HumanoidBone::LeftHand].delta_world, QUARTER_TURN) < 1e-3,
+            "under-cap remainder should pass through to the target"
+        );
+    }
+
+    #[test]
+    fn change_under_cap_passes_through() {
+        let mut b = limiter();
+        b.apply(&mut rig(1.0, IDENTITY, [0.1, 0.2, 0.3]));
+        let mut r = rig(1.05, SMALL_TURN, [0.1, 0.2, 0.3]);
+        b.apply(&mut r);
+        assert_eq!(r.bones[&HumanoidBone::LeftHand].delta_world, SMALL_TURN);
+    }
+
+    #[test]
+    fn wrist_anchor_is_capped_in_position_space() {
+        let mut b = limiter();
+        b.apply(&mut rig(1.0, IDENTITY, [0.0, 0.0, 0.0]));
+        // Small rotation (passes the rotation cap) but a 1 m wrist jump.
+        let mut r = rig(1.05, SMALL_TURN, [1.0, 0.0, 0.0]);
+        b.apply(&mut r);
+        let w = r.head_local_wrists[0];
+        let d = (w[0].powi(2) + w[1].powi(2) + w[2].powi(2)).sqrt();
+        assert!(
+            (d - TRANSITION_WRIST_STEP_M).abs() < 1e-3,
+            "wrist should advance exactly the cap, got {d}"
+        );
+        // Catch-up moves one cap per update until it lands on the target.
+        let mut x = TRANSITION_WRIST_STEP_M;
+        for i in 2.. {
+            let mut r = rig(1.0 + 0.05 * i as f64, SMALL_TURN, [1.0, 0.0, 0.0]);
+            b.apply(&mut r);
+            x = (x + TRANSITION_WRIST_STEP_M).min(1.0);
+            assert!((r.head_local_wrists[0][0] - x).abs() < 1e-4, "frame {i}");
+            if x >= 1.0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn publication_gap_clears_memory() {
+        let mut b = limiter();
+        b.apply(&mut rig(1.0, IDENTITY, [0.1, 0.2, 0.3]));
+        // Person left and came back: first new frame publishes as-is.
+        let mut r = rig(2.5, QUARTER_TURN, [0.5, 0.2, 0.3]);
+        b.apply(&mut r);
+        assert_eq!(r.bones[&HumanoidBone::LeftHand].delta_world, QUARTER_TURN);
+    }
+
+    #[test]
+    fn zero_step_disables_limiting() {
+        let mut b = PoseTransitionBlender::new();
+        b.max_step = 0.0;
+        b.apply(&mut rig(1.0, IDENTITY, [0.1, 0.2, 0.3]));
+        let mut r = rig(1.05, QUARTER_TURN, [0.5, 0.2, 0.3]);
+        b.apply(&mut r);
+        assert_eq!(r.bones[&HumanoidBone::LeftHand].delta_world, QUARTER_TURN);
+    }
+
+    #[test]
+    fn first_frame_establishes_baseline_without_limiting() {
+        let mut b = limiter();
+        // Even a huge first delta passes through: nothing to cap from.
+        let mut r = rig(1.0, QUARTER_TURN, [0.5, 0.2, 0.3]);
+        b.apply(&mut r);
+        assert_eq!(r.bones[&HumanoidBone::LeftHand].delta_world, QUARTER_TURN);
+    }
+}

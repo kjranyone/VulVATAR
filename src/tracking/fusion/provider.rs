@@ -71,7 +71,7 @@ const DEPTH_RING_CAP: usize = 8;
 
 pub struct FusionProvider {
     det: DetectorSlot,
-    hands: Option<super::hands::HandLandmarker>,
+    hands: Option<super::hands::HandBackend>,
     /// Last hand-crop results `[left, right]` (diagnostics).
     pub last_hands: [Option<super::hands::HandResult>; 2],
     /// Last LOCKED hand results (persist across a frame where every crop
@@ -95,6 +95,17 @@ pub struct FusionProvider {
     /// (it sees the whole person), so a lock that the body cannot back up
     /// for a few frames is dropped.
     hand_unsupported: [u8; 2],
+    /// Consecutive passing frames while acquiring a NEW hand lock. A
+    /// first publish needs 3 in a row — gate-rejected remnants of a
+    /// desk-envelope recording arrive in 1-4 frame bursts (measured: 51
+    /// bursts, median 2), which this eats instead of snapping the wrist
+    /// into them.
+    hand_acq_streak: [u32; 2],
+    /// Consecutive soft-read (0.45-0.5) frames an ESTABLISHED lock has
+    /// survived. RTMPose's sharpness hovers ~0.5-0.7 on genuine hands, so
+    /// a single soft read must not drop the lock and snap the wrist to
+    /// the prior.
+    hand_hold: [u32; 2],
     /// This frame's crop result for each slot carries the OTHER hand's
     /// handedness (see the veto note at the crop loop). Dropping such a
     /// result outright makes the arm flicker between the data pose and
@@ -121,6 +132,9 @@ pub struct FusionProvider {
     pub last_est_ms: f32,
     /// Per-phase wall-time breakdown (ms) of the last `estimate_pose`.
     pub last_timings: PhaseTimings,
+    /// Smooths the one-shot wrist/arm yank when a bone flips between
+    /// observed and prior-driven (`output::PoseTransitionBlender`).
+    pub pose_blend: output::PoseTransitionBlender,
     /// Diagnostics: sparse surface points.
     pub last_surface: Vec<[f32; 3]>,
     /// Diagnostics: metric joint observations `(joint index, point, σ)`.
@@ -318,10 +332,13 @@ impl FusionProvider {
                 warnings,
             )
         };
-        let hands = match super::hands::HandLandmarker::try_from_models_dir(dir) {
+        let hands = match super::hands::HandBackend::try_from_models_dir(dir) {
             Ok(h) => {
                 if h.is_none() {
-                    warnings.push("hand landmarker model missing (models/mediapipe_hand_landmark.onnx): fingers use the body detector only".to_string());
+                    warnings.push("hand pose model missing (models/mediapipe_hand_landmark.onnx or rtmpose-m-hand_256.onnx): fingers use the body detector only".to_string());
+                }
+                if let Some(b) = &h {
+                    info!("hand backend: {}", b.label());
                 }
                 h
             }
@@ -350,6 +367,8 @@ impl FusionProvider {
             face_fit: super::canonical_face::FaceFit::new(),
             head_ori: super::head_ori::HeadOriTracker::new(),
             hand_unsupported: [0, 0],
+            hand_acq_streak: [0, 0],
+            hand_hold: [0, 0],
             hand_suspect: [false, false],
             hand_dupes: 0,
             external_depth: None,
@@ -371,6 +390,7 @@ impl FusionProvider {
             hand_kp_start: 0,
             last_solve_ms: 0.0,
             last_est_ms: 0.0,
+            pose_blend: output::PoseTransitionBlender::new(),
             last_timings: PhaseTimings::default(),
             last_surface: Vec::new(),
             last_kp3d: Vec::new(),
@@ -1014,10 +1034,110 @@ impl FusionProvider {
             }
         }
         // ---- hand crops (state-driven) --------------------------------------
-        let mut hand_done = [false; 2];
-        self.last_hands = [None, None];
+        // Depth-consistency gate for crop results (RTMPose-class landmarks
+        // have NO detection score, so without this every crop window yields
+        // a confident "hand": a handless desk recording hallucinated 317
+        // locks and window-hopping drove 57 px median wrist jumps). A
+        // genuine lock sits at the FK wrist's depth; a wrong-window crop
+        // (face, desk edge) sits at whatever surface fills the crop.
+        // `VULVATAR_HAND_NO_DEPTH_GATE=1` disables; tolerance in metres via
+        // `VULVATAR_HAND_DEPTH_TOL_M` (default 0.14).
+        let hand_depth_gate = std::env::var_os("VULVATAR_HAND_NO_DEPTH_GATE").is_none();
+        let hand_depth_tol_m: f64 = std::env::var("VULVATAR_HAND_DEPTH_TOL_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.30);
+        let hand_depth_pts: Option<&[[f32; 3]]> =
+            depth.as_ref().map(|d| d.points_m.as_slice());
+        let mut hand_done = [false; 2];        self.last_hands = [None, None];
         if let Some(hl) = self.hands.as_mut() {
             for hand in 0..2 {
+                // Gate anchor: the body-detector wrist is a MEASUREMENT that
+                // tracks a raised arm even while no hand lock exists, so
+                // acquisition prefers it over the FK prior — whose wrist can
+                // lag behind a bootstrapping arm and then gate-reject the
+                // very locks that would fix it (measured: the chin hand
+                // collapsed to 20 locks on FK alone).
+                let det_w = det_kps[9 + hand];
+                let meas_anchor: Option<[f64; 3]> = if det_w.2 >= 0.5 {
+                    hand_depth_pts.and_then(|pts| {
+                        super::coherence::sample_depth_at(
+                            pts,
+                            width,
+                            height,
+                            det_w.0 as f64,
+                            det_w.1 as f64,
+                        )
+                        .map(|z| {
+                            [
+                                (det_w.0 as f64 * width as f64 - intr.cx) * z / intr.fx,
+                                (det_w.1 as f64 * height as f64 - intr.cy) * z / intr.fy,
+                                z,
+                            ]
+                        })
+                    })
+                } else {
+                    None
+                };
+                let p_fk = fk_pred.t[if hand == 0 {
+                    self.h.j.l_wrist
+                } else {
+                    self.h.j.r_wrist
+                }];
+                let had_lock = self.prev_hands[hand].is_some();
+                // Depth-consistency gate. Tiered by evidence: an established
+                // lock continues on the loose band; escalation candidates
+                // (temporal backing lost mid-scan) sit tight against the FK
+                // wrist; fresh acquisition must corroborate against the
+                // measured body wrist when one exists.
+                let hand_gate = |px: [f32; 2], ci: usize| -> bool {
+                    if !hand_depth_gate {
+                        return true;
+                    }
+                    let Some(pts) = hand_depth_pts else {
+                        return true;
+                    };
+                    // A wrist outside the depth frame cannot be corroborated
+                    // by any surface — RTMPose happily returns confident
+                    // landmarks for ceiling/window crops there (measured:
+                    // wrist pixels at y = −16..−97 on a handless recording).
+                    // Out-of-bounds is a REJECT; only interior depth holes
+                    // pass through to the other gates.
+                    let u = px[0] as f64;
+                    let v = px[1] as f64;
+                    if !(0.0..width as f64).contains(&u) || !(0.0..height as f64).contains(&v) {
+                        return false;
+                    }
+                    let Some(z) = super::coherence::sample_depth_at(
+                        pts,
+                        width,
+                        height,
+                        (px[0] / width as f32) as f64,
+                        (px[1] / height as f32) as f64,
+                    ) else {
+                        return true; // interior depth hole: the other gates still apply
+                    };
+                    let p = [
+                        (px[0] as f64 - intr.cx) * z / intr.fx,
+                        (px[1] as f64 - intr.cy) * z / intr.fy,
+                        z,
+                    ];
+                    let d_fk = ((p[0] - p_fk[0]).powi(2)
+                        + (p[1] - p_fk[1]).powi(2)
+                        + (p[2] - p_fk[2]).powi(2))
+                    .sqrt();
+                    if ci == 0 && had_lock {
+                        return d_fk <= hand_depth_tol_m;
+                    }
+                    if let Some(a) = meas_anchor {
+                        let d_meas = ((p[0] - a[0]).powi(2)
+                            + (p[1] - a[1]).powi(2)
+                            + (p[2] - a[2]).powi(2))
+                        .sqrt();
+                        return d_meas <= 0.20 && d_fk <= hand_depth_tol_m;
+                    }
+                    d_fk <= 0.18
+                };
                 // Crop candidates, best first: (1) last frame's locked hand
                 // re-cropped around its own landmarks (tightest, survives a
                 // detector miss), (2) the body detector's hand block, (3)
@@ -1068,6 +1188,12 @@ impl FusionProvider {
                 for (ci, crop) in candidates.into_iter().enumerate() {
                     if let Some(mut res) = hl.estimate(rgb_data, width, height, crop) {
                         res.src = ci as u8;
+                        // Depth-consistency veto (see the anchor note above):
+                        // reject candidates whose wrist pixel sits at an
+                        // inconsistent surface.
+                        if !hand_gate([res.px[0][0], res.px[0][1]], ci) {
+                            continue;
+                        }
                         // Handedness veto: a slot must never lock onto the opposing hand
                         // when the classifier is decisive (left ≈0.15, right ≈0.85).
                         // Middle band [0.30, 0.70] is genuinely uncertain and passes.
@@ -1078,6 +1204,18 @@ impl FusionProvider {
                         };
                         if wrong_hand {
                             continue;
+                        }
+                        // Candidate acceptance. An ESTABLISHED lock
+                        // continues on its own re-crop (candidate 0) at a
+                        // lower bar: RTMPose's sharpness hovers ~0.5-0.7 on
+                        // genuine hands, so a per-frame best-of scan
+                        // re-rolls the window lottery every frame —
+                        // measured as 57 px median wrist jumps on a
+                        // clasped-hands recording. Fresh ACQUISITION still
+                        // demands lock-grade (≥0.6) evidence.
+                        if had_lock && ci == 0 && res.presence >= 0.40 {
+                            best = Some(res);
+                            break;
                         }
                         let better = best
                             .as_ref()
@@ -1132,13 +1270,66 @@ impl FusionProvider {
                 } else {
                     self.hand_unsupported[hand] = 0;
                 }
+                // Publish with temporal debounce: a NEW lock needs 3
+                // consecutive passing frames (see `hand_acq_streak`); an
+                // established lock survives up to 2 consecutive soft reads
+                // (see `hand_hold`) before dropping, so one soft frame
+                // doesn't snap the wrist to the prior.
                 match best {
-                    Some(res) if res.presence >= 0.5 => {
-                        hand_done[hand] = true;
-                        self.prev_hands[hand] = Some(res.clone());
-                        self.last_hands[hand] = Some(res);
+                    Some(mut res) if res.presence >= 0.5 => {
+                        if self.prev_hands[hand].is_some() || self.hand_acq_streak[hand] >= 2 {
+                            // Landmark EMA on continuation — the same
+                            // substitution the body detector makes for
+                            // RTMW3D's self-tracking crop. SimCC decodes each
+                            // keypoint independently, so overlapping hands
+                            // jitter per-point (measured: 57 px median
+                            // frame-to-frame on a clasped recording); the
+                            // blend damps it and a >80 px jump takes the
+                            // fresh value unblended so real fast motion
+                            // passes through.
+                            if let Some(prev) = self.prev_hands[hand].as_ref() {
+                                for (p, q) in res.px.iter_mut().zip(prev.px.iter()) {
+                                    let jump =
+                                        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+                                    let a = if jump > 80.0 { 1.0 } else { 0.5 };
+                                    p[0] = a * p[0] + (1.0 - a) * q[0];
+                                    p[1] = a * p[1] + (1.0 - a) * q[1];
+                                }
+                            }
+                            hand_done[hand] = true;
+                            self.prev_hands[hand] = Some(res.clone());
+                            self.last_hands[hand] = Some(res);
+                            self.hand_acq_streak[hand] = 0;
+                            self.hand_hold[hand] = 0;
+                        } else {
+                            self.hand_acq_streak[hand] += 1;
+                        }
                     }
-                    _ => self.prev_hands[hand] = None,
+                    Some(res) if res.presence >= 0.45 && self.hand_hold[hand] < 3 => {
+                        match self.prev_hands[hand].as_ref() {
+                            // Established lock: hold through the soft read.
+                            Some(prev) => {
+                                let mut held = res.clone();
+                                held.presence = prev.presence.max(0.5);
+                                hand_done[hand] = true;
+                                self.prev_hands[hand] = Some(held.clone());
+                                self.last_hands[hand] = Some(held);
+                                self.hand_hold[hand] += 1;
+                            }
+                            // Still acquiring: count the soft frame toward
+                            // the streak? No — acquisition demands lock
+                            // grade; a soft frame just resets the streak.
+                            None => {
+                                self.hand_acq_streak[hand] = 0;
+                                self.prev_hands[hand] = None;
+                            }
+                        }
+                    }
+                    _ => {
+                        self.prev_hands[hand] = None;
+                        self.hand_acq_streak[hand] = 0;
+                        self.hand_hold[hand] = 0;
+                    }
                 }
             }
             // Duplicate lock: with the hands clasped or crossing, both
@@ -2187,7 +2378,8 @@ impl FusionProvider {
                 _ => None,
             }
         };
-        let rig = output::rig_pose(&self.h, &self.est, t, span_px);
+        let mut rig = output::rig_pose(&self.h, &self.est, t, span_px);
+        self.pose_blend.apply(&mut rig);
         let ref_span = {
             let fk = self.h.model.fk(&self.est.state);
             norm(sub(fk.t[self.h.j.l_shoulder], fk.t[self.h.j.r_shoulder])) as f32
