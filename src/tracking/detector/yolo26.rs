@@ -67,6 +67,8 @@ pub(crate) struct Yolo26PoseInference {
     /// Square model input size (from the export filename convention).
     size: u32,
     face_mesh: Option<FaceMeshInference>,
+    /// Ready-made RTMPose-face sidecar chain (the MediaPipe replacement).
+    face_rtmt: Option<crate::tracking::face_rtmtface::FaceRtmpose>,
     face_selector: face::FaceSourceSelector,
     frame_timestamp_ms: Option<f64>,
     frame_dt: crate::tracking::metric_frame::FrameDtTracker,
@@ -147,13 +149,40 @@ impl Yolo26PoseInference {
             .unwrap_or(640);
 
         let mut load_warnings = Vec::new();
-        let face_mesh = match FaceMeshInference::try_from_models_dir(&models_dir, opts.face_ep) {
-            Ok(opt) => opt,
-            Err(e) => {
-                let msg = format!("Face inference failed to load: {e}. Expressions disabled.");
-                warn!("{}", msg);
-                load_warnings.push(msg);
-                None
+        // Face backend: the ready-made RTMPose-face sidecar is the
+        // default (MediaPipe removal, 2026-09-18); the MediaPipe pair
+        // stays available behind VULVATAR_FACE_BACKEND=mediapipe for
+        // A/B comparisons until the final sign-off.
+        let face_backend_mp =
+            std::env::var("VULVATAR_FACE_BACKEND")
+                .map(|v| v.eq_ignore_ascii_case("mediapipe"))
+                .unwrap_or(false);
+        let (face_mesh, face_rtmt) = if face_backend_mp {
+            match FaceMeshInference::try_from_models_dir(&models_dir, opts.face_ep) {
+                Ok(opt) => (opt, None),
+                Err(e) => {
+                    let msg =
+                        format!("Face inference failed to load: {e}. Expressions disabled.");
+                    warn!("{}", msg);
+                    load_warnings.push(msg);
+                    (None, None)
+                }
+            }
+        } else {
+            match crate::tracking::face_rtmtface::FaceRtmpose::try_from_models_dir(&models_dir)
+            {
+                Ok(f) => {
+                    info!("face backend: RTMPose-face sidecar");
+                    (None, Some(f))
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "face sidecar unavailable: {e}. Expressions disabled."
+                    );
+                    warn!("{}", msg);
+                    load_warnings.push(msg);
+                    (None, None)
+                }
             }
         };
 
@@ -172,6 +201,7 @@ impl Yolo26PoseInference {
             output_name,
             size,
             face_mesh,
+            face_rtmt,
             face_selector: face::FaceSourceSelector::default(),
             frame_timestamp_ms: None,
             frame_dt: crate::tracking::metric_frame::FrameDtTracker::default(),
@@ -318,7 +348,21 @@ impl Yolo26PoseInference {
         // Face cascade: bbox from the five body-frame face points.
         let mut mesh_conf = 0.0f32;
         let mut mesh_face_pose: Option<crate::tracking::FacePose> = None;
-        if let Some(face_mesh) = self.face_mesh.as_mut() {
+        if let Some(face_rtmt) = self.face_rtmt.as_mut() {
+            if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
+                if let Some((exprs, conf, pose, mesh478)) =
+                    face_rtmt.estimate(rgb_data, width, height, (bbox.x, bbox.y, bbox.size))
+                {
+                    skeleton.expressions = exprs;
+                    skeleton.face_mesh_confidence = Some(conf);
+                    mesh_conf = conf;
+                    mesh_face_pose = pose;
+                    if let Some(aux) = self.last_aux.as_mut() {
+                        aux.face_mesh = Some((mesh478, conf));
+                    }
+                }
+            }
+        } else if let Some(face_mesh) = self.face_mesh.as_mut() {
             if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
                 if let Some((exprs, conf, pose)) =
                     face_mesh.estimate(rgb_data, width, height, &bbox)
