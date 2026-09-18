@@ -32,7 +32,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::tracking::{FacePose, SourceExpression};
 
@@ -60,6 +60,10 @@ pub struct FaceRtmpose {
     canonical: Vec<[f32; 3]>,
     /// wflw slot -> mp478 index (the 98 measured anchors)
     wflw_to_mp478: Vec<usize>,
+    /// distilled landmark->blendshape regression (ready-made ONNX,
+    /// trained offline on MP blendshape labels) — supplies the channels
+    /// the geometric rules do not cover (gaze, brows, lip detail)
+    blend: Option<ort::session::Session>,
     /// slow EAR baselines per eye ring (image-left, image-right)
     ear_base: [f32; 2],
     /// blink latch per eye ring
@@ -215,6 +219,28 @@ impl FaceRtmpose {
                 wflw_to_mp478.len()
             ));
         }
+        let blend_path = dir.join("rtmpose-face-blendshape_98.onnx");
+        let blend = if blend_path.is_file() {
+            let builder = ort::session::Session::builder();
+            match builder.and_then(|b| {
+                let mut b = b;
+                b.commit_from_file(blend_path.to_string_lossy().as_ref())
+            }) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(
+                        "blendshape MLP failed to load: {e}; only geometric expressions run"
+                    );
+                    None
+                }
+            }
+        } else {
+            warn!(
+                "blendshape MLP missing ({}): only geometric expressions run",
+                blend_path.display()
+            );
+            None
+        };
         let python = std::env::var("VULVATAR_FACE_SIDECAR_PYTHON")
             .unwrap_or_else(|_| "python".to_string());
         let script = std::env::var("VULVATAR_FACE_SIDECAR_SCRIPT")
@@ -226,6 +252,7 @@ impl FaceRtmpose {
             script,
             canonical,
             wflw_to_mp478,
+            blend,
             ear_base: [f32::NAN; 2],
             blink_latched: [false; 2],
             fail_run: 0,
@@ -410,7 +437,41 @@ impl FaceRtmpose {
             })
             .collect();
 
-        let exprs = self.geometric_expressions(&pts_frame);
+        let mut exprs = self.geometric_expressions(&pts_frame);
+        // MLP channels: 98 box-normalized landmarks -> 52 ARKit weights.
+        // Geometric overrides win for blink/jaw (measured more robust
+        // than the learned channels on this domain); the MLP contributes
+        // gaze, brows and lip detail.
+        if let Some(sess) = self.blend.as_mut() {
+            let xin: Vec<f32> = pts_norm.iter().flat_map(|p| [p[0], p[1]]).collect();
+            let shape = [1i64, 98, 2];
+            if let Ok(vt) = ort::value::TensorRef::from_array_view((&shape[..], xin.as_slice())) {
+                if let Ok(outputs) = sess.run(ort::inputs!["landmarks98" => vt]) {
+                    if let Some(o) = outputs.get("blendshapes") {
+                        if let Ok((_, data)) = o.try_extract_tensor::<f32>() {
+                            let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+                            for (i, name) in FACE_BLENDSHAPE_NAMES.iter().enumerate().skip(1) {
+                                let geo = exprs
+                                    .iter()
+                                    .find(|e| e.name == *name)
+                                    .map(|e| e.weight);
+                                let v = sigmoid(data[i]).clamp(0.0, 1.0);
+                                // geometric rule wins when more extreme
+                                // (a detected blink must not be washed
+                                // out by the MLP's milder read)
+                                match exprs.iter_mut().find(|e| e.name == *name) {
+                                    Some(e) => e.weight = e.weight.max(v),
+                                    None => exprs.push(SourceExpression {
+                                        name: (*name).to_string(),
+                                        weight: v,
+                                    }),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let pose = self.derive_pose(&pts_frame);
         Some((exprs, conf, pose, mesh478))
     }
@@ -509,6 +570,25 @@ impl FaceRtmpose {
         })
     }
 }
+
+/// ARKit blendshape names in the distilled MLP's output order (index 0
+/// `_neutral` skipped at the call site) — mirrors
+/// `face_mediapipe::FACE_BLENDSHAPE_NAMES`.
+const FACE_BLENDSHAPE_NAMES: [&str; 51] = [
+    "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft",
+    "browOuterUpRight", "cheekPuff", "cheekSquintLeft", "cheekSquintRight",
+    "eyeBlinkLeft", "eyeBlinkRight", "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft", "eyeLookInRight", "eyeLookOutLeft", "eyeLookOutRight",
+    "eyeLookUpLeft", "eyeLookUpRight", "eyeSquintLeft", "eyeSquintRight",
+    "eyeWideLeft", "eyeWideRight", "jawForward", "jawLeft", "jawOpen",
+    "jawRight", "mouthClose", "mouthDimpleLeft", "mouthDimpleRight",
+    "mouthFrownLeft", "mouthFrownRight", "mouthFunnel", "mouthLeft",
+    "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft",
+    "mouthPressRight", "mouthPucker", "mouthRight", "mouthRollLower",
+    "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper", "mouthSmileLeft",
+    "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight",
+    "mouthUpperUpLeft", "mouthUpperUpRight", "noseSneerLeft", "noseSneerRight",
+];
 
 fn expr(name: &str, weight: f32) -> SourceExpression {
     SourceExpression {
