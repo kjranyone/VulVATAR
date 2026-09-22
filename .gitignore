@@ -72,3 +72,10 @@ nul
 /datasets/
 /runs/
 /weights/
+# model binaries beyond the *.onnx pattern: external-weight companions,
+# tflite exports, canonical npy meshes and local backup copies
+models/*.onnx.data
+models/*.tflite
+models/*.npy
+models/*.bak
+models/*.json

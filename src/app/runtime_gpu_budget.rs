@@ -23,6 +23,9 @@
 //! - `degraded_mode == EmergencyCpu` → forces `RenderExportMode::CpuReadback`
 //!   in `app/render.rs`, breaking the GPU-export → failure loop
 //!
+//! Operator override: `VULVATAR_POSE_HZ_MIN` floors `pose_hz_target`
+//! across all modes (0 = follow the ladder). See `pose_hz_floor`.
+//!
 //! Not yet wired (would be follow-up work, with a real consumer in the
 //! same commit so the budget doesn't accumulate dead policy outputs):
 //! none. Future candidates live in docs/gpu-runtime-roadmap.md
@@ -139,6 +142,12 @@ pub struct RuntimeGpuBudget {
     /// Whether FaceMesh should stay off DirectML. Read at ONNX session
     /// build, so a flip takes effect on the next tracking start.
     facemesh_cpu_ep: bool,
+    /// Operator floor for `pose_hz_target` (`VULVATAR_POSE_HZ_MIN`, 0 =
+    /// follow the ladder). When it lifts a pressure mode's setpoint, the
+    /// depth cloud also refreshes every frame — a 30 Hz pose on a
+    /// 3-frame-stale cloud trades coherent smoothness for tracking
+    /// quality, which is the opposite of what the floor is for.
+    pose_hz_floor: u32,
     degraded_mode: DegradedMode,
 
     pressure_since: Option<Instant>,
@@ -204,12 +213,17 @@ const MAX_FAILURE_HISTORY: usize = 1024;
 
 impl RuntimeGpuBudget {
     pub fn new(now: Instant) -> Self {
+        let pose_hz_floor = std::env::var("VULVATAR_POSE_HZ_MIN")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
         Self {
             user_render_fps: 60,
             render_fps_target: 60,
             pose_hz_target: 30,
             depth_refresh_period: 1,
             facemesh_cpu_ep: false,
+            pose_hz_floor,
             degraded_mode: DegradedMode::Healthy,
             pressure_since: None,
             clean_streak_started: Some(now),
@@ -455,6 +469,14 @@ impl RuntimeGpuBudget {
                 self.facemesh_cpu_ep = true;
             }
         }
+        // Operator floor (VULVATAR_POSE_HZ_MIN): lift the pose cadence
+        // above the pressure ladder's setpoint and keep the depth cloud
+        // per-frame fresh so the extra samples stay coherent (see the
+        // `pose_hz_floor` field doc).
+        if self.pose_hz_floor > self.pose_hz_target {
+            self.pose_hz_target = self.pose_hz_floor;
+            self.depth_refresh_period = 1;
+        }
     }
 }
 
@@ -589,6 +611,33 @@ mod tests {
         );
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
         assert_eq!(budget.render_fps_target(), 30);
+    }
+
+    /// VULVATAR_POSE_HZ_MIN (the operator floor) lifts the pressure
+    /// ladder's pose cadence and forces the depth cloud per-frame fresh,
+    /// but leaves the render target and degraded mode alone.
+    #[test]
+    fn pose_hz_floor_lifts_pressure_setpoint() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        budget.pose_hz_floor = 30;
+        budget.update(&render_overrun_measurements(), t0);
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
+        assert_eq!(budget.pose_hz_target(), 30);
+        assert_eq!(budget.depth_refresh_period(), 1);
+        budget.update(
+            &render_overrun_measurements(),
+            t0 + LIGHT_TO_HEAVY_DWELL + Duration::from_millis(1),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+        assert_eq!(budget.pose_hz_target(), 30, "floor holds in Heavy");
+        assert_eq!(budget.depth_refresh_period(), 1, "depth stays per-frame");
+        assert_eq!(budget.render_fps_target(), 30, "render ladder untouched");
+        // A floor below the ladder setpoint changes nothing.
+        budget.pose_hz_floor = 10;
+        budget.recompute_targets();
+        assert_eq!(budget.pose_hz_target(), 20);
+        assert_eq!(budget.depth_refresh_period(), 3);
     }
 
     #[test]

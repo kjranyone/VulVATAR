@@ -231,6 +231,11 @@ fn ypr_deg(r: &M3) -> (f64, f64, f64) {
     (yaw, pitch, roll)
 }
 
+/// Dot product of `[x, y, z, w]` quaternions.
+fn quat_dot(a: [f32; 4], b: [f32; 4]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+}
+
 fn stats(v: &[f64]) -> (f64, f64, f64, f64) {
     if v.is_empty() {
         return (0.0, 0.0, 0.0, 0.0);
@@ -414,6 +419,27 @@ fn main() -> Result<(), String> {
     let mut fing_churn_idx: Vec<u64> = Vec::new();
     let mut prev_finger_angles: std::collections::HashMap<usize, f64> =
         std::collections::HashMap::new();
+    // Published-rig arm metrics: the yank the AVATAR actually feels. The
+    // observation-transition blend (VULVATAR_TRANSITION_BLEND_FRAMES)
+    // acts on the rig, not on the estimator FK reported above, so both
+    // views are needed for the A/B.
+    const ARM_BONES: [vulvatar_lib::asset::HumanoidBone; 8] = [
+        vulvatar_lib::asset::HumanoidBone::LeftShoulder,
+        vulvatar_lib::asset::HumanoidBone::LeftUpperArm,
+        vulvatar_lib::asset::HumanoidBone::LeftLowerArm,
+        vulvatar_lib::asset::HumanoidBone::LeftHand,
+        vulvatar_lib::asset::HumanoidBone::RightShoulder,
+        vulvatar_lib::asset::HumanoidBone::RightUpperArm,
+        vulvatar_lib::asset::HumanoidBone::RightLowerArm,
+        vulvatar_lib::asset::HumanoidBone::RightHand,
+    ];
+    let mut prev_rig_delta: std::collections::HashMap<
+        vulvatar_lib::asset::HumanoidBone,
+        [f32; 4],
+    > = std::collections::HashMap::new();
+    let mut prev_rig_wrist: [Option<[f32; 3]>; 2] = [None, None];
+    let mut rig_rot_jumps: Vec<f64> = Vec::new();
+    let mut rig_wrist_jumps: Vec<f64> = Vec::new();
 
     for (n, (idx, cp, dp)) in pairs.iter().enumerate() {
         let (rgb, mut metric) = load_metric_frame(cp, dp)?;
@@ -424,6 +450,28 @@ fn main() -> Result<(), String> {
         provider.set_external_depth(metric);
         let est_out = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64);
         let rig = est_out.skeleton.rig.clone();
+        if let Some(r) = rig.as_ref() {
+            let mut worst = 0.0f64;
+            for bone in ARM_BONES {
+                if let Some(rb) = r.bones.get(&bone) {
+                    if let Some(prev) = prev_rig_delta.get(&bone) {
+                        let d = quat_dot(*prev, rb.delta_world).abs().clamp(-1.0, 1.0);
+                        worst = worst.max((2.0 * d.acos()) as f64);
+                    }
+                    prev_rig_delta.insert(bone, rb.delta_world);
+                }
+            }
+            rig_rot_jumps.push(worst.to_degrees());
+            let mut wj = 0.0f64;
+            for side in 0..2 {
+                let w = r.head_local_wrists[side];
+                if let Some(p) = prev_rig_wrist[side] {
+                    wj = wj.max((((w[0] - p[0]).powi(2) + (w[1] - p[1]).powi(2) + (w[2] - p[2]).powi(2)).sqrt()) as f64);
+                }
+                prev_rig_wrist[side] = Some(w);
+            }
+            rig_wrist_jumps.push(wj);
+        }
         // VULVATAR_REPLAY_HAND_DUMP=1: per-frame hand-crop provenance +
         // wrist landmark — for attributing wrist-observation noise to its
         // source (0 prev-lock, 1 detector block, 2 prediction).
@@ -1473,6 +1521,22 @@ fn main() -> Result<(), String> {
     println!("root: max jump {rjmax:.3} m");
     println!("L knee : max jump {lkmax:.3} m, snaps>0.15m {lk_snaps}");
     println!("R knee : max jump {rkmax:.3} m, snaps>0.15m {rk_snaps}");
+    // Published-rig view (post transition-blend): what the avatar sees.
+    {
+        let finite_rot: Vec<f64> =
+            rig_rot_jumps.iter().copied().filter(|v| v.is_finite()).collect();
+        let finite_wr: Vec<f64> =
+            rig_wrist_jumps.iter().copied().filter(|v| v.is_finite()).collect();
+        if !finite_rot.is_empty() {
+            let rmax = finite_rot.iter().cloned().fold(0.0, f64::max);
+            let rmean = finite_rot.iter().sum::<f64>() / finite_rot.len() as f64;
+            let wmax = finite_wr.iter().cloned().fold(0.0, f64::max);
+            let wsnaps = finite_wr.iter().filter(|&&j| j > 0.15).count();
+            println!(
+                "rig arm: max rot jump {rmax:.1} deg, mean {rmean:.1} deg | rig wrist: max jump {wmax:.3} m, snaps>0.15m {wsnaps}"
+            );
+        }
+    }
     println!("leg data-σ<0.4 duty: {leg_duty_s}");
     for (name, v) in ["shoulders", "elbows", "wrists", "other"]
         .iter()

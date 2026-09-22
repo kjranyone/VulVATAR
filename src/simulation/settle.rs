@@ -21,6 +21,25 @@
 /// sits above the residual oscillation of a converged chain (measured
 /// ~10 µm post-settle offline; the spring tail's sustained swing is
 /// mm-scale and legitimately stays awake).
+///
+/// `VULVATAR_SETTLE_SLEEP_EPS` (metres) overrides. Raised live
+/// (2026-09-16, GPU-在り共存 campaign): the GPU skirt cloth's residual
+/// limit cycle measures ~1.2 mm/frame at rest — above the 100 µm
+/// default, so the cloth never qualifies as quiet and keeps dispatching
+/// its full kernel ladder forever even with nobody at the desk (the
+/// quantised input fingerprint holds, but this half of the gate never
+/// completes). 2 mm is still invisible on cloth; springs keep the
+/// default unless the operator overrides globally.
+pub(crate) fn settle_sleep_eps() -> f32 {
+    static EPS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *EPS.get_or_init(|| {
+        std::env::var("VULVATAR_SETTLE_SLEEP_EPS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(SETTLE_SLEEP_EPS)
+    })
+}
 pub(crate) const SETTLE_SLEEP_EPS: f32 = 1e-4;
 /// Consecutive quiet steps before a solver may sleep. With 1-2 substeps
 /// per frame this is a few frames (~0.1 s) after the last real motion.
@@ -31,9 +50,9 @@ pub(crate) const SETTLE_SLEEP_QUIET_FRAMES: u32 = 5;
 /// latched: a chain woken by an input change (or a driver) falls back
 /// to `false` as soon as it moves again, so a driver that stops
 /// bit-stable mid-swing freezes nothing; the solver keeps stepping
-/// until the swing decays below [`SETTLE_SLEEP_EPS`].
+/// until the swing decays below [`settle_sleep_eps`].
 pub(crate) fn settle_bump(quiet_frames: u32, max_move: f32) -> (u32, bool) {
-    let quiet_frames = if max_move < SETTLE_SLEEP_EPS {
+    let quiet_frames = if max_move < settle_sleep_eps() {
         quiet_frames.saturating_add(1)
     } else {
         0
@@ -91,6 +110,15 @@ pub struct ClothSettleSleep {
     /// Fingerprint of every solver-relevant input of the last awake
     /// frame; `None` = never stepped.
     pub last_inputs: Option<u64>,
+    /// Quantised input stream of the last accepted frame (same order
+    /// the fingerprint hashes). While sleeping, a fingerprint change
+    /// whose values all sit within [`CLOTH_SLEEP_TOLERATE_CELLS`] of
+    /// this stream is slow drift — tolerated instead of waking — and
+    /// the slot re-simulates one step every
+    /// [`CLOTH_SLEEP_REFRESH_FRAMES`] to catch the pins up.
+    pub last_values: Option<Vec<f32>>,
+    /// Frames of tolerated drift since the last refresh step.
+    pub drift_frames: u32,
     /// Previous readback/step positions — the baseline the max-delta
     /// metric diffs against. GPU: the one-frame-stale position readback
     /// (`apply_cloth_readback`); CPU: implicit in `prev_position`.
@@ -103,6 +131,16 @@ pub struct ClothSettleSleep {
     /// before every evaluation.
     pub suppress_dispatch: bool,
 }
+
+/// While asleep, a quantised-input change where every value moved less
+/// than this many grid cells counts as slow drift (prior wander), not
+/// real motion — tolerated with a periodic catch-up step instead of
+/// waking the full kernel ladder.
+pub(crate) const CLOTH_SLEEP_TOLERATE_CELLS: f32 = 2.0;
+/// Asleep slots re-simulate one frame every this many tolerated frames
+/// (~1 s at 60 Hz) so pin-band drift stays bounded by
+/// tolerance x interval.
+pub(crate) const CLOTH_SLEEP_REFRESH_FRAMES: u32 = 60;
 
 #[cfg(test)]
 mod tests {

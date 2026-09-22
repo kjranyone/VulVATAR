@@ -572,6 +572,9 @@ pub struct VulkanRenderer {
     readback_cpu_pool: [Option<Arc<Vec<u8>>>; READBACK_RING_SIZE],
     readback_slot: usize,
     pending_readback: Option<PendingReadbackState>,
+    /// GPU timestamp breakdown pool (`VULVATAR_RENDER_PROF=1`, on-demand
+    /// instrumentation per docs/profiling.md — not a committed feature).
+    prof_ts_pool: Option<(Arc<vulkano::query::QueryPool>, f32)>,
     // When set, the 1× render path copies the depth aspect to a CPU buffer and
     // surfaces it as `RenderResult::depth_ndc`. Off on the live path; enabled
     // only by the metric-depth benches (`validate_gt`) via `set_depth_readback`.
@@ -669,6 +672,7 @@ impl VulkanRenderer {
             readback_cpu_pool: [None, None],
             readback_slot: 0,
             pending_readback: None,
+            prof_ts_pool: None,
             depth_readback_enabled: false,
             depth_readback_buffer: None,
             skinning_cache: Vec::new(),
@@ -1342,6 +1346,38 @@ impl VulkanRenderer {
                 counters.pixel_pool_reuses,
                 counters.pixel_pool_allocs,
             );
+            if let Some((pool, period_ns)) = &self.prof_ts_pool {
+                // Read ONLY the slots the CB writes (0..9): WAIT blocks on
+                // any unwritten query and would stall the render thread
+                // forever (observed as a driver device-lost on first use).
+                let mut ticks = [0u64; 9];
+                match pool.get_results(0..9, &mut ticks, vulkano::query::QueryResultFlags::WAIT) {
+                    Ok(_) => {
+                        // Timestamps carry the queue family's valid bits in
+                        // the low word; mask to 32 bits (wraps ≈ 100 s at
+                        // 24 ns — far apart relative to one frame).
+                        const MASK: u64 = 0xFFFF_FFFF;
+                        let ms = |a: u64, b: u64| {
+                            (b.wrapping_sub(a) & MASK) as f32 * period_ns / 1_000_000.0
+                        };
+                        let total = ms(ticks[0], ticks[4]);
+                        let cloth = ms(ticks[5], ticks[6]);
+                        let sdf = ms(ticks[7], ticks[8]);
+                        println!(
+                            "RENDER_PROF compute_prepass={:.2}ms scene={:.2}ms post={:.2}ms readback_copy={:.2}ms total={:.2}ms | clothsim={:.2}ms sdf_splat={:.2}ms rest={:.2}ms (iters=env)",
+                            ms(ticks[0], ticks[1]),
+                            ms(ticks[1], ticks[2]),
+                            ms(ticks[2], ticks[3]),
+                            ms(ticks[3], ticks[4]),
+                            total,
+                            cloth,
+                            sdf,
+                            (total - cloth - sdf).max(0.0),
+                        );
+                    }
+                    Err(e) => println!("RENDER_PROF get_results failed: {e:?}"),
+                }
+            }
         }
 
         let stats = RenderStats {
@@ -1398,7 +1434,17 @@ impl VulkanRenderer {
     /// re-records + rebuilds every frame). Evaluated once per process.
     fn cb_cache_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_CACHE").map_or(true, |v| v != "0"))
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_CACHE").is_ok_and(|v| v != "0"))
+    }
+
+    /// Profiling knob (`VULVATAR_RENDER_PROF=1`): GPU timestamp
+    /// breakdown of the cached frame CB (compute prepass / scene /
+    /// post / readback copies), logged as `RENDER_PROF` every 60
+    /// frames. On-demand instrumentation per docs/profiling.md — not
+    /// part of the committed feature set.
+    fn render_prof_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_RENDER_PROF").is_ok_and(|v| v == "1"))
     }
 
     /// Read the previous frame's final-VBO audit rows from the
@@ -1579,6 +1625,37 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("render: failed to create command buffer: {e}"))?;
 
+        // ── GPU timestamp breakdown (profiling only, RENDER_PROF) ───────
+        let prof_pool = if Self::render_prof_enabled() {
+            if self.prof_ts_pool.is_none() {
+                let device = queue.device().clone();
+                let mut info =
+                    vulkano::query::QueryPoolCreateInfo::query_type(vulkano::query::QueryType::Timestamp);
+                info.query_count = 9;
+                let pool = vulkano::query::QueryPool::new(device.clone(), info)
+                    .map_err(|e| format!("render: prof query pool failed: {e}"))?;
+                let period = device.physical_device().properties().timestamp_period;
+                self.prof_ts_pool = Some((pool, period));
+            }
+            Some(self.prof_ts_pool.as_ref().unwrap().clone())
+        } else {
+            None
+        };
+        if let Some((pool, _)) = &prof_pool {
+            unsafe {
+                builder
+                    .reset_query_pool(pool.clone(), 0..9)
+                    .map_err(|e| format!("render: prof reset failed: {e:?}"))?;
+                builder
+                    .write_timestamp(
+                        pool.clone(),
+                        0,
+                        vulkano::sync::PipelineStage::BottomOfPipe,
+                    )
+                    .map_err(|e| format!("render: prof ts0 failed: {e:?}"))?;
+            }
+        }
+
         // ── Compute prepass: fuse skinning + morph + cloth per primitive
         Self::record_compute_prepass_planned(
             &mut builder,
@@ -1599,6 +1676,13 @@ impl VulkanRenderer {
             &plan.containment_copies,
             &plan.audit_copies,
         )?;
+        if let Some((pool, _)) = &prof_pool {
+            unsafe {
+                builder
+                    .write_timestamp(pool.clone(), 1, vulkano::sync::PipelineStage::BottomOfPipe)
+                    .map_err(|e| format!("render: prof ts1 failed: {e:?}"))?;
+            }
+        }
 
         // ── Scene pass: forward draws + outlines ────────────────────────
         self.record_scene_pass(
@@ -1608,6 +1692,13 @@ impl VulkanRenderer {
             &gfx_pipeline,
             &outline_pipeline,
         )?;
+        if let Some((pool, _)) = &prof_pool {
+            unsafe {
+                builder
+                    .write_timestamp(pool.clone(), 2, vulkano::sync::PipelineStage::BottomOfPipe)
+                    .map_err(|e| format!("render: prof ts2 failed: {e:?}"))?;
+            }
+        }
 
         // ── Post effects: bloom chain + composite/encode ────────────────
         // The composite always runs — it is the HDR→8-bit encode stage that
@@ -1624,6 +1715,13 @@ impl VulkanRenderer {
             }
             Self::record_composite(&mut builder, post, plan.composite_intensity, plan.use_bloom)?;
         }
+        if let Some((pool, _)) = &prof_pool {
+            unsafe {
+                builder
+                    .write_timestamp(pool.clone(), 3, vulkano::sync::PipelineStage::BottomOfPipe)
+                    .map_err(|e| format!("render: prof ts3 failed: {e:?}"))?;
+            }
+        }
 
         // ── Readback: two-stage copy to avoid slow Intel DMA path ───────
         builder
@@ -1639,6 +1737,13 @@ impl VulkanRenderer {
                 plan.readback_buffer.clone(),
             ))
             .map_err(|e| format!("render: copy_buffer staging→readback failed: {e}"))?;
+        if let Some((pool, _)) = &prof_pool {
+            unsafe {
+                builder
+                    .write_timestamp(pool.clone(), 4, vulkano::sync::PipelineStage::BottomOfPipe)
+                    .map_err(|e| format!("render: prof ts4 failed: {e:?}"))?;
+            }
+        }
 
         // Optional depth-aspect readback (metric-depth benches only). 1× only
         // — the MSAA depth attachment is multisampled + `DontCare`. The depth

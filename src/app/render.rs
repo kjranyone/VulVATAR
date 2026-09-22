@@ -1543,14 +1543,37 @@ fn cloth_gpu_inputs_hash(
     global_transforms: &[crate::asset::Mat4],
     colliders: &[crate::renderer::frame_input::ClothGpuCollider],
 ) -> u64 {
+    cloth_gpu_inputs_hash_with_values(ctrl_dt, sim, global_transforms, colliders).0
+}
+
+/// The same quantised stream the fingerprint hashes, materialised so
+/// the sleep gate can tell a slow drift (every spatial value within a
+/// couple of grid cells of the sleeping snapshot) from a real driver
+/// motion while the slot sleeps.
+fn cloth_gpu_inputs_hash_with_values(
+    ctrl_dt: f32,
+    sim: &crate::simulation::cloth::ClothSimState,
+    global_transforms: &[crate::asset::Mat4],
+    colliders: &[crate::renderer::frame_input::ClothGpuCollider],
+) -> (u64, Vec<f32>) {
     use crate::math_utils::vec3_scale;
     use crate::simulation::settle::SettleHasher;
+    fn qpush(h: &mut SettleHasher, vals: &mut Vec<f32>, v: f32) {
+        let q = settle_quant(v);
+        h.write_f32(q);
+        vals.push(q);
+    }
     let mut h = SettleHasher::new();
+    let mut vals: Vec<f32> = Vec::new();
     h.write_f32(ctrl_dt);
     h.write_f32(sim.damping);
     h.write_f32(sim.sdf_contact);
-    h.write_f32s(&sim.gravity);
-    h.write_f32s(&vec3_scale(&sim.wind_direction, sim.wind_response));
+    for v in &sim.gravity {
+        qpush(&mut h, &mut vals, *v);
+    }
+    for v in &vec3_scale(&sim.wind_direction, sim.wind_response) {
+        qpush(&mut h, &mut vals, *v);
+    }
     h.write_u32(sim.solver_iterations);
     h.write_f32(sim.collision_margin);
     h.write_bool(sim.self_collision);
@@ -1558,22 +1581,29 @@ fn cloth_gpu_inputs_hash(
     h.write_u32(sim.pin_targets.len() as u32);
     for pin in &sim.pin_targets {
         h.write_u32(pin.node_index as u32);
-        // Pin offsets are spatial (metres) — quantise.
-        h.write_f32s(&pin.offset.map(settle_quant));
+        for v in &pin.offset {
+            qpush(&mut h, &mut vals, *v);
+        }
     }
     h.write_u32(global_transforms.len() as u32);
     for m in global_transforms {
         for col in m {
-            h.write_f32s(&col.map(settle_quant));
+            for v in col {
+                qpush(&mut h, &mut vals, *v);
+            }
         }
     }
     h.write_u32(colliders.len() as u32);
     for c in colliders {
-        h.write_f32s(&c.p0.map(settle_quant));
-        h.write_f32s(&c.p1.map(settle_quant));
-        h.write_f32(settle_quant(c.radius));
+        for v in &c.p0 {
+            qpush(&mut h, &mut vals, *v);
+        }
+        for v in &c.p1 {
+            qpush(&mut h, &mut vals, *v);
+        }
+        qpush(&mut h, &mut vals, c.radius);
     }
-    h.finish()
+    (h.finish(), vals)
 }
 
 /// Per-frame settle-sleep gate for every cloth slot on one avatar
@@ -1620,18 +1650,56 @@ fn update_cloth_settle_gate(
         colliders: &[crate::renderer::frame_input::ClothGpuCollider],
     ) {
         use crate::simulation::cloth_gpu_boundary::ClothSolverBackend;
+        use crate::simulation::settle::{
+            CLOTH_SLEEP_REFRESH_FRAMES, CLOTH_SLEEP_TOLERATE_CELLS,
+        };
         if cs.solver_backend != ClothSolverBackend::Gpu || !cs.enabled {
             return;
         }
         let Some(sim) = sim else { return };
-        let hash = cloth_gpu_inputs_hash(ctrl_dt, sim, global_transforms, colliders);
+        let (hash, values) =
+            cloth_gpu_inputs_hash_with_values(ctrl_dt, sim, global_transforms, colliders);
         let settle = &mut cs.settle;
-        if settle.last_inputs != Some(hash) {
+        let unchanged = settle.last_inputs == Some(hash);
+        if unchanged {
+            settle.drift_frames = 0;
+            if settle.sleeping {
+                settle.suppress_dispatch = true;
+            }
+        } else if settle.sleeping
+            && settle.last_values.as_ref().is_some_and(|prev| {
+                prev.len() == values.len()
+                    && prev
+                        .iter()
+                        .zip(&values)
+                        .all(|(a, b)| (a - b).abs() <= CLOTH_SLEEP_TOLERATE_CELLS)
+            })
+        {
+            // Slow drift while asleep (prior wander crossing fingerprint
+            // cells): accept the new fingerprint without waking, and
+            // re-simulate one frame every CLOTH_SLEEP_REFRESH_FRAMES so
+            // the pin band catches up — drift stays bounded by
+            // tolerance x interval instead of never sleeping at all
+            // (measured 2026-09-16: the prior-driven hips wander crosses
+            // the ~0.5 mm fingerprint cells every frame, so a strict
+            // wake-on-change kept the cloth at full dispatch rate even
+            // with nobody at the desk).
+            settle.drift_frames += 1;
+            if settle.drift_frames >= CLOTH_SLEEP_REFRESH_FRAMES {
+                settle.drift_frames = 0;
+            } else {
+                settle.suppress_dispatch = true;
+            }
+            settle.last_inputs = Some(hash);
+            settle.last_values = Some(values);
+        } else {
+            // Real driver motion (or first frame): wake and re-accumulate
+            // the quiet streak.
             settle.sleeping = false;
             settle.quiet_frames = 0;
+            settle.drift_frames = 0;
             settle.last_inputs = Some(hash);
-        } else if settle.sleeping {
-            settle.suppress_dispatch = true;
+            settle.last_values = Some(values);
         }
     }
 
