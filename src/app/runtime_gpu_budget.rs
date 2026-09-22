@@ -17,9 +17,6 @@
 //! - `depth_refresh_period` → `tracking::worker::DEPTH_REFRESH_PERIOD`
 //!   (metric-cloud rebuild cadence; skipped frames clone the last
 //!   cloud)
-//! - `facemesh_cpu_ep` → `tracking::face_mediapipe::FACEMESH_EP_CPU`
-//!   (consulted at ONNX session build — takes effect on the next
-//!   tracking start)
 //! - `degraded_mode == EmergencyCpu` → forces `RenderExportMode::CpuReadback`
 //!   in `app/render.rs`, breaking the GPU-export → failure loop
 //!
@@ -141,7 +138,6 @@ pub struct RuntimeGpuBudget {
     depth_refresh_period: u32,
     /// Whether FaceMesh should stay off DirectML. Read at ONNX session
     /// build, so a flip takes effect on the next tracking start.
-    facemesh_cpu_ep: bool,
     /// Operator floor for `pose_hz_target` (`VULVATAR_POSE_HZ_MIN`, 0 =
     /// follow the ladder). When it lifts a pressure mode's setpoint, the
     /// depth cloud also refreshes every frame — a 30 Hz pose on a
@@ -222,7 +218,6 @@ impl RuntimeGpuBudget {
             render_fps_target: 60,
             pose_hz_target: 30,
             depth_refresh_period: 1,
-            facemesh_cpu_ep: false,
             pose_hz_floor,
             degraded_mode: DegradedMode::Healthy,
             pressure_since: None,
@@ -253,9 +248,6 @@ impl RuntimeGpuBudget {
     }
     pub fn depth_refresh_period(&self) -> u32 {
         self.depth_refresh_period
-    }
-    pub fn facemesh_prefers_cpu_ep(&self) -> bool {
-        self.facemesh_cpu_ep
     }
     pub fn degraded_mode(&self) -> DegradedMode {
         self.degraded_mode
@@ -448,25 +440,21 @@ impl RuntimeGpuBudget {
                 self.render_fps_target = self.user_render_fps;
                 self.pose_hz_target = 30;
                 self.depth_refresh_period = 1;
-                self.facemesh_cpu_ep = false;
             }
             DegradedMode::PressureLight => {
                 self.render_fps_target = self.user_render_fps.min(45);
                 self.pose_hz_target = 25;
                 self.depth_refresh_period = 2;
-                self.facemesh_cpu_ep = false;
             }
             DegradedMode::PressureHeavy => {
                 self.render_fps_target = self.user_render_fps.min(30);
                 self.pose_hz_target = 20;
                 self.depth_refresh_period = 3;
-                self.facemesh_cpu_ep = true;
             }
             DegradedMode::EmergencyCpu => {
                 self.render_fps_target = self.user_render_fps.min(30);
                 self.pose_hz_target = 15;
                 self.depth_refresh_period = 4;
-                self.facemesh_cpu_ep = true;
             }
         }
         // Operator floor (VULVATAR_POSE_HZ_MIN): lift the pose cadence
@@ -949,16 +937,16 @@ mod tests {
         // behaviour), FaceMesh goes CPU from PressureHeavy up.
         budget.degraded_mode = DegradedMode::Healthy;
         budget.recompute_targets();
-        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (30, 1, false));
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period()), (30, 1));
         budget.degraded_mode = DegradedMode::PressureLight;
         budget.recompute_targets();
-        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (25, 2, false));
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period()), (25, 2));
         budget.degraded_mode = DegradedMode::PressureHeavy;
         budget.recompute_targets();
-        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (20, 3, true));
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period()), (20, 3));
         budget.degraded_mode = DegradedMode::EmergencyCpu;
         budget.recompute_targets();
-        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period(), budget.facemesh_prefers_cpu_ep()), (15, 4, true));
+        assert_eq!((budget.pose_hz_target(), budget.depth_refresh_period()), (15, 4));
     }
 
     /// Defence: if the dwell timer's anchor is in the future relative

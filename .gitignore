@@ -45,6 +45,9 @@ models/vitpose-h-wholebody_onnx/
 # Scratch / ad-hoc tooling workspace (live debug scripts, throwaway probes)
 /scratchpad/
 
+# Local venvs provisioned by dev.ps1 (face landmark sidecar runtime env)
+/tools/
+
 # Python bytecode (depth_capture.py and other scripts run via uv)
 __pycache__/
 *.pyc

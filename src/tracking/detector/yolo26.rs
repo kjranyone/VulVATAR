@@ -28,7 +28,7 @@ use std::path::Path;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use super::super::face_mediapipe::{derive_face_bbox, FaceBbox, FaceMeshInference};
+use crate::tracking::face_bbox::{derive_face_bbox, FaceBbox};
 use super::session::build_session;
 use super::yolo_pose::{anchor_box, anchor_keypoints, best_pose_anchor, letterbox, pose_anchor_count, pose_channels};
 use super::{
@@ -66,8 +66,7 @@ pub(crate) struct Yolo26PoseInference {
     output_name: String,
     /// Square model input size (from the export filename convention).
     size: u32,
-    face_mesh: Option<FaceMeshInference>,
-    /// Ready-made RTMPose-face sidecar chain (the MediaPipe replacement).
+    /// Ready-made RTMPose-face sidecar chain (the only face backend).
     face_rtmt: Option<crate::tracking::face_rtmtface::FaceRtmpose>,
     face_selector: face::FaceSourceSelector,
     frame_timestamp_ms: Option<f64>,
@@ -149,31 +148,14 @@ impl Yolo26PoseInference {
             .unwrap_or(640);
 
         let mut load_warnings = Vec::new();
-        // Face backend: the ready-made RTMPose-face sidecar is the
-        // default (MediaPipe removal, 2026-09-18); the MediaPipe pair
-        // stays available behind VULVATAR_FACE_BACKEND=mediapipe for
-        // A/B comparisons until the final sign-off.
-        let face_backend_mp =
-            std::env::var("VULVATAR_FACE_BACKEND")
-                .map(|v| v.eq_ignore_ascii_case("mediapipe"))
-                .unwrap_or(false);
-        let (face_mesh, face_rtmt) = if face_backend_mp {
-            match FaceMeshInference::try_from_models_dir(&models_dir, opts.face_ep) {
-                Ok(opt) => (opt, None),
-                Err(e) => {
-                    let msg =
-                        format!("Face inference failed to load: {e}. Expressions disabled.");
-                    warn!("{}", msg);
-                    load_warnings.push(msg);
-                    (None, None)
-                }
-            }
-        } else {
-            match crate::tracking::face_rtmtface::FaceRtmpose::try_from_models_dir(&models_dir)
-            {
+        // Face backend: the ready-made RTMPose-face sidecar is the only
+        // path (the MediaPipe FaceMesh pair was removed on 2026-09-22;
+        // the pre-removal A/B implementation lives in git history).
+        let face_rtmt =
+            match crate::tracking::face_rtmtface::FaceRtmpose::try_from_models_dir(&models_dir) {
                 Ok(f) => {
                     info!("face backend: RTMPose-face sidecar");
-                    (None, Some(f))
+                    Some(f)
                 }
                 Err(e) => {
                     let msg = format!(
@@ -181,10 +163,9 @@ impl Yolo26PoseInference {
                     );
                     warn!("{}", msg);
                     load_warnings.push(msg);
-                    (None, None)
+                    None
                 }
-            }
-        };
+            };
 
         info!(
             "YOLO26-pose loaded {} (input '{}x{}', output '{}'), backend {}",
@@ -200,7 +181,6 @@ impl Yolo26PoseInference {
             input_name,
             output_name,
             size,
-            face_mesh,
             face_rtmt,
             face_selector: face::FaceSourceSelector::default(),
             frame_timestamp_ms: None,
@@ -359,24 +339,6 @@ impl Yolo26PoseInference {
                     mesh_face_pose = pose;
                     if let Some(aux) = self.last_aux.as_mut() {
                         aux.face_mesh = Some((mesh478, conf));
-                    }
-                }
-            }
-        } else if let Some(face_mesh) = self.face_mesh.as_mut() {
-            if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
-                if let Some((exprs, conf, pose)) =
-                    face_mesh.estimate(rgb_data, width, height, &bbox)
-                {
-                    skeleton.expressions = exprs;
-                    skeleton.face_mesh_confidence = Some(conf);
-                    mesh_conf = conf;
-                    mesh_face_pose = pose;
-                    if let Some(aux) = self.last_aux.as_mut() {
-                        // take_landmarks_px drains; re-run only when the
-                        // mesh produced a face this frame.
-                        if let Some(lm) = face_mesh.take_landmarks_px() {
-                            aux.face_mesh = Some(lm);
-                        }
                     }
                 }
             }

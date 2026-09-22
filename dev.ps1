@@ -78,26 +78,21 @@ function Install-Font {
 }
 
 function Install-Models {
-    # Pulls RTMW3D-x for body / hands, MediaPipe FaceMeshV2 +
-    # BlendshapeV2 for face expression, and YOLOX-m for human-art
-    # person detection.
+    # Pulls RTMW3D-x for body / hands and YOLOX-m for human-art person
+    # detection (both kept only for legacy offline tooling — the runtime
+    # detector is YOLO26-pose, exported via the 'export yolo26-pose ONNX'
+    # menu entry), plus the RTMPose-Face-WFLW LiteRT model for the face
+    # sidecar.
     #
     #   * RTMW3D-x   — Soykaf/RTMW3D-x              (370 MB, 133 3D landmarks)
-    #   * FaceMesh   — PINTO 410 FaceMeshV2         (4.8 MB, 478 face landmarks)
-    #   * Blendshape — PINTO 390 BlendshapeV2       (1.8 MB, 52 ARKit weights)
-    #   * HandLandmk — opencv_zoo 2023feb           (4.1 MB, 21 hand landmarks)
     #   * YOLOX-m    — mmpose rtmposev1 onnx_sdk    (94 MB,  human-art bbox)
+    #   * RTMPose-Face — litert-community WFLW98    (34 MB,  face sidecar)
     #
-    # YOLOX-m is optional — without it, RTMW3D runs on the whole frame
-    # (Kinemotion-style). With it, we crop to the largest detected
-    # person bbox before RTMW3D so small / distant subjects get model-
-    # input-resolution treatment.
-    #
-    # RTMW3D's body keypoints 0..=4 (nose / eyes / ears) are used to
-    # crop the face for FaceMesh, so we don't need a separate face
-    # detector. The 52 ARKit blendshape coefficients drive the avatar's
-    # expression channel directly (with a few VRM 1.0 preset
-    # aggregations layered on for stock rigs).
+    # The MediaPipe FaceMesh / Blendshape / hand-landmarker downloads were
+    # removed with the MediaPipe runtime backends (hand 2026-09-18, face
+    # 2026-09-22). The offline face-distillation teacher models are no
+    # longer provisioned here — re-running scratchpad face-distill tooling
+    # fetches them manually (PINTO 410/390).
     Write-Host "Setting up VulVATAR ONNX models..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
@@ -113,34 +108,46 @@ function Install-Models {
         -KeepGlobs @("end2end.onnx") `
         -RenameMap @{ "end2end.onnx" = "yolox.onnx" }
 
-    # Face mesh + blendshape from PINTO_model_zoo. PINTO ships
-    # MediaPipe FaceMeshV2 (478 landmarks) and BlendshapeV2 (52 ARKit
-    # weights) as separate ONNX files inside per-project tar.gz
-    # archives. The OpenCV HF org does not publish these particular
-    # models, so we fall back to PINTO's Wasabi S3 mirror.
-    Install-PintoArchive -Name "MediaPipe FaceMeshV2 (478 landmarks)" `
-        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/410_FaceMeshV2/resources.tar.gz" `
-        -KeepGlobs @("face_landmarks_detector_1x3x256x256.onnx")
-    Install-PintoArchive -Name "MediaPipe BlendshapeV2 (52 ARKit blendshapes)" `
-        -ArchiveUrl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/390_BlendShapeV2/resources.tar.gz" `
-        -KeepGlobs @("face_blendshapes.onnx")
+    # Face mesh + blendshape from PINTO_model_zoo were removed with the
+    # MediaPipe face backend (2026-09-22); the RTMPose-face sidecar below
+    # replaced them.
 
-    # MediaPipe hand landmarker (21 keypoints + wrist-relative world layout)
-    # from opencv_zoo — fusion/hands.rs crops around the *predicted* hand, so
-    # the landmark model alone suffices (no palm detector needed). Raw URL is
-    # a Git LFS pointer target; curl -L follows the redirect to the blob.
-    # Without this file the tracker warns and fingers fall back to the coarse
-    # body-detector block (~20 px σ).
-    Install-DirectFiles -Name "MediaPipe hand landmarker (21 keypoints)" -Files @(
-        @{ Url = "https://github.com/opencv/opencv_zoo/raw/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx";
-           OutName = "mediapipe_hand_landmark.onnx" }
+    # RTMPose-Face-WFLW LiteRT — the default face backend's landmark model
+    # (ready-made Apache-2 export from Google's litert-community HF org).
+    # It runs in a Python sidecar (scripts/face98_service.py via
+    # ai-edge-litert) because the Rust runtime is onnxruntime and cannot
+    # load tflite. The distilled blendshape MLP
+    # (models/rtmpose-face-blendshape_98.onnx) is a locally trained
+    # artifact — without it the sidecar still runs, geometric-only.
+    Install-DirectFiles -Name "RTMPose-Face-WFLW LiteRT (face sidecar)" -Files @(
+        @{ Url = "https://huggingface.co/litert-community/RTMPose-Face-WFLW-LiteRT/resolve/main/rtm_face_fp16.tflite";
+           OutName = "rtm_face_fp16.tflite" }
     )
 
-    # Rename to the canonical filename the loader expects.
-    if ((Test-Path "models\face_landmarks_detector_1x3x256x256.onnx") -and
-        (-not (Test-Path "models\face_landmark.onnx"))) {
-        Move-Item "models\face_landmarks_detector_1x3x256x256.onnx" "models\face_landmark.onnx"
-        Write-Host "    renamed to face_landmark.onnx" -ForegroundColor Green
+    # Isolated Python env the sidecar runs in (ai-edge-litert + numpy).
+    # The run menu entries export its interpreter as
+    # VULVATAR_FACE_SIDECAR_PYTHON; without it the app would spawn bare
+    # `python` off PATH, which has no ai-edge-litert.
+    Install-FaceSidecarEnv
+
+    if (-not (Test-Path "models\yolo26-pose.onnx") -and
+        -not (Test-Path "models\yolo26n-pose_480.onnx")) {
+        Write-Host "  WARNING: YOLO26-pose ONNX not exported yet - tracking will not start." -ForegroundColor Yellow
+        Write-Host "    Run the 'export yolo26-pose ONNX' menu entry (Setup group) once." -ForegroundColor Yellow
+    }
+
+    # Trained artifacts that setup cannot download: the RTMPose hand
+    # exports and the face blendshape MLP are distilled offline (see
+    # AGENTS.md "Tracking"). Without them the hand chain stays disabled
+    # and the face sidecar runs geometric-only expressions.
+    foreach ($trained in @(
+            "models\rtmpose-m-hand_256.onnx",
+            "models\rtmpose-hand-presence_64.onnx",
+            "models\rtmpose-hand-palm_256.onnx",
+            "models\rtmpose-face-blendshape_98.onnx")) {
+        if (-not (Test-Path $trained)) {
+            Write-Host "  NOTE: $trained missing (offline-distilled; cannot be downloaded)." -ForegroundColor DarkYellow
+        }
     }
 
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
@@ -207,74 +214,6 @@ function Install-ZipArchive {
     }
 }
 
-# Download a PINTO_model_zoo `resources*.tar.gz` archive, extract to a
-# temp dir, copy ONNX files matching `KeepGlobs` into `models\`, and
-# remove the temp dir. PINTO archives often bundle 10+ variants per
-# model; keeping only the ones we need keeps `models\` lean.
-function Install-PintoArchive {
-    param(
-        [Parameter(Mandatory)] [string]$Name,
-        [Parameter(Mandatory)] [string]$ArchiveUrl,
-        [Parameter(Mandatory)] [string[]]$KeepGlobs
-    )
-
-    # If every kept glob already resolves to at least one file in
-    # models/, the bundle is already installed — skip the redownload.
-    $allPresent = $true
-    foreach ($glob in $KeepGlobs) {
-        $matched = Get-ChildItem -Path "models\$glob" -ErrorAction SilentlyContinue
-        if (-not $matched) {
-            $allPresent = $false
-            break
-        }
-    }
-    if ($allPresent) {
-        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
-        return
-    }
-
-    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-    try {
-        $archivePath = Join-Path $tempDir "resources.tar.gz"
-        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
-        # curl.exe is more reliable than Invoke-WebRequest for archives
-        # in the 100MB+ range — IWR's progress UI slows the transfer to a
-        # crawl and (on flaky links) can return without writing the full
-        # body, leaving tar to error out with "Truncated tar archive".
-        # `--fail` exits non-zero on HTTP errors; `-L` follows redirects.
-        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
-        }
-
-        Write-Host "    extracting..." -ForegroundColor DarkGray
-        # tar.exe has shipped with Windows 10 1803+ and Windows 11.
-        # PowerShell's Expand-Archive does not handle .tar.gz natively.
-        $tarOutput = & tar.exe -xzf $archivePath -C $tempDir 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "tar -xzf failed for $Name (exit $LASTEXITCODE): $tarOutput"
-        }
-
-        $copied = 0
-        foreach ($glob in $KeepGlobs) {
-            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
-            foreach ($file in $matched) {
-                $dest = Join-Path "models" $file.Name
-                Copy-Item -Path $file.FullName -Destination $dest -Force
-                Write-Host "    kept $($file.Name)" -ForegroundColor Green
-                $copied++
-            }
-        }
-        if ($copied -eq 0) {
-            throw "$Name archive contained no files matching: $($KeepGlobs -join ', ')"
-        }
-    } finally {
-        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
 # Download individual .onnx files directly. Used for sources that
 # publish pre-built ONNX as release assets (no archive unpacking).
 function Install-DirectFiles {
@@ -299,6 +238,88 @@ function Install-DirectFiles {
     }
 }
 
+#endregion
+
+#region Face sidecar & YOLO26 export
+# Interpreter path of the face-sidecar venv. Install-FaceSidecarEnv
+# provisions it; the run menu entries export it as
+# VULVATAR_FACE_SIDECAR_PYTHON so the app spawns the RTMPose-face
+# sidecar with ai-edge-litert importable instead of whatever `python`
+# is on PATH.
+function Get-FaceSidecarPython {
+    return Join-Path (Get-Location).Path "tools\face98-venv\Scripts\python.exe"
+}
+
+# Create (once) the isolated venv the face landmark sidecar runs in and
+# install its two deps. Idempotent: an existing venv with importable
+# deps is left untouched, so the per-launch Install-Models call stays
+# cheap.
+function Install-FaceSidecarEnv {
+    $venvPython = Get-FaceSidecarPython
+    if (Test-Path $venvPython) {
+        & $venvPython -c "import ai_edge_litert, numpy" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  face sidecar venv: already provisioned, skipping" -ForegroundColor Green
+            return
+        }
+    }
+
+    Write-Host "  Provisioning face sidecar venv (tools\face98-venv)..." -ForegroundColor Cyan
+    if (-not (Test-Path "tools")) { New-Item -ItemType Directory -Force -Path "tools" | Out-Null }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        & python -m venv "tools\face98-venv"
+    } else {
+        & py -3 -m venv "tools\face98-venv"
+    }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
+        throw "could not create tools\face98-venv (needs python or py -3 on PATH)"
+    }
+    & $venvPython -m pip install --quiet ai-edge-litert numpy
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip install ai-edge-litert numpy failed - the face sidecar cannot run without it"
+    }
+    Write-Host "  face sidecar venv ready: $venvPython" -ForegroundColor Green
+}
+
+# One-time ONNX export of the YOLO26-pose body detector. models/ is
+# gitignored and the repo carries only the .pt sources, so a fresh
+# checkout has no exported detector and tracking fails to start
+# (AGENTS.md "Tracking"). ultralytics pulls torch, so the first run of
+# this entry is heavyweight; the venv under $TEMP is reused after.
+function Export-Yolo26PoseOnnx {
+    $venv = Join-Path $env:TEMP "yolo_export_venv"
+    $venvPython = Join-Path $venv "Scripts\python.exe"
+    if (-not (Test-Path $venvPython)) {
+        Write-Host "Creating ultralytics venv ($venv) - downloads torch, one-time..." -ForegroundColor Cyan
+        if (Get-Command python -ErrorAction SilentlyContinue) {
+            & python -m venv $venv
+        } else {
+            & py -3 -m venv $venv
+        }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
+            throw "could not create $venv (needs python or py -3 on PATH)"
+        }
+        & $venvPython -m pip install --quiet ultralytics onnx onnxslim
+        if ($LASTEXITCODE -ne 0) { throw "pip install ultralytics failed" }
+    }
+    if (-not (Test-Path "models")) { New-Item -ItemType Directory -Force -Path "models" | Out-Null }
+    foreach ($weight in @("yolo26n-pose.pt", "yolo26s-pose.pt")) {
+        $out = "models\$($weight.Replace('.pt', ''))_480.onnx"
+        if (Test-Path $out) {
+            Write-Host "  $out already exported, skipping" -ForegroundColor Green
+            continue
+        }
+        if (-not (Test-Path $weight)) {
+            Write-Host "  $weight not found in repo root, skipping" -ForegroundColor Yellow
+            continue
+        }
+        Write-Host "  exporting $weight @ imgsz=480 opset=17..." -ForegroundColor Cyan
+        & $venvPython -c "from ultralytics import YOLO; YOLO('$weight').export(format='onnx', imgsz=480, opset=17, simplify=True)"
+        if ($LASTEXITCODE -ne 0) { throw "ONNX export failed for $weight" }
+        Move-Item $weight.Replace('.pt', '.onnx') $out -Force
+        Write-Host "  kept $out" -ForegroundColor Green
+    }
+}
 #endregion
 
 #region MediaFoundation virtual camera
@@ -616,9 +637,15 @@ function Test-DistributionPrereqs {
         "assets\MaterialSymbolsRounded.ttf",
         "models\rtmw3d.onnx",
         "models\yolox.onnx",
-        "models\face_landmark.onnx",
-        "models\face_blendshapes.onnx",
-        "models\mediapipe_hand_landmark.onnx",
+        # Default (RTMPose-face sidecar) face chain: landmark tflite +
+        # canonical-mesh anchors + the sidecar script itself. The MediaPipe
+        # face/hand ONNX bundles are no longer shipped (runtime removed
+        # 2026-09-22); the trained hand exports + blendshape MLP stay
+        # offline artifacts and are not installer-prerequisites.
+        "models\rtm_face_fp16.tflite",
+        "models\mp_canonical478.npy",
+        "models\mp_wflw98_idx.json",
+        "scripts\face98_service.py",
         "THIRD_PARTY_LICENSES.md",
         "docs\USER_GUIDE_JA.md"
     )
@@ -865,6 +892,7 @@ function Start-DepthCapture {
 #region Dev menu
 $commands = @(
     @{ Group = "Setup";          Label = "setup (download pose models + CJK fonts)"; Cmd = "Install-Models; Install-Font" },
+    @{ Group = "Setup";          Label = "export yolo26-pose ONNX (models/, one-time)"; Cmd = "Export-Yolo26PoseOnnx" },
 
     # D435-exclusive build: `realsense` ships in default features and its
     # build.rs needs the pkg-config + LIBCLANG env, so every build/run goes
@@ -872,8 +900,8 @@ $commands = @(
     # There is no webcam path — no camera means the tracker idles.
     @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (debug)";   Cmd = "Invoke-CargoRealsense -CargoArgs @('build')" },
     @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (release)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('build','--release')" },
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
 
     @{ Group = "Camera & depth"; Label = "diagnose realsense (enumerate + stream test)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('run','--bin','diagnose_realsense')" },
     @{ Group = "Camera & depth"; Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },

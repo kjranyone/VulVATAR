@@ -71,10 +71,7 @@ pub(crate) struct DetectorAux {
 /// execution provider.
 #[derive(Clone, Copy, Debug)]
 pub struct DetectorOptions {
-    /// Execution provider for the FaceMesh + Blendshape cascade.
-    /// Overridden to CPU when `force_cpu` is set.
-    pub face_ep: crate::tracking::face_mediapipe::FaceMeshEp,
-    /// Run the detector and FaceMesh on the CPU EP, keeping DirectML —
+    /// Run the detector on the CPU EP, keeping DirectML —
     /// and therefore the GPU driver's compute queue — completely out of
     /// the tracking pipeline. YOLO26-pose is fast enough on CPU (~34 ms)
     /// for this to be a usable degraded mode.
@@ -83,10 +80,7 @@ pub struct DetectorOptions {
 
 impl Default for DetectorOptions {
     fn default() -> Self {
-        Self {
-            face_ep: crate::tracking::face_mediapipe::FaceMeshEp::Auto,
-            force_cpu: false,
-        }
+        Self { force_cpu: false }
     }
 }
 

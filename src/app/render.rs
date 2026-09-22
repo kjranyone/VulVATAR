@@ -669,15 +669,6 @@ impl Application {
         self.output
             .set_target_fps(self.runtime_gpu_budget.render_fps_target());
 
-        // FaceMesh CPU-EP preference under pressure (takes effect on the
-        // next tracking start — the ONNX session is built there).
-        #[cfg(feature = "inference")]
-        {
-            crate::tracking::face_mediapipe::FACEMESH_EP_CPU.store(
-                self.runtime_gpu_budget.facemesh_prefers_cpu_ep(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
         // Pose Hz + depth refresh are consumed by the realsense
         // worker's estimate loop (worker::POSE_HZ_TARGET /
         // worker::DEPTH_REFRESH_PERIOD). Same Relaxed rationale.

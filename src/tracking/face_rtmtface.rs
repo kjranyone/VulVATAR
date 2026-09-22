@@ -572,8 +572,9 @@ impl FaceRtmpose {
 }
 
 /// ARKit blendshape names in the distilled MLP's output order (index 0
-/// `_neutral` skipped at the call site) — mirrors
-/// `face_mediapipe::FACE_BLENDSHAPE_NAMES`.
+/// `_neutral` skipped at the call site) — the same ordering the retired
+/// MediaPipe BlendshapeV2 head used, kept so distilled labels and the
+/// downstream ARKit aggregation stay aligned.
 const FACE_BLENDSHAPE_NAMES: [&str; 51] = [
     "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft",
     "browOuterUpRight", "cheekPuff", "cheekSquintLeft", "cheekSquintRight",

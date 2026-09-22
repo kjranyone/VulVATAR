@@ -14,7 +14,7 @@ pub mod stagelog;
 
 pub mod debug_channel;
 pub mod devices;
-pub mod face_mediapipe;
+pub mod face_bbox;
 pub mod face_rtmtface;
 pub mod fusion;
 pub mod mailbox;

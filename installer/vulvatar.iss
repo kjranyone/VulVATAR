@@ -88,9 +88,17 @@ Source: "..\assets\NotoSansSC-Regular.otf";     DestDir: "{app}\assets";        
 Source: "..\assets\MaterialSymbolsRounded.ttf"; DestDir: "{app}\assets";         Flags: ignoreversion
 Source: "..\models\rtmw3d.onnx";                DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\yolox.onnx";                 DestDir: "{app}\models";         Flags: ignoreversion
-Source: "..\models\face_landmark.onnx";         DestDir: "{app}\models";         Flags: ignoreversion
-Source: "..\models\face_blendshapes.onnx";      DestDir: "{app}\models";         Flags: ignoreversion
-Source: "..\models\mediapipe_hand_landmark.onnx"; DestDir: "{app}\models";        Flags: ignoreversion
+; Default (RTMPose-face sidecar) face chain: landmark tflite, the
+; canonical-mesh anchors, and the sidecar script. The MediaPipe
+; face/hand ONNX bundles are no longer shipped (runtime removed
+; 2026-09-22). NOTE: the sidecar also needs a Python with
+; ai-edge-litert on PATH (VULVATAR_FACE_SIDECAR_PYTHON) — bundling an
+; interpreter is not solved yet, so installed builds fall back to
+; "expressions disabled" with a warning when no python exists.
+Source: "..\models\rtm_face_fp16.tflite";       DestDir: "{app}\models";         Flags: ignoreversion
+Source: "..\models\mp_canonical478.npy";        DestDir: "{app}\models";         Flags: ignoreversion
+Source: "..\models\mp_wflw98_idx.json";         DestDir: "{app}\models";         Flags: ignoreversion
+Source: "..\scripts\face98_service.py";         DestDir: "{app}\scripts";        Flags: ignoreversion
 
 [Registry]
 ; HKLM CLSID registration — mirrors what dev.ps1 Register-MfCameraSystem

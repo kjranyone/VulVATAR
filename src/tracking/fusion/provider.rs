@@ -303,7 +303,6 @@ impl FusionProvider {
     ) -> Result<Self, String> {
         let dir = models_dir.as_ref();
         let opts = DetectorOptions {
-            face_ep: crate::tracking::face_mediapipe::FaceMeshEp::Auto,
             force_cpu: config.force_cpu,
         };
         let (det, backend_label, mut warnings) = if remote {
