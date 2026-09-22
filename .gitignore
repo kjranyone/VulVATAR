@@ -79,3 +79,4 @@ models/*.tflite
 models/*.npy
 models/*.bak
 models/*.json
+models/*bak
