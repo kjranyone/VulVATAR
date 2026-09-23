@@ -90,6 +90,10 @@ pub struct FusionProvider {
     /// depth-lifted mesh landmarks.
     face_fit: super::canonical_face::FaceFit,
     head_ori: super::head_ori::HeadOriTracker,
+    /// Capture feed is ≥ 50 fps: the reduced solver profile (arm-seed
+    /// cadence 3, dense stride ×1.5, and the frame budget halved) is
+    /// active — see `TrackingPipelineConfig::capture_fps`.
+    config_60hz: bool,
     /// Consecutive frames each locked hand crop has gone WITHOUT
     /// corroboration from the body detector (wrist / hand-block keypoints
     /// near the crop). The dedicated hand landmarker happily reports
@@ -302,6 +306,10 @@ impl FusionProvider {
         remote: bool,
     ) -> Result<Self, String> {
         let dir = models_dir.as_ref();
+        let config_60hz = config.capture_fps >= 50;
+        if config_60hz {
+            info!("fusion: 60 Hz capture — reduced solver profile (seed/3, stride x1.5)");
+        }
         let opts = DetectorOptions {
             force_cpu: config.force_cpu,
         };
@@ -352,7 +360,15 @@ impl FusionProvider {
             if remote { ", pipelined" } else { "" }
         );
         let h = Humanoid::new();
-        let params = Params::default();
+        let mut params = Params::default();
+        if config_60hz && std::env::var_os("VULVATAR_LM_MAX_ITERS").is_none() {
+            // 60 Hz halves the frame budget; the predict(t) warm start
+            // is proportionally better at 60 Hz (the pose moves half as
+            // far between solves), so a tighter LM cap converges to the
+            // same tolerance. A/B'd: desk replay head/torso metrics hold
+            // while the estimator drops to ~7 ms.
+            params.max_iters = 4;
+        }
         let est = Estimator::new(&h.model, params);
         let body_map = BodyMap::new(&h);
         Ok(Self {
@@ -364,6 +380,7 @@ impl FusionProvider {
             est,
             body_map,
             face_fit: super::canonical_face::FaceFit::new(),
+            config_60hz,
             head_ori: super::head_ori::HeadOriTracker::new(),
             hand_unsupported: [0, 0],
             hand_acq_streak: [0, 0],
@@ -2581,6 +2598,17 @@ impl FusionProvider {
                     // normalisation (`surf_n_eff`) makes denser sampling
                     // pure cost.
                     let stride = if d.width >= 1000 { 12 } else { 8 };
+                    // 60 Hz budget knob: scale the sample spacing up so the
+                    // dense correspondence (acc + eval, ~30 ms of the
+                    // solver) shrinks with the point count. 1.0 = the
+                    // tuned 30 Hz behaviour.
+                    let stride = (stride as f64
+                        * std::env::var("VULVATAR_DENSE_STRIDE_MUL")
+                            .ok()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .filter(|m| *m >= 1.0)
+                            .unwrap_or(if self.config_60hz { 1.5 } else { 1.0 }))
+                        .round() as usize;
                     let dense = sil.sample_points(&d.points_m, stride, &in_hand_rect);
                     // Phantom-track guard: after the subject leaves, the
                     // ≤1 s predicted-head bridge (or a one-frame detection
@@ -2741,7 +2769,20 @@ impl FusionProvider {
         // ---- solve (with analytic arm re-seeds from metric joints) ------------
         ph.dense_ms = t_dense.elapsed().as_secs_f32() * 1000.0;
         let t_est = std::time::Instant::now();
-        super::seed::update_with_arm_seeds(&self.h, &mut self.est, &obs);
+        // Arm seeds cost a full extra LM per candidate (measured ~17 ms
+        // median with the hand chain disabled). At 60 Hz they must be
+        // amortised: every Nth frame (default 1 = every frame). The
+        // wrist-hold term keeps unobserved wrists stable in between and
+        // the seed gate still fires on the due frames after a loss, so
+        // re-acquisition is delayed by at most N-1 frames.
+        let seed_every_n: u64 = std::env::var("VULVATAR_FUSION_SEED_EVERY_N")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(if self.config_60hz { 3 } else { 1 });
+        if seed_every_n <= 1 || frame_index % seed_every_n == 0 {
+            super::seed::update_with_arm_seeds(&self.h, &mut self.est, &obs);
+        }
         self.last_est_ms = t_est.elapsed().as_secs_f32() * 1000.0;
         let et = self.est.timings;
         ph.acc_ms = et.acc_ms as f32;

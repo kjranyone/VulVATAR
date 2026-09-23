@@ -186,7 +186,11 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            max_iters: 8,
+            max_iters: std::env::var("VULVATAR_LM_MAX_ITERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(8),
             c_2d: 4.0,
             c_3d: 5.0,
             surf_model_sigma: 0.012,

@@ -294,6 +294,9 @@ impl TrackingGuiState {
         } else {
             crate::tracking::provider::TrackingPipelineConfig {
                 force_cpu: self.force_cpu_inference,
+                capture_fps: crate::tracking::camera_fps_for_index(
+                    self.camera_framerate_index,
+                ),
             }
         }
     }

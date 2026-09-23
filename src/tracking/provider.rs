@@ -21,12 +21,20 @@ pub struct TrackingPipelineConfig {
     /// pipeline entirely. Slower, but isolates tracking from
     /// GPU-driver instability (see the 2026-06-11 freeze incident).
     pub force_cpu: bool,
+    /// Capture rate the pipeline is being fed at (camera fps). At 60 Hz
+    /// the frame budget halves, so the solver profile (arm-seed
+    /// cadence, dense stride, LM cap) automatically switches to the
+    /// reduced-cost variant; the `VULVATAR_FUSION_SEED_EVERY_N` /
+    /// `VULVATAR_DENSE_STRIDE_MUL` / `VULVATAR_LM_MAX_ITERS` env knobs
+    /// still override individually.
+    pub capture_fps: u32,
 }
 
 impl Default for TrackingPipelineConfig {
     fn default() -> Self {
         Self {
             force_cpu: false,
+            capture_fps: 30,
         }
     }
 }
@@ -38,6 +46,7 @@ impl TrackingPipelineConfig {
     pub fn safe_mode() -> Self {
         Self {
             force_cpu: true,
+            capture_fps: 30,
         }
     }
 }

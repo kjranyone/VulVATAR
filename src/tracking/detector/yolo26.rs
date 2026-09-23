@@ -76,6 +76,10 @@ pub(crate) struct Yolo26PoseInference {
     /// last result is republished in between). `VULVATAR_FACE_EVERY_N`
     /// overrides (1 = every frame).
     face_every_n: u64,
+    /// Wall-clock floor between face-chain runs (ms). 66 ≈ 15 Hz.
+    face_interval_ms: u64,
+    /// Capture timestamp of the last face run.
+    last_face_ts_ms: f64,
     /// Last accepted face result, republished on skipped frames.
     last_face: Option<(
         Vec<crate::tracking::SourceExpression>,
@@ -203,6 +207,11 @@ impl Yolo26PoseInference {
             size,
             face_rtmt,
             face_every_n,
+            face_interval_ms: std::env::var("VULVATAR_FACE_MIN_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(66),
+            last_face_ts_ms: f64::NEG_INFINITY,
             last_face: None,
             face_selector: face::FaceSourceSelector::default(),
             frame_timestamp_ms: None,
@@ -351,7 +360,16 @@ impl Yolo26PoseInference {
         let mut mesh_conf = 0.0f32;
         let mut mesh_face_pose: Option<crate::tracking::FacePose> = None;
         let face_dbg = std::env::var_os("VULVATAR_FACE_DEBUG").is_some();
-        let face_due = self.face_every_n <= 1 || frame_index % self.face_every_n == 0;
+        // Time-based cadence: keep the face at ~15 Hz regardless of the
+        // camera rate (frame-count modulo would double it at 60 fps).
+        // Falls back to the frame-count rule while timestamps are
+        // missing (first frames).
+        let face_due = match self.frame_timestamp_ms {
+            Some(ts) if ts.is_finite() => {
+                ts - self.last_face_ts_ms >= self.face_interval_ms as f64
+            }
+            _ => self.face_every_n <= 1 || frame_index % self.face_every_n == 0,
+        };
         if let Some(face_rtmt) = self.face_rtmt.as_mut() {
             if face_dbg && frame_index % 30 == 0 {
                 let n_pts = joints.iter().take(5).filter(|j| j.score >= 0.3).count();
@@ -370,6 +388,9 @@ impl Yolo26PoseInference {
                         face_rtmt.estimate(rgb_data, width, height, (bbox.x, bbox.y, bbox.size))
                     {
                         self.last_face = Some(result.clone());
+                        if let Some(ts) = self.frame_timestamp_ms {
+                            self.last_face_ts_ms = ts;
+                        }
                         fresh = true;
                     }
                 }
