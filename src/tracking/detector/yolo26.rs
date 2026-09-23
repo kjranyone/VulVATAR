@@ -66,8 +66,12 @@ pub(crate) struct Yolo26PoseInference {
     output_name: String,
     /// Square model input size (from the export filename convention).
     size: u32,
-    /// Ready-made RTMPose-face sidecar chain (the only face backend).
-    face_rtmt: Option<crate::tracking::face_rtmtface::FaceRtmpose>,
+    /// Ready-made RTMPose-face sidecar chain (the only face backend),
+    /// running on its own worker thread — the ~30-60 ms sidecar
+    /// roundtrip must never sit inside the detector's frame budget.
+    face_worker: Option<crate::tracking::face_rtmtface::FaceWorker>,
+    /// Sequence tag of the last adopted worker result.
+    last_face_seen: u64,
     /// Run the face chain every Nth frame (default 2 = 15 Hz). The
     /// sidecar roundtrip + the downstream 478-point face attach are the
     /// two largest per-frame costs added by the face channel; at 15 Hz
@@ -175,11 +179,11 @@ impl Yolo26PoseInference {
         // Face backend: the ready-made RTMPose-face sidecar is the only
         // path (the MediaPipe FaceMesh pair was removed on 2026-09-22;
         // the pre-removal A/B implementation lives in git history).
-        let face_rtmt =
+        let face_worker =
             match crate::tracking::face_rtmtface::FaceRtmpose::try_from_models_dir(&models_dir) {
                 Ok(f) => {
-                    info!("face backend: RTMPose-face sidecar");
-                    Some(f)
+                    info!("face backend: RTMPose-face sidecar (async worker)");
+                    Some(crate::tracking::face_rtmtface::FaceWorker::spawn(f))
                 }
                 Err(e) => {
                     let msg = format!(
@@ -205,7 +209,8 @@ impl Yolo26PoseInference {
             input_name,
             output_name,
             size,
-            face_rtmt,
+            face_worker,
+            last_face_seen: 0,
             face_every_n,
             face_interval_ms: std::env::var("VULVATAR_FACE_MIN_INTERVAL_MS")
                 .ok()
@@ -370,12 +375,15 @@ impl Yolo26PoseInference {
             }
             _ => self.face_every_n <= 1 || frame_index % self.face_every_n == 0,
         };
-        if let Some(face_rtmt) = self.face_rtmt.as_mut() {
+        if let Some(face_worker) = self.face_worker.as_mut() {
             if face_dbg && frame_index % 30 == 0 {
                 let n_pts = joints.iter().take(5).filter(|j| j.score >= 0.3).count();
                 info!("face debug: body face pts >=0.3: {n_pts}/5");
             }
-            let mut fresh = false;
+            // Submit a new job on the cadence; ADOPT whatever the worker
+            // finished since last frame regardless of cadence (the
+            // result may lag the frame by one face interval — invisible
+            // at 15 Hz data rate, and the roundtrip never blocks here).
             if face_due {
                 if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
                     if face_dbg && frame_index % 30 == 0 {
@@ -384,29 +392,32 @@ impl Yolo26PoseInference {
                             bbox.x, bbox.y, bbox.size
                         );
                     }
-                    if let Some(result) =
-                        face_rtmt.estimate(rgb_data, width, height, (bbox.x, bbox.y, bbox.size))
-                    {
-                        self.last_face = Some(result.clone());
-                        if let Some(ts) = self.frame_timestamp_ms {
-                            self.last_face_ts_ms = ts;
-                        }
-                        fresh = true;
+                    face_worker.submit(
+                        frame_index,
+                        rgb_data.to_vec(),
+                        width,
+                        height,
+                        (bbox.x, bbox.y, bbox.size),
+                    );
+                    if let Some(ts) = self.frame_timestamp_ms {
+                        self.last_face_ts_ms = ts;
                     }
                 }
             }
-            if fresh || !face_due {
-                if let Some((exprs, conf, pose, mesh478)) = self.last_face.as_ref() {
-                    skeleton.expressions = exprs.clone();
-                    skeleton.face_mesh_confidence = Some(*conf);
-                    mesh_conf = *conf;
-                    mesh_face_pose = pose.clone();
-                    if let Some(aux) = self.last_aux.as_mut() {
-                        aux.face_mesh = Some((mesh478.clone(), *conf));
-                    }
+            if let Some(result) = face_worker.take_newer(&mut self.last_face_seen) {
+                self.last_face = Some(result);
+            }
+            if let Some((exprs, conf, pose, mesh478)) = self.last_face.as_ref() {
+                skeleton.expressions = exprs.clone();
+                skeleton.face_mesh_confidence = Some(*conf);
+                mesh_conf = *conf;
+                mesh_face_pose = pose.clone();
+                if let Some(aux) = self.last_aux.as_mut() {
+                    aux.face_mesh = Some((mesh478.clone(), *conf));
                 }
             }
         }
+
         skeleton.face =
             self.face_selector
                 .select(body_face_pose, mesh_face_pose, mesh_conf, dt_s);

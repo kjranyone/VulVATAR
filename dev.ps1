@@ -106,6 +106,16 @@ function Install-Models {
     # load tflite. The distilled blendshape MLP
     # (models/rtmpose-face-blendshape_98.onnx) is a locally trained
     # artifact — without it the sidecar still runs, geometric-only.
+    # RTMPose-m hand landmark model (mmpose ready-made, SimCC 512 bins,
+    # 256 input — renamed to the runtime's `_256` filename contract).
+    # The distilled presence/palm nets are NOT fetchable (offline
+    # distillation from this camera's own recordings) — without them the
+    # hand chain runs on the SimCC sharpness presence proxy (degraded).
+    Install-DirectFiles -Name "RTMPose-m hand landmark" -Files @(
+        @{ Url = "https://huggingface.co/datasets/DavidPagnon/rtmlib_models/resolve/main/mmpose/rtmposev1/onnx_sdk/rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.onnx";
+           OutName = "rtmpose-m-hand_256.onnx" }
+    )
+
     Install-DirectFiles -Name "RTMPose-Face-WFLW LiteRT (face sidecar)" -Files @(
         @{ Url = "https://huggingface.co/litert-community/RTMPose-Face-WFLW-LiteRT/resolve/main/rtm_face_fp16.tflite";
            OutName = "rtm_face_fp16.tflite" }
@@ -123,12 +133,12 @@ function Install-Models {
         Write-Host "    Run the 'export yolo26-pose ONNX' menu entry (Setup group) once." -ForegroundColor Yellow
     }
 
-    # Trained artifacts that setup cannot download: the RTMPose hand
-    # exports and the face blendshape MLP are distilled offline (see
-    # AGENTS.md "Tracking"). Without them the hand chain stays disabled
-    # and the face sidecar runs geometric-only expressions.
+    # Trained artifacts that setup cannot download: the distilled hand
+    # presence/palm nets and the face blendshape MLP (the hand LANDMARK
+    # model above is ready-made and IS downloaded; without the distilled
+    # nets the hand chain runs on the SimCC sharpness presence proxy and
+    # the face sidecar runs geometric-only expressions).
     foreach ($trained in @(
-            "models\rtmpose-m-hand_256.onnx",
             "models\rtmpose-hand-presence_64.onnx",
             "models\rtmpose-hand-palm_256.onnx",
             "models\rtmpose-face-blendshape_98.onnx")) {

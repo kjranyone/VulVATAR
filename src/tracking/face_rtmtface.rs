@@ -852,3 +852,113 @@ mod tests {
         assert!((det_vt - 1.0).abs() < 1e-9, "det vt {det_vt}");
     }
 }
+
+/// One queued face job: the full RGB frame (the 256 crop is built on
+/// the worker thread) plus the face bbox and the frame's sequence tag.
+struct FaceJob {
+    frame: u64,
+    rgb: Vec<u8>,
+    width: u32,
+    height: u32,
+    bbox: (f32, f32, f32),
+}
+
+/// Latest completed face result from the worker thread: the frame whose
+/// crop produced it and the full `FaceRtmpose::estimate` output.
+pub type FaceOutput = (
+    Vec<crate::tracking::SourceExpression>,
+    f32,
+    Option<crate::tracking::FacePose>,
+    Vec<[f32; 3]>,
+);
+
+/// Asynchronous face-chain runner: the detector thread submits 256×256
+/// crops and never blocks on the sidecar roundtrip (~30-60 ms — at a
+/// 16.6 ms frame budget an in-thread call caps the whole detector at
+/// ~40 fps). A dedicated thread owns the [`FaceRtmpose`] and publishes
+/// complete results into a latest-wins cell the detector polls.
+///
+/// Submission is latest-wins too: a crop waiting in the channel while a
+/// new one arrives is dropped (the face is 15 Hz data; one skipped face
+/// update is invisible, a blocked detector is not).
+pub struct FaceWorker {
+    tx: Option<std::sync::mpsc::Sender<FaceJob>>,
+    cell: std::sync::Arc<std::sync::Mutex<(u64, Option<FaceOutput>)>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FaceWorker {
+    pub fn spawn(face: FaceRtmpose) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<FaceJob>();
+        let cell = std::sync::Arc::new(std::sync::Mutex::new((0u64, None)));
+        let cell_thread = cell.clone();
+        let handle = std::thread::Builder::new()
+            .name("face98-worker".into())
+            .spawn(move || {
+                let mut face = face;
+                // Batch drain: keep only the newest queued frame.
+                while let Ok(mut job) = rx.recv() {
+                    while let Ok(j2) = rx.try_recv() {
+                        job = j2;
+                    }
+                    if let Some(out) =
+                        face.estimate(&job.rgb, job.width, job.height, job.bbox)
+                    {
+                        if let Ok(mut g) = cell_thread.lock() {
+                            if job.frame >= g.0 {
+                                *g = (job.frame, Some(out));
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self {
+            tx: Some(tx),
+            cell,
+            handle,
+        }
+    }
+
+    /// Hand a frame + face bbox to the worker (the crop build runs on
+    /// the worker thread too). Non-blocking; drops the frame when the
+    /// worker is still busy with the previous one.
+    pub fn submit(
+        &mut self,
+        frame: u64,
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
+        bbox: (f32, f32, f32),
+    ) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(FaceJob {
+                frame,
+                rgb,
+                width,
+                height,
+                bbox,
+            });
+        }
+    }
+
+    /// Adopt the newest completed result produced AFTER `last_seen`.
+    pub fn take_newer(&mut self, last_seen: &mut u64) -> Option<FaceOutput> {
+        let g = self.cell.lock().ok()?;
+        if g.0 > *last_seen {
+            *last_seen = g.0;
+            g.1.clone()
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for FaceWorker {
+    fn drop(&mut self) {
+        self.tx.take(); // close the channel: the worker loop exits
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
